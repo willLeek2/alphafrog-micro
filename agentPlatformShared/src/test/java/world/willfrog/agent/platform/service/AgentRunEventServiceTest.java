@@ -40,6 +40,9 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class AgentRunEventServiceTest {
 
+    private static final String DEPLOYMENT_ID = "stable";
+    private static final String DEPLOYMENT_GENERATION_ID = "gen-" + "a".repeat(64);
+
     @Mock
     private AgentRunMapper runMapper;
     @Mock
@@ -307,6 +310,9 @@ class AgentRunEventServiceTest {
                         2,
                         false,
                         "{}",
+                        DEPLOYMENT_ID,
+                        DEPLOYMENT_GENERATION_ID,
+                        false,
                         false));
 
         assertEquals("unsupported_execution_mode:PARALLEL", error.getMessage());
@@ -327,9 +333,12 @@ class AgentRunEventServiceTest {
 
         AgentRun run = run("r-test", "u-test");
         when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString())).thenReturn(run);
 
         service.createRun("u-test", "hello", "{\"executionMode\":\" dag \"}",
-                "idem", "m", "e", false, "openrouter", 2, false, "{}", false);
+                "idem", "m", "e", false, "openrouter", 2, false, "{}",
+                DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
         ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(runCaptor.capture());
@@ -362,8 +371,12 @@ class AgentRunEventServiceTest {
 
         AgentRun run = run("r-test2", "u-test2");
         when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString())).thenReturn(run);
 
-        service.createRun("u-test2", "hello", "{}", "idem", "m", "e", false, "openrouter", 2, false, "{}", false);
+        service.createRun("u-test2", "hello", "{}", "idem", "m", "e", false,
+                "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                DEPLOYMENT_GENERATION_ID, false, false);
 
         ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(runCaptor.capture());
@@ -377,10 +390,15 @@ class AgentRunEventServiceTest {
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
         when(eventMapper.insert(any())).thenReturn(1);
-        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run("r-artifact", "u-artifact"));
+        when(runMapper.findByIdAndUser(anyString(), anyString()))
+                .thenReturn(run("r-artifact", "u-artifact"));
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(run("r-artifact", "u-artifact"));
 
         service.createRun("u-artifact", "hello", "{}", "idem", "m", "e",
-                false, "openrouter", 2, false, "{}", true, false);
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                DEPLOYMENT_GENERATION_ID, true, false);
 
         ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(runCaptor.capture());

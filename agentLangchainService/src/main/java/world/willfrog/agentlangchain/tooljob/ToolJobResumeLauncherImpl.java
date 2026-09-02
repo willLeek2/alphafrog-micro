@@ -3,10 +3,13 @@ package world.willfrog.agentlangchain.tooljob;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,6 +34,8 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
     private final LangchainLinearRunPipeline pipeline;
     private final ObjectProvider<ToolJobResumeService> resumeServiceProvider;
     private final ConcurrentMap<ToolJobResumeClaimKey, Boolean> activeClaims = new ConcurrentHashMap<>();
+    @Autowired(required = false)
+    private DeploymentIdentityProvider deploymentIdentityProvider;
 
     @Override
     public boolean launch(String runId, ToolJobResumeContext context) {
@@ -47,7 +52,12 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
             return true;
         }
         // 入队前重新读取 Run；排队身份仍由 id 和 context lease 约束。
-        AgentRun run = runMapper.findById(runId);
+        DeploymentIdentity identity = deploymentIdentityProvider == null
+                ? null : deploymentIdentityProvider.current();
+        AgentRun run = identity == null
+                ? runMapper.findById(runId)
+                : runMapper.findByIdForDeployment(
+                        runId, identity.deploymentId(), identity.generationId());
         if (run == null) {
             // Run 已删除，释放本地去重键并报告 launch 失败。
             activeClaims.remove(key);

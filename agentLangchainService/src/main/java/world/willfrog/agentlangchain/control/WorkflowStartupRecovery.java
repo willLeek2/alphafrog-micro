@@ -4,7 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
@@ -15,6 +15,8 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -29,14 +31,16 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 @Slf4j
-@ConditionalOnProperty(prefix = "agent.workflow-restart", name = "enabled",
-        havingValue = "true", matchIfMissing = true)
+@ConditionalOnExpression("${agent.langchain.provider.enabled:false}"
+        + " && ${agent.workflow-restart.enabled:true}"
+        + " && !${agent.deployment.retirement-only:false}")
 public class WorkflowStartupRecovery {
 
     private final AgentRunMapper runMapper;
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunEventService eventService;
     private final AgentRunFinalizationService finalizationService;
+    private final DeploymentIdentityProvider deploymentIdentityProvider;
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
@@ -51,7 +55,9 @@ public class WorkflowStartupRecovery {
     public void onReady() {
         OffsetDateTime startedBefore = OffsetDateTime.now();
         int boundedLimit = Math.max(1, Math.min(scanLimit, 1000));
-        List<AgentRun> candidates = runMapper.listStartupRecoveryCandidates(startedBefore, boundedLimit);
+        DeploymentIdentity identity = deploymentIdentityProvider.current();
+        List<AgentRun> candidates = runMapper.listStartupRecoveryCandidatesForDeployment(
+                startedBefore, identity.deploymentId(), identity.generationId(), boundedLimit);
         for (AgentRun candidate : candidates) {
             recoverOne(candidate);
         }
@@ -68,7 +74,8 @@ public class WorkflowStartupRecovery {
         AgentRunStatus status = candidate.getStatus();
         try {
             if (status == AgentRunStatus.CANCELING) {
-                if (runMapper.completeStartupCancellation(runId) == 1) {
+                if (runMapper.completeStartupCancellationForDeployment(
+                        runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId()) == 1) {
                     if (schedulerMetrics != null) {
                         schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
                     }
@@ -97,11 +104,13 @@ public class WorkflowStartupRecovery {
                 fail(candidate, "workflow_restart_plan_missing");
                 return;
             }
-            if (runMapper.claimStartupRestart(
-                    runId, status, attempt, maxAttempts) != 1) {
+            if (runMapper.claimStartupRestartForDeployment(
+                    runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId(),
+                    status, attempt, maxAttempts) != 1) {
                 return;
             }
-            AgentRun claimed = runMapper.findById(runId);
+            AgentRun claimed = runMapper.findByIdForDeployment(
+                    runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId());
             if (claimed == null) {
                 return;
             }
@@ -122,7 +131,8 @@ public class WorkflowStartupRecovery {
                     "previous_status", status.name()));
         } catch (Exception e) {
             log.error("Workflow startup recovery failed for run={}", runId, e);
-            AgentRun latest = runMapper.findById(runId);
+            AgentRun latest = runMapper.findByIdForDeployment(
+                    runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId());
             if (latest != null) {
                 failClaimed(latest, "workflow_restart_launch_failed:" + safeMessage(e));
             }
@@ -130,13 +140,17 @@ public class WorkflowStartupRecovery {
     }
 
     private void fail(AgentRun run, String reason) {
-        if (runMapper.failStartupRecovery(run.getId(), run.getStatus(), reason) == 1) {
+        if (runMapper.failStartupRecoveryForDeployment(
+                run.getId(), run.getDeploymentId(), run.getDeploymentGenerationId(),
+                run.getStatus(), reason) == 1) {
             publishRejected(run, reason);
         }
     }
 
     private void failClaimed(AgentRun run, String reason) {
-        if (runMapper.failStartupRecovery(run.getId(), AgentRunStatus.RECEIVED, reason) == 1) {
+        if (runMapper.failStartupRecoveryForDeployment(
+                run.getId(), run.getDeploymentId(), run.getDeploymentGenerationId(),
+                AgentRunStatus.RECEIVED, reason) == 1) {
             publishRejected(run, reason);
         }
     }

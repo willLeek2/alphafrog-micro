@@ -15,6 +15,8 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.nio.charset.StandardCharsets;
@@ -67,6 +69,9 @@ public class ToolJobFinalizer {
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
+
+    @Autowired(required = false)
+    private DeploymentIdentityProvider deploymentIdentityProvider;
 
     @Autowired
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
@@ -135,6 +140,10 @@ public class ToolJobFinalizer {
     public FinalizerOutcome handleTerminal(String runId, ToolJobAnchor anchor,
                                 String terminalStatus, TaskResultResponse resultResp,
                                 boolean autoResume) {
+        if (!belongsToLocalDeployment(runId)) {
+            log.warn("拒绝由非所属部署代际处理工具终态: runId={}", runId);
+            return FinalizerOutcome.incomplete("DEPLOYMENT_IDENTITY", "deployment_generation_inactive");
+        }
         // 同一轮收尾统一使用一个时间点，避免各字段在重入时产生互相矛盾的时间。
         Instant now = Instant.now();
         // 第一步：把 Sandbox 终态和有界结果摘要写入真相源。
@@ -562,7 +571,12 @@ public class ToolJobFinalizer {
             return;
         }
         try {
-            AgentRun run = agentRunMapper.findById(runId);
+            DeploymentIdentity identity = deploymentIdentityProvider == null
+                    ? null : deploymentIdentityProvider.current();
+            AgentRun run = identity == null
+                    ? agentRunMapper.findById(runId)
+                    : agentRunMapper.findByIdForDeployment(
+                            runId, identity.deploymentId(), identity.generationId());
             if (run == null || run.getUserId() == null || run.getUserId().isBlank()) {
                 log.warn("Workspace finalization event skipped after CANCELED CAS: "
                         + "run/user missing runId={}", runId);
@@ -578,6 +592,10 @@ public class ToolJobFinalizer {
     }
 
     public void handleNotFound(String runId, ToolJobAnchor anchor) {
+        if (!belongsToLocalDeployment(runId)) {
+            log.warn("拒绝由非所属部署代际处理工具缺失结果: runId={}", runId);
+            return;
+        }
         // getTaskResult 暂无结果体时，用有界次数与保留期限决定继续轮询或 RESULT_LOST。
         Instant now = Instant.now();
         // 已确认 Sandbox 终态后仍取不到结果，才累计“终态结果丢失”窗口。
@@ -607,6 +625,15 @@ public class ToolJobFinalizer {
             redisCache.upsertDue(runId, anchor);
             redisCache.writePendingCache(runId, anchor);
         }
+    }
+
+    private boolean belongsToLocalDeployment(String runId) {
+        if (deploymentIdentityProvider == null || agentRunMapper == null) {
+            return true;
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return agentRunMapper.findByIdForDeployment(
+                runId, local.deploymentId(), local.generationId()) != null;
     }
 
     // ========== capacity release ==========

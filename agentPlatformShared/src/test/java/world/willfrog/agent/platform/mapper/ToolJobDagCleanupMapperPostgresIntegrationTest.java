@@ -48,6 +48,8 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
                     CREATE TABLE alphafrog_agent_run (
                         id VARCHAR(64) PRIMARY KEY,
                         user_id VARCHAR(64),
+                        deployment_id VARCHAR(64) NOT NULL,
+                        deployment_generation_id VARCHAR(68) NOT NULL,
                         status VARCHAR(32),
                         current_step INT DEFAULT 0,
                         max_steps INT DEFAULT 20,
@@ -301,6 +303,8 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId("user-1");
+        run.setDeploymentId("stable");
+        run.setDeploymentGenerationId("gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         run.setStatus(status);
         run.setCurrentStep(1);
         run.setMaxSteps(12);

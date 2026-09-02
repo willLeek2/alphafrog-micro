@@ -5,10 +5,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.List;
 import java.util.Objects;
@@ -29,6 +32,9 @@ public class ToolJobCheckpointFailureRecoveryService {
     private final ToolJobAnchorService anchorService;
     private final AgentRunMapper runMapper;
     private final ObjectMapper objectMapper;
+
+    @Autowired(required = false)
+    private DeploymentIdentityProvider deploymentIdentityProvider;
 
     public ToolJobCheckpointFailureRecoveryService(ToolJobAnchorService anchorService,
                                                    AgentRunMapper runMapper,
@@ -64,7 +70,7 @@ public class ToolJobCheckpointFailureRecoveryService {
         if (!hasSameFrozenOwner(request)) return Outcome.SUPERSEDED;
 
         // CAS 也可能因为同一 marker 已由另一个线程写入；读取 last_error 识别幂等成功。
-        AgentRun current = runMapper.findById(request.getRunId());
+        AgentRun current = findLocalRun(request.getRunId());
         if (current != null && markerOwnsSameTuple(current.getLastError(), request)) {
             return Outcome.RETRY_OWNED;
         }
@@ -86,7 +92,7 @@ public class ToolJobCheckpointFailureRecoveryService {
     /** @return true when no pending marker exists or this call durably resolved it. */
     public boolean retryPending(String runId) {
         // 重启/周期扫描从数据库读取 marker；Redis 不参与所有权判断。
-        AgentRun run = runMapper.findById(runId);
+        AgentRun run = findLocalRun(runId);
         // 没有 marker 代表无需重试，幂等返回 true。
         if (run == null || run.getLastError() == null
                 || !run.getLastError().startsWith(MARKER_PREFIX)) {
@@ -115,19 +121,21 @@ public class ToolJobCheckpointFailureRecoveryService {
                     request, "durable_checkpoint_write_failed");
         }
         // 只有失败处置已确认写入数据库、且 last_error 仍等于原 marker 时才清理，避免删掉新错误。
-        return resolved && runMapper.clearToolJobCheckpointFailurePending(runId, marker) == 1;
+        return resolved && runMapper.clearToolJobCheckpointFailurePending(
+                runId, marker, deploymentIdentity()) == 1;
     }
 
     private int writePendingMarker(ToolJobCheckpointRequest request, String marker) {
         return runMapper.markToolJobCheckpointFailurePending(
                 request.getRunId(), request.getOperationId(), request.getToolCallId(),
-                request.getAttempt(), request.getTaskId(), request.getExpectedCheckpointVersion(), marker);
+                request.getAttempt(), request.getTaskId(), request.getExpectedCheckpointVersion(), marker,
+                deploymentIdentity());
     }
 
     private boolean hasSameFrozenOwner(ToolJobCheckpointRequest request) {
         try {
             // 每次都从数据库读取当前 anchor，判断旧请求是否仍拥有同一元组。
-            AgentRun run = runMapper.findById(request.getRunId());
+            AgentRun run = findLocalRun(request.getRunId());
             if (run == null || run.getStatus() != AgentRunStatus.WAITING_TOOL_JOB
                     || blank(run.getToolJobAnchorJson())) {
                 return false;
@@ -146,6 +154,18 @@ public class ToolJobCheckpointFailureRecoveryService {
             // 分类异常时保守返回 true，避免把仍有效的失败 owner 错判为 superseded 后丢失处置。
             return true;
         }
+    }
+
+    private DeploymentIdentity deploymentIdentity() {
+        return deploymentIdentityProvider == null ? null : deploymentIdentityProvider.current();
+    }
+
+    private AgentRun findLocalRun(String runId) {
+        DeploymentIdentity identity = deploymentIdentity();
+        return identity == null
+                ? runMapper.findById(runId)
+                : runMapper.findByIdForDeployment(
+                        runId, identity.deploymentId(), identity.generationId());
     }
 
     private boolean markerOwnsSameTuple(String marker, ToolJobCheckpointRequest request) {

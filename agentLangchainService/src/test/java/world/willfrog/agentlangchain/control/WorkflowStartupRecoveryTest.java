@@ -10,6 +10,8 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
@@ -19,6 +21,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class WorkflowStartupRecoveryTest {
+
+    private static final String GENERATION = "gen-" + "a".repeat(64);
 
     private AgentRunMapper runMapper;
     private LangchainLinearRunPipeline pipeline;
@@ -34,7 +38,9 @@ class WorkflowStartupRecoveryTest {
         eventService = mock(AgentRunEventService.class);
         finalizationService = mock(AgentRunFinalizationService.class);
         schedulerMetrics = mock(LangchainSchedulerMetrics.class);
-        recovery = new WorkflowStartupRecovery(runMapper, pipeline, eventService, finalizationService);
+        DeploymentIdentityProvider identityProvider = () -> new DeploymentIdentity("stable", GENERATION);
+        recovery = new WorkflowStartupRecovery(
+                runMapper, pipeline, eventService, finalizationService, identityProvider);
         ReflectionTestUtils.setField(recovery, "schedulerMetrics", schedulerMetrics);
         ReflectionTestUtils.setField(recovery, "maxRestartAttempts", 1);
         ReflectionTestUtils.setField(recovery, "scanLimit", 100);
@@ -44,8 +50,9 @@ class WorkflowStartupRecoveryTest {
     void frozenPlanIsClaimedOnceAndQueuedWithoutReplanning() {
         AgentRun candidate = run(AgentRunStatus.EXECUTING, 0, "{\"items\":[]}");
         AgentRun claimed = run(AgentRunStatus.RECEIVED, 1, candidate.getPlanJson());
-        when(runMapper.claimStartupRestart("run-1", AgentRunStatus.EXECUTING, 0, 1)).thenReturn(1);
-        when(runMapper.findById("run-1")).thenReturn(claimed);
+        when(runMapper.claimStartupRestartForDeployment(
+                "run-1", "stable", GENERATION, AgentRunStatus.EXECUTING, 0, 1)).thenReturn(1);
+        when(runMapper.findByIdForDeployment("run-1", "stable", GENERATION)).thenReturn(claimed);
         when(pipeline.launchRestartedAsync(claimed)).thenReturn(true);
 
         recovery.recoverOne(candidate);
@@ -59,8 +66,9 @@ class WorkflowStartupRecoveryTest {
     @Test
     void restartAttemptLimitFailsClearlyWithoutScheduling() {
         AgentRun candidate = run(AgentRunStatus.EXECUTING, 1, "{\"items\":[]}");
-        when(runMapper.failStartupRecovery(
-                "run-1", AgentRunStatus.EXECUTING, "workflow_restart_attempts_exhausted")).thenReturn(1);
+        when(runMapper.failStartupRecoveryForDeployment(
+                "run-1", "stable", GENERATION,
+                AgentRunStatus.EXECUTING, "workflow_restart_attempts_exhausted")).thenReturn(1);
 
         recovery.recoverOne(candidate);
 
@@ -74,7 +82,8 @@ class WorkflowStartupRecoveryTest {
     @Test
     void cancelingRunIsFinishedAsCanceledAndNeverQueued() {
         AgentRun candidate = run(AgentRunStatus.CANCELING, 0, "{}");
-        when(runMapper.completeStartupCancellation("run-1")).thenReturn(1);
+        when(runMapper.completeStartupCancellationForDeployment(
+                "run-1", "stable", GENERATION)).thenReturn(1);
 
         recovery.recoverOne(candidate);
 
@@ -87,6 +96,8 @@ class WorkflowStartupRecoveryTest {
         AgentRun run = new AgentRun();
         run.setId("run-1");
         run.setUserId("user-1");
+        run.setDeploymentId("stable");
+        run.setDeploymentGenerationId(GENERATION);
         run.setStatus(status);
         run.setRestartAttempt(restartAttempt);
         run.setPlanJson(planJson);

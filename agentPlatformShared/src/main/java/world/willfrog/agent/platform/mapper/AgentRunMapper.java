@@ -4,6 +4,7 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -15,7 +16,18 @@ public interface AgentRunMapper {
 
     AgentRun findById(@Param("id") String id);
 
+    AgentRun findByIdForDeployment(
+            @Param("id") String id,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId);
+
     AgentRun findByIdAndUser(@Param("id") String id, @Param("userId") String userId);
+
+    AgentRun findByIdAndUserForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId);
 
     List<AgentRun> listByUser(@Param("userId") String userId,
                               @Param("status") AgentRunStatus status,
@@ -38,38 +50,113 @@ public interface AgentRunMapper {
                             @Param("status") AgentRunStatus status,
                             @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
+    int updateStatusWithTtlForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("status") AgentRunStatus status,
+            @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
+
     int updatePlanJson(@Param("id") String id,
                        @Param("userId") String userId,
                        @Param("planJson") String planJson);
+
+    int updatePlanJsonForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("planJson") String planJson);
 
     int updateExecutionCheckpoint(@Param("id") String id,
                                   @Param("userId") String userId,
                                   @Param("executionCheckpointJson") String executionCheckpointJson);
 
+    int updateExecutionCheckpointForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("executionCheckpointJson") String executionCheckpointJson);
+
     /**
      * 列出服务启动前遗留、可能需要恢复的 Run。调用者必须再逐条校验 Plan/checkpoint，
      * 本查询只负责有界发现，不把人工暂停 WAITING 或终态带入恢复链。
      */
-    List<AgentRun> listStartupRecoveryCandidates(
+    List<AgentRun> listStartupRecoveryCandidatesForDeployment(
             @Param("startedBefore") OffsetDateTime startedBefore,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
             @Param("limit") int limit);
+
+    /** 历史测试接缝；运行代码必须调用带部署身份的方法。 */
+    @Deprecated
+    default List<AgentRun> listStartupRecoveryCandidates(OffsetDateTime startedBefore, int limit) {
+        return listStartupRecoveryCandidatesForDeployment(
+                startedBefore, "stable", "legacy-stable", limit);
+    }
 
     /**
      * 单实例启动扫描的窄 CAS：状态和 restartAttempt 同时匹配才取得本次恢复权。
      * 当前不提供多实例租约；多实例部署必须关闭启动恢复或升级所有权协议。
      */
-    int claimStartupRestart(@Param("id") String id,
+    int claimStartupRestartForDeployment(@Param("id") String id,
+                            @Param("deploymentId") String deploymentId,
+                            @Param("deploymentGenerationId") String deploymentGenerationId,
                             @Param("expectedStatus") AgentRunStatus expectedStatus,
                             @Param("expectedRestartAttempt") int expectedRestartAttempt,
                             @Param("maxRestartAttempts") int maxRestartAttempts);
 
+    /** 历史数据只能被显式失败处理，不能由活动实例重新执行。 */
+    @Deprecated
+    default int claimStartupRestart(String id, AgentRunStatus expectedStatus,
+                                    int expectedRestartAttempt, int maxRestartAttempts) {
+        return 0;
+    }
+
     /** CANCELING 遗留记录只收口到 CANCELED，不重新进入执行器。 */
-    int completeStartupCancellation(@Param("id") String id);
+    int completeStartupCancellationForDeployment(@Param("id") String id,
+                                    @Param("deploymentId") String deploymentId,
+                                    @Param("deploymentGenerationId") String deploymentGenerationId);
+
+    @Deprecated
+    default int completeStartupCancellation(String id) {
+        return completeStartupCancellationForDeployment(id, "stable", "legacy-stable");
+    }
 
     /** 校验失败或达到自动重启上限时，按当前状态原子写成可见失败。 */
-    int failStartupRecovery(@Param("id") String id,
+    int failStartupRecoveryForDeployment(@Param("id") String id,
+                            @Param("deploymentId") String deploymentId,
+                            @Param("deploymentGenerationId") String deploymentGenerationId,
                             @Param("expectedStatus") AgentRunStatus expectedStatus,
                             @Param("lastError") String lastError);
+
+    @Deprecated
+    default int failStartupRecovery(String id, AgentRunStatus expectedStatus, String lastError) {
+        return failStartupRecoveryForDeployment(
+                id, "stable", "legacy-stable", expectedStatus, lastError);
+    }
+
+    /** 异步执行写入的通用代际栅栏；不允许其他代际修改 Run 状态。 */
+    int updateStatusForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("status") AgentRunStatus status);
+
+    /** 仅在本实例已收到可信退役信号后，把一个本代际 Run 写成明确终态。 */
+    int closeRetiredDeploymentRun(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId);
+
+    /** 仅由显式退役 RPC 调用，批量终止当前实例自身代际的未结束 Run。 */
+    int closeNonTerminalRunsForDeployment(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId);
 
     int updateExt(@Param("id") String id,
                   @Param("userId") String userId,
@@ -81,6 +168,25 @@ public interface AgentRunMapper {
                        @Param("snapshotJson") String snapshotJson,
                        @Param("completed") boolean completed,
                        @Param("lastError") String lastError);
+
+    /** 仅在 Run 仍属于当前部署代际且状态未变化时更新非终态快照。 */
+    int updateSnapshotForDeploymentIfStatus(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("snapshotJson") String snapshotJson);
+
+    /** 暂停专用原子写：身份、旧状态、快照、WAITING 和 TTL 在同一条语句中核对。 */
+    int pauseSnapshotWithTtlForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("snapshotJson") String snapshotJson,
+            @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
     /**
      * 终态专用快照写入：比 updateSnapshot 多一条状态栅栏，数据库里已是终态时返回 0，
@@ -94,6 +200,16 @@ public interface AgentRunMapper {
                                @Param("completed") boolean completed,
                                @Param("lastError") String lastError);
 
+    int updateTerminalSnapshotForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("status") AgentRunStatus status,
+            @Param("snapshotJson") String snapshotJson,
+            @Param("completed") boolean completed,
+            @Param("lastError") String lastError);
+
     /**
      * 无活跃锚点取消的终态写入：快照 + 状态 + TTL 一条 UPDATE 原子落库，
      * 数据库已是终态时返回 0（先落库的终态赢）。返回 0 时调用方必须跳过
@@ -104,9 +220,34 @@ public interface AgentRunMapper {
                                       @Param("snapshotJson") String snapshotJson,
                                       @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
+    int cancelTerminalSnapshotWithTtlForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("snapshotJson") String snapshotJson,
+            @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
+
     int resetForResume(@Param("id") String id,
                        @Param("userId") String userId,
                        @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
+
+    /**
+     * 追问准入的数据库领取。只有 Run 仍完成且部署身份未变化时，才在写消息前转回待执行状态。
+     */
+    int admitFollowUpForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
+
+    int resetForResumeForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
     /**
      * 仅在当前 data-analysis observability 子树仍等于 expectedJson 时写入下一版。
@@ -137,7 +278,7 @@ public interface AgentRunMapper {
                                                @Param("fromTime") OffsetDateTime fromTime,
                                                @Param("limit") int limit);
 
-    /** D21-B 5.2.3: 复合游标查询 (cursorTime, cursorRunId)，防止同秒超批永久漏扫。 */
+    /** 复合游标查询 (cursorTime, cursorRunId)，防止同秒超批永久漏扫。 */
     List<AgentRun> listByStatusAndUpdatedAfterComposite(
             @Param("statuses") List<AgentRunStatus> statuses,
             @Param("cursorTime") OffsetDateTime cursorTime,
@@ -171,6 +312,12 @@ public interface AgentRunMapper {
                             @Param("toolJobAnchorJson") String toolJobAnchorJson,
                             @Param("expectedStatus") AgentRunStatus expectedStatus);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateToolJobAnchor(@Param("id") String id,
+                            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                            @Param("expectedStatus") AgentRunStatus expectedStatus,
+                            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 在同一条 SQL 中同时更新 anchor 与 Run 状态，避免观察者看见只完成一半的上下文切换。
      */
@@ -179,8 +326,15 @@ public interface AgentRunMapper {
                                      @Param("newStatus") AgentRunStatus newStatus,
                                      @Param("expectedStatus") AgentRunStatus expectedStatus);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateToolJobAnchorAndStatus(@Param("id") String id,
+                                     @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                     @Param("newStatus") AgentRunStatus newStatus,
+                                     @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                     @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
-     * 260818（grace round-4）：取消意图专用窄写——仅在 Run 状态与精确 operationId 仍
+     * 取消意图专用窄写——仅在 Run 状态与精确 operationId 仍
      * 匹配时，用 jsonb 合并只写 autoResume=false 与 runDisposition=CANCELED，绝不写回
      * 内存中的整份旧锚点。返回 0 表示 operationId 已被新工具任务替换（或状态已变），
      * 调用方必须重读当前任务重试或按既有语义失败关闭。
@@ -188,6 +342,12 @@ public interface AgentRunMapper {
     int persistCancelDisposition(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
                                  @Param("expectedOperationId") String expectedOperationId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int persistCancelDisposition(@Param("id") String id,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId,
+                                 @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 只合并修复计数的专项更新：只 jsonb 合并 {@code repairAttempts[toolName]}，并顺带去掉旧的
@@ -201,6 +361,16 @@ public interface AgentRunMapper {
                               @Param("pending") boolean pending,
                               @Param("exhausted") boolean exhausted);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int persistRepairAttempt(@Param("id") String id,
+                              @Param("expectedStatus") AgentRunStatus expectedStatus,
+                              @Param("expectedOperationId") String expectedOperationId,
+                              @Param("toolName") String toolName,
+                              @Param("attempt") int attempt,
+                              @Param("pending") boolean pending,
+                              @Param("exhausted") boolean exhausted,
+                              @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 暂停意图的专项更新——形状与 persistCancelDisposition 完全对称：仅在 Run 状态与
      * 精确 operationId 仍匹配时，用 jsonb 合并只写 autoResume=false 与
@@ -212,12 +382,23 @@ public interface AgentRunMapper {
                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
                                 @Param("expectedOperationId") String expectedOperationId);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int persistPauseDisposition(@Param("id") String id,
+                                @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                @Param("expectedOperationId") String expectedOperationId,
+                                @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 手动恢复前清掉已收尾的暂停锚点。栅栏：Run 仍 WAITING + runDisposition 仍 PAUSED +
      * 精确 operationId。返回 0 表示并发处置已改变状态，调用方必须放弃本次恢复。
      */
     int clearPausedToolJobAnchor(@Param("id") String id,
                                  @Param("expectedOperationId") String expectedOperationId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearPausedToolJobAnchor(@Param("id") String id,
+                                 @Param("expectedOperationId") String expectedOperationId,
+                                 @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 第一次 PREPARING dispatch 只允许占用空 anchor。
@@ -226,6 +407,12 @@ public interface AgentRunMapper {
     int claimPreparingToolJobAnchor(@Param("id") String id,
                                     @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                     @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int claimPreparingToolJobAnchor(@Param("id") String id,
+                                    @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                    @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                    @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。
@@ -237,11 +424,26 @@ public interface AgentRunMapper {
             @Param("expectedResumeToken") String expectedResumeToken,
             @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int claimPreparingToolJobAnchorFromResume(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /** 仅替换仍由 expectedOperationId 拥有的活跃 dispatch，拒绝旧 operation 的迟到写入。 */
     int updateActiveToolJobAnchor(@Param("id") String id,
                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
                                   @Param("expectedOperationId") String expectedOperationId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateActiveToolJobAnchor(@Param("id") String id,
+                                  @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                  @Param("expectedOperationId") String expectedOperationId,
+                                  @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * DAG blocking live worker 的 owner/lease fenced 写入口。
@@ -255,6 +457,16 @@ public interface AgentRunMapper {
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("expectedLeaseUntil") String expectedLeaseUntil);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateLiveDagBlockingToolJobAnchor(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 仅当前未过期 DAG PREPARING owner 可把被权威证明未创建的任务推进到 durable ABORTING。
      */
@@ -265,6 +477,16 @@ public interface AgentRunMapper {
             @Param("expectedOperationId") String expectedOperationId,
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int beginLiveDagBlockingPreparingAbort(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 幂等容量释放后，先把 ABORTING（或租约已过期的 CLEARING）推进到独占 CLEARING。
@@ -277,6 +499,15 @@ public interface AgentRunMapper {
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("expectedLeaseUntil") String expectedLeaseUntil);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int claimLiveDagBlockingPreparingAbortCleanup(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * Redis 清理完成后，按 operation/owner/lease/CLEARING disposition 清除 durable abort anchor。
      */
@@ -286,6 +517,15 @@ public interface AgentRunMapper {
             @Param("expectedOperationId") String expectedOperationId,
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int completeLiveDagBlockingPreparingAbort(
+            @Param("id") String id,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 仅对当前 operation 原子写入下一版 anchor 并切换 Run 状态。
@@ -298,11 +538,19 @@ public interface AgentRunMapper {
             @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("expectedOperationId") String expectedOperationId);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateToolJobAnchorAndStatusByOperation(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
-     * 260818：CANCELED 终态收口专用。expectedStatus 同时接受 WAITING_TOOL_JOB（正常
-     * 后台工具取消）与 EXECUTING（取消落在 markHandoffAccepted 已恢复执行之后——批次
-     * 20260818-182948 两个 Run 因此永久 EXECUTING 并触发 finalizer 5s / resume 60s
-     * 双循环）。operationId 栅栏保证旧 finalizer 不能覆盖已被第二次长工具替换的新 anchor。
+     * CANCELED 终态收口专用。expectedStatus 同时接受 WAITING_TOOL_JOB（正常后台工具取消）
+     * 与 EXECUTING（取消落在 markHandoffAccepted 已恢复执行之后）。operationId 栅栏保证
+     * 旧 finalizer 不能覆盖已被第二次长工具替换的新 anchor。
      */
     int cancelToolJobAnchorFromStatuses(
             @Param("id") String id,
@@ -310,8 +558,16 @@ public interface AgentRunMapper {
             @Param("newStatus") AgentRunStatus newStatus,
             @Param("expectedOperationId") String expectedOperationId);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int cancelToolJobAnchorFromStatuses(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
-     * 260819：终态 Run 残留取消锚点的兜底收口。Run 已被其他写入方落进任意业务终态
+     * 终态 Run 残留取消锚点的兜底收口。Run 已被其他写入方落进任意业务终态
      * （FAILED/CANCELED/COMPLETED/PARTIAL/EXPIRED）后，cancelToolJobAnchorFromStatuses
      * 永远 0 行，finalizer 每 5s 重试形成告警循环。本语句只清空残留锚点，不改写已落
      * 的业务终态。WHERE 完整栅栏：终态 status 集合 + operationId 精确匹配 +
@@ -322,10 +578,22 @@ public interface AgentRunMapper {
             @Param("id") String id,
             @Param("expectedOperationId") String expectedOperationId);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int closeResidualCanceledAnchorOnTerminalRun(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /** 只清理仍属于指定 operation 的活跃 anchor，防止旧清理动作删除新一轮工具上下文。 */
     int clearActiveToolJobAnchor(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
                                  @Param("expectedOperationId") String expectedOperationId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearActiveToolJobAnchor(@Param("id") String id,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId,
+                                 @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 只有租约已经过期且 operation/owner/disposition 仍匹配时，才把在线 DAG worker
@@ -337,6 +605,14 @@ public interface AgentRunMapper {
             @Param("expectedOperationId") String expectedOperationId,
             @Param("expectedOwnerId") String expectedOwnerId);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int promoteExpiredDagBlockingWorkerLost(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * cleanup-only 中间步骤允许跨 EXECUTING/FAILED/CANCELED 重入，但始终绑定
      * operation、原 blocking owner、worker-lost disposition 和 autoResume=false。
@@ -346,6 +622,14 @@ public interface AgentRunMapper {
             @Param("toolJobAnchorJson") String toolJobAnchorJson,
             @Param("expectedOperationId") String expectedOperationId,
             @Param("expectedOwnerId") String expectedOwnerId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateDagCleanupToolJobAnchor(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * PREPARING cleanup 的专用状态 CAS。远端解析结果或 retry 时间只能在数据库当前
@@ -358,6 +642,15 @@ public interface AgentRunMapper {
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("expectedRequestFingerprint") String expectedRequestFingerprint);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateDagCleanupPreparingToolJobAnchor(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * cleanup-only 的终态证明全部落地后清空 anchor。EXECUTING 转为 FAILED；
      * 已经 FAILED/CANCELED 的 Run 保留原 status、snapshot 和 last_error。
@@ -368,6 +661,14 @@ public interface AgentRunMapper {
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("lastError") String lastError);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int completeDagCleanupAndClearToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("lastError") String lastError,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 同步返回后的窄清理：除 status/operation 所有权外，还要求 terminal、released 和 usage proof。
      */
@@ -375,6 +676,13 @@ public interface AgentRunMapper {
             @Param("id") String id,
             @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("expectedOperationId") String expectedOperationId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearSynchronouslyCompletedToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * DAG blocking 同步返回后的窄清理。除终态证明外，还绑定进程 owner、
@@ -385,6 +693,14 @@ public interface AgentRunMapper {
             @Param("expectedOperationId") String expectedOperationId,
             @Param("expectedOwnerId") String expectedOwnerId,
             @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 完整 checkpoint 写失败后的白名单补偿写入：只登记失败身份与错误，不覆盖 terminal/reservation。
@@ -398,6 +714,16 @@ public interface AgentRunMapper {
                                     @Param("checkpointVersion") int checkpointVersion,
                                     @Param("finalizerError") String finalizerError);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int markToolJobCheckpointFailed(@Param("id") String id,
+                                    @Param("operationId") String operationId,
+                                    @Param("toolCallId") String toolCallId,
+                                    @Param("attempt") int attempt,
+                                    @Param("taskId") String taskId,
+                                    @Param("checkpointVersion") int checkpointVersion,
+                                    @Param("finalizerError") String finalizerError,
+                                    @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     int markToolJobCheckpointFailurePending(@Param("id") String id,
                                             @Param("operationId") String operationId,
                                             @Param("toolCallId") String toolCallId,
@@ -406,8 +732,23 @@ public interface AgentRunMapper {
                                             @Param("checkpointVersion") int checkpointVersion,
                                             @Param("marker") String marker);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int markToolJobCheckpointFailurePending(@Param("id") String id,
+                                            @Param("operationId") String operationId,
+                                            @Param("toolCallId") String toolCallId,
+                                            @Param("attempt") int attempt,
+                                            @Param("taskId") String taskId,
+                                            @Param("checkpointVersion") int checkpointVersion,
+                                            @Param("marker") String marker,
+                                            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     int clearToolJobCheckpointFailurePending(@Param("id") String id,
                                              @Param("marker") String marker);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearToolJobCheckpointFailurePending(@Param("id") String id,
+                                             @Param("marker") String marker,
+                                             @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 条件更新 Run 状态：只有当前状态等于 expectedStatus 时才更新。
@@ -417,23 +758,56 @@ public interface AgentRunMapper {
                         @Param("newStatus") AgentRunStatus newStatus,
                         @Param("expectedStatus") AgentRunStatus expectedStatus);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int casUpdateStatus(@Param("id") String id,
+                        @Param("newStatus") AgentRunStatus newStatus,
+                        @Param("expectedStatus") AgentRunStatus expectedStatus,
+                        @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 列出存在活跃 tool job anchor 的 Run，供 reconciler 周期补扫。
      * 这使 terminal webhook 丢失、Redis 丢键或进程重启后仍能从数据库重新进入收口链。
      */
-    List<AgentRun> listActiveToolJobAnchors(@Param("limit") int limit);
+    List<AgentRun> listActiveToolJobAnchorsForDeployment(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("limit") int limit);
+
+    /** 历史测试接缝；运行代码必须调用带部署身份的方法。 */
+    @Deprecated
+    default List<AgentRun> listActiveToolJobAnchors(int limit) {
+        return listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", limit);
+    }
 
     /**
      * 列出 RECEIVED+READY，以及 launcher lease 已过期的 RECEIVED/EXECUTING+LAUNCHING Run。
      * 活跃 lease 不进入扫描结果，避免多个实例反复提交同一恢复 worker。
      */
-    List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
+    List<AgentRun> listResumeReadyAnchorsForDeployment(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("limit") int limit);
+
+    /** 历史测试接缝；运行代码必须调用带部署身份的方法。 */
+    @Deprecated
+    default List<AgentRun> listResumeReadyAnchors(int limit) {
+        return listResumeReadyAnchorsForDeployment("stable", "legacy-stable", limit);
+    }
 
     /**
      * 发现 CAS_STATUS→RESUME_READY 半状态：RECEIVED + finalizerStep=CAS_STATUS + resumeState 空。
      * 只用于发现，不承担并发正确性。推进必须走 {@link #promoteCasStatusToResumeReady}。
      */
-    List<AgentRun> listStuckAtCasStatusAnchors(@Param("limit") int limit);
+    List<AgentRun> listStuckAtCasStatusAnchorsForDeployment(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("limit") int limit);
+
+    /** 历史测试接缝；运行代码必须调用带部署身份的方法。 */
+    @Deprecated
+    default List<AgentRun> listStuckAtCasStatusAnchors(int limit) {
+        return listStuckAtCasStatusAnchorsForDeployment("stable", "legacy-stable", limit);
+    }
 
     /**
      * 原子推进 CAS_STATUS→RESUME_READY。
@@ -452,6 +826,17 @@ public interface AgentRunMapper {
             @Param("expectedResumeLeaseVersion") long expectedResumeLeaseVersion,
             @Param("newResumeToken") String newResumeToken);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int promoteCasStatusToResumeReady(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedToolCallId") String expectedToolCallId,
+            @Param("expectedAttempt") int expectedAttempt,
+            @Param("expectedTaskId") String expectedTaskId,
+            @Param("expectedResumeLeaseVersion") long expectedResumeLeaseVersion,
+            @Param("newResumeToken") String newResumeToken,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 原子 CAS 更新 resumeState，同时约束 Run 状态、旧 state、token 与 lease version。
      * READY→LAUNCHING 和过期 LAUNCHING→READY 都经此入口，防止双 launch 与旧租约回滚新声明。
@@ -463,6 +848,15 @@ public interface AgentRunMapper {
                                    @Param("expectedResumeToken") String expectedResumeToken,
                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int casUpdateAnchorResumeState(@Param("id") String id,
+                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                   @Param("expectedResumeState") String expectedResumeState,
+                                   @Param("expectedResumeToken") String expectedResumeToken,
+                                   @Param("expectedLeaseVersion") long expectedLeaseVersion,
+                                   @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /** 同一条 CAS 同时推进恢复 anchor 与 Run 状态，避免已恢复 worker 长时间停在 RECEIVED。 */
     int casUpdateAnchorResumeStateAndStatus(
             @Param("id") String id,
@@ -472,6 +866,17 @@ public interface AgentRunMapper {
             @Param("expectedResumeState") String expectedResumeState,
             @Param("expectedResumeToken") String expectedResumeToken,
             @Param("expectedLeaseVersion") long expectedLeaseVersion);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int casUpdateAnchorResumeStateAndStatus(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedResumeState") String expectedResumeState,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /** READY→LAUNCHING 的持久化 launcher claim；owner 与 lease 使用同一条数据库 CAS 写入。 */
     int claimResumeLauncher(
@@ -483,6 +888,18 @@ public interface AgentRunMapper {
             @Param("expectedLeaseVersion") long expectedLeaseVersion,
             @Param("launcherOwnerId") String launcherOwnerId,
             @Param("leaseSeconds") long leaseSeconds);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int claimResumeLauncher(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("launcherOwnerId") String launcherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /** 只有数据库确认 launcher lease 已过期时，新的实例才能原子旋转 token/version/owner。 */
     int takeoverExpiredResumeLauncher(
@@ -496,6 +913,19 @@ public interface AgentRunMapper {
             @Param("leaseSeconds") long leaseSeconds,
             @Param("legacyStaleSeconds") long legacyStaleSeconds);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int takeoverExpiredResumeLauncher(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("launcherOwnerId") String launcherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds,
+            @Param("legacyStaleSeconds") long legacyStaleSeconds,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /** 仅当前 owner/token/version 可以窄更新 launcher lease，不能覆盖 handoff/checkpoint 字段。 */
     int heartbeatResumeLauncher(
             @Param("id") String id,
@@ -503,6 +933,15 @@ public interface AgentRunMapper {
             @Param("expectedLeaseVersion") long expectedLeaseVersion,
             @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
             @Param("leaseSeconds") long leaseSeconds);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int heartbeatResumeLauncher(
+            @Param("id") String id,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /** 首次消费终态时，在未过期 launcher lease 下原子写 accepted handoff 并恢复 EXECUTING。 */
     int acceptResumeHandoff(
@@ -512,6 +951,16 @@ public interface AgentRunMapper {
             @Param("expectedLeaseVersion") long expectedLeaseVersion,
             @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
             @Param("leaseSeconds") long leaseSeconds);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int acceptResumeHandoff(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * resumed pipeline 的唯一终态写入口。plan/status/snapshot 在同一条 UPDATE 中写入，
@@ -529,12 +978,34 @@ public interface AgentRunMapper {
             @Param("expectedLeaseVersion") long expectedLeaseVersion,
             @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId);
 
+    int updateResumedTerminalForDeployment(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("status") AgentRunStatus status,
+            @Param("planJson") String planJson,
+            @Param("snapshotJson") String snapshotJson,
+            @Param("completed") boolean completed,
+            @Param("lastError") String lastError,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId);
+
     /** 终态已落稳后，仅清理精确 accepted handoff。 */
     int clearAcceptedResumeHandoff(
             @Param("id") String id,
             @Param("expectedResumeToken") String expectedResumeToken,
             @Param("expectedLeaseVersion") long expectedLeaseVersion,
             @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearAcceptedResumeHandoff(
+            @Param("id") String id,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
      * 原子合并检查点白名单字段，并保留 reservation、terminal、finalizer 等并发子树。
@@ -557,6 +1028,24 @@ public interface AgentRunMapper {
                                  @Param("toolCallsUsed") int toolCallsUsed,
                                  @Param("estimateJson") String estimateJson);
 
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int updateToolJobCheckpoint(@Param("id") String id,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId,
+                                 @Param("expectedToolCallId") String expectedToolCallId,
+                                 @Param("expectedAttempt") int expectedAttempt,
+                                 @Param("expectedTaskId") String expectedTaskId,
+                                 @Param("expectedCheckpointVersion") int expectedCheckpointVersion,
+                                 @Param("todoId") String todoId,
+                                 @Param("sequence") int sequence,
+                                 @Param("completedTodosJson") String completedTodosJson,
+                                 @Param("datasetSnapshotJson") String datasetSnapshotJson,
+                                 @Param("datasetSnapshotDigest") String datasetSnapshotDigest,
+                                 @Param("datasetRefsJson") String datasetRefsJson,
+                                 @Param("toolCallsUsed") int toolCallsUsed,
+                                 @Param("estimateJson") String estimateJson,
+                                 @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
+
     /**
      * 仅在 resumeState、resumeToken 与 resumeLeaseVersion 全部匹配时清空 anchor。
      * 恢复 pipeline 必须先完成 durable handoff，再用自己持有的精确租约清理；旧 consumer 即使迟到，
@@ -566,4 +1055,11 @@ public interface AgentRunMapper {
                                     @Param("expectedResumeState") String expectedResumeState,
                                     @Param("expectedToken") String expectedToken,
                                     @Param("expectedLeaseVersion") long expectedLeaseVersion);
+
+    /** Spring 运行路径使用的部署身份 SQL 栅栏；旧重载仅保留给既有测试。 */
+    int clearToolJobAnchorWithToken(@Param("id") String id,
+                                    @Param("expectedResumeState") String expectedResumeState,
+                                    @Param("expectedToken") String expectedToken,
+                                    @Param("expectedLeaseVersion") long expectedLeaseVersion,
+                                    @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 }

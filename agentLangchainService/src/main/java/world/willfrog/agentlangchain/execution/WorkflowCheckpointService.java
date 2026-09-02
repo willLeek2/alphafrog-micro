@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.artifact.RunRawRefStore;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
@@ -11,6 +12,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -39,6 +42,9 @@ public class WorkflowCheckpointService {
     private final ObjectMapper objectMapper;
     private final ObjectProvider<RunRawRefStore> rawRefStoreProvider;
     private final ToolRetrySafetyCatalog toolSafetyCatalog;
+
+    @Autowired(required = false)
+    private DeploymentIdentityProvider deploymentIdentityProvider;
 
     @Value("${agent.workflow-restart.checkpoint.max-json-chars:262144}")
     private int maxCheckpointJsonChars = 262144;
@@ -74,7 +80,7 @@ public class WorkflowCheckpointService {
         if (toolName == null || toolName.isBlank()) {
             throw new IllegalArgumentException("workflow_checkpoint_tool_name_required");
         }
-        AgentRun run = runMapper.findById(runId);
+        AgentRun run = findLocalRun(runId);
         if (run == null || !Objects.equals(userId, run.getUserId())) {
             throw new IllegalStateException("workflow_checkpoint_run_not_found");
         }
@@ -224,7 +230,7 @@ public class WorkflowCheckpointService {
             if (json.length() > maxCheckpointJsonChars) {
                 throw new IllegalStateException("workflow_checkpoint_json_too_large");
             }
-            if (runMapper.updateExecutionCheckpoint(runId, userId, json) != 1) {
+            if (updateExecutionCheckpoint(runId, userId, json) != 1) {
                 throw new IllegalStateException("workflow_checkpoint_run_not_found");
             }
         } catch (IllegalStateException e) {
@@ -246,6 +252,24 @@ public class WorkflowCheckpointService {
         } catch (Exception e) {
             throw new IllegalStateException("workflow_checkpoint_invalid", e);
         }
+    }
+
+    private AgentRun findLocalRun(String runId) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.findById(runId);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.findByIdForDeployment(
+                runId, local.deploymentId(), local.generationId());
+    }
+
+    private int updateExecutionCheckpoint(String runId, String userId, String json) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.updateExecutionCheckpoint(runId, userId, json);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.updateExecutionCheckpointForDeployment(
+                runId, userId, local.deploymentId(), local.generationId(), json);
     }
 
     private void validateReplaySafety(WorkflowExecutionCheckpoint checkpoint) {

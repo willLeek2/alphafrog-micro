@@ -1,5 +1,8 @@
 # Shared agent platform config for active agent runtimes.
 agent:
+  deployment:
+    # 人工补写代际退役结果时使用。开启后进程只提供退役 RPC，不运行普通业务入口或恢复器。
+    retirement-only: ${AF_DEPLOYMENT_RETIREMENT_ONLY:false}
   # D04 统一存储路径门面（AgentStoragePaths，W5 task #105）：
   # 解析顺序 = 新键 → 旧键别名 → 代码默认值；空白值视为未设置，回退旧键。
   # 旧→新映射与迁移注意见 agentPlatformShared/docs/d04-storage-key-mapping-v1.md。

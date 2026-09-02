@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
@@ -27,10 +27,8 @@ import java.util.List;
  * 服务重启后的遗留 Run 由工作流启动扫描处理。</p>
  */
 @Service
-@ConditionalOnProperty(
-        name = "agent.tool-job.durable-recovery-enabled",
-        havingValue = "true",
-        matchIfMissing = false)
+@ConditionalOnExpression("${agent.tool-job.durable-recovery-enabled:false}"
+        + " && !${agent.deployment.retirement-only:false}")
 public class ToolJobStartupRecovery {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobStartupRecovery.class);

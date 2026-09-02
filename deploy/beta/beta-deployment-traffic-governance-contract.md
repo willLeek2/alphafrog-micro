@@ -8,7 +8,7 @@
 - `deploy/beta/controller-state.schema.json`
 - `deploy/beta/verify-contract.mjs`
 
-这套合同适用于 AlphaFrog 的所有服务。部署控制器不会因为某个服务处理 Agent Run、普通 HTTP 请求或行情查询而采用不同流程。
+这套合同适用于 AlphaFrog 的所有服务。实例启动、健康检查、切流和停机使用同一流程；只有部署单显式声明的停止前动作按服务类型执行。停止前动作只调用服务自己的生命周期接口，不让部署控制器读取业务数据。
 
 ## 1. 要解决的问题
 
@@ -21,7 +21,11 @@ flowchart LR
     C -->|否| D[删除 B，A 继续服务]
     C -->|是| E[原子更新唯一路由指针：A → B]
     E --> X[回读新路由，禁用 A 的 Nacos 注册]
-    X --> F[向 A 发送 SIGTERM]
+    X --> R{A 是否声明停止前动作}
+    R -->|无| F[向 A 发送 SIGTERM]
+    R -->|Agent 代际退役| Y[按 A 的直接地址调用退役 RPC]
+    Y -->|成功| F
+    Y -->|失败| Z[保留 A 并记录失败，等待重试]
     F --> G[A 停止接收新连接并处理在手请求]
     G -->|正常退出| H[删除 A，B 成为稳定活动实例]
     G -->|超过排空期限| I[强制停止并删除 A]
@@ -30,13 +34,14 @@ flowchart LR
 
 候选实例健康以前，旧实例继续承接流量，所以更新不会主动制造维护窗口。流量切换以后，部署控制器不重试旧实例里的请求，也不判断这些请求最终成功还是失败。
 
-部署控制器只管理五类事实：
+部署控制器只管理六类事实：
 
 1. 当前默认流量指向哪个实例。
 2. 是否有候选实例正在启动或等待健康检查。
 3. 是否有旧实例正在排空。
 4. 容器、端口和 Nacos 注册分别对应哪个实例。
 5. 最近一次部署操作失败在哪里。
+6. 每个实例属于哪个不可变部署代际，以及当前路由指向哪个代际。
 
 Agent Run、数据库事务、业务重试和业务恢复不属于本合同。部署控制器不查询 Run 表，不统计活动 Run，也不根据业务结果回滚流量。
 
@@ -64,20 +69,22 @@ Agent Run、数据库事务、业务重试和业务恢复不属于本合同。�
 
 - `alphafrog.traffic-scope-id`：实例属于哪个主 Beta 或泳道范围。
 - `alphafrog.release-id`：实例属于哪个服务版本。
+- `alphafrog.deployment-generation-id`：实例所属的完整部署代际。
 - `alphafrog.instance-id`：该次部署生成的实例标识。
 
-因此正常更新时查询到两个实例不是错误。控制器必须逐字比较完整注册键、三个固定元数据键和四个可选择事实，不能以“查询结果恰好一条”代替身份核对。
+因此正常更新时查询到两个实例不是错误。控制器必须逐字比较完整注册键、四个固定元数据键和四个可选择事实，不能以“查询结果恰好一条”代替身份核对。
 
 默认路由由 `trafficScopeId + serviceName` 唯一定位。首版的实际执行方法是：Beta 部署控制器提供路由快照接口，入口请求路由组件和服务间调用路由组件必须根据这份快照选择精确的 `instanceId + endpoint`。Beta 流量禁止直接从未过滤的 Nacos 实例列表随机选择。路由快照包含：
 
 - `route.defaultInstanceId`：默认实例。
 - `route.defaultReleaseId`：新请求和后续服务调用使用的默认版本标签。
+- `route.defaultDeploymentGenerationId`：新请求和后续服务调用写入 Run 请求的部署代际；空路由时为 `null`。
 - `route.routeVersion`：每次创建、切换或移除默认路由时递增。
 - `route.updatedAt`：该路由事实的原子切换时间。
 
 首版不缓存可变的默认路由指针。每个新入口请求或新服务调用开始时，入口请求路由组件或服务间调用路由组件都从同一个原子路由执行点读取一次当前指针，并把该请求绑定到返回的精确实例。路由读取是新请求的线性化时刻：原子替换以前已经读到 A 的请求继续由 A 完成；替换以后才开始读取的请求只能得到 B。路由执行点无法读取时停止转发 Beta 新请求，不能继续使用上一份指针，也不能回退到未过滤的 Nacos 列表。
 
-控制器通过一次 `controller-state.json` 原子替换同时更新默认指针和实例角色。路由接口回读相同 `routeVersion` 后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0` 并回读确认，然后发送 SIGTERM。
+控制器通过一次 `controller-state.json` 原子替换同时更新默认指针和实例角色。路由接口回读相同 `routeVersion` 后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0` 并回读确认。若旧服务声明停止前动作，控制器必须先执行并确认成功，随后才能发送 SIGTERM。
 
 候选注册时先固定为 `enabled=false, weight=0, ephemeral=true`，因此切换前它不具备默认流量资格。候选就绪后，控制器先把它改为 `enabled=true, weight=1`并回读，再发布指向它的路由快照。这个短窗口里路由仍精确指向旧实例，所以新实例仍不会获得默认流量。
 
@@ -118,7 +125,7 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 | `schemaVersion` | 首版固定为 `1` |
 | `deploymentId` | Beta 部署标识；保留值 `stable` 禁止使用 |
 | `trafficScopeId` | 主 Beta 或某条泳道的隔离流量范围 |
-| `manifestVersion` | 同一部署从 1 开始严格递增的部署单版本 |
+| `manifestVersion` | 同一部署从 1 开始严格递增的部署单版本，最大为 9007199254740991 |
 | `gitCommit` | 这次部署对应的 40 位 Git 提交标识 |
 | `owner` | 至少包含 `ownerId`，用于找到部署负责人 |
 | `createdAt`、`expiresAt` | UTC 时间；到期触发删除操作，不触发业务恢复 |
@@ -138,6 +145,7 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 - `runtime.hostPorts`：两个不同的固定宿主端口，数组第一个对应槽 A，第二个对应槽 B。
 - `runtime.healthCheckProfile`：Beta 部署控制器为专用 Compose 注入的固定健康检查方案，首版只接受 `CONTROLLER_TCP_V1`。
 - `runtime.readinessTimeoutSeconds`：候选容器从启动到必须就绪的最长时间。
+- `runtime.preStopPolicy`：发送 SIGTERM 前要执行的固定生命周期动作；普通服务使用 `NONE`，Agent 服务使用 `AGENT_RETIRE_GENERATION_V1`。
 - `runtime.shutdownProfile`：服务在 SIGTERM 后怎样停止接收新请求并等待在手请求。
 - `runtime.applicationDrainSeconds`：应用内部允许排空的最长时间。
 - `runtime.drainGraceSeconds`：Docker 在 SIGTERM 后等待的总时间；它至少比应用排空上限多 5 秒，留给进程退出和容器清理。
@@ -156,9 +164,15 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 
 [Spring Boot 3.2.3 优雅停机文档](https://docs.spring.io/spring-boot/docs/3.2.3/reference/html/web.html#web.graceful-shutdown)说明了 `server.shutdown=graceful` 和生命周期超时的作用；[Dubbo 优雅停机文档](https://dubbo.apache.org/en/docs3-v2/java-sdk/advanced-features-and-usage/others/graceful-shutdown/)说明了服务端等待请求完成的配置。Beta 部署控制器必须在专用 Compose 生成后检查有效配置；不识别的服务协议或未实现的停机方案直接拒绝发布。这是部署控制器实现与泳道端到端验收必须完成的前置，不是当前服务已经具备的事实。
 
+`AGENT_RETIRE_GENERATION_V1` 表示控制器在路由已切走、旧 Nacos 注册已禁用并回读以后，按旧实例的直接地址调用 `RetireDeploymentGeneration`。请求只携带部署标识、旧实例保存的 `deploymentGenerationId` 和退役凭证，不携带 Run 标识。RPC 成功才允许发送 SIGTERM；RPC 失败或无法确认时，控制器保留已经退出默认路由的旧容器，写入部署错误并等待人重试，不能越过这一步强制停止。该接口只返回成功或失败，部署控制器不读取 Run 数量、内容、状态或事务结果。
+
+退役凭证的唯一受控来源固定为控制器主机上的 `/etc/alphafrog-beta/secrets/agent-retirement-token`。文件内容是至少 32 个字符、没有首尾空白和控制字符的随机值；文件必须由运行控制器的系统用户独占读取，权限不得宽于 `0600`。控制器启动时读取该文件，并把同一值以 `AF_DEPLOYMENT_RETIREMENT_TOKEN` 注入 Agent 容器；凭证不得写入部署单、全局状态、Compose 输出、命令行参数、日志或状态接口。控制器重启后重新读取同一文件，所以切流后退出也能重放退役调用。只要仍有 Agent 活动、候选或排空实例，就禁止轮换或删除该文件；所有 Agent 实例清理完后，运维人员可以用原子替换生成新凭证，再重启控制器。稳定环境使用自己的受控秘密文件执行同一规则，不能与 Beta 共用凭证。
+
+部署代际按 `deploy/agent-run/run-deployment-identity-contract.md` 的固定字节算法计算：输入是部署单版本、完整 Git 提交和按服务名排序的全部不可变镜像引用。仓库中的 `deploy/agent-run/deployment-generation-test-vector.json` 是跨语言共同向量。控制器在创建候选以前计算一次，并把结果同时写入实例状态、Nacos 元数据和容器的 `AF_DEPLOYMENT_GENERATION_ID`；Agent 容器还接收当前部署单的 `deploymentId` 作为 `AF_DEPLOYMENT_ID`。普通服务也保存相同的实例代际事实，使路由快照只有一套结构。
+
 `serviceSpecSha256` 使用 RFC 8785 JSON Canonicalization Scheme（JCS，规范 JSON 序列化）计算。输入是当前服务对象删除 `serviceSpecSha256` 后的结果。Beta 部署控制器每次读取部署单时重新计算，摘要不一致就拒绝应用。
 
-`manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `33374acd2c19107cca9c23cf9dda3ccc1590678f2aa3e2a2fc7c62cf0d62c40b`；同一对象的紧凑排版和缩进排版都必须得到该值。
+`manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `cce91891dc152cbc64b78e068fd2303c7c451b783f147c95135390fdbb28b73d`；同一对象的紧凑排版和缩进排版都必须得到该值。
 
 ## 6. 全局状态 `controller-state.json`
 
@@ -207,11 +221,11 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 
 ### 6.3 实例状态
 
-三类实例都保存实例标识、机器、服务版本、部署单版本、服务摘要、容器名称与标识、端口槽、宿主端口、可路由地址和完整 Nacos 注册事实。
+三类实例都保存实例标识、机器、服务版本、`deploymentGenerationId`、部署单版本、服务摘要、容器名称与标识、端口槽、宿主端口、可路由地址和完整 Nacos 注册事实。实例还冻结它创建时实际使用的 `preStopPolicy`、`shutdownProfile`、`applicationDrainSeconds` 和 `drainGraceSeconds`。候选实例和切流后的新活动实例使用当前部署单计算出的代际和停机配置；旧活动实例和排空实例保留各自创建时的事实，不能在切流时改写。首次引入 Agent 退役接口时，升级前的旧实例可以保存 `NONE`；迁移已先把旧数据库 Run 收成历史终态，新实例开始使用 `AGENT_RETIRE_GENERATION_V1`。后续已经使用部署身份的 Agent 发布不得退回 `NONE`。
 
 候选实例另外保存 `readiness`、`readinessObservedAt` 和 `readinessDeadline`。控制器用候选启动时间加 `readinessTimeoutSeconds` 得到截止时间，并在等待健康以前落盘。Docker 状态映射固定为：`starting` 写 `STARTING`，`healthy` 写 `READY`，`unhealthy` 或缺少 HEALTHCHECK 写 `FAILED`；目标机器无法访问写 `UNKNOWN`，不能把候选当作已经不存在。到达截止时间仍未 `READY` 也按候选失败处理。
 
-排空实例另外保存 `drainStartedAt` 和 `drainDeadline`。`drainStartedAt` 是原子路由指针已移开该实例的时间；从这一时刻开始，新请求不再绑定该实例。这两个时间已经在同一次路由切换中持久化，因此控制器在发送 SIGTERM 前一定能读到截止时间。实例正常退出或到期强制停止后，先注销该实例的 Nacos 注册并删除容器，再清空 `drainingInstance`。
+排空实例另外保存 `trafficRemovedAt`、可空的 `preStopCompletedAt`、`stopSignalRequestedAt` 和 `stopDeadline`。`trafficRemovedAt` 是原子路由指针已移开该实例的时间；从这一时刻开始，新请求不再绑定该实例。切流时后三个字段均为 `null`。策略为 `NONE`，或 `AGENT_RETIRE_GENERATION_V1` 已返回成功后，控制器先用一次全局状态原子替换写入完成时间。随后每次请求 Docker 发送 SIGTERM 前，都先把本次请求时间和“请求时间加该旧实例自身 `drainGraceSeconds`”写入后两个字段，再调用停止接口。控制器退出后重试时重新给该次停止请求完整期限，因此停止前动作耗时不会侵占应用排空时间。只有 `preStopCompletedAt` 非空时，实例退出或到期强制停止后才能注销 Nacos、删除容器并清空 `drainingInstance`；该字段仍为空的异常退出必须按第 8 节保留并修复。
 
 ### 6.4 当前操作
 
@@ -253,15 +267,15 @@ CREATING / STARTING_CANDIDATE
 
 候选缺少 HEALTHCHECK、明确 `unhealthy` 或到截止时间仍未就绪时，只删除候选的容器和 Nacos 注册，旧实例继续服务并回到 `STABLE + CLEAN_RETRYABLE`。如果机器无法访问，控制器不能确认候选是否已删除，服务进入 `FAILED + FACTS_UNCERTAIN` 并保留候选事实。普通扫描不自动重试失败目标。更高部署单或显式 `RETRY_UPDATE` 只能在活动实例、旧路由和候选已清理事实都唯一时，于同一次状态替换中清除失败暂停，将 `STABLE` 改为 `UPDATING / STARTING_CANDIDATE` 并建立新 `operationId`。`FACTS_UNCERTAIN` 必须先由人消除冲突，提高版本不能直接清除。
 
-候选就绪后，控制器先写入 `SWITCHING_TRAFFIC` 检查点，启用候选注册并回读。下一次全局状态原子替换同时发布指向候选的新路由、把候选变成 `activeInstance`、把旧活动实例变成 `drainingInstance`、写入 `drainStartedAt/drainDeadline`，并进入 `DRAINING_PREVIOUS`。这次替换是唯一切流时刻：替换前已经读到旧指针的请求继续由旧实例完成，替换后开始的新入口请求和新服务调用只能读到候选实例。
+候选就绪后，控制器先写入 `SWITCHING_TRAFFIC` 检查点，启用候选注册并回读。下一次全局状态原子替换同时发布指向候选的新路由、把候选变成 `activeInstance`、把旧活动实例变成 `drainingInstance`、写入 `trafficRemovedAt`，并把 `preStopCompletedAt`、`stopSignalRequestedAt` 和 `stopDeadline` 写成 `null`，随后进入 `DRAINING_PREVIOUS`。路由同时保存候选的 `defaultDeploymentGenerationId`。这次替换是唯一切流时刻：替换前已经读到旧指针的请求继续由旧实例完成，替换后开始的新入口请求和新服务调用只能读到候选实例。
 
-替换成功后，控制器必须通过一次独立路由接口请求回读同一 `routeVersion` 和候选精确端点。回读失败或结果不一致时，控制器保留当前状态并报告错误，不禁用旧注册，也不发送 SIGTERM。回读成功后，控制器将旧 Nacos 实例改为 `enabled=false, weight=0`并再次回读；确认旧实例不再可选择后，才对旧容器执行带超时的停止。旧请求的成功、失败或业务重试不改变部署状态。旧实例退出或被强制停止、注册和容器都清理后，服务进入 `STABLE`。
+替换成功后，控制器必须通过一次独立路由接口请求回读同一 `routeVersion`、候选精确端点和 `defaultDeploymentGenerationId`。回读失败或结果不一致时，控制器保留当前状态并报告错误，不禁用旧注册，也不发送 SIGTERM。回读成功后，控制器将旧 Nacos 实例改为 `enabled=false, weight=0`并再次回读；确认旧实例不再可选择后，按排空实例自身保存的 `preStopPolicy` 执行停止前动作。`AGENT_RETIRE_GENERATION_V1` 必须使用排空实例保存的部署标识和代际调用旧实例，并确认成功；失败时保留旧容器并记录错误。停止前动作成功或策略为 `NONE` 后，控制器先写入 `preStopCompletedAt`，再按旧实例冻结的停机配置写入本次停止请求时间和期限，最后对旧容器执行带超时的停止。旧请求的成功、失败或业务重试不改变部署状态。旧实例退出或被强制停止、注册和容器都清理后，服务进入 `STABLE`。
 
 ### 7.3 删除整个部署
 
 首版普通新部署单禁止从 `services` 中移除已有服务。需要减少服务集合时，调用方先删除整个部署，等实例和端口全部清理，再用新的完整服务集合创建部署。这样删除期间原部署单一直保留每个服务的目标、机器和两个端口，不需要增加单服务删除墓碑。
 
-删除整个部署时，每个服务先进入 `REMOVING_TRAFFIC`。下一次全局状态原子替换同时发布空路由、把活动实例移入 `drainingInstance`、写入 `drainStartedAt/drainDeadline`，并进入 `DRAINING_ACTIVE`。这次替换以后开始的新入口请求和新服务调用读到空路由并立即拒绝，不能继续使用删除前的指针。控制器必须通过一次独立路由接口请求回读空路由和新 `routeVersion`；回读失败或结果不一致时，不禁用旧注册，也不发送 SIGTERM。回读成功后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0`并回读，再发送 SIGTERM。实例退出或到期强制停止后，控制器注销注册、删除容器并移除服务状态。
+删除整个部署时，每个服务先进入 `REMOVING_TRAFFIC`。下一次全局状态原子替换同时发布空路由、把活动实例移入 `drainingInstance`、写入 `trafficRemovedAt`，并把 `preStopCompletedAt`、`stopSignalRequestedAt` 和 `stopDeadline` 写成 `null`，随后进入 `DRAINING_ACTIVE`。这次替换以后开始的新入口请求和新服务调用读到空路由并立即拒绝，不能继续使用删除前的指针。控制器必须通过一次独立路由接口请求回读空路由、新 `routeVersion` 和空的代际指针；回读失败或结果不一致时，不禁用旧注册，也不发送 SIGTERM。回读成功后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0`并回读，再按排空实例冻结的 `preStopPolicy` 执行并确认停止前动作，写入 `preStopCompletedAt`。最后按该实例冻结的停机期限写入本次停止请求时间和截止时间，再发送 SIGTERM。实例退出或到期强制停止后，控制器注销注册、删除容器并移除服务状态。
 
 删除整个部署时，控制器先确认没有其他当前操作，再把部署 `phase` 写成 `DELETING`。尚未轮到的服务保持 `STABLE + operation=null`；控制器按 `serviceName` 字典序选择一个服务，原子写入它的 `DELETING + DELETE operation`，完成后移除该服务，再选择下一个。查询机器、容器或 Nacos 时若无法唯一确认结果，当前服务进入 `FAILED + operation=null`，剩余服务继续保持 `STABLE`，整个部署停止自动删除。显式 `RETRY_DELETE` 只能重建这一服务的 `DELETE` 操作，并从实际路由、Nacos 和容器事实唯一确定的阶段继续。后续服务不能被越过；不确定事实未消除时不能重建操作。
 
@@ -276,7 +290,7 @@ CREATING / STARTING_CANDIDATE
 3. 容器名称和标签必须同时匹配 `deploymentId`、`trafficScopeId`、`serviceName`、`instanceId` 和 `releaseId`。仅找到一个完全匹配对象时可以补齐状态；找到多个对象或身份冲突时写 `FAILED`。
 4. 路由接口仍指向旧实例时，旧实例继续服务；接口已经指向候选时，实例角色必须是“候选已成为活动实例、旧实例正在排空”；接口已经返回空路由时，活动实例必须已经移入排空角色。接口、持久化指针和实例角色不一致时写 `FAILED + FACTS_UNCERTAIN`，不猜测哪一方正确。
 5. 候选仍在等待时，控制器同时检查 Docker 健康、Nacos 身份与可选择事实、路由仍未指向候选，再按 `readinessDeadline` 继续或失败。
-6. 处于 `DRAINING_PREVIOUS` 或 `DRAINING_ACTIVE` 时，控制器先核对路由接口已经返回持久化的当前指针，再核对旧注册。旧注册仍可选择时先把它改为 `enabled=false, weight=0`并回读；确认禁用后才按剩余 `drainDeadline` 幂等发送停止命令。容器已退出时继续注销 Nacos、删除容器并清空排空记录。
+6. 处于 `DRAINING_PREVIOUS` 或 `DRAINING_ACTIVE` 时，控制器先核对路由接口已经返回持久化的当前实例、版本和代际指针，再核对旧注册。旧注册仍可选择时先把它改为 `enabled=false, weight=0`并回读。若旧容器已经退出但 `preStopCompletedAt` 仍为空，控制器不能把异常退出冒充正常停机；它写 `FAILED + FACTS_UNCERTAIN` 并保留实例记录。人工修复只能按同一镜像、部署标识和代际重建不注册到 Nacos 的隔离实例，同时设置 `AF_DEPLOYMENT_RETIREMENT_ONLY=true` 和 `AF_DUBBO_REGISTRY_REGISTER=false`。这个模式从进程初始化开始就把本代际视为不可准入：普通 Agent RPC 实现不装配，对这些方法的直接调用返回“未实现”；只有退役 RPC 可用，并且不创建工作流启动恢复器、长工具启动恢复器、长工具周期协调器、进程内长工具跟踪器、取消协调器或工作区重放组件。启动检查只要发现隔离实例仍允许服务注册就直接失败。控制器或运维人员确认该实例健康后，使用固定秘密文件中的凭证调用退役 RPC；批量终态写入成功后写回 `preStopCompletedAt`，再停止和删除这个隔离实例。不得用普通 Agent 启动后再抢在恢复器前发送退役请求，因为旧 Run 可能已经重新调用模型或工具。旧容器仍运行时，`preStopCompletedAt` 非空可直接继续；否则 `NONE` 写入完成时间，`AGENT_RETIRE_GENERATION_V1` 使用固定秘密文件中的凭证，按排空实例自己的直接地址、代际和策略幂等重放退役 RPC，成功后再写入完成时间。每次发送停止命令前重新写入 `stopSignalRequestedAt`，并用排空实例自身的 `drainGraceSeconds` 计算新的 `stopDeadline`，随后提交同样时长的 Docker 停止请求；RPC 失败或无法确认时写错误并保留容器。容器已退出且 `preStopCompletedAt` 非空时，才能继续注销 Nacos、删除容器并清空排空记录。
 7. 机器、Nacos 或路由接口查询失败时保留最后事实并写错误，不把“无法观察”当作“对象不存在”。
 
 如果这些事实不能唯一决定下一步，控制器停在 `FAILED`，由人重新操作。它不建设多阶段自动回滚、通用人工修复工作流或业务请求恢复。
@@ -287,9 +301,9 @@ JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器
 
 1. `deploymentId` 唯一；一个 `trafficScopeId` 最多对应一个活动部署；部署内 `serviceName` 唯一。
 2. 所有实例标识、容器标识和完整 Nacos 注册身份全局唯一。同一服务的活动、候选和排空实例不能使用相同 `instanceId` 或端口槽。所有活动部署单中的两个预留槽都参与检查，`machineId + hostPort` 全局唯一；主 Beta、不同泳道和不同服务也不能重叠。服务仍存在时，新部署单的 `machineId + hostPorts` 必须与旧状态一致，因此未退出的上一代实例不会因为部署单改址而提前释放端口。
-3. 候选实例和切流后的新活动实例必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256` 和 `releaseId`。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；三个固定 metadata 值等于实例的流量范围、版本和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`。路由刚切换或移除时，排空实例的已观察注册可以暂时仍是 `enabled=true, weight=1`；发送 SIGTERM 前必须已经改成 `enabled=false, weight=0`并回读确认。其他 `enabled/weight` 组合非法。
-4. `STABLE` 必须只有一个活动实例，且默认实例和默认版本等于活动实例；不能有候选、排空实例或当前操作。`CREATING` 的默认实例和默认版本必须为空。
-5. `UPDATING` 切流前必须保存“旧活动实例 + 新候选实例”，路由仍指向旧活动实例；同一次原子替换发布新路由后必须保存“新活动实例 + 旧排空实例”，路由逐字指向新活动实例，并进入 `DRAINING_PREVIOUS`。删除在 `REMOVING_TRAFFIC` 时路由仍等于活动实例；同一次原子替换发布空路由后把活动实例移入排空角色，并进入 `DRAINING_ACTIVE`。两种替换都要同时写入排空起止时间。
+3. 候选实例和切流后的新活动实例必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256`、`releaseId`、按完整部署单计算的 `deploymentGenerationId`，以及当前服务的四项冻结停机配置。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；四个固定 metadata 值等于实例的流量范围、版本、部署代际和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`。路由刚切换或移除时，排空实例的已观察注册可以暂时仍是 `enabled=true, weight=1`；发送 SIGTERM 前必须已经改成 `enabled=false, weight=0`并回读确认，且 `preStopCompletedAt` 必须非空。其他 `enabled/weight` 组合非法。
+4. `STABLE` 必须只有一个活动实例，且默认实例、默认版本和默认部署代际等于活动实例；不能有候选、排空实例或当前操作。`CREATING` 的默认实例、默认版本和默认部署代际必须为空。
+5. `UPDATING` 切流前必须保存“旧活动实例 + 新候选实例”，路由仍指向旧活动实例；同一次原子替换发布新路由后必须保存“新活动实例 + 旧排空实例”，路由逐字指向新活动实例及其部署代际，并进入 `DRAINING_PREVIOUS`。删除在 `REMOVING_TRAFFIC` 时路由仍等于活动实例；同一次原子替换发布空实例、空版本和空部署代际后把活动实例移入排空角色，并进入 `DRAINING_ACTIVE`。两种替换都要写入等于路由切换时间的 `trafficRemovedAt`，并把三个停止字段初始化为 `null`。停止前完成时间非空时，注册必须已经禁用，且时间不能早于流量移除时间；停止请求时间与截止时间必须同时为空或同时非空，非空时停止前动作必须已经完成，截止时间必须精确等于请求时间加排空实例自身的 `drainGraceSeconds`。
 6. 全部部署合计最多一个非空 `operation`。没有当前操作时，只要某个部署内存在 `FAILED` 服务，控制器就停止该部署的自动调度。普通调度只能选择没有失败暂停的排队服务；失败创建、更新和删除必须分别走第 7 节的显式原子转换。`FACTS_UNCERTAIN` 不能被更高部署单版本直接清除；删除失败时只能恢复当前服务的 `DELETE`，不能选择后续服务。
 7. `CREATE/UPDATE` 操作先保存非空 `candidateInstanceId`。`STARTING_CANDIDATE` 允许完整候选记录暂时为 `null`；候选记录出现后，它的 `instanceId` 必须逐字等于预分配的 `operation.candidateInstanceId`。`DELETE` 和 `DRAINING_PREVIOUS` 的 `candidateInstanceId` 必须为 `null`。排空期限必须等于或晚于排空开始时间，部署到期时间必须晚于创建时间。
 8. 部署记录的 `acceptedManifestVersion`、按第 5.2 节 JCS 算法计算的 `manifestSha256`、Git 提交、负责人、到期时间和服务目标必须与部署单一致；只允许第 4 节定义的新部署单领先窗口和删除窗口。
@@ -302,9 +316,10 @@ JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器
 
 - `trafficScopeId`、`serviceName` 和服务 `phase`。
 - 活动、候选和排空实例标识。
-- 默认实例、默认版本、路由版本和切换时间。
+- 每个实例的部署代际，以及默认实例、默认版本、默认部署代际、路由版本和切换时间。
 - 每个实例的 Nacos `enabled`、`healthy`、`weight`、`ephemeral` 与候选就绪状态。
 - 当前操作类型和阶段。
+- 排空实例冻结的停机配置，以及 `trafficRemovedAt`、`preStopCompletedAt`、`stopSignalRequestedAt` 和 `stopDeadline`。
 - 最近一次部署错误和失败的部署单版本。
 
 本合同的可重放验证入口是 `node deploy/beta/verify-contract.mjs`。脚本会用固定版本的 AJV CLI 与 `ajv-formats` 严格编译两份 Schema，生成临时正反例并运行跨字段检查。运行环境需要 Node.js 和可使用的 npm 包源；实现仓库后应把固定依赖收入正常测试任务，不在运行时下载。
@@ -319,10 +334,11 @@ JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器
 - 创建起点、候选就绪、切流后排空、稳定状态和删除排空样例通过。
 - `CREATE/UPDATE/DELETE` 与阶段的非法组合被拒绝。
 - 自定义检查拒绝同一范围的两个部署、全局两个并行操作、活动与候选共用端口槽、实例标识或容器标识重复、Nacos 身份重复、`STABLE` 路由不指向活动实例。
-- 候选验收覆盖 Docker 健康、Nacos `healthy=true`、候选仍禁用和路由未指向候选的四项联合条件。路由验收覆盖单一原子切换时刻：切换前已经绑定旧实例的请求保持完成，切换后的每个新入口请求和新服务调用都重新读取指针并只得到新实例；删除指针后新请求立即拒绝；指针不可读时失败关闭。验收还要覆盖路由回读、旧 Nacos 实例禁用并回读后才 SIGTERM，以及重启时按实际路由接口而非只读本地 JSON 判断。
+- 候选验收覆盖 Docker 健康、Nacos `healthy=true`、候选仍禁用和路由未指向候选的四项联合条件。路由验收覆盖单一原子切换时刻：切换前已经绑定旧实例的请求保持完成，切换后的每个新入口请求和新服务调用都重新读取指针并只得到新实例和同一部署代际；删除指针后新请求立即拒绝；指针不可读时失败关闭。验收还要覆盖路由回读、旧 Nacos 实例禁用并回读、停止前动作成功且完成时间落盘后才 SIGTERM，以及重启时按实际路由接口而非只读本地 JSON 判断。
+- 停止前动作验收必须覆盖 `NONE`、Agent 退役成功、退役失败保留旧容器、切流后退役前控制器退出、RPC 成功但完成时间未落盘时重放、完成时间已落盘但 SIGTERM 未发送时续做、停止前异常退出不能直接清理，以及秘密文件缺失、权限过宽和实例存续期间禁止轮换。异常退出的人工修复还必须证明：退役专用实例从启动起拒绝普通准入，不出现在 Nacos 中，不执行工作流、长工具、取消或工作区恢复；只有身份和凭证匹配的退役 RPC 能批量关闭本代际 Run，RPC 成功后才能清理实例。新旧部署单使用不同停机期限和不同停止前策略时，排空必须使用旧实例冻结的事实；停止前动作等待多久都不能扣减 SIGTERM 之后的完整应用排空预算。所有请求和响应都不得包含 Run 标识、数量或内容。
 - 泳道端到端验收必须运行至少一条长 HTTP/SSE 或 RPC 请求：切流完成后新请求不再进入旧实例，已在手请求在 `applicationDrainSeconds` 内完成，整个进程在 `drainGraceSeconds` 内退出。
 - 两服务首次创建失败、更新失败和两服务删除失败都使用与完整两服务部署单一致的独立摘要、实例、容器标识和端口，并让失败态与重试态分别通过 Schema 和跨记录检查。每次重试的 `stateVersion` 必须比失败态精确增加 1；版本不变、倒退或跳号都由转换检查拒绝。转换检查还必须证明后续服务不越过、显式重试只恢复正确服务和正确操作、`FACTS_UNCERTAIN` 不会被更高版本直接清除，人工消除冲突后才允许重试。
-- `manifestSha256` 固定向量覆盖同一对象的两种排版，并断言两者产生合同中同一预期摘要。
+- `manifestSha256` 固定向量覆盖同一对象的两种排版，并断言两者产生合同中同一预期摘要；部署代际向量还要由同一脚本按 Agent Run 合同独立复算。
 - 一个部署单同时更新多个服务时，只允许一个服务拥有 `operation`，其余服务以 `STABLE` 上一代实例合法排队；轮到以后再进入更新。
 - 首次部署两个服务或一次增加两个服务时，只允许一个服务拥有 `CREATE operation`，其余新增服务以 `CREATING + operation=null + candidateInstance=null` 合法排队。
 - 删除至少两个服务时，只有当前服务拥有 `DELETE operation`，未轮到的服务保持 `STABLE`；当前删除失败后该服务进入 `FAILED`，后续服务不能启动删除。

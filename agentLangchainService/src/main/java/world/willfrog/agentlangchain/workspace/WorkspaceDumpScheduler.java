@@ -4,7 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -68,7 +68,8 @@ import java.util.concurrent.atomic.AtomicLong;
 @Component
 // 260814 scheduler-03: workspace export 总开关默认关闭；关闭时本调度器不注册，
 // 没有 DLQ 目录、启动重放或后台任务。
-@ConditionalOnProperty(name = "agent.workspace.export-enabled", havingValue = "true", matchIfMissing = false)
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}"
+        + " && !${agent.deployment.retirement-only:false}")
 @Slf4j
 public class WorkspaceDumpScheduler {
 

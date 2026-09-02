@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
 import java.time.Duration;
@@ -108,36 +109,7 @@ public class AgentRunEventService {
     private int payloadPreviewChars;
 
     /**
-     * 创建新的 run 记录并写入初始事件。
-     *
-     * @param userId           用户 ID
-     * @param message          用户输入
-     * @param contextJson      上下文 JSON
-     * @param idempotencyKey   幂等键
-     * @param modelName        模型名（可为空，后续会用默认）
-     * @param endpointName     端点名（可为空，后续会用默认）
-     * @param debugMode        run 级调试模式开关
-     * @param stageConfigJson  各阶段 LLM 配置 JSON（可为空）
-     * @return 创建后的 run
-     */
-    public AgentRun createRun(String userId,
-                              String message,
-                              String contextJson,
-                              String idempotencyKey,
-                              String modelName,
-                              String endpointName,
-                              boolean captureLlmRequests,
-                              String provider,
-                              int plannerCandidateCount,
-                              boolean debugMode,
-                              String stageConfigJson) {
-        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
-                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson, false, false);
-    }
-
-    /**
-     * createRun 重载：接受 isAdmin 标志，落 ext.is_admin，
-     * 让 executor / pipeline 防御层有 admin 旁路信号。
+     * 创建并冻结部署身份。调用方只能传入当前服务实例已经验证过的可信值。
      */
     public AgentRun createRun(String userId,
                               String message,
@@ -150,26 +122,8 @@ public class AgentRunEventService {
                               int plannerCandidateCount,
                               boolean debugMode,
                               String stageConfigJson,
-                              boolean isAdmin) {
-        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
-                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson,
-                false, isAdmin);
-    }
-
-    /**
-     * 完整创建入口。generateArtifacts 只冻结用户是否请求正式产物，不控制模型内部 rawRef。
-     */
-    public AgentRun createRun(String userId,
-                              String message,
-                              String contextJson,
-                              String idempotencyKey,
-                              String modelName,
-                              String endpointName,
-                              boolean captureLlmRequests,
-                              String provider,
-                              int plannerCandidateCount,
-                              boolean debugMode,
-                              String stageConfigJson,
+                              String deploymentId,
+                              String deploymentGenerationId,
                               boolean generateArtifacts,
                               boolean isAdmin) {
         log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
@@ -193,7 +147,7 @@ public class AgentRunEventService {
         PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
                 runId, userId, contextJson);
         ext.put("prompt_selection", promptSelection.toExtMap());
-        // 260612-01-02: 落 admin 旁路信号，供 executor / pipeline 防御层使用
+        // 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
         ext.put("generate_artifacts", generateArtifacts);
         if (stageConfigJson != null && !stageConfigJson.isBlank()) {
@@ -239,6 +193,9 @@ public class AgentRunEventService {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId(userId);
+        run.setDeploymentId(DeploymentIdentity.requireDeploymentId(deploymentId));
+        run.setDeploymentGenerationId(
+                DeploymentIdentity.requireActiveGenerationId(deploymentGenerationId));
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setCurrentStep(0);
         run.setMaxSteps(12);
@@ -264,7 +221,8 @@ public class AgentRunEventService {
         }
 
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
-        return runMapper.findByIdAndUser(runId, userId);
+        return runMapper.findByIdAndUserForDeployment(
+                runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
     }
 
     /**

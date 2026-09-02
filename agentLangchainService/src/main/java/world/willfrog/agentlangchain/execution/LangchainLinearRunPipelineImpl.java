@@ -34,11 +34,15 @@ import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.failure.LangchainFailureDecision;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
+import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
+import world.willfrog.agentlangchain.deployment.AgentServiceShutdownState;
 import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
@@ -50,6 +54,7 @@ import java.util.Map;
 import java.util.function.Consumer;
 import java.util.function.BooleanSupplier;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 
 /**
  * agentLangchainService 的 run 级总控流水线。
@@ -60,9 +65,6 @@ import java.time.LocalDate;
  * 生成 todo（任务项）计划，之后根据计划选择
  * {@link LangchainLinearWorkflowExecutor} 或 {@link LangchainDagWorkflowExecutor} 执行，
  * 最后把答案、事件、运行快照和可观测数据写回共享存储。</p>
- * <p>讲解材料见
- * {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}</p>
- *
  * <p>这个类本身不直接和大模型对话，也不直接执行工具；它负责把“模型、prompt、工具目录、
  * 状态机、可观测性、取消/暂停控制”串成一个完整业务流程。具体规划逻辑在
  * {@link LangchainAiPlanner}，单个 todo 的工具循环在 {@link LangchainTodoNodeExecutor}。</p>
@@ -119,6 +121,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
 
+    @Autowired(required = false)
+    private DeploymentIdentityProvider deploymentIdentityProvider;
+
+    @Autowired(required = false)
+    private DeploymentGenerationRetirementService retirementService;
+
+    @Autowired(required = false)
+    private AgentServiceShutdownState shutdownState;
+
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
                                           LangchainDagWorkflowExecutor dagWorkflowExecutor,
@@ -170,6 +181,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     @Override
     public void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
+        if (!belongsToLocalDeployment(run)) {
+            log.warn("拒绝把非当前部署代际的 Run 提交到执行队列: runId={}",
+                    run == null ? null : run.getId());
+            return;
+        }
+        if (retirementService != null && retirementService.isRetired()) {
+            closeRetiredLocalRun(run);
+            return;
+        }
         // 入口层只把 run 交给并发调度器，不直接开线程。
         // hard/current 并发闸门、排队顺序和队列容量都集中在 scheduler，pipeline 只负责拿到执行权后的业务流程。
         runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
@@ -191,6 +211,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                       Consumer<Boolean> completion) {
         // 缺少 Run 身份或恢复上下文时不允许创建一个无法 fencing 的排队任务。
         if (run == null || context == null || isBlank(run.getId())) {
+            return false;
+        }
+        if (!belongsToLocalDeployment(run)) {
+            log.warn("拒绝把非当前部署代际的 Run 提交到恢复队列: runId={}", run.getId());
+            return false;
+        }
+        if (retirementService != null && retirementService.isRetired()) {
+            closeRetiredLocalRun(run);
             return false;
         }
         // reservation 传 null，让恢复任务重新经过普通 Run 的限流、排队和拒绝策略。
@@ -217,9 +245,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         // 重新从数据库读取 run，而不是完全相信入口传入的对象。
         // createRun 之后到异步线程真正执行之间，run 可能已经被取消、更新或存活时间（TTL）状态变化。
-        AgentRun run = runMapper.findById(initialRun.getId());
+        AgentRun run = findLocalRun(initialRun.getId());
         if (run == null) {
-            log.warn("LangChain run not found, skip: {}", initialRun.getId());
+            log.warn("LangChain Run 不存在或不属于当前部署代际，停止执行: {}", initialRun.getId());
+            return;
+        }
+        if (retirementService != null && retirementService.isRetired()) {
+            closeRetiredLocalRun(run);
             return;
         }
         String runId = run.getId();
@@ -254,13 +286,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             // cancel/pause 可能发生在 todo 执行和最终落库之间。
             // 这里再次检查，避免用户已经取消后 pipeline 又把 run 覆盖成 COMPLETED/FAILED。
-            if (result.isInterrupted() || abortIfStopped(runId, userId, "before_persist")) {
+            if (isOrdinaryShutdown() || result.isInterrupted()
+                    || abortIfStopped(runId, userId, "before_persist")) {
                 log.info("LangChain run {} stopped before persist (interrupted={}, reason={})",
                         runId, result.isInterrupted(), result.getFailureReason());
                 return;
             }
 
-            runMapper.updatePlanJson(runId, userId, writeJson(result.getPlan()));
+            updatePlanForLocal(runId, userId, writeJson(result.getPlan()));
             if (result.isSuccess()) {
                 persistCompletedOutcome(run, userGoal, inputs.stageModels(), result, null);
             } else if (result.isPartial()) {
@@ -270,6 +303,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 tryScheduleSettlement(runId, userId);
             }
         } catch (Exception e) {
+            if (isOrdinaryShutdown()) {
+                log.info("Agent 服务正在普通关闭，Run 保留非终态供同代际重启恢复: runId={}", runId);
+                return;
+            }
             log.error("LangChain run failed: runId={}", runId, e);
             // 所有未被 workflow result（工作流结果）显式表达的异常都会收敛到统一失败出口，
             // 由 LangchainFailureMapper 决定前端事件类型和 observability failure type（可观测失败类型）。
@@ -347,9 +384,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             }
             String blockedSnapshot = attachObservability(
                     runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
-            int snapshotRows = runMapper.updateTerminalSnapshot(
+            int snapshotRows = updateTerminalForLocal(
                     runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
-            int ttlRows = runMapper.updateStatusWithTtl(
+            int ttlRows = updateStatusWithTtlForLocal(
                     runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
             if (snapshotRows == 1 && ttlRows == 1) {
                 recordSchedulerCompletion(AgentRunStatus.FAILED);
@@ -359,7 +396,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             markRunStatus(runId, AgentRunStatus.FAILED);
             return false;
         }
-        runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
+        if (updateStatusForLocal(runId, userId, AgentRunStatus.EXECUTING) != 1) {
+            log.warn("Run 状态或部署代际已经变化，停止进入执行阶段: runId={}", runId);
+            return false;
+        }
         markRunStatus(runId, AgentRunStatus.EXECUTING);
         return true;
     }
@@ -520,9 +560,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                               ToolJobResumeContext resumeContext,
                               BooleanSupplier terminalConsumed) {
         // 排队期间 Run 可能被取消或 checkpoint 被更新，因此必须重新读取数据库真相源。
-        AgentRun run = runMapper.findById(initialRun.getId());
+        AgentRun run = findLocalRun(initialRun.getId());
         if (run == null) {
             return false;
+        }
+        if (retirementService != null && retirementService.isRetired()) {
+            closeRetiredLocalRun(run);
+            return true;
         }
         // 后续事件、快照和 CAS 都使用数据库中的稳定身份。
         String runId = run.getId();
@@ -585,6 +629,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 只有结果成功写入 DB，launcher 才能完成消费确认并清理 anchor。
             return persistResumedResult(run, userGoal, stageModels, result, resumeContext);
         } catch (Exception e) {
+            if (isOrdinaryShutdown()) {
+                log.info("Agent 服务正在普通关闭，长工具恢复权保留给同代际重启: runId={}", runId);
+                return false;
+            }
             // 恢复异常也要尝试持久化为可见失败，不能只依赖当前进程日志。
             log.error("Resumed LangChain run failed: runId={}", runId, e);
             try {
@@ -646,7 +694,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             return true;
         }
         // 恢复执行期间用户状态可能再次变化，终态覆盖前做最后一次停止检查。
-        if (result.isInterrupted() || abortIfStopped(runId, userId, "resume_before_persist")) {
+        if (isOrdinaryShutdown() || result.isInterrupted()
+                || abortIfStopped(runId, userId, "resume_before_persist")) {
             return hasDurableStopState(runId);
         }
         if (result.isSuccess()) {
@@ -748,7 +797,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 是因为 follow-up 只应该引用已经确定落库的最终答案。
         String snapshot = attachObservability(
                 runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
-        int completedRows = runMapper.updateTerminalSnapshot(
+        int completedRows = updateTerminalForLocal(
                 runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
         if (completedRows != 1) {
             log.warn("Completed snapshot was not persisted for run={} rows={}", runId, completedRows);
@@ -797,7 +846,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String snapshot = attachObservability(
                 runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
                 result.getFailureReason());
-        int partialRows = runMapper.updateTerminalSnapshot(
+        int partialRows = updateTerminalForLocal(
                 runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
         if (partialRows != 1) {
             log.warn("Partial snapshot was not persisted for run={} rows={}", runId, partialRows);
@@ -869,7 +918,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     private boolean hasDurableStopState(String runId) {
-        AgentRun latest = runMapper.findById(runId);
+        AgentRun latest = findLocalRun(runId);
         if (latest == null || latest.getStatus() == null) {
             return false;
         }
@@ -882,6 +931,114 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 || latest.getStatus() == AgentRunStatus.PARTIAL;
     }
 
+    /**
+     * Spring 运行时一定会注入可信部署身份；直接 new 本类的单元测试没有 Spring 容器，
+     * 此时沿用原有测试行为。生产入口和真正执行前各检查一次，避免排队期间发生代际切换后
+     * 旧实例继续处理不属于自己的 Run。
+     */
+    private boolean belongsToLocalDeployment(AgentRun run) {
+        if (run == null) {
+            return false;
+        }
+        if (deploymentIdentityProvider == null) {
+            return true;
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return local.deploymentId().equals(run.getDeploymentId())
+                && local.generationId().equals(run.getDeploymentGenerationId());
+    }
+
+    private boolean isOrdinaryShutdown() {
+        return shutdownState != null && shutdownState.isShuttingDown();
+    }
+
+    private AgentRun findLocalRun(String runId) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.findById(runId);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.findByIdForDeployment(
+                runId, local.deploymentId(), local.generationId());
+    }
+
+    private int updateStatusForLocal(String runId, String userId, AgentRunStatus status) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.updateStatus(runId, userId, status);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.updateStatusForDeployment(
+                runId, userId, local.deploymentId(), local.generationId(), status);
+    }
+
+    private int updateStatusWithTtlForLocal(String runId,
+                                            String userId,
+                                            AgentRunStatus status,
+                                            OffsetDateTime ttlExpiresAt) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.updateStatusWithTtl(runId, userId, status, ttlExpiresAt);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.updateStatusWithTtlForDeployment(
+                runId, userId, local.deploymentId(), local.generationId(), status, ttlExpiresAt);
+    }
+
+    private int updatePlanForLocal(String runId, String userId, String planJson) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.updatePlanJson(runId, userId, planJson);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.updatePlanJsonForDeployment(
+                runId, userId, local.deploymentId(), local.generationId(), planJson);
+    }
+
+    private int updateTerminalForLocal(String runId,
+                                       String userId,
+                                       AgentRunStatus status,
+                                       String snapshotJson,
+                                       boolean completed,
+                                       String lastError) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.updateTerminalSnapshot(
+                    runId, userId, status, snapshotJson, completed, lastError);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.updateTerminalSnapshotForDeployment(
+                runId, userId, local.deploymentId(), local.generationId(),
+                status, snapshotJson, completed, lastError);
+    }
+
+    private int updateResumedTerminalForLocal(String runId,
+                                              String userId,
+                                              AgentRunStatus status,
+                                              String planJson,
+                                              String snapshotJson,
+                                              boolean completed,
+                                              String lastError,
+                                              String expectedResumeToken,
+                                              long expectedLeaseVersion,
+                                              String expectedLauncherOwnerId) {
+        if (deploymentIdentityProvider == null) {
+            return runMapper.updateResumedTerminal(
+                    runId, userId, status, planJson, snapshotJson, completed, lastError,
+                    expectedResumeToken, expectedLeaseVersion, expectedLauncherOwnerId);
+        }
+        DeploymentIdentity local = deploymentIdentityProvider.current();
+        return runMapper.updateResumedTerminalForDeployment(
+                runId, userId, local.deploymentId(), local.generationId(),
+                status, planJson, snapshotJson, completed, lastError,
+                expectedResumeToken, expectedLeaseVersion, expectedLauncherOwnerId);
+    }
+
+    private void closeRetiredLocalRun(AgentRun run) {
+        if (deploymentIdentityProvider == null || run == null
+                || isBlank(run.getId()) || isBlank(run.getUserId())
+                || isBlank(run.getDeploymentId()) || isBlank(run.getDeploymentGenerationId())) {
+            return;
+        }
+        runMapper.closeRetiredDeploymentRun(
+                run.getId(), run.getUserId(), run.getDeploymentId(), run.getDeploymentGenerationId());
+    }
+
     private LangchainToolJobCheckpointCoordinator checkpointCoordinator() {
         return new LangchainToolJobCheckpointCoordinator(
                 runMapper,
@@ -889,7 +1046,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 objectMapper,
                 agentRunDatasetRegistryProvider,
                 toolJobCheckpointWriter,
-                checkpointFailureRecoveryService);
+                checkpointFailureRecoveryService,
+                deploymentIdentityProvider);
     }
 
     private LangchainWorkflowStepCoordinator stepCoordinator() {
@@ -902,7 +1060,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
-        runMapper.updatePlanJson(runId, userId, planJson);
+        updatePlanForLocal(runId, userId, planJson);
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
             // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史的权威副本。
@@ -1171,18 +1329,16 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         int updated = requireDurableWrite
                 ? persistResumedTerminal(runId, userId, AgentRunStatus.FAILED,
                 result, snapshot, decision.getReason(), resumeContext)
-                : runMapper.updateTerminalSnapshot(runId, userId, AgentRunStatus.FAILED,
+                : updateTerminalForLocal(runId, userId, AgentRunStatus.FAILED,
                 snapshot, true, decision.getReason());
-        if (requireDurableWrite && updated != 1) {
+        if (updated != 1) {
             log.warn("FAILED snapshot was not persisted for run={}", runId);
             return false;
         }
         if (requireDurableWrite) {
             commitResumedTerminalObservability(prepared);
         }
-        if (updated == 1) {
-            recordSchedulerCompletion(AgentRunStatus.FAILED);
-        }
+        recordSchedulerCompletion(AgentRunStatus.FAILED);
         try {
             markRunStatus(runId, AgentRunStatus.FAILED);
             finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
@@ -1238,7 +1394,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         String planJson = result == null || result.getPlan() == null
                 ? null : writeJson(result.getPlan());
-        return runMapper.updateResumedTerminal(
+        return updateResumedTerminalForLocal(
                 runId, userId, status, planJson, snapshot, true, lastError,
                 resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion(),
                 resumeContext.getResumeLauncherOwnerId());

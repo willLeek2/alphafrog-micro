@@ -15,6 +15,10 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.Map;
 
@@ -31,8 +35,19 @@ public class AgentLangchainRunService {
     private final AgentRunMapper runMapper;
     private final AgentCreditService creditService;
     private final UserDao userDao;
+    private final DeploymentIdentityProvider deploymentIdentityProvider;
+
+    @Autowired(required = false)
+    private DeploymentGenerationRetirementService retirementService;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
+        if (retirementService == null) {
+            return createRunWhileActive(request);
+        }
+        return retirementService.executeWhileActive(() -> createRunWhileActive(request));
+    }
+
+    private AgentRunMessage createRunWhileActive(CreateAgentRunRequest request) {
         String userId = request.getUserId();
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("user_id is required");
@@ -41,6 +56,9 @@ public class AgentLangchainRunService {
         if (message == null || message.isBlank()) {
             throw new IllegalArgumentException("message is required");
         }
+        DeploymentIdentity deploymentIdentity = deploymentIdentityProvider.current();
+        deploymentIdentity.requireExactMatch(
+                request.getDeploymentId(), request.getDeploymentGenerationId());
         if (!isAdminUser(userId) && !creditService.hasPositiveCredit(userId)) {
             throw new IllegalStateException("credit 余额不足，无法创建新任务");
         }
@@ -69,6 +87,8 @@ public class AgentLangchainRunService {
                     request.getPlannerCandidateCount(),
                     request.getDebugMode(),
                     request.getStageConfigJson(),
+                    deploymentIdentity.deploymentId(),
+                    deploymentIdentity.generationId(),
                     request.getGenerateArtifacts(),
                     isAdminUser(userId)
             );
@@ -109,7 +129,9 @@ public class AgentLangchainRunService {
                     "engine", "agentLangchainService",
                     "reason", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()
             ));
-            runMapper.updateStatus(run.getId(), run.getUserId(), AgentRunStatus.FAILED);
+            runMapper.updateStatusForDeployment(
+                    run.getId(), run.getUserId(), run.getDeploymentId(),
+                    run.getDeploymentGenerationId(), AgentRunStatus.FAILED);
         } catch (Exception markError) {
             log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
                     run.getId(), markError.getMessage());
