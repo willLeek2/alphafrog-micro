@@ -31,6 +31,7 @@ class LaneExactInstanceRouterTest {
     @AfterEach
     void reset() {
         LaneContext.clear();
+        LaneCallBindingContext.clear();
         LaneRoutingSupport.reset();
     }
 
@@ -109,6 +110,68 @@ class LaneExactInstanceRouterTest {
         List<Invoker<Object>> unfiltered = List.of(invoker("10.0.0.8", 28080, "instance-old"));
         LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
         assertThat(router.route(unfiltered, null, null)).isSameAs(unfiltered);
+    }
+
+    @Test
+    void route_shouldHonorTrustedRequestBindingWithoutAProcessLevelPointer() {
+        LaneContext.setTrafficScopeId(SCOPE);
+        LaneCallBindingContext.set("com.alphafrog.AgentService:1.0@@providers", NEW_BINDING);
+        Invoker<Object> oldInvoker = invoker("10.0.0.8", 28080, "instance-old");
+        Invoker<Object> newInvoker = invoker("10.0.0.8", 28081, "instance-new");
+        LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
+
+        List<Invoker<Object>> selected = router.route(
+                List.of(oldInvoker, newInvoker),
+                URL.valueOf("dubbo://127.0.0.1/com.alphafrog.AgentService:1.0@@providers"),
+                invocation("com.alphafrog.AgentService:1.0@@providers"));
+
+        assertThat(selected).containsExactly(newInvoker);
+    }
+
+    @Test
+    void route_shouldUseRequestBindingForMatchingServiceButReadCurrentPointerForOtherServices() {
+        AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
+        pointer.replaceAll(LaneRouteTable.of(List.of(
+                new LaneServiceRoute(
+                        SCOPE,
+                        "agent-service",
+                        "com.alphafrog.AgentService:1.0@@providers",
+                        "instance-current",
+                        "release-3",
+                        "gen-" + "d".repeat(64),
+                        9L,
+                        "2026-09-01T00:03:00Z",
+                        new LaneEndpoint("10.0.0.8", 28082)),
+                new LaneServiceRoute(
+                        SCOPE,
+                        "tools-service",
+                        "com.alphafrog.ToolsService:1.0@@providers",
+                        "tools-current",
+                        "tools-release-3",
+                        "gen-" + "e".repeat(64),
+                        10L,
+                        "2026-09-01T00:04:00Z",
+                        new LaneEndpoint("10.0.0.9", 29082)))));
+        LaneRoutingSupport.install(new LaneCallRouter(pointer), true);
+        LaneContext.setTrafficScopeId(SCOPE);
+        LaneCallBindingContext.set("com.alphafrog.AgentService:1.0@@providers", NEW_BINDING);
+        Invoker<Object> pinned = invoker("10.0.0.8", 28081, "instance-new");
+        Invoker<Object> current = invoker("10.0.0.8", 28082, "instance-current");
+        LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
+
+        List<Invoker<Object>> selected = router.route(
+                List.of(pinned, current),
+                URL.valueOf("dubbo://127.0.0.1/com.alphafrog.AgentService:1.0@@providers"),
+                invocation("com.alphafrog.AgentService:1.0@@providers"));
+
+        assertThat(selected).containsExactly(pinned);
+
+        Invoker<Object> toolsCurrent = invoker("10.0.0.9", 29082, "tools-current");
+        List<Invoker<Object>> selectedTools = router.route(
+                List.of(toolsCurrent),
+                URL.valueOf("dubbo://127.0.0.1/com.alphafrog.ToolsService:1.0@@providers"),
+                invocation("com.alphafrog.ToolsService:1.0@@providers"));
+        assertThat(selectedTools).containsExactly(toolsCurrent);
     }
 
     private static void installNewRoute() {

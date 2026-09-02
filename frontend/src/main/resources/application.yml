@@ -53,8 +53,6 @@ alphafrog:
       identity-service-name: ${AF_LANE_IDENTITY_SERVICE_NAME:agent-langchain-service}
       controller-base-url: ${AF_BETA_CONTROLLER_BASE_URL:http://127.0.0.1:19090}
       controller-api-token-file: ${AF_BETA_CONTROLLER_API_TOKEN_FILE:/etc/alphafrog-beta/secrets/controller-api-token}
-      refresh-interval: ${AF_LANE_ROUTE_REFRESH_INTERVAL:2s}
-      max-stale: ${AF_LANE_ROUTE_MAX_STALE:10s}
       connect-timeout: ${AF_LANE_CONTROLLER_CONNECT_TIMEOUT:2s}
       request-timeout: ${AF_LANE_CONTROLLER_REQUEST_TIMEOUT:2s}
       local-deployment-id: ${AF_DEPLOYMENT_ID:}

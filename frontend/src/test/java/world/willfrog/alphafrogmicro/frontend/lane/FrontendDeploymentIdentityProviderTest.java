@@ -35,6 +35,8 @@ class FrontendDeploymentIdentityProviderTest {
                 "lane-test",
                 "agent-langchain-service",
                 new DeploymentIdentity("beta-main-001", "gen-" + "a".repeat(64)),
+                LaneRouteFactsTestData.REGISTRATION,
+                LaneRouteFactsTestData.facts("instance-a", 28081, 7).callBinding(),
                 11));
 
         DeploymentIdentity identity = new FrontendDeploymentIdentityProvider(properties).current();

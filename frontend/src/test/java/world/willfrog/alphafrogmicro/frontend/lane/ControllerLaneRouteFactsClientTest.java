@@ -18,6 +18,14 @@ class ControllerLaneRouteFactsClientTest {
         assertEquals("lane-test", facts.trafficScopeId());
         assertEquals("beta-main-001", facts.deploymentIdentity().deploymentId());
         assertEquals("gen-" + "a".repeat(64), facts.deploymentIdentity().generationId());
+        assertEquals("instance-a", facts.callBinding().instanceId());
+        assertEquals("release-a", facts.callBinding().releaseId());
+        assertEquals(9, facts.callBinding().routeVersion());
+        assertEquals("10.0.0.8", facts.callBinding().endpoint().address());
+        assertEquals(28081, facts.callBinding().endpoint().port());
+        assertEquals(
+                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
+                facts.registrationServiceName());
         assertEquals(17, facts.stateVersion());
     }
 
@@ -55,13 +63,18 @@ class ControllerLaneRouteFactsClientTest {
                   "route":{
                     "defaultInstanceId":"instance-a",
                     "defaultReleaseId":"release-a",
-                    "defaultDeploymentGenerationId":"%s"
+                    "defaultDeploymentGenerationId":"%s",
+                    "routeVersion":9
                   },
                   "activeInstance":{
                     "instanceId":"instance-a",
                     "releaseId":"release-a",
                     "deploymentGenerationId":"%s",
+                    "endpoint":{"address":"10.0.0.8","port":28081},
                     "registration":{
+                      "serviceName":"world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
+                      "ip":"10.0.0.8",
+                      "port":28081,
                       "enabled":true,
                       "healthy":true,
                       "weight":1,

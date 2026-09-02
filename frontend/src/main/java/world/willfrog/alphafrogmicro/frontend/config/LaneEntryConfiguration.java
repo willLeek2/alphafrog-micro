@@ -9,8 +9,8 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvide
 import world.willfrog.alphafrogmicro.frontend.filter.FetchAccessFilter;
 import world.willfrog.alphafrogmicro.frontend.filter.JwtAuthFilter;
 import world.willfrog.alphafrogmicro.frontend.filter.LaneWebFilter;
-import world.willfrog.alphafrogmicro.frontend.lane.CachingLaneRouteFactsSource;
 import world.willfrog.alphafrogmicro.frontend.lane.ControllerLaneRouteFactsClient;
+import world.willfrog.alphafrogmicro.frontend.lane.DirectLaneRouteFactsSource;
 import world.willfrog.alphafrogmicro.frontend.lane.FrontendDeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneEntryProperties;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneRouteFactsSource;
@@ -22,9 +22,7 @@ public class LaneEntryConfiguration {
 
     @Bean
     LaneRouteFactsSource laneRouteFactsSource(LaneEntryProperties properties, ObjectMapper objectMapper) {
-        return new CachingLaneRouteFactsSource(
-                new ControllerLaneRouteFactsClient(properties, objectMapper),
-                properties);
+        return new DirectLaneRouteFactsSource(new ControllerLaneRouteFactsClient(properties, objectMapper));
     }
 
     @Bean

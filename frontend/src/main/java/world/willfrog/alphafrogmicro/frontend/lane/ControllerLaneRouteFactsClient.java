@@ -14,6 +14,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.lane.LaneCallBinding;
+import world.willfrog.alphafrogmicro.common.lane.LaneEndpoint;
 
 /** 通过部署控制器只读状态接口取得流量范围的默认部署身份。 */
 public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetcher {
@@ -117,6 +119,17 @@ public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetch
                     || registration.path("weight").asInt(0) != 1) {
                 return Optional.empty();
             }
+            String registrationServiceName = text(registration, "serviceName");
+            JsonNode endpoint = active.path("endpoint");
+            if (!endpoint.isObject()) {
+                return Optional.empty();
+            }
+            String endpointAddress = text(endpoint, "address");
+            int endpointPort = port(endpoint, "port");
+            if (!endpointAddress.equals(text(registration, "ip"))
+                    || endpointPort != port(registration, "port")) {
+                return Optional.empty();
+            }
             JsonNode metadata = registration.path("metadata");
             if (!trafficScopeId.equals(metadata.path("alphafrog.traffic-scope-id").asText())
                     || !instanceId.equals(metadata.path("alphafrog.instance-id").asText())
@@ -125,10 +138,21 @@ public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetch
                 return Optional.empty();
             }
             DeploymentIdentity identity = new DeploymentIdentity(text(root, "deploymentId"), generationId);
+            long routeVersion = route.path("routeVersion").asLong(-1);
+            LaneCallBinding callBinding = new LaneCallBinding(
+                    trafficScopeId,
+                    serviceName,
+                    instanceId,
+                    releaseId,
+                    generationId,
+                    routeVersion,
+                    new LaneEndpoint(endpointAddress, endpointPort));
             return Optional.of(new LaneRouteFacts(
                     trafficScopeId,
                     serviceName,
                     identity,
+                    registrationServiceName,
+                    callBinding,
                     root.path("stateVersion").asLong(-1)));
         } catch (IllegalArgumentException | IOException exception) {
             return Optional.empty();
@@ -139,6 +163,14 @@ public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetch
         String value = node.path(field).asText("");
         if (value.isBlank() || !value.equals(value.strip())) {
             throw new IllegalArgumentException(field + " 不能为空或包含首尾空白");
+        }
+        return value;
+    }
+
+    private static int port(JsonNode node, String field) {
+        int value = node.path(field).asInt(-1);
+        if (value < 1 || value > 65535) {
+            throw new IllegalArgumentException(field + " 不是合法端口");
         }
         return value;
     }

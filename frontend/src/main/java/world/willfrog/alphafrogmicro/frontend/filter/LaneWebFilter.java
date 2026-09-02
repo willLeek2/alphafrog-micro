@@ -21,6 +21,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.filter.OncePerRequestFilter;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
+import world.willfrog.alphafrogmicro.common.lane.LaneCallBindingContext;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneEntryProperties;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneRequestContext;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneRouteFacts;
@@ -63,23 +64,32 @@ public class LaneWebFilter extends OncePerRequestFilter {
         HttpServletRequest sanitized = new StrippedHeaderRequest(request, strippedHeaders);
         String previousScope = LaneContext.trafficScopeId();
         LaneRouteFacts previousFacts = LaneRequestContext.current();
+        LaneCallBindingContext.PinnedBinding previousBinding = LaneCallBindingContext.current();
         String previousMdc = MDC.get(LaneContext.MDC_LANE_TAG);
 
         LaneContext.clear();
         LaneRequestContext.clear();
+        LaneCallBindingContext.clear();
         MDC.remove(LaneContext.MDC_LANE_TAG);
         try {
-            Optional<LaneRouteFacts> selected = selectFacts(request, suppliedPassphrase);
-            if (selected.isPresent()) {
-                LaneRouteFacts facts = selected.get();
+            if (requiresTaggedRoute(request, suppliedPassphrase)) {
+                Optional<LaneRouteFacts> selected = routeFactsSource.current(
+                        properties.getTrafficScopeId(), properties.getIdentityServiceName());
+                if (selected.isEmpty()) {
+                    response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+                    return;
+                }
+                LaneRouteFacts facts = selected.orElseThrow();
                 LaneContext.setTrafficScopeId(facts.trafficScopeId());
                 LaneRequestContext.set(facts);
+                LaneCallBindingContext.set(facts.registrationServiceName(), facts.callBinding());
                 MDC.put(LaneContext.MDC_LANE_TAG, facts.trafficScopeId());
             }
             chain.doFilter(sanitized, response);
         } finally {
             LaneContext.restore(previousScope);
             LaneRequestContext.restore(previousFacts);
+            LaneCallBindingContext.restore(previousBinding);
             if (previousMdc == null) {
                 MDC.remove(LaneContext.MDC_LANE_TAG);
             } else {
@@ -88,19 +98,19 @@ public class LaneWebFilter extends OncePerRequestFilter {
         }
     }
 
-    private Optional<LaneRouteFacts> selectFacts(HttpServletRequest request, String suppliedPassphrase) {
+    private boolean requiresTaggedRoute(HttpServletRequest request, String suppliedPassphrase) {
         if (!properties.isEnabled()) {
-            return Optional.empty();
+            return false;
         }
         if (!properties.hasUsableEntryConfiguration()) {
             if (invalidConfigurationReported.compareAndSet(false, true)) {
                 logger.warn("入口流量范围配置不完整，所有请求都按普通流量处理");
             }
-            return Optional.empty();
+            return false;
         }
         String path = request.getRequestURI();
         if (path != null && path.startsWith("/internal/")) {
-            return Optional.empty();
+            return false;
         }
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
         if (authentication == null
@@ -108,9 +118,9 @@ public class LaneWebFilter extends OncePerRequestFilter {
                 || authentication instanceof AnonymousAuthenticationToken
                 || !properties.getTestUsernames().contains(authentication.getName())
                 || !matchesPassphrase(suppliedPassphrase, properties.getPassphrase())) {
-            return Optional.empty();
+            return false;
         }
-        return routeFactsSource.current(properties.getTrafficScopeId(), properties.getIdentityServiceName());
+        return true;
     }
 
     private static boolean matchesPassphrase(String supplied, String expected) {

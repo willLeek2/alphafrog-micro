@@ -10,11 +10,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 带隔离范围的新调用只保留指针指向的那一个实例。
+ * 带隔离范围的新调用只保留可信绑定指向的那一个实例。
  *
  * <p>匹配要求实例标识、地址和端口同时与当前绑定一致；缺少实例标识或多个记录同时命中
- * 都视为路由事实不确定。{@link #isRuntime()} 为 true，所以不会把过滤结果缓存到下一次调用。
- * 匹配失败时抛错，绝不把原来的未过滤列表交回去。</p>
+ * 都视为路由事实不确定。入口已经固定的目标调用优先使用请求级绑定，其他调用各自读取当前指针。
+ * {@link #isRuntime()} 为 true，所以不会把过滤结果缓存到下一次调用。匹配失败时抛错，绝不把
+ * 原来的未过滤列表交回去。</p>
  */
 public final class LaneExactInstanceRouter implements Router {
 
@@ -32,15 +33,19 @@ public final class LaneExactInstanceRouter implements Router {
     @Override
     public <T> List<Invoker<T>> route(List<Invoker<T>> invokers, URL url, Invocation invocation)
             throws RpcException {
-        if (!LaneRoutingSupport.enabled()) {
-            return invokers;
-        }
         String scope = LaneContext.trafficScopeId();
         if (scope == null || scope.isBlank()) {
             return invokers;
         }
         try {
-            LaneCallBinding binding = bind(url, invocation);
+            String registrationName = registrationName(url, invocation);
+            LaneCallBinding binding = LaneCallBindingContext.find(scope, registrationName);
+            if (binding == null) {
+                if (!LaneRoutingSupport.enabled()) {
+                    return invokers;
+                }
+                binding = LaneRoutingSupport.router().bindNewCallByRegistration(scope, registrationName);
+            }
             List<Invoker<T>> matched = new ArrayList<>();
             if (invokers != null) {
                 for (Invoker<T> invoker : invokers) {
@@ -75,13 +80,6 @@ public final class LaneExactInstanceRouter implements Router {
     @Override
     public int getPriority() {
         return -10_000;
-    }
-
-    private static LaneCallBinding bind(URL url, Invocation invocation) {
-        String registrationName = registrationName(url, invocation);
-        return LaneRoutingSupport.router().bindNewCallByRegistration(
-                LaneContext.trafficScopeId(),
-                registrationName);
     }
 
     private static String registrationName(URL url, Invocation invocation) {

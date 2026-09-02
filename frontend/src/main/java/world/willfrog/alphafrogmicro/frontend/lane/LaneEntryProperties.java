@@ -21,8 +21,6 @@ public class LaneEntryProperties {
     private String identityServiceName = "agent-langchain-service";
     private URI controllerBaseUrl = URI.create("http://127.0.0.1:19090");
     private Path controllerApiTokenFile = Path.of("/etc/alphafrog-beta/secrets/controller-api-token");
-    private Duration refreshInterval = Duration.ofSeconds(2);
-    private Duration maxStale = Duration.ofSeconds(10);
     private Duration connectTimeout = Duration.ofSeconds(2);
     private Duration requestTimeout = Duration.ofSeconds(2);
     private String localDeploymentId = "";
@@ -92,22 +90,6 @@ public class LaneEntryProperties {
         this.controllerApiTokenFile = controllerApiTokenFile;
     }
 
-    public Duration getRefreshInterval() {
-        return refreshInterval;
-    }
-
-    public void setRefreshInterval(Duration refreshInterval) {
-        this.refreshInterval = refreshInterval;
-    }
-
-    public Duration getMaxStale() {
-        return maxStale;
-    }
-
-    public void setMaxStale(Duration maxStale) {
-        this.maxStale = maxStale;
-    }
-
     public Duration getConnectTimeout() {
         return connectTimeout;
     }
@@ -159,13 +141,8 @@ public class LaneEntryProperties {
                 || "authorization".equalsIgnoreCase(passphraseHeader)) {
             throw new IllegalArgumentException("入口口令请求头名称不合法");
         }
-        requirePositive(refreshInterval, "refresh-interval");
-        requirePositive(maxStale, "max-stale");
         requirePositive(connectTimeout, "connect-timeout");
         requirePositive(requestTimeout, "request-timeout");
-        if (maxStale.compareTo(refreshInterval) < 0) {
-            throw new IllegalArgumentException("max-stale 不能短于 refresh-interval");
-        }
     }
 
     private static void requirePositive(Duration value, String field) {
