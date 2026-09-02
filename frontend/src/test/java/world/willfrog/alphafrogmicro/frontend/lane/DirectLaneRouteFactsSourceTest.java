@@ -30,14 +30,34 @@ class DirectLaneRouteFactsSourceTest {
     }
 
     @Test
-    void authoritativeEmptyAndReadFailureBothReturnNoBinding() {
-        DirectLaneRouteFactsSource empty = new DirectLaneRouteFactsSource(
-                (scope, service) -> Optional.empty());
-        DirectLaneRouteFactsSource failed = new DirectLaneRouteFactsSource((scope, service) -> {
+    void authoritativeEmptyAfterSuccessDoesNotReuseThePreviousBinding() {
+        LaneRouteFacts first = LaneRouteFactsTestData.facts("instance-a", 28081, 7);
+        AtomicInteger calls = new AtomicInteger();
+        DirectLaneRouteFactsSource source = new DirectLaneRouteFactsSource((scope, service) -> {
+            if (calls.incrementAndGet() == 1) {
+                return Optional.of(first);
+            }
+            return Optional.empty();
+        });
+
+        assertEquals(first, source.current("lane-test", "agent-langchain-service").orElseThrow());
+        assertTrue(source.current("lane-test", "agent-langchain-service").isEmpty());
+        assertEquals(2, calls.get());
+    }
+
+    @Test
+    void readFailureAfterSuccessDoesNotReuseThePreviousBinding() {
+        LaneRouteFacts first = LaneRouteFactsTestData.facts("instance-a", 28081, 7);
+        AtomicInteger calls = new AtomicInteger();
+        DirectLaneRouteFactsSource source = new DirectLaneRouteFactsSource((scope, service) -> {
+            if (calls.incrementAndGet() == 1) {
+                return Optional.of(first);
+            }
             throw new LaneRouteFactsUnavailableException("controller unavailable");
         });
 
-        assertTrue(empty.current("lane-test", "agent-langchain-service").isEmpty());
-        assertTrue(failed.current("lane-test", "agent-langchain-service").isEmpty());
+        assertEquals(first, source.current("lane-test", "agent-langchain-service").orElseThrow());
+        assertTrue(source.current("lane-test", "agent-langchain-service").isEmpty());
+        assertEquals(2, calls.get());
     }
 }

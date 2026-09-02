@@ -98,22 +98,45 @@ class LaneWebFilterTest {
     }
 
     @Test
-    void missingAuthenticationOrWrongPassphraseRunsAsUntaggedTraffic() throws Exception {
+    void authenticatedAllowedUserWithoutPassphraseRunsAsUntaggedTraffic() throws Exception {
         LaneEntryProperties properties = properties();
         AtomicInteger lookups = new AtomicInteger();
-        LaneWebFilter filter = new LaneWebFilter(properties, (scope, service) -> {
-            lookups.incrementAndGet();
-            throw new AssertionError("未满足身份和口令时不应读取路由事实");
-        });
+        LaneWebFilter filter = filterThatMustNotReadRoute(properties, lookups);
+        SecurityContextHolder.getContext().setAuthentication(
+                UsernamePasswordAuthenticationToken.authenticated("tester", "n/a", Collections.emptyList()));
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
+
+        assertUntaggedAndRunsOnce(filter, properties, request);
+
+        assertEquals(0, lookups.get());
+    }
+
+    @Test
+    void authenticatedAllowedUserWithWrongPassphraseRunsAsUntaggedTraffic() throws Exception {
+        LaneEntryProperties properties = properties();
+        AtomicInteger lookups = new AtomicInteger();
+        LaneWebFilter filter = filterThatMustNotReadRoute(properties, lookups);
+        SecurityContextHolder.getContext().setAuthentication(
+                UsernamePasswordAuthenticationToken.authenticated("tester", "n/a", Collections.emptyList()));
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
         request.addHeader(properties.getPassphraseHeader(), "wrong");
 
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) -> {
-            assertNull(LaneContext.trafficScopeId());
-            assertNull(LaneRequestContext.current());
-            assertNull(((jakarta.servlet.http.HttpServletRequest) sanitized)
-                    .getHeader(properties.getPassphraseHeader()));
-        });
+        assertUntaggedAndRunsOnce(filter, properties, request);
+
+        assertEquals(0, lookups.get());
+    }
+
+    @Test
+    void authenticatedUserOutsideAllowListWithCorrectPassphraseRunsAsUntaggedTraffic() throws Exception {
+        LaneEntryProperties properties = properties();
+        AtomicInteger lookups = new AtomicInteger();
+        LaneWebFilter filter = filterThatMustNotReadRoute(properties, lookups);
+        SecurityContextHolder.getContext().setAuthentication(
+                UsernamePasswordAuthenticationToken.authenticated("ordinary-user", "n/a", Collections.emptyList()));
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
+        request.addHeader(properties.getPassphraseHeader(), PASSPHRASE);
+
+        assertUntaggedAndRunsOnce(filter, properties, request);
 
         assertEquals(0, lookups.get());
     }
@@ -228,6 +251,31 @@ class LaneWebFilterTest {
         properties.setLocalDeploymentId("stable");
         properties.setLocalDeploymentGenerationId("gen-" + "1".repeat(64));
         return properties;
+    }
+
+    private static LaneWebFilter filterThatMustNotReadRoute(
+            LaneEntryProperties properties, AtomicInteger lookups) {
+        return new LaneWebFilter(properties, (scope, service) -> {
+            lookups.incrementAndGet();
+            throw new AssertionError("未同时满足已认证允许用户和正确口令时不应读取路由事实");
+        });
+    }
+
+    private static void assertUntaggedAndRunsOnce(
+            LaneWebFilter filter,
+            LaneEntryProperties properties,
+            MockHttpServletRequest request) throws ServletException, IOException {
+        AtomicInteger downstreamCalls = new AtomicInteger();
+        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) -> {
+            downstreamCalls.incrementAndGet();
+            assertNull(LaneContext.trafficScopeId());
+            assertNull(LaneRequestContext.current());
+            assertNull(LaneCallBindingContext.current());
+            assertNull(MDC.get(LaneContext.MDC_LANE_TAG));
+            assertNull(((jakarta.servlet.http.HttpServletRequest) sanitized)
+                    .getHeader(properties.getPassphraseHeader()));
+        });
+        assertEquals(1, downstreamCalls.get());
     }
 
     private static LaneRouteFacts facts(String instanceId, int port, long routeVersion) {
