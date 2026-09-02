@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -40,8 +41,10 @@ class DockerComposeContainerRuntimeTest {
         Files.writeString(health, "#!/bin/sh\nexit 0\n");
         health.toFile().setExecutable(true, true);
         properties.setHealthcheckScript(health);
-        Path environment = temporary.resolve("agent.env");
+        Path environment = temporary.resolve("agent-service.env");
         Files.writeString(environment, "SERVER_PORT=18080\n");
+        try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
         BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
         template.setEnvFile(environment);
         properties.setServices(Map.of("agent-service", template));
@@ -97,6 +100,35 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void refusesWholeProductionDotenvBeforeCreatingACandidate() throws Exception {
+        Path production = temporary.resolve(".env");
+        Files.writeString(production, "AF_DB_MAIN_PASSWORD=prod\n");
+        try { Files.setPosixFilePermissions(production, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        properties.getServices().get("agent-service").setEnvFile(production);
+        FakeCommands commands = new FakeCommands(false, false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class, () -> runtime.validateManifest(manifest));
+
+        assertEquals("ENV_FILE_WHOLE_PRODUCTION", failure.code());
+        assertTrue(commands.commands.isEmpty());
+    }
+
+    @Test
+    void refusesEffectiveComposeThatAddsTheProductionDotenv() throws Exception {
+        FakeCommands commands = new FakeCommands(false, false);
+        commands.leakProductionDotenv = true;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.create(manifest, service, plan, "s".repeat(48)));
+
+        assertEquals("ENV_FILE_MISMATCH", failure.code());
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
+    }
+
+    @Test
     void boundsComposeAndContainerNamesWithoutLosingDeterminism() {
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
                 mapper, new FakeCommands(false, false), properties);
@@ -118,6 +150,7 @@ class DockerComposeContainerRuntimeTest {
         private int inspectCalls;
         private final List<List<String>> commands = new ArrayList<>();
         private Map<String, String> composeEnvironment = Map.of();
+        private boolean leakProductionDotenv;
 
         private FakeCommands(boolean startsPresent, boolean wrongIdentity) {
             this.startsPresent = startsPresent;
@@ -138,8 +171,15 @@ class DockerComposeContainerRuntimeTest {
             }
             if (arguments.contains("config")) {
                 int file = arguments.indexOf("--file") + 1;
-                try { return Files.readString(Path.of(arguments.get(file))); }
-                catch (Exception exception) { throw new AssertionError(exception); }
+                try {
+                    String content = Files.readString(Path.of(arguments.get(file)));
+                    if (!leakProductionDotenv) return content;
+                    var root = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(content);
+                    ((com.fasterxml.jackson.databind.node.ObjectNode) root.path("services").path("app"))
+                            .withArray("env_file")
+                            .add(temporary.resolve(".env").toAbsolutePath().normalize().toString());
+                    return mapper.writeValueAsString(root);
+                } catch (Exception exception) { throw new AssertionError(exception); }
             }
             if (arguments.contains("up")) composeEnvironment = new LinkedHashMap<>(environment);
             return "";

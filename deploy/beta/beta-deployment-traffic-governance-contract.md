@@ -152,6 +152,8 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 - `registration`：Nacos 服务名、分组、命名空间和集群模板。
 - `runtimeConfigSha256`：可选运行配置摘要；秘密值本身不得写入部署单。
 
+每个服务的运行环境变量来自控制器主机上为该服务单独准备的环境文件。运维按服务摘取需要的变量，不能把生产环境整份 `.env` 作为 Compose `env_file` 或数据卷挂进容器。环境文件必须是普通文件、不是符号链接，权限不得宽于 `0600`，且每个服务使用不同路径。仓库中的生产 `.env` 由 `.gitignore` 排除，不得提交。控制器在生成专用 Compose 之后，用 `compose config` 核对有效配置里的 `env_file` 恰好是该服务文件，并拒绝文件名为 `.env` 的路径。
+
 当前业务服务的 Dockerfile 和常规 Compose 没有普遍提供 `HEALTHCHECK`，所以 Beta 部署控制器必须在专用 Compose 中提供它。控制器向容器只读挂载一份固定 TCP 探针，并注入执行 `/opt/alphafrog-beta/bin/tcp-healthcheck 127.0.0.1 <containerPort>` 的 Compose `healthcheck`。部署单不接受任意命令、脚本路径或网络 URL。探针、挂载或 Docker 健康状态缺失时，候选发布失败。
 
 `READY` 不等于“容器进程存活”。它必须同时满足：Docker 返回 `State.Health.Status=healthy`；Nacos 查到唯一份完整身份匹配的注册且 `healthy=true`；注册仍为 `enabled=false, weight=0`；路由接口仍精确指向旧实例（首次创建时为空）。这一条件让 RPC 注册比 TCP 端口晚几秒时不会提前切流。
