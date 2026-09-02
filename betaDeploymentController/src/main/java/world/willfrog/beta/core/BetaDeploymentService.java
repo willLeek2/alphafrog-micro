@@ -291,6 +291,11 @@ public class BetaDeploymentService {
 
     private void observeCandidate(OperationRef ref) {
         JsonNode candidate = ref.service().path("candidateInstance");
+        ObjectNode observedRoute = route(ref.trafficScopeId(), ref.serviceName());
+        if (!observedRoute.path("route").equals(ref.service().path("route"))
+                || observedRoute.path("route").path("defaultInstanceId").equals(candidate.path("instanceId"))) {
+            throw new ControllerException("ROUTE_READBACK_FAILED", "Candidate readiness observed a conflicting route");
+        }
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
         containers.verifyPersistedInstance(manifest, spec, candidate);
@@ -372,11 +377,18 @@ public class BetaDeploymentService {
             return null;
         });
         ObjectNode observedRoute = route(ref.trafficScopeId(), ref.serviceName());
-        if (observedRoute.path("route").path("routeVersion").asLong() != routeVersion[0])
+        JsonNode published = observedRoute.path("route");
+        if (published.path("routeVersion").asLong() != routeVersion[0]
+                || !published.path("defaultInstanceId").equals(candidate.path("instanceId"))
+                || !published.path("defaultReleaseId").equals(candidate.path("releaseId"))
+                || !published.path("defaultDeploymentGenerationId").equals(candidate.path("deploymentGenerationId"))
+                || !observedRoute.path("endpoint").equals(candidate.path("endpoint"))) {
             throw new ControllerException("ROUTE_READBACK_FAILED", "Published route could not be read back");
+        }
     }
 
     private void removeTraffic(OperationRef ref) {
+        final long[] routeVersion = new long[1];
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode active = ((ObjectNode) service.path("activeInstance")).deepCopy();
@@ -388,6 +400,7 @@ public class BetaDeploymentService {
             service.putNull("activeInstance");
             service.set("drainingInstance", active);
             long nextRoute = Math.addExact(service.path("route").path("routeVersion").asLong(), 1);
+            routeVersion[0] = nextRoute;
             service.set("route", emptyRoute(nextRoute, switchAt));
             ObjectNode operation = (ObjectNode) service.path("operation");
             operation.put("phase", "DRAINING_ACTIVE");
@@ -396,8 +409,14 @@ public class BetaDeploymentService {
             return null;
         });
         ObjectNode observed = route(ref.trafficScopeId(), ref.serviceName());
-        if (!observed.path("route").path("defaultInstanceId").isNull())
+        JsonNode removed = observed.path("route");
+        if (removed.path("routeVersion").asLong() != routeVersion[0]
+                || !removed.path("defaultInstanceId").isNull()
+                || !removed.path("defaultReleaseId").isNull()
+                || !removed.path("defaultDeploymentGenerationId").isNull()
+                || !observed.path("endpoint").isNull()) {
             throw new ControllerException("ROUTE_READBACK_FAILED", "Removed route is still selectable");
+        }
     }
 
     private void drain(OperationRef ref) {
