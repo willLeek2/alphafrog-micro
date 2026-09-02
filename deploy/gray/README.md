@@ -1,6 +1,8 @@
 # 灰度规则 v1 合同
 
-这里固定 `gray-rules.json` 的文档结构和稳定分桶算法，供后续 Java 灰度模块、Nacos 配置接入和 Python 验收工具共同使用。本目录只定义合同，不实现业务灰度逻辑，也不代表 Nacos 已经开启认证或真实环境已经发布过规则。
+这里固定 `gray-rules.json` 的文档结构和稳定分桶算法，供 Java 灰度模块、Nacos 配置接入和 Python 验收工具共同使用。
+
+本目录交付的是**契约资产**，不是生产运行时实现：JSON Schema 规定配置能写成什么形状，固定测试向量规定 Java 与 Python 必须得到什么分桶结果，自检脚本只负责在仓库中复算这些约定。真正的 Java 灰度模块另行负责读取配置、执行结构与语义校验、原子维护内存和落盘快照，并通过 `GrayDecider` 提供业务判定。本目录的 Python 脚本不会被生产服务调用；在 Java 模块和配置接入完成并通过验收之前，仅加入这些文件不会让任何请求进入灰度，也不代表 Nacos 已经开启认证或真实环境已经发布过规则。
 
 ## 1. 文件与版本
 
@@ -84,6 +86,6 @@ python3 -m json.tool deploy/gray/gray-rules.example.json >/dev/null
 python3 -m json.tool deploy/gray/gray-bucket-test-vectors.json >/dev/null
 ```
 
-后续 2-1 的 Java 单元测试必须直接读取同一个 `gray-bucket-test-vectors.json`，不能在 Java 测试里另抄一份数值。Python 验收也读取同一文件。修改 v1 算法或任何预期向量时，Java 与 Python 两边必须在同一个变更中重新验证；单独改某一语言的“正确答案”不算合同变更完成。
+Java 灰度模块的单元测试必须直接读取同一个 `gray-bucket-test-vectors.json`，不能在 Java 测试里另抄一份数值。Python 验收也读取同一文件。修改 v1 算法或任何预期向量时，Java 与 Python 两边必须在同一个变更中重新验证；单独改某一语言的“正确答案”不算合同变更完成。
 
-2-1 还必须单独测试首次加载边界：首份文档到达前所有规则都返回 `false`、对外没有 `ruleVersion`；首份坏文档不会产生半份规则或伪造版本；首份合法文档才原子替换空快照。Schema 测试必须至少包含一个没有时区的负例 `2026-09-15T00:00:00`，并确认即使校验器忽略 `format`，结尾时区 `pattern` 仍会拒绝它。
+Java 灰度模块还必须单独测试首次加载边界：首份文档到达前所有规则都返回 `false`、对外没有 `ruleVersion`；首份坏文档不会产生半份规则或伪造版本；首份合法文档才原子替换空快照。Schema 测试必须至少包含一个没有时区的负例 `2026-09-15T00:00:00`，并确认即使校验器忽略 `format`，结尾时区 `pattern` 仍会拒绝它。
