@@ -18,7 +18,9 @@ Agent 实例的停止前动作使用另一份独立凭证。`AF_BETA_RETIREMENT_
 - `bind-ip`：候选容器发布宿主端口时绑定的确定 IP 地址。
 - `routable-address`：其他服务实际能够访问的地址，也是 Nacos 注册地址。
 
-每个服务还需要配置一个已有的环境文件，以及部署时必须挂载的业务卷。环境文件由运维准备，部署单不能提交任意环境变量或挂载路径。固定 TCP 探针应从 `bin/tcp-healthcheck` 安装到控制器主机的 `/opt/alphafrog-beta/bin/tcp-healthcheck`，保持可执行，并以同一路径只读挂载到候选容器。当前探针需要候选镜像提供 Bash。
+每个服务还需要配置一个已经存在的环境文件，以及部署时必须挂载的业务卷。环境文件由运维按服务摘取需要的变量后放在控制器主机上，部署单不能提交任意环境变量或挂载路径。文件必须是普通文件、不是符号链接，权限不得宽于 `0600`，每个服务使用不同路径，文件名不能是整份生产 `.env`。控制器生成专用 Compose 之后，先用 `compose config --quiet` 确认环境文件可读；再用 `compose config --no-env-resolution --format json` 核对保留下来的 `env_file` 恰好指向该服务文件，并把 `.env` 当作数据卷挂进去的配置一并拒绝。默认的 `config --format json` 会把环境文件展开后丢掉 `env_file`，不能拿来做路径核验。
+
+固定 TCP 探针应从 `bin/tcp-healthcheck` 安装到控制器主机的 `/opt/alphafrog-beta/bin/tcp-healthcheck`，保持可执行，并以同一路径只读挂载到候选容器。当前探针需要候选镜像提供 Bash。仓库里的生产 `.env` 由 `.gitignore` 排除，不得提交。
 
 示例配置：
 

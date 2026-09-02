@@ -14,6 +14,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -31,6 +32,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     private final CommandRunner commands;
     private final BetaControllerProperties properties;
     private final Path composeRoot;
+    private final ServiceEnvironmentFileGuard environmentFiles = new ServiceEnvironmentFileGuard();
 
     public DockerComposeContainerRuntime(ObjectMapper mapper, CommandRunner commands, BetaControllerProperties properties) {
         this.mapper = mapper;
@@ -44,6 +46,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (properties.getMachines().isEmpty() || properties.getMachines().size() > 8)
             throw new ControllerException("MACHINE_CONFIG_INVALID", "Between one and eight Beta machines must be configured");
         requireSafeRegularFile(properties.getHealthcheckScript(), true, "Health-check script");
+        Map<String, Path> assignedEnvFiles = new LinkedHashMap<>();
         for (JsonNode service : manifest.path("services")) {
             String machineId = service.path("machineId").asText();
             BetaControllerProperties.Machine machine = machine(machineId);
@@ -52,11 +55,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 throw new ControllerException("MACHINE_CONFIG_INVALID", "Docker host scheme is not supported");
             requireIpLiteral(machine.getBindIp(), "Docker bind address");
             requireIpLiteral(machine.getRoutableAddress(), "Routable machine address");
-            BetaControllerProperties.ServiceTemplate template = properties.getServices()
-                    .get(service.path("serviceName").asText());
+            String serviceName = service.path("serviceName").asText();
+            BetaControllerProperties.ServiceTemplate template = properties.getServices().get(serviceName);
             if (template == null || template.getEnvFile() == null)
                 throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
-            requireSafeRegularFile(template.getEnvFile(), false, "Service environment file");
+            environmentFiles.requireDedicatedFile(serviceName, template.getEnvFile(), assignedEnvFiles);
+            assignedEnvFiles.put(serviceName, template.getEnvFile().toAbsolutePath().normalize());
             JsonNode expectedConfigDigest = service.path("runtimeConfigSha256");
             if (!expectedConfigDigest.isMissingNode() && !expectedConfigDigest.isNull()
                     && !expectedConfigDigest.asText().equals(fileSha256(template.getEnvFile())))
@@ -64,6 +68,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             if (template.getVolumes().stream().anyMatch(value -> value == null || value.isBlank()
                     || value.indexOf('\0') >= 0 || value.contains("\n") || value.contains("\r")))
                 throw new ControllerException("SERVICE_CONFIG_INVALID", "Service volume configuration is invalid");
+            template.getVolumes().forEach(environmentFiles::rejectProductionDotenvVolume);
         }
     }
 
@@ -78,6 +83,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             return observation(machineId, name, existing);
         }
         verifyImage(machineId, service);
+        BetaControllerProperties.ServiceTemplate template = properties.getServices()
+                .get(service.path("serviceName").asText());
+        if (template == null || template.getEnvFile() == null)
+            throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
+        environmentFiles.requireDedicatedFile(service.path("serviceName").asText(), template.getEnvFile(), Map.of());
         Path compose = writeCompose(manifest, service, plan, name, machine);
         Map<String, String> environment = new HashMap<>();
         if (!retirementToken.isEmpty()) environment.put("AF_DEPLOYMENT_RETIREMENT_TOKEN", retirementToken);
@@ -284,8 +294,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     private void verifyEffectiveCompose(JsonNode manifest, JsonNode service, CandidatePlan plan, String name,
                                         BetaControllerProperties.Machine machine, Path compose,
                                         Map<String, String> processEnvironment) {
-        String output = commands.run(docker(service.path("machineId").asText(), "compose", "--project-name",
-                projectName(plan), "--file", compose.toString(), "config", "--format", "json"),
+        String machineId = service.path("machineId").asText();
+        commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
+                "config", "--quiet"), processEnvironment, Duration.ofSeconds(30));
+        String output = commands.run(docker(machineId, "compose", "--project-name", projectName(plan),
+                "--file", compose.toString(), "config", "--no-env-resolution", "--format", "json"),
                 processEnvironment, Duration.ofSeconds(30));
         try {
             JsonNode app = mapper.readTree(output).path("services").path("app");
@@ -326,6 +339,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             }
             if (!valid)
                 throw new ControllerException("COMPOSE_CONFIG_INVALID", "Effective Compose configuration does not match the deployment contract");
+            BetaControllerProperties.ServiceTemplate template = properties.getServices()
+                    .get(service.path("serviceName").asText());
+            if (template == null || template.getEnvFile() == null)
+                throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
+            environmentFiles.requireEffectiveCompose(app, template.getEnvFile());
         } catch (IOException exception) {
             throw new ControllerException("COMPOSE_CONFIG_INVALID", "Docker Compose returned invalid effective configuration", exception);
         }
