@@ -112,6 +112,19 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>${project.basedir}/../deploy/gray</directory>
+                <includes>
+                    <include>gray-rules.schema.json</include>
+                </includes>
+                <targetPath>META-INF/alphafrog/gray</targetPath>
+                <filtering>false</filtering>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
