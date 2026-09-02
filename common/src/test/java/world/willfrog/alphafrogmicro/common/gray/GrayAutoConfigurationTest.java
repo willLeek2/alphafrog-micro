@@ -1,5 +1,6 @@
 package world.willfrog.alphafrogmicro.common.gray;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
@@ -93,6 +94,53 @@ class GrayAutoConfigurationTest {
             assertThat(context).hasSingleBean(GrayDecider.class);
             assertThat(context.getBean(GrayDecider.class)).isSameAs(OverrideConfiguration.CUSTOM);
         });
+    }
+
+    @Test
+    void disabledMissingAndInvalidSwitch_shouldIgnoreAServiceProvidedStore() throws Exception {
+        Path file = Files.createTempFile("gray-rules-custom-store-", ".json");
+        try (GrayRuleStore store = loadedStore(file)) {
+            assertThat(new GrayDecider(store).isEnabled("allowlist-rule", "allowlisted-user")).isTrue();
+
+            runner().withBean(GrayRuleStore.class, () -> store).run(context ->
+                    assertThat(context.getBean(GrayDecider.class)
+                            .isEnabled("allowlist-rule", "allowlisted-user")).isFalse());
+            runner().withBean(GrayRuleStore.class, () -> store)
+                    .withPropertyValues("alphafrog.gray.enabled=false")
+                    .run(context -> assertThat(context.getBean(GrayDecider.class)
+                            .isEnabled("allowlist-rule", "allowlisted-user")).isFalse());
+            runner().withBean(GrayRuleStore.class, () -> store)
+                    .withPropertyValues("alphafrog.gray.enabled=unexpected")
+                    .run(context -> assertThat(context.getBean(GrayDecider.class)
+                            .isEnabled("allowlist-rule", "allowlisted-user")).isFalse());
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    void enabledSwitch_shouldUseAServiceProvidedStore() throws Exception {
+        Path file = Files.createTempFile("gray-rules-custom-store-", ".json");
+        try (GrayRuleStore store = loadedStore(file)) {
+            runner().withBean(GrayRuleStore.class, () -> store)
+                    .withPropertyValues("alphafrog.gray.enabled=true")
+                    .run(context -> assertThat(context.getBean(GrayDecider.class)
+                            .isEnabled("allowlist-rule", "allowlisted-user")).isTrue());
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    private GrayRuleStore loadedStore(Path file) throws Exception {
+        Files.writeString(file, validDocument(), StandardCharsets.UTF_8);
+        GrayRuleStore store = new GrayRuleStore(
+                new ObjectMapper(),
+                file,
+                60_000L,
+                "gray-auto-config-test",
+                "instance-custom");
+        assertThat(store.refreshNow()).isTrue();
+        return store;
     }
 
     private String validDocument() {

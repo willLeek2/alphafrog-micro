@@ -43,8 +43,11 @@ public class GrayAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(GrayDecider.class)
-    public GrayDecider grayDecider(ObjectProvider<GrayRuleStore> storeProvider) {
-        GrayRuleStore store = storeProvider.getIfAvailable();
+    public GrayDecider grayDecider(
+            ObjectProvider<GrayRuleStore> storeProvider,
+            @Value("${alphafrog.gray.enabled:false}") String enabled) {
+        boolean dynamicEnabled = enabled != null && "true".equalsIgnoreCase(enabled.trim());
+        GrayRuleStore store = dynamicEnabled ? storeProvider.getIfAvailable() : null;
         return store == null ? GrayDecider.disabled() : new GrayDecider(store);
     }
 }
