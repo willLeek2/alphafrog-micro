@@ -145,5 +145,6 @@
         <module>externalInfoService</module>
         <module>pythonSandboxApi</module>
         <module>pythonSandboxGatewayService</module>
+        <module>betaDeploymentController</module>
     </modules>
 </project>

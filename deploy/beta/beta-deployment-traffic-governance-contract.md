@@ -254,12 +254,15 @@ CREATING / STARTING_CANDIDATE
   → WAITING_CANDIDATE_READINESS
   → Docker 健康、Nacos healthy 且仍无默认流量
   → SWITCHING_TRAFFIC
-  → 启用 Nacos 实例并回读，再发布和回读默认路由
-  → 候选成为 activeInstance
+  → 启用 Nacos 实例并回读，再原子发布默认路由
+  → 候选成为 activeInstance，保留 CREATE / SWITCHING_TRAFFIC 操作
+  → 独立回读默认路由
   → STABLE，清空 operation
 ```
 
-候选缺少 HEALTHCHECK、明确 `unhealthy` 或到截止时间仍未就绪时，控制器删除候选容器和注册，写入 `FAILED + CLEAN_RETRYABLE`，不生成或重试业务请求。显式 `RETRY_CREATE` 必须在同一次全局状态替换中重新核对空路由和无实例事实，再把该服务从 `FAILED` 改为 `CREATING / STARTING_CANDIDATE`并建立新 `operationId`。后续新服务仍保持空操作的 `CREATING`，不能被越过。
+首次创建的路由已发布、独立回读尚未完成时，磁盘状态固定为 `CREATING + CREATE / SWITCHING_TRAFFIC + activeInstance`，`candidateInstance` 为空，`operation.candidateInstanceId` 继续指向已发布的活动实例。这个检查点使控制器重启后仍能识别“创建已发布、等待确认”，并只回读同一活动实例，不会创建第二个候选。回读错误或不可用时，控制器写入 `FAILED + FACTS_UNCERTAIN + failedOperationType=CREATE`；人工修正外部事实后，显式重试只重新确认这个已发布实例，确认成功才进入 `STABLE` 并调度下一服务。
+
+候选缺少 HEALTHCHECK、明确 `unhealthy` 或到截止时间仍未就绪时，控制器删除候选容器和注册，写入 `FAILED + CLEAN_RETRYABLE`，不生成或重试业务请求。这种候选已清理的显式 `RETRY_CREATE` 必须在同一次全局状态替换中重新核对空路由和无实例事实，再把该服务从 `FAILED` 改为 `CREATING / STARTING_CANDIDATE`并建立新 `operationId`。路由已发布后的 `FACTS_UNCERTAIN` 创建失败按上一段恢复，不走空路由分支。后续新服务仍保持空操作的 `CREATING`，不能被越过。
 
 ### 7.2 更新
 
@@ -302,10 +305,10 @@ JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器
 1. `deploymentId` 唯一；一个 `trafficScopeId` 最多对应一个活动部署；部署内 `serviceName` 唯一。
 2. 所有实例标识、容器标识和完整 Nacos 注册身份全局唯一。同一服务的活动、候选和排空实例不能使用相同 `instanceId` 或端口槽。所有活动部署单中的两个预留槽都参与检查，`machineId + hostPort` 全局唯一；主 Beta、不同泳道和不同服务也不能重叠。服务仍存在时，新部署单的 `machineId + hostPorts` 必须与旧状态一致，因此未退出的上一代实例不会因为部署单改址而提前释放端口。
 3. 候选实例和切流后的新活动实例必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256`、`releaseId`、按完整部署单计算的 `deploymentGenerationId`，以及当前服务的四项冻结停机配置。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；四个固定 metadata 值等于实例的流量范围、版本、部署代际和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`。路由刚切换或移除时，排空实例的已观察注册可以暂时仍是 `enabled=true, weight=1`；发送 SIGTERM 前必须已经改成 `enabled=false, weight=0`并回读确认，且 `preStopCompletedAt` 必须非空。其他 `enabled/weight` 组合非法。
-4. `STABLE` 必须只有一个活动实例，且默认实例、默认版本和默认部署代际等于活动实例；不能有候选、排空实例或当前操作。`CREATING` 的默认实例、默认版本和默认部署代际必须为空。
+4. `STABLE` 必须只有一个活动实例，且默认实例、默认版本和默认部署代际等于活动实例；不能有候选、排空实例或当前操作。`CREATING` 在路由发布前的默认实例、默认版本和默认部署代际必须为空；首次路由已发布但尚未独立确认时，允许 `CREATING + CREATE / SWITCHING_TRAFFIC` 保存一个活动实例和逐字一致的默认路由，但不允许有候选或排空实例。
 5. `UPDATING` 切流前必须保存“旧活动实例 + 新候选实例”，路由仍指向旧活动实例；同一次原子替换发布新路由后必须保存“新活动实例 + 旧排空实例”，路由逐字指向新活动实例及其部署代际，并进入 `DRAINING_PREVIOUS`。删除在 `REMOVING_TRAFFIC` 时路由仍等于活动实例；同一次原子替换发布空实例、空版本和空部署代际后把活动实例移入排空角色，并进入 `DRAINING_ACTIVE`。两种替换都要写入等于路由切换时间的 `trafficRemovedAt`，并把三个停止字段初始化为 `null`。停止前完成时间非空时，注册必须已经禁用，且时间不能早于流量移除时间；停止请求时间与截止时间必须同时为空或同时非空，非空时停止前动作必须已经完成，截止时间必须精确等于请求时间加排空实例自身的 `drainGraceSeconds`。
 6. 全部部署合计最多一个非空 `operation`。没有当前操作时，只要某个部署内存在 `FAILED` 服务，控制器就停止该部署的自动调度。普通调度只能选择没有失败暂停的排队服务；失败创建、更新和删除必须分别走第 7 节的显式原子转换。`FACTS_UNCERTAIN` 不能被更高部署单版本直接清除；删除失败时只能恢复当前服务的 `DELETE`，不能选择后续服务。
-7. `CREATE/UPDATE` 操作先保存非空 `candidateInstanceId`。`STARTING_CANDIDATE` 允许完整候选记录暂时为 `null`；候选记录出现后，它的 `instanceId` 必须逐字等于预分配的 `operation.candidateInstanceId`。`DELETE` 和 `DRAINING_PREVIOUS` 的 `candidateInstanceId` 必须为 `null`。排空期限必须等于或晚于排空开始时间，部署到期时间必须晚于创建时间。
+7. `CREATE/UPDATE` 操作先保存非空 `candidateInstanceId`。`STARTING_CANDIDATE` 允许完整候选记录暂时为 `null`；候选记录出现后，它的 `instanceId` 必须逐字等于预分配的 `operation.candidateInstanceId`。首次路由已发布、候选已提升为活动实例时，`CREATE / SWITCHING_TRAFFIC` 操作继续保留，且 `operation.candidateInstanceId` 必须逐字等于 `activeInstance.instanceId`。`DELETE` 和 `DRAINING_PREVIOUS` 的 `candidateInstanceId` 必须为 `null`。排空期限必须等于或晚于排空开始时间，部署到期时间必须晚于创建时间。
 8. 部署记录的 `acceptedManifestVersion`、按第 5.2 节 JCS 算法计算的 `manifestSha256`、Git 提交、负责人、到期时间和服务目标必须与部署单一致；只允许第 4 节定义的新部署单领先窗口和删除窗口。
 
 任一检查失败时，控制器停止新的外部写操作并记录部署错误。它不会根据业务 Run 或请求结果修复状态。

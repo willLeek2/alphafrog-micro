@@ -1,0 +1,34 @@
+server:
+  address: ${AF_BETA_CONTROLLER_BIND_ADDRESS:127.0.0.1}
+  port: ${AF_BETA_CONTROLLER_PORT:19090}
+spring:
+  application:
+    name: beta-deployment-controller
+  autoconfigure:
+    exclude:
+      - org.apache.dubbo.spring.boot.autoconfigure.DubboAutoConfiguration
+      - org.apache.dubbo.spring.boot.autoconfigure.DubboRelaxedBindingAutoConfiguration
+      - org.apache.dubbo.spring.boot.autoconfigure.DubboRelaxedBinding2AutoConfiguration
+      - org.apache.dubbo.spring.boot.autoconfigure.DubboListenerAutoConfiguration
+  main:
+    banner-mode: "off"
+dubbo:
+  enabled: false
+  registry:
+    address: N/A
+    register: false
+  application:
+    qos-enable: false
+alphafrog:
+  beta-controller:
+    enabled: ${AF_BETA_CONTROLLER_ENABLED:false}
+    state-root: ${AF_BETA_CONTROLLER_STATE_ROOT:/var/lib/alphafrog-beta}
+    reconcile-delay: ${AF_BETA_CONTROLLER_RECONCILE_DELAY:PT2S}
+    retirement-token-file: ${AF_BETA_RETIREMENT_TOKEN_FILE:/etc/alphafrog-beta/secrets/agent-retirement-token}
+    api-token-file: ${AF_BETA_CONTROLLER_API_TOKEN_FILE:/etc/alphafrog-beta/secrets/controller-api-token}
+    healthcheck-script: ${AF_BETA_HEALTHCHECK_SCRIPT:/opt/alphafrog-beta/bin/tcp-healthcheck}
+    nacos:
+      server-address: ${AF_BETA_NACOS_SERVER_ADDRESS:}
+      namespace: ${AF_CONFIG_NACOS_NAMESPACE:public}
+      username: ${AF_CONFIG_NACOS_USERNAME:}
+      password: ${AF_CONFIG_NACOS_PASSWORD:}
