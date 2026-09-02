@@ -12,6 +12,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
@@ -351,6 +354,44 @@ class BetaDeploymentServiceTest {
         assertTrue(serviceState().path("lastError").isNull());
     }
 
+    @Test
+    void everyRepeatedContainerStopGetsAFreshPersistedDeadline() {
+        Instant firstAttempt = Instant.parse("2026-09-03T01:00:00Z");
+        service = serviceAt(firstAttempt);
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b'));
+        service.reconcileOne();
+        service.reconcileOne();
+        service.reconcileOne();
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd'));
+        service.reconcileOne();
+        service.reconcileOne();
+        service.reconcileOne();
+
+        containers.failStop = true;
+        service.reconcileOne();
+        assertEquals("FAILED", serviceState().path("phase").asText());
+        assertEquals(firstAttempt.toString(), serviceState().path("drainingInstance")
+                .path("stopSignalRequestedAt").asText());
+        assertEquals(firstAttempt.plusSeconds(60).toString(), serviceState().path("drainingInstance")
+                .path("stopDeadline").asText());
+
+        Instant secondAttempt = firstAttempt.plusSeconds(300);
+        service = serviceAt(secondAttempt);
+        service.retry("beta-main-001", "agent-service");
+        service.reconcileOne();
+
+        assertEquals("FAILED", serviceState().path("phase").asText());
+        assertEquals(secondAttempt.toString(), serviceState().path("drainingInstance")
+                .path("stopSignalRequestedAt").asText());
+        assertEquals(secondAttempt.plusSeconds(60).toString(), serviceState().path("drainingInstance")
+                .path("stopDeadline").asText());
+    }
+
+    private BetaDeploymentService serviceAt(Instant instant) {
+        return new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper), containers,
+                registry, retirement, retirementToken, Clock.fixed(instant, ZoneOffset.UTC));
+    }
+
     private ObjectNode manifest(long version, String release, char git, char repository, char local) {
         ObjectNode manifest = mapper.createObjectNode();
         manifest.put("schemaVersion", 1);
@@ -405,6 +446,7 @@ class BetaDeploymentServiceTest {
 
     private final class FakeContainers implements ContainerRuntime {
         ContainerObservation.Health health = ContainerObservation.Health.HEALTHY;
+        boolean failStop;
         final Map<String, ContainerObservation> values = new LinkedHashMap<>();
         final Map<String, Boolean> stopped = new LinkedHashMap<>();
 
@@ -422,7 +464,10 @@ class BetaDeploymentServiceTest {
             boolean running = !Boolean.TRUE.equals(stopped.get(name));
             return new ContainerObservation(value.containerId(), name, value.endpointAddress(), value.hostPort(), running, health);
         }
-        @Override public void stop(String machineId, String name, int timeoutSeconds) { stopped.put(name, true); }
+        @Override public void stop(String machineId, String name, int timeoutSeconds) {
+            if (failStop) throw new ControllerException("CONTAINER_STOP_FAILED", "simulated stop failure");
+            stopped.put(name, true);
+        }
         @Override public void remove(String machineId, String name) { values.remove(name); }
     }
 

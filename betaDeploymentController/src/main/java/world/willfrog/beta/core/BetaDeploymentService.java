@@ -455,7 +455,7 @@ public class BetaDeploymentService {
         }
         current = store.read(state -> checkedService(state, ref).deepCopy());
         draining = (ObjectNode) current.path("drainingInstance");
-        if (draining.path("stopSignalRequestedAt").isNull()) {
+        if (beforeStop.running()) {
             String requested = Instant.now(clock).toString();
             String deadline = Instant.parse(requested).plusSeconds(draining.path("drainGraceSeconds").asLong()).toString();
             store.update(state -> {
@@ -465,8 +465,6 @@ public class BetaDeploymentService {
                 validateAll(state);
                 return null;
             });
-        }
-        if (beforeStop.running()) {
             containers.stop(draining.path("machineId").asText(), draining.path("containerName").asText(),
                     draining.path("drainGraceSeconds").asInt());
         }
