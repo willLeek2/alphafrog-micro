@@ -89,7 +89,7 @@ public class AgentAiServiceFactory {
                 .logRequests(false)
                 .logResponses(false);
 
-        Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
+        Map<String, String> headers = buildCustomHeaders(resolved);
         if (!headers.isEmpty()) {
             builder.customHeaders(headers);
         }
@@ -123,7 +123,7 @@ public class AgentAiServiceFactory {
                 throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
             }
             double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
-            Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
+            Map<String, String> headers = buildCustomHeaders(resolved);
             OpenRouterProviderRoutedChatModel model = new OpenRouterProviderRoutedChatModel(
                     objectMapper,
                     resolved.baseUrl(),
@@ -165,7 +165,7 @@ public class AgentAiServiceFactory {
             return buildDashScopeChatModel(resolved, apiKey, temperature, effectiveMaxTokens);
         }
         if (shouldUseProviderRoutedModel(resolved)) {
-            Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
+            Map<String, String> headers = buildCustomHeaders(resolved);
             OpenRouterProviderRoutedChatModel model = new OpenRouterProviderRoutedChatModel(
                     objectMapper,
                     resolved.baseUrl(),
@@ -196,15 +196,16 @@ public class AgentAiServiceFactory {
                 .logRequests(false)
                 .logResponses(false);
 
-        Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
+        Map<String, String> headers = buildCustomHeaders(resolved);
         if (!headers.isEmpty()) {
             builder.customHeaders(headers);
         }
         return builder.build();
     }
 
-    private Map<String, String> buildCustomHeaders(String baseUrl) {
-        if (baseUrl == null || !baseUrl.contains("openrouter.ai")) {
+    private Map<String, String> buildCustomHeaders(AgentLlmResolver.ResolvedLlm resolved) {
+        if (resolved == null || !OpenRouterProviderRoutedChatModel.isOpenRouter(
+                resolved.baseUrl(), resolved.endpointName())) {
             return Map.of();
         }
         Map<String, String> headers = new HashMap<>();
@@ -357,13 +358,15 @@ public class AgentAiServiceFactory {
             return false;
         }
         // 支持所有 OpenAI 兼容 API：OpenRouter、Fireworks、OpenAI 等
-        String baseUrl = resolved.baseUrl().toLowerCase();
+        String baseUrl = resolved.baseUrl() == null ? "" : resolved.baseUrl().toLowerCase();
         if (baseUrl.contains("dashscope")) {
             return false;
         }
-        return baseUrl.contains("openrouter.ai") 
-            || baseUrl.contains("fireworks.ai")
-            || baseUrl.contains("openai.com")
+        if (OpenRouterProviderRoutedChatModel.isOpenRouter(resolved.baseUrl(), resolved.endpointName())
+                || OpenRouterProviderRoutedChatModel.isFireworks(resolved.baseUrl(), resolved.endpointName())) {
+            return true;
+        }
+        return baseUrl.contains("openai.com")
             || baseUrl.contains("api/v1");  // OpenAI 兼容 API 通用路径
     }
     

@@ -270,7 +270,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
         if (isDashScope(resolved) || baseUrl.contains("dashscope")) {
             return "dashscope";
         }
-        if (baseUrl.contains("openrouter.ai")) {
+        if (OpenRouterProviderRoutedChatModel.isOpenRouter(resolved.baseUrl(), resolved.endpointName())) {
             return "openrouter";
         }
         return "openai-compatible";

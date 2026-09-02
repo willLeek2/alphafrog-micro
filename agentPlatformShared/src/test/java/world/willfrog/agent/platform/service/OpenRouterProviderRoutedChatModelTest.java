@@ -199,6 +199,78 @@ class OpenRouterProviderRoutedChatModelTest {
     }
 
     @Test
+    void isOpenRouter_shouldAcceptOfficialHostAndSingaporeUrlWithEndpointName() {
+        assertTrue(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://openrouter.ai/api/v1", null));
+        assertTrue(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://openrouter.ai/api/v1", "openrouter"));
+        assertTrue(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://llm.frogwch.com/openrouter/api/v1", "openrouter"));
+        assertFalse(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://llm.frogwch.com/openrouter/api/v1", null));
+        assertFalse(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://llm.frogwch.com/openrouter/api/v1", "fireworks"));
+    }
+
+    @Test
+    void isFireworks_shouldAcceptOfficialHostAndSingaporeUrlWithEndpointName() {
+        assertTrue(OpenRouterProviderRoutedChatModel.isFireworks(
+                "https://api.fireworks.ai/inference/v1", null));
+        assertTrue(OpenRouterProviderRoutedChatModel.isFireworks(
+                "https://llm.frogwch.com/fireworks/inference/v1", "fireworks"));
+        assertFalse(OpenRouterProviderRoutedChatModel.isFireworks(
+                "https://llm.frogwch.com/fireworks/inference/v1", null));
+    }
+
+    @Test
+    void applyStreamingOptions_singaporeOpenRouterEndpointName_shouldSkipStreamOptionsInPlanning() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("stream", true);
+        payload.put("stream_options", Map.of("include_usage", true));
+
+        OpenRouterProviderRoutedChatModel.applyStreamingOptions(
+                payload,
+                "https://llm.frogwch.com/openrouter/api/v1",
+                AgentRunObservabilityService.PHASE_PLANNING,
+                "openrouter"
+        );
+
+        assertFalse(payload.containsKey("stream_options"));
+        assertFalse(payload.containsKey("perf_metrics_in_response"));
+    }
+
+    @Test
+    void applyStreamingOptions_singaporeFireworksEndpointName_shouldUsePerfMetrics() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("stream", true);
+        payload.put("stream_options", Map.of("include_usage", true));
+
+        OpenRouterProviderRoutedChatModel.applyStreamingOptions(
+                payload,
+                "https://llm.frogwch.com/fireworks/inference/v1",
+                "execution",
+                "fireworks"
+        );
+
+        assertFalse(payload.containsKey("stream_options"));
+        assertEquals(true, payload.get("perf_metrics_in_response"));
+    }
+
+    @Test
+    void applyEndpointSamplingDefaults_singaporeFireworksEndpointName_shouldOmitTemperature() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("temperature", 0.7D);
+
+        OpenRouterProviderRoutedChatModel.applyEndpointSamplingDefaults(
+                payload,
+                "https://llm.frogwch.com/fireworks/inference/v1",
+                "fireworks"
+        );
+
+        assertFalse(payload.containsKey("temperature"));
+    }
+
+    @Test
     void resolveRequestTimeout_shouldUseStageAndPhaseBuckets() {
         assertEquals(Duration.ofSeconds(90),
                 OpenRouterProviderRoutedChatModel.resolveRequestTimeout("planning", "execution"));
