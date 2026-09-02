@@ -317,8 +317,7 @@
           AND user_id = #{userId}
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
-          AND (status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
-               OR (status = 'COMPLETED' AND #{status} = 'EXPIRED'))
+          AND status = #{expectedStatus}
     </update>
 
     <update id="closeRetiredDeploymentRun">
@@ -371,8 +370,7 @@
           AND user_id = #{userId}
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
-          AND (status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
-               OR status = #{status})
+          AND status = #{expectedStatus}
     </update>
 
     <update id="updatePlanJson">
@@ -391,7 +389,7 @@
           AND user_id = #{userId}
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
-          AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND status = #{expectedStatus}
     </update>
 
     <update id="updateExecutionCheckpoint">
@@ -410,7 +408,7 @@
           AND user_id = #{userId}
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
-          AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND status = #{expectedStatus}
     </update>
 
     <select id="listStartupRecoveryCandidatesForDeployment" resultMap="AgentRunResultMap">
@@ -527,14 +525,7 @@
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
     </update>
 
-    <!--
-        终态专用快照写入：比 updateSnapshot 多一条状态栅栏——数据库里已是终态
-        （COMPLETED/PARTIAL/FAILED/CANCELED/EXPIRED）时返回 0，不覆盖既有终态。
-        用于执行路径的 COMPLETED/PARTIAL/FAILED 落库：取消与执行并发时，
-        先落库的终态（例如用户取消的 CANCELED）赢，后到的一方拿不到行、
-        由调用方按「未提交」语义跳过收尾副作用。非终态写入（如暂停写 WAITING）
-        仍走 updateSnapshot，不受本条影响。
-    -->
+    <!-- 兼容旧调用的终态写，只拒绝已经进入终态的记录。 -->
     <update id="updateTerminalSnapshot">
         UPDATE alphafrog_agent_run
         SET status = #{status},
@@ -549,6 +540,7 @@
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
     </update>
 
+    <!-- 带部署身份的普通执行终态只接受精确原状态；暂停或取消先落库后，迟到执行写返回 0。 -->
     <update id="updateTerminalSnapshotForDeployment">
         UPDATE alphafrog_agent_run
         SET status = #{status},
@@ -562,7 +554,7 @@
           AND user_id = #{userId}
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
-          AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND status = #{expectedStatus}
     </update>
 
     <!--

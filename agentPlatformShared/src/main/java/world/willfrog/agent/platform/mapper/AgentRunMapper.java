@@ -55,6 +55,7 @@ public interface AgentRunMapper {
             @Param("userId") String userId,
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("status") AgentRunStatus status,
             @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
@@ -67,6 +68,7 @@ public interface AgentRunMapper {
             @Param("userId") String userId,
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("planJson") String planJson);
 
     int updateExecutionCheckpoint(@Param("id") String id,
@@ -78,6 +80,7 @@ public interface AgentRunMapper {
             @Param("userId") String userId,
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("executionCheckpointJson") String executionCheckpointJson);
 
     /**
@@ -138,12 +141,13 @@ public interface AgentRunMapper {
                 id, "stable", "legacy-stable", expectedStatus, lastError);
     }
 
-    /** 异步执行写入的通用代际栅栏；不允许其他代际修改 Run 状态。 */
+    /** 异步执行写入的状态推进；部署身份与读取时的原状态必须在同一条 SQL 中仍然匹配。 */
     int updateStatusForDeployment(
             @Param("id") String id,
             @Param("userId") String userId,
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("status") AgentRunStatus status);
 
     /** 仅在本实例已收到可信退役信号后，把一个本代际 Run 写成明确终态。 */
@@ -189,9 +193,7 @@ public interface AgentRunMapper {
             @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
     /**
-     * 终态专用快照写入：比 updateSnapshot 多一条状态栅栏，数据库里已是终态时返回 0，
-     * 不覆盖既有终态（取消与执行并发时先落库的终态赢）。只用于执行路径的
-     * COMPLETED/PARTIAL/FAILED 落库；非终态写入（暂停写 WAITING 等）仍用 updateSnapshot。
+     * 兼容旧调用的终态写入，只拒绝已经进入终态的记录；Spring 运行路径使用下面带部署身份的方法。
      */
     int updateTerminalSnapshot(@Param("id") String id,
                                @Param("userId") String userId,
@@ -200,11 +202,16 @@ public interface AgentRunMapper {
                                @Param("completed") boolean completed,
                                @Param("lastError") String lastError);
 
+    /**
+     * 普通执行终态写入：部署身份和执行线程读取时的原状态必须仍然匹配。
+     * 暂停、取消或其他控制写先落库后，本方法返回 0，不覆盖控制结果。
+     */
     int updateTerminalSnapshotForDeployment(
             @Param("id") String id,
             @Param("userId") String userId,
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("status") AgentRunStatus status,
             @Param("snapshotJson") String snapshotJson,
             @Param("completed") boolean completed,

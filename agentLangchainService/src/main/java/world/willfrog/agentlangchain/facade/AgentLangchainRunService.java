@@ -131,7 +131,7 @@ public class AgentLangchainRunService {
             ));
             runMapper.updateStatusForDeployment(
                     run.getId(), run.getUserId(), run.getDeploymentId(),
-                    run.getDeploymentGenerationId(), AgentRunStatus.FAILED);
+                    run.getDeploymentGenerationId(), run.getStatus(), AgentRunStatus.FAILED);
         } catch (Exception markError) {
             log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
                     run.getId(), markError.getMessage());

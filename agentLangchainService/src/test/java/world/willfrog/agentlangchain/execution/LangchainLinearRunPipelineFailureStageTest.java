@@ -21,9 +21,15 @@ import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.deployment.AgentServiceShutdownState;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -42,6 +48,107 @@ import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSup
  * 预期失败不走异常通道，仍由各阶段的结果对象表达。
  */
 class LangchainLinearRunPipelineFailureStageTest {
+
+    private static final String GENERATION = "gen-" + "a".repeat(64);
+
+    @Test
+    void pauseWinningAfterLastStopCheckRejectsLatePlanAndTerminalWrites() {
+        AgentRun run = new AgentRun();
+        run.setId("run-pause-race");
+        run.setUserId("user-1");
+        run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
+        run.setDeploymentId("beta-main");
+        run.setDeploymentGenerationId(GENERATION);
+
+        AtomicReference<AgentRunStatus> databaseStatus =
+                new AtomicReference<>(AgentRunStatus.RECEIVED);
+        AtomicBoolean latePlanRejected = new AtomicBoolean(false);
+        AtomicBoolean lateTerminalRejected = new AtomicBoolean(false);
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        when(runMapper.findByIdForDeployment("run-pause-race", "beta-main", GENERATION))
+                .thenReturn(run);
+        when(runMapper.updateStatusForDeployment(
+                "run-pause-race", "user-1", "beta-main", GENERATION,
+                AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING))
+                .thenAnswer(invocation -> databaseStatus.compareAndSet(
+                        AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING) ? 1 : 0);
+        when(runMapper.updatePlanJsonForDeployment(
+                eq("run-pause-race"), eq("user-1"), eq("beta-main"), eq(GENERATION),
+                eq(AgentRunStatus.EXECUTING), anyString()))
+                .thenAnswer(invocation -> {
+                    boolean accepted = databaseStatus.get() == AgentRunStatus.EXECUTING;
+                    if (!accepted) {
+                        latePlanRejected.set(true);
+                    }
+                    return accepted ? 1 : 0;
+                });
+        when(runMapper.updateTerminalSnapshotForDeployment(
+                eq("run-pause-race"), eq("user-1"), eq("beta-main"), eq(GENERATION),
+                eq(AgentRunStatus.EXECUTING), eq(AgentRunStatus.COMPLETED),
+                anyString(), eq(true), any()))
+                .thenAnswer(invocation -> {
+                    boolean accepted = databaseStatus.compareAndSet(
+                            AgentRunStatus.EXECUTING, AgentRunStatus.COMPLETED);
+                    if (!accepted) {
+                        lateTerminalRejected.set(true);
+                    }
+                    return accepted ? 1 : 0;
+                });
+
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
+        when(eventService.isRunnable("run-pause-race", "user-1")).thenReturn(true);
+        when(eventService.extractCaptureLlmRequests("{}")).thenReturn(false);
+        when(eventService.extractRunConfig("{}"))
+                .thenReturn(AgentRunEventService.RunConfig.defaults());
+        LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
+        when(stageModelResolver.resolve(run)).thenReturn(
+                new LangchainRunStageModelResolver.StageModels(
+                        null, null, null, "openrouter", "model", List.of()));
+        LangchainFollowUpContextSupport followUpContextSupport = mock(LangchainFollowUpContextSupport.class);
+        when(followUpContextSupport.resolve(run)).thenReturn(
+                new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(TodoItem.builder().id("todo_1").sequence(1).description("x").build()))
+                .build();
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        when(planner.plan(any())).thenReturn(plan);
+        LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
+        when(linear.executePlanned(any(), any())).thenReturn(
+                LangchainWorkflowResult.builder().success(true).plan(plan).build());
+        AgentCreditService creditService = mock(AgentCreditService.class);
+        when(creditService.hasPositiveCredit("user-1")).thenReturn(true);
+        LangchainRunExecutionGuard executionGuard = mock(LangchainRunExecutionGuard.class);
+        AtomicInteger stopChecks = new AtomicInteger();
+        when(executionGuard.stopReason("run-pause-race", "user-1")).thenAnswer(invocation -> {
+            if (stopChecks.incrementAndGet() == 2) {
+                // 模拟停止检查刚返回后，暂停 SQL 先把数据库状态从 EXECUTING 改成 WAITING。
+                databaseStatus.compareAndSet(AgentRunStatus.EXECUTING, AgentRunStatus.WAITING);
+            }
+            return Optional.empty();
+        });
+        AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
+
+        LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
+                planner, linear, mock(LangchainDagWorkflowExecutor.class), stageModelResolver,
+                runMapper, eventService, new ObjectMapper(), mock(ObjectProvider.class),
+                mock(ObjectProvider.class), mock(ObjectProvider.class), new LangchainFailureMapper(),
+                followUpContextSupport, mock(AgentMessageService.class), executionGuard,
+                immediateScheduler(), creditService, mock(AgentRunCreditSettlementService.class),
+                finalizationService, mock(world.willfrog.agent.platform.service.AgentPromptService.class),
+                mock(ObjectProvider.class), mock(ObjectProvider.class));
+        ReflectionTestUtils.setField(pipeline, "deploymentIdentityProvider",
+                (DeploymentIdentityProvider) () -> new DeploymentIdentity("beta-main", GENERATION));
+
+        pipeline.executeRun(run);
+
+        assertThat(databaseStatus.get()).isEqualTo(AgentRunStatus.WAITING);
+        assertThat(latePlanRejected).isTrue();
+        assertThat(lateTerminalRejected).isTrue();
+        verify(finalizationService, never()).publishFinalizedEvent(
+                anyString(), anyString(), anyString());
+    }
 
     @Test
     void lostTerminalWriteDoesNotPublishFailureSideEffects() {

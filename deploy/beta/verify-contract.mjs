@@ -350,6 +350,19 @@ function customErrors(manifestValue, stateValue) {
   const specByName = new Map();
   const reservedPorts = new Set();
   const expectedGeneration = deploymentGeneration(manifestValue);
+  const checkTargetInstance = (instance, spec, role) => {
+    if (!instance || !spec) return;
+    if (instance.manifestVersion !== manifestValue.manifestVersion) errors.push(`${role} manifest version ${instance.instanceId}`);
+    if (instance.serviceSpecSha256 !== spec.serviceSpecSha256) errors.push(`${role} service digest ${instance.instanceId}`);
+    if (instance.releaseId !== spec.releaseId) errors.push(`${role} release ${instance.instanceId}`);
+    if (instance.deploymentGenerationId !== expectedGeneration) errors.push(`${role} deployment generation ${instance.instanceId}`);
+    if (instance.preStopPolicy !== spec.runtime.preStopPolicy) errors.push(`${role} pre-stop policy ${instance.instanceId}`);
+    if (instance.shutdownProfile !== spec.runtime.shutdownProfile
+        || instance.applicationDrainSeconds !== spec.runtime.applicationDrainSeconds
+        || instance.drainGraceSeconds !== spec.runtime.drainGraceSeconds) {
+      errors.push(`${role} shutdown policy ${instance.instanceId}`);
+    }
+  };
   if (Date.parse(manifestValue.expiresAt) <= Date.parse(manifestValue.createdAt)) errors.push('manifest expiry');
   for (const spec of manifestValue.services) {
     if (specByName.has(spec.serviceName)) errors.push(`duplicate manifest service ${spec.serviceName}`);
@@ -389,6 +402,10 @@ function customErrors(manifestValue, stateValue) {
       if (spec && item.targetManifestVersion !== manifestValue.manifestVersion) errors.push(`target manifest version ${item.serviceName}`);
       if (spec && item.targetServiceSpecSha256 !== spec.serviceSpecSha256) errors.push(`target service digest ${item.serviceName}`);
       if ((item.failedManifestVersion === null) !== (item.lastError === null)) errors.push(`failure fields pair ${item.serviceName}`);
+      checkTargetInstance(item.candidateInstance, spec, 'candidate');
+      if (item.operation?.phase === 'DRAINING_PREVIOUS') {
+        checkTargetInstance(item.activeInstance, spec, 'post-switch active');
+      }
       const roleSlots = new Set();
       for (const instance of [item.activeInstance, item.candidateInstance, item.drainingInstance].filter(Boolean)) {
         if (instanceIds.has(instance.instanceId)) errors.push(`duplicate instance ${instance.instanceId}`);
@@ -548,6 +565,36 @@ try {
   selectableCandidate.deployments[0].services[0].candidateInstance.registration.enabled = true;
   selectableCandidate.deployments[0].services[0].candidateInstance.registration.weight = 1;
   customNegatives.push(['candidate selectable', manifest, selectableCandidate]);
+  const staleCandidateTarget = clone(positiveStates.updateSwitching);
+  const staleCandidate = staleCandidateTarget.deployments[0].services[0].candidateInstance;
+  staleCandidate.manifestVersion = 1;
+  staleCandidate.serviceSpecSha256 = repeated('d');
+  staleCandidate.releaseId = 'release-1';
+  staleCandidate.deploymentGenerationId = previousGeneration;
+  staleCandidate.preStopPolicy = previousAgentRuntime.preStopPolicy;
+  staleCandidate.shutdownProfile = previousAgentRuntime.shutdownProfile;
+  staleCandidate.applicationDrainSeconds = previousAgentRuntime.applicationDrainSeconds;
+  staleCandidate.drainGraceSeconds = previousAgentRuntime.drainGraceSeconds;
+  staleCandidate.registration.metadata['alphafrog.release-id'] = staleCandidate.releaseId;
+  staleCandidate.registration.metadata['alphafrog.deployment-generation-id'] = staleCandidate.deploymentGenerationId;
+  runAjv('validate', stateSchema, writeFixture('state-stale-candidate-target', staleCandidateTarget), true);
+  customNegatives.push(['candidate target mismatch', manifest, staleCandidateTarget]);
+  const stalePostSwitchTarget = clone(positiveStates.updateDraining);
+  const stalePostSwitchActive = stalePostSwitchTarget.deployments[0].services[0].activeInstance;
+  stalePostSwitchActive.manifestVersion = 1;
+  stalePostSwitchActive.serviceSpecSha256 = repeated('d');
+  stalePostSwitchActive.releaseId = 'release-1';
+  stalePostSwitchActive.deploymentGenerationId = previousGeneration;
+  stalePostSwitchActive.preStopPolicy = previousAgentRuntime.preStopPolicy;
+  stalePostSwitchActive.shutdownProfile = previousAgentRuntime.shutdownProfile;
+  stalePostSwitchActive.applicationDrainSeconds = previousAgentRuntime.applicationDrainSeconds;
+  stalePostSwitchActive.drainGraceSeconds = previousAgentRuntime.drainGraceSeconds;
+  stalePostSwitchActive.registration.metadata['alphafrog.release-id'] = stalePostSwitchActive.releaseId;
+  stalePostSwitchActive.registration.metadata['alphafrog.deployment-generation-id'] = stalePostSwitchActive.deploymentGenerationId;
+  stalePostSwitchTarget.deployments[0].services[0].route.defaultReleaseId = stalePostSwitchActive.releaseId;
+  stalePostSwitchTarget.deployments[0].services[0].route.defaultDeploymentGenerationId = stalePostSwitchActive.deploymentGenerationId;
+  runAjv('validate', stateSchema, writeFixture('state-stale-post-switch-target', stalePostSwitchTarget), true);
+  customNegatives.push(['post-switch active target mismatch', manifest, stalePostSwitchTarget]);
   const invalidDrainingRegistration = clone(positiveStates.updateDraining);
   invalidDrainingRegistration.deployments[0].services[0].drainingInstance.registration.enabled = true;
   invalidDrainingRegistration.deployments[0].services[0].drainingInstance.registration.weight = 0;

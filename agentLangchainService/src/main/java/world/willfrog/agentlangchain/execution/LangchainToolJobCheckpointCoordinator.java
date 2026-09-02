@@ -122,7 +122,7 @@ final class LangchainToolJobCheckpointCoordinator {
                 DeploymentIdentity local = deploymentIdentityProvider.current();
                 failed = runMapper.updateTerminalSnapshotForDeployment(
                         runId, userId, local.deploymentId(), local.generationId(),
-                        AgentRunStatus.FAILED,
+                        AgentRunStatus.EXECUTING, AgentRunStatus.FAILED,
                         "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
                         "tool_job_checkpoint_anchor_missing") == 1;
             }

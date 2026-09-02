@@ -293,7 +293,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 return;
             }
 
-            updatePlanForLocal(runId, userId, writeJson(result.getPlan()));
+            updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, writeJson(result.getPlan()));
             if (result.isSuccess()) {
                 persistCompletedOutcome(run, userGoal, inputs.stageModels(), result, null);
             } else if (result.isPartial()) {
@@ -385,9 +385,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             String blockedSnapshot = attachObservability(
                     runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
             int snapshotRows = updateTerminalForLocal(
-                    runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
+                    runId, userId, run.getStatus(), AgentRunStatus.FAILED,
+                    blockedSnapshot, true, reason);
             int ttlRows = updateStatusWithTtlForLocal(
-                    runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
+                    runId, userId, AgentRunStatus.FAILED, AgentRunStatus.FAILED,
+                    eventService.nextInterruptedExpiresAt());
             if (snapshotRows == 1 && ttlRows == 1) {
                 recordSchedulerCompletion(AgentRunStatus.FAILED);
             }
@@ -396,7 +398,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             markRunStatus(runId, AgentRunStatus.FAILED);
             return false;
         }
-        if (updateStatusForLocal(runId, userId, AgentRunStatus.EXECUTING) != 1) {
+        if (updateStatusForLocal(runId, userId, run.getStatus(), AgentRunStatus.EXECUTING) != 1) {
             log.warn("Run 状态或部署代际已经变化，停止进入执行阶段: runId={}", runId);
             return false;
         }
@@ -798,7 +800,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String snapshot = attachObservability(
                 runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
         int completedRows = updateTerminalForLocal(
-                runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
+                runId, userId, AgentRunStatus.EXECUTING, AgentRunStatus.COMPLETED,
+                snapshot, true, null);
         if (completedRows != 1) {
             log.warn("Completed snapshot was not persisted for run={} rows={}", runId, completedRows);
             return false;
@@ -847,7 +850,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
                 result.getFailureReason());
         int partialRows = updateTerminalForLocal(
-                runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
+                runId, userId, AgentRunStatus.EXECUTING, AgentRunStatus.PARTIAL,
+                snapshot, true, result.getFailureReason());
         if (partialRows != 1) {
             log.warn("Partial snapshot was not persisted for run={} rows={}", runId, partialRows);
             return false;
@@ -961,17 +965,21 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 runId, local.deploymentId(), local.generationId());
     }
 
-    private int updateStatusForLocal(String runId, String userId, AgentRunStatus status) {
+    private int updateStatusForLocal(String runId,
+                                     String userId,
+                                     AgentRunStatus expectedStatus,
+                                     AgentRunStatus status) {
         if (deploymentIdentityProvider == null) {
             return runMapper.updateStatus(runId, userId, status);
         }
         DeploymentIdentity local = deploymentIdentityProvider.current();
         return runMapper.updateStatusForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(), status);
+                runId, userId, local.deploymentId(), local.generationId(), expectedStatus, status);
     }
 
     private int updateStatusWithTtlForLocal(String runId,
                                             String userId,
+                                            AgentRunStatus expectedStatus,
                                             AgentRunStatus status,
                                             OffsetDateTime ttlExpiresAt) {
         if (deploymentIdentityProvider == null) {
@@ -979,20 +987,25 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         DeploymentIdentity local = deploymentIdentityProvider.current();
         return runMapper.updateStatusWithTtlForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(), status, ttlExpiresAt);
+                runId, userId, local.deploymentId(), local.generationId(),
+                expectedStatus, status, ttlExpiresAt);
     }
 
-    private int updatePlanForLocal(String runId, String userId, String planJson) {
+    private int updatePlanForLocal(String runId,
+                                   String userId,
+                                   AgentRunStatus expectedStatus,
+                                   String planJson) {
         if (deploymentIdentityProvider == null) {
             return runMapper.updatePlanJson(runId, userId, planJson);
         }
         DeploymentIdentity local = deploymentIdentityProvider.current();
         return runMapper.updatePlanJsonForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(), planJson);
+                runId, userId, local.deploymentId(), local.generationId(), expectedStatus, planJson);
     }
 
     private int updateTerminalForLocal(String runId,
                                        String userId,
+                                       AgentRunStatus expectedStatus,
                                        AgentRunStatus status,
                                        String snapshotJson,
                                        boolean completed,
@@ -1004,7 +1017,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         DeploymentIdentity local = deploymentIdentityProvider.current();
         return runMapper.updateTerminalSnapshotForDeployment(
                 runId, userId, local.deploymentId(), local.generationId(),
-                status, snapshotJson, completed, lastError);
+                expectedStatus, status, snapshotJson, completed, lastError);
     }
 
     private int updateResumedTerminalForLocal(String runId,
@@ -1060,7 +1073,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
-        updatePlanForLocal(runId, userId, planJson);
+        updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, planJson);
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
             // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史的权威副本。
@@ -1329,8 +1342,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         int updated = requireDurableWrite
                 ? persistResumedTerminal(runId, userId, AgentRunStatus.FAILED,
                 result, snapshot, decision.getReason(), resumeContext)
-                : updateTerminalForLocal(runId, userId, AgentRunStatus.FAILED,
-                snapshot, true, decision.getReason());
+                : updateTerminalForLocal(runId, userId, AgentRunStatus.EXECUTING,
+                AgentRunStatus.FAILED, snapshot, true, decision.getReason());
         if (updated != 1) {
             log.warn("FAILED snapshot was not persisted for run={}", runId);
             return false;

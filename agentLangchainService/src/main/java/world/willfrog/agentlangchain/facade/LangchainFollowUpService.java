@@ -96,7 +96,7 @@ public class LangchainFollowUpService {
         if (agentEventService.shouldMarkExpired(run)) {
             runMapper.updateStatusForDeployment(
                     runId, userId, localIdentity.deploymentId(),
-                    localIdentity.generationId(), AgentRunStatus.EXPIRED);
+                    localIdentity.generationId(), AgentRunStatus.COMPLETED, AgentRunStatus.EXPIRED);
             agentEventService.append(runId, userId, "RUN_EXPIRED", Map.of(
                     "run_id", runId,
                     "expired_at", java.time.OffsetDateTime.now().toString()));

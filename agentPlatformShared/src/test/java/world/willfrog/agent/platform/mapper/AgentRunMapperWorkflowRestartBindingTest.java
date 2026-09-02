@@ -202,7 +202,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
-    void pipelineAndResumeWritesUseDeploymentAndTerminalFences() {
+    void ordinaryPipelineWritesCompareDeploymentAndExactSourceStatus() {
         for (String id : List.of(
                 "updateStatusForDeployment",
                 "updateStatusWithTtlForDeployment",
@@ -214,7 +214,8 @@ class AgentRunMapperWorkflowRestartBindingTest {
             assertThat(sql).as(id)
                     .contains("deployment_id = ?")
                     .contains("deployment_generation_id = ?")
-                    .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+                    .contains("status = ?")
+                    .doesNotContain("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
         }
 
         String resumed = normalizedSql(statement("updateResumedTerminalForDeployment")

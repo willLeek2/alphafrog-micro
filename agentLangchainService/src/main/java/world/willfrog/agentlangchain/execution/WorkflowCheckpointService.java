@@ -10,6 +10,7 @@ import world.willfrog.agent.platform.artifact.RunRawRefStore;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
@@ -269,7 +270,8 @@ public class WorkflowCheckpointService {
         }
         DeploymentIdentity local = deploymentIdentityProvider.current();
         return runMapper.updateExecutionCheckpointForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(), json);
+                runId, userId, local.deploymentId(), local.generationId(),
+                AgentRunStatus.EXECUTING, json);
     }
 
     private void validateReplaySafety(WorkflowExecutionCheckpoint checkpoint) {
