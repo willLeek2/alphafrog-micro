@@ -152,7 +152,12 @@ public class BetaDeploymentService {
                 String failedType = service.path("lastError").path("failedOperationType").asText();
                 service.putNull("failedManifestVersion");
                 service.putNull("lastError");
-                if (service.path("drainingInstance").isObject()) {
+                if ("CREATE".equals(failedType) && service.path("activeInstance").isObject()
+                        && service.path("candidateInstance").isNull() && service.path("drainingInstance").isNull()) {
+                    service.put("phase", "STABLE");
+                    service.putNull("operation");
+                    scheduleNext(state);
+                } else if (service.path("drainingInstance").isObject()) {
                     boolean deleting = "DELETE".equals(failedType);
                     service.put("phase", deleting ? "DELETING" : "UPDATING");
                     service.set("operation", operation(failedType,
@@ -189,6 +194,14 @@ public class BetaDeploymentService {
         mutationLock.lock();
         try {
             OperationRef ref = store.read(this::currentOperation);
+            if (ref == null && store.read(state -> nextService(state) != null)) {
+                store.update(state -> {
+                    scheduleNext(state);
+                    validateAll(state);
+                    return null;
+                });
+                ref = store.read(this::currentOperation);
+            }
             if (ref == null) {
                 String expired = store.read(this::firstExpiredDeployment);
                 if (expired == null) return store.snapshot();
@@ -343,6 +356,7 @@ public class BetaDeploymentService {
         ServiceRegistry.Registration enabled = registry.setSelectable(registration(candidate.path("registration")), true);
         if (!enabled.enabled() || enabled.weight() != 1 || !enabled.healthy())
             throw new ControllerException("NACOS_ENABLE_NOT_CONFIRMED", "Candidate registration was not enabled");
+        final boolean[] initialCreate = new boolean[1];
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode promoted = ((ObjectNode) service.path("candidateInstance")).deepCopy();
@@ -367,17 +381,57 @@ public class BetaDeploymentService {
                 operation.put("phase", "DRAINING_PREVIOUS");
                 operation.putNull("candidateInstanceId");
             } else {
+                initialCreate[0] = true;
                 service.putNull("drainingInstance");
                 stable(service);
-                scheduleNext(state);
             }
             validateAll(state);
             return null;
         });
         JsonNode published = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
                 ref.serviceName()).deepCopy());
-        requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
-                "Published route could not be read back");
+        try {
+            requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
+                    "Published route could not be read back");
+        } catch (ControllerException failure) {
+            if (!initialCreate[0]) throw failure;
+            recordPublishedCreateFailure(ref, failure);
+            return;
+        }
+        if (initialCreate[0]) {
+            store.update(state -> {
+                ObjectNode service = requireService(requireDeployment(state, ref.deploymentId()), ref.serviceName());
+                if (!"STABLE".equals(service.path("phase").asText()) || !service.path("operation").isNull()
+                        || !ref.candidateInstanceId().equals(service.path("activeInstance").path("instanceId").asText())) {
+                    throw new ControllerException("OPERATION_CHANGED", "Published create changed before route confirmation");
+                }
+                scheduleNext(state);
+                validateAll(state);
+                return null;
+            });
+        }
+    }
+
+    private void recordPublishedCreateFailure(OperationRef ref, ControllerException failure) {
+        store.update(state -> {
+            ObjectNode service = requireService(requireDeployment(state, ref.deploymentId()), ref.serviceName());
+            if (!"STABLE".equals(service.path("phase").asText()) || !service.path("operation").isNull()
+                    || !ref.candidateInstanceId().equals(service.path("activeInstance").path("instanceId").asText())) {
+                throw new ControllerException("OPERATION_CHANGED", "Published create changed before failure was recorded");
+            }
+            service.put("phase", "FAILED");
+            service.put("failedManifestVersion", service.path("targetManifestVersion").asLong());
+            ObjectNode error = mapper.createObjectNode();
+            error.put("code", failure.code().replaceAll("[^A-Z0-9_]", "_"));
+            error.put("message", sanitize(failure.getMessage()));
+            error.put("at", Instant.now(clock).toString());
+            error.put("failedOperationType", "CREATE");
+            error.put("recoveryClass", "FACTS_UNCERTAIN");
+            service.set("lastError", error);
+            scheduleNext(state);
+            validateAll(state);
+            return null;
+        });
     }
 
     private void removeTraffic(OperationRef ref) {
@@ -934,7 +988,15 @@ public class BetaDeploymentService {
     }
 
     private void scheduleNext(ObjectNode state) {
-        if (currentOperation(state) != null) return;
+        ServiceRef item = nextService(state);
+        if (item == null) return;
+        String instanceId = newInstanceId(item.deployment(), item.service());
+        item.service().put("phase", item.create() ? "CREATING" : "UPDATING");
+        item.service().set("operation", operation(item.create() ? "CREATE" : "UPDATE", "STARTING_CANDIDATE", instanceId));
+    }
+
+    private ServiceRef nextService(JsonNode state) {
+        if (currentOperation(state) != null) return null;
         java.util.List<ServiceRef> queue = new java.util.ArrayList<>();
         for (JsonNode deployment : state.path("deployments")) {
             if (!"ACTIVE".equals(deployment.path("phase").asText())) continue;
@@ -946,12 +1008,8 @@ public class BetaDeploymentService {
                 if (create || update) queue.add(new ServiceRef((ObjectNode) deployment, (ObjectNode) service, create));
             }
         }
-        queue.stream().min(Comparator.comparing((ServiceRef item) -> item.deployment().path("trafficScopeId").asText())
-                .thenComparing(item -> item.service().path("serviceName").asText())).ifPresent(item -> {
-            String instanceId = newInstanceId(item.deployment(), item.service());
-            item.service().put("phase", item.create() ? "CREATING" : "UPDATING");
-            item.service().set("operation", operation(item.create() ? "CREATE" : "UPDATE", "STARTING_CANDIDATE", instanceId));
-        });
+        return queue.stream().min(Comparator.comparing((ServiceRef item) -> item.deployment().path("trafficScopeId").asText())
+                .thenComparing(item -> item.service().path("serviceName").asText())).orElse(null);
     }
 
     private void startNextDelete(ObjectNode deployment) {

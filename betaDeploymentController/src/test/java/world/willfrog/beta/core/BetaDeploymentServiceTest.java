@@ -469,6 +469,42 @@ class BetaDeploymentServiceTest {
         assertEquals(0, retirement.calls);
     }
 
+    @Test
+    void initialCreateRouteFailurePausesTheDeploymentAndRetryConfirmsThePublishedInstance() {
+        service.submitManifest(twoServiceManifest());
+        service.reconcileOne();
+        service.reconcileOne();
+        String publishedInstance = serviceState().path("candidateInstance").path("instanceId").asText();
+        routeMutation = route -> {
+            ((ObjectNode) route.path("endpoint")).put("address", "10.0.0.99");
+            return route;
+        };
+
+        service.reconcileOne();
+
+        JsonNode failed = namedService("agent-service");
+        assertEquals("FAILED", failed.path("phase").asText());
+        assertEquals("FACTS_UNCERTAIN", failed.path("lastError").path("recoveryClass").asText());
+        assertEquals(publishedInstance, failed.path("activeInstance").path("instanceId").asText());
+        assertTrue(failed.path("operation").isNull());
+        assertTrue(namedService("tools-service").path("operation").isNull());
+        assertEquals(1, containers.values.size());
+
+        service.reconcileOne();
+        assertTrue(namedService("tools-service").path("operation").isNull());
+        assertEquals(1, containers.values.size());
+
+        routeMutation = UnaryOperator.identity();
+        service.retry("beta-main-001", "agent-service");
+
+        JsonNode confirmed = namedService("agent-service");
+        assertEquals("STABLE", confirmed.path("phase").asText());
+        assertEquals(publishedInstance, confirmed.path("activeInstance").path("instanceId").asText());
+        assertTrue(confirmed.path("candidateInstance").isNull());
+        assertEquals(1, containers.values.size());
+        assertEquals("STARTING_CANDIDATE", namedService("tools-service").path("operation").path("phase").asText());
+    }
+
     private void createStableService() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b'));
         service.reconcileOne();
@@ -535,7 +571,30 @@ class BetaDeploymentServiceTest {
         return manifest;
     }
 
+    private ObjectNode twoServiceManifest() {
+        ObjectNode manifest = manifest(1, "release-1", '1', 'a', 'b');
+        ObjectNode tools = ((ObjectNode) manifest.path("services").path(0)).deepCopy();
+        tools.put("serviceName", "tools-service");
+        tools.put("releaseId", "tools-release-1");
+        ((ObjectNode) tools.path("image"))
+                .put("repositoryDigest", "registry.local/tools-service@sha256:" + "e".repeat(64))
+                .put("localImageId", "sha256:" + "f".repeat(64));
+        com.fasterxml.jackson.databind.node.ArrayNode ports =
+                (com.fasterxml.jackson.databind.node.ArrayNode) tools.path("runtime").path("hostPorts");
+        ports.set(0, mapper.getNodeFactory().numberNode(29080));
+        ports.set(1, mapper.getNodeFactory().numberNode(29081));
+        ((ObjectNode) tools.path("registration")).put("serviceName", "com.alphafrog.ToolsService:1.0@@providers");
+        tools.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, tools));
+        ((com.fasterxml.jackson.databind.node.ArrayNode) manifest.path("services")).add(tools);
+        return manifest;
+    }
+
     private JsonNode serviceState() { return store.snapshot().path("deployments").path(0).path("services").path(0); }
+    private JsonNode namedService(String serviceName) {
+        for (JsonNode value : store.snapshot().path("deployments").path(0).path("services"))
+            if (serviceName.equals(value.path("serviceName").asText())) return value;
+        return mapper.missingNode();
+    }
     private String operationPhase() { return serviceState().path("operation").path("phase").asText(); }
     private JsonNode deployment(String deploymentId) {
         for (JsonNode deployment : store.snapshot().path("deployments"))
