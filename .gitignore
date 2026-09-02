@@ -1,5 +1,7 @@
 HELP.md
 target/
+deploy/otel/opentelemetry-javaagent.jar
+deploy/otel/runtime.env
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/

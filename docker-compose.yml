@@ -5,6 +5,16 @@ x-agent-llm-proxy-env: &agent-llm-proxy-env
   http_proxy: ${HTTP_PROXY-http://host.docker.internal:7890}
   https_proxy: ${HTTPS_PROXY-http://host.docker.internal:7890}
 
+# JVM 服务把 trace 直接发到 Jaeger。日志由服务写入文件，再由采集器发送到
+# VictoriaLogs；因此 javaagent 的日志和指标导出在这里关闭。
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${AF_OTEL_TRACES_ENDPOINT:-http://jaeger:4318}
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+  AF_DEPLOYMENT_ID: ${AF_DEPLOYMENT_ID:-stable}
+
 services:
   # postgres:  <-- 用户使用的是宿主机 PG
   #   image: postgres:16-alpine
@@ -146,7 +156,10 @@ services:
       meilisearch:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: domestic-stock-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_STOCK_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -167,6 +180,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
+    volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/domestic-stock-service:/app/logs
     ports:
       - "50055:50055"
     deploy:
@@ -192,7 +209,10 @@ services:
       meilisearch:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: domestic-index-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_INDEX_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -212,6 +232,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
+    volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/domestic-index-service:/app/logs
     ports:
       - "50053:50053"
     deploy:
@@ -237,7 +261,10 @@ services:
       meilisearch:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: domestic-fund-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_FUND_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -257,6 +284,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
+    volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/domestic-fund-service:/app/logs
     ports:
       - "50052:50052"
     deploy:
@@ -280,7 +311,10 @@ services:
       meilisearch:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: domestic-listed-asset-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_LISTED_ASSET_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -297,6 +331,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
+    volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/domestic-listed-asset-service:/app/logs
     ports:
       - "50062:50062"
     deploy:
@@ -322,7 +360,10 @@ services:
       nacos:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: domestic-fetch-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_FETCH_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -354,7 +395,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
     volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/domestic-fetch-service:/app/logs
       - ./domesticFetchService/config:/app/config:ro
       - ./data/domestic-fetch-configs:/app/config-dynamic
     ports:
@@ -380,7 +424,10 @@ services:
       nacos:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: admin-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_ADMIN_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -396,6 +443,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
+    volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/admin-service:/app/logs
     deploy:
       resources:
         limits:
@@ -417,7 +468,10 @@ services:
       rabbitmq:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: portfolio-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_PORTFOLIO_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -438,6 +492,10 @@ services:
         -Xmx200m
         -XX:MaxRAM=420m
         -XX:MaxMetaspaceSize=128m
+      JAVA_TOOL_OPTIONS: "-javaagent:/otel/javaagent.jar"
+    volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/portfolio-service:/app/logs
     ports:
       - "50056:50056"
     deploy:
@@ -461,7 +519,10 @@ services:
       redis:
         condition: service_healthy
     environment:
+      <<: [*otel-env, *agent-llm-proxy-env]
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: agentLangchainService
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_AGENT_LANGCHAIN_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -488,7 +549,7 @@ services:
       AF_AGENT_DEFAULT_ENDPOINT: ${AF_AGENT_DEFAULT_ENDPOINT:-openrouter}
       AF_AGENT_DEFAULT_MODEL: ${AF_AGENT_DEFAULT_MODEL:-openai/gpt-5.2}
       AF_AGENT_MODELS: ${AF_AGENT_MODELS:-openai/gpt-5.2,openai/gpt-5.1,google/gemini-3-pro-preview,moonshotai/kimi-k2.5,accounts/fireworks/models/kimi-k2p5}
-      AF_AGENT_ENDPOINT_OPENROUTER: ${AF_AGENT_ENDPOINT_OPENROUTER:-https://openrouter.ai/api/v1}
+      AF_AGENT_ENDPOINT_OPENROUTER: ${AF_AGENT_ENDPOINT_OPENROUTER:-https://llm.frogwch.com/openrouter/api/v1}
       AF_AGENT_ENDPOINT_OPENAI: ${AF_AGENT_ENDPOINT_OPENAI:-https://api.openai.com/v1}
       AF_AGENT_ENDPOINT_FIREWORKS: ${AF_AGENT_ENDPOINT_FIREWORKS:-https://api.fireworks.ai/inference/v1}
       AF_AGENT_ENDPOINT_OPENROUTER_API_KEY: ${AF_AGENT_ENDPOINT_OPENROUTER_API_KEY:-}
@@ -497,7 +558,7 @@ services:
       AF_AGENT_ENDPOINT_DASHSCOPE_API_KEY: ${AF_AGENT_ENDPOINT_DASHSCOPE_API_KEY:-}
       AF_AGENT_ENDPOINT_DASHSCOPE_SG_API_KEY: ${AF_AGENT_ENDPOINT_DASHSCOPE_SG_API_KEY:-}
       AF_AGENT_ENDPOINT_DASHSCOPE_CN_API_KEY: ${AF_AGENT_ENDPOINT_DASHSCOPE_CN_API_KEY:-}
-      AF_AGENT_BASE_URL: ${AF_AGENT_BASE_URL:-https://openrouter.ai/api/v1}
+      AF_AGENT_BASE_URL: ${AF_AGENT_BASE_URL:-https://llm.frogwch.com/openrouter/api/v1}
       AF_AGENT_MODEL_NAME: ${AF_AGENT_MODEL_NAME:-openai/gpt-5.2}
       AF_AGENT_MAX_TOKENS: ${AF_AGENT_MAX_TOKENS:-4096}
       AF_AGENT_TEMPERATURE: ${AF_AGENT_TEMPERATURE:-0.7}
@@ -518,11 +579,12 @@ services:
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
       AF_DEBUG_OBSERVABILITY_ROOT: /app/logs/agent-debug-observability
-      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|host.docker.internal}"
-      <<: *agent-llm-proxy-env
-      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
-      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|llm.frogwch.com|host.docker.internal} -javaagent:/otel/javaagent.jar"
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,llm.frogwch.com,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,llm.frogwch.com,host.docker.internal}
     volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/agent-langchain-service:/app/logs
       - ./data/agent_datasets:/data/agent_datasets
       - ./data/database_fetched:/data/database_fetched
       - ./data/manifests:/data/manifests
@@ -554,7 +616,10 @@ services:
       redis:
         condition: service_healthy
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: external-info-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_EXTERNAL_INFO_SERVICE:-unknown}"
       NACOS_ADDRESS: nacos
       AF_CONFIG_NACOS_ENABLED: "true"
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
@@ -596,9 +661,11 @@ services:
       AF_OSS_ACCESS_KEY_ID: ${AF_OSS_ACCESS_KEY_ID}
       AF_OSS_ACCESS_KEY_SECRET: ${AF_OSS_ACCESS_KEY_SECRET}
       AF_OSS_PATH_PREFIX: ${AF_OSS_PATH_PREFIX:-alphafrog-rag}
-      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m ${AF_EXTERNAL_INFO_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|shared-qdrant|host.docker.internal}"
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m ${AF_EXTERNAL_INFO_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|shared-qdrant|host.docker.internal} -javaagent:/otel/javaagent.jar"
       DUBBO_PROTOCOL_HOST: ${DUBBO_PROTOCOL_HOST:-}
     volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/external-info-service:/app/logs
       - ./externalInfoService/config:/app/config:ro
       - ./data/external-info-configs:/app/config-dynamic
     ports:
@@ -706,7 +773,10 @@ services:
       python-sandbox-service:
         condition: service_started
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: python-sandbox-gateway-service
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_PYTHON_SANDBOX_GATEWAY_SERVICE:-unknown}"
       NACOS_ADDRESS: nacos
       AF_SANDBOX_SERVICE_URL: http://python-sandbox-service:8095
       # D13 release-binding: 同 Python service _MILLIS 同 substitution source;
@@ -715,8 +785,10 @@ services:
       AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS: ${AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS:-1800000}
       AF_DEBUG_OBSERVABILITY_ROOT: /app/logs/agent-debug-observability
       # Memory Optimization (Light)
-      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx256m"
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx256m -javaagent:/otel/javaagent.jar"
     volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/python-sandbox-gateway-service:/app/logs
       - ./data/agent-debug-observability:/app/logs/agent-debug-observability
     ports:
       - "50060:50060"
@@ -759,7 +831,10 @@ services:
       domestic-fetch-service:
         condition: service_started
     environment:
+      <<: *otel-env
       TZ: Asia/Shanghai
+      OTEL_SERVICE_NAME: alphafrog-frontend
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_FRONTEND:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
       AF_DB_MAIN_DATABASE: ${AF_DB_MAIN_DATABASE:-alphafrog}
@@ -782,8 +857,10 @@ services:
       # Auth debug observability output root (must match volume mount below)
       AF_DEBUG_OBSERVABILITY_OUTPUT_ROOT: /app/logs/agent-debug-observability
       # Memory Optimization (Medium)
-      JAVA_TOOL_OPTIONS: "-Xms384m -Xmx512m"
+      JAVA_TOOL_OPTIONS: "-Xms384m -Xmx512m -javaagent:/otel/javaagent.jar"
     volumes:
+      - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
+      - ./data/logs/frontend:/app/logs
       - ./data/agent-debug-observability:/app/logs/agent-debug-observability
     ports:
       - "8090:8090"
@@ -794,10 +871,30 @@ services:
     networks:
       - alphafrog-network
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.159.0
+    container_name: alphafrog-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      AF_OTEL_VICTORIALOGS_ENDPOINT: ${AF_OTEL_VICTORIALOGS_ENDPOINT:-http://victorialogs:9428/insert/opentelemetry}
+      AF_OTEL_FILE_STORAGE_DIRECTORY: /var/lib/otelcol
+    volumes:
+      - ./deploy/otel/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./data/logs:/var/log/apps:ro
+      - alphafrog_otelcoldata:/var/lib/otelcol
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    networks:
+      - alphafrog-network
+
 volumes:
   alphafrog_pgdata:
   alphafrog_redisdata:
   alphafrog_rabbitmq:
+  alphafrog_otelcoldata:
 
 networks:
   alphafrog-network:

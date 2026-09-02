@@ -1,0 +1,7 @@
+# OpenTelemetry Java Agent 的固定制品信息。
+# 发布脚本只接受这个版本、字节数和 SHA-256 摘要完全一致的本地文件。
+OTEL_JAVAAGENT_VERSION=2.31.1
+OTEL_JAVAAGENT_FILE=opentelemetry-javaagent.jar
+OTEL_JAVAAGENT_URL=https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.31.1/opentelemetry-javaagent.jar
+OTEL_JAVAAGENT_SIZE_BYTES=25107554
+OTEL_JAVAAGENT_SHA256=bbf83c151b6400709e2f225bdd07a04f839d9d13b8b93464241333fd25d3e3ba
