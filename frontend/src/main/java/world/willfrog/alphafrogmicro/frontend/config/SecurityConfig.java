@@ -17,6 +17,7 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import world.willfrog.alphafrogmicro.frontend.filter.FetchAccessFilter;
 import world.willfrog.alphafrogmicro.frontend.filter.JwtAuthFilter;
+import world.willfrog.alphafrogmicro.frontend.filter.LaneWebFilter;
 
 @Configuration
 @EnableWebSecurity
@@ -25,6 +26,7 @@ import world.willfrog.alphafrogmicro.frontend.filter.JwtAuthFilter;
 public class SecurityConfig {
 
     private final JwtAuthFilter jwtAuthFilter;
+    private final LaneWebFilter laneWebFilter;
     private final FetchAccessFilter fetchAccessFilter;
 
     /**
@@ -60,6 +62,8 @@ public class SecurityConfig {
                         .dispatcherTypeMatchers(DispatcherType.ASYNC, DispatcherType.ERROR).permitAll()
                         .anyRequest().permitAll())
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(laneWebFilter, jwtAuthFilter.getClass())
+                .addFilterAfter(fetchAccessFilter, laneWebFilter.getClass())
                 .exceptionHandling(exceptionHandling -> exceptionHandling
                         .authenticationEntryPoint(SecurityConfig::committedAwareUnauthorizedEntryPoint))
                 .headers(headers -> headers
@@ -97,7 +101,8 @@ public class SecurityConfig {
                         .requestMatchers("/tasks/**").authenticated()
                         .anyRequest().authenticated())
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
-                .addFilterAfter(fetchAccessFilter, JwtAuthFilter.class)
+                .addFilterAfter(laneWebFilter, jwtAuthFilter.getClass())
+                .addFilterAfter(fetchAccessFilter, laneWebFilter.getClass())
                 .exceptionHandling(exceptionHandling -> exceptionHandling
                         .authenticationEntryPoint(SecurityConfig::committedAwareUnauthorizedEntryPoint))
                 .headers(headers -> headers
