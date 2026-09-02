@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://alphafrog.local/schemas/beta/controller-state.schema.json",
   "title": "AlphaFrog Beta traffic controller state",
-  "description": "Observed service instances and default traffic cutover state. Runtime file: /var/lib/alphafrog-beta/controller-state.json.",
+  "description": "Validates the complete JSON object stored at /var/lib/alphafrog-beta/controller-state.json. The Beta deployment controller is the sole runtime writer; its startup reconciliation, status-query handler, and route-snapshot API implementation read this file. manifest.schema.json validates each deployment's desired manifest.json, while this schema validates accepted manifest identity plus observed container, Nacos, route, and current-operation facts. beta-deployment-traffic-governance-contract.md defines write ordering and cross-file consistency checks that JSON Schema cannot express.",
   "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time, ipv4, and ipv6. Treating format as annotation is not conforming.",
   "type": "object",
   "additionalProperties": false,

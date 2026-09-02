@@ -647,7 +647,7 @@ try {
     && postSwitch.route.defaultInstanceId === postSwitch.activeInstance.instanceId;
   assert(routeReadbackMatches && !postSwitch.drainingInstance.registration.enabled, 'SIGTERM requires exact route readback and a disabled old registration');
 
-  console.log(`0-3 contract verification passed: ${schemaChecks} AJV checks, ${contractChecks} contract checks`);
+  console.log(`Beta deployment traffic contract verification passed: ${schemaChecks} AJV checks, ${contractChecks} contract checks`);
   console.log(`manifestSha256 vector: ${manifestSha256}`);
 } finally {
   fs.rmSync(tempDir, {recursive: true, force: true});
