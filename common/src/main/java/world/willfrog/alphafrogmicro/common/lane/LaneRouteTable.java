@@ -2,6 +2,7 @@ package world.willfrog.alphafrogmicro.common.lane;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -9,32 +10,29 @@ import java.util.Objects;
 public final class LaneRouteTable {
 
     private final Map<String, LaneServiceRoute> byService;
-    private final Map<String, LaneServiceRoute> byRegistration;
+    private final List<LaneServiceRoute> routes;
 
     private LaneRouteTable(
             Map<String, LaneServiceRoute> byService,
-            Map<String, LaneServiceRoute> byRegistration) {
+            List<LaneServiceRoute> routes) {
         this.byService = byService;
-        this.byRegistration = byRegistration;
+        this.routes = routes;
     }
 
     public static LaneRouteTable empty() {
-        return new LaneRouteTable(Map.of(), Map.of());
+        return new LaneRouteTable(Map.of(), List.of());
     }
 
     public static LaneRouteTable of(Iterable<LaneServiceRoute> routes) {
         Map<String, LaneServiceRoute> byService = new LinkedHashMap<>();
-        Map<String, LaneServiceRoute> byRegistration = new LinkedHashMap<>();
+        List<LaneServiceRoute> allRoutes = new java.util.ArrayList<>();
         for (LaneServiceRoute route : Objects.requireNonNull(routes, "routes")) {
             byService.put(serviceKey(route.trafficScopeId(), route.serviceName()), route);
-            if (route.registrationServiceName() != null) {
-                byRegistration.put(
-                        serviceKey(route.trafficScopeId(), route.registrationServiceName()), route);
-            }
+            allRoutes.add(route);
         }
         return new LaneRouteTable(
                 Collections.unmodifiableMap(byService),
-                Collections.unmodifiableMap(byRegistration));
+                List.copyOf(allRoutes));
     }
 
     public LaneServiceRoute find(String trafficScopeId, String serviceName) {
@@ -48,12 +46,37 @@ public final class LaneRouteTable {
         if (trafficScopeId == null || registrationServiceName == null) {
             return null;
         }
-        LaneServiceRoute exact = byRegistration.get(serviceKey(trafficScopeId, registrationServiceName));
-        if (exact != null) {
-            return exact;
+        LaneServiceRoute exact = null;
+        for (LaneServiceRoute route : routes) {
+            if (trafficScopeId.equals(route.trafficScopeId())
+                    && registrationServiceName.equals(route.registrationServiceName())) {
+                if (exact != null && exact != route) {
+                    return null;
+                }
+                exact = route;
+            }
         }
-        String interfaceName = stripGroupSuffix(registrationServiceName);
-        return byRegistration.get(serviceKey(trafficScopeId, interfaceName));
+        return exact;
+    }
+
+    public LaneServiceRoute findByDubboServiceKey(
+            String trafficScopeId,
+            LaneDubboServiceKey dubboServiceKey) {
+        if (trafficScopeId == null || dubboServiceKey == null) {
+            return null;
+        }
+        LaneServiceRoute matched = null;
+        for (LaneServiceRoute route : routes) {
+            if (!trafficScopeId.equals(route.trafficScopeId())
+                    || !dubboServiceKey.equals(route.dubboServiceKey())) {
+                continue;
+            }
+            if (matched != null && matched != route) {
+                return null;
+            }
+            matched = route;
+        }
+        return matched;
     }
 
     public boolean isEmpty() {
@@ -64,11 +87,4 @@ public final class LaneRouteTable {
         return trafficScopeId + "\0" + serviceName;
     }
 
-    private static String stripGroupSuffix(String registrationServiceName) {
-        int groupSeparator = registrationServiceName.indexOf("@@");
-        if (groupSeparator < 0) {
-            return registrationServiceName;
-        }
-        return registrationServiceName.substring(0, groupSeparator);
-    }
 }

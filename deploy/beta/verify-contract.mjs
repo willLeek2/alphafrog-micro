@@ -15,6 +15,10 @@ const clone = value => structuredClone(value);
 const repeated = character => character.repeat(64);
 let schemaChecks = 0;
 let contractChecks = 0;
+const agentDubboServiceKey = 'langchain/com.alphafrog.AgentService';
+const agentNacosServiceName = 'providers:com.alphafrog.AgentService::langchain';
+const toolsDubboServiceKey = 'tools/com.alphafrog.AgentToolsService';
+const toolsNacosServiceName = 'providers:com.alphafrog.AgentToolsService::tools';
 
 function canonicalize(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -30,6 +34,16 @@ function serviceDigest(service) {
   const input = clone(service);
   delete input.serviceSpecSha256;
   return digest(input);
+}
+
+function dubboRegistrationName(dubboServiceKey) {
+  const matched = /^([0-9A-Za-z._-]+)\/([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*(?::[0-9A-Za-z._-]+)?)$/.exec(dubboServiceKey);
+  if (!matched) return null;
+  const group = matched[1];
+  const lastColon = matched[2].lastIndexOf(':');
+  const interfaceName = lastColon < 0 ? matched[2] : matched[2].slice(0, lastColon);
+  const version = lastColon < 0 ? '' : matched[2].slice(lastColon + 1);
+  return `providers:${interfaceName}:${version}:${group}`;
 }
 
 function deploymentGenerationFromParts(manifestVersion, gitCommit, serviceImages) {
@@ -108,6 +122,7 @@ const manifest = {
   expiresAt: '2026-09-08T00:00:00Z',
   services: [{
     serviceName: 'agent-service',
+    dubboServiceKey: agentDubboServiceKey,
     releaseId: 'release-2',
     serviceSpecSha256: repeated('a'),
     machineId: 'beta-machine-1',
@@ -126,7 +141,7 @@ const manifest = {
       drainGraceSeconds: 60
     },
     registration: {
-      serviceName: 'com.alphafrog.AgentService:1.0@@providers',
+      serviceName: agentNacosServiceName,
       groupName: 'DEFAULT_GROUP',
       namespaceId: 'public',
       clusterName: 'DEFAULT'
@@ -137,12 +152,13 @@ const manifest = {
 manifest.services[0].serviceSpecSha256 = serviceDigest(manifest.services[0]);
 const targetSpec = manifest.services[0].serviceSpecSha256;
 const manifestSha256 = digest(manifest);
-const expectedManifestSha256 = 'cce91891dc152cbc64b78e068fd2303c7c451b783f147c95135390fdbb28b73d';
+const expectedManifestSha256 = 'e60bbd13685faec74d91d65712b752e0d76899c99a413af244f2a1b1ea14d66c';
 const targetGeneration = deploymentGeneration(manifest);
 const previousGeneration = `gen-${repeated('8')}`;
 
 const toolsServiceSpec = clone(manifest.services[0]);
 toolsServiceSpec.serviceName = 'agent-tools-service';
+toolsServiceSpec.dubboServiceKey = toolsDubboServiceKey;
 toolsServiceSpec.releaseId = 'tools-release-2';
 toolsServiceSpec.serviceSpecSha256 = repeated('0');
 toolsServiceSpec.image.repositoryDigest = `registry.local/agent-tools-service@sha256:${repeated('e')}`;
@@ -150,7 +166,7 @@ toolsServiceSpec.image.localImageId = `sha256:${repeated('f')}`;
 toolsServiceSpec.runtime.containerPort = 18081;
 toolsServiceSpec.runtime.hostPorts = [28180, 28181];
 toolsServiceSpec.runtime.preStopPolicy = 'NONE';
-toolsServiceSpec.registration.serviceName = 'com.alphafrog.AgentToolsService:1.0@@providers';
+toolsServiceSpec.registration.serviceName = toolsNacosServiceName;
 toolsServiceSpec.serviceSpecSha256 = serviceDigest(toolsServiceSpec);
 const toolsTargetSpec = toolsServiceSpec.serviceSpecSha256;
 const twoServiceManifest = clone(manifest);
@@ -158,7 +174,7 @@ twoServiceManifest.services.push(toolsServiceSpec);
 const twoServiceManifestSha256 = digest(twoServiceManifest);
 const twoServiceGeneration = deploymentGeneration(twoServiceManifest);
 
-function registration(instanceId, releaseId, generationId, port, selectable, registeredServiceName = 'com.alphafrog.AgentService:1.0@@providers') {
+function registration(instanceId, releaseId, generationId, port, selectable, registeredServiceName = agentNacosServiceName) {
   return {
     serviceName: registeredServiceName,
     groupName: 'DEFAULT_GROUP',
@@ -181,7 +197,7 @@ function registration(instanceId, releaseId, generationId, port, selectable, reg
 }
 
 function baseInstance(instanceId, releaseId, generationId, version, spec, slot, port, selectable = true,
-  registeredServiceName = 'com.alphafrog.AgentService:1.0@@providers', runtimeFacts = manifest.services[0].runtime) {
+  registeredServiceName = agentNacosServiceName, runtimeFacts = manifest.services[0].runtime) {
   return {
     instanceId,
     machineId: 'beta-machine-1',
@@ -204,7 +220,7 @@ function baseInstance(instanceId, releaseId, generationId, version, spec, slot, 
 
 const previousAgentRuntime = {...manifest.services[0].runtime, applicationDrainSeconds: 40, drainGraceSeconds: 45};
 const oldActive = baseInstance('instance-old', 'release-1', previousGeneration, 1, repeated('d'), 'A', 28080, true,
-  'com.alphafrog.AgentService:1.0@@providers', previousAgentRuntime);
+  agentNacosServiceName, previousAgentRuntime);
 const newActive = baseInstance('instance-new', 'release-2', targetGeneration, 2, targetSpec, 'B', 28081);
 const newDisabled = baseInstance('instance-new', 'release-2', targetGeneration, 2, targetSpec, 'B', 28081, false);
 const candidateStarting = {...newDisabled, readiness: 'STARTING', readinessObservedAt: null, readinessDeadline: '2026-09-01T00:02:00Z'};
@@ -216,8 +232,8 @@ oldDisabled.registration.weight = 0;
 const newDisabledDraining = {...clone(newActive), trafficRemovedAt: '2026-09-01T00:02:00Z', stopSignalRequestedAt: null, stopDeadline: null, preStopCompletedAt: null};
 newDisabledDraining.registration.enabled = false;
 newDisabledDraining.registration.weight = 0;
-const toolsOldActive = baseInstance('tools-instance-old', 'tools-release-1', previousGeneration, 1, repeated('9'), 'A', 28180, true, 'com.alphafrog.AgentToolsService:1.0@@providers', toolsServiceSpec.runtime);
-const toolsNewActive = baseInstance('tools-instance-new', 'tools-release-2', twoServiceGeneration, 2, toolsTargetSpec, 'B', 28181, true, 'com.alphafrog.AgentToolsService:1.0@@providers', toolsServiceSpec.runtime);
+const toolsOldActive = baseInstance('tools-instance-old', 'tools-release-1', previousGeneration, 1, repeated('9'), 'A', 28180, true, toolsNacosServiceName, toolsServiceSpec.runtime);
+const toolsNewActive = baseInstance('tools-instance-new', 'tools-release-2', twoServiceGeneration, 2, toolsTargetSpec, 'B', 28181, true, toolsNacosServiceName, toolsServiceSpec.runtime);
 
 const routeOld = {
   defaultInstanceId: 'instance-old',
@@ -249,6 +265,7 @@ function error(failedOperationType, recoveryClass) {
 function service(overrides = {}) {
   return {
     serviceName: 'agent-service',
+    dubboServiceKey: agentDubboServiceKey,
     phase: 'STABLE',
     targetManifestVersion: 2,
     targetServiceSpecSha256: targetSpec,
@@ -309,6 +326,7 @@ function twoServiceState(firstService, secondService, deploymentOverrides = {}) 
 function toolsService(overrides = {}) {
   return service({
     serviceName: 'agent-tools-service',
+    dubboServiceKey: toolsDubboServiceKey,
     targetServiceSpecSha256: toolsTargetSpec,
     activeInstance: toolsNewActive,
     route: toolsRouteNew,
@@ -352,6 +370,7 @@ positiveStates.stableIpv6.deployments[0].services[0].activeInstance.registration
 function customErrors(manifestValue, stateValue) {
   const errors = [];
   const specByName = new Map();
+  const dubboServiceKeys = new Set();
   const reservedPorts = new Set();
   const expectedGeneration = deploymentGeneration(manifestValue);
   const checkTargetInstance = (instance, spec, role) => {
@@ -371,7 +390,12 @@ function customErrors(manifestValue, stateValue) {
   for (const spec of manifestValue.services) {
     if (specByName.has(spec.serviceName)) errors.push(`duplicate manifest service ${spec.serviceName}`);
     specByName.set(spec.serviceName, spec);
+    if (dubboServiceKeys.has(spec.dubboServiceKey)) errors.push(`duplicate Dubbo service key ${spec.dubboServiceKey}`);
+    dubboServiceKeys.add(spec.dubboServiceKey);
     if (spec.serviceSpecSha256 !== serviceDigest(spec)) errors.push(`service digest ${spec.serviceName}`);
+    if (dubboRegistrationName(spec.dubboServiceKey) !== spec.registration.serviceName) {
+      errors.push(`Dubbo service key registration ${spec.serviceName}`);
+    }
     if (spec.runtime.applicationDrainSeconds + 5 > spec.runtime.drainGraceSeconds) errors.push(`drain reserve ${spec.serviceName}`);
     if (spec.registration.namespaceId !== 'public' && spec.registration.namespaceId.length === 0) errors.push(`namespace ${spec.serviceName}`);
     for (const port of spec.runtime.hostPorts) {
@@ -405,6 +429,7 @@ function customErrors(manifestValue, stateValue) {
       }
       if (spec && item.targetManifestVersion !== manifestValue.manifestVersion) errors.push(`target manifest version ${item.serviceName}`);
       if (spec && item.targetServiceSpecSha256 !== spec.serviceSpecSha256) errors.push(`target service digest ${item.serviceName}`);
+      if (spec && item.dubboServiceKey !== spec.dubboServiceKey) errors.push(`Dubbo service key ${item.serviceName}`);
       if ((item.failedManifestVersion === null) !== (item.lastError === null)) errors.push(`failure fields pair ${item.serviceName}`);
       checkTargetInstance(item.candidateInstance, spec, 'candidate');
       if (item.operation?.phase === 'DRAINING_PREVIOUS') {
@@ -437,6 +462,9 @@ function customErrors(manifestValue, stateValue) {
         if (registrationValue.metadata['alphafrog.release-id'] !== instance.releaseId) errors.push(`release metadata ${instance.instanceId}`);
         if (registrationValue.metadata['alphafrog.deployment-generation-id'] !== instance.deploymentGenerationId) errors.push(`generation metadata ${instance.instanceId}`);
         if (registrationValue.metadata['alphafrog.instance-id'] !== instance.instanceId) errors.push(`instance metadata ${instance.instanceId}`);
+        if (dubboRegistrationName(item.dubboServiceKey) !== registrationValue.serviceName) {
+          errors.push(`instance Dubbo registration ${instance.instanceId}`);
+        }
         if (registrationValue.port !== instance.hostPort || instance.endpoint.port !== instance.hostPort) errors.push(`endpoint ${instance.instanceId}`);
         if (spec && !spec.runtime.hostPorts.includes(instance.hostPort)) errors.push(`port slot ${instance.instanceId}`);
         if (spec && instance.manifestVersion === manifestValue.manifestVersion
@@ -571,6 +599,12 @@ try {
   const obsoleteDeletePhase = clone(positiveStates.deleteDraining);
   obsoleteDeletePhase.deployments[0].services[0].operation.phase = 'WAITING_DELETE_ROUTE_LEASES';
   invalidFixtures.push(['state-obsolete-delete-lease-phase', stateSchema, obsoleteDeletePhase]);
+  const malformedDubboServiceKey = clone(manifest);
+  malformedDubboServiceKey.services[0].dubboServiceKey = 'missing-group.Interface';
+  invalidFixtures.push(['manifest-malformed-dubbo-service-key', manifestSchema, malformedDubboServiceKey]);
+  const missingStateDubboServiceKey = clone(positiveStates.stable);
+  delete missingStateDubboServiceKey.deployments[0].services[0].dubboServiceKey;
+  invalidFixtures.push(['state-missing-dubbo-service-key', stateSchema, missingStateDubboServiceKey]);
   for (const [name, schema, value] of invalidFixtures) {
     runAjv('validate', schema, writeFixture(name, value), false);
   }
@@ -630,6 +664,13 @@ try {
   const badServiceDigest = clone(manifest);
   badServiceDigest.services[0].serviceSpecSha256 = repeated('f');
   customNegatives.push(['service digest', badServiceDigest, positiveStates.stable]);
+  const wrongDubboGroupRegistration = clone(manifest);
+  wrongDubboGroupRegistration.services[0].dubboServiceKey = 'experimental/com.alphafrog.AgentService';
+  wrongDubboGroupRegistration.services[0].serviceSpecSha256 = serviceDigest(wrongDubboGroupRegistration.services[0]);
+  customNegatives.push(['Dubbo group registration', wrongDubboGroupRegistration, positiveStates.stable]);
+  const wrongPersistedDubboServiceKey = clone(positiveStates.stable);
+  wrongPersistedDubboServiceKey.deployments[0].services[0].dubboServiceKey = 'experimental/com.alphafrog.AgentService';
+  customNegatives.push(['persisted Dubbo service key', manifest, wrongPersistedDubboServiceKey]);
   const wrongDeploymentGeneration = clone(positiveStates.stable);
   wrongDeploymentGeneration.deployments[0].services[0].activeInstance.deploymentGenerationId = `gen-${repeated('7')}`;
   customNegatives.push(['deployment generation', manifest, wrongDeploymentGeneration]);
@@ -651,6 +692,13 @@ try {
   const duplicateServiceManifest = clone(manifest);
   duplicateServiceManifest.services.push(clone(duplicateServiceManifest.services[0]));
   customNegatives.push(['duplicate service', duplicateServiceManifest, positiveStates.stable]);
+  const duplicateDubboServiceKeyManifest = clone(twoServiceManifest);
+  duplicateDubboServiceKeyManifest.services[1].dubboServiceKey = agentDubboServiceKey;
+  duplicateDubboServiceKeyManifest.services[1].registration.serviceName = agentNacosServiceName;
+  duplicateDubboServiceKeyManifest.services[1].serviceSpecSha256 = serviceDigest(duplicateDubboServiceKeyManifest.services[1]);
+  assert(customErrors(duplicateDubboServiceKeyManifest, positiveStates.stable)
+    .includes(`duplicate Dubbo service key ${agentDubboServiceKey}`),
+  'a deployment must reject two services with the same Dubbo service key');
   const duplicateSlot = clone(positiveStates.updateSwitching);
   duplicateSlot.deployments[0].services[0].candidateInstance.portSlot = 'A';
   customNegatives.push(['duplicate role slot', manifest, duplicateSlot]);
@@ -692,7 +740,8 @@ try {
   const pretty = JSON.stringify(manifest, null, 2);
   assert(digest(JSON.parse(compact)) === digest(JSON.parse(pretty)), 'manifest formatting must not change digest');
   assert(digest(JSON.parse(pretty)) === manifestSha256, 'manifest digest vector must stay fixed');
-  assert(manifestSha256 === expectedManifestSha256, 'manifest digest must match the published fixed vector');
+  assert(manifestSha256 === expectedManifestSha256,
+    `manifest digest must match the published fixed vector: actual=${manifestSha256}`);
   const generationVector = JSON.parse(fs.readFileSync(path.join(here, '..', 'agent-run', 'deployment-generation-test-vector.json'), 'utf8'));
   assert(deploymentGenerationFromParts(
     generationVector.manifestVersion,

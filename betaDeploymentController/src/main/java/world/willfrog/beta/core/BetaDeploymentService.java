@@ -237,6 +237,7 @@ public class BetaDeploymentService {
                         ObjectNode result = mapper.createObjectNode();
                         result.put("trafficScopeId", trafficScopeId);
                         result.put("serviceName", serviceName);
+                        result.put("dubboServiceKey", service.path("dubboServiceKey").asText());
                         result.set("route", service.path("route").deepCopy());
                         JsonNode active = service.path("activeInstance");
                         if (active.isNull()) result.putNull("endpoint");
@@ -804,6 +805,8 @@ public class BetaDeploymentService {
             JsonNode spec = findService(manifest, service.path("serviceName").asText());
             if (spec == null)
                 throw new ControllerException("STATE_MANIFEST_MISMATCH", "Leading manifest removed a service");
+            if (!service.path("dubboServiceKey").equals(spec.path("dubboServiceKey")))
+                throw new ControllerException("STATE_MANIFEST_MISMATCH", "Leading manifest changed a Dubbo service key");
             for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
                 JsonNode instance = service.path(role);
                 if (!instance.isObject()) continue;
@@ -851,6 +854,7 @@ public class BetaDeploymentService {
             existing.add(service.path("serviceName").asText());
             service.put("targetManifestVersion", manifest.path("manifestVersion").asLong());
             service.put("targetServiceSpecSha256", spec.path("serviceSpecSha256").asText());
+            service.put("dubboServiceKey", spec.path("dubboServiceKey").asText());
             if ("CLEAN_RETRYABLE".equals(service.path("lastError").path("recoveryClass").asText())) {
                 service.put("phase", service.path("activeInstance").isObject() ? "STABLE" : "CREATING");
                 service.putNull("failedManifestVersion");
@@ -874,6 +878,7 @@ public class BetaDeploymentService {
     private ObjectNode newService(JsonNode spec, long version) {
         ObjectNode service = mapper.createObjectNode();
         service.put("serviceName", spec.path("serviceName").asText());
+        service.put("dubboServiceKey", spec.path("dubboServiceKey").asText());
         service.put("phase", "CREATING");
         service.put("targetManifestVersion", version);
         service.put("targetServiceSpecSha256", spec.path("serviceSpecSha256").asText());
@@ -1051,6 +1056,9 @@ public class BetaDeploymentService {
                     || !oldSpec.path("runtime").path("containerPort").equals(next.path("runtime").path("containerPort"))
                     || !oldSpec.path("runtime").path("hostPorts").equals(next.path("runtime").path("hostPorts"))) {
                 throw new ControllerException("SERVICE_LOCATION_IMMUTABLE", "Machine and fixed host ports cannot change during update");
+            }
+            if (!oldSpec.path("dubboServiceKey").equals(next.path("dubboServiceKey"))) {
+                throw new ControllerException("DUBBO_SERVICE_KEY_IMMUTABLE", "Dubbo service key cannot change during update");
             }
         }
     }

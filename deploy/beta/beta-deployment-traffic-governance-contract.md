@@ -72,6 +72,8 @@ Agent Run、数据库事务、业务重试和业务恢复不属于本合同。�
 - `alphafrog.deployment-generation-id`：实例所属的完整部署代际。
 - `alphafrog.instance-id`：该次部署生成的实例标识。
 
+部署单还为每个服务保存独立的 `dubboServiceKey`，格式固定为 `group/interface[:version]`。它是 Dubbo 调用身份，完整保留分组、接口全名和可选的显式版本；没有显式版本时不能补写一个猜测的版本。Nacos 在当前 Dubbo 3.3.2 接口级注册模式下使用另一套名称：`providers:<interface>:<version>:<group>`，没有显式版本时中间的版本段为空，例如 `providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::langchain`。控制器必须从完整 `dubboServiceKey` 唯一计算并核对 Nacos 名称，但运行时路由不能反过来从 Nacos 名称猜调用身份。这两个字段用途不同，不能互相冒充。
+
 因此正常更新时查询到两个实例不是错误。控制器必须逐字比较完整注册键、四个固定元数据键和四个可选择事实，不能以“查询结果恰好一条”代替身份核对。
 
 默认路由由 `trafficScopeId + serviceName` 唯一定位。首版的实际执行方法是：Beta 部署控制器提供路由快照接口，入口请求路由组件和服务间调用路由组件必须根据这份快照选择精确的 `instanceId + endpoint`。Beta 流量禁止直接从未过滤的 Nacos 实例列表随机选择。路由快照包含：
@@ -129,13 +131,14 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 | `gitCommit` | 这次部署对应的 40 位 Git 提交标识 |
 | `owner` | 至少包含 `ownerId`，用于找到部署负责人 |
 | `createdAt`、`expiresAt` | UTC 时间；到期触发删除操作，不触发业务恢复 |
-| `services` | 该流量范围的完整服务集合，`serviceName` 必须唯一；首版普通更新只能保持或增加服务，不能移除已有服务 |
+| `services` | 该流量范围的完整服务集合，`serviceName` 和完整 `dubboServiceKey` 在单个部署内都必须唯一；首版普通更新只能保持或增加服务，不能移除已有服务 |
 
 ### 5.2 服务字段
 
 每个服务包含：
 
 - `serviceName`：服务名。
+- `dubboServiceKey`：完整 Dubbo 调用身份，格式为 `group/interface[:version]`。普通更新不得修改；需要改变分组、接口或显式版本时，必须先删除原部署，再按新服务身份创建。
 - `releaseId`：该服务这次发布的可追踪版本标识。不同服务可以使用不同版本，因此它属于服务而不是部署单顶层。
 - `serviceSpecSha256`：本服务完整配置的规范 JSON 摘要。
 - `machineId`：服务运行在哪台静态 Beta 机器。
@@ -174,7 +177,7 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 
 `serviceSpecSha256` 使用 RFC 8785 JSON Canonicalization Scheme（JCS，规范 JSON 序列化）计算。输入是当前服务对象删除 `serviceSpecSha256` 后的结果。Beta 部署控制器每次读取部署单时重新计算，摘要不一致就拒绝应用。
 
-`manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `cce91891dc152cbc64b78e068fd2303c7c451b783f147c95135390fdbb28b73d`；同一对象的紧凑排版和缩进排版都必须得到该值。
+`manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `e60bbd13685faec74d91d65712b752e0d76899c99a413af244f2a1b1ea14d66c`；同一对象的紧凑排版和缩进排版都必须得到该值。
 
 ## 6. 全局状态 `controller-state.json`
 
@@ -190,6 +193,8 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 这些重复字段必须与当前部署单逐项相等。只有删除部署的最后一个固定窗口允许 `phase=DELETING`、`services=[]` 且 `manifest.json` 已不存在；控制器随后只需移除部署记录。
 
 ### 6.2 服务状态
+
+每个服务状态都保存 `serviceName`，并从已接受部署单原样复制 `dubboServiceKey`。这个字段是入口和服务间调用选择路由时使用的完整调用身份；状态写入后不能从 Nacos 登记名重新推导或补猜分组、版本。
 
 一个服务槽位最多保存三个实例位置：
 
@@ -304,9 +309,9 @@ CREATING / STARTING_CANDIDATE
 
 JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器选用的 Draft 2020-12 校验器必须开启 `date-time`、`ipv4` 和 `ipv6` 的 `format` 断言，不能把 `format` 当作注释。启动自检必须证明合法 IPv4、合法 IPv6 通过，普通文本 IP 和伪 UTC 时间被拒绝；自检失败时控制器拒绝启动。控制器还必须执行以下跨记录检查：
 
-1. `deploymentId` 唯一；一个 `trafficScopeId` 最多对应一个活动部署；部署内 `serviceName` 唯一。
+1. `deploymentId` 唯一；一个 `trafficScopeId` 最多对应一个活动部署；部署内 `serviceName` 和完整 `dubboServiceKey` 都唯一。如果两个服务复用同一个调用键，入口和服务间调用将无法唯一选择路由，因此整份部署单必须拒绝。
 2. 所有实例标识、容器标识和完整 Nacos 注册身份全局唯一。同一服务的活动、候选和排空实例不能使用相同 `instanceId` 或端口槽。所有活动部署单中的两个预留槽都参与检查，`machineId + hostPort` 全局唯一；主 Beta、不同泳道和不同服务也不能重叠。服务仍存在时，新部署单的 `machineId + hostPorts` 必须与旧状态一致，因此未退出的上一代实例不会因为部署单改址而提前释放端口。
-3. 候选实例和切流后的新活动实例必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256`、`releaseId`、按完整部署单计算的 `deploymentGenerationId`，以及当前服务的四项冻结停机配置。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；四个固定 metadata 值等于实例的流量范围、版本、部署代际和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`。路由刚切换或移除时，排空实例的已观察注册可以暂时仍是 `enabled=true, weight=1`；发送 SIGTERM 前必须已经改成 `enabled=false, weight=0`并回读确认，且 `preStopCompletedAt` 必须非空。其他 `enabled/weight` 组合非法。
+3. 服务状态的 `dubboServiceKey` 必须逐字等于已接受部署单的同名字段；部署单和每个实例的 Nacos `registration.serviceName` 必须等于该调用键按当前接口级格式计算出的名称。分组、接口或显式版本任一不同都必须拒绝，不能仅凭接口相同选中同一条路由。候选实例和切流后的新活动实例还必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256`、`releaseId`、按完整部署单计算的 `deploymentGenerationId`，以及当前服务的四项冻结停机配置。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；四个固定 metadata 值等于实例的流量范围、版本、部署代际和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`。路由刚切换或移除时，排空实例的已观察注册可以暂时仍是 `enabled=true, weight=1`；发送 SIGTERM 前必须已经改成 `enabled=false, weight=0`并回读确认，且 `preStopCompletedAt` 必须非空。其他 `enabled/weight` 组合非法。
 4. `STABLE` 必须只有一个活动实例，且默认实例、默认版本和默认部署代际等于活动实例；不能有候选、排空实例或当前操作。`CREATING` 在路由发布前的默认实例、默认版本和默认部署代际必须为空；首次路由已发布但尚未独立确认时，允许 `CREATING + CREATE / SWITCHING_TRAFFIC` 保存一个活动实例和逐字一致的默认路由，但不允许有候选或排空实例。
 5. `UPDATING` 切流前必须保存“旧活动实例 + 新候选实例”，路由仍指向旧活动实例；同一次原子替换发布新路由后必须保存“新活动实例 + 旧排空实例”，路由逐字指向新活动实例及其部署代际，并进入 `DRAINING_PREVIOUS`。删除在 `REMOVING_TRAFFIC` 时路由仍等于活动实例；同一次原子替换发布空实例、空版本和空部署代际后把活动实例移入排空角色，并进入 `DRAINING_ACTIVE`。两种替换都要写入等于路由切换时间的 `trafficRemovedAt`，并把三个停止字段初始化为 `null`。停止前完成时间非空时，注册必须已经禁用，且时间不能早于流量移除时间；停止请求时间与截止时间必须同时为空或同时非空，非空时停止前动作必须已经完成，截止时间必须精确等于请求时间加排空实例自身的 `drainGraceSeconds`。
 6. 全部部署合计最多一个非空 `operation`。没有当前操作时，只要某个部署内存在 `FAILED` 服务，控制器就停止该部署的自动调度。普通调度只能选择没有失败暂停的排队服务；失败创建、更新和删除必须分别走第 7 节的显式原子转换。`FACTS_UNCERTAIN` 不能被更高部署单版本直接清除；删除失败时只能恢复当前服务的 `DELETE`，不能选择后续服务。
@@ -319,7 +324,7 @@ JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器
 
 状态接口按流量范围和服务至少返回：
 
-- `trafficScopeId`、`serviceName` 和服务 `phase`。
+- `trafficScopeId`、`serviceName`、完整 `dubboServiceKey` 和服务 `phase`。
 - 活动、候选和排空实例标识。
 - 每个实例的部署代际，以及默认实例、默认版本、默认部署代际、路由版本和切换时间。
 - 每个实例的 Nacos `enabled`、`healthy`、`weight`、`ephemeral` 与候选就绪状态。
@@ -333,6 +338,7 @@ JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器
 
 - 两份 Schema 通过 Draft 2020-12 元 Schema校验；开启格式断言后 IPv4/IPv6 正例通过，普通文本 IP 和伪 UTC 时间反例失败。
 - 合法部署单通过；重复服务、相同的两个宿主端口、可变镜像标签、错误摘要和保留标识 `stable` 被拒绝。
+- `dubboServiceKey` 缺失或格式错误被 Schema 拒绝；跨记录检查证明状态原样保存完整键，并拒绝同一部署内重复的调用键、以及分组、接口或版本与 Nacos 真实登记名不一致的部署单和实例。
 - 普通部署单移除已有服务被拒绝；删除整个部署时，原部署单保留到全部服务完成排空和清理。
 - 自定义检查拒绝两个部署在同一机器预留重叠宿主端口，并同时覆盖跨服务和跨流量范围冲突。
 - 自定义检查拒绝普通更新改变 `machineId` 或两个固定宿主端口，并覆盖上一代容器尚未退出时不能释放旧端口。

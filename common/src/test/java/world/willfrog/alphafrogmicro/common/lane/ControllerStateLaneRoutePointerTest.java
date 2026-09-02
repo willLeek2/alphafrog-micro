@@ -15,6 +15,10 @@ class ControllerStateLaneRoutePointerTest {
 
     private static final String OLD_GEN = "gen-" + "a".repeat(64);
     private static final String NEW_GEN = "gen-" + "b".repeat(64);
+    private static final String AGENT_INTERFACE =
+            "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService";
+    private static final LaneDubboServiceKey AGENT_KEY =
+            new LaneDubboServiceKey("langchain", AGENT_INTERFACE, "");
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -62,6 +66,32 @@ class ControllerStateLaneRoutePointerTest {
     }
 
     @Test
+    void current_shouldMatchThePersistedDubboServiceKeyExactly() throws Exception {
+        Path file = tempDir.resolve("controller-state.json");
+        Files.writeString(file, stateJson("instance-old", "release-1", OLD_GEN, 7, 28080), StandardCharsets.UTF_8);
+        LaneCallRouter router = new LaneCallRouter(new ControllerStateLaneRoutePointer(objectMapper, file));
+
+        assertThat(router.bindNewCallByDubboServiceKey("main-beta", AGENT_KEY).instanceId())
+                .isEqualTo("instance-old");
+        assertThatThrownBy(() -> router.bindNewCallByDubboServiceKey(
+                "main-beta", new LaneDubboServiceKey("experimental", AGENT_INTERFACE, "")))
+                .isInstanceOf(LaneRouteUnavailableException.class);
+    }
+
+    @Test
+    void current_shouldRejectARegistrationFromAnotherDubboGroup() throws Exception {
+        Path file = tempDir.resolve("controller-state.json");
+        String wrongRegistration = stateJson("instance-old", "release-1", OLD_GEN, 7, 28080)
+                .replace("::langchain", "::experimental");
+        Files.writeString(file, wrongRegistration, StandardCharsets.UTF_8);
+        LaneCallRouter router = new LaneCallRouter(new ControllerStateLaneRoutePointer(objectMapper, file));
+
+        assertThatThrownBy(() -> router.bindNewCallByDubboServiceKey("main-beta", AGENT_KEY))
+                .isInstanceOf(LaneRouteFactsUncertainException.class)
+                .hasMessage(LaneRouteFactsUncertainException.CODE);
+    }
+
+    @Test
     void current_shouldRejectReleaseMismatchAsUncertainFacts() throws Exception {
         Path file = tempDir.resolve("controller-state.json");
         Files.writeString(
@@ -74,6 +104,7 @@ class ControllerStateLaneRoutePointerTest {
                       "services": [
                         {
                           "serviceName": "agent-service",
+                          "dubboServiceKey": "langchain/%s",
                           "activeInstance": {
                             "instanceId": "instance-old",
                             "releaseId": "release-1",
@@ -93,7 +124,7 @@ class ControllerStateLaneRoutePointerTest {
                     }
                   ]
                 }
-                """.formatted("gen-" + "a".repeat(64), "gen-" + "a".repeat(64)),
+                """.formatted(AGENT_INTERFACE, "gen-" + "a".repeat(64), "gen-" + "a".repeat(64)),
                 StandardCharsets.UTF_8);
         LaneCallRouter router = new LaneCallRouter(new ControllerStateLaneRoutePointer(objectMapper, file));
         assertThatThrownBy(() -> router.bindNewCall("main-beta", "agent-service"))
@@ -118,9 +149,9 @@ class ControllerStateLaneRoutePointerTest {
                   "releaseId": %s,
                   "deploymentGenerationId": %s,
                   "endpoint": {"address": "10.0.0.8", "port": %d},
-                  "registration": {"serviceName": "com.alphafrog.AgentService:1.0@@providers"}
+                  "registration": {"serviceName": "providers:%s::langchain"}
                 }
-                """.formatted(quote(instanceId), quote(releaseId), quote(generationId), port);
+                """.formatted(quote(instanceId), quote(releaseId), quote(generationId), port, AGENT_INTERFACE);
         return """
                 {
                   "schemaVersion": 1,
@@ -132,6 +163,7 @@ class ControllerStateLaneRoutePointerTest {
                       "services": [
                         {
                           "serviceName": "agent-service",
+                          "dubboServiceKey": "langchain/%s",
                           "activeInstance": %s,
                           "candidateInstance": null,
                           "drainingInstance": null,
@@ -147,7 +179,7 @@ class ControllerStateLaneRoutePointerTest {
                     }
                   ]
                 }
-                """.formatted(active, defaultInstance, defaultRelease, defaultGeneration, routeVersion);
+                """.formatted(AGENT_INTERFACE, active, defaultInstance, defaultRelease, defaultGeneration, routeVersion);
     }
 
     private static String quote(String value) {

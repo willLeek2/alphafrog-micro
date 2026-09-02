@@ -66,7 +66,8 @@ class LaneAutoConfigurationTest {
                     pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
                             "main-beta",
                             "agent-service",
-                            "com.alphafrog.AgentService:1.0@@providers",
+                            new LaneDubboServiceKey("langchain", "com.alphafrog.AgentService", ""),
+                            "providers:com.alphafrog.AgentService::langchain",
                             "instance-new",
                             "release-2",
                             "gen-" + "d".repeat(64),

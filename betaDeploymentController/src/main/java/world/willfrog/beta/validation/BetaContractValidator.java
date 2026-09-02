@@ -18,6 +18,8 @@ import world.willfrog.beta.core.JsonSupport;
 
 @Component
 public class BetaContractValidator {
+    private static final java.util.regex.Pattern DUBBO_SERVICE_KEY = java.util.regex.Pattern.compile(
+            "^([0-9A-Za-z._-]+)/([A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*)(?::([0-9A-Za-z._-]+))?$");
     private final ObjectMapper mapper;
     private final JsonSchema manifestSchema;
     private final JsonSchema stateSchema;
@@ -52,16 +54,25 @@ public class BetaContractValidator {
             throw new ControllerException("MANIFEST_INVALID", "Deployment expiry must be after creation time");
         }
         Set<String> names = new HashSet<>();
+        Set<String> dubboServiceKeys = new HashSet<>();
         Set<String> ports = new HashSet<>();
         for (JsonNode service : manifest.path("services")) {
             String name = service.path("serviceName").asText();
             if (!names.add(name)) throw new ControllerException("MANIFEST_INVALID", "Duplicate service " + name);
+            String dubboServiceKey = service.path("dubboServiceKey").asText();
+            if (!dubboServiceKeys.add(dubboServiceKey)) {
+                throw new ControllerException("MANIFEST_INVALID", "Duplicate Dubbo service key " + dubboServiceKey);
+            }
             if (!JsonSupport.serviceSha256(mapper, service).equals(service.path("serviceSpecSha256").asText())) {
                 throw new ControllerException("MANIFEST_INVALID", "Service digest mismatch for " + name);
             }
             if (service.path("runtime").path("applicationDrainSeconds").asInt() + 5
                     > service.path("runtime").path("drainGraceSeconds").asInt()) {
                 throw new ControllerException("MANIFEST_INVALID", "Drain reserve is too small for " + name);
+            }
+            if (!expectedNacosServiceName(dubboServiceKey)
+                    .equals(service.path("registration").path("serviceName").asText())) {
+                throw new ControllerException("MANIFEST_INVALID", "Nacos service name differs from the Dubbo service key for " + name);
             }
             for (JsonNode port : service.path("runtime").path("hostPorts")) {
                 String key = service.path("machineId").asText() + ':' + port.asInt();
@@ -92,7 +103,8 @@ public class BetaContractValidator {
             for (JsonNode service : deployment.path("services")) {
                 JsonNode spec = findService(manifest, service.path("serviceName").asText());
                 if (spec == null || service.path("targetManifestVersion").asLong() != manifest.path("manifestVersion").asLong()
-                        || !service.path("targetServiceSpecSha256").equals(spec.path("serviceSpecSha256")))
+                        || !service.path("targetServiceSpecSha256").equals(spec.path("serviceSpecSha256"))
+                        || !service.path("dubboServiceKey").equals(spec.path("dubboServiceKey")))
                     throw new ControllerException("STATE_MANIFEST_MISMATCH", "Service target differs from the accepted manifest");
                 if (!service.path("operation").isNull()) operations++;
                 for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
@@ -109,6 +121,10 @@ public class BetaContractValidator {
                             || !registration.path("ephemeral").asBoolean()
                             || !registration.path("metadata").equals(expectedMetadata(deployment, instance))) {
                         throw new ControllerException("STATE_INVALID", "Instance registration identity mismatch");
+                    }
+                    if (!registration.path("serviceName").asText()
+                            .equals(expectedNacosServiceName(service.path("dubboServiceKey").asText()))) {
+                        throw new ControllerException("STATE_INVALID", "Nacos service name differs from the persisted Dubbo service key");
                     }
                     String slot = instance.path("portSlot").asText();
                     int expectedPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
@@ -182,6 +198,17 @@ public class BetaContractValidator {
         for (JsonNode service : manifest.path("services"))
             if (name.equals(service.path("serviceName").asText())) return service;
         return null;
+    }
+
+    private static String expectedNacosServiceName(String dubboServiceKey) {
+        java.util.regex.Matcher matcher = DUBBO_SERVICE_KEY.matcher(dubboServiceKey);
+        if (!matcher.matches()) {
+            throw new ControllerException("MANIFEST_INVALID", "Dubbo service key is invalid");
+        }
+        String group = matcher.group(1);
+        String serviceInterface = matcher.group(2);
+        String version = matcher.group(3) == null ? "" : matcher.group(3);
+        return "providers:" + serviceInterface + ':' + version + ':' + group;
     }
 
     private void validate(JsonSchema schema, JsonNode value, String code) {

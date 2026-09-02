@@ -19,6 +19,8 @@ class LaneCallRouterTest {
     private static final String SERVICE = "agent-service";
     private static final String OLD_GEN = "gen-" + "a".repeat(64);
     private static final String NEW_GEN = "gen-" + "b".repeat(64);
+    private static final LaneDubboServiceKey DUBBO_SERVICE_KEY =
+            new LaneDubboServiceKey("langchain", "com.alphafrog.AgentService", "");
 
     private final AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
     private final LaneCallRouter router = new LaneCallRouter(pointer);
@@ -118,7 +120,8 @@ class LaneCallRouterTest {
         return new LaneServiceRoute(
                 SCOPE,
                 SERVICE,
-                "com.alphafrog.AgentService:1.0@@providers",
+                DUBBO_SERVICE_KEY,
+                "providers:com.alphafrog.AgentService::langchain",
                 "instance-old",
                 "release-1",
                 OLD_GEN,
@@ -131,7 +134,8 @@ class LaneCallRouterTest {
         return new LaneServiceRoute(
                 SCOPE,
                 SERVICE,
-                "com.alphafrog.AgentService:1.0@@providers",
+                DUBBO_SERVICE_KEY,
+                "providers:com.alphafrog.AgentService::langchain",
                 "instance-new",
                 "release-2",
                 NEW_GEN,

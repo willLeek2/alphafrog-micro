@@ -7,6 +7,7 @@ public final class LaneServiceRoute {
 
     private final String trafficScopeId;
     private final String serviceName;
+    private final LaneDubboServiceKey dubboServiceKey;
     private final String registrationServiceName;
     private final String defaultInstanceId;
     private final String defaultReleaseId;
@@ -18,6 +19,7 @@ public final class LaneServiceRoute {
     public LaneServiceRoute(
             String trafficScopeId,
             String serviceName,
+            LaneDubboServiceKey dubboServiceKey,
             String registrationServiceName,
             String defaultInstanceId,
             String defaultReleaseId,
@@ -27,6 +29,7 @@ public final class LaneServiceRoute {
             LaneEndpoint endpoint) {
         this.trafficScopeId = requireText(trafficScopeId, "trafficScopeId");
         this.serviceName = requireText(serviceName, "serviceName");
+        this.dubboServiceKey = Objects.requireNonNull(dubboServiceKey, "dubboServiceKey");
         this.registrationServiceName = registrationServiceName == null || registrationServiceName.isBlank()
                 ? null
                 : registrationServiceName;
@@ -48,6 +51,10 @@ public final class LaneServiceRoute {
 
     public String serviceName() {
         return serviceName;
+    }
+
+    public LaneDubboServiceKey dubboServiceKey() {
+        return dubboServiceKey;
     }
 
     public String registrationServiceName() {
