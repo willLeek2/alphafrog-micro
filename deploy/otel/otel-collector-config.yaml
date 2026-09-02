@@ -1,0 +1,57 @@
+extensions:
+  file_storage:
+    directory: ${env:AF_OTEL_FILE_STORAGE_DIRECTORY}
+    create_directory: true
+
+receivers:
+  filelog:
+    include:
+      - /var/log/apps/*/*.log
+    start_at: end
+    storage: file_storage
+    operators:
+      - type: json_parser
+        parse_from: body
+        on_error: send
+      - type: add
+        field: attributes["parse.error"]
+        value: json_parse_failed
+        if: 'attributes.message == nil'
+      - type: move
+        from: attributes.message
+        to: body
+        if: 'attributes.message != nil'
+      - type: move
+        from: attributes.service
+        to: resource["service.name"]
+        if: 'attributes.service != nil'
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  batch: {}
+
+exporters:
+  otlphttp/victorialogs:
+    # Collector 会自动追加 /v1/logs。101 本机可使用容器名，Beta 机改成
+    # 101 宿主机地址；两台机器共用同一份配置文件。
+    endpoint: ${env:AF_OTEL_VICTORIALOGS_ENDPOINT}
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 4096
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 300s
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/victorialogs]

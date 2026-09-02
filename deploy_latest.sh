@@ -11,6 +11,7 @@ INFRA_SERVICES=(
   rabbitmq
   nacos
   meilisearch
+  otel-collector
 )
 
 # Python沙箱服务（独立于Java服务）
@@ -254,6 +255,19 @@ fi
 
 echo "=== Selected services: ${SELECTED[*]} ==="
 
+# 采集器镜像版本写在 compose 中，配置内容另用固定摘要校验。101 与 Beta
+# 机器使用同一份 YAML，只通过环境变量改变 VictoriaLogs 地址。
+bash "$ROOT_DIR/deploy/otel/verify-collector-config.sh"
+
+# 所有 JVM 容器挂载同一份官方 Java Agent。部署脚本在构建和启动之前验证
+# 固定版本、字节数与摘要，缺失或被替换时停止。
+for selected_service in "${SELECTED[@]}"; do
+  if is_in_list "$selected_service" "${ALL_SERVICES[@]}"; then
+    bash "$ROOT_DIR/deploy/otel/verify-javaagent.sh"
+    break
+  fi
+done
+
 # MethodSpec V5 §12: 部署目标运行时镜像引用必须是 sha256 摘要引用（生产）。
 # 裸标签仅在显式 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true/1 时允许，且开发开关只放行
 # 【语法合法】的裸标签/引用（round-2 R2-4）：空值、空白/控制字符、大写仓库名、
@@ -422,6 +436,26 @@ if [[ "$DEPLOY_ONLY" != true ]]; then
   done
 else
   echo "=== Deploy-only mode: skipping Maven and Docker image build ==="
+fi
+
+# 镜像已经构建或拉取完成、容器尚未启动。现在逐服务读取本地 Image ID，
+# 生成五个观测身份字段所需的环境变量。生产部署不接受 local/unknown；本机
+# 开发若直接运行 docker compose，则仍可使用 compose 中的占位默认值。
+OBSERVABILITY_SERVICES=()
+for svc in "${SELECTED[@]}"; do
+  if is_in_list "$svc" "${ALL_SERVICES[@]}"; then
+    OBSERVABILITY_SERVICES+=("$svc")
+  fi
+done
+if [[ ${#OBSERVABILITY_SERVICES[@]} -gt 0 ]]; then
+  bash "$ROOT_DIR/deploy/otel/prepare-runtime-env.sh" "${OBSERVABILITY_SERVICES[@]}"
+  set -a
+  # 该文件由上一步以 0600 权限原子生成，只包含已经校验的构建身份。
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/deploy/otel/runtime.env"
+  set +a
+  AF_OTEL_LOG_ROOT_DIR="$ROOT_DIR/data/logs" \
+    bash "$ROOT_DIR/deploy/otel/prepare-log-directories.sh" "${OBSERVABILITY_SERVICES[@]}"
 fi
 # === post-build / pre-deploy 唯一执行区间 (v14 MF2 frozen) ===
 if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then
