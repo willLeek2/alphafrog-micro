@@ -17,9 +17,12 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import world.willfrog.beta.config.BetaControllerProperties;
 import world.willfrog.beta.state.AtomicJsonStore;
 import world.willfrog.beta.validation.BetaContractValidator;
@@ -33,6 +36,7 @@ class BetaDeploymentServiceTest {
     private FakeRetirement retirement;
     private BetaDeploymentService service;
     private Path retirementToken;
+    private UnaryOperator<ObjectNode> routeMutation;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -48,8 +52,8 @@ class BetaDeploymentServiceTest {
         containers = new FakeContainers();
         registry = new FakeRegistry();
         retirement = new FakeRetirement();
-        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper), containers,
-                registry, retirement, properties);
+        routeMutation = UnaryOperator.identity();
+        service = serviceAt(Clock.systemUTC());
     }
 
     @Test
@@ -387,9 +391,111 @@ class BetaDeploymentServiceTest {
                 .path("stopDeadline").asText());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"endpoint", "generation"})
+    void switchReadbackRequiresTheExactCandidateEndpointAndGeneration(String fault) {
+        prepareUpdateForSwitch();
+        String oldInstance = serviceState().path("activeInstance").path("instanceId").asText();
+        routeMutation = route -> {
+            if ("endpoint".equals(fault)) {
+                ((ObjectNode) route.path("endpoint")).put("address", "10.0.0.99");
+            } else {
+                ((ObjectNode) route.path("route")).put("defaultDeploymentGenerationId", "gen-" + "f".repeat(64));
+            }
+            return route;
+        };
+
+        ControllerException failure = assertThrows(ControllerException.class, service::reconcileOne);
+
+        assertEquals("ROUTE_READBACK_FAILED", failure.code());
+        assertEquals("DRAINING_PREVIOUS", operationPhase());
+        assertTrue(registry.values.get(oldInstance).enabled());
+        assertEquals(0, retirement.calls);
+    }
+
+    @Test
+    void deleteReadbackRequiresANewEmptyRouteVersionAndClearedGeneration() {
+        createStableService();
+        String oldInstance = serviceState().path("activeInstance").path("instanceId").asText();
+        long oldRouteVersion = serviceState().path("route").path("routeVersion").asLong();
+        service.requestDelete("beta-main-001");
+        routeMutation = route -> {
+            ObjectNode pointer = (ObjectNode) route.path("route");
+            pointer.put("routeVersion", oldRouteVersion);
+            pointer.put("defaultDeploymentGenerationId", "gen-" + "f".repeat(64));
+            return route;
+        };
+
+        ControllerException failure = assertThrows(ControllerException.class, service::reconcileOne);
+
+        assertEquals("ROUTE_READBACK_FAILED", failure.code());
+        assertEquals("DRAINING_ACTIVE", operationPhase());
+        assertTrue(registry.values.get(oldInstance).enabled());
+        assertEquals(0, retirement.calls);
+    }
+
+    @Test
+    void drainReadbackRejectsAWrongEndpointBeforeDisablingTheOldInstance() {
+        prepareUpdateForSwitch();
+        service.reconcileOne();
+        String oldInstance = serviceState().path("drainingInstance").path("instanceId").asText();
+        routeMutation = route -> {
+            ((ObjectNode) route.path("endpoint")).put("port", 6553);
+            return route;
+        };
+
+        service.reconcileOne();
+
+        assertEquals("FAILED", serviceState().path("phase").asText());
+        assertEquals("ROUTE_READBACK_FAILED", serviceState().path("lastError").path("code").asText());
+        assertTrue(registry.values.get(oldInstance).enabled());
+        assertEquals(0, retirement.calls);
+    }
+
+    @Test
+    void startupReadbackRejectsAnEndpointThatDoesNotMatchThePersistedRoute() {
+        createStableService();
+        String activeInstance = serviceState().path("activeInstance").path("instanceId").asText();
+        routeMutation = route -> {
+            ((ObjectNode) route.path("endpoint")).put("address", "10.0.0.99");
+            return route;
+        };
+
+        service.verifyPersistentStateAtStartup();
+
+        assertEquals("FAILED", serviceState().path("phase").asText());
+        assertEquals("ROUTE_READBACK_FAILED", serviceState().path("lastError").path("code").asText());
+        assertTrue(registry.values.get(activeInstance).enabled());
+        assertEquals(0, retirement.calls);
+    }
+
+    private void createStableService() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b'));
+        service.reconcileOne();
+        service.reconcileOne();
+        service.reconcileOne();
+    }
+
+    private void prepareUpdateForSwitch() {
+        createStableService();
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd'));
+        service.reconcileOne();
+        service.reconcileOne();
+        assertEquals("SWITCHING_TRAFFIC", operationPhase());
+    }
+
     private BetaDeploymentService serviceAt(Instant instant) {
+        return serviceAt(Clock.fixed(instant, ZoneOffset.UTC));
+    }
+
+    private BetaDeploymentService serviceAt(Clock clock) {
         return new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper), containers,
-                registry, retirement, retirementToken, Clock.fixed(instant, ZoneOffset.UTC));
+                registry, retirement, retirementToken, clock) {
+            @Override
+            public ObjectNode route(String trafficScopeId, String serviceName) {
+                return routeMutation.apply(super.route(trafficScopeId, serviceName));
+            }
+        };
     }
 
     private ObjectNode manifest(long version, String release, char git, char repository, char local) {

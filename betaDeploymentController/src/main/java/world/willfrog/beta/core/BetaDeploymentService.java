@@ -291,9 +291,9 @@ public class BetaDeploymentService {
 
     private void observeCandidate(OperationRef ref) {
         JsonNode candidate = ref.service().path("candidateInstance");
-        ObjectNode observedRoute = route(ref.trafficScopeId(), ref.serviceName());
-        if (!observedRoute.path("route").equals(ref.service().path("route"))
-                || observedRoute.path("route").path("defaultInstanceId").equals(candidate.path("instanceId"))) {
+        ObjectNode observedRoute = requireExactRoute(ref.service(), ref.trafficScopeId(), ref.serviceName(),
+                "Candidate readiness observed a conflicting route");
+        if (observedRoute.path("route").path("defaultInstanceId").equals(candidate.path("instanceId"))) {
             throw new ControllerException("ROUTE_READBACK_FAILED", "Candidate readiness observed a conflicting route");
         }
         JsonNode manifest = store.readManifest(ref.deploymentId());
@@ -343,7 +343,6 @@ public class BetaDeploymentService {
         ServiceRegistry.Registration enabled = registry.setSelectable(registration(candidate.path("registration")), true);
         if (!enabled.enabled() || enabled.weight() != 1 || !enabled.healthy())
             throw new ControllerException("NACOS_ENABLE_NOT_CONFIRMED", "Candidate registration was not enabled");
-        final long[] routeVersion = new long[1];
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode promoted = ((ObjectNode) service.path("candidateInstance")).deepCopy();
@@ -351,7 +350,6 @@ public class BetaDeploymentService {
             promoted.set("registration", registration(enabled));
             JsonNode previous = service.path("activeInstance").deepCopy();
             long nextRoute = Math.addExact(service.path("route").path("routeVersion").asLong(), 1);
-            routeVersion[0] = nextRoute;
             String switchAt = Instant.now(clock).toString();
             ObjectNode route = route(promoted, nextRoute, switchAt);
             service.set("activeInstance", promoted);
@@ -376,19 +374,13 @@ public class BetaDeploymentService {
             validateAll(state);
             return null;
         });
-        ObjectNode observedRoute = route(ref.trafficScopeId(), ref.serviceName());
-        JsonNode published = observedRoute.path("route");
-        if (published.path("routeVersion").asLong() != routeVersion[0]
-                || !published.path("defaultInstanceId").equals(candidate.path("instanceId"))
-                || !published.path("defaultReleaseId").equals(candidate.path("releaseId"))
-                || !published.path("defaultDeploymentGenerationId").equals(candidate.path("deploymentGenerationId"))
-                || !observedRoute.path("endpoint").equals(candidate.path("endpoint"))) {
-            throw new ControllerException("ROUTE_READBACK_FAILED", "Published route could not be read back");
-        }
+        JsonNode published = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
+                ref.serviceName()).deepCopy());
+        requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
+                "Published route could not be read back");
     }
 
     private void removeTraffic(OperationRef ref) {
-        final long[] routeVersion = new long[1];
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode active = ((ObjectNode) service.path("activeInstance")).deepCopy();
@@ -400,7 +392,6 @@ public class BetaDeploymentService {
             service.putNull("activeInstance");
             service.set("drainingInstance", active);
             long nextRoute = Math.addExact(service.path("route").path("routeVersion").asLong(), 1);
-            routeVersion[0] = nextRoute;
             service.set("route", emptyRoute(nextRoute, switchAt));
             ObjectNode operation = (ObjectNode) service.path("operation");
             operation.put("phase", "DRAINING_ACTIVE");
@@ -408,23 +399,17 @@ public class BetaDeploymentService {
             validateAll(state);
             return null;
         });
-        ObjectNode observed = route(ref.trafficScopeId(), ref.serviceName());
-        JsonNode removed = observed.path("route");
-        if (removed.path("routeVersion").asLong() != routeVersion[0]
-                || !removed.path("defaultInstanceId").isNull()
-                || !removed.path("defaultReleaseId").isNull()
-                || !removed.path("defaultDeploymentGenerationId").isNull()
-                || !observed.path("endpoint").isNull()) {
-            throw new ControllerException("ROUTE_READBACK_FAILED", "Removed route is still selectable");
-        }
+        JsonNode removed = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
+                ref.serviceName()).deepCopy());
+        requireExactRoute(removed, ref.trafficScopeId(), ref.serviceName(),
+                "Removed route is still selectable");
     }
 
     private void drain(OperationRef ref) {
         JsonNode current = store.read(state -> checkedService(state, ref).deepCopy());
         ObjectNode draining = (ObjectNode) current.path("drainingInstance");
-        ObjectNode route = route(ref.trafficScopeId(), ref.serviceName());
-        if (!route.path("route").equals(current.path("route")))
-            throw new ControllerException("ROUTE_READBACK_FAILED", "Route readback differs from persisted state");
+        requireExactRoute(current, ref.trafficScopeId(), ref.serviceName(),
+                "Route readback differs from persisted state");
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
         containers.verifyPersistedInstance(manifest, spec, draining);
@@ -516,7 +501,12 @@ public class BetaDeploymentService {
             case "REMOVING_TRAFFIC" -> "DELETE_RETRYABLE";
             default -> "FACTS_UNCERTAIN";
         };
-        markFailed(ref, failure.code(), failure.getMessage(), recovery, false);
+        try {
+            markFailed(ref, failure.code(), failure.getMessage(), recovery, false);
+        } catch (ControllerException stateChanged) {
+            if ("OPERATION_CHANGED".equals(stateChanged.code())) throw failure;
+            throw stateChanged;
+        }
     }
 
     private void markFailed(OperationRef ref, String code, String message, String recovery, boolean candidateCleaned) {
@@ -568,10 +558,8 @@ public class BetaDeploymentService {
     }
 
     private void verifyServiceFacts(JsonNode deployment, JsonNode service, JsonNode manifest) {
-        ObjectNode observedRoute = route(deployment.path("trafficScopeId").asText(),
-                service.path("serviceName").asText());
-        if (!observedRoute.path("route").equals(service.path("route")))
-            throw new ControllerException("ROUTE_READBACK_FAILED", "Route readback differs from persisted state");
+        requireExactRoute(service, deployment.path("trafficScopeId").asText(),
+                service.path("serviceName").asText(), "Route readback differs from persisted state");
         JsonNode spec = findService(manifest, service.path("serviceName").asText());
         Set<String> trackedContainerIds = new HashSet<>();
         Set<String> trackedInstanceIds = new HashSet<>();
@@ -919,6 +907,19 @@ public class BetaDeploymentService {
         route.put("routeVersion", version);
         route.put("updatedAt", updatedAt);
         return route;
+    }
+
+    private ObjectNode requireExactRoute(JsonNode service, String trafficScopeId, String serviceName,
+                                         String failureMessage) {
+        ObjectNode observed = route(trafficScopeId, serviceName);
+        JsonNode active = service.path("activeInstance");
+        boolean endpointMatches = active.isObject()
+                ? observed.path("endpoint").equals(active.path("endpoint"))
+                : observed.path("endpoint").isNull();
+        if (!observed.path("route").equals(service.path("route")) || !endpointMatches) {
+            throw new ControllerException("ROUTE_READBACK_FAILED", failureMessage);
+        }
+        return observed;
     }
 
     private ObjectNode operation(String type, String phase, String candidateId) {

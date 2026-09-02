@@ -43,7 +43,14 @@ public class ApiTokenFilter extends OncePerRequestFilter {
         String authorization = request.getHeader("Authorization");
         String supplied = authorization != null && authorization.startsWith("Bearer ") ? authorization.substring(7) : "";
         String expected = readToken();
-        if (!MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8))) {
+        if (expected.isEmpty()) {
+            response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+            response.setContentType("application/json");
+            response.getWriter().write("{\"code\":\"CONTROLLER_AUTH_UNAVAILABLE\",\"message\":\"Authentication is unavailable\"}\n");
+            return;
+        }
+        if (supplied.isEmpty() || !MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8),
+                supplied.getBytes(StandardCharsets.UTF_8))) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             response.setContentType("application/json");
             response.getWriter().write("{\"code\":\"CONTROLLER_UNAUTHORIZED\",\"message\":\"Authentication failed\"}\n");

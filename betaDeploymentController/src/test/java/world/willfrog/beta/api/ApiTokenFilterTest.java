@@ -1,6 +1,7 @@
 package world.willfrog.beta.api;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.nio.file.Files;
@@ -40,5 +41,46 @@ class ApiTokenFilterTest {
         MockHttpServletResponse allowedResponse = new MockHttpServletResponse();
         filter.doFilter(allowed, allowedResponse, new MockFilterChain());
         assertEquals(200, allowedResponse.getStatus());
+    }
+
+    @Test
+    void runtimeTokenFailureNeverTurnsAnEmptyOrOldBearerIntoAuthorization() throws Exception {
+        Path token = temporary.resolve("api-token");
+        String validToken = "t".repeat(48);
+        Files.writeString(token, validToken);
+        try { Files.setPosixFilePermissions(token, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { return; }
+        BetaControllerProperties properties = new BetaControllerProperties();
+        properties.setApiTokenFile(token);
+        ApiTokenFilter filter = new ApiTokenFilter(properties);
+        filter.verifyTokenAtStartup();
+
+        Files.delete(token);
+        assertUnavailable(filter, null);
+        assertUnavailable(filter, validToken);
+
+        Files.writeString(token, validToken);
+        Files.setPosixFilePermissions(token, PosixFilePermissions.fromString("rw-r--r--"));
+        assertUnavailable(filter, null);
+        assertUnavailable(filter, validToken);
+
+        Files.setPosixFilePermissions(token, PosixFilePermissions.fromString("rw-------"));
+        Files.writeString(token, "short");
+        assertUnavailable(filter, null);
+        assertUnavailable(filter, validToken);
+
+        Files.writeString(token, validToken + "\n");
+        assertUnavailable(filter, null);
+        assertUnavailable(filter, validToken);
+    }
+
+    private void assertUnavailable(ApiTokenFilter filter, String bearer) throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/internal/beta/status/main/service-a");
+        if (bearer != null) request.addHeader("Authorization", "Bearer " + bearer);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockFilterChain chain = new MockFilterChain();
+        filter.doFilter(request, response, chain);
+        assertEquals(503, response.getStatus());
+        assertNull(chain.getRequest());
     }
 }
