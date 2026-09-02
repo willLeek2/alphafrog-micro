@@ -17,6 +17,8 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -502,7 +504,101 @@ class BetaDeploymentServiceTest {
         assertEquals(publishedInstance, confirmed.path("activeInstance").path("instanceId").asText());
         assertTrue(confirmed.path("candidateInstance").isNull());
         assertEquals(1, containers.values.size());
+        assertEquals("STARTING_CANDIDATE", namedService("tools-service").path("operation").path("phase").asText(),
+                () -> store.snapshot().toPrettyString());
+    }
+
+    @Test
+    void initialCreateUnexpectedRouteFailureIsPersistedAsCreateFailure() {
+        service.submitManifest(twoServiceManifest());
+        service.reconcileOne();
+        service.reconcileOne();
+        String publishedInstance = serviceState().path("candidateInstance").path("instanceId").asText();
+        routeMutation = route -> {
+            throw new IllegalStateException("simulated route reader outage");
+        };
+
+        service.reconcileOne();
+
+        JsonNode failed = namedService("agent-service");
+        assertEquals("FAILED", failed.path("phase").asText());
+        assertEquals("EXTERNAL_OPERATION_FAILED", failed.path("lastError").path("code").asText());
+        assertEquals("CREATE", failed.path("lastError").path("failedOperationType").asText());
+        assertEquals("FACTS_UNCERTAIN", failed.path("lastError").path("recoveryClass").asText());
+        assertEquals(publishedInstance, failed.path("activeInstance").path("instanceId").asText());
+        assertTrue(failed.path("operation").isNull());
+        assertTrue(namedService("tools-service").path("operation").isNull());
+        assertEquals(1, containers.values.size());
+    }
+
+    @Test
+    void initialCreateDoesNotExposeStableBeforeRouteConfirmation() {
+        service.submitManifest(twoServiceManifest());
+        service.reconcileOne();
+        service.reconcileOne();
+        AtomicReference<JsonNode> visibleDuringReadback = new AtomicReference<>();
+        routeMutation = route -> {
+            visibleDuringReadback.set(service.status("main-beta", "agent-service"));
+            return route;
+        };
+
+        service.reconcileOne();
+
+        JsonNode visible = visibleDuringReadback.get();
+        assertEquals("CREATING", visible.path("phase").asText());
+        assertEquals("CREATE", visible.path("operation").path("type").asText());
+        assertEquals("SWITCHING_TRAFFIC", visible.path("operation").path("phase").asText());
+        assertTrue(visible.path("activeInstance").isObject());
+        assertTrue(visible.path("candidateInstance").isNull());
+        assertEquals("STABLE", namedService("agent-service").path("phase").asText());
         assertEquals("STARTING_CANDIDATE", namedService("tools-service").path("operation").path("phase").asText());
+    }
+
+    @Test
+    void restartPreservesPublishedCreateConfirmationAndRetryDoesNotCreateAnotherCandidate() {
+        service.submitManifest(twoServiceManifest());
+        service.reconcileOne();
+        service.reconcileOne();
+        String publishedInstance = serviceState().path("candidateInstance").path("instanceId").asText();
+        AtomicInteger routeReads = new AtomicInteger();
+        routeMutation = route -> {
+            if ("agent-service".equals(route.path("serviceName").asText())) {
+                if (routeReads.getAndIncrement() == 0) throw new SimulatedProcessExit();
+                ((ObjectNode) route.path("endpoint")).put("address", "10.0.0.99");
+            }
+            return route;
+        };
+
+        assertThrows(SimulatedProcessExit.class, service::reconcileOne);
+
+        JsonNode persisted = namedService("agent-service");
+        assertEquals("CREATING", persisted.path("phase").asText());
+        assertEquals("CREATE", persisted.path("operation").path("type").asText());
+        assertEquals("SWITCHING_TRAFFIC", persisted.path("operation").path("phase").asText());
+        assertEquals(publishedInstance, persisted.path("activeInstance").path("instanceId").asText());
+        assertTrue(persisted.path("candidateInstance").isNull());
+        assertTrue(namedService("tools-service").path("operation").isNull());
+        assertEquals(1, containers.values.size());
+
+        service = serviceAt(Clock.systemUTC());
+        service.verifyPersistentStateAtStartup();
+
+        JsonNode failed = namedService("agent-service");
+        assertEquals("FAILED", failed.path("phase").asText());
+        assertEquals("CREATE", failed.path("lastError").path("failedOperationType").asText());
+        assertEquals("FACTS_UNCERTAIN", failed.path("lastError").path("recoveryClass").asText());
+        assertTrue(namedService("tools-service").path("operation").isNull());
+
+        routeMutation = UnaryOperator.identity();
+        service.retry("beta-main-001", "agent-service");
+
+        JsonNode confirmed = namedService("agent-service");
+        assertEquals("STABLE", confirmed.path("phase").asText());
+        assertEquals(publishedInstance, confirmed.path("activeInstance").path("instanceId").asText());
+        assertTrue(confirmed.path("candidateInstance").isNull());
+        assertEquals(1, containers.values.size());
+        assertEquals("STARTING_CANDIDATE", namedService("tools-service").path("operation").path("phase").asText(),
+                () -> store.snapshot().toPrettyString());
     }
 
     private void createStableService() {
@@ -677,4 +773,6 @@ class BetaDeploymentServiceTest {
             calls++;
         }
     }
+
+    private static final class SimulatedProcessExit extends Error { }
 }

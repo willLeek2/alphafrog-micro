@@ -84,7 +84,7 @@ function runAjv(command, schema, data, shouldPass) {
   }
   schemaChecks++;
   if (passed !== shouldPass) {
-    throw new Error(`${path.basename(data ?? schema)} ${shouldPass ? 'should pass' : 'should fail'} AJV`);
+    throw new Error(`${path.basename(data ?? schema)} ${shouldPass ? 'should pass' : 'should fail'} AJV: ${failureOutput.trim()}`);
   }
   if (!shouldPass && !passed && !/\binvalid\b/i.test(failureOutput)) {
     throw new Error(`${path.basename(data)} AJV did not report a validation failure: ${failureOutput.trim()}`);
@@ -322,6 +322,10 @@ const positiveStates = {
     phase: 'CREATING', activeInstance: null, candidateInstance: candidateStarting, route: routeNone,
     operation: operation('CREATE', 'WAITING_CANDIDATE_READINESS', 'instance-new')
   })),
+  createPublishedAwaitingConfirmation: state(service({
+    phase: 'CREATING', activeInstance: newActive, candidateInstance: null, route: routeNewStable,
+    operation: operation('CREATE', 'SWITCHING_TRAFFIC', 'instance-new')
+  })),
   updateSwitching: state(service({
     phase: 'UPDATING', activeInstance: oldActive, candidateInstance: candidateReady, route: routeOld,
     operation: operation('UPDATE', 'SWITCHING_TRAFFIC', 'instance-new')
@@ -406,6 +410,15 @@ function customErrors(manifestValue, stateValue) {
       if (item.operation?.phase === 'DRAINING_PREVIOUS') {
         checkTargetInstance(item.activeInstance, spec, 'post-switch active');
       }
+      const publishedCreate = item.operation?.type === 'CREATE'
+        && item.operation?.phase === 'SWITCHING_TRAFFIC'
+        && item.activeInstance && !item.candidateInstance;
+      if (publishedCreate) {
+        checkTargetInstance(item.activeInstance, spec, 'published create');
+        if (item.operation.candidateInstanceId !== item.activeInstance.instanceId) {
+          errors.push(`published create operation instance ${item.serviceName}`);
+        }
+      }
       const roleSlots = new Set();
       for (const instance of [item.activeInstance, item.candidateInstance, item.drainingInstance].filter(Boolean)) {
         if (instanceIds.has(instance.instanceId)) errors.push(`duplicate instance ${instance.instanceId}`);
@@ -442,7 +455,8 @@ function customErrors(manifestValue, stateValue) {
       }
       if (item.activeInstance && (!item.activeInstance.registration.enabled || item.activeInstance.registration.weight !== 1 || !item.activeInstance.registration.healthy)) errors.push(`active not selectable ${item.serviceName}`);
       if (item.candidateInstance && (item.candidateInstance.registration.enabled || item.candidateInstance.registration.weight !== 0)) errors.push(`candidate selectable ${item.serviceName}`);
-      if (item.operation?.phase === 'SWITCHING_TRAFFIC' && (!item.candidateInstance?.registration.healthy || item.candidateInstance?.readiness !== 'READY')) errors.push(`candidate not ready ${item.serviceName}`);
+      if (item.operation?.phase === 'SWITCHING_TRAFFIC' && !publishedCreate
+          && (!item.candidateInstance?.registration.healthy || item.candidateInstance?.readiness !== 'READY')) errors.push(`candidate not ready ${item.serviceName}`);
       if (item.drainingInstance) {
         const {enabled, weight} = item.drainingInstance.registration;
         if (!((enabled && weight === 1) || (!enabled && weight === 0))) errors.push(`draining registration pair ${item.serviceName}`);
@@ -644,6 +658,9 @@ try {
   const stableRouteGenerationMismatch = clone(positiveStates.stable);
   stableRouteGenerationMismatch.deployments[0].services[0].route.defaultDeploymentGenerationId = previousGeneration;
   customNegatives.push(['stable route generation mismatch', manifest, stableRouteGenerationMismatch]);
+  const publishedCreateOperationMismatch = clone(positiveStates.createPublishedAwaitingConfirmation);
+  publishedCreateOperationMismatch.deployments[0].services[0].operation.candidateInstanceId = 'instance-other';
+  customNegatives.push(['published create operation instance', manifest, publishedCreateOperationMismatch]);
   const drainingSwitchMismatch = clone(positiveStates.updateDraining);
   drainingSwitchMismatch.deployments[0].services[0].drainingInstance.trafficRemovedAt = '2026-09-01T00:02:01Z';
   customNegatives.push(['draining switch time', manifest, drainingSwitchMismatch]);

@@ -132,9 +132,16 @@ public class BetaContractValidator {
                         || !route.path("defaultDeploymentGenerationId").equals(active.path("deploymentGenerationId")))) {
                     throw new ControllerException("STATE_INVALID", "Stable route does not point to its active instance");
                 }
+                boolean publishedCreate = "CREATE".equals(service.path("operation").path("type").asText())
+                        && "SWITCHING_TRAFFIC".equals(service.path("operation").path("phase").asText())
+                        && candidate.isNull() && active.isObject();
+                if (publishedCreate
+                        && !active.path("instanceId").equals(service.path("operation").path("candidateInstanceId")))
+                    throw new ControllerException("STATE_INVALID", "Published create differs from its operation instance");
                 if (active.isObject() && ("STABLE".equals(service.path("phase").asText())
                         && active.path("manifestVersion").asLong() == manifest.path("manifestVersion").asLong()
-                        || "DRAINING_PREVIOUS".equals(service.path("operation").path("phase").asText())))
+                        || "DRAINING_PREVIOUS".equals(service.path("operation").path("phase").asText())
+                        || publishedCreate))
                     requireTargetInstance(active, manifest, spec);
                 JsonNode draining = service.path("drainingInstance");
                 if (draining.isObject()) {

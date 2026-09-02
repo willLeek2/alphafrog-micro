@@ -352,6 +352,10 @@ public class BetaDeploymentService {
     }
 
     private void switchTraffic(OperationRef ref) {
+        if (isPublishedCreateAwaitingConfirmation(ref.service(), ref)) {
+            confirmPublishedCreate(ref);
+            return;
+        }
         JsonNode candidate = ref.service().path("candidateInstance");
         ServiceRegistry.Registration enabled = registry.setSelectable(registration(candidate.path("registration")), true);
         if (!enabled.enabled() || enabled.weight() != 1 || !enabled.healthy())
@@ -383,51 +387,44 @@ public class BetaDeploymentService {
             } else {
                 initialCreate[0] = true;
                 service.putNull("drainingInstance");
-                stable(service);
+                service.put("phase", "CREATING");
             }
             validateAll(state);
             return null;
         });
         JsonNode published = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
                 ref.serviceName()).deepCopy());
-        try {
-            requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
-                    "Published route could not be read back");
-        } catch (ControllerException failure) {
-            if (!initialCreate[0]) throw failure;
-            recordPublishedCreateFailure(ref, failure);
-            return;
-        }
+        requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
+                "Published route could not be read back");
         if (initialCreate[0]) {
-            store.update(state -> {
-                ObjectNode service = requireService(requireDeployment(state, ref.deploymentId()), ref.serviceName());
-                if (!"STABLE".equals(service.path("phase").asText()) || !service.path("operation").isNull()
-                        || !ref.candidateInstanceId().equals(service.path("activeInstance").path("instanceId").asText())) {
-                    throw new ControllerException("OPERATION_CHANGED", "Published create changed before route confirmation");
-                }
-                scheduleNext(state);
-                validateAll(state);
-                return null;
-            });
+            completePublishedCreate(ref);
         }
     }
 
-    private void recordPublishedCreateFailure(OperationRef ref, ControllerException failure) {
+    private boolean isPublishedCreateAwaitingConfirmation(JsonNode service, OperationRef ref) {
+        return "CREATE".equals(ref.type()) && "SWITCHING_TRAFFIC".equals(ref.phase())
+                && service.path("activeInstance").isObject()
+                && service.path("candidateInstance").isNull()
+                && service.path("drainingInstance").isNull();
+    }
+
+    private void confirmPublishedCreate(OperationRef ref) {
+        JsonNode published = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
+                ref.serviceName()).deepCopy());
+        requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
+                "Published route could not be read back");
+        completePublishedCreate(ref);
+    }
+
+    private void completePublishedCreate(OperationRef ref) {
         store.update(state -> {
-            ObjectNode service = requireService(requireDeployment(state, ref.deploymentId()), ref.serviceName());
-            if (!"STABLE".equals(service.path("phase").asText()) || !service.path("operation").isNull()
+            ObjectNode service = checkedService(state, ref);
+            if (!"CREATING".equals(service.path("phase").asText())
+                    || !isPublishedCreateAwaitingConfirmation(service, ref)
                     || !ref.candidateInstanceId().equals(service.path("activeInstance").path("instanceId").asText())) {
-                throw new ControllerException("OPERATION_CHANGED", "Published create changed before failure was recorded");
+                throw new ControllerException("OPERATION_CHANGED", "Published create changed before route confirmation");
             }
-            service.put("phase", "FAILED");
-            service.put("failedManifestVersion", service.path("targetManifestVersion").asLong());
-            ObjectNode error = mapper.createObjectNode();
-            error.put("code", failure.code().replaceAll("[^A-Z0-9_]", "_"));
-            error.put("message", sanitize(failure.getMessage()));
-            error.put("at", Instant.now(clock).toString());
-            error.put("failedOperationType", "CREATE");
-            error.put("recoveryClass", "FACTS_UNCERTAIN");
-            service.set("lastError", error);
+            stable(service);
             scheduleNext(state);
             validateAll(state);
             return null;

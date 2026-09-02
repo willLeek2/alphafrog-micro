@@ -1038,10 +1038,7 @@
                 "type": "object",
                 "properties": {
                   "phase": {
-                    "enum": [
-                      "WAITING_CANDIDATE_READINESS",
-                      "SWITCHING_TRAFFIC"
-                    ]
+                    "const": "WAITING_CANDIDATE_READINESS"
                   }
                 },
                 "required": [
@@ -1086,23 +1083,43 @@
             ]
           },
           "then": {
-            "properties": {
-              "candidateInstance": {
-                "allOf": [
-                  {
-                    "$ref": "#/$defs/candidateInstance"
+            "oneOf": [
+              {
+                "properties": {
+                  "activeInstance": {
+                    "type": "null"
                   },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "readiness": {
-                        "const": "READY"
+                  "candidateInstance": {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/candidateInstance"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "readiness": {
+                            "const": "READY"
+                          }
+                        }
                       }
-                    }
+                    ]
                   }
-                ]
+                }
+              },
+              {
+                "properties": {
+                  "activeInstance": {
+                    "$ref": "#/$defs/activeInstance"
+                  },
+                  "candidateInstance": {
+                    "type": "null"
+                  },
+                  "drainingInstance": {
+                    "type": "null"
+                  }
+                }
               }
-            }
+            ]
           }
         },
         {
@@ -1382,31 +1399,64 @@
             ]
           },
           "then": {
-            "type": "object",
-            "properties": {
-              "activeInstance": {
-                "type": "null"
-              },
-              "drainingInstance": {
-                "type": "null"
-              },
-              "route": {
+            "oneOf": [
+              {
                 "type": "object",
                 "properties": {
-                  "defaultInstanceId": {
+                  "activeInstance": {
                     "type": "null"
                   },
-                  "defaultReleaseId": {
+                  "drainingInstance": {
                     "type": "null"
+                  },
+                  "route": {
+                    "type": "object",
+                    "properties": {
+                      "defaultInstanceId": {
+                        "type": "null"
+                      },
+                      "defaultReleaseId": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "operation": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "allOf": [
+                          {
+                            "$ref": "#/$defs/operation"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "const": "CREATE"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    ]
                   }
                 }
               },
-              "operation": {
-                "anyOf": [
-                  {
+              {
+                "type": "object",
+                "properties": {
+                  "activeInstance": {
+                    "$ref": "#/$defs/activeInstance"
+                  },
+                  "candidateInstance": {
                     "type": "null"
                   },
-                  {
+                  "drainingInstance": {
+                    "type": "null"
+                  },
+                  "operation": {
                     "allOf": [
                       {
                         "$ref": "#/$defs/operation"
@@ -1416,14 +1466,17 @@
                         "properties": {
                           "type": {
                             "const": "CREATE"
+                          },
+                          "phase": {
+                            "const": "SWITCHING_TRAFFIC"
                           }
                         }
                       }
                     ]
                   }
-                ]
+                }
               }
-            }
+            ]
           }
         },
         {
