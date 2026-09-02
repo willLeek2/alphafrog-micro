@@ -454,10 +454,8 @@ if [[ ${#OBSERVABILITY_SERVICES[@]} -gt 0 ]]; then
   # shellcheck disable=SC1091
   source "$ROOT_DIR/deploy/otel/runtime.env"
   set +a
-  for svc in "${OBSERVABILITY_SERVICES[@]}"; do
-    mkdir -p "$ROOT_DIR/data/logs/$svc"
-    chmod 0755 "$ROOT_DIR/data/logs/$svc"
-  done
+  AF_OTEL_LOG_ROOT_DIR="$ROOT_DIR/data/logs" \
+    bash "$ROOT_DIR/deploy/otel/prepare-log-directories.sh" "${OBSERVABILITY_SERVICES[@]}"
 fi
 # === post-build / pre-deploy 唯一执行区间 (v14 MF2 frozen) ===
 if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then

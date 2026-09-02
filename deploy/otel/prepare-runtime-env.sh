@@ -93,6 +93,8 @@ chmod 600 "$temporary_file"
   printf 'AF_LANE_TAG=%q\n' "$lane_tag"
 } > "$temporary_file"
 
+seen_image_ids=()
+seen_service_names=()
 for service_name in "$@"; do
   image_ref="$(service_image "$service_name" 2>/dev/null || true)"
   image_variable="$(service_image_variable "$service_name" 2>/dev/null || true)"
@@ -106,6 +108,14 @@ for service_name in "$@"; do
     exit 1
   fi
   validate_resource_value image.digest "$image_id"
+  for image_index in "${!seen_image_ids[@]}"; do
+    if [[ "${seen_image_ids[$image_index]}" == "$image_id" ]]; then
+      echo "[otel-preflight] ERROR: ${service_name} 与 ${seen_service_names[$image_index]} 指向同一个本地 Image ID ${image_id}。不同服务必须使用不同镜像。" >&2
+      exit 1
+    fi
+  done
+  seen_image_ids+=("$image_id")
+  seen_service_names+=("$service_name")
   printf '%s=%q\n' "$image_variable" "$image_id" >> "$temporary_file"
 done
 

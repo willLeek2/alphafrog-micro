@@ -874,6 +874,8 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.159.0
     container_name: alphafrog-otel-collector
+    # 首版不把业务日志目录开放给宿主机用户组；Collector 以容器 root 读取 0700 绑定挂载。
+    user: "0:0"
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     environment:
       AF_OTEL_VICTORIALOGS_ENDPOINT: ${AF_OTEL_VICTORIALOGS_ENDPOINT:-http://victorialogs:9428/insert/opentelemetry}
