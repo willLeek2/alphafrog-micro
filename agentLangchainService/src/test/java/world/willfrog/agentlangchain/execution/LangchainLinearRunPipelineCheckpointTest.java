@@ -63,6 +63,8 @@ class LangchainLinearRunPipelineCheckpointTest {
         anchor.setEstimateJson("{\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
         anchored.setToolJobAnchorJson(anchor.toJson());
         when(runMapper.findById("run-1")).thenReturn(run, anchored);
+        when(runMapper.updateStatus("run-1", "user-1", world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING))
+                .thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(models.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(

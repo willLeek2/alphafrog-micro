@@ -34,7 +34,7 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
                 .isEqualTo(ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT);
         verify(anchors, never()).markCheckpointFailed(any(), any());
         verify(mapper, never()).markToolJobCheckpointFailurePending(
-                any(), any(), any(), anyInt(), any(), anyInt(), any());
+                any(), any(), any(), anyInt(), any(), anyInt(), any(), any());
     }
 
     @Test
@@ -49,7 +49,7 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         when(anchors.markCheckpointFailed(request, "durable_checkpoint_write_failed"))
                 .thenReturn(false);
         when(mapper.markToolJobCheckpointFailurePending(
-                eq("run-1"), eq("run-1:tc-1:1"), eq("tc-1"), eq(1), eq("task-1"), eq(1), any()))
+                eq("run-1"), eq("run-1:tc-1:1"), eq("tc-1"), eq(1), eq("task-1"), eq(1), any(), isNull()))
                 .thenReturn(1);
         ToolJobCheckpointFailureRecoveryService service =
                 new ToolJobCheckpointFailureRecoveryService(anchors, mapper, objectMapper);
@@ -58,7 +58,7 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
                 .isEqualTo(ToolJobCheckpointFailureRecoveryService.Outcome.RETRY_OWNED);
         ArgumentCaptor<String> marker = ArgumentCaptor.forClass(String.class);
         verify(mapper).markToolJobCheckpointFailurePending(
-                eq("run-1"), eq("run-1:tc-1:1"), eq("tc-1"), eq(1), eq("task-1"), eq(1), marker.capture());
+                eq("run-1"), eq("run-1:tc-1:1"), eq("tc-1"), eq(1), eq("task-1"), eq(1), marker.capture(), isNull());
         assertThat(marker.getValue())
                 .startsWith(ToolJobCheckpointFailureRecoveryService.MARKER_PREFIX);
     }
@@ -75,7 +75,7 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         when(anchors.markCheckpointFailed(request, "durable_checkpoint_write_failed"))
                 .thenReturn(false);
         when(mapper.markToolJobCheckpointFailurePending(
-                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any())).thenReturn(1);
+                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any(), isNull())).thenReturn(1);
         ToolJobCheckpointFailureRecoveryService service =
                 new ToolJobCheckpointFailureRecoveryService(anchors, mapper, objectMapper);
 
@@ -92,14 +92,14 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         when(anchors.markCheckpointFailed(request, "durable_checkpoint_write_failed"))
                 .thenReturn(false);
         when(mapper.markToolJobCheckpointFailurePending(
-                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any())).thenReturn(1);
+                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any(), isNull())).thenReturn(1);
         ToolJobCheckpointFailureRecoveryService service =
                 new ToolJobCheckpointFailureRecoveryService(anchors, mapper, objectMapper);
         assertThat(service.handleFailure(request))
                 .isEqualTo(ToolJobCheckpointFailureRecoveryService.Outcome.RETRY_OWNED);
         ArgumentCaptor<String> marker = ArgumentCaptor.forClass(String.class);
         verify(mapper).markToolJobCheckpointFailurePending(
-                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), marker.capture());
+                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), marker.capture(), isNull());
         AgentRun run = new AgentRun();
         run.setId("run-1");
         run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB);
@@ -110,10 +110,10 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         when(mapper.findById("run-1")).thenReturn(run);
         when(anchors.markCheckpointFailed(any(ToolJobCheckpointRequest.class),
                 eq("durable_checkpoint_write_failed"))).thenReturn(true);
-        when(mapper.clearToolJobCheckpointFailurePending("run-1", marker.getValue())).thenReturn(1);
+        when(mapper.clearToolJobCheckpointFailurePending("run-1", marker.getValue(), null)).thenReturn(1);
 
         assertThat(service.retryPending("run-1")).isTrue();
-        verify(mapper).clearToolJobCheckpointFailurePending("run-1", marker.getValue());
+        verify(mapper).clearToolJobCheckpointFailurePending("run-1", marker.getValue(), null);
     }
 
     @Test
@@ -127,7 +127,7 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         when(anchors.markCheckpointFailed(request, "durable_checkpoint_write_failed"))
                 .thenReturn(false);
         when(mapper.markToolJobCheckpointFailurePending(
-                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any())).thenReturn(0);
+                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any(), isNull())).thenReturn(0);
 
         ToolJobAnchor replacement = equivalentAnchor(request);
         replacement.setOperationId("run-1:tc-2:1");
@@ -160,7 +160,7 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         when(anchors.markCheckpointFailed(request, "durable_checkpoint_write_failed"))
                 .thenReturn(false, true);
         when(mapper.markToolJobCheckpointFailurePending(
-                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any())).thenReturn(0);
+                eq("run-1"), any(), any(), anyInt(), any(), anyInt(), any(), isNull())).thenReturn(0);
         AgentRun run = new AgentRun();
         run.setId("run-1");
         run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB);
@@ -199,14 +199,14 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
         run.setToolJobAnchorJson(replacement.toJson());
         run.setLastError(marker);
         when(mapper.findById("run-1")).thenReturn(run);
-        when(mapper.clearToolJobCheckpointFailurePending("run-1", marker)).thenReturn(1);
+        when(mapper.clearToolJobCheckpointFailurePending("run-1", marker, null)).thenReturn(1);
 
         ToolJobCheckpointFailureRecoveryService service =
                 new ToolJobCheckpointFailureRecoveryService(anchors, mapper, objectMapper);
 
         assertThat(service.retryPending("run-1")).isTrue();
         verify(anchors, never()).markCheckpointFailed(any(), any());
-        verify(mapper).clearToolJobCheckpointFailurePending("run-1", marker);
+        verify(mapper).clearToolJobCheckpointFailurePending("run-1", marker, null);
     }
 
     private ToolJobCheckpointRequest request() throws Exception {
