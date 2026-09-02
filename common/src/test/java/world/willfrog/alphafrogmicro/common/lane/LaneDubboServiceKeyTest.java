@@ -26,12 +26,14 @@ class LaneDubboServiceKeyTest {
     }
 
     @Test
-    void mapsOnlyTheCurrentNacosDefaultVersionWhenDubboVersionIsAbsent() {
-        LaneDubboServiceKey key = new LaneDubboServiceKey("langchain", INTERFACE, "");
+    void actualProviderUrlProducesTheInterfaceLevelNacosServiceName() {
+        URL providerUrl = consumerUrl(INTERFACE, "langchain", "");
 
-        assertThat(key.matchesNacosRegistration(INTERFACE + ":1.0@@providers")).isTrue();
-        assertThat(key.matchesNacosRegistration(INTERFACE + ":2.0@@providers")).isFalse();
-        assertThat(key.matchesNacosRegistration("another.Interface:1.0@@providers")).isFalse();
+        assertThat("providers:" + providerUrl.getColonSeparatedKey())
+                .isEqualTo("providers:" + INTERFACE + "::langchain");
+        assertThat(new LaneDubboServiceKey("langchain", INTERFACE, "")
+                .interfaceLevelNacosServiceName())
+                .isEqualTo("providers:" + providerUrl.getColonSeparatedKey());
     }
 
     @Test
@@ -42,8 +44,10 @@ class LaneDubboServiceKeyTest {
 
         assertThat(versionOne).isNotEqualTo(versionTwo);
         assertThat(versionOne).isNotEqualTo(anotherGroup);
-        assertThat(versionTwo.matchesNacosRegistration(INTERFACE + ":2.0@@providers")).isTrue();
-        assertThat(versionTwo.matchesNacosRegistration(INTERFACE + ":1.0@@providers")).isFalse();
+        assertThat(versionTwo.value()).isEqualTo("langchain/" + INTERFACE + ":2.0");
+        assertThat(anotherGroup.value()).isEqualTo("experimental/" + INTERFACE + ":1.0");
+        assertThat(versionTwo.interfaceLevelNacosServiceName())
+                .isEqualTo("providers:" + INTERFACE + ":2.0:langchain");
     }
 
     @Test

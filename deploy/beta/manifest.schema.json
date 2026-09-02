@@ -72,6 +72,12 @@
       "maxLength": 96,
       "pattern": "^[a-z][a-z0-9-]*$"
     },
+    "dubboServiceKey": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^[0-9A-Za-z._-]+/[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*(?::[0-9A-Za-z._-]+)?$"
+    },
     "opaqueId": {
       "type": "string",
       "minLength": 1,
@@ -119,6 +125,7 @@
       "additionalProperties": false,
       "required": [
         "serviceName",
+        "dubboServiceKey",
         "releaseId",
         "serviceSpecSha256",
         "machineId",
@@ -129,6 +136,9 @@
       "properties": {
         "serviceName": {
           "$ref": "#/$defs/serviceName"
+        },
+        "dubboServiceKey": {
+          "$ref": "#/$defs/dubboServiceKey"
         },
         "releaseId": {
           "$ref": "#/$defs/opaqueId"

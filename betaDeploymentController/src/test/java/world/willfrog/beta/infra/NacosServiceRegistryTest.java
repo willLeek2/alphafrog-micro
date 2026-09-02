@@ -37,7 +37,7 @@ class NacosServiceRegistryTest {
         ObjectMapper mapper = new ObjectMapper();
         manifest = mapper.readTree("{\"trafficScopeId\":\"main-beta\"}");
         service = mapper.readTree("""
-                {"releaseId":"release-1","registration":{"serviceName":"com.alphafrog.AgentService:1.0@@providers",
+                {"releaseId":"release-1","registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
                  "groupName":"DEFAULT_GROUP","namespaceId":"public","clusterName":"DEFAULT"}}
                 """);
     }
@@ -81,7 +81,7 @@ class NacosServiceRegistryTest {
     @Test
     void distinguishesAnAbsentRegistrationFromAConflictingIdentity() throws Exception {
         ServiceRegistry.Registration expected = new ServiceRegistry.Registration(
-                "com.alphafrog.AgentService:1.0@@providers", "DEFAULT_GROUP", "public", "DEFAULT",
+                "providers:com.alphafrog.AgentService::langchain", "DEFAULT_GROUP", "public", "DEFAULT",
                 "10.0.0.8", 28080, "nacos-i-one", false, true, 0, true, instance(false).getMetadata());
         when(naming.getAllInstances(anyString(), anyString(), anyList(), anyBoolean()))
                 .thenReturn(List.of());

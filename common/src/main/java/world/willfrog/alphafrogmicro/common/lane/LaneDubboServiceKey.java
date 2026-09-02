@@ -12,9 +12,6 @@ import org.apache.dubbo.rpc.Invocation;
  */
 public record LaneDubboServiceKey(String group, String interfaceName, String version) {
 
-    /** 部署控制器当前保存的 Dubbo 接口级 Nacos 登记名使用 1.0 表示未显式配置版本。 */
-    private static final String DEFAULT_NACOS_INTERFACE_VERSION = "1.0";
-
     public LaneDubboServiceKey {
         group = normalizeOptional(group, "Dubbo 分组");
         interfaceName = requireSegment(interfaceName, "Dubbo 接口名");
@@ -86,16 +83,9 @@ public record LaneDubboServiceKey(String group, String interfaceName, String ver
         return result.toString();
     }
 
-    public boolean matchesNacosRegistration(String registrationServiceName) {
-        if (registrationServiceName == null || registrationServiceName.isBlank()) {
-            return false;
-        }
-        int category = registrationServiceName.indexOf("@@");
-        String withoutCategory = category < 0
-                ? registrationServiceName
-                : registrationServiceName.substring(0, category);
-        String nacosVersion = version.isEmpty() ? DEFAULT_NACOS_INTERFACE_VERSION : version;
-        return (interfaceName + ':' + nacosVersion).equals(withoutCategory);
+    /** Dubbo 3.3 接口级提供者写入 Nacos 的完整服务名称。 */
+    public String interfaceLevelNacosServiceName() {
+        return "providers:" + interfaceName + ':' + version + ':' + group;
     }
 
     private static String requireSegment(String value, String fieldName) {

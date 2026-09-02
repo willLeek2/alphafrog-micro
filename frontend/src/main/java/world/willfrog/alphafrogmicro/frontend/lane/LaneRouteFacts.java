@@ -2,12 +2,14 @@ package world.willfrog.alphafrogmicro.frontend.lane;
 
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.lane.LaneCallBinding;
+import world.willfrog.alphafrogmicro.common.lane.LaneDubboServiceKey;
 
 /** 由部署控制器确认的当前流量范围默认路由事实。 */
 public record LaneRouteFacts(
         String trafficScopeId,
         String serviceName,
         DeploymentIdentity deploymentIdentity,
+        LaneDubboServiceKey dubboServiceKey,
         String registrationServiceName,
         LaneCallBinding callBinding,
         long stateVersion) {
@@ -25,6 +27,9 @@ public record LaneRouteFacts(
         }
         if (registrationServiceName == null || registrationServiceName.isBlank()) {
             throw new IllegalArgumentException("注册服务名称不能为空");
+        }
+        if (dubboServiceKey == null) {
+            throw new IllegalArgumentException("Dubbo 调用服务键不能为空");
         }
         if (callBinding == null
                 || !trafficScopeId.equals(callBinding.trafficScopeId())

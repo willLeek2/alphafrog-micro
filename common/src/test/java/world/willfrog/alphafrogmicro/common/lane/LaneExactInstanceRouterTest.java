@@ -23,7 +23,7 @@ class LaneExactInstanceRouterTest {
     private static final String AGENT_INTERFACE =
             "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService";
     private static final String AGENT_GROUP = "langchain";
-    private static final String AGENT_REGISTRATION = AGENT_INTERFACE + ":1.0@@providers";
+    private static final String AGENT_REGISTRATION = "providers:" + AGENT_INTERFACE + "::" + AGENT_GROUP;
     private static final LaneDubboServiceKey AGENT_SERVICE_KEY =
             new LaneDubboServiceKey(AGENT_GROUP, AGENT_INTERFACE, "");
     private static final LaneCallBinding NEW_BINDING = new LaneCallBinding(
@@ -147,6 +147,7 @@ class LaneExactInstanceRouterTest {
                 new LaneServiceRoute(
                         SCOPE,
                         "agent-service",
+                        AGENT_SERVICE_KEY,
                         AGENT_REGISTRATION,
                         "instance-current",
                         "release-3",
@@ -157,7 +158,8 @@ class LaneExactInstanceRouterTest {
                 new LaneServiceRoute(
                         SCOPE,
                         "tools-service",
-                        "com.alphafrog.ToolsService:1.0@@providers",
+                        new LaneDubboServiceKey("tools", "com.alphafrog.ToolsService", ""),
+                        "providers:com.alphafrog.ToolsService::tools",
                         "tools-current",
                         "tools-release-3",
                         "gen-" + "e".repeat(64),
@@ -194,7 +196,8 @@ class LaneExactInstanceRouterTest {
         pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
                 SCOPE,
                 "agent-service-other-group",
-                AGENT_REGISTRATION,
+                new LaneDubboServiceKey("experimental", AGENT_INTERFACE, ""),
+                "providers:" + AGENT_INTERFACE + "::experimental",
                 "instance-other-group",
                 "release-other-group",
                 "gen-" + "9".repeat(64),
@@ -218,12 +221,28 @@ class LaneExactInstanceRouterTest {
     }
 
     @Test
+    void route_shouldFailClosedWhenOnlyAnotherGroupUsesTheSameInterface() {
+        installNewRoute();
+        LaneContext.setTrafficScopeId(SCOPE);
+        URL experimentalUrl = consumerUrl(AGENT_INTERFACE, "experimental", "");
+        LaneExactInstanceRouter router = new LaneExactInstanceRouter(experimentalUrl);
+
+        assertThatThrownBy(() -> router.route(
+                List.of(invoker("10.0.0.8", 28081, "instance-new")),
+                experimentalUrl,
+                realInvocation(experimentalUrl)))
+                .isInstanceOf(RpcException.class)
+                .hasMessageContaining(LaneRouteUnavailableException.CODE);
+    }
+
+    @Test
     void route_shouldRetainProtocolVersionWhenMatchingARequestBinding() {
         AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
         pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
                 SCOPE,
                 "agent-service-v2",
-                        AGENT_INTERFACE + ":2.0@@providers",
+                new LaneDubboServiceKey(AGENT_GROUP, AGENT_INTERFACE, "2.0"),
+                "providers:" + AGENT_INTERFACE + ":2.0:" + AGENT_GROUP,
                 "instance-v2",
                 "release-v2",
                 "gen-" + "f".repeat(64),
@@ -253,6 +272,7 @@ class LaneExactInstanceRouterTest {
         pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
                 SCOPE,
                 "agent-service",
+                AGENT_SERVICE_KEY,
                 AGENT_REGISTRATION,
                 "instance-new",
                 "release-2",

@@ -71,9 +71,19 @@ public final class ControllerStateLaneRoutePointer implements LaneRoutePointer {
 
     private static LaneServiceRoute parseService(String trafficScopeId, JsonNode service) {
         String serviceName = text(service, "serviceName");
+        String dubboServiceKeyValue = text(service, "dubboServiceKey");
         JsonNode routeNode = service.get("route");
         if (serviceName == null || routeNode == null || !routeNode.isObject()) {
             return null;
+        }
+        if (dubboServiceKeyValue == null) {
+            throw new LaneRouteFactsUncertainException();
+        }
+        final LaneDubboServiceKey dubboServiceKey;
+        try {
+            dubboServiceKey = LaneDubboServiceKey.parse(dubboServiceKeyValue);
+        } catch (IllegalArgumentException invalid) {
+            throw new LaneRouteFactsUncertainException();
         }
         String defaultInstanceId = text(routeNode, "defaultInstanceId");
         if (defaultInstanceId == null) {
@@ -105,10 +115,14 @@ public final class ControllerStateLaneRoutePointer implements LaneRoutePointer {
         if (registration != null && registration.isObject()) {
             registrationServiceName = text(registration, "serviceName");
         }
+        if (!dubboServiceKey.interfaceLevelNacosServiceName().equals(registrationServiceName)) {
+            throw new LaneRouteFactsUncertainException();
+        }
         long routeVersion = routeNode.path("routeVersion").asLong(0L);
         return new LaneServiceRoute(
                 trafficScopeId,
                 serviceName,
+                dubboServiceKey,
                 registrationServiceName,
                 defaultInstanceId,
                 defaultReleaseId,

@@ -121,8 +121,9 @@ public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetch
                 return Optional.empty();
             }
             String registrationServiceName = text(registration, "serviceName");
-            LaneDubboServiceKey dubboServiceKey = properties.resolvedIdentityDubboServiceKey();
-            if (!dubboServiceKey.matchesNacosRegistration(registrationServiceName)) {
+            LaneDubboServiceKey dubboServiceKey = LaneDubboServiceKey.parse(text(root, "dubboServiceKey"));
+            if (!dubboServiceKey.equals(properties.resolvedIdentityDubboServiceKey())
+                    || !registrationServiceName.equals(dubboServiceKey.interfaceLevelNacosServiceName())) {
                 return Optional.empty();
             }
             JsonNode endpoint = active.path("endpoint");
@@ -156,6 +157,7 @@ public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetch
                     trafficScopeId,
                     serviceName,
                     identity,
+                    dubboServiceKey,
                     registrationServiceName,
                     callBinding,
                     root.path("stateVersion").asLong(-1)));

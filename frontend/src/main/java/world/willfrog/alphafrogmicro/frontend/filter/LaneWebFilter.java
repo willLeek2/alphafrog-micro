@@ -82,7 +82,7 @@ public class LaneWebFilter extends OncePerRequestFilter {
                 LaneRouteFacts facts = selected.orElseThrow();
                 LaneContext.setTrafficScopeId(facts.trafficScopeId());
                 LaneRequestContext.set(facts);
-                LaneCallBindingContext.set(properties.resolvedIdentityDubboServiceKey(), facts.callBinding());
+                LaneCallBindingContext.set(facts.dubboServiceKey(), facts.callBinding());
                 MDC.put(LaneContext.MDC_LANE_TAG, facts.trafficScopeId());
             }
             chain.doFilter(sanitized, response);

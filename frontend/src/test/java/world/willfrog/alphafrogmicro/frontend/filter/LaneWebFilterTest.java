@@ -30,6 +30,7 @@ import world.willfrog.alphafrogmicro.common.lane.LaneCallBinding;
 import world.willfrog.alphafrogmicro.common.lane.LaneCallBindingContext;
 import world.willfrog.alphafrogmicro.common.lane.LaneCallRouter;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
+import world.willfrog.alphafrogmicro.common.lane.LaneDubboServiceKey;
 import world.willfrog.alphafrogmicro.common.lane.LaneEndpoint;
 import world.willfrog.alphafrogmicro.common.lane.LaneExactInstanceRouter;
 import world.willfrog.alphafrogmicro.common.lane.LaneRouteTable;
@@ -296,6 +297,7 @@ class LaneWebFilterTest {
                 "lane-test",
                 "agent-langchain-service",
                 new DeploymentIdentity("beta-main-001", GENERATION),
+                agentDubboServiceKey(),
                 registrationName(),
                 binding,
                 17);
@@ -305,6 +307,7 @@ class LaneWebFilterTest {
         return new LaneServiceRoute(
                 "lane-test",
                 "agent-langchain-service",
+                agentDubboServiceKey(),
                 registrationName(),
                 instanceId,
                 "release-b",
@@ -346,11 +349,11 @@ class LaneWebFilterTest {
     }
 
     private static String registrationName() {
-        return agentProtocolServiceKey() + "@@providers";
+        return "providers:" + agentInterfaceName() + "::" + AGENT_GROUP;
     }
 
-    private static String agentProtocolServiceKey() {
-        return agentInterfaceName() + ":1.0";
+    private static LaneDubboServiceKey agentDubboServiceKey() {
+        return new LaneDubboServiceKey(AGENT_GROUP, agentInterfaceName(), "");
     }
 
     private static String agentInterfaceName() {

@@ -56,25 +56,7 @@ public final class LaneRouteTable {
                 exact = route;
             }
         }
-        if (exact != null) {
-            return exact;
-        }
-        // Nacos 末尾的 @@providers 是登记类别，不属于 Dubbo 协议服务键。
-        // 分组、接口名和版本仍全部保留；若去掉类别后出现多个候选，则拒绝猜测。
-        String protocolServiceKey = stripRegistryCategorySuffix(registrationServiceName);
-        LaneServiceRoute matched = null;
-        for (LaneServiceRoute route : routes) {
-            if (!trafficScopeId.equals(route.trafficScopeId())
-                    || route.registrationServiceName() == null
-                    || !protocolServiceKey.equals(stripRegistryCategorySuffix(route.registrationServiceName()))) {
-                continue;
-            }
-            if (matched != null && matched != route) {
-                return null;
-            }
-            matched = route;
-        }
-        return matched;
+        return exact;
     }
 
     public LaneServiceRoute findByDubboServiceKey(
@@ -86,7 +68,7 @@ public final class LaneRouteTable {
         LaneServiceRoute matched = null;
         for (LaneServiceRoute route : routes) {
             if (!trafficScopeId.equals(route.trafficScopeId())
-                    || !dubboServiceKey.matchesNacosRegistration(route.registrationServiceName())) {
+                    || !dubboServiceKey.equals(route.dubboServiceKey())) {
                 continue;
             }
             if (matched != null && matched != route) {
@@ -105,11 +87,4 @@ public final class LaneRouteTable {
         return trafficScopeId + "\0" + serviceName;
     }
 
-    private static String stripRegistryCategorySuffix(String registrationServiceName) {
-        int groupSeparator = registrationServiceName.indexOf("@@");
-        if (groupSeparator < 0) {
-            return registrationServiceName;
-        }
-        return registrationServiceName.substring(0, groupSeparator);
-    }
 }

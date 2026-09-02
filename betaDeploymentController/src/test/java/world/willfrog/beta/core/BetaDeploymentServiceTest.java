@@ -73,6 +73,10 @@ class BetaDeploymentServiceTest {
         String oldInstance = serviceState().path("activeInstance").path("instanceId").asText();
         assertEquals(oldInstance, service.route("main-beta", "agent-service")
                 .path("route").path("defaultInstanceId").asText());
+        assertEquals("langchain/com.alphafrog.AgentService",
+                service.route("main-beta", "agent-service").path("dubboServiceKey").asText());
+        assertEquals("langchain/com.alphafrog.AgentService",
+                service.status("main-beta", "agent-service").path("dubboServiceKey").asText());
 
         ObjectNode second = manifest(2, "release-2", '2', 'c', 'd');
         service.submitManifest(second);
@@ -145,6 +149,15 @@ class BetaDeploymentServiceTest {
         assertEquals("SERVICE_LOCATION_IMMUTABLE", assertThrows(ControllerException.class,
                 () -> service.submitManifest(moved)).code());
 
+        ObjectNode changedDubboIdentity = manifest(2, "release-2", '2', 'c', 'd');
+        ObjectNode changedSpec = (ObjectNode) changedDubboIdentity.path("services").path(0);
+        changedSpec.put("dubboServiceKey", "experimental/com.alphafrog.AgentService");
+        ((ObjectNode) changedSpec.path("registration"))
+                .put("serviceName", "providers:com.alphafrog.AgentService::experimental");
+        changedSpec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, changedSpec));
+        assertEquals("DUBBO_SERVICE_KEY_IMMUTABLE", assertThrows(ControllerException.class,
+                () -> service.submitManifest(changedDubboIdentity)).code());
+
         ObjectNode other = manifest(1, "release-x", '3', 'e', 'f');
         other.put("deploymentId", "beta-other-001");
         assertEquals("TRAFFIC_SCOPE_CONFLICT", assertThrows(ControllerException.class,
@@ -174,6 +187,20 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void rejectsTwoServicesWithTheSameDubboServiceKey() {
+        ObjectNode duplicate = twoServiceManifest();
+        ObjectNode second = (ObjectNode) duplicate.path("services").path(1);
+        second.put("dubboServiceKey", "langchain/com.alphafrog.AgentService");
+        ((ObjectNode) second.path("registration"))
+                .put("serviceName", "providers:com.alphafrog.AgentService::langchain");
+        second.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, second));
+
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> service.submitManifest(duplicate)).code());
+        assertFalse(store.hasManifest("beta-main-001"));
+    }
+
+    @Test
     void startupPromotesACompleteLeadingManifestAndFinishesTheDeleteWindow() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b'));
         service.reconcileOne();
@@ -197,6 +224,28 @@ class BetaDeploymentServiceTest {
         store.deleteManifest("beta-main-001");
         service.verifyPersistentStateAtStartup();
         assertEquals(0, store.snapshot().path("deployments").size());
+    }
+
+    @Test
+    void startupRejectsALeadingManifestThatChangesTheDubboServiceKey() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b'));
+        service.reconcileOne();
+        service.reconcileOne();
+        service.reconcileOne();
+
+        ObjectNode next = manifest(2, "release-2", '2', 'c', 'd');
+        ObjectNode nextSpec = (ObjectNode) next.path("services").path(0);
+        nextSpec.put("dubboServiceKey", "experimental/com.alphafrog.AgentService");
+        ((ObjectNode) nextSpec.path("registration"))
+                .put("serviceName", "providers:com.alphafrog.AgentService::experimental");
+        nextSpec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, nextSpec));
+        store.writeManifest("beta-main-001", next);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                service::verifyPersistentStateAtStartup);
+        assertEquals("STATE_MANIFEST_MISMATCH", failure.code());
+        assertEquals(1, store.snapshot().path("deployments").path(0)
+                .path("acceptedManifestVersion").asLong());
     }
 
     @Test
@@ -642,6 +691,7 @@ class BetaDeploymentServiceTest {
         manifest.put("expiresAt", "2026-09-10T00:00:00Z");
         ObjectNode spec = manifest.putArray("services").addObject();
         spec.put("serviceName", "agent-service");
+        spec.put("dubboServiceKey", "langchain/com.alphafrog.AgentService");
         spec.put("releaseId", release);
         spec.put("serviceSpecSha256", "0".repeat(64));
         spec.put("machineId", "beta-machine-1");
@@ -658,7 +708,7 @@ class BetaDeploymentServiceTest {
         runtime.put("applicationDrainSeconds", 55);
         runtime.put("drainGraceSeconds", 60);
         ObjectNode registration = spec.putObject("registration");
-        registration.put("serviceName", "com.alphafrog.AgentService:1.0@@providers");
+        registration.put("serviceName", "providers:com.alphafrog.AgentService::langchain");
         registration.put("groupName", "DEFAULT_GROUP");
         registration.put("namespaceId", "public");
         registration.put("clusterName", "DEFAULT");
@@ -671,6 +721,7 @@ class BetaDeploymentServiceTest {
         ObjectNode manifest = manifest(1, "release-1", '1', 'a', 'b');
         ObjectNode tools = ((ObjectNode) manifest.path("services").path(0)).deepCopy();
         tools.put("serviceName", "tools-service");
+        tools.put("dubboServiceKey", "tools/com.alphafrog.ToolsService");
         tools.put("releaseId", "tools-release-1");
         ((ObjectNode) tools.path("image"))
                 .put("repositoryDigest", "registry.local/tools-service@sha256:" + "e".repeat(64))
@@ -679,7 +730,8 @@ class BetaDeploymentServiceTest {
                 (com.fasterxml.jackson.databind.node.ArrayNode) tools.path("runtime").path("hostPorts");
         ports.set(0, mapper.getNodeFactory().numberNode(29080));
         ports.set(1, mapper.getNodeFactory().numberNode(29081));
-        ((ObjectNode) tools.path("registration")).put("serviceName", "com.alphafrog.ToolsService:1.0@@providers");
+        ((ObjectNode) tools.path("registration"))
+                .put("serviceName", "providers:com.alphafrog.ToolsService::tools");
         tools.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, tools));
         ((com.fasterxml.jackson.databind.node.ArrayNode) manifest.path("services")).add(tools);
         return manifest;

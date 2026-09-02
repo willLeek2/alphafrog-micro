@@ -24,8 +24,11 @@ class ControllerLaneRouteFactsClientTest {
         assertEquals("10.0.0.8", facts.callBinding().endpoint().address());
         assertEquals(28081, facts.callBinding().endpoint().port());
         assertEquals(
-                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
+                "providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::langchain",
                 facts.registrationServiceName());
+        assertEquals(
+                "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService",
+                facts.dubboServiceKey().value());
         assertEquals(17, facts.stateVersion());
     }
 
@@ -43,16 +46,25 @@ class ControllerLaneRouteFactsClientTest {
     }
 
     @Test
-    void rejectsRegistrationThatDoesNotMatchConfiguredDubboCallIdentity() {
-        String anotherInterface = validStatus().replace(
-                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
-                "world.willfrog.alphafrogmicro.agent.idl.AnotherDubboService:1.0@@providers");
+    void rejectsPersistedDubboCallIdentityThatDoesNotMatchTheConfiguredIdentity() {
+        String anotherGroup = validStatus().replace(
+                "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService",
+                "experimental/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService");
         String anotherVersion = validStatus().replace(
-                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
-                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:2.0@@providers");
+                "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService",
+                "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:2.0");
 
-        assertTrue(client.parseStatus(anotherInterface, "lane-test", "agent-langchain-service").isEmpty());
+        assertTrue(client.parseStatus(anotherGroup, "lane-test", "agent-langchain-service").isEmpty());
         assertTrue(client.parseStatus(anotherVersion, "lane-test", "agent-langchain-service").isEmpty());
+    }
+
+    @Test
+    void rejectsARegistrationNameThatDoesNotBelongToThePersistedDubboIdentity() {
+        String wrongRegistrationGroup = validStatus().replace(
+                "providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::langchain",
+                "providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::experimental");
+
+        assertTrue(client.parseStatus(wrongRegistrationGroup, "lane-test", "agent-langchain-service").isEmpty());
     }
 
     @Test
@@ -69,6 +81,7 @@ class ControllerLaneRouteFactsClientTest {
         return """
                 {
                   "serviceName":"agent-langchain-service",
+                  "dubboServiceKey":"langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService",
                   "phase":"STABLE",
                   "deploymentId":"beta-main-001",
                   "trafficScopeId":"lane-test",
@@ -85,7 +98,7 @@ class ControllerLaneRouteFactsClientTest {
                     "deploymentGenerationId":"%s",
                     "endpoint":{"address":"10.0.0.8","port":28081},
                     "registration":{
-                      "serviceName":"world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
+                      "serviceName":"providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::langchain",
                       "ip":"10.0.0.8",
                       "port":28081,
                       "enabled":true,
