@@ -418,6 +418,11 @@ function customErrors(manifestValue, stateValue) {
         if (item.operation.candidateInstanceId !== item.activeInstance.instanceId) {
           errors.push(`published create operation instance ${item.serviceName}`);
         }
+        if (item.route.defaultInstanceId !== item.activeInstance.instanceId
+            || item.route.defaultReleaseId !== item.activeInstance.releaseId
+            || item.route.defaultDeploymentGenerationId !== item.activeInstance.deploymentGenerationId) {
+          errors.push(`published create route ${item.serviceName}`);
+        }
       }
       const roleSlots = new Set();
       for (const instance of [item.activeInstance, item.candidateInstance, item.drainingInstance].filter(Boolean)) {
@@ -661,6 +666,16 @@ try {
   const publishedCreateOperationMismatch = clone(positiveStates.createPublishedAwaitingConfirmation);
   publishedCreateOperationMismatch.deployments[0].services[0].operation.candidateInstanceId = 'instance-other';
   customNegatives.push(['published create operation instance', manifest, publishedCreateOperationMismatch]);
+  const publishedCreateRouteInstanceMismatch = clone(positiveStates.createPublishedAwaitingConfirmation);
+  publishedCreateRouteInstanceMismatch.deployments[0].services[0].route.defaultInstanceId = 'instance-other';
+  runAjv('validate', stateSchema,
+    writeFixture('state-published-create-route-instance-structurally-valid', publishedCreateRouteInstanceMismatch), true);
+  customNegatives.push(['published create route instance', manifest, publishedCreateRouteInstanceMismatch]);
+  const publishedCreateRouteGenerationMismatch = clone(positiveStates.createPublishedAwaitingConfirmation);
+  publishedCreateRouteGenerationMismatch.deployments[0].services[0].route.defaultDeploymentGenerationId = previousGeneration;
+  runAjv('validate', stateSchema,
+    writeFixture('state-published-create-route-generation-structurally-valid', publishedCreateRouteGenerationMismatch), true);
+  customNegatives.push(['published create route generation', manifest, publishedCreateRouteGenerationMismatch]);
   const drainingSwitchMismatch = clone(positiveStates.updateDraining);
   drainingSwitchMismatch.deployments[0].services[0].drainingInstance.trafficRemovedAt = '2026-09-01T00:02:01Z';
   customNegatives.push(['draining switch time', manifest, drainingSwitchMismatch]);
