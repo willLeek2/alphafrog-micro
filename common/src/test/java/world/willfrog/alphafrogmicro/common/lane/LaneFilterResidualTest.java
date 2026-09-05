@@ -26,7 +26,6 @@ class LaneFilterResidualTest {
         MDC.clear();
         RpcContext.removeContext();
         RpcContext.removeServerContext();
-        LaneRoutingSupport.reset();
     }
 
     @Test
@@ -48,71 +47,114 @@ class LaneFilterResidualTest {
     }
 
     @Test
-    void provider_markedCall_shouldExposeScopeInsideInvoker() {
+    void provider_markedCall_shouldExposeOfficialTagInsideInvoker() {
         LaneContext.setTrafficScopeId("previous-scope");
         Invocation invocation = mock(Invocation.class);
-        when(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)).thenReturn("main-beta");
+        when(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).thenReturn("lane-test");
         AtomicReference<String> inside = new AtomicReference<>();
         new LaneProviderEntryFilter().invoke(invoker(() -> {
             inside.set(LaneContext.trafficScopeId());
             return mock(Result.class);
         }), invocation);
-        assertThat(inside.get()).isEqualTo("main-beta");
+        assertThat(inside.get()).isEqualTo("lane-test");
         assertThat(LaneContext.trafficScopeId()).isEqualTo("previous-scope");
     }
 
     @Test
-    void consumer_unmarkedCall_shouldRemoveOutboundAttachmentBeforeInvoke() {
+    void provider_legacyCustomAttachment_shouldNotRestoreScope() {
+        LaneContext.setTrafficScopeId("previous-scope");
+        Invocation invocation = mock(Invocation.class);
+        when(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).thenReturn(null);
+        when(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)).thenReturn("lane-test");
+        AtomicReference<String> inside = new AtomicReference<>();
+        new LaneProviderEntryFilter().invoke(invoker(() -> {
+            inside.set(LaneContext.trafficScopeId());
+            return mock(Result.class);
+        }), invocation);
+        assertThat(inside.get()).isNull();
+        assertThat(LaneContext.trafficScopeId()).isEqualTo("previous-scope");
+    }
+
+    @Test
+    void consumer_unmarkedCall_shouldRemoveOfficialTagBeforeInvoke() {
+        RpcContext.getClientAttachment().setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-tag");
         RpcContext.getClientAttachment().setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "stale-scope");
-        MDC.put(LaneContext.MDC_LANE_TAG, "stale-scope");
+        MDC.put(LaneContext.MDC_LANE_TAG, "stale-tag");
         LaneContext.clear();
         AtomicBoolean insideClean = new AtomicBoolean();
         new LaneConsumerHopFilter().invoke(invoker(() -> {
             insideClean.set(
-                    RpcContext.getClientAttachment().getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                    RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY) == null
+                            && RpcContext.getClientAttachment()
+                                    .getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
                             && MDC.get(LaneContext.MDC_LANE_TAG) == null);
             return mock(Result.class);
         }), mock(Invocation.class));
         assertThat(insideClean).isTrue();
+        assertThat(RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY))
+                .isEqualTo("stale-tag");
         assertThat(RpcContext.getClientAttachment().getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID))
                 .isEqualTo("stale-scope");
     }
 
     @Test
-    void consumer_markedCall_shouldWriteScopeBeforeInvoke() {
-        LaneContext.setTrafficScopeId("main-beta");
-        AtomicReference<String> outbound = new AtomicReference<>();
+    void consumer_laneTag_shouldWriteOfficialTagBeforeInvoke() {
+        LaneContext.setTrafficScopeId("lane-test");
+        RpcInvocation invocation = new RpcInvocation();
+        AtomicReference<String> clientTag = new AtomicReference<>();
+        AtomicReference<String> invocationTag = new AtomicReference<>();
         new LaneConsumerHopFilter().invoke(invoker(() -> {
-            outbound.set(RpcContext.getClientAttachment().getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID));
+            clientTag.set(RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY));
+            invocationTag.set(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY));
             return mock(Result.class);
-        }), mock(Invocation.class));
-        assertThat(outbound.get()).isEqualTo("main-beta");
-        assertThat(LaneContext.trafficScopeId()).isEqualTo("main-beta");
+        }), invocation);
+        assertThat(clientTag.get()).isEqualTo("lane-test");
+        assertThat(invocationTag.get()).isEqualTo("lane-test");
+        assertThat(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)).isNull();
+        assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-test");
     }
 
     @Test
-    void consumer_unmarkedRpcInvocation_shouldClearStaleInvocationAttachmentInsideInvoker() {
+    void consumer_mainBeta_shouldNotWriteOfficialTag() {
+        LaneContext.setTrafficScopeId(LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID);
+        RpcContext.getClientAttachment().setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-tag");
+        RpcInvocation invocation = new RpcInvocation();
+        invocation.setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-tag");
+        AtomicBoolean insideClean = new AtomicBoolean();
+        new LaneConsumerHopFilter().invoke(invoker(() -> {
+            insideClean.set(
+                    RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY) == null
+                            && invocation.getAttachment(LaneContext.DUBBO_TAG_KEY) == null);
+            return mock(Result.class);
+        }), invocation);
+        assertThat(insideClean).isTrue();
+        assertThat(LaneContext.trafficScopeId()).isEqualTo(LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID);
+    }
+
+    @Test
+    void consumer_unmarkedRpcInvocation_shouldClearStaleOfficialTagInsideInvoker() {
         LaneContext.clear();
         RpcInvocation invocation = new RpcInvocation();
+        invocation.setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-invocation-tag");
         invocation.setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "stale-invocation-scope");
         AtomicBoolean insideClean = new AtomicBoolean();
         new LaneConsumerHopFilter().invoke(invoker(() -> {
             insideClean.set(
-                    invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
-                            && RpcContext.getClientAttachment()
-                                    .getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                    invocation.getAttachment(LaneContext.DUBBO_TAG_KEY) == null
+                            && invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                            && RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY) == null
                             && MDC.get(LaneContext.MDC_LANE_TAG) == null);
             return mock(Result.class);
         }), invocation);
         assertThat(insideClean).isTrue();
+        assertThat(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).isEqualTo("stale-invocation-tag");
         assertThat(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID))
                 .isEqualTo("stale-invocation-scope");
     }
 
     @Test
     void provider_unmarkedRpcInvocation_shouldIgnoreStaleServerAttachment() {
-        RpcContext.getServerAttachment()
-                .setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "stale-server-scope");
+        RpcContext.getServerAttachment().setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-server-tag");
         LaneContext.setTrafficScopeId("outer-scope");
         MDC.put(LaneContext.MDC_LANE_TAG, "outer-scope");
         RpcInvocation invocation = new RpcInvocation();
@@ -140,7 +182,7 @@ class LaneFilterResidualTest {
 
     private static Invocation unmarkedInvocation() {
         Invocation invocation = mock(Invocation.class);
-        when(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)).thenReturn(null);
+        when(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).thenReturn(null);
         return invocation;
     }
 }
