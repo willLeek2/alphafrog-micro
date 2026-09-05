@@ -27,7 +27,6 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
@@ -90,8 +89,7 @@ class AgentControllerTest {
         ObjectMapper objectMapper = new ObjectMapper();
         controller = new AgentController(new AgentAuthSupport(authService), creditGateway,
                 objectMapper, runResultCacheService, callDetailBlobReader, new AgentTracePartsService(),
-                new AgentTimelineMergeService(objectMapper),
-                () -> new DeploymentIdentity("stable", "gen-" + "1".repeat(64)));
+                new AgentTimelineMergeService(objectMapper));
         ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
 
         authentication = mock(Authentication.class);
@@ -132,8 +130,6 @@ class AgentControllerTest {
         ArgumentCaptor<world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest> captor =
                 ArgumentCaptor.forClass(world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest.class);
         verify(agentDubboService).createRun(captor.capture());
-        assertEquals("stable", captor.getValue().getDeploymentId());
-        assertEquals("gen-" + "1".repeat(64), captor.getValue().getDeploymentGenerationId());
     }
 
     @Test
@@ -342,12 +338,10 @@ class AgentControllerTest {
         verify(agentDubboService).sendMessage(captor.capture());
         assertEquals("{\"x\":1}", captor.getValue().getContextOverride());
         assertEquals(false, captor.getValue().getStream());
-        assertEquals("stable", captor.getValue().getDeploymentId());
-        assertEquals("gen-" + "1".repeat(64), captor.getValue().getDeploymentGenerationId());
     }
 
     @Test
-    void resume_shouldWriteTrustedDeploymentIdentity() {
+    void resume_shouldSendTheUserAndRunToTheAgentService() {
         when(agentDubboService.resumeRun(any(ResumeAgentRunRequest.class))).thenReturn(
                 AgentRunMessage.newBuilder().setId("run-1").setStatus("RECEIVED").build());
 
@@ -355,8 +349,8 @@ class AgentControllerTest {
 
         ArgumentCaptor<ResumeAgentRunRequest> captor = ArgumentCaptor.forClass(ResumeAgentRunRequest.class);
         verify(agentDubboService).resumeRun(captor.capture());
-        assertEquals("stable", captor.getValue().getDeploymentId());
-        assertEquals("gen-" + "1".repeat(64), captor.getValue().getDeploymentGenerationId());
+        assertEquals("1127", captor.getValue().getUserId());
+        assertEquals("run-1", captor.getValue().getId());
     }
 
     @Test

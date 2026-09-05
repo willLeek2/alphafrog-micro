@@ -12,7 +12,6 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedHashSet;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.MDC;
@@ -21,11 +20,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.filter.OncePerRequestFilter;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
-import world.willfrog.alphafrogmicro.common.lane.LaneCallBindingContext;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneEntryProperties;
-import world.willfrog.alphafrogmicro.frontend.lane.LaneRequestContext;
-import world.willfrog.alphafrogmicro.frontend.lane.LaneRouteFacts;
-import world.willfrog.alphafrogmicro.frontend.lane.LaneRouteFactsSource;
 
 /**
  * 在 JWT 身份建立后决定当前请求是否进入测试流量范围，并在离开请求线程前恢复旧上下文。
@@ -38,13 +33,11 @@ public class LaneWebFilter extends OncePerRequestFilter {
     public static final String LANE_TAG_HEADER = "X-AlphaFrog-Lane-Tag";
 
     private final LaneEntryProperties properties;
-    private final LaneRouteFactsSource routeFactsSource;
     private final Set<String> strippedHeaders;
     private final AtomicBoolean invalidConfigurationReported = new AtomicBoolean();
 
-    public LaneWebFilter(LaneEntryProperties properties, LaneRouteFactsSource routeFactsSource) {
+    public LaneWebFilter(LaneEntryProperties properties) {
         this.properties = properties;
-        this.routeFactsSource = routeFactsSource;
         properties.validateStaticConfiguration();
         this.strippedHeaders = lowercase(Set.of(
                 properties.getPassphraseHeader(),
@@ -56,6 +49,16 @@ public class LaneWebFilter extends OncePerRequestFilter {
     }
 
     @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
+    @Override
+    protected boolean shouldNotFilterErrorDispatch() {
+        return false;
+    }
+
+    @Override
     protected void doFilterInternal(
             HttpServletRequest request,
             HttpServletResponse response,
@@ -63,33 +66,18 @@ public class LaneWebFilter extends OncePerRequestFilter {
         String suppliedPassphrase = request.getHeader(properties.getPassphraseHeader());
         HttpServletRequest sanitized = new StrippedHeaderRequest(request, strippedHeaders);
         String previousScope = LaneContext.trafficScopeId();
-        LaneRouteFacts previousFacts = LaneRequestContext.current();
-        LaneCallBindingContext.PinnedBinding previousBinding = LaneCallBindingContext.current();
         String previousMdc = MDC.get(LaneContext.MDC_LANE_TAG);
 
         LaneContext.clear();
-        LaneRequestContext.clear();
-        LaneCallBindingContext.clear();
         MDC.remove(LaneContext.MDC_LANE_TAG);
         try {
-            if (requiresTaggedRoute(request, suppliedPassphrase)) {
-                Optional<LaneRouteFacts> selected = routeFactsSource.current(
-                        properties.getTrafficScopeId(), properties.getIdentityServiceName());
-                if (selected.isEmpty()) {
-                    response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
-                    return;
-                }
-                LaneRouteFacts facts = selected.orElseThrow();
-                LaneContext.setTrafficScopeId(facts.trafficScopeId());
-                LaneRequestContext.set(facts);
-                LaneCallBindingContext.set(facts.dubboServiceKey(), facts.callBinding());
-                MDC.put(LaneContext.MDC_LANE_TAG, facts.trafficScopeId());
+            if (requiresTag(request, suppliedPassphrase)) {
+                LaneContext.setTrafficScopeId(properties.getTrafficScopeId());
+                MDC.put(LaneContext.MDC_LANE_TAG, properties.getTrafficScopeId());
             }
             chain.doFilter(sanitized, response);
         } finally {
             LaneContext.restore(previousScope);
-            LaneRequestContext.restore(previousFacts);
-            LaneCallBindingContext.restore(previousBinding);
             if (previousMdc == null) {
                 MDC.remove(LaneContext.MDC_LANE_TAG);
             } else {
@@ -98,7 +86,15 @@ public class LaneWebFilter extends OncePerRequestFilter {
         }
     }
 
-    private boolean requiresTaggedRoute(HttpServletRequest request, String suppliedPassphrase) {
+    @Override
+    protected void doFilterNestedErrorDispatch(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            FilterChain chain) throws ServletException, IOException {
+        chain.doFilter(new StrippedHeaderRequest(request, strippedHeaders), response);
+    }
+
+    private boolean requiresTag(HttpServletRequest request, String suppliedPassphrase) {
         if (!properties.isEnabled()) {
             return false;
         }
