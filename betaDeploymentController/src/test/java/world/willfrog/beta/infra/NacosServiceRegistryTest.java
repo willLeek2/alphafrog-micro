@@ -35,10 +35,12 @@ class NacosServiceRegistryTest {
         naming = mock(NamingService.class);
         registry = new NacosServiceRegistry(naming, "public");
         ObjectMapper mapper = new ObjectMapper();
-        manifest = mapper.readTree("{\"trafficScopeId\":\"main-beta\"}");
+        manifest = mapper.readTree("{\"deploymentId\":\"beta-main-001\",\"trafficScopeId\":\"main-beta\"}");
         service = mapper.readTree("""
-                {"releaseId":"release-1","registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
-                 "groupName":"DEFAULT_GROUP","namespaceId":"public","clusterName":"DEFAULT"}}
+                {"releaseId":"release-1","dubboServiceKey":"langchain/com.alphafrog.AgentService",
+                 "registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
+                 "groupName":"alphafrog-beta","namespaceId":"public","clusterName":"DEFAULT",
+                 "applicationName":"agent-langchain-service"}}
                 """);
     }
 
@@ -55,6 +57,16 @@ class NacosServiceRegistryTest {
         assertEquals(false, registration.enabled());
         assertEquals(0, registration.weight());
         assertEquals("nacos-i-one", registration.nacosInstanceId());
+        assertEquals("beta", registration.metadata().get("zone"));
+        assertEquals("beta-main-001", registration.metadata().get("alphafrog.deployment-id"));
+        assertEquals("tri", registration.metadata().get("protocol"));
+        assertEquals("com.alphafrog.AgentService", registration.metadata().get("path"));
+        assertEquals("com.alphafrog.AgentService", registration.metadata().get("interface"));
+        assertEquals("langchain", registration.metadata().get("group"));
+        assertEquals("", registration.metadata().get("version"));
+        assertEquals("agent-langchain-service", registration.metadata().get("application"));
+        assertEquals("providers", registration.metadata().get("category"));
+        assertEquals("provider", registration.metadata().get("side"));
         verify(naming).registerInstance(anyString(), anyString(), any(Instance.class));
         verify(naming).deregisterInstance(anyString(), anyString(), anyString(),
                 org.mockito.ArgumentMatchers.anyInt(), anyString());
@@ -64,7 +76,7 @@ class NacosServiceRegistryTest {
     @Test
     void rejectsNamespaceDriftAndDuplicateExactRegistrations() throws Exception {
         JsonNode wrongNamespace = new ObjectMapper().readTree("""
-                {"releaseId":"release-1","registration":{"serviceName":"service","groupName":"DEFAULT_GROUP",
+                {"releaseId":"release-1","registration":{"serviceName":"service","groupName":"alphafrog-beta",
                  "namespaceId":"other","clusterName":"DEFAULT"}}
                 """);
         assertEquals("NACOS_NAMESPACE_MISMATCH", assertThrows(ControllerException.class,
@@ -79,9 +91,28 @@ class NacosServiceRegistryTest {
     }
 
     @Test
+    void laneRegistrationCarriesTheOfficialProviderTagAndItsObservationMirror() throws Exception {
+        manifest = new ObjectMapper().readTree(
+                "{\"deploymentId\":\"beta-lane-a\",\"trafficScopeId\":\"lane-a\"}");
+        Instance observed = instance(false);
+        observed.getMetadata().put("alphafrog.deployment-id", "beta-lane-a");
+        observed.getMetadata().put("alphafrog.traffic-scope-id", "lane-a");
+        observed.getMetadata().put("tag", "lane-a");
+        observed.getMetadata().put("dubbo.tag", "lane-a");
+        when(naming.getAllInstances(anyString(), anyString(), anyList(), anyBoolean()))
+                .thenReturn(List.of(observed));
+
+        ServiceRegistry.Registration registration = registry.register(manifest, service, "i-one",
+                "gen-" + "a".repeat(64), "10.0.0.8", 28080, false);
+
+        assertEquals("lane-a", registration.metadata().get("tag"));
+        assertEquals("lane-a", registration.metadata().get("dubbo.tag"));
+    }
+
+    @Test
     void distinguishesAnAbsentRegistrationFromAConflictingIdentity() throws Exception {
         ServiceRegistry.Registration expected = new ServiceRegistry.Registration(
-                "providers:com.alphafrog.AgentService::langchain", "DEFAULT_GROUP", "public", "DEFAULT",
+                "providers:com.alphafrog.AgentService::langchain", "alphafrog-beta", "public", "DEFAULT",
                 "10.0.0.8", 28080, "nacos-i-one", false, true, 0, true, instance(false).getMetadata());
         when(naming.getAllInstances(anyString(), anyString(), anyList(), anyBoolean()))
                 .thenReturn(List.of());
@@ -106,10 +137,21 @@ class NacosServiceRegistryTest {
         value.setWeight(selectable ? 1 : 0);
         value.setEphemeral(true);
         Map<String, String> metadata = new LinkedHashMap<>();
+        metadata.put("alphafrog.deployment-id", "beta-main-001");
         metadata.put("alphafrog.traffic-scope-id", "main-beta");
         metadata.put("alphafrog.release-id", "release-1");
         metadata.put("alphafrog.deployment-generation-id", "gen-" + "a".repeat(64));
         metadata.put("alphafrog.instance-id", "i-one");
+        metadata.put("zone", "beta");
+        metadata.put("application", "agent-langchain-service");
+        metadata.put("category", "providers");
+        metadata.put("dynamic", "true");
+        metadata.put("group", "langchain");
+        metadata.put("interface", "com.alphafrog.AgentService");
+        metadata.put("path", "com.alphafrog.AgentService");
+        metadata.put("protocol", "tri");
+        metadata.put("side", "provider");
+        metadata.put("version", "");
         value.setMetadata(metadata);
         return value;
     }

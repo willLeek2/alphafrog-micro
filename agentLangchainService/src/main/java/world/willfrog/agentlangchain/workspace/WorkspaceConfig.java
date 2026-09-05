@@ -26,8 +26,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Configuration
 // 260814 scheduler-03: workspace export 总开关默认关闭；关闭时 dump executor
 // bean 不创建。
-@ConditionalOnExpression("${agent.workspace.export-enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}")
 public class WorkspaceConfig {
 
     @Bean(name = "workspaceDumpExecutor")

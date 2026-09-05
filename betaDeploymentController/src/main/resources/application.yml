@@ -24,7 +24,7 @@ alphafrog:
     enabled: ${AF_BETA_CONTROLLER_ENABLED:false}
     state-root: ${AF_BETA_CONTROLLER_STATE_ROOT:/var/lib/alphafrog-beta}
     reconcile-delay: ${AF_BETA_CONTROLLER_RECONCILE_DELAY:PT2S}
-    retirement-token-file: ${AF_BETA_RETIREMENT_TOKEN_FILE:/etc/alphafrog-beta/secrets/agent-retirement-token}
+    application-drain-seconds: ${AF_BETA_APPLICATION_DRAIN_SECONDS:60}
     api-token-file: ${AF_BETA_CONTROLLER_API_TOKEN_FILE:/etc/alphafrog-beta/secrets/controller-api-token}
     healthcheck-script: ${AF_BETA_HEALTHCHECK_SCRIPT:/opt/alphafrog-beta/bin/tcp-healthcheck}
     nacos:

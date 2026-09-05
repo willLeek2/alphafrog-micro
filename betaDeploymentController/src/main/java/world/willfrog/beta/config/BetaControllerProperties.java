@@ -13,7 +13,7 @@ public class BetaControllerProperties {
     private boolean enabled;
     private Path stateRoot = Path.of("/var/lib/alphafrog-beta");
     private Duration reconcileDelay = Duration.ofSeconds(2);
-    private Path retirementTokenFile = Path.of("/etc/alphafrog-beta/secrets/agent-retirement-token");
+    private int applicationDrainSeconds = 60;
     private Path apiTokenFile = Path.of("/etc/alphafrog-beta/secrets/controller-api-token");
     private Path healthcheckScript = Path.of("/opt/alphafrog-beta/bin/tcp-healthcheck");
     private final Nacos nacos = new Nacos();
@@ -26,8 +26,10 @@ public class BetaControllerProperties {
     public void setStateRoot(Path stateRoot) { this.stateRoot = stateRoot; }
     public Duration getReconcileDelay() { return reconcileDelay; }
     public void setReconcileDelay(Duration reconcileDelay) { this.reconcileDelay = reconcileDelay; }
-    public Path getRetirementTokenFile() { return retirementTokenFile; }
-    public void setRetirementTokenFile(Path retirementTokenFile) { this.retirementTokenFile = retirementTokenFile; }
+    public int getApplicationDrainSeconds() { return applicationDrainSeconds; }
+    public void setApplicationDrainSeconds(int applicationDrainSeconds) {
+        this.applicationDrainSeconds = applicationDrainSeconds;
+    }
     public Path getApiTokenFile() { return apiTokenFile; }
     public void setApiTokenFile(Path apiTokenFile) { this.apiTokenFile = apiTokenFile; }
     public Path getHealthcheckScript() { return healthcheckScript; }

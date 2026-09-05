@@ -1,7 +1,9 @@
 package world.willfrog.agentlangchain.execution.dag;
 
+import com.alibaba.ttl.threadpool.TtlExecutors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -24,6 +26,7 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.execution.LangchainBudgetPartialAnswerBuilder;
+import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -45,6 +48,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -64,7 +68,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>将 todo items 构建为 {@link LangchainDagExecutionGraph}，并检测是否存在环（circular dependency）；</li>
  *   <li>为每个 todo 节点创建 {@link CompletableFuture} 依赖链，前置依赖完成后才调度执行；</li>
  *   <li>通过线程池并发执行就绪节点；工作线程用 OpenTelemetry {@code Context.taskWrapping}
- *       接上调度线程的追踪上下文，并恢复 {@link AgentContext.ContextSnapshot}；</li>
+ *       接上调度线程的追踪上下文，用 TTL 包装传递泳道标签，并恢复
+ *       {@link AgentContext.ContextSnapshot}；</li>
  *   <li>支持失败传播：若某节点失败，其所有下游节点自动标记为 SKIPPED（跳过）；</li>
  *   <li>所有节点完成后，调用 {@link LangchainTodoNodeExecutor#writeFinalAnswer} 生成最终答案。</li>
  * </ol>
@@ -260,8 +265,8 @@ public class LangchainDagWorkflowExecutor {
      *       等待完成，总超时 30 分钟。</li>
      * </ol>
      *
-     * <p>线程上下文传递：父线程的 {@link AgentContext.ContextSnapshot} 被捕获，
-     * 每个工作线程在执行节点前恢复该快照，确保 runId/userId/phase 等上下文在 observability trace 中正确关联。</p>
+     * <p>线程上下文传递：父线程的 {@link AgentContext.ContextSnapshot}、泳道标签与日志标签被捕获，
+     * 每个工作线程在执行节点前恢复这些值，确保 runId/userId/phase 等上下文和下游 Dubbo 标签正确关联。</p>
      *
      * @param graph         DAG 执行图，包含节点映射和依赖关系
      * @param items         所有 todo items
@@ -307,13 +312,15 @@ public class LangchainDagWorkflowExecutor {
         Map<String, TodoItem> nodeStates = new LinkedHashMap<>();
         // 捕获父线程的 AgentContext 快照，工作线程在执行节点前恢复此快照，确保 observability trace 关联到正确的 runId/userId
         AgentContext.ContextSnapshot parentContext = AgentContext.captureRunContext();
+        DagLaneContextSnapshot parentLaneContext = DagLaneContextSnapshot.capture();
 
         // 线程池大小 = min(配置上限, 实际节点数)，至少为 1。
         // 当节点数少于配置上限时不需要创建多余线程（避免空闲线程浪费），但不能超过配置上限（避免并发 LLM 调用打满 rate limit）
         int poolSize = Math.max(1, Math.min(dagThreadPoolSize, items.size()));
         ThreadPoolExecutor pool = new ThreadPoolExecutor(
                 poolSize, poolSize, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
-        DagObserve observe = new DagObserve(pool, runId, userId);
+        ExecutorService ttlPool = TtlExecutors.getTtlExecutorService(pool);
+        DagObserve observe = new DagObserve(pool, ttlPool, runId, userId);
         AtomicInteger completedCount = new AtomicInteger();
         long scheduleStartedNanos = System.nanoTime();
         Span dagSpan = observe.tracer.spanBuilder(LangchainDagScheduleEvents.TRACE_OPERATION_INVOKE_AGENT)
@@ -324,7 +331,8 @@ public class LangchainDagWorkflowExecutor {
             Map<String, CompletableFuture<Void>> futures = new ConcurrentHashMap<>();
             for (TodoItem item : items) {
                 scheduleNode(graph, items, item, request, sharedContext, toolCalls, results, nodeSuccess,
-                        workflowStateLock, nodeStates, parentContext, observe, completedCount, futures);
+                        workflowStateLock, nodeStates, parentContext, parentLaneContext, observe,
+                        completedCount, futures);
             }
             CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0]))
                     .get(30, TimeUnit.MINUTES);
@@ -378,6 +386,7 @@ public class LangchainDagWorkflowExecutor {
                                                  Object workflowStateLock,
                                                  Map<String, TodoItem> nodeStates,
                                                  AgentContext.ContextSnapshot parentContext,
+                                                 DagLaneContextSnapshot parentLaneContext,
                                                  DagObserve observe,
                                                  AtomicInteger completedCount,
                                                  Map<String, CompletableFuture<Void>> futures) {
@@ -390,16 +399,16 @@ public class LangchainDagWorkflowExecutor {
                     .map(depId -> graph.getItemMap().get(depId))
                     .filter(dep -> dep != null)
                     .map(dep -> scheduleNode(graph, items, dep, request, sharedContext, toolCalls, results,
-                            nodeSuccess, workflowStateLock, nodeStates, parentContext, observe, completedCount,
-                            futures))
+                            nodeSuccess, workflowStateLock, nodeStates, parentContext, parentLaneContext,
+                            observe, completedCount, futures))
                     .toArray(CompletableFuture[]::new);
             emitEventBestEffort(request.getRunId(), request.getUserId(),
                     LangchainDagScheduleEvents.WAITING, Map.of("todo_id", item.getId()));
             // 所有依赖完成后，异步执行当前节点
             return CompletableFuture.allOf(dependencyFutures)
                     .thenRunAsync(() -> executeNode(graph, items, item, request, sharedContext, toolCalls,
-                            results, nodeSuccess, workflowStateLock, nodeStates, parentContext, observe,
-                            completedCount),
+                            results, nodeSuccess, workflowStateLock, nodeStates, parentContext,
+                            parentLaneContext, observe, completedCount),
                             observe.submittingExecutor(item));
         });
     }
@@ -438,6 +447,7 @@ public class LangchainDagWorkflowExecutor {
                              Object workflowStateLock,
                              Map<String, TodoItem> nodeStates,
                              AgentContext.ContextSnapshot parentContext,
+                             DagLaneContextSnapshot parentLaneContext,
                              DagObserve observe,
                              AtomicInteger completedCount) {
         String runId = request.getRunId();
@@ -446,7 +456,9 @@ public class LangchainDagWorkflowExecutor {
         boolean enteredExecution = false;
         Span nodeSpan = null;
         Scope nodeScope = null;
+        DagLaneContextSnapshot workerLaneContext = DagLaneContextSnapshot.capture();
         try {
+            parentLaneContext.restore();
             // 0. 恢复判定器重调度：已有结果的节点跳过，避免重复执行
             LangchainTodoNodeResult existing = results.get(item.getId());
             if (existing != null) {
@@ -594,6 +606,7 @@ public class LangchainDagWorkflowExecutor {
             // 增加完成计数（用于监控和调试），并清理 ThreadLocal
             completedCount.incrementAndGet();
             AgentContext.clear();
+            workerLaneContext.restore();
         }
     }
 
@@ -1340,11 +1353,11 @@ public class LangchainDagWorkflowExecutor {
         final AtomicInteger maxQueueDepth = new AtomicInteger();
         final AtomicInteger inFlight = new AtomicInteger();
 
-        DagObserve(ThreadPoolExecutor pool, String runId, String userId) {
+        DagObserve(ThreadPoolExecutor pool, ExecutorService ttlPool, String runId, String userId) {
             this.pool = pool;
             this.runId = runId;
             this.userId = userId;
-            this.wrappedExecutor = Context.taskWrapping(pool);
+            this.wrappedExecutor = Context.taskWrapping(ttlPool);
             this.metrics = dagMetrics;
             this.tracer = GlobalOpenTelemetry.getTracer("world.willfrog.agentlangchain.dag");
         }
@@ -1378,6 +1391,30 @@ public class LangchainDagWorkflowExecutor {
             inFlight.updateAndGet(value -> Math.max(0, value - 1));
             if (metrics != null) {
                 metrics.leaveExecution();
+            }
+        }
+    }
+
+    /**
+     * DAG 节点进入工作线程时使用的泳道上下文快照。
+     *
+     * <p>TTL 线程池负责跨提交边界传递 {@link LaneContext}；这里同时显式恢复日志上下文，
+     * 并在节点结束后还原工作线程原值。即使节点内部临时改写标签，后续节点也不会继承残留。</p>
+     */
+    private record DagLaneContextSnapshot(String laneTag, String mdcLaneTag) {
+
+        static DagLaneContextSnapshot capture() {
+            return new DagLaneContextSnapshot(
+                    LaneContext.trafficScopeId(),
+                    MDC.get(LaneContext.MDC_LANE_TAG));
+        }
+
+        void restore() {
+            LaneContext.restore(laneTag);
+            if (mdcLaneTag == null || mdcLaneTag.isBlank()) {
+                MDC.remove(LaneContext.MDC_LANE_TAG);
+            } else {
+                MDC.put(LaneContext.MDC_LANE_TAG, mdcLaneTag);
             }
         }
     }

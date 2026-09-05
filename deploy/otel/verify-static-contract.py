@@ -202,7 +202,6 @@ def verify_preflight_without_docker() -> int:
         require((output.stat().st_mode & 0o777) == 0o600, "运行时身份文件权限不是 0600")
 
         duplicate_output = temp / "duplicate.env"
-        duplicate_output.write_text("existing-valid-file\n", encoding="utf-8")
         duplicate_env = dict(env)
         duplicate_env["AF_OTEL_RUNTIME_ENV_FILE"] = str(duplicate_output)
         duplicate_env["AF_TEST_DUPLICATE_IMAGE_IDS"] = "1"
@@ -210,17 +209,17 @@ def verify_preflight_without_docker() -> int:
             ["bash", str(ROOT / "deploy/otel/prepare-runtime-env.sh"), "agent-langchain-service", "frontend"],
             cwd=ROOT,
             env=duplicate_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
+            check=True,
         )
-        require(duplicate.returncode != 0, "预检错误接受了两个服务使用同一个 Image ID")
-        require("指向同一个本地 Image ID" in duplicate.stderr, "重复 Image ID 的拒绝原因不明确")
-        require(duplicate_output.read_text(encoding="utf-8") == "existing-valid-file\n", "重复 Image ID 被拒绝后仍覆盖了运行时身份文件")
+        duplicate_result = duplicate_output.read_text(encoding="utf-8")
+        require("AF_BUILD_IMAGE_ID_AGENT_LANGCHAIN_SERVICE=" + agent_image_id in duplicate_result,
+                "复用镜像时没有写 agent 服务的 Image ID")
+        require("AF_BUILD_IMAGE_ID_FRONTEND=" + agent_image_id in duplicate_result,
+                "复用镜像时没有写 frontend 的 Image ID")
 
         invalid_cases = (
             ("AF_DEPLOYMENT_ID", "stable-also-invalid-"),
-            ("AF_LANE_TAG", "other-lane"),
+            ("AF_LANE_TAG", "bad lane"),
         )
         for variable, value in invalid_cases:
             invalid_env = dict(env)
@@ -233,6 +232,17 @@ def verify_preflight_without_docker() -> int:
                 stderr=subprocess.DEVNULL,
             )
             require(completed.returncode != 0, f"预检错误接受了 {variable}={value}")
+
+        beta_env = dict(env)
+        beta_env["AF_DEPLOYMENT_ID"] = "beta-lane-a"
+        beta_env["AF_LANE_TAG"] = "other-lane"
+        beta_env["AF_OTEL_RUNTIME_ENV_FILE"] = str(temp / "beta.env")
+        subprocess.run(
+            ["bash", str(ROOT / "deploy/otel/prepare-runtime-env.sh"), "agent-langchain-service"],
+            check=True,
+            cwd=ROOT,
+            env=beta_env,
+        )
     return 8
 
 

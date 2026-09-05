@@ -1,11 +1,8 @@
 # Shared agent platform config for active agent runtimes.
 agent:
-  deployment:
-    # 人工补写代际退役结果时使用。开启后进程只提供退役 RPC，不运行普通业务入口或恢复器。
-    retirement-only: ${AF_DEPLOYMENT_RETIREMENT_ONLY:false}
-  # D04 统一存储路径门面（AgentStoragePaths，W5 task #105）：
+  # AgentStoragePaths 统一管理 Agent 运行时存储路径：
   # 解析顺序 = 新键 → 旧键别名 → 代码默认值；空白值视为未设置，回退旧键。
-  # 旧→新映射与迁移注意见 agentPlatformShared/docs/d04-storage-key-mapping-v1.md。
+  # 旧键只作为迁移期别名，新配置使用下面的统一键。
   # 路径键无 Nacos 热更通道，根迁移只能走重启级发布。
   storage:
     workspace-root: ${AF_AGENT_STORAGE_WORKSPACE_ROOT:}
@@ -29,7 +26,7 @@ agent:
     # reconciler/startup/heartbeat 只有显式开启后才注册，避免两套恢复链同时接管。
     durable-recovery-enabled: ${AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED:false}
     continuation-max-consecutive-poll-failures: ${AF_AGENT_TOOL_JOB_CONTINUATION_MAX_FAILURES:5}
-  # D06 production sub-agent execution. The executor is bounded and independent
+  # Production sub-agent execution. The executor is bounded and independent
   # from the main Agent worker pool. A task timeout is best-effort interrupt;
   # terminal state is persisted before any late completion can win.
   sub-agent:
@@ -185,7 +182,7 @@ alphafrog:
       max-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_ACTIVE:20}
       max-heavy-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_HEAVY_ACTIVE:6}
 
-# D14 (Q-14): non-production Legacy create without capacity wiring.
+# Non-production legacy create without capacity wiring.
 # Default false = fail-closed. Set true ONLY together with Gateway
 # `sandbox.gateway.allow-create-without-operation-id` and Python
 # `AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID` for annotated fixtures.

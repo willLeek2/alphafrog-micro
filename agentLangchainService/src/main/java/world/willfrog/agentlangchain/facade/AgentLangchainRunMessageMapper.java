@@ -25,6 +25,7 @@ final class AgentLangchainRunMessageMapper {
                 .setExt(nvl(run.getExt()))
                 .setDeploymentId(nvl(run.getDeploymentId()))
                 .setDeploymentGenerationId(nvl(run.getDeploymentGenerationId()))
+                .setLaneTag(nvl(run.getLaneTag()))
                 .build();
     }
 

@@ -19,8 +19,7 @@ import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
 @Component
 // 260814 scheduler-03: workspace export 总开关默认关闭；关闭时本监听器不注册，
 // Run 终态不会触发任何 workspace dump 副作用。
-@ConditionalOnExpression("${agent.workspace.export-enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}")
 @RequiredArgsConstructor
 @Slf4j
 public class WorkspaceFinalizedEventListener {

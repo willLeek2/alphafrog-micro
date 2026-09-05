@@ -19,6 +19,8 @@ public class AgentRun {
     private String deploymentId;
     /** 创建 Run 的不可变执行代际；异步领取和恢复必须同时匹配此值。 */
     private String deploymentGenerationId;
+    /** 创建请求携带的泳道标签；主 Beta 和生产流量为 null。 */
+    private String laneTag;
     /** 当前 Run 状态；WAITING_TOOL_JOB 表示内存 worker 已退出、但外部作业仍拥有后续恢复权。 */
     private AgentRunStatus status;
     private Integer currentStep;

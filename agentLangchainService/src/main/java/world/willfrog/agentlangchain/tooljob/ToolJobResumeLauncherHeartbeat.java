@@ -2,7 +2,7 @@ package world.willfrog.agentlangchain.tooljob;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -15,8 +15,7 @@ import org.springframework.stereotype.Service;
  * 独占驱动，数据库 LAUNCHING 租约也不存在跨实例竞争。</p>
  */
 @Service
-@ConditionalOnExpression("${agent.tool-job.durable-recovery-enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnProperty(name = "agent.tool-job.durable-recovery-enabled", havingValue = "true")
 @Slf4j
 public class ToolJobResumeLauncherHeartbeat {
 

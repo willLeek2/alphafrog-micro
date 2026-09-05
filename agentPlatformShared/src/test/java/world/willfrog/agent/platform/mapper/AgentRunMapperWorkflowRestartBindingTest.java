@@ -40,12 +40,14 @@ class AgentRunMapperWorkflowRestartBindingTest {
             "updateTerminalSnapshotForDeployment",
             "cancelTerminalSnapshotWithTtlForDeployment",
             "updateResumedTerminalForDeployment",
-            "closeRetiredDeploymentRun",
-            "closeNonTerminalRunsForDeployment",
             "listStartupRecoveryCandidatesForDeployment",
             "claimStartupRestartForDeployment",
             "completeStartupCancellationForDeployment",
             "failStartupRecoveryForDeployment",
+            "listNonTerminalDeploymentGenerations",
+            "failNonTerminalRunsForDeploymentGeneration",
+            "countNonTerminalRunsForDeploymentGeneration",
+            "failOrphanedNonTerminalRunsForDeploymentGeneration",
             "admitFollowUpForDeployment",
             "resetForResumeForDeployment",
             "listActiveToolJobAnchorsForDeployment",
@@ -112,6 +114,42 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
+    void runInsertAndRecoveryReadsPersistTheImmutableLaneTag() {
+        String insert = normalizedSql(statement("insert").getBoundSql(dummyParameters(methodParams.get("insert"))));
+        String recovery = normalizedSql(statement("listStartupRecoveryCandidatesForDeployment").getBoundSql(Map.of(
+                "startedBefore", OffsetDateTime.now(),
+                "deploymentId", "stable",
+                "deploymentGenerationId", "gen-" + "a".repeat(64),
+                "limit", 100)));
+        assertThat(insert).contains("lane_tag");
+        assertThat(recovery).contains("lane_tag");
+    }
+
+    @Test
+    void everyAgentRunReadRestoresThePersistedLaneTag() {
+        for (String id : List.of(
+                "findById",
+                "findByIdForDeployment",
+                "findByIdAndUser",
+                "findByIdAndUserForDeployment",
+                "listByUser",
+                "listByStatusAndUpdatedAfter",
+                "listByStatusAndUpdatedAfterComposite",
+                "listStartupRecoveryCandidatesForDeployment",
+                "listActiveToolJobAnchorsForDeployment",
+                "listResumeReadyAnchorsForDeployment",
+                "listStuckAtCasStatusAnchorsForDeployment")) {
+            Map<String, Object> parameters = dummyParameters(methodParams.get(id));
+            if (parameters.containsKey("statuses")) {
+                parameters.put("statuses", List.of(AgentRunStatus.COMPLETED));
+            }
+            String sql = normalizedSql(statement(id).getBoundSql(parameters));
+            assertThat(sql).as(id + " 必须恢复受理时的泳道标签")
+                    .contains("lane_tag");
+        }
+    }
+
+    @Test
     void restartClaimIsNarrowCasAndClearsOnlyLegacyToolAnchor() {
         String sql = normalizedSql(statement("claimStartupRestartForDeployment").getBoundSql(Map.of(
                 "id", "run-1",
@@ -152,6 +190,46 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
+    void shutdownAndOrphanCleanupUseGenerationFencesAndTheOrphanWriteIsBounded() {
+        Map<String, Object> parameters = Map.of(
+                "deploymentId", "beta-a",
+                "deploymentGenerationId", "gen-" + "a".repeat(64),
+                "lastError", "deadline_exceeded",
+                "limit", 32);
+        String shutdown = normalizedSql(statement("failNonTerminalRunsForDeploymentGeneration")
+                .getBoundSql(parameters));
+        String orphan = normalizedSql(statement("failOrphanedNonTerminalRunsForDeploymentGeneration")
+                .getBoundSql(parameters));
+        String candidates = normalizedSql(statement("listNonTerminalDeploymentGenerations")
+                .getBoundSql(Map.of(
+                        "excludedDeploymentId", "beta-a",
+                        "excludedDeploymentGenerationId", "gen-" + "b".repeat(64),
+                        "limit", 32)));
+
+        assertThat(shutdown)
+                .contains("deployment_id = ?", "deployment_generation_id = ?", "status = 'FAILED'")
+                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+        assertThat(orphan)
+                .contains("WITH candidates AS", "LIMIT ?", "FOR UPDATE SKIP LOCKED")
+                .contains("deployment_id <> 'stable'", "deployment_id = ?",
+                        "deployment_generation_id = ?", "status = 'FAILED'");
+        assertThat(candidates)
+                .contains("SELECT DISTINCT deployment_id", "LIMIT ?")
+                .contains("deployment_id <> 'stable'")
+                .contains("NOT (deployment_id = ? AND deployment_generation_id = ?)");
+
+        String pagedCandidates = normalizedSql(statement("listNonTerminalDeploymentGenerations")
+                .getBoundSql(Map.of(
+                        "excludedDeploymentId", "beta-a",
+                        "excludedDeploymentGenerationId", "gen-" + "b".repeat(64),
+                        "afterDeploymentId", "beta-b",
+                        "afterDeploymentGenerationId", "gen-" + "c".repeat(64),
+                        "limit", 32)));
+        assertThat(pagedCandidates)
+                .contains("(deployment_id, deployment_generation_id) > (?, ?)");
+    }
+
+    @Test
     void userAdmissionAndRecoveryScansAlwaysCompareDeploymentIdentity() {
         for (String id : List.of(
                 "findByIdForDeployment",
@@ -165,8 +243,6 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 "updateTerminalSnapshotForDeployment",
                 "cancelTerminalSnapshotWithTtlForDeployment",
                 "updateResumedTerminalForDeployment",
-                "closeRetiredDeploymentRun",
-                "closeNonTerminalRunsForDeployment",
                 "admitFollowUpForDeployment",
                 "resetForResumeForDeployment",
                 "listActiveToolJobAnchorsForDeployment",
@@ -178,27 +254,6 @@ class AgentRunMapperWorkflowRestartBindingTest {
                     .contains("deployment_id = ?")
                     .contains("deployment_generation_id = ?");
         }
-    }
-
-    @Test
-    void retirementWritesAnExplicitTerminalStateWithoutChangingIdentity() {
-        String single = normalizedSql(statement("closeRetiredDeploymentRun")
-                .getBoundSql(dummyParameters(methodParams.get("closeRetiredDeploymentRun"))));
-        String generation = normalizedSql(statement("closeNonTerminalRunsForDeployment")
-                .getBoundSql(dummyParameters(methodParams.get("closeNonTerminalRunsForDeployment"))));
-
-        assertThat(single)
-                .contains("CASE WHEN status = 'CANCELING' THEN 'CANCELED' ELSE 'FAILED' END")
-                .contains("deployment_generation_inactive")
-                .contains("status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELING')")
-                .doesNotContain("SET deployment_id")
-                .doesNotContain("SET deployment_generation_id");
-        assertThat(generation)
-                .contains("deployment_id = ?")
-                .contains("deployment_generation_id = ?")
-                .contains("completed_at = CURRENT_TIMESTAMP")
-                .doesNotContain("SET deployment_id")
-                .doesNotContain("SET deployment_generation_id");
     }
 
     @Test

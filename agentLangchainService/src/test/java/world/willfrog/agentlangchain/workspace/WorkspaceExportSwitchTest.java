@@ -72,15 +72,4 @@ class WorkspaceExportSwitchTest {
         });
     }
 
-    @Test
-    void retirementOnlyModeDisablesWorkspaceRecoveryEvenWhenExportWasEnabled() {
-        runner().withPropertyValues(
-                "agent.workspace.export-enabled=true",
-                "agent.deployment.retirement-only=true").run(ctx -> {
-            assertThat(ctx).doesNotHaveBean("workspaceDumpExecutor");
-            assertThat(ctx).doesNotHaveBean(WorkspaceDumpScheduler.class);
-            assertThat(ctx).doesNotHaveBean(WorkspacePollingObserver.class);
-            assertThat(ctx).doesNotHaveBean(WorkspaceFinalizedEventListener.class);
-        });
-    }
 }

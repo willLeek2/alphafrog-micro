@@ -25,10 +25,8 @@ import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
-import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
 
 import java.util.Map;
-import java.util.function.Supplier;
 
 /**
  * Agent run 的生命周期控制服务 —— 取消（cancel）、暂停（pause）、恢复（resume）、删除（delete）。
@@ -78,9 +76,6 @@ public class LangchainRunControlService {
     private final DeploymentIdentityProvider deploymentIdentityProvider;
 
     @Autowired(required = false)
-    private DeploymentGenerationRetirementService retirementService;
-
-    @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
 
     /**
@@ -105,7 +100,7 @@ public class LangchainRunControlService {
      * 已在终态的 run 直接返回当前状态（幂等）。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRun(CancelAgentRunRequest request) {
-        return executeWhileGenerationActive(() -> cancelRunWhileActive(request));
+        return cancelRunWhileActive(request);
     }
 
     private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRunWhileActive(
@@ -260,7 +255,7 @@ public class LangchainRunControlService {
      * Run 保持原状。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRun(PauseAgentRunRequest request) {
-        return executeWhileGenerationActive(() -> pauseRunWhileActive(request));
+        return pauseRunWhileActive(request);
     }
 
     private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRunWhileActive(
@@ -297,14 +292,12 @@ public class LangchainRunControlService {
      * 先清除旧 plan 再存入新 plan，然后重置状态为 RECEIVED 异步重新执行。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage resumeRun(ResumeAgentRunRequest request) {
-        return executeWhileGenerationActive(() -> resumeRunWhileActive(request));
+        return resumeRunWhileActive(request);
     }
 
     private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage resumeRunWhileActive(
             ResumeAgentRunRequest request) {
         DeploymentIdentity localIdentity = deploymentIdentityProvider.current();
-        localIdentity.requireExactMatch(
-                request.getDeploymentId(), request.getDeploymentGenerationId());
         AgentRun ownedRun = runMapper.findByIdAndUserForDeployment(
                 request.getId(), request.getUserId(), localIdentity.deploymentId(),
                 localIdentity.generationId());
@@ -443,20 +436,6 @@ public class LangchainRunControlService {
             }
         }
         return current;
-    }
-
-    private <T> T executeWhileGenerationActive(Supplier<T> operation) {
-        if (retirementService == null) {
-            return operation.get();
-        }
-        try {
-            return retirementService.executeWhileActive(operation);
-        } catch (IllegalStateException e) {
-            if ("deployment_generation_inactive".equals(e.getMessage())) {
-                throw new IllegalStateException("原测试部署已停用", e);
-            }
-            throw e;
-        }
     }
 
     /** COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED 均为不可逆终态 */

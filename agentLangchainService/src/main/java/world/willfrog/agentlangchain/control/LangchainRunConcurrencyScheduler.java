@@ -93,6 +93,7 @@ public class LangchainRunConcurrencyScheduler {
 
     // ── Latest snapshot store (consumed by observability / actuator) ──
     private volatile Map<String, Object> latestSnapshot = Map.of();
+    private volatile boolean acceptingNewRuns = true;
 
     public LangchainRunConcurrencyScheduler(
             @Qualifier("agentLangchainRunTaskExecutor") ThreadPoolTaskExecutor executor,
@@ -119,32 +120,52 @@ public class LangchainRunConcurrencyScheduler {
     }
 
     public Reservation reserve() {
+        synchronized (lock) {
+            if (!acceptingNewRuns) {
+                throw new RejectedExecutionException("Agent 服务正在自然排空，不再接收新的 Run");
+            }
+            return reserveAcceptedWorkLocked();
+        }
+    }
+
+    private Reservation reserveAcceptedWork() {
         // 整个准入过程必须原子执行，否则两个请求可能同时看到同一个空槽位。
         synchronized (lock) {
-            // 每次准入都读取最新动态限制，让 Nacos 调整能立即生效。
-            LangchainRunExecutorLimits limits = limitsResolver.currentLimits();
-            // 先把已有排队任务提升到可用核心槽位，避免新请求插队。
-            drainLocked(limits);
-            // 准入策略是纯函数：持锁构建一致的状态快照，策略只返回决定。
-            int weight = weightPolicy.weightUnitsFor(null);
-            RunAdmissionPolicy.AdmissionState state = new RunAdmissionPolicy.AdmissionState(
-                    running,
-                    queue.isEmpty(),
-                    reservedQueued,
-                    limits.getQueueCapacity(),
-                    capacityLedger.usedUnits(),
-                    capacityLedger.maxUnits(),
-                    limits.getCorePoolSize(),
-                    limits.getMaxPoolSize(),
-                    weight);
-            RunAdmissionPolicy.AdmissionDecision decision = admissionPolicy.evaluate(state);
-            RunPriority priority = priorityPolicy.priorityFor(null);
-            return switch (decision) {
-                case RUNNING -> grantRunningLocked(limits, priority, weight);
-                case QUEUED -> reserveQueuedLocked(limits, priority, weight);
-                case ELASTIC -> elasticLocked(limits, priority, weight);
-                case REJECTED -> rejectLocked(limits, decision.rejectReason(state));
-            };
+            return reserveAcceptedWorkLocked();
+        }
+    }
+
+    private Reservation reserveAcceptedWorkLocked() {
+        // 每次准入都读取最新动态限制，让 Nacos 调整能立即生效。
+        LangchainRunExecutorLimits limits = limitsResolver.currentLimits();
+        // 先把已有排队任务提升到可用线程槽位，避免新请求插队。
+        drainLocked(limits);
+        // 准入策略是纯函数：持锁构建一致的状态快照，策略只返回决定。
+        int weight = weightPolicy.weightUnitsFor(null);
+        RunAdmissionPolicy.AdmissionState state = new RunAdmissionPolicy.AdmissionState(
+                running,
+                queue.isEmpty(),
+                reservedQueued,
+                limits.getQueueCapacity(),
+                capacityLedger.usedUnits(),
+                capacityLedger.maxUnits(),
+                limits.getCorePoolSize(),
+                limits.getMaxPoolSize(),
+                weight);
+        RunAdmissionPolicy.AdmissionDecision decision = admissionPolicy.evaluate(state);
+        RunPriority priority = priorityPolicy.priorityFor(null);
+        return switch (decision) {
+            case RUNNING -> grantRunningLocked(limits, priority, weight);
+            case QUEUED -> reserveQueuedLocked(limits, priority, weight);
+            case ELASTIC -> elasticLocked(limits, priority, weight);
+            case REJECTED -> rejectLocked(limits, decision.rejectReason(state));
+        };
+    }
+
+    /** 注册摘除后的关闭阶段只阻止新 Run；已经受理的排队与续接任务仍可完成。 */
+    public void stopAcceptingNewRuns() {
+        synchronized (lock) {
+            acceptingNewRuns = false;
         }
     }
 
@@ -212,16 +233,19 @@ public class LangchainRunConcurrencyScheduler {
     }
 
     public void submit(Reservation reservation, AgentRun run, Runnable task) {
+        Runnable laneScopedTask = RunLaneContextScope.wrap(run, task);
         // 恢复入口通常没有提前 reserve；在这里统一走相同准入规则。
         if (reservation == null) {
-            reservation = reserve();
+            // 没有预留名额的入口只用于已经持久化的 Run 恢复执行。关闭期间仍允许这些
+            // 已受理工作继续，只有创建新 Run 的 reserve() 会被停收开关拒绝。
+            reservation = reserveAcceptedWork();
         }
         // activate 后，槽位归还责任从调用方转移给任务包装层。
         reservation.activate();
         // RUNNING 类型已经在 reserve 中计入 running，可以立即提交线程池。
         if (reservation.slotType == SlotType.RUNNING) {
             try {
-                submitRunning(task, reservation.id);
+                submitRunning(laneScopedTask, reservation.id);
             } catch (LangchainRunRejectedException e) {
                 // 物理线程池硬拒绝时回滚已经占用的槽位与容量，再让队首补位。
                 synchronized (lock) {
@@ -237,7 +261,7 @@ public class LangchainRunConcurrencyScheduler {
         synchronized (lock) {
             // run 只用于排队诊断与排队取消定位；task 才是恢复/普通执行的实际闭包。
             queue.enqueue(reservation.priority,
-                    new PendingRun(run, task, System.currentTimeMillis(),
+                    new PendingRun(run, laneScopedTask, System.currentTimeMillis(),
                             reservation.priority, reservation.id, reservation.weight));
             // 理论上 reserve 已设置时间；这里兼容历史状态并给出默认值。
             if (oldestQueuedAtMillis == 0) {

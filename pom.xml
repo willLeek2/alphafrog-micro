@@ -20,11 +20,17 @@
         <protobuf-java.version>3.25.3</protobuf-java.version>
         <protoc.version>3.25.3</protoc.version>
         <langchain4j.version>1.15.0</langchain4j.version>
+        <transmittable-thread-local.version>2.14.5</transmittable-thread-local.version>
         <!-- Spring Boot starters ship on LC4j companion line; P0/P1 do not use agentic beta -->
         <langchain4j.spring.version>1.15.0-beta25</langchain4j.spring.version>
     </properties>
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>com.alibaba</groupId>
+                <artifactId>transmittable-thread-local</artifactId>
+                <version>${transmittable-thread-local.version}</version>
+            </dependency>
             <dependency>
                 <groupId>dev.langchain4j</groupId>
                 <artifactId>langchain4j-bom</artifactId>

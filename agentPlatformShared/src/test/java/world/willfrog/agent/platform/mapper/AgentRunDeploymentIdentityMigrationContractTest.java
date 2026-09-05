@@ -41,7 +41,20 @@ class AgentRunDeploymentIdentityMigrationContractTest {
                 .contains("'WAITING_TOOL_JOB'")
                 .contains("'PARTIAL'")
                 .contains("'CANCELING'")
-                .contains("BEFORE UPDATE OF deployment_id, deployment_generation_id");
+                .contains("lane_tag VARCHAR(96)")
+                .contains("BEFORE UPDATE OF deployment_id, deployment_generation_id, lane_tag");
+    }
+
+    @Test
+    void laneTagUpgradeIsNullableValidatedAndImmutable() throws Exception {
+        String sql = Files.readString(findRepositoryRoot().resolve(
+                "migrate/migrations/upgrades/v1.5/002_agent_run_lane_tag.sql"));
+
+        assertThat(sql)
+                .contains("ADD COLUMN IF NOT EXISTS lane_tag VARCHAR(96)")
+                .contains("alphafrog_agent_run_lane_tag_check")
+                .contains("NEW.lane_tag IS DISTINCT FROM OLD.lane_tag")
+                .contains("BEFORE UPDATE OF deployment_id, deployment_generation_id, lane_tag");
     }
 
     private static Path findRepositoryRoot() {

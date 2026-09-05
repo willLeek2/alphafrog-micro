@@ -2,7 +2,6 @@ package world.willfrog.agentlangchain.facade;
 
 import org.apache.dubbo.config.annotation.DubboService;
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 
 import java.util.Arrays;
 import java.util.Set;
@@ -21,24 +20,6 @@ class AgentLangchainDubboServiceMethodsTest {
     }
 
     @Test
-    void normalAndRetirementOnlyRpcProvidersAreMutuallyExclusive() {
-        ConditionalOnExpression normal = AgentLangchainDubboServiceImpl.class
-                .getAnnotation(ConditionalOnExpression.class);
-        ConditionalOnExpression retirementOnly = RetirementOnlyAgentDubboService.class
-                .getAnnotation(ConditionalOnExpression.class);
-
-        assertEquals("${agent.langchain.provider.enabled:false}"
-                + " && !${agent.deployment.retirement-only:false}", normal.value());
-        assertEquals("${agent.langchain.provider.enabled:false}"
-                + " && ${agent.deployment.retirement-only:false}", retirementOnly.value());
-        assertEquals(Set.of("retireDeploymentGeneration"),
-                Arrays.stream(RetirementOnlyAgentDubboService.class.getDeclaredMethods())
-                        .filter(method -> !method.isSynthetic())
-                        .map(java.lang.reflect.Method::getName)
-                        .collect(Collectors.toSet()));
-    }
-
-    @Test
     void allExpectedPublicServiceMethodsAreStillOverridden() {
         Set<String> overrides = Arrays.stream(AgentLangchainDubboServiceImpl.class.getDeclaredMethods())
                 .filter(m -> !m.isSynthetic() && !"reject".equals(m.getName()))
@@ -54,7 +35,6 @@ class AgentLangchainDubboServiceMethodsTest {
     private static Set<String> expectedServiceMethods() {
         return Set.of(
                 "createRun",
-                "retireDeploymentGeneration",
                 "getRun",
                 "updateRun",
                 "listRuns",

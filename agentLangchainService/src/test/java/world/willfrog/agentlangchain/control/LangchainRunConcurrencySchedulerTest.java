@@ -16,6 +16,7 @@ import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -71,6 +72,29 @@ class LangchainRunConcurrencySchedulerTest {
             }
         }
         executor.shutdown();
+    }
+
+    @Test
+    void shutdownStopsNewReservationsWithoutDiscardingAlreadyAcceptedWork() {
+        LangchainRunConcurrencyScheduler.Reservation accepted = scheduler.reserve();
+
+        scheduler.stopAcceptingNewRuns();
+
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(scheduler::reserve))
+                .isInstanceOf(RejectedExecutionException.class);
+        scheduler.release(accepted);
+    }
+
+    @Test
+    void shutdownStillRunsAContinuationForAnAlreadyPersistedRun() throws Exception {
+        scheduler.stopAcceptingNewRuns();
+        AgentRun run = new AgentRun();
+        run.setId("persisted-run");
+        CountDownLatch started = new CountDownLatch(1);
+
+        scheduler.submit(null, run, started::countDown);
+
+        assertThat(started.await(1, TimeUnit.SECONDS)).isTrue();
     }
 
     @Test

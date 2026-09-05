@@ -11,18 +11,13 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvide
 public class DeploymentIdentityStartupVerifier implements InitializingBean {
 
     private final DeploymentIdentityProvider identityProvider;
-    private final DeploymentRetirementAuthorizer retirementAuthorizer;
 
-    public DeploymentIdentityStartupVerifier(
-            DeploymentIdentityProvider identityProvider,
-            DeploymentRetirementAuthorizer retirementAuthorizer) {
+    public DeploymentIdentityStartupVerifier(DeploymentIdentityProvider identityProvider) {
         this.identityProvider = identityProvider;
-        this.retirementAuthorizer = retirementAuthorizer;
     }
 
     @Override
     public void afterPropertiesSet() {
         identityProvider.current();
-        retirementAuthorizer.verifyConfigured();
     }
 }

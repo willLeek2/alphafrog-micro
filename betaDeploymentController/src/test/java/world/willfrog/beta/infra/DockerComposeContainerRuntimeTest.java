@@ -37,6 +37,7 @@ class DockerComposeContainerRuntimeTest {
     void setUp() throws Exception {
         mapper = new ObjectMapper();
         properties = new BetaControllerProperties();
+        properties.getNacos().setServerAddress("nacos.internal:8848");
         properties.setStateRoot(temporary.resolve("state"));
         Path health = temporary.resolve("tcp-healthcheck");
         Files.writeString(health, "#!/bin/sh\nexit 0\n");
@@ -59,9 +60,12 @@ class DockerComposeContainerRuntimeTest {
                  "manifestVersion":1,"services":[{"serviceName":"agent-service","releaseId":"release-1","machineId":"beta-machine-1",
                  "image":{"repositoryDigest":"registry.local/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                           "localImageId":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-                 "runtime":{"containerPort":18080,"hostPorts":[28080,28081],"preStopPolicy":"AGENT_RETIRE_GENERATION_V1",
-                            "shutdownProfile":"SPRING_BOOT_HTTP_DUBBO_V1","applicationDrainSeconds":55,
-                            "drainGraceSeconds":60,"readinessTimeoutSeconds":120}}]}
+                 "runtime":{"containerPort":18080,"hostPorts":[28080,28081],
+                            "shutdownProfile":"SPRING_BOOT_HTTP_DUBBO_V1","applicationDrainSeconds":60,
+                            "drainGraceSeconds":60,"readinessTimeoutSeconds":120},
+                 "registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
+                    "groupName":"alphafrog-beta","namespaceId":"public","clusterName":"DEFAULT",
+                    "applicationName":"agent-langchain-service"}}]}
                 """);
         service = manifest.path("services").path(0);
         plan = new ContainerRuntime.CandidatePlan("beta-main-001", "main-beta", "i-one",
@@ -69,25 +73,94 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
-    void createsFromAnImmutableImageWithoutPersistingTheRetirementSecret() throws Exception {
+    void createsFromAnImmutableImageWithOneApplicationAndContainerDeadline() throws Exception {
         FakeCommands commands = new FakeCommands(false, false);
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
         runtime.validateManifest(manifest);
 
-        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan, "s".repeat(48));
+        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan);
 
         assertTrue(created.running());
         assertEquals(28080, created.hostPort());
         Path compose = temporary.resolve("state/compose/i-one.json");
         String content = Files.readString(compose);
-        assertFalse(content.contains("s".repeat(48)));
-        assertTrue(content.contains("${AF_DEPLOYMENT_RETIREMENT_TOKEN:?missing}"));
+        JsonNode effectiveRouting = mapper.readTree(mapper.readTree(content)
+                .path("services").path("app").path("environment").path("SPRING_APPLICATION_JSON").asText());
+        assertFalse(content.contains("RETIREMENT_TOKEN"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS"));
+        assertTrue(content.contains("OTEL_SERVICE_NAME"));
+        assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
+        assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
+        assertFalse(content.contains("image.digest=registry.local"));
+        assertTrue(content.contains("alphafrog-beta"));
+        assertTrue(content.contains("zone-aware"));
+        assertTrue(effectiveRouting.path("dubbo").path("registries").path("beta").path("preferred").asBoolean());
+        assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("preferred").asBoolean());
+        assertTrue(effectiveRouting.path("dubbo").path("registries").path("production").path("address").asText()
+                .contains("group=DEFAULT_GROUP"));
+        assertEquals("zone-aware", effectiveRouting.path("dubbo").path("consumer").path("cluster").asText());
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
-        assertEquals("s".repeat(48), commands.composeEnvironment.get("AF_DEPLOYMENT_RETIREMENT_TOKEN"));
+        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
+        assertEquals("60", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
+        assertEquals("5", environmentNode.path(
+                "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
+        assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void laneFrontendReceivesItsTrustedEntryTagWhileMainBetaDoesNotEnableEntryTagging() throws Exception {
+        ObjectNode frontend = (ObjectNode) service;
+        frontend.put("serviceName", "frontend");
+        ((ObjectNode) frontend.path("registration")).put("applicationName", "frontend");
+        Path environment = temporary.resolve("frontend.env");
+        Files.writeString(environment, "SERVER_PORT=18080\n");
+        try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
+        template.setEnvFile(environment);
+        properties.setServices(Map.of("frontend", template));
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        FakeCommands commands = new FakeCommands(false, false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, frontend, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode environmentNode = compose.path("services").path("app").path("environment");
+        assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
+        assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+        assertEquals("60s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("60000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+    }
+
+    @Test
+    void nonDefaultAgentDeadlineKeepsOneFiveSecondFinalizationBudget() throws Exception {
+        ((ObjectNode) service.path("runtime")).put("applicationDrainSeconds", 30);
+        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 30);
+        FakeCommands commands = new FakeCommands(false, false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode app = compose.path("services").path("app");
+        JsonNode environmentNode = app.path("environment");
+        assertEquals("30s", app.path("stop_grace_period").asText());
+        assertEquals("30", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
+        assertEquals("5", environmentNode.path(
+                "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
+        assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
     }
 
     @Test
@@ -95,7 +168,7 @@ class DockerComposeContainerRuntimeTest {
         FakeCommands commands = new FakeCommands(false, false);
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
-        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan, "s".repeat(48));
+        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan);
 
         assertTrue(created.running());
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
@@ -109,7 +182,7 @@ class DockerComposeContainerRuntimeTest {
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
         ControllerException failure = assertThrows(ControllerException.class,
-                () -> runtime.create(manifest, service, plan, "s".repeat(48)));
+                () -> runtime.create(manifest, service, plan));
 
         assertEquals("CONTAINER_IDENTITY_CONFLICT", failure.code());
         assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
@@ -138,7 +211,7 @@ class DockerComposeContainerRuntimeTest {
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
         ControllerException failure = assertThrows(ControllerException.class,
-                () -> runtime.create(manifest, service, plan, "s".repeat(48)));
+                () -> runtime.create(manifest, service, plan));
 
         assertEquals("ENV_FILE_MISMATCH", failure.code());
         assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
@@ -225,13 +298,18 @@ class DockerComposeContainerRuntimeTest {
 
         private String inspectJson(boolean wrong) {
             String instance = wrong ? "i-other" : "i-one";
+            String serviceName = service.path("serviceName").asText();
+            String name = "afb-" + plan.deploymentId() + '-' + serviceName + '-' + plan.instanceId();
             return """
-                    [{"Id":"%s","Name":"/afb-beta-main-001-agent-service-i-one","Image":"sha256:%s",
-                      "Config":{"Labels":{"alphafrog.deployment-id":"beta-main-001","alphafrog.traffic-scope-id":"main-beta",
-                      "alphafrog.service-name":"agent-service","alphafrog.instance-id":"%s","alphafrog.release-id":"release-1",
-                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"28080"}},"State":{"Running":true,"Health":{"Status":"healthy"}},
-                      "NetworkSettings":{"Ports":{"18080/tcp":[{"HostIp":"127.0.0.1","HostPort":"28080"}]}}}]
-                    """.formatted("d".repeat(64), "b".repeat(64), instance, plan.generationId());
+                    [{"Id":"%s","Name":"/%s","Image":"%s",
+                      "Config":{"Labels":{"alphafrog.deployment-id":"%s","alphafrog.traffic-scope-id":"%s",
+                      "alphafrog.service-name":"%s","alphafrog.instance-id":"%s","alphafrog.release-id":"%s",
+                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"%d"}},"State":{"Running":true,"Health":{"Status":"healthy"}},
+                      "NetworkSettings":{"Ports":{"%d/tcp":[{"HostIp":"127.0.0.1","HostPort":"%d"}]}}}]
+                    """.formatted("d".repeat(64), name,
+                    service.path("image").path("localImageId").asText(), plan.deploymentId(), plan.trafficScopeId(),
+                    serviceName, instance, service.path("releaseId").asText(), plan.generationId(), plan.hostPort(),
+                    service.path("runtime").path("containerPort").asInt(), plan.hostPort());
         }
     }
 }

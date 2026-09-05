@@ -126,6 +126,27 @@ public class AgentRunEventService {
                               String deploymentGenerationId,
                               boolean generateArtifacts,
                               boolean isAdmin) {
+        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson,
+                deploymentId, deploymentGenerationId, null, generateArtifacts, isAdmin);
+    }
+
+    public AgentRun createRun(String userId,
+                              String message,
+                              String contextJson,
+                              String idempotencyKey,
+                              String modelName,
+                              String endpointName,
+                              boolean captureLlmRequests,
+                              String provider,
+                              int plannerCandidateCount,
+                              boolean debugMode,
+                              String stageConfigJson,
+                              String deploymentId,
+                              String deploymentGenerationId,
+                              String laneTag,
+                              boolean generateArtifacts,
+                              boolean isAdmin) {
         log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
         // 生成无连字符 UUID 作为 runId
         String runId = java.util.UUID.randomUUID().toString().replace("-", "");
@@ -196,6 +217,7 @@ public class AgentRunEventService {
         run.setDeploymentId(DeploymentIdentity.requireDeploymentId(deploymentId));
         run.setDeploymentGenerationId(
                 DeploymentIdentity.requireActiveGenerationId(deploymentGenerationId));
+        run.setLaneTag(normalizeLaneTag(laneTag));
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setCurrentStep(0);
         run.setMaxSteps(12);
@@ -223,6 +245,20 @@ public class AgentRunEventService {
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
         return runMapper.findByIdAndUserForDeployment(
                 runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
+    }
+
+    private static String normalizeLaneTag(String laneTag) {
+        if (laneTag == null || laneTag.isBlank()) {
+            return null;
+        }
+        String normalized = laneTag.trim();
+        if ("main-beta".equals(normalized)) {
+            return null;
+        }
+        if (!normalized.matches("[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?")) {
+            throw new IllegalArgumentException("invalid lane tag");
+        }
+        return normalized;
     }
 
     /**
@@ -394,7 +430,7 @@ public class AgentRunEventService {
      * 按 run 与去重键读取 PostgreSQL 权威事件。
      *
      * <p>去重键是 durable 生命周期状态的主键，不能只读可能过期的 Redis 投影。
-     * D06 子代理用它在进程内句柄丢失后重放已持久化的 accepted/terminal 状态。</p>
+     * 子代理用它在进程内句柄丢失后重放已持久化的 accepted/terminal 状态。</p>
      */
     public Optional<AgentRunEvent> findByDedupeKey(String runId, String dedupeKey) {
         if (runId == null || runId.isBlank() || dedupeKey == null || dedupeKey.isBlank()) {

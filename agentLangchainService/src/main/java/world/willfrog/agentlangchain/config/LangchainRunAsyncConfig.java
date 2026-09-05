@@ -31,10 +31,10 @@ public class LangchainRunAsyncConfig {
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix(hard.getThreadNamePrefix());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        // 普通重启不能被误认为代际退役。Spring 关闭时立即中断 worker，数据库中的
-        // 同代际 Run 由启动恢复继续；真正退役由控制器显式调用代际退役 RPC。
+        // AgentServiceShutdownState 在自然处理窗口内保持执行器可用，窗口结束后主动
+        // 中断剩余任务并写失败终态。Bean 销毁阶段不得重新等待一遍完整处理期限。
         executor.setWaitForTasksToCompleteOnShutdown(false);
-        executor.initialize();
+        executor.setAwaitTerminationSeconds(0);
         return executor;
     }
 }
