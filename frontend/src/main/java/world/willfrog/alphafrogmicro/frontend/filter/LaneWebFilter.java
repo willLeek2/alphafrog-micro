@@ -49,6 +49,16 @@ public class LaneWebFilter extends OncePerRequestFilter {
     }
 
     @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
+
+    @Override
+    protected boolean shouldNotFilterErrorDispatch() {
+        return false;
+    }
+
+    @Override
     protected void doFilterInternal(
             HttpServletRequest request,
             HttpServletResponse response,
@@ -74,6 +84,14 @@ public class LaneWebFilter extends OncePerRequestFilter {
                 MDC.put(LaneContext.MDC_LANE_TAG, previousMdc);
             }
         }
+    }
+
+    @Override
+    protected void doFilterNestedErrorDispatch(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            FilterChain chain) throws ServletException, IOException {
+        chain.doFilter(new StrippedHeaderRequest(request, strippedHeaders), response);
     }
 
     private boolean requiresTag(HttpServletRequest request, String suppliedPassphrase) {
