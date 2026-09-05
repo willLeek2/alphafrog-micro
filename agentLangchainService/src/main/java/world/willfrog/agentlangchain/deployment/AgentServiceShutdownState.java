@@ -74,7 +74,7 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
         long totalDeadlineNanos = System.nanoTime() + totalTimeout.toNanos();
         long totalDeadlineEpochMillis = System.currentTimeMillis() + totalTimeout.toMillis();
         // Dubbo 3.3.2 会按 expectedShutdownTime 重新计算剩余等待时间。这里在所有
-        // 后续关闭监听器之前登记同一个绝对截止时间，避免它们从自然窗口结束后重新计时。
+        // 在后续关闭监听器运行前登记统一截止时间，避免它们从自然窗口结束后重新计时。
         ConfigurationUtils.setExpectedShutdownTime(totalDeadlineEpochMillis);
         disableLaterSpringLifecycleWaiting(event.getApplicationContext());
         scheduler.stopAcceptingNewRuns();
@@ -116,7 +116,7 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
                 AbstractApplicationContext.LIFECYCLE_PROCESSOR_BEAN_NAME);
         if (lifecycleProcessor instanceof DefaultLifecycleProcessor defaultLifecycleProcessor) {
             // 本监听器已经覆盖自然处理窗口。事件返回后不能让每个 Spring phase 再次
-            // 获得完整期限；剩余工作由 Dubbo 的绝对截止时间和 Docker 硬期限约束。
+            // 获得完整期限；剩余工作由 Dubbo 的统一截止时间和 Docker 硬期限约束。
             defaultLifecycleProcessor.setTimeoutPerShutdownPhase(0);
             return;
         }

@@ -25,7 +25,7 @@ Beta 控制器负责把部署单变成服务实例，并通过 Nacos 注册完�
 
 控制器配置 `applicationDrainSeconds` 是这一台控制器管理的所有主 Beta 与泳道服务共同使用的处理期限，默认 60 秒且不得小于 6 秒。每份部署单中全部服务的 `applicationDrainSeconds` 与 `drainGraceSeconds` 都必须等于这个配置值。Agent 在总期限中固定保留最后 5 秒用于失败记录持久化和进程退出，其余时间是自然处理窗口；控制器把相同总期限交给 Docker 作为强制停止边界。这样多个部署单不能各自延长或缩短停止窗口，也不会出现自然处理窗口为零的配置。
 
-Agent 的应用名固定为 `agent-langchain-service`。控制器为这个应用生成一条可推导的关闭时间线：公共期限 `T` 同时写入 Agent 关闭配置和 Docker `stop_grace_period`；自然处理窗口为 `T-5`；Dubbo 静态等待上限为 5 秒；Spring 后续生命周期等待为 0。Agent 在关闭事件开始时再把 Dubbo 的绝对截止时间登记为“当前时间 + T”，自然窗口结束后停止 Run 执行器并执行失败写入。因此，数据库写入、Dubbo 和进程退出共享最后 5 秒，Run 执行器、Dubbo 或 Spring 都不能在自然窗口结束后重新取得完整的 `T`。其它服务继续按自己的 `shutdownProfile` 使用 Spring 或 Dubbo 有序关闭，Docker 的 `T` 是所有服务共同的最终强制停止边界。
+Agent 的应用名固定为 `agent-langchain-service`。控制器为这个应用生成一条可推导的关闭时间线：公共期限 `T` 同时写入 Agent 关闭配置和 Docker `stop_grace_period`；自然处理窗口为 `T-5`；Dubbo 静态等待上限为 5 秒；Spring 后续生命周期等待为 0。Agent 在关闭事件开始时再把 Dubbo 的统一截止时间登记为“当前时间 + T”，自然窗口结束后停止 Run 执行器并执行失败写入。因此，数据库写入、Dubbo 和进程退出共享最后 5 秒，Run 执行器、Dubbo 或 Spring 都不能在自然窗口结束后重新取得完整的 `T`。其它服务继续按自己的 `shutdownProfile` 使用 Spring 或 Dubbo 有序关闭，Docker 的 `T` 是所有服务共同的最终强制停止边界。
 
 服务使用两个固定宿主端口槽。活动实例占一个槽，更新候选占另一个槽；切换完成并清理旧实例后，两者角色互换。容器内端口保持服务自己的固定值，部署单显式保存两组宿主端口。
 
@@ -135,7 +135,7 @@ metadata 与部署单、实例记录逐项一致。候选创建时就带最终�
 - 注入 `OTEL_SERVICE_NAME` 与包含部署、泳道、版本、提交和本地 Image ID 的五字段 `OTEL_RESOURCE_ATTRIBUTES`；
 - frontend 泳道实例启用可信入口打标并注入本部署的泳道名；主 Beta frontend 保持入口打标关闭；
 - 使用显式宿主地址、宿主端口、容器端口和 `SIGTERM`；
-- 配置 Spring 与 Dubbo 的有序关闭期限；`agent-langchain-service` 使用 0 秒 Spring 后续等待和 5 秒 Dubbo 静态上限，Dubbo 还必须服从进程内的公共绝对截止时间；
+- 配置 Spring 与 Dubbo 的有序关闭期限；`agent-langchain-service` 使用 0 秒 Spring 后续等待和 5 秒 Dubbo 静态上限，Dubbo 还必须服从进程内的统一截止时间；
 - 配置同一台 Nacos 的 Beta、生产两路消费注册，分别带 `zone=beta`、`zone=prod`，Beta 路为 `preferred=true`，消费集群为 `zone-aware`；
 - 关闭应用自身的提供者注册，由控制器统一创建、启用和注销实例；
 

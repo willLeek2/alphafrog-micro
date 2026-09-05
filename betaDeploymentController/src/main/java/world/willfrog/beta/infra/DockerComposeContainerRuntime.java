@@ -262,7 +262,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         String shutdownProfile = service.path("runtime").path("shutdownProfile").asText();
         if ("SPRING_BOOT_DUBBO_V1".equals(shutdownProfile)
                 || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
-            // Agent 的 Dubbo 阶段只拿收尾余量，并由进程内登记的绝对截止时间再次截短。
+            // Agent 的 Dubbo 阶段只拿收尾余量，并由进程内登记的统一截止时间再次截短。
             // 其它 Dubbo 服务继续使用公共处理期限，Docker 仍是所有服务的最终硬边界。
             int dubboWaitSeconds = coordinatedAgentShutdown
                     ? finalizationMarginSeconds
