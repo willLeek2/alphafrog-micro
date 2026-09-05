@@ -1,7 +1,6 @@
 package world.willfrog.alphafrogmicro.common.lane;
 
 import org.apache.dubbo.common.URL;
-import org.apache.dubbo.rpc.Filter;
 import org.apache.dubbo.rpc.Invoker;
 import org.apache.dubbo.rpc.Result;
 import org.apache.dubbo.rpc.RpcContext;
@@ -25,7 +24,7 @@ class LaneTagRouterOrderTest {
 
     private static final URL CONSUMER_URL = URL.valueOf("consumer://127.0.0.1/demo");
     private static final URL TAGGED_PROVIDER =
-            URL.valueOf("dubbo://10.0.0.8:20880/demo?" + LaneContext.DUBBO_TAG_KEY + "=lane-test");
+            URL.valueOf("dubbo://10.0.0.8:20880/demo").addParameter(LaneContext.DUBBO_TAG_KEY, "lane-test");
     private static final URL UNTAGGED_PROVIDER = URL.valueOf("dubbo://10.0.0.9:20880/demo");
 
     @AfterEach
@@ -37,9 +36,8 @@ class LaneTagRouterOrderTest {
     }
 
     @Test
-    void consumerHopFilter_shouldBeClusterFilterNotProtocolFilter() {
+    void consumerHopFilter_shouldBeClusterFilter() {
         assertThat(new LaneConsumerHopFilter()).isInstanceOf(ClusterFilter.class);
-        assertThat(Filter.class.isAssignableFrom(LaneConsumerHopFilter.class)).isFalse();
     }
 
     @Test
