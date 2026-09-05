@@ -1,9 +1,9 @@
 /**
- * 服务间调用按原子路由指针绑定精确实例。
+ * 服务间调用只透传官方流量标签，选路交给 Dubbo 标签路由和同区优先。
  *
- * <p>本包不得 import {@code gray} 或 {@code datasource}。Beta 流量必须按控制器已经原子替换的
- * 路由快照选择 {@code instanceId} 和访问地址，不能把可变指针缓存到下一次调用。入口完成身份判断
- * 后可以把同一次读取固定到对应的目标调用，使请求身份和网络目标属于同一代。读不到可信绑定时
- * 不能回退到未过滤的 Nacos 实例列表。稳定流量没有泳道范围时不经过这套绑定。</p>
+ * <p>本包不得 import {@code gray} 或 {@code datasource}。消费方集群过滤器在官方标签路由
+ * 选实例之前，把当前线程的泳道标签写入官方附件 {@code dubbo.tag}；提供方入站后从同一附件
+ * 恢复线程上下文。主 Beta 流量范围 {@code main-beta} 不写标签，因此会落到无标实例。
+ * 没有泳道标签的稳定流量也不写附件。本包不再按实例坐标选择地址。</p>
  */
 package world.willfrog.alphafrogmicro.common.lane;
