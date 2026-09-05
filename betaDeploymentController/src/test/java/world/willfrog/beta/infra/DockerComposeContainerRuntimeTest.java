@@ -62,7 +62,10 @@ class DockerComposeContainerRuntimeTest {
                           "localImageId":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
                  "runtime":{"containerPort":18080,"hostPorts":[28080,28081],
                             "shutdownProfile":"SPRING_BOOT_HTTP_DUBBO_V1","applicationDrainSeconds":60,
-                            "drainGraceSeconds":60,"readinessTimeoutSeconds":120}}]}
+                            "drainGraceSeconds":60,"readinessTimeoutSeconds":120},
+                 "registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
+                    "groupName":"alphafrog-beta","namespaceId":"public","clusterName":"DEFAULT",
+                    "applicationName":"agent-langchain-service"}}]}
                 """);
         service = manifest.path("services").path(0);
         plan = new ContainerRuntime.CandidatePlan("beta-main-001", "main-beta", "i-one",
@@ -102,6 +105,12 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("zone-aware", effectiveRouting.path("dubbo").path("consumer").path("cluster").asText());
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
+        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
+        assertEquals("60", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
+        assertEquals("5", environmentNode.path(
+                "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
+        assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
@@ -111,6 +120,7 @@ class DockerComposeContainerRuntimeTest {
     void laneFrontendReceivesItsTrustedEntryTagWhileMainBetaDoesNotEnableEntryTagging() throws Exception {
         ObjectNode frontend = (ObjectNode) service;
         frontend.put("serviceName", "frontend");
+        ((ObjectNode) frontend.path("registration")).put("applicationName", "frontend");
         Path environment = temporary.resolve("frontend.env");
         Files.writeString(environment, "SERVER_PORT=18080\n");
         try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
@@ -129,6 +139,28 @@ class DockerComposeContainerRuntimeTest {
         JsonNode environmentNode = compose.path("services").path("app").path("environment");
         assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
         assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+        assertEquals("60s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("60000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+    }
+
+    @Test
+    void nonDefaultAgentDeadlineKeepsOneFiveSecondFinalizationBudget() throws Exception {
+        ((ObjectNode) service.path("runtime")).put("applicationDrainSeconds", 30);
+        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 30);
+        FakeCommands commands = new FakeCommands(false, false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode app = compose.path("services").path("app");
+        JsonNode environmentNode = app.path("environment");
+        assertEquals("30s", app.path("stop_grace_period").asText());
+        assertEquals("30", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
+        assertEquals("5", environmentNode.path(
+                "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
+        assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
     }
 
     @Test

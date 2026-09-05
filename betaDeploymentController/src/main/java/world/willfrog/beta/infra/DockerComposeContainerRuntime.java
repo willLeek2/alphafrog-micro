@@ -241,8 +241,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
         environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS",
                 Integer.toString(applicationDrainSeconds));
-        environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS", "5");
         JsonNode registration = service.path("registration");
+        boolean coordinatedAgentShutdown = coordinatedAgentShutdown(registration);
+        int finalizationMarginSeconds = finalizationMarginSeconds(applicationDrainSeconds);
+        environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS",
+                Integer.toString(finalizationMarginSeconds));
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED", "true");
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS",
                 properties.getNacos().getServerAddress());
@@ -252,11 +255,19 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS",
                 Integer.toString(applicationDrainSeconds));
         environment.put("SERVER_SHUTDOWN", "graceful");
-        environment.put("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE", applicationDrainSeconds + "s");
+        // Agent 自己在 ContextClosedEvent 内等待自然处理窗口，并在返回前把 Spring
+        // 后续 phase 等待设为 0；其余服务仍由 Spring 的有序关闭等待完整期限。
+        environment.put("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE",
+                coordinatedAgentShutdown ? "0s" : applicationDrainSeconds + "s");
         String shutdownProfile = service.path("runtime").path("shutdownProfile").asText();
         if ("SPRING_BOOT_DUBBO_V1".equals(shutdownProfile)
                 || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
-            environment.put("DUBBO_SERVICE_SHUTDOWN_WAIT", Integer.toString(applicationDrainSeconds * 1000));
+            // Agent 的 Dubbo 阶段只拿收尾余量，并由进程内登记的绝对截止时间再次截短。
+            // 其它 Dubbo 服务继续使用公共处理期限，Docker 仍是所有服务的最终硬边界。
+            int dubboWaitSeconds = coordinatedAgentShutdown
+                    ? finalizationMarginSeconds
+                    : applicationDrainSeconds;
+            environment.put("DUBBO_SERVICE_SHUTDOWN_WAIT", Integer.toString(dubboWaitSeconds * 1000));
         }
         BetaControllerProperties.ServiceTemplate template = properties.getServices().get(service.path("serviceName").asText());
         if (template != null && template.getEnvFile() != null)
@@ -385,7 +396,8 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                     && betaRoutingConfiguration().equals(environment.path("SPRING_APPLICATION_JSON").asText())
                     && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
                         .equals(environment.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText())
-                    && "5".equals(environment
+                    && Integer.toString(finalizationMarginSeconds(
+                        service.path("runtime").path("applicationDrainSeconds").asInt())).equals(environment
                         .path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText())
                     && "true".equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED").asText())
                     && properties.getNacos().getServerAddress().equals(environment
@@ -397,7 +409,9 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                     && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
                         .equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS").asText())
                     && "graceful".equals(environment.path("SERVER_SHUTDOWN").asText())
-                    && (service.path("runtime").path("applicationDrainSeconds").asInt() + "s")
+                    && (coordinatedAgentShutdown(service.path("registration"))
+                        ? "0s"
+                        : service.path("runtime").path("applicationDrainSeconds").asInt() + "s")
                         .equals(environment.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText())
                     && health.isArray() && health.size() == 4
                     && "CMD".equals(health.path(0).asText())
@@ -407,7 +421,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             String shutdownProfile = service.path("runtime").path("shutdownProfile").asText();
             if ("SPRING_BOOT_DUBBO_V1".equals(shutdownProfile)
                     || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
-                valid = valid && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt() * 1000)
+                int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
+                int dubboWaitSeconds = coordinatedAgentShutdown(service.path("registration"))
+                        ? finalizationMarginSeconds(applicationDrainSeconds)
+                        : applicationDrainSeconds;
+                valid = valid && Integer.toString(dubboWaitSeconds * 1000)
                         .equals(environment.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
             }
             if ("frontend".equals(service.path("serviceName").asText())) {
@@ -426,6 +444,15 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         } catch (IOException exception) {
             throw new ControllerException("COMPOSE_CONFIG_INVALID", "Docker Compose returned invalid effective configuration", exception);
         }
+    }
+
+    private static boolean coordinatedAgentShutdown(JsonNode registration) {
+        return "agent-langchain-service".equals(registration.path("applicationName").asText());
+    }
+
+    private static int finalizationMarginSeconds(int totalSeconds) {
+        int normalizedTotal = Math.max(0, totalSeconds);
+        return normalizedTotal <= 1 ? 0 : Math.min(5, normalizedTotal - 1);
     }
 
     private String otelResourceAttributes(JsonNode manifest, JsonNode service, CandidatePlan plan,

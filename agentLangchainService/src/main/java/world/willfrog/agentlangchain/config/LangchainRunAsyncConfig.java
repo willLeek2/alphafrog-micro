@@ -20,7 +20,6 @@ public class LangchainRunAsyncConfig {
     @Bean(name = "agentLangchainRunTaskExecutor")
     public ThreadPoolTaskExecutor agentLangchainRunTaskExecutor(
             @Value("${agent.langchain.run.executor.keep-alive-seconds:60}") int keepAliveSeconds,
-            @Value("${agent.langchain.run.executor.shutdown-await-seconds:120}") int shutdownAwaitSeconds,
             LangchainRunExecutorLimitsResolver limitsResolver) {
         LangchainRunExecutorLimits hard = limitsResolver.hardLimits();
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
@@ -32,11 +31,10 @@ public class LangchainRunAsyncConfig {
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix(hard.getThreadNamePrefix());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        // 注册被摘除后不再接收新请求，已经进入执行器的 Run 按正常逻辑完成。
-        // 所有服务共用部署单冻结的处理期限，超过期限后由容器运行时强制停止进程。
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(shutdownAwaitSeconds);
-        executor.initialize();
+        // AgentServiceShutdownState 在自然处理窗口内保持执行器可用，窗口结束后主动
+        // 中断剩余任务并写失败终态。Bean 销毁阶段不得重新等待一遍完整处理期限。
+        executor.setWaitForTasksToCompleteOnShutdown(false);
+        executor.setAwaitTerminationSeconds(0);
         return executor;
     }
 }
