@@ -54,8 +54,6 @@ import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
 import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
@@ -131,7 +129,6 @@ public class AgentController {
     private final AgentCallDetailBlobReader callDetailBlobReader;
     private final AgentTracePartsService tracePartsService;
     private final AgentTimelineMergeService timelineMergeService;
-    private final DeploymentIdentityProvider deploymentIdentityProvider;
 
     private AgentDubboService resolveService() {
         return agentDubboServiceLangchain;
@@ -242,7 +239,6 @@ public class AgentController {
             }
             String contextJson = contextMap.isEmpty() ? "" : objectMapper.writeValueAsString(contextMap);
             String stageConfigJson = nvl(request.stageConfigJson());
-            DeploymentIdentity deploymentIdentity = deploymentIdentityProvider.current();
             log.info("[AgentController] 创建 Run: userId={}, stageConfigJson={}", userId, stageConfigJson);
             AgentRunMessage run = dubboService.createRun(
                     CreateAgentRunRequest.newBuilder()
@@ -258,8 +254,6 @@ public class AgentController {
                             .setDebugMode(debugMode)
                             .setStageConfigJson(stageConfigJson)
                             .setGenerateArtifacts(Boolean.TRUE.equals(request.generateArtifacts()))
-                            .setDeploymentId(deploymentIdentity.deploymentId())
-                            .setDeploymentGenerationId(deploymentIdentity.generationId())
                             .build());
             return ResponseWrapper.success(toRunResponse(run, admin));
         } catch (RpcException e) {
@@ -613,13 +607,10 @@ public class AgentController {
         }
         try {
             String planOverrideJson = request == null ? "" : nvl(request.planOverrideJson());
-            DeploymentIdentity deploymentIdentity = deploymentIdentityProvider.current();
             AgentRunMessage run = resolveService().resumeRun(ResumeAgentRunRequest.newBuilder()
                     .setUserId(userId)
                     .setId(runId)
                     .setPlanOverrideJson(planOverrideJson)
-                    .setDeploymentId(deploymentIdentity.deploymentId())
-                    .setDeploymentGenerationId(deploymentIdentity.generationId())
                     .build());
             return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
@@ -1536,7 +1527,6 @@ public class AgentController {
         }
 
         try {
-            DeploymentIdentity deploymentIdentity = deploymentIdentityProvider.current();
             SendAgentMessageResponse resp = resolveService().sendMessage(
                     SendAgentMessageRequest.newBuilder()
                             .setUserId(userId)
@@ -1544,8 +1534,6 @@ public class AgentController {
                             .setContent(request.content())
                             .setContextOverride(nvl(contextOverride))
                             .setStream(Boolean.TRUE.equals(request.stream()))
-                            .setDeploymentId(deploymentIdentity.deploymentId())
-                            .setDeploymentGenerationId(deploymentIdentity.generationId())
                             .build()
             );
             return ResponseWrapper.success(new AgentMessageSendResponse(

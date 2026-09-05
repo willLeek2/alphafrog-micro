@@ -165,7 +165,7 @@ class SecurityFilterChainOrderTest {
         private int calls;
 
         CountingLaneWebFilter(List<String> events) {
-            super(new LaneEntryProperties(), (scope, service) -> java.util.Optional.empty());
+            super(new LaneEntryProperties());
             this.events = events;
         }
 
