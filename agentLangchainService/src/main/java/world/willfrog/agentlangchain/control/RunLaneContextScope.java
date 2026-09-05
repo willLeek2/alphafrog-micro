@@ -9,7 +9,7 @@ import world.willfrog.alphafrogmicro.common.lane.LaneContext;
  * 从 Run 的持久化标签重建执行线程上下文。
  *
  * <p>调度器可能先把任务放入业务队列，随后由另一个线程提交到物理线程池，因此不能依赖
- * 提交线程当时碰巧携带的标签。包装任务会在真正执行前写入数据库中的标签，并在结束后恢复
+ * 提交线程当时碰巧携带的标签。包装任务会在实际执行前写入数据库中的标签，并在结束后恢复
  * 原值；TransmittableThreadLocal 的任务包装同时处理线程池复用时的上下文捕获和还原。</p>
  */
 public final class RunLaneContextScope {

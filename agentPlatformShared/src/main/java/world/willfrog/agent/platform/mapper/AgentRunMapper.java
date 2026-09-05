@@ -145,7 +145,7 @@ public interface AgentRunMapper {
             @Param("limit") int limit);
 
     /**
-     * 当前实例在自然处理窗口结束时，只收口本实例所属代际。
+     * 当前实例在自然处理窗口结束时，只为本实例所属代际补写失败终态。
      * 这条语句不由部署控制器调用，也不用于切流时提前终止业务。
      */
     int failNonTerminalRunsForDeploymentGeneration(

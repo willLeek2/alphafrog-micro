@@ -138,7 +138,7 @@ public class LangchainRunConcurrencyScheduler {
     private Reservation reserveAcceptedWorkLocked() {
         // 每次准入都读取最新动态限制，让 Nacos 调整能立即生效。
         LangchainRunExecutorLimits limits = limitsResolver.currentLimits();
-        // 先把已有排队任务提升到可用核心槽位，避免新请求插队。
+        // 先把已有排队任务提升到可用线程槽位，避免新请求插队。
         drainLocked(limits);
         // 准入策略是纯函数：持锁构建一致的状态快照，策略只返回决定。
         int weight = weightPolicy.weightUnitsFor(null);
