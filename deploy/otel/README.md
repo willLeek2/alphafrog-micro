@@ -11,11 +11,11 @@ bash deploy/otel/fetch-javaagent.sh
 bash deploy/otel/verify-javaagent.sh
 ```
 
-构建服务镜像以后、启动容器以前，部署脚本会调用 `prepare-runtime-env.sh`。这个脚本逐个读取本地镜像的 Docker Image ID，并写入权限为 `0600` 的 `deploy/otel/runtime.env`。每个服务使用自己的 `AF_BUILD_IMAGE_ID_*` 变量，不能用仓库清单摘要代替容器实际镜像身份。同一次命令选择两个或更多服务时，脚本还会拒绝任意两个服务得到相同 Image ID，避免错误镜像标签带着格式正确的身份进入 Jaeger。
+构建服务镜像以后、启动容器以前，部署脚本会调用 `prepare-runtime-env.sh`。这个脚本逐个读取本地镜像的 Docker Image ID，并写入权限为 `0600` 的 `deploy/otel/runtime.env`。每个服务使用自己的 `AF_BUILD_IMAGE_ID_*` 变量，不能用仓库清单摘要代替容器实际镜像身份。多个服务确实复用同一份不可变镜像时，各自变量可以保存相同的 Image ID；预检仍会逐项核对服务与实际镜像。
 
-单独部署一个服务时，脚本只能证明这个服务的 Image ID 格式与本地标签一致，不能证明它与本次没有选择的十个服务互不重复。完整部署验收必须一次选择全部 11 个服务。
+单独部署一个服务时，脚本只能证明这个服务的 Image ID 格式与本地标签一致。完整部署验收应一次选择全部 JVM 服务，确保每个服务变量都来自自己的实际镜像。
 
-稳定环境使用 `AF_DEPLOYMENT_ID=stable` 和 `AF_LANE_TAG=stable`。Beta 试点使用部署单里的部署标识和 `AF_LANE_TAG=lane-test`。生产和 Beta 启动前都必须拒绝 `service.version=local`、未知提交标识、非法部署标识以及无效 Image ID。
+稳定环境使用 `AF_DEPLOYMENT_ID=stable` 和 `AF_LANE_TAG=stable`。Beta 使用部署单里的部署标识和流量范围名称；流量范围可以是 `main-beta` 或合法泳道名，但不能冒用 `stable`。生产和 Beta 启动前都必须拒绝 `service.version=local`、未知提交标识、非法部署标识以及无效 Image ID。
 
 `prepare-log-directories.sh` 负责准备宿主机日志目录。新建的 `data/logs` 和服务子目录由当前部署账号持有，权限固定为 `0700`；已有目录只有在属主仍是当前部署账号且权限已经是 `0700` 时才继续，脚本不会把已有目录自动放宽或静默改权。这样即使容器内新日志文件是常见的 `0644`，其他宿主机账号也不能进入父目录读取。
 
@@ -44,7 +44,7 @@ python3 deploy/otel/verify-static-contract.py
 bash deploy/otel/verify-collector-config.sh
 ```
 
-静态检查可以证明 11 个 JVM 服务的 Compose 环境、日志配置、同批服务镜像身份唯一性拒绝分支、宿主机日志目录的 `0700` 新建与拒绝放宽行为，以及制品摘要互相一致。它不能证明 Collector 能在真实镜像中启动，也不能证明 Jaeger、VictoriaLogs、跨机网络、容器对宿主机目录的实际读写权限、持久队列和 Java Agent 自动埋点已经正常工作。
+静态检查可以证明 11 个 JVM 服务的 Compose 环境、日志配置、每个服务的镜像身份与本地实际镜像一致、宿主机日志目录的 `0700` 新建与拒绝放宽行为，以及制品摘要互相一致。不同服务确实使用同一不可变镜像时，镜像 Image ID 允许相同。它不能证明 Collector 能在真实镜像中启动，也不能证明 Jaeger、VictoriaLogs、跨机网络、容器对宿主机目录的实际读写权限、持久队列和 Java Agent 自动埋点已经正常工作。
 
 ## 真实环境试点
 

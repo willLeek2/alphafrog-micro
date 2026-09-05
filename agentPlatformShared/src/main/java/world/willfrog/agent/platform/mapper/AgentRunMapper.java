@@ -3,6 +3,7 @@ package world.willfrog.agent.platform.mapper;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.entity.DeploymentGenerationRecord;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
@@ -135,6 +136,37 @@ public interface AgentRunMapper {
                             @Param("expectedStatus") AgentRunStatus expectedStatus,
                             @Param("lastError") String lastError);
 
+    /** 查询仍有未结束 Run 的部署代际，供实例消亡后的有界补漏清扫使用。 */
+    List<DeploymentGenerationRecord> listNonTerminalDeploymentGenerations(
+            @Param("excludedDeploymentId") String excludedDeploymentId,
+            @Param("excludedDeploymentGenerationId") String excludedDeploymentGenerationId,
+            @Param("afterDeploymentId") String afterDeploymentId,
+            @Param("afterDeploymentGenerationId") String afterDeploymentGenerationId,
+            @Param("limit") int limit);
+
+    /**
+     * 当前实例在自然处理窗口结束时，只收口本实例所属代际。
+     * 这条语句不由部署控制器调用，也不用于切流时提前终止业务。
+     */
+    int failNonTerminalRunsForDeploymentGeneration(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("lastError") String lastError);
+
+    int countNonTerminalRunsForDeploymentGeneration(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId);
+
+    /**
+     * 已确认没有存活实例的代际补漏写。调用方必须先从注册中心连续确认代际消亡，
+     * 并在执行本语句前再次核对；SQL 仍以原部署身份和非终态作为窄条件。
+     */
+    int failOrphanedNonTerminalRunsForDeploymentGeneration(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("lastError") String lastError,
+            @Param("limit") int limit);
+
     @Deprecated
     default int failStartupRecovery(String id, AgentRunStatus expectedStatus, String lastError) {
         return failStartupRecoveryForDeployment(
@@ -149,18 +181,6 @@ public interface AgentRunMapper {
             @Param("deploymentGenerationId") String deploymentGenerationId,
             @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("status") AgentRunStatus status);
-
-    /** 仅在本实例已收到可信退役信号后，把一个本代际 Run 写成明确终态。 */
-    int closeRetiredDeploymentRun(
-            @Param("id") String id,
-            @Param("userId") String userId,
-            @Param("deploymentId") String deploymentId,
-            @Param("deploymentGenerationId") String deploymentGenerationId);
-
-    /** 仅由显式退役 RPC 调用，批量终止当前实例自身代际的未结束 Run。 */
-    int closeNonTerminalRunsForDeployment(
-            @Param("deploymentId") String deploymentId,
-            @Param("deploymentGenerationId") String deploymentGenerationId);
 
     int updateExt(@Param("id") String id,
                   @Param("userId") String userId,

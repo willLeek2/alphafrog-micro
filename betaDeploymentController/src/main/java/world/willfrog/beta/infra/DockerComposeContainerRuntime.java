@@ -73,7 +73,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     }
 
     @Override
-    public ContainerObservation create(JsonNode manifest, JsonNode service, CandidatePlan plan, String retirementToken) {
+    public ContainerObservation create(JsonNode manifest, JsonNode service, CandidatePlan plan) {
         String machineId = service.path("machineId").asText();
         BetaControllerProperties.Machine machine = machine(machineId);
         String name = containerName(plan, service.path("serviceName").asText());
@@ -90,7 +90,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environmentFiles.requireDedicatedFile(service.path("serviceName").asText(), template.getEnvFile(), Map.of());
         Path compose = writeCompose(manifest, service, plan, name, machine);
         Map<String, String> environment = new HashMap<>();
-        if (!retirementToken.isEmpty()) environment.put("AF_DEPLOYMENT_RETIREMENT_TOKEN", retirementToken);
         verifyEffectiveCompose(manifest, service, plan, name, machine, compose, environment);
         commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
                 "up", "--detach", "--no-deps", "app"), environment, Duration.ofMinutes(5));
@@ -227,9 +226,31 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AF_LANE_TAG", plan.trafficScopeId());
         environment.put("AF_SERVICE_VERSION", service.path("releaseId").asText());
         environment.put("AF_GIT_COMMIT", manifest.path("gitCommit").asText());
-        environment.put("AF_IMAGE_DIGEST", service.path("image").path("repositoryDigest").asText());
+        String localImageId = service.path("image").path("localImageId").asText();
+        environment.put("AF_IMAGE_DIGEST", localImageId);
+        environment.put("OTEL_SERVICE_NAME", service.path("serviceName").asText());
+        environment.put("OTEL_RESOURCE_ATTRIBUTES", otelResourceAttributes(manifest, service, plan, localImageId));
+        if ("frontend".equals(service.path("serviceName").asText())) {
+            boolean laneEntry = !"main-beta".equals(plan.trafficScopeId());
+            environment.put("AF_LANE_ENTRY_ENABLED", Boolean.toString(laneEntry));
+            environment.put("AF_LANE_TRAFFIC_SCOPE_ID", plan.trafficScopeId());
+        }
         environment.put("AF_DUBBO_PORT_TO_REGISTRY", Integer.toString(plan.hostPort()));
+        environment.put("AF_DUBBO_REGISTRY_REGISTER", "false");
+        environment.put("SPRING_APPLICATION_JSON", betaRoutingConfiguration());
         int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
+        environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS",
+                Integer.toString(applicationDrainSeconds));
+        environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS", "5");
+        JsonNode registration = service.path("registration");
+        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED", "true");
+        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS",
+                properties.getNacos().getServerAddress());
+        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_NAMESPACE", normalizedNacosNamespace());
+        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_GROUP_NAME",
+                registration.path("groupName").asText());
+        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS",
+                Integer.toString(applicationDrainSeconds));
         environment.put("SERVER_SHUTDOWN", "graceful");
         environment.put("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE", applicationDrainSeconds + "s");
         String shutdownProfile = service.path("runtime").path("shutdownProfile").asText();
@@ -237,8 +258,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
             environment.put("DUBBO_SERVICE_SHUTDOWN_WAIT", Integer.toString(applicationDrainSeconds * 1000));
         }
-        if ("AGENT_RETIRE_GENERATION_V1".equals(service.path("runtime").path("preStopPolicy").asText()))
-            environment.put("AF_DEPLOYMENT_RETIREMENT_TOKEN", "${AF_DEPLOYMENT_RETIREMENT_TOKEN:?missing}");
         BetaControllerProperties.ServiceTemplate template = properties.getServices().get(service.path("serviceName").asText());
         if (template != null && template.getEnvFile() != null)
             app.putArray("env_file").add(template.getEnvFile().toAbsolutePath().normalize().toString());
@@ -284,6 +303,41 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         }
     }
 
+    private String betaRoutingConfiguration() {
+        String server = properties.getNacos().getServerAddress();
+        if (server == null || server.isBlank())
+            throw new ControllerException("NACOS_CONFIG_INVALID", "Nacos server address is required for Beta routing");
+        String namespace = normalizedNacosNamespace();
+        ObjectNode root = mapper.createObjectNode();
+        ObjectNode dubbo = root.putObject("dubbo");
+        dubbo.putObject("registry").put("register", false);
+        ObjectNode registries = dubbo.putObject("registries");
+        registryConfig(registries.putObject("beta"), server, namespace, "alphafrog-beta", "beta", true);
+        registryConfig(registries.putObject("production"), server, namespace, "DEFAULT_GROUP", "prod", false);
+        dubbo.putObject("consumer").put("cluster", "zone-aware");
+        try {
+            return mapper.writeValueAsString(root);
+        } catch (IOException impossible) {
+            throw new IllegalStateException("Unable to render Beta routing configuration", impossible);
+        }
+    }
+
+    private String normalizedNacosNamespace() {
+        String namespace = properties.getNacos().getNamespace();
+        return namespace == null || namespace.isBlank() ? "public" : namespace;
+    }
+
+    private void registryConfig(ObjectNode target, String server, String namespace, String group, String zone,
+                                boolean preferred) {
+        target.put("address", "nacos://" + server + "?namespace=" + namespace + "&group=" + group + "&zone=" + zone);
+        target.put("username", "${AF_CONFIG_NACOS_USERNAME:}");
+        target.put("password", "${AF_CONFIG_NACOS_PASSWORD:}");
+        target.put("register", false);
+        target.put("preferred", preferred);
+        target.put("use-as-config-center", false);
+        target.put("use-as-metadata-center", false);
+    }
+
     private void verifyImage(String machineId, JsonNode service) {
         String actual = commands.run(docker(machineId, "image", "inspect", service.path("image").path("repositoryDigest").asText(),
                 "--format", "{{.Id}}"), Map.of(), Duration.ofSeconds(30)).strip();
@@ -320,9 +374,28 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                     && plan.trafficScopeId().equals(environment.path("AF_LANE_TAG").asText())
                     && service.path("releaseId").asText().equals(environment.path("AF_SERVICE_VERSION").asText())
                     && manifest.path("gitCommit").asText().equals(environment.path("AF_GIT_COMMIT").asText())
-                    && service.path("image").path("repositoryDigest").asText()
+                    && service.path("image").path("localImageId").asText()
                         .equals(environment.path("AF_IMAGE_DIGEST").asText())
+                    && service.path("serviceName").asText().equals(environment.path("OTEL_SERVICE_NAME").asText())
+                    && otelResourceAttributes(manifest, service, plan,
+                        service.path("image").path("localImageId").asText())
+                        .equals(environment.path("OTEL_RESOURCE_ATTRIBUTES").asText())
                     && Integer.toString(plan.hostPort()).equals(environment.path("AF_DUBBO_PORT_TO_REGISTRY").asText())
+                    && "false".equals(environment.path("AF_DUBBO_REGISTRY_REGISTER").asText())
+                    && betaRoutingConfiguration().equals(environment.path("SPRING_APPLICATION_JSON").asText())
+                    && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
+                        .equals(environment.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText())
+                    && "5".equals(environment
+                        .path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText())
+                    && "true".equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED").asText())
+                    && properties.getNacos().getServerAddress().equals(environment
+                        .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS").asText())
+                    && normalizedNacosNamespace().equals(environment
+                        .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_NAMESPACE").asText())
+                    && service.path("registration").path("groupName").asText().equals(environment
+                        .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_GROUP_NAME").asText())
+                    && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
+                        .equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS").asText())
                     && "graceful".equals(environment.path("SERVER_SHUTDOWN").asText())
                     && (service.path("runtime").path("applicationDrainSeconds").asInt() + "s")
                         .equals(environment.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText())
@@ -337,6 +410,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 valid = valid && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt() * 1000)
                         .equals(environment.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
             }
+            if ("frontend".equals(service.path("serviceName").asText())) {
+                valid = valid
+                        && Boolean.toString(!"main-beta".equals(plan.trafficScopeId()))
+                        .equals(environment.path("AF_LANE_ENTRY_ENABLED").asText())
+                        && plan.trafficScopeId().equals(environment.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+            }
             if (!valid)
                 throw new ControllerException("COMPOSE_CONFIG_INVALID", "Effective Compose configuration does not match the deployment contract");
             BetaControllerProperties.ServiceTemplate template = properties.getServices()
@@ -347,6 +426,15 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         } catch (IOException exception) {
             throw new ControllerException("COMPOSE_CONFIG_INVALID", "Docker Compose returned invalid effective configuration", exception);
         }
+    }
+
+    private String otelResourceAttributes(JsonNode manifest, JsonNode service, CandidatePlan plan,
+                                          String localImageId) {
+        return "deployment.id=" + plan.deploymentId()
+                + ",lane.tag=" + plan.trafficScopeId()
+                + ",service.version=" + service.path("releaseId").asText()
+                + ",git.commit=" + manifest.path("gitCommit").asText()
+                + ",image.digest=" + localImageId;
     }
 
     private void verifyContainerIdentity(JsonNode actual, JsonNode manifest, JsonNode service,

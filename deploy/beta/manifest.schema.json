@@ -64,7 +64,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 96,
-      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$"
+      "pattern": "^(?!stable$)[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$"
     },
     "serviceName": {
       "type": "string",
@@ -198,7 +198,6 @@
         "hostPorts",
         "healthCheckProfile",
         "readinessTimeoutSeconds",
-        "preStopPolicy",
         "shutdownProfile",
         "applicationDrainSeconds",
         "drainGraceSeconds"
@@ -224,12 +223,6 @@
           "minimum": 1,
           "maximum": 3600
         },
-        "preStopPolicy": {
-          "enum": [
-            "NONE",
-            "AGENT_RETIRE_GENERATION_V1"
-          ]
-        },
         "shutdownProfile": {
           "enum": [
             "SPRING_BOOT_HTTP_DUBBO_V1",
@@ -239,7 +232,7 @@
         },
         "applicationDrainSeconds": {
           "type": "integer",
-          "minimum": 1,
+          "minimum": 6,
           "maximum": 86395
         },
         "drainGraceSeconds": {
@@ -256,14 +249,15 @@
         "serviceName",
         "groupName",
         "namespaceId",
-        "clusterName"
+        "clusterName",
+        "applicationName"
       ],
       "properties": {
         "serviceName": {
           "$ref": "#/$defs/nacosText"
         },
         "groupName": {
-          "$ref": "#/$defs/nacosText"
+          "const": "alphafrog-beta"
         },
         "namespaceId": {
           "$ref": "#/$defs/nacosText"
@@ -272,6 +266,9 @@
           "type": "string",
           "pattern": "^[0-9A-Za-z-]+$",
           "maxLength": 128
+        },
+        "applicationName": {
+          "$ref": "#/$defs/nacosText"
         }
       }
     }

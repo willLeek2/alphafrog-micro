@@ -20,6 +20,7 @@ public class LangchainRunAsyncConfig {
     @Bean(name = "agentLangchainRunTaskExecutor")
     public ThreadPoolTaskExecutor agentLangchainRunTaskExecutor(
             @Value("${agent.langchain.run.executor.keep-alive-seconds:60}") int keepAliveSeconds,
+            @Value("${agent.langchain.run.executor.shutdown-await-seconds:120}") int shutdownAwaitSeconds,
             LangchainRunExecutorLimitsResolver limitsResolver) {
         LangchainRunExecutorLimits hard = limitsResolver.hardLimits();
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
@@ -31,9 +32,10 @@ public class LangchainRunAsyncConfig {
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix(hard.getThreadNamePrefix());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        // 普通重启不能被误认为代际退役。Spring 关闭时立即中断 worker，数据库中的
-        // 同代际 Run 由启动恢复继续；真正退役由控制器显式调用代际退役 RPC。
-        executor.setWaitForTasksToCompleteOnShutdown(false);
+        // 注册被摘除后不再接收新请求，已经进入执行器的 Run 按正常逻辑完成。
+        // 所有服务共用部署单冻结的处理期限，超过期限后由容器运行时强制停止进程。
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(shutdownAwaitSeconds);
         executor.initialize();
         return executor;
     }

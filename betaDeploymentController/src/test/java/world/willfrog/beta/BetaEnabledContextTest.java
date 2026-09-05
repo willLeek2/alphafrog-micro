@@ -14,7 +14,6 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import world.willfrog.beta.core.BetaDeploymentService;
 import world.willfrog.beta.core.ContainerRuntime;
-import world.willfrog.beta.core.RetirementGateway;
 import world.willfrog.beta.core.ServiceRegistry;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
@@ -22,18 +21,15 @@ import world.willfrog.beta.core.ServiceRegistry;
 class BetaEnabledContextTest {
     private static final Path ROOT = createRuntimeDirectory();
     private static final Path API_TOKEN = secret("api-token");
-    private static final Path RETIREMENT_TOKEN = secret("retirement-token");
 
     @MockBean ContainerRuntime containers;
     @MockBean ServiceRegistry registry;
-    @MockBean RetirementGateway retirement;
     @Autowired BetaDeploymentService service;
 
     @DynamicPropertySource
     static void runtimeProperties(DynamicPropertyRegistry properties) {
         properties.add("alphafrog.beta-controller.state-root", () -> ROOT.resolve("state"));
         properties.add("alphafrog.beta-controller.api-token-file", () -> API_TOKEN);
-        properties.add("alphafrog.beta-controller.retirement-token-file", () -> RETIREMENT_TOKEN);
     }
 
     @Test

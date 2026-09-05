@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://alphafrog.local/schemas/beta/controller-state.schema.json",
   "title": "AlphaFrog Beta traffic controller state",
-  "description": "Validates the complete JSON object stored at /var/lib/alphafrog-beta/controller-state.json. The Beta deployment controller is the sole runtime writer; its startup reconciliation, status-query handler, and route-snapshot API implementation read this file. manifest.schema.json validates each deployment's desired manifest.json, while this schema validates accepted manifest identity plus observed container, Nacos, route, and current-operation facts. beta-deployment-traffic-governance-contract.md defines write ordering and cross-file consistency checks that JSON Schema cannot express.",
+  "description": "Validates the complete JSON object stored at /var/lib/alphafrog-beta/controller-state.json. The Beta deployment controller is the sole runtime writer. The file records accepted manifest identity, observed containers, Nacos registrations, drain deadlines, and current operations; it is not a request-routing source.",
   "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time, ipv4, and ipv6. Treating format as annotation is not conforming.",
   "type": "object",
   "additionalProperties": false,
@@ -41,12 +41,6 @@
       "type": "string",
       "pattern": "^gen-[a-f0-9]{64}$"
     },
-    "preStopPolicy": {
-      "enum": [
-        "NONE",
-        "AGENT_RETIRE_GENERATION_V1"
-      ]
-    },
     "shutdownProfile": {
       "enum": [
         "SPRING_BOOT_HTTP_DUBBO_V1",
@@ -58,7 +52,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 96,
-      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$"
+      "pattern": "^(?!stable$)[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$"
     },
     "serviceName": {
       "type": "string",
@@ -200,7 +194,7 @@
           "$ref": "#/$defs/nacosText"
         },
         "groupName": {
-          "$ref": "#/$defs/nacosText"
+          "const": "alphafrog-beta"
         },
         "namespaceId": {
           "$ref": "#/$defs/nacosText"
@@ -238,12 +232,26 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
+            "alphafrog.deployment-id",
             "alphafrog.traffic-scope-id",
             "alphafrog.release-id",
             "alphafrog.deployment-generation-id",
-            "alphafrog.instance-id"
+            "alphafrog.instance-id",
+            "zone",
+            "application",
+            "category",
+            "dynamic",
+            "group",
+            "interface",
+            "path",
+            "protocol",
+            "side",
+            "version"
           ],
           "properties": {
+            "alphafrog.deployment-id": {
+              "$ref": "#/$defs/deploymentId"
+            },
             "alphafrog.traffic-scope-id": {
               "$ref": "#/$defs/trafficScopeId"
             },
@@ -255,6 +263,53 @@
             },
             "alphafrog.instance-id": {
               "$ref": "#/$defs/opaqueId"
+            },
+            "zone": {
+              "const": "beta"
+            },
+            "application": {
+              "$ref": "#/$defs/nacosText"
+            },
+            "category": {
+              "const": "providers"
+            },
+            "dynamic": {
+              "const": "true"
+            },
+            "group": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[0-9A-Za-z._-]+$"
+            },
+            "interface": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"
+            },
+            "protocol": {
+              "const": "tri"
+            },
+            "side": {
+              "const": "provider"
+            },
+            "version": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^(?:[0-9A-Za-z._-]+)?$"
+            },
+            "dubbo.tag": {
+              "$ref": "#/$defs/trafficScopeId"
+            },
+            "tag": {
+              "$ref": "#/$defs/trafficScopeId"
             }
           }
         }
@@ -268,7 +323,6 @@
         "machineId",
         "releaseId",
         "deploymentGenerationId",
-        "preStopPolicy",
         "shutdownProfile",
         "applicationDrainSeconds",
         "drainGraceSeconds",
@@ -294,15 +348,12 @@
         "deploymentGenerationId": {
           "$ref": "#/$defs/deploymentGenerationId"
         },
-        "preStopPolicy": {
-          "$ref": "#/$defs/preStopPolicy"
-        },
         "shutdownProfile": {
           "$ref": "#/$defs/shutdownProfile"
         },
         "applicationDrainSeconds": {
           "type": "integer",
-          "minimum": 1,
+          "minimum": 6,
           "maximum": 86395
         },
         "drainGraceSeconds": {
@@ -359,7 +410,6 @@
             "machineId",
             "releaseId",
             "deploymentGenerationId",
-            "preStopPolicy",
             "shutdownProfile",
             "applicationDrainSeconds",
             "drainGraceSeconds",
@@ -377,7 +427,6 @@
             "machineId": true,
             "releaseId": true,
             "deploymentGenerationId": true,
-            "preStopPolicy": true,
             "shutdownProfile": true,
             "applicationDrainSeconds": true,
             "drainGraceSeconds": true,
@@ -406,7 +455,6 @@
             "machineId",
             "releaseId",
             "deploymentGenerationId",
-            "preStopPolicy",
             "shutdownProfile",
             "applicationDrainSeconds",
             "drainGraceSeconds",
@@ -427,7 +475,6 @@
             "machineId": true,
             "releaseId": true,
             "deploymentGenerationId": true,
-            "preStopPolicy": true,
             "shutdownProfile": true,
             "applicationDrainSeconds": true,
             "drainGraceSeconds": true,
@@ -495,7 +542,6 @@
             "machineId",
             "releaseId",
             "deploymentGenerationId",
-            "preStopPolicy",
             "shutdownProfile",
             "applicationDrainSeconds",
             "drainGraceSeconds",
@@ -510,14 +556,13 @@
             "trafficRemovedAt",
             "stopSignalRequestedAt",
             "stopDeadline",
-            "preStopCompletedAt"
+            "registrationRemovedAt"
           ],
           "properties": {
             "instanceId": true,
             "machineId": true,
             "releaseId": true,
             "deploymentGenerationId": true,
-            "preStopPolicy": true,
             "shutdownProfile": true,
             "applicationDrainSeconds": true,
             "drainGraceSeconds": true,
@@ -538,33 +583,11 @@
             "stopDeadline": {
               "$ref": "#/$defs/nullableTimestamp"
             },
-            "preStopCompletedAt": {
-              "$ref": "#/$defs/nullableTimestamp"
+            "registrationRemovedAt": {
+              "$ref": "#/$defs/timestamp"
             }
           },
           "allOf": [
-            {
-              "if": {
-                "properties": {
-                  "preStopCompletedAt": {
-                    "type": "null"
-                  }
-                },
-                "required": [
-                  "preStopCompletedAt"
-                ]
-              },
-              "then": {
-                "properties": {
-                  "stopSignalRequestedAt": {
-                    "type": "null"
-                  },
-                  "stopDeadline": {
-                    "type": "null"
-                  }
-                }
-              }
-            },
             {
               "if": {
                 "properties": {
@@ -585,9 +608,6 @@
               },
               "else": {
                 "properties": {
-                  "preStopCompletedAt": {
-                    "$ref": "#/$defs/timestamp"
-                  },
                   "stopDeadline": {
                     "$ref": "#/$defs/timestamp"
                   }
@@ -595,76 +615,6 @@
               }
             }
           ]
-        }
-      ]
-    },
-    "routeState": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "defaultInstanceId",
-        "defaultReleaseId",
-        "defaultDeploymentGenerationId",
-        "routeVersion",
-        "updatedAt"
-      ],
-      "properties": {
-        "defaultInstanceId": {
-          "$ref": "#/$defs/nullableOpaqueId"
-        },
-        "defaultReleaseId": {
-          "$ref": "#/$defs/nullableOpaqueId"
-        },
-        "defaultDeploymentGenerationId": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/deploymentGenerationId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "routeVersion": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "updatedAt": {
-          "$ref": "#/$defs/timestamp"
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "defaultInstanceId": {
-                "type": "null"
-              }
-            },
-            "required": [
-              "defaultInstanceId"
-            ]
-          },
-          "then": {
-            "properties": {
-              "defaultReleaseId": {
-                "type": "null"
-              },
-              "defaultDeploymentGenerationId": {
-                "type": "null"
-              }
-            }
-          },
-          "else": {
-            "properties": {
-              "defaultReleaseId": {
-                "$ref": "#/$defs/opaqueId"
-              },
-              "defaultDeploymentGenerationId": {
-                "$ref": "#/$defs/deploymentGenerationId"
-              }
-            }
-          }
         }
       ]
     },
@@ -830,7 +780,6 @@
         "activeInstance",
         "candidateInstance",
         "drainingInstance",
-        "route",
         "operation",
         "failedManifestVersion",
         "lastError"
@@ -887,9 +836,6 @@
               "type": "null"
             }
           ]
-        },
-        "route": {
-          "$ref": "#/$defs/routeState"
         },
         "operation": {
           "anyOf": [
@@ -998,8 +944,8 @@
                       "trafficRemovedAt": {
                         "$ref": "#/$defs/timestamp"
                       },
-                      "preStopCompletedAt": {
-                        "$ref": "#/$defs/nullableTimestamp"
+                      "registrationRemovedAt": {
+                        "$ref": "#/$defs/timestamp"
                       }
                     }
                   }
@@ -1163,17 +1109,6 @@
             "properties": {
               "drainingInstance": {
                 "type": "null"
-              },
-              "route": {
-                "type": "object",
-                "properties": {
-                  "defaultInstanceId": {
-                    "$ref": "#/$defs/opaqueId"
-                  },
-                  "defaultReleaseId": {
-                    "$ref": "#/$defs/opaqueId"
-                  }
-                }
               }
             }
           }
@@ -1285,17 +1220,6 @@
               },
               "drainingInstance": {
                 "$ref": "#/$defs/drainingInstance"
-              },
-              "route": {
-                "type": "object",
-                "properties": {
-                  "defaultInstanceId": {
-                    "$ref": "#/$defs/opaqueId"
-                  },
-                  "defaultReleaseId": {
-                    "$ref": "#/$defs/opaqueId"
-                  }
-                }
               }
             }
           }
@@ -1333,17 +1257,6 @@
               },
               "drainingInstance": {
                 "type": "null"
-              },
-              "route": {
-                "type": "object",
-                "properties": {
-                  "defaultInstanceId": {
-                    "$ref": "#/$defs/opaqueId"
-                  },
-                  "defaultReleaseId": {
-                    "$ref": "#/$defs/opaqueId"
-                  }
-                }
               }
             }
           }
@@ -1381,17 +1294,6 @@
               },
               "drainingInstance": {
                 "$ref": "#/$defs/drainingInstance"
-              },
-              "route": {
-                "type": "object",
-                "properties": {
-                  "defaultInstanceId": {
-                    "type": "null"
-                  },
-                  "defaultReleaseId": {
-                    "type": "null"
-                  }
-                }
               }
             }
           }
@@ -1418,17 +1320,6 @@
                   },
                   "drainingInstance": {
                     "type": "null"
-                  },
-                  "route": {
-                    "type": "object",
-                    "properties": {
-                      "defaultInstanceId": {
-                        "type": "null"
-                      },
-                      "defaultReleaseId": {
-                        "type": "null"
-                      }
-                    }
                   },
                   "operation": {
                     "anyOf": [

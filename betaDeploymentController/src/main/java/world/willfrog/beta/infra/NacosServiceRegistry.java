@@ -22,6 +22,8 @@ import world.willfrog.beta.core.ServiceRegistry;
 @Component
 @ConditionalOnProperty(prefix = "alphafrog.beta-controller", name = "enabled", havingValue = "true")
 public class NacosServiceRegistry implements ServiceRegistry {
+    private static final java.util.regex.Pattern DUBBO_SERVICE_KEY = java.util.regex.Pattern.compile(
+            "^([0-9A-Za-z._-]+)/([A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*)(?::([0-9A-Za-z._-]+))?$");
     private final NamingService naming;
     private final String namespace;
 
@@ -61,10 +63,27 @@ public class NacosServiceRegistry implements ServiceRegistry {
         if (!namespace.equals(normalizeNamespace(template.path("namespaceId").asText())))
             throw new ControllerException("NACOS_NAMESPACE_MISMATCH", "Manifest namespace differs from the configured Nacos namespace");
         Map<String, String> metadata = new LinkedHashMap<>();
+        metadata.put("alphafrog.deployment-id", manifest.path("deploymentId").asText());
         metadata.put("alphafrog.traffic-scope-id", manifest.path("trafficScopeId").asText());
         metadata.put("alphafrog.release-id", service.path("releaseId").asText());
         metadata.put("alphafrog.deployment-generation-id", generationId);
         metadata.put("alphafrog.instance-id", instanceId);
+        metadata.put("zone", "beta");
+        DubboProviderIdentity provider = dubboProvider(service.path("dubboServiceKey").asText());
+        metadata.put("application", requireText(template.path("applicationName").asText(), "Dubbo application name"));
+        metadata.put("category", "providers");
+        metadata.put("dynamic", "true");
+        metadata.put("group", provider.group());
+        metadata.put("interface", provider.interfaceName());
+        metadata.put("path", provider.interfaceName());
+        metadata.put("protocol", "tri");
+        metadata.put("side", "provider");
+        metadata.put("version", provider.version());
+        String trafficScopeId = manifest.path("trafficScopeId").asText();
+        if (!"main-beta".equals(trafficScopeId)) {
+            metadata.put("tag", trafficScopeId);
+            metadata.put("dubbo.tag", trafficScopeId);
+        }
         Instance instance = instance(address, port, template.path("clusterName").asText(), selectable, metadata);
         call(() -> naming.registerInstance(template.path("serviceName").asText(),
                 template.path("groupName").asText(), instance));
@@ -188,6 +207,21 @@ public class NacosServiceRegistry implements ServiceRegistry {
         catch (NacosException exception) { throw new ControllerException("NACOS_WRITE_FAILED", "Nacos instance update failed", exception); }
     }
 
+    private DubboProviderIdentity dubboProvider(String serviceKey) {
+        java.util.regex.Matcher matcher = DUBBO_SERVICE_KEY.matcher(serviceKey);
+        if (!matcher.matches())
+            throw new ControllerException("NACOS_CONFIG_INVALID", "Dubbo service key is invalid");
+        return new DubboProviderIdentity(matcher.group(1), matcher.group(2),
+                matcher.group(3) == null ? "" : matcher.group(3));
+    }
+
+    private String requireText(String value, String name) {
+        if (value == null || value.isBlank())
+            throw new ControllerException("NACOS_CONFIG_INVALID", name + " is required");
+        return value.trim();
+    }
+
     private String normalizeNamespace(String value) { return value == null || value.isBlank() ? "public" : value; }
+    private record DubboProviderIdentity(String group, String interfaceName, String version) { }
     @FunctionalInterface private interface NacosCall { void run() throws NacosException; }
 }

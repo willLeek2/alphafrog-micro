@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.config;
 
+import com.alibaba.ttl.threadpool.TtlExecutors;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -25,7 +26,7 @@ public class LangchainSubAgentConfiguration {
         int core = Math.max(1, corePoolSize);
         int max = Math.max(core, maxPoolSize);
         int queue = Math.max(1, queueCapacity);
-        return new ThreadPoolExecutor(
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
                 core,
                 max,
                 60L,
@@ -33,6 +34,7 @@ public class LangchainSubAgentConfiguration {
                 new ArrayBlockingQueue<>(queue),
                 namedFactory("agent-sub-agent-"),
                 new ThreadPoolExecutor.AbortPolicy());
+        return TtlExecutors.getTtlExecutorService(executor);
     }
 
     @Bean(name = "langchainSubAgentTimeoutScheduler", destroyMethod = "shutdown")

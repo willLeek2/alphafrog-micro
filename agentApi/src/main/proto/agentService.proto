@@ -24,6 +24,7 @@ message AgentRunMessage {
   string ext = 13;
   string deployment_id = 14;
   string deployment_generation_id = 15;
+  string lane_tag = 16;
 }
 
 message CreateAgentRunRequest {
@@ -39,8 +40,8 @@ message CreateAgentRunRequest {
   bool debug_mode = 10;
   string stage_config_json = 11;  // 各阶段 LLM 配置（包含 planning/execution/sub_agent）
   bool generate_artifacts = 12;   // 默认 false；只控制用户可查询/下载的正式产物
-  string deployment_id = 13;      // 入口从可信部署上下文写入，不能使用客户端原始头
-  string deployment_generation_id = 14; // 本次请求绑定的不可变部署代际
+  string deployment_id = 13 [deprecated = true]; // 服务端忽略；由实际受理的 Agent 实例写入身份
+  string deployment_generation_id = 14 [deprecated = true]; // 服务端忽略
 }
 
 message GetAgentRunRequest {
@@ -100,8 +101,8 @@ message ResumeAgentRunRequest {
   string user_id = 1;
   string id = 2;
   string plan_override_json = 3;
-  string deployment_id = 4;
-  string deployment_generation_id = 5;
+  string deployment_id = 4 [deprecated = true]; // 服务端忽略，使用 Run 已保存身份与本机身份核对
+  string deployment_generation_id = 5 [deprecated = true];
 }
 
 message AgentRunEventMessage {
@@ -458,8 +459,8 @@ message SendAgentMessageRequest {
   string content = 3;           // 用户消息内容
   string context_override = 4;  // 可选：上下文覆盖（仅 admin + debugMode 可用）
   bool stream = 5;              // 是否流式响应（预留）
-  string deployment_id = 6;     // 必须与原 Run 和实际命中的服务实例一致
-  string deployment_generation_id = 7;
+  string deployment_id = 6 [deprecated = true]; // 服务端忽略，使用 Run 已保存身份与本机身份核对
+  string deployment_generation_id = 7 [deprecated = true];
 }
 
 // 发送消息响应
@@ -533,20 +534,10 @@ message GetAgentDiagnosticReadCapabilitiesResponse {
   bool artifact_skip_lazy_registration = 3;
 }
 
-// 部署控制器在默认路由已经切离旧实例后，直接请求旧 Agent 实例退役当前代际。
-// Agent 只接受与自身环境身份完全一致的请求；调用方不提交也不读取 Run 标识。
-message RetireAgentDeploymentGenerationRequest {
-  string deployment_id = 1;
-  string deployment_generation_id = 2;
-  string retirement_token = 3; // 部署控制器专用凭证，不写日志、不进入响应
-}
-
 service AgentDubboService {
   rpc GetDiagnosticReadCapabilities(GetAgentDiagnosticReadCapabilitiesRequest)
       returns (GetAgentDiagnosticReadCapabilitiesResponse);
   rpc CreateRun(CreateAgentRunRequest) returns (AgentRunMessage);
-  rpc RetireDeploymentGeneration(RetireAgentDeploymentGenerationRequest)
-      returns (AgentEmpty);
   rpc GetRun(GetAgentRunRequest) returns (AgentRunMessage);
   rpc UpdateRun(UpdateAgentRunRequest) returns (AgentRunMessage);
   rpc ListRuns(ListAgentRunsRequest) returns (ListAgentRunsResponse);

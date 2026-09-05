@@ -36,9 +36,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * workspace dump 异步调度器（单进程 writer）。
  *
  * <p>在 {@code workspaceDumpExecutor} 线程池上异步执行 dump；失败时 3 次重试，
- * 仍失败则入磁盘 DLQ（基于 D04 WorkspacePathResolver）。
+ * 仍失败则通过 WorkspacePathResolver 写入磁盘 DLQ。
  *
- * <h3>DLQ 持久化（D21-B 5.2.4）</h3>
+ * <h3>DLQ 持久化</h3>
  * <ul>
  *   <li>介质：{workspaceRoot}/_dlq/entry-{uuid}.json</li>
  *   <li>原子写入：写 .tmp → ATOMIC_MOVE 替换</li>
@@ -68,8 +68,7 @@ import java.util.concurrent.atomic.AtomicLong;
 @Component
 // 260814 scheduler-03: workspace export 总开关默认关闭；关闭时本调度器不注册，
 // 没有 DLQ 目录、启动重放或后台任务。
-@ConditionalOnExpression("${agent.workspace.export-enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}")
 @Slf4j
 public class WorkspaceDumpScheduler {
 

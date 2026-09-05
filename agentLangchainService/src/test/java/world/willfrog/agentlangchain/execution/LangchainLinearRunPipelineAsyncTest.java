@@ -17,6 +17,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSupport.immediateScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
@@ -96,8 +97,7 @@ class LangchainLinearRunPipelineAsyncTest {
         pipeline.launchAsync(run);
 
         assertThat(workflowEntered).isFalse();
-        verify(runMapper, never()).closeRetiredDeploymentRun(
-                "run-other-generation", "u1", "beta-a", "gen-" + "b".repeat(64));
+        verifyNoInteractions(runMapper);
     }
 
     private LangchainLinearRunPipelineImpl pipelineThatRecordsExecution(

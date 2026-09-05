@@ -53,12 +53,10 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentToolsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentToolsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
-import world.willfrog.alphafrogmicro.agent.idl.RetireAgentDeploymentGenerationRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.agent.idl.SubmitAgentFeedbackRequest;
 import world.willfrog.alphafrogmicro.agent.idl.UpdateAgentRunRequest;
-import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
 
 /**
  * agentLangchainService 的 Dubbo RPC 入口 —— 实现共享的
@@ -86,8 +84,7 @@ import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementSe
  * @see LangchainRunControlService 控制路径
  */
 @DubboService(group = "langchain")
-@ConditionalOnExpression("${agent.langchain.provider.enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnExpression("${agent.langchain.provider.enabled:false}")
 @RequiredArgsConstructor
 public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDubboServiceImplBase {
 
@@ -96,7 +93,6 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     private final LangchainRunControlService controlService;
     private final LangchainFollowUpService followUpService;
     private final LangchainArtifactFacadeService artifactFacadeService;
-    private final DeploymentGenerationRetirementService retirementService;
 
     @Override
     public GetAgentDiagnosticReadCapabilitiesResponse getDiagnosticReadCapabilities(
@@ -107,16 +103,6 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     @Override
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         return runService.createRun(request);
-    }
-
-    @Override
-    public AgentEmpty retireDeploymentGeneration(
-            RetireAgentDeploymentGenerationRequest request) {
-        retirementService.retire(
-                request.getDeploymentId(),
-                request.getDeploymentGenerationId(),
-                request.getRetirementToken());
-        return AgentEmpty.getDefaultInstance();
     }
 
     @Override

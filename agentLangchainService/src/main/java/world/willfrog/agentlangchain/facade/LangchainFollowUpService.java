@@ -1,7 +1,6 @@
 package world.willfrog.agentlangchain.facade;
 
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -18,7 +17,6 @@ import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
-import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
 
 import java.util.Map;
 import java.util.function.Supplier;
@@ -35,23 +33,11 @@ public class LangchainFollowUpService {
     private final LangchainLinearRunPipeline pipeline;
     private final DeploymentIdentityProvider deploymentIdentityProvider;
 
-    @Autowired(required = false)
-    private DeploymentGenerationRetirementService retirementService;
-    @Autowired(required = false)
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
     private PlatformTransactionManager transactionManager;
 
     public SendAgentMessageResponse sendMessage(SendAgentMessageRequest request) {
-        if (retirementService == null) {
-            return sendMessageWhileActive(request);
-        }
-        try {
-            return retirementService.executeWhileActive(() -> sendMessageWhileActive(request));
-        } catch (IllegalStateException e) {
-            if ("deployment_generation_inactive".equals(e.getMessage())) {
-                return rejectedInactiveDeployment();
-            }
-            throw e;
-        }
+        return sendMessageWhileActive(request);
     }
 
     private <T> T executeAdmissionTransaction(Supplier<T> operation) {
@@ -70,13 +56,6 @@ public class LangchainFollowUpService {
         String content = requireNonBlank(request.getContent(), "content is required");
 
         DeploymentIdentity localIdentity = deploymentIdentityProvider.current();
-        try {
-            localIdentity.requireExactMatch(
-                    request.getDeploymentId(), request.getDeploymentGenerationId());
-        } catch (IllegalArgumentException | IllegalStateException e) {
-            return rejectedInactiveDeployment();
-        }
-
         AgentRun ownedRun = runMapper.findByIdAndUserForDeployment(
                 runId, userId, localIdentity.deploymentId(), localIdentity.generationId());
         if (ownedRun == null) {

@@ -14,8 +14,6 @@ import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
-import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
-import world.willfrog.agentlangchain.deployment.DeploymentRetirementAuthorizer;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
@@ -82,64 +80,6 @@ class LangchainRunControlServiceTest {
         assertEquals("原测试部署已停用", cancelError.getMessage());
         assertEquals("原测试部署已停用", pauseError.getMessage());
         verify(readService, never()).requireWritableRun(anyString(), anyString());
-    }
-
-    @Test
-    void retirementWaitsForPauseCommitAndRejectsEveryLaterControlWrite() throws Exception {
-        AgentRun running = run(AgentRunStatus.EXECUTING);
-        AgentRun paused = run(AgentRunStatus.WAITING);
-        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
-        when(readService.requireReadableRun("r1", "u1")).thenReturn(paused);
-        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.WAITING))
-                .thenReturn("{\"observability\":{}}");
-        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        CountDownLatch pauseWriteStarted = new CountDownLatch(1);
-        CountDownLatch releasePauseWrite = new CountDownLatch(1);
-        when(runMapper.pauseSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION),
-                eq(AgentRunStatus.EXECUTING), anyString(), any()))
-                .thenAnswer(invocation -> {
-                    pauseWriteStarted.countDown();
-                    if (!releasePauseWrite.await(2, TimeUnit.SECONDS)) {
-                        throw new IllegalStateException("pause write timed out");
-                    }
-                    return 1;
-                });
-        when(runMapper.closeNonTerminalRunsForDeployment("stable", GENERATION)).thenReturn(1);
-        DeploymentGenerationRetirementService retirement = new DeploymentGenerationRetirementService(
-                runMapper, identityProvider, mock(DeploymentRetirementAuthorizer.class), false);
-        ReflectionTestUtils.setField(service, "retirementService", retirement);
-
-        ExecutorService executor = Executors.newFixedThreadPool(2);
-        try {
-            Future<?> pauseFuture = executor.submit(() -> service.pauseRun(
-                    PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
-            assertTrue(pauseWriteStarted.await(1, TimeUnit.SECONDS));
-            Future<Integer> retirementFuture = executor.submit(
-                    () -> retirement.retire("stable", GENERATION, "secret"));
-            assertThrows(TimeoutException.class, () -> retirementFuture.get(100, TimeUnit.MILLISECONDS));
-
-            releasePauseWrite.countDown();
-            pauseFuture.get(1, TimeUnit.SECONDS);
-            assertEquals(1, retirementFuture.get(1, TimeUnit.SECONDS));
-
-            IllegalStateException afterRetirement = assertThrows(IllegalStateException.class, () ->
-                    service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
-            IllegalStateException cancelAfterRetirement = assertThrows(IllegalStateException.class, () ->
-                    service.cancelRun(CancelAgentRunRequest.newBuilder()
-                            .setUserId("u1").setId("r1").build()));
-            assertEquals("原测试部署已停用", afterRetirement.getMessage());
-            assertEquals("原测试部署已停用", cancelAfterRetirement.getMessage());
-            verify(runMapper, times(1)).pauseSnapshotWithTtlForDeployment(
-                    eq("r1"), eq("u1"), eq("stable"), eq(GENERATION),
-                    eq(AgentRunStatus.EXECUTING), anyString(), any());
-            verify(runMapper, never()).cancelTerminalSnapshotWithTtlForDeployment(
-                    anyString(), anyString(), anyString(), anyString(), anyString(), any());
-        } finally {
-            releasePauseWrite.countDown();
-            executor.shutdownNow();
-            ReflectionTestUtils.setField(service, "retirementService", null);
-        }
     }
 
     @Test

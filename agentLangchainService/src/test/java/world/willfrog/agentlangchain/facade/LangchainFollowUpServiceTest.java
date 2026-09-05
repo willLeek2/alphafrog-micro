@@ -12,8 +12,6 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
-import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
-import world.willfrog.agentlangchain.deployment.DeploymentRetirementAuthorizer;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
@@ -134,7 +132,7 @@ class LangchainFollowUpServiceTest {
     }
 
     @Test
-    void followUpTransactionCommitsBeforeRetirementGateIsReleased() {
+    void followUpTransactionCommitsBeforeScheduling() {
         AgentRun completed = run(AgentRunStatus.COMPLETED);
         AgentRun received = run(AgentRunStatus.RECEIVED);
         AgentRunMessage userMessage = new AgentRunMessage();
@@ -151,22 +149,18 @@ class LangchainFollowUpServiceTest {
         when(runMapper.admitFollowUpForDeployment(
                 eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any())).thenReturn(1);
 
-        DeploymentGenerationRetirementService retirement =
-                new DeploymentGenerationRetirementService(
-                        runMapper, identityProvider, mock(DeploymentRetirementAuthorizer.class), false);
         PlatformTransactionManager transactionManager = mock(PlatformTransactionManager.class);
         TransactionStatus transactionStatus = mock(TransactionStatus.class);
         when(transactionManager.getTransaction(any())).thenReturn(transactionStatus);
-        AtomicBoolean committedWhileHoldingRetirementGate = new AtomicBoolean();
+        AtomicBoolean committedBeforeScheduling = new AtomicBoolean();
         doAnswer(invocation -> {
-            committedWhileHoldingRetirementGate.set(Thread.holdsLock(retirement));
+            committedBeforeScheduling.set(true);
             return null;
         }).when(transactionManager).commit(transactionStatus);
         doAnswer(invocation -> {
-            assertEquals(true, committedWhileHoldingRetirementGate.get());
+            assertEquals(true, committedBeforeScheduling.get());
             return null;
         }).when(pipeline).launchAsync(received);
-        ReflectionTestUtils.setField(service, "retirementService", retirement);
         ReflectionTestUtils.setField(service, "transactionManager", transactionManager);
 
         var response = service.sendMessage(SendAgentMessageRequest.newBuilder()
@@ -178,7 +172,7 @@ class LangchainFollowUpServiceTest {
                 .build());
 
         assertEquals("accepted", response.getStatus());
-        assertEquals(true, committedWhileHoldingRetirementGate.get());
+        assertEquals(true, committedBeforeScheduling.get());
         verify(transactionManager).commit(transactionStatus);
         verify(pipeline).launchAsync(received);
     }

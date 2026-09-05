@@ -67,8 +67,13 @@ if [[ "$deployment_id" != "stable" && ! "$deployment_id" =~ ^[a-z0-9]([a-z0-9-]{
   echo "[otel-preflight] ERROR: deployment.id 必须是 stable，或 3–64 位小写字母、数字、连字符，并且首尾不是连字符。" >&2
   exit 1
 fi
-if [[ "$lane_tag" != "stable" && "$lane_tag" != "lane-test" ]]; then
-  echo "[otel-preflight] ERROR: 首版 lane.tag 只接受 stable 或 lane-test。" >&2
+if [[ "$deployment_id" == "stable" ]]; then
+  if [[ "$lane_tag" != "stable" ]]; then
+    echo "[otel-preflight] ERROR: 稳定部署的 lane.tag 必须是 stable。" >&2
+    exit 1
+  fi
+elif [[ "$lane_tag" == "stable" || ! "$lane_tag" =~ ^[a-z0-9]([a-z0-9._-]{0,94}[a-z0-9])?$ ]]; then
+  echo "[otel-preflight] ERROR: Beta lane.tag 必须是合法的流量范围名称，且不能使用 stable。" >&2
   exit 1
 fi
 if [[ "$build_version" == "local" ]]; then
@@ -93,8 +98,6 @@ chmod 600 "$temporary_file"
   printf 'AF_LANE_TAG=%q\n' "$lane_tag"
 } > "$temporary_file"
 
-seen_image_ids=()
-seen_service_names=()
 for service_name in "$@"; do
   image_ref="$(service_image "$service_name" 2>/dev/null || true)"
   image_variable="$(service_image_variable "$service_name" 2>/dev/null || true)"
@@ -108,14 +111,6 @@ for service_name in "$@"; do
     exit 1
   fi
   validate_resource_value image.digest "$image_id"
-  for image_index in "${!seen_image_ids[@]}"; do
-    if [[ "${seen_image_ids[$image_index]}" == "$image_id" ]]; then
-      echo "[otel-preflight] ERROR: ${service_name} 与 ${seen_service_names[$image_index]} 指向同一个本地 Image ID ${image_id}。不同服务必须使用不同镜像。" >&2
-      exit 1
-    fi
-  done
-  seen_image_ids+=("$image_id")
-  seen_service_names+=("$service_name")
   printf '%s=%q\n' "$image_variable" "$image_id" >> "$temporary_file"
 done
 

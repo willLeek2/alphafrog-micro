@@ -38,11 +38,6 @@ public class BetaControllerApi {
     @PostMapping("/reconcile")
     public ObjectNode reconcile() { return service.reconcileOne(); }
 
-    @GetMapping("/routes/{trafficScopeId}/{serviceName}")
-    public ObjectNode route(@PathVariable String trafficScopeId, @PathVariable String serviceName) {
-        return service.route(trafficScopeId, serviceName);
-    }
-
     @GetMapping("/status/{trafficScopeId}/{serviceName}")
     public ObjectNode status(@PathVariable String trafficScopeId, @PathVariable String serviceName) {
         return service.status(trafficScopeId, serviceName);

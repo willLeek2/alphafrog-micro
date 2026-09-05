@@ -20,7 +20,6 @@ import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
-import world.willfrog.agentlangchain.deployment.AgentServiceShutdownState;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
@@ -215,7 +214,7 @@ class LangchainLinearRunPipelineFailureStageTest {
     }
 
     @Test
-    void ordinaryShutdownDoesNotTurnInterruptedRunIntoBusinessFailure() {
+    void interruptedWorkflowDoesNotBecomeBusinessFailure() {
         AgentRun run = new AgentRun();
         run.setId("run-shutdown");
         run.setUserId("user-1");
@@ -246,6 +245,7 @@ class LangchainLinearRunPipelineFailureStageTest {
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
         when(linear.executePlanned(any(), any())).thenReturn(LangchainWorkflowResult.builder()
                 .success(false)
+                .interrupted(true)
                 .failureReason("interrupted while closing")
                 .toolCallsUsed(0)
                 .build());
@@ -263,10 +263,6 @@ class LangchainLinearRunPipelineFailureStageTest {
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class), mock(ObjectProvider.class));
-        AgentServiceShutdownState shutdownState = mock(AgentServiceShutdownState.class);
-        when(shutdownState.isShuttingDown()).thenReturn(true);
-        ReflectionTestUtils.setField(pipeline, "shutdownState", shutdownState);
-
         pipeline.executeRun(run);
 
         verify(runMapper, never()).updateTerminalSnapshot(

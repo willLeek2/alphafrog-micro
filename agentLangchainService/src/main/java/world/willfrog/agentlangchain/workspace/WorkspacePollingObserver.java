@@ -49,8 +49,7 @@ import java.util.concurrent.atomic.AtomicReference;
 @Component
 // 260814 scheduler-03: workspace export 总开关默认关闭；关闭时本观察者不注册，
 // 没有 @Scheduled 定时线程。
-@ConditionalOnExpression("${agent.workspace.export-enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}")
 @RequiredArgsConstructor
 @Slf4j
 public class WorkspacePollingObserver {
@@ -68,7 +67,7 @@ public class WorkspacePollingObserver {
     private int initialLookbackMinutes;
 
     /**
-     * D21-B 5.2.3: 复合游标 (updatedAt, runId)，防止同秒超批永久漏扫。
+     * 使用复合游标 (updatedAt, runId)，防止同秒超批后永久漏扫。
      * 每批处理完成后推进到本批最后一条记录的 (updatedAt, runId)。
      */
     private volatile OffsetDateTime lastSeenTime;

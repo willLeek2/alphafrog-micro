@@ -4,10 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermission;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -22,7 +18,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import world.willfrog.beta.config.BetaControllerProperties;
 import world.willfrog.beta.state.AtomicJsonStore;
 import world.willfrog.beta.validation.BetaContractValidator;
 
@@ -34,35 +29,27 @@ public class BetaDeploymentService {
     private final BetaContractValidator validator;
     private final ContainerRuntime containers;
     private final ServiceRegistry registry;
-    private final RetirementGateway retirement;
-    private final Path retirementTokenFile;
     private final Clock clock;
     private final ReentrantLock mutationLock = new ReentrantLock(true);
 
     @Autowired
     public BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
-                                 ContainerRuntime containers, ServiceRegistry registry,
-                                 RetirementGateway retirement, BetaControllerProperties properties) {
-        this(mapper, store, validator, containers, registry, retirement,
-                properties.getRetirementTokenFile(), Clock.systemUTC());
+                                 ContainerRuntime containers, ServiceRegistry registry) {
+        this(mapper, store, validator, containers, registry, Clock.systemUTC());
     }
 
     BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
-                          ContainerRuntime containers, ServiceRegistry registry,
-                          RetirementGateway retirement, Path retirementTokenFile, Clock clock) {
+                          ContainerRuntime containers, ServiceRegistry registry, Clock clock) {
         this.mapper = mapper;
         this.store = store;
         this.validator = validator;
         this.containers = containers;
         this.registry = registry;
-        this.retirement = retirement;
-        this.retirementTokenFile = retirementTokenFile;
         this.clock = clock;
     }
 
     @PostConstruct
     void verifyPersistentStateAtStartup() {
-        readSecret(retirementTokenFile);
         recoverManifestLead();
         validateAll(store.snapshot());
         verifyExternalFactsAtStartup();
@@ -77,6 +64,7 @@ public class BetaDeploymentService {
             store.read(state -> {
                 validateAll(state.deepCopy());
                 assertNoOtherScopeOwner(state, deploymentId, manifest.path("trafficScopeId").asText());
+                assertLaneHasMainBetaProviders(state, deploymentId, manifest);
                 assertManifestReservationsAvailable(state, deploymentId, manifest);
                 JsonNode existing = findDeployment(state, deploymentId);
                 if (existing != null) validateReplacement(existing, manifest);
@@ -110,6 +98,7 @@ public class BetaDeploymentService {
                 ObjectNode deployment = requireDeployment(state, deploymentId);
                 if (!"ACTIVE".equals(deployment.path("phase").asText()))
                     throw new ControllerException("DEPLOYMENT_BUSY", "A deployment deletion must be resumed through its failed service");
+                assertMainBetaDeletionSafe(state, deployment);
                 for (JsonNode service : deployment.path("services"))
                     if ("FACTS_UNCERTAIN".equals(service.path("lastError").path("recoveryClass").asText()))
                         throw new ControllerException("FACTS_UNCERTAIN", "Conflicting external facts must be repaired before deletion");
@@ -228,29 +217,6 @@ public class BetaDeploymentService {
         }
     }
 
-    public ObjectNode route(String trafficScopeId, String serviceName) {
-        return store.read(state -> {
-            for (JsonNode deployment : state.path("deployments")) {
-                if (!trafficScopeId.equals(deployment.path("trafficScopeId").asText())) continue;
-                for (JsonNode service : deployment.path("services")) {
-                    if (serviceName.equals(service.path("serviceName").asText())) {
-                        ObjectNode result = mapper.createObjectNode();
-                        result.put("trafficScopeId", trafficScopeId);
-                        result.put("serviceName", serviceName);
-                        result.put("dubboServiceKey", service.path("dubboServiceKey").asText());
-                        result.set("route", service.path("route").deepCopy());
-                        JsonNode active = service.path("activeInstance");
-                        if (active.isNull()) result.putNull("endpoint");
-                        else result.set("endpoint", active.path("endpoint").deepCopy());
-                        result.put("stateVersion", state.path("stateVersion").asLong());
-                        return result;
-                    }
-                }
-            }
-            throw new ControllerException("ROUTE_NOT_FOUND", "No route exists for this traffic scope and service");
-        });
-    }
-
     public ObjectNode status(String trafficScopeId, String serviceName) {
         return store.read(state -> {
             for (JsonNode deployment : state.path("deployments")) {
@@ -282,11 +248,9 @@ public class BetaDeploymentService {
         String slot = active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
         int hostPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
         String generation = JsonSupport.deploymentGeneration(manifest);
-        String token = "AGENT_RETIRE_GENERATION_V1".equals(spec.path("runtime").path("preStopPolicy").asText())
-                ? readSecret(retirementTokenFile) : "";
         ContainerRuntime.CandidatePlan plan = new ContainerRuntime.CandidatePlan(
                 ref.deploymentId(), ref.trafficScopeId(), ref.candidateInstanceId(), generation, slot, hostPort);
-        ContainerRuntime.ContainerObservation observation = containers.create(manifest, spec, plan, token);
+        ContainerRuntime.ContainerObservation observation = containers.create(manifest, spec, plan);
         ServiceRegistry.Registration registration = registry.register(manifest, spec, ref.candidateInstanceId(), generation,
                 observation.endpointAddress(), hostPort, false);
         Instant now = Instant.now(clock);
@@ -305,11 +269,6 @@ public class BetaDeploymentService {
 
     private void observeCandidate(OperationRef ref) {
         JsonNode candidate = ref.service().path("candidateInstance");
-        ObjectNode observedRoute = requireExactRoute(ref.service(), ref.trafficScopeId(), ref.serviceName(),
-                "Candidate readiness observed a conflicting route");
-        if (observedRoute.path("route").path("defaultInstanceId").equals(candidate.path("instanceId"))) {
-            throw new ControllerException("ROUTE_READBACK_FAILED", "Candidate readiness observed a conflicting route");
-        }
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
         containers.verifyPersistedInstance(manifest, spec, candidate);
@@ -353,31 +312,32 @@ public class BetaDeploymentService {
     }
 
     private void switchTraffic(OperationRef ref) {
-        if (isPublishedCreateAwaitingConfirmation(ref.service(), ref)) {
-            confirmPublishedCreate(ref);
-            return;
-        }
         JsonNode candidate = ref.service().path("candidateInstance");
         ServiceRegistry.Registration enabled = registry.setSelectable(registration(candidate.path("registration")), true);
         if (!enabled.enabled() || enabled.weight() != 1 || !enabled.healthy())
             throw new ControllerException("NACOS_ENABLE_NOT_CONFIRMED", "Candidate registration was not enabled");
-        final boolean[] initialCreate = new boolean[1];
+        JsonNode previous = ref.service().path("activeInstance");
+        if (previous.isObject()) {
+            ServiceRegistry.Registration oldRegistration = registration(previous.path("registration"));
+            if (registry.find(oldRegistration).isPresent()) {
+                registry.unregister(oldRegistration);
+                if (registry.find(oldRegistration).isPresent())
+                    throw new ControllerException("NACOS_REMOVE_NOT_CONFIRMED", "Previous registration is still selectable");
+            }
+        }
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode promoted = ((ObjectNode) service.path("candidateInstance")).deepCopy();
             promoted.remove(java.util.List.of("readiness", "readinessObservedAt", "readinessDeadline"));
             promoted.set("registration", registration(enabled));
-            JsonNode previous = service.path("activeInstance").deepCopy();
-            long nextRoute = Math.addExact(service.path("route").path("routeVersion").asLong(), 1);
+            JsonNode storedPrevious = service.path("activeInstance").deepCopy();
             String switchAt = Instant.now(clock).toString();
-            ObjectNode route = route(promoted, nextRoute, switchAt);
             service.set("activeInstance", promoted);
             service.putNull("candidateInstance");
-            service.set("route", route);
-            if (previous.isObject()) {
-                ObjectNode draining = ((ObjectNode) previous).deepCopy();
+            if (storedPrevious.isObject()) {
+                ObjectNode draining = ((ObjectNode) storedPrevious).deepCopy();
                 draining.put("trafficRemovedAt", switchAt);
-                draining.putNull("preStopCompletedAt");
+                draining.put("registrationRemovedAt", switchAt);
                 draining.putNull("stopSignalRequestedAt");
                 draining.putNull("stopDeadline");
                 service.set("drainingInstance", draining);
@@ -386,106 +346,58 @@ public class BetaDeploymentService {
                 operation.put("phase", "DRAINING_PREVIOUS");
                 operation.putNull("candidateInstanceId");
             } else {
-                initialCreate[0] = true;
                 service.putNull("drainingInstance");
-                service.put("phase", "CREATING");
+                stable(service);
+                scheduleNext(state);
             }
-            validateAll(state);
-            return null;
-        });
-        JsonNode published = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
-                ref.serviceName()).deepCopy());
-        requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
-                "Published route could not be read back");
-        if (initialCreate[0]) {
-            completePublishedCreate(ref);
-        }
-    }
-
-    private boolean isPublishedCreateAwaitingConfirmation(JsonNode service, OperationRef ref) {
-        return "CREATE".equals(ref.type()) && "SWITCHING_TRAFFIC".equals(ref.phase())
-                && service.path("activeInstance").isObject()
-                && service.path("candidateInstance").isNull()
-                && service.path("drainingInstance").isNull();
-    }
-
-    private void confirmPublishedCreate(OperationRef ref) {
-        JsonNode published = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
-                ref.serviceName()).deepCopy());
-        requireExactRoute(published, ref.trafficScopeId(), ref.serviceName(),
-                "Published route could not be read back");
-        completePublishedCreate(ref);
-    }
-
-    private void completePublishedCreate(OperationRef ref) {
-        store.update(state -> {
-            ObjectNode service = checkedService(state, ref);
-            if (!"CREATING".equals(service.path("phase").asText())
-                    || !isPublishedCreateAwaitingConfirmation(service, ref)
-                    || !ref.candidateInstanceId().equals(service.path("activeInstance").path("instanceId").asText())) {
-                throw new ControllerException("OPERATION_CHANGED", "Published create changed before route confirmation");
-            }
-            stable(service);
-            scheduleNext(state);
             validateAll(state);
             return null;
         });
     }
 
     private void removeTraffic(OperationRef ref) {
+        JsonNode activeSnapshot = ref.service().path("activeInstance");
+        ServiceRegistry.Registration activeRegistration = registration(activeSnapshot.path("registration"));
+        registry.unregister(activeRegistration);
+        if (registry.find(activeRegistration).isPresent())
+            throw new ControllerException("NACOS_REMOVE_NOT_CONFIRMED", "Active registration is still selectable");
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode active = ((ObjectNode) service.path("activeInstance")).deepCopy();
             String switchAt = Instant.now(clock).toString();
             active.put("trafficRemovedAt", switchAt);
-            active.putNull("preStopCompletedAt");
+            active.put("registrationRemovedAt", switchAt);
             active.putNull("stopSignalRequestedAt");
             active.putNull("stopDeadline");
             service.putNull("activeInstance");
             service.set("drainingInstance", active);
-            long nextRoute = Math.addExact(service.path("route").path("routeVersion").asLong(), 1);
-            service.set("route", emptyRoute(nextRoute, switchAt));
             ObjectNode operation = (ObjectNode) service.path("operation");
             operation.put("phase", "DRAINING_ACTIVE");
             operation.putNull("candidateInstanceId");
             validateAll(state);
             return null;
         });
-        JsonNode removed = store.read(state -> requireService(requireDeployment(state, ref.deploymentId()),
-                ref.serviceName()).deepCopy());
-        requireExactRoute(removed, ref.trafficScopeId(), ref.serviceName(),
-                "Removed route is still selectable");
     }
 
     private void drain(OperationRef ref) {
         JsonNode current = store.read(state -> checkedService(state, ref).deepCopy());
         ObjectNode draining = (ObjectNode) current.path("drainingInstance");
-        requireExactRoute(current, ref.trafficScopeId(), ref.serviceName(),
-                "Route readback differs from persisted state");
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
         containers.verifyPersistedInstance(manifest, spec, draining);
         ContainerRuntime.ContainerObservation beforeStop = containers.inspect(
                 draining.path("machineId").asText(), draining.path("containerName").asText());
-        if (!beforeStop.running() && draining.path("preStopCompletedAt").isNull())
-            throw new ControllerException("PRESTOP_NOT_CONFIRMED", "Draining container exited before its stop action was confirmed");
         ServiceRegistry.Registration expected = registration(draining.path("registration"));
         Optional<ServiceRegistry.Registration> registered = registry.find(expected);
-        ServiceRegistry.Registration disabled = registered.isPresent()
-                ? registry.setSelectable(registered.get(), false) : disabled(expected);
-        if (disabled.enabled() || disabled.weight() != 0)
-            throw new ControllerException("NACOS_DISABLE_NOT_CONFIRMED", "Draining registration is still selectable");
-        if (draining.path("preStopCompletedAt").isNull()) {
-            if ("AGENT_RETIRE_GENERATION_V1".equals(draining.path("preStopPolicy").asText())) {
-                retirement.retire(draining.path("endpoint").path("address").asText(),
-                        draining.path("endpoint").path("port").asInt(), ref.deploymentId(),
-                        draining.path("deploymentGenerationId").asText(), readSecret(retirementTokenFile));
-            }
+        if (registered.isPresent()) {
+            registry.unregister(registered.get());
+            if (registry.find(expected).isPresent())
+                throw new ControllerException("NACOS_REMOVE_NOT_CONFIRMED", "Draining registration is still present");
+        }
+        if (draining.path("registrationRemovedAt").isNull()) {
             store.update(state -> {
-                ObjectNode service = checkedService(state, ref);
-                ObjectNode value = (ObjectNode) service.path("drainingInstance");
-                value.set("registration", registration(disabled));
-                value.put("preStopCompletedAt", Instant.now(clock).toString());
+                ObjectNode value = (ObjectNode) checkedService(state, ref).path("drainingInstance");
+                value.put("registrationRemovedAt", Instant.now(clock).toString());
                 validateAll(state);
                 return null;
             });
@@ -493,22 +405,28 @@ public class BetaDeploymentService {
         current = store.read(state -> checkedService(state, ref).deepCopy());
         draining = (ObjectNode) current.path("drainingInstance");
         if (beforeStop.running()) {
-            String requested = Instant.now(clock).toString();
-            String deadline = Instant.parse(requested).plusSeconds(draining.path("drainGraceSeconds").asLong()).toString();
-            store.update(state -> {
-                ObjectNode value = (ObjectNode) checkedService(state, ref).path("drainingInstance");
-                value.put("stopSignalRequestedAt", requested);
-                value.put("stopDeadline", deadline);
-                validateAll(state);
-                return null;
-            });
+            Instant requestedAt = Instant.now(clock);
+            if (draining.path("stopSignalRequestedAt").isNull()) {
+                String requested = requestedAt.toString();
+                String deadline = requestedAt.plusSeconds(draining.path("applicationDrainSeconds").asLong()).toString();
+                store.update(state -> {
+                    ObjectNode value = (ObjectNode) checkedService(state, ref).path("drainingInstance");
+                    value.put("stopSignalRequestedAt", requested);
+                    value.put("stopDeadline", deadline);
+                    validateAll(state);
+                    return null;
+                });
+                draining = (ObjectNode) store.read(state -> checkedService(state, ref)
+                        .path("drainingInstance").deepCopy());
+            }
+            int remainingSeconds = remainingStopSeconds(requestedAt,
+                    Instant.parse(draining.path("stopDeadline").asText()));
             containers.stop(draining.path("machineId").asText(), draining.path("containerName").asText(),
-                    draining.path("drainGraceSeconds").asInt());
+                    remainingSeconds);
         }
         ContainerRuntime.ContainerObservation stopped = containers.inspect(
                 draining.path("machineId").asText(), draining.path("containerName").asText());
         if (stopped.running()) throw new ControllerException("CONTAINER_STILL_RUNNING", "Container did not stop before cleanup");
-        registry.unregister(disabled);
         containers.remove(draining.path("machineId").asText(), draining.path("containerName").asText());
         finishDrain(ref);
     }
@@ -610,8 +528,6 @@ public class BetaDeploymentService {
     }
 
     private void verifyServiceFacts(JsonNode deployment, JsonNode service, JsonNode manifest) {
-        requireExactRoute(service, deployment.path("trafficScopeId").asText(),
-                service.path("serviceName").asText(), "Route readback differs from persisted state");
         JsonNode spec = findService(manifest, service.path("serviceName").asText());
         Set<String> trackedContainerIds = new HashSet<>();
         Set<String> trackedInstanceIds = new HashSet<>();
@@ -632,9 +548,8 @@ public class BetaDeploymentService {
                     instance.path("machineId").asText(), instance.path("containerName").asText());
             boolean missing = observed.health() == ContainerRuntime.ContainerObservation.Health.MISSING
                     || observed.containerId().isEmpty();
-            boolean completedDrain = "drainingInstance".equals(role)
-                    && !instance.path("preStopCompletedAt").isNull();
-            if (missing && !completedDrain)
+            boolean draining = "drainingInstance".equals(role);
+            if (missing && !draining)
                 throw new ControllerException("CONTAINER_FACT_MISSING", "Persisted container is missing");
             if (!missing && (!observed.containerId().equals(instance.path("containerId").asText())
                     || !observed.endpointAddress().equals(instance.path("endpoint").path("address").asText())
@@ -642,15 +557,18 @@ public class BetaDeploymentService {
                 throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Observed container differs from persisted state");
             if (("activeInstance".equals(role) || "candidateInstance".equals(role)) && !observed.running())
                 throw new ControllerException("CONTAINER_NOT_RUNNING", "Routable or candidate container is not running");
-            if ("drainingInstance".equals(role) && !observed.running()
-                    && instance.path("preStopCompletedAt").isNull())
-                throw new ControllerException("PRESTOP_NOT_CONFIRMED", "Draining container exited before its stop action was confirmed");
 
             Optional<ServiceRegistry.Registration> registration = registry.find(registration(instance.path("registration")));
-            if (registration.isEmpty()) {
-                if (!completedDrain)
-                    throw new ControllerException("NACOS_FACT_MISSING", "Persisted Nacos registration is missing");
+            if (draining) {
+                if (registration.isPresent())
+                    throw new ControllerException("NACOS_DRAINING_PRESENT", "A draining instance remains registered");
                 continue;
+            }
+            if (registration.isEmpty()) {
+                if ("activeInstance".equals(role) && trafficWasSwitchedBeforeStateCommit(service)) {
+                    continue;
+                }
+                throw new ControllerException("NACOS_FACT_MISSING", "Persisted Nacos registration is missing");
             }
             ServiceRegistry.Registration value = registration.get();
             if (!value.ephemeral())
@@ -668,6 +586,18 @@ public class BetaDeploymentService {
                             "Candidate Nacos selectability does not match the persisted phase");
             }
         }
+    }
+
+    private boolean trafficWasSwitchedBeforeStateCommit(JsonNode service) {
+        if (!"SWITCHING_TRAFFIC".equals(service.path("operation").path("phase").asText())) return false;
+        JsonNode candidate = service.path("candidateInstance");
+        if (!candidate.isObject()) return false;
+        Optional<ServiceRegistry.Registration> observed = registry.find(
+                registration(candidate.path("registration")));
+        return observed.isPresent()
+                && observed.get().enabled()
+                && observed.get().weight() == 1
+                && observed.get().healthy();
     }
 
     private void recordStartupFailure(String deploymentId, String serviceName, ControllerException failure) {
@@ -749,6 +679,7 @@ public class BetaDeploymentService {
                 }
             }
         }
+        assertPersistedLaneTopology(state);
     }
 
     private void recoverManifestLead() {
@@ -885,7 +816,6 @@ public class BetaDeploymentService {
         service.putNull("activeInstance");
         service.putNull("candidateInstance");
         service.putNull("drainingInstance");
-        service.set("route", emptyRoute(0));
         service.putNull("operation");
         service.putNull("failedManifestVersion");
         service.putNull("lastError");
@@ -899,7 +829,6 @@ public class BetaDeploymentService {
         result.put("machineId", spec.path("machineId").asText());
         result.put("releaseId", spec.path("releaseId").asText());
         result.put("deploymentGenerationId", generation);
-        result.put("preStopPolicy", spec.path("runtime").path("preStopPolicy").asText());
         result.put("shutdownProfile", spec.path("runtime").path("shutdownProfile").asText());
         result.put("applicationDrainSeconds", spec.path("runtime").path("applicationDrainSeconds").asInt());
         result.put("drainGraceSeconds", spec.path("runtime").path("drainGraceSeconds").asInt());
@@ -923,59 +852,12 @@ public class BetaDeploymentService {
         return node;
     }
 
-    private ServiceRegistry.Registration disabled(ServiceRegistry.Registration value) {
-        return new ServiceRegistry.Registration(value.serviceName(), value.groupName(), value.namespaceId(),
-                value.clusterName(), value.ip(), value.port(), value.nacosInstanceId(), false,
-                value.healthy(), 0, value.ephemeral(), value.metadata());
-    }
-
     private ServiceRegistry.Registration registration(JsonNode value) {
         return new ServiceRegistry.Registration(value.path("serviceName").asText(), value.path("groupName").asText(),
                 value.path("namespaceId").asText(), value.path("clusterName").asText(), value.path("ip").asText(),
                 value.path("port").asInt(), value.path("nacosInstanceId").asText(), value.path("enabled").asBoolean(),
                 value.path("healthy").asBoolean(), value.path("weight").asInt(), value.path("ephemeral").asBoolean(),
                 mapper.convertValue(value.path("metadata"), mapper.getTypeFactory().constructMapType(java.util.Map.class, String.class, String.class)));
-    }
-
-    private ObjectNode route(JsonNode instance, long version) {
-        return route(instance, version, Instant.now(clock).toString());
-    }
-
-    private ObjectNode route(JsonNode instance, long version, String updatedAt) {
-        ObjectNode route = mapper.createObjectNode();
-        route.put("defaultInstanceId", instance.path("instanceId").asText());
-        route.put("defaultReleaseId", instance.path("releaseId").asText());
-        route.put("defaultDeploymentGenerationId", instance.path("deploymentGenerationId").asText());
-        route.put("routeVersion", version);
-        route.put("updatedAt", updatedAt);
-        return route;
-    }
-
-    private ObjectNode emptyRoute(long version) {
-        return emptyRoute(version, Instant.now(clock).toString());
-    }
-
-    private ObjectNode emptyRoute(long version, String updatedAt) {
-        ObjectNode route = mapper.createObjectNode();
-        route.putNull("defaultInstanceId");
-        route.putNull("defaultReleaseId");
-        route.putNull("defaultDeploymentGenerationId");
-        route.put("routeVersion", version);
-        route.put("updatedAt", updatedAt);
-        return route;
-    }
-
-    private ObjectNode requireExactRoute(JsonNode service, String trafficScopeId, String serviceName,
-                                         String failureMessage) {
-        ObjectNode observed = route(trafficScopeId, serviceName);
-        JsonNode active = service.path("activeInstance");
-        boolean endpointMatches = active.isObject()
-                ? observed.path("endpoint").equals(active.path("endpoint"))
-                : observed.path("endpoint").isNull();
-        if (!observed.path("route").equals(service.path("route")) || !endpointMatches) {
-            throw new ControllerException("ROUTE_READBACK_FAILED", failureMessage);
-        }
-        return observed;
     }
 
     private ObjectNode operation(String type, String phase, String candidateId) {
@@ -1069,6 +951,71 @@ public class BetaDeploymentService {
                     && !deploymentId.equals(deployment.path("deploymentId").asText()))
                 throw new ControllerException("TRAFFIC_SCOPE_CONFLICT", "Traffic scope already belongs to another deployment");
         }
+    }
+
+    private void assertLaneHasMainBetaProviders(JsonNode state, String deploymentId, JsonNode candidate) {
+        if ("main-beta".equals(candidate.path("trafficScopeId").asText())) return;
+        for (JsonNode requestedService : candidate.path("services")) {
+            if (!hasActiveMainBetaProvider(state, deploymentId, requestedService.path("serviceName").asText(),
+                    requestedService.path("dubboServiceKey").asText())) {
+                throw new ControllerException("MAIN_BETA_PROVIDER_REQUIRED",
+                        "A lane service requires an active untagged main Beta provider");
+            }
+        }
+    }
+
+    private void assertPersistedLaneTopology(JsonNode state) {
+        for (JsonNode deployment : state.path("deployments")) {
+            if ("main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
+            for (JsonNode service : deployment.path("services")) {
+                boolean hasInstance = service.path("activeInstance").isObject()
+                        || service.path("candidateInstance").isObject()
+                        || service.path("drainingInstance").isObject();
+                if (hasInstance && !hasActiveMainBetaProvider(state,
+                        deployment.path("deploymentId").asText(), service.path("serviceName").asText(),
+                        service.path("dubboServiceKey").asText())) {
+                    throw new ControllerException("STATE_INVALID",
+                            "A persisted lane provider has no active untagged main Beta provider");
+                }
+            }
+        }
+    }
+
+    private boolean hasActiveMainBetaProvider(JsonNode state, String excludedDeploymentId,
+                                              String serviceName, String dubboServiceKey) {
+        for (JsonNode deployment : state.path("deployments")) {
+            if (excludedDeploymentId.equals(deployment.path("deploymentId").asText())
+                    || !"main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
+            JsonNode service = findService(deployment, serviceName);
+            if (service != null && service.path("activeInstance").isObject()
+                    && dubboServiceKey.equals(service.path("dubboServiceKey").asText())) return true;
+        }
+        return false;
+    }
+
+    private void assertMainBetaDeletionSafe(JsonNode state, JsonNode target) {
+        if (!"main-beta".equals(target.path("trafficScopeId").asText())) return;
+        for (JsonNode mainService : target.path("services")) {
+            for (JsonNode deployment : state.path("deployments")) {
+                if (target.path("deploymentId").equals(deployment.path("deploymentId"))
+                        || "main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
+                JsonNode laneService = findService(deployment, mainService.path("serviceName").asText());
+                if (laneService != null && mainService.path("dubboServiceKey").equals(laneService.path("dubboServiceKey"))
+                        && (laneService.path("activeInstance").isObject()
+                        || laneService.path("candidateInstance").isObject()
+                        || laneService.path("drainingInstance").isObject())) {
+                    throw new ControllerException("MAIN_BETA_PROVIDER_REQUIRED",
+                            "Main Beta cannot be deleted while a lane provider for the same service exists");
+                }
+            }
+        }
+    }
+
+    private int remainingStopSeconds(Instant now, Instant deadline) {
+        long remainingMillis = java.time.Duration.between(now, deadline).toMillis();
+        if (remainingMillis <= 0) return 0;
+        long roundedUp = (remainingMillis + 999L) / 1000L;
+        return (int) Math.min(Integer.MAX_VALUE, roundedUp);
     }
 
     private void assertManifestReservationsAvailable(JsonNode state, String deploymentId, JsonNode candidate) {
@@ -1174,25 +1121,6 @@ public class BetaDeploymentService {
     }
 
     private String prefix(String value, int length) { return value.substring(0, Math.min(length, value.length())); }
-
-    private String readSecret(Path file) {
-        try {
-            if (!Files.isRegularFile(file) || Files.isSymbolicLink(file))
-                throw new ControllerException("SECRET_FILE_INVALID", "Required secret file is missing or unsafe");
-            try {
-                Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(file);
-                if (permissions.stream().anyMatch(permission -> permission != PosixFilePermission.OWNER_READ
-                        && permission != PosixFilePermission.OWNER_WRITE))
-                    throw new ControllerException("SECRET_FILE_PERMISSIONS", "Secret file permissions are wider than 0600");
-            } catch (UnsupportedOperationException ignored) { }
-            String value = Files.readString(file);
-            if (value.length() < 32 || !value.equals(value.strip()) || value.chars().anyMatch(Character::isISOControl))
-                throw new ControllerException("SECRET_FILE_INVALID", "Secret file content is invalid");
-            return value;
-        } catch (IOException exception) {
-            throw new ControllerException("SECRET_FILE_READ_FAILED", "Unable to read required secret file", exception);
-        }
-    }
 
     private String safeMessage(Throwable failure) { return sanitize(failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage()); }
     private String sanitize(String value) {

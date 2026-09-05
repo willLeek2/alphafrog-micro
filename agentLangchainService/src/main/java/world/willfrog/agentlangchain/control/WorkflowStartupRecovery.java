@@ -32,8 +32,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 @Slf4j
 @ConditionalOnExpression("${agent.langchain.provider.enabled:false}"
-        + " && ${agent.workflow-restart.enabled:true}"
-        + " && !${agent.deployment.retirement-only:false}")
+        + " && ${agent.workflow-restart.enabled:true}")
 public class WorkflowStartupRecovery {
 
     private final AgentRunMapper runMapper;

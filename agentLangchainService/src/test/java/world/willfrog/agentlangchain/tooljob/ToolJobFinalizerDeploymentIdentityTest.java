@@ -55,8 +55,6 @@ class ToolJobFinalizerDeploymentIdentityTest {
 
         assertThat(outcome.done()).isFalse();
         assertThat(outcome.reason()).isEqualTo("deployment_generation_inactive");
-        verify(runMapper, never()).closeRetiredDeploymentRun(
-                "run-old", "user-1", "beta-a", "gen-" + "b".repeat(64));
         verifyNoInteractions(anchorService);
     }
 }

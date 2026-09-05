@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
@@ -32,8 +32,8 @@ import java.util.concurrent.ConcurrentMap;
  * 开启耐久恢复时由 ToolJobReconciler 承担发现职责，两者不会同时存在。</p>
  */
 @Service
-@ConditionalOnExpression("!${agent.tool-job.durable-recovery-enabled:false}"
-        + " && !${agent.deployment.retirement-only:false}")
+@ConditionalOnProperty(name = "agent.tool-job.durable-recovery-enabled",
+        havingValue = "false", matchIfMissing = true)
 @Slf4j
 public class ToolJobContinuationTracker {
 
