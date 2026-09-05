@@ -2,21 +2,22 @@ package world.willfrog.alphafrogmicro.common.lane;
 
 import org.apache.dubbo.common.constants.CommonConstants;
 import org.apache.dubbo.common.extension.Activate;
-import org.apache.dubbo.rpc.Filter;
 import org.apache.dubbo.rpc.Invocation;
 import org.apache.dubbo.rpc.Invoker;
 import org.apache.dubbo.rpc.Result;
 import org.apache.dubbo.rpc.RpcContext;
+import org.apache.dubbo.rpc.cluster.filter.ClusterFilter;
 import org.slf4j.MDC;
 
 /**
- * 消费方出站时写入官方 {@code dubbo.tag}，无标调用在发出前清掉残留。
+ * 消费方在标签路由之前写入官方 {@code dubbo.tag}，无标调用在发出前清掉残留。
  *
- * <p>无标路径会同时清除客户端上下文、MDC、本次 {@link Invocation} 上的官方标签，
- * 以及旧的自定义流量范围附件。选路由 Dubbo 标签路由完成，本过滤器不选择实例。</p>
+ * <p>本组件是集群过滤器，包在集群调用器外面，因此 {@code TagStateRouter} 读取本次
+ * {@link Invocation} 时已经能看到标签。无标路径会同时清除客户端上下文、MDC、本次调用上的
+ * 官方标签，以及旧的自定义流量范围附件。本过滤器不选择实例。</p>
  */
 @Activate(group = CommonConstants.CONSUMER, order = -10000)
-public final class LaneConsumerHopFilter implements Filter {
+public final class LaneConsumerHopFilter implements ClusterFilter {
 
     @Override
     public Result invoke(Invoker<?> invoker, Invocation invocation) {
