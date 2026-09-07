@@ -1,6 +1,6 @@
 # Beta 部署控制器
 
-这个服务实现 `deploy/beta/` 中固定的部署与流量治理合同。它接收已经校验的部署单，逐个启动候选实例，联合检查 Docker 健康状态和 Nacos 注册状态。候选健康后，控制器先把候选注册改为可选，再从 Nacos 注销旧实例；随后旧实例在公共处理期限扣除收尾余量后的窗口内自然完成已经受理的工作，剩余时间用于把本代未结束的 Run 写成明确失败并退出，整个公共期限到达后才由容器运行时强制停止。
+这个服务实现 `deploy/beta/` 中固定的部署与流量治理合同。它接收已经校验的部署单，逐个启动候选实例，并检查 Docker 健康状态。导出 Dubbo 提供者的服务由自身注册到 Nacos，控制器只读确认候选端点已经可用；frontend 这类非提供者服务只检查容器健康。候选就绪后，控制器更新本地实例角色并正常停止旧容器；旧服务自行注销。旧实例在公共处理期限扣除收尾余量后的窗口内自然完成已经受理的工作，剩余时间用于把本代未结束的 Run 写成明确失败并退出，整个公共期限到达后才由容器运行时强制停止。
 
 控制器只管理服务实例和流量。它不会查询 Agent Run、Todo、数据库事务、业务重试或业务恢复状态。候选实例在切流前失败时，旧实例与旧路由保持不变；主 Beta 和各个泳道通过不同的 `trafficScopeId` 分开管理。
 
@@ -42,7 +42,7 @@ alphafrog:
 ## 接口
 
 - `PUT /internal/beta/deployments/{deploymentId}/manifest`：提交新部署或更高版本部署单。
-- `DELETE /internal/beta/deployments/{deploymentId}`：按服务名顺序注销实例、排空并删除整个部署。
+- `DELETE /internal/beta/deployments/{deploymentId}`：按服务名顺序停止、排空并删除整个部署；提供者实例由服务自行注销。
 - `POST /internal/beta/deployments/{deploymentId}/services/{serviceName}/retry`：在外部事实确定时重试已记录的失败。
 - `POST /internal/beta/reconcile`：立即执行一个持久化步骤；后台也会按固定间隔执行。
 - `GET /internal/beta/status/{trafficScopeId}/{serviceName}`：读取服务、候选、排空进度和最近错误。
@@ -51,4 +51,4 @@ alphafrog:
 
 ## 当前验证边界
 
-本模块的普通单元测试使用内存中的 Docker 与 Nacos 替身，不会连接真实基础设施。真实 Beta 机器仍需验证 Docker 远程连接、镜像本地标识、Nacos 2.5.0 两路注册、Dubbo 标签与同区回落、SIGTERM 自然排空、期限强停和控制器进程重启。
+本模块的普通单元测试使用内存中的 Docker 与 Nacos 替身，不会连接真实基础设施。真实 Beta 机器仍需验证 Docker 远程连接、镜像本地标识、提供者自注册到 Nacos 2.5.0、非提供者健康判断、Dubbo 标签与同区回落、SIGTERM 自然排空、期限强停和控制器进程重启。

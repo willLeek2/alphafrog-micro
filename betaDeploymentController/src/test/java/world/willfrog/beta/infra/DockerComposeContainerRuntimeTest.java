@@ -98,6 +98,9 @@ class DockerComposeContainerRuntimeTest {
         assertFalse(content.contains("image.digest=registry.local"));
         assertTrue(content.contains("alphafrog-beta"));
         assertTrue(content.contains("zone-aware"));
+        assertFalse(effectiveRouting.path("dubbo").path("registry").path("register").asBoolean());
+        assertTrue(effectiveRouting.path("dubbo").path("registries").path("beta").path("register").asBoolean());
+        assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("register").asBoolean());
         assertTrue(effectiveRouting.path("dubbo").path("registries").path("beta").path("preferred").asBoolean());
         assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("preferred").asBoolean());
         assertTrue(effectiveRouting.path("dubbo").path("registries").path("production").path("address").asText()
@@ -106,6 +109,17 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
         JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
+        assertEquals("10.0.0.8", environmentNode.path("DUBBO_IP_TO_REGISTRY").asText());
+        assertEquals("28080", environmentNode.path("DUBBO_PORT_TO_REGISTRY").asText());
+        assertFalse(environmentNode.has("AF_DUBBO_PORT_TO_REGISTRY"));
+        JsonNode providerParameters = effectiveRouting.path("dubbo").path("provider").path("parameters");
+        assertEquals("beta-main-001", providerParameters.path("alphafrog.deployment-id").asText());
+        assertEquals("main-beta", providerParameters.path("alphafrog.traffic-scope-id").asText());
+        assertEquals("release-1", providerParameters.path("alphafrog.release-id").asText());
+        assertEquals(plan.generationId(), providerParameters.path("alphafrog.deployment-generation-id").asText());
+        assertEquals("i-one", providerParameters.path("alphafrog.instance-id").asText());
+        assertEquals("beta", providerParameters.path("zone").asText());
+        assertFalse(providerParameters.has("dubbo.tag"));
         assertEquals("60", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
         assertEquals("5", environmentNode.path(
                 "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
@@ -120,7 +134,7 @@ class DockerComposeContainerRuntimeTest {
     void laneFrontendReceivesItsTrustedEntryTagWhileMainBetaDoesNotEnableEntryTagging() throws Exception {
         ObjectNode frontend = (ObjectNode) service;
         frontend.put("serviceName", "frontend");
-        ((ObjectNode) frontend.path("registration")).put("applicationName", "frontend");
+        frontend.remove("registration");
         Path environment = temporary.resolve("frontend.env");
         Files.writeString(environment, "SERVER_PORT=18080\n");
         try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
@@ -137,10 +151,31 @@ class DockerComposeContainerRuntimeTest {
 
         JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
         JsonNode environmentNode = compose.path("services").path("app").path("environment");
+        JsonNode routing = mapper.readTree(environmentNode.path("SPRING_APPLICATION_JSON").asText());
         assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
         assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+        assertFalse(environmentNode.has("DUBBO_IP_TO_REGISTRY"));
+        assertFalse(environmentNode.has("DUBBO_PORT_TO_REGISTRY"));
+        assertFalse(routing.path("dubbo").has("provider"));
         assertEquals("60s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
         assertEquals("60000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+    }
+
+    @Test
+    void laneProviderRegistersItsOfficialDubboTag() throws Exception {
+        ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        FakeCommands commands = new FakeCommands(false, false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode environmentNode = compose.path("services").path("app").path("environment");
+        JsonNode routing = mapper.readTree(environmentNode.path("SPRING_APPLICATION_JSON").asText());
+        assertEquals("lane-a", routing.path("dubbo").path("provider").path("parameters")
+                .path("dubbo.tag").asText());
     }
 
     @Test

@@ -130,8 +130,7 @@
         "serviceSpecSha256",
         "machineId",
         "image",
-        "runtime",
-        "registration"
+        "runtime"
       ],
       "properties": {
         "serviceName": {

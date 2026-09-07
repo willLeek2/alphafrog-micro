@@ -235,14 +235,16 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             environment.put("AF_LANE_ENTRY_ENABLED", Boolean.toString(laneEntry));
             environment.put("AF_LANE_TRAFFIC_SCOPE_ID", plan.trafficScopeId());
         }
-        environment.put("AF_DUBBO_PORT_TO_REGISTRY", Integer.toString(plan.hostPort()));
+        if (service.path("registration").isObject()) {
+            environment.put("DUBBO_IP_TO_REGISTRY", machine.getRoutableAddress());
+            environment.put("DUBBO_PORT_TO_REGISTRY", Integer.toString(plan.hostPort()));
+        }
         environment.put("AF_DUBBO_REGISTRY_REGISTER", "false");
-        environment.put("SPRING_APPLICATION_JSON", betaRoutingConfiguration());
+        environment.put("SPRING_APPLICATION_JSON", betaRoutingConfiguration(service, plan));
         int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
         environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS",
                 Integer.toString(applicationDrainSeconds));
-        JsonNode registration = service.path("registration");
-        boolean coordinatedAgentShutdown = coordinatedAgentShutdown(registration);
+        boolean coordinatedAgentShutdown = coordinatedAgentShutdown(service);
         int finalizationMarginSeconds = finalizationMarginSeconds(applicationDrainSeconds);
         environment.put("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS",
                 Integer.toString(finalizationMarginSeconds));
@@ -250,8 +252,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS",
                 properties.getNacos().getServerAddress());
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_NAMESPACE", normalizedNacosNamespace());
-        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_GROUP_NAME",
-                registration.path("groupName").asText());
+        environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_GROUP_NAME", "alphafrog-beta");
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS",
                 Integer.toString(applicationDrainSeconds));
         environment.put("SERVER_SHUTDOWN", "graceful");
@@ -314,7 +315,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         }
     }
 
-    private String betaRoutingConfiguration() {
+    private String betaRoutingConfiguration(JsonNode service, CandidatePlan plan) {
         String server = properties.getNacos().getServerAddress();
         if (server == null || server.isBlank())
             throw new ControllerException("NACOS_CONFIG_INVALID", "Nacos server address is required for Beta routing");
@@ -323,9 +324,21 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         ObjectNode dubbo = root.putObject("dubbo");
         dubbo.putObject("registry").put("register", false);
         ObjectNode registries = dubbo.putObject("registries");
-        registryConfig(registries.putObject("beta"), server, namespace, "alphafrog-beta", "beta", true);
-        registryConfig(registries.putObject("production"), server, namespace, "DEFAULT_GROUP", "prod", false);
+        registryConfig(registries.putObject("beta"), server, namespace, "alphafrog-beta", "beta", true, true);
+        registryConfig(registries.putObject("production"), server, namespace, "DEFAULT_GROUP", "prod", false, false);
         dubbo.putObject("consumer").put("cluster", "zone-aware");
+        if (service.path("registration").isObject()) {
+            ObjectNode providerParameters = dubbo.putObject("provider").putObject("parameters");
+            providerParameters.put("alphafrog.deployment-id", plan.deploymentId());
+            providerParameters.put("alphafrog.traffic-scope-id", plan.trafficScopeId());
+            providerParameters.put("alphafrog.release-id", service.path("releaseId").asText());
+            providerParameters.put("alphafrog.deployment-generation-id", plan.generationId());
+            providerParameters.put("alphafrog.instance-id", plan.instanceId());
+            providerParameters.put("zone", "beta");
+            if (!"main-beta".equals(plan.trafficScopeId())) {
+                providerParameters.put("dubbo.tag", plan.trafficScopeId());
+            }
+        }
         try {
             return mapper.writeValueAsString(root);
         } catch (IOException impossible) {
@@ -339,11 +352,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     }
 
     private void registryConfig(ObjectNode target, String server, String namespace, String group, String zone,
-                                boolean preferred) {
+                                boolean register, boolean preferred) {
         target.put("address", "nacos://" + server + "?namespace=" + namespace + "&group=" + group + "&zone=" + zone);
         target.put("username", "${AF_CONFIG_NACOS_USERNAME:}");
         target.put("password", "${AF_CONFIG_NACOS_PASSWORD:}");
-        target.put("register", false);
+        target.put("register", register);
         target.put("preferred", preferred);
         target.put("use-as-config-center", false);
         target.put("use-as-metadata-center", false);
@@ -391,9 +404,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                     && otelResourceAttributes(manifest, service, plan,
                         service.path("image").path("localImageId").asText())
                         .equals(environment.path("OTEL_RESOURCE_ATTRIBUTES").asText())
-                    && Integer.toString(plan.hostPort()).equals(environment.path("AF_DUBBO_PORT_TO_REGISTRY").asText())
+                    && (!service.path("registration").isObject()
+                        || machine.getRoutableAddress().equals(environment.path("DUBBO_IP_TO_REGISTRY").asText())
+                        && Integer.toString(plan.hostPort()).equals(environment.path("DUBBO_PORT_TO_REGISTRY").asText()))
                     && "false".equals(environment.path("AF_DUBBO_REGISTRY_REGISTER").asText())
-                    && betaRoutingConfiguration().equals(environment.path("SPRING_APPLICATION_JSON").asText())
+                    && betaRoutingConfiguration(service, plan)
+                        .equals(environment.path("SPRING_APPLICATION_JSON").asText())
                     && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
                         .equals(environment.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText())
                     && Integer.toString(finalizationMarginSeconds(
@@ -404,12 +420,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                         .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS").asText())
                     && normalizedNacosNamespace().equals(environment
                         .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_NAMESPACE").asText())
-                    && service.path("registration").path("groupName").asText().equals(environment
+                    && "alphafrog-beta".equals(environment
                         .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_GROUP_NAME").asText())
                     && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
                         .equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS").asText())
                     && "graceful".equals(environment.path("SERVER_SHUTDOWN").asText())
-                    && (coordinatedAgentShutdown(service.path("registration"))
+                    && (coordinatedAgentShutdown(service)
                         ? "0s"
                         : service.path("runtime").path("applicationDrainSeconds").asInt() + "s")
                         .equals(environment.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText())
@@ -422,7 +438,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             if ("SPRING_BOOT_DUBBO_V1".equals(shutdownProfile)
                     || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
                 int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
-                int dubboWaitSeconds = coordinatedAgentShutdown(service.path("registration"))
+                int dubboWaitSeconds = coordinatedAgentShutdown(service)
                         ? finalizationMarginSeconds(applicationDrainSeconds)
                         : applicationDrainSeconds;
                 valid = valid && Integer.toString(dubboWaitSeconds * 1000)
@@ -446,8 +462,8 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         }
     }
 
-    private static boolean coordinatedAgentShutdown(JsonNode registration) {
-        return "agent-langchain-service".equals(registration.path("applicationName").asText());
+    private static boolean coordinatedAgentShutdown(JsonNode service) {
+        return "agent-service".equals(service.path("serviceName").asText());
     }
 
     private static int finalizationMarginSeconds(int totalSeconds) {

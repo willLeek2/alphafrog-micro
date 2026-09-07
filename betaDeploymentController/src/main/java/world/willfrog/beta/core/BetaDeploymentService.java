@@ -9,7 +9,6 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
 import java.util.HashSet;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
@@ -28,23 +27,23 @@ public class BetaDeploymentService {
     private final AtomicJsonStore store;
     private final BetaContractValidator validator;
     private final ContainerRuntime containers;
-    private final ServiceRegistry registry;
+    private final CandidateRegistrationProbe registrationProbe;
     private final Clock clock;
     private final ReentrantLock mutationLock = new ReentrantLock(true);
 
     @Autowired
     public BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
-                                 ContainerRuntime containers, ServiceRegistry registry) {
-        this(mapper, store, validator, containers, registry, Clock.systemUTC());
+                                 ContainerRuntime containers, CandidateRegistrationProbe registrationProbe) {
+        this(mapper, store, validator, containers, registrationProbe, Clock.systemUTC());
     }
 
     BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
-                          ContainerRuntime containers, ServiceRegistry registry, Clock clock) {
+                          ContainerRuntime containers, CandidateRegistrationProbe registrationProbe, Clock clock) {
         this.mapper = mapper;
         this.store = store;
         this.validator = validator;
         this.containers = containers;
-        this.registry = registry;
+        this.registrationProbe = registrationProbe;
         this.clock = clock;
     }
 
@@ -251,10 +250,8 @@ public class BetaDeploymentService {
         ContainerRuntime.CandidatePlan plan = new ContainerRuntime.CandidatePlan(
                 ref.deploymentId(), ref.trafficScopeId(), ref.candidateInstanceId(), generation, slot, hostPort);
         ContainerRuntime.ContainerObservation observation = containers.create(manifest, spec, plan);
-        ServiceRegistry.Registration registration = registry.register(manifest, spec, ref.candidateInstanceId(), generation,
-                observation.endpointAddress(), hostPort, false);
         Instant now = Instant.now(clock);
-        ObjectNode candidate = instance(spec, manifest, ref.candidateInstanceId(), generation, slot, observation, registration);
+        ObjectNode candidate = instance(spec, manifest, ref.candidateInstanceId(), generation, slot, observation);
         candidate.put("readiness", "STARTING");
         candidate.putNull("readinessObservedAt");
         candidate.put("readinessDeadline", now.plusSeconds(spec.path("runtime").path("readinessTimeoutSeconds").asLong()).toString());
@@ -274,23 +271,19 @@ public class BetaDeploymentService {
         containers.verifyPersistedInstance(manifest, spec, candidate);
         ContainerRuntime.ContainerObservation observed = containers.inspect(
                 candidate.path("machineId").asText(), candidate.path("containerName").asText());
-        Optional<ServiceRegistry.Registration> found = registry.find(registration(candidate.path("registration")));
-        if (found.isEmpty()) {
-            cleanupCandidate(candidate);
-            markFailed(ref, "CANDIDATE_REGISTRATION_MISSING", "Candidate registration is missing",
-                    "CLEAN_RETRYABLE", true);
-            return;
-        }
-        ServiceRegistry.Registration registration = found.get();
         if ((!observed.containerId().isEmpty() && !observed.containerId().equals(candidate.path("containerId").asText()))
                 || (!observed.endpointAddress().isEmpty()
                     && !observed.endpointAddress().equals(candidate.path("endpoint").path("address").asText()))
                 || (observed.hostPort() != 0 && observed.hostPort() != candidate.path("hostPort").asInt()))
             throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Observed candidate differs from the persisted instance");
-        if (registration.enabled() || registration.weight() != 0)
-            throw new ControllerException("CANDIDATE_SELECTABLE_UNEXPECTEDLY", "Candidate registration became selectable before the route switch");
-        boolean ready = observed.running() && observed.health() == ContainerRuntime.ContainerObservation.Health.HEALTHY
-                && registration.healthy() && !registration.enabled() && registration.weight() == 0;
+        boolean healthy = observed.running()
+                && observed.health() == ContainerRuntime.ContainerObservation.Health.HEALTHY;
+        boolean registered = !spec.path("registration").isObject()
+                || healthy && registrationProbe.isVisible(
+                    spec,
+                    candidate.path("endpoint").path("address").asText(),
+                    candidate.path("hostPort").asInt());
+        boolean ready = healthy && registered;
         boolean expired = !Instant.now(clock).isBefore(Instant.parse(candidate.path("readinessDeadline").asText()));
         if (!ready && !expired && observed.health() != ContainerRuntime.ContainerObservation.Health.UNHEALTHY
                 && observed.health() != ContainerRuntime.ContainerObservation.Health.MISSING) return;
@@ -304,7 +297,6 @@ public class BetaDeploymentService {
             ObjectNode stored = (ObjectNode) service.path("candidateInstance");
             stored.put("readiness", "READY");
             stored.put("readinessObservedAt", Instant.now(clock).toString());
-            stored.set("registration", registration(registration));
             ((ObjectNode) service.path("operation")).put("phase", "SWITCHING_TRAFFIC");
             validateAll(state);
             return null;
@@ -312,32 +304,15 @@ public class BetaDeploymentService {
     }
 
     private void switchTraffic(OperationRef ref) {
-        JsonNode candidate = ref.service().path("candidateInstance");
-        ServiceRegistry.Registration enabled = registry.setSelectable(registration(candidate.path("registration")), true);
-        if (!enabled.enabled() || enabled.weight() != 1 || !enabled.healthy())
-            throw new ControllerException("NACOS_ENABLE_NOT_CONFIRMED", "Candidate registration was not enabled");
-        JsonNode previous = ref.service().path("activeInstance");
-        if (previous.isObject()) {
-            ServiceRegistry.Registration oldRegistration = registration(previous.path("registration"));
-            if (registry.find(oldRegistration).isPresent()) {
-                registry.unregister(oldRegistration);
-                if (registry.find(oldRegistration).isPresent())
-                    throw new ControllerException("NACOS_REMOVE_NOT_CONFIRMED", "Previous registration is still selectable");
-            }
-        }
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode promoted = ((ObjectNode) service.path("candidateInstance")).deepCopy();
             promoted.remove(java.util.List.of("readiness", "readinessObservedAt", "readinessDeadline"));
-            promoted.set("registration", registration(enabled));
             JsonNode storedPrevious = service.path("activeInstance").deepCopy();
-            String switchAt = Instant.now(clock).toString();
             service.set("activeInstance", promoted);
             service.putNull("candidateInstance");
             if (storedPrevious.isObject()) {
                 ObjectNode draining = ((ObjectNode) storedPrevious).deepCopy();
-                draining.put("trafficRemovedAt", switchAt);
-                draining.put("registrationRemovedAt", switchAt);
                 draining.putNull("stopSignalRequestedAt");
                 draining.putNull("stopDeadline");
                 service.set("drainingInstance", draining);
@@ -356,17 +331,9 @@ public class BetaDeploymentService {
     }
 
     private void removeTraffic(OperationRef ref) {
-        JsonNode activeSnapshot = ref.service().path("activeInstance");
-        ServiceRegistry.Registration activeRegistration = registration(activeSnapshot.path("registration"));
-        registry.unregister(activeRegistration);
-        if (registry.find(activeRegistration).isPresent())
-            throw new ControllerException("NACOS_REMOVE_NOT_CONFIRMED", "Active registration is still selectable");
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             ObjectNode active = ((ObjectNode) service.path("activeInstance")).deepCopy();
-            String switchAt = Instant.now(clock).toString();
-            active.put("trafficRemovedAt", switchAt);
-            active.put("registrationRemovedAt", switchAt);
             active.putNull("stopSignalRequestedAt");
             active.putNull("stopDeadline");
             service.putNull("activeInstance");
@@ -387,23 +354,6 @@ public class BetaDeploymentService {
         containers.verifyPersistedInstance(manifest, spec, draining);
         ContainerRuntime.ContainerObservation beforeStop = containers.inspect(
                 draining.path("machineId").asText(), draining.path("containerName").asText());
-        ServiceRegistry.Registration expected = registration(draining.path("registration"));
-        Optional<ServiceRegistry.Registration> registered = registry.find(expected);
-        if (registered.isPresent()) {
-            registry.unregister(registered.get());
-            if (registry.find(expected).isPresent())
-                throw new ControllerException("NACOS_REMOVE_NOT_CONFIRMED", "Draining registration is still present");
-        }
-        if (draining.path("registrationRemovedAt").isNull()) {
-            store.update(state -> {
-                ObjectNode value = (ObjectNode) checkedService(state, ref).path("drainingInstance");
-                value.put("registrationRemovedAt", Instant.now(clock).toString());
-                validateAll(state);
-                return null;
-            });
-        }
-        current = store.read(state -> checkedService(state, ref).deepCopy());
-        draining = (ObjectNode) current.path("drainingInstance");
         if (beforeStop.running()) {
             Instant requestedAt = Instant.now(clock);
             if (draining.path("stopSignalRequestedAt").isNull()) {
@@ -502,8 +452,6 @@ public class BetaDeploymentService {
     }
 
     private void cleanupCandidate(JsonNode candidate) {
-        ServiceRegistry.Registration registration = registration(candidate.path("registration"));
-        registry.unregister(registration);
         containers.remove(candidate.path("machineId").asText(), candidate.path("containerName").asText());
     }
 
@@ -530,16 +478,13 @@ public class BetaDeploymentService {
     private void verifyServiceFacts(JsonNode deployment, JsonNode service, JsonNode manifest) {
         JsonNode spec = findService(manifest, service.path("serviceName").asText());
         Set<String> trackedContainerIds = new HashSet<>();
-        Set<String> trackedInstanceIds = new HashSet<>();
         for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
             JsonNode instance = service.path(role);
             if (instance.isObject()) {
                 trackedContainerIds.add(instance.path("containerId").asText());
-                trackedInstanceIds.add(instance.path("instanceId").asText());
             }
         }
         containers.assertNoUntrackedInstances(manifest, spec, trackedContainerIds);
-        registry.assertNoUntrackedRegistrations(manifest, spec, trackedInstanceIds);
         for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
             JsonNode instance = service.path(role);
             if (!instance.isObject()) continue;
@@ -557,47 +502,7 @@ public class BetaDeploymentService {
                 throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Observed container differs from persisted state");
             if (("activeInstance".equals(role) || "candidateInstance".equals(role)) && !observed.running())
                 throw new ControllerException("CONTAINER_NOT_RUNNING", "Routable or candidate container is not running");
-
-            Optional<ServiceRegistry.Registration> registration = registry.find(registration(instance.path("registration")));
-            if (draining) {
-                if (registration.isPresent())
-                    throw new ControllerException("NACOS_DRAINING_PRESENT", "A draining instance remains registered");
-                continue;
-            }
-            if (registration.isEmpty()) {
-                if ("activeInstance".equals(role) && trafficWasSwitchedBeforeStateCommit(service)) {
-                    continue;
-                }
-                throw new ControllerException("NACOS_FACT_MISSING", "Persisted Nacos registration is missing");
-            }
-            ServiceRegistry.Registration value = registration.get();
-            if (!value.ephemeral())
-                throw new ControllerException("NACOS_FACT_INVALID", "Nacos registration is not ephemeral");
-            if ("activeInstance".equals(role) && (!value.enabled() || value.weight() != 1 || !value.healthy()))
-                throw new ControllerException("ACTIVE_INSTANCE_DISABLED", "Active Nacos registration is disabled");
-            if ("candidateInstance".equals(role)) {
-                String operationPhase = service.path("operation").path("phase").asText();
-                boolean selectable = value.enabled() && value.weight() == 1;
-                boolean disabled = !value.enabled() && value.weight() == 0;
-                boolean allowed = "SWITCHING_TRAFFIC".equals(operationPhase)
-                        ? (selectable || disabled) : disabled;
-                if (!allowed)
-                    throw new ControllerException("CANDIDATE_SELECTABILITY_CONFLICT",
-                            "Candidate Nacos selectability does not match the persisted phase");
-            }
         }
-    }
-
-    private boolean trafficWasSwitchedBeforeStateCommit(JsonNode service) {
-        if (!"SWITCHING_TRAFFIC".equals(service.path("operation").path("phase").asText())) return false;
-        JsonNode candidate = service.path("candidateInstance");
-        if (!candidate.isObject()) return false;
-        Optional<ServiceRegistry.Registration> observed = registry.find(
-                registration(candidate.path("registration")));
-        return observed.isPresent()
-                && observed.get().enabled()
-                && observed.get().weight() == 1
-                && observed.get().healthy();
     }
 
     private void recordStartupFailure(String deploymentId, String serviceName, ControllerException failure) {
@@ -631,8 +536,6 @@ public class BetaDeploymentService {
         Set<String> reservedPorts = new HashSet<>();
         Set<String> instanceIds = new HashSet<>();
         Set<String> containerIds = new HashSet<>();
-        Set<String> registrationIds = new HashSet<>();
-        Set<String> nacosInstanceIds = new HashSet<>();
         int operations = 0;
         for (JsonNode deployment : state.path("deployments")) {
             if (!deploymentIds.add(deployment.path("deploymentId").asText()))
@@ -657,16 +560,6 @@ public class BetaDeploymentService {
                         throw new ControllerException("STATE_INVALID", "Instance identifier is duplicated");
                     if (!containerIds.add(instance.path("containerId").asText()))
                         throw new ControllerException("STATE_INVALID", "Container identifier is duplicated");
-                    JsonNode registration = instance.path("registration");
-                    String registrationKey = registration.path("namespaceId").asText() + '\u0000'
-                            + registration.path("groupName").asText() + '\u0000'
-                            + registration.path("serviceName").asText() + '\u0000'
-                            + registration.path("clusterName").asText() + '\u0000'
-                            + registration.path("ip").asText() + '\u0000' + registration.path("port").asInt();
-                    if (!registrationIds.add(registrationKey))
-                        throw new ControllerException("STATE_INVALID", "Nacos registration identity is duplicated");
-                    if (!nacosInstanceIds.add(registration.path("nacosInstanceId").asText()))
-                        throw new ControllerException("STATE_INVALID", "Nacos instance identifier is duplicated");
                     if (!usedSlots.add(instance.path("portSlot").asText()))
                         throw new ControllerException("STATE_INVALID", "Service instances reuse the same port slot");
                 }
@@ -823,7 +716,7 @@ public class BetaDeploymentService {
     }
 
     private ObjectNode instance(JsonNode spec, JsonNode manifest, String instanceId, String generation, String slot,
-                                ContainerRuntime.ContainerObservation container, ServiceRegistry.Registration registration) {
+                                ContainerRuntime.ContainerObservation container) {
         ObjectNode result = mapper.createObjectNode();
         result.put("instanceId", instanceId);
         result.put("machineId", spec.path("machineId").asText());
@@ -842,22 +735,7 @@ public class BetaDeploymentService {
         endpoint.put("address", container.endpointAddress());
         endpoint.put("port", container.hostPort());
         result.set("endpoint", endpoint);
-        result.set("registration", registration(registration));
         return result;
-    }
-
-    private ObjectNode registration(ServiceRegistry.Registration value) {
-        ObjectNode node = mapper.valueToTree(value);
-        node.set("metadata", mapper.valueToTree(value.metadata()));
-        return node;
-    }
-
-    private ServiceRegistry.Registration registration(JsonNode value) {
-        return new ServiceRegistry.Registration(value.path("serviceName").asText(), value.path("groupName").asText(),
-                value.path("namespaceId").asText(), value.path("clusterName").asText(), value.path("ip").asText(),
-                value.path("port").asInt(), value.path("nacosInstanceId").asText(), value.path("enabled").asBoolean(),
-                value.path("healthy").asBoolean(), value.path("weight").asInt(), value.path("ephemeral").asBoolean(),
-                mapper.convertValue(value.path("metadata"), mapper.getTypeFactory().constructMapType(java.util.Map.class, String.class, String.class)));
     }
 
     private ObjectNode operation(String type, String phase, String candidateId) {

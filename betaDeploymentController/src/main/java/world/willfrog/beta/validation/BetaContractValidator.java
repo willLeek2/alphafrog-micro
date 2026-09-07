@@ -81,12 +81,15 @@ public class BetaContractValidator {
             if (commonDrainSeconds == null) commonDrainSeconds = applicationDrainSeconds;
             else if (commonDrainSeconds != applicationDrainSeconds)
                 throw new ControllerException("MANIFEST_INVALID", "All services must use one common drain deadline");
-            if (!expectedNacosServiceName(dubboServiceKey)
-                    .equals(service.path("registration").path("serviceName").asText())) {
-                throw new ControllerException("MANIFEST_INVALID", "Nacos service name differs from the Dubbo service key for " + name);
+            JsonNode registration = service.path("registration");
+            if (registration.isObject()) {
+                if (!expectedNacosServiceName(dubboServiceKey)
+                        .equals(registration.path("serviceName").asText())) {
+                    throw new ControllerException("MANIFEST_INVALID", "Nacos service name differs from the Dubbo service key for " + name);
+                }
+                if (!"alphafrog-beta".equals(registration.path("groupName").asText()))
+                    throw new ControllerException("MANIFEST_INVALID", "Beta instances must use the isolated Nacos group alphafrog-beta");
             }
-            if (!"alphafrog-beta".equals(service.path("registration").path("groupName").asText()))
-                throw new ControllerException("MANIFEST_INVALID", "Beta instances must use the isolated Nacos group alphafrog-beta");
             for (JsonNode port : service.path("runtime").path("hostPorts")) {
                 String key = service.path("machineId").asText() + ':' + port.asInt();
                 if (!ports.add(key)) throw new ControllerException("MANIFEST_INVALID", "Reserved port collision " + key);
@@ -127,18 +130,6 @@ public class BetaContractValidator {
                         throw new ControllerException("STATE_INVALID", "Duplicate instance identifier");
                     if (!containerIds.add(instance.path("containerId").asText()))
                         throw new ControllerException("STATE_INVALID", "Duplicate container identifier");
-                    JsonNode registration = instance.path("registration");
-                    if (registration.path("port").asInt() != instance.path("hostPort").asInt()
-                            || !registration.path("ip").equals(instance.path("endpoint").path("address"))
-                            || registration.path("port").asInt() != instance.path("endpoint").path("port").asInt()
-                            || !registration.path("ephemeral").asBoolean()
-                    || !registration.path("metadata").equals(expectedMetadata(deployment, instance, spec))) {
-                        throw new ControllerException("STATE_INVALID", "Instance registration identity mismatch");
-                    }
-                    if (!registration.path("serviceName").asText()
-                            .equals(expectedNacosServiceName(service.path("dubboServiceKey").asText()))) {
-                        throw new ControllerException("STATE_INVALID", "Nacos service name differs from the persisted Dubbo service key");
-                    }
                     String slot = instance.path("portSlot").asText();
                     int expectedPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
                     if (!instance.path("machineId").equals(spec.path("machineId"))
@@ -149,21 +140,14 @@ public class BetaContractValidator {
                 if (candidate.isObject()) {
                     requireTargetInstance(candidate, manifest, spec);
                     if ((service.path("operation").isObject()
-                            && !candidate.path("instanceId").equals(service.path("operation").path("candidateInstanceId")))
-                            || candidate.path("registration").path("enabled").asBoolean()
-                            || candidate.path("registration").path("weight").asInt() != 0)
-                        throw new ControllerException("STATE_INVALID", "Candidate identity or selectable state is invalid");
+                            && !candidate.path("instanceId").equals(service.path("operation").path("candidateInstanceId"))))
+                        throw new ControllerException("STATE_INVALID", "Candidate identity does not match the current operation");
                 }
                 JsonNode active = service.path("activeInstance");
                 if (active.isObject() && ("STABLE".equals(service.path("phase").asText())
                         && active.path("manifestVersion").asLong() == manifest.path("manifestVersion").asLong()
                         || "DRAINING_PREVIOUS".equals(service.path("operation").path("phase").asText())))
                     requireTargetInstance(active, manifest, spec);
-                JsonNode draining = service.path("drainingInstance");
-                if (draining.isObject()) {
-                    if (draining.path("registrationRemovedAt").isNull())
-                        throw new ControllerException("STATE_INVALID", "A draining instance must record registration removal");
-                }
             }
         }
         if (operations > 1) throw new ControllerException("STATE_INVALID", "Only one deployment operation may run at a time");
@@ -178,32 +162,6 @@ public class BetaContractValidator {
                 || !instance.path("applicationDrainSeconds").equals(spec.path("runtime").path("applicationDrainSeconds"))
                 || !instance.path("drainGraceSeconds").equals(spec.path("runtime").path("drainGraceSeconds")))
             throw new ControllerException("STATE_INVALID", "Candidate or promoted instance differs from the current target");
-    }
-
-    private JsonNode expectedMetadata(JsonNode deployment, JsonNode instance, JsonNode spec) {
-        var expected = mapper.createObjectNode();
-        expected.put("alphafrog.deployment-id", deployment.path("deploymentId").asText());
-        expected.put("alphafrog.traffic-scope-id", deployment.path("trafficScopeId").asText());
-        expected.put("alphafrog.release-id", instance.path("releaseId").asText());
-        expected.put("alphafrog.deployment-generation-id", instance.path("deploymentGenerationId").asText());
-        expected.put("alphafrog.instance-id", instance.path("instanceId").asText());
-        expected.put("zone", "beta");
-        DubboProviderIdentity provider = dubboProvider(spec.path("dubboServiceKey").asText());
-        expected.put("application", spec.path("registration").path("applicationName").asText());
-        expected.put("category", "providers");
-        expected.put("dynamic", "true");
-        expected.put("group", provider.group());
-        expected.put("interface", provider.interfaceName());
-        expected.put("path", provider.interfaceName());
-        expected.put("protocol", "tri");
-        expected.put("side", "provider");
-        expected.put("version", provider.version());
-        String trafficScopeId = deployment.path("trafficScopeId").asText();
-        if (!"main-beta".equals(trafficScopeId)) {
-            expected.put("tag", trafficScopeId);
-            expected.put("dubbo.tag", trafficScopeId);
-        }
-        return expected;
     }
 
     private JsonNode findService(JsonNode manifest, String name) {

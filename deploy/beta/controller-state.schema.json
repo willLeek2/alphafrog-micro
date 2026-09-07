@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://alphafrog.local/schemas/beta/controller-state.schema.json",
   "title": "AlphaFrog Beta traffic controller state",
-  "description": "Validates the complete JSON object stored at /var/lib/alphafrog-beta/controller-state.json. The Beta deployment controller is the sole runtime writer. The file records accepted manifest identity, observed containers, Nacos registrations, drain deadlines, and current operations; it is not a request-routing source.",
+  "description": "Validates the complete JSON object stored at /var/lib/alphafrog-beta/controller-state.json. The Beta deployment controller is the sole runtime writer. The file records accepted manifest identity, observed containers, drain deadlines, and current operations; it is not a request-routing source.",
   "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time, ipv4, and ipv6. Treating format as annotation is not conforming.",
   "type": "object",
   "additionalProperties": false,
@@ -71,18 +71,6 @@
       "minLength": 1,
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-    },
-    "nacosText": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 256,
-      "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f]+$"
-    },
-    "nacosInstanceId": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 1024,
-      "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f]+$"
     },
     "sha256": {
       "type": "string",
@@ -172,149 +160,6 @@
         }
       }
     },
-    "registration": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "serviceName",
-        "groupName",
-        "namespaceId",
-        "clusterName",
-        "ip",
-        "port",
-        "nacosInstanceId",
-        "enabled",
-        "healthy",
-        "weight",
-        "ephemeral",
-        "metadata"
-      ],
-      "properties": {
-        "serviceName": {
-          "$ref": "#/$defs/nacosText"
-        },
-        "groupName": {
-          "const": "alphafrog-beta"
-        },
-        "namespaceId": {
-          "$ref": "#/$defs/nacosText"
-        },
-        "clusterName": {
-          "type": "string",
-          "pattern": "^[0-9A-Za-z-]+$",
-          "maxLength": 128
-        },
-        "ip": {
-          "$ref": "#/$defs/ipAddress"
-        },
-        "port": {
-          "$ref": "#/$defs/port"
-        },
-        "nacosInstanceId": {
-          "$ref": "#/$defs/nacosInstanceId"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "healthy": {
-          "type": "boolean"
-        },
-        "weight": {
-          "enum": [
-            0,
-            1
-          ]
-        },
-        "ephemeral": {
-          "const": true
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "alphafrog.deployment-id",
-            "alphafrog.traffic-scope-id",
-            "alphafrog.release-id",
-            "alphafrog.deployment-generation-id",
-            "alphafrog.instance-id",
-            "zone",
-            "application",
-            "category",
-            "dynamic",
-            "group",
-            "interface",
-            "path",
-            "protocol",
-            "side",
-            "version"
-          ],
-          "properties": {
-            "alphafrog.deployment-id": {
-              "$ref": "#/$defs/deploymentId"
-            },
-            "alphafrog.traffic-scope-id": {
-              "$ref": "#/$defs/trafficScopeId"
-            },
-            "alphafrog.release-id": {
-              "$ref": "#/$defs/opaqueId"
-            },
-            "alphafrog.deployment-generation-id": {
-              "$ref": "#/$defs/deploymentGenerationId"
-            },
-            "alphafrog.instance-id": {
-              "$ref": "#/$defs/opaqueId"
-            },
-            "zone": {
-              "const": "beta"
-            },
-            "application": {
-              "$ref": "#/$defs/nacosText"
-            },
-            "category": {
-              "const": "providers"
-            },
-            "dynamic": {
-              "const": "true"
-            },
-            "group": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[0-9A-Za-z._-]+$"
-            },
-            "interface": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 512,
-              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"
-            },
-            "path": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 512,
-              "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"
-            },
-            "protocol": {
-              "const": "tri"
-            },
-            "side": {
-              "const": "provider"
-            },
-            "version": {
-              "type": "string",
-              "maxLength": 128,
-              "pattern": "^(?:[0-9A-Za-z._-]+)?$"
-            },
-            "dubbo.tag": {
-              "$ref": "#/$defs/trafficScopeId"
-            },
-            "tag": {
-              "$ref": "#/$defs/trafficScopeId"
-            }
-          }
-        }
-      }
-    },
     "instanceBase": {
       "type": "object",
       "additionalProperties": true,
@@ -332,8 +177,7 @@
         "containerId",
         "portSlot",
         "hostPort",
-        "endpoint",
-        "registration"
+        "endpoint"
       ],
       "properties": {
         "instanceId": {
@@ -391,9 +235,6 @@
         },
         "endpoint": {
           "$ref": "#/$defs/endpoint"
-        },
-        "registration": {
-          "$ref": "#/$defs/registration"
         }
       }
     },
@@ -419,8 +260,7 @@
             "containerId",
             "portSlot",
             "hostPort",
-            "endpoint",
-            "registration"
+            "endpoint"
           ],
           "properties": {
             "instanceId": true,
@@ -436,8 +276,7 @@
             "containerId": true,
             "portSlot": true,
             "hostPort": true,
-            "endpoint": true,
-            "registration": true
+            "endpoint": true
           }
         }
       ]
@@ -465,7 +304,6 @@
             "portSlot",
             "hostPort",
             "endpoint",
-            "registration",
             "readiness",
             "readinessObservedAt",
             "readinessDeadline"
@@ -485,7 +323,6 @@
             "portSlot": true,
             "hostPort": true,
             "endpoint": true,
-            "registration": true,
             "readiness": {
               "enum": [
                 "STARTING",
@@ -552,11 +389,8 @@
             "portSlot",
             "hostPort",
             "endpoint",
-            "registration",
-            "trafficRemovedAt",
             "stopSignalRequestedAt",
-            "stopDeadline",
-            "registrationRemovedAt"
+            "stopDeadline"
           ],
           "properties": {
             "instanceId": true,
@@ -573,18 +407,11 @@
             "portSlot": true,
             "hostPort": true,
             "endpoint": true,
-            "registration": true,
-            "trafficRemovedAt": {
-              "$ref": "#/$defs/timestamp"
-            },
             "stopSignalRequestedAt": {
               "$ref": "#/$defs/nullableTimestamp"
             },
             "stopDeadline": {
               "$ref": "#/$defs/nullableTimestamp"
-            },
-            "registrationRemovedAt": {
-              "$ref": "#/$defs/timestamp"
             }
           },
           "allOf": [
@@ -905,51 +732,6 @@
               "failedManifestVersion": {
                 "type": "integer",
                 "minimum": 1
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "operation": {
-                "type": "object",
-                "properties": {
-                  "phase": {
-                    "enum": [
-                      "DRAINING_PREVIOUS",
-                      "DRAINING_ACTIVE"
-                    ]
-                  }
-                },
-                "required": [
-                  "phase"
-                ]
-              }
-            },
-            "required": [
-              "operation"
-            ]
-          },
-          "then": {
-            "properties": {
-              "drainingInstance": {
-                "allOf": [
-                  {
-                    "$ref": "#/$defs/drainingInstance"
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "trafficRemovedAt": {
-                        "$ref": "#/$defs/timestamp"
-                      },
-                      "registrationRemovedAt": {
-                        "$ref": "#/$defs/timestamp"
-                      }
-                    }
-                  }
-                ]
               }
             }
           }

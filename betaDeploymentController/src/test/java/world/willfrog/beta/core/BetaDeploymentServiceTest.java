@@ -2,7 +2,6 @@ package world.willfrog.beta.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -15,8 +14,6 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -29,7 +26,7 @@ class BetaDeploymentServiceTest {
     private ObjectMapper mapper;
     private AtomicJsonStore store;
     private FakeContainers containers;
-    private FakeRegistry registry;
+    private FakeRegistrationProbe registrationProbe;
     private BetaDeploymentService service;
 
     @BeforeEach
@@ -39,30 +36,26 @@ class BetaDeploymentServiceTest {
         properties.setStateRoot(temporary.resolve("state"));
         store = new AtomicJsonStore(mapper, properties);
         containers = new FakeContainers();
-        registry = new FakeRegistry();
-        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers, registry,
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe,
                 Clock.fixed(Instant.parse("2026-09-01T00:00:00Z"), ZoneOffset.UTC));
     }
 
     @Test
-    void updateEnablesCandidateRemovesOldRegistrationThenNaturallyStopsOldContainer() {
+    void updatePromotesHealthyRegisteredCandidateThenNaturallyStopsOldContainer() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
         String oldId = state().path("activeInstance").path("instanceId").asText();
-        assertTrue(registry.values.containsKey(oldId));
 
         service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
         reconcile(3);
         JsonNode draining = state().path("drainingInstance");
         String newId = state().path("activeInstance").path("instanceId").asText();
         assertFalse(oldId.equals(newId));
-        assertFalse(registry.values.containsKey(oldId));
-        assertTrue(registry.values.containsKey(newId));
-        assertEquals("beta", registry.values.get(newId).metadata().get("zone"));
-        assertEquals("beta-main-001", registry.values.get(newId).metadata().get("alphafrog.deployment-id"));
-        assertNull(registry.values.get(newId).metadata().get("dubbo.tag"));
-        assertNull(registry.values.get(newId).metadata().get("tag"));
-        assertFalse(draining.path("registrationRemovedAt").isNull());
+        assertEquals(oldId, draining.path("instanceId").asText());
+        assertEquals("10.0.0.8", registrationProbe.lastAddress);
+        assertEquals(28081, registrationProbe.lastPort);
 
         service.reconcileOne();
         assertEquals("STABLE", state().path("phase").asText());
@@ -71,7 +64,7 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
-    void startupResumesAfterCandidateWasEnabledAndOldRegistrationWasRemoved() {
+    void startupResumesFromPersistedTrafficSwitchCheckpoint() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
         String oldId = state().path("activeInstance").path("instanceId").asText();
@@ -80,13 +73,11 @@ class BetaDeploymentServiceTest {
         reconcile(2);
         assertEquals("SWITCHING_TRAFFIC", state().path("operation").path("phase").asText());
         JsonNode candidate = state().path("candidateInstance");
-        ServiceRegistry.Registration expected = registry.values.get(candidate.path("instanceId").asText());
-        registry.setSelectable(expected, true);
-        registry.values.remove(oldId);
 
         BetaControllerProperties properties = new BetaControllerProperties();
         properties.setStateRoot(temporary.resolve("state"));
-        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers, registry,
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe,
                 Clock.fixed(Instant.parse("2026-09-01T00:00:00Z"), ZoneOffset.UTC));
         assertTrue(state().path("lastError").isNull());
 
@@ -97,18 +88,34 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
-    void laneCandidateCarriesFinalStaticTagBeforeItBecomesSelectable() {
+    void healthyCandidateWaitsUntilItsSelfRegistrationIsVisible() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
-        service.submitManifest(manifest("beta-lane-a", 1, "release-1", '1', 'c', 'd', "lane-a", 38080));
+        registrationProbe.visible = false;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
         service.reconcileOne();
-        JsonNode candidate = state("lane-a").path("candidateInstance");
-        ServiceRegistry.Registration value = registry.values.get(candidate.path("instanceId").asText());
-        assertFalse(value.enabled());
-        assertEquals(0, value.weight());
-        assertEquals("lane-a", value.metadata().get("dubbo.tag"));
-        assertEquals("lane-a", value.metadata().get("tag"));
-        assertEquals("beta", value.metadata().get("zone"));
+        service.reconcileOne();
+        assertEquals("WAITING_CANDIDATE_READINESS", state().path("operation").path("phase").asText());
+        assertEquals("release-1", state().path("activeInstance").path("releaseId").asText());
+
+        registrationProbe.visible = true;
+        service.reconcileOne();
+        assertEquals("SWITCHING_TRAFFIC", state().path("operation").path("phase").asText());
+    }
+
+    @Test
+    void serviceWithoutDubboProviderUsesContainerHealthOnly() {
+        ObjectNode value = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
+        ObjectNode spec = (ObjectNode) value.path("services").path(0);
+        spec.remove("registration");
+        spec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, spec));
+        registrationProbe.visible = false;
+
+        service.submitManifest(value);
+        reconcile(3);
+
+        assertEquals("STABLE", state().path("phase").asText());
+        assertEquals(0, registrationProbe.calls);
     }
 
     @Test
@@ -124,20 +131,18 @@ class BetaDeploymentServiceTest {
 
         assertEquals("STABLE", state().path("phase").asText());
         assertEquals(oldId, state().path("activeInstance").path("instanceId").asText());
-        assertTrue(registry.values.containsKey(oldId));
         assertFalse(state().path("lastError").isNull());
     }
 
     @Test
-    void deleteRemovesRegistrationBeforeSendingTheCommonStopDeadline() {
+    void deleteMovesInstanceToDrainingBeforeSendingTheCommonStopDeadline() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
         String activeId = state().path("activeInstance").path("instanceId").asText();
 
         service.requestDelete("beta-main-001");
         service.reconcileOne();
-        assertFalse(registry.values.containsKey(activeId));
-        assertFalse(state().path("drainingInstance").path("registrationRemovedAt").isNull());
+        assertEquals(activeId, state().path("drainingInstance").path("instanceId").asText());
         service.reconcileOne();
         assertEquals(0, store.snapshot().path("deployments").size());
         assertEquals(60, containers.stopTimeoutSeconds);
@@ -187,7 +192,8 @@ class BetaDeploymentServiceTest {
         containers.leaveRunningAfterStop = false;
         BetaControllerProperties properties = new BetaControllerProperties();
         properties.setStateRoot(temporary.resolve("state"));
-        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers, registry,
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe,
                 Clock.fixed(Instant.parse("2026-09-01T00:00:30Z"), ZoneOffset.UTC));
         service.retry("beta-main-001", "agent-service");
         service.reconcileOne();
@@ -283,48 +289,17 @@ class BetaDeploymentServiceTest {
         @Override public void remove(String machineId, String name) { values.remove(name); }
     }
 
-    private static final class FakeRegistry implements ServiceRegistry {
-        final Map<String, Registration> values = new LinkedHashMap<>();
-        @Override public Registration register(JsonNode manifest, JsonNode service, String instanceId,
-                                               String generation, String address, int port, boolean selectable) {
-            Map<String, String> metadata = new LinkedHashMap<>();
-            metadata.put("alphafrog.deployment-id", manifest.path("deploymentId").asText());
-            metadata.put("alphafrog.traffic-scope-id", manifest.path("trafficScopeId").asText());
-            metadata.put("alphafrog.release-id", service.path("releaseId").asText());
-            metadata.put("alphafrog.deployment-generation-id", generation);
-            metadata.put("alphafrog.instance-id", instanceId);
-            metadata.put("zone", "beta");
-            metadata.put("application", service.path("registration").path("applicationName").asText());
-            metadata.put("category", "providers");
-            metadata.put("dynamic", "true");
-            metadata.put("group", "langchain");
-            metadata.put("interface", "com.alphafrog.AgentService");
-            metadata.put("path", "com.alphafrog.AgentService");
-            metadata.put("protocol", "tri");
-            metadata.put("side", "provider");
-            metadata.put("version", "");
-            if (!"main-beta".equals(manifest.path("trafficScopeId").asText())) {
-                metadata.put("tag", manifest.path("trafficScopeId").asText());
-                metadata.put("dubbo.tag", manifest.path("trafficScopeId").asText());
-            }
-            Registration value = new Registration(service.path("registration").path("serviceName").asText(),
-                    "alphafrog-beta", "public", "DEFAULT", address, port, "nacos:" + instanceId,
-                    selectable, true, selectable ? 1 : 0, true, Map.copyOf(metadata));
-            values.put(instanceId, value);
-            return value;
+    private static final class FakeRegistrationProbe implements CandidateRegistrationProbe {
+        boolean visible = true;
+        String lastAddress;
+        int lastPort;
+        int calls;
+
+        @Override public boolean isVisible(JsonNode service, String address, int port) {
+            calls++;
+            lastAddress = address;
+            lastPort = port;
+            return visible;
         }
-        @Override public Registration setSelectable(Registration expected, boolean selectable) {
-            Registration value = new Registration(expected.serviceName(), expected.groupName(), expected.namespaceId(),
-                    expected.clusterName(), expected.ip(), expected.port(), expected.nacosInstanceId(), selectable,
-                    true, selectable ? 1 : 0, true, expected.metadata());
-            values.put(expected.metadata().get("alphafrog.instance-id"), value);
-            return value;
-        }
-        @Override public Registration observe(Registration expected) { return values.get(expected.metadata().get("alphafrog.instance-id")); }
-        @Override public Optional<Registration> find(Registration expected) {
-            return Optional.ofNullable(values.get(expected.metadata().get("alphafrog.instance-id")));
-        }
-        @Override public void unregister(Registration expected) { values.remove(expected.metadata().get("alphafrog.instance-id")); }
-        @Override public void assertNoUntrackedRegistrations(JsonNode manifest, JsonNode service, Set<String> tracked) { }
     }
 }
