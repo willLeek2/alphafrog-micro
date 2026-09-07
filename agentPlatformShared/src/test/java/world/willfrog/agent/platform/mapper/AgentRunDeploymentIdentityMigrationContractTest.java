@@ -10,7 +10,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AgentRunDeploymentIdentityMigrationContractTest {
 
     @Test
-    void upgradeBackfillsLegacyIdentityAndMakesItImmutable() throws Exception {
+    void initialIdentityUpgradeBackfillsLegacyRowsAndAddsOriginalGuards() throws Exception {
         String sql = Files.readString(findRepositoryRoot().resolve(
                 "migrate/migrations/upgrades/v1.5/001_agent_run_deployment_identity.sql"));
 
@@ -42,19 +42,25 @@ class AgentRunDeploymentIdentityMigrationContractTest {
                 .contains("'PARTIAL'")
                 .contains("'CANCELING'")
                 .contains("lane_tag VARCHAR(96)")
-                .contains("BEFORE UPDATE OF deployment_id, deployment_generation_id, lane_tag");
+                .doesNotContain("alphafrog_agent_run_lane_tag_check")
+                .doesNotContain("alphafrog_reject_agent_run_identity_change")
+                .doesNotContain("trg_agent_run_deployment_identity_immutable");
     }
 
     @Test
-    void laneTagUpgradeIsNullableValidatedAndImmutable() throws Exception {
-        String sql = Files.readString(findRepositoryRoot().resolve(
+    void laneTagUpgradeIsNullableAndCleanupRemovesDuplicateDatabaseGuards() throws Exception {
+        Path repositoryRoot = findRepositoryRoot();
+        String addColumn = Files.readString(repositoryRoot.resolve(
                 "migrate/migrations/upgrades/v1.5/002_agent_run_lane_tag.sql"));
+        String cleanup = Files.readString(repositoryRoot.resolve(
+                "migrate/migrations/upgrades/v1.5/003_agent_run_lane_tag_constraint_cleanup.sql"));
 
-        assertThat(sql)
-                .contains("ADD COLUMN IF NOT EXISTS lane_tag VARCHAR(96)")
-                .contains("alphafrog_agent_run_lane_tag_check")
-                .contains("NEW.lane_tag IS DISTINCT FROM OLD.lane_tag")
-                .contains("BEFORE UPDATE OF deployment_id, deployment_generation_id, lane_tag");
+        assertThat(addColumn).contains("ADD COLUMN IF NOT EXISTS lane_tag VARCHAR(96)");
+        assertThat(cleanup)
+                .contains("DROP CONSTRAINT IF EXISTS alphafrog_agent_run_lane_tag_check")
+                .contains("DROP TRIGGER IF EXISTS trg_agent_run_deployment_identity_immutable")
+                .contains("DROP FUNCTION IF EXISTS alphafrog_reject_agent_run_identity_change()")
+                .doesNotContain("DROP COLUMN", "ALTER COLUMN lane_tag");
     }
 
     private static Path findRepositoryRoot() {
