@@ -88,6 +88,18 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void startupValidatesPersistedFilesWithoutScanningEveryContainer() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        containers.inspectCalls = 0;
+
+        service.verifyPersistentStateAtStartup();
+
+        assertEquals(0, containers.inspectCalls);
+        assertEquals("STABLE", state().path("phase").asText());
+    }
+
+    @Test
     void healthyCandidateWaitsUntilItsSelfRegistrationIsVisible() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
@@ -179,6 +191,25 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void keepsManifestSchemaAndFixedHostPortGuards() {
+        ObjectNode malformed = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
+        malformed.remove("expiresAt");
+
+        ControllerException schemaFailure = assertThrows(ControllerException.class,
+                () -> service.submitManifest(malformed));
+        assertEquals("MANIFEST_INVALID", schemaFailure.code());
+
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        ObjectNode conflictingLane = manifest(
+                "beta-lane-a", 1, "release-1", '2', 'c', 'd', "lane-a", 28080);
+
+        ControllerException portFailure = assertThrows(ControllerException.class,
+                () -> service.submitManifest(conflictingLane));
+        assertEquals("HOST_PORT_CONFLICT", portFailure.code());
+    }
+
+    @Test
     void retryUsesThePersistedStopDeadlineInsteadOfStartingANewWindow() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
@@ -267,6 +298,7 @@ class BetaDeploymentServiceTest {
         final Map<String, ContainerObservation> values = new LinkedHashMap<>();
         final Map<String, Boolean> stopped = new LinkedHashMap<>();
         int stopTimeoutSeconds;
+        int inspectCalls;
         boolean leaveRunningAfterStop;
 
         @Override public ContainerObservation create(JsonNode manifest, JsonNode spec, CandidatePlan plan) {
@@ -277,6 +309,7 @@ class BetaDeploymentServiceTest {
             return value;
         }
         @Override public ContainerObservation inspect(String machineId, String name) {
+            inspectCalls++;
             ContainerObservation value = values.get(name);
             if (value == null) return new ContainerObservation("", name, "", 0, false, ContainerObservation.Health.MISSING);
             return new ContainerObservation(value.containerId(), name, value.endpointAddress(), value.hostPort(),

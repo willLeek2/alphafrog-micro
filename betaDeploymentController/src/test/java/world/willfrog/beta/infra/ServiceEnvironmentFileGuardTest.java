@@ -4,9 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -47,49 +44,14 @@ class ServiceEnvironmentFileGuardTest {
     }
 
     @Test
-    void rejectsEffectiveComposeThatAttachesOrMountsProductionDotenv() throws Exception {
-        Path serviceFile = writeSecret(temporary.resolve("agent-service.env"), "SERVER_PORT=18080\n");
-        ObjectMapper mapper = new ObjectMapper();
-        ObjectNode app = mapper.createObjectNode();
-        app.putArray("env_file").add(serviceFile.toAbsolutePath().normalize().toString());
+    void rejectsAProductionDotenvDeclaredAsAVolume() {
         ServiceEnvironmentFileGuard guard = new ServiceEnvironmentFileGuard();
-        guard.requireEffectiveCompose(app, serviceFile);
-
-        app.putArray("env_file").add(temporary.resolve(".env").toAbsolutePath().normalize().toString());
-        ControllerException extraFile = assertThrows(ControllerException.class,
-                () -> guard.requireEffectiveCompose(app, serviceFile));
-        assertEquals("ENV_FILE_MISMATCH", extraFile.code());
-
-        ObjectNode leaked = mapper.createObjectNode();
-        leaked.putArray("env_file").add(temporary.resolve(".env").toString());
-        ControllerException dotenv = assertThrows(ControllerException.class,
-                () -> guard.requireEffectiveCompose(leaked, temporary.resolve(".env")));
-        assertEquals("ENV_FILE_WHOLE_PRODUCTION", dotenv.code());
-
-        ObjectNode mounted = mapper.createObjectNode();
-        mounted.putArray("env_file").add(serviceFile.toString());
-        mounted.putArray("volumes").add(temporary.resolve(".env") + ":/app/.env:ro");
-        ControllerException volume = assertThrows(ControllerException.class,
-                () -> guard.requireEffectiveCompose(mounted, serviceFile));
-        assertEquals("ENV_FILE_WHOLE_PRODUCTION", volume.code());
 
         guard.rejectProductionDotenvVolume("/srv/alphafrog/shared:/srv/alphafrog/shared:rw");
         ControllerException declared = assertThrows(ControllerException.class,
                 () -> guard.rejectProductionDotenvVolume(temporary.resolve(".env") + ":/secret/.env:ro"));
         assertEquals("ENV_FILE_WHOLE_PRODUCTION", declared.code());
         assertTrue(ServiceEnvironmentFileGuard.isWholeProductionDotenv(Path.of("/repo/.env")));
-    }
-
-    @Test
-    void acceptsComposeObjectEnvFileEntries() throws Exception {
-        Path serviceFile = writeSecret(temporary.resolve("agent-service.env"), "SERVER_PORT=18080\n");
-        ObjectMapper mapper = new ObjectMapper();
-        ObjectNode app = mapper.createObjectNode();
-        ArrayNode files = app.putArray("env_file");
-        ObjectNode entry = files.addObject();
-        entry.put("path", serviceFile.toAbsolutePath().normalize().toString());
-        entry.put("required", true);
-        new ServiceEnvironmentFileGuard().requireEffectiveCompose(app, serviceFile);
     }
 
     private Path writeSecret(Path path, String content) throws Exception {

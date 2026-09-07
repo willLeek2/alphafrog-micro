@@ -1,19 +1,16 @@
 package world.willfrog.beta.infra;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import world.willfrog.beta.core.ControllerException;
 
 /**
- * 核对每个服务使用自己的环境文件，并且有效 Compose 不会把生产环境整份 {@code .env}
- * 作为 {@code env_file} 或数据卷挂进容器。
+ * 核对每个服务使用自己的环境文件，并防止把生产环境整份 {@code .env}
+ * 当作服务环境文件或数据卷挂进容器。
  */
 final class ServiceEnvironmentFileGuard {
     void requireDedicatedFile(String serviceName, Path envFile, Map<String, Path> alreadyAssigned) {
@@ -35,23 +32,6 @@ final class ServiceEnvironmentFileGuard {
         if (isWholeProductionDotenv(Path.of(source)))
             throw new ControllerException("ENV_FILE_WHOLE_PRODUCTION",
                     "Service volumes must not mount the whole production .env");
-    }
-
-    void requireEffectiveCompose(JsonNode app, Path expectedEnvFile) {
-        Path expected = expectedEnvFile.toAbsolutePath().normalize();
-        List<Path> actual = envFiles(app.path("env_file"));
-        if (actual.size() != 1 || !expected.equals(actual.get(0)))
-            throw new ControllerException("ENV_FILE_MISMATCH",
-                    "Effective Compose env_file must be exactly the dedicated service environment file");
-        if (isWholeProductionDotenv(actual.get(0)))
-            throw new ControllerException("ENV_FILE_WHOLE_PRODUCTION",
-                    "Effective Compose must not attach the whole production .env");
-        for (JsonNode volume : app.path("volumes")) {
-            String source = volumeSource(volume);
-            if (source != null && isWholeProductionDotenv(Path.of(source)))
-                throw new ControllerException("ENV_FILE_WHOLE_PRODUCTION",
-                        "Effective Compose must not mount the whole production .env");
-        }
     }
 
     static boolean isWholeProductionDotenv(Path path) {
@@ -78,31 +58,4 @@ final class ServiceEnvironmentFileGuard {
         return normalized;
     }
 
-    private List<Path> envFiles(JsonNode node) {
-        List<Path> files = new ArrayList<>();
-        if (node.isMissingNode() || node.isNull()) return files;
-        if (node.isTextual()) {
-            files.add(Path.of(node.asText()).toAbsolutePath().normalize());
-            return files;
-        }
-        if (!node.isArray())
-            throw new ControllerException("ENV_FILE_MISMATCH", "Effective Compose env_file is not a list");
-        for (JsonNode item : node) {
-            if (item.isTextual()) files.add(Path.of(item.asText()).toAbsolutePath().normalize());
-            else if (item.isObject() && item.path("path").isTextual())
-                files.add(Path.of(item.path("path").asText()).toAbsolutePath().normalize());
-            else throw new ControllerException("ENV_FILE_MISMATCH", "Effective Compose env_file entry is invalid");
-        }
-        return files;
-    }
-
-    private String volumeSource(JsonNode volume) {
-        if (volume.isTextual()) {
-            String value = volume.asText();
-            int separator = value.indexOf(':');
-            return separator < 0 ? value : value.substring(0, separator);
-        }
-        if (volume.isObject() && volume.path("source").isTextual()) return volume.path("source").asText();
-        return null;
-    }
 }
