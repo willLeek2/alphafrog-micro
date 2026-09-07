@@ -13,8 +13,8 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import world.willfrog.beta.core.BetaDeploymentService;
+import world.willfrog.beta.core.CandidateRegistrationProbe;
 import world.willfrog.beta.core.ContainerRuntime;
-import world.willfrog.beta.core.ServiceRegistry;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = "alphafrog.beta-controller.enabled=true")
@@ -23,7 +23,7 @@ class BetaEnabledContextTest {
     private static final Path API_TOKEN = secret("api-token");
 
     @MockBean ContainerRuntime containers;
-    @MockBean ServiceRegistry registry;
+    @MockBean CandidateRegistrationProbe registrationProbe;
     @Autowired BetaDeploymentService service;
 
     @DynamicPropertySource

@@ -94,37 +94,13 @@ const manifest = {
 };
 manifest.services[0].serviceSpecSha256 = serviceDigest(manifest.services[0]);
 const deploymentGenerationId = generation(manifest);
-const provider = dubboProvider(manifest.services[0].dubboServiceKey);
-const registration = (id, enabled) => ({
-  serviceName: manifest.services[0].registration.serviceName,
-  groupName: 'alphafrog-beta', namespaceId: 'public', clusterName: 'DEFAULT',
-  ip: '10.0.0.8', port: 28081, nacosInstanceId: `nacos:${id}`,
-  enabled, healthy: true, weight: enabled ? 1 : 0, ephemeral: true,
-  metadata: {
-    'alphafrog.deployment-id': manifest.deploymentId,
-    'alphafrog.traffic-scope-id': 'main-beta',
-    'alphafrog.release-id': 'release-2',
-    'alphafrog.deployment-generation-id': deploymentGenerationId,
-    'alphafrog.instance-id': id,
-    zone: 'beta',
-    application: manifest.services[0].registration.applicationName,
-    category: 'providers',
-    dynamic: 'true',
-    group: provider.group,
-    interface: provider.interfaceName,
-    path: provider.interfaceName,
-    protocol: 'tri',
-    side: 'provider',
-    version: provider.version
-  }
-});
 const active = {
   instanceId: 'instance-new', machineId: 'beta-machine-1', releaseId: 'release-2',
   deploymentGenerationId, shutdownProfile: 'SPRING_BOOT_HTTP_DUBBO_V1',
   applicationDrainSeconds: 60, drainGraceSeconds: 60, manifestVersion: 2,
   serviceSpecSha256: manifest.services[0].serviceSpecSha256, containerName: 'af-instance-new',
   containerId: 'd'.repeat(64), portSlot: 'B', hostPort: 28081,
-  endpoint: {address: '10.0.0.8', port: 28081}, registration: registration('instance-new', true)
+  endpoint: {address: '10.0.0.8', port: 28081}
 };
 const service = {
   serviceName: 'agent-service', dubboServiceKey: manifest.services[0].dubboServiceKey,
@@ -148,10 +124,12 @@ function relationErrors(wanted, observed) {
   const commonDeadline = wanted.services[0]?.runtime.applicationDrainSeconds;
   for (const spec of wanted.services) {
     if (spec.serviceSpecSha256 !== serviceDigest(spec)) errors.push('service digest');
-    if (spec.registration.groupName !== 'alphafrog-beta') errors.push('beta registry group');
-    const providerIdentity = dubboProvider(spec.dubboServiceKey);
-    if (spec.registration.serviceName !== `providers:${providerIdentity.interfaceName}:${providerIdentity.version}:${providerIdentity.group}`)
-      errors.push('Nacos service name');
+    if (spec.registration) {
+      if (spec.registration.groupName !== 'alphafrog-beta') errors.push('beta registry group');
+      const providerIdentity = dubboProvider(spec.dubboServiceKey);
+      if (spec.registration.serviceName !== `providers:${providerIdentity.interfaceName}:${providerIdentity.version}:${providerIdentity.group}`)
+        errors.push('Nacos service name');
+    }
     if (spec.runtime.applicationDrainSeconds !== spec.runtime.drainGraceSeconds
         || spec.runtime.applicationDrainSeconds !== commonDeadline) errors.push('common drain deadline');
   }
@@ -162,27 +140,11 @@ function relationErrors(wanted, observed) {
       for (const [role, instance] of [['active', item.activeInstance], ['candidate', item.candidateInstance]]) {
         if (!instance) continue;
         if (instance.deploymentGenerationId !== expectedGeneration) errors.push(`${role} generation`);
-        if (instance.registration.groupName !== 'alphafrog-beta') errors.push(`${role} group`);
-        if (instance.registration.metadata.zone !== 'beta') errors.push(`${role} zone`);
-        if (spec) {
-          const identity = dubboProvider(spec.dubboServiceKey);
-          const metadata = instance.registration.metadata;
-          if (metadata.application !== spec.registration.applicationName
-              || metadata.category !== 'providers' || metadata.dynamic !== 'true'
-              || metadata.group !== identity.group || metadata.interface !== identity.interfaceName
-              || metadata.path !== identity.interfaceName || metadata.protocol !== 'tri'
-              || metadata.side !== 'provider' || metadata.version !== identity.version)
-            errors.push(`${role} Dubbo provider metadata`);
-        }
-        const expectedTag = deployment.trafficScopeId === 'main-beta' ? undefined : deployment.trafficScopeId;
-        if (instance.registration.metadata.tag !== expectedTag) errors.push(`${role} provider tag`);
-        if (instance.registration.metadata['dubbo.tag'] !== expectedTag) errors.push(`${role} tag`);
         if (instance.applicationDrainSeconds !== commonDeadline || instance.drainGraceSeconds !== commonDeadline)
           errors.push(`${role} deadline`);
         if (spec && instance.serviceSpecSha256 !== spec.serviceSpecSha256) errors.push(`${role} service digest`);
       }
       if (item.drainingInstance) {
-        if (!item.drainingInstance.registrationRemovedAt) errors.push('draining registration removal');
         if ((item.drainingInstance.stopSignalRequestedAt === null) !== (item.drainingInstance.stopDeadline === null))
           errors.push('stop time pair');
       }
@@ -204,6 +166,11 @@ try {
   wrongGroup.services[0].registration.groupName = 'DEFAULT_GROUP';
   ajv(manifestSchema, wrongGroup, false, 'manifest-production-group-rejected');
 
+  const consumerOnlyManifest = clone(manifest);
+  delete consumerOnlyManifest.services[0].registration;
+  consumerOnlyManifest.services[0].serviceSpecSha256 = serviceDigest(consumerOnlyManifest.services[0]);
+  ajv(manifestSchema, consumerOnlyManifest, true, 'manifest-consumer-only-service-valid');
+
   const stableScope = clone(manifest);
   stableScope.trafficScopeId = 'stable';
   ajv(manifestSchema, stableScope, false, 'manifest-stable-scope-rejected');
@@ -220,18 +187,11 @@ try {
   stableStateScope.deployments[0].trafficScopeId = 'stable';
   ajv(stateSchema, stableStateScope, false, 'state-stable-scope-rejected');
 
-  const wrongZone = clone(state);
-  wrongZone.deployments[0].services[0].activeInstance.registration.metadata.zone = 'prod';
-  ajv(stateSchema, wrongZone, false, 'state-production-zone-rejected');
-
-  const incompleteProvider = clone(state);
-  delete incompleteProvider.deployments[0].services[0].activeInstance.registration.metadata.protocol;
-  ajv(stateSchema, incompleteProvider, false, 'state-provider-protocol-required');
-
-  const wrongProvider = clone(state);
-  wrongProvider.deployments[0].services[0].activeInstance.registration.metadata.interface = 'com.alphafrog.OtherService';
-  assert(relationErrors(manifest, wrongProvider).includes('active Dubbo provider metadata'),
-    'provider metadata must reconstruct the callable Dubbo URL');
+  const obsoleteRegistrationMirror = clone(state);
+  obsoleteRegistrationMirror.deployments[0].services[0].activeInstance.registration = {
+    serviceName: 'service', groupName: 'alphafrog-beta'
+  };
+  ajv(stateSchema, obsoleteRegistrationMirror, false, 'state-registration-mirror-rejected');
 
   const laneManifest = clone(manifest);
   laneManifest.trafficScopeId = 'lane-a';
@@ -239,13 +199,9 @@ try {
   const laneState = clone(state);
   laneState.deployments[0].trafficScopeId = 'lane-a';
   laneState.deployments[0].manifestSha256 = digest(laneManifest);
-  const laneInstance = laneState.deployments[0].services[0].activeInstance;
-  laneInstance.registration.metadata['alphafrog.traffic-scope-id'] = 'lane-a';
-  laneInstance.registration.metadata.tag = 'lane-a';
-  laneInstance.registration.metadata['dubbo.tag'] = 'lane-a';
-  laneInstance.deploymentGenerationId = generation(laneManifest);
-  laneInstance.registration.metadata['alphafrog.deployment-generation-id'] = generation(laneManifest);
-  assert(relationErrors(laneManifest, laneState).length === 0, 'lane registration must carry its static Dubbo tag');
+  laneState.deployments[0].services[0].activeInstance.deploymentGenerationId = generation(laneManifest);
+  assert(relationErrors(laneManifest, laneState).length === 0,
+    'lane deployment identity remains valid without duplicating provider registration facts');
 
   console.log(`Beta contract verification passed: ${schemaChecks} schema checks, ${relationChecks} relation checks.`);
 } finally {
