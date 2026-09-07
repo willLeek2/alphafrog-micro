@@ -59,6 +59,7 @@ class AgentRunDeploymentIdentityMigrationContractTest {
         assertThat(cleanup)
                 .contains("DROP CONSTRAINT IF EXISTS alphafrog_agent_run_lane_tag_check")
                 .contains("DROP TRIGGER IF EXISTS trg_agent_run_deployment_identity_immutable")
+                .contains("DROP FUNCTION IF EXISTS alphafrog_reject_agent_run_identity_change()")
                 .doesNotContain("DROP COLUMN", "ALTER COLUMN lane_tag");
     }
 
