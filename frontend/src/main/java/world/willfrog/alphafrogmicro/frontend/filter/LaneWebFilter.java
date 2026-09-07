@@ -6,8 +6,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedHashSet;
@@ -123,9 +121,7 @@ public class LaneWebFilter extends OncePerRequestFilter {
         if (supplied == null || expected == null || supplied.isEmpty() || expected.isEmpty()) {
             return false;
         }
-        return MessageDigest.isEqual(
-                expected.getBytes(StandardCharsets.UTF_8),
-                supplied.getBytes(StandardCharsets.UTF_8));
+        return expected.equals(supplied);
     }
 
     private static Set<String> lowercase(Set<String> names) {
