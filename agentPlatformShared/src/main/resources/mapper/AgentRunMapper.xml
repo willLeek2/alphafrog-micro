@@ -470,12 +470,7 @@
           AND deployment_id &lt;&gt; 'stable'
           AND NOT (deployment_id = #{excludedDeploymentId}
                    AND deployment_generation_id = #{excludedDeploymentGenerationId})
-        <if test="afterDeploymentId != null and afterDeploymentGenerationId != null">
-          AND (deployment_id, deployment_generation_id)
-              &gt; (#{afterDeploymentId}, #{afterDeploymentGenerationId})
-        </if>
         ORDER BY deployment_id, deployment_generation_id
-        LIMIT #{limit}
     </select>
 
     <update id="failNonTerminalRunsForDeploymentGeneration">

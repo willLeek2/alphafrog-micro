@@ -209,15 +209,15 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS",
                 Integer.toString(applicationDrainSeconds));
         environment.put("SERVER_SHUTDOWN", "graceful");
-        // Agent 自己在 ContextClosedEvent 内等待自然处理窗口，并在返回前把 Spring
-        // 后续 phase 等待设为 0；其余服务仍由 Spring 的有序关闭等待完整期限。
+        // Agent 自己在 ContextClosedEvent 内等待自然处理窗口，Spring 后续阶段不再
+        // 追加等待；其余服务仍由 Spring 的有序关闭等待完整期限。
         environment.put("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE",
                 coordinatedAgentShutdown ? "0s" : applicationDrainSeconds + "s");
         String shutdownProfile = service.path("runtime").path("shutdownProfile").asText();
         if ("SPRING_BOOT_DUBBO_V1".equals(shutdownProfile)
                 || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
-            // Agent 的 Dubbo 阶段只拿收尾余量，并由进程内登记的统一截止时间再次截短。
-            // 其它 Dubbo 服务继续使用公共处理期限，Docker 仍是所有服务的最终硬边界。
+            // Agent 的 Dubbo 阶段只使用收尾余量；其它 Dubbo 服务继续使用公共处理
+            // 期限，Docker 仍是所有服务的最终强制停止边界。
             int dubboWaitSeconds = coordinatedAgentShutdown
                     ? finalizationMarginSeconds
                     : applicationDrainSeconds;

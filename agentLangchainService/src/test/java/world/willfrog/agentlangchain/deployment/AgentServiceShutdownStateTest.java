@@ -4,18 +4,21 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.context.LifecycleAutoConfiguration;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.Ordered;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -27,11 +30,6 @@ import world.willfrog.agentlangchain.config.LangchainRunExecutorLimitsResolver;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 
 class AgentServiceShutdownStateTest {
-
-    @AfterEach
-    void resetDubboShutdownDeadline() {
-        org.apache.dubbo.common.config.ConfigurationUtils.setExpectedShutdownTime(Long.MAX_VALUE);
-    }
 
     @Test
     void deadlineClosesOnlyTheCurrentGenerationAndIsIdempotent() {
@@ -89,17 +87,34 @@ class AgentServiceShutdownStateTest {
     }
 
     @Test
-    void realSpringCloseUsesOneAbsoluteDeadlineInsteadOfAddingExecutorAndLifecycleWaits() throws Exception {
-        assertRealContextClosesWithinOneDeadline(Duration.ofMillis(900), Duration.ofMillis(300));
+    void shutdownTimingIsControlledByConfigurationInsteadOfApplicationContextMutation() {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        DeploymentIdentityProvider identityProvider = mock(DeploymentIdentityProvider.class);
+        LangchainRunConcurrencyScheduler scheduler = mock(LangchainRunConcurrencyScheduler.class);
+        ThreadPoolTaskExecutor runExecutor = mock(ThreadPoolTaskExecutor.class);
+        DeploymentIdentity identity = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
+        when(identityProvider.current()).thenReturn(identity);
+        ContextClosedEvent event = mock(ContextClosedEvent.class);
+        AgentServiceShutdownState state = new AgentServiceShutdownState(
+                runMapper, identityProvider, scheduler, runExecutor, Duration.ZERO, Duration.ZERO);
+
+        state.onApplicationEvent(event);
+
+        verifyNoInteractions(event);
     }
 
     @Test
-    void realSpringCloseAlsoHonorsANonDefaultDeadline() throws Exception {
-        assertRealContextClosesWithinOneDeadline(Duration.ofMillis(1400), Duration.ofMillis(500));
+    void realSpringCloseUsesConfiguredWindowsWithoutAddingExecutorAndLifecycleWaits() throws Exception {
+        assertRealContextClosesWithinConfiguredWindows(Duration.ofMillis(900), Duration.ofMillis(300));
     }
 
-    private void assertRealContextClosesWithinOneDeadline(Duration totalTimeout,
-                                                           Duration finalizationMargin) throws Exception {
+    @Test
+    void realSpringCloseAlsoHonorsNonDefaultConfiguredWindows() throws Exception {
+        assertRealContextClosesWithinConfiguredWindows(Duration.ofMillis(1400), Duration.ofMillis(500));
+    }
+
+    private void assertRealContextClosesWithinConfiguredWindows(Duration totalTimeout,
+                                                                 Duration finalizationMargin) throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         DeploymentIdentityProvider identityProvider = mock(DeploymentIdentityProvider.class);
         LangchainRunConcurrencyScheduler scheduler = mock(LangchainRunConcurrencyScheduler.class);
@@ -118,17 +133,21 @@ class AgentServiceShutdownStateTest {
 
         LangchainRunExecutorLimitsResolver limitsResolver = mock(LangchainRunExecutorLimitsResolver.class);
         when(limitsResolver.hardLimits()).thenReturn(
-                new LangchainRunExecutorLimits(1, 1, 0, "shutdown-deadline-test-"));
+                new LangchainRunExecutorLimits(1, 1, 0, "shutdown-window-test-"));
         ThreadPoolTaskExecutor runExecutor = new LangchainRunAsyncConfig()
                 .agentLangchainRunTaskExecutor(60, limitsResolver);
 
         AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        context.getEnvironment().getPropertySources().addFirst(new MapPropertySource(
+                "configured-shutdown-window",
+                Map.of("spring.lifecycle.timeout-per-shutdown-phase", "0ms")));
+        context.register(LifecycleAutoConfiguration.class);
         context.registerBean("agentLangchainRunTaskExecutor", ThreadPoolTaskExecutor.class, () -> runExecutor);
         context.registerBean("agentServiceShutdownState", AgentServiceShutdownState.class,
                 () -> new AgentServiceShutdownState(runMapper, identityProvider, scheduler, runExecutor,
                         totalTimeout, finalizationMargin));
-        context.registerBean("dubboLikeShutdownListener", DubboLikeShutdownListener.class,
-                DubboLikeShutdownListener::new);
+        context.registerBean("dubboLikeShutdownListener", ConfiguredDubboShutdownListener.class,
+                () -> new ConfiguredDubboShutdownListener(finalizationMargin));
         context.registerBean("slowLifecycle", SlowLifecycle.class, SlowLifecycle::new);
         context.refresh();
         runExecutor.execute(() -> {
@@ -155,12 +174,18 @@ class AgentServiceShutdownStateTest {
                 "deployment_generation_shutdown_deadline_exceeded");
     }
 
-    private static final class DubboLikeShutdownListener
+    private static final class ConfiguredDubboShutdownListener
             implements ApplicationListener<ContextClosedEvent>, Ordered {
+        private final Duration wait;
+
+        private ConfiguredDubboShutdownListener(Duration wait) {
+            this.wait = wait;
+        }
+
         @Override
         public void onApplicationEvent(ContextClosedEvent event) {
             try {
-                Thread.sleep(org.apache.dubbo.common.config.ConfigurationUtils.reCalShutdownTime(10_000));
+                Thread.sleep(wait.toMillis());
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             }

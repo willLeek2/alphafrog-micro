@@ -203,8 +203,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
         String candidates = normalizedSql(statement("listNonTerminalDeploymentGenerations")
                 .getBoundSql(Map.of(
                         "excludedDeploymentId", "beta-a",
-                        "excludedDeploymentGenerationId", "gen-" + "b".repeat(64),
-                        "limit", 32)));
+                        "excludedDeploymentGenerationId", "gen-" + "b".repeat(64))));
 
         assertThat(shutdown)
                 .contains("deployment_id = ?", "deployment_generation_id = ?", "status = 'FAILED'")
@@ -214,19 +213,10 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("deployment_id <> 'stable'", "deployment_id = ?",
                         "deployment_generation_id = ?", "status = 'FAILED'");
         assertThat(candidates)
-                .contains("SELECT DISTINCT deployment_id", "LIMIT ?")
+                .contains("SELECT DISTINCT deployment_id")
                 .contains("deployment_id <> 'stable'")
-                .contains("NOT (deployment_id = ? AND deployment_generation_id = ?)");
-
-        String pagedCandidates = normalizedSql(statement("listNonTerminalDeploymentGenerations")
-                .getBoundSql(Map.of(
-                        "excludedDeploymentId", "beta-a",
-                        "excludedDeploymentGenerationId", "gen-" + "b".repeat(64),
-                        "afterDeploymentId", "beta-b",
-                        "afterDeploymentGenerationId", "gen-" + "c".repeat(64),
-                        "limit", 32)));
-        assertThat(pagedCandidates)
-                .contains("(deployment_id, deployment_generation_id) > (?, ?)");
+                .contains("NOT (deployment_id = ? AND deployment_generation_id = ?)")
+                .doesNotContain("LIMIT ?", "(deployment_id, deployment_generation_id) > (?, ?)");
     }
 
     @Test

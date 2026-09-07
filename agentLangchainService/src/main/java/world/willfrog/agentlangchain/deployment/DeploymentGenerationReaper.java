@@ -12,16 +12,17 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvide
 
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 /**
  * 为已经没有存活实例的代际补写明确失败终态。
  *
- * <p>第一次观察到注册为空时只开始计时；连续缺席达到统一处理期限，并在写库前再次核对
- * 注册仍为空，才允许使用独立 SQL 补写失败终态。注册查询失败时停止当前及剩余候选，绝不把
- * “不知道”当作消亡；失败前已经提交的其它候选写入不回滚。</p>
+ * <p>第一次观察到注册为空时只开始计时；确认期限到达后，在写库前再次核对注册仍为空，
+ * 才允许使用独立 SQL 分批补写失败终态。注册查询失败时停止本轮清扫。</p>
  */
 @Component
 @ConditionalOnProperty(prefix = "agent.langchain.generation-reaper", name = "enabled", havingValue = "true")
@@ -37,9 +38,6 @@ public class DeploymentGenerationReaper {
     private final int batchSize;
     private final LongSupplier nanoTime;
     private final Map<DeploymentIdentity, Long> missingSinceNanos = new HashMap<>();
-    private final Map<DeploymentIdentity, Long> lastSeenScanCycle = new HashMap<>();
-    private DeploymentIdentity scanCursor;
-    private long scanCycle;
 
     public DeploymentGenerationReaper(
             AgentRunMapper runMapper,
@@ -72,10 +70,7 @@ public class DeploymentGenerationReaper {
         try {
             sweepWithVerifiedRegistry();
         } catch (RegistryUncertainException registryUncertain) {
-            missingSinceNanos.clear();
-            lastSeenScanCycle.clear();
-            log.warn("无法核对 Nacos 注册现场，停止当前及剩余候选的清扫并重新计算连续缺席期限；"
-                    + "此前已提交的写入不回滚", registryUncertain);
+            log.warn("无法核对 Nacos 注册现场，本轮不再清扫其它部署代际", registryUncertain);
         } catch (RuntimeException databaseFailure) {
             log.error("代际清扫器访问数据库失败，本轮停止且不改变注册缺席计时", databaseFailure);
         }
@@ -83,28 +78,28 @@ public class DeploymentGenerationReaper {
 
     private void sweepWithVerifiedRegistry() {
         DeploymentIdentity local = identityProvider.current();
-        List<DeploymentGenerationRecord> candidates = listNextCandidates(local);
-        long now = nanoTime.getAsLong();
-        int remaining = batchSize;
+        List<DeploymentGenerationRecord> candidates = runMapper.listNonTerminalDeploymentGenerations(
+                local.deploymentId(), local.generationId());
+        Set<DeploymentIdentity> currentCandidates = new LinkedHashSet<>();
         for (DeploymentGenerationRecord candidate : candidates) {
-            if (remaining == 0) {
-                break;
-            }
-            DeploymentIdentity identity;
             try {
-                identity = new DeploymentIdentity(
+                DeploymentIdentity identity = new DeploymentIdentity(
                         candidate.getDeploymentId(), candidate.getDeploymentGenerationId());
+                if (!"stable".equals(identity.deploymentId())) {
+                    currentCandidates.add(identity);
+                }
             } catch (IllegalArgumentException invalidIdentity) {
                 log.error("拒绝清扫格式不合法的部署代际记录: deploymentId={} generationId={}",
                         candidate.getDeploymentId(), candidate.getDeploymentGenerationId());
-                continue;
             }
-            if ("stable".equals(identity.deploymentId())) {
-                missingSinceNanos.remove(identity);
-                lastSeenScanCycle.remove(identity);
-                continue;
+        }
+        missingSinceNanos.keySet().retainAll(currentCandidates);
+        long now = nanoTime.getAsLong();
+        int remaining = batchSize;
+        for (DeploymentIdentity identity : currentCandidates) {
+            if (remaining == 0) {
+                break;
             }
-            lastSeenScanCycle.put(identity, scanCycle);
             if (hasLiveInstance(identity)) {
                 missingSinceNanos.remove(identity);
                 continue;
@@ -123,46 +118,13 @@ public class DeploymentGenerationReaper {
             remaining -= Math.min(remaining, Math.max(0, failed));
             if (failed < requested) {
                 missingSinceNanos.remove(identity);
-                lastSeenScanCycle.remove(identity);
-            } else if (runMapper.countNonTerminalRunsForDeploymentGeneration(
-                    identity.deploymentId(), identity.generationId()) == 0) {
-                missingSinceNanos.remove(identity);
-                lastSeenScanCycle.remove(identity);
             }
             if (failed > 0) {
-                log.warn("部署代际已连续超过处理期限没有存活实例，已把遗留 Run 写为失败: "
+                log.warn("部署代际经过确认期限仍没有存活实例，已把遗留 Run 写为失败: "
                                 + "deploymentId={} generationId={} count={}",
                         identity.deploymentId(), identity.generationId(), failed);
             }
         }
-        if (!candidates.isEmpty()) {
-            DeploymentGenerationRecord last = candidates.get(candidates.size() - 1);
-            try {
-                scanCursor = new DeploymentIdentity(
-                        last.getDeploymentId(), last.getDeploymentGenerationId());
-            } catch (IllegalArgumentException invalidCursor) {
-                scanCursor = null;
-            }
-        }
-    }
-
-    private List<DeploymentGenerationRecord> listNextCandidates(DeploymentIdentity local) {
-        List<DeploymentGenerationRecord> candidates = runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                scanCursor == null ? null : scanCursor.deploymentId(),
-                scanCursor == null ? null : scanCursor.generationId(), batchSize);
-        if (candidates.isEmpty() && scanCursor != null) {
-            evictEntriesNotSeenInCycle(scanCycle);
-            scanCycle++;
-            scanCursor = null;
-            candidates = runMapper.listNonTerminalDeploymentGenerations(
-                    local.deploymentId(), local.generationId(), null, null, batchSize);
-            if (candidates.isEmpty()) {
-                missingSinceNanos.clear();
-                lastSeenScanCycle.clear();
-            }
-        }
-        return candidates;
     }
 
     private boolean hasLiveInstance(DeploymentIdentity identity) {
@@ -171,16 +133,6 @@ public class DeploymentGenerationReaper {
         } catch (RuntimeException registryUncertain) {
             throw new RegistryUncertainException(registryUncertain);
         }
-    }
-
-    private void evictEntriesNotSeenInCycle(long completedCycle) {
-        lastSeenScanCycle.entrySet().removeIf(entry -> {
-            if (entry.getValue() < completedCycle) {
-                missingSinceNanos.remove(entry.getKey());
-                return true;
-            }
-            return false;
-        });
     }
 
     private static final class RegistryUncertainException extends RuntimeException {
