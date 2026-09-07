@@ -85,8 +85,8 @@ class LaneFilterResidualTest {
         new LaneConsumerHopFilter().invoke(invoker(() -> {
             insideClean.set(
                     RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY) == null
-                            && RpcContext.getClientAttachment()
-                                    .getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                            && "stale-scope".equals(RpcContext.getClientAttachment()
+                                    .getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID))
                             && MDC.get(LaneContext.MDC_LANE_TAG) == null);
             return mock(Result.class);
         }), mock(Invocation.class));
@@ -100,17 +100,30 @@ class LaneFilterResidualTest {
     @Test
     void consumer_laneTag_shouldWriteOfficialTagBeforeInvoke() {
         LaneContext.setTrafficScopeId("lane-test");
+        RpcContext.getClientAttachment().setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "leftover-scope");
         RpcInvocation invocation = new RpcInvocation();
+        invocation.setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "leftover-invocation-scope");
         AtomicReference<String> clientTag = new AtomicReference<>();
         AtomicReference<String> invocationTag = new AtomicReference<>();
+        AtomicReference<String> clientLegacyInside = new AtomicReference<>();
+        AtomicReference<String> invocationLegacyInside = new AtomicReference<>();
         new LaneConsumerHopFilter().invoke(invoker(() -> {
             clientTag.set(RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY));
             invocationTag.set(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY));
+            clientLegacyInside.set(
+                    RpcContext.getClientAttachment().getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID));
+            invocationLegacyInside.set(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID));
             return mock(Result.class);
         }), invocation);
         assertThat(clientTag.get()).isEqualTo("lane-test");
         assertThat(invocationTag.get()).isEqualTo("lane-test");
-        assertThat(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)).isNull();
+        assertThat(clientLegacyInside.get()).isEqualTo("leftover-scope");
+        assertThat(invocationLegacyInside.get()).isEqualTo("leftover-invocation-scope");
+        assertThat(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).isNull();
+        assertThat(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID))
+                .isEqualTo("leftover-invocation-scope");
+        assertThat(RpcContext.getClientAttachment().getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID))
+                .isEqualTo("leftover-scope");
         assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-test");
     }
 
@@ -141,7 +154,8 @@ class LaneFilterResidualTest {
         new LaneConsumerHopFilter().invoke(invoker(() -> {
             insideClean.set(
                     invocation.getAttachment(LaneContext.DUBBO_TAG_KEY) == null
-                            && invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                            && invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)
+                                    .equals("stale-invocation-scope")
                             && RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY) == null
                             && MDC.get(LaneContext.MDC_LANE_TAG) == null);
             return mock(Result.class);
