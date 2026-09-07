@@ -1,13 +1,9 @@
 package world.willfrog.agentlangchain.deployment;
 
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.common.config.ConfigurationUtils;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextClosedEvent;
-import org.springframework.context.support.AbstractApplicationContext;
-import org.springframework.context.support.DefaultLifecycleProcessor;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -31,7 +27,6 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
     private final DeploymentIdentityProvider identityProvider;
     private final LangchainRunConcurrencyScheduler scheduler;
     private final ThreadPoolTaskExecutor runExecutor;
-    private final Duration totalTimeout;
     private final Duration drainTimeout;
 
     public AgentServiceShutdownState(
@@ -59,11 +54,11 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
         this.identityProvider = identityProvider;
         this.scheduler = scheduler;
         this.runExecutor = runExecutor;
-        this.totalTimeout = nonNegative(totalTimeout);
+        Duration normalizedTotalTimeout = nonNegative(totalTimeout);
         Duration requestedMargin = nonNegative(finalizationMargin);
-        this.drainTimeout = requestedMargin.compareTo(this.totalTimeout) >= 0
+        this.drainTimeout = requestedMargin.compareTo(normalizedTotalTimeout) >= 0
                 ? Duration.ZERO
-                : this.totalTimeout.minus(requestedMargin);
+                : normalizedTotalTimeout.minus(requestedMargin);
     }
 
     @Override
@@ -71,17 +66,11 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
         if (!handled.compareAndSet(false, true)) {
             return;
         }
-        long totalDeadlineNanos = System.nanoTime() + totalTimeout.toNanos();
-        long totalDeadlineEpochMillis = System.currentTimeMillis() + totalTimeout.toMillis();
-        // Dubbo 3.3.2 会按 expectedShutdownTime 重新计算剩余等待时间。这里在所有
-        // 在后续关闭监听器运行前登记统一截止时间，避免它们从自然窗口结束后重新计时。
-        ConfigurationUtils.setExpectedShutdownTime(totalDeadlineEpochMillis);
-        disableLaterSpringLifecycleWaiting(event.getApplicationContext());
         scheduler.stopAcceptingNewRuns();
         DeploymentIdentity identity = identityProvider.current();
         boolean interrupted = false;
         try {
-            long naturalDeadlineNanos = totalDeadlineNanos - (totalTimeout.minus(drainTimeout).toNanos());
+            long naturalDeadlineNanos = System.nanoTime() + drainTimeout.toNanos();
             while (remainingNanos(naturalDeadlineNanos) > 0
                     && runMapper.countNonTerminalRunsForDeploymentGeneration(
                     identity.deploymentId(), identity.generationId()) > 0) {
@@ -106,21 +95,6 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
                 Thread.currentThread().interrupt();
             }
         }
-    }
-
-    private void disableLaterSpringLifecycleWaiting(ApplicationContext applicationContext) {
-        if (applicationContext == null) {
-            return;
-        }
-        Object lifecycleProcessor = applicationContext.getBean(
-                AbstractApplicationContext.LIFECYCLE_PROCESSOR_BEAN_NAME);
-        if (lifecycleProcessor instanceof DefaultLifecycleProcessor defaultLifecycleProcessor) {
-            // 本监听器已经覆盖自然处理窗口。事件返回后不能让每个 Spring phase 再次
-            // 获得完整期限；剩余工作由 Dubbo 的统一截止时间和 Docker 硬期限约束。
-            defaultLifecycleProcessor.setTimeoutPerShutdownPhase(0);
-            return;
-        }
-        throw new IllegalStateException("Agent 统一关闭期限要求 Spring DefaultLifecycleProcessor");
     }
 
     private static long remainingNanos(long deadlineNanos) {

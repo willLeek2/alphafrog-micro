@@ -17,215 +17,135 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvide
 
 class DeploymentGenerationReaperTest {
 
+    private static final String FAILURE = "deployment_generation_shutdown_deadline_exceeded";
+
     @Test
-    void requiresContinuousAbsenceAndASecondCheckBeforeWritingABoundedFailureBatch() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
-        DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        DeploymentIdentity old = new DeploymentIdentity("beta-a", "gen-" + "b".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 32))
-                .thenReturn(List.of(record(old)));
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                old.deploymentId(), old.generationId(), 32)).thenReturn(List.of());
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        when(probe.hasLiveInstance(old)).thenReturn(false, false, false);
-        AtomicLong now = new AtomicLong();
-        DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ofSeconds(60), 32, now::get);
+    void requiresAnAbsenceConfirmationAndASecondCheckBeforeWritingABoundedBatch() {
+        Fixture fixture = fixture(32);
+        when(fixture.runMapper.listNonTerminalDeploymentGenerations(
+                fixture.local.deploymentId(), fixture.local.generationId()))
+                .thenReturn(List.of(record(fixture.old)));
+        when(fixture.probe.hasLiveInstance(fixture.old)).thenReturn(false);
 
-        reaper.sweep();
-        verify(runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+        fixture.reaper.sweep();
+        verify(fixture.runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
 
-        now.set(Duration.ofSeconds(60).toNanos());
-        reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(60).toNanos());
+        fixture.reaper.sweep();
 
-        verify(probe, times(3)).hasLiveInstance(old);
-        verify(runMapper).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+        verify(fixture.probe, times(3)).hasLiveInstance(fixture.old);
+        verify(fixture.runMapper).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
     }
 
     @Test
-    void aLiveInstanceClearsTheAbsenceWindow() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
-        DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        DeploymentIdentity old = new DeploymentIdentity("beta-a", "gen-" + "b".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 32))
-                .thenReturn(List.of(record(old)));
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                old.deploymentId(), old.generationId(), 32)).thenReturn(List.of());
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        when(probe.hasLiveInstance(old)).thenReturn(false, true, false);
-        AtomicLong now = new AtomicLong();
-        DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ofSeconds(60), 32, now::get);
+    void aLiveInstanceStartsANewAbsenceWindow() {
+        Fixture fixture = fixture(32);
+        when(fixture.runMapper.listNonTerminalDeploymentGenerations(
+                fixture.local.deploymentId(), fixture.local.generationId()))
+                .thenReturn(List.of(record(fixture.old)));
+        when(fixture.probe.hasLiveInstance(fixture.old)).thenReturn(false, true, false);
 
-        reaper.sweep();
-        now.set(Duration.ofSeconds(60).toNanos());
-        reaper.sweep();
-        now.set(Duration.ofSeconds(120).toNanos());
-        reaper.sweep();
+        fixture.reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(60).toNanos());
+        fixture.reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(120).toNanos());
+        fixture.reaper.sweep();
 
-        verify(runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+        verify(fixture.runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
     }
 
     @Test
-    void anUncertainRegistryReadResetsTheContinuousAbsenceWindow() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
-        DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        DeploymentIdentity old = new DeploymentIdentity("beta-a", "gen-" + "b".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 32))
-                .thenReturn(List.of(record(old)));
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                old.deploymentId(), old.generationId(), 32)).thenReturn(List.of());
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        when(probe.hasLiveInstance(old))
+    void anUncertainRegistryReadSkipsThatSweep() {
+        Fixture fixture = fixture(32);
+        when(fixture.runMapper.listNonTerminalDeploymentGenerations(
+                fixture.local.deploymentId(), fixture.local.generationId()))
+                .thenReturn(List.of(record(fixture.old)));
+        when(fixture.probe.hasLiveInstance(fixture.old))
                 .thenReturn(false)
                 .thenThrow(new IllegalStateException("registry unavailable"))
                 .thenReturn(false, false);
-        AtomicLong now = new AtomicLong();
-        DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ofSeconds(60), 32, now::get);
 
-        reaper.sweep();
-        now.set(Duration.ofSeconds(60).toNanos());
-        reaper.sweep();
-        now.set(Duration.ofSeconds(120).toNanos());
-        reaper.sweep();
+        fixture.reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(60).toNanos());
+        fixture.reaper.sweep();
+        verify(fixture.runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
 
-        verify(runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+        fixture.now.set(Duration.ofSeconds(120).toNanos());
+        fixture.reaper.sweep();
+        verify(fixture.runMapper).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
     }
 
     @Test
     void stableDeploymentIsRejectedEvenIfTheCandidateQueryReturnsIt() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
-        DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        DeploymentIdentity stable = new DeploymentIdentity("stable", "gen-" + "b".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 32))
+        Fixture fixture = fixture(32);
+        DeploymentIdentity stable = new DeploymentIdentity("stable", "gen-" + "c".repeat(64));
+        when(fixture.runMapper.listNonTerminalDeploymentGenerations(
+                fixture.local.deploymentId(), fixture.local.generationId()))
                 .thenReturn(List.of(record(stable)));
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ZERO, 32, () -> 0L);
 
-        reaper.sweep();
+        fixture.reaper.sweep();
 
-        verify(probe, never()).hasLiveInstance(stable);
-        verify(runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                stable.deploymentId(), stable.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+        verify(fixture.probe, never()).hasLiveInstance(stable);
+        verify(fixture.runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                stable.deploymentId(), stable.generationId(), FAILURE, 32);
     }
 
     @Test
-    void cursorAdvancesPastLiveGenerationsAndWrapsForLaterCandidates() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
-        DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        DeploymentIdentity first = new DeploymentIdentity("beta-a", "gen-" + "b".repeat(64));
-        DeploymentIdentity second = new DeploymentIdentity("beta-b", "gen-" + "c".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 1))
-                .thenReturn(List.of(record(first)));
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                first.deploymentId(), first.generationId(), 1))
-                .thenReturn(List.of(record(second)));
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        when(probe.hasLiveInstance(first)).thenReturn(true);
-        when(probe.hasLiveInstance(second)).thenReturn(false);
-        DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ofSeconds(60), 1, () -> 0L);
+    void aCandidateThatDisappearsFromTheDatabaseGetsANewAbsenceWindowIfItReturns() {
+        Fixture fixture = fixture(32);
+        when(fixture.runMapper.listNonTerminalDeploymentGenerations(
+                fixture.local.deploymentId(), fixture.local.generationId()))
+                .thenReturn(List.of(record(fixture.old)), List.of(), List.of(record(fixture.old)));
+        when(fixture.probe.hasLiveInstance(fixture.old)).thenReturn(false);
 
-        reaper.sweep();
-        reaper.sweep();
+        fixture.reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(60).toNanos());
+        fixture.reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(120).toNanos());
+        fixture.reaper.sweep();
 
-        verify(probe).hasLiveInstance(first);
-        verify(probe).hasLiveInstance(second);
+        verify(fixture.runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
     }
 
     @Test
-    void aNaturallyFinishedGenerationStartsANewAbsenceWindowIfItAppearsAgain() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
-        DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        DeploymentIdentity old = new DeploymentIdentity("beta-a", "gen-" + "b".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 32))
-                .thenReturn(List.of(record(old)), List.of(), List.of(record(old)));
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                old.deploymentId(), old.generationId(), 32)).thenReturn(List.of());
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        when(probe.hasLiveInstance(old)).thenReturn(false);
-        AtomicLong now = new AtomicLong();
-        DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ofSeconds(60), 32, now::get);
+    void oneSweepNeverWritesMoreThanTheConfiguredBatch() {
+        Fixture fixture = fixture(32);
+        DeploymentIdentity another = new DeploymentIdentity("beta-b", "gen-" + "c".repeat(64));
+        when(fixture.runMapper.listNonTerminalDeploymentGenerations(
+                fixture.local.deploymentId(), fixture.local.generationId()))
+                .thenReturn(List.of(record(fixture.old), record(another)));
+        when(fixture.probe.hasLiveInstance(fixture.old)).thenReturn(false);
+        when(fixture.probe.hasLiveInstance(another)).thenReturn(false);
+        when(fixture.runMapper.failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32)).thenReturn(32);
 
-        reaper.sweep();
-        now.set(Duration.ofSeconds(60).toNanos());
-        reaper.sweep();
-        now.set(Duration.ofSeconds(120).toNanos());
-        reaper.sweep();
+        fixture.reaper.sweep();
+        fixture.now.set(Duration.ofSeconds(60).toNanos());
+        fixture.reaper.sweep();
 
-        verify(runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+        verify(fixture.runMapper).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                fixture.old.deploymentId(), fixture.old.generationId(), FAILURE, 32);
+        verify(fixture.runMapper, never()).failOrphanedNonTerminalRunsForDeploymentGeneration(
+                another.deploymentId(), another.generationId(), FAILURE, 32);
     }
 
-    @Test
-    void anExactFullBatchIsForgottenAfterTheDatabaseConfirmsNoRunsRemain() {
+    private static Fixture fixture(int batchSize) {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         DeploymentIdentityProvider provider = mock(DeploymentIdentityProvider.class);
+        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
         DeploymentIdentity local = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
         DeploymentIdentity old = new DeploymentIdentity("beta-a", "gen-" + "b".repeat(64));
-        when(provider.current()).thenReturn(local);
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(), null, null, 32))
-                .thenReturn(List.of(record(old)));
-        when(runMapper.listNonTerminalDeploymentGenerations(
-                local.deploymentId(), local.generationId(),
-                old.deploymentId(), old.generationId(), 32)).thenReturn(List.of());
-        when(runMapper.failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32)).thenReturn(32);
-        when(runMapper.countNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId())).thenReturn(0);
-        DeploymentGenerationLivenessProbe probe = mock(DeploymentGenerationLivenessProbe.class);
-        when(probe.hasLiveInstance(old)).thenReturn(false);
         AtomicLong now = new AtomicLong();
+        when(provider.current()).thenReturn(local);
         DeploymentGenerationReaper reaper = new DeploymentGenerationReaper(
-                runMapper, provider, probe, Duration.ofSeconds(60), 32, now::get);
-
-        reaper.sweep();
-        now.set(Duration.ofSeconds(60).toNanos());
-        reaper.sweep();
-        now.set(Duration.ofSeconds(120).toNanos());
-        reaper.sweep();
-
-        verify(runMapper, times(1)).failOrphanedNonTerminalRunsForDeploymentGeneration(
-                old.deploymentId(), old.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded", 32);
+                runMapper, provider, probe, Duration.ofSeconds(60), batchSize, now::get);
+        return new Fixture(runMapper, probe, local, old, now, reaper);
     }
 
     private static DeploymentGenerationRecord record(DeploymentIdentity identity) {
@@ -233,5 +153,13 @@ class DeploymentGenerationReaperTest {
         record.setDeploymentId(identity.deploymentId());
         record.setDeploymentGenerationId(identity.generationId());
         return record;
+    }
+
+    private record Fixture(AgentRunMapper runMapper,
+                           DeploymentGenerationLivenessProbe probe,
+                           DeploymentIdentity local,
+                           DeploymentIdentity old,
+                           AtomicLong now,
+                           DeploymentGenerationReaper reaper) {
     }
 }

@@ -139,10 +139,7 @@ public interface AgentRunMapper {
     /** 查询仍有未结束 Run 的部署代际，供实例消亡后的有界补漏清扫使用。 */
     List<DeploymentGenerationRecord> listNonTerminalDeploymentGenerations(
             @Param("excludedDeploymentId") String excludedDeploymentId,
-            @Param("excludedDeploymentGenerationId") String excludedDeploymentGenerationId,
-            @Param("afterDeploymentId") String afterDeploymentId,
-            @Param("afterDeploymentGenerationId") String afterDeploymentGenerationId,
-            @Param("limit") int limit);
+            @Param("excludedDeploymentGenerationId") String excludedDeploymentGenerationId);
 
     /**
      * 当前实例在自然处理窗口结束时，只为本实例所属代际补写失败终态。
@@ -158,8 +155,8 @@ public interface AgentRunMapper {
             @Param("deploymentGenerationId") String deploymentGenerationId);
 
     /**
-     * 已确认没有存活实例的代际补漏写。调用方必须先从注册中心连续确认代际消亡，
-     * 并在执行本语句前再次核对；SQL 仍以原部署身份和非终态作为窄条件。
+     * 已确认没有存活实例的代际补漏写。调用方必须先记录注册缺席，在确认期限后仍未
+     * 发现存活实例，并在执行本语句前再次核对；SQL 仍以原部署身份和非终态作为窄条件。
      */
     int failOrphanedNonTerminalRunsForDeploymentGeneration(
             @Param("deploymentId") String deploymentId,
