@@ -51,7 +51,6 @@ public class BetaDeploymentService {
     void verifyPersistentStateAtStartup() {
         recoverManifestLead();
         validateAll(store.snapshot());
-        verifyExternalFactsAtStartup();
     }
 
     public ObjectNode submitManifest(ObjectNode manifest) {
@@ -123,14 +122,6 @@ public class BetaDeploymentService {
     public ObjectNode retry(String deploymentId, String serviceName) {
         mutationLock.lock();
         try {
-            store.read(state -> {
-                ObjectNode deployment = requireDeployment(state, deploymentId);
-                ObjectNode service = requireService(deployment, serviceName);
-                if ("FACTS_UNCERTAIN".equals(service.path("lastError").path("recoveryClass").asText())) {
-                    verifyServiceFacts(deployment, service, store.readManifest(deploymentId));
-                }
-                return null;
-            });
             store.update(state -> {
                 requireNoOperation(state);
                 ObjectNode deployment = requireDeployment(state, deploymentId);
@@ -268,7 +259,6 @@ public class BetaDeploymentService {
         JsonNode candidate = ref.service().path("candidateInstance");
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
-        containers.verifyPersistedInstance(manifest, spec, candidate);
         ContainerRuntime.ContainerObservation observed = containers.inspect(
                 candidate.path("machineId").asText(), candidate.path("containerName").asText());
         if ((!observed.containerId().isEmpty() && !observed.containerId().equals(candidate.path("containerId").asText()))
@@ -349,9 +339,6 @@ public class BetaDeploymentService {
     private void drain(OperationRef ref) {
         JsonNode current = store.read(state -> checkedService(state, ref).deepCopy());
         ObjectNode draining = (ObjectNode) current.path("drainingInstance");
-        JsonNode manifest = store.readManifest(ref.deploymentId());
-        JsonNode spec = findService(manifest, ref.serviceName());
-        containers.verifyPersistedInstance(manifest, spec, draining);
         ContainerRuntime.ContainerObservation beforeStop = containers.inspect(
                 draining.path("machineId").asText(), draining.path("containerName").asText());
         if (beforeStop.running()) {
@@ -453,80 +440,6 @@ public class BetaDeploymentService {
 
     private void cleanupCandidate(JsonNode candidate) {
         containers.remove(candidate.path("machineId").asText(), candidate.path("containerName").asText());
-    }
-
-    private void verifyExternalFactsAtStartup() {
-        ObjectNode snapshot = store.snapshot();
-        for (JsonNode deployment : snapshot.path("deployments")) {
-            JsonNode manifest = store.readManifest(deployment.path("deploymentId").asText());
-            for (JsonNode service : deployment.path("services")) {
-                if (service.path("lastError").isObject()) continue;
-                try {
-                    verifyServiceFacts(deployment, service, manifest);
-                } catch (ControllerException failure) {
-                    recordStartupFailure(deployment.path("deploymentId").asText(),
-                            service.path("serviceName").asText(), failure);
-                } catch (RuntimeException failure) {
-                    recordStartupFailure(deployment.path("deploymentId").asText(),
-                            service.path("serviceName").asText(),
-                            new ControllerException("EXTERNAL_FACTS_UNAVAILABLE", safeMessage(failure), failure));
-                }
-            }
-        }
-    }
-
-    private void verifyServiceFacts(JsonNode deployment, JsonNode service, JsonNode manifest) {
-        JsonNode spec = findService(manifest, service.path("serviceName").asText());
-        Set<String> trackedContainerIds = new HashSet<>();
-        for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
-            JsonNode instance = service.path(role);
-            if (instance.isObject()) {
-                trackedContainerIds.add(instance.path("containerId").asText());
-            }
-        }
-        containers.assertNoUntrackedInstances(manifest, spec, trackedContainerIds);
-        for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
-            JsonNode instance = service.path(role);
-            if (!instance.isObject()) continue;
-            containers.verifyPersistedInstance(manifest, spec, instance);
-            ContainerRuntime.ContainerObservation observed = containers.inspect(
-                    instance.path("machineId").asText(), instance.path("containerName").asText());
-            boolean missing = observed.health() == ContainerRuntime.ContainerObservation.Health.MISSING
-                    || observed.containerId().isEmpty();
-            boolean draining = "drainingInstance".equals(role);
-            if (missing && !draining)
-                throw new ControllerException("CONTAINER_FACT_MISSING", "Persisted container is missing");
-            if (!missing && (!observed.containerId().equals(instance.path("containerId").asText())
-                    || !observed.endpointAddress().equals(instance.path("endpoint").path("address").asText())
-                    || observed.hostPort() != instance.path("hostPort").asInt()))
-                throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Observed container differs from persisted state");
-            if (("activeInstance".equals(role) || "candidateInstance".equals(role)) && !observed.running())
-                throw new ControllerException("CONTAINER_NOT_RUNNING", "Routable or candidate container is not running");
-        }
-    }
-
-    private void recordStartupFailure(String deploymentId, String serviceName, ControllerException failure) {
-        store.update(state -> {
-            ObjectNode deployment = requireDeployment(state, deploymentId);
-            ObjectNode service = requireService(deployment, serviceName);
-            JsonNode operation = service.path("operation");
-            String type = operation.isObject() ? operation.path("type").asText()
-                    : "DELETING".equals(deployment.path("phase").asText()) ? "DELETE"
-                    : service.path("activeInstance").isObject() ? "UPDATE" : "CREATE";
-            service.put("phase", "FAILED");
-            service.putNull("operation");
-            service.put("failedManifestVersion", service.path("targetManifestVersion").asLong());
-            ObjectNode error = mapper.createObjectNode();
-            error.put("code", failure.code().replaceAll("[^A-Z0-9_]", "_"));
-            error.put("message", sanitize(failure.getMessage()));
-            error.put("at", Instant.now(clock).toString());
-            error.put("failedOperationType", type);
-            error.put("recoveryClass", "FACTS_UNCERTAIN");
-            service.set("lastError", error);
-            scheduleNext(state);
-            validateAll(state);
-            return null;
-        });
     }
 
     private void validateAll(ObjectNode state) {

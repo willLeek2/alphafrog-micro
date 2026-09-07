@@ -13,11 +13,9 @@ import java.time.Duration;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import world.willfrog.beta.config.BetaControllerProperties;
@@ -79,7 +77,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         String name = containerName(plan, service.path("serviceName").asText());
         JsonNode existing = inspectDocument(machineId, name);
         if (!existing.isMissingNode()) {
-            verifyContainerIdentity(existing, manifest, service, plan, name, machine);
             return observation(machineId, name, existing);
         }
         verifyImage(machineId, service);
@@ -89,61 +86,17 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
         environmentFiles.requireDedicatedFile(service.path("serviceName").asText(), template.getEnvFile(), Map.of());
         Path compose = writeCompose(manifest, service, plan, name, machine);
-        Map<String, String> environment = new HashMap<>();
-        verifyEffectiveCompose(manifest, service, plan, name, machine, compose, environment);
+        Map<String, String> environment = Map.of();
+        commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
+                "config", "--quiet"), environment, Duration.ofSeconds(30));
         commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
                 "up", "--detach", "--no-deps", "app"), environment, Duration.ofMinutes(5));
         JsonNode createdDocument = inspectDocument(machineId, name);
         if (createdDocument.isMissingNode())
             throw new ControllerException("CONTAINER_START_FAILED", "Candidate container was not created");
-        verifyContainerIdentity(createdDocument, manifest, service, plan, name, machine);
         ContainerObservation created = observation(machineId, name, createdDocument);
         if (!created.running()) throw new ControllerException("CONTAINER_START_FAILED", "Candidate container did not start");
         return created;
-    }
-
-    @Override
-    public void verifyPersistedInstance(JsonNode manifest, JsonNode service, JsonNode instance) {
-        String machineId = instance.path("machineId").asText();
-        String name = instance.path("containerName").asText();
-        JsonNode actual = inspectDocument(machineId, name);
-        if (actual.isMissingNode()) return;
-        JsonNode labels = actual.path("Config").path("Labels");
-        JsonNode bindings = actual.path("NetworkSettings").path("Ports")
-                .path(service.path("runtime").path("containerPort").asText() + "/tcp");
-        boolean identityMatches = name.equals(actual.path("Name").asText().replaceFirst("^/", ""))
-                && manifest.path("deploymentId").asText().equals(labels.path("alphafrog.deployment-id").asText())
-                && manifest.path("trafficScopeId").asText().equals(labels.path("alphafrog.traffic-scope-id").asText())
-                && service.path("serviceName").asText().equals(labels.path("alphafrog.service-name").asText())
-                && instance.path("instanceId").asText().equals(labels.path("alphafrog.instance-id").asText())
-                && instance.path("releaseId").asText().equals(labels.path("alphafrog.release-id").asText())
-                && instance.path("deploymentGenerationId").asText()
-                    .equals(labels.path("alphafrog.deployment-generation-id").asText())
-                && instance.path("hostPort").asText().equals(labels.path("alphafrog.host-port").asText())
-                && bindings.isArray() && bindings.size() == 1
-                && machine(machineId).getBindIp().equals(bindings.path(0).path("HostIp").asText())
-                && instance.path("hostPort").asText().equals(bindings.path(0).path("HostPort").asText());
-        if (instance.path("manifestVersion").asLong() == manifest.path("manifestVersion").asLong()) {
-            identityMatches = identityMatches && service.path("image").path("localImageId").asText()
-                    .equals(actual.path("Image").asText());
-        }
-        if (!identityMatches || !instance.path("containerId").asText().equals(actual.path("Id").asText()))
-            throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Container identifier differs from persisted state");
-    }
-
-    @Override
-    public void assertNoUntrackedInstances(JsonNode manifest, JsonNode service, Set<String> trackedContainerIds) {
-        String machineId = service.path("machineId").asText();
-        String output = commands.run(docker(machineId, "ps", "--all", "--no-trunc",
-                "--filter", "label=alphafrog.deployment-id=" + manifest.path("deploymentId").asText(),
-                "--filter", "label=alphafrog.traffic-scope-id=" + manifest.path("trafficScopeId").asText(),
-                "--filter", "label=alphafrog.service-name=" + service.path("serviceName").asText(),
-                "--format", "{{.ID}}"), Map.of(), Duration.ofSeconds(15));
-        for (String containerId : output.split("\\R")) {
-            String value = containerId.strip();
-            if (!value.isEmpty() && !trackedContainerIds.contains(value))
-                throw new ControllerException("UNTRACKED_CONTAINER", "Docker contains an untracked deployment container");
-        }
     }
 
     @Override
@@ -369,99 +322,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             throw new ControllerException("IMAGE_ID_MISMATCH", "Installed image does not match the manifest Image ID");
     }
 
-    private void verifyEffectiveCompose(JsonNode manifest, JsonNode service, CandidatePlan plan, String name,
-                                        BetaControllerProperties.Machine machine, Path compose,
-                                        Map<String, String> processEnvironment) {
-        String machineId = service.path("machineId").asText();
-        commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
-                "config", "--quiet"), processEnvironment, Duration.ofSeconds(30));
-        String output = commands.run(docker(machineId, "compose", "--project-name", projectName(plan),
-                "--file", compose.toString(), "config", "--no-env-resolution", "--format", "json"),
-                processEnvironment, Duration.ofSeconds(30));
-        try {
-            JsonNode app = mapper.readTree(output).path("services").path("app");
-            JsonNode environment = app.path("environment");
-            JsonNode port = app.path("ports").path(0);
-            JsonNode health = app.path("healthcheck").path("test");
-            boolean valid = app.isObject()
-                    && service.path("image").path("repositoryDigest").asText().equals(app.path("image").asText())
-                    && name.equals(app.path("container_name").asText())
-                    && "never".equals(app.path("pull_policy").asText())
-                    && "SIGTERM".equals(app.path("stop_signal").asText())
-                    && Integer.toString(plan.hostPort()).equals(port.path("published").asText())
-                    && service.path("runtime").path("containerPort").asText().equals(port.path("target").asText())
-                    && machine.getBindIp().equals(port.path("host_ip").asText())
-                    && "tcp".equals(port.path("protocol").asText())
-                    && "host".equals(port.path("mode").asText())
-                    && plan.deploymentId().equals(environment.path("AF_DEPLOYMENT_ID").asText())
-                    && plan.generationId().equals(environment.path("AF_DEPLOYMENT_GENERATION_ID").asText())
-                    && plan.trafficScopeId().equals(environment.path("AF_LANE_TAG").asText())
-                    && service.path("releaseId").asText().equals(environment.path("AF_SERVICE_VERSION").asText())
-                    && manifest.path("gitCommit").asText().equals(environment.path("AF_GIT_COMMIT").asText())
-                    && service.path("image").path("localImageId").asText()
-                        .equals(environment.path("AF_IMAGE_DIGEST").asText())
-                    && service.path("serviceName").asText().equals(environment.path("OTEL_SERVICE_NAME").asText())
-                    && otelResourceAttributes(manifest, service, plan,
-                        service.path("image").path("localImageId").asText())
-                        .equals(environment.path("OTEL_RESOURCE_ATTRIBUTES").asText())
-                    && (!service.path("registration").isObject()
-                        || machine.getRoutableAddress().equals(environment.path("DUBBO_IP_TO_REGISTRY").asText())
-                        && Integer.toString(plan.hostPort()).equals(environment.path("DUBBO_PORT_TO_REGISTRY").asText()))
-                    && "false".equals(environment.path("AF_DUBBO_REGISTRY_REGISTER").asText())
-                    && betaRoutingConfiguration(service, plan)
-                        .equals(environment.path("SPRING_APPLICATION_JSON").asText())
-                    && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
-                        .equals(environment.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText())
-                    && Integer.toString(finalizationMarginSeconds(
-                        service.path("runtime").path("applicationDrainSeconds").asInt())).equals(environment
-                        .path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText())
-                    && "true".equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED").asText())
-                    && properties.getNacos().getServerAddress().equals(environment
-                        .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS").asText())
-                    && normalizedNacosNamespace().equals(environment
-                        .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_NAMESPACE").asText())
-                    && "alphafrog-beta".equals(environment
-                        .path("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_GROUP_NAME").asText())
-                    && Integer.toString(service.path("runtime").path("applicationDrainSeconds").asInt())
-                        .equals(environment.path("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS").asText())
-                    && "graceful".equals(environment.path("SERVER_SHUTDOWN").asText())
-                    && (coordinatedAgentShutdown(service)
-                        ? "0s"
-                        : service.path("runtime").path("applicationDrainSeconds").asInt() + "s")
-                        .equals(environment.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText())
-                    && health.isArray() && health.size() == 4
-                    && "CMD".equals(health.path(0).asText())
-                    && properties.getHealthcheckScript().toString().equals(health.path(1).asText())
-                    && "127.0.0.1".equals(health.path(2).asText())
-                    && service.path("runtime").path("containerPort").asText().equals(health.path(3).asText());
-            String shutdownProfile = service.path("runtime").path("shutdownProfile").asText();
-            if ("SPRING_BOOT_DUBBO_V1".equals(shutdownProfile)
-                    || "SPRING_BOOT_HTTP_DUBBO_V1".equals(shutdownProfile)) {
-                int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
-                int dubboWaitSeconds = coordinatedAgentShutdown(service)
-                        ? finalizationMarginSeconds(applicationDrainSeconds)
-                        : applicationDrainSeconds;
-                valid = valid && Integer.toString(dubboWaitSeconds * 1000)
-                        .equals(environment.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
-            }
-            if ("frontend".equals(service.path("serviceName").asText())) {
-                valid = valid
-                        && Boolean.toString(!"main-beta".equals(plan.trafficScopeId()))
-                        .equals(environment.path("AF_LANE_ENTRY_ENABLED").asText())
-                        && plan.trafficScopeId().equals(environment.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
-            }
-            if (!valid)
-                throw new ControllerException("COMPOSE_CONFIG_INVALID", "Effective Compose configuration does not match the deployment contract");
-            BetaControllerProperties.ServiceTemplate template = properties.getServices()
-                    .get(service.path("serviceName").asText());
-            if (template == null || template.getEnvFile() == null)
-                throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
-            environmentFiles.requireEffectiveCompose(app, template.getEnvFile());
-        } catch (IOException exception) {
-            throw new ControllerException("COMPOSE_CONFIG_INVALID", "Docker Compose returned invalid effective configuration", exception);
-        }
-    }
-
     private static boolean coordinatedAgentShutdown(JsonNode service) {
         return "agent-service".equals(service.path("serviceName").asText());
     }
@@ -478,30 +338,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 + ",service.version=" + service.path("releaseId").asText()
                 + ",git.commit=" + manifest.path("gitCommit").asText()
                 + ",image.digest=" + localImageId;
-    }
-
-    private void verifyContainerIdentity(JsonNode actual, JsonNode manifest, JsonNode service,
-                                         CandidatePlan plan, String name,
-                                         BetaControllerProperties.Machine machine) {
-        JsonNode labels = actual.path("Config").path("Labels");
-        boolean identityMatches = name.equals(actual.path("Name").asText().replaceFirst("^/", ""))
-                && plan.deploymentId().equals(labels.path("alphafrog.deployment-id").asText())
-                && plan.trafficScopeId().equals(labels.path("alphafrog.traffic-scope-id").asText())
-                && service.path("serviceName").asText().equals(labels.path("alphafrog.service-name").asText())
-                && plan.instanceId().equals(labels.path("alphafrog.instance-id").asText())
-                && service.path("releaseId").asText().equals(labels.path("alphafrog.release-id").asText())
-                && plan.generationId().equals(labels.path("alphafrog.deployment-generation-id").asText())
-                && Integer.toString(plan.hostPort()).equals(labels.path("alphafrog.host-port").asText())
-                && service.path("image").path("localImageId").asText().equals(actual.path("Image").asText());
-        JsonNode bindings = actual.path("NetworkSettings").path("Ports")
-                .path(service.path("runtime").path("containerPort").asText() + "/tcp");
-        identityMatches = identityMatches && bindings.isArray() && bindings.size() == 1
-                && machine.getBindIp().equals(bindings.path(0).path("HostIp").asText())
-                && Integer.toString(plan.hostPort()).equals(bindings.path(0).path("HostPort").asText());
-        if (!identityMatches)
-            throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Existing container does not match the persisted candidate plan");
-        if (!JsonSupport.deploymentGeneration(manifest).equals(plan.generationId()))
-            throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Candidate generation differs from the accepted manifest");
     }
 
     private List<String> docker(String machineId, String... args) {
