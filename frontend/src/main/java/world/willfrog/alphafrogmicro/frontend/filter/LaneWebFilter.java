@@ -13,15 +13,18 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.MDC;
-import org.springframework.security.authentication.AnonymousAuthenticationToken;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.filter.OncePerRequestFilter;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 import world.willfrog.alphafrogmicro.frontend.lane.LaneEntryProperties;
 
 /**
- * 在 JWT 身份建立后决定当前请求是否进入测试流量范围，并在离开请求线程前恢复旧上下文。
+ * 在 JWT 身份建立后决定当前请求是否进入某个测试泳道，并在离开请求线程前恢复旧上下文。
+ *
+ * <p>泳道名有两个来源：部署注入的 {@code alphafrog.lane.entry.traffic-scope-id}（只有泳道自己的
+ * frontend 实例会被注入，优先采用，此时不看请求头），以及共用入口的请求头
+ * {@code X-AlphaFrog-Lane-Tag}（主 Beta frontend 上没有注入时的兜底）。两者按同一套规则解析：
+ * 空白或 {@code main-beta} 不打标；格式不合法只告警一次并按普通流量处理。所有可伪造的入口
+ * 标记头都会在进入业务代码前剥除，业务代码只认线程上下文里的泳道名。</p>
  */
 public class LaneWebFilter extends OncePerRequestFilter {
 
@@ -30,19 +33,19 @@ public class LaneWebFilter extends OncePerRequestFilter {
     public static final String DEPLOYMENT_GENERATION_HEADER = "X-AlphaFrog-Deployment-Generation-Id";
     public static final String LANE_TAG_HEADER = "X-AlphaFrog-Lane-Tag";
 
+    private static final String LANE_TAG_PATTERN = "^[a-z0-9]([a-z0-9._-]{0,94}[a-z0-9])?$";
+
     private final LaneEntryProperties properties;
     private final Set<String> strippedHeaders;
-    private final AtomicBoolean invalidConfigurationReported = new AtomicBoolean();
+    private final AtomicBoolean invalidLaneTagReported = new AtomicBoolean();
 
     public LaneWebFilter(LaneEntryProperties properties) {
         this.properties = properties;
-        properties.validateStaticConfiguration();
         this.strippedHeaders = lowercase(Set.of(
-                properties.getPassphraseHeader(),
+                LANE_TAG_HEADER,
                 TRAFFIC_SCOPE_HEADER,
                 DEPLOYMENT_HEADER,
                 DEPLOYMENT_GENERATION_HEADER,
-                LANE_TAG_HEADER,
                 LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID));
     }
 
@@ -61,7 +64,7 @@ public class LaneWebFilter extends OncePerRequestFilter {
             HttpServletRequest request,
             HttpServletResponse response,
             FilterChain chain) throws ServletException, IOException {
-        String suppliedPassphrase = request.getHeader(properties.getPassphraseHeader());
+        String headerLaneTag = request.getHeader(LANE_TAG_HEADER);
         HttpServletRequest sanitized = new StrippedHeaderRequest(request, strippedHeaders);
         String previousScope = LaneContext.trafficScopeId();
         String previousMdc = MDC.get(LaneContext.MDC_LANE_TAG);
@@ -69,9 +72,10 @@ public class LaneWebFilter extends OncePerRequestFilter {
         LaneContext.clear();
         MDC.remove(LaneContext.MDC_LANE_TAG);
         try {
-            if (requiresTag(request, suppliedPassphrase)) {
-                LaneContext.setTrafficScopeId(properties.getTrafficScopeId());
-                MDC.put(LaneContext.MDC_LANE_TAG, properties.getTrafficScopeId());
+            String laneTag = properties.isEnabled() ? resolveLaneTag(headerLaneTag) : null;
+            if (requiresTag(request, laneTag)) {
+                LaneContext.setTrafficScopeId(laneTag);
+                MDC.put(LaneContext.MDC_LANE_TAG, laneTag);
             }
             chain.doFilter(sanitized, response);
         } finally {
@@ -92,36 +96,45 @@ public class LaneWebFilter extends OncePerRequestFilter {
         chain.doFilter(new StrippedHeaderRequest(request, strippedHeaders), response);
     }
 
-    private boolean requiresTag(HttpServletRequest request, String suppliedPassphrase) {
+    private boolean requiresTag(HttpServletRequest request, String laneTag) {
         if (!properties.isEnabled()) {
-            return false;
-        }
-        if (!properties.hasUsableEntryConfiguration()) {
-            if (invalidConfigurationReported.compareAndSet(false, true)) {
-                logger.warn("入口流量范围配置不完整，所有请求都按普通流量处理");
-            }
             return false;
         }
         String path = request.getRequestURI();
         if (path != null && path.startsWith("/internal/")) {
             return false;
         }
-        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-        if (authentication == null
-                || !authentication.isAuthenticated()
-                || authentication instanceof AnonymousAuthenticationToken
-                || !properties.getTestUsernames().contains(authentication.getName())
-                || !matchesPassphrase(suppliedPassphrase, properties.getPassphrase())) {
-            return false;
-        }
-        return true;
+        return laneTag != null;
     }
 
-    private static boolean matchesPassphrase(String supplied, String expected) {
-        if (supplied == null || expected == null || supplied.isEmpty() || expected.isEmpty()) {
-            return false;
+    /**
+     * 泳道名解析：部署注入值优先；没有注入时使用共用入口请求头。解析规则与
+     * {@code AgentRunEventService.normalizeLaneTag} 一致，但格式不合法时不抛异常，
+     * 只告警一次并按普通流量处理。
+     */
+    private String resolveLaneTag(String headerLaneTag) {
+        String injected = properties.getTrafficScopeId();
+        if (injected != null && !injected.isBlank()) {
+            return normalizeLaneTag(injected);
         }
-        return expected.equals(supplied);
+        return normalizeLaneTag(headerLaneTag);
+    }
+
+    private String normalizeLaneTag(String candidate) {
+        if (candidate == null || candidate.isBlank()) {
+            return null;
+        }
+        String normalized = candidate.trim();
+        if (LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID.equals(normalized)) {
+            return null;
+        }
+        if (!normalized.matches(LANE_TAG_PATTERN)) {
+            if (invalidLaneTagReported.compareAndSet(false, true)) {
+                logger.warn("入口泳道请求头格式不合法，按普通流量处理");
+            }
+            return null;
+        }
+        return normalized;
     }
 
     private static Set<String> lowercase(Set<String> names) {

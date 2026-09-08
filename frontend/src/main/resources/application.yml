@@ -46,10 +46,7 @@ alphafrog:
   lane:
     entry:
       enabled: ${AF_LANE_ENTRY_ENABLED:false}
-      test-usernames: ${AF_LANE_TEST_USERNAMES:}
-      passphrase: ${AF_LANE_TAG_PASSPHRASE:}
-      passphrase-header: ${AF_LANE_TAG_PASSPHRASE_HEADER:X-AlphaFrog-Lane-Passphrase}
-      traffic-scope-id: ${AF_LANE_TRAFFIC_SCOPE_ID:lane-test}
+      traffic-scope-id: ${AF_LANE_TRAFFIC_SCOPE_ID:}
   domestic-fetch:
     debug-base-url: ${AF_DOMESTIC_FETCH_DEBUG_BASE_URL:http://domestic-fetch-service:18082}
   debug:
