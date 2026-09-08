@@ -12,7 +12,6 @@ import java.time.Duration;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -43,7 +42,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (properties.getMachines().isEmpty() || properties.getMachines().size() > 8)
             throw new ControllerException("MACHINE_CONFIG_INVALID", "Between one and eight Beta machines must be configured");
         requireSafeRegularFile(properties.getHealthcheckScript(), true, "Health-check script");
-        Map<String, Path> assignedEnvFiles = new LinkedHashMap<>();
         for (JsonNode service : manifest.path("services")) {
             String machineId = service.path("machineId").asText();
             BetaControllerProperties.Machine machine = machine(machineId);
@@ -54,8 +52,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             BetaControllerProperties.ServiceTemplate template = properties.getServices().get(serviceName);
             if (template == null || template.getEnvFile() == null)
                 throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
-            environmentFiles.requireDedicatedFile(serviceName, template.getEnvFile(), assignedEnvFiles);
-            assignedEnvFiles.put(serviceName, template.getEnvFile().toAbsolutePath().normalize());
+            environmentFiles.requireDedicatedFile(template.getEnvFile());
             JsonNode expectedConfigDigest = service.path("runtimeConfigSha256");
             if (!expectedConfigDigest.isMissingNode() && !expectedConfigDigest.isNull()
                     && !expectedConfigDigest.asText().equals(fileSha256(template.getEnvFile())))
@@ -81,7 +78,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 .get(service.path("serviceName").asText());
         if (template == null || template.getEnvFile() == null)
             throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
-        environmentFiles.requireDedicatedFile(service.path("serviceName").asText(), template.getEnvFile(), Map.of());
+        environmentFiles.requireDedicatedFile(template.getEnvFile());
         Path compose = writeCompose(manifest, service, plan, name, machine);
         Map<String, String> environment = Map.of();
         commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),

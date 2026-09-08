@@ -135,7 +135,7 @@ Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因�
 - 配置同一台 Nacos 的 Beta、生产两路逻辑注册，分别带 `zone=beta`、`zone=prod`，Beta 路为 `preferred=true`，生产路只订阅，消费集群为 `zone-aware`；含 `registration` 的服务允许向 Beta 路自注册，不含该字段的服务只订阅；
 - 为提供者服务注入 Beta 机器的可路由地址与宿主端口，并把部署、代际、发布、实例、区和泳道标签作为 Dubbo 提供者参数；非提供者服务不注入提供者参数；
 
-控制器在启动容器前执行 `docker compose config --quiet`，配置无法解析时拒绝启动。静态校验包括部署单 Schema 与端口查重、禁止整份生产 `.env`、以及每个服务使用独立环境文件。部署单提供 `runtimeConfigSha256` 时，控制器还会比较环境文件的 SHA-256 摘要。控制器不解析 Compose 展开结果来重复检查由自身生成的每个字段。
+控制器在启动容器前执行 `docker compose config --quiet`，配置无法解析时拒绝启动。静态校验包括部署单 Schema 与端口查重，以及禁止把整份生产 `.env` 当作服务环境文件或数据卷。每个服务必须配置一份已经存在的普通环境文件。部署单提供 `runtimeConfigSha256` 时，控制器还会比较环境文件的 SHA-256 摘要。控制器不解析 Compose 展开结果来重复检查由自身生成的每个字段。
 
 ## 9. 重启恢复
 
