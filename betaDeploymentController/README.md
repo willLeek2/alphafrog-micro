@@ -13,8 +13,8 @@
 每台 Beta 机器需要配置以下属性：
 
 - `docker-host`：Docker 守护进程地址，只接受 `unix`、`tcp` 或 `ssh` 协议。
-- `bind-ip`：候选容器发布宿主端口时绑定的确定 IP 地址。
-- `routable-address`：其他服务实际能够访问的地址，也是 Nacos 注册地址。
+- `bind-ip`：候选容器发布宿主端口时使用的非空绑定地址。控制器不要求该值必须写成 IP 字面量，由 Docker 核对最终地址是否可用。
+- `routable-address`：其他服务实际能够访问的非空地址，也是 Nacos 注册地址。该值可以是 IP 字面量或可解析名称。
 
 每个服务还需要配置一个已经存在的环境文件，以及部署时必须挂载的业务卷。环境文件由运维按服务摘取需要的变量后放在控制器主机上，部署单不能提交任意环境变量或挂载路径。文件必须是普通文件、不是符号链接，权限不得宽于 `0600`，每个服务使用不同路径，文件名不能是整份生产 `.env`。部署单提供 `runtimeConfigSha256` 时，控制器会比较环境文件的 SHA-256 摘要。控制器还会拒绝把整份生产 `.env` 作为数据卷挂进容器。生成专用 Compose 后，控制器用 `compose config --quiet` 确认配置可解析，再启动候选。
 
@@ -47,7 +47,7 @@ alphafrog:
 - `POST /internal/beta/reconcile`：立即执行一个持久化步骤；后台也会按固定间隔执行。
 - `GET /internal/beta/status/{trafficScopeId}/{serviceName}`：读取服务、候选、排空进度和最近错误。
 
-状态文件固定保存在 `/var/lib/alphafrog-beta/controller-state.json`，部署单固定保存在 `/var/lib/alphafrog-beta/deployments/<deployment-id>/manifest.json`。写入使用同目录临时文件、文件同步、原子重命名和父目录同步。状态文件只保存部署编排检查点，不是业务路由真相；调用方根据 Dubbo 原生标签路由、同区优先和 Nacos 当前注册选路。控制器启动时会校验两份 Schema、时间和 IP 格式断言及跨文件关系，然后由后台协调按已保存阶段继续处理候选或排空实例。`application-drain-seconds` 是所有部署单共用的停止期限，部署单中的每个服务都必须与它相等；停止开始后保存的截止时间不会因控制器重启或重试而延长。
+状态文件固定保存在 `/var/lib/alphafrog-beta/controller-state.json`，部署单固定保存在 `/var/lib/alphafrog-beta/deployments/<deployment-id>/manifest.json`。写入使用同目录临时文件、文件同步、原子重命名和父目录同步。状态文件只保存部署编排检查点，不是业务路由真相；调用方根据 Dubbo 原生标签路由、同区优先和 Nacos 当前注册选路。控制器启动时会校验两份 Schema、时间、机器地址非空约束、Docker host 协议及跨文件关系，然后由后台协调按已保存阶段继续处理候选或排空实例。`application-drain-seconds` 是所有部署单共用的停止期限，部署单中的每个服务都必须与它相等；停止开始后保存的截止时间不会因控制器重启或重试而延长。
 
 ## 当前验证边界
 

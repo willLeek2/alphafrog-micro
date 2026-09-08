@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -51,8 +50,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             String scheme = machine.getDockerHost().getScheme();
             if (!("unix".equals(scheme) || "tcp".equals(scheme) || "ssh".equals(scheme)))
                 throw new ControllerException("MACHINE_CONFIG_INVALID", "Docker host scheme is not supported");
-            requireIpLiteral(machine.getBindIp(), "Docker bind address");
-            requireIpLiteral(machine.getRoutableAddress(), "Routable machine address");
             String serviceName = service.path("serviceName").asText();
             BetaControllerProperties.ServiceTemplate template = properties.getServices().get(serviceName);
             if (template == null || template.getEnvFile() == null)
@@ -356,6 +353,8 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         BetaControllerProperties.Machine value = properties.getMachines().get(id);
         if (value == null || value.getDockerHost() == null || value.getBindIp() == null || value.getRoutableAddress() == null)
             throw new ControllerException("MACHINE_UNKNOWN", "Machine is not configured: " + id);
+        if (value.getBindIp().isBlank() || value.getRoutableAddress().isBlank())
+            throw new ControllerException("MACHINE_CONFIG_INVALID", "Machine addresses must not be blank");
         return value;
     }
 
@@ -363,15 +362,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (path == null || !path.isAbsolute() || Files.isSymbolicLink(path) || !Files.isRegularFile(path)
                 || (executable && !Files.isExecutable(path)))
             throw new ControllerException("SERVICE_CONFIG_INVALID", label + " is missing or unsafe");
-    }
-
-    private void requireIpLiteral(String value, String label) {
-        if (value == null || !value.matches("[0-9A-Fa-f:.]+"))
-            throw new ControllerException("MACHINE_CONFIG_INVALID", label + " must be an IP literal");
-        try { InetAddress.getByName(value); }
-        catch (IOException exception) {
-            throw new ControllerException("MACHINE_CONFIG_INVALID", label + " is not a valid IP literal", exception);
-        }
     }
 
     private String fileSha256(Path path) {

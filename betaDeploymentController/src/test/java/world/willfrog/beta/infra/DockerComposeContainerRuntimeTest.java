@@ -145,6 +145,42 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void acceptsNonEmptyMachineAddressNamesAndPassesThemThrough() throws Exception {
+        BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
+        machine.setBindIp("beta-bind.example.internal");
+        machine.setRoutableAddress("beta-route.example.internal");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.validateManifest(manifest);
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode app = compose.path("services").path("app");
+        assertEquals("beta-bind.example.internal", app.path("ports").path(0).path("host_ip").asText());
+        assertEquals("beta-route.example.internal",
+                app.path("environment").path("DUBBO_IP_TO_REGISTRY").asText());
+    }
+
+    @Test
+    void refusesBlankMachineAddresses() {
+        BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        machine.setBindIp(" ");
+        ControllerException blankBind = assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest));
+        assertEquals("MACHINE_CONFIG_INVALID", blankBind.code());
+
+        machine.setBindIp("beta-bind.example.internal");
+        machine.setRoutableAddress("\t");
+        ControllerException blankRoute = assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest));
+        assertEquals("MACHINE_CONFIG_INVALID", blankRoute.code());
+    }
+
+    @Test
     void refusesALocalTagWhenItsImageIdDiffersFromTheManifest() {
         ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
         FakeCommands commands = new FakeCommands(false);
