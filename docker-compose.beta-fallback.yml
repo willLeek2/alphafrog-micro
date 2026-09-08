@@ -1,0 +1,28 @@
+# 生产机（101）opt-in 叠加层：让 Beta 机器跨机订阅这几个服务。
+#
+# 背景：这些服务默认把容器网 IP（172.18.0.x）注册进 Nacos，只有同机容器能调。
+# Beta 环境的消费者按「泳道 → 主 beta → 生产」回落到生产实例时，需要它们注册
+# 宿主机的可路由地址。四个服务的容器内协议端口与 compose 发布端口相同
+# （50052/50053/50061/50062），因此只需要覆盖注册 IP，不需要覆盖端口。
+#
+# 用法（只改 101 机器上的 .env，本文件不写任何 IP）：
+#   AF_DUBBO_REGISTRY_HOST_IP=<本机私网 IP>
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.beta-fallback.yml
+# 然后照常 deploy_latest.sh。不叠加深层文件时生产行为与之前逐字节一致。
+services:
+  domestic-index-service:
+    environment:
+      TRI_DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+
+  domestic-fund-service:
+    environment:
+      TRI_DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+
+  domestic-listed-asset-service:
+    environment:
+      TRI_DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+
+  external-info-service:
+    environment:
+      # externalInfoService/entrypoint.sh 检测到该变量已预设时不再覆盖（绑定地址仍自动检测）
+      TRI_DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}

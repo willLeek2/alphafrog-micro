@@ -100,6 +100,9 @@ services:
       JVM_XMX: 512m
     ports:
       - "8848:8848"
+      # Nacos 2.x 客户端（Dubbo 3.3 注册/订阅、Beta 控制器探针）走 gRPC 9848（= 8848+1000）。
+      # 同机容器间通信不需要这行；Beta 机器跨机连本 Nacos 时必须发布。
+      - "9848:9848"
     volumes:
       - ./data/nacos/logs:/home/nacos/logs
       - ./data/nacos/data:/home/nacos/data
