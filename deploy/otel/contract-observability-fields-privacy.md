@@ -167,7 +167,6 @@ beta 机器把 trace 发到 101 的 `4318`，把日志发到 101 的 `9428`。�
 | 类别 | 具体项 |
 |------|--------|
 | 令牌与会话 | `Authorization` / `Bearer` / JWT 全文、`Cookie` / `Set-Cookie` 全文、刷新令牌 |
-| 泳道入口口令 | `AF_LANE_TAG_PASSPHRASE`（请求头口令：不写日志、不回传响应、不进 span 属性或事件） |
 | 数据库口令 | 生产库写口令、beta 库口令、`market_reader` 只读口令；含连接串里的密码段；错误消息不得回显完整连接串 |
 | Nacos 凭据 | 管理员口令、发布口令、各服务读账号口令；Nacos 2.5 的 `NACOS_AUTH_TOKEN`、`NACOS_AUTH_IDENTITY_KEY`、`NACOS_AUTH_IDENTITY_VALUE` 也全部禁止记录 |
 | 机器与仓库 | SSH 私钥、镜像仓库管理凭据 |

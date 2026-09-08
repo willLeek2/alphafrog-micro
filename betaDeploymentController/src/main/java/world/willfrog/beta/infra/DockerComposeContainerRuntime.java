@@ -184,9 +184,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("OTEL_SERVICE_NAME", service.path("serviceName").asText());
         environment.put("OTEL_RESOURCE_ATTRIBUTES", otelResourceAttributes(manifest, service, plan, localImageId));
         if ("frontend".equals(service.path("serviceName").asText())) {
-            boolean laneEntry = !"main-beta".equals(plan.trafficScopeId());
-            environment.put("AF_LANE_ENTRY_ENABLED", Boolean.toString(laneEntry));
-            environment.put("AF_LANE_TRAFFIC_SCOPE_ID", plan.trafficScopeId());
+            // 所有 Beta frontend 都开入口：主 Beta frontend 是共用入口，靠请求头指定泳道；
+            // 泳道名只注入给非 main-beta 的泳道 frontend，从该口进来的流量一律打本部署的标。
+            environment.put("AF_LANE_ENTRY_ENABLED", "true");
+            if (!"main-beta".equals(plan.trafficScopeId())) {
+                environment.put("AF_LANE_TRAFFIC_SCOPE_ID", plan.trafficScopeId());
+            }
         }
         if (service.path("registration").isObject()) {
             environment.put("DUBBO_IP_TO_REGISTRY", machine.getRoutableAddress());

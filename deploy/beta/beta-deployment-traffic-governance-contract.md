@@ -129,7 +129,7 @@ Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因�
 - 使用不可变镜像引用并核对本机 Image ID；
 - 注入部署标识、部署代际、泳道范围、发布标识和镜像摘要；
 - 注入 `OTEL_SERVICE_NAME` 与包含部署、泳道、版本、提交和本地 Image ID 的五字段 `OTEL_RESOURCE_ATTRIBUTES`；
-- frontend 泳道实例启用可信入口打标并注入本部署的泳道名；主 Beta frontend 保持入口打标关闭；
+- 所有 Beta frontend 实例都启用入口打标；泳道名只注入给非主 Beta 的泳道 frontend，主 Beta frontend 不注入泳道名，作为共用入口改读请求头指定的泳道名；
 - 使用显式宿主地址、宿主端口、容器端口和 `SIGTERM`；
 - 配置 Spring 与 Dubbo 的有序关闭期限；`agent-langchain-service` 使用 0 秒 Spring 后续等待和 5 秒 Dubbo 静态上限，应用代码不得在运行时改写这两个框架的生命周期对象；
 - 配置同一台 Nacos 的 Beta、生产两路逻辑注册，分别带 `zone=beta`、`zone=prod`，Beta 路为 `preferred=true`，生产路只订阅，消费集群为 `zone-aware`；含 `registration` 的服务允许向 Beta 路自注册，不含该字段的服务只订阅；

@@ -130,7 +130,7 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
-    void laneFrontendReceivesItsTrustedEntryTagWhileMainBetaDoesNotEnableEntryTagging() throws Exception {
+    void everyBetaFrontendEnablesEntryWhileOnlyLanesInjectTheirScopeTag() throws Exception {
         ObjectNode frontend = (ObjectNode) service;
         frontend.put("serviceName", "frontend");
         frontend.remove("registration");
@@ -141,23 +141,34 @@ class DockerComposeContainerRuntimeTest {
         BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
         template.setEnvFile(environment);
         properties.setServices(Map.of("frontend", template));
-        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
-                JsonSupport.deploymentGeneration(manifest), "A", 28080);
         FakeCommands commands = new FakeCommands(false);
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
+        // 主 Beta frontend 是共用入口：入口打标开启，但不注入泳道名，靠请求头指定泳道。
         runtime.create(manifest, frontend, plan);
 
         JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
         JsonNode environmentNode = compose.path("services").path("app").path("environment");
         JsonNode routing = mapper.readTree(environmentNode.path("SPRING_APPLICATION_JSON").asText());
         assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
-        assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+        assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
         assertFalse(environmentNode.has("DUBBO_IP_TO_REGISTRY"));
         assertFalse(environmentNode.has("DUBBO_PORT_TO_REGISTRY"));
         assertFalse(routing.path("dubbo").has("provider"));
         assertEquals("60s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
         assertEquals("60000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+
+        // 泳道 frontend 是特判入口：入口开关与本部署的泳道名都注入。
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-two",
+                JsonSupport.deploymentGeneration(manifest), "A", 28081);
+        DockerComposeContainerRuntime laneRuntime =
+                new DockerComposeContainerRuntime(mapper, new FakeCommands(false), properties);
+        laneRuntime.create(manifest, frontend, plan);
+
+        compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-two.json")));
+        environmentNode = compose.path("services").path("app").path("environment");
+        assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
+        assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
     }
 
     @Test
