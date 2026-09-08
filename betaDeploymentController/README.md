@@ -20,6 +20,8 @@
 
 固定 TCP 探针应从 `bin/tcp-healthcheck` 安装到控制器主机的 `/opt/alphafrog-beta/bin/tcp-healthcheck`，保持可执行，并以同一路径只读挂载到候选容器。当前探针需要候选镜像提供 Bash。仓库里的生产 `.env` 由 `.gitignore` 排除，不得提交。
 
+宿主机安装、systemd 启动、凭证和观测配置见 [`deploy/beta/controller-run.md`](../deploy/beta/controller-run.md)。覆盖八个主 Beta 服务的部署单样例是 [`deploy/beta/main-beta-manifest.example.json`](../deploy/beta/main-beta-manifest.example.json)。样例中的 Git 提交、构建版本、本机 Image ID、时间和服务摘要都是演示值，提交前必须替换并重新计算服务摘要。`runtimeConfigSha256` 保留 `null` 时不校验服务环境文件；需要绑定该文件时再填写它的 SHA-256。
+
 示例配置：
 
 ```yaml
@@ -27,6 +29,9 @@ alphafrog:
   beta-controller:
     enabled: true
     application-drain-seconds: 60
+    observability:
+      traces-endpoint: http://jaeger.example.internal:4318
+      java-agent-jar: /opt/alphafrog-beta/otel/opentelemetry-javaagent.jar
     machines:
       beta-machine-1:
         docker-host: unix:///var/run/docker.sock
@@ -35,9 +40,12 @@ alphafrog:
     services:
       agent-service:
         env-file: /etc/alphafrog-beta/services/agent-service.env
+        java-tool-options: -Xms512m -Xmx1g
         volumes:
           - /srv/alphafrog/shared:/srv/alphafrog/shared:rw
 ```
+
+控制器把 OTLP 轨迹地址、导出开关、服务与部署资源属性直接写进生成的 Compose `environment`，并为 Java 服务添加 Java Agent 和按服务隔离的 `/app/logs` 宿主目录。Compose 的 `environment` 优先于 `env_file`，因此服务环境文件中的同名观测变量不会覆盖这些统一设置。非 Java 服务把 `java-agent-enabled` 设为 `false`；它仍获得 OTLP 环境变量和日志目录，不会挂载 Java Agent。
 
 ## 接口
 

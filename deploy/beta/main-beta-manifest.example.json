@@ -1,0 +1,224 @@
+{
+  "schemaVersion": 1,
+  "deploymentId": "beta-main-001",
+  "trafficScopeId": "main-beta",
+  "manifestVersion": 1,
+  "gitCommit": "0000000000000000000000000000000000000000",
+  "owner": {
+    "ownerId": "replace-before-use"
+  },
+  "createdAt": "2026-09-09T00:00:00Z",
+  "expiresAt": "2026-09-16T00:00:00Z",
+  "services": [
+    {
+      "serviceName": "domestic-stock-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.domestic.idl.DomesticStockService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "249aef8551aa9601483aff6f9821bb5a898caa0ce02b2952b883e39fcd48f68c",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-domestic-stock-service:latest",
+        "localImageId": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "runtime": {
+        "containerPort": 50055,
+        "hostPorts": [51055, 52055],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.domestic.idl.DomesticStockService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "domestic-stock-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "domestic-fetch-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.domestic.idl.DomesticStockFetchService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "9233db02a0acd6c80cdfd302a3803cef09c5663f410b5a8d84817cc46f152f5d",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-domestic-fetch-service:latest",
+        "localImageId": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "runtime": {
+        "containerPort": 20882,
+        "hostPorts": [51082, 52082],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.domestic.idl.DomesticStockFetchService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "domestic-fetch-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "admin-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.admin.idl.AdminService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "4f30415119c28eecf38ccc3673618f07e0bd77146665284895702341e329e5ad",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-admin-service:latest",
+        "localImageId": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "runtime": {
+        "containerPort": 50057,
+        "hostPorts": [51057, 52057],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.admin.idl.AdminService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "admin-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "portfolio-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.portfolio.idl.PortfolioDubboService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "f8447eb47b24a717932a384d28db0cd1b1b94fc899f738732d71ee31f979f105",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-portfolio-service:latest",
+        "localImageId": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "runtime": {
+        "containerPort": 50056,
+        "hostPorts": [51056, 52056],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.portfolio.idl.PortfolioDubboService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "portfolio-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "agent-service",
+      "dubboServiceKey": "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "b0f07ba817538bf709347a6c8d0cc400f163076fa4e198599dd544a2b83d2398",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-agent-langchain-service:latest",
+        "localImageId": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "runtime": {
+        "containerPort": 50059,
+        "hostPorts": [51059, 52059],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 180,
+        "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::langchain",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "agent-langchain-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "python-sandbox-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.sandbox.http.PythonSandboxHttp",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "fb2c4dacf78c728032335d5576524cdd2662c3a85b0d0d858203b11e03f513eb",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-python-sandbox:latest",
+        "localImageId": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+      },
+      "runtime": {
+        "containerPort": 8095,
+        "hostPorts": [18095, 18096],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_HTTP_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "python-sandbox-gateway-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "4cd687de9189788856cbd892a3a4d18ad28be6d084edd1fb3cd80abba26eeeab",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-python-sandbox-gateway-service:latest",
+        "localImageId": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      "runtime": {
+        "containerPort": 50060,
+        "hostPorts": [51060, 52060],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "python-sandbox-gateway-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "frontend",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.frontend.http.FrontendHttp",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "771dec6167acebedd5b13234bbdf4e224a9f972b59564ec0165cba2472f3295b",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-frontend:latest",
+        "localImageId": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "runtime": {
+        "containerPort": 8090,
+        "hostPorts": [18090, 18091],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 180,
+        "shutdownProfile": "SPRING_BOOT_HTTP_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "runtimeConfigSha256": null
+    }
+  ]
+}

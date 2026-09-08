@@ -10,6 +10,7 @@ import {fileURLToPath} from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const manifestSchema = path.join(here, 'manifest.schema.json');
 const stateSchema = path.join(here, 'controller-state.schema.json');
+const mainBetaExample = JSON.parse(fs.readFileSync(path.join(here, 'main-beta-manifest.example.json'), 'utf8'));
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'alphafrog-beta-contract-'));
 const clone = structuredClone;
 let schemaChecks = 0;
@@ -35,9 +36,9 @@ const generation = value => {
   return `gen-${crypto.createHash('sha256').update(`${lines.join('\n')}\n`).digest('hex')}`;
 };
 const dubboProvider = serviceKey => {
-  const match = /^([0-9A-Za-z._-]+)\/([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)(?::([0-9A-Za-z._-]+))?$/.exec(serviceKey);
+  const match = /^(?:([0-9A-Za-z._-]+)\/)?([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)(?::([0-9A-Za-z._-]+))?$/.exec(serviceKey);
   if (!match) throw new Error(`invalid Dubbo service key: ${serviceKey}`);
-  return {group: match[1], interfaceName: match[2], version: match[3] ?? ''};
+  return {group: match[1] ?? '', interfaceName: match[2], version: match[3] ?? ''};
 };
 const fixture = (name, value) => {
   const target = path.join(temp, `${name}.json`);
@@ -154,6 +155,17 @@ function relationErrors(wanted, observed) {
 }
 
 try {
+  ajv(manifestSchema, mainBetaExample, true, 'manifest-main-beta-example-valid');
+  assert(mainBetaExample.services.length === 8, 'main Beta example must cover all eight managed services');
+  assert(new Set(mainBetaExample.services.map(item => item.serviceName)).size === 8,
+    'main Beta example service names must be unique');
+  assert(['domestic-stock-service', 'domestic-fetch-service', 'admin-service', 'portfolio-service',
+    'agent-service', 'python-sandbox-service', 'python-sandbox-gateway-service', 'frontend']
+    .every(name => mainBetaExample.services.some(item => item.serviceName === name)),
+  'main Beta example must contain the fixed managed service set');
+  assert(relationErrors(mainBetaExample, {deployments: []}).length === 0,
+    'main Beta example service digests, registration names, and drain deadlines must agree');
+
   ajv(manifestSchema, manifest, true, 'manifest-valid');
   ajv(stateSchema, state, true, 'state-valid');
   assert(relationErrors(manifest, state).length === 0, 'valid manifest and state must agree');
@@ -183,6 +195,30 @@ try {
   delete consumerOnlyManifest.services[0].registration;
   consumerOnlyManifest.services[0].serviceSpecSha256 = serviceDigest(consumerOnlyManifest.services[0]);
   ajv(manifestSchema, consumerOnlyManifest, true, 'manifest-consumer-only-service-valid');
+
+  const defaultServiceGroup = clone(manifest);
+  defaultServiceGroup.services[0].dubboServiceKey = 'com.alphafrog.StockService';
+  defaultServiceGroup.services[0].registration.serviceName = 'providers:com.alphafrog.StockService::';
+  defaultServiceGroup.services[0].serviceSpecSha256 = serviceDigest(defaultServiceGroup.services[0]);
+  ajv(manifestSchema, defaultServiceGroup, true, 'manifest-default-dubbo-service-group-valid');
+  assert(relationErrors(defaultServiceGroup, {deployments: []}).length === 0,
+    'default Dubbo service group must map to a trailing empty group in the Nacos service name');
+
+  const inventedServiceGroup = clone(defaultServiceGroup);
+  inventedServiceGroup.services[0].registration.serviceName = 'providers:com.alphafrog.StockService::default';
+  inventedServiceGroup.services[0].serviceSpecSha256 = serviceDigest(inventedServiceGroup.services[0]);
+  ajv(manifestSchema, inventedServiceGroup, true, 'manifest-invented-dubbo-group-shape-valid');
+  assert(relationErrors(inventedServiceGroup, {deployments: []}).includes('Nacos service name'),
+    'an invented non-empty Dubbo service group must be rejected');
+
+  const defaultServiceGroupState = clone(state);
+  defaultServiceGroupState.deployments[0].services[0].dubboServiceKey = 'com.alphafrog.StockService';
+  ajv(stateSchema, defaultServiceGroupState, true, 'state-default-dubbo-service-group-valid');
+
+  const malformedServiceKey = clone(defaultServiceGroup);
+  malformedServiceKey.services[0].dubboServiceKey = '/com.alphafrog.StockService';
+  malformedServiceKey.services[0].serviceSpecSha256 = serviceDigest(malformedServiceKey.services[0]);
+  ajv(manifestSchema, malformedServiceKey, false, 'manifest-empty-explicit-dubbo-service-group-rejected');
 
   const stableScope = clone(manifest);
   stableScope.trafficScopeId = 'stable';

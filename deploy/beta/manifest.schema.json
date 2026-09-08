@@ -76,7 +76,7 @@
       "type": "string",
       "minLength": 3,
       "maxLength": 512,
-      "pattern": "^[0-9A-Za-z._-]+/[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*(?::[0-9A-Za-z._-]+)?$"
+      "pattern": "^(?:[0-9A-Za-z._-]+/)?[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*(?::[0-9A-Za-z._-]+)?$"
     },
     "opaqueId": {
       "type": "string",

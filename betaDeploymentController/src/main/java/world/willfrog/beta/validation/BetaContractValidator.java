@@ -20,7 +20,7 @@ import world.willfrog.beta.config.BetaControllerProperties;
 @Component
 public class BetaContractValidator {
     private static final java.util.regex.Pattern DUBBO_SERVICE_KEY = java.util.regex.Pattern.compile(
-            "^([0-9A-Za-z._-]+)/([A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*)(?::([0-9A-Za-z._-]+))?$");
+            "^(?:([0-9A-Za-z._-]+)/)?([A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*)(?::([0-9A-Za-z._-]+))?$");
     private final ObjectMapper mapper;
     private final JsonSchema manifestSchema;
     private final JsonSchema stateSchema;
@@ -180,7 +180,7 @@ public class BetaContractValidator {
         if (!matcher.matches()) {
             throw new ControllerException("MANIFEST_INVALID", "Dubbo service key is invalid");
         }
-        return new DubboProviderIdentity(matcher.group(1), matcher.group(2),
+        return new DubboProviderIdentity(matcher.group(1) == null ? "" : matcher.group(1), matcher.group(2),
                 matcher.group(3) == null ? "" : matcher.group(3));
     }
 

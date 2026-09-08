@@ -10,6 +10,8 @@ Beta 控制器负责把部署单变成服务实例。候选容器健康后，控
 
 每个部署目录保存一份通过 `manifest.schema.json` 校验的部署单。控制器状态根目录保存一份通过 `controller-state.schema.json` 校验的 `controller-state.json`。
 
+仓库中的 `main-beta-manifest.example.json` 展示八个主 Beta 服务的完整结构和当前接口注册形态。它包含明确的演示值，不能原样提交；实际使用前必须替换 Git 提交、构建版本、本机 Image ID 和时间，并按替换后的服务内容重新计算 `serviceSpecSha256`。需要把服务环境文件绑定进部署单时，再把 `runtimeConfigSha256` 从 `null` 改为该文件的 SHA-256；保留 `null` 表示控制器不校验这个摘要。
+
 部署单由调用方提交并在接受后保持不可变。全局状态只有控制器可以写，读取者不得把它当作路由表。写入使用同目录临时文件、文件落盘、原子替换和目录落盘；读取到损坏或无法解释的状态时停止自动操作并报告错误。
 
 两份 Schema 只检查单份 JSON 的结构。跨文件相等关系、部署代际摘要、服务摘要、公共处理期限和实例角色由控制器的合同校验器检查。Nacos 是服务自行注册形成的外部事实，不复制进控制器状态文件。
@@ -51,7 +53,7 @@ Beta 消费方同时订阅两路并使用 Dubbo 原生 `zone-aware` 集群。生
 
 Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因为所选 Beta registry 中缺少某个标签而返回外层重选生产 registry。因此，三级回落依赖一个运行约束：只要某服务还有任何泳道实例，Beta registry 中必须同时保留该服务的无标签主 Beta 实例。控制器在接受泳道部署前检查状态中对应主 Beta 服务已经有活动实例；泳道实例仍存在时拒绝删除对应主 Beta 服务。这项检查只能阻止状态中明显非法的拓扑，不能证明 Nacos 现场仍有可用的主 Beta。整个 Beta registry 对该服务都没有可用提供者时，`zone-aware` 才能选择生产路，真实回落关系必须通过组合验收确认。
 
-部署单含 `registration` 的服务表示它导出 Dubbo 提供者。控制器向这类服务进程注入以下提供者参数，由 Dubbo 自注册时带入 Nacos：
+部署单含 `registration` 的服务表示它导出 Dubbo 提供者。`dubboServiceKey` 使用 `<接口>` 或 `<服务分组>/<接口>`，接口后还可以追加 `:<版本>`；省略服务分组和版本时，两者都按空字符串处理。对应的 Nacos 服务名固定为 `providers:<接口>:<版本>:<服务分组>`，因此默认空分组和空版本的名称以两个冒号结尾。这个服务分组是 Dubbo 服务自身的分组，不是 Nacos 的 `alphafrog-beta` 注册分组。一个容器导出多个接口时，`dubboServiceKey` 选择其中一个代表接口供控制器判断候选就绪，其余接口仍由服务进程正常注册；控制器不会逐项探测。没有 `registration` 的入口或纯消费服务仍填写一个全局唯一、符合接口名称格式的逻辑键，控制器只用它核对主 Beta 与泳道服务清单，不会向 Nacos 查询这个键。控制器向提供者服务进程注入以下参数，由 Dubbo 自注册时带入 Nacos：
 
 - `alphafrog.deployment-id`
 - `alphafrog.deployment-generation-id`
@@ -129,6 +131,9 @@ Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因�
 - 使用镜像引用（本地 tag 或摘要）并核对本机 Image ID；
 - 注入部署标识、部署代际、泳道范围、发布标识和镜像摘要；
 - 注入 `OTEL_SERVICE_NAME` 与包含部署、泳道、版本、提交和本地 Image ID 的五字段 `OTEL_RESOURCE_ATTRIBUTES`；
+- 从控制器配置注入 OTLP HTTP 轨迹地址、协议和导出开关；生成 Compose 的 `environment` 对同名服务环境文件值具有更高优先级；
+- 为 Java 服务只读挂载一份宿主机上已经校验的 OpenTelemetry Java Agent，并把启动参数追加到服务专用 JVM 参数之后；非 Java 服务不挂载 Java Agent；
+- 为每个服务创建并挂载独立的 `<状态根目录>/data/logs/<serviceName>:/app/logs`，服务模板不得覆盖该目录或 Java Agent 的固定容器路径；
 - 所有 Beta frontend 实例都启用入口打标；泳道名只注入给非主 Beta 的泳道 frontend，主 Beta frontend 不注入泳道名，作为共用入口改读请求头指定的泳道名；
 - 使用显式且非空的宿主绑定地址、宿主端口、容器端口和 `SIGTERM`；控制器不限制绑定地址和可路由地址必须写成 IP 字面量；
 - 配置 Spring 与 Dubbo 的有序关闭期限；`agent-langchain-service` 使用 0 秒 Spring 后续等待和 5 秒 Dubbo 静态上限，应用代码不得在运行时改写这两个框架的生命周期对象；
