@@ -17,6 +17,7 @@ public class BetaControllerProperties {
     private Path apiTokenFile = Path.of("/etc/alphafrog-beta/secrets/controller-api-token");
     private Path healthcheckScript = Path.of("/opt/alphafrog-beta/bin/tcp-healthcheck");
     private final Nacos nacos = new Nacos();
+    private final Observability observability = new Observability();
     private Map<String, Machine> machines = new LinkedHashMap<>();
     private Map<String, ServiceTemplate> services = new LinkedHashMap<>();
 
@@ -35,6 +36,7 @@ public class BetaControllerProperties {
     public Path getHealthcheckScript() { return healthcheckScript; }
     public void setHealthcheckScript(Path healthcheckScript) { this.healthcheckScript = healthcheckScript; }
     public Nacos getNacos() { return nacos; }
+    public Observability getObservability() { return observability; }
     public Map<String, Machine> getMachines() { return machines; }
     public void setMachines(Map<String, Machine> machines) { this.machines = machines; }
     public Map<String, ServiceTemplate> getServices() { return services; }
@@ -55,10 +57,25 @@ public class BetaControllerProperties {
     public static class ServiceTemplate {
         private Path envFile;
         private List<String> volumes = List.of();
+        private boolean javaAgentEnabled = true;
+        private String javaToolOptions = "";
         public Path getEnvFile() { return envFile; }
         public void setEnvFile(Path envFile) { this.envFile = envFile; }
         public List<String> getVolumes() { return volumes; }
         public void setVolumes(List<String> volumes) { this.volumes = volumes; }
+        public boolean isJavaAgentEnabled() { return javaAgentEnabled; }
+        public void setJavaAgentEnabled(boolean javaAgentEnabled) { this.javaAgentEnabled = javaAgentEnabled; }
+        public String getJavaToolOptions() { return javaToolOptions; }
+        public void setJavaToolOptions(String javaToolOptions) { this.javaToolOptions = javaToolOptions; }
+    }
+
+    public static class Observability {
+        private URI tracesEndpoint;
+        private Path javaAgentJar = Path.of("/opt/alphafrog-beta/otel/opentelemetry-javaagent.jar");
+        public URI getTracesEndpoint() { return tracesEndpoint; }
+        public void setTracesEndpoint(URI tracesEndpoint) { this.tracesEndpoint = tracesEndpoint; }
+        public Path getJavaAgentJar() { return javaAgentJar; }
+        public void setJavaAgentJar(Path javaAgentJar) { this.javaAgentJar = javaAgentJar; }
     }
 
     public static class Nacos {

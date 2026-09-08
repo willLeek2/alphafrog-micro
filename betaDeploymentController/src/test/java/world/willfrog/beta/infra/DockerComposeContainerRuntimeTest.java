@@ -37,11 +37,15 @@ class DockerComposeContainerRuntimeTest {
         mapper = new ObjectMapper();
         properties = new BetaControllerProperties();
         properties.getNacos().setServerAddress("nacos.internal:8848");
+        properties.getObservability().setTracesEndpoint(URI.create("http://jaeger.internal:4318"));
         properties.setStateRoot(temporary.resolve("state"));
         Path health = temporary.resolve("tcp-healthcheck");
         Files.writeString(health, "#!/bin/sh\nexit 0\n");
         health.toFile().setExecutable(true, true);
         properties.setHealthcheckScript(health);
+        Path javaAgent = temporary.resolve("opentelemetry-javaagent.jar");
+        Files.writeString(javaAgent, "test java agent");
+        properties.getObservability().setJavaAgentJar(javaAgent);
         Path environment = temporary.resolve("agent-service.env");
         Files.writeString(environment, "SERVER_PORT=18080\n");
         try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
@@ -83,6 +87,7 @@ class DockerComposeContainerRuntimeTest {
         assertEquals(28080, created.hostPort());
         Path compose = temporary.resolve("state/compose/i-one.json");
         String content = Files.readString(compose);
+        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
         JsonNode effectiveRouting = mapper.readTree(mapper.readTree(content)
                 .path("services").path("app").path("environment").path("SPRING_APPLICATION_JSON").asText());
         assertFalse(content.contains("RETIREMENT_TOKEN"));
@@ -92,6 +97,13 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS"));
         assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS"));
         assertTrue(content.contains("OTEL_SERVICE_NAME"));
+        assertEquals("http://jaeger.internal:4318",
+                environmentNode.path("OTEL_EXPORTER_OTLP_ENDPOINT").asText());
+        assertEquals("http/protobuf", environmentNode.path("OTEL_EXPORTER_OTLP_PROTOCOL").asText());
+        assertEquals("otlp", environmentNode.path("OTEL_TRACES_EXPORTER").asText());
+        assertEquals("none", environmentNode.path("OTEL_METRICS_EXPORTER").asText());
+        assertEquals("none", environmentNode.path("OTEL_LOGS_EXPORTER").asText());
+        assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
         assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));
@@ -107,7 +119,6 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("zone-aware", effectiveRouting.path("dubbo").path("consumer").path("cluster").asText());
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
-        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
         assertEquals("10.0.0.8", environmentNode.path("DUBBO_IP_TO_REGISTRY").asText());
         assertEquals("28080", environmentNode.path("DUBBO_PORT_TO_REGISTRY").asText());
         assertFalse(environmentNode.has("AF_DUBBO_PORT_TO_REGISTRY"));
@@ -124,6 +135,11 @@ class DockerComposeContainerRuntimeTest {
                 "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
         assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
         assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+        JsonNode volumes = mapper.readTree(content).path("services").path("app").path("volumes");
+        assertTrue(containsVolume(volumes, properties.getObservability().getJavaAgentJar()
+                + ":/otel/javaagent.jar:ro"));
+        assertTrue(containsVolume(volumes, temporary.resolve("state/data/logs/agent-service") + ":/app/logs"));
+        assertTrue(Files.isDirectory(temporary.resolve("state/data/logs/agent-service")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
         assertFalse(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
@@ -160,6 +176,73 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("beta-bind.example.internal", app.path("ports").path(0).path("host_ip").asText());
         assertEquals("beta-route.example.internal",
                 app.path("environment").path("DUBBO_IP_TO_REGISTRY").asText());
+    }
+
+    @Test
+    void controllerManagedObservabilityOverridesEnvFileValuesAndPreservesConfiguredJvmOptions() throws Exception {
+        Path environment = properties.getServices().get("agent-service").getEnvFile();
+        Files.writeString(environment, """
+                OTEL_EXPORTER_OTLP_ENDPOINT=http://wrong.example:4318
+                OTEL_TRACES_EXPORTER=none
+                JAVA_TOOL_OPTIONS=-Xmx16m
+                """);
+        BetaControllerProperties.ServiceTemplate template = properties.getServices().get("agent-service");
+        template.setJavaToolOptions("-Xms256m -Xmx512m");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode app = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app");
+        assertEquals("http://jaeger.internal:4318",
+                app.path("environment").path("OTEL_EXPORTER_OTLP_ENDPOINT").asText());
+        assertEquals("otlp", app.path("environment").path("OTEL_TRACES_EXPORTER").asText());
+        assertEquals("-Xms256m -Xmx512m -javaagent:/otel/javaagent.jar",
+                app.path("environment").path("JAVA_TOOL_OPTIONS").asText());
+    }
+
+    @Test
+    void nonJvmServiceStillGetsExporterAndLogSettingsWithoutAJavaAgent() throws Exception {
+        BetaControllerProperties.ServiceTemplate template = properties.getServices().get("agent-service");
+        template.setJavaAgentEnabled(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode app = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app");
+        assertEquals("otlp", app.path("environment").path("OTEL_TRACES_EXPORTER").asText());
+        assertFalse(app.path("environment").has("JAVA_TOOL_OPTIONS"));
+        assertFalse(containsTarget(app.path("volumes"), "/otel/javaagent.jar"));
+        assertTrue(containsTarget(app.path("volumes"), "/app/logs"));
+    }
+
+    @Test
+    void refusesMissingOrConflictingControllerManagedObservabilitySettings() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        properties.getObservability().setTracesEndpoint(null);
+        assertEquals("OBSERVABILITY_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        properties.getObservability().setTracesEndpoint(URI.create("http://jaeger.internal:4318"));
+        BetaControllerProperties.ServiceTemplate template = properties.getServices().get("agent-service");
+        template.setVolumes(List.of("/tmp/custom:/app/logs"));
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        template.setVolumes(List.of());
+        template.setJavaToolOptions("-javaagent:/tmp/other.jar");
+        assertEquals("OBSERVABILITY_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        template.setJavaToolOptions("");
+        Files.delete(properties.getObservability().getJavaAgentJar());
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
     }
 
     @Test
@@ -405,5 +488,19 @@ class DockerComposeContainerRuntimeTest {
                     serviceName, "i-one", service.path("releaseId").asText(), plan.generationId(), plan.hostPort(),
                     service.path("runtime").path("containerPort").asInt(), plan.hostPort());
         }
+    }
+
+    private static boolean containsVolume(JsonNode volumes, String expected) {
+        for (JsonNode volume : volumes) {
+            if (expected.equals(volume.asText())) return true;
+        }
+        return false;
+    }
+
+    private static boolean containsTarget(JsonNode volumes, String target) {
+        for (JsonNode volume : volumes) {
+            if (volume.asText().contains(':' + target)) return true;
+        }
+        return false;
     }
 }

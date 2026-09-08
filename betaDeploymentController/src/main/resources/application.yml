@@ -32,3 +32,6 @@ alphafrog:
       namespace: ${AF_CONFIG_NACOS_NAMESPACE:public}
       username: ${AF_CONFIG_NACOS_USERNAME:}
       password: ${AF_CONFIG_NACOS_PASSWORD:}
+    observability:
+      traces-endpoint: ${AF_OTEL_TRACES_ENDPOINT:}
+      java-agent-jar: ${AF_BETA_OTEL_JAVAAGENT_JAR:/opt/alphafrog-beta/otel/opentelemetry-javaagent.jar}

@@ -1,0 +1,49 @@
+alphafrog:
+  beta-controller:
+    machines:
+      beta-machine-1:
+        docker-host: unix:///var/run/docker.sock
+        # 两项地址都要替换为 Beta 机器实际使用的地址或可解析名称。
+        bind-ip: BETA_BIND_ADDRESS
+        routable-address: BETA_ROUTABLE_ADDRESS
+    services:
+      domestic-stock-service:
+        env-file: /etc/alphafrog-beta/services/domestic-stock-service.env
+      domestic-fetch-service:
+        env-file: /etc/alphafrog-beta/services/domestic-fetch-service.env
+        volumes:
+          - /var/lib/alphafrog-beta/data/domestic-fetch-configs:/app/config-dynamic
+      admin-service:
+        env-file: /etc/alphafrog-beta/services/admin-service.env
+      portfolio-service:
+        env-file: /etc/alphafrog-beta/services/portfolio-service.env
+      agent-service:
+        env-file: /etc/alphafrog-beta/services/agent-service.env
+        java-tool-options: -Xms512m -Xmx1g
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent_datasets:/data/agent_datasets
+          - /var/lib/alphafrog-beta/data/database_fetched:/data/database_fetched
+          - /var/lib/alphafrog-beta/data/manifests:/data/manifests
+          - /var/lib/alphafrog-beta/data/agent_artifacts:/data/agent_artifacts
+          - /var/lib/alphafrog-beta/data/agent_workspaces:/data/agent_workspaces
+          - /var/lib/alphafrog-beta/data/agent-configs:/app/config-dynamic
+      python-sandbox-service:
+        env-file: /etc/alphafrog-beta/services/python-sandbox-service.env
+        java-agent-enabled: false
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent_datasets:/data/agent_datasets
+          - /var/lib/alphafrog-beta/data/database_fetched:/data/database_fetched
+          - /var/lib/alphafrog-beta/data/manifests:/data/manifests
+          - /var/lib/alphafrog-beta/data/agent_artifacts:/data/agent_artifacts
+          - /var/lib/alphafrog-beta/data/sandbox_tasks:/data/sandbox_tasks
+          - /var/run/docker.sock:/var/run/docker.sock
+      python-sandbox-gateway-service:
+        env-file: /etc/alphafrog-beta/services/python-sandbox-gateway-service.env
+        java-tool-options: -Xms256m -Xmx256m
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent-debug-observability:/app/logs/agent-debug-observability
+      frontend:
+        env-file: /etc/alphafrog-beta/services/frontend.env
+        java-tool-options: -Xms384m -Xmx512m
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent-debug-observability:/app/logs/agent-debug-observability

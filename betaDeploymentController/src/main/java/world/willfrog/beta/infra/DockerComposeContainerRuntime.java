@@ -8,9 +8,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.time.Duration;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +42,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (properties.getMachines().isEmpty() || properties.getMachines().size() > 8)
             throw new ControllerException("MACHINE_CONFIG_INVALID", "Between one and eight Beta machines must be configured");
         requireSafeRegularFile(properties.getHealthcheckScript(), true, "Health-check script");
+        requireTracesEndpoint();
         for (JsonNode service : manifest.path("services")) {
             String machineId = service.path("machineId").asText();
             BetaControllerProperties.Machine machine = machine(machineId);
@@ -61,6 +62,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                     || value.indexOf('\0') >= 0 || value.contains("\n") || value.contains("\r")))
                 throw new ControllerException("SERVICE_CONFIG_INVALID", "Service volume configuration is invalid");
             template.getVolumes().forEach(environmentFiles::rejectProductionDotenvVolume);
+            if (template.getVolumes().stream().anyMatch(this::usesControllerManagedMount))
+                throw new ControllerException("SERVICE_CONFIG_INVALID",
+                        "Service volumes must not replace controller-managed observability mounts");
+            validateJavaAgent(template);
+            prepareLogDirectory(serviceName);
         }
     }
 
@@ -79,6 +85,10 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (template == null || template.getEnvFile() == null)
             throw new ControllerException("SERVICE_CONFIG_MISSING", "Service environment file is not configured");
         environmentFiles.requireDedicatedFile(template.getEnvFile());
+        if (template.getVolumes().stream().anyMatch(this::usesControllerManagedMount))
+            throw new ControllerException("SERVICE_CONFIG_INVALID",
+                    "Service volumes must not replace controller-managed observability mounts");
+        validateJavaAgent(template);
         Path compose = writeCompose(manifest, service, plan, name, machine);
         Map<String, String> environment = Map.of();
         commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
@@ -177,6 +187,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AF_IMAGE_DIGEST", localImageId);
         environment.put("OTEL_SERVICE_NAME", service.path("serviceName").asText());
         environment.put("OTEL_RESOURCE_ATTRIBUTES", otelResourceAttributes(manifest, service, plan, localImageId));
+        environment.put("OTEL_EXPORTER_OTLP_ENDPOINT", requireTracesEndpoint());
+        environment.put("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
+        environment.put("OTEL_TRACES_EXPORTER", "otlp");
+        environment.put("OTEL_METRICS_EXPORTER", "none");
+        environment.put("OTEL_LOGS_EXPORTER", "none");
         if ("frontend".equals(service.path("serviceName").asText())) {
             // 所有 Beta frontend 都开入口：主 Beta frontend 是共用入口，靠请求头指定泳道；
             // 泳道名只注入给非 main-beta 的泳道 frontend，从该口进来的流量一律打本部署的标。
@@ -232,7 +247,16 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         port.put("mode", "host");
         ArrayNode volumes = app.putArray("volumes");
         volumes.add(properties.getHealthcheckScript().toString() + ':' + properties.getHealthcheckScript() + ":ro");
-        if (template != null) template.getVolumes().forEach(volumes::add);
+        if (template != null) {
+            if (template.isJavaAgentEnabled()) {
+                String javaAgentContainerPath = "/otel/javaagent.jar";
+                environment.put("JAVA_TOOL_OPTIONS", javaToolOptions(template, javaAgentContainerPath));
+                volumes.add(properties.getObservability().getJavaAgentJar().toString()
+                        + ':' + javaAgentContainerPath + ":ro");
+            }
+            volumes.add(prepareLogDirectory(service.path("serviceName").asText()) + ":/app/logs");
+            template.getVolumes().forEach(volumes::add);
+        }
         ObjectNode health = app.putObject("healthcheck");
         health.putArray("test").add("CMD").add(properties.getHealthcheckScript().toString())
                 .add("127.0.0.1").add(Integer.toString(service.path("runtime").path("containerPort").asInt()));
@@ -335,6 +359,75 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 + ",service.version=" + service.path("releaseId").asText()
                 + ",git.commit=" + manifest.path("gitCommit").asText()
                 + ",image.digest=" + localImageId;
+    }
+
+    private String requireTracesEndpoint() {
+        java.net.URI endpoint = properties.getObservability().getTracesEndpoint();
+        if (endpoint == null || !endpoint.isAbsolute() || endpoint.getHost() == null
+                || !("http".equals(endpoint.getScheme()) || "https".equals(endpoint.getScheme()))
+                || endpoint.getUserInfo() != null || endpoint.getFragment() != null) {
+            throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
+                    "OpenTelemetry traces endpoint must be an absolute HTTP or HTTPS URL");
+        }
+        return endpoint.toString();
+    }
+
+    private void validateJavaAgent(BetaControllerProperties.ServiceTemplate template) {
+        String options = template.getJavaToolOptions();
+        if (options == null || options.indexOf('\0') >= 0 || options.contains("\n") || options.contains("\r")) {
+            throw new ControllerException("OBSERVABILITY_CONFIG_INVALID", "Java tool options are invalid");
+        }
+        if (!template.isJavaAgentEnabled()) {
+            if (!options.isBlank()) {
+                throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
+                        "Java tool options require the Java Agent to be enabled");
+            }
+            return;
+        }
+        if (options.contains("-javaagent:")) {
+            throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
+                    "Java tool options must not configure a second Java Agent");
+        }
+        requireSafeRegularFile(properties.getObservability().getJavaAgentJar(), false, "OpenTelemetry Java Agent");
+    }
+
+    private String javaToolOptions(BetaControllerProperties.ServiceTemplate template, String javaAgentContainerPath) {
+        String configured = template.getJavaToolOptions().strip();
+        String javaAgent = "-javaagent:" + javaAgentContainerPath;
+        return configured.isEmpty() ? javaAgent : configured + ' ' + javaAgent;
+    }
+
+    private boolean usesControllerManagedMount(String volume) {
+        String normalized = volume.replace(" ", "");
+        return normalized.matches(".*:/app/logs(?::(?:ro|rw))?$")
+                || normalized.matches(".*:/otel/javaagent\\.jar(?::(?:ro|rw))?$");
+    }
+
+    private Path prepareLogDirectory(String serviceName) {
+        Path stateRoot = properties.getStateRoot().toAbsolutePath().normalize();
+        Path dataRoot = stateRoot.resolve("data");
+        Path logRoot = dataRoot.resolve("logs");
+        Path serviceLog = logRoot.resolve(serviceName).normalize();
+        if (!serviceLog.startsWith(logRoot)) {
+            throw new ControllerException("OBSERVABILITY_CONFIG_INVALID", "Service log path escapes the state root");
+        }
+        try {
+            for (Path path : List.of(stateRoot, dataRoot, logRoot, serviceLog)) {
+                if (Files.isSymbolicLink(path)) {
+                    throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
+                            "Service log path must not contain a symbolic link");
+                }
+            }
+            Files.createDirectories(serviceLog);
+            if (Files.isSymbolicLink(serviceLog)) {
+                throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
+                        "Service log path must not be a symbolic link");
+            }
+            return serviceLog;
+        } catch (IOException exception) {
+            throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
+                    "Unable to prepare the service log directory", exception);
+        }
     }
 
     private List<String> docker(String machineId, String... args) {
