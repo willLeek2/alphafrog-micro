@@ -158,6 +158,19 @@ try {
   ajv(stateSchema, state, true, 'state-valid');
   assert(relationErrors(manifest, state).length === 0, 'valid manifest and state must agree');
 
+  const localTagManifest = clone(manifest);
+  localTagManifest.services[0].image.repositoryDigest = 'agent-langchain-service:local';
+  localTagManifest.services[0].serviceSpecSha256 = serviceDigest(localTagManifest.services[0]);
+  ajv(manifestSchema, localTagManifest, true, 'manifest-local-image-tag-valid');
+
+  const missingLocalTag = clone(manifest);
+  missingLocalTag.services[0].image.repositoryDigest = 'agent-langchain-service';
+  ajv(manifestSchema, missingLocalTag, false, 'manifest-local-image-tag-required');
+
+  const emptyLocalTag = clone(manifest);
+  emptyLocalTag.services[0].image.repositoryDigest = 'agent-langchain-service:';
+  ajv(manifestSchema, emptyLocalTag, false, 'manifest-empty-local-image-tag-rejected');
+
   const oldRetirement = clone(manifest);
   oldRetirement.services[0].runtime.preStopPolicy = 'AGENT_RETIRE_GENERATION_V1';
   ajv(manifestSchema, oldRetirement, false, 'manifest-retirement-policy-rejected');

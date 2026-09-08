@@ -36,8 +36,9 @@
 ### 2.1 部署代际算法
 
 部署代际由部署单版本 `manifestVersion`、40 位小写十六进制 Git 提交标识 `gitCommit`，以及
-部署单中全部服务的不可变镜像引用共同计算。镜像引用格式为
-`<repository>@sha256:<64 位小写十六进制字符>`。
+部署单中全部服务的镜像引用共同计算。镜像引用可以是 Beta 机器上已存在镜像的
+`name:tag`，也可以是 `<repository>@sha256:<64 位小写十六进制字符>`。这个引用字符串只参与代际计算；
+部署控制器仍必须将部署单中的 `localImageId` 与本机实际 Image ID 精确比较，不能用镜像引用替代这项核对。
 
 服务先按 `serviceName` 的 ASCII 字符升序排列，再用 UTF-8 拼接下面的字节串。`\n` 是一个
 换行字节，`\0` 是一个零字节。
@@ -46,7 +47,7 @@
 alphafrog-deployment-generation-v1\n
 manifest-version:<manifestVersion>\n
 git-commit:<gitCommit>\n
-service:<serviceName>\0<immutableImageReference>\n
+service:<serviceName>\0<imageReference>\n
 ```
 
 对完整字节串计算 SHA-256，在 64 位小写十六进制结果前加 `gen-`。公共 Java 实现是

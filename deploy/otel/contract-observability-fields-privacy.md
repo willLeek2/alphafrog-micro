@@ -26,7 +26,7 @@
 | `lane.tag` | 观测中的流量范围。泳道实例取泳道名；主 Beta 取 `main-beta`，但该值只用于观测，不会成为 Dubbo 静态路由标签。 | 固定字符串 `stable` | Beta 部署单的 `trafficScopeId`，可以是 `main-beta` 或具体泳道名 | 同上。值来自可信部署配置，不来自客户端请求头。 | 同一验收面。稳定、主 Beta 与各泳道 trace 可以分开过滤。 |
 | `service.version` | 构建该镜像时写入的服务版本字符串。 | 构建/部署流水线注入的 `AF_BUILD_VERSION` | 控制器按本次构建产物写入，与部署单记录一致 | 稳定：部署环境文件提供 `AF_BUILD_VERSION`。beta：控制器写 override。compose 里允许 `${AF_BUILD_VERSION:-local}` 只给本机起容器。 | 与部署单记录的版本字节相等。生产与 beta 预检拒绝值为 `local` 或空。 |
 | `git.commit` | 构建该镜像所用的完整 Git 提交对象 ID。 | 流水线注入的 `AF_BUILD_COMMIT` | 同上，与部署单记录一致 | 同上，变量名 `AF_BUILD_COMMIT`。 | 与部署单记录的提交字节相等。当前仓库是 SHA-1，值为 40 位小写十六进制。禁止短 hash。生产与 beta 预检拒绝值为 `unknown` 或空。 |
-| `image.digest` | **该服务容器实际使用的本地 Image ID**（见 §2.4 两列，不是仓库清单摘要）。 | 该服务自己的 `AF_BUILD_IMAGE_ID_*`（§2.1 表） | 控制器在镜像已经在本机、容器启动之前，读取该服务镜像的 `docker inspect .Id` 写入 override | 稳定：构建/部署脚本在镜像构建或拉取完成之后、允许启动之前，逐服务读取并写入对应变量。beta：部署控制器对选定服务做同样的事。禁止 11 个服务共用一个进程级变量。 | 与**该容器** `docker inspect --format '{{.Image}}'` 的值精确相等。禁止只核对前缀，禁止拿部署单里的 `repository@sha256:...` 仓库摘要来充数。生产与 beta 预检拒绝值为 `unknown` 或空。 |
+| `image.digest` | **该服务容器实际使用的本地 Image ID**（见 §2.4 两列，不是部署单镜像引用）。 | 该服务自己的 `AF_BUILD_IMAGE_ID_*`（§2.1 表） | 控制器在镜像已经在本机、容器启动之前，读取该服务镜像的 `docker inspect .Id` 写入 override | 稳定：构建/部署脚本在镜像构建或拉取完成之后、允许启动之前，逐服务读取并写入对应变量。beta：部署控制器对选定服务做同样的事。禁止 11 个服务共用一个进程级变量。 | 与**该容器** `docker inspect --format '{{.Image}}'` 的值精确相等。禁止只核对前缀，禁止拿部署单里的本地 `name:tag` 或仓库摘要引用来充数。生产与 beta 预检拒绝值为 `unknown` 或空。 |
 
 硬性规则：
 
@@ -82,7 +82,7 @@ OTEL_RESOURCE_ATTRIBUTES: "deployment.id=<deployment-id>,lane.tag=<泳道值>,se
 AF_DEPLOYMENT_ID: "<deployment-id>"
 ```
 
-`<deployment-id>` 与 `AF_DEPLOYMENT_ID`、部署单 id 必须是同一字符串。部署单另存「不可变镜像引用」（见 §2.4 左列），不要把那一列抄进 `image.digest`。
+`<deployment-id>` 与 `AF_DEPLOYMENT_ID`、部署单 id 必须是同一字符串。部署单另存「镜像引用」（见 §2.4 左列），不要把那一列抄进 `image.digest`。
 
 ### 2.3 部署预检（稳定侧由脚本检查，Beta 侧由部署控制器检查）
 
@@ -101,11 +101,11 @@ AF_DEPLOYMENT_ID: "<deployment-id>"
 
 ### 2.4 镜像身份必须分成两列（不要混用）
 
-仓库清单摘要和容器本地 Image ID 都长得像 `sha256:` + 64 位十六进制，但它们是两个对象。一次 `docker pull repository@sha256:...` 之后，本地 Image ID 仍可能与清单摘要不同。
+部署单的镜像引用和容器本地 Image ID 是两个对象。仓库摘要引用可能包含 `sha256:` + 64 位十六进制，本地 Image ID 也使用这个摘要形式，但两者的含义不同。一次 `docker pull repository@sha256:...` 之后，本地 Image ID 仍可能与清单摘要不同；部署单也可以使用 Beta 机器上已存在镜像的 `name:tag`。
 
 | 列 | 存在哪 | 值从哪来 | 谁用来做什么 |
 |----|--------|----------|--------------|
-| 不可变镜像引用（含仓库清单摘要） | 部署单 / 专用部署 Compose 的 `image:` | `repository@sha256:<64位小写十六进制>` | 部署控制器按摘要拉取、config 精确比较、禁止按 tag 起容器 |
+| 部署单镜像引用 | 部署单 / 专用部署 Compose 的 `image:` | Beta 机器上已存在镜像的 `name:tag`，或 `repository@sha256:<64位小写十六进制>` | 部署控制器用该引用找到本机镜像，并将其 `docker inspect .Id` 与部署单的 `localImageId` 精确比较后才启动容器 |
 | 容器实际 Image ID | span 资源属性 `image.digest`；环境变量 `AF_BUILD_IMAGE_ID_*` | `docker inspect` 的 `.Id`（对镜像）或容器的 `.Image`。格式同样是 `sha256:` + 64 位小写十六进制，**不含**仓库名、**不含** `@` | 观测验收、启动预检。只和该容器实际 Image ID 比 |
 
 把左列填进 `image.digest` 会让单服务试点和泳道端到端验收的「与容器实际 Image ID 精确相等」整批失败，也会让服务镜像身份失真。稳定侧由 `docker-compose.yml`、`deploy/otel/prepare-runtime-env.sh` 与 `deploy/otel/verify-static-contract.py` 共同生成和检查；Beta 侧由部署控制器生成和检查。两侧生成资源属性时都只读右列。
@@ -245,7 +245,7 @@ VictoriaLogs 的删除 HTTP 接口（`POST /delete/run_task` 等）默认应保�
 下面列出本合同负责的检查。Java Agent 是否加载、跨服务 span 是否连接，还要在真实服务环境验证。
 
 1. 稳定实例任取一条带请求上下文的 trace：五个资源属性都在；`deployment.id=stable`；`lane.tag=stable`；`service.version` / `git.commit` 不是 `local` / `unknown`（生产与 beta 环境）；`image.digest` 等于**该容器**的 `inspect .Image`，且来自该服务自己的 `AF_BUILD_IMAGE_ID_*`，不是共用变量、不是部署单仓库摘要。
-2. beta 实例一条 trace：五个资源属性都在；`deployment.id` / `lane.tag` / `service.version` / `git.commit` 与本次部署单一致；`image.digest` 与**该容器**实际 Image ID 精确相等，不等于部署单里的 `repository@sha256:...` 仓库摘要。
+2. beta 实例一条 trace：五个资源属性都在；`deployment.id` / `lane.tag` / `service.version` / `git.commit` 与本次部署单一致；`image.digest` 与**该容器**实际 Image ID 精确相等，不能用部署单里的本地 `name:tag` 或仓库摘要引用替代。
 3. 同一条请求：VictoriaLogs 按 `trace_id` 查到的日志行，`deployment` 字段等于该 trace 的 `deployment.id`。
 4. 同一服务的 stable 与 beta 日志能按 `deployment` 分别查出，值不同。
 5. 采集器配置里找不到用进程级变量覆盖 `deployment` 的 `add` / `replace`。

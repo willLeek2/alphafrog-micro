@@ -130,6 +130,35 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void createsFromALocalTagWhenItsImageIdMatchesTheManifest() throws Exception {
+        ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        assertEquals("agent-langchain-service:local", compose.path("services").path("app").path("image").asText());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("image")
+                && command.contains("inspect") && command.contains("agent-langchain-service:local")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void refusesALocalTagWhenItsImageIdDiffersFromTheManifest() {
+        ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
+        FakeCommands commands = new FakeCommands(false);
+        commands.imageInspectId = "sha256:" + "c".repeat(64);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.create(manifest, service, plan));
+
+        assertEquals("IMAGE_ID_MISMATCH", failure.code());
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
+    }
+
+    @Test
     void everyBetaFrontendEnablesEntryWhileOnlyLanesInjectTheirScopeTag() throws Exception {
         ObjectNode frontend = (ObjectNode) service;
         frontend.put("serviceName", "frontend");
@@ -297,6 +326,7 @@ class DockerComposeContainerRuntimeTest {
         private final List<List<String>> commands = new ArrayList<>();
         private boolean failComposeValidation;
         private boolean returnOnlyObservedFields;
+        private String imageInspectId = "sha256:" + "b".repeat(64);
 
         private FakeCommands(boolean startsPresent) {
             this.startsPresent = startsPresent;
@@ -307,7 +337,7 @@ class DockerComposeContainerRuntimeTest {
             commands.add(List.copyOf(arguments));
             if (arguments.contains("info")) return "27.0.0\n";
             if (arguments.contains("inspect") && arguments.contains("image"))
-                return "sha256:" + "b".repeat(64) + "\n";
+                return imageInspectId + "\n";
             if (arguments.contains("inspect")) {
                 inspectCalls++;
                 if (!startsPresent && inspectCalls == 1)

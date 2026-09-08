@@ -21,7 +21,7 @@ Beta 控制器负责把部署单变成服务实例。候选容器健康后，控
 - `deploymentId`：测试部署标识，不能使用稳定环境保留值 `stable`。
 - `trafficScopeId`：`main-beta` 或一个泳道名称；不能使用稳定环境保留值 `stable`。
 - `manifestVersion`、完整 Git 提交和部署所有者。
-- 每个服务的不可变镜像摘要、本机 Image ID、机器、双宿主端口、健康检查和统一处理期限。导出 Dubbo 提供者的服务还要保存 Dubbo 应用名和 Nacos 注册键；frontend 等入口或纯消费服务省略 `registration` 字段。
+- 每个服务的镜像引用（本地 `name:tag` 或 `repository@sha256:...` 摘要）、本机 Image ID、机器、双宿主端口、健康检查和统一处理期限。导出 Dubbo 提供者的服务还要保存 Dubbo 应用名和 Nacos 注册键；frontend 等入口或纯消费服务省略 `registration` 字段。
 
 控制器配置 `applicationDrainSeconds` 是这一台控制器管理的所有主 Beta 与泳道服务共同使用的处理期限，默认 60 秒且不得小于 6 秒。每份部署单中全部服务的 `applicationDrainSeconds` 与 `drainGraceSeconds` 都必须等于这个配置值。Agent 在总期限中固定保留最后 5 秒用于失败记录持久化和进程退出，其余时间是自然处理窗口；控制器把相同总期限交给 Docker 作为强制停止边界。这样多个部署单不能各自延长或缩短停止窗口，也不会出现自然处理窗口为零的配置。
 
@@ -126,7 +126,7 @@ Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因�
 
 控制器生成的 Compose 配置必须：
 
-- 使用不可变镜像引用并核对本机 Image ID；
+- 使用镜像引用（本地 tag 或摘要）并核对本机 Image ID；
 - 注入部署标识、部署代际、泳道范围、发布标识和镜像摘要；
 - 注入 `OTEL_SERVICE_NAME` 与包含部署、泳道、版本、提交和本地 Image ID 的五字段 `OTEL_RESOURCE_ATTRIBUTES`；
 - 所有 Beta frontend 实例都启用入口打标；泳道名只注入给非主 Beta 的泳道 frontend，主 Beta frontend 不注入泳道名，作为共用入口改读请求头指定的泳道名；
