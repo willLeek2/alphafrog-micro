@@ -14,7 +14,7 @@ mvn -pl betaDeploymentController -am install
 
 - 把 `betaDeploymentController/bin/tcp-healthcheck` 安装为 `/opt/alphafrog-beta/bin/tcp-healthcheck`，属主为运行账号，权限为 `0755`。
 - 运行 `deploy/otel/fetch-javaagent.sh` 和 `deploy/otel/verify-javaagent.sh`，再把校验通过的 `deploy/otel/opentelemetry-javaagent.jar` 安装为 `/opt/alphafrog-beta/otel/opentelemetry-javaagent.jar`，权限为 `0444`。
-- 把 `deploy/beta/controller.service` 安装为 `/etc/systemd/system/alphafrog-beta-controller.service`。
+- 把 `deploy/beta/alphafrog-beta-controller.service` 安装为 `/etc/systemd/system/alphafrog-beta-controller.service`。
 - 把 `deploy/beta/controller.env.example` 和 `deploy/beta/controller.yml.example` 分别复制为 `/etc/alphafrog-beta/controller.env` 和 `/etc/alphafrog-beta/controller.yml`，替换其中的地址占位值。
 
 安装前创建不允许登录的 `alphafrog-beta` 系统账号，以及控制器需要的目录。`/opt/alphafrog-beta/controller`、`/opt/alphafrog-beta/bin` 和 `/opt/alphafrog-beta/otel` 由该账号读取；`/etc/alphafrog-beta` 及其 `services`、`secrets` 子目录只允许 `root` 和该账号读取。systemd 会以 `0700` 创建 `/var/lib/alphafrog-beta`，控制器再在其中保存状态、Compose 文件和日志目录。目标机器使用的 Docker socket 如果不属于 `docker` 组，还要把单元文件中的 `SupplementaryGroups` 改为实际组名。
