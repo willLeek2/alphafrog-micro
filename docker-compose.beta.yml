@@ -1,8 +1,19 @@
 # Beta 测试机器专用 compose。生产机（101）继续用 docker-compose.yml。
 #
-# 这台机器上只跑两个基础设施容器：
+# 隔离原则：beta 上拉起的实例只连 beta 本地的业务依赖（PG、redis、rabbitmq、
+# meili、qdrant）；共用生产的只有三类——Nacos/Dubbo（泳道路由与回落）、jaeger
+# （trace，服务直发）、victorialogs（log，经本地 collector 转发）。
+#
+# 这台机器上跑的基础设施容器：
 #   - redis / rabbitmq：给部署单拉起的业务容器用（地址走各服务环境文件，
 #     指向本机可路由地址的 6379/5672）。
+#   - meilisearch（低配额）：beta 的 domestic-stock 连它（保持默认开启、
+#     auto-sync 开，从 beta PG 同步，不碰生产索引）。
+#   - qdrant（低配额）：现阶段没有 beta 服务连它，先备着；将来把
+#     index/fund/listed-asset/external-info 四个回落服务拉到 beta 测新功能时
+#     直接连本地。
+#   - otel-collector：采 beta 本地日志文件转发生产 victorialogs（导出地址经
+#     AF_OTEL_VICTORIALOGS_ENDPOINT 指生产机，值在 .env，本文件不写 IP）。
 #
 # 不在这里出现的，以及为什么：
 #   - nacos：不本地起，业务容器注册到生产 Nacos（控制器配置
@@ -10,15 +21,11 @@
 #     本文件与 .env 均不写 IP）。生产 Nacos 需发布 8848+9848 并对 Beta 放行。
 #   - postgres：用宿主机已有的 PG，容器经 host.docker.internal 访问；
 #     宿主 PG 需要 listen_addresses 覆盖 docker 网段，pg_hba 放行 172.16.0.0/12。
-#   - meilisearch / qdrant：Beta 不部署。回落到生产的四个服务
-#     （index/fund/listed-asset/external-info）跑在生产机上，用生产本地的
-#     meili/qdrant；Beta 上跑的 domestic-stock-service 通过
-#     ADVANCED_MEILI_ENABLED=false 关闭搜索与自动同步。
 #   - 业务服务（frontend/agent/admin/portfolio/stock/fetch/沙箱两件套）：
 #     由 betaDeploymentController 按部署单拉起，控制器本身也是宿主机进程
-#     （见 betaDeploymentController/README.md），不进本文件。
-#   - otel-collector：Beta 服务可把 trace 直接发生产 collector
-#     （各服务环境文件里 AF_OTEL_TRACES_ENDPOINT=http://<生产机私网IP>:4318）。
+#     （运行方式见 deploy/beta/），不进本文件。
+#   - trace 不经 collector：服务环境文件直设
+#     AF_OTEL_TRACES_ENDPOINT=http://<生产机私网IP>:4318 发生产 jaeger。
 services:
   redis:
     image: redis:7-alpine
@@ -65,6 +72,75 @@ services:
       timeout: 5s
       retries: 5
 
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    container_name: alphafrog-beta-meilisearch
+    environment:
+      MEILI_MASTER_KEY: ${AF_MEILI_API_KEY:-alphafrog_search_key}
+      MEILI_HTTP_ADDR: 0.0.0.0:7700
+      # 与生产同套低内存开关；MAX_INDEXING_MEMORY 必须小于容器限额，
+      # 否则全量同步会顶破 256M 被 OOM kill
+      MEILI_MAX_INDEXING_MEMORY: 100Mb
+      MEILI_MAX_INDEXING_THREADS: 1
+      MEILI_EXPERIMENTAL_REDUCE_INDEXING_MEMORY_USAGE: "true"
+      MEILI_EXPERIMENTAL_SEARCH_QUEUE_SIZE: 100
+    ports:
+      - "7700:7700"
+    volumes:
+      - alphafrog_beta_meilidata:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.0
+    container_name: alphafrog-beta-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - alphafrog_beta_qdrantdata:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.159.0
+    container_name: alphafrog-beta-otel-collector
+    # 与生产一致：容器 root 读取宿主机日志目录的绑定挂载
+    user: "0:0"
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      # beta 没有本地 victorialogs，必须在 .env 里指到生产机，例如
+      # http://<生产机私网IP>:9428/insert/opentelemetry
+      AF_OTEL_VICTORIALOGS_ENDPOINT: ${AF_OTEL_VICTORIALOGS_ENDPOINT:?set AF_OTEL_VICTORIALOGS_ENDPOINT in .env to production VictoriaLogs}
+      AF_OTEL_FILE_STORAGE_DIRECTORY: /var/lib/otelcol
+    volumes:
+      - ./deploy/otel/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # 与控制器给各服务挂的日志目录同一绝对路径（控制器 state-root 约定）
+      - /var/lib/alphafrog-beta/data/logs:/var/log/apps:ro
+      - alphafrog_beta_otelcoldata:/var/lib/otelcol
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
 volumes:
   alphafrog_beta_redisdata:
   alphafrog_beta_rabbitmq:
+  alphafrog_beta_meilidata:
+  alphafrog_beta_qdrantdata:
+  alphafrog_beta_otelcoldata:
