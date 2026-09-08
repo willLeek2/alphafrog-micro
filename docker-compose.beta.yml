@@ -1,0 +1,70 @@
+# Beta 测试机器专用 compose。生产机（101）继续用 docker-compose.yml。
+#
+# 这台机器上只跑两个基础设施容器：
+#   - redis / rabbitmq：给部署单拉起的业务容器用（地址走各服务环境文件，
+#     指向本机可路由地址的 6379/5672）。
+#
+# 不在这里出现的，以及为什么：
+#   - nacos：不本地起，业务容器注册到生产 Nacos（控制器配置
+#     AF_BETA_NACOS_SERVER_ADDRESS=<生产机私网IP>:8848，值在控制器主机配置里，
+#     本文件与 .env 均不写 IP）。生产 Nacos 需发布 8848+9848 并对 Beta 放行。
+#   - postgres：用宿主机已有的 PG，容器经 host.docker.internal 访问；
+#     宿主 PG 需要 listen_addresses 覆盖 docker 网段，pg_hba 放行 172.16.0.0/12。
+#   - meilisearch / qdrant：Beta 不部署。回落到生产的四个服务
+#     （index/fund/listed-asset/external-info）跑在生产机上，用生产本地的
+#     meili/qdrant；Beta 上跑的 domestic-stock-service 通过
+#     ADVANCED_MEILI_ENABLED=false 关闭搜索与自动同步。
+#   - 业务服务（frontend/agent/admin/portfolio/stock/fetch/沙箱两件套）：
+#     由 betaDeploymentController 按部署单拉起，控制器本身也是宿主机进程
+#     （见 betaDeploymentController/README.md），不进本文件。
+#   - otel-collector：Beta 服务可把 trace 直接发生产 collector
+#     （各服务环境文件里 AF_OTEL_TRACES_ENDPOINT=http://<生产机私网IP>:4318）。
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: alphafrog-beta-redis
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${AF_REDIS_PASSWORD:-Excited1s}", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - alphafrog_beta_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${AF_REDIS_PASSWORD:-Excited1s}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 1280M
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: alphafrog-beta-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${AF_RABBITMQ_USER:-alphafrog}
+      RABBITMQ_DEFAULT_PASS: ${AF_RABBITMQ_PASS:-Excited1s}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: >-
+        +P 1048576
+        +sbwt none
+        +sbwtdcpu none
+        +sbwtdio none
+        -rabbit vm_memory_high_watermark 0.70
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - alphafrog_beta_rabbitmq:/var/lib/rabbitmq
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  alphafrog_beta_redisdata:
+  alphafrog_beta_rabbitmq:
