@@ -6,6 +6,7 @@ import com.alibaba.nacos.api.naming.NamingService;
 import com.alibaba.nacos.api.naming.pojo.Instance;
 import com.alibaba.nacos.api.naming.pojo.ListView;
 import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -27,6 +28,9 @@ public class NacosDeploymentGenerationLivenessProbe implements DeploymentGenerat
     private final String groupName;
     private final int servicePageSize;
 
+    // 生产构造器显式标 @Autowired：类里保留包级测试构造器，多构造器无一标注时
+    // Spring 会回退找无参构造器并直接失败（No default constructor found）。
+    @Autowired
     public NacosDeploymentGenerationLivenessProbe(
             @Value("${agent.langchain.generation-reaper.nacos.server-address}") String serverAddress,
             @Value("${agent.langchain.generation-reaper.nacos.namespace:public}") String namespace,

@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.deployment;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationListener;
 import org.springframework.context.event.ContextClosedEvent;
@@ -29,6 +30,9 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
     private final ThreadPoolTaskExecutor runExecutor;
     private final Duration drainTimeout;
 
+    // 生产构造器显式标 @Autowired：类里保留包级测试构造器，多构造器无一标注时
+    // Spring 会回退找无参构造器并直接失败（No default constructor found）。
+    @Autowired
     public AgentServiceShutdownState(
             AgentRunMapper runMapper,
             DeploymentIdentityProvider identityProvider,

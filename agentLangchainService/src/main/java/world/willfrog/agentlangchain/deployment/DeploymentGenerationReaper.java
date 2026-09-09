@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.deployment;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -39,6 +40,9 @@ public class DeploymentGenerationReaper {
     private final LongSupplier nanoTime;
     private final Map<DeploymentIdentity, Long> missingSinceNanos = new HashMap<>();
 
+    // 生产构造器显式标 @Autowired：类里保留包级测试构造器，多构造器无一标注时
+    // Spring 会回退找无参构造器并直接失败（No default constructor found）。
+    @Autowired
     public DeploymentGenerationReaper(
             AgentRunMapper runMapper,
             DeploymentIdentityProvider identityProvider,
