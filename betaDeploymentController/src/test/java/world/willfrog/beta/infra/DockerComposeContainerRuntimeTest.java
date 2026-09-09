@@ -137,6 +137,13 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("10.0.0.8", environmentNode.path("DUBBO_IP_TO_REGISTRY").asText());
         assertEquals("28080", environmentNode.path("DUBBO_PORT_TO_REGISTRY").asText());
         assertFalse(environmentNode.has("AF_DUBBO_PORT_TO_REGISTRY"));
+        JsonNode composeNetworks = mapper.readTree(content).path("networks");
+        assertEquals("alphafrog-beta", composeNetworks.path("default").path("name").asText());
+        assertTrue(composeNetworks.path("default").path("external").asBoolean());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("network")
+                && command.contains("create") && command.contains("--subnet")
+                && command.contains("172.16.0.0/24") && command.contains("--gateway")
+                && command.contains("172.16.0.1") && command.contains("alphafrog-beta")));
         JsonNode providerParameters = effectiveRouting.path("dubbo").path("provider").path("parameters");
         assertEquals("beta-main-001", providerParameters.path("alphafrog.deployment-id").asText());
         assertEquals("main-beta", providerParameters.path("alphafrog.traffic-scope-id").asText());
@@ -569,6 +576,47 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(metadataLength < 1024, "registered metadata length=" + metadataLength);
     }
 
+    @Test
+    void reusesTheExistingFixedNetworkWithoutCreatingAnotherOne() throws Exception {
+        FakeCommands commands = new FakeCommands(false);
+        commands.networkExists = true;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        assertTrue(commands.commands.stream().noneMatch(command ->
+                command.contains("network") && command.contains("create")));
+        JsonNode composeNetworks = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("networks");
+        assertEquals("alphafrog-beta", composeNetworks.path("default").path("name").asText());
+        assertTrue(composeNetworks.path("default").path("external").asBoolean());
+    }
+
+    @Test
+    void rejectsMachineNetworkConfigOutsideThePgHbaRange() {
+        BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        machine.setNetworkSubnet("192.168.0.0/20");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+
+        machine.setNetworkSubnet("172.32.0.0/16");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+
+        machine.setNetworkSubnet("172.16.0.0/24");
+        machine.setNetworkName(" ");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+
+        machine.setNetworkName("alphafrog-beta");
+        machine.setNetworkSubnet("not-a-cidr");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+    }
+
     private final class FakeCommands extends CommandRunner {
         private final boolean startsPresent;
         private int inspectCalls;
@@ -578,6 +626,7 @@ class DockerComposeContainerRuntimeTest {
         private boolean returnOnlyObservedFields;
         private int failInfoCall;
         private boolean removed;
+        private boolean networkExists;
         private String imageInspectId = "sha256:" + "b".repeat(64);
 
         private FakeCommands(boolean startsPresent) {
@@ -591,6 +640,14 @@ class DockerComposeContainerRuntimeTest {
                 infoCalls++;
                 if (failInfoCall == infoCalls) throw new ControllerException("COMMAND_FAILED", "docker unavailable");
                 return "27.0.0\n";
+            }
+            if (arguments.contains("network")) {
+                if (arguments.contains("inspect")) {
+                    if (!networkExists) throw new ControllerException("COMMAND_FAILED", "no such network");
+                    return "[{\"Name\":\"alphafrog-beta\"}]\n";
+                }
+                networkExists = true;
+                return "";
             }
             if (arguments.contains("inspect") && arguments.contains("image"))
                 return imageInspectId + "\n";

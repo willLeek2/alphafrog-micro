@@ -52,7 +52,59 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             if (!("unix".equals(scheme) || "tcp".equals(scheme) || "ssh".equals(scheme)))
                 throw new ControllerException("MACHINE_CONFIG_INVALID",
                         "Beta machine " + machineId + " uses unsupported Docker host " + machine.getDockerHost());
+            requireBetaNetworkConfig(machineId, machine);
         }
+    }
+
+    // 宿主 PostgreSQL 的 pg_hba 只放行 172.16.0.0/12：固定网络的子网必须留在这一段内，
+    // 否则容器会被数据库在连接建立时直接拒绝（不改 pg_hba 是本设计的硬约束）。
+    private static void requireBetaNetworkConfig(String machineId, BetaControllerProperties.Machine machine) {
+        if (isBlank(machine.getNetworkName()) || isBlank(machine.getNetworkSubnet())
+                || isBlank(machine.getNetworkGateway()))
+            throw new ControllerException("MACHINE_CONFIG_INVALID",
+                    "Beta machine " + machineId + " network name, subnet and gateway are required");
+        long[] subnet = parseIpv4Cidr(machineId, machine.getNetworkSubnet());
+        if (subnet[1] < 12 || (subnet[0] & PREFIX_12_MASK) != (IPV4_172_16 & PREFIX_12_MASK))
+            throw new ControllerException("MACHINE_CONFIG_INVALID",
+                    "Beta machine " + machineId + " subnet " + machine.getNetworkSubnet()
+                            + " must stay inside 172.16.0.0/12 to remain reachable for the host PostgreSQL");
+    }
+
+    private static final long IPV4_172_16 = (172L << 24) | (16L << 16);
+    private static final long PREFIX_12_MASK = 0xFFF00000L;
+
+    private static long[] parseIpv4Cidr(String machineId, String cidr) {
+        String[] parts = cidr.split("/", 2);
+        if (parts.length != 2) throw invalidSubnet(machineId, cidr);
+        String[] octets = parts[0].split("\\.", -1);
+        if (octets.length != 4) throw invalidSubnet(machineId, cidr);
+        long address = 0;
+        for (String octet : octets) {
+            try {
+                int value = Integer.parseInt(octet.trim());
+                if (value < 0 || value > 255) throw invalidSubnet(machineId, cidr);
+                address = (address << 8) | value;
+            } catch (NumberFormatException exception) {
+                throw invalidSubnet(machineId, cidr);
+            }
+        }
+        int prefix;
+        try {
+            prefix = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException exception) {
+            throw invalidSubnet(machineId, cidr);
+        }
+        if (prefix < 0 || prefix > 32) throw invalidSubnet(machineId, cidr);
+        return new long[] {address, prefix};
+    }
+
+    private static ControllerException invalidSubnet(String machineId, String cidr) {
+        return new ControllerException("MACHINE_CONFIG_INVALID",
+                "Beta machine " + machineId + " subnet " + cidr + " is not a valid IPv4 CIDR");
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     @Override
@@ -100,6 +152,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             throw new ControllerException("SERVICE_CONFIG_INVALID",
                     "Service volumes must not replace controller-managed observability mounts");
         validateJavaAgent(template);
+        ensureBetaNetwork(machineId, machine);
         Path compose = writeCompose(manifest, service, plan, name, machine);
         Map<String, String> environment = Map.of();
         boolean containerMayExist = false;
@@ -211,10 +264,39 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         }
     }
 
+    private void ensureBetaNetwork(String machineId, BetaControllerProperties.Machine machine) {
+        if (betaNetworkExists(machineId, machine.getNetworkName())) return;
+        try {
+            commands.run(docker(machineId, "network", "create", "--driver", "bridge",
+                    "--subnet", machine.getNetworkSubnet(), "--gateway", machine.getNetworkGateway(),
+                    machine.getNetworkName()), Map.of(), Duration.ofSeconds(30));
+        } catch (ControllerException creationFailure) {
+            // 两个候选并发创建会撞「网络已存在」；网络确实在就视为成功。
+            if (!betaNetworkExists(machineId, machine.getNetworkName())) throw creationFailure;
+        }
+    }
+
+    private boolean betaNetworkExists(String machineId, String networkName) {
+        try {
+            commands.run(docker(machineId, "network", "inspect", networkName), Map.of(), Duration.ofSeconds(15));
+            return true;
+        } catch (ControllerException failure) {
+            if ("COMMAND_FAILED".equals(failure.code())) return false;
+            throw failure;
+        }
+    }
+
     private Path writeCompose(JsonNode manifest, JsonNode service, CandidatePlan plan, String name,
                               BetaControllerProperties.Machine machine) {
         ObjectNode root = mapper.createObjectNode();
         root.put("name", projectName(plan));
+        // 不声明网络时 compose 会按项目名自动建一次性网络：每次滚动一个新项目就多一个
+        // 网络、退役也不回收，docker 默认地址池被占满后容器漂出 172.16/12，被宿主
+        // PostgreSQL 的 pg_hba 拒绝。照生产 docker-compose.yml 的固定网络做法，所有
+        // 实例共用一个 external 网络（由控制器幂等创建，compose 不建也不删）。
+        ObjectNode fixedNetwork = root.putObject("networks").putObject("default");
+        fixedNetwork.put("name", machine.getNetworkName());
+        fixedNetwork.put("external", true);
         ObjectNode services = root.putObject("services");
         ObjectNode app = services.putObject("app");
         app.put("image", service.path("image").path("repositoryDigest").asText());

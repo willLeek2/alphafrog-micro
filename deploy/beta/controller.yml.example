@@ -6,6 +6,13 @@ alphafrog:
         # 两项地址都要替换为 Beta 机器实际使用的地址或可解析名称。
         bind-ip: BETA_BIND_ADDRESS
         routable-address: BETA_ROUTABLE_ADDRESS
+        # 所有实例共用的固定 docker 网络（照生产 docker-compose.yml 的固定网络做法）：
+        # 控制器首次创建后幂等复用，避免每次滚动新建网络、地址池耗尽后容器漂出
+        # 172.16/12 被宿主 PostgreSQL 拒绝。子网必须留在 172.16.0.0/12 内且避开
+        # docker 默认自动池（172.17 起），设置前先核对现网占用。
+        network-name: alphafrog-beta
+        network-subnet: 172.16.0.0/24
+        network-gateway: 172.16.0.1
     services:
       domestic-stock-service:
         env-file: /etc/alphafrog-beta/services/domestic-stock-service.env

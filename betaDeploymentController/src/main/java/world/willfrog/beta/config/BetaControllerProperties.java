@@ -46,12 +46,21 @@ public class BetaControllerProperties {
         private URI dockerHost;
         private String bindIp;
         private String routableAddress;
+        private String networkName = "alphafrog-beta";
+        private String networkSubnet = "172.16.0.0/24";
+        private String networkGateway = "172.16.0.1";
         public URI getDockerHost() { return dockerHost; }
         public void setDockerHost(URI dockerHost) { this.dockerHost = dockerHost; }
         public String getBindIp() { return bindIp; }
         public void setBindIp(String bindIp) { this.bindIp = bindIp; }
         public String getRoutableAddress() { return routableAddress; }
         public void setRoutableAddress(String routableAddress) { this.routableAddress = routableAddress; }
+        public String getNetworkName() { return networkName; }
+        public void setNetworkName(String networkName) { this.networkName = networkName; }
+        public String getNetworkSubnet() { return networkSubnet; }
+        public void setNetworkSubnet(String networkSubnet) { this.networkSubnet = networkSubnet; }
+        public String getNetworkGateway() { return networkGateway; }
+        public void setNetworkGateway(String networkGateway) { this.networkGateway = networkGateway; }
     }
 
     public static class ServiceTemplate {

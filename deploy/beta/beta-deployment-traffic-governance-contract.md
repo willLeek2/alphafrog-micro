@@ -31,6 +31,8 @@ Agent 的应用名固定为 `agent-langchain-service`。控制器为这个应用
 
 服务使用两个固定宿主端口槽。活动实例占一个槽，更新候选占另一个槽；切换完成并清理旧实例后，两者角色互换。容器内端口保持服务自己的固定值，部署单显式保存两组宿主端口。
 
+每台 Beta 机器的全部实例挂同一个固定 docker 网络（机器配置里的网络名、子网和网关，控制器首次创建后幂等复用），不随滚动新建或回收网络。子网必须留在 `172.16.0.0/12` 内并避开 docker 默认自动池，容器源地址才能留在宿主 PostgreSQL `pg_hba` 的放行段里。服务间通信不经过 docker 网络：Dubbo 注册宿主可路由地址与发布端口，依赖也经宿主地址访问。
+
 ## 4. 注册拓扑与官方路由
 
 本合同按仓库固定的 Dubbo 3.3.2 行为编写。标签筛选以官方 [`TagStateRouter`](https://github.com/apache/dubbo/blob/dubbo-3.3.2/dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/router/tag/TagStateRouter.java) 为准；跨注册订阅的同区优先以官方 [`ZoneAwareClusterInvoker`](https://github.com/apache/dubbo/blob/dubbo-3.3.2/dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/support/registry/ZoneAwareClusterInvoker.java) 为准。升级 Dubbo 时必须先重跑真实路由顺序测试，再确认下面的回落关系仍成立。
