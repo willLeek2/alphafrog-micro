@@ -333,6 +333,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         return namespace == null || namespace.isBlank() ? "public" : namespace;
     }
 
+    // simplified 注册时 Dubbo 只保留白名单参数 + 这些键；TagStateRouter 读实例的
+    // dubbo.tag，其余是控制器注入、从实例 metadata 读的代际与流量信息。
+    private static final String ROUTING_EXTRA_KEYS = "application,zone,dubbo.tag,"
+            + "alphafrog.deployment-id,alphafrog.traffic-scope-id,alphafrog.release-id,"
+            + "alphafrog.deployment-generation-id,alphafrog.instance-id";
+
     private void registryConfig(ObjectNode target, String server, String namespace, String group, String zone,
                                 boolean register, boolean preferred) {
         target.put("address", "nacos://" + server + "?namespace=" + namespace + "&group=" + group + "&zone=" + zone);
@@ -342,6 +348,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         target.put("preferred", preferred);
         target.put("use-as-config-center", false);
         target.put("use-as-metadata-center", false);
+        // beta 注入的路由参数会把 provider 实例 metadata 顶过 Nacos 1024 字符上限，注册被拒、
+        // 应用启动失败。simplified 让注册 URL 只保留 Dubbo 白名单参数 + extra-keys（丢掉
+        // methods 这类大参数）；extra-keys 保住泳道路由（dubbo.tag）和代际治理要从实例
+        // metadata 读的全部键。production 注册中心只订阅，带上无副作用。
+        target.put("simplified", true);
+        target.put("extra-keys", ROUTING_EXTRA_KEYS);
     }
 
     private void verifyImage(String machineId, JsonNode service) {

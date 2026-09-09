@@ -14,8 +14,12 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import org.apache.dubbo.common.URL;
+import org.apache.dubbo.registry.integration.DefaultServiceURLCustomizer;
+import org.apache.dubbo.rpc.model.ApplicationModel;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -23,6 +27,9 @@ import world.willfrog.beta.config.BetaControllerProperties;
 import world.willfrog.beta.core.ContainerRuntime;
 import world.willfrog.beta.core.ControllerException;
 import world.willfrog.beta.core.JsonSupport;
+
+import static org.apache.dubbo.common.constants.CommonConstants.EXTRA_KEYS_KEY;
+import static org.apache.dubbo.registry.Constants.SIMPLIFIED_KEY;
 
 class DockerComposeContainerRuntimeTest {
     @TempDir Path temporary;
@@ -116,6 +123,14 @@ class DockerComposeContainerRuntimeTest {
         assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("preferred").asBoolean());
         assertTrue(effectiveRouting.path("dubbo").path("registries").path("production").path("address").asText()
                 .contains("group=DEFAULT_GROUP"));
+        for (String registry : List.of("beta", "production")) {
+            JsonNode named = effectiveRouting.path("dubbo").path("registries").path(registry);
+            assertTrue(named.path("simplified").asBoolean(), registry);
+            assertEquals(Arrays.asList("application", "zone", "dubbo.tag", "alphafrog.deployment-id",
+                    "alphafrog.traffic-scope-id", "alphafrog.release-id", "alphafrog.deployment-generation-id",
+                    "alphafrog.instance-id"), Arrays.asList(named.path("extra-keys").asText().split(",")),
+                    registry);
+        }
         assertEquals("zone-aware", effectiveRouting.path("dubbo").path("consumer").path("cluster").asText());
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
@@ -459,6 +474,55 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(container.length() <= 128);
         assertEquals(project, runtime.projectName(longPlan));
         assertEquals(container, runtime.containerName(longPlan, "s".repeat(96)));
+    }
+
+    @Test
+    void simplifiedRegistrationKeepsRoutingKeysAndDropsMethodsBelowTheNacosLimit() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        // extra-keys 直接取自渲染出的 SPRING_APPLICATION_JSON：键清单与控制器输出单一来源。
+        JsonNode routing = mapper.readTree(mapper.readTree(
+                        Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app").path("environment").path("SPRING_APPLICATION_JSON").asText());
+        String extraKeys = routing.path("dubbo").path("registries").path("beta").path("extra-keys").asText();
+
+        // admin-service 量级的注册 URL（36 个方法、methods 值约 720 字符，含 beta 注入的全部
+        // 路由参数）过 Dubbo 自己的裁剪器：simplified 后 Nacos 实例 metadata 应回到 1024 以内、
+        // 路由键全保留、methods 等大参数被丢掉。
+        StringBuilder methods = new StringBuilder();
+        for (int index = 0; index < 36; index++) {
+            if (index > 0) methods.append(',');
+            methods.append("queryImportantThing").append(index);
+        }
+        URL providerUrl = URL.valueOf("tri://10.0.0.8:50057/com.alphafrog.AdminService"
+                + "?application=admin-service&dubbo=2.0.2&release=3.3.2&side=provider"
+                + "&methods=" + methods
+                + "&timestamp=1700000000000&pid=12345"
+                + "&zone=beta&dubbo.tag=lane-a"
+                + "&alphafrog.deployment-id=beta-main-001&alphafrog.traffic-scope-id=lane-a"
+                + "&alphafrog.release-id=release-1&alphafrog.deployment-generation-id=" + "g".repeat(32)
+                + "&alphafrog.instance-id=i-beta-main-001-admin-service-00000001");
+        URL registered = new DefaultServiceURLCustomizer().customize(
+                providerUrl.putAttribute(SIMPLIFIED_KEY, true).putAttribute(EXTRA_KEYS_KEY, extraKeys),
+                ApplicationModel.defaultModel());
+
+        assertFalse(registered.hasParameter("methods"));
+        assertFalse(registered.hasParameter("timestamp"));
+        assertFalse(registered.hasParameter("pid"));
+        assertEquals("admin-service", registered.getParameter("application"));
+        assertEquals("beta", registered.getParameter("zone"));
+        assertEquals("lane-a", registered.getParameter("dubbo.tag"));
+        assertEquals("beta-main-001", registered.getParameter("alphafrog.deployment-id"));
+        assertEquals("lane-a", registered.getParameter("alphafrog.traffic-scope-id"));
+        assertEquals("release-1", registered.getParameter("alphafrog.release-id"));
+        assertTrue(registered.hasParameter("alphafrog.deployment-generation-id"));
+        assertEquals("i-beta-main-001-admin-service-00000001", registered.getParameter("alphafrog.instance-id"));
+        int metadataLength = registered.getParameters().entrySet().stream()
+                .mapToInt(entry -> entry.getKey().length() + entry.getValue().length() + 1).sum();
+        assertTrue(metadataLength < 1024, "registered metadata length=" + metadataLength);
     }
 
     private final class FakeCommands extends CommandRunner {
