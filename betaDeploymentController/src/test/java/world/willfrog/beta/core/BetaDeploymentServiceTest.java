@@ -100,6 +100,69 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void startupIsolatesOneDeploymentWithInvalidRuntimeFilesAndContinuesAnotherDeployment() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        service.submitManifest(manifest("beta-lane-a", 1, "release-1", '1', 'c', 'd', "lane-a", 38080));
+        reconcile(3);
+        containers.invalidManifestId = "beta-lane-a";
+
+        service.verifyPersistentStateAtStartup();
+
+        assertEquals("STABLE", state("main-beta").path("phase").asText());
+        assertEquals("FAILED", state("lane-a").path("phase").asText());
+        assertEquals("RUNTIME_CONFIG_MISMATCH", state("lane-a").path("lastError").path("code").asText());
+        assertEquals("FACTS_UNCERTAIN", state("lane-a").path("lastError").path("recoveryClass").asText());
+
+        service.submitManifest(manifest(2, "release-2", '2', 'e', 'f', "main-beta"));
+        reconcile(4);
+        assertEquals("STABLE", state("main-beta").path("phase").asText());
+        assertEquals("release-2", state("main-beta").path("activeInstance").path("releaseId").asText());
+    }
+
+    @Test
+    void scheduledReconcileContinuesAfterOneUnexpectedFailure() {
+        class FlakyDeploymentService extends BetaDeploymentService {
+            int calls;
+
+            FlakyDeploymentService() {
+                super(mapper, store, new BetaContractValidator(mapper, new BetaControllerProperties()),
+                        containers, registrationProbe, Clock.systemUTC());
+            }
+
+            @Override
+            public ObjectNode reconcileOne() {
+                calls++;
+                if (calls == 1) throw new IllegalStateException("transient failure");
+                return mapper.createObjectNode();
+            }
+        }
+        FlakyDeploymentService flaky = new FlakyDeploymentService();
+
+        flaky.scheduledReconcile();
+        flaky.scheduledReconcile();
+
+        assertEquals(2, flaky.calls);
+    }
+
+    @Test
+    void expiryThatDeletesAnEmptyDeploymentReturnsWithoutDereferencingANullOperation() {
+        ObjectNode expired = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
+        expired.put("createdAt", "2025-08-01T00:00:00Z");
+        expired.put("expiresAt", "2025-09-01T00:00:00Z");
+        service.submitManifest(expired);
+        store.update(state -> {
+            ((com.fasterxml.jackson.databind.node.ArrayNode) state.path("deployments").path(0).path("services"))
+                    .removeAll();
+            return null;
+        });
+
+        service.reconcileOne();
+
+        assertEquals(0, store.snapshot().path("deployments").size());
+    }
+
+    @Test
     void healthyCandidateWaitsUntilItsSelfRegistrationIsVisible() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
@@ -300,6 +363,13 @@ class BetaDeploymentServiceTest {
         int stopTimeoutSeconds;
         int inspectCalls;
         boolean leaveRunningAfterStop;
+        String invalidManifestId;
+
+        @Override public void validateManifestEnvironment(JsonNode manifest) {
+            if (manifest.path("deploymentId").asText().equals(invalidManifestId)) {
+                throw new ControllerException("RUNTIME_CONFIG_MISMATCH", "Service environment file changed");
+            }
+        }
 
         @Override public ContainerObservation create(JsonNode manifest, JsonNode spec, CandidatePlan plan) {
             String name = "af-" + plan.instanceId();

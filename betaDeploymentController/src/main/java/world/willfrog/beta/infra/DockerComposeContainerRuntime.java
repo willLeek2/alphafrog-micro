@@ -38,17 +38,25 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     }
 
     @Override
-    public void validateManifest(JsonNode manifest) {
+    public void validateHostPrerequisites() {
         if (properties.getMachines().isEmpty() || properties.getMachines().size() > 8)
             throw new ControllerException("MACHINE_CONFIG_INVALID", "Between one and eight Beta machines must be configured");
         requireSafeRegularFile(properties.getHealthcheckScript(), true, "Health-check script");
         requireTracesEndpoint();
-        for (JsonNode service : manifest.path("services")) {
-            String machineId = service.path("machineId").asText();
+        for (String machineId : properties.getMachines().keySet()) {
             BetaControllerProperties.Machine machine = machine(machineId);
             String scheme = machine.getDockerHost().getScheme();
             if (!("unix".equals(scheme) || "tcp".equals(scheme) || "ssh".equals(scheme)))
-                throw new ControllerException("MACHINE_CONFIG_INVALID", "Docker host scheme is not supported");
+                throw new ControllerException("MACHINE_CONFIG_INVALID",
+                        "Beta machine " + machineId + " uses unsupported Docker host " + machine.getDockerHost());
+        }
+    }
+
+    @Override
+    public void validateManifestEnvironment(JsonNode manifest) {
+        for (JsonNode service : manifest.path("services")) {
+            String machineId = service.path("machineId").asText();
+            machine(machineId);
             String serviceName = service.path("serviceName").asText();
             BetaControllerProperties.ServiceTemplate template = properties.getServices().get(serviceName);
             if (template == null || template.getEnvFile() == null)
@@ -387,7 +395,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
                 || !("http".equals(endpoint.getScheme()) || "https".equals(endpoint.getScheme()))
                 || endpoint.getUserInfo() != null || endpoint.getFragment() != null) {
             throw new ControllerException("OBSERVABILITY_CONFIG_INVALID",
-                    "OpenTelemetry traces endpoint must be an absolute HTTP or HTTPS URL");
+                    "OpenTelemetry traces endpoint is invalid: " + endpoint);
         }
         return endpoint.toString();
     }
@@ -462,16 +470,16 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     private BetaControllerProperties.Machine machine(String id) {
         BetaControllerProperties.Machine value = properties.getMachines().get(id);
         if (value == null || value.getDockerHost() == null || value.getBindIp() == null || value.getRoutableAddress() == null)
-            throw new ControllerException("MACHINE_UNKNOWN", "Machine is not configured: " + id);
+            throw new ControllerException("MACHINE_UNKNOWN", "Beta machine is not fully configured: " + id);
         if (value.getBindIp().isBlank() || value.getRoutableAddress().isBlank())
-            throw new ControllerException("MACHINE_CONFIG_INVALID", "Machine addresses must not be blank");
+            throw new ControllerException("MACHINE_CONFIG_INVALID", "Beta machine addresses must not be blank: " + id);
         return value;
     }
 
     private void requireSafeRegularFile(Path path, boolean executable, String label) {
         if (path == null || !path.isAbsolute() || Files.isSymbolicLink(path) || !Files.isRegularFile(path)
                 || (executable && !Files.isExecutable(path)))
-            throw new ControllerException("SERVICE_CONFIG_INVALID", label + " is missing or unsafe");
+            throw new ControllerException("SERVICE_CONFIG_INVALID", label + " is missing or unsafe: " + path);
     }
 
     private String fileSha256(Path path) {

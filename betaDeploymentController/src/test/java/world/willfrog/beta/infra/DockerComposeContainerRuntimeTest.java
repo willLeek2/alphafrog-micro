@@ -261,6 +261,19 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void startupPrerequisiteFailureNamesTheUnsafeHostFile() throws Exception {
+        Path missing = temporary.resolve("missing-healthcheck").toAbsolutePath();
+        properties.setHealthcheckScript(missing);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        ControllerException failure = assertThrows(ControllerException.class, runtime::validateHostPrerequisites);
+
+        assertEquals("SERVICE_CONFIG_INVALID", failure.code());
+        assertTrue(failure.getMessage().contains(missing.toString()));
+    }
+
+    @Test
     void refusesBlankMachineAddresses() {
         BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(

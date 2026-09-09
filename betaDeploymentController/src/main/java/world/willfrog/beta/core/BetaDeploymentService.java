@@ -9,10 +9,14 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -23,6 +27,7 @@ import world.willfrog.beta.validation.BetaContractValidator;
 @Service
 @ConditionalOnProperty(prefix = "alphafrog.beta-controller", name = "enabled", havingValue = "true")
 public class BetaDeploymentService {
+    private static final Logger log = LoggerFactory.getLogger(BetaDeploymentService.class);
     private final ObjectMapper mapper;
     private final AtomicJsonStore store;
     private final BetaContractValidator validator;
@@ -49,6 +54,7 @@ public class BetaDeploymentService {
 
     @PostConstruct
     void verifyPersistentStateAtStartup() {
+        containers.validateHostPrerequisites();
         recoverManifestLead();
         validateAll(store.snapshot());
     }
@@ -167,27 +173,35 @@ public class BetaDeploymentService {
     }
 
     @Scheduled(fixedDelayString = "${alphafrog.beta-controller.reconcile-delay:PT2S}")
-    public void scheduledReconcile() { reconcileOne(); }
+    public void scheduledReconcile() {
+        try {
+            reconcileOne();
+        } catch (Throwable failure) {
+            log.error("Beta deployment reconciliation failed unexpectedly; the next scheduled cycle will retry", failure);
+        }
+    }
 
     public ObjectNode reconcileOne() {
         mutationLock.lock();
         try {
-            OperationRef ref = store.read(this::currentOperation);
-            if (ref == null && store.read(state -> nextService(state) != null)) {
-                store.update(state -> {
-                    scheduleNext(state);
-                    validateAll(state);
-                    return null;
-                });
-                ref = store.read(this::currentOperation);
-            }
-            if (ref == null) {
-                String expired = store.read(this::firstExpiredDeployment);
-                if (expired == null) return store.snapshot();
-                requestDelete(expired);
-                ref = store.read(this::currentOperation);
-            }
+            OperationRef ref = null;
             try {
+                ref = store.read(this::currentOperation);
+                if (ref == null && store.read(state -> nextService(state) != null)) {
+                    store.update(state -> {
+                        scheduleNext(state);
+                        validateAll(state);
+                        return null;
+                    });
+                    ref = store.read(this::currentOperation);
+                }
+                if (ref == null) {
+                    String expired = store.read(this::firstExpiredDeployment);
+                    if (expired == null) return store.snapshot();
+                    requestDelete(expired);
+                    ref = store.read(this::currentOperation);
+                }
+                if (ref == null) return store.snapshot();
                 switch (ref.phase()) {
                     case "STARTING_CANDIDATE" -> startCandidate(ref);
                     case "WAITING_CANDIDATE_READINESS" -> observeCandidate(ref);
@@ -197,9 +211,17 @@ public class BetaDeploymentService {
                     default -> throw new ControllerException("OPERATION_PHASE_INVALID", "Unknown operation phase");
                 }
             } catch (ControllerException failure) {
-                fail(ref, failure);
+                if (ref == null) {
+                    log.error("Beta deployment reconciliation failed before an operation was selected", failure);
+                } else {
+                    fail(ref, failure);
+                }
             } catch (RuntimeException failure) {
-                fail(ref, new ControllerException("EXTERNAL_OPERATION_FAILED", safeMessage(failure), failure));
+                if (ref == null) {
+                    log.error("Beta deployment reconciliation failed before an operation was selected", failure);
+                } else {
+                    fail(ref, new ControllerException("EXTERNAL_OPERATION_FAILED", safeMessage(failure), failure));
+                }
             }
             return store.snapshot();
         } finally {
@@ -410,9 +432,9 @@ public class BetaDeploymentService {
         };
         try {
             markFailed(ref, failure.code(), failure.getMessage(), recovery, false);
-        } catch (ControllerException stateChanged) {
-            if ("OPERATION_CHANGED".equals(stateChanged.code())) throw failure;
-            throw stateChanged;
+        } catch (RuntimeException stateFailure) {
+            log.error("Unable to persist Beta deployment failure for deployment {} service {} operation {}",
+                    ref.deploymentId(), ref.serviceName(), ref.operationId(), stateFailure);
         }
     }
 
@@ -491,11 +513,19 @@ public class BetaDeploymentService {
     private void recoverManifestLead() {
         ObjectNode before = store.snapshot();
         Set<String> manifestIds = store.manifestDeploymentIds();
+        Map<String, ControllerException> isolated = new LinkedHashMap<>();
         boolean recoveryNeeded = false;
         for (String deploymentId : manifestIds) {
             JsonNode manifest = store.readManifest(deploymentId);
             validator.validateManifest(manifest);
-            containers.validateManifest(manifest);
+            try {
+                containers.validateManifestEnvironment(manifest);
+            } catch (ControllerException failure) {
+                isolated.put(deploymentId, failure);
+                recoveryNeeded = true;
+                log.error("Deployment {} is excluded from reconciliation because its runtime files are invalid: {}",
+                        deploymentId, failure.getMessage());
+            }
             JsonNode deployment = findDeployment(before, deploymentId);
             if (deployment == null
                     || deployment.path("acceptedManifestVersion").asLong() < manifest.path("manifestVersion").asLong()) {
@@ -513,16 +543,20 @@ public class BetaDeploymentService {
                 ObjectNode deployment = (ObjectNode) findDeployment(state, deploymentId);
                 if (deployment == null) {
                     assertNoOtherScopeOwner(state, deploymentId, manifest.path("trafficScopeId").asText());
-                    ((ArrayNode) state.path("deployments")).add(newDeployment(manifest));
-                    continue;
+                    deployment = newDeployment(manifest);
+                    ((ArrayNode) state.path("deployments")).add(deployment);
+                } else {
+                    long accepted = deployment.path("acceptedManifestVersion").asLong();
+                    long onDisk = manifest.path("manifestVersion").asLong();
+                    if (onDisk != accepted) {
+                        if (onDisk < accepted || hasOperation(deployment))
+                            throw new ControllerException("STATE_MANIFEST_MISMATCH", "Manifest lead cannot be recovered safely");
+                        assertRecoverableReplacement(deployment, manifest);
+                        acceptReplacement(deployment, manifest);
+                    }
                 }
-                long accepted = deployment.path("acceptedManifestVersion").asLong();
-                long onDisk = manifest.path("manifestVersion").asLong();
-                if (onDisk == accepted) continue;
-                if (onDisk < accepted || hasOperation(deployment))
-                    throw new ControllerException("STATE_MANIFEST_MISMATCH", "Manifest lead cannot be recovered safely");
-                assertRecoverableReplacement(deployment, manifest);
-                acceptReplacement(deployment, manifest);
+                ControllerException failure = isolated.get(deploymentId);
+                if (failure != null) isolateDeployment(deployment, failure);
             }
             java.util.List<String> completedDeletes = new java.util.ArrayList<>();
             for (JsonNode deployment : state.path("deployments")) {
@@ -535,6 +569,28 @@ public class BetaDeploymentService {
             validateAll(state);
             return null;
         });
+    }
+
+    private void isolateDeployment(ObjectNode deployment, ControllerException failure) {
+        for (JsonNode value : deployment.path("services")) {
+            ObjectNode service = (ObjectNode) value;
+            String failedType = service.path("operation").path("type").asText();
+            if (failedType.isEmpty()) {
+                failedType = "DELETING".equals(deployment.path("phase").asText())
+                        ? "DELETE"
+                        : service.path("activeInstance").isObject() ? "UPDATE" : "CREATE";
+            }
+            service.put("phase", "FAILED");
+            service.putNull("operation");
+            service.put("failedManifestVersion", service.path("targetManifestVersion").asLong());
+            ObjectNode error = mapper.createObjectNode();
+            error.put("code", failure.code().replaceAll("[^A-Z0-9_]", "_"));
+            error.put("message", sanitize(failure.getMessage()));
+            error.put("at", Instant.now(clock).toString());
+            error.put("failedOperationType", failedType);
+            error.put("recoveryClass", "FACTS_UNCERTAIN");
+            service.set("lastError", error);
+        }
     }
 
     private void assertRecoverableReplacement(JsonNode deployment, JsonNode manifest) {
