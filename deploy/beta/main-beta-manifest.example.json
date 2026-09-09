@@ -126,7 +126,7 @@
       "serviceName": "agent-service",
       "dubboServiceKey": "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService",
       "releaseId": "replace-with-build-version",
-      "serviceSpecSha256": "b0f07ba817538bf709347a6c8d0cc400f163076fa4e198599dd544a2b83d2398",
+      "serviceSpecSha256": "a7673875b45764d0fe675f0a3f9ee2c38e1079a93211a1a69f9754bd233ff812",
       "machineId": "beta-machine-1",
       "image": {
         "repositoryDigest": "alphafrog-micro-agent-langchain-service:latest",
@@ -139,7 +139,7 @@
         "readinessTimeoutSeconds": 180,
         "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
         "applicationDrainSeconds": 60,
-        "drainGraceSeconds": 60
+        "drainGraceSeconds": 65
       },
       "registration": {
         "serviceName": "providers:world.willfrog.alphafrogmicro.agent.idl.AgentDubboService::langchain",

@@ -81,7 +81,7 @@ const manifest = {
       readinessTimeoutSeconds: 120,
       shutdownProfile: 'SPRING_BOOT_HTTP_DUBBO_V1',
       applicationDrainSeconds: 60,
-      drainGraceSeconds: 60
+      drainGraceSeconds: 65
     },
     registration: {
       serviceName: 'providers:com.alphafrog.AgentService::langchain',
@@ -98,7 +98,7 @@ const deploymentGenerationId = generation(manifest);
 const active = {
   instanceId: 'instance-new', machineId: 'beta-machine-1', releaseId: 'release-2',
   deploymentGenerationId, shutdownProfile: 'SPRING_BOOT_HTTP_DUBBO_V1',
-  applicationDrainSeconds: 60, drainGraceSeconds: 60, manifestVersion: 2,
+  applicationDrainSeconds: 60, drainGraceSeconds: 65, manifestVersion: 2,
   serviceSpecSha256: manifest.services[0].serviceSpecSha256, containerName: 'af-instance-new',
   containerId: 'd'.repeat(64), portSlot: 'B', hostPort: 28081,
   endpoint: {address: '10.0.0.8', port: 28081}
@@ -131,8 +131,12 @@ function relationErrors(wanted, observed) {
       if (spec.registration.serviceName !== `providers:${providerIdentity.interfaceName}:${providerIdentity.version}:${providerIdentity.group}`)
         errors.push('Nacos service name');
     }
-    if (spec.runtime.applicationDrainSeconds !== spec.runtime.drainGraceSeconds
-        || spec.runtime.applicationDrainSeconds !== commonDeadline) errors.push('common drain deadline');
+    if (spec.runtime.applicationDrainSeconds !== commonDeadline) errors.push('common application drain deadline');
+    if (spec.runtime.drainGraceSeconds < spec.runtime.applicationDrainSeconds)
+      errors.push('container drain budget');
+    if (spec.serviceName === 'agent-service'
+        && spec.runtime.drainGraceSeconds < spec.runtime.applicationDrainSeconds + 5)
+      errors.push('agent finalization margin');
   }
   for (const deployment of observed.deployments) {
     if (deployment.manifestSha256 !== digest(wanted)) errors.push('manifest digest');
@@ -141,7 +145,8 @@ function relationErrors(wanted, observed) {
       for (const [role, instance] of [['active', item.activeInstance], ['candidate', item.candidateInstance]]) {
         if (!instance) continue;
         if (instance.deploymentGenerationId !== expectedGeneration) errors.push(`${role} generation`);
-        if (instance.applicationDrainSeconds !== commonDeadline || instance.drainGraceSeconds !== commonDeadline)
+        if (spec && (instance.applicationDrainSeconds !== spec.runtime.applicationDrainSeconds
+            || instance.drainGraceSeconds !== spec.runtime.drainGraceSeconds))
           errors.push(`${role} deadline`);
         if (spec && instance.serviceSpecSha256 !== spec.serviceSpecSha256) errors.push(`${role} service digest`);
       }
@@ -224,9 +229,15 @@ try {
   stableScope.trafficScopeId = 'stable';
   ajv(manifestSchema, stableScope, false, 'manifest-stable-scope-rejected');
 
-  const splitDeadline = clone(manifest);
-  splitDeadline.services[0].runtime.drainGraceSeconds = 65;
-  assert(relationErrors(splitDeadline, state).includes('common drain deadline'), 'split deadlines must be rejected');
+  const shortContainerGrace = clone(manifest);
+  shortContainerGrace.services[0].runtime.drainGraceSeconds = 59;
+  assert(relationErrors(shortContainerGrace, state).includes('container drain budget'),
+    'container grace shorter than the application shutdown budget must be rejected');
+
+  const missingAgentMargin = clone(manifest);
+  missingAgentMargin.services[0].runtime.drainGraceSeconds = 60;
+  assert(relationErrors(missingAgentMargin, state).includes('agent finalization margin'),
+    'agent container grace must reserve the finalization margin');
 
   const staleRoute = clone(state);
   staleRoute.deployments[0].services[0].route = {defaultInstanceId: 'instance-old'};

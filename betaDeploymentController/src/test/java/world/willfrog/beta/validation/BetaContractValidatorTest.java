@@ -50,6 +50,41 @@ class BetaContractValidatorTest {
         assertDoesNotThrow(() -> validator.validateManifest(manifest));
     }
 
+    @Test
+    void rejectsAContainerGraceShorterThanTheApplicationDrainBudget() {
+        ObjectMapper mapper = new ObjectMapper();
+        BetaContractValidator validator = new BetaContractValidator(mapper, new BetaControllerProperties());
+        ObjectNode manifest = manifest(mapper, "com.alphafrog.StockService",
+                "providers:com.alphafrog.StockService::");
+        ObjectNode service = (ObjectNode) manifest.path("services").path(0);
+        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 59);
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest));
+
+        assertEquals("MANIFEST_INVALID", failure.code());
+    }
+
+    @Test
+    void agentContainerGraceIncludesTheFiveSecondFinalizationMargin() {
+        ObjectMapper mapper = new ObjectMapper();
+        BetaContractValidator validator = new BetaContractValidator(mapper, new BetaControllerProperties());
+        ObjectNode manifest = manifest(mapper, "langchain/com.alphafrog.AgentService",
+                "providers:com.alphafrog.AgentService::langchain");
+        ObjectNode service = (ObjectNode) manifest.path("services").path(0);
+        service.put("serviceName", "agent-service");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+
+        ControllerException tooShort = assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest));
+        assertEquals("MANIFEST_INVALID", tooShort.code());
+
+        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 65);
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertDoesNotThrow(() -> validator.validateManifest(manifest));
+    }
+
     private static ObjectNode manifest(ObjectMapper mapper, String serviceKey, String nacosServiceName) {
         ObjectNode root = mapper.createObjectNode();
         root.put("schemaVersion", 1);

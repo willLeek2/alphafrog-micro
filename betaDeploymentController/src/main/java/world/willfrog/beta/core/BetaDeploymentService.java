@@ -386,7 +386,7 @@ public class BetaDeploymentService {
             Instant requestedAt = Instant.now(clock);
             if (draining.path("stopSignalRequestedAt").isNull()) {
                 String requested = requestedAt.toString();
-                String deadline = requestedAt.plusSeconds(draining.path("applicationDrainSeconds").asLong()).toString();
+                String deadline = requestedAt.plusSeconds(draining.path("drainGraceSeconds").asLong()).toString();
                 store.update(state -> {
                     ObjectNode value = (ObjectNode) checkedService(state, ref).path("drainingInstance");
                     value.put("stopSignalRequestedAt", requested);

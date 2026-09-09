@@ -72,7 +72,7 @@ class DockerComposeContainerRuntimeTest {
                           "localImageId":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
                  "runtime":{"containerPort":18080,"hostPorts":[28080,28081],
                             "shutdownProfile":"SPRING_BOOT_HTTP_DUBBO_V1","applicationDrainSeconds":60,
-                            "drainGraceSeconds":60,"readinessTimeoutSeconds":120},
+                            "drainGraceSeconds":65,"readinessTimeoutSeconds":120},
                  "registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
                     "groupName":"alphafrog-beta","namespaceId":"public","clusterName":"DEFAULT",
                     "applicationName":"agent-langchain-service"}}]}
@@ -83,7 +83,7 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
-    void createsFromAnImmutableImageWithOneApplicationAndContainerDeadline() throws Exception {
+    void createsFromAnImmutableImageWithAContainerGraceBeyondTheApplicationBudget() throws Exception {
         FakeCommands commands = new FakeCommands(false);
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
         runtime.validateManifest(manifest);
@@ -150,6 +150,8 @@ class DockerComposeContainerRuntimeTest {
                 "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
         assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
         assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+        assertEquals("65s", mapper.readTree(content).path("services").path("app")
+                .path("stop_grace_period").asText());
         JsonNode volumes = mapper.readTree(content).path("services").path("app").path("volumes");
         assertTrue(containsVolume(volumes, properties.getObservability().getJavaAgentJar()
                 + ":/otel/javaagent.jar:ro"));
@@ -367,7 +369,7 @@ class DockerComposeContainerRuntimeTest {
     @Test
     void nonDefaultAgentDeadlineKeepsOneFiveSecondFinalizationBudget() throws Exception {
         ((ObjectNode) service.path("runtime")).put("applicationDrainSeconds", 30);
-        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 30);
+        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 35);
         FakeCommands commands = new FakeCommands(false);
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
@@ -376,7 +378,7 @@ class DockerComposeContainerRuntimeTest {
         JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
         JsonNode app = compose.path("services").path("app");
         JsonNode environmentNode = app.path("environment");
-        assertEquals("30s", app.path("stop_grace_period").asText());
+        assertEquals("35s", app.path("stop_grace_period").asText());
         assertEquals("30", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
         assertEquals("5", environmentNode.path(
                 "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());

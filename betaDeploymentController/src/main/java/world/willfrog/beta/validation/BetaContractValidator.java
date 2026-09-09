@@ -76,8 +76,12 @@ public class BetaContractValidator {
             int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
             if (applicationDrainSeconds != this.applicationDrainSeconds)
                 throw new ControllerException("MANIFEST_INVALID", "Service drain deadline differs from the controller-wide deadline");
-            if (applicationDrainSeconds != service.path("runtime").path("drainGraceSeconds").asInt())
-                throw new ControllerException("MANIFEST_INVALID", "Application and container drain deadlines must be identical");
+            int drainGraceSeconds = service.path("runtime").path("drainGraceSeconds").asInt();
+            int minimumGraceSeconds = applicationDrainSeconds
+                    + ("agent-service".equals(name) ? finalizationMarginSeconds(applicationDrainSeconds) : 0);
+            if (drainGraceSeconds < minimumGraceSeconds)
+                throw new ControllerException("MANIFEST_INVALID",
+                        "Container drain deadline is shorter than the service shutdown budget for " + name);
             if (commonDrainSeconds == null) commonDrainSeconds = applicationDrainSeconds;
             else if (commonDrainSeconds != applicationDrainSeconds)
                 throw new ControllerException("MANIFEST_INVALID", "All services must use one common drain deadline");
@@ -185,6 +189,10 @@ public class BetaContractValidator {
     }
 
     private record DubboProviderIdentity(String group, String interfaceName, String version) { }
+
+    private static int finalizationMarginSeconds(int totalSeconds) {
+        return totalSeconds <= 1 ? 0 : Math.min(5, totalSeconds - 1);
+    }
 
     private void validate(JsonSchema schema, JsonNode value, String code) {
         Set<ValidationMessage> failures = schema.validate(value);

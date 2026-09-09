@@ -61,7 +61,7 @@ class BetaDeploymentServiceTest {
         assertEquals("STABLE", state().path("phase").asText());
         assertTrue(containers.stopped.containsKey("af-" + oldId));
         assertTrue(containers.removedComposeInstanceIds.contains(oldId));
-        assertEquals(60, containers.stopTimeoutSeconds);
+        assertEquals(65, containers.stopTimeoutSeconds);
     }
 
     @Test
@@ -292,7 +292,7 @@ class BetaDeploymentServiceTest {
         assertEquals(activeId, state().path("drainingInstance").path("instanceId").asText());
         service.reconcileOne();
         assertEquals(0, store.snapshot().path("deployments").size());
-        assertEquals(60, containers.stopTimeoutSeconds);
+        assertEquals(65, containers.stopTimeoutSeconds);
         assertTrue(containers.removedComposeInstanceIds.contains(activeId));
     }
 
@@ -354,7 +354,7 @@ class BetaDeploymentServiceTest {
         containers.leaveRunningAfterStop = true;
         service.reconcileOne();
         assertEquals("FAILED", state().path("phase").asText());
-        assertEquals("2026-09-01T00:01:00Z", state().path("drainingInstance").path("stopDeadline").asText());
+        assertEquals("2026-09-01T00:01:05Z", state().path("drainingInstance").path("stopDeadline").asText());
 
         containers.leaveRunningAfterStop = false;
         BetaControllerProperties properties = new BetaControllerProperties();
@@ -365,7 +365,7 @@ class BetaDeploymentServiceTest {
         service.retry("beta-main-001", "agent-service");
         service.reconcileOne();
 
-        assertEquals(30, containers.stopTimeoutSeconds);
+        assertEquals(35, containers.stopTimeoutSeconds);
         assertEquals("STABLE", state().path("phase").asText());
     }
 
@@ -417,7 +417,7 @@ class BetaDeploymentServiceTest {
         runtime.put("readinessTimeoutSeconds", 120);
         runtime.put("shutdownProfile", "SPRING_BOOT_HTTP_DUBBO_V1");
         runtime.put("applicationDrainSeconds", 60);
-        runtime.put("drainGraceSeconds", 60);
+        runtime.put("drainGraceSeconds", 65);
         ObjectNode registration = spec.putObject("registration");
         registration.put("serviceName", "providers:com.alphafrog.AgentService::langchain");
         registration.put("groupName", "alphafrog-beta");
