@@ -150,9 +150,18 @@ public class BetaDeploymentService {
                 } else if (service.path("candidateInstance").isObject()) {
                     boolean create = service.path("activeInstance").isNull();
                     service.put("phase", create ? "CREATING" : "UPDATING");
+                    JsonNode manifest = store.readManifest(deploymentId);
+                    JsonNode spec = findService(manifest, serviceName);
+                    if (spec == null)
+                        throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
+                    ObjectNode candidate = (ObjectNode) service.path("candidateInstance");
+                    candidate.put("readiness", "STARTING");
+                    candidate.putNull("readinessObservedAt");
+                    candidate.put("readinessDeadline", Instant.now(clock)
+                            .plusSeconds(spec.path("runtime").path("readinessTimeoutSeconds").asLong()).toString());
                     service.set("operation", operation(create ? "CREATE" : "UPDATE",
                             "WAITING_CANDIDATE_READINESS",
-                            service.path("candidateInstance").path("instanceId").asText()));
+                            candidate.path("instanceId").asText()));
                 } else if ("DELETE".equals(failedType)) {
                     service.put("phase", "DELETING");
                     service.set("operation", operation("DELETE", "REMOVING_TRAFFIC", null));
@@ -290,11 +299,25 @@ public class BetaDeploymentService {
             throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Observed candidate differs from the persisted instance");
         boolean healthy = observed.running()
                 && observed.health() == ContainerRuntime.ContainerObservation.Health.HEALTHY;
-        boolean registered = !spec.path("registration").isObject()
-                || healthy && registrationProbe.isVisible(
-                    spec,
-                    candidate.path("endpoint").path("address").asText(),
-                    candidate.path("hostPort").asInt());
+        boolean registered = !spec.path("registration").isObject();
+        if (!registered && healthy) {
+            try {
+                registered = registrationProbe.isVisible(
+                        spec,
+                        candidate.path("endpoint").path("address").asText(),
+                        candidate.path("hostPort").asInt());
+            } catch (ControllerException failure) {
+                if ("NACOS_QUERY_FAILED".equals(failure.code())) {
+                    registered = false;
+                } else if ("NACOS_NAMESPACE_MISMATCH".equals(failure.code())) {
+                    cleanupCandidate(candidate);
+                    markFailed(ref, failure.code(), failure.getMessage(), "CLEAN_RETRYABLE", true);
+                    return;
+                } else {
+                    throw failure;
+                }
+            }
+        }
         boolean ready = healthy && registered;
         boolean expired = !Instant.now(clock).isBefore(Instant.parse(candidate.path("readinessDeadline").asText()));
         if (!ready && !expired && observed.health() != ContainerRuntime.ContainerObservation.Health.UNHEALTHY

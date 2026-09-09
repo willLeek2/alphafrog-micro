@@ -179,6 +179,63 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void transientNacosQueryFailureKeepsWaitingAndLaterPromotesTheCandidate() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        service.reconcileOne();
+        registrationProbe.nextFailure = new ControllerException(
+                "NACOS_QUERY_FAILED", "Unable to confirm the candidate self-registration");
+
+        service.reconcileOne();
+
+        assertEquals("WAITING_CANDIDATE_READINESS", state().path("operation").path("phase").asText());
+        assertTrue(state().path("lastError").isNull());
+
+        service.reconcileOne();
+
+        assertEquals("SWITCHING_TRAFFIC", state().path("operation").path("phase").asText());
+    }
+
+    @Test
+    void namespaceMismatchFailsFastWithoutBlockingDeploymentDeletion() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        service.reconcileOne();
+        registrationProbe.nextFailure = new ControllerException(
+                "NACOS_NAMESPACE_MISMATCH", "Manifest namespace differs from the configured Nacos namespace");
+
+        service.reconcileOne();
+
+        assertEquals("FAILED", state().path("phase").asText());
+        assertEquals("CLEAN_RETRYABLE", state().path("lastError").path("recoveryClass").asText());
+        assertTrue(state().path("candidateInstance").isNull());
+
+        service.requestDelete("beta-main-001");
+
+        assertEquals(0, store.snapshot().path("deployments").size());
+    }
+
+    @Test
+    void retryingAPersistedCandidateStartsANewReadinessWindow() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        service.reconcileOne();
+        containers.observedPortOffset = 1;
+        BetaControllerProperties properties = new BetaControllerProperties();
+        properties.setStateRoot(temporary.resolve("state"));
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe,
+                Clock.fixed(Instant.parse("2026-09-01T00:03:00Z"), ZoneOffset.UTC));
+        service.reconcileOne();
+        assertEquals("FAILED", state().path("phase").asText());
+        assertTrue(state().path("candidateInstance").isObject());
+        containers.observedPortOffset = 0;
+
+        service.retry("beta-main-001", "agent-service");
+
+        assertEquals("WAITING_CANDIDATE_READINESS", state().path("operation").path("phase").asText());
+        assertEquals("2026-09-01T00:05:00Z", state().path("candidateInstance")
+                .path("readinessDeadline").asText());
+    }
+
+    @Test
     void serviceWithoutDubboProviderUsesContainerHealthOnly() {
         ObjectNode value = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
         ObjectNode spec = (ObjectNode) value.path("services").path(0);
@@ -364,6 +421,7 @@ class BetaDeploymentServiceTest {
         int inspectCalls;
         boolean leaveRunningAfterStop;
         String invalidManifestId;
+        int observedPortOffset;
 
         @Override public void validateManifestEnvironment(JsonNode manifest) {
             if (manifest.path("deploymentId").asText().equals(invalidManifestId)) {
@@ -382,7 +440,8 @@ class BetaDeploymentServiceTest {
             inspectCalls++;
             ContainerObservation value = values.get(name);
             if (value == null) return new ContainerObservation("", name, "", 0, false, ContainerObservation.Health.MISSING);
-            return new ContainerObservation(value.containerId(), name, value.endpointAddress(), value.hostPort(),
+            return new ContainerObservation(value.containerId(), name, value.endpointAddress(),
+                    value.hostPort() + observedPortOffset,
                     !Boolean.TRUE.equals(stopped.get(name)), health);
         }
         @Override public void stop(String machineId, String name, int timeoutSeconds) {
@@ -397,9 +456,15 @@ class BetaDeploymentServiceTest {
         String lastAddress;
         int lastPort;
         int calls;
+        ControllerException nextFailure;
 
         @Override public boolean isVisible(JsonNode service, String address, int port) {
             calls++;
+            if (nextFailure != null) {
+                ControllerException failure = nextFailure;
+                nextFailure = null;
+                throw failure;
+            }
             lastAddress = address;
             lastPort = port;
             return visible;
