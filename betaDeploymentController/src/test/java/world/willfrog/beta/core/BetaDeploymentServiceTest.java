@@ -60,7 +60,22 @@ class BetaDeploymentServiceTest {
         service.reconcileOne();
         assertEquals("STABLE", state().path("phase").asText());
         assertTrue(containers.stopped.containsKey("af-" + oldId));
+        assertTrue(containers.removedComposeInstanceIds.contains(oldId));
         assertEquals(60, containers.stopTimeoutSeconds);
+    }
+
+    @Test
+    void startFailureRemovesTheDeterministicCandidateBeforeRetry() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        String candidateId = state().path("operation").path("candidateInstanceId").asText();
+        containers.failAfterCreating = true;
+
+        service.reconcileOne();
+
+        assertEquals("FAILED", state().path("phase").asText());
+        assertEquals("CLEAN_RETRYABLE", state().path("lastError").path("recoveryClass").asText());
+        assertFalse(containers.values.containsKey("af-" + candidateId));
+        assertTrue(containers.removedComposeInstanceIds.contains(candidateId));
     }
 
     @Test
@@ -278,6 +293,7 @@ class BetaDeploymentServiceTest {
         service.reconcileOne();
         assertEquals(0, store.snapshot().path("deployments").size());
         assertEquals(60, containers.stopTimeoutSeconds);
+        assertTrue(containers.removedComposeInstanceIds.contains(activeId));
     }
 
     @Test
@@ -417,11 +433,13 @@ class BetaDeploymentServiceTest {
         ContainerObservation.Health health = ContainerObservation.Health.HEALTHY;
         final Map<String, ContainerObservation> values = new LinkedHashMap<>();
         final Map<String, Boolean> stopped = new LinkedHashMap<>();
+        final java.util.Set<String> removedComposeInstanceIds = new java.util.LinkedHashSet<>();
         int stopTimeoutSeconds;
         int inspectCalls;
         boolean leaveRunningAfterStop;
         String invalidManifestId;
         int observedPortOffset;
+        boolean failAfterCreating;
 
         @Override public void validateManifestEnvironment(JsonNode manifest) {
             if (manifest.path("deploymentId").asText().equals(invalidManifestId)) {
@@ -434,6 +452,7 @@ class BetaDeploymentServiceTest {
             ContainerObservation value = new ContainerObservation(String.format("%064x", values.size() + 1),
                     name, "10.0.0.8", plan.hostPort(), true, health);
             values.put(name, value);
+            if (failAfterCreating) throw new ControllerException("CONTAINER_START_FAILED", "post-create check failed");
             return value;
         }
         @Override public ContainerObservation inspect(String machineId, String name) {
@@ -449,6 +468,10 @@ class BetaDeploymentServiceTest {
             if (!leaveRunningAfterStop) stopped.put(name, true);
         }
         @Override public void remove(String machineId, String name) { values.remove(name); }
+        @Override public void removeCompose(String instanceId) { removedComposeInstanceIds.add(instanceId); }
+        @Override public String containerName(CandidatePlan plan, String serviceName) {
+            return "af-" + plan.instanceId();
+        }
     }
 
     private static final class FakeRegistrationProbe implements CandidateRegistrationProbe {

@@ -265,15 +265,11 @@ public class BetaDeploymentService {
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
         if (spec == null) throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
-        JsonNode active = ref.service().path("activeInstance");
-        String slot = active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
-        int hostPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
-        String generation = JsonSupport.deploymentGeneration(manifest);
-        ContainerRuntime.CandidatePlan plan = new ContainerRuntime.CandidatePlan(
-                ref.deploymentId(), ref.trafficScopeId(), ref.candidateInstanceId(), generation, slot, hostPort);
+        ContainerRuntime.CandidatePlan plan = candidatePlan(ref, manifest, spec);
         ContainerRuntime.ContainerObservation observation = containers.create(manifest, spec, plan);
         Instant now = Instant.now(clock);
-        ObjectNode candidate = instance(spec, manifest, ref.candidateInstanceId(), generation, slot, observation);
+        ObjectNode candidate = instance(spec, manifest, ref.candidateInstanceId(), plan.generationId(),
+                plan.portSlot(), observation);
         candidate.put("readiness", "STARTING");
         candidate.putNull("readinessObservedAt");
         candidate.put("readinessDeadline", now.plusSeconds(spec.path("runtime").path("readinessTimeoutSeconds").asLong()).toString());
@@ -410,6 +406,7 @@ public class BetaDeploymentService {
                 draining.path("machineId").asText(), draining.path("containerName").asText());
         if (stopped.running()) throw new ControllerException("CONTAINER_STILL_RUNNING", "Container did not stop before cleanup");
         containers.remove(draining.path("machineId").asText(), draining.path("containerName").asText());
+        containers.removeCompose(draining.path("instanceId").asText());
         finishDrain(ref);
     }
 
@@ -448,13 +445,19 @@ public class BetaDeploymentService {
     }
 
     private void fail(OperationRef ref, ControllerException failure) {
+        boolean candidateCleaned = false;
+        if ("STARTING_CANDIDATE".equals(ref.phase()) || "SWITCHING_TRAFFIC".equals(ref.phase())) {
+            candidateCleaned = cleanupFailedCandidate(ref);
+        }
         String recovery = switch (ref.phase()) {
-            case "STARTING_CANDIDATE", "WAITING_CANDIDATE_READINESS", "SWITCHING_TRAFFIC" -> "FACTS_UNCERTAIN";
+            case "STARTING_CANDIDATE", "SWITCHING_TRAFFIC" -> candidateCleaned
+                    ? "CLEAN_RETRYABLE" : "FACTS_UNCERTAIN";
+            case "WAITING_CANDIDATE_READINESS" -> "FACTS_UNCERTAIN";
             case "REMOVING_TRAFFIC" -> "DELETE_RETRYABLE";
             default -> "FACTS_UNCERTAIN";
         };
         try {
-            markFailed(ref, failure.code(), failure.getMessage(), recovery, false);
+            markFailed(ref, failure.code(), failure.getMessage(), recovery, candidateCleaned);
         } catch (RuntimeException stateFailure) {
             log.error("Unable to persist Beta deployment failure for deployment {} service {} operation {}",
                     ref.deploymentId(), ref.serviceName(), ref.operationId(), stateFailure);
@@ -485,6 +488,38 @@ public class BetaDeploymentService {
 
     private void cleanupCandidate(JsonNode candidate) {
         containers.remove(candidate.path("machineId").asText(), candidate.path("containerName").asText());
+        containers.removeCompose(candidate.path("instanceId").asText());
+    }
+
+    private boolean cleanupFailedCandidate(OperationRef ref) {
+        try {
+            JsonNode candidate = ref.service().path("candidateInstance");
+            if (candidate.isObject()) {
+                cleanupCandidate(candidate);
+            } else {
+                JsonNode manifest = store.readManifest(ref.deploymentId());
+                JsonNode spec = findService(manifest, ref.serviceName());
+                if (spec == null)
+                    throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
+                ContainerRuntime.CandidatePlan plan = candidatePlan(ref, manifest, spec);
+                containers.remove(spec.path("machineId").asText(),
+                        containers.containerName(plan, spec.path("serviceName").asText()));
+                containers.removeCompose(plan.instanceId());
+            }
+            return true;
+        } catch (RuntimeException cleanupFailure) {
+            log.error("Unable to clean failed Beta candidate for deployment {} service {} operation {}",
+                    ref.deploymentId(), ref.serviceName(), ref.operationId(), cleanupFailure);
+            return false;
+        }
+    }
+
+    private ContainerRuntime.CandidatePlan candidatePlan(OperationRef ref, JsonNode manifest, JsonNode spec) {
+        JsonNode active = ref.service().path("activeInstance");
+        String slot = active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
+        int hostPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
+        return new ContainerRuntime.CandidatePlan(ref.deploymentId(), ref.trafficScopeId(),
+                ref.candidateInstanceId(), JsonSupport.deploymentGeneration(manifest), slot, hostPort);
     }
 
     private void validateAll(ObjectNode state) {

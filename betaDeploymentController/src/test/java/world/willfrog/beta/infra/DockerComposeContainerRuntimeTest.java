@@ -409,6 +409,35 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("COMMAND_FAILED", failure.code());
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
         assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
+        assertFalse(Files.exists(temporary.resolve("state/compose/i-one.json")));
+    }
+
+    @Test
+    void removesContainerAndComposeFileWhenPostCreateInspectionFails() {
+        FakeCommands commands = new FakeCommands(false);
+        commands.failInfoCall = 2;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.create(manifest, service, plan));
+
+        assertEquals("COMMAND_FAILED", failure.code());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("rm")
+                && command.contains(runtime.containerName(plan, "agent-service"))));
+        assertFalse(Files.exists(temporary.resolve("state/compose/i-one.json")));
+    }
+
+    @Test
+    void removesComposeFileAfterAnInstanceIsCleaned() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+        runtime.create(manifest, service, plan);
+        assertTrue(Files.exists(temporary.resolve("state/compose/i-one.json")));
+
+        runtime.removeCompose("i-one");
+
+        assertFalse(Files.exists(temporary.resolve("state/compose/i-one.json")));
     }
 
     @Test
@@ -541,9 +570,12 @@ class DockerComposeContainerRuntimeTest {
     private final class FakeCommands extends CommandRunner {
         private final boolean startsPresent;
         private int inspectCalls;
+        private int infoCalls;
         private final List<List<String>> commands = new ArrayList<>();
         private boolean failComposeValidation;
         private boolean returnOnlyObservedFields;
+        private int failInfoCall;
+        private boolean removed;
         private String imageInspectId = "sha256:" + "b".repeat(64);
 
         private FakeCommands(boolean startsPresent) {
@@ -553,14 +585,23 @@ class DockerComposeContainerRuntimeTest {
         @Override
         public String run(List<String> arguments, Map<String, String> environment, Duration timeout) {
             commands.add(List.copyOf(arguments));
-            if (arguments.contains("info")) return "27.0.0\n";
+            if (arguments.contains("info")) {
+                infoCalls++;
+                if (failInfoCall == infoCalls) throw new ControllerException("COMMAND_FAILED", "docker unavailable");
+                return "27.0.0\n";
+            }
             if (arguments.contains("inspect") && arguments.contains("image"))
                 return imageInspectId + "\n";
             if (arguments.contains("inspect")) {
                 inspectCalls++;
+                if (removed) throw new ControllerException("COMMAND_FAILED", "missing");
                 if (!startsPresent && inspectCalls == 1)
                     throw new ControllerException("COMMAND_FAILED", "missing");
                 return inspectJson();
+            }
+            if (arguments.contains("rm")) {
+                removed = true;
+                return "";
             }
             if (arguments.contains("config") && arguments.contains("--quiet") && failComposeValidation)
                 throw new ControllerException("COMMAND_FAILED", "invalid compose");

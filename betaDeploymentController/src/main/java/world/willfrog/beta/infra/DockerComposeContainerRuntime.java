@@ -14,6 +14,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import world.willfrog.beta.config.BetaControllerProperties;
@@ -24,6 +26,7 @@ import world.willfrog.beta.core.JsonSupport;
 @Component
 @ConditionalOnProperty(prefix = "alphafrog.beta-controller", name = "enabled", havingValue = "true")
 public class DockerComposeContainerRuntime implements ContainerRuntime {
+    private static final Logger log = LoggerFactory.getLogger(DockerComposeContainerRuntime.class);
     private final ObjectMapper mapper;
     private final CommandRunner commands;
     private final BetaControllerProperties properties;
@@ -34,7 +37,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         this.mapper = mapper;
         this.commands = commands;
         this.properties = properties;
-        this.composeRoot = properties.getStateRoot().resolve("compose");
+        this.composeRoot = properties.getStateRoot().toAbsolutePath().normalize().resolve("compose");
     }
 
     @Override
@@ -99,16 +102,25 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         validateJavaAgent(template);
         Path compose = writeCompose(manifest, service, plan, name, machine);
         Map<String, String> environment = Map.of();
-        commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
-                "config", "--quiet"), environment, Duration.ofSeconds(30));
-        commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
-                "up", "--detach", "--no-deps", "app"), environment, Duration.ofMinutes(5));
-        JsonNode createdDocument = inspectDocument(machineId, name);
-        if (createdDocument.isMissingNode())
-            throw new ControllerException("CONTAINER_START_FAILED", "Candidate container was not created");
-        ContainerObservation created = observation(machineId, name, createdDocument);
-        if (!created.running()) throw new ControllerException("CONTAINER_START_FAILED", "Candidate container did not start");
-        return created;
+        boolean containerMayExist = false;
+        try {
+            commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
+                    "config", "--quiet"), environment, Duration.ofSeconds(30));
+            containerMayExist = true;
+            commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
+                    "up", "--detach", "--no-deps", "app"), environment, Duration.ofMinutes(5));
+            JsonNode createdDocument = inspectDocument(machineId, name);
+            if (createdDocument.isMissingNode())
+                throw new ControllerException("CONTAINER_START_FAILED", "Candidate container was not created");
+            ContainerObservation created = observation(machineId, name, createdDocument);
+            if (!created.running())
+                throw new ControllerException("CONTAINER_START_FAILED", "Candidate container did not start");
+            return created;
+        } catch (RuntimeException failure) {
+            if (containerMayExist) bestEffortRemoveFailedCandidate(machineId, name, failure);
+            bestEffortRemoveCompose(plan.instanceId(), failure);
+            throw failure;
+        }
     }
 
     @Override
@@ -164,6 +176,39 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         commands.run(docker(machineId, "rm", "--force", containerName), Map.of(), Duration.ofSeconds(30));
         if (!inspect(machineId, containerName).containerId().isEmpty())
             throw new ControllerException("CONTAINER_REMOVE_NOT_CONFIRMED", "Candidate container still exists after removal");
+    }
+
+    @Override
+    public void removeCompose(String instanceId) {
+        Path target = composePath(instanceId);
+        try {
+            if (Files.isSymbolicLink(target))
+                throw new ControllerException("COMPOSE_PATH_UNSAFE", "Compose state file must not be a symbolic link");
+            if (!Files.deleteIfExists(target)) return;
+            try (var channel = java.nio.channels.FileChannel.open(composeRoot, java.nio.file.StandardOpenOption.READ)) {
+                channel.force(true);
+            }
+        } catch (IOException exception) {
+            throw new ControllerException("COMPOSE_DELETE_FAILED", "Unable to remove candidate Compose file", exception);
+        }
+    }
+
+    private void bestEffortRemoveFailedCandidate(String machineId, String name, RuntimeException original) {
+        try {
+            remove(machineId, name);
+        } catch (RuntimeException cleanupFailure) {
+            original.addSuppressed(cleanupFailure);
+            log.error("Unable to remove candidate container {} after create failed", name, cleanupFailure);
+        }
+    }
+
+    private void bestEffortRemoveCompose(String instanceId, RuntimeException original) {
+        try {
+            removeCompose(instanceId);
+        } catch (RuntimeException cleanupFailure) {
+            original.addSuppressed(cleanupFailure);
+            log.error("Unable to remove Compose file for candidate {} after create failed", instanceId, cleanupFailure);
+        }
     }
 
     private Path writeCompose(JsonNode manifest, JsonNode service, CandidatePlan plan, String name,
@@ -283,8 +328,8 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             if (Files.isSymbolicLink(properties.getStateRoot()) || Files.isSymbolicLink(composeRoot))
                 throw new ControllerException("COMPOSE_PATH_UNSAFE", "Compose state path must not be a symbolic link");
             Files.createDirectories(composeRoot);
-            Path target = composeRoot.resolve(plan.instanceId() + ".json");
-            if (!target.normalize().startsWith(composeRoot.normalize()) || Files.isSymbolicLink(target))
+            Path target = composePath(plan.instanceId());
+            if (Files.isSymbolicLink(target))
                 throw new ControllerException("COMPOSE_PATH_UNSAFE", "Compose state path is unsafe");
             Path temporary = Files.createTempFile(composeRoot, "." + plan.instanceId(), ".tmp");
             try {
@@ -494,8 +539,18 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         return boundedName(("afb-" + plan.deploymentId() + '-' + plan.instanceId()).toLowerCase(), 63);
     }
 
-    String containerName(CandidatePlan plan, String service) {
+    @Override
+    public String containerName(CandidatePlan plan, String service) {
         return boundedName(("afb-" + plan.deploymentId() + '-' + service + '-' + plan.instanceId()).toLowerCase(), 128);
+    }
+
+    private Path composePath(String instanceId) {
+        if (instanceId == null || !instanceId.matches("[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"))
+            throw new ControllerException("COMPOSE_PATH_UNSAFE", "Candidate instance identifier is invalid");
+        Path target = composeRoot.resolve(instanceId + ".json").normalize();
+        if (!target.startsWith(composeRoot))
+            throw new ControllerException("COMPOSE_PATH_UNSAFE", "Compose state path escapes the state root");
+        return target;
     }
 
     private String boundedName(String value, int maximumLength) {

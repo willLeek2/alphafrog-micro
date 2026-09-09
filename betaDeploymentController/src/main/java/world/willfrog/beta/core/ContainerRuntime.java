@@ -13,6 +13,8 @@ public interface ContainerRuntime {
     ContainerObservation inspect(String machineId, String containerName);
     void stop(String machineId, String containerName, int timeoutSeconds);
     void remove(String machineId, String containerName);
+    void removeCompose(String instanceId);
+    String containerName(CandidatePlan plan, String serviceName);
 
     record CandidatePlan(String deploymentId, String trafficScopeId, String instanceId,
                          String generationId, String portSlot, int hostPort) {}
