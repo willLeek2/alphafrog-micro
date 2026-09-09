@@ -384,6 +384,28 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void escapesEveryDollarInEnvironmentValuesSoComposeSkipsInterpolation() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        String content = Files.readString(temporary.resolve("state/compose/i-one.json"));
+        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
+        // 文件层面：环境值里每个 $ 都必须成对写成 $$，否则 docker compose 会把
+        // ${AF_CONFIG_NACOS_USERNAME:} 当插值语法直接拒绝，整个部署卡死在建容器前。
+        List<String> names = new ArrayList<>();
+        environmentNode.fieldNames().forEachRemaining(names::add);
+        for (String name : names)
+            assertTrue(environmentNode.path(name).asText().matches("(?:[^$]|\\$\\$)*"), name);
+        // 容器层面：compose 把 $$ 还原成字面 $，Spring 照常解析这两个占位符。
+        assertTrue(environmentNode.path("SPRING_APPLICATION_JSON").asText()
+                .contains("$${AF_CONFIG_NACOS_USERNAME:}"));
+        assertTrue(environmentNode.path("SPRING_APPLICATION_JSON").asText()
+                .contains("$${AF_CONFIG_NACOS_PASSWORD:}"));
+    }
+
+    @Test
     void refusesAnEnvironmentFileWhoseDigestDiffersFromTheManifest() {
         ((ObjectNode) service).put("runtimeConfigSha256", "c".repeat(64));
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(

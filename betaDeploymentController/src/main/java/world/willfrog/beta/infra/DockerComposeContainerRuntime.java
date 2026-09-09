@@ -257,6 +257,14 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             volumes.add(prepareLogDirectory(service.path("serviceName").asText()) + ":/app/logs");
             template.getVolumes().forEach(volumes::add);
         }
+        // Compose 在建容器前会先对文件里的 ${...} 做变量插值，而环境值里的
+        // ${AF_CONFIG_NACOS_USERNAME:} 这类 Spring 占位符不是合法的插值语法，会让
+        // docker compose config 直接拒绝。控制器写入的环境值都要原样进容器，统一把
+        // $ 转义成 $$（compose 会还原成字面 $，Spring 照常解析占位符）。
+        List<String> environmentNames = new ArrayList<>();
+        environment.fieldNames().forEachRemaining(environmentNames::add);
+        for (String environmentName : environmentNames)
+            environment.put(environmentName, environment.path(environmentName).asText().replace("$", "$$"));
         ObjectNode health = app.putObject("healthcheck");
         health.putArray("test").add("CMD").add(properties.getHealthcheckScript().toString())
                 .add("127.0.0.1").add(Integer.toString(service.path("runtime").path("containerPort").asInt()));
