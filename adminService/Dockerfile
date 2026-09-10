@@ -1,3 +1,3 @@
-FROM openjdk:17.0.1-jdk-slim
+FROM eclipse-temurin:17-jdk-noble
 COPY target/adminService-1.0-SNAPSHOT.jar /app.jar
 ENTRYPOINT ["sh", "-c", "java ${JAVA_OPTS} -jar /app.jar"]
