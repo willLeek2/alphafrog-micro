@@ -54,3 +54,15 @@ alphafrog:
         java-tool-options: -Xms384m -Xmx512m
         volumes:
           - /var/lib/alphafrog-beta/data/agent-debug-observability:/app/logs/agent-debug-observability
+      # 四个回落生产的服务；Beta 纳入可拉起名单后按需在部署单里出现，缺映射会在
+      # 提交对应服务时报 SERVICE_CONFIG_MISSING。真实 env 文件由 Beta 本机按文档 04 落盘。
+      domestic-index-service:
+        env-file: /etc/alphafrog-beta/services/domestic-index-service.env
+      domestic-fund-service:
+        env-file: /etc/alphafrog-beta/services/domestic-fund-service.env
+      domestic-listed-asset-service:
+        env-file: /etc/alphafrog-beta/services/domestic-listed-asset-service.env
+      external-info-service:
+        env-file: /etc/alphafrog-beta/services/external-info-service.env
+        volumes:
+          - /var/lib/alphafrog-beta/data/external-info-configs:/app/config-dynamic
