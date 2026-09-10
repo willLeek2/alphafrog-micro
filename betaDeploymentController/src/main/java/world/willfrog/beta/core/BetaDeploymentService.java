@@ -792,8 +792,11 @@ public class BetaDeploymentService {
             if (hasFailure(deployment)) continue;
             for (JsonNode service : deployment.path("services")) {
                 boolean create = "CREATING".equals(service.path("phase").asText()) && service.path("operation").isNull();
+                // 按服务内容摘要而不是部署单版本号决定滚动：版本号升高但服务摘要没变的
+                // 服务保持当前容器，只有真正改过的服务进入蓝绿。
                 boolean update = "STABLE".equals(service.path("phase").asText())
-                        && service.path("targetManifestVersion").asLong() != service.path("activeInstance").path("manifestVersion").asLong();
+                        && !service.path("targetServiceSpecSha256").asText()
+                                .equals(service.path("activeInstance").path("serviceSpecSha256").asText());
                 if (create || update) queue.add(new ServiceRef((ObjectNode) deployment, (ObjectNode) service, create));
             }
         }

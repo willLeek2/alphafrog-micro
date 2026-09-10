@@ -65,6 +65,31 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void updatingOneServiceLeavesServicesWithUnchangedDigestsStable() {
+        ObjectNode first = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
+        ObjectNode secondService = withPortfolioService(first);
+        service.submitManifest(first);
+        reconcile(6);
+        String agentContainer = stateOf("agent-service").path("activeInstance").path("containerName").asText();
+        String portfolioContainer = stateOf("portfolio-service").path("activeInstance").path("containerName").asText();
+        String portfolioInstance = stateOf("portfolio-service").path("activeInstance").path("instanceId").asText();
+        assertEquals("STABLE", stateOf("agent-service").path("phase").asText());
+        assertEquals("STABLE", stateOf("portfolio-service").path("phase").asText());
+
+        // 新部署单只换 agent 的镜像（版本号也升高）；portfolio 的服务摘要不变。
+        ObjectNode second = manifest(2, "release-1", '1', 'a', 'c', "main-beta");
+        ((com.fasterxml.jackson.databind.node.ArrayNode) second.path("services")).add(secondService.deepCopy());
+        service.submitManifest(second);
+        reconcile(4);
+
+        assertEquals("STABLE", stateOf("portfolio-service").path("phase").asText());
+        assertEquals(portfolioInstance, stateOf("portfolio-service").path("activeInstance").path("instanceId").asText());
+        assertTrue(containers.values.containsKey(portfolioContainer));
+        assertFalse(containers.stopped.containsKey(portfolioContainer));
+        assertFalse(agentContainer.equals(stateOf("agent-service").path("activeInstance").path("containerName").asText()));
+    }
+
+    @Test
     void startFailureRemovesTheDeterministicCandidateBeforeRetry() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         String candidateId = state().path("operation").path("candidateInstanceId").asText();
@@ -375,6 +400,29 @@ class BetaDeploymentServiceTest {
 
     private JsonNode state() {
         return store.snapshot().path("deployments").path(0).path("services").path(0);
+    }
+
+    private JsonNode stateOf(String serviceName) {
+        for (JsonNode deployment : store.snapshot().path("deployments")) {
+            for (JsonNode service : deployment.path("services")) {
+                if (serviceName.equals(service.path("serviceName").asText())) return service;
+            }
+        }
+        throw new AssertionError("Missing service " + serviceName);
+    }
+
+    private ObjectNode withPortfolioService(ObjectNode manifest) {
+        ObjectNode spec = (ObjectNode) manifest.path("services").path(0).deepCopy();
+        spec.put("serviceName", "portfolio-service");
+        spec.put("dubboServiceKey", "portfolio/com.alphafrog.PortfolioService");
+        ((ObjectNode) spec.path("registration"))
+                .put("serviceName", "providers:com.alphafrog.PortfolioService::portfolio");
+        ObjectNode runtime = (ObjectNode) spec.path("runtime");
+        runtime.remove("hostPorts");
+        runtime.putArray("hostPorts").add(28100).add(28101);
+        spec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, spec));
+        ((com.fasterxml.jackson.databind.node.ArrayNode) manifest.path("services")).add(spec);
+        return spec;
     }
 
     private JsonNode state(String scope) {
