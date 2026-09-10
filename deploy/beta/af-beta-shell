@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# SSH 强制命令（forced command）包装：开发机专用受限钥匙连入时，sshd 忽略客户端
+# 请求的任何命令、只运行本脚本；客户端原本想执行的命令在 SSH_ORIGINAL_COMMAND
+# 里，这里只放行 af-beta 的白名单子命令，其余一律拒绝。不经过 shell 解析，
+# 参数按词传递，避免命令注入。
+#
+# 安装：cp af-beta-shell /opt/alphafrog-beta/bin/af-beta-shell && chmod 755 ...
+# 白名单以《03-beta-机开发入口》的子命令清单为准增删。
+set -euo pipefail
+
+ALLOWED_SUBCOMMANDS="status retry how-to-test lane main"
+
+read -r -a request <<<"${SSH_ORIGINAL_COMMAND:-}"
+
+if [ "${#request[@]}" -eq 0 ] || [ "${request[0]}" != "af-beta" ]; then
+  echo "af-beta-shell: 只允许执行 af-beta 子命令，收到: ${SSH_ORIGINAL_COMMAND:-<空>}" >&2
+  exit 111
+fi
+
+subcommand="${request[1]:-}"
+if [ -z "$subcommand" ] || ! [[ " $ALLOWED_SUBCOMMANDS " == *" $subcommand "* ]]; then
+  echo "af-beta-shell: 子命令不在白名单: ${subcommand:-<空>}（允许: $ALLOWED_SUBCOMMANDS）" >&2
+  exit 111
+fi
+
+exec af-beta "${request[@]:1}"
