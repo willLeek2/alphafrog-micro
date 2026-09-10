@@ -12,6 +12,7 @@ description: 开发机 Agent 通过 SSH 包装脚本调用 Beta 机本机接待�
 ## 硬性边界
 
 - 默认只做泳道（lane）操作。**更新主 Beta 环境（main roll）必须用户在当前对话里明确说了才允许调用**。
+- **开某个服务的泳道前，主 Beta 要先有该服务的活动实例**；主 Beta 没有（该服务还在回落生产）时，先让用户确认是否把它纳入主环境，不要直接开泳道。
 - 镜像构建、部署单填写、端口分配、口令读取都发生在 Beta 本机，由 `af-beta` 完成；开发机 Agent 的职责是选对子命令和参数（泳道名、服务短名、git 提交）。
 - 对 Beta 的访问只有包装脚本这一条路：专用受限钥匙（Beta 侧 authorized_keys 绑定强制命令 af-beta-shell，服务端只放行 af-beta 白名单子命令，拿不到 shell、不能端口转发）。**不得尝试用其它钥匙、其它用户、直接 ssh、scp、端口转发或任何方式连 Beta**。
 - 不读取、不修改 `/etc/alphafrog-beta/` 下的任何文件。
@@ -32,7 +33,7 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 
 ## 服务短名对照
 
-与 Beta 机文档《04-beta-机全量微服务拉起》的 12 行对照表保持一致；以那份文档为权威，发现不一致以它为准并在对话里指出：
+调用 `af-beta` 时用短名指定服务。短名在 Beta 机接待命令侧登记，未知短名会被拒收；对照表如下（12 个）：
 
 | 短名 | 部署单里的服务名 | 说明 |
 | --- | --- | --- |
@@ -49,16 +50,14 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 | listed | domestic-listed-asset-service | 国内上市资产（默认回落生产，可拉起） |
 | ext-info | external-info-service | 外部信息（默认回落生产，可拉起） |
 
-操作顺序：开某个服务的泳道前，主 Beta 要先有该服务的活动实例；主 Beta 没有（该服务还在回落生产）时，先让用户确认是否把它纳入主环境，不要直接开泳道。默认动作仍是开泳道；改主环境必须用户明确说了才调用 `main roll`。
-
-## 常用子命令（以 03 文档为准）
+## 常用子命令
 
 - `status`：查看当前部署与滚动状态。
-- 泳道相关子命令：按 03 文档用泳道名 + 服务短名 + git 提交发起。
-- `main roll`：更新主 Beta 环境。见上文硬性边界：必须用户明确要求。
+- `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。
+- `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加。见上文硬性边界：必须用户明确要求。
 - `retry`：对失败部署重试。
 - `how-to-test`：拿到本次部署的验证指引，成功后原样转告用户。
 
 ## 联调前置
 
-- Beta 本机接待命令按 03 文档 1-1 就绪后，`bash deploy/beta/af-beta-remote.sh status` 能跑通即联调成功。
+- Beta 本机接待命令 `af-beta` 就绪后，`bash deploy/beta/af-beta-remote.sh status` 能跑通即联调成功。
