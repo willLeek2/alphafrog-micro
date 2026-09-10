@@ -32,20 +32,24 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 
 ## 服务短名对照
 
-与 Beta 机文档《03-beta-机开发入口》的对照表保持一致；以那份文档为权威，发现不一致以它为准并在对话里指出：
+与 Beta 机文档《04-beta-机全量微服务拉起》的 12 行对照表保持一致；以那份文档为权威，发现不一致以它为准并在对话里指出：
 
-| 部署单里的服务名 | 说明 |
-| --- | --- |
-| domestic-stock-service | 行情（Beta 本地） |
-| domestic-fetch-service | 抓取（Beta 本地） |
-| admin-service | 管理 |
-| portfolio-service | 组合 |
-| agent-service | agent-langchain |
-| python-sandbox-service | Python 沙箱执行 |
-| python-sandbox-gateway-service | 沙箱网关 |
-| frontend | 前端入口 |
+| 短名 | 部署单里的服务名 | 说明 |
+| --- | --- | --- |
+| stock | domestic-stock-service | 行情（Beta 本地） |
+| fetch | domestic-fetch-service | 抓取（Beta 本地） |
+| admin | admin-service | 管理 |
+| portfolio | portfolio-service | 组合 |
+| agent | agent-service | agent-langchain |
+| sandbox | python-sandbox-service | Python 沙箱执行 |
+| sandbox-gw | python-sandbox-gateway-service | 沙箱网关 |
+| frontend | frontend | 前端入口 |
+| index | domestic-index-service | 国内指数（默认回落生产，可拉起） |
+| fund | domestic-fund-service | 国内基金（默认回落生产，可拉起） |
+| listed | domestic-listed-asset-service | 国内上市资产（默认回落生产，可拉起） |
+| ext-info | external-info-service | 外部信息（默认回落生产，可拉起） |
 
-（短名形式以 03 文档的对照表为准；上表先列部署单实名，供核对。）
+操作顺序：开某个服务的泳道前，主 Beta 要先有该服务的活动实例；主 Beta 没有（该服务还在回落生产）时，先让用户确认是否把它纳入主环境，不要直接开泳道。默认动作仍是开泳道；改主环境必须用户明确说了才调用 `main roll`。
 
 ## 常用子命令（以 03 文档为准）
 
