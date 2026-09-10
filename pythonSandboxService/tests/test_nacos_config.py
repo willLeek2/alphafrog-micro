@@ -32,9 +32,18 @@ Covered behavior:
     task-local (it now travels in wrapper-input.json instead of the
     shared global sitecustomize.py); the cmc==1 rule still holds, driven
     by the dynamic-install venv mutation race (S3B-04 governs lifting).
+  - Lane -> main Beta data-id fallback chain for the Nacos listener
+    (2026-09-10 beta needs, 改动二): a non-blank AF_LANE_TRAFFIC_SCOPE_ID
+    makes the candidate chain ["{lane}.{data_id}", data_id]; the first
+    non-blank candidate wins; the whole chain empty applies nothing and
+    logs an error; a config watcher on ANY chain member re-resolves the
+    full chain (pushed bodies are not trusted), so deleting the lane item
+    falls back to the main Beta data-id automatically. No group fallback:
+    the group comes from AF_CONFIG_NACOS_GROUP only.
 
 Constructed directly from a ``SandboxConfig`` instance; stdlib unittest only,
-no nacos SDK or network required.
+no nacos SDK or network required (the listener wiring tests patch
+``_get_nacos_client`` with an in-memory fake client class).
 
 Run: ``cd pythonSandboxService && python3 -m unittest tests.test_nacos_config -v``
 """
@@ -43,9 +52,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 # Spec §7.1 wrapper-input example shape values (numbers only denote shape;
 # production numbers await the four-stage tests, contract §13).
@@ -546,6 +558,365 @@ class ExampleConfigFileTest(NacosConfigTest):
             self.assertLessEqual(
                 payload[key], self.config_module.HARD_OUTPUT_LIMIT_CEILINGS[key], key
             )
+
+
+class FakeNacosConfigClient:
+    """In-memory stand-in for the nacos SDK client used by the listener.
+
+    ``get_config`` serves a plain dict and records every (data_id, group)
+    call so tests can assert the chain resolution order. ``add_config_watcher``
+    records (data_id, group, callback) triples so tests can assert
+    per-candidate watcher registration and fire pushes by hand via ``fire``.
+    No nacos SDK import, no network.
+    """
+
+    def __init__(self, contents=None) -> None:
+        self.contents = dict(contents or {})
+        self.get_config_calls = []
+        self.watchers = []  # list of (data_id, group, callback)
+
+    def get_config(self, data_id, group):
+        self.get_config_calls.append((data_id, group))
+        return self.contents.get(data_id)
+
+    def add_config_watcher(self, data_id, group, callback) -> None:
+        self.watchers.append((data_id, group, callback))
+
+    def delete(self, data_id) -> None:
+        self.contents.pop(data_id, None)
+
+    def fire(self, data_id, raw) -> None:
+        """Invoke the watcher registered for data_id like the SDK would push."""
+        registered = [cb for d, _, cb in self.watchers if d == data_id]
+        assert registered, f"no watcher registered for {data_id}"
+        registered[0](SimpleNamespace(raw=raw))
+
+
+class CandidateDataIdsTest(NacosConfigTest):
+    """Chain construction: lane prefix first, plain data-id (main Beta) last."""
+
+    DATA_ID = "python-sandbox.json"
+
+    def test_absent_or_blank_lane_collapses_to_main_data_id_only(self) -> None:
+        candidate_ids = self.nacos_module._candidate_data_ids
+        for lane in ("", "   ", "\t"):
+            with self.subTest(lane=lane):
+                self.assertEqual(candidate_ids(self.DATA_ID, lane), [self.DATA_ID])
+
+    def test_lane_prefixes_data_id_and_main_is_always_last(self) -> None:
+        candidate_ids = self.nacos_module._candidate_data_ids
+        chain = candidate_ids(self.DATA_ID, "lane-demo")
+        self.assertEqual(chain, ["lane-demo.python-sandbox.json", self.DATA_ID])
+        # Surrounding whitespace must not leak into the constructed data-id.
+        self.assertEqual(candidate_ids(self.DATA_ID, "  lane-demo  "), chain)
+
+
+class ResolveConfigChainTest(NacosConfigTest):
+    """Pure resolver: order, first non-blank wins, empty-chain result."""
+
+    GROUP = "alphafrog-beta-config"
+    LANE_ID = "lane-demo.python-sandbox.json"
+    MAIN_ID = "python-sandbox.json"
+
+    def test_single_candidate_with_content_resolves(self) -> None:
+        client = FakeNacosConfigClient({self.MAIN_ID: '{"stdoutMaxBytes": 111}'})
+        content, winner = self.nacos_module.resolve_config_chain(
+            client.get_config, [self.MAIN_ID], self.GROUP
+        )
+        self.assertEqual(winner, self.MAIN_ID)
+        self.assertEqual(content, '{"stdoutMaxBytes": 111}')
+        # The group from the environment is passed through to get_config.
+        self.assertEqual(client.get_config_calls, [(self.MAIN_ID, self.GROUP)])
+
+    def test_lane_candidate_is_fetched_first_and_short_circuits(self) -> None:
+        client = FakeNacosConfigClient({
+            self.LANE_ID: '{"stdoutMaxBytes": 222}',
+            self.MAIN_ID: '{"stdoutMaxBytes": 333}',
+        })
+        content, winner = self.nacos_module.resolve_config_chain(
+            client.get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+        )
+        self.assertEqual(winner, self.LANE_ID)
+        self.assertEqual(json.loads(content)["stdoutMaxBytes"], 222)
+        # Resolution order: the lane data-id is fetched first and wins, so
+        # the main data-id is never fetched.
+        self.assertEqual(client.get_config_calls, [(self.LANE_ID, self.GROUP)])
+
+    def test_missing_or_blank_lane_content_falls_through_to_main(self) -> None:
+        for lane_content in (None, "", "   "):
+            with self.subTest(lane_content=lane_content):
+                client = FakeNacosConfigClient({self.MAIN_ID: '{"stdoutMaxBytes": 444}'})
+                if lane_content is not None:
+                    client.contents[self.LANE_ID] = lane_content
+                content, winner = self.nacos_module.resolve_config_chain(
+                    client.get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+                )
+                self.assertEqual(winner, self.MAIN_ID)
+                self.assertEqual(json.loads(content)["stdoutMaxBytes"], 444)
+                self.assertEqual(
+                    client.get_config_calls,
+                    [(self.LANE_ID, self.GROUP), (self.MAIN_ID, self.GROUP)],
+                )
+
+    def test_whole_chain_empty_returns_none_none(self) -> None:
+        client = FakeNacosConfigClient({self.MAIN_ID: "   "})
+        self.assertEqual(
+            self.nacos_module.resolve_config_chain(
+                client.get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+            ),
+            (None, None),
+        )
+        # The whole chain was scanned before giving up.
+        self.assertEqual(
+            client.get_config_calls,
+            [(self.LANE_ID, self.GROUP), (self.MAIN_ID, self.GROUP)],
+        )
+
+
+class ApplyResolvedChainContentTest(NacosConfigTest):
+    """Resolve-and-apply helper against a real DynamicSandboxConfig.
+
+    Scenarios from the 2026-09-10 beta needs (改动二):
+      (a) no lane, main has content -> main applied;
+      (b) lane set, both present -> lane applied (order asserted);
+      (c) whole chain empty -> nothing applied + ERROR log.
+    """
+
+    GROUP = "alphafrog-beta-config"
+    LANE_ID = "lane-demo.python-sandbox.json"
+    MAIN_ID = "python-sandbox.json"
+
+    def test_no_lane_applies_main_content(self) -> None:
+        dyn = self._make_dynamic()
+        client = FakeNacosConfigClient({self.MAIN_ID: json.dumps({"stdoutMaxBytes": 2048})})
+        with self.assertLogs("app.nacos_config", level="INFO") as captured:
+            winner = self.nacos_module._apply_resolved_chain_content(
+                dyn, client.get_config, [self.MAIN_ID], self.GROUP
+            )
+        self.assertEqual(winner, self.MAIN_ID)
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 2048)
+        resolved = [m for m in captured.output if "NACOS_CONFIG_RESOLVED" in m]
+        self.assertEqual(len(resolved), 1, captured.output)
+        self.assertIn(f"data_id={self.MAIN_ID}", resolved[0])
+        self.assertIn(self.GROUP, resolved[0])
+
+    def test_lane_chain_applies_lane_content(self) -> None:
+        dyn = self._make_dynamic()
+        client = FakeNacosConfigClient({
+            self.LANE_ID: json.dumps({"stdoutMaxBytes": 1111}),
+            self.MAIN_ID: json.dumps({"stdoutMaxBytes": 2222}),
+        })
+        with self.assertLogs("app.nacos_config", level="INFO") as captured:
+            winner = self.nacos_module._apply_resolved_chain_content(
+                dyn, client.get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+            )
+        self.assertEqual(winner, self.LANE_ID)
+        # The LANE value was applied, not the main value.
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 1111)
+        self.assertTrue(any(
+            "NACOS_CONFIG_RESOLVED" in m and f"data_id={self.LANE_ID}" in m
+            for m in captured.output
+        ))
+        # The lane candidate was fetched first and short-circuited the chain.
+        self.assertEqual(client.get_config_calls, [(self.LANE_ID, self.GROUP)])
+
+    def test_whole_chain_empty_applies_nothing_and_logs_error(self) -> None:
+        dyn = self._make_dynamic()
+        client = FakeNacosConfigClient({self.MAIN_ID: "   "})
+        with self.assertLogs("app.nacos_config", level="ERROR") as captured:
+            winner = self.nacos_module._apply_resolved_chain_content(
+                dyn, client.get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+            )
+        self.assertIsNone(winner)
+        self.assertTrue(
+            any("NACOS_CONFIG_CHAIN_EMPTY" in m for m in captured.output),
+            captured.output,
+        )
+        # The ERROR line carries the chain and the group.
+        self.assertTrue(any(
+            self.LANE_ID in m and self.MAIN_ID in m and self.GROUP in m
+            for m in captured.output
+        ))
+        # Nothing was applied: still the complete static-default snapshot.
+        self._assert_last_known_good(dyn, SHAPE_OUTPUT_LIMITS, "static-default")
+
+
+class ChainConfigWatcherTest(NacosConfigTest):
+    """Watcher callback: never trust the push, re-resolve the full chain.
+
+    Scenario (d) from the 2026-09-10 beta needs (改动二): the watcher fires
+    after the lane item was deleted in Nacos, so re-resolution only finds
+    the main Beta data-id -> main content is applied.
+    """
+
+    GROUP = "alphafrog-beta-config"
+    LANE_ID = "lane-demo.python-sandbox.json"
+    MAIN_ID = "python-sandbox.json"
+
+    def _make_watcher(self, dyn, client):
+        return self.nacos_module._make_chain_config_watcher(
+            dyn, client.get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+        )
+
+    def test_lane_deleted_falls_back_to_main_and_push_body_is_not_trusted(self) -> None:
+        dyn = self._make_dynamic()
+        lane_payload = json.dumps({"stdoutMaxBytes": 1111})
+        main_payload = json.dumps({"stdoutMaxBytes": 2222})
+        client = FakeNacosConfigClient({
+            self.LANE_ID: lane_payload,
+            self.MAIN_ID: main_payload,
+        })
+        watcher = self._make_watcher(dyn, client)
+        self.assertTrue(dyn.apply_dynamic_content(lane_payload))
+        # The lane item is deleted in Nacos (e.g. `af-beta lane stop`), then a
+        # push fires whose body still carries the OLD lane content. The
+        # callback must ignore the pushed body and re-resolve the chain,
+        # falling back to the main Beta content.
+        client.delete(self.LANE_ID)
+        with self.assertLogs("app.nacos_config", level="INFO") as captured:
+            watcher(SimpleNamespace(raw=lane_payload))
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 2222)
+        self.assertTrue(any(
+            "NACOS_CONFIG_RESOLVED" in m and f"data_id={self.MAIN_ID}" in m
+            for m in captured.output
+        ))
+
+    def test_all_empty_push_keeps_last_known_good(self) -> None:
+        dyn = self._make_dynamic()
+        lane_payload = json.dumps({"stdoutMaxBytes": 1111})
+        client = FakeNacosConfigClient({self.LANE_ID: lane_payload})
+        watcher = self._make_watcher(dyn, client)
+        self.assertTrue(dyn.apply_dynamic_content(lane_payload))
+        revision = dyn.source_revision
+        # Both chain members are now gone in Nacos.
+        client.delete(self.LANE_ID)
+        with self.assertLogs("app.nacos_config", level="ERROR") as captured:
+            watcher(SimpleNamespace(raw=""))
+        self.assertTrue(
+            any("NACOS_CONFIG_CHAIN_EMPTY" in m for m in captured.output),
+            captured.output,
+        )
+        # Last-known-good retained wholesale; no reset is attempted.
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 1111)
+        self.assertEqual(dyn.source_revision, revision)
+
+    def test_get_config_failure_keeps_last_known_good_and_does_not_raise(self) -> None:
+        dyn = self._make_dynamic()
+        self.assertTrue(dyn.apply_dynamic_content(json.dumps({"stdoutMaxBytes": 4096})))
+        revision = dyn.source_revision
+
+        def broken_get_config(data_id, group):
+            raise ConnectionError("nacos unreachable")
+
+        watcher = self.nacos_module._make_chain_config_watcher(
+            dyn, broken_get_config, [self.LANE_ID, self.MAIN_ID], self.GROUP
+        )
+        # The exception must not escape into the SDK's watcher thread.
+        with self.assertLogs("app.nacos_config", level="ERROR") as captured:
+            watcher(SimpleNamespace(raw="anything"))
+        self.assertTrue(
+            any("NACOS_CONFIG_WATCHER_FAILED" in m for m in captured.output),
+            captured.output,
+        )
+        self.assertEqual(dyn.source_revision, revision)
+
+
+class StartNacosListenerChainTest(NacosConfigTest):
+    """Listener wiring end to end (SDK patched out, no network, no sleep).
+
+    ``_get_nacos_client`` is patched to return a factory that builds an
+    in-memory FakeNacosConfigClient; the fake's add_config_watcher sets an
+    Event so the test synchronizes with the listener thread without sleeping.
+    """
+
+    GROUP = "alphafrog-beta-config"
+    LANE_ID = "lane-demo.python-sandbox.json"
+    MAIN_ID = "python-sandbox.json"
+
+    def _start_listener(self, dyn, contents, env, expected_watchers):
+        """Run start_nacos_listener with a fake client; wait for watcher setup.
+
+        The fake client's add_config_watcher sets an Event once the expected
+        number of chain watchers is registered, so the test synchronizes
+        with the listener thread without sleeping.
+        """
+        created = {}
+        registered = threading.Event()
+
+        def fake_client_factory(**kwargs):
+            client = FakeNacosConfigClient(contents)
+            created["client"] = client
+
+            class _SignalingClient:
+                # The listener only uses get_config / add_config_watcher.
+                def get_config(self, data_id, group):
+                    return client.get_config(data_id, group)
+
+                def add_config_watcher(self, data_id, group, cb):
+                    client.add_config_watcher(data_id, group, cb)
+                    if len(client.watchers) >= expected_watchers:
+                        registered.set()
+
+            return _SignalingClient()
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(
+                    self.nacos_module, "_get_nacos_client",
+                    return_value=fake_client_factory,
+                ), \
+                self.assertLogs("app.nacos_config", level="INFO"):
+            self.nacos_module.start_nacos_listener(self._make_base_config(), dyn)
+            self.assertTrue(
+                registered.wait(timeout=5),
+                "listener thread did not register all config watchers in time",
+            )
+        return created["client"]
+
+    def test_lane_env_resolves_chain_and_watches_every_candidate(self) -> None:
+        contents = {
+            self.LANE_ID: json.dumps({"stdoutMaxBytes": 1111}),
+            self.MAIN_ID: json.dumps({"stdoutMaxBytes": 2222}),
+        }
+        env = {
+            "AF_CONFIG_NACOS_ENABLED": "true",
+            "AF_CONFIG_NACOS_GROUP": self.GROUP,
+            "AF_CONFIG_NACOS_DATA_ID": self.MAIN_ID,
+            "AF_LANE_TRAFFIC_SCOPE_ID": "lane-demo",
+        }
+        dyn = self._make_dynamic()
+        client = self._start_listener(dyn, contents, env, expected_watchers=2)
+        # Initial resolution applied the LANE content (first chain member).
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 1111)
+        # One watcher per chain candidate, in chain order, in the env group.
+        self.assertEqual(
+            [(d, g) for d, g, _ in client.watchers],
+            [(self.LANE_ID, self.GROUP), (self.MAIN_ID, self.GROUP)],
+        )
+        # Lane item deleted in Nacos; firing the MAIN watcher must re-resolve
+        # the full chain and fall back to the main Beta content.
+        client.delete(self.LANE_ID)
+        with self.assertLogs("app.nacos_config", level="INFO") as captured:
+            client.fire(self.MAIN_ID, contents[self.MAIN_ID])
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 2222)
+        self.assertTrue(any("NACOS_CONFIG_RESOLVED" in m for m in captured.output))
+
+    def test_no_lane_env_uses_single_main_data_id(self) -> None:
+        contents = {self.MAIN_ID: json.dumps({"stdoutMaxBytes": 3333})}
+        env = {
+            "AF_CONFIG_NACOS_ENABLED": "true",
+            "AF_CONFIG_NACOS_GROUP": self.GROUP,
+            "AF_CONFIG_NACOS_DATA_ID": self.MAIN_ID,
+            "AF_LANE_TRAFFIC_SCOPE_ID": "",
+        }
+        dyn = self._make_dynamic()
+        client = self._start_listener(dyn, contents, env, expected_watchers=1)
+        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 3333)
+        # No lane env var -> the chain (and the watcher set) is main only.
+        self.assertEqual(
+            [(d, g) for d, g, _ in client.watchers],
+            [(self.MAIN_ID, self.GROUP)],
+        )
+        self.assertEqual(client.get_config_calls, [(self.MAIN_ID, self.GROUP)])
 
 
 if __name__ == "__main__":

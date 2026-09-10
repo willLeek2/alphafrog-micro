@@ -111,6 +111,7 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("none", environmentNode.path("OTEL_METRICS_EXPORTER").asText());
         assertEquals("none", environmentNode.path("OTEL_LOGS_EXPORTER").asText());
         assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
+        assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
         assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));

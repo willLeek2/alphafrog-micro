@@ -37,6 +37,12 @@ import java.util.concurrent.Executor;
  *
  * <p>订阅 Nacos Config 的指定 dataId，收到推送后三段式写本地文件，
  * 让各微服务现有的 *LocalConfigLoader 通过文件轮询自动热加载。</p>
+ *
+ * <p>dataId 解析按「泳道 → 主」候选链（见 {@link #candidateDataIds(Subscription)}）：
+ * 容器设置了 AF_LANE_TRAFFIC_SCOPE_ID 时先查 "{scopeId}.{dataId}"（泳道覆盖），
+ * 无内容再回落 "{dataId}"（主配置）；整链为空打 error 日志，本地加载器回落默认。
+ * 候选链只做组内 data-id 回落：所有查询都固定用订阅自身的 group，
+ * 绝不跨组回退（不回落到订阅组之外的任何组，也不在组内造别的组名）。</p>
  */
 @Slf4j
 @Component
@@ -62,6 +68,9 @@ public class NacosConfigBridge {
 
     /** Prompt 覆盖层的默认 Nacos dataId。这份配置被删掉时，本地文件也得一起拿掉，加载器才能回落到权威默认。 */
     private static final String PROMPT_OVERLAY_DATA_ID = "agent-prompt-overlay.json";
+
+    /** 泳道隔离变量（由 Beta 控制器注入容器）：非空表示容器跑在某条泳道上，配置解析先查 "{scopeId}.{dataId}" 再回落主 dataId。 */
+    private static final String LANE_SCOPE_PROPERTY = "AF_LANE_TRAFFIC_SCOPE_ID";
 
     private final ObjectMapper objectMapper;
     private final Environment environment;
@@ -145,16 +154,40 @@ public class NacosConfigBridge {
 
     private void subscribe(Subscription subscription) throws NacosException {
         String subscriptionGroup = isBlank(subscription.getGroup()) ? group : subscription.getGroup();
-        clearNacosLocalSnapshot(subscription.getDataId(), subscriptionGroup);
-        String initialConfig = configService.getConfig(subscription.getDataId(), subscriptionGroup, 5000);
-        if (initialConfig != null && !initialConfig.isBlank()) {
-            writeConfigToFileIfChanged(subscription, initialConfig, "initial-load");
-        } else if (shouldDeleteLocalOnBlank(subscription)) {
-            // 启动时 Nacos 上已经没有 overlay，别把上次留下的本地文件继续当成覆盖层。
-            removeLocalTargetIfPresent(subscription);
+        List<String> candidates = candidateDataIds(subscription);
+        // Nacos 客户端断连时 getConfig 会回退本地快照文件；候选链上每一条的快照都要清掉，
+        // 残留的泳道快照可能遮蔽已在服务端删除的泳道配置。
+        for (String candidate : candidates) {
+            clearNacosLocalSnapshot(candidate, subscriptionGroup);
         }
+        ResolvedConfig resolved = resolveConfigContent(subscription);
+        applyResolvedConfig(subscription, resolved, "initial-load");
 
-        configService.addListener(subscription.getDataId(), subscriptionGroup, new Listener() {
+        for (String candidate : candidates) {
+            addChainListener(subscription, candidate, subscriptionGroup);
+        }
+        synchronized (activeSubscriptions) {
+            activeSubscriptions.add(subscription);
+        }
+        log.info("[NacosConfigBridge] 已订阅 Nacos 配置 server={} dataId={} 候选链={} group={} filePath={}",
+                serverAddr, subscription.getDataId(), candidates, subscriptionGroup, subscription.getTargetFile());
+    }
+
+    /**
+     * 对候选链上的单条 data-id 注册监听。
+     *
+     * <p>需求原文写「对链上实际生效的那条 data-id 注册 listener」；本实现是它的超集：
+     * 链上每一条（主 dataId 恒有，设了 AF_LANE_TRAFFIC_SCOPE_ID 时再加泳道那条）都挂 listener，
+     * 回调不直接信任推送内容，而是重新跑整链解析（{@link #resolveConfigContent}）后应用结果。
+     * 取舍原因：「实际生效的那条」会随泳道覆盖的增删动态变化，只挂生效条就必须维护 listener
+     * 换绑状态机（泳道删除时解绑旧条、回落时再绑新条、断连重启还要恢复）；两条全挂 + 事件到达时
+     * 整链重解析，用一次多余的服务端查询换掉整个状态机，并天然覆盖两类事件——「泳道被删后
+     * 回落主 Beta」和「泳道缺失期间主 Beta 变更」。代价是泳道命中期间主 Beta 的变更推送会多查
+     * 一次泳道 data-id，重解析结果仍是泳道内容，行为正确。</p>
+     */
+    private void addChainListener(Subscription subscription, String candidateDataId, String subscriptionGroup)
+            throws NacosException {
+        configService.addListener(candidateDataId, subscriptionGroup, new Listener() {
             @Override
             public Executor getExecutor() {
                 return null;
@@ -162,24 +195,83 @@ public class NacosConfigBridge {
 
             @Override
             public void receiveConfigInfo(String config) {
-                log.info("[NacosConfigBridge] 收到配置推送 dataId={}", subscription.getDataId());
-                if (config == null || config.isBlank()) {
-                    if (shouldDeleteLocalOnBlank(subscription)) {
-                        // 空串不是合法 JSON，不能走写入路径（校验失败会把备份还原回来）。
-                        removeLocalTargetIfPresent(subscription);
-                    } else {
-                        log.warn("[NacosConfigBridge] 忽略空白配置推送 dataId={}", subscription.getDataId());
-                    }
-                    return;
+                log.info("[NacosConfigBridge] 收到配置推送 dataId={} 逻辑dataId={}",
+                        candidateDataId, subscription.getDataId());
+                try {
+                    ResolvedConfig latest = resolveConfigContent(subscription);
+                    applyResolvedConfig(subscription, latest, "listener");
+                } catch (Exception e) {
+                    log.error("[NacosConfigBridge] 监听回调整链重解析失败 dataId={} 候选链={} group={}",
+                            subscription.getDataId(), candidateDataIds(subscription), subscriptionGroup, e);
                 }
-                writeConfigToFileIfChanged(subscription, config, "listener");
             }
         });
-        synchronized (activeSubscriptions) {
-            activeSubscriptions.add(subscription);
+    }
+
+    /**
+     * 候选 data-id 链（组内回落，绝不跨组）：
+     * 设了 AF_LANE_TRAFFIC_SCOPE_ID 时 = ["{scopeId}.{dataId}", "{dataId}"]
+     * （如 lane-demo.agent-llm.json → agent-llm.json）；未设时 = ["{dataId}"]。
+     * 所有查询都用订阅自身的 group（默认 alphafrog-config，来自现有 @Value/订阅配置），
+     * 绝不回落到订阅组之外的任何组（如生产 alphafrog-config），也不在组内造别的组名。
+     */
+    private List<String> candidateDataIds(Subscription subscription) {
+        List<String> candidates = new ArrayList<>();
+        String scopeId = laneScopeId();
+        if (!scopeId.isBlank()) {
+            candidates.add(scopeId + "." + subscription.getDataId());
         }
-        log.info("[NacosConfigBridge] 已订阅 Nacos 配置 server={} dataId={} group={} filePath={}",
-                serverAddr, subscription.getDataId(), subscriptionGroup, subscription.getTargetFile());
+        candidates.add(subscription.getDataId());
+        return candidates;
+    }
+
+    private String laneScopeId() {
+        String scopeId = environment == null ? null : environment.getProperty(LANE_SCOPE_PROPERTY);
+        return scopeId == null ? "" : scopeId.trim();
+    }
+
+    /**
+     * 按候选顺序逐条 getConfig，第一条非 null 且非 blank 的内容生效；整链都空返回 content=null。
+     * 方法内不吞异常：getConfig 抛出的 NacosException 原样上抛，由调用方按现有结构处理
+     * （subscribe 直接上抛给 init 的 catch；refresh/listener 回调已有 try-catch）。
+     */
+    private ResolvedConfig resolveConfigContent(Subscription subscription) throws NacosException {
+        String subscriptionGroup = isBlank(subscription.getGroup()) ? group : subscription.getGroup();
+        for (String candidate : candidateDataIds(subscription)) {
+            String content = configService.getConfig(candidate, subscriptionGroup, 5000);
+            if (content != null && !content.isBlank()) {
+                return new ResolvedConfig(content, candidate);
+            }
+        }
+        return new ResolvedConfig(null, null);
+    }
+
+    /** resolveConfigContent 的结果：content 为最终生效内容（整链为空时为 null），effectiveDataId 为它来自候选链的哪一条。 */
+    private record ResolvedConfig(String content, String effectiveDataId) {
+        boolean hasContent() {
+            return content != null && !content.isBlank();
+        }
+    }
+
+    /**
+     * 应用整链解析结果（初始加载 / listener 回调 / 定时刷新共用）：
+     * 有内容走既有写入路径；整链为空时 prompt overlay 删本地文件（回落权威默认），
+     * 其它 dataId 打 error 日志并保留本地文件不动，由各 *LocalConfigLoader 回落 classpath/env 默认。
+     */
+    private void applyResolvedConfig(Subscription subscription, ResolvedConfig resolved, String source) {
+        if (resolved.hasContent()) {
+            writeConfigToFileIfChanged(subscription, resolved.content(), resolved.effectiveDataId(), source);
+            return;
+        }
+        if (shouldDeleteLocalOnBlank(subscription)) {
+            // 启动时 Nacos 上已经没有 overlay，别把上次留下的本地文件继续当成覆盖层。
+            removeLocalTargetIfPresent(subscription);
+            return;
+        }
+        String subscriptionGroup = isBlank(subscription.getGroup()) ? group : subscription.getGroup();
+        log.error("[NacosConfigBridge] 配置候选链全部为空 dataId={} 候选链={} group={} source={}，"
+                        + "保留本地文件不动，等待候选链恢复或由本地加载器回落默认",
+                subscription.getDataId(), candidateDataIds(subscription), subscriptionGroup, source);
     }
 
     /**
@@ -197,16 +289,8 @@ public class NacosConfigBridge {
         for (Subscription subscription : subscriptionsSnapshot) {
             String subscriptionGroup = isBlank(subscription.getGroup()) ? group : subscription.getGroup();
             try {
-                String latest = configService.getConfig(subscription.getDataId(), subscriptionGroup, 5000);
-                if (latest == null || latest.isBlank()) {
-                    if (shouldDeleteLocalOnBlank(subscription)) {
-                        removeLocalTargetIfPresent(subscription);
-                    } else {
-                        log.warn("[NacosConfigBridge] 定时刷新忽略空白配置 dataId={}", subscription.getDataId());
-                    }
-                    continue;
-                }
-                writeConfigToFileIfChanged(subscription, latest, "periodic-refresh");
+                ResolvedConfig latest = resolveConfigContent(subscription);
+                applyResolvedConfig(subscription, latest, "periodic-refresh");
             } catch (Exception e) {
                 log.warn("[NacosConfigBridge] 定时刷新失败 dataId={} group={}",
                         subscription.getDataId(), subscriptionGroup, e);
@@ -214,7 +298,7 @@ public class NacosConfigBridge {
         }
     }
 
-    private void writeConfigToFileIfChanged(Subscription subscription, String configContent, String source) {
+    private void writeConfigToFileIfChanged(Subscription subscription, String configContent, String effectiveDataId, String source) {
         String key = subscriptionKey(subscription);
         synchronized (lastWrittenContentBySubscription) {
             String lastWritten = lastWrittenContentBySubscription.get(key);
@@ -224,8 +308,8 @@ public class NacosConfigBridge {
             writeConfigToFile(subscription, configContent);
             if (fileContentEquals(subscription, configContent)) {
                 lastWrittenContentBySubscription.put(key, configContent);
-                log.info("[NacosConfigBridge] 配置同步完成 dataId={} source={}",
-                        subscription.getDataId(), source);
+                log.info("[NacosConfigBridge] 配置同步完成 dataId={} effectiveDataId={} source={}",
+                        subscription.getDataId(), effectiveDataId, source);
             }
         }
     }

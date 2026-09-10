@@ -8,7 +8,7 @@
 # 白名单以《03-beta-机开发入口》的子命令清单为准增删。
 set -euo pipefail
 
-ALLOWED_SUBCOMMANDS="status retry how-to-test lane main"
+ALLOWED_SUBCOMMANDS="status retry how-to-test lane main configs"
 
 read -r -a request <<<"${SSH_ORIGINAL_COMMAND:-}"
 

@@ -407,6 +407,121 @@ def _get_nacos_client() -> _NacosClient:
         return None
 
 
+def _candidate_data_ids(data_id: str, lane: str) -> list[str]:
+    """Data-id resolution chain for one logical data-id (lane -> main Beta).
+
+    A non-blank lane scope id prefixes the logical data-id
+    (``lane-demo.python-sandbox.json``) and that candidate is tried FIRST;
+    the plain data-id (main Beta) is always the last candidate. An absent /
+    empty / whitespace-only lane collapses the chain to ``[data_id]`` (main
+    Beta containers have no lane env var). Mirrors the Java
+    ``NacosConfigBridge`` lane chain. Note there is deliberately NO group
+    fallback anywhere: the group comes from ``AF_CONFIG_NACOS_GROUP`` only
+    (production default ``alphafrog-config``; Beta containers get
+    ``alphafrog-beta-config`` injected by the beta controller).
+    """
+    lane = lane.strip()
+    if lane:
+        return [f"{lane}.{data_id}", data_id]
+    return [data_id]
+
+
+def resolve_config_chain(
+    get_config: Callable[[str, str], str | None],
+    data_ids: list[str],
+    group: str,
+) -> tuple[str | None, str | None]:
+    """Pure lane -> main data-id chain resolution (no SDK / network / state).
+
+    Calls ``get_config(candidate, group)`` for each candidate data-id in
+    order; the first response that is non-None and non-blank (``.strip()``
+    non-empty) wins and resolution short-circuits (later candidates are not
+    fetched). Returns ``(content, winner_data_id)``; ``(None, None)`` when
+    every candidate on the chain resolves empty. Exceptions from
+    ``get_config`` propagate to the caller: a transient fetch error must
+    keep the last-known-good config, not silently fall through to the next
+    candidate.
+
+    Kept as a pure function with all I/O injected (the client is passed in
+    as a ``get_config`` callable) so the fallback chain is unit-testable
+    without the Nacos SDK, a server, or listener threads.
+    """
+    for candidate in data_ids:
+        content = get_config(candidate, group)
+        if content is not None and content.strip():
+            return content, candidate
+    return None, None
+
+
+def _apply_resolved_chain_content(
+    dynamic_config: DynamicSandboxConfig,
+    get_config: Callable[[str, str], str | None],
+    data_ids: list[str],
+    group: str,
+) -> str | None:
+    """Resolve the data-id chain, apply the winning content, log the outcome.
+
+    The winner (first candidate with non-blank content) is applied
+    whole-object via ``apply_dynamic_content`` and logged as
+    ``NACOS_CONFIG_RESOLVED``. When the WHOLE chain resolves empty, logs
+    ``NACOS_CONFIG_CHAIN_EMPTY`` at ERROR and applies nothing —
+    ``DynamicSandboxConfig`` keeps its default or last-known-good snapshot
+    (this layer never tries to reset it). Returns the winning data-id, or
+    None for an empty chain.
+    """
+    content, winner = resolve_config_chain(get_config, data_ids, group)
+    if content is None:
+        logger.error(
+            "NACOS_CONFIG_CHAIN_EMPTY chain=%s group=%s: no candidate data-id "
+            "returned non-blank content; keeping current dynamic config "
+            "(default or last-known-good)",
+            data_ids,
+            group,
+        )
+        return None
+    dynamic_config.apply_dynamic_content(content)
+    logger.info(
+        "NACOS_CONFIG_RESOLVED data_id=%s chain=%s group=%s",
+        winner,
+        data_ids,
+        group,
+    )
+    return winner
+
+
+def _make_chain_config_watcher(
+    dynamic_config: DynamicSandboxConfig,
+    get_config: Callable[[str, str], str | None],
+    data_ids: list[str],
+    group: str,
+) -> Callable[[object], None]:
+    """Build the ``add_config_watcher`` callback for a lane -> main chain.
+
+    The pushed payload is deliberately NOT trusted or applied directly: any
+    push on ANY chain member re-runs the FULL chain resolution and applies
+    whatever wins at that moment. That is what makes a lane item deleted or
+    blanked in Nacos fall back to the main Beta data-id automatically. If
+    re-resolution comes back empty (or raises), nothing is applied and the
+    last-known-good snapshot is kept; the callback never lets an exception
+    escape into the SDK's watcher thread.
+    """
+
+    def _on_config_change(config_response: object) -> None:
+        # config_response (the pushed body) is intentionally unused.
+        try:
+            _apply_resolved_chain_content(dynamic_config, get_config, data_ids, group)
+        except Exception:
+            logger.exception(
+                "NACOS_CONFIG_WATCHER_FAILED chain=%s group=%s: chain "
+                "re-resolution failed; keeping current dynamic config "
+                "(last-known-good)",
+                data_ids,
+                group,
+            )
+
+    return _on_config_change
+
+
 def start_nacos_listener(
     base_config: SandboxConfig,
     dynamic_config: DynamicSandboxConfig,
@@ -418,8 +533,16 @@ def start_nacos_listener(
       - NACOS_ADDRESS: host or host:port (default "nacos:8848")
       - NACOS_USER / NACOS_PASSWORD
       - AF_CONFIG_NACOS_NAMESPACE: namespace id (default "")
-      - AF_CONFIG_NACOS_GROUP: group (default "alphafrog-config")
+      - AF_CONFIG_NACOS_GROUP: group (default "alphafrog-config" — the
+        production default; Beta containers get "alphafrog-beta-config"
+        injected by the beta controller. There is deliberately NO group
+        fallback to production.)
       - AF_CONFIG_NACOS_DATA_ID: data id (default "python-sandbox.json")
+      - AF_LANE_TRAFFIC_SCOPE_ID: lane scope id (e.g. "lane-demo"). When
+        non-blank, the data-id chain becomes
+        ["{lane}.{data_id}", data_id] — lane override first, main Beta
+        second — matching the Java NacosConfigBridge. Absent / blank
+        collapses the chain to [data_id] (main Beta only).
 
     Expected config content is a single JSON object, e.g.
     {"containerMaxConcurrency": 1, "stdoutMaxBytes": 1048576,
@@ -446,17 +569,8 @@ def start_nacos_listener(
     namespace = os.getenv("AF_CONFIG_NACOS_NAMESPACE", "")
     group = os.getenv("AF_CONFIG_NACOS_GROUP", "alphafrog-config")
     data_id = os.getenv("AF_CONFIG_NACOS_DATA_ID", "python-sandbox.json")
-
-    def _parse_content(content: str) -> None:
-        # Whole-object parse/validate/apply lives in DynamicSandboxConfig so
-        # it is testable without the Nacos SDK or network.
-        dynamic_config.apply_dynamic_content(content)
-
-    def _on_config_change(config_response: object) -> None:
-        content = getattr(config_response, "raw", None)
-        if content is None:
-            content = str(config_response)
-        _parse_content(content)
+    lane = os.getenv("AF_LANE_TRAFFIC_SCOPE_ID", "")
+    data_ids = _candidate_data_ids(data_id, lane)
 
     def _listen() -> None:
         try:
@@ -466,16 +580,27 @@ def start_nacos_listener(
                 username=user,
                 password=password,
             )
-            # Fetch initial config.
-            initial = client.get_config(data_id, group)
-            if initial:
-                _parse_content(initial)
-            # Add listener for subsequent changes.
-            client.add_config_watcher(data_id, group, _on_config_change)
+            # Initial load: resolve the lane -> main Beta data-id chain once
+            # and apply the winner (logs NACOS_CONFIG_RESOLVED, or
+            # NACOS_CONFIG_CHAIN_EMPTY + keeps defaults when all empty).
+            _apply_resolved_chain_content(
+                dynamic_config, client.get_config, data_ids, group
+            )
+            # Add listeners for subsequent changes: one watcher on EVERY
+            # data-id of the chain (not only the initial winner). Each push
+            # re-resolves the full chain (see _make_chain_config_watcher),
+            # so a lane item deleted or blanked in Nacos automatically
+            # falls back to the main Beta data-id.
+            on_config_change = _make_chain_config_watcher(
+                dynamic_config, client.get_config, data_ids, group
+            )
+            for candidate in data_ids:
+                client.add_config_watcher(candidate, group, on_config_change)
             logger.info(
-                "NACOS_LISTENER_STARTED server=%s data_id=%s group=%s namespace=%s",
+                "NACOS_LISTENER_STARTED server=%s data_id=%s chain=%s group=%s namespace=%s",
                 server_addresses,
                 data_id,
+                data_ids,
                 group,
                 namespace,
             )

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.mock.env.MockEnvironment;
 
@@ -226,8 +227,10 @@ class NacosConfigBridgeTest {
 
         NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
         ConfigService mockConfigService = mock(ConfigService.class);
+        // listener 回调不再直接信任推送内容，而是整链重解析（getConfig），所以按调用次序给值：
+        // 第 1 次（初始加载）返回旧内容，之后每次重解析返回最新内容。
         when(mockConfigService.getConfig(anyString(), anyString(), anyLong()))
-                .thenReturn("{\"from\":\"nacos\"}");
+                .thenReturn("{\"from\":\"nacos\"}", "{\"updated\":true}");
 
         // 将 mock 的 ConfigService 注入
         java.lang.reflect.Field configServiceField = NacosConfigBridge.class.getDeclaredField("configService");
@@ -272,8 +275,9 @@ class NacosConfigBridgeTest {
         injectValueField(bridge, "group", "alphafrog-config");
 
         ConfigService mockConfigService = mock(ConfigService.class);
+        // listener 收到空白推送后走整链重解析：第 1 次（初始加载）有内容，之后重解析返回空白（overlay 已删）。
         when(mockConfigService.getConfig(eq("agent-prompt-overlay.json"), eq("alphafrog-config"), anyLong()))
-                .thenReturn("{\"formatVersion\":1,\"prompts\":{}}");
+                .thenReturn("{\"formatVersion\":1,\"prompts\":{}}", "   ");
 
         java.lang.reflect.Field configServiceField = NacosConfigBridge.class.getDeclaredField("configService");
         configServiceField.setAccessible(true);
@@ -440,6 +444,230 @@ class NacosConfigBridgeTest {
         }
     }
 
+    // ==================== 泳道 → 主 Beta 候选链测试 ====================
+
+    @Test
+    void subscribe_shouldWriteMainBetaContent_whenNoScopeIdAndOnlyMainPresent(@TempDir Path tempDir) throws Exception {
+        // 场景 a：无 scopeId，仅主 data-id 有内容 → 写入主内容，且只有单候选/单 listener
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"main-beta\"}");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+
+        assertEquals("{\"from\":\"main-beta\"}", Files.readString(targetFile));
+        verify(mockConfigService, times(1)).getConfig(anyString(), anyString(), anyLong());
+        verify(mockConfigService, times(1)).addListener(anyString(), anyString(), any(Listener.class));
+    }
+
+    @Test
+    void subscribe_shouldPreferLaneContent_whenScopeIdSetAndBothPresent(@TempDir Path tempDir) throws Exception {
+        // 场景 b：scopeId=lane-demo、泳道+主都有 → 用泳道内容。
+        // 解析按候选顺序短路（第一条非空生效），泳道命中后主 data-id 不再查询；
+        // 「先 lane 后主」的完整调用顺序断言在回落场景（listener_shouldFallBackToMainBeta...）里覆盖。
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"lane-demo\"}");
+        when(mockConfigService.getConfig(eq("agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"main-beta\"}");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+
+        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(targetFile));
+        // 泳道候选第一个被查且命中即短路，主 data-id 未被查询
+        InOrder inOrder = inOrder(mockConfigService);
+        inOrder.verify(mockConfigService).getConfig("lane-demo.agent-llm.json", "alphafrog-beta-config", 5000L);
+        verify(mockConfigService, never()).getConfig(eq("agent-llm.json"), anyString(), anyLong());
+        // 候选链上每一条都挂了 listener（泳道 + 主）
+        verify(mockConfigService).addListener(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), any(Listener.class));
+        verify(mockConfigService).addListener(eq("agent-llm.json"), eq("alphafrog-beta-config"), any(Listener.class));
+    }
+
+    @Test
+    void subscribe_shouldKeepLocalFileUntouched_whenWholeChainEmpty(@TempDir Path tempDir) throws Exception {
+        // 场景 c（非 overlay）：整链全空 → 不写文件，已有本地文件保留不动
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        String oldLocal = "{\"from\":\"old-local\"}";
+        Files.writeString(targetFile, oldLocal);
+
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn(null);
+        when(mockConfigService.getConfig(eq("agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("   ");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+
+        assertEquals(oldLocal, Files.readString(targetFile));
+        // 整链两条候选都被查过
+        verify(mockConfigService).getConfig("lane-demo.agent-llm.json", "alphafrog-beta-config", 5000L);
+        verify(mockConfigService).getConfig("agent-llm.json", "alphafrog-beta-config", 5000L);
+    }
+
+    @Test
+    void subscribe_shouldDeleteLocalOverlayFile_whenWholeChainEmpty(@TempDir Path tempDir) throws Exception {
+        // 场景 c（overlay）：整链全空 → 删本地文件，加载器回落权威默认
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-prompt-overlay.local.json");
+        Files.writeString(targetFile, "{\"formatVersion\":1,\"prompts\":{}}");
+
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-prompt-overlay.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn(null);
+        when(mockConfigService.getConfig(eq("agent-prompt-overlay.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn(null);
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-prompt-overlay.json", "alphafrog-beta-config", targetFile));
+
+        assertFalse(Files.exists(targetFile));
+        verify(mockConfigService).getConfig("lane-demo.agent-prompt-overlay.json", "alphafrog-beta-config", 5000L);
+        verify(mockConfigService).getConfig("agent-prompt-overlay.json", "alphafrog-beta-config", 5000L);
+    }
+
+    @Test
+    void listener_shouldFallBackToMainBeta_whenLaneConfigDeleted(@TempDir Path tempDir) throws Exception {
+        // 场景 d：泳道先存在后删除，listener 推送触发整链重解析 → 回落主 Beta 内容写进 target，
+        // 本地不残留泳道 JSON；getConfig 实际调用顺序为先 lane 后主
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"lane-demo\"}", null);
+        when(mockConfigService.getConfig(eq("agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"main-beta\"}");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(targetFile));
+
+        // 泳道 listener 收到「泳道配置被删」的推送（此时 getConfig(lane) 已返回 null）
+        ArgumentCaptor<Listener> laneListenerCaptor = ArgumentCaptor.forClass(Listener.class);
+        verify(mockConfigService).addListener(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"),
+                laneListenerCaptor.capture());
+        laneListenerCaptor.getValue().receiveConfigInfo(null);
+
+        // 整链重解析：泳道空 → 主 Beta 内容写入，覆盖掉旧泳道 JSON
+        assertEquals("{\"from\":\"main-beta\"}", Files.readString(targetFile));
+        InOrder inOrder = inOrder(mockConfigService);
+        inOrder.verify(mockConfigService).getConfig("lane-demo.agent-llm.json", "alphafrog-beta-config", 5000L);
+        inOrder.verify(mockConfigService).getConfig("agent-llm.json", "alphafrog-beta-config", 5000L);
+    }
+
+    @Test
+    void refresh_shouldFallBackToMainBeta_whenLaneConfigDeleted(@TempDir Path tempDir) throws Exception {
+        // 场景 d 的定时刷新触发版：泳道删除后 refresh 重解析整链 → 回落主 Beta
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+        injectValueField(bridge, "enabled", true);
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"lane-demo\"}", null);
+        when(mockConfigService.getConfig(eq("agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"main-beta\"}");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(targetFile));
+
+        bridge.refreshSubscriptions();
+
+        assertEquals("{\"from\":\"main-beta\"}", Files.readString(targetFile));
+    }
+
+    @Test
+    void resolveChain_shouldOnlyEverQuerySubscriptionGroup_whenScopeIdSet(@TempDir Path tempDir) throws Exception {
+        // 组隔离断言：scopeId 设置时，初始加载/定时刷新/两条 listener 回调的全部 getConfig
+        // 调用都只用订阅组，绝不以其它 group 查询（不跨组回退）
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+        injectValueField(bridge, "enabled", true);
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"lane-demo\"}");
+        when(mockConfigService.getConfig(eq("agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"from\":\"main-beta\"}");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+        bridge.refreshSubscriptions();
+
+        ArgumentCaptor<Listener> listenerCaptor = ArgumentCaptor.forClass(Listener.class);
+        verify(mockConfigService, times(2)).addListener(anyString(), eq("alphafrog-beta-config"), listenerCaptor.capture());
+        for (Listener listener : listenerCaptor.getAllValues()) {
+            listener.receiveConfigInfo("{\"touched\":true}");
+        }
+
+        ArgumentCaptor<String> groupCaptor = ArgumentCaptor.forClass(String.class);
+        verify(mockConfigService, atLeastOnce()).getConfig(anyString(), groupCaptor.capture(), anyLong());
+        assertTrue(groupCaptor.getAllValues().stream().allMatch("alphafrog-beta-config"::equals),
+                "getConfig 只能用订阅组，实际调用过的组: " + groupCaptor.getAllValues());
+    }
+
+    @Test
+    void subscribe_shouldClearSnapshotsForAllChainCandidates_whenScopeIdSet(@TempDir Path tempDir) throws Exception {
+        // 候选链上每一条的 Nacos 本地快照都要清（残留泳道快照可能遮蔽已删除的泳道配置）
+        String previousHome = System.getProperty("user.home");
+        System.setProperty("user.home", tempDir.toString());
+        try {
+            environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+            NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+            injectValueField(bridge, "serverAddr", "nacos:8848");
+            injectValueField(bridge, "namespace", "");
+            injectValueField(bridge, "group", "alphafrog-beta-config");
+
+            Path snapshotDir = tempDir.resolve(Path.of(
+                    "nacos", "config", "fixed-nacos_8848", "nacos",
+                    "snapshot", "alphafrog-beta-config"));
+            Path laneSnapshot = snapshotDir.resolve("lane-demo.agent-llm.json");
+            Path mainSnapshot = snapshotDir.resolve("agent-llm.json");
+            Files.createDirectories(snapshotDir);
+            Files.writeString(laneSnapshot, "{\"from\":\"lane-stale\"}");
+            Files.writeString(mainSnapshot, "{\"from\":\"main-stale\"}");
+
+            ConfigService mockConfigService = mock(ConfigService.class);
+            when(mockConfigService.getConfig(anyString(), eq("alphafrog-beta-config"), anyLong()))
+                    .thenReturn("{\"version\":\"fresh\"}");
+            injectConfigService(bridge, mockConfigService);
+
+            invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config",
+                    tempDir.resolve("agent-llm.local.json")));
+
+            assertFalse(Files.exists(laneSnapshot));
+            assertFalse(Files.exists(mainSnapshot));
+        } finally {
+            System.setProperty("user.home", previousHome);
+        }
+    }
+
     // ==================== 反射辅助方法 ====================
 
     @SuppressWarnings("unchecked")
@@ -472,5 +700,34 @@ class NacosConfigBridgeTest {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private void injectConfigService(NacosConfigBridge bridge, ConfigService configService) {
+        try {
+            java.lang.reflect.Field field = NacosConfigBridge.class.getDeclaredField("configService");
+            field.setAccessible(true);
+            field.set(bridge, configService);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void invokeSubscribe(NacosConfigBridge bridge, NacosConfigBridge.Subscription sub) {
+        try {
+            java.lang.reflect.Method method = NacosConfigBridge.class.getDeclaredMethod(
+                    "subscribe", NacosConfigBridge.Subscription.class);
+            method.setAccessible(true);
+            method.invoke(bridge, sub);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private NacosConfigBridge.Subscription subscription(String dataId, String group, Path targetFile) {
+        NacosConfigBridge.Subscription sub = new NacosConfigBridge.Subscription();
+        sub.setDataId(dataId);
+        sub.setGroup(group);
+        sub.setTargetFile(targetFile.toString());
+        return sub;
     }
 }

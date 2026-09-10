@@ -316,6 +316,9 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AF_DEPLOYMENT_ID", plan.deploymentId());
         environment.put("AF_DEPLOYMENT_GENERATION_ID", plan.generationId());
         environment.put("AF_LANE_TAG", plan.trafficScopeId());
+        // Beta 配置隔离组：桥接层只读这个组（泳道→主 Beta 链都在组内），不回落生产组；
+        // compose 的 environment 优先级高于 env-file，同名变量以这里为准
+        environment.put("AF_CONFIG_NACOS_GROUP", "alphafrog-beta-config");
         environment.put("AF_SERVICE_VERSION", service.path("releaseId").asText());
         environment.put("AF_GIT_COMMIT", manifest.path("gitCommit").asText());
         String localImageId = service.path("image").path("localImageId").asText();
