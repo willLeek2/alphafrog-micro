@@ -443,7 +443,9 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         ObjectNode registries = dubbo.putObject("registries");
         registryConfig(registries.putObject("beta"), server, namespace, "alphafrog-beta", "beta", true, true);
         registryConfig(registries.putObject("production"), server, namespace, "DEFAULT_GROUP", "prod", false, false);
-        dubbo.putObject("consumer").put("cluster", "zone-aware");
+        // 不写 dubbo.consumer.cluster：多注册中心时 Dubbo 的外层合并集群默认就是 zone-aware，
+        // 写到全局 consumer 会让单注册中心内部也用 zone-aware，内层把直连提供者强转成
+        // ClusterInvoker 直接 ClassCastException（ZoneAwareClusterInvoker.doInvoke 72 行）
         if (service.path("registration").isObject()) {
             ObjectNode providerParameters = dubbo.putObject("provider").putObject("parameters");
             providerParameters.put("alphafrog.deployment-id", plan.deploymentId());

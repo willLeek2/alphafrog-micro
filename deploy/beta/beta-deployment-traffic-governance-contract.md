@@ -44,7 +44,7 @@ Beta 和生产共享同一台 Nacos 服务，但使用两套逻辑注册配置�
 | Beta | `alphafrog-beta` | `beta` | Beta 消费方 |
 | 生产 | `DEFAULT_GROUP` | `prod` | Beta 与生产消费方按各自配置 |
 
-Beta 消费方同时订阅两路并使用 Dubbo 原生 `zone-aware` 集群。生产服务的现有 Dubbo 配置没有另设 Nacos 分组，因此 Beta 消费方的生产路订阅 Nacos 默认分组 `DEFAULT_GROUP`。Beta registry 标记为官方 `preferred=true`，因此当前 Beta 消费方先选 Beta 路；Beta 路对该服务没有可用提供者时才落到生产路。生产服务只订阅它现有的默认分组，不反向看到 Beta 实例。
+Beta 消费方同时订阅两路。多注册中心场景下 Dubbo 的外层合并集群默认就是原生 `zone-aware`，控制器不写全局 `dubbo.consumer.cluster`：该键一旦写到全局 consumer，单注册中心内部也会套用 zone-aware，内层把直连提供者强转成 `ClusterInvoker` 直接抛 `ClassCastException`（Dubbo 3.3.2 `ZoneAwareClusterInvoker` 首行强转）。生产服务的现有 Dubbo 配置没有另设 Nacos 分组，因此 Beta 消费方的生产路订阅 Nacos 默认分组 `DEFAULT_GROUP`。Beta registry 标记为官方 `preferred=true`，因此当前 Beta 消费方先选 Beta 路；Beta 路对该服务没有可用提供者时才落到生产路。生产服务只订阅它现有的默认分组，不反向看到 Beta 实例。
 
 导出 Dubbo 提供者的 Beta 服务进程使用控制器注入的 Dubbo 配置自行注册并维持心跳。frontend 这类入口或纯消费服务仍订阅两路，但不注册提供者。Beta 逻辑注册内部使用 Dubbo 原生标签路由：
 
@@ -139,7 +139,7 @@ Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因�
 - 所有 Beta frontend 实例都启用入口打标；泳道名只注入给非主 Beta 的泳道 frontend，主 Beta frontend 不注入泳道名，作为共用入口改读请求头指定的泳道名；
 - 使用显式且非空的宿主绑定地址、宿主端口、容器端口和 `SIGTERM`；控制器不限制绑定地址和可路由地址必须写成 IP 字面量；
 - 配置 Spring 与 Dubbo 的有序关闭期限；`agent-langchain-service` 使用 0 秒 Spring 后续等待和 5 秒 Dubbo 静态上限，应用代码不得在运行时改写这两个框架的生命周期对象；
-- 配置同一台 Nacos 的 Beta、生产两路逻辑注册，分别带 `zone=beta`、`zone=prod`，Beta 路为 `preferred=true`，生产路只订阅，消费集群为 `zone-aware`；含 `registration` 的服务允许向 Beta 路自注册，不含该字段的服务只订阅；
+- 配置同一台 Nacos 的 Beta、生产两路逻辑注册，分别带 `zone=beta`、`zone=prod`，Beta 路为 `preferred=true`，生产路只订阅；不写 `dubbo.consumer.cluster`，多注册中心外层合并集群由 Dubbo 默认给 `zone-aware`，单注册中心内部保持默认 `failover`；含 `registration` 的服务允许向 Beta 路自注册，不含该字段的服务只订阅；
 - 为提供者服务注入 Beta 机器的可路由地址与宿主端口，并把部署、代际、发布、实例、区和泳道标签作为 Dubbo 提供者参数；非提供者服务不注入提供者参数；
 
 控制器在启动容器前执行 `docker compose config --quiet`，配置无法解析时拒绝启动。静态校验包括部署单 Schema 与端口查重，以及禁止把整份生产 `.env` 当作服务环境文件或数据卷。每个服务必须配置一份已经存在的普通环境文件。部署单提供 `runtimeConfigSha256` 时，控制器还会比较环境文件的 SHA-256 摘要。控制器不解析 Compose 展开结果来重复检查由自身生成的每个字段。
@@ -167,7 +167,7 @@ Dubbo 先选择 registry，再在该 registry 内执行标签路由，不会因�
 - 删除先把活动实例移入排空记录，再发送停止信号让服务自行注销；控制器全程不查询 Run。
 - 所有服务共享同一应用处理期限，容器期限不得短于应用处理期限；Agent 还要额外预留 5 秒完成注销和退出。排空到期后可以强停，Agent 的 Run 自然处理、失败写入、执行器停止、Dubbo 关闭与 Spring 生命周期不能形成串行重复等待。
 - 泳道服务在控制器状态中缺少主 Beta 活动实例时不能创建；存在泳道实例时不能删除同服务主 Beta。
-- 同一台 Nacos 的两路消费配置、两个 zone、Beta `preferred=true` 和 `zone-aware` 集群进入有效 Compose 配置。
+- 同一台 Nacos 的两路消费配置、两个 zone、Beta `preferred=true` 进入有效 Compose 配置，且不出现 `dubbo.consumer.cluster`（外层合并集群由 Dubbo 多注册中心默认给 `zone-aware`）。
 - 控制器重启时能按确定容器名继续候选健康确认、角色提升和排空；停止截止时间不因重启或重试延长，也不创建重复候选。
 - Nacos 查询失败或候选端点不可见时不提升候选；控制器不得调用注册、改权重或注销接口。
 

@@ -115,7 +115,9 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));
         assertTrue(content.contains("alphafrog-beta"));
-        assertTrue(content.contains("zone-aware"));
+        // 不注入 consumer.cluster：多注册中心外层合并由 Dubbo 默认给 zone-aware，
+        // 全局 consumer 写 zone-aware 会让单注册中心内层强转 ClassCastException
+        assertFalse(content.contains("zone-aware"));
         assertFalse(effectiveRouting.path("dubbo").path("registry").path("register").asBoolean());
         assertTrue(effectiveRouting.path("dubbo").path("registries").path("beta").path("register").asBoolean());
         assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("register").asBoolean());
@@ -131,7 +133,7 @@ class DockerComposeContainerRuntimeTest {
                     "alphafrog.instance-id"), Arrays.asList(named.path("extra-keys").asText().split(",")),
                     registry);
         }
-        assertEquals("zone-aware", effectiveRouting.path("dubbo").path("consumer").path("cluster").asText());
+        assertFalse(effectiveRouting.path("dubbo").has("consumer"));
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
         assertEquals("10.0.0.8", environmentNode.path("DUBBO_IP_TO_REGISTRY").asText());
