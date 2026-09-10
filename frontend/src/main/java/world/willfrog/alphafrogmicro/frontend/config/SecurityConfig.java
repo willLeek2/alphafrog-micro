@@ -15,6 +15,7 @@ import org.springframework.security.config.annotation.web.configurers.AbstractHt
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.util.matcher.AntPathRequestMatcher;
 import world.willfrog.alphafrogmicro.frontend.filter.FetchAccessFilter;
 import world.willfrog.alphafrogmicro.frontend.filter.JwtAuthFilter;
 import world.willfrog.alphafrogmicro.frontend.filter.LaneWebFilter;
@@ -80,6 +81,7 @@ public class SecurityConfig {
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(
                                 "/auth/login",
                                 "/auth/register",
@@ -94,7 +96,12 @@ public class SecurityConfig {
                                 "/api/auth/reset-password",
                                 "/api/auth/verify-reset-token"
                         ).permitAll()
-                        .requestMatchers("/admin/login", "/admin/create").permitAll()
+                        // 显式路径 matcher：字符串形式在 classpath 有 Spring MVC 时走 MVC introspector，
+                        // 主 Beta 实测未登录 POST /admin/create 未命中此条 permitAll 而落到 /admin/** 的 401
+                        .requestMatchers(
+                                AntPathRequestMatcher.antMatcher("/admin/login"),
+                                AntPathRequestMatcher.antMatcher("/admin/create"))
+                        .permitAll()
                         .requestMatchers("/admin/**").authenticated()
                         .requestMatchers("/auth/**").authenticated()
                         .requestMatchers("/api/auth/**").authenticated()
