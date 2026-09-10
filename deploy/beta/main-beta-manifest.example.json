@@ -22,7 +22,10 @@
       },
       "runtime": {
         "containerPort": 50055,
-        "hostPorts": [51055, 52055],
+        "hostPorts": [
+          51055,
+          52055
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 120,
         "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
@@ -50,7 +53,10 @@
       },
       "runtime": {
         "containerPort": 20882,
-        "hostPorts": [51082, 52082],
+        "hostPorts": [
+          51082,
+          52082
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 120,
         "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
@@ -78,7 +84,10 @@
       },
       "runtime": {
         "containerPort": 50057,
-        "hostPorts": [51057, 52057],
+        "hostPorts": [
+          51057,
+          52057
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 120,
         "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
@@ -106,7 +115,10 @@
       },
       "runtime": {
         "containerPort": 50056,
-        "hostPorts": [51056, 52056],
+        "hostPorts": [
+          51056,
+          52056
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 120,
         "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
@@ -134,7 +146,10 @@
       },
       "runtime": {
         "containerPort": 50059,
-        "hostPorts": [51059, 52059],
+        "hostPorts": [
+          51059,
+          52059
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 180,
         "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
@@ -162,7 +177,10 @@
       },
       "runtime": {
         "containerPort": 8095,
-        "hostPorts": [18095, 18096],
+        "hostPorts": [
+          18095,
+          18096
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 120,
         "shutdownProfile": "SPRING_BOOT_HTTP_V1",
@@ -183,7 +201,10 @@
       },
       "runtime": {
         "containerPort": 50060,
-        "hostPorts": [51060, 52060],
+        "hostPorts": [
+          51060,
+          52060
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 120,
         "shutdownProfile": "SPRING_BOOT_HTTP_DUBBO_V1",
@@ -211,12 +232,139 @@
       },
       "runtime": {
         "containerPort": 8090,
-        "hostPorts": [18090, 18091],
+        "hostPorts": [
+          18090,
+          18091
+        ],
         "healthCheckProfile": "CONTROLLER_TCP_V1",
         "readinessTimeoutSeconds": 180,
         "shutdownProfile": "SPRING_BOOT_HTTP_V1",
         "applicationDrainSeconds": 60,
         "drainGraceSeconds": 60
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "domestic-index-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "8f57e84b2a679114eeec222db8babbe2eacb555115106ec9219840fd64462d93",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-domestic-index-service:latest",
+        "localImageId": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "runtime": {
+        "containerPort": 50053,
+        "hostPorts": [
+          51053,
+          52053
+        ],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "domestic-index-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "domestic-fund-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.domestic.idl.DomesticFundService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "e5e6f1e320c1291f55e5cd610d4f60517d168064c7ef45a7fbe09eb6ed220ab0",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-domestic-fund-service:latest",
+        "localImageId": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "runtime": {
+        "containerPort": 50052,
+        "hostPorts": [
+          51052,
+          52052
+        ],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.domestic.idl.DomesticFundService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "domestic-fund-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "domestic-listed-asset-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.domestic.idl.DomesticListedAssetService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "bf684d3f1791fcd2afcb4cf8af9582851f1b57acf2ec69431df7963193c085d6",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-domestic-listed-asset-service:latest",
+        "localImageId": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "runtime": {
+        "containerPort": 50062,
+        "hostPorts": [
+          51062,
+          52062
+        ],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.domestic.idl.DomesticListedAssetService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "domestic-listed-asset-service"
+      },
+      "runtimeConfigSha256": null
+    },
+    {
+      "serviceName": "external-info-service",
+      "dubboServiceKey": "world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService",
+      "releaseId": "replace-with-build-version",
+      "serviceSpecSha256": "82b203ba07f1cc3464e9df1f15f31991991fbf51cb6ca6ae80a6b99d71f686a4",
+      "machineId": "beta-machine-1",
+      "image": {
+        "repositoryDigest": "alphafrog-micro-external-info-service:latest",
+        "localImageId": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "runtime": {
+        "containerPort": 50061,
+        "hostPorts": [
+          51061,
+          52061
+        ],
+        "healthCheckProfile": "CONTROLLER_TCP_V1",
+        "readinessTimeoutSeconds": 120,
+        "shutdownProfile": "SPRING_BOOT_DUBBO_V1",
+        "applicationDrainSeconds": 60,
+        "drainGraceSeconds": 60
+      },
+      "registration": {
+        "serviceName": "providers:world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService::",
+        "groupName": "alphafrog-beta",
+        "namespaceId": "public",
+        "clusterName": "DEFAULT",
+        "applicationName": "external-info-service"
       },
       "runtimeConfigSha256": null
     }

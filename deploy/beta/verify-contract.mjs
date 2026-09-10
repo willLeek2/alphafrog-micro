@@ -161,11 +161,12 @@ function relationErrors(wanted, observed) {
 
 try {
   ajv(manifestSchema, mainBetaExample, true, 'manifest-main-beta-example-valid');
-  assert(mainBetaExample.services.length === 8, 'main Beta example must cover all eight managed services');
-  assert(new Set(mainBetaExample.services.map(item => item.serviceName)).size === 8,
+  assert(mainBetaExample.services.length === 12, 'main Beta example must cover all twelve managed services');
+  assert(new Set(mainBetaExample.services.map(item => item.serviceName)).size === 12,
     'main Beta example service names must be unique');
   assert(['domestic-stock-service', 'domestic-fetch-service', 'admin-service', 'portfolio-service',
-    'agent-service', 'python-sandbox-service', 'python-sandbox-gateway-service', 'frontend']
+    'agent-service', 'python-sandbox-service', 'python-sandbox-gateway-service', 'frontend',
+    'domestic-index-service', 'domestic-fund-service', 'domestic-listed-asset-service', 'external-info-service']
     .every(name => mainBetaExample.services.some(item => item.serviceName === name)),
   'main Beta example must contain the fixed managed service set');
   assert(relationErrors(mainBetaExample, {deployments: []}).length === 0,
