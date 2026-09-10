@@ -8,4 +8,6 @@ else
   PROXY_ARGS=""
 fi
 
-docker build $PROXY_ARGS -t alphafrog-micro-domestic-fund-service:latest ./domesticFundService
+# IMAGE_TAG 或第一个参数可覆盖产物标签，未设置时保持 :latest（生产现有调用不变）。
+IMAGE_TAG="${1:-${IMAGE_TAG:-alphafrog-micro-domestic-fund-service:latest}}"
+docker build $PROXY_ARGS -t "$IMAGE_TAG" ./domesticFundService

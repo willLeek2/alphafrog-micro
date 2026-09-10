@@ -53,9 +53,12 @@ else
   echo "[agentLangchain] USE_PROXY=0（直连 apt / 拉取基础镜像）"
 fi
 
+# IMAGE_TAG 或第一个参数可覆盖产物标签，未设置时保持 :latest（生产现有调用不变）。
+IMAGE_TAG="${1:-${IMAGE_TAG:-alphafrog-micro-agent-langchain-service:latest}}"
+
 docker build \
   "${NETWORK_ARGS[@]}" \
   "${HOST_ARGS[@]}" \
   "${PROXY_ARGS[@]}" \
-  -t alphafrog-micro-agent-langchain-service:latest \
+  -t "$IMAGE_TAG" \
   "$SCRIPT_DIR"

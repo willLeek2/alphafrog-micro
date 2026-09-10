@@ -1,3 +1,7 @@
+# IMAGE_TAG 或第一个参数可覆盖本次服务镜像的产物标签，未设置时保持 :latest
+#（生产现有调用不变；runtime 镜像标签不在此列）。
+IMAGE_TAG="${1:-${IMAGE_TAG:-alphafrog-python-sandbox:latest}}"
+
 #!/bin/bash
 # AlphaFrog pythonSandboxService image build orchestration.
 #
@@ -780,8 +784,8 @@ if [ "$BUILD_TARGET" = "all" ] || [ "$BUILD_TARGET" = "runtime" ]; then
 fi
 
 if [ "$BUILD_TARGET" = "all" ] || [ "$BUILD_TARGET" = "service" ]; then
-  echo "[pythonSandbox] Building service image: alphafrog-python-sandbox:latest"
+  echo "[pythonSandbox] Building service image: $IMAGE_TAG"
   run_docker_build \
-    -t alphafrog-python-sandbox:latest \
+    -t "$IMAGE_TAG" \
     "$SCRIPT_DIR"
 fi

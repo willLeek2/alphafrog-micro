@@ -12,4 +12,6 @@ else
 fi
 
 # 使用 host 网络模式构建，使容器内 127.0.0.1 指向宿主机代理
-docker build --network host $PROXY_ARGS -t alphafrog-micro-external-info-service:latest ./externalInfoService
+# IMAGE_TAG 或第一个参数可覆盖产物标签，未设置时保持 :latest（生产现有调用不变）。
+IMAGE_TAG="${1:-${IMAGE_TAG:-alphafrog-micro-external-info-service:latest}}"
+docker build --network host $PROXY_ARGS -t "$IMAGE_TAG" ./externalInfoService
