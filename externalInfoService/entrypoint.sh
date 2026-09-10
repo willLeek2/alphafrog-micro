@@ -22,9 +22,12 @@ fi
 echo "[alphafrog] Detected DUBBO_IP: $DUBBO_IP"
 
 # Triple 协议需要使用 TRI_DUBBO_IP_TO_BIND 环境变量。
-# 绑定地址始终用自动检测的容器 IP；注册地址若已被外部预设（跨机订阅场景，
-# 由 docker-compose.beta-fallback.yml 注入宿主机可路由地址），则不再覆盖。
+# 绑定地址始终用自动检测的容器 IP；注册地址若已被外部预设（compose 注入的
+# DUBBO_IP_TO_REGISTRY，或外部预设的 TRI_DUBBO_IP_TO_REGISTRY），则不再写容器 IP，
+# 避免带协议前缀的值覆盖宿主机可路由地址。
 export TRI_DUBBO_IP_TO_BIND="$DUBBO_IP"
-export TRI_DUBBO_IP_TO_REGISTRY="${TRI_DUBBO_IP_TO_REGISTRY:-$DUBBO_IP}"
+if [ -z "${DUBBO_IP_TO_REGISTRY:-}" ] && [ -z "${TRI_DUBBO_IP_TO_REGISTRY:-}" ]; then
+    export TRI_DUBBO_IP_TO_REGISTRY="$DUBBO_IP"
+fi
 
 exec java -jar /app/app.jar

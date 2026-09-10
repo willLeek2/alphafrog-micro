@@ -56,6 +56,17 @@ Usage:
   ./deploy_latest.sh --skip-maven     # skip Maven, still run docker_build.sh, then recreate containers
   ./deploy_latest.sh --deploy-only    # skip Maven and docker_build.sh, only recreate containers
 
+Before deploying (required in .env):
+  AF_DUBBO_REGISTRY_HOST_IP=<host private IP>
+  # Dubbo providers register this address into Nacos (with their published host
+  # ports), so cross-machine consumers (e.g. Beta fallback) can reach them.
+  # Missing or invalid value fails before any container is recreated.
+
+Typical release (production):
+  git checkout <target commit>
+  ./deploy_latest.sh <service>              # maven + image build + recreate
+  ./deploy_latest.sh --deploy-only <service>  # recreate only, image already built
+
 Services:
   # Business Services
   domestic-stock-service
@@ -540,6 +551,36 @@ else
   echo "docker not found in PATH" >&2
   exit 1
 fi
+
+# Dubbo 注册地址 fail-closed：compose 里每个 Dubbo 提供者都引用
+# ${AF_DUBBO_REGISTRY_HOST_IP:?...}，缺值时任何 compose 命令都会失败。这里在
+# 调用 compose 之前先校验（进程环境优先，否则回退读仓库根 .env，与 sandbox
+# 段同款），避免构建完成后才发现容器起不来。compose 解析整份文件，即使本次
+# 只重建不含 Dubbo 提供者的服务，该变量也必须存在。
+AF_DUBBO_REGISTRY_HOST_IP_CHECK="${AF_DUBBO_REGISTRY_HOST_IP:-}"
+if [[ -z "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" && -f "$ROOT_DIR/.env" ]]; then
+  AF_DUBBO_REGISTRY_HOST_IP_CHECK="$(grep -E '^AF_DUBBO_REGISTRY_HOST_IP=' "$ROOT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+fi
+if [[ -z "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" ]]; then
+  echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 未设置（生产 .env 必填：本机私网 IP）。" >&2
+  echo "  Dubbo 提供者用它登记跨机可路由地址；缺失时 compose 会拒绝解析。" >&2
+  exit 1
+fi
+if [[ ! "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+  echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 必须是点分十进制 IPv4（不接受 0.0.0.0 / 127.0.0.1），got '${AF_DUBBO_REGISTRY_HOST_IP_CHECK}'。" >&2
+  exit 1
+fi
+for af_octet in "${BASH_REMATCH[@]:1}"; do
+  if (( 10#$af_octet > 255 )); then
+    echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 八位组越界（>255），got '${AF_DUBBO_REGISTRY_HOST_IP_CHECK}'。" >&2
+    exit 1
+  fi
+done
+if [[ "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" == "0.0.0.0" || "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" == "127.0.0.1" ]]; then
+  echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 不接受 0.0.0.0 / 127.0.0.1（生产跨机连不上），got '${AF_DUBBO_REGISTRY_HOST_IP_CHECK}'。" >&2
+  exit 1
+fi
+echo "[deploy] Dubbo 注册 IP: ${AF_DUBBO_REGISTRY_HOST_IP_CHECK}"
 
 wait_for_compose_service() {
   local svc="$1"

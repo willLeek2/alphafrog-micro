@@ -1,3 +1,8 @@
+# Dubbo 提供者的注册地址：每个对外提供 Dubbo 的服务注入 DUBBO_IP_TO_REGISTRY /
+# DUBBO_PORT_TO_REGISTRY（无前缀写法，与 Beta 控制器注入同款），值来自 .env 的
+# AF_DUBBO_REGISTRY_HOST_IP（宿主机私网 IP）与该服务已发布的宿主端口。未设置该
+# 变量时 compose 解析直接失败（fail-closed），避免把容器网 172.18.x 登记进 Nacos、
+# 跨机消费者（如 Beta 回落生产）连不上。frontend 只消费不提供，不注入。
 # Agent LLM（OpenRouter 等）经宿主机 HTTP 代理出网。在 .env 中显式设置 HTTP_PROXY= 与 AF_JAVA_PROXY_OPTIONS= 可关闭。
 x-agent-llm-proxy-env: &agent-llm-proxy-env
   HTTP_PROXY: ${HTTP_PROXY-http://host.docker.internal:7890}
@@ -162,6 +167,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: domestic-stock-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50055"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_STOCK_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -215,6 +222,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: domestic-index-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50053"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_INDEX_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -267,6 +276,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: domestic-fund-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50052"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_FUND_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -317,6 +328,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: domestic-listed-asset-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50062"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_LISTED_ASSET_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -366,6 +379,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: domestic-fetch-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "20882"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_DOMESTIC_FETCH_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -430,6 +445,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: admin-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50057"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_ADMIN_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -450,6 +467,8 @@ services:
     volumes:
       - ./deploy/otel/opentelemetry-javaagent.jar:/otel/javaagent.jar:ro
       - ./data/logs/admin-service:/app/logs
+    ports:
+      - "50057:50057"
     deploy:
       resources:
         limits:
@@ -474,6 +493,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: portfolio-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50056"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_PORTFOLIO_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -525,6 +546,8 @@ services:
       <<: [*otel-env, *agent-llm-proxy-env]
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: agentLangchainService
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50059"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_AGENT_LANGCHAIN_SERVICE:-unknown}"
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
       AF_DB_MAIN_PORT: 5432
@@ -622,6 +645,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: external-info-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50061"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_EXTERNAL_INFO_SERVICE:-unknown}"
       NACOS_ADDRESS: nacos
       AF_CONFIG_NACOS_ENABLED: "true"
@@ -779,6 +804,8 @@ services:
       <<: *otel-env
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: python-sandbox-gateway-service
+      DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
+      DUBBO_PORT_TO_REGISTRY: "50060"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_PYTHON_SANDBOX_GATEWAY_SERVICE:-unknown}"
       NACOS_ADDRESS: nacos
       AF_SANDBOX_SERVICE_URL: http://python-sandbox-service:8095
