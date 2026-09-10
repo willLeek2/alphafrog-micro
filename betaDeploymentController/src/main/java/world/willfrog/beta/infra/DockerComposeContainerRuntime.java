@@ -299,7 +299,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         fixedNetwork.put("external", true);
         ObjectNode services = root.putObject("services");
         ObjectNode app = services.putObject("app");
-        app.put("image", service.path("image").path("repositoryDigest").asText());
+        app.put("image", service.path("image").path("localImageId").asText());
         app.put("container_name", name);
         app.put("pull_policy", "never");
         app.put("stop_signal", "SIGTERM");
@@ -491,11 +491,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         target.put("extra-keys", ROUTING_EXTRA_KEYS);
     }
 
+    // 直接按部署单里的本机 Image ID 校验和启动：标签可以被挪到另一张镜像上，按
+    // Image ID 定位则不受标签移动影响。repositoryDigest 只作为人类可读的镜像说明保留。
     private void verifyImage(String machineId, JsonNode service) {
-        String actual = commands.run(docker(machineId, "image", "inspect", service.path("image").path("repositoryDigest").asText(),
-                "--format", "{{.Id}}"), Map.of(), Duration.ofSeconds(30)).strip();
-        if (!actual.equals(service.path("image").path("localImageId").asText()))
-            throw new ControllerException("IMAGE_ID_MISMATCH", "Installed image does not match the manifest Image ID");
+        commands.run(docker(machineId, "image", "inspect", service.path("image").path("localImageId").asText(),
+                "--format", "{{.Id}}"), Map.of(), Duration.ofSeconds(30));
     }
 
     private static boolean coordinatedAgentShutdown(JsonNode service) {

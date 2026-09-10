@@ -170,17 +170,19 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
-    void createsFromALocalTagWhenItsImageIdMatchesTheManifest() throws Exception {
+    void createsByLocalImageIdRegardlessOfWhatTheReadableTagPointsAt() throws Exception {
         ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
         FakeCommands commands = new FakeCommands(false);
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
         runtime.create(manifest, service, plan);
 
+        // 校验和启动都用本机 Image ID：标签之后被挪到别的镜像也不影响已提交的部署。
         JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
-        assertEquals("agent-langchain-service:local", compose.path("services").path("app").path("image").asText());
+        assertEquals("sha256:" + "b".repeat(64), compose.path("services").path("app").path("image").asText());
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("image")
-                && command.contains("inspect") && command.contains("agent-langchain-service:local")));
+                && command.contains("inspect") && command.contains("sha256:" + "b".repeat(64))));
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("agent-langchain-service:local")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
     }
 
@@ -301,16 +303,15 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
-    void refusesALocalTagWhenItsImageIdDiffersFromTheManifest() {
-        ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
+    void refusesToStartWhenTheLocalImageIdIsNotInstalled() {
         FakeCommands commands = new FakeCommands(false);
-        commands.imageInspectId = "sha256:" + "c".repeat(64);
+        commands.imageInspectFails = true;
         DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
 
         ControllerException failure = assertThrows(ControllerException.class,
                 () -> runtime.create(manifest, service, plan));
 
-        assertEquals("IMAGE_ID_MISMATCH", failure.code());
+        assertEquals("COMMAND_FAILED", failure.code());
         assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
     }
 
@@ -627,6 +628,7 @@ class DockerComposeContainerRuntimeTest {
         private int failInfoCall;
         private boolean removed;
         private boolean networkExists;
+        private boolean imageInspectFails;
         private String imageInspectId = "sha256:" + "b".repeat(64);
 
         private FakeCommands(boolean startsPresent) {
@@ -649,8 +651,10 @@ class DockerComposeContainerRuntimeTest {
                 networkExists = true;
                 return "";
             }
-            if (arguments.contains("inspect") && arguments.contains("image"))
+            if (arguments.contains("inspect") && arguments.contains("image")) {
+                if (imageInspectFails) throw new ControllerException("COMMAND_FAILED", "no such image");
                 return imageInspectId + "\n";
+            }
             if (arguments.contains("inspect")) {
                 inspectCalls++;
                 if (removed) throw new ControllerException("COMMAND_FAILED", "missing");
