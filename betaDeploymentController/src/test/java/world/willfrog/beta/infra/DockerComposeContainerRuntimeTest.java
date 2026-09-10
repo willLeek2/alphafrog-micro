@@ -112,6 +112,8 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("none", environmentNode.path("OTEL_LOGS_EXPORTER").asText());
         assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
         assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
+        // 主 Beta 容器不带泳道名，配置候选链只查主 data-id，不去查 "main-beta.{dataId}"
+        assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
         assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));
@@ -375,6 +377,9 @@ class DockerComposeContainerRuntimeTest {
         JsonNode routing = mapper.readTree(environmentNode.path("SPRING_APPLICATION_JSON").asText());
         assertEquals("lane-a", routing.path("dubbo").path("provider").path("parameters")
                 .path("dubbo.tag").asText());
+        // 泳道容器（不只 frontend）都带泳道名：Nacos 配置桥/沙箱监听靠它构造
+        // "{scopeId}.{dataId}" 候选，漏注会让泳道容器读不到泳道覆盖配置
+        assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
     }
 
     @Test

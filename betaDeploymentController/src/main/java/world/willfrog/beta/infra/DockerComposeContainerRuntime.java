@@ -316,6 +316,12 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AF_DEPLOYMENT_ID", plan.deploymentId());
         environment.put("AF_DEPLOYMENT_GENERATION_ID", plan.generationId());
         environment.put("AF_LANE_TAG", plan.trafficScopeId());
+        // 泳道配置链入口：Nacos 配置桥/沙箱监听读它构造 "{scopeId}.{dataId}" 候选；
+        // 所有非主 Beta 的业务容器都要有（不只 frontend），否则泳道容器读不到泳道覆盖配置。
+        // 主 Beta 不写，避免去查 "main-beta.{dataId}"。
+        if (!"main-beta".equals(plan.trafficScopeId())) {
+            environment.put("AF_LANE_TRAFFIC_SCOPE_ID", plan.trafficScopeId());
+        }
         // Beta 配置隔离组：桥接层只读这个组（泳道→主 Beta 链都在组内），不回落生产组；
         // compose 的 environment 优先级高于 env-file，同名变量以这里为准
         environment.put("AF_CONFIG_NACOS_GROUP", "alphafrog-beta-config");
@@ -332,11 +338,8 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("OTEL_LOGS_EXPORTER", "none");
         if ("frontend".equals(service.path("serviceName").asText())) {
             // 所有 Beta frontend 都开入口：主 Beta frontend 是共用入口，靠请求头指定泳道；
-            // 泳道名只注入给非 main-beta 的泳道 frontend，从该口进来的流量一律打本部署的标。
+            // 从泳道口进来的流量一律打本部署的标（泳道名本身由上面的通用注入提供）。
             environment.put("AF_LANE_ENTRY_ENABLED", "true");
-            if (!"main-beta".equals(plan.trafficScopeId())) {
-                environment.put("AF_LANE_TRAFFIC_SCOPE_ID", plan.trafficScopeId());
-            }
         }
         if (service.path("registration").isObject()) {
             environment.put("DUBBO_IP_TO_REGISTRY", machine.getRoutableAddress());
