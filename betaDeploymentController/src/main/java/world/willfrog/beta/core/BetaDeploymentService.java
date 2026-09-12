@@ -421,7 +421,17 @@ public class BetaDeploymentService {
                 deploymentEmpty[0] = deployment.path("services").isEmpty();
             } else {
                 service.putNull("drainingInstance");
-                stable(service);
+                if (service.path("activeInstance").isNull()) {
+                    // frontend 同口替换：旧实例排空完已无活动实例，结束本次更新并回到
+                    // 创建路径在第一只宿主口拉新；操作必须先清空，下一次调度才能为该
+                    // 服务立新的创建操作。
+                    service.putNull("operation");
+                    service.putNull("failedManifestVersion");
+                    service.putNull("lastError");
+                    service.put("phase", "CREATING");
+                } else {
+                    stable(service);
+                }
                 scheduleNext(state);
             }
             validateAll(state);
@@ -516,7 +526,10 @@ public class BetaDeploymentService {
 
     private ContainerRuntime.CandidatePlan candidatePlan(OperationRef ref, JsonNode manifest, JsonNode spec) {
         JsonNode active = ref.service().path("activeInstance");
-        String slot = active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
+        // frontend 是人直接访问的 HTTP 入口且不注册 Dubbo 提供者，蓝绿翻口后消费方
+        // 无法自动找到新口；跟随生产 force-recreate 语义固定占用第一只宿主口。
+        String slot = "frontend".equals(spec.path("serviceName").asText()) ? "A"
+                : active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
         int hostPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
         return new ContainerRuntime.CandidatePlan(ref.deploymentId(), ref.trafficScopeId(),
                 ref.candidateInstanceId(), JsonSupport.deploymentGeneration(manifest), slot, hostPort);
@@ -779,6 +792,18 @@ public class BetaDeploymentService {
     private void scheduleNext(ObjectNode state) {
         ServiceRef item = nextService(state);
         if (item == null) return;
+        if (!item.create() && "frontend".equals(item.service().path("serviceName").asText())) {
+            // frontend 更新走同口替换（与生产 force-recreate 同类）：先把活动实例移入排空并
+            // 停掉旧容器，排空结束后 finishDrain 回到创建路径在第一只宿主口拉新。
+            ObjectNode active = ((ObjectNode) item.service().path("activeInstance")).deepCopy();
+            active.putNull("stopSignalRequestedAt");
+            active.putNull("stopDeadline");
+            item.service().putNull("activeInstance");
+            item.service().set("drainingInstance", active);
+            item.service().put("phase", "UPDATING");
+            item.service().set("operation", operation("UPDATE", "DRAINING_PREVIOUS", null));
+            return;
+        }
         String instanceId = newInstanceId(item.deployment(), item.service());
         item.service().put("phase", item.create() ? "CREATING" : "UPDATING");
         item.service().set("operation", operation(item.create() ? "CREATE" : "UPDATE", "STARTING_CANDIDATE", instanceId));
@@ -864,6 +889,8 @@ public class BetaDeploymentService {
     private void assertLaneHasMainBetaProviders(JsonNode state, String deploymentId, JsonNode candidate) {
         if ("main-beta".equals(candidate.path("trafficScopeId").asText())) return;
         for (JsonNode requestedService : candidate.path("services")) {
+            // frontend 不注册 Dubbo 提供者，泳道 frontend 不依赖主 Beta 的 Dubbo 提供者在场。
+            if ("frontend".equals(requestedService.path("serviceName").asText())) continue;
             if (!hasActiveMainBetaProvider(state, deploymentId, requestedService.path("serviceName").asText(),
                     requestedService.path("dubboServiceKey").asText())) {
                 throw new ControllerException("MAIN_BETA_PROVIDER_REQUIRED",
@@ -876,6 +903,8 @@ public class BetaDeploymentService {
         for (JsonNode deployment : state.path("deployments")) {
             if ("main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
             for (JsonNode service : deployment.path("services")) {
+                // 主 Beta frontend 同口替换排空期间没有活动实例，不构成泳道依赖缺失。
+                if ("frontend".equals(service.path("serviceName").asText())) continue;
                 boolean hasInstance = service.path("activeInstance").isObject()
                         || service.path("candidateInstance").isObject()
                         || service.path("drainingInstance").isObject();

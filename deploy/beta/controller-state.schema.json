@@ -1208,9 +1208,6 @@
           "then": {
             "type": "object",
             "properties": {
-              "activeInstance": {
-                "$ref": "#/$defs/activeInstance"
-              },
               "operation": {
                 "allOf": [
                   {
@@ -1226,7 +1223,40 @@
                   }
                 ]
               }
-            }
+            },
+            "oneOf": [
+              {
+                "properties": {
+                  "activeInstance": {
+                    "$ref": "#/$defs/activeInstance"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "activeInstance": {
+                    "type": "null"
+                  },
+                  "candidateInstance": {
+                    "type": "null"
+                  },
+                  "drainingInstance": {
+                    "$ref": "#/$defs/drainingInstance"
+                  },
+                  "operation": {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "const": "DRAINING_PREVIOUS"
+                      }
+                    },
+                    "required": [
+                      "phase"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         },
         {

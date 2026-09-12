@@ -291,6 +291,51 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void frontendUpdateStopsTheOldContainerFirstAndRecreatesOnTheFirstHostPort() {
+        service.submitManifest(frontendManifest(1, "release-1", 'a'));
+        reconcile(3);
+        String oldId = state().path("activeInstance").path("instanceId").asText();
+        assertEquals("STABLE", state().path("phase").asText());
+
+        // 模拟旧控制器蓝绿翻口留下的现场：活动实例在槽 B（对应现网 18091）。
+        store.update(state -> {
+            ObjectNode active = (ObjectNode) state.path("deployments").path(0).path("services").path(0)
+                    .path("activeInstance");
+            active.put("portSlot", "B");
+            active.put("hostPort", 28081);
+            ((ObjectNode) active.path("endpoint")).put("port", 28081);
+            return null;
+        });
+
+        service.submitManifest(frontendManifest(2, "release-2", 'c'));
+
+        assertEquals("UPDATING", state().path("phase").asText());
+        assertEquals("DRAINING_PREVIOUS", state().path("operation").path("phase").asText());
+        assertTrue(state().path("activeInstance").isNull());
+        assertEquals(oldId, state().path("drainingInstance").path("instanceId").asText());
+
+        reconcile(4);
+
+        assertEquals("STABLE", state().path("phase").asText());
+        assertEquals("release-2", state().path("activeInstance").path("releaseId").asText());
+        assertEquals(28080, state().path("activeInstance").path("hostPort").asInt());
+        assertEquals("A", state().path("activeInstance").path("portSlot").asText());
+        assertTrue(containers.stopped.containsKey("af-" + oldId));
+        assertTrue(containers.removedComposeInstanceIds.contains(oldId));
+        assertEquals(0, registrationProbe.calls);
+
+        // 再滚一次仍固定第一只口，不翻口。
+        service.submitManifest(frontendManifest(3, "release-3", 'e'));
+        reconcile(4);
+
+        assertEquals("STABLE", state().path("phase").asText());
+        assertEquals("release-3", state().path("activeInstance").path("releaseId").asText());
+        assertEquals(28080, state().path("activeInstance").path("hostPort").asInt());
+        assertEquals("A", state().path("activeInstance").path("portSlot").asText());
+        assertEquals(0, registrationProbe.calls);
+    }
+
+    @Test
     void unhealthyCandidateIsRemovedWhileOldInstanceContinuesServing() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
@@ -409,6 +454,16 @@ class BetaDeploymentServiceTest {
             }
         }
         throw new AssertionError("Missing service " + serviceName);
+    }
+
+    private ObjectNode frontendManifest(int version, String release, char image) {
+        ObjectNode value = manifest(version, release, '1', 'a', image, "main-beta");
+        ObjectNode spec = (ObjectNode) value.path("services").path(0);
+        spec.put("serviceName", "frontend");
+        spec.put("dubboServiceKey", "world.willfrog.alphafrogmicro.frontend.http.FrontendHttp");
+        spec.remove("registration");
+        spec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, spec));
+        return value;
     }
 
     private ObjectNode withPortfolioService(ObjectNode manifest) {
