@@ -345,6 +345,13 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             environment.put("DUBBO_IP_TO_REGISTRY", machine.getRoutableAddress());
             environment.put("DUBBO_PORT_TO_REGISTRY", Integer.toString(plan.hostPort()));
         }
+        // 沙箱网关的 HTTP 上游走静态环境变量而非服务发现：沙箱蓝绿翻口后 env-file 里的
+        // 旧口不再监听，控制器把同部署沙箱的当前活动宿主口写进 environment（优先于
+        // env-file），口变时由更新判定重建网关。
+        if ("python-sandbox-gateway-service".equals(service.path("serviceName").asText())
+                && plan.httpUpstream() != null) {
+            environment.put("AF_SANDBOX_SERVICE_URL", plan.httpUpstream().url());
+        }
         environment.put("AF_DUBBO_REGISTRY_REGISTER", "false");
         environment.put("SPRING_APPLICATION_JSON", betaRoutingConfiguration(service, plan));
         int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();

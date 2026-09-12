@@ -114,6 +114,8 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
         // 主 Beta 容器不带泳道名，配置候选链只查主 data-id，不去查 "main-beta.{dataId}"
         assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
+        // agent 这类服务没有 HTTP 上游，compose 里不出现沙箱地址变量。
+        assertFalse(environmentNode.has("AF_SANDBOX_SERVICE_URL"));
         assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));
@@ -360,6 +362,33 @@ class DockerComposeContainerRuntimeTest {
         environmentNode = compose.path("services").path("app").path("environment");
         assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
         assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+    }
+
+    @Test
+    void sandboxGatewayGetsTheSandboxUrlFromTheCandidatePlan() throws Exception {
+        ObjectNode gateway = ((ObjectNode) service).deepCopy();
+        gateway.put("serviceName", "python-sandbox-gateway-service");
+        Path environment = temporary.resolve("sandbox-gateway.env");
+        Files.writeString(environment, "AF_SANDBOX_SERVICE_URL=http://127.0.0.1:18095\n");
+        try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
+        template.setEnvFile(environment);
+        Map<String, BetaControllerProperties.ServiceTemplate> templates =
+                new java.util.HashMap<>(properties.getServices());
+        templates.put("python-sandbox-gateway-service", template);
+        properties.setServices(templates);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, gateway, new ContainerRuntime.CandidatePlan("beta-main-001", "main-beta",
+                "i-two", JsonSupport.deploymentGeneration(manifest), "A", 28080,
+                new ContainerRuntime.HttpUpstream("10.0.0.8", 18096)));
+
+        // environment 覆盖 env-file 里的回落值，容器里生效的是计划里沙箱的当前口。
+        JsonNode gatewayEnvironment = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-two.json")))
+                .path("services").path("app").path("environment");
+        assertEquals("http://10.0.0.8:18096", gatewayEnvironment.path("AF_SANDBOX_SERVICE_URL").asText());
     }
 
     @Test

@@ -235,6 +235,9 @@
         },
         "endpoint": {
           "$ref": "#/$defs/endpoint"
+        },
+        "httpUpstream": {
+          "$ref": "#/$defs/endpoint"
         }
       }
     },
@@ -276,7 +279,8 @@
             "containerId": true,
             "portSlot": true,
             "hostPort": true,
-            "endpoint": true
+            "endpoint": true,
+            "httpUpstream": true
           }
         }
       ]
@@ -323,6 +327,7 @@
             "portSlot": true,
             "hostPort": true,
             "endpoint": true,
+            "httpUpstream": true,
             "readiness": {
               "enum": [
                 "STARTING",
@@ -407,6 +412,7 @@
             "portSlot": true,
             "hostPort": true,
             "endpoint": true,
+            "httpUpstream": true,
             "stopSignalRequestedAt": {
               "$ref": "#/$defs/nullableTimestamp"
             },
