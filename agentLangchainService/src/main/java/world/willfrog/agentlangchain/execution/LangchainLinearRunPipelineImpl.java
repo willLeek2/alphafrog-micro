@@ -1310,7 +1310,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 : updateTerminalForLocal(runId, userId, AgentRunStatus.EXECUTING,
                 AgentRunStatus.FAILED, snapshot, true, decision.getReason());
         if (updated != 1) {
-            log.warn("FAILED snapshot was not persisted for run={}", runId);
+            log.warn("FAILED snapshot was not persisted for run={} failureReason={}",
+                    runId, failureReason);
             return false;
         }
         if (requireDurableWrite) {

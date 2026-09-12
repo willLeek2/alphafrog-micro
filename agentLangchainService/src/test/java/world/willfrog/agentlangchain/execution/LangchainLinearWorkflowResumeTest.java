@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.execution;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
@@ -22,6 +23,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
@@ -507,6 +510,96 @@ class LangchainLinearWorkflowResumeTest {
                 .contains("Traceback: bad date")
                 .contains("print('broken date parser')")
                 .contains("禁止原样重放");
+    }
+
+    @Test
+    void resumePersistsCheckpointThroughTheServiceBeforeConsumingTheHandoff() {
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        when(nodeExecutor.execute(any(), any(), any(), any(), any()))
+                .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
+
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentRunEventService.class));
+        WorkflowCheckpointService checkpoints = mock(WorkflowCheckpointService.class);
+        ReflectionTestUtils.setField(executor, "workflowCheckpointService", checkpoints);
+
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        CompletedTodoRecord prior = new CompletedTodoRecord();
+        prior.setTodoId("todo-1");
+        prior.setSequence(1);
+        prior.setDescription("todo-1-description");
+        prior.setOutput("prior-output");
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setResumeToken("token-1");
+        context.setResumeLeaseVersion(2);
+        context.setCompletedTodos(List.of(prior));
+        context.setToolCallsUsed(5);
+        context.setTerminalSuccess(true);
+        context.setTerminalResultPreview("terminal-preview");
+        AtomicInteger consumed = new AtomicInteger();
+
+        LangchainWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    consumed.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuccess()).isTrue();
+        // 注入挂起节点写一次 checkpoint，后续 Todo 完成再写一次。
+        verify(checkpoints, times(2)).persistLinearProgress(
+                eq("run-1"), eq("user-1"), any(), any(), anyInt());
+        assertThat(consumed.get()).isEqualTo(1);
+        verify(nodeExecutor, times(1)).execute(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void checkpointPersistFailureStopsResumeBeforeTerminalConsume() {
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentRunEventService.class));
+        WorkflowCheckpointService checkpoints = mock(WorkflowCheckpointService.class);
+        // 现网现场：checkpoint CAS 0 行（workflow_checkpoint_run_not_found）。
+        when(checkpoints.persistLinearProgress(any(), any(), any(), any(), anyInt()))
+                .thenThrow(new IllegalStateException("workflow_checkpoint_run_not_found"));
+        ReflectionTestUtils.setField(executor, "workflowCheckpointService", checkpoints);
+
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setResumeToken("token-1");
+        context.setResumeLeaseVersion(2);
+        context.setToolCallsUsed(5);
+        context.setTerminalSuccess(true);
+        context.setTerminalResultPreview("terminal-preview");
+        AtomicInteger consumed = new AtomicInteger();
+
+        LangchainWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    consumed.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).isEqualTo("workflow_checkpoint_run_not_found");
+        // checkpoint 写失败时不得消费 handoff，也不得启动后续 Todo。
+        assertThat(consumed.get()).isZero();
+        verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any());
+        verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
     }
 
     private static ToolJobResumeContext failedPythonContext(boolean consumed, int repairAttempt) {

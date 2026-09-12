@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.execution;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
@@ -45,6 +46,7 @@ import java.util.function.BooleanSupplier;
  * @see LangchainWorkflowRouting 决策 LINEAR vs DAG 的路由逻辑
  */
 @Service
+@Slf4j
 public class LangchainLinearWorkflowExecutor {
 
     private final LangchainTodoNodeExecutor todoNodeExecutor;
@@ -98,6 +100,7 @@ public class LangchainLinearWorkflowExecutor {
             plan = LangchainWorkflowRouting.effectivePlan(plan, true);
             return executePlanned(request, plan, toolCalls, null, null, null);
         } catch (Exception e) {
+            log.error("Linear execution failed before result publish: runId={}", request.getRunId(), e);
             return LangchainWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
@@ -137,6 +140,8 @@ public class LangchainLinearWorkflowExecutor {
             return executePlanned(request, plan, toolCalls, context, terminalConsumed, null);
         } catch (Exception e) {
             // 把恢复异常转换为普通 workflow result，由 pipeline 统一持久化。
+            // 失败结果可能因状态栅栏而写不进库，日志是这条异常唯一的可见出口。
+            log.error("Linear resume failed before result publish: runId={}", request.getRunId(), e);
             return LangchainWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
