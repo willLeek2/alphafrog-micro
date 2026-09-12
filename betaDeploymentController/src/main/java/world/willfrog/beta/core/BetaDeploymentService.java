@@ -21,6 +21,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import world.willfrog.beta.config.BetaControllerProperties;
 import world.willfrog.beta.state.AtomicJsonStore;
 import world.willfrog.beta.validation.BetaContractValidator;
 
@@ -33,22 +34,26 @@ public class BetaDeploymentService {
     private final BetaContractValidator validator;
     private final ContainerRuntime containers;
     private final CandidateRegistrationProbe registrationProbe;
+    private final BetaControllerProperties properties;
     private final Clock clock;
     private final ReentrantLock mutationLock = new ReentrantLock(true);
 
     @Autowired
     public BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
-                                 ContainerRuntime containers, CandidateRegistrationProbe registrationProbe) {
-        this(mapper, store, validator, containers, registrationProbe, Clock.systemUTC());
+                                 ContainerRuntime containers, CandidateRegistrationProbe registrationProbe,
+                                 BetaControllerProperties properties) {
+        this(mapper, store, validator, containers, registrationProbe, properties, Clock.systemUTC());
     }
 
     BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
-                          ContainerRuntime containers, CandidateRegistrationProbe registrationProbe, Clock clock) {
+                          ContainerRuntime containers, CandidateRegistrationProbe registrationProbe,
+                          BetaControllerProperties properties, Clock clock) {
         this.mapper = mapper;
         this.store = store;
         this.validator = validator;
         this.containers = containers;
         this.registrationProbe = registrationProbe;
+        this.properties = properties;
         this.clock = clock;
     }
 
@@ -269,7 +274,7 @@ public class BetaDeploymentService {
         ContainerRuntime.ContainerObservation observation = containers.create(manifest, spec, plan);
         Instant now = Instant.now(clock);
         ObjectNode candidate = instance(spec, manifest, ref.candidateInstanceId(), plan.generationId(),
-                plan.portSlot(), observation);
+                plan.portSlot(), observation, plan.httpUpstream());
         candidate.put("readiness", "STARTING");
         candidate.putNull("readinessObservedAt");
         candidate.put("readinessDeadline", now.plusSeconds(spec.path("runtime").path("readinessTimeoutSeconds").asLong()).toString());
@@ -532,7 +537,34 @@ public class BetaDeploymentService {
                 : active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
         int hostPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
         return new ContainerRuntime.CandidatePlan(ref.deploymentId(), ref.trafficScopeId(),
-                ref.candidateInstanceId(), JsonSupport.deploymentGeneration(manifest), slot, hostPort);
+                ref.candidateInstanceId(), JsonSupport.deploymentGeneration(manifest), slot, hostPort,
+                sandboxHttpUpstream(ref, manifest, spec));
+    }
+
+    // 沙箱网关的 HTTP 上游是同一部署里的 Python 沙箱。沙箱不向 Nacos 注册 HTTP 口，
+    // 蓝绿翻口后网关只能靠重建拿到新地址：启动网关候选时把沙箱当前活动宿主口算进
+    // 候选计划。同部署没有沙箱服务时不注入，沿用环境文件；沙箱还没有活动实例
+    // （同部署首次一起创建）时用沙箱部署单的第一只宿主口和机器可路由地址。
+    private ContainerRuntime.HttpUpstream sandboxHttpUpstream(OperationRef ref, JsonNode manifest, JsonNode spec) {
+        if (!"python-sandbox-gateway-service".equals(spec.path("serviceName").asText())) return null;
+        JsonNode sandboxSpec = findService(manifest, "python-sandbox-service");
+        if (sandboxSpec == null) return null;
+        JsonNode sandbox = findService(ref.deployment(), "python-sandbox-service");
+        JsonNode sandboxActive = sandbox == null ? null : sandbox.path("activeInstance");
+        if (sandboxActive != null && sandboxActive.isObject()) {
+            return new ContainerRuntime.HttpUpstream(sandboxActive.path("endpoint").path("address").asText(),
+                    sandboxActive.path("hostPort").asInt());
+        }
+        return new ContainerRuntime.HttpUpstream(
+                machineRoutableAddress(sandboxSpec.path("machineId").asText()),
+                sandboxSpec.path("runtime").path("hostPorts").path(0).asInt());
+    }
+
+    private String machineRoutableAddress(String machineId) {
+        BetaControllerProperties.Machine machine = properties.getMachines().get(machineId);
+        if (machine == null || machine.getRoutableAddress() == null || machine.getRoutableAddress().isBlank())
+            throw new ControllerException("MACHINE_UNKNOWN", "Beta machine is not fully configured: " + machineId);
+        return machine.getRoutableAddress();
     }
 
     private void validateAll(ObjectNode state) {
@@ -756,7 +788,8 @@ public class BetaDeploymentService {
     }
 
     private ObjectNode instance(JsonNode spec, JsonNode manifest, String instanceId, String generation, String slot,
-                                ContainerRuntime.ContainerObservation container) {
+                                ContainerRuntime.ContainerObservation container,
+                                ContainerRuntime.HttpUpstream httpUpstream) {
         ObjectNode result = mapper.createObjectNode();
         result.put("instanceId", instanceId);
         result.put("machineId", spec.path("machineId").asText());
@@ -775,6 +808,13 @@ public class BetaDeploymentService {
         endpoint.put("address", container.endpointAddress());
         endpoint.put("port", container.hostPort());
         result.set("endpoint", endpoint);
+        // 网关实例记录带进来的 HTTP 上游，供后续判断沙箱翻口后是否需要重建网关。
+        if (httpUpstream != null) {
+            ObjectNode upstream = mapper.createObjectNode();
+            upstream.put("address", httpUpstream.address());
+            upstream.put("port", httpUpstream.port());
+            result.set("httpUpstream", upstream);
+        }
         return result;
     }
 
@@ -818,15 +858,33 @@ public class BetaDeploymentService {
             for (JsonNode service : deployment.path("services")) {
                 boolean create = "CREATING".equals(service.path("phase").asText()) && service.path("operation").isNull();
                 // 按服务内容摘要而不是部署单版本号决定滚动：版本号升高但服务摘要没变的
-                // 服务保持当前容器，只有真正改过的服务进入蓝绿。
+                // 服务保持当前容器，只有真正改过的服务进入蓝绿；网关在摘要没变时还
+                // 跟随同部署沙箱的活动宿主口，口不匹配也排进更新。
                 boolean update = "STABLE".equals(service.path("phase").asText())
-                        && !service.path("targetServiceSpecSha256").asText()
-                                .equals(service.path("activeInstance").path("serviceSpecSha256").asText());
+                        && (!service.path("targetServiceSpecSha256").asText()
+                                .equals(service.path("activeInstance").path("serviceSpecSha256").asText())
+                            || gatewayFollowsSandboxPort(deployment, service));
                 if (create || update) queue.add(new ServiceRef((ObjectNode) deployment, (ObjectNode) service, create));
             }
         }
+        // 同一部署里沙箱先于网关：网关候选要带沙箱翻口后的新宿主口，沙箱后滚会让
+        // 网关再被重建一次；网关排到队尾即可保证两者都在队列时的先后。
         return queue.stream().min(Comparator.comparing((ServiceRef item) -> item.deployment().path("trafficScopeId").asText())
+                .thenComparing(item -> "python-sandbox-gateway-service"
+                        .equals(item.service().path("serviceName").asText()) ? 1 : 0)
                 .thenComparing(item -> item.service().path("serviceName").asText())).orElse(null);
+    }
+
+    // 网关把沙箱的 HTTP 口记录在实例的 httpUpstream 上；服务摘要没变，但记录和沙箱
+    // 当前活动口不一致（或旧实例还没有这个记录）时，网关也要重建去追新的口。
+    private boolean gatewayFollowsSandboxPort(JsonNode deployment, JsonNode service) {
+        if (!"python-sandbox-gateway-service".equals(service.path("serviceName").asText())) return false;
+        JsonNode sandbox = findService(deployment, "python-sandbox-service");
+        JsonNode gateway = service.path("activeInstance");
+        if (sandbox == null || !sandbox.path("activeInstance").isObject() || !gateway.isObject()) return false;
+        JsonNode upstream = gateway.path("httpUpstream");
+        return !upstream.isObject()
+                || upstream.path("port").asInt() != sandbox.path("activeInstance").path("hostPort").asInt();
     }
 
     private void startNextDelete(ObjectNode deployment) {
@@ -1001,7 +1059,8 @@ public class BetaDeploymentService {
                 if (found != null) throw new ControllerException("STATE_INVALID", "More than one operation is active");
                 found = new OperationRef(deployment.path("deploymentId").asText(), deployment.path("trafficScopeId").asText(),
                         service.path("serviceName").asText(), op.path("operationId").asText(), op.path("type").asText(),
-                        op.path("phase").asText(), op.path("candidateInstanceId").asText(null), service.deepCopy());
+                        op.path("phase").asText(), op.path("candidateInstanceId").asText(null), service.deepCopy(),
+                        deployment.deepCopy());
             }
         }
         return found;
@@ -1068,6 +1127,6 @@ public class BetaDeploymentService {
 
     private record OperationRef(String deploymentId, String trafficScopeId, String serviceName,
                                 String operationId, String type, String phase, String candidateInstanceId,
-                                JsonNode service) {}
+                                JsonNode service, JsonNode deployment) {}
     private record ServiceRef(ObjectNode deployment, ObjectNode service, boolean create) {}
 }

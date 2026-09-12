@@ -120,6 +120,8 @@ frontend 更新不走上面的蓝绿顺序。它是人直接访问的 HTTP 入�
 
 排空实例保存 `stopSignalRequestedAt` 和 `stopDeadline`，记录本次停止请求和该服务的容器期限。停止信号发送前先按 `drainGraceSeconds` 持久化一次截止时间；控制器重启或显式重试时只使用原截止时间计算剩余秒数，截止时间已到就立即强停，不能重新获得完整窗口。状态文件保存容器核对与候选注册探测所需的地址和端口，但这些字段不是业务路由表；业务选路仍以 Dubbo 与 Nacos 现场为准。状态文件不保存注册副本、路由版本或默认实例指针。
 
+更新是否发生以服务内容摘要为准：活动实例的 `serviceSpecSha256` 与部署单目标摘要不同才进入更新，版本号升高但服务内容没变时保持当前容器。沙箱网关（`python-sandbox-gateway-service`）的实例记录额外保存 `httpUpstream`（同部署 `python-sandbox-service` 当时活动宿主口的地址和端口），它还按这份记录是否匹配沙箱活动口来决定是否更新：不匹配时，即使服务摘要没变也会把网关排进更新。同一部署里沙箱与网关同时待更新时，先滚沙箱、再滚网关，网关候选取到的是沙箱翻口后的新口。
+
 服务操作阶段限定为：
 
 - 创建：`STARTING_CANDIDATE`、`WAITING_CANDIDATE_READINESS`、`SWITCHING_TRAFFIC`；
@@ -145,6 +147,7 @@ frontend 更新是操作阶段上的唯一例外：跳过候选阶段，提交�
 - 配置 Spring 与 Dubbo 的有序关闭期限；`agent-langchain-service` 使用 0 秒 Spring 后续等待和 5 秒 Dubbo 静态上限，应用代码不得在运行时改写这两个框架的生命周期对象；
 - 配置同一台 Nacos 的 Beta、生产两路逻辑注册，分别带 `zone=beta`、`zone=prod`，Beta 路为 `preferred=true`，生产路只订阅；不写 `dubbo.consumer.cluster`，多注册中心外层合并集群由 Dubbo 默认给 `zone-aware`，单注册中心内部保持默认 `failover`；含 `registration` 的服务允许向 Beta 路自注册，不含该字段的服务只订阅；
 - 为提供者服务注入 Beta 机器的可路由地址与宿主端口，并把部署、代际、发布、实例、区和泳道标签作为 Dubbo 提供者参数；非提供者服务不注入提供者参数；
+- 含 HTTP 上游的网关由控制器注入 `AF_SANDBOX_SERVICE_URL`，值为同部署 `python-sandbox-service` 当前活动宿主口（沙箱还没有活动实例时用其部署单的第一只宿主口与机器可路由地址）；该口变化后控制器重建网关；
 
 控制器在启动容器前执行 `docker compose config --quiet`，配置无法解析时拒绝启动。静态校验包括部署单 Schema 与端口查重，以及禁止把整份生产 `.env` 当作服务环境文件或数据卷。每个服务必须配置一份已经存在的普通环境文件。部署单提供 `runtimeConfigSha256` 时，控制器还会比较环境文件的 SHA-256 摘要。控制器不解析 Compose 展开结果来重复检查由自身生成的每个字段。
 

@@ -32,14 +32,24 @@ class BetaDeploymentServiceTest {
     @BeforeEach
     void setUp() {
         mapper = new ObjectMapper();
-        BetaControllerProperties properties = new BetaControllerProperties();
-        properties.setStateRoot(temporary.resolve("state"));
+        BetaControllerProperties properties = testProperties();
         store = new AtomicJsonStore(mapper, properties);
         containers = new FakeContainers();
         registrationProbe = new FakeRegistrationProbe();
         service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
-                registrationProbe,
+                registrationProbe, properties,
                 Clock.fixed(Instant.parse("2026-09-01T00:00:00Z"), ZoneOffset.UTC));
+    }
+
+    private BetaControllerProperties testProperties() {
+        BetaControllerProperties properties = new BetaControllerProperties();
+        properties.setStateRoot(temporary.resolve("state"));
+        BetaControllerProperties.Machine machine = new BetaControllerProperties.Machine();
+        machine.setDockerHost(java.net.URI.create("unix:///var/run/docker.sock"));
+        machine.setBindIp("127.0.0.1");
+        machine.setRoutableAddress("10.0.0.8");
+        properties.setMachines(Map.of("beta-machine-1", machine));
+        return properties;
     }
 
     @Test
@@ -114,10 +124,9 @@ class BetaDeploymentServiceTest {
         assertEquals("SWITCHING_TRAFFIC", state().path("operation").path("phase").asText());
         JsonNode candidate = state().path("candidateInstance");
 
-        BetaControllerProperties properties = new BetaControllerProperties();
-        properties.setStateRoot(temporary.resolve("state"));
+        BetaControllerProperties properties = testProperties();
         service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
-                registrationProbe,
+                registrationProbe, properties,
                 Clock.fixed(Instant.parse("2026-09-01T00:00:00Z"), ZoneOffset.UTC));
         assertTrue(state().path("lastError").isNull());
 
@@ -167,7 +176,7 @@ class BetaDeploymentServiceTest {
 
             FlakyDeploymentService() {
                 super(mapper, store, new BetaContractValidator(mapper, new BetaControllerProperties()),
-                        containers, registrationProbe, Clock.systemUTC());
+                        containers, registrationProbe, new BetaControllerProperties(), Clock.systemUTC());
             }
 
             @Override
@@ -258,10 +267,9 @@ class BetaDeploymentServiceTest {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         service.reconcileOne();
         containers.observedPortOffset = 1;
-        BetaControllerProperties properties = new BetaControllerProperties();
-        properties.setStateRoot(temporary.resolve("state"));
+        BetaControllerProperties properties = testProperties();
         service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
-                registrationProbe,
+                registrationProbe, properties,
                 Clock.fixed(Instant.parse("2026-09-01T00:03:00Z"), ZoneOffset.UTC));
         service.reconcileOne();
         assertEquals("FAILED", state().path("phase").asText());
@@ -333,6 +341,85 @@ class BetaDeploymentServiceTest {
         assertEquals(28080, state().path("activeInstance").path("hostPort").asInt());
         assertEquals("A", state().path("activeInstance").path("portSlot").asText());
         assertEquals(0, registrationProbe.calls);
+    }
+
+    @Test
+    void gatewayRebuildsToFollowTheSandboxHostPortEvenWhenItsOwnDigestIsUnchanged() {
+        service.submitManifest(sandboxDeployment(1, 'a', 'b'));
+        reconcile(6);
+
+        JsonNode sandbox = stateOf("python-sandbox-service");
+        JsonNode gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("STABLE", sandbox.path("phase").asText());
+        assertEquals("STABLE", gateway.path("phase").asText());
+        assertEquals(18095, sandbox.path("activeInstance").path("hostPort").asInt());
+        assertFalse(sandbox.path("activeInstance").has("httpUpstream"));
+        assertEquals("10.0.0.8", gateway.path("activeInstance").path("httpUpstream").path("address").asText());
+        assertEquals(18095, gateway.path("activeInstance").path("httpUpstream").path("port").asInt());
+        String oldGatewayInstance = gateway.path("activeInstance").path("instanceId").asText();
+        String oldGatewayContainer = gateway.path("activeInstance").path("containerName").asText();
+
+        // 只改沙箱镜像摘要：沙箱翻到第二只口，网关摘要没变也要重建追上新口。
+        service.submitManifest(sandboxDeployment(2, 'c', 'd'));
+        reconcile(5);
+
+        assertEquals(18096, stateOf("python-sandbox-service").path("activeInstance").path("hostPort").asInt());
+        gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("UPDATING", gateway.path("phase").asText());
+        // 网关自己的目标摘要和活动实例摘要一致，更新只由沙箱新口驱动。
+        assertEquals(gateway.path("targetServiceSpecSha256").asText(),
+                gateway.path("activeInstance").path("serviceSpecSha256").asText());
+        assertEquals(18096, gateway.path("candidateInstance").path("httpUpstream").path("port").asInt());
+
+        reconcile(3);
+
+        gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("STABLE", gateway.path("phase").asText());
+        assertFalse(oldGatewayInstance.equals(gateway.path("activeInstance").path("instanceId").asText()));
+        assertEquals(18096, gateway.path("activeInstance").path("httpUpstream").path("port").asInt());
+        assertTrue(containers.stopped.containsKey(oldGatewayContainer));
+        assertTrue(containers.removedComposeInstanceIds.contains(oldGatewayInstance));
+    }
+
+    @Test
+    void legacyGatewayWithoutAnUpstreamRecordIsRebuiltOnTheNextReconcile() {
+        service.submitManifest(sandboxDeployment(1, 'a', 'b'));
+        reconcile(6);
+        // 模拟现网旧控制器留下的记录：网关活动实例没有 httpUpstream（services[1] 是网关）。
+        store.update(state -> {
+            ((ObjectNode) state.path("deployments").path(0).path("services").path(1)
+                    .path("activeInstance")).remove("httpUpstream");
+            return null;
+        });
+        assertEquals("STABLE", stateOf("python-sandbox-gateway-service").path("phase").asText());
+
+        service.reconcileOne();
+
+        JsonNode gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("UPDATING", gateway.path("phase").asText());
+        assertEquals(18095, gateway.path("candidateInstance").path("httpUpstream").path("port").asInt());
+    }
+
+    @Test
+    void gatewayWithoutASandboxServiceInTheDeploymentKeepsTheEnvironmentFileUpstream() {
+        ObjectNode onlyGateway = sandboxDeployment(1, 'a', 'b');
+        ((com.fasterxml.jackson.databind.node.ArrayNode) onlyGateway.path("services")).remove(0);
+        service.submitManifest(onlyGateway);
+        reconcile(3);
+
+        JsonNode gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("STABLE", gateway.path("phase").asText());
+        assertFalse(gateway.path("activeInstance").has("httpUpstream"));
+
+        // 没有沙箱服务可跟随，摘要没变的重复提交也不触发网关更新。
+        ObjectNode repeat = sandboxDeployment(2, 'a', 'b');
+        ((com.fasterxml.jackson.databind.node.ArrayNode) repeat.path("services")).remove(0);
+        service.submitManifest(repeat);
+        reconcile(1);
+
+        gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("STABLE", gateway.path("phase").asText());
+        assertTrue(gateway.path("operation").isNull());
     }
 
     @Test
@@ -427,10 +514,9 @@ class BetaDeploymentServiceTest {
         assertEquals("2026-09-01T00:01:05Z", state().path("drainingInstance").path("stopDeadline").asText());
 
         containers.leaveRunningAfterStop = false;
-        BetaControllerProperties properties = new BetaControllerProperties();
-        properties.setStateRoot(temporary.resolve("state"));
+        BetaControllerProperties properties = testProperties();
         service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
-                registrationProbe,
+                registrationProbe, properties,
                 Clock.fixed(Instant.parse("2026-09-01T00:00:30Z"), ZoneOffset.UTC));
         service.retry("beta-main-001", "agent-service");
         service.reconcileOne();
@@ -464,6 +550,59 @@ class BetaDeploymentServiceTest {
         spec.remove("registration");
         spec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, spec));
         return value;
+    }
+
+    private ObjectNode sandboxDeployment(int version, char sandboxRepository, char sandboxImage) {
+        ObjectNode root = mapper.createObjectNode();
+        root.put("schemaVersion", 1);
+        root.put("deploymentId", "beta-main-001");
+        root.put("trafficScopeId", "main-beta");
+        root.put("manifestVersion", version);
+        root.put("gitCommit", "1".repeat(40));
+        root.putObject("owner").put("ownerId", "frog");
+        root.put("createdAt", "2026-09-01T00:00:00Z");
+        root.put("expiresAt", "2026-09-08T00:00:00Z");
+        ObjectNode sandbox = root.putArray("services").addObject();
+        sandbox.put("serviceName", "python-sandbox-service");
+        sandbox.put("dubboServiceKey", "world.willfrog.alphafrogmicro.sandbox.http.PythonSandboxHttp");
+        sandbox.put("releaseId", "release-1");
+        sandbox.put("machineId", "beta-machine-1");
+        ObjectNode sandboxImageNode = sandbox.putObject("image");
+        sandboxImageNode.put("repositoryDigest",
+                "registry.local/sandbox@sha256:" + String.valueOf(sandboxRepository).repeat(64));
+        sandboxImageNode.put("localImageId", "sha256:" + String.valueOf(sandboxImage).repeat(64));
+        ObjectNode sandboxRuntime = sandbox.putObject("runtime");
+        sandboxRuntime.put("containerPort", 8095);
+        sandboxRuntime.putArray("hostPorts").add(18095).add(18096);
+        sandboxRuntime.put("healthCheckProfile", "CONTROLLER_TCP_V1");
+        sandboxRuntime.put("readinessTimeoutSeconds", 120);
+        sandboxRuntime.put("shutdownProfile", "SPRING_BOOT_HTTP_V1");
+        sandboxRuntime.put("applicationDrainSeconds", 60);
+        sandboxRuntime.put("drainGraceSeconds", 60);
+        sandbox.putNull("runtimeConfigSha256");
+        sandbox.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, sandbox));
+
+        // 网关镜像摘要固定：第二次提交里它不变，验证网关重建由沙箱口驱动而不是摘要。
+        ObjectNode gateway = sandbox.deepCopy();
+        gateway.put("serviceName", "python-sandbox-gateway-service");
+        gateway.put("dubboServiceKey", "world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService");
+        ObjectNode gatewayImage = (ObjectNode) gateway.path("image");
+        gatewayImage.put("repositoryDigest", "registry.local/gateway@sha256:" + "e".repeat(64));
+        gatewayImage.put("localImageId", "sha256:" + "f".repeat(64));
+        ObjectNode gatewayRuntime = (ObjectNode) gateway.path("runtime");
+        gatewayRuntime.put("containerPort", 50060);
+        gatewayRuntime.remove("hostPorts");
+        gatewayRuntime.putArray("hostPorts").add(51060).add(52060);
+        gatewayRuntime.put("shutdownProfile", "SPRING_BOOT_HTTP_DUBBO_V1");
+        ObjectNode registration = gateway.putObject("registration");
+        registration.put("serviceName", "providers:world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService::");
+        registration.put("groupName", "alphafrog-beta");
+        registration.put("namespaceId", "public");
+        registration.put("clusterName", "DEFAULT");
+        registration.put("applicationName", "python-sandbox-gateway-service");
+        gateway.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, gateway));
+        ((com.fasterxml.jackson.databind.node.ArrayNode) root.path("services")).add(gateway);
+        return root;
     }
 
     private ObjectNode withPortfolioService(ObjectNode manifest) {
@@ -543,6 +682,7 @@ class BetaDeploymentServiceTest {
         String invalidManifestId;
         int observedPortOffset;
         boolean failAfterCreating;
+        int createdContainers;
 
         @Override public void validateManifestEnvironment(JsonNode manifest) {
             if (manifest.path("deploymentId").asText().equals(invalidManifestId)) {
@@ -552,7 +692,8 @@ class BetaDeploymentServiceTest {
 
         @Override public ContainerObservation create(JsonNode manifest, JsonNode spec, CandidatePlan plan) {
             String name = "af-" + plan.instanceId();
-            ContainerObservation value = new ContainerObservation(String.format("%064x", values.size() + 1),
+            // 容器 ID 用只增计数：删除旧实例后 values.size() 会回退，两个存活实例会撞 ID。
+            ContainerObservation value = new ContainerObservation(String.format("%064x", ++createdContainers),
                     name, "10.0.0.8", plan.hostPort(), true, health);
             values.put(name, value);
             if (failAfterCreating) throw new ControllerException("CONTAINER_START_FAILED", "post-create check failed");
