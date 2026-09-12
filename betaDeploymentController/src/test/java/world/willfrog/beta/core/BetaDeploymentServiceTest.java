@@ -382,6 +382,25 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void legacyGatewayWithoutAnUpstreamRecordIsRebuiltOnTheNextReconcile() {
+        service.submitManifest(sandboxDeployment(1, 'a', 'b'));
+        reconcile(6);
+        // 模拟现网旧控制器留下的记录：网关活动实例没有 httpUpstream（services[1] 是网关）。
+        store.update(state -> {
+            ((ObjectNode) state.path("deployments").path(0).path("services").path(1)
+                    .path("activeInstance")).remove("httpUpstream");
+            return null;
+        });
+        assertEquals("STABLE", stateOf("python-sandbox-gateway-service").path("phase").asText());
+
+        service.reconcileOne();
+
+        JsonNode gateway = stateOf("python-sandbox-gateway-service");
+        assertEquals("UPDATING", gateway.path("phase").asText());
+        assertEquals(18095, gateway.path("candidateInstance").path("httpUpstream").path("port").asInt());
+    }
+
+    @Test
     void gatewayWithoutASandboxServiceInTheDeploymentKeepsTheEnvironmentFileUpstream() {
         ObjectNode onlyGateway = sandboxDeployment(1, 'a', 'b');
         ((com.fasterxml.jackson.databind.node.ArrayNode) onlyGateway.path("services")).remove(0);
