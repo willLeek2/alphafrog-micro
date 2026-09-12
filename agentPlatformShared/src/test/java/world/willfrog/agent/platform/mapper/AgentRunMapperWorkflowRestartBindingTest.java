@@ -353,6 +353,24 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
+    void cancelTerminalCasAcceptsEveryCancelWindowStatusWithOperationFence() {
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put("id", "run-cancel");
+        parameters.put("toolJobAnchorJson", "{}");
+        parameters.put("newStatus", AgentRunStatus.CANCELED);
+        parameters.put("expectedOperationId", "run-cancel:call-1:1");
+        parameters.put("deploymentIdentity",
+                new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64)));
+
+        String sql = normalizedSql(statement("cancelToolJobAnchorFromStatuses")
+                .getBoundSql(parameters));
+        assertThat(sql)
+                .contains("status IN ('WAITING_TOOL_JOB', 'EXECUTING', 'WAITING', 'RECEIVED')")
+                .contains("tool_job_anchor_json ->> 'operationId' = ?")
+                .contains("deployment_id = ?", "deployment_generation_id = ?");
+    }
+
+    @Test
     void legacyToolJobTestOverloadDoesNotAddAnUnknownDeploymentParameter() {
         String sql = normalizedSql(statement("updateToolJobAnchor").getBoundSql(Map.of()));
         assertThat(sql)

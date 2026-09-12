@@ -677,9 +677,13 @@ class ToolJobAnchorMapperIntegrationTest {
      * EXECUTING with a CANCELED-disposition anchor; the finalizer's terminal
      * CAS previously required WAITING_TOOL_JOB only and retried forever
      * (5s finalizer loop + ~60s resume takeover loop, resumeLeaseVersion → 27).
+     *
+     * <p>260913: the same class of gap between the finalizer CAS to RECEIVED and
+     * the resume handoff is also covered here (batch 20260913-012514, 5 runs
+     * stuck at RECEIVED with a 5s terminal_transition_failed retry loop).
      */
     @Test
-    void cancelTerminalCasAcceptsExecutingAndWaitingToolJobAndFencesOperation() throws Exception {
+    void cancelTerminalCasAcceptsEveryCancelWindowStatusAndFencesOperation() throws Exception {
         // EXECUTING + matching operationId → CANCELED lands (the fixed gap)
         insertRun("run-cancel-exec", "EXECUTING", """
             {"operationId":"run-cancel-exec:call-1:1","anchorState":"TERMINAL",
@@ -719,8 +723,24 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(mapper.findById("run-cancel-wait").getStatus())
                 .isEqualTo(AgentRunStatus.CANCELED);
 
-        // Any other status (e.g. RECEIVED) → rejected
-        insertRun("run-cancel-other", "RECEIVED", """
+        // RECEIVED window regression (batch 20260913-012514): the finalizer CASed the
+        // run to RECEIVED and a resume worker already claimed it, but no handoff has
+        // landed yet — a cancel in this window must collect here, otherwise the
+        // finalizer retries terminal_transition_failed every 5s.
+        insertRun("run-cancel-received", "RECEIVED", """
+            {"operationId":"run-cancel-received:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"tok-r","runDisposition":"CANCELED"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-received",
+                "{\"operationId\":\"run-cancel-received:call-1:1\",\"anchorState\":\"TERMINAL\","
+                        + "\"resumeState\":\"LAUNCHING\",\"resumeToken\":\"tok-r\","
+                        + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
+                AgentRunStatus.CANCELED, "run-cancel-received:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-cancel-received").getStatus())
+                .isEqualTo(AgentRunStatus.CANCELED);
+
+        // Any other status (e.g. COMPLETED) → rejected
+        insertRun("run-cancel-other", "COMPLETED", """
             {"operationId":"run-cancel-other:call-1:1","anchorState":"TERMINAL",
              "runDisposition":"CANCELED"}""");
         assertThat(mapper.cancelToolJobAnchorFromStatuses(
@@ -729,7 +749,7 @@ class ToolJobAnchorMapperIntegrationTest {
                         + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
                 AgentRunStatus.CANCELED, "run-cancel-other:call-1:1")).isEqualTo(0);
         assertThat(mapper.findById("run-cancel-other").getStatus())
-                .isEqualTo(AgentRunStatus.RECEIVED);
+                .isEqualTo(AgentRunStatus.COMPLETED);
     }
 
     @Test

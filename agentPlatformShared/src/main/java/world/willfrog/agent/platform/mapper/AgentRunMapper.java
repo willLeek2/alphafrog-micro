@@ -572,8 +572,10 @@ public interface AgentRunMapper {
             @Param("deploymentIdentity") DeploymentIdentity deploymentIdentity);
 
     /**
-     * CANCELED 终态收口专用。expectedStatus 同时接受 WAITING_TOOL_JOB（正常后台工具取消）
-     * 与 EXECUTING（取消落在 markHandoffAccepted 已恢复执行之后）。operationId 栅栏保证
+     * CANCELED 终态收口专用。status 集合覆盖取消可能落地的全部业务窗口：
+     * WAITING_TOOL_JOB（正常后台工具取消）、EXECUTING（取消落在 markHandoffAccepted
+     * 已恢复执行之后）、WAITING（先暂停后取消）、RECEIVED（finalizer 已把 Run 推到
+     * RECEIVED、恢复 worker 已 claim 但 handoff 尚未落库）。operationId 栅栏保证
      * 旧 finalizer 不能覆盖已被第二次长工具替换的新 anchor。
      */
     int cancelToolJobAnchorFromStatuses(

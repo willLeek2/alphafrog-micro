@@ -26,8 +26,11 @@ import static org.mockito.Mockito.*;
  * which accepts both WAITING_TOOL_JOB (cancel during background wait) and
  * EXECUTING (cancel landing after markHandoffAccepted resumed execution —
  * batch 20260818-182948's permanent-EXECUTING + dual retry loop root cause).
- * The status-pair semantics live in the SQL and are pinned by
- * {@code ToolJobAnchorMapperIntegrationTest}; this class pins the wiring.
+ * 260913: the accepted set additionally covers WAITING (pause-then-cancel) and
+ * RECEIVED (finalizer CAS to RECEIVED, resume claimed but handoff not yet
+ * written — batch 20260913-012514). The status-set semantics live in the SQL
+ * and are pinned by {@code ToolJobAnchorMapperIntegrationTest}; this class
+ * pins the wiring.
  */
 class ToolJobFinalizerCanceledGuardTest {
 
