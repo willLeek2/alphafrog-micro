@@ -1,4 +1,4 @@
-package world.willfrog.agentlangchain.control;
+package world.willfrog.agentlangchain.gateway;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -15,7 +15,7 @@ import org.slf4j.MDC;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
-class RunLaneContextScopeTest {
+class LaneScopeGatewayTest {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     @AfterEach
@@ -46,7 +46,7 @@ class RunLaneContextScopeTest {
         assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS)).isNull();
         LaneContext.setTrafficScopeId("unrelated-caller-lane");
         MDC.put(LaneContext.MDC_LANE_TAG, "unrelated-caller-lane");
-        executor.submit(RunLaneContextScope.wrap(run, () -> {
+        executor.submit(LaneScopeGateway.wrap(run, () -> {
             observed.set(LaneContext.trafficScopeId());
             observedMdc.set(MDC.get(LaneContext.MDC_LANE_TAG));
         })).get(2, TimeUnit.SECONDS);
@@ -57,5 +57,19 @@ class RunLaneContextScopeTest {
         assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isEqualTo("unrelated-caller-lane");
         assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS)).isNull();
         assertThat(executor.submit(() -> MDC.get(LaneContext.MDC_LANE_TAG)).get(2, TimeUnit.SECONDS)).isNull();
+    }
+
+    @ParameterizedTest(name = "snapshot {0}")
+    @MethodSource("activationBoundaries")
+    void snapshotRestoreRoundTripsLaneTagAndMdc(String boundary, String laneTag) {
+        LaneScopeGateway.Snapshot snapshot = LaneScopeGateway.capture();
+        try {
+            LaneContext.setTrafficScopeId(laneTag);
+            MDC.put(LaneContext.MDC_LANE_TAG, laneTag);
+        } finally {
+            snapshot.restore();
+        }
+        assertThat(LaneContext.trafficScopeId()).isNull();
+        assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isNull();
     }
 }

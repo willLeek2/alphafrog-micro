@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
@@ -39,6 +40,7 @@ public class ToolJobStartupRecovery {
     private final ToolJobFinalizer finalizer;
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
+    private final RunOwnershipGateway ownershipGateway;
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
 
@@ -51,7 +53,8 @@ public class ToolJobStartupRecovery {
                                   DataAnalysisCapacityProperties capacityProperties,
                                   ToolJobFinalizer finalizer,
                                   ToolJobResumeService resumeService,
-                                  ToolJobConfig config) {
+                                  ToolJobConfig config,
+                                  RunOwnershipGateway ownershipGateway) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
@@ -59,6 +62,7 @@ public class ToolJobStartupRecovery {
         this.finalizer = finalizer;
         this.resumeService = resumeService;
         this.config = config;
+        this.ownershipGateway = ownershipGateway;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -78,7 +82,7 @@ public class ToolJobStartupRecovery {
 
     private void recoverCapacityLedger() {
         // 只扫描仍有 active anchor 的 Run，终态已清理 anchor 不再占用容量。
-        List<AgentRun> activeRuns = anchorService.listActive(200);
+        List<AgentRun> activeRuns = ownershipGateway.listActiveAnchors(200);
         // durableReservations 会一次性提交给容量服务重建。
         List<DataAnalysisReservation> durableReservations = new ArrayList<>();
         // 无法解析/确认的 reservation 必须隔离并阻止 admission 开放。
@@ -236,8 +240,8 @@ public class ToolJobStartupRecovery {
 
     private void recoverToolJobAnchors() {
         // activeRuns 用于恢复轮询/finalizer；resumeReadyRuns 用于恢复 launch handoff。
-        List<AgentRun> activeRuns = anchorService.listActive(200);
-        List<AgentRun> resumeReadyRuns = anchorService.listResumeReady(200);
+        List<AgentRun> activeRuns = ownershipGateway.listActiveAnchors(200);
+        List<AgentRun> resumeReadyRuns = ownershipGateway.listResumeReadyAnchors(200);
 
         for (AgentRun run : activeRuns) {
             // 重新读取 anchor，防止列表与处理之间被其他实例推进。

@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 
 import java.lang.reflect.Field;
 import java.time.Instant;
@@ -44,6 +45,9 @@ class ToolJobCasStatusRecoveryTest {
 
     @Mock
     private AgentRunMapper agentRunMapper;
+
+    @Mock
+    private RunOwnershipGateway ownershipGateway;
 
     private ToolJobAnchorService anchorService;
     private ToolJobFinalizer finalizer;
@@ -81,7 +85,11 @@ class ToolJobCasStatusRecoveryTest {
         inject(finalizer, "eventHook", eventHook);
 
         reconciler = new ToolJobReconciler(
-                redisCache, anchorService, finalizer, resumeService, config, capacityService);
+                redisCache, anchorService, finalizer, resumeService, config, capacityService,
+                ownershipGateway);
+        lenient().when(ownershipGateway.listActiveAnchors(100)).thenReturn(List.of());
+        lenient().when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
+        lenient().when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of());
     }
 
     // ===== completeResumeReady: guard conditions =====
@@ -323,12 +331,12 @@ class ToolJobCasStatusRecoveryTest {
         stuckRun.setStatus(AgentRunStatus.RECEIVED);
         stuckRun.setToolJobAnchorJson(stuck.toJson());
 
-        when(anchorService.listStuckAtCasStatus(20)).thenReturn(List.of(stuckRun));
+        when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of(stuckRun));
         // Do NOT stub loadAnchor — let real impl call agentRunMapper.findById
         // so the thenReturn chain on findById is exercised.
         // AnchorService.listActive/listResumeReady return empty for the other sections
-        when(agentRunMapper.listActiveToolJobAnchors(100)).thenReturn(List.of());
-        when(agentRunMapper.listResumeReadyAnchors(50)).thenReturn(List.of());
+        when(ownershipGateway.listActiveAnchors(100)).thenReturn(List.of());
+        when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
         // promoteCasStatusToResumeReady will be called; make it win
         when(agentRunMapper.promoteCasStatusToResumeReady(
                 eq("run-stuck"), eq("run-stuck:tc-s:1"), eq("tc-s"), eq(1), eq("task-s"),
@@ -364,10 +372,10 @@ class ToolJobCasStatusRecoveryTest {
         readyRun.setStatus(AgentRunStatus.RECEIVED);
         readyRun.setToolJobAnchorJson(alreadyReady.toJson());
 
-        when(anchorService.listStuckAtCasStatus(20)).thenReturn(List.of(readyRun));
+        when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of(readyRun));
         when(agentRunMapper.findById("run-ready")).thenReturn(readyRun);
-        when(agentRunMapper.listActiveToolJobAnchors(100)).thenReturn(List.of());
-        when(agentRunMapper.listResumeReadyAnchors(50)).thenReturn(List.of());
+        when(ownershipGateway.listActiveAnchors(100)).thenReturn(List.of());
+        when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
 
         reconciler.rebuildFromAnchors();
 
@@ -390,8 +398,8 @@ class ToolJobCasStatusRecoveryTest {
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setToolJobAnchorJson(ready.toJson());
 
-        when(agentRunMapper.listResumeReadyAnchors(50)).thenReturn(List.of(run));
-        List<AgentRun> result = anchorService.listResumeReady(50);
+        when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of(run));
+        List<AgentRun> result = ownershipGateway.listResumeReadyAnchors(50);
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).getId()).isEqualTo("run-rd");
@@ -406,8 +414,8 @@ class ToolJobCasStatusRecoveryTest {
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setToolJobAnchorJson(stuck.toJson());
 
-        when(agentRunMapper.listStuckAtCasStatusAnchors(20)).thenReturn(List.of(run));
-        List<AgentRun> result = anchorService.listStuckAtCasStatus(20);
+        when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of(run));
+        List<AgentRun> result = ownershipGateway.listStuckAtCasStatusAnchors(20);
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).getId()).isEqualTo("run-cas");

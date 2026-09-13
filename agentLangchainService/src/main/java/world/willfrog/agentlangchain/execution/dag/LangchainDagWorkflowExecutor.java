@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.execution.dag;
 import com.alibaba.ttl.threadpool.TtlExecutors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.slf4j.MDC;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,7 +25,7 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.execution.LangchainBudgetPartialAnswerBuilder;
-import world.willfrog.alphafrogmicro.common.lane.LaneContext;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -312,7 +311,7 @@ public class LangchainDagWorkflowExecutor {
         Map<String, TodoItem> nodeStates = new LinkedHashMap<>();
         // 捕获父线程的 AgentContext 快照，工作线程在执行节点前恢复此快照，确保 observability trace 关联到正确的 runId/userId
         AgentContext.ContextSnapshot parentContext = AgentContext.captureRunContext();
-        DagLaneContextSnapshot parentLaneContext = DagLaneContextSnapshot.capture();
+        LaneScopeGateway.Snapshot parentLaneContext = LaneScopeGateway.capture();
 
         // 线程池大小 = min(配置上限, 实际节点数)，至少为 1。
         // 当节点数少于配置上限时不需要创建多余线程（避免空闲线程浪费），但不能超过配置上限（避免并发 LLM 调用打满 rate limit）
@@ -386,7 +385,7 @@ public class LangchainDagWorkflowExecutor {
                                                  Object workflowStateLock,
                                                  Map<String, TodoItem> nodeStates,
                                                  AgentContext.ContextSnapshot parentContext,
-                                                 DagLaneContextSnapshot parentLaneContext,
+                                                 LaneScopeGateway.Snapshot parentLaneContext,
                                                  DagObserve observe,
                                                  AtomicInteger completedCount,
                                                  Map<String, CompletableFuture<Void>> futures) {
@@ -447,7 +446,7 @@ public class LangchainDagWorkflowExecutor {
                              Object workflowStateLock,
                              Map<String, TodoItem> nodeStates,
                              AgentContext.ContextSnapshot parentContext,
-                             DagLaneContextSnapshot parentLaneContext,
+                             LaneScopeGateway.Snapshot parentLaneContext,
                              DagObserve observe,
                              AtomicInteger completedCount) {
         String runId = request.getRunId();
@@ -456,7 +455,7 @@ public class LangchainDagWorkflowExecutor {
         boolean enteredExecution = false;
         Span nodeSpan = null;
         Scope nodeScope = null;
-        DagLaneContextSnapshot workerLaneContext = DagLaneContextSnapshot.capture();
+        LaneScopeGateway.Snapshot workerLaneContext = LaneScopeGateway.capture();
         try {
             parentLaneContext.restore();
             // 0. 恢复判定器重调度：已有结果的节点跳过，避免重复执行
@@ -1395,29 +1394,8 @@ public class LangchainDagWorkflowExecutor {
         }
     }
 
-    /**
-     * DAG 节点进入工作线程时使用的泳道上下文快照。
-     *
-     * <p>TTL 线程池负责跨提交边界传递 {@link LaneContext}；这里同时显式恢复日志上下文，
-     * 并在节点结束后还原工作线程原值。即使节点内部临时改写标签，后续节点也不会继承残留。</p>
-     */
-    private record DagLaneContextSnapshot(String laneTag, String mdcLaneTag) {
-
-        static DagLaneContextSnapshot capture() {
-            return new DagLaneContextSnapshot(
-                    LaneContext.trafficScopeId(),
-                    MDC.get(LaneContext.MDC_LANE_TAG));
-        }
-
-        void restore() {
-            LaneContext.restore(laneTag);
-            if (mdcLaneTag == null || mdcLaneTag.isBlank()) {
-                MDC.remove(LaneContext.MDC_LANE_TAG);
-            } else {
-                MDC.put(LaneContext.MDC_LANE_TAG, mdcLaneTag);
-            }
-        }
-    }
+    // DAG 节点跨工作线程的泳道快照由 gateway.LaneScopeGateway 提供：
+    // TTL 线程池负责传递，节点进入时显式恢复、结束后还原，避免标签残留。
 
     /**
      * DAG 并行执行的内部结果包装，持有所有节点的执行结果映射。

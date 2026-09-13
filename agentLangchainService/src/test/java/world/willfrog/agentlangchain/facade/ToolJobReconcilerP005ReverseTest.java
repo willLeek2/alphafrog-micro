@@ -251,15 +251,17 @@ class ToolJobReconcilerP005ReverseTest {
         ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
 
         // Construct LangchainRunControlService with REAL mapper + anchor service + mocked dependencies
+        world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive(
+                        mapper);
         controlService = new LangchainRunControlService(
                 readService, mapper, eventService, stateStore,
                 observabilityService, pipeline, creditSettlementService, anchorService,
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
-                () -> new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity(
-                        "stable", "gen-" + "a".repeat(64)));
+                ownershipGateway);
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, om);
+                anchorService, redisCache, config, om, ownershipGateway);
 
         // Stateful capacity ledger (tracks release call count and ledger identity)
         capacityFake = new StatefulCapacityFake();

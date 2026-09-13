@@ -34,8 +34,7 @@ import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
@@ -119,8 +118,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
 
-    @Autowired(required = false)
-    private DeploymentIdentityProvider deploymentIdentityProvider;
+    private final RunOwnershipGateway ownershipGateway;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -142,7 +140,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           AgentRunFinalizationService finalizationService,
                                           AgentPromptService promptService,
                                           ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider,
-                                          ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider) {
+                                          ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider,
+                                          RunOwnershipGateway ownershipGateway) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -164,6 +163,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.promptService = promptService;
         this.agentRunDatasetRegistryProvider = agentRunDatasetRegistryProvider;
         this.debugObservabilityServiceProvider = debugObservabilityServiceProvider;
+        this.ownershipGateway = ownershipGateway;
     }
 
     @Override
@@ -915,41 +915,24 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     /**
-     * Spring 运行时一定会注入可信部署身份；直接 new 本类的单元测试没有 Spring 容器，
-     * 此时沿用原有测试行为。生产入口和真正执行前各检查一次，避免排队期间发生代际切换后
-     * 旧实例继续处理不属于自己的 Run。
+     * 归属判定收在 gateway：生产入口和真正执行前各检查一次，避免排队期间发生代际切换后
+     * 旧实例继续处理不属于自己的 Run。业务代码不感知自己的部署身份。
      */
     private boolean belongsToLocalDeployment(AgentRun run) {
-        if (run == null) {
-            return false;
-        }
-        if (deploymentIdentityProvider == null) {
-            return true;
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return local.deploymentId().equals(run.getDeploymentId())
-                && local.generationId().equals(run.getDeploymentGenerationId());
+        return ownershipGateway.owns(run);
     }
 
     private AgentRun findLocalRun(String runId) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.findById(runId);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.findByIdForDeployment(
-                runId, local.deploymentId(), local.generationId());
+        return runMapper.findById(runId);
     }
+
+    // 以下写入条件只用业务字段（run id、user、精确原状态、恢复租约）；不再按部署身份分叉 SQL。
 
     private int updateStatusForLocal(String runId,
                                      String userId,
                                      AgentRunStatus expectedStatus,
                                      AgentRunStatus status) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.updateStatus(runId, userId, status);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.updateStatusForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(), expectedStatus, status);
+        return runMapper.updateStatus(runId, userId, expectedStatus, status);
     }
 
     private int updateStatusWithTtlForLocal(String runId,
@@ -957,25 +940,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                             AgentRunStatus expectedStatus,
                                             AgentRunStatus status,
                                             OffsetDateTime ttlExpiresAt) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.updateStatusWithTtl(runId, userId, status, ttlExpiresAt);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.updateStatusWithTtlForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(),
-                expectedStatus, status, ttlExpiresAt);
+        return runMapper.updateStatusWithTtl(
+                runId, userId, expectedStatus, status, ttlExpiresAt);
     }
 
     private int updatePlanForLocal(String runId,
                                    String userId,
                                    AgentRunStatus expectedStatus,
                                    String planJson) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.updatePlanJson(runId, userId, planJson);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.updatePlanJsonForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(), expectedStatus, planJson);
+        return runMapper.updatePlanJson(runId, userId, expectedStatus, planJson);
     }
 
     private int updateTerminalForLocal(String runId,
@@ -985,14 +958,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                        String snapshotJson,
                                        boolean completed,
                                        String lastError) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.updateTerminalSnapshot(
-                    runId, userId, status, snapshotJson, completed, lastError);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.updateTerminalSnapshotForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(),
-                expectedStatus, status, snapshotJson, completed, lastError);
+        return runMapper.updateTerminalSnapshot(
+                runId, userId, expectedStatus, status, snapshotJson, completed, lastError);
     }
 
     private int updateResumedTerminalForLocal(String runId,
@@ -1005,15 +972,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                               String expectedResumeToken,
                                               long expectedLeaseVersion,
                                               String expectedLauncherOwnerId) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.updateResumedTerminal(
-                    runId, userId, status, planJson, snapshotJson, completed, lastError,
-                    expectedResumeToken, expectedLeaseVersion, expectedLauncherOwnerId);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.updateResumedTerminalForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(),
-                status, planJson, snapshotJson, completed, lastError,
+        return runMapper.updateResumedTerminal(
+                runId, userId, status, planJson, snapshotJson, completed, lastError,
                 expectedResumeToken, expectedLeaseVersion, expectedLauncherOwnerId);
     }
 
@@ -1024,8 +984,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 objectMapper,
                 agentRunDatasetRegistryProvider,
                 toolJobCheckpointWriter,
-                checkpointFailureRecoveryService,
-                deploymentIdentityProvider);
+                checkpointFailureRecoveryService);
     }
 
     private LangchainWorkflowStepCoordinator stepCoordinator() {

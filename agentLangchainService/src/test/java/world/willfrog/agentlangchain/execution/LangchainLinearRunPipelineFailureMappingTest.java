@@ -42,8 +42,9 @@ class LangchainLinearRunPipelineFailureMappingTest {
         run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById("run-budget-1")).thenReturn(run);
         when(runMapper.updateStatus("run-budget-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED,
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(eq("run-budget-1"), eq("user-1"),
+        when(runMapper.updateTerminalSnapshot(eq("run-budget-1"), eq("user-1"), eq(world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED), any(),
                 eq(true), any())).thenReturn(1);
         when(eventService.isRunnable("run-budget-1", "user-1")).thenReturn(true);
@@ -97,7 +98,8 @@ class LangchainLinearRunPipelineFailureMappingTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 

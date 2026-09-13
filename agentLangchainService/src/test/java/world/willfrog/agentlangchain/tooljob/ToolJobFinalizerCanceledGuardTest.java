@@ -61,7 +61,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class),
-                runMapper, finalizationService);
+                runMapper, finalizationService, null);
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -100,7 +100,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
 
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-2:call-1:1");
@@ -150,7 +150,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();
@@ -187,7 +187,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();
@@ -225,7 +225,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-5:call-1:1");
         anchor.setAutoResume(false);
@@ -259,7 +259,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-6:call-1:1");
         anchor.setAutoResume(false);
@@ -298,7 +298,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-7:call-1:1");
         anchor.setAutoResume(false);
@@ -329,7 +329,7 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-8:call-1:1");
         anchor.setAutoResume(false);

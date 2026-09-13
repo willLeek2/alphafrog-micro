@@ -110,7 +110,8 @@ class LangchainLinearRunPipelineResumeTest {
                 settlementService,
                 finalizationService,
                 promptService,
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
+                mock(ObjectProvider.class), mock(ObjectProvider.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
         context.setTodoId("todo-2");
@@ -287,7 +288,7 @@ class LangchainLinearRunPipelineResumeTest {
         clearInvocations(observabilityService);
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
         verify(observabilityService, never()).commitTerminalSnapshot(any());
-        verify(runMapper, never()).updatePlanJson(any(), any(), any());
+        verify(runMapper, never()).updatePlanJson(any(), any(), any(), any());
         verify(runMapper, never()).updateSnapshot(any(), any(), any(), any(), anyBoolean(), any());
     }
 }

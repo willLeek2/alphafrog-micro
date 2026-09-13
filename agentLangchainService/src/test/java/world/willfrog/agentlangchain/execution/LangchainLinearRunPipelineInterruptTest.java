@@ -86,7 +86,8 @@ class LangchainLinearRunPipelineInterruptTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 

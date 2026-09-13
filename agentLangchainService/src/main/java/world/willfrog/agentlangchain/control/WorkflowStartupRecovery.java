@@ -15,8 +15,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -39,7 +38,7 @@ public class WorkflowStartupRecovery {
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunEventService eventService;
     private final AgentRunFinalizationService finalizationService;
-    private final DeploymentIdentityProvider deploymentIdentityProvider;
+    private final RunOwnershipGateway ownershipGateway;
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
@@ -54,9 +53,8 @@ public class WorkflowStartupRecovery {
     public void onReady() {
         OffsetDateTime startedBefore = OffsetDateTime.now();
         int boundedLimit = Math.max(1, Math.min(scanLimit, 1000));
-        DeploymentIdentity identity = deploymentIdentityProvider.current();
-        List<AgentRun> candidates = runMapper.listStartupRecoveryCandidatesForDeployment(
-                startedBefore, identity.deploymentId(), identity.generationId(), boundedLimit);
+        List<AgentRun> candidates = ownershipGateway.listStartupRecoveryCandidates(
+                startedBefore, boundedLimit);
         for (AgentRun candidate : candidates) {
             recoverOne(candidate);
         }
@@ -73,8 +71,7 @@ public class WorkflowStartupRecovery {
         AgentRunStatus status = candidate.getStatus();
         try {
             if (status == AgentRunStatus.CANCELING) {
-                if (runMapper.completeStartupCancellationForDeployment(
-                        runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId()) == 1) {
+                if (runMapper.completeStartupCancellation(runId, userId) == 1) {
                     if (schedulerMetrics != null) {
                         schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
                     }
@@ -103,13 +100,11 @@ public class WorkflowStartupRecovery {
                 fail(candidate, "workflow_restart_plan_missing");
                 return;
             }
-            if (runMapper.claimStartupRestartForDeployment(
-                    runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId(),
-                    status, attempt, maxAttempts) != 1) {
+            if (ownershipGateway.claimStartupRestart(
+                    runId, status, attempt, maxAttempts) != 1) {
                 return;
             }
-            AgentRun claimed = runMapper.findByIdForDeployment(
-                    runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId());
+            AgentRun claimed = runMapper.findById(runId);
             if (claimed == null) {
                 return;
             }
@@ -130,8 +125,7 @@ public class WorkflowStartupRecovery {
                     "previous_status", status.name()));
         } catch (Exception e) {
             log.error("Workflow startup recovery failed for run={}", runId, e);
-            AgentRun latest = runMapper.findByIdForDeployment(
-                    runId, candidate.getDeploymentId(), candidate.getDeploymentGenerationId());
+            AgentRun latest = runMapper.findById(runId);
             if (latest != null) {
                 failClaimed(latest, "workflow_restart_launch_failed:" + safeMessage(e));
             }
@@ -139,17 +133,15 @@ public class WorkflowStartupRecovery {
     }
 
     private void fail(AgentRun run, String reason) {
-        if (runMapper.failStartupRecoveryForDeployment(
-                run.getId(), run.getDeploymentId(), run.getDeploymentGenerationId(),
-                run.getStatus(), reason) == 1) {
+        if (runMapper.failStartupRecovery(
+                run.getId(), run.getUserId(), run.getStatus(), reason) == 1) {
             publishRejected(run, reason);
         }
     }
 
     private void failClaimed(AgentRun run, String reason) {
-        if (runMapper.failStartupRecoveryForDeployment(
-                run.getId(), run.getDeploymentId(), run.getDeploymentGenerationId(),
-                AgentRunStatus.RECEIVED, reason) == 1) {
+        if (runMapper.failStartupRecovery(
+                run.getId(), run.getUserId(), AgentRunStatus.RECEIVED, reason) == 1) {
             publishRejected(run, reason);
         }
     }

@@ -208,7 +208,7 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
             insertRun(mapper, "already-canceled", AgentRunStatus.CANCELED,
                     "user_canceled", proofAnchor("already-canceled"));
 
-            assertThat(mapper.listActiveToolJobAnchors(20))
+            assertThat(mapper.listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", 20))
                     .extracting(AgentRun::getId)
                     .contains("already-failed", "already-canceled");
             assertThat(mapper.updateDagCleanupToolJobAnchor(

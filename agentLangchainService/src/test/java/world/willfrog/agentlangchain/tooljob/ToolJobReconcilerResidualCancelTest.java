@@ -92,7 +92,8 @@ class ToolJobReconcilerResidualCancelTest {
         when(anchorService.loadAnchor("run-res")).thenReturn(anchor);
 
         ToolJobReconciler reconciler = new ToolJobReconciler(
-                redisCache, anchorService, finalizer, resumeService, config, capacityService);
+                redisCache, anchorService, finalizer, resumeService, config, capacityService,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         inject(reconciler, "sandboxService", sandbox);
         return new Fixture(reconciler, redisCache, anchorService, finalizer, sandbox);
     }

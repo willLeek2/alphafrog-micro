@@ -17,8 +17,6 @@ import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.time.OffsetDateTime;
 import java.util.concurrent.CountDownLatch;
@@ -46,24 +44,24 @@ class LangchainRunControlServiceTest {
     private final AgentRunCreditSettlementService creditSettlementService = mock(AgentRunCreditSettlementService.class);
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
     private final AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
-    private final DeploymentIdentityProvider identityProvider =
-            () -> new DeploymentIdentity("stable", GENERATION);
     private final LangchainRunControlService service = new LangchainRunControlService(
             readService, runMapper, eventService, stateStore, observabilityService, pipeline,
-            creditSettlementService, anchorService, finalizationService, identityProvider);
+            creditSettlementService, anchorService, finalizationService,
+            world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
+                    withIdentity(runMapper, "stable", GENERATION));
 
     @BeforeEach
-    void defaultDeploymentOwnedRunAndFencedWrites() {
+    void defaultDeploymentOwnedRunAndPlainBusinessWrites() {
         lenient().when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
                 .thenReturn(run(AgentRunStatus.EXECUTING));
-        lenient().when(runMapper.cancelTerminalSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), anyString(), any()))
+        lenient().when(runMapper.cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any()))
                 .thenReturn(1);
-        lenient().when(runMapper.updateSnapshotForDeploymentIfStatus(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any(), anyString()))
+        lenient().when(runMapper.updateSnapshotIfStatus(
+                eq("r1"), eq("u1"), any(), anyString()))
                 .thenReturn(1);
-        lenient().when(runMapper.pauseSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any(), anyString(), any()))
+        lenient().when(runMapper.pauseSnapshotWithTtl(
+                eq("r1"), eq("u1"), any(), anyString(), any()))
                 .thenReturn(1);
     }
 
@@ -91,16 +89,16 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        when(runMapper.cancelTerminalSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), anyString(), any()))
+        when(runMapper.cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any()))
                 .thenReturn(1);
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
         assertEquals("CANCELED", response.getStatus());
         verify(observabilityService).forceFlush("r1");
-        verify(runMapper).cancelTerminalSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), anyString(), any());
+        verify(runMapper).cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any());
         verify(eventService).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
         verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
     }
@@ -114,8 +112,8 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        when(runMapper.cancelTerminalSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), anyString(), any()))
+        when(runMapper.cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any()))
                 .thenReturn(1);
         doThrow(new RuntimeException("listener unavailable"))
                 .when(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
@@ -124,8 +122,8 @@ class LangchainRunControlServiceTest {
                 CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
         assertEquals("CANCELED", response.getStatus());
-        verify(runMapper).cancelTerminalSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), anyString(), any());
+        verify(runMapper).cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any());
         verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
     }
 
@@ -140,8 +138,8 @@ class LangchainRunControlServiceTest {
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
         // 终态栅栏拒写（数据库已是终态，例如执行刚提交 COMPLETED）：不发 CANCELED 事件、
         // 不写 Redis 终态、不结算、不发布，按现状返回——不广播数据库里不存在的终态。
-        when(runMapper.cancelTerminalSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), anyString(), any()))
+        when(runMapper.cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any()))
                 .thenReturn(0);
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
@@ -173,15 +171,16 @@ class LangchainRunControlServiceTest {
         when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
         when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
                 .thenReturn(received);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(received);
         when(eventService.nextTtlExpiresAt()).thenReturn(OffsetDateTime.now().plusHours(1));
-        when(runMapper.resetForResumeForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any())).thenReturn(1);
+        when(runMapper.resetForResume(
+                eq("r1"), eq("u1"), any())).thenReturn(1);
 
         var response = service.resumeRun(resumeRequest());
 
         assertEquals("RECEIVED", response.getStatus());
-        verify(runMapper).resetForResumeForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any());
+        verify(runMapper).resetForResume(
+                eq("r1"), eq("u1"), any());
         verify(pipeline).launchAsync(received);
     }
 
@@ -198,8 +197,8 @@ class LangchainRunControlServiceTest {
 
         assertEquals("原测试部署已停用", error.getMessage());
         verify(readService, never()).requireWritableRun(anyString(), anyString());
-        verify(runMapper, never()).resetForResumeForDeployment(
-                anyString(), anyString(), anyString(), anyString(), any());
+        verify(runMapper, never()).resetForResume(
+                anyString(), anyString(), any());
         verify(pipeline, never()).launchAsync(any());
     }
 
@@ -226,8 +225,8 @@ class LangchainRunControlServiceTest {
                 service.resumeRun(resumeRequest()));
 
         assertTrue(ex.getMessage().contains("still in flight"));
-        verify(runMapper, never()).resetForResumeForDeployment(
-                anyString(), anyString(), anyString(), anyString(), any());
+        verify(runMapper, never()).resetForResume(
+                anyString(), anyString(), any());
         verify(pipeline, never()).launchAsync(any());
     }
 
@@ -244,8 +243,8 @@ class LangchainRunControlServiceTest {
                 service.resumeRun(resumeRequest()));
 
         assertTrue(ex.getMessage().contains("cleanup is still in progress"));
-        verify(runMapper, never()).resetForResumeForDeployment(
-                anyString(), anyString(), anyString(), anyString(), any());
+        verify(runMapper, never()).resetForResume(
+                anyString(), anyString(), any());
         verify(pipeline, never()).launchAsync(any());
     }
 
@@ -257,9 +256,10 @@ class LangchainRunControlServiceTest {
         when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
         when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
                 .thenReturn(received);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(received);
         when(eventService.nextTtlExpiresAt()).thenReturn(OffsetDateTime.now().plusHours(1));
-        when(runMapper.resetForResumeForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any())).thenReturn(1);
+        when(runMapper.resetForResume(
+                eq("r1"), eq("u1"), any())).thenReturn(1);
         when(anchorService.loadAnchor("r1")).thenReturn(pausedAnchor("op-1", "SUCCEEDED", "EVENT"));
         when(anchorService.clearPausedAnchor("r1", "op-1")).thenReturn(true);
 
@@ -268,8 +268,8 @@ class LangchainRunControlServiceTest {
         assertEquals("RECEIVED", response.getStatus());
         var inOrder = inOrder(anchorService, runMapper, pipeline);
         inOrder.verify(anchorService).clearPausedAnchor("r1", "op-1");
-        inOrder.verify(runMapper).resetForResumeForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION), any());
+        inOrder.verify(runMapper).resetForResume(
+                eq("r1"), eq("u1"), any());
         inOrder.verify(pipeline).launchAsync(received);
     }
 
@@ -287,8 +287,8 @@ class LangchainRunControlServiceTest {
                 service.resumeRun(resumeRequest()));
 
         assertTrue(ex.getMessage().contains("resume_anchor_clear_failed"));
-        verify(runMapper, never()).resetForResumeForDeployment(
-                anyString(), anyString(), anyString(), anyString(), any());
+        verify(runMapper, never()).resetForResume(
+                anyString(), anyString(), any());
         verify(pipeline, never()).launchAsync(any());
     }
 
@@ -313,9 +313,8 @@ class LangchainRunControlServiceTest {
 
         var inOrder = inOrder(anchorService, runMapper);
         inOrder.verify(anchorService).persistPauseDisposition("r1", "op-1", AgentRunStatus.WAITING_TOOL_JOB);
-        inOrder.verify(runMapper).pauseSnapshotWithTtlForDeployment(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION),
-                eq(AgentRunStatus.WAITING_TOOL_JOB), anyString(), any());
+        inOrder.verify(runMapper).pauseSnapshotWithTtl(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB), anyString(), any());
         verify(stateStore).markRunStatus("r1", AgentRunStatus.WAITING.name());
     }
 
@@ -335,8 +334,8 @@ class LangchainRunControlServiceTest {
                 service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
 
         assertTrue(ex.getMessage().contains("pause_anchor_disposition_failed"));
-        verify(runMapper, never()).pauseSnapshotWithTtlForDeployment(
-                anyString(), anyString(), anyString(), anyString(), any(), anyString(), any());
+        verify(runMapper, never()).pauseSnapshotWithTtl(
+                anyString(), anyString(), any(), anyString(), any());
         verify(stateStore, never()).markRunStatus(anyString(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
     }
@@ -368,9 +367,8 @@ class LangchainRunControlServiceTest {
                 eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB));
         verify(anchorService, never()).updateAnchor(anyString(), any(), any());
         // Oracle: snapshot updated with current status (not CANCELED)
-        verify(runMapper).updateSnapshotForDeploymentIfStatus(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION),
-                eq(AgentRunStatus.WAITING_TOOL_JOB), anyString());
+        verify(runMapper).updateSnapshotIfStatus(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB), anyString());
         verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
     }
 
@@ -387,9 +385,8 @@ class LangchainRunControlServiceTest {
         when(anchorService.loadAnchor("r1")).thenReturn(anchor);
         when(anchorService.persistCancelDisposition(
                 "r1", "r1:tc-1:1", AgentRunStatus.WAITING_TOOL_JOB)).thenReturn(true);
-        when(runMapper.updateSnapshotForDeploymentIfStatus(
-                eq("r1"), eq("u1"), eq("stable"), eq(GENERATION),
-                eq(AgentRunStatus.WAITING_TOOL_JOB), anyString())).thenReturn(0);
+        when(runMapper.updateSnapshotIfStatus(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB), anyString())).thenReturn(0);
 
         var response = service.cancelRun(
                 CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
@@ -420,8 +417,8 @@ class LangchainRunControlServiceTest {
 
         // Oracle: no DB/Redis mutations, no event, no settlement
         verify(stateStore, never()).markRunStatus(eq("r1"), anyString());
-        verify(runMapper, never()).updateSnapshotForDeploymentIfStatus(
-                anyString(), anyString(), anyString(), anyString(), any(), anyString());
+        verify(runMapper, never()).updateSnapshotIfStatus(
+                anyString(), anyString(), any(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
         verify(creditSettlementService, never()).settleAsync(anyString(), anyString());
     }
@@ -437,8 +434,8 @@ class LangchainRunControlServiceTest {
 
         // Oracle: no side effects on failure
         verify(stateStore, never()).markRunStatus(eq("r1"), anyString());
-        verify(runMapper, never()).updateSnapshotForDeploymentIfStatus(
-                anyString(), anyString(), anyString(), anyString(), any(), anyString());
+        verify(runMapper, never()).updateSnapshotIfStatus(
+                anyString(), anyString(), any(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
         verify(creditSettlementService, never()).settleAsync(anyString(), anyString());
     }
@@ -460,8 +457,8 @@ class LangchainRunControlServiceTest {
 
         // Oracle: no side effects on failure
         verify(stateStore, never()).markRunStatus(eq("r1"), anyString());
-        verify(runMapper, never()).updateSnapshotForDeploymentIfStatus(
-                anyString(), anyString(), anyString(), anyString(), any(), anyString());
+        verify(runMapper, never()).updateSnapshotIfStatus(
+                anyString(), anyString(), any(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
         verify(creditSettlementService, never()).settleAsync(anyString(), anyString());
     }
@@ -554,8 +551,8 @@ class LangchainRunControlServiceTest {
                 service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
 
         verify(stateStore, never()).markRunStatus(eq("r1"), anyString());
-        verify(runMapper, never()).updateSnapshotForDeploymentIfStatus(
-                anyString(), anyString(), anyString(), anyString(), any(), anyString());
+        verify(runMapper, never()).updateSnapshotIfStatus(
+                anyString(), anyString(), any(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
         verify(creditSettlementService, never()).settleAsync(anyString(), anyString());
         // 恰好两次窄写尝试（旧 operationId 一次 + 重读后的新 operationId 一次），没有整份写回

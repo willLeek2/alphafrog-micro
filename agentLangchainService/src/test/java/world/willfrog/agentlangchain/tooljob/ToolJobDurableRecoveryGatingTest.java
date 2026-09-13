@@ -82,6 +82,11 @@ class ToolJobDurableRecoveryGatingTest {
         ToolJobResumeLauncherImpl resumeLauncher() {
             return mock(ToolJobResumeLauncherImpl.class);
         }
+
+        @Bean
+        world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway() {
+            return mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+        }
     }
 
     /**

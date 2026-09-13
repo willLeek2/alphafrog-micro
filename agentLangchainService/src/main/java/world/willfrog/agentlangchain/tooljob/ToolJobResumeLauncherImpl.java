@@ -8,8 +8,6 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,9 +32,6 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
     private final LangchainLinearRunPipeline pipeline;
     private final ObjectProvider<ToolJobResumeService> resumeServiceProvider;
     private final ConcurrentMap<ToolJobResumeClaimKey, Boolean> activeClaims = new ConcurrentHashMap<>();
-    @Autowired(required = false)
-    private DeploymentIdentityProvider deploymentIdentityProvider;
-
     @Override
     public boolean launch(String runId, ToolJobResumeContext context) {
         // 先校验 run、token、lease、todo 恢复身份，缺失字段不能提交匿名任务。
@@ -52,12 +47,7 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
             return true;
         }
         // 入队前重新读取 Run；排队身份仍由 id 和 context lease 约束。
-        DeploymentIdentity identity = deploymentIdentityProvider == null
-                ? null : deploymentIdentityProvider.current();
-        AgentRun run = identity == null
-                ? runMapper.findById(runId)
-                : runMapper.findByIdForDeployment(
-                        runId, identity.deploymentId(), identity.generationId());
+        AgentRun run = runMapper.findById(runId);
         if (run == null) {
             // Run 已删除，释放本地去重键并报告 launch 失败。
             activeClaims.remove(key);

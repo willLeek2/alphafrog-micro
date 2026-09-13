@@ -52,7 +52,8 @@ class ToolJobFinalizerPausedGuardTest {
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
                 mock(FinanceResultModelAdapter.class), runMapper,
-                mock(AgentRunFinalizationService.class));
+                mock(AgentRunFinalizationService.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive(runMapper));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -90,7 +91,8 @@ class ToolJobFinalizerPausedGuardTest {
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
                 mock(FinanceResultModelAdapter.class), mock(AgentRunMapper.class),
-                mock(AgentRunFinalizationService.class));
+                mock(AgentRunFinalizationService.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-1:call-1:1");

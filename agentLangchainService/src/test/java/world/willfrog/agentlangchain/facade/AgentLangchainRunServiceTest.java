@@ -53,7 +53,9 @@ class AgentLangchainRunServiceTest {
     @BeforeEach
     void setUp() {
         runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, scheduler, runMapper,
-                creditService, userDao, deploymentIdentityProvider);
+                creditService, userDao,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
+                        withIdentity(runMapper, "stable", GENERATION));
         lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
         lenient().when(deploymentIdentityProvider.current())
                 .thenReturn(new DeploymentIdentity("stable", GENERATION));

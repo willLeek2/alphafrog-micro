@@ -64,6 +64,7 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
         run.setRestartAttempt(1);
         when(runMapper.findById(run.getId())).thenReturn(run);
         when(runMapper.updateStatus(run.getId(), run.getUserId(),
+                world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED,
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(events.isRunnable(run.getId(), run.getUserId())).thenReturn(true);
         when(events.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
@@ -95,7 +96,8 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
+                mock(ObjectProvider.class), mock(ObjectProvider.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         ReflectionTestUtils.setField(pipeline, "workflowCheckpointService", checkpoints);
 
         pipeline.executeRun(run);

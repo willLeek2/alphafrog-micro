@@ -542,7 +542,7 @@ public class LangchainRunReadService {
         // 过期是读时发现并补写的状态：旧 run 没有后台定时器一直扫描。
         // 一旦某次读取发现超出保留窗口，就补 RUN_EXPIRED 事件并刷新 Redis 状态。
         int updatedRows = runMapper.updateStatus(
-                run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
+                run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.EXPIRED);
         if (updatedRows != 1) {
             log.warn("EXPIRED persistence was not exact; skip terminal side effects: "
                     + "runId={} status={} rows={}", run.getId(), AgentRunStatus.EXPIRED, updatedRows);

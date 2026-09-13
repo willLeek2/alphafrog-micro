@@ -27,6 +27,10 @@ import static org.mockito.Mockito.*;
 
 class ToolJobStartupPreparingAbortRecoveryTest {
 
+    private final world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+            org.mockito.Mockito.mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+
+
     @Test
     void failedPreparingAbortRecoversCapacityWithoutSandboxWaitingOrResume()
             throws Exception {
@@ -46,9 +50,9 @@ class ToolJobStartupPreparingAbortRecoveryTest {
         failed.setId("run-abort");
         failed.setStatus(AgentRunStatus.FAILED);
         ToolJobAnchor aborting = abortingAnchor();
-        when(anchorService.listActive(200))
+        when(ownershipGateway.listActiveAnchors(200))
                 .thenReturn(List.of(failed), List.of());
-        when(anchorService.listResumeReady(200)).thenReturn(List.of());
+        when(ownershipGateway.listResumeReadyAnchors(200)).thenReturn(List.of());
         when(anchorService.loadAnchor("run-abort")).thenReturn(aborting);
         when(capacityService.releaseReservation(any()))
                 .thenReturn(DataAnalysisReleaseOutcome.NOT_FOUND);
@@ -95,7 +99,8 @@ class ToolJobStartupPreparingAbortRecoveryTest {
                 capacityProperties,
                 finalizer,
                 resumeService,
-                config);
+                config,
+                ownershipGateway);
         inject(recovery, "sandboxService", sandbox);
 
         recovery.onReady();
@@ -137,9 +142,9 @@ class ToolJobStartupPreparingAbortRecoveryTest {
         ToolJobAnchor winner = new ToolJobAnchor();
         winner.setOperationId("run-abort:call-2:1");
         winner.setAnchorState("ATTACHED");
-        when(anchorService.listActive(200))
+        when(ownershipGateway.listActiveAnchors(200))
                 .thenReturn(List.of(failed), List.of());
-        when(anchorService.listResumeReady(200)).thenReturn(List.of());
+        when(ownershipGateway.listResumeReadyAnchors(200)).thenReturn(List.of());
         when(anchorService.loadAnchor("run-abort"))
                 .thenReturn(staleAbort, winner);
         when(capacityService.releaseReservation(any()))
@@ -159,7 +164,8 @@ class ToolJobStartupPreparingAbortRecoveryTest {
                 new DataAnalysisCapacityProperties(),
                 finalizer,
                 resumeService,
-                new ToolJobConfig());
+                new ToolJobConfig(),
+                ownershipGateway);
         inject(recovery, "sandboxService", sandbox);
 
         recovery.onReady();

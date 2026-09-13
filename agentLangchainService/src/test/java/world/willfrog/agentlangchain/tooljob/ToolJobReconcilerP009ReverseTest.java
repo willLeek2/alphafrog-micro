@@ -183,7 +183,8 @@ class ToolJobReconcilerP009ReverseTest {
         anchorService = new ToolJobAnchorService(mapper);
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, om);
+                anchorService, redisCache, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         // Stateful capacity ledger (pre-seeded later in the test with the
         // real DataAnalysisReservation)

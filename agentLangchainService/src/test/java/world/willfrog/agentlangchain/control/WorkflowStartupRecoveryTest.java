@@ -10,8 +10,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.gateway.GatewayTestFixtures;
 
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
@@ -38,9 +37,10 @@ class WorkflowStartupRecoveryTest {
         eventService = mock(AgentRunEventService.class);
         finalizationService = mock(AgentRunFinalizationService.class);
         schedulerMetrics = mock(LangchainSchedulerMetrics.class);
-        DeploymentIdentityProvider identityProvider = () -> new DeploymentIdentity("stable", GENERATION);
+        // 归属判定由 gateway 承担；这里用真实判定 + 测试固定身份，扫描/认领语句参数保持原样。
         recovery = new WorkflowStartupRecovery(
-                runMapper, pipeline, eventService, finalizationService, identityProvider);
+                runMapper, pipeline, eventService, finalizationService,
+                GatewayTestFixtures.withIdentity(runMapper, "stable", GENERATION));
         ReflectionTestUtils.setField(recovery, "schedulerMetrics", schedulerMetrics);
         ReflectionTestUtils.setField(recovery, "maxRestartAttempts", 1);
         ReflectionTestUtils.setField(recovery, "scanLimit", 100);
@@ -52,7 +52,7 @@ class WorkflowStartupRecoveryTest {
         AgentRun claimed = run(AgentRunStatus.RECEIVED, 1, candidate.getPlanJson());
         when(runMapper.claimStartupRestartForDeployment(
                 "run-1", "stable", GENERATION, AgentRunStatus.EXECUTING, 0, 1)).thenReturn(1);
-        when(runMapper.findByIdForDeployment("run-1", "stable", GENERATION)).thenReturn(claimed);
+        when(runMapper.findById("run-1")).thenReturn(claimed);
         when(pipeline.launchRestartedAsync(claimed)).thenReturn(true);
 
         recovery.recoverOne(candidate);
@@ -66,8 +66,8 @@ class WorkflowStartupRecoveryTest {
     @Test
     void restartAttemptLimitFailsClearlyWithoutScheduling() {
         AgentRun candidate = run(AgentRunStatus.EXECUTING, 1, "{\"items\":[]}");
-        when(runMapper.failStartupRecoveryForDeployment(
-                "run-1", "stable", GENERATION,
+        when(runMapper.failStartupRecovery(
+                "run-1", "user-1",
                 AgentRunStatus.EXECUTING, "workflow_restart_attempts_exhausted")).thenReturn(1);
 
         recovery.recoverOne(candidate);
@@ -82,8 +82,7 @@ class WorkflowStartupRecoveryTest {
     @Test
     void cancelingRunIsFinishedAsCanceledAndNeverQueued() {
         AgentRun candidate = run(AgentRunStatus.CANCELING, 0, "{}");
-        when(runMapper.completeStartupCancellationForDeployment(
-                "run-1", "stable", GENERATION)).thenReturn(1);
+        when(runMapper.completeStartupCancellation("run-1", "user-1")).thenReturn(1);
 
         recovery.recoverOne(candidate);
 

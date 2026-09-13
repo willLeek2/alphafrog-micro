@@ -694,7 +694,8 @@ class PythonSandboxToolsP001FastPathTest {
 
         // ResumeService that throws on tryResume (simulating crash during resume)
         ToolJobResumeService crashResumeService = new ToolJobResumeService(
-                anchorService1, redisCache1, new ToolJobConfig(), om) {
+                anchorService1, redisCache1, new ToolJobConfig(), om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive()) {
             @Override
             public boolean tryResume(String runId) {
                 throw new RuntimeException("simulated crash during tryResume");
@@ -758,7 +759,8 @@ class PythonSandboxToolsP001FastPathTest {
 
         // Real ToolJobResumeService (no launcher yet — circular dep via ObjectProvider)
         ToolJobResumeService resumeService2 = new ToolJobResumeService(
-                anchorService2, redisCache2, new ToolJobConfig(), om);
+                anchorService2, redisCache2, new ToolJobConfig(), om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         // Mock pipeline — capture callbacks
         LangchainLinearRunPipelineImpl pipeline2 = mock(LangchainLinearRunPipelineImpl.class);
@@ -799,7 +801,8 @@ class PythonSandboxToolsP001FastPathTest {
         // ToolJobStartupRecovery — simulates onReady()
         ToolJobStartupRecovery recovery = new ToolJobStartupRecovery(
                 anchorService2, redisCache2, capacity2, new DataAnalysisCapacityProperties(),
-                finalizer2, resumeService2, new ToolJobConfig());
+                finalizer2, resumeService2, new ToolJobConfig(),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         // Execute onReady — startup scan picks up READY anchor → tryResume
         recovery.onReady();

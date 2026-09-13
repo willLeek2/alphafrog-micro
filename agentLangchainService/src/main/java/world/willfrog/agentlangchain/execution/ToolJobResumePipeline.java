@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.service.tool.ToolProvider;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -50,13 +51,14 @@ public class ToolJobResumePipeline extends LangchainLinearRunPipelineImpl {
                                  AgentRunFinalizationService finalizationService,
                                  AgentPromptService promptService,
                                  ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider,
-                                 ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider) {
+                                 ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider,
+                            RunOwnershipGateway ownershipGateway) {
         super(planner, linearWorkflowExecutor, dagWorkflowExecutor, stageModelResolver, runMapper,
                 eventService, objectMapper, toolProviderProvider, stateStoreProvider,
                 observabilityServiceProvider, failureMapper, followUpContextSupport, messageService,
                 executionGuard, runConcurrencyScheduler, creditService, creditSettlementService,
                 finalizationService, promptService, agentRunDatasetRegistryProvider,
-                debugObservabilityServiceProvider);
+                debugObservabilityServiceProvider, ownershipGateway);
     }
 
     @Override

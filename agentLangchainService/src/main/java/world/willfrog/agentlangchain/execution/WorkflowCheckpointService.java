@@ -12,8 +12,6 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -43,9 +41,6 @@ public class WorkflowCheckpointService {
     private final ObjectProvider<RunRawRefStore> rawRefStoreProvider;
     private final ToolRetrySafetyCatalog toolSafetyCatalog;
 
-    @Autowired(required = false)
-    private DeploymentIdentityProvider deploymentIdentityProvider;
-
     @Value("${agent.workflow-restart.checkpoint.max-json-chars:262144}")
     private int maxCheckpointJsonChars = 262144;
 
@@ -62,7 +57,7 @@ public class WorkflowCheckpointService {
     }
 
     public WorkflowExecutionCheckpoint initializeDag(String runId, String userId) {
-        requireIdentity(runId, userId);
+        requireRunAndUser(runId, userId);
         WorkflowExecutionCheckpoint checkpoint = new WorkflowExecutionCheckpoint();
         checkpoint.setWorkflow(WorkflowExecutionCheckpoint.DAG);
         checkpoint.setNextTodoId(null);
@@ -76,7 +71,7 @@ public class WorkflowCheckpointService {
      * 对 JSONB 做读改写时互相覆盖；当前合同明确是单 Agent 实例。
      */
     public synchronized void markToolStarted(String runId, String userId, String toolName) {
-        requireIdentity(runId, userId);
+        requireRunAndUser(runId, userId);
         if (toolName == null || toolName.isBlank()) {
             throw new IllegalArgumentException("workflow_checkpoint_tool_name_required");
         }
@@ -100,7 +95,7 @@ public class WorkflowCheckpointService {
                                                              LangchainTodoPlan plan,
                                                              List<LangchainCompletedTodo> completedTodos,
                                                              int toolCallsUsed) {
-        requireIdentity(runId, userId);
+        requireRunAndUser(runId, userId);
         List<TodoItem> items = requireLinearPlan(plan);
         List<LangchainCompletedTodo> completed = completedTodos == null
                 ? List.of()
@@ -255,29 +250,21 @@ public class WorkflowCheckpointService {
     }
 
     private AgentRun findLocalRun(String runId) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.findById(runId);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return runMapper.findByIdForDeployment(
-                runId, local.deploymentId(), local.generationId());
+        return runMapper.findById(runId);
     }
 
+    /**
+     * 恢复路径唯一的 checkpoint 写入：条件只用业务字段（run id、user、该行当前 status），
+     * 不再按进程有没有部署身份分叉 SQL。长工具恢复会把 Run 停在 RECEIVED，直到
+     * markHandoffAccepted 才推进到 EXECUTING，所以 expectedStatus 必须取该行当前值，
+     * 不能写死 EXECUTING，否则恢复第一个写点就 0 行失败（workflow_checkpoint_run_not_found）。
+     */
     private int updateExecutionCheckpoint(String runId, String userId, String json) {
-        if (deploymentIdentityProvider == null) {
-            return runMapper.updateExecutionCheckpoint(runId, userId, json);
-        }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        // 长工具恢复会把 Run 停在 RECEIVED，直到 markHandoffAccepted 才推进到 EXECUTING。
-        // checkpoint 写入必须按该行当前 status 做 CAS，不能写死 EXECUTING，否则恢复
-        // 第一个写点就 0 行失败（workflow_checkpoint_run_not_found），工作流不再前进。
         AgentRun run = findLocalRun(runId);
         if (run == null || !Objects.equals(userId, run.getUserId())) {
             return 0;
         }
-        return runMapper.updateExecutionCheckpointForDeployment(
-                runId, userId, local.deploymentId(), local.generationId(),
-                run.getStatus(), json);
+        return runMapper.updateExecutionCheckpoint(runId, userId, run.getStatus(), json);
     }
 
     private void validateReplaySafety(WorkflowExecutionCheckpoint checkpoint) {
@@ -338,7 +325,7 @@ public class WorkflowCheckpointService {
         }
     }
 
-    private void requireIdentity(String runId, String userId) {
+    private void requireRunAndUser(String runId, String userId) {
         if (runId == null || runId.isBlank() || userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("workflow_checkpoint_identity_required");
         }

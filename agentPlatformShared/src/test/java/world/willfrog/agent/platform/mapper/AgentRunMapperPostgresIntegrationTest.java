@@ -258,7 +258,7 @@ class AgentRunMapperPostgresIntegrationTest {
             assertThat(mapper.casUpdateStatus(
                     "dag-preparing-abort", AgentRunStatus.FAILED, AgentRunStatus.EXECUTING))
                     .isEqualTo(1);
-            assertThat(mapper.listActiveToolJobAnchors(20))
+            assertThat(mapper.listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", 20))
                     .extracting(AgentRun::getId)
                     .contains("dag-preparing-abort");
             ToolJobAnchor cleanup = ToolJobAnchor.fromJson(
@@ -447,7 +447,7 @@ class AgentRunMapperPostgresIntegrationTest {
 
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
-            List<String> activeIds = mapper.listActiveToolJobAnchors(20).stream()
+            List<String> activeIds = mapper.listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", 20).stream()
                     .map(AgentRun::getId)
                     .toList();
             // DAG cleanup CANCELED must still be included
