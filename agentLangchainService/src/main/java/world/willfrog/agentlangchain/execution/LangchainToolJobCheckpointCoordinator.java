@@ -13,8 +13,6 @@ import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -35,22 +33,19 @@ final class LangchainToolJobCheckpointCoordinator {
     private final ObjectProvider<AgentRunDatasetRegistry> datasetRegistryProvider;
     private final ToolJobCheckpointWriter checkpointWriter;
     private final ToolJobCheckpointFailureRecoveryService failureRecoveryService;
-    private final DeploymentIdentityProvider deploymentIdentityProvider;
 
     LangchainToolJobCheckpointCoordinator(AgentRunMapper runMapper,
                                           AgentRunEventService eventService,
                                           ObjectMapper objectMapper,
                                           ObjectProvider<AgentRunDatasetRegistry> datasetRegistryProvider,
                                           ToolJobCheckpointWriter checkpointWriter,
-                                          ToolJobCheckpointFailureRecoveryService failureRecoveryService,
-                                          DeploymentIdentityProvider deploymentIdentityProvider) {
+                                          ToolJobCheckpointFailureRecoveryService failureRecoveryService) {
         this.runMapper = runMapper;
         this.eventService = eventService;
         this.objectMapper = objectMapper;
         this.datasetRegistryProvider = datasetRegistryProvider;
         this.checkpointWriter = checkpointWriter;
         this.failureRecoveryService = failureRecoveryService;
-        this.deploymentIdentityProvider = deploymentIdentityProvider;
     }
 
     Attempt persist(String runId, LangchainWorkflowResult result) {
@@ -59,14 +54,7 @@ final class LangchainToolJobCheckpointCoordinator {
         }
         ToolJobCheckpointRequest request = null;
         try {
-            AgentRun latest;
-            if (deploymentIdentityProvider == null) {
-                latest = runMapper.findById(runId);
-            } else {
-                DeploymentIdentity local = deploymentIdentityProvider.current();
-                latest = runMapper.findByIdForDeployment(
-                        runId, local.deploymentId(), local.generationId());
-            }
+            AgentRun latest = runMapper.findById(runId);
             if (latest == null || isBlank(latest.getToolJobAnchorJson())) {
                 return new Attempt(false, null);
             }
@@ -113,19 +101,12 @@ final class LangchainToolJobCheckpointCoordinator {
             LangchainWorkflowResult result,
             ToolJobCheckpointRequest failedRequest) {
         if (failedRequest == null) {
-            boolean failed;
-            if (deploymentIdentityProvider == null) {
-                failed = runMapper.updateTerminalSnapshot(runId, userId, AgentRunStatus.FAILED,
-                        "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
-                        "tool_job_checkpoint_anchor_missing") == 1;
-            } else {
-                DeploymentIdentity local = deploymentIdentityProvider.current();
-                failed = runMapper.updateTerminalSnapshotForDeployment(
-                        runId, userId, local.deploymentId(), local.generationId(),
-                        AgentRunStatus.EXECUTING, AgentRunStatus.FAILED,
-                        "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
-                        "tool_job_checkpoint_anchor_missing") == 1;
-            }
+            // 恢复的公共前缀已由 gateway 判定归属；这里的条件只有业务字段：
+            // 精确原状态 EXECUTING（暂停/取消先落库时本写返回 0，不覆盖控制结果）。
+            boolean failed = runMapper.updateTerminalSnapshot(
+                    runId, userId, AgentRunStatus.EXECUTING, AgentRunStatus.FAILED,
+                    "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
+                    "tool_job_checkpoint_anchor_missing") == 1;
             emitFailure(runId, userId, result, failed, false);
             return failed ? ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED
                     : ToolJobCheckpointFailureRecoveryService.Outcome.UNOWNED;

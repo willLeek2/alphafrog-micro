@@ -16,6 +16,7 @@ import world.willfrog.agentlangchain.control.scheduler.RunPriority;
 import world.willfrog.agentlangchain.control.scheduler.RunPriorityPolicy;
 import world.willfrog.agentlangchain.control.scheduler.RunPriorityQueue;
 import world.willfrog.agentlangchain.control.scheduler.RunWeightPolicy;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -233,7 +234,7 @@ public class LangchainRunConcurrencyScheduler {
     }
 
     public void submit(Reservation reservation, AgentRun run, Runnable task) {
-        Runnable laneScopedTask = RunLaneContextScope.wrap(run, task);
+        Runnable laneScopedTask = LaneScopeGateway.wrap(run, task);
         // 恢复入口通常没有提前 reserve；在这里统一走相同准入规则。
         if (reservation == null) {
             // 没有预留名额的入口只用于已经持久化的 Run 恢复执行。关闭期间仍允许这些

@@ -14,8 +14,6 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.List;
 
@@ -33,8 +31,6 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
 
     private final AgentRunMapper agentRunMapper;
     private final ToolJobAnchorService anchorService;
-    @Autowired(required = false)
-    private DeploymentIdentityProvider deploymentIdentityProvider;
     private final ObjectMapper objectMapper = new ObjectMapper()
             .findAndRegisterModules()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
@@ -56,12 +52,7 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
         }
 
         // 重新读取最新 Run，不能使用 pipeline 早先持有的对象快照。
-        DeploymentIdentity identity = deploymentIdentityProvider == null
-                ? null : deploymentIdentityProvider.current();
-        AgentRun run = identity == null
-                ? agentRunMapper.findById(runId)
-                : agentRunMapper.findByIdForDeployment(
-                        runId, identity.deploymentId(), identity.generationId());
+        AgentRun run = agentRunMapper.findById(runId);
         if (run == null) {
             log.warn("Checkpoint rejected: run not found id={}", runId);
             return false;

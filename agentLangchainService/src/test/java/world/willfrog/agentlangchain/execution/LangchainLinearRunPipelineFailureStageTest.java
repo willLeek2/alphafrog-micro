@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -20,8 +19,6 @@ import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.List;
 import java.util.Map;
@@ -78,15 +75,14 @@ class LangchainLinearRunPipelineFailureStageTest {
         AtomicBoolean latePlanRejected = new AtomicBoolean(false);
         AtomicBoolean lateTerminalRejected = new AtomicBoolean(false);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        when(runMapper.findByIdForDeployment("run-pause-race", "beta-main", GENERATION))
-                .thenReturn(run);
-        when(runMapper.updateStatusForDeployment(
-                "run-pause-race", "user-1", "beta-main", GENERATION,
+        when(runMapper.findById("run-pause-race")).thenReturn(run);
+        when(runMapper.updateStatus(
+                "run-pause-race", "user-1",
                 AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING))
                 .thenAnswer(invocation -> databaseStatus.compareAndSet(
                         AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING) ? 1 : 0);
-        when(runMapper.updatePlanJsonForDeployment(
-                eq("run-pause-race"), eq("user-1"), eq("beta-main"), eq(GENERATION),
+        when(runMapper.updatePlanJson(
+                eq("run-pause-race"), eq("user-1"),
                 eq(AgentRunStatus.EXECUTING), anyString()))
                 .thenAnswer(invocation -> {
                     boolean accepted = databaseStatus.get() == AgentRunStatus.EXECUTING;
@@ -95,8 +91,8 @@ class LangchainLinearRunPipelineFailureStageTest {
                     }
                     return accepted ? 1 : 0;
                 });
-        when(runMapper.updateTerminalSnapshotForDeployment(
-                eq("run-pause-race"), eq("user-1"), eq("beta-main"), eq(GENERATION),
+        when(runMapper.updateTerminalSnapshot(
+                eq("run-pause-race"), eq("user-1"),
                 eq(AgentRunStatus.EXECUTING), eq(AgentRunStatus.COMPLETED),
                 anyString(), eq(true), any()))
                 .thenAnswer(invocation -> {
@@ -149,9 +145,8 @@ class LangchainLinearRunPipelineFailureStageTest {
                 followUpContextSupport, mock(AgentMessageService.class), executionGuard,
                 immediateScheduler(), creditService, mock(AgentRunCreditSettlementService.class),
                 finalizationService, mock(world.willfrog.agent.platform.service.AgentPromptService.class),
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
-        ReflectionTestUtils.setField(pipeline, "deploymentIdentityProvider",
-                (DeploymentIdentityProvider) () -> new DeploymentIdentity("beta-main", GENERATION));
+                mock(ObjectProvider.class), mock(ObjectProvider.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 
@@ -172,9 +167,9 @@ class LangchainLinearRunPipelineFailureStageTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-terminal-race")).thenReturn(run);
-        when(runMapper.updateStatus("run-terminal-race", "user-1", AgentRunStatus.EXECUTING))
+        when(runMapper.updateStatus("run-terminal-race", "user-1", AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING))
                 .thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(anyString(), anyString(), any(), anyString(), eq(true), any()))
+        when(runMapper.updateTerminalSnapshot(anyString(), anyString(), any(), any(), anyString(), eq(true), any()))
                 .thenReturn(0);
 
         AgentRunEventService eventService = mock(AgentRunEventService.class);
@@ -204,7 +199,8 @@ class LangchainLinearRunPipelineFailureStageTest {
                 mock(LangchainRunExecutionGuard.class), immediateScheduler(), creditService,
                 mock(AgentRunCreditSettlementService.class), finalizationService,
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
+                mock(ObjectProvider.class), mock(ObjectProvider.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 
@@ -223,7 +219,7 @@ class LangchainLinearRunPipelineFailureStageTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-shutdown")).thenReturn(run);
-        when(runMapper.updateStatus("run-shutdown", "user-1", AgentRunStatus.EXECUTING))
+        when(runMapper.updateStatus("run-shutdown", "user-1", AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING))
                 .thenReturn(1);
         AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-shutdown", "user-1")).thenReturn(true);
@@ -262,11 +258,12 @@ class LangchainLinearRunPipelineFailureStageTest {
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
+                mock(ObjectProvider.class), mock(ObjectProvider.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         pipeline.executeRun(run);
 
         verify(runMapper, never()).updateTerminalSnapshot(
-                anyString(), anyString(), any(), anyString(), eq(true), any());
+                anyString(), anyString(), any(), any(), anyString(), eq(true), any());
         verify(eventService, never()).append(
                 anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
     }
@@ -281,9 +278,9 @@ class LangchainLinearRunPipelineFailureStageTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-fs-1")).thenReturn(run);
-        when(runMapper.updateStatus("run-fs-1", "user-1", AgentRunStatus.EXECUTING))
+        when(runMapper.updateStatus("run-fs-1", "user-1", AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING))
                 .thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(anyString(), anyString(), any(), anyString(), eq(true), any()))
+        when(runMapper.updateTerminalSnapshot(anyString(), anyString(), any(), any(), anyString(), eq(true), any()))
                 .thenReturn(1);
 
         AgentRunEventService eventService = mock(AgentRunEventService.class);
@@ -334,7 +331,8 @@ class LangchainLinearRunPipelineFailureStageTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 
@@ -358,9 +356,9 @@ class LangchainLinearRunPipelineFailureStageTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-fs-2")).thenReturn(run);
-        when(runMapper.updateStatus("run-fs-2", "user-1", AgentRunStatus.EXECUTING))
+        when(runMapper.updateStatus("run-fs-2", "user-1", AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING))
                 .thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(anyString(), anyString(), any(), anyString(), eq(true), any()))
+        when(runMapper.updateTerminalSnapshot(anyString(), anyString(), any(), any(), anyString(), eq(true), any()))
                 .thenReturn(1);
 
         AgentRunEventService eventService = mock(AgentRunEventService.class);
@@ -417,7 +415,8 @@ class LangchainLinearRunPipelineFailureStageTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 
@@ -459,15 +458,16 @@ class LangchainLinearRunPipelineFailureStageTest {
                 mock(LangchainRunExecutionGuard.class), immediateScheduler(), creditService,
                 mock(AgentRunCreditSettlementService.class), mock(AgentRunFinalizationService.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
+                mock(ObjectProvider.class), mock(ObjectProvider.class),
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 
         verify(creditService, never()).hasPositiveCredit(anyString());
         verify(planner, never()).plan(any());
-        verify(runMapper, never()).updateStatus(anyString(), anyString(), any());
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
         verify(runMapper, never()).updateTerminalSnapshot(
-                anyString(), anyString(), any(), anyString(), eq(true), any());
+                anyString(), anyString(), any(), any(), anyString(), eq(true), any());
         verify(eventService, never()).append(anyString(), anyString(), anyString(), any());
         verify(stateStoreProvider, never()).getIfAvailable();
     }

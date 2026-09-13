@@ -32,6 +32,9 @@ class ToolJobResumeServiceTest {
     @Mock
     private ToolJobAnchorService anchorService;
 
+    private final world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+            org.mockito.Mockito.mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+
     @Mock
     private ToolJobRedisCache redisCache;
 
@@ -49,7 +52,7 @@ class ToolJobResumeServiceTest {
         lenient().when(config.getLaunchingStaleSeconds()).thenReturn(120L);
         lenient().when(config.getResumeLauncherLeaseSeconds()).thenReturn(30L);
         resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, objectMapper, "owner-a");
+                anchorService, redisCache, config, objectMapper, "owner-a", ownershipGateway);
         setLauncher(resumeService, resumeLauncher);
     }
 
@@ -101,9 +104,9 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
 
         assertThat(resumeService.tryResume("run-1")).isFalse();
-        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+        verify(ownershipGateway, never()).takeoverExpiredResumeLauncher(
                 any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
-        verify(anchorService, never()).claimResumeLauncher(
+        verify(ownershipGateway, never()).claimResumeLauncher(
                 any(), any(), any(), any(), any(), anyLong(), any(), anyLong());
         verifyNoInteractions(resumeLauncher);
     }
@@ -143,7 +146,7 @@ class ToolJobResumeServiceTest {
         anchor.setPythonFailedRequestFingerprints(List.of("sha256:failed-1"));
         anchor.setCreateRequestJson("{\"code\":\"print(1)\"}");
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
@@ -181,7 +184,7 @@ class ToolJobResumeServiceTest {
     void shouldNotLaunchWhenCasFails() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(false);
 
@@ -194,7 +197,7 @@ class ToolJobResumeServiceTest {
     void shouldRollbackToReadWhenLaunchRejected() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(false);
@@ -214,7 +217,7 @@ class ToolJobResumeServiceTest {
     void launchRejectedWithLosingRollbackProducesNoFurtherLaunchSideEffects() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(false);
@@ -228,7 +231,7 @@ class ToolJobResumeServiceTest {
         assertThat(result).isFalse();
         // 恰好一次启动尝试；回滚输掉后没有重试启动、没有二次 claim
         verify(resumeLauncher, times(1)).launch(eq("run-1"), any(ToolJobResumeContext.class));
-        verify(anchorService, times(1)).claimResumeLauncher(
+        verify(ownershipGateway, times(1)).claimResumeLauncher(
                 any(), any(), any(), any(), any(), anyLong(), any(), anyLong());
         verifyNoInteractions(redisCache);
     }
@@ -237,7 +240,7 @@ class ToolJobResumeServiceTest {
     void shouldRollbackToReadWhenLaunchThrows() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class)))
@@ -266,7 +269,7 @@ class ToolJobResumeServiceTest {
         boolean result = resumeService.tryResume("run-1");
         assertThat(result).isFalse();
         verify(resumeLauncher, never()).launch(any(), any());
-        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+        verify(ownershipGateway, never()).takeoverExpiredResumeLauncher(
                 any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
     }
 
@@ -405,7 +408,7 @@ class ToolJobResumeServiceTest {
         ToolJobAnchor anchor2 = buildReadyAnchor(); // same token+version
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor1, anchor2);
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L)))
                 .thenReturn(true)   // first process wins
@@ -430,9 +433,9 @@ class ToolJobResumeServiceTest {
         ToolJobResumeLauncher launcherA = mock(ToolJobResumeLauncher.class);
         ToolJobResumeLauncher launcherB = mock(ToolJobResumeLauncher.class);
         ToolJobResumeService serviceA = new ToolJobResumeService(
-                anchorService, redisCache, config, objectMapper, "owner-a");
+                anchorService, redisCache, config, objectMapper, "owner-a", ownershipGateway);
         ToolJobResumeService serviceB = new ToolJobResumeService(
-                anchorService, redisCache, config, objectMapper, "owner-b");
+                anchorService, redisCache, config, objectMapper, "owner-b", ownershipGateway);
         setLauncher(serviceA, launcherA);
         setLauncher(serviceB, launcherB);
 
@@ -441,7 +444,7 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(loadedByA, loadedByB);
         when(launcherA.isActive(eq("run-1"), eq("accepted-token"), eq(11L))).thenReturn(false);
         when(launcherB.isActive(eq("run-1"), eq("accepted-token"), eq(11L))).thenReturn(false);
-        when(anchorService.takeoverExpiredResumeLauncher(
+        when(ownershipGateway.takeoverExpiredResumeLauncher(
                 eq("run-1"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING),
                 eq("accepted-token"), eq(11L), eq("owner-old"), any(),
                 eq(30L), eq(120L))).thenReturn(true, false);
@@ -465,7 +468,7 @@ class ToolJobResumeServiceTest {
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         // CAS with token-v2/version 7 (matching what we loaded) succeeds
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v2"), eq(7L), eq("owner-a"), eq(30L)))
                 .thenReturn(true);
@@ -484,7 +487,7 @@ class ToolJobResumeServiceTest {
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         // CAS with token-v1/version 5 fails because DB has different token
-        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
                 eq("token-v1"), eq(5L), eq("owner-a"), eq(30L)))
                 .thenReturn(false);
@@ -509,7 +512,7 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         // isActive guard: same-process worker not active → allow takeover
         when(resumeLauncher.isActive(eq("run-1"), eq("stale-token"), eq(8L))).thenReturn(false);
-        when(anchorService.takeoverExpiredResumeLauncher(
+        when(ownershipGateway.takeoverExpiredResumeLauncher(
                 eq("run-1"), same(anchor), eq(AgentRunStatus.RECEIVED),
                 eq("stale-token"), eq(8L), eq("owner-old"), eq("owner-a"),
                 eq(30L), eq(120L))).thenReturn(true);
@@ -540,7 +543,7 @@ class ToolJobResumeServiceTest {
         assertThat(resumeService.tryResume("run-1")).isFalse();
         verify(resumeLauncher).isActive(eq("run-1"), eq("active-token"), eq(8L));
         // Must NOT attempt takeover CAS when isActive blocks
-        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+        verify(ownershipGateway, never()).takeoverExpiredResumeLauncher(
                 any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
         verify(resumeLauncher, never()).launch(any(), any());
     }
@@ -558,7 +561,7 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         // Different token → isActive returns false (identity mismatch)
         when(resumeLauncher.isActive(eq("run-1"), eq("token-a"), eq(5L))).thenReturn(false);
-        when(anchorService.takeoverExpiredResumeLauncher(
+        when(ownershipGateway.takeoverExpiredResumeLauncher(
                 eq("run-1"), same(anchor), eq(AgentRunStatus.RECEIVED),
                 eq("token-a"), eq(5L), eq("owner-old"), eq("owner-a"),
                 eq(30L), eq(120L))).thenReturn(true);
@@ -581,7 +584,7 @@ class ToolJobResumeServiceTest {
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(resumeLauncher.isActive(eq("run-1"), eq("accepted-token"), eq(11L))).thenReturn(false);
-        when(anchorService.takeoverExpiredResumeLauncher(
+        when(ownershipGateway.takeoverExpiredResumeLauncher(
                 eq("run-1"), same(anchor), eq(AgentRunStatus.EXECUTING),
                 eq("accepted-token"), eq(11L), eq("owner-old"), eq("owner-a"),
                 eq(30L), eq(120L))).thenReturn(true);
@@ -605,7 +608,7 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
 
         assertThat(resumeService.tryResume("run-1")).isFalse();
-        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+        verify(ownershipGateway, never()).takeoverExpiredResumeLauncher(
                 any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
         verify(resumeLauncher, never()).launch(any(), any());
     }

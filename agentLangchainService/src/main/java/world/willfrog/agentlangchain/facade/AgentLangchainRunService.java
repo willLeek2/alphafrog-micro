@@ -11,13 +11,13 @@ import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
-import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
 import java.util.Map;
 
@@ -34,7 +34,7 @@ public class AgentLangchainRunService {
     private final AgentRunMapper runMapper;
     private final AgentCreditService creditService;
     private final UserDao userDao;
-    private final DeploymentIdentityProvider deploymentIdentityProvider;
+    private final RunOwnershipGateway ownershipGateway;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         String userId = request.getUserId();
@@ -45,7 +45,7 @@ public class AgentLangchainRunService {
         if (message == null || message.isBlank()) {
             throw new IllegalArgumentException("message is required");
         }
-        DeploymentIdentity deploymentIdentity = deploymentIdentityProvider.current();
+        DeploymentIdentity deploymentIdentity = ownershipGateway.requireIdentity();
         if (!isAdminUser(userId) && !creditService.hasPositiveCredit(userId)) {
             throw new IllegalStateException("credit 余额不足，无法创建新任务");
         }
@@ -76,7 +76,7 @@ public class AgentLangchainRunService {
                     request.getStageConfigJson(),
                     deploymentIdentity.deploymentId(),
                     deploymentIdentity.generationId(),
-                    LaneContext.trafficScopeId(),
+                    LaneScopeGateway.currentLaneTag(),
                     request.getGenerateArtifacts(),
                     isAdminUser(userId)
             );
@@ -117,9 +117,8 @@ public class AgentLangchainRunService {
                     "engine", "agentLangchainService",
                     "reason", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()
             ));
-            runMapper.updateStatusForDeployment(
-                    run.getId(), run.getUserId(), run.getDeploymentId(),
-                    run.getDeploymentGenerationId(), run.getStatus(), AgentRunStatus.FAILED);
+            runMapper.updateStatus(
+                    run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.FAILED);
         } catch (Exception markError) {
             log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
                     run.getId(), markError.getMessage());

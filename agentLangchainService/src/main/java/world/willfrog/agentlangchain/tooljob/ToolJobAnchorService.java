@@ -7,8 +7,6 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.time.Instant;
 import java.util.Collections;
@@ -19,23 +17,20 @@ import java.util.List;
  *
  * <p>方法返回值都表示数据库 CAS 是否真正更新一行，而不是“调用没有抛异常”。
  * 调用方必须把 false 当作失去所有权，重新读取当前 anchor 后再决定重入或退场。</p>
+ *
+ * <p>本类只处理业务字段条件（status、operationId、taskId、token/lease、checkpointVersion）。
+ * 「当前进程允许处理哪些行」的跨代际归属判定由
+ * {@link world.willfrog.agentlangchain.gateway.RunOwnershipGateway} 在认领与受理入口完成，
+ * 这里不再按部署身份分叉 SQL。</p>
  */
 @Service
 public class ToolJobAnchorService {
 
     private final AgentRunMapper agentRunMapper;
-    private final DeploymentIdentityProvider deploymentIdentityProvider;
-
-    /** 仅供同包旧单元测试使用；Spring 运行时必须注入可信部署身份。 */
-    public ToolJobAnchorService(AgentRunMapper agentRunMapper) {
-        this(agentRunMapper, null);
-    }
 
     @Autowired
-    public ToolJobAnchorService(AgentRunMapper agentRunMapper,
-                                DeploymentIdentityProvider deploymentIdentityProvider) {
+    public ToolJobAnchorService(AgentRunMapper agentRunMapper) {
         this.agentRunMapper = agentRunMapper;
-        this.deploymentIdentityProvider = deploymentIdentityProvider;
     }
 
     /**
@@ -43,11 +38,8 @@ public class ToolJobAnchorService {
      */
     public ToolJobAnchor loadAnchor(String runId) {
         // 每次从 PostgreSQL 真相源读取；不使用可能丢失的 Redis 热副本。
-        DeploymentIdentity identity = deploymentIdentity();
-        AgentRun run = identity == null
-                ? agentRunMapper.findById(runId)
-                : agentRunMapper.findByIdForDeployment(
-                        runId, identity.deploymentId(), identity.generationId());
+        // 归属由 gateway 在认领处判定；这里只按 run id 读当前 anchor。
+        AgentRun run = agentRunMapper.findById(runId);
         // 空 JSON 表示当前 Run 没有可恢复的外部工具任务。
         if (run == null || run.getToolJobAnchorJson() == null || run.getToolJobAnchorJson().isBlank()) {
             return null;
@@ -63,7 +55,7 @@ public class ToolJobAnchorService {
      */
     public boolean updateAnchor(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
         // expectedStatus 防止终态/暂停流程被旧 finalizer 覆盖。
-        int rows = agentRunMapper.updateToolJobAnchor(runId, anchor.toJson(), expectedStatus, deploymentIdentity());
+        int rows = agentRunMapper.updateToolJobAnchor(runId, anchor.toJson(), expectedStatus);
         // 只有恰好一行表示本调用仍拥有写权限。
         return rows == 1;
     }
@@ -77,7 +69,7 @@ public class ToolJobAnchorService {
     public boolean updateAnchorAndStatus(String runId, ToolJobAnchor anchor,
                                           AgentRunStatus newStatus, AgentRunStatus expectedStatus) {
         // anchor 与 Run status 在同一条 UPDATE 中提交，不产生“状态已变但上下文未变”的中间窗口。
-        int rows = agentRunMapper.updateToolJobAnchorAndStatus(runId, anchor.toJson(), newStatus, expectedStatus, deploymentIdentity());
+        int rows = agentRunMapper.updateToolJobAnchorAndStatus(runId, anchor.toJson(), newStatus, expectedStatus);
         return rows == 1;
     }
 
@@ -91,7 +83,7 @@ public class ToolJobAnchorService {
         if (operationId == null || operationId.isBlank()) {
             return false;
         }
-        return agentRunMapper.persistCancelDisposition(runId, expectedStatus, operationId, deploymentIdentity()) == 1;
+        return agentRunMapper.persistCancelDisposition(runId, expectedStatus, operationId) == 1;
     }
 
     /**
@@ -105,7 +97,7 @@ public class ToolJobAnchorService {
         if (operationId == null || operationId.isBlank()) {
             return false;
         }
-        return agentRunMapper.persistPauseDisposition(runId, expectedStatus, operationId, deploymentIdentity()) == 1;
+        return agentRunMapper.persistPauseDisposition(runId, expectedStatus, operationId) == 1;
     }
 
     /**
@@ -116,7 +108,7 @@ public class ToolJobAnchorService {
         if (operationId == null || operationId.isBlank()) {
             return false;
         }
-        return agentRunMapper.clearPausedToolJobAnchor(runId, operationId, deploymentIdentity()) == 1;
+        return agentRunMapper.clearPausedToolJobAnchor(runId, operationId) == 1;
     }
 
     /**
@@ -133,13 +125,13 @@ public class ToolJobAnchorService {
         }
         return agentRunMapper.persistRepairAttempt(
                 runId, expectedStatus, operationId, toolName, Math.max(0, attempt),
-                pending, exhausted, deploymentIdentity()) == 1;
+                pending, exhausted) == 1;
     }
 
     public boolean claimPreparing(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
         // 只有空 anchor 才能创建 PREPARING owner，重复分发会返回 false。
         return agentRunMapper.claimPreparingToolJobAnchor(
-                runId, anchor.toJson(), expectedStatus, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), expectedStatus) == 1;
     }
 
     public boolean claimPreparingFromResume(String runId,
@@ -151,14 +143,14 @@ public class ToolJobAnchorService {
             return false;
         }
         return agentRunMapper.claimPreparingToolJobAnchorFromResume(
-                runId, anchor.toJson(), expectedResumeToken, expectedResumeLeaseVersion, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), expectedResumeToken, expectedResumeLeaseVersion) == 1;
     }
 
     public boolean updateActive(String runId, ToolJobAnchor anchor,
                                 AgentRunStatus expectedStatus, String operationId) {
         // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。
         return agentRunMapper.updateActiveToolJobAnchor(
-                runId, anchor.toJson(), expectedStatus, operationId, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), expectedStatus, operationId) == 1;
     }
 
     public boolean updateLiveDagBlocking(
@@ -178,7 +170,7 @@ public class ToolJobAnchorService {
                 expectedStatus,
                 operationId,
                 ownerId,
-                expectedLeaseUntil.toString(), deploymentIdentity()) == 1;
+                expectedLeaseUntil.toString()) == 1;
     }
 
     public boolean beginLiveDagBlockingPreparingAbort(
@@ -197,7 +189,7 @@ public class ToolJobAnchorService {
                 expectedStatus,
                 operationId,
                 ownerId,
-                expectedLeaseUntil.toString(), deploymentIdentity()) == 1;
+                expectedLeaseUntil.toString()) == 1;
     }
 
     public boolean completeLiveDagBlockingPreparingAbort(
@@ -214,7 +206,7 @@ public class ToolJobAnchorService {
                 expectedStatus,
                 operationId,
                 ownerId,
-                expectedLeaseUntil.toString(), deploymentIdentity()) == 1;
+                expectedLeaseUntil.toString()) == 1;
     }
 
     public boolean claimLiveDagBlockingPreparingAbortCleanup(
@@ -231,7 +223,7 @@ public class ToolJobAnchorService {
                 cleanupAnchor.toJson(),
                 operationId,
                 expectedOwnerId,
-                expectedLeaseUntil.toString(), deploymentIdentity()) == 1;
+                expectedLeaseUntil.toString()) == 1;
     }
 
     public boolean updateActiveAndStatus(String runId, ToolJobAnchor anchor,
@@ -240,7 +232,7 @@ public class ToolJobAnchorService {
                                          String operationId) {
         // 同时转移 anchor 和 Run 状态，并保留 operationId 所有权条件。
         return agentRunMapper.updateToolJobAnchorAndStatusByOperation(
-                runId, anchor.toJson(), newStatus, expectedStatus, operationId, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), newStatus, expectedStatus, operationId) == 1;
     }
 
     /**
@@ -255,7 +247,7 @@ public class ToolJobAnchorService {
                     "cancelFromStatuses only writes CANCELED, got " + newStatus);
         }
         return agentRunMapper.cancelToolJobAnchorFromStatuses(
-                runId, anchor.toJson(), newStatus, anchor.getOperationId(), deploymentIdentity()) == 1;
+                runId, anchor.toJson(), newStatus, anchor.getOperationId()) == 1;
     }
 
     /**
@@ -269,12 +261,12 @@ public class ToolJobAnchorService {
             return false;
         }
         return agentRunMapper.closeResidualCanceledAnchorOnTerminalRun(
-                runId, operationId, deploymentIdentity()) == 1;
+                runId, operationId) == 1;
     }
 
     public boolean clearActive(String runId, AgentRunStatus expectedStatus, String operationId) {
         // 仅当前 operation owner 可以清空；旧回调不能删除新任务 anchor。
-        return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId, deploymentIdentity()) == 1;
+        return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
     }
 
     public boolean promoteExpiredDagBlockingWorkerLost(
@@ -284,7 +276,7 @@ public class ToolJobAnchorService {
             String ownerId) {
         // SQL 复核数据库时间的租约过期条件；调用方本地时间只用于减少无效 CAS。
         return agentRunMapper.promoteExpiredDagBlockingWorkerLost(
-                runId, anchor.toJson(), operationId, ownerId, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), operationId, ownerId) == 1;
     }
 
     public boolean updateDagCleanup(
@@ -294,7 +286,7 @@ public class ToolJobAnchorService {
             String ownerId) {
         // cleanup 可跨业务终态重入，但不能越过 operation/owner/disposition fencing。
         return agentRunMapper.updateDagCleanupToolJobAnchor(
-                runId, anchor.toJson(), operationId, ownerId, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), operationId, ownerId) == 1;
     }
 
     public boolean updateDagCleanupPreparing(
@@ -312,7 +304,7 @@ public class ToolJobAnchorService {
                 anchor.toJson(),
                 operationId,
                 ownerId,
-                requestFingerprint, deploymentIdentity()) == 1;
+                requestFingerprint) == 1;
     }
 
     public boolean completeDagCleanupAndClear(
@@ -322,7 +314,7 @@ public class ToolJobAnchorService {
             String lastError) {
         // SQL 复核全部终态证明，并按当前 status 决定失败或保留原业务终态。
         return agentRunMapper.completeDagCleanupAndClearToolJobAnchor(
-                runId, operationId, ownerId, lastError, deploymentIdentity()) == 1;
+                runId, operationId, ownerId, lastError) == 1;
     }
 
     public boolean clearSynchronouslyCompleted(
@@ -331,7 +323,7 @@ public class ToolJobAnchorService {
             String operationId) {
         // mapper 同时校验 terminal、released reservation 与 usage proof；缺一项均保留 anchor。
         return agentRunMapper.clearSynchronouslyCompletedToolJobAnchor(
-                runId, expectedStatus, operationId, deploymentIdentity()) == 1;
+                runId, expectedStatus, operationId) == 1;
     }
 
     public boolean clearLiveDagBlockingSynchronouslyCompleted(
@@ -346,7 +338,7 @@ public class ToolJobAnchorService {
                 runId,
                 operationId,
                 ownerId,
-                expectedLeaseUntil.toString(), deploymentIdentity()) == 1;
+                expectedLeaseUntil.toString()) == 1;
     }
 
     /**
@@ -359,7 +351,7 @@ public class ToolJobAnchorService {
         return agentRunMapper.markToolJobCheckpointFailed(
                 request.getRunId(), request.getOperationId(), request.getToolCallId(),
                 request.getAttempt(), request.getTaskId(),
-                request.getExpectedCheckpointVersion(), error, deploymentIdentity()) == 1;
+                request.getExpectedCheckpointVersion(), error) == 1;
     }
 
     /**
@@ -368,53 +360,8 @@ public class ToolJobAnchorService {
      * @return true if the status was changed by this call
      */
     public boolean casUpdateStatus(String runId, AgentRunStatus newStatus, AgentRunStatus expectedStatus) {
-        int rows = agentRunMapper.casUpdateStatus(runId, newStatus, expectedStatus, deploymentIdentity());
+        int rows = agentRunMapper.casUpdateStatus(runId, newStatus, expectedStatus);
         return rows == 1;
-    }
-
-    private DeploymentIdentity deploymentIdentity() {
-        return deploymentIdentityProvider == null ? null : deploymentIdentityProvider.current();
-    }
-
-    /**
-     * Lists all runs with non-empty tool job anchors in WAITING_TOOL_JOB status.
-     */
-    public List<AgentRun> listActive(int limit) {
-        // limit 约束单轮补扫工作量，避免恢复风暴长期占用调度线程。
-        if (deploymentIdentityProvider == null) {
-            return agentRunMapper.listActiveToolJobAnchors(limit);
-        }
-        DeploymentIdentity identity = deploymentIdentityProvider.current();
-        return agentRunMapper.listActiveToolJobAnchorsForDeployment(
-                identity.deploymentId(), identity.generationId(), limit);
-    }
-
-    /**
-     * Lists RECEIVED READY/LAUNCHING runs and EXECUTING accepted LAUNCHING handoffs.
-     * 后者覆盖终态已消费、状态已回到执行中，但 resumed worker 在最终结果或下一工具 checkpoint
-     * 已确认写入数据库之前崩溃的窗口。
-     */
-    public List<AgentRun> listResumeReady(int limit) {
-        // READY 与超时 LAUNCHING 都需要启动恢复扫描，具体租约判断在 ResumeService。
-        if (deploymentIdentityProvider == null) {
-            return agentRunMapper.listResumeReadyAnchors(limit);
-        }
-        DeploymentIdentity identity = deploymentIdentityProvider.current();
-        return agentRunMapper.listResumeReadyAnchorsForDeployment(
-                identity.deploymentId(), identity.generationId(), limit);
-    }
-
-    /**
-     * 发现 CAS_STATUS→RESUME_READY 半状态：RECEIVED + finalizerStep=CAS_STATUS + resumeState 空。
-     * 只用于发现；推进必须走 {@link #promoteCasStatusToResumeReady}。
-     */
-    public List<AgentRun> listStuckAtCasStatus(int limit) {
-        if (deploymentIdentityProvider == null) {
-            return agentRunMapper.listStuckAtCasStatusAnchors(limit);
-        }
-        DeploymentIdentity identity = deploymentIdentityProvider.current();
-        return agentRunMapper.listStuckAtCasStatusAnchorsForDeployment(
-                identity.deploymentId(), identity.generationId(), limit);
     }
 
     /**
@@ -428,7 +375,7 @@ public class ToolJobAnchorService {
                                               String newResumeToken) {
         return agentRunMapper.promoteCasStatusToResumeReady(
                 runId, operationId, toolCallId, attempt, taskId,
-                expectedResumeLeaseVersion, newResumeToken, deploymentIdentity());
+                expectedResumeLeaseVersion, newResumeToken);
     }
 
     /**
@@ -444,7 +391,7 @@ public class ToolJobAnchorService {
         // state + token + leaseVersion 三重条件共同阻止双 launcher 和陈旧重放。
         int rows = agentRunMapper.casUpdateAnchorResumeState(
                 runId, anchor.toJson(), expectedStatus, expectedResumeState,
-                expectedResumeToken, expectedLeaseVersion, deploymentIdentity());
+                expectedResumeToken, expectedLeaseVersion);
         return rows == 1;
     }
 
@@ -457,42 +404,7 @@ public class ToolJobAnchorService {
                                             long expectedLeaseVersion) {
         return agentRunMapper.casUpdateAnchorResumeStateAndStatus(
                 runId, anchor.toJson(), newStatus, expectedStatus,
-                expectedResumeState, expectedResumeToken, expectedLeaseVersion, deploymentIdentity()) == 1;
-    }
-
-    public boolean claimResumeLauncher(String runId,
-                                       ToolJobAnchor anchor,
-                                       AgentRunStatus newStatus,
-                                       AgentRunStatus expectedStatus,
-                                       String expectedResumeToken,
-                                       long expectedLeaseVersion,
-                                       String launcherOwnerId,
-                                       long leaseSeconds) {
-        if (launcherOwnerId == null || launcherOwnerId.isBlank() || leaseSeconds <= 0) {
-            return false;
-        }
-        return agentRunMapper.claimResumeLauncher(
-                runId, anchor.toJson(), newStatus, expectedStatus, expectedResumeToken,
-                expectedLeaseVersion, launcherOwnerId, leaseSeconds, deploymentIdentity()) == 1;
-    }
-
-    public boolean takeoverExpiredResumeLauncher(String runId,
-                                                  ToolJobAnchor anchor,
-                                                  AgentRunStatus expectedStatus,
-                                                  String expectedResumeToken,
-                                                  long expectedLeaseVersion,
-                                                  String expectedLauncherOwnerId,
-                                                  String launcherOwnerId,
-                                                  long leaseSeconds,
-                                                  long legacyStaleSeconds) {
-        if (launcherOwnerId == null || launcherOwnerId.isBlank()
-                || leaseSeconds <= 0 || legacyStaleSeconds <= 0) {
-            return false;
-        }
-        return agentRunMapper.takeoverExpiredResumeLauncher(
-                runId, anchor.toJson(), expectedStatus, expectedResumeToken,
-                expectedLeaseVersion, expectedLauncherOwnerId, launcherOwnerId,
-                leaseSeconds, legacyStaleSeconds, deploymentIdentity()) == 1;
+                expectedResumeState, expectedResumeToken, expectedLeaseVersion) == 1;
     }
 
     public boolean heartbeatResumeLauncher(String runId,
@@ -505,7 +417,7 @@ public class ToolJobAnchorService {
             return false;
         }
         return agentRunMapper.heartbeatResumeLauncher(
-                runId, token, version, launcherOwnerId, leaseSeconds, deploymentIdentity()) == 1;
+                runId, token, version, launcherOwnerId, leaseSeconds) == 1;
     }
 
     public boolean acceptResumeHandoff(String runId,
@@ -519,7 +431,7 @@ public class ToolJobAnchorService {
             return false;
         }
         return agentRunMapper.acceptResumeHandoff(
-                runId, anchor.toJson(), token, version, launcherOwnerId, leaseSeconds, deploymentIdentity()) == 1;
+                runId, anchor.toJson(), token, version, launcherOwnerId, leaseSeconds) == 1;
     }
 
     public boolean clearAcceptedResumeHandoff(String runId,
@@ -531,7 +443,7 @@ public class ToolJobAnchorService {
             return false;
         }
         return agentRunMapper.clearAcceptedResumeHandoff(
-                runId, token, version, launcherOwnerId, deploymentIdentity()) == 1;
+                runId, token, version, launcherOwnerId) == 1;
     }
 
     /**
@@ -558,7 +470,7 @@ public class ToolJobAnchorService {
                 completedTodosJson,
                 datasetSnapshotJson, datasetSnapshotDigest,
                 datasetRefsJson, toolCallsUsed,
-                estimateJson, deploymentIdentity());
+                estimateJson);
         // rows=0 表示身份、状态或版本任一已变化，调用方必须进入失败归属判断。
         return rows == 1;
     }
@@ -574,6 +486,6 @@ public class ToolJobAnchorService {
                                          String expectedToken, long expectedLeaseVersion) {
         // 没有非 token clear 旁路；只有已消费当前 lease 的 launcher 可以清理。
         return agentRunMapper.clearToolJobAnchorWithToken(
-                runId, expectedResumeState, expectedToken, expectedLeaseVersion, deploymentIdentity()) == 1;
+                runId, expectedResumeState, expectedToken, expectedLeaseVersion) == 1;
     }
 }

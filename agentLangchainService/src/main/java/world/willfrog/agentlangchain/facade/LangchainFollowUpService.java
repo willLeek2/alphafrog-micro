@@ -15,8 +15,7 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 
 import java.util.Map;
 import java.util.function.Supplier;
@@ -31,7 +30,7 @@ public class LangchainFollowUpService {
     private final AgentMessageService messageService;
     private final AgentRunStateStore stateStore;
     private final LangchainLinearRunPipeline pipeline;
-    private final DeploymentIdentityProvider deploymentIdentityProvider;
+    private final RunOwnershipGateway ownershipGateway;
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private PlatformTransactionManager transactionManager;
@@ -55,14 +54,11 @@ public class LangchainFollowUpService {
         String runId = requireNonBlank(request.getRunId(), "run_id is required");
         String content = requireNonBlank(request.getContent(), "content is required");
 
-        DeploymentIdentity localIdentity = deploymentIdentityProvider.current();
-        AgentRun ownedRun = runMapper.findByIdAndUserForDeployment(
-                runId, userId, localIdentity.deploymentId(), localIdentity.generationId());
-        if (ownedRun == null) {
+        // 归属判定在 gateway 的受理入口完成：只受理本部署代际的 Run。
+        // Run 上的部署身份由数据库触发器保持不可变，判定结论在本次处理内保持有效。
+        if (ownershipGateway.findOwnedRunForUser(runId, userId) == null) {
             return rejectedInactiveDeployment();
         }
-        // 先用带身份的 SQL 确认归属，再复用现有读取服务的过期收敛逻辑。
-        // 部署身份由数据库触发器保持不可变，因此后续读取不会转移到其他代际。
         AgentRun run = runReadService.requireWritableRun(runId, userId);
         if (run.getStatus() != AgentRunStatus.COMPLETED) {
             return SendAgentMessageResponse.newBuilder()
@@ -73,9 +69,8 @@ public class LangchainFollowUpService {
                     .build();
         }
         if (agentEventService.shouldMarkExpired(run)) {
-            runMapper.updateStatusForDeployment(
-                    runId, userId, localIdentity.deploymentId(),
-                    localIdentity.generationId(), AgentRunStatus.COMPLETED, AgentRunStatus.EXPIRED);
+            runMapper.updateStatus(
+                    runId, userId, AgentRunStatus.COMPLETED, AgentRunStatus.EXPIRED);
             agentEventService.append(runId, userId, "RUN_EXPIRED", Map.of(
                     "run_id", runId,
                     "expired_at", java.time.OffsetDateTime.now().toString()));
@@ -87,9 +82,8 @@ public class LangchainFollowUpService {
         }
 
         AgentRunMessage userMessage = executeAdmissionTransaction(() -> {
-            if (runMapper.admitFollowUpForDeployment(
-                    runId, userId, localIdentity.deploymentId(), localIdentity.generationId(),
-                    agentEventService.nextTtlExpiresAt()) != 1) {
+            if (ownershipGateway.admitFollowUp(
+                    runId, userId, agentEventService.nextTtlExpiresAt()) != 1) {
                 return null;
             }
             String metaJson = messageService.buildMetaJson(null, null, null, null);
@@ -114,10 +108,9 @@ public class LangchainFollowUpService {
                 "engine", "agentLangchainService"));
         stateStore.markRunStatus(runId, AgentRunStatus.RECEIVED.name());
 
-        AgentRun refreshed = runMapper.findByIdAndUserForDeployment(
-                runId, userId, localIdentity.deploymentId(), localIdentity.generationId());
+        AgentRun refreshed = runMapper.findByIdAndUser(runId, userId);
         if (refreshed == null) {
-            throw new IllegalStateException("追问准入后无法读取同一部署身份的 Run");
+            throw new IllegalStateException("追问准入后无法读取 Run");
         }
         pipeline.launchAsync(refreshed);
 

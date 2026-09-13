@@ -15,8 +15,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.nio.charset.StandardCharsets;
@@ -70,8 +69,11 @@ public class ToolJobFinalizer {
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
 
-    @Autowired(required = false)
-    private DeploymentIdentityProvider deploymentIdentityProvider;
+    /**
+     * 认领处归属判定；Spring 装配必填。兼容旧单元测试的窄构造器传 null，
+     * 表示测试环境不做跨代际归属判定（生产路径永远有 gateway）。
+     */
+    private final RunOwnershipGateway ownershipGateway;
 
     @Autowired
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
@@ -84,7 +86,8 @@ public class ToolJobFinalizer {
                             FinanceToolResultFormatter formatter,
                             FinanceResultModelAdapter adapter,
                             AgentRunMapper agentRunMapper,
-                            AgentRunFinalizationService finalizationService) {
+                            AgentRunFinalizationService finalizationService,
+                            RunOwnershipGateway ownershipGateway) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
@@ -96,6 +99,7 @@ public class ToolJobFinalizer {
         this.adapter = adapter;
         this.agentRunMapper = agentRunMapper;
         this.finalizationService = finalizationService;
+        this.ownershipGateway = ownershipGateway;
     }
 
     /**
@@ -112,7 +116,7 @@ public class ToolJobFinalizer {
                             FinanceToolResultFormatter formatter,
                             FinanceResultModelAdapter adapter) {
         this(anchorService, redisCache, capacityService, resumeService, config,
-                financeProcessor, configLoader, formatter, adapter, null, null);
+                financeProcessor, configLoader, formatter, adapter, null, null, null);
     }
 
     // ========== public entry points ==========
@@ -571,12 +575,7 @@ public class ToolJobFinalizer {
             return;
         }
         try {
-            DeploymentIdentity identity = deploymentIdentityProvider == null
-                    ? null : deploymentIdentityProvider.current();
-            AgentRun run = identity == null
-                    ? agentRunMapper.findById(runId)
-                    : agentRunMapper.findByIdForDeployment(
-                            runId, identity.deploymentId(), identity.generationId());
+            AgentRun run = agentRunMapper.findById(runId);
             if (run == null || run.getUserId() == null || run.getUserId().isBlank()) {
                 log.warn("Workspace finalization event skipped after CANCELED CAS: "
                         + "run/user missing runId={}", runId);
@@ -627,13 +626,16 @@ public class ToolJobFinalizer {
         }
     }
 
+    /**
+     * 归属判定收在 gateway：Redis due 集合等未分级来源可能带来其它部署代际的 runId，
+     * 这里拒绝处理不属于本代际的工具终态。兼容构造器的测试场景（gateway/mapper 为空）
+     * 不做判定。
+     */
     private boolean belongsToLocalDeployment(String runId) {
-        if (deploymentIdentityProvider == null || agentRunMapper == null) {
+        if (ownershipGateway == null || agentRunMapper == null) {
             return true;
         }
-        DeploymentIdentity local = deploymentIdentityProvider.current();
-        return agentRunMapper.findByIdForDeployment(
-                runId, local.deploymentId(), local.generationId()) != null;
+        return ownershipGateway.owns(runId);
     }
 
     // ========== capacity release ==========

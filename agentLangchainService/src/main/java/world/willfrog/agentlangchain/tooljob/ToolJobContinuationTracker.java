@@ -11,8 +11,6 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
@@ -46,9 +44,6 @@ public class ToolJobContinuationTracker {
     private final AgentRunMapper runMapper;
     private final ToolJobConfig config;
     private final LangchainSchedulerMetrics metrics;
-    @Autowired(required = false)
-    private DeploymentIdentityProvider deploymentIdentityProvider;
-
     @DubboReference
     private PythonSandboxService sandboxService;
 
@@ -256,12 +251,8 @@ public class ToolJobContinuationTracker {
             return true;
         }
         // 防御：Run 在数据库层面已进入取消终态路径。
-        DeploymentIdentity identity = deploymentIdentityProvider == null
-                ? null : deploymentIdentityProvider.current();
-        AgentRun run = identity == null
-                ? runMapper.findById(entry.runId())
-                : runMapper.findByIdForDeployment(
-                        entry.runId(), identity.deploymentId(), identity.generationId());
+        // 本组件的登记项都来自本进程派发的工具任务（归属已由 gateway 在认领处判定）。
+        AgentRun run = runMapper.findById(entry.runId());
         return run != null && (run.getStatus() == AgentRunStatus.CANCELING
                 || run.getStatus() == AgentRunStatus.CANCELED);
     }

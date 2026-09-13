@@ -36,7 +36,9 @@ class LangchainFollowUpServiceTest {
     private final DeploymentIdentityProvider identityProvider =
             () -> new DeploymentIdentity("stable", GENERATION);
     private final LangchainFollowUpService service = new LangchainFollowUpService(
-            readService, runMapper, eventService, messageService, stateStore, pipeline, identityProvider);
+            readService, runMapper, eventService, messageService, stateStore, pipeline,
+            world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
+                    withIdentity(runMapper, "stable", GENERATION));
 
     @Test
     void sendMessageRejectsNonCompletedRun() {
@@ -67,6 +69,7 @@ class LangchainFollowUpServiceTest {
         when(readService.requireWritableRun("r1", "u1")).thenReturn(completed);
         when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
                 .thenReturn(received);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(received);
         when(eventService.shouldMarkExpired(completed)).thenReturn(false);
         when(messageService.buildMetaJson(any(), any(), any(), any())).thenReturn("{}");
         when(messageService.createUserMessage(eq("r1"), eq("follow up"), any())).thenReturn(userMessage);
@@ -140,7 +143,8 @@ class LangchainFollowUpServiceTest {
         userMessage.setSeq(2);
         when(readService.requireWritableRun("r1", "u1")).thenReturn(completed);
         when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
-                .thenReturn(completed, received);
+                .thenReturn(completed);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(received);
         when(eventService.shouldMarkExpired(completed)).thenReturn(false);
         when(messageService.buildMetaJson(any(), any(), any(), any())).thenReturn("{}");
         when(messageService.createUserMessage(eq("r1"), eq("follow up"), any()))

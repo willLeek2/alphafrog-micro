@@ -107,7 +107,8 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 registryProvider,
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
     }
 
     /**
@@ -219,7 +220,8 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 registryProvider,
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
     }
 
     /**

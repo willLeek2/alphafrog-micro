@@ -70,8 +70,9 @@ class LangchainLinearRunPipelineEmptyOutputTest {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-empty-1")).thenReturn(run);
         when(runMapper.updateStatus("run-empty-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED,
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(eq("run-empty-1"), eq("user-1"), any(),
+        when(runMapper.updateTerminalSnapshot(eq("run-empty-1"), eq("user-1"), any(), any(),
                 anyString(), eq(true), any())).thenReturn(1);
         AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-empty-1", "user-1")).thenReturn(true);
@@ -153,8 +154,9 @@ class LangchainLinearRunPipelineEmptyOutputTest {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-empty-2")).thenReturn(run);
         when(runMapper.updateStatus("run-empty-2", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED,
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(eq("run-empty-2"), eq("user-1"), any(),
+        when(runMapper.updateTerminalSnapshot(eq("run-empty-2"), eq("user-1"), any(), any(),
                 anyString(), eq(true), any())).thenReturn(1);
         AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-empty-2", "user-1")).thenReturn(true);
@@ -237,6 +239,7 @@ class LangchainLinearRunPipelineEmptyOutputTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
     }
 }

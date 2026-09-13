@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 
 import javax.sql.DataSource;
@@ -36,6 +37,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Testcontainers
 class ToolJobAnchorMapperIntegrationTest {
+
+    private static final String DEPLOYMENT_ID = "stable";
+    private static final String GENERATION_ID = "gen-" + "a".repeat(64);
+    private static final DeploymentIdentity LOCAL_IDENTITY =
+            new DeploymentIdentity(DEPLOYMENT_ID, GENERATION_ID);
 
     @Container
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15")
@@ -71,6 +77,9 @@ class ToolJobAnchorMapperIntegrationTest {
                 CREATE TABLE alphafrog_agent_run (
                     id VARCHAR(64) PRIMARY KEY,
                     user_id VARCHAR(64),
+                    deployment_id VARCHAR(64),
+                    deployment_generation_id VARCHAR(64),
+                    lane_tag VARCHAR(128),
                     status VARCHAR(32) NOT NULL,
                     current_step INT DEFAULT 0,
                     max_steps INT DEFAULT 20,
@@ -149,10 +158,15 @@ class ToolJobAnchorMapperIntegrationTest {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection();
              var ps = conn.prepareStatement(
-                     "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) VALUES (?, ?, CAST(? AS jsonb))")) {
+                     "INSERT INTO alphafrog_agent_run "
+                             + "(id, status, tool_job_anchor_json, deployment_id, "
+                             + "deployment_generation_id) "
+                             + "VALUES (?, ?, CAST(? AS jsonb), ?, ?)")) {
             ps.setString(1, id);
             ps.setString(2, status);
             ps.setString(3, anchorJson);
+            ps.setString(4, DEPLOYMENT_ID);
+            ps.setString(5, GENERATION_ID);
             ps.executeUpdate();
         }
     }
@@ -762,10 +776,10 @@ class ToolJobAnchorMapperIntegrationTest {
              "resultConsumed":true}""");
         AgentRunMapper mapper = newMapper();
 
-        assertThat(mapper.listResumeReadyAnchors(10))
+        assertThat(mapper.listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-scan");
-        assertThat(mapper.listActiveToolJobAnchors(10))
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-scan");
     }
@@ -792,7 +806,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "autoResume":false,"runDisposition":"CANCELED"}""");
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listActiveToolJobAnchors(10))
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-accepted-normal")
                 .contains("run-accepted-cancel");
@@ -813,18 +827,18 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(newMapper().claimResumeLauncher(
                 "run-resume-claim", launchingA,
                 AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
-                "ready-token", 1L, "owner-a", 30L)).isEqualTo(1);
+                "ready-token", 1L, "owner-a", 30L, LOCAL_IDENTITY)).isEqualTo(1);
         assertThat(newMapper().claimResumeLauncher(
                 "run-resume-claim", launchingB,
                 AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
-                "ready-token", 1L, "owner-b", 30L)).isZero();
+                "ready-token", 1L, "owner-b", 30L, LOCAL_IDENTITY)).isZero();
 
         ToolJobAnchor claimed = ToolJobAnchor.fromJson(
                 newMapper().findById("run-resume-claim").getToolJobAnchorJson());
         assertThat(claimed.getResumeLauncherOwnerId()).isEqualTo("owner-a");
         assertThat(claimed.getResumeLeaseVersion()).isEqualTo(2L);
         assertThat(claimed.getResumeLauncherLeaseUntil()).isNotNull();
-        assertThat(newMapper().listResumeReadyAnchors(10))
+        assertThat(newMapper().listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-claim");
     }
@@ -839,7 +853,7 @@ class ToolJobAnchorMapperIntegrationTest {
         updateUserId("run-resume-takeover", "user-1");
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listResumeReadyAnchors(10))
+        assertThat(mapper.listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .contains("run-resume-takeover");
         assertThat(mapper.heartbeatResumeLauncher(
@@ -853,7 +867,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "resumeLauncherOwnerId":"owner-new","resultConsumed":true}""";
         assertThat(mapper.takeoverExpiredResumeLauncher(
                 "run-resume-takeover", takeover, AgentRunStatus.EXECUTING,
-                "token-old", 6L, "owner-old", "owner-new", 30L, 120L)).isEqualTo(1);
+                "token-old", 6L, "owner-old", "owner-new", 30L, 120L, LOCAL_IDENTITY)).isEqualTo(1);
 
         assertThat(mapper.updateResumedTerminal(
                 "run-resume-takeover", "user-1", AgentRunStatus.COMPLETED,
@@ -881,7 +895,7 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-dispatch-active", "EXECUTING", """
             {"operationId":"run-dispatch-active:call-1:1","anchorState":"PREPARING"}""");
 
-        assertThat(newMapper().listActiveToolJobAnchors(10))
+        assertThat(newMapper().listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(run -> run.getId())
                 .contains("run-dispatch-active");
     }
@@ -931,7 +945,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "autoResume":true,"resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z"}""";
         assertThat(mapper.takeoverExpiredResumeLauncher(
                 "run-race-takeover", staleTakeover, AgentRunStatus.EXECUTING,
-                "tok-t", 7L, "owner-old", "owner-new", 30L, 120L)).isZero();
+                "tok-t", 7L, "owner-old", "owner-new", 30L, 120L, LOCAL_IDENTITY)).isZero();
         ToolJobAnchor afterTakeover = ToolJobAnchor.fromJson(
                 mapper.findById("run-race-takeover").getToolJobAnchorJson());
         assertThat(afterTakeover.getRunDisposition()).isEqualTo("CANCELED");
@@ -946,7 +960,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "resumeLauncherOwnerId":"owner-new","autoResume":true}""";
         assertThat(mapper.claimResumeLauncher(
                 "run-race-claim", staleClaim, AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
-                "tok-r", 2L, "owner-new", 30L)).isZero();
+                "tok-r", 2L, "owner-new", 30L, LOCAL_IDENTITY)).isZero();
         ToolJobAnchor afterClaim = ToolJobAnchor.fromJson(
                 mapper.findById("run-race-claim").getToolJobAnchorJson());
         assertThat(afterClaim.getRunDisposition()).isEqualTo("CANCELED");
@@ -989,7 +1003,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "autoResume":false,"runDisposition":"CANCELED"}""");
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listResumeReadyAnchors(10))
+        assertThat(mapper.listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .contains("run-scan-normal")
                 .doesNotContain("run-scan-cancel");
@@ -1288,7 +1302,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "finalizerStep":"RESUME_READY"}""");
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listActiveToolJobAnchors(50))
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 50))
                 .extracting(AgentRun::getId)
                 .contains("run-scan-ok-event", "run-scan-ok-cas-status",
                         "run-scan-ok-resume-ready", "run-scan-ok-canceled",
@@ -1322,7 +1336,7 @@ class ToolJobAnchorMapperIntegrationTest {
         }
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listActiveToolJobAnchors(100))
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 100))
                 .extracting(AgentRun::getId)
                 .contains("run-starve-valid")
                 .doesNotContain("run-starve-0", "run-starve-99");

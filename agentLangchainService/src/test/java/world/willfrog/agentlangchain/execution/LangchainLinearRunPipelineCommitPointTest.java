@@ -54,7 +54,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-1"), eq("user-1"),
+        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-1"), eq("user-1"), eq(AgentRunStatus.EXECUTING),
                 eq(AgentRunStatus.COMPLETED), anyString(), eq(true), isNull());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
         verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
@@ -70,7 +70,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-2"), eq("user-1"),
+        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-2"), eq("user-1"), eq(AgentRunStatus.EXECUTING),
                 eq(AgentRunStatus.PARTIAL), anyString(), eq(true), any());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
         verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
@@ -117,7 +117,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-5"), eq("user-1"),
+        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-5"), eq("user-1"), eq(AgentRunStatus.EXECUTING),
                 eq(AgentRunStatus.COMPLETED), anyString(), eq(true), isNull());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_COMPLETED"), any());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
@@ -188,8 +188,8 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById(runId)).thenReturn(run);
-        when(runMapper.updateStatus(runId, "user-1", AgentRunStatus.EXECUTING)).thenReturn(1);
-        when(runMapper.updateTerminalSnapshot(eq(runId), eq("user-1"), any(), anyString(), eq(true), any()))
+        when(runMapper.updateStatus(runId, "user-1", AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING)).thenReturn(1);
+        when(runMapper.updateTerminalSnapshot(eq(runId), eq("user-1"), any(), any(), anyString(), eq(true), any()))
                 .thenReturn(snapshotRows);
 
         AgentRunEventService eventService = mock(AgentRunEventService.class);
@@ -247,7 +247,8 @@ class LangchainLinearRunPipelineCommitPointTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         return new Fixture(run, pipeline, runMapper, eventService, messageService,
                 creditSettlementService, finalizationService);
     }

@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 
 import java.time.Instant;
@@ -37,6 +38,7 @@ public class ToolJobResumeService {
     private final ToolJobConfig config;
     private final ObjectMapper objectMapper;
     private final String launcherOwnerId;
+    private final RunOwnershipGateway ownershipGateway;
 
     @Autowired(required = false)
     private AgentRunDatasetRegistry datasetRegistry;
@@ -47,18 +49,22 @@ public class ToolJobResumeService {
     @Autowired
     public ToolJobResumeService(ToolJobAnchorService anchorService,
                                 ToolJobRedisCache redisCache, ToolJobConfig config,
-                                ObjectMapper objectMapper) {
-        this(anchorService, redisCache, config, objectMapper, "resume-launcher-" + UUID.randomUUID());
+                                ObjectMapper objectMapper,
+                                RunOwnershipGateway ownershipGateway) {
+        this(anchorService, redisCache, config, objectMapper,
+                "resume-launcher-" + UUID.randomUUID(), ownershipGateway);
     }
 
     ToolJobResumeService(ToolJobAnchorService anchorService,
                          ToolJobRedisCache redisCache, ToolJobConfig config,
-                         ObjectMapper objectMapper, String launcherOwnerId) {
+                         ObjectMapper objectMapper, String launcherOwnerId,
+                         RunOwnershipGateway ownershipGateway) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.config = config;
         this.objectMapper = objectMapper;
         this.launcherOwnerId = launcherOwnerId;
+        this.ownershipGateway = ownershipGateway;
     }
 
     public boolean tryResume(String runId) {
@@ -120,7 +126,7 @@ public class ToolJobResumeService {
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
 
         // owner、数据库时间 lease 和 token/version 在同一条 CAS 中一起确认写入。
-        boolean claimed = anchorService.claimResumeLauncher(
+        boolean claimed = ownershipGateway.claimResumeLauncher(
                 runId, anchor,
                 anchor.isResultConsumed() ? AgentRunStatus.EXECUTING : AgentRunStatus.RECEIVED,
                 AgentRunStatus.RECEIVED, expectedToken, expectedVersion,
@@ -218,7 +224,7 @@ public class ToolJobResumeService {
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
         AgentRunStatus expectedStatus = anchor.isResultConsumed()
                 ? AgentRunStatus.EXECUTING : AgentRunStatus.RECEIVED;
-        if (!anchorService.takeoverExpiredResumeLauncher(
+        if (!ownershipGateway.takeoverExpiredResumeLauncher(
                 runId, anchor, expectedStatus, expectedToken, expectedVersion,
                 expectedOwnerId, launcherOwnerId, leaseSeconds(), legacyStaleSeconds())) {
             // 数据库时间仍未过期，或另一个实例已经先赢得 takeover。

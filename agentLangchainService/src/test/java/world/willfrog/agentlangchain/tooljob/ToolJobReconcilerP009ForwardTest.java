@@ -159,7 +159,8 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
         ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobResumeService resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, om);
+                anchorService, redisCache, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacityFake, resumeService, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
@@ -237,7 +238,8 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobAnchorService anchorService2 = new ToolJobAnchorService(mapper2);
         ToolJobRedisCache redisCache2 = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobResumeService resumeService2 = new ToolJobResumeService(
-                anchorService2, redisCache2, config, om);
+                anchorService2, redisCache2, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
                 anchorService2, redisCache2, capacityFake2, resumeService2, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer2, "usageHook", (ToolJobUsageHook) (rid, a) -> true);
@@ -297,7 +299,8 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobAnchorService anchorService1 = new ToolJobAnchorService(mapper1);
         ToolJobRedisCache redisCache1 = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobResumeService resumeService1 = new ToolJobResumeService(
-                anchorService1, redisCache1, config, om);
+                anchorService1, redisCache1, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         ToolJobFinalizer finalizer1 = new ToolJobFinalizer(
                 anchorService1, redisCache1, capacity1, resumeService1, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
@@ -328,7 +331,8 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobAnchorService anchorService2 = new ToolJobAnchorService(mapper2);
         ToolJobRedisCache redisCache2 = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobResumeService resumeService2 = new ToolJobResumeService(
-                anchorService2, redisCache2, config, om);
+                anchorService2, redisCache2, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         AtomicInteger usageCount2 = new AtomicInteger(0);
         AtomicInteger eventCount2 = new AtomicInteger(0);
@@ -364,7 +368,8 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobAnchorService anchorService3 = new ToolJobAnchorService(mapper3);
         ToolJobRedisCache redisCache3 = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobResumeService resumeService3 = new ToolJobResumeService(
-                anchorService3, redisCache3, config, om);
+                anchorService3, redisCache3, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         CapacityCountingFake capacity3 = new CapacityCountingFake();
 
         AtomicInteger usageCount3 = new AtomicInteger(0);
@@ -443,7 +448,8 @@ class ToolJobReconcilerP009ForwardTest {
         };
 
         ToolJobResumeService resumeService1 = new ToolJobResumeService(
-                failOnceService, redisCache1, config, om);
+                failOnceService, redisCache1, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         CapacityCountingFake capacity1 = new CapacityCountingFake();
         ToolJobFinalizer finalizer1 = new ToolJobFinalizer(
                 failOnceService, redisCache1, capacity1, resumeService1, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
@@ -477,7 +483,8 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobAnchorService anchorService2 = new ToolJobAnchorService(mapper2);
         ToolJobRedisCache redisCache2 = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobResumeService resumeService2 = new ToolJobResumeService(
-                anchorService2, redisCache2, config, om);
+                anchorService2, redisCache2, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
         CapacityCountingFake capacity2 = new CapacityCountingFake();
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
                 anchorService2, redisCache2, capacity2, resumeService2, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));

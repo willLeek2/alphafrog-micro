@@ -19,6 +19,10 @@ import static org.mockito.Mockito.*;
 
 class ToolJobStartupDispatchRecoveryTest {
 
+    private final world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+            org.mockito.Mockito.mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+
+
     @Test
     void preparingAnchorFindsExistingOperationBeforeAdmissionOpens() throws Exception {
         Fixture fixture = fixture();
@@ -109,7 +113,8 @@ class ToolJobStartupDispatchRecoveryTest {
         DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
         PythonSandboxService sandbox = mock(PythonSandboxService.class);
         ToolJobStartupRecovery recovery = new ToolJobStartupRecovery(
-                anchorService, redisCache, capacity, properties, finalizer, resumeService, config);
+                anchorService, redisCache, capacity, properties, finalizer, resumeService, config,
+                ownershipGateway);
         java.lang.reflect.Field sandboxField = ToolJobStartupRecovery.class.getDeclaredField("sandboxService");
         sandboxField.setAccessible(true);
         sandboxField.set(recovery, sandbox);
@@ -118,8 +123,8 @@ class ToolJobStartupDispatchRecoveryTest {
         run.setId("run-1");
         run.setStatus(AgentRunStatus.EXECUTING);
         ToolJobAnchor anchor = preparingAnchor();
-        when(anchorService.listActive(200)).thenReturn(List.of(run));
-        when(anchorService.listResumeReady(200)).thenReturn(List.of());
+        when(ownershipGateway.listActiveAnchors(200)).thenReturn(List.of(run));
+        when(ownershipGateway.listResumeReadyAnchors(200)).thenReturn(List.of());
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(anchorService.updateAnchor(eq("run-1"), any(), any())).thenReturn(true);
         when(anchorService.updateAnchorAndStatus(eq("run-1"), any(), any(), any())).thenReturn(true);

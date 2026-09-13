@@ -31,6 +31,7 @@ import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -115,8 +116,8 @@ class ToolJobReconcilerDagCleanupTest {
         AgentRun run = new AgentRun();
         run.setId("run-dag");
         run.setStatus(AgentRunStatus.EXECUTING);
-        when(fixture.anchorService.listActive(100)).thenReturn(List.of(run));
-        when(fixture.anchorService.listResumeReady(50)).thenReturn(List.of());
+        when(fixture.ownershipGateway.listActiveAnchors(100)).thenReturn(List.of(run));
+        when(fixture.ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
 
         fixture.reconciler.rebuildFromAnchors();
 
@@ -412,13 +413,20 @@ class ToolJobReconcilerDagCleanupTest {
         when(redisCache.fetchDue(20)).thenReturn(Set.of("run-dag"));
         when(anchorService.loadAnchor("run-dag")).thenReturn(anchor);
 
+        world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+                mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+        when(ownershipGateway.owns(anyString())).thenReturn(true);
+        when(ownershipGateway.listActiveAnchors(100)).thenReturn(List.of());
+        when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
+        when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of());
         ToolJobReconciler reconciler = new ToolJobReconciler(
                 redisCache,
                 anchorService,
                 finalizer,
                 resumeService,
                 config,
-                capacityService);
+                capacityService,
+                ownershipGateway);
         inject(reconciler, "sandboxService", sandbox);
         return new Fixture(
                 reconciler,
@@ -427,7 +435,8 @@ class ToolJobReconcilerDagCleanupTest {
                 finalizer,
                 resumeService,
                 capacityService,
-                sandbox);
+                sandbox,
+                ownershipGateway);
     }
 
     private ToolJobAnchor liveAnchor() {
@@ -526,6 +535,7 @@ class ToolJobReconcilerDagCleanupTest {
             ToolJobFinalizer finalizer,
             ToolJobResumeService resumeService,
             DataAnalysisCapacityService capacityService,
-            PythonSandboxService sandbox) {
+            PythonSandboxService sandbox,
+            world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway) {
     }
 }

@@ -59,6 +59,7 @@ class LangchainLinearRunPipelineObservabilityTest {
                 """);
         when(runMapper.findById("run-obs-1")).thenReturn(run);
         when(runMapper.updateStatus("run-obs-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED,
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(eventService.isRunnable("run-obs-1", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(true);
@@ -121,7 +122,8 @@ class LangchainLinearRunPipelineObservabilityTest {
                 promptService,
                 datasetRegistryProvider,
                 debugObservabilityProvider
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 
@@ -189,7 +191,8 @@ class LangchainLinearRunPipelineObservabilityTest {
                 promptService,
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        );
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         pipeline.executeRun(run);
 

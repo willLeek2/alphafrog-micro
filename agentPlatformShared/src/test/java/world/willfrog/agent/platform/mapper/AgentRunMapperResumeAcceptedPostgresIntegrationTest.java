@@ -157,7 +157,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-acc-2", takeover.toJson(),
                     AgentRunStatus.EXECUTING,
                     "tok-2", 7L, "owner-old",
-                    "owner-new", 30L, 120L))
+                    "owner-new", 30L, 120L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("takeoverExpiredResumeLauncher: ACCEPTED+过期lease 必须成功")
                     .isEqualTo(1);
 
@@ -198,7 +199,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-acc-2b", takeover.toJson(),
                     AgentRunStatus.EXECUTING,
                     "tok-2b", 5L, "owner-old",
-                    "owner-new", 30L, 120L))
+                    "owner-new", 30L, 120L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("takeoverExpiredResumeLauncher: 未过期lease 必须返回0")
                     .isZero();
 
@@ -394,7 +396,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-legacy-1", takeover.toJson(),
                     AgentRunStatus.EXECUTING,
                     "legacy-tok", 5L, "owner-legacy",
-                    "owner-new", 30L, 120L))
+                    "owner-new", 30L, 120L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("legacy EXECUTING+LAUNCHING+true 的 takeover 必须成功")
                     .isEqualTo(1);
 
@@ -429,12 +432,13 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
             assertThat(mapper.claimResumeLauncher(
                     "run-bad-1", claimAnchor.toJson(),
                     AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
-                    "bad-tok", 1L, "owner-x", 30L))
+                    "bad-tok", 1L, "owner-x", 30L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("claimResumeLauncher: READY+true 必须返回0")
                     .isZero();
 
             // listResumeReadyAnchors 不包含矛盾行
-            assertThat(mapper.listResumeReadyAnchors(20).stream()
+            assertThat(mapper.listResumeReadyAnchorsForDeployment("stable", "legacy-stable", 20).stream()
                     .map(world.willfrog.agent.platform.entity.AgentRun::getId))
                     .as("listResumeReadyAnchors 必须排除 READY+true")
                     .doesNotContain("run-bad-1");
@@ -482,7 +486,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-launch-1", takeover.toJson(),
                     AgentRunStatus.RECEIVED,
                     "tok-launch", 3L, "owner-old",
-                    "owner-new", 30L, 120L))
+                    "owner-new", 30L, 120L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("takeoverExpiredResumeLauncher: LAUNCHING+过期lease 回归守卫必须成功")
                     .isEqualTo(1);
         }
@@ -547,7 +552,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-bad-2", takeover.toJson(),
                     AgentRunStatus.RECEIVED,
                     "tok-bad2", 1L, "owner-bad2",
-                    "owner-new", 30L, 120L))
+                    "owner-new", 30L, 120L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("takeover: RECEIVED+ACCEPTED 矛盾组合必须返回 0")
                     .isZero();
         }
@@ -577,7 +583,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-bad-3", takeover.toJson(),
                     AgentRunStatus.EXECUTING,
                     "tok-bad3", 1L, "owner-bad3",
-                    "owner-new", 30L, 120L))
+                    "owner-new", 30L, 120L,
+                    new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity("stable", "legacy-stable")))
                     .as("takeover: EXECUTING+LAUNCHING+false 矛盾组合必须返回 0")
                     .isZero();
         }

@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Duration;
@@ -46,6 +47,7 @@ public class ToolJobReconciler {
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
     private final DataAnalysisCapacityService capacityService;
+    private final RunOwnershipGateway ownershipGateway;
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
 
@@ -58,20 +60,22 @@ public class ToolJobReconciler {
     public ToolJobReconciler(ToolJobRedisCache redisCache, ToolJobAnchorService anchorService,
                              ToolJobFinalizer finalizer, ToolJobResumeService resumeService,
                              ToolJobConfig config) {
-        this(redisCache, anchorService, finalizer, resumeService, config, null);
+        this(redisCache, anchorService, finalizer, resumeService, config, null, null);
     }
 
     @Autowired
     public ToolJobReconciler(ToolJobRedisCache redisCache, ToolJobAnchorService anchorService,
                              ToolJobFinalizer finalizer, ToolJobResumeService resumeService,
                              ToolJobConfig config,
-                             DataAnalysisCapacityService capacityService) {
+                             DataAnalysisCapacityService capacityService,
+                             RunOwnershipGateway ownershipGateway) {
         this.redisCache = redisCache;
         this.anchorService = anchorService;
         this.finalizer = finalizer;
         this.resumeService = resumeService;
         this.config = config;
         this.capacityService = capacityService;
+        this.ownershipGateway = ownershipGateway;
     }
 
     @Scheduled(fixedDelayString = "${agent.tool-job.reconciler-interval-ms:5000}")
@@ -79,8 +83,15 @@ public class ToolJobReconciler {
         try {
             // 每轮最多取 20 个到期 Run，限制单次调度耗时和 Sandbox 压力。
             Set<String> due = redisCache.fetchDue(20);
-            // 每个 runId 独立处理；单项异常由 processItem 捕获，不阻塞其他 Run。
-            for (String runId : due) processItem(runId);
+            // Redis 是跨部署代际共享的未分级来源：先判定归属，只处理本代际的 Run 才进入
+            // 后续认领/收尾。不属于本代际的条目留给原代际自己的 reconciler，不在这里清理。
+            for (String runId : due) {
+                if (ownershipGateway != null && !ownershipGateway.owns(runId)) {
+                    log.debug("Reconciler skips due item of another deployment generation: runId={}", runId);
+                    continue;
+                }
+                processItem(runId);
+            }
         } catch (Exception e) {
             log.error("Reconciler due-cycle error", e);
         }
@@ -90,7 +101,7 @@ public class ToolJobReconciler {
     public void rebuildFromAnchors() {
         try {
             // 第一段从 PostgreSQL 真相源重建 pending cache 与 due 索引。
-            for (AgentRun run : anchorService.listActive(100)) {
+            for (AgentRun run : ownershipGateway.listActiveAnchors(100)) {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
@@ -116,7 +127,7 @@ public class ToolJobReconciler {
         } catch (Exception e) { log.error("Reconciler rebuild error", e); }
         try {
             // 第二段专扫 READY/LAUNCHING，覆盖 finalizer 写 READY 后进程崩溃的窗口。
-            for (AgentRun run : anchorService.listResumeReady(50)) {
+            for (AgentRun run : ownershipGateway.listResumeReadyAnchors(50)) {
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 // 先补热副本，再由 ResumeService 执行 token/lease CAS claim。
                 if (a != null) { redisCache.atomicWritePendingAndDue(run.getId(), a); resumeService.tryResume(run.getId()); }
@@ -125,7 +136,7 @@ public class ToolJobReconciler {
         try {
             // 第三段：补扫 CAS_STATUS→RESUME_READY 半状态。
             // completeResumeReady 内部用精确旧值 CAS 保证只有一个实例推进成功。
-            for (AgentRun run : anchorService.listStuckAtCasStatus(20)) {
+            for (AgentRun run : ownershipGateway.listStuckAtCasStatusAnchors(20)) {
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
                 finalizer.completeResumeReady(run.getId(), a);

@@ -139,7 +139,7 @@ class LangchainRunReadServiceTest {
         verify(runMapper, times(4)).findById("r1");
         verify(runMapper, never()).findByIdAndUser("r1", "admin-user");
         verify(eventService, never()).shouldMarkExpired(run);
-        verify(runMapper, never()).updateStatus(anyString(), anyString(), any());
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
         verify(eventService, never()).append(eq("r1"), eq("u1"), eq("RUN_EXPIRED"), anyMap());
         verify(eventService).listByRunIdAfterSeqFromDatabase("r1", 0, 201);
         verify(eventService).findLatestByRunIdFromDatabase("r1");
@@ -195,7 +195,7 @@ class LangchainRunReadServiceTest {
         expired.setStatus(AgentRunStatus.EXPIRED);
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
         when(eventService.shouldMarkExpired(active)).thenReturn(true);
-        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXPIRED)).thenReturn(1);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.CANCELED, AgentRunStatus.EXPIRED)).thenReturn(1);
 
         var message = service.getRun(GetAgentRunRequest.newBuilder()
                 .setUserId("u1")
@@ -204,7 +204,7 @@ class LangchainRunReadServiceTest {
 
         assertEquals("EXPIRED", message.getStatus());
         InOrder order = inOrder(runMapper, eventService, stateStore, finalizationService);
-        order.verify(runMapper).updateStatus("r1", "u1", AgentRunStatus.EXPIRED);
+        order.verify(runMapper).updateStatus("r1", "u1", AgentRunStatus.CANCELED, AgentRunStatus.EXPIRED);
         order.verify(eventService).append(eq("r1"), eq("u1"), eq("RUN_EXPIRED"), anyMap());
         order.verify(stateStore).markRunStatus("r1", "EXPIRED");
         order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
@@ -218,7 +218,7 @@ class LangchainRunReadServiceTest {
         expired.setStatus(AgentRunStatus.EXPIRED);
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
         when(eventService.shouldMarkExpired(active)).thenReturn(true);
-        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXPIRED)).thenReturn(1);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.CANCELED, AgentRunStatus.EXPIRED)).thenReturn(1);
         doThrow(new RuntimeException("listener unavailable"))
                 .when(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
 
@@ -228,7 +228,7 @@ class LangchainRunReadServiceTest {
                 .build());
 
         assertEquals("EXPIRED", message.getStatus());
-        verify(runMapper).updateStatus("r1", "u1", AgentRunStatus.EXPIRED);
+        verify(runMapper).updateStatus("r1", "u1", AgentRunStatus.CANCELED, AgentRunStatus.EXPIRED);
         verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
     }
 
@@ -238,7 +238,7 @@ class LangchainRunReadServiceTest {
         active.setStatus(AgentRunStatus.CANCELED);
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active);
         when(eventService.shouldMarkExpired(active)).thenReturn(true);
-        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXPIRED)).thenReturn(0);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.CANCELED, AgentRunStatus.EXPIRED)).thenReturn(0);
 
         var message = service.getRun(GetAgentRunRequest.newBuilder()
                 .setUserId("u1")

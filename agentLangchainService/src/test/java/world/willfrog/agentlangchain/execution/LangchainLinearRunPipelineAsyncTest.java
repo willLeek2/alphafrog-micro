@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.execution;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
@@ -20,7 +19,6 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSupport.immediateScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
-import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 class LangchainLinearRunPipelineAsyncTest {
 
@@ -54,7 +52,8 @@ class LangchainLinearRunPipelineAsyncTest {
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
-        ) {
+        ,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive()) {
             @Override
             void executeRun(AgentRun initialRun) {
                 workflowEntered.countDown();
@@ -83,10 +82,11 @@ class LangchainLinearRunPipelineAsyncTest {
         AtomicBoolean workflowEntered = new AtomicBoolean(false);
         world.willfrog.agent.platform.mapper.AgentRunMapper runMapper =
                 mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
-        LangchainLinearRunPipelineImpl pipeline = pipelineThatRecordsExecution(workflowEntered, runMapper);
-        ReflectionTestUtils.setField(pipeline, "deploymentIdentityProvider",
-                (world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider)
-                        () -> new DeploymentIdentity("beta-a", GENERATION));
+        world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.withIdentity(
+                        runMapper, "beta-a", GENERATION);
+        LangchainLinearRunPipelineImpl pipeline =
+                pipelineThatRecordsExecution(workflowEntered, runMapper, ownershipGateway);
 
         AgentRun run = new AgentRun();
         run.setId("run-other-generation");
@@ -102,7 +102,8 @@ class LangchainLinearRunPipelineAsyncTest {
 
     private LangchainLinearRunPipelineImpl pipelineThatRecordsExecution(
             AtomicBoolean workflowEntered,
-            world.willfrog.agent.platform.mapper.AgentRunMapper runMapper) {
+            world.willfrog.agent.platform.mapper.AgentRunMapper runMapper,
+            world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway) {
         return new LangchainLinearRunPipelineImpl(
                 mock(world.willfrog.agentlangchain.planning.LangchainAiPlanner.class),
                 mock(LangchainLinearWorkflowExecutor.class),
@@ -124,7 +125,8 @@ class LangchainLinearRunPipelineAsyncTest {
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
-                mock(ObjectProvider.class)) {
+                mock(ObjectProvider.class),
+                ownershipGateway) {
             @Override
             void executeRun(AgentRun initialRun) {
                 workflowEntered.set(true);
