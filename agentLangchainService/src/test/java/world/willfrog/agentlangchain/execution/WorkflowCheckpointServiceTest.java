@@ -6,18 +6,24 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.artifact.RunRawRefStore;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -115,6 +121,73 @@ class WorkflowCheckpointServiceTest {
 
         verify(rawRefStore).read("run-1", "user-1", "raw_ref_001", 0, 1, null);
         verify(rawRefStore).read("run-1", "user-1", compactionRef, 0, 1, null);
+    }
+
+    @Test
+    void deploymentIdentityCheckpointWriteUsesTheRowCurrentStatus() {
+        String generation = "gen-" + "a".repeat(64);
+        ReflectionTestUtils.setField(service, "deploymentIdentityProvider",
+                (DeploymentIdentityProvider) () -> new DeploymentIdentity("beta-main-001", generation));
+        AgentRun run = run("run-1", "user-1", null);
+        // 长工具恢复窗口：Run 停在 RECEIVED 直到 markHandoffAccepted。
+        run.setStatus(AgentRunStatus.RECEIVED);
+        when(runMapper.findByIdForDeployment("run-1", "beta-main-001", generation)).thenReturn(run);
+        when(runMapper.updateExecutionCheckpointForDeployment(
+                anyString(), anyString(), anyString(), anyString(), any(), anyString())).thenReturn(1);
+
+        service.initializeLinear("run-1", "user-1", linearPlan());
+
+        ArgumentCaptor<AgentRunStatus> statusCaptor = ArgumentCaptor.forClass(AgentRunStatus.class);
+        verify(runMapper).updateExecutionCheckpointForDeployment(
+                eq("run-1"), eq("user-1"), eq("beta-main-001"), eq(generation),
+                statusCaptor.capture(), anyString());
+        assertThat(statusCaptor.getValue()).isEqualTo(AgentRunStatus.RECEIVED);
+    }
+
+    @Test
+    void deploymentIdentityCheckpointWriteKeepsExecutingWhenRowIsExecuting() {
+        String generation = "gen-" + "a".repeat(64);
+        ReflectionTestUtils.setField(service, "deploymentIdentityProvider",
+                (DeploymentIdentityProvider) () -> new DeploymentIdentity("beta-main-001", generation));
+        AgentRun run = run("run-1", "user-1", null);
+        run.setStatus(AgentRunStatus.EXECUTING);
+        when(runMapper.findByIdForDeployment("run-1", "beta-main-001", generation)).thenReturn(run);
+        when(runMapper.updateExecutionCheckpointForDeployment(
+                anyString(), anyString(), anyString(), anyString(), any(), anyString())).thenReturn(1);
+
+        service.initializeLinear("run-1", "user-1", linearPlan());
+
+        ArgumentCaptor<AgentRunStatus> statusCaptor = ArgumentCaptor.forClass(AgentRunStatus.class);
+        verify(runMapper).updateExecutionCheckpointForDeployment(
+                eq("run-1"), eq("user-1"), eq("beta-main-001"), eq(generation),
+                statusCaptor.capture(), anyString());
+        assertThat(statusCaptor.getValue()).isEqualTo(AgentRunStatus.EXECUTING);
+    }
+
+    @Test
+    void deploymentIdentityCheckpointWriteFailsClosedWhenRowIsMissingOrForeign() {
+        String generation = "gen-" + "a".repeat(64);
+        ReflectionTestUtils.setField(service, "deploymentIdentityProvider",
+                (DeploymentIdentityProvider) () -> new DeploymentIdentity("beta-main-001", generation));
+
+        // 行不存在（默认 mock 返回 null）→ 0 行，仍映射成条带错误。
+        assertThatThrownBy(() -> service.initializeLinear("run-1", "user-1", linearPlan()))
+                .hasMessage("workflow_checkpoint_run_not_found");
+
+        // userId 对不上 → 同样拒绝写入。
+        AgentRun foreign = run("run-1", "someone-else", null);
+        foreign.setStatus(AgentRunStatus.RECEIVED);
+        when(runMapper.findByIdForDeployment("run-1", "beta-main-001", generation))
+                .thenReturn(foreign);
+        assertThatThrownBy(() -> service.initializeLinear("run-1", "user-1", linearPlan()))
+                .hasMessage("workflow_checkpoint_run_not_found");
+    }
+
+    private static LangchainTodoPlan linearPlan() {
+        return LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(TodoItem.builder().id("todo_1").sequence(1).description("read").build()))
+                .build();
     }
 
     private AgentRun run(String runId, String userId, String checkpointJson) {

@@ -10,7 +10,6 @@ import world.willfrog.agent.platform.artifact.RunRawRefStore;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
@@ -269,9 +268,16 @@ public class WorkflowCheckpointService {
             return runMapper.updateExecutionCheckpoint(runId, userId, json);
         }
         DeploymentIdentity local = deploymentIdentityProvider.current();
+        // 长工具恢复会把 Run 停在 RECEIVED，直到 markHandoffAccepted 才推进到 EXECUTING。
+        // checkpoint 写入必须按该行当前 status 做 CAS，不能写死 EXECUTING，否则恢复
+        // 第一个写点就 0 行失败（workflow_checkpoint_run_not_found），工作流不再前进。
+        AgentRun run = findLocalRun(runId);
+        if (run == null || !Objects.equals(userId, run.getUserId())) {
+            return 0;
+        }
         return runMapper.updateExecutionCheckpointForDeployment(
                 runId, userId, local.deploymentId(), local.generationId(),
-                AgentRunStatus.EXECUTING, json);
+                run.getStatus(), json);
     }
 
     private void validateReplaySafety(WorkflowExecutionCheckpoint checkpoint) {

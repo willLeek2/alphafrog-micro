@@ -1036,9 +1036,11 @@
     </update>
 
     <!--
-        CANCELED 终态收口。expectedStatus 固定为 WAITING_TOOL_JOB 或 EXECUTING：
-        取消可能落在后台工具等待期（WAITING_TOOL_JOB），也可能落在
-        markHandoffAccepted 已把 Run 恢复为 EXECUTING 之后（accepted handoff 期间）。
+        CANCELED 终态收口。status 集合按取消可能落地的真实窗口逐次补齐：
+        WAITING_TOOL_JOB（后台工具等待期正常取消）、EXECUTING（markHandoffAccepted
+        已把 Run 恢复为 EXECUTING 之后，accepted handoff 期间）、WAITING（先暂停后
+        取消）、RECEIVED（finalizer 已把 Run CAS 到 RECEIVED、恢复 worker 已 claim
+        但 handoff 尚未落库的窗口，260913-012514 批次 5 个 run 的现场）。
         operationId 栅栏：旧 finalizer 不能覆盖已被第二次长工具替换的新 anchor。
     -->
     <update id="cancelToolJobAnchorFromStatuses">
@@ -1050,8 +1052,10 @@
           <!-- WAITING 在列的理由：先暂停后取消的 Run 停在 WAITING（锚点处置已从
                PAUSED 被覆盖为 CANCELED），收尾器必须能把它原子写进 CANCELED，
                否则每 5 秒重试形成告警循环。无锚点的纯暂停 Run 到不了这里——
-               本语句还有 operationId 栅栏。 -->
-          AND status IN ('WAITING_TOOL_JOB', 'EXECUTING', 'WAITING')
+               本语句还有 operationId 栅栏。
+               RECEIVED 在列的理由：不补这一格，finalizer 会在 claim 之后、handoff
+               之前的窗口上永远 CAS 失败，每 5 秒刷 terminal_transition_failed。 -->
+          AND status IN ('WAITING_TOOL_JOB', 'EXECUTING', 'WAITING', 'RECEIVED')
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
             <include refid="optionalDeploymentIdentityFence"/>
     </update>
