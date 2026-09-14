@@ -8,8 +8,8 @@
   {
     "name": "trade_date",
     "meaning": "交易日期",
-    "dataType": "string",
-    "dataFormat": "YYYYMMDD（8位日期字符串）或 13 位毫秒时间戳"
+    "dataType": "long",
+    "dataFormat": "13 位毫秒时间戳整数"
   },
   {
     "name": "open",
