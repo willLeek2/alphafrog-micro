@@ -1,0 +1,1 @@
+统一搜索股票/ETF/指数/场外基金基本信息；也支持 mode=advanced。advanced 要求 advancedQuery.asset_type=stock|etf，stock 支持 index_component / sw_industry_l2_component / sw_industry_l3_component，etf 支持 has_stock。simple 模式继续使用 query + assetTypes。对 index_component 的 NONE/NONE 默认取最新公告期完整快照，单边 NONE 表示不限制该侧边界。

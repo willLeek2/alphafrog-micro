@@ -14,5 +14,7 @@ public class RunStageConfig {
     private StageLlmConfig finalAnswer;
     @JsonAlias({"search_judge", "searchJudge"})
     private StageLlmConfig searchJudge;
+    @JsonAlias({"finance_method_resolver", "financeMethodResolver"})
+    private StageLlmConfig financeMethodResolver;
     private SubAgentStageConfig subAgent;
 }

@@ -23,6 +23,9 @@ final class AgentLangchainRunMessageMapper {
                 .setUpdatedAt(run.getUpdatedAt() == null ? "" : run.getUpdatedAt().toString())
                 .setCompletedAt(run.getCompletedAt() == null ? "" : run.getCompletedAt().toString())
                 .setExt(nvl(run.getExt()))
+                .setDeploymentId(nvl(run.getDeploymentId()))
+                .setDeploymentGenerationId(nvl(run.getDeploymentGenerationId()))
+                .setLaneTag(nvl(run.getLaneTag()))
                 .build();
     }
 

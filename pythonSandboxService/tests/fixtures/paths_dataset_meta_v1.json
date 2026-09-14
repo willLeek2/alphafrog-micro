@@ -1,0 +1,22 @@
+{
+  "schema_version": "agent_run_dataset_meta_v1",
+  "datasets": {
+    "7": {
+      "rowCount": 1000,
+      "bytes": 87000,
+      "columns": ["ts_code", "trade_date", "close", "vol", "amount"],
+      "recommendedUsecols": ["ts_code", "trade_date", "close", "vol", "amount"],
+      "recommendedDtype": {
+        "ts_code": "category",
+        "trade_date": "Int64",
+        "close": "float64",
+        "vol": "float64",
+        "amount": "float64"
+      },
+      "readProfiles": {
+        "price_volume": ["ts_code", "trade_date", "close", "vol", "amount"]
+      },
+      "metadataStatus": "complete"
+    }
+  }
+}

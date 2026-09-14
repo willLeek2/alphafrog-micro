@@ -1,5 +1,7 @@
 HELP.md
 target/
+deploy/otel/opentelemetry-javaagent.jar
+deploy/otel/runtime.env
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
@@ -66,6 +68,7 @@ test-secrets.yml
 .kilocode/
 .github/
 .claude/
+.collab/
 
 # Coding Agent Files
 
@@ -85,11 +88,12 @@ CLAUDE.md
 /test_scripts
 /test_guide
 /docs
+/output/
 
 
 .env
-agentService/config/agent-llm.local.json
-agentService/config/search-llm.local.json
+agentLangchainService/config/agent-llm.local.json
+agentLangchainService/config/code-refine.local.json
 externalInfoService/config/rag-fetch.local.json
 externalInfoService/config/rag-embedding.local.json
 
@@ -105,3 +109,7 @@ remote_pr/
 migrate_config.yml
 
 node_modules/
+
+# 260809-26Q3-stage1-w3 D13: task-local audit notes, not for owner code commit
+# (codex 531cc154 + Cindy 313d871e non-blocking)
+notes-w3/

@@ -1,0 +1,68 @@
+alphafrog:
+  beta-controller:
+    machines:
+      beta-machine-1:
+        docker-host: unix:///var/run/docker.sock
+        # 两项地址都要替换为 Beta 机器实际使用的地址或可解析名称。
+        bind-ip: BETA_BIND_ADDRESS
+        routable-address: BETA_ROUTABLE_ADDRESS
+        # 所有实例共用的固定 docker 网络（照生产 docker-compose.yml 的固定网络做法）：
+        # 控制器首次创建后幂等复用，避免每次滚动新建网络、地址池耗尽后容器漂出
+        # 172.16/12 被宿主 PostgreSQL 拒绝。子网必须留在 172.16.0.0/12 内且避开
+        # docker 默认自动池（172.17 起），设置前先核对现网占用。
+        network-name: alphafrog-beta
+        network-subnet: 172.16.0.0/24
+        network-gateway: 172.16.0.1
+    services:
+      domestic-stock-service:
+        env-file: /etc/alphafrog-beta/services/domestic-stock-service.env
+      domestic-fetch-service:
+        env-file: /etc/alphafrog-beta/services/domestic-fetch-service.env
+        volumes:
+          - /var/lib/alphafrog-beta/data/domestic-fetch-configs:/app/config-dynamic
+      admin-service:
+        env-file: /etc/alphafrog-beta/services/admin-service.env
+      portfolio-service:
+        env-file: /etc/alphafrog-beta/services/portfolio-service.env
+      agent-service:
+        env-file: /etc/alphafrog-beta/services/agent-service.env
+        java-tool-options: -Xms512m -Xmx1g
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent_datasets:/data/agent_datasets
+          - /var/lib/alphafrog-beta/data/database_fetched:/data/database_fetched
+          - /var/lib/alphafrog-beta/data/manifests:/data/manifests
+          - /var/lib/alphafrog-beta/data/agent_artifacts:/data/agent_artifacts
+          - /var/lib/alphafrog-beta/data/agent_workspaces:/data/agent_workspaces
+          - /var/lib/alphafrog-beta/data/agent-configs:/app/config-dynamic
+      python-sandbox-service:
+        env-file: /etc/alphafrog-beta/services/python-sandbox-service.env
+        java-agent-enabled: false
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent_datasets:/data/agent_datasets
+          - /var/lib/alphafrog-beta/data/database_fetched:/data/database_fetched
+          - /var/lib/alphafrog-beta/data/manifests:/data/manifests
+          - /var/lib/alphafrog-beta/data/agent_artifacts:/data/agent_artifacts
+          - /var/lib/alphafrog-beta/data/sandbox_tasks:/data/sandbox_tasks
+          - /var/run/docker.sock:/var/run/docker.sock
+      python-sandbox-gateway-service:
+        env-file: /etc/alphafrog-beta/services/python-sandbox-gateway-service.env
+        java-tool-options: -Xms256m -Xmx256m
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent-debug-observability:/app/logs/agent-debug-observability
+      frontend:
+        env-file: /etc/alphafrog-beta/services/frontend.env
+        java-tool-options: -Xms384m -Xmx512m
+        volumes:
+          - /var/lib/alphafrog-beta/data/agent-debug-observability:/app/logs/agent-debug-observability
+      # 四个回落生产的服务；Beta 纳入可拉起名单后按需在部署单里出现，缺映射会在
+      # 提交对应服务时报 SERVICE_CONFIG_MISSING。真实 env 文件由 Beta 本机按文档 04 落盘。
+      domestic-index-service:
+        env-file: /etc/alphafrog-beta/services/domestic-index-service.env
+      domestic-fund-service:
+        env-file: /etc/alphafrog-beta/services/domestic-fund-service.env
+      domestic-listed-asset-service:
+        env-file: /etc/alphafrog-beta/services/domestic-listed-asset-service.env
+      external-info-service:
+        env-file: /etc/alphafrog-beta/services/external-info-service.env
+        volumes:
+          - /var/lib/alphafrog-beta/data/external-info-configs:/app/config-dynamic

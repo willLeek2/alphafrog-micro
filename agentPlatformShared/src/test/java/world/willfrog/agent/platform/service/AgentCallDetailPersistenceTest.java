@@ -19,13 +19,14 @@ class AgentCallDetailPersistenceTest {
 
     @Test
     void scrubLlmTrace_removesRawFieldsAndSetsFlagOnlyWhenBlobStored() {
-        AgentObservabilityService.LlmTrace trace = new AgentObservabilityService.LlmTrace();
+        AgentRunObservabilityService.LlmTrace trace = new AgentRunObservabilityService.LlmTrace();
         trace.setTraceId("llm-1");
         trace.setOutputText("full output");
         trace.setInputMessages(Map.of("role", "user"));
-        trace.setHttpRequest(new AgentObservabilityService.RawHttpTrace());
+        trace.setHttpRequest(new AgentRunObservabilityService.RawHttpTrace());
         trace.setCurlCommand("curl secret");
         trace.setEndpoint("openrouter");
+        trace.setGenerationId("gen-1");
 
         AgentCallDetailPersistence.scrubLlmTrace(trace, true);
 
@@ -34,12 +35,13 @@ class AgentCallDetailPersistenceTest {
         assertNull(trace.getInputMessages());
         assertNull(trace.getHttpRequest());
         assertNull(trace.getCurlCommand());
-        assertNull(trace.getEndpoint());
+        assertEquals("openrouter", trace.getEndpoint());
+        assertEquals("gen-1", trace.getGenerationId());
     }
 
     @Test
     void scrubLlmTrace_withoutBlobStored_doesNotSetFlag() {
-        AgentObservabilityService.LlmTrace trace = new AgentObservabilityService.LlmTrace();
+        AgentRunObservabilityService.LlmTrace trace = new AgentRunObservabilityService.LlmTrace();
         trace.setTraceId("llm-2");
         trace.setModel("qwen");
 
@@ -51,7 +53,7 @@ class AgentCallDetailPersistenceTest {
     @Test
     void scrubLlmTrace_capsLargePreviewInSnapshotShape() throws Exception {
         String huge = "x".repeat(50_000);
-        AgentObservabilityService.LlmTrace trace = new AgentObservabilityService.LlmTrace();
+        AgentRunObservabilityService.LlmTrace trace = new AgentRunObservabilityService.LlmTrace();
         trace.setTraceId("llm-3");
         trace.setOutputText(huge);
 
@@ -69,6 +71,8 @@ class AgentCallDetailPersistenceTest {
         llmTrace.put("traceId", "llm-1");
         llmTrace.put("outputText", huge);
         llmTrace.put("httpRequest", Map.of("url", "http://x"));
+        llmTrace.put("endpoint", "openrouter");
+        llmTrace.put("generationId", "gen-map-1");
         llmTrace.put("detailBlobStored", true);
         Map<String, Object> diagnostics = new LinkedHashMap<>();
         diagnostics.put("llmTraces", List.of(llmTrace));
@@ -81,6 +85,8 @@ class AgentCallDetailPersistenceTest {
         Map<String, Object> scrubbed = ((List<Map<String, Object>>) diagnostics.get("llmTraces")).get(0);
         assertFalse(scrubbed.containsKey("outputText"));
         assertFalse(scrubbed.containsKey("httpRequest"));
+        assertEquals("openrouter", scrubbed.get("endpoint"));
+        assertEquals("gen-map-1", scrubbed.get("generationId"));
         assertEquals(true, scrubbed.get("detailBlobStored"));
         String preview = String.valueOf(scrubbed.get("responsePreview"));
         assertTrue(preview.length() <= OBSERVABILITY_PREVIEW_MAX_CHARS + 3);
@@ -97,8 +103,20 @@ class AgentCallDetailPersistenceTest {
     }
 
     @Test
+    void hasPersistableLlmRawContentBlob_requiresHttpRequestOrResponse() {
+        Map<String, Object> onlyIds = Map.of("type", "llm_raw_http", "runId", "run-1", "traceId", "a");
+        assertFalse(AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(onlyIds));
+        Map<String, Object> withRequest = new LinkedHashMap<>(onlyIds);
+        withRequest.put("httpRequest", Map.of("url", "https://example.test"));
+        assertTrue(AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(withRequest));
+        Map<String, Object> withResponse = new LinkedHashMap<>(onlyIds);
+        withResponse.put("httpResponse", Map.of("statusCode", 200));
+        assertTrue(AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(withResponse));
+    }
+
+    @Test
     void toToolDetailBlob_capturesParamsAndOutput() {
-        AgentObservabilityService.ToolTrace trace = new AgentObservabilityService.ToolTrace();
+        AgentRunObservabilityService.ToolTrace trace = new AgentRunObservabilityService.ToolTrace();
         trace.setTraceId("tool-1");
         trace.setParams(Map.of("query", "茅台"));
         trace.setOutput("{\"hits\":[]}");

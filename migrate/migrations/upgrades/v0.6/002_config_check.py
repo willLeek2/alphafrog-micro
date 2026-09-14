@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 import sys
 
-CONFIG_FILE = Path("agentService/config/agent-llm.local.json")
-EXAMPLE_FILE = Path("agentService/config/agent-llm.local.example.json")
+CONFIG_FILE = Path("agentLangchainService/config/agent-llm.local.json")
+EXAMPLE_FILE = Path("agentLangchainService/config/agent-llm.local.example.json")
 
 def main():
     print("v0.6 配置检查")

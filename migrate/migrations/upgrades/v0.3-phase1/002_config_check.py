@@ -7,8 +7,8 @@ v0.3-phase1 配置检查脚本
 from pathlib import Path
 import sys
 
-CONFIG_FILE = Path("agentService/config/agent-llm.local.json")
-EXAMPLE_FILE = Path("agentService/config/agent-llm.local.example.json")
+CONFIG_FILE = Path("agentLangchainService/config/agent-llm.local.json")
+EXAMPLE_FILE = Path("agentLangchainService/config/agent-llm.local.example.json")
 
 def main():
     if CONFIG_FILE.exists():
@@ -20,7 +20,7 @@ def main():
         print(f"       请从示例文件复制并修改:")
         print(f"       cp {EXAMPLE_FILE} {CONFIG_FILE}")
     else:
-        print(f"       示例文件也不存在，请检查 agentService/config/ 目录")
+        print(f"       示例文件也不存在，请检查 agentLangchainService/config/ 目录")
     return 0  # 非阻塞，仅提示
 
 if __name__ == "__main__":

@@ -1,10 +1,8 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
-import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -12,10 +10,9 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentModelsRequest;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentModelListResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentModelResponse;
-import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -27,23 +24,13 @@ public class AgentConfigController {
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
 
-    @DubboReference(group = "legacy", check = false)
-    private AgentDubboService agentDubboServiceLegacy;
+    private final AgentAuthSupport authSupport;
 
-    @Autowired
-    private HttpServletRequest request;
-
-    private final AuthService authService;
-
-    public AgentConfigController(AuthService authService) {
-        this.authService = authService;
+    public AgentConfigController(AgentAuthSupport authSupport) {
+        this.authSupport = authSupport;
     }
 
     private AgentDubboService resolveService() {
-        String uri = request.getRequestURI();
-        if (uri != null && uri.startsWith("/api/agent-legacy")) {
-            return agentDubboServiceLegacy;
-        }
         return agentDubboServiceLangchain;
     }
 
@@ -52,22 +39,8 @@ public class AgentConfigController {
         return listModels(authentication);
     }
 
-    /** @deprecated Use {@code GET /api/agent/models}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/models")
-    public ResponseWrapper<AgentModelListResponse> modelsLegacy(Authentication authentication) {
-        return listModels(authentication);
-    }
-
     @GetMapping("/api/agent/config/search-sources")
     public ResponseWrapper<List<SearchSourceResponse>> searchSources(Authentication authentication) {
-        return searchSourcesInternal(authentication);
-    }
-
-    /** @deprecated Use {@code GET /api/agent/config/search-sources}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/config/search-sources")
-    public ResponseWrapper<List<SearchSourceResponse>> searchSourcesLegacy(Authentication authentication) {
         return searchSourcesInternal(authentication);
     }
 
@@ -76,21 +49,14 @@ public class AgentConfigController {
         return retrievalSourcesInternal(authentication);
     }
 
-    /** @deprecated Use {@code GET /api/agent/config/retrieval-sources}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/config/retrieval-sources")
-    public ResponseWrapper<List<RetrievalSourceResponse>> retrievalSourcesLegacy(Authentication authentication) {
-        return retrievalSourcesInternal(authentication);
-    }
-
     private ResponseWrapper<AgentModelListResponse> listModels(Authentication authentication) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
             var resp = resolveService().listModels(
-                    ListAgentModelsRequest.newBuilder().setUserId(userId).build()
+                    ListAgentModelsRequest.newBuilder().setUserId(caller.userId()).build()
             );
             List<AgentModelResponse> models = new ArrayList<>();
             for (var model : resp.getModelsList()) {
@@ -115,8 +81,8 @@ public class AgentConfigController {
     }
 
     private ResponseWrapper<List<SearchSourceResponse>> searchSourcesInternal(Authentication authentication) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         List<SearchSourceResponse> items = List.of(
@@ -130,8 +96,8 @@ public class AgentConfigController {
     }
 
     private ResponseWrapper<List<RetrievalSourceResponse>> retrievalSourcesInternal(Authentication authentication) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         List<RetrievalSourceResponse> items = List.of(
@@ -140,17 +106,6 @@ public class AgentConfigController {
                 new RetrievalSourceResponse("report", "券商研报", 10)
         );
         return ResponseWrapper.success(items);
-    }
-
-    private String resolveUserId(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return null;
-        }
-        User user = authService.getUserByUsername(authentication.getName());
-        if (user == null || user.getUserId() == null) {
-            return null;
-        }
-        return String.valueOf(user.getUserId());
     }
 
     private record SearchSourceResponse(String id, String name, String desc) {

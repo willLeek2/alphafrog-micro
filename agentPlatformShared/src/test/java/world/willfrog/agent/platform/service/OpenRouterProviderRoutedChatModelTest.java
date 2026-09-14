@@ -9,8 +9,10 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.ProviderFailureCategory;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -43,7 +45,7 @@ class OpenRouterProviderRoutedChatModelTest {
         AgentContext.setPhase("execution");
         AgentContext.setTodoContext("todo-1", 2);
         AgentContext.setWorkflow("dag");
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         OpenRouterProviderRoutedChatModel model = new OpenRouterProviderRoutedChatModel(
                 new ObjectMapper(),
                 "https://openrouter.ai/api/v1",
@@ -54,7 +56,7 @@ class OpenRouterProviderRoutedChatModelTest {
                 1024,
                 List.of("fireworks"),
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 mock(OpenRouterCostService.class),
                 eventService,
                 "openrouter",
@@ -144,7 +146,7 @@ class OpenRouterProviderRoutedChatModelTest {
         OpenRouterProviderRoutedChatModel.applyStreamingOptions(
                 payload,
                 "https://openrouter.ai/api/v1",
-                AgentObservabilityService.PHASE_PLANNING
+                AgentRunObservabilityService.PHASE_PLANNING
         );
 
         assertFalse(payload.containsKey("stream_options"));
@@ -194,6 +196,78 @@ class OpenRouterProviderRoutedChatModelTest {
         );
 
         assertEquals(0.7D, payload.get("temperature"));
+    }
+
+    @Test
+    void isOpenRouter_shouldAcceptOfficialHostAndSingaporeUrlWithEndpointName() {
+        assertTrue(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://openrouter.ai/api/v1", null));
+        assertTrue(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://openrouter.ai/api/v1", "openrouter"));
+        assertTrue(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://llm.frogwch.com/openrouter/api/v1", "openrouter"));
+        assertFalse(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://llm.frogwch.com/openrouter/api/v1", null));
+        assertFalse(OpenRouterProviderRoutedChatModel.isOpenRouter(
+                "https://llm.frogwch.com/openrouter/api/v1", "fireworks"));
+    }
+
+    @Test
+    void isFireworks_shouldAcceptOfficialHostAndSingaporeUrlWithEndpointName() {
+        assertTrue(OpenRouterProviderRoutedChatModel.isFireworks(
+                "https://api.fireworks.ai/inference/v1", null));
+        assertTrue(OpenRouterProviderRoutedChatModel.isFireworks(
+                "https://llm.frogwch.com/fireworks/inference/v1", "fireworks"));
+        assertFalse(OpenRouterProviderRoutedChatModel.isFireworks(
+                "https://llm.frogwch.com/fireworks/inference/v1", null));
+    }
+
+    @Test
+    void applyStreamingOptions_singaporeOpenRouterEndpointName_shouldSkipStreamOptionsInPlanning() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("stream", true);
+        payload.put("stream_options", Map.of("include_usage", true));
+
+        OpenRouterProviderRoutedChatModel.applyStreamingOptions(
+                payload,
+                "https://llm.frogwch.com/openrouter/api/v1",
+                AgentRunObservabilityService.PHASE_PLANNING,
+                "openrouter"
+        );
+
+        assertFalse(payload.containsKey("stream_options"));
+        assertFalse(payload.containsKey("perf_metrics_in_response"));
+    }
+
+    @Test
+    void applyStreamingOptions_singaporeFireworksEndpointName_shouldUsePerfMetrics() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("stream", true);
+        payload.put("stream_options", Map.of("include_usage", true));
+
+        OpenRouterProviderRoutedChatModel.applyStreamingOptions(
+                payload,
+                "https://llm.frogwch.com/fireworks/inference/v1",
+                "execution",
+                "fireworks"
+        );
+
+        assertFalse(payload.containsKey("stream_options"));
+        assertEquals(true, payload.get("perf_metrics_in_response"));
+    }
+
+    @Test
+    void applyEndpointSamplingDefaults_singaporeFireworksEndpointName_shouldOmitTemperature() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("temperature", 0.7D);
+
+        OpenRouterProviderRoutedChatModel.applyEndpointSamplingDefaults(
+                payload,
+                "https://llm.frogwch.com/fireworks/inference/v1",
+                "fireworks"
+        );
+
+        assertFalse(payload.containsKey("temperature"));
     }
 
     @Test
@@ -414,6 +488,49 @@ class OpenRouterProviderRoutedChatModelTest {
         assertEquals("value", request.headers().firstValue("X-Custom").get());
     }
 
+    @Test
+    void isRetryableStreamingException_shouldTreatSseReadIOExceptionAsRetryable() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("deepseek", "fireworks"));
+        IllegalStateException streamError = new IllegalStateException(
+                "SSE 流读取失败",
+                new IOException("SSE stream idle timeout after 25s")
+        );
+
+        Boolean retryable = (Boolean) ReflectionTestUtils.invokeMethod(
+                model, "isRetryableStreamingException", streamError
+        );
+        Boolean shouldRetryFirstAttempt = (Boolean) ReflectionTestUtils.invokeMethod(
+                model,
+                "shouldRetryStreamingException",
+                streamError,
+                LlmRequestRetryPolicy.withMaxRetries(2),
+                1
+        );
+        Boolean shouldRetryLastAttempt = (Boolean) ReflectionTestUtils.invokeMethod(
+                model,
+                "shouldRetryStreamingException",
+                streamError,
+                LlmRequestRetryPolicy.withMaxRetries(2),
+                3
+        );
+
+        assertEquals(true, retryable);
+        assertEquals(true, shouldRetryFirstAttempt);
+        assertEquals(false, shouldRetryLastAttempt);
+    }
+
+    @Test
+    void isRetryableStreamingException_shouldNotRetryProviderErrorChunk() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("deepseek", "fireworks"));
+        IllegalStateException providerError = new IllegalStateException("SSE 流中收到错误 chunk: {}");
+
+        Boolean retryable = (Boolean) ReflectionTestUtils.invokeMethod(
+                model, "isRetryableStreamingException", providerError
+        );
+
+        assertEquals(false, retryable);
+    }
+
     private OpenRouterProviderRoutedChatModel createMinimalModel(List<String> providerOrder) {
         return new OpenRouterProviderRoutedChatModel(
                 new ObjectMapper(),
@@ -432,6 +549,101 @@ class OpenRouterProviderRoutedChatModelTest {
                 null,
                 null
         );
+    }
+
+    // ── Provider error classification tests (Phase 3.1) ──
+
+    @Test
+    void classifyProviderError_shouldMap400ContextLengthExceededToBadRequestTokenLimit() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String body = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}";
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 400, body, null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.BAD_REQUEST_TOKEN_LIMIT, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMap429ToRateLimit() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String body = "{\"error\":{\"code\":\"rate_limit_exceeded\"}}";
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 429, body, null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.RATE_LIMIT, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMap502ToTransientNetwork() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 502, "bad gateway", null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.TRANSIENT_NETWORK, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMapNetworkConnectionLostToTransientNetwork() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", -1, "Network connection lost", null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.TRANSIENT_NETWORK, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMapSseIOExceptionToTransientNetwork() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 200, "SSE stream idle timeout after 25s",
+                new IOException("SSE broken pipe"), List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.TRANSIENT_NETWORK, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMap404ModelNotFoundToModelUnavailable() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String body = "{\"error\":{\"code\":\"model_not_found\"}}";
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 404, body, null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.MODEL_UNAVAILABLE, category);
+    }
+
+    @Test
+    void extractErrorCodeFromBody_shouldReadNestedErrorCode() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        String code = (String) ReflectionTestUtils.invokeMethod(
+                model, "extractErrorCodeFromBody",
+                "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"x\"}}"
+        );
+
+        assertEquals("context_length_exceeded", code);
+    }
+
+    @Test
+    void extractErrorCodeFromBody_shouldReturnEmptyForNonJson() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        String code = (String) ReflectionTestUtils.invokeMethod(
+                model, "extractErrorCodeFromBody", "not json"
+        );
+
+        assertEquals("", code);
     }
 
 }

@@ -3,8 +3,9 @@ package world.willfrog.agentlangchain.config;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -13,14 +14,16 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Sandbox tool concurrency throttle using a fair {@link Semaphore}.
+ * 用公平 {@link Semaphore} 限制 executePython 的前台并发。
  *
- * <p>Only tools in the allowlist are throttled; all others pass through.
- * Metrics (acquire wait, timeout count, exec duration) are collected per tool
- * for consumption by adaptive concurrency and observability.</p>
+ * <p>当前 allowlist 固定为 executePython，其他工具直接通过。permit 的作用范围是工具
+ * 调用入口，数据库里的持久容量预留由其他机制负责，同步工具也不会因此自动获得
+ * 后台恢复能力。等待时间、超时数和执行耗时按工具累计，供观测与后续自适应使用。</p>
  *
- * <p><b>Allowlist:</b> hardcoded to {@code ["executePython"]} in Phase 1a.
- * Phase 1b will make this configurable via {@code agent.langchain.tool.throttle.enabledTools}.</p>
+ * <p><b>作用域</b>：本类使用 <em>JVM 进程内</em> Semaphore；多实例部署时每个实例
+ * 各自计数、各自封顶，容量保证只覆盖单个进程。运维估算全局限流时使用公式：
+ * {@code 全局许可近似 ≈ 实例数 × 每实例 maxPermits}（本类默认/配置的每实例 permits）。
+ * 观测快照字段 {@code scope} 固定为 {@code "per-node"}，低基数、无用户/run 标识。</p>
  */
 @Component
 @Slf4j
@@ -32,7 +35,7 @@ public class LangchainToolConcurrencyThrottle {
     private final long timeoutSeconds;
     private final int maxPermits;
 
-    // per-tool metrics
+    // 每个工具的低基数累计指标；这里只保存计数/总量，不保存用户或 runId。
     private final Map<String, AtomicLong> timeoutCounts = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> waitMsTotal = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> waitCount = new ConcurrentHashMap<>();
@@ -46,16 +49,15 @@ public class LangchainToolConcurrencyThrottle {
         this.enabled = enabled;
         this.timeoutSeconds = timeoutSeconds;
         this.maxPermits = Math.max(1, maxConcurrent);
-        // Phase 1a: exact-match allowlist. Phase 1b: configurable via agent.langchain.tool.throttle.enabledTools
+        // 当前固定只匹配 executePython 这一个工具名。
         this.throttledTools = Set.of("executePython");
-        this.semaphore = new Semaphore(this.maxPermits, true); // fair mode
+        this.semaphore = new Semaphore(this.maxPermits, true); // 公平模式按等待顺序发 permit。
     }
 
     /**
-     * Attempt to acquire a permit for the given tool.
+     * 尝试为工具拿到 permit。
      *
-     * @return result with {@code acquired=true} iff a permit was obtained.
-     *         Always check {@code result.acquired()} before calling {@link #release}.
+     * @return 只有真正取得 permit 时 acquired 才为 true；调用 release 前必须检查该标志。
      */
     public ToolThrottleResult tryAcquire(String toolName) {
         if (!enabled || !throttledTools.contains(toolName)) {
@@ -67,7 +69,7 @@ public class LangchainToolConcurrencyThrottle {
         try {
             acquired = semaphore.tryAcquire(timeoutSeconds, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt(); // restore interrupt flag
+            Thread.currentThread().interrupt(); // 恢复中断位，让上层取消逻辑仍能观察到。
             long waitedMs = System.currentTimeMillis() - waitStartedAt;
             timeoutCounts.computeIfAbsent(toolName, k -> new AtomicLong()).incrementAndGet();
             log.warn("Tool throttle interrupted: tool={} waitMs={} availablePermits={}",
@@ -90,7 +92,7 @@ public class LangchainToolConcurrencyThrottle {
     }
 
     /**
-     * Release a permit. Call only when {@code result.acquired() == true}.
+     * 释放 permit；ToolThrottleResult 内部做一次性标记，重复 finally 不会多释放。
      */
     public void release(ToolThrottleResult result) {
         if (result == null || !result.acquired()) return;
@@ -100,10 +102,8 @@ public class LangchainToolConcurrencyThrottle {
     }
 
     /**
-     * Record tool execution duration after completion (for metrics).
-     * Called for ALL tools (not just throttled ones) to provide baseline
-     * exec duration data. This is intentionally asymmetric with wait/timeout
-     * metrics which only cover throttled tools.
+     * 记录所有工具的执行耗时作为基线；等待与超时指标按被限流的工具分别累计，
+     * 与全量耗时基线不同是设计使然。
      */
     public void recordExecution(String toolName, long durationMs) {
         if (durationMs <= 0) return;
@@ -111,21 +111,28 @@ public class LangchainToolConcurrencyThrottle {
         execMsTotal.computeIfAbsent(toolName, k -> new AtomicLong()).addAndGet(durationMs);
     }
 
-    // ── Metric accessors (for observability / D4) ──
+    // ── 观测快照：返回副本/标量，调用方不能修改 semaphore 状态 ──
 
+    /**
+     * 返回本实例工具前台限流观测快照。
+     *
+     * <p>稳定字段 {@code scope} 恒为 {@code "per-node"}，标明计数仅覆盖本 JVM；
+     * 多实例时请按「实例数 × 每实例 maxPermits」估算全局许可，勿当作集群配额。</p>
+     */
     public Map<String, Object> throttleMetrics() {
-        return Map.of(
-                "enabled", enabled,
-                "maxPermits", maxPermits,
-                "availablePermits", semaphore.availablePermits(),
-                "queueLength", semaphore.getQueueLength(),
-                "timeoutSeconds", timeoutSeconds,
-                "timeoutCounts", toLongMap(timeoutCounts),
-                "waitMsTotal", toLongMap(waitMsTotal),
-                "waitCount", toLongMap(waitCount),
-                "execMsTotal", toLongMap(execMsTotal),
-                "execCount", toLongMap(execCount)
-        );
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("scope", "per-node");
+        metrics.put("enabled", enabled);
+        metrics.put("maxPermits", maxPermits);
+        metrics.put("availablePermits", semaphore.availablePermits());
+        metrics.put("queueLength", semaphore.getQueueLength());
+        metrics.put("timeoutSeconds", timeoutSeconds);
+        metrics.put("timeoutCounts", toLongMap(timeoutCounts));
+        metrics.put("waitMsTotal", toLongMap(waitMsTotal));
+        metrics.put("waitCount", toLongMap(waitCount));
+        metrics.put("execMsTotal", toLongMap(execMsTotal));
+        metrics.put("execCount", toLongMap(execCount));
+        return metrics;
     }
 
     private static Map<String, Long> toLongMap(Map<String, AtomicLong> source) {

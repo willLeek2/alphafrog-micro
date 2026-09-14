@@ -1,0 +1,1 @@
+Wait for one or more child agents from this run. Returns one structured state per id. A wait timeout does not cancel unfinished children; call this tool again to continue waiting.

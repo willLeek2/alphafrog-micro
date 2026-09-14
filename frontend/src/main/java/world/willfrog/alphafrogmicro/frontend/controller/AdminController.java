@@ -1,5 +1,6 @@
 package world.willfrog.alphafrogmicro.frontend.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
@@ -13,6 +14,9 @@ import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.RateLimitingService;
+import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityManager;
+import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityScope;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 
 import java.util.HashMap;
 import java.util.List;
@@ -26,6 +30,7 @@ import java.util.stream.Collectors;
 public class AdminController {
 
     private static final int ADMIN_USER_TYPE = 1127;
+    private static final ObjectMapper OUTBOUND_JSON = new ObjectMapper();
 
     private static final String STATUS_ACTIVE = "ACTIVE";
     private static final String STATUS_DISABLED = "DISABLED";
@@ -33,6 +38,7 @@ public class AdminController {
     private final AuthService authService;
     private final RateLimitingService rateLimitingService;
     private final UserDao userDao;
+    private final AuthObservabilityManager authObservabilityManager;
 
     @DubboReference
     private AdminService adminService;
@@ -526,6 +532,10 @@ public class AdminController {
         map.put("idempotencyKey", entry.getIdempotencyKey());
         map.put("ext", entry.getExt());
         map.put("createdAt", entry.getCreatedAt());
+        map.put("reason", entry.getReason());
+        map.put("deltaDecimal", entry.getDeltaDecimal());
+        map.put("balanceBeforeDecimal", entry.getBalanceBeforeDecimal());
+        map.put("balanceAfterDecimal", entry.getBalanceAfterDecimal());
         return map;
     }
 
@@ -549,6 +559,82 @@ public class AdminController {
         map.put("balanceAfter", creditChange.getBalanceAfter());
         map.put("ledgerId", creditChange.getLedgerId());
         return map;
+    }
+
+    // ========== Debug / Observability ==========
+
+    @PostMapping("/debug/auth-observability/enable")
+    public ResponseEntity<?> enableAuthObservability(Authentication authentication,
+                                                    @RequestBody Map<String, Object> request) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        User adminUser = authService.getUserByUsername(authentication.getName());
+        String operator = adminUser == null || adminUser.getUserId() == null
+                ? authentication.getName()
+                : String.valueOf(adminUser.getUserId());
+        String reason = request == null ? "" : nvl(request.get("reason"));
+        if (reason.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "reason is required"));
+        }
+        Integer ttlSeconds = readInt(request == null ? null : request.get("ttlSeconds"));
+        boolean force = readBoolean(request, "force", false);
+        boolean forceAllUsers = readBoolean(request, "forceAllUsers", false);
+        AuthObservabilityScope scope = parseScope(request == null ? null : (Map<String, Object>) request.get("scope"));
+
+        AuthObservabilityManager.EnableResult result = authObservabilityManager.enable(
+                operator, reason, ttlSeconds, scope, force, forceAllUsers);
+
+        if (result.isConflict()) {
+            Map<String, Object> body = new HashMap<>();
+            body.put("error", "An active auth observability session already exists; use force=true to replace.");
+            body.put("existingSessionId", result.getSession().getDebugSessionId());
+            return ResponseEntity.status(409).body(body);
+        }
+        if (!result.isSuccess()) {
+            return ResponseEntity.badRequest().body(Map.of("error", result.getError()));
+        }
+        Map<String, Object> body = new HashMap<>();
+        body.put("debugSessionId", result.getSession().getDebugSessionId());
+        body.put("outputDir", result.getSession().getOutputDir());
+        body.put("ttlDeadline", result.getSession().getTtlDeadline());
+        return ResponseEntity.ok(body);
+    }
+
+    @PostMapping("/debug/auth-observability/disable")
+    public ResponseEntity<?> disableAuthObservability(Authentication authentication,
+                                                     @RequestBody(required = false) Map<String, Object> request) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        String debugSessionId = request == null ? null : nvl(request.get("debugSessionId"));
+        boolean disabled = authObservabilityManager.disable(debugSessionId, "ADMIN_DISABLED");
+        return ResponseEntity.ok(Map.of("disabled", disabled));
+    }
+
+    @GetMapping("/debug/auth-observability/status")
+    public ResponseEntity<?> authObservabilityStatus(Authentication authentication) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        return ResponseEntity.ok(authObservabilityManager.buildStatus());
+    }
+
+    private AuthObservabilityScope parseScope(Map<String, Object> scopeMap) {
+        AuthObservabilityScope scope = new AuthObservabilityScope();
+        if (scopeMap == null) {
+            return scope;
+        }
+        Object sampleUsers = scopeMap.get("sampleUsers");
+        if (sampleUsers instanceof List<?> list) {
+            scope.setSampleUsers(list.stream().map(String::valueOf).toList());
+        }
+        scope.setUsernamePattern(nvl(scopeMap.get("usernamePattern")));
+        Object pathIncludes = scopeMap.get("pathIncludes");
+        if (pathIncludes instanceof List<?> list) {
+            scope.setPathIncludes(list.stream().map(String::valueOf).toList());
+        }
+        return scope;
     }
 
     // ========== Agent 运行监控 ==========
@@ -602,9 +688,11 @@ public class AdminController {
         }
         Map<String, Object> payload = new HashMap<>();
         payload.put("run", convertAdminAgentRunToMap(response.getRun()));
-        payload.put("planJson", response.getPlanJson());
-        payload.put("snapshotJson", response.getSnapshotJson());
-        payload.put("lastError", response.getLastError());
+        payload.put("planJson", AgentExternalObservabilityMapper.parseToJson(
+                OUTBOUND_JSON, response.getPlanJson(), AgentExternalObservabilityMapper.View.ADMIN));
+        payload.put("snapshotJson", AgentExternalObservabilityMapper.parseToJson(
+                OUTBOUND_JSON, response.getSnapshotJson(), AgentExternalObservabilityMapper.View.ADMIN));
+        payload.put("lastError", AgentExternalObservabilityMapper.safePreview(response.getLastError(), 10_000));
         return ResponseEntity.ok(payload);
     }
 
@@ -734,6 +822,64 @@ public class AdminController {
         payload.put("ledgerId", response.getLedgerId());
         payload.put("auditId", response.getAuditId());
         payload.put("idempotentReplay", response.getIdempotentReplay());
+        payload.put("message", response.getMessage());
+        return ResponseEntity.ok(payload);
+    }
+
+    @PostMapping("/users/credit-add")
+    public ResponseEntity<?> addUserCredit(Authentication authentication,
+                                           @RequestHeader("Idempotency-Key") String idempotencyKey,
+                                           @RequestBody Map<String, Object> requestBody) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Idempotency-Key is required"));
+        }
+
+        String userId = requestBody == null ? "" : nvl(requestBody.get("userId"));
+        String username = requestBody == null ? "" : nvl(requestBody.get("username"));
+        String currency = requestBody == null ? "" : nvl(requestBody.get("currency"));
+        String amount = requestBody == null ? "" : nvl(requestBody.get("amount"));
+        String reason = requestBody == null ? "" : nvl(requestBody.get("reason"));
+        if ((userId.isBlank() && username.isBlank()) || (!userId.isBlank() && !username.isBlank())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "exactly one of userId/username is required"));
+        }
+        if (currency.isBlank() || amount.isBlank() || reason.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "currency/amount/reason are required"));
+        }
+
+        User adminUser = authService.getUserByUsername(authentication.getName());
+        String operatorId = adminUser == null || adminUser.getUserId() == null ? "" : String.valueOf(adminUser.getUserId());
+
+        AddUserCreditResponse response = adminService.addUserCredit(
+                AddUserCreditRequest.newBuilder()
+                        .setUserId(userId)
+                        .setUsername(username)
+                        .setCurrency(currency)
+                        .setAmount(amount)
+                        .setReason(reason)
+                        .setOperatorId(operatorId)
+                        .setIdempotencyKey(idempotencyKey)
+                        .build()
+        );
+        if (!response.getSuccess()) {
+            return buildError(response.getErrorCode(), response.getMessage());
+        }
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("userId", response.getUserId());
+        payload.put("username", response.getUsername());
+        payload.put("currency", response.getCurrency());
+        payload.put("originalAmount", response.getOriginalAmount());
+        payload.put("exchangeRateToUsd", response.getExchangeRateToUsd());
+        payload.put("creditAmount", response.getCreditAmount());
+        payload.put("balanceBefore", response.getBalanceBefore());
+        payload.put("balanceAfter", response.getBalanceAfter());
+        payload.put("ledgerId", response.getLedgerId());
+        payload.put("rechargeId", response.getRechargeId());
+        payload.put("auditId", response.getAuditId());
+        payload.put("idempotentReplay", response.getIdempotentReplay());
+        payload.put("idempotencyKey", response.getIdempotencyKey());
         payload.put("message", response.getMessage());
         return ResponseEntity.ok(payload);
     }

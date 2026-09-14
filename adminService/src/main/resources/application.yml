@@ -11,6 +11,24 @@ mybatis:
   configuration:
     map-underscore-to-camel-case: true
 
+agent:
+  llm:
+    config-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+  credit:
+    cny-to-usd-rate: ${AF_AGENT_CREDIT_CNY_TO_USD_RATE:0.14}
+
+alphafrog:
+  config:
+    nacos:
+      enabled: ${AF_CONFIG_NACOS_ENABLED:false}
+      server-addr: ${NACOS_ADDRESS:127.0.0.1}:8848
+      namespace: ${AF_CONFIG_NACOS_NAMESPACE:}
+      group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
+      subscriptions:
+        - data-id: ${AF_AGENT_LLM_CONFIG_DATA_ID:agent-llm.local.json}
+          group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
+          target-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+
 dubbo:
   application:
     name: admin-service

@@ -26,6 +26,13 @@ public interface ConfigActiveDao {
                                 @Param("activatedAt") java.time.OffsetDateTime activatedAt,
                                 @Param("activatedBy") String activatedBy);
 
+    @Delete("DELETE FROM alphafrog_config_active WHERE type_id = #{typeId}")
+    int deleteByType(@Param("typeId") Integer typeId);
+
+    @Delete("DELETE FROM alphafrog_config_active WHERE type_id = #{typeId} AND snapshot_id = #{expectedSnapshotId}")
+    int deleteIfSnapshotMatches(@Param("typeId") Integer typeId,
+                                @Param("expectedSnapshotId") Integer expectedSnapshotId);
+
     @Select("SELECT * FROM alphafrog_config_active WHERE type_id = #{typeId}")
     @Results(id = "configActiveResult", value = {
             @Result(property = "typeId", column = "type_id"),

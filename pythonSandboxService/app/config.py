@@ -1,8 +1,270 @@
 from __future__ import annotations
 
+import logging
+import math
 import os
+import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
+
+
+# --- MethodSpec V5 output limits (Spec §7.1/§7.2, frozen contract §13) -----
+# Verbatim camelCase keys used in python-sandbox.json / Nacos payloads and in
+# the per-task snapshot. Contract §13 fixes the exact spelling:
+# recordChannelMaxRecords/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes.
+OUTPUT_LIMIT_KEYS: tuple[str, ...] = (
+    "stdoutMaxBytes",
+    "stderrMaxBytes",
+    "recordChannelMaxBytes",
+    "recordChannelMaxRecords",
+)
+
+# Application defaults. These mirror the *shape* of the Spec §7.1 wrapper
+# input example (numbers only denote shape, 数字只表示形状). The production
+# numbers must be confirmed by the four-stage tests (subprocess / Python HTTP
+# / Java gateway-Dubbo / Java parse-save, Spec §7.1 & contract §13: 生产默认
+# 取四段最小已验证值并留余量；正式数字必须由工作包 C/D 的四段测试确认，本协议
+# 不编造生产值). Do not raise them until those tests exist.
+DEFAULT_OUTPUT_LIMITS: dict[str, int] = {
+    "stdoutMaxBytes": 1048576,
+    "stderrMaxBytes": 262144,
+    "recordChannelMaxBytes": 262144,
+    "recordChannelMaxRecords": 128,
+}
+
+# Static hard ceilings, written in code (Spec §7.1: 静态硬上限写在代码或启动
+# 配置里，Nacos 只能调低或调到硬上限，不能提高硬上限; contract §13: 静态硬上限
+# 只能被 Nacos 调低，不能被动态配置提高). Until the four-stage tests confirm
+# real numbers, the ceilings are pinned AT the application defaults so no
+# dynamic config can raise any limit above what the code ships with. Raising a
+# ceiling requires a code change backed by four-stage test evidence.
+HARD_OUTPUT_LIMIT_CEILINGS: dict[str, int] = {
+    "stdoutMaxBytes": 1048576,
+    "stderrMaxBytes": 262144,
+    "recordChannelMaxBytes": 262144,
+    "recordChannelMaxRecords": 128,
+}
+
+
+# --- AF_SANDBOX_IMAGE reference policy (MethodSpec V5, Spec §12) -------------
+# Production AF_SANDBOX_IMAGE must be a sha256 digest reference; a bare tag is
+# permitted only behind the explicit, independent dev-allow switch
+# AF_SANDBOX_IMAGE_ALLOW_DEV_TAG (accepted values: true/1). There is NO silent
+# fallback to `latest`.
+#
+# These helpers mirror scripts/build_runtime_manifest.py's is_digest_reference /
+# validate_af_sandbox_image with identical semantics. They are implemented here
+# (plain stdlib, no pydantic) because scripts/ is not an importable package.
+# The identical semantics are also pinned over the same accept/reject vectors
+# (tests/digest_reference_vectors.py) for the shell entry points
+# (deploy_latest.sh / docker_build.sh via scripts/af_digest_reference.sh).
+#
+# A pinned runtime image ref must be EXACTLY ``<repo>@sha256:<64 lowercase
+# hex>``: anchored full match over the ENTIRE string (no leading/trailing
+# content), lowercase-only hex. Grammar mirrors the Docker reference grammar
+# (conservative lowercase-only form, see scripts/build_runtime_manifest.py).
+_PATH_COMPONENT = r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+_DIGEST_REFERENCE_RE = re.compile(
+    # Optional leading registry host component (may carry a numeric port),
+    # e.g. "registry.local/" or "registry.local:5000/". A port is only
+    # accepted when a path component follows it ("host:5000" alone is not a
+    # plausible repository).
+    r"(?:%s(?::[0-9]+)?/)?" % _PATH_COMPONENT
+    # At least one path component, then any number of further components.
+    # Components are non-empty, so there can be no leading/trailing slash,
+    # no empty "//" components, no whitespace and no control characters.
+    + _PATH_COMPONENT
+    + r"(?:/%s)*" % _PATH_COMPONENT
+    # Digest: "@sha256:" + exactly 64 LOWERCASE hex chars; the fullmatch
+    # anchors both ends (trailing hex chars or ":latest" are rejected).
+    + r"@sha256:[0-9a-f]{64}"
+)
+
+# A syntactically VALID bare tag/reference (admitted ONLY under the explicit
+# dev-allow switch; Spec §12 round-2 R2-4): ``<repo>[:<tag>]`` over the same
+# conservative lowercase path grammar. No ``@`` anywhere -- anything
+# digest-shaped must satisfy the anchored digest grammar EVEN UNDER the dev
+# switch. Tag grammar per the conservative Docker reference form.
+_BARE_TAG = r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
+_DEV_TAG_REFERENCE_RE = re.compile(
+    r"(?:%s(?::[0-9]+)?/)?" % _PATH_COMPONENT
+    + _PATH_COMPONENT
+    + r"(?:/%s)*" % _PATH_COMPONENT
+    + r"(?::%s)?" % _BARE_TAG
+)
+
+# Exact accepted values for AF_SANDBOX_IMAGE_ALLOW_DEV_TAG (Spec §12: the
+# dev-allow must be an independent, explicit switch -- never implicit).
+_DEV_TAG_ALLOW_VALUES = {"true", "1"}
+
+
+def is_digest_reference(value: str) -> bool:
+    """Return True iff ``value`` is a complete sha256 digest reference.
+
+    The ENTIRE string must be ``<repo>@sha256:<64 lowercase hex>`` (anchored
+    full match, lowercase-only), e.g.
+    ``registry.local/alphafrog/runtime@sha256:<64hex>``. Uppercase hex, a
+    wrong hex length, or any leading/trailing content is rejected.
+    """
+    if not isinstance(value, str):
+        return False
+    return _DIGEST_REFERENCE_RE.fullmatch(value) is not None
+
+
+def is_valid_dev_reference(value: str) -> bool:
+    """Return True iff ``value`` is a syntactically VALID bare tag/reference.
+
+    This is the ONLY shape the explicit dev-allow switch admits (Spec §12
+    round-2 R2-4): ``<repo>[:<tag>]`` over the conservative lowercase path
+    grammar, anchored full match. Empty values, whitespace or control
+    characters, uppercase repositories and malformed tags are rejected;
+    anything ``@``-bearing is digest-shaped and must satisfy the anchored
+    lowercase digest grammar EVEN UNDER the dev switch (rejected here).
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    return _DEV_TAG_REFERENCE_RE.fullmatch(value) is not None
+
+
+def validate_sandbox_image(value: str, *, allow_dev_tag: bool) -> None:
+    """Validate an ``AF_SANDBOX_IMAGE`` reference (Spec §12).
+
+    Digest references are always accepted. The dev-allow switch admits ONLY a
+    syntactically valid bare tag/reference (``is_valid_dev_reference``) -- it
+    is NOT a blanket bypass (Spec §12 round-2 R2-4): empty values,
+    whitespace/control characters, wrong digest lengths, uppercase digests
+    and arbitrary garbage are ALWAYS rejected, and anything digest-shaped but
+    not an anchored-lowercase-64hex digest reference is rejected EVEN UNDER
+    the switch. Raises ``ValueError`` otherwise; never falls back silently to
+    ``latest``.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "AF_SANDBOX_IMAGE must be a non-empty image reference; got %r. "
+            "There is no implicit default and no silent fallback to 'latest' "
+            "(Spec §12)." % (value,)
+        )
+    if is_digest_reference(value):
+        return
+    if "@" in value:
+        raise ValueError(
+            "AF_SANDBOX_IMAGE %r is digest-shaped but is NOT a valid anchored "
+            "sha256:<64 lowercase hex> digest reference; such values are "
+            "rejected EVEN UNDER the dev-allow switch (Spec §12 R2-4)."
+            % (value,)
+        )
+    if allow_dev_tag and is_valid_dev_reference(value):
+        return
+    raise ValueError(
+        "AF_SANDBOX_IMAGE must be a sha256 digest reference "
+        "(e.g. repo/name@sha256:<64hex>); got bare/undigested reference %r. "
+        "Set AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true (or 1) to permit a development "
+        "tag. Spec §12: production requires a digest reference and must never "
+        "silently fall back to 'latest'." % (value,)
+    )
+
+
+# --- AF_SANDBOX_IMAGE_VERIFY_MODE (260814 scheduler-03, Spec §14.2) ----------
+# Single-machine default mode: AF_SANDBOX_IMAGE must be a LOCAL immutable
+# Image ID (``sha256:<64 lowercase hex>``, no repository prefix). The service
+# refuses to start unless the configured ID exists on the host (verified via
+# the mounted Docker socket at startup, see runtime_image_verify.py). A mutable
+# tag is NEVER accepted in this mode -- there is no dev-allow escape, because
+# local-image-id IS the officially supported single-machine mode.
+#
+# ``strict-release`` keeps the pre-existing Spec §12 digest-reference policy
+# (including the independent AF_SANDBOX_IMAGE_ALLOW_DEV_TAG switch) for the
+# future registry-based release chain. The two modes are independent: enabling
+# strict-release must not silently re-enable tag acceptance in local mode and
+# vice versa.
+_VERIFY_MODE_LOCAL_IMAGE_ID = "local-image-id"
+_VERIFY_MODE_STRICT_RELEASE = "strict-release"
+_VERIFY_MODES = frozenset({_VERIFY_MODE_LOCAL_IMAGE_ID, _VERIFY_MODE_STRICT_RELEASE})
+
+# A local Docker Image ID is EXACTLY ``sha256:`` + 64 lowercase hex chars.
+# ``docker image inspect`` on the host returns this form; nothing shorter,
+# longer, uppercase or repo-prefixed is a local Image ID.
+_LOCAL_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def validate_local_image_id(value: str) -> None:
+    """Validate an ``AF_SANDBOX_IMAGE`` value in local-image-id mode.
+
+    Only a complete local Image ID (``sha256:<64 lowercase hex>``) is
+    accepted. Registry digest references (``repo@sha256:...``), bare tags and
+    everything else are rejected -- in this mode the value must BE the local
+    ID, not something that resolves to one.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "AF_SANDBOX_IMAGE must be a local Image ID "
+            "(sha256:<64 lowercase hex>) in local-image-id mode; got %r. "
+            "There is no implicit default and no tag fallback." % (value,)
+        )
+    if _LOCAL_IMAGE_ID_RE.fullmatch(value):
+        return
+    if value.startswith("sha256:") or "@sha256:" in value:
+        raise ValueError(
+            "AF_SANDBOX_IMAGE %r is not a valid local Image ID: local-image-id "
+            "mode requires exactly sha256:<64 lowercase hex> with no "
+            "repository prefix. Registry digest references belong to "
+            "strict-release mode (AF_SANDBOX_IMAGE_VERIFY_MODE=strict-release)."
+            % (value,)
+        )
+    raise ValueError(
+        "AF_SANDBOX_IMAGE %r is not a local Image ID and not a digest "
+        "reference: local-image-id mode requires sha256:<64 lowercase hex>. "
+        "Bare tags are never accepted in this mode." % (value,)
+    )
+
+
+def reject_root_container_user(user: str) -> None:
+    """Reject any docker ``user[:group]`` spelling that still means root.
+
+    260818 non-root simplification + grace review: docker accepts
+    ``user[:group]`` where each side may be a name OR a numeric id, so the
+    check must parse both sides independently — ``root:10001`` (uid 0) and
+    ``alphafrog-sandbox:root`` (gid 0) are legal docker spellings that
+    still produce root.  Rejected fail-fast: name ``root`` on either side
+    (case-insensitive), numeric ``0`` on either side, empty fields, extra
+    colons, or any other malformed shape.
+
+    Public because app.container_copy reuses this exact parser for the
+    runtime root-exec guard — one grammar, no drift between the startup
+    config check and the runtime check (grace round-3 MUST-FIX 2).
+    """
+
+    def _reject_field(field: str, kind: str) -> None:
+        if field == "":
+            raise ValueError(
+                f"AF_SANDBOX_CHILD_USER has an empty {kind} field: the "
+                "sandbox container user must be a username or uid:gid pair"
+            )
+        if field.lower() == "root":
+            raise ValueError(
+                f"AF_SANDBOX_CHILD_USER must not name root as the {kind}: "
+                "the sandbox container is always created as an unprivileged "
+                "user"
+            )
+        if field.isdigit() and int(field) == 0:
+            raise ValueError(
+                f"AF_SANDBOX_CHILD_USER must not have a zero {kind}: the "
+                "sandbox container is always created as an unprivileged user"
+            )
+
+    parts = user.split(":")
+    if len(parts) > 2:
+        raise ValueError(
+            "AF_SANDBOX_CHILD_USER must be 'user' or 'user:group' — extra "
+            "colons are malformed"
+        )
+    _reject_field(parts[0], "user")
+    if len(parts) == 2:
+        _reject_field(parts[1], "group")
 
 
 @dataclass(frozen=True)
@@ -18,6 +280,11 @@ class SandboxConfig:
     sandbox_image: str
     skip_environment_setup: bool
     preinstalled_libraries: frozenset[str]
+    # Per-container concurrency: how many Python tasks may execute concurrently
+    # inside a single warm container. Default 5; set to 1 for the legacy serial
+    # behavior. Values >1 require compat_input_path_enabled=False (global symlink
+    # would otherwise collide across concurrent tasks).
+    container_max_concurrency: int
     # Pool config
     pool_enabled: bool
     pool_min_size: int
@@ -27,6 +294,139 @@ class SandboxConfig:
     pool_max_container_uses: int | None
     workspace_root: str
     compat_input_path_enabled: bool
+    standard_memory_limit_bytes: int = 512 * 1024 * 1024
+    heavy_memory_limit_bytes: int = 1536 * 1024 * 1024
+    queue_wait_timeout_seconds: float = 30.0
+    usage_sampling_interval_millis: int = 200
+    task_store_path: Path = Path("/data/sandbox_tasks/state.json")
+    # D13 (26Q3): bounded acceptance queue. create rejects with HTTP 503
+    # when the queue already holds queue_max_size waiting tasks, making
+    # capacity exhaustion machine-observable (frozen D13 category
+    # OVERLOADED_OR_UNAVAILABLE). The post-acceptance queue-wait timeout
+    # (queue_wait_timeout_seconds) remains a 200-data terminal outcome.
+    queue_max_size: int = 128
+    # D13 (26Q3, Cindy 91490076 MUST-FIX 3 execution-entry side): hard
+    # per-task timeout ceiling enforced at the execution entry. The value is
+    # aligned with the Gateway-side platform max key
+    # `sandbox.service.max-task-timeout-millis` (default 30min = 1800s,
+    # ccmax ac601ddd); release config must lock both ends to the same value
+    # to avoid runtime drift (Cindy 8e21955c). Rejection threshold is
+    # `effective > max` — the Gateway long-read margin is NOT part of the
+    # business limit (Cindy 6a6e6158). Both legacy timeout_seconds and
+    # canonical timeout_millis are subject to this ceiling after they are
+    # normalized in create_task; tasks created with BOTH timeout fields
+    # absent are frozen to execution_timeout_seconds at create time and are
+    # subject to the same ceiling (codex 5457b713 MUST-FIX 2). The ceiling
+    # itself must be finite: load_config rejects inf/nan/<=0 (codex
+    # 5457b713). Release binding uses the canonical companion key
+    # AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS with fail-fast equivalence
+    # checking in load_config (codex 5457b713 MUST-FIX 1).
+    max_task_timeout_seconds: float = 1800.0
+    # D14 (Q-14): production refuses create without operation_id by default.
+    # Set AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true only for explicitly
+    # annotated non-production fixtures (no global capacity admission, no
+    # idempotent recovery — must not be pointed at production clients).
+    allow_create_without_operation_id: bool = False
+    # MethodSpec V5 sandbox output limits (Spec §7.2 / contract §13).
+    # Application defaults; the dynamic (Nacos) layer may only lower these or
+    # clamp them down to HARD_OUTPUT_LIMIT_CEILINGS, never raise them.
+    stdout_max_bytes: int = DEFAULT_OUTPUT_LIMITS["stdoutMaxBytes"]
+    stderr_max_bytes: int = DEFAULT_OUTPUT_LIMITS["stderrMaxBytes"]
+    record_channel_max_bytes: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxBytes"]
+    record_channel_max_records: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxRecords"]
+    # 260814 scheduler-03: which image reference policy validates and pins
+    # sandbox_image at startup: local-image-id (default, single machine) or
+    # strict-release (registry digest chain, Spec §12).
+    verify_mode: str = _VERIFY_MODE_LOCAL_IMAGE_ID
+    # 260817 non-root simplification: the sandbox container is CREATED as
+    # this user (docker --user semantics; "alphafrog-sandbox" = uid 10000/
+    # gid 10001 baked into the runtime image). Everything inside the
+    # container — wrapper and user code alike — runs with this single
+    # unprivileged identity; there is no in-container privilege drop.
+    # load_config always passes the AF_SANDBOX_CHILD_USER-derived value
+    # explicitly; the default only exists so test constructors stay small.
+    container_user: str = "alphafrog-sandbox"
+    # Optional cross-check (local-image-id mode only): a mutable tag that must
+    # currently resolve to the SAME local Image ID at startup. Resolution
+    # happens exactly once; task creation never re-resolves it.
+    image_tag_check: str = ""
+
+
+# --- D13 (26Q3) release timeout binding keys --------------------------------
+# AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS (Python ceiling) and the canonical
+# companion AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS (same substitution source as
+# the Gateway key `sandbox.service.max-task-timeout-millis`) must be bound
+# to ONE canonical release value by the deployment layer (docker-compose
+# substitution; ccmax single-writer release-binding commit per codex
+# a1b749ad). Python fail-fast closes drift at startup: when the companion is
+# present it must equal seconds * 1000 EXACTLY (codex 5457b713 MUST-FIX 1).
+MAX_TASK_TIMEOUT_SECONDS_ENV = "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS"
+MAX_TASK_TIMEOUT_MILLIS_ENV = "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS"
+DEFAULT_MAX_TASK_TIMEOUT_SECONDS = "1800"
+
+
+def validate_max_task_timeout_binding(
+    seconds_raw: str | None,
+    millis_raw: str | None,
+) -> float:
+    """Validate the D13 release timeout binding; return the ceiling seconds.
+
+    MUST-FIX 1 (codex 5457b713): the Gateway key
+    ``sandbox.service.max-task-timeout-millis`` and the Python key
+    ``AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS`` must NOT be two independently
+    overridable defaults. The deployment layer injects the SAME canonical
+    millis value into both services; when the canonical companion
+    ``AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS`` is present, startup FAILS unless
+    it is finite, positive and EXACTLY ``seconds * 1000`` (decimal-exact
+    comparison -- no float epsilon). An absent companion stays permitted for
+    dev/test environments; release presence is enforced by the compose
+    contract test in the release-binding commit, not here.
+
+    MUST-FIX 2 (codex 5457b713): the ceiling itself must be finite -- the
+    pre-fix ``<= 0`` check accepted ``inf`` (and ``nan``), silently
+    disabling the ceiling.
+
+    Reusable seam: the compose contract test calls this same function so the
+    release-binding evidence exercises the production validation path.
+    """
+    if seconds_raw is None:
+        seconds_raw = DEFAULT_MAX_TASK_TIMEOUT_SECONDS
+    try:
+        seconds_dec = Decimal(seconds_raw.strip())
+    except InvalidOperation as error:
+        raise ValueError(
+            f"{MAX_TASK_TIMEOUT_SECONDS_ENV} must be a number; got {seconds_raw!r}"
+        ) from error
+    seconds_value = float(seconds_dec)
+    if (
+        not seconds_dec.is_finite()
+        or not math.isfinite(seconds_value)
+        or seconds_value <= 0
+    ):
+        raise ValueError(
+            f"{MAX_TASK_TIMEOUT_SECONDS_ENV} must be a finite positive number; "
+            f"got {seconds_raw!r}"
+        )
+    if millis_raw is not None and millis_raw.strip():
+        try:
+            millis_dec = Decimal(millis_raw.strip())
+        except InvalidOperation as error:
+            raise ValueError(
+                f"{MAX_TASK_TIMEOUT_MILLIS_ENV} must be a number; got {millis_raw!r}"
+            ) from error
+        if not millis_dec.is_finite() or millis_dec <= 0:
+            raise ValueError(
+                f"{MAX_TASK_TIMEOUT_MILLIS_ENV} must be a finite positive "
+                f"number; got {millis_raw!r}"
+            )
+        if millis_dec != seconds_dec * 1000:
+            raise ValueError(
+                "release timeout binding mismatch: "
+                f"{MAX_TASK_TIMEOUT_MILLIS_ENV}={millis_raw!r} must equal "
+                f"{MAX_TASK_TIMEOUT_SECONDS_ENV}={seconds_raw!r} * 1000 "
+                f"(expected {seconds_dec * 1000})"
+            )
+    return seconds_value
 
 
 def load_config() -> SandboxConfig:
@@ -38,7 +438,66 @@ def load_config() -> SandboxConfig:
     docker_backend = os.getenv("AF_SANDBOX_BACKEND", "docker")
     workdir = os.getenv("AF_SANDBOX_WORKDIR", "/sandbox")
     log_level = os.getenv("AF_SANDBOX_LOG_LEVEL", "INFO")
-    sandbox_image = os.getenv("AF_SANDBOX_IMAGE", "alphafrog-sandbox-runtime:latest")
+    # 260817 non-root simplification: container-level unprivileged user
+    # (docker --user). Accepts a username or uid:gid pair, resolved by the
+    # container runtime against the runtime image's passwd database.
+    container_user = os.getenv("AF_SANDBOX_CHILD_USER", "alphafrog-sandbox").strip()
+    if not container_user:
+        raise ValueError(
+            "AF_SANDBOX_CHILD_USER must not be empty: the sandbox container "
+            "is always created as this unprivileged user (set it to "
+            "'alphafrog-sandbox' or a uid:gid pair, or unset it for the "
+            "default)"
+        )
+    reject_root_container_user(container_user)
+    # Spec §12: AF_SANDBOX_IMAGE has NO implicit default (the pre-§12 silent
+    # fallback to "alphafrog-sandbox-runtime:latest" is removed).
+    # 260814 scheduler-03: which reference grammar applies is selected by
+    # AF_SANDBOX_IMAGE_VERIFY_MODE -- local-image-id (default) requires a bare
+    # local Image ID; strict-release keeps the Spec §12 digest-reference policy
+    # (with the independent AF_SANDBOX_IMAGE_ALLOW_DEV_TAG dev switch).
+    sandbox_image = os.getenv("AF_SANDBOX_IMAGE", "").strip()
+    verify_mode = (
+        os.getenv("AF_SANDBOX_IMAGE_VERIFY_MODE", _VERIFY_MODE_LOCAL_IMAGE_ID)
+        .strip()
+        .lower()
+    )
+    image_tag_check = os.getenv("AF_SANDBOX_IMAGE_TAG_CHECK", "").strip()
+    sandbox_image_allow_dev_tag = (
+        os.getenv("AF_SANDBOX_IMAGE_ALLOW_DEV_TAG", "").strip().lower()
+        in _DEV_TAG_ALLOW_VALUES
+    )
+    if verify_mode not in _VERIFY_MODES:
+        raise ValueError(
+            "AF_SANDBOX_IMAGE_VERIFY_MODE must be one of %s; got %r."
+            % (sorted(_VERIFY_MODES), verify_mode)
+        )
+    if not sandbox_image:
+        raise ValueError(
+            "AF_SANDBOX_IMAGE must be set explicitly; there is no implicit "
+            "default and no silent fallback to 'latest' (Spec §12). "
+            "local-image-id mode requires a local Image ID "
+            "(sha256:<64 lowercase hex>); strict-release requires a sha256 "
+            "digest reference, e.g. registry.example/alphafrog/runtime@sha256:<64hex>."
+        )
+    if verify_mode == _VERIFY_MODE_LOCAL_IMAGE_ID:
+        validate_local_image_id(sandbox_image)
+        if image_tag_check and not is_valid_dev_reference(image_tag_check):
+            raise ValueError(
+                "AF_SANDBOX_IMAGE_TAG_CHECK must be a valid bare tag/reference "
+                "(e.g. alphafrog-sandbox-runtime:latest); got %r."
+                % (image_tag_check,)
+            )
+    else:
+        validate_sandbox_image(sandbox_image, allow_dev_tag=sandbox_image_allow_dev_tag)
+        if image_tag_check:
+            raise ValueError(
+                "AF_SANDBOX_IMAGE_TAG_CHECK is only supported in "
+                "local-image-id mode; remove it or switch "
+                "AF_SANDBOX_IMAGE_VERIFY_MODE. strict-release has its own "
+                "digest verification chain (Spec §12) and does not resolve "
+                "mutable tags."
+            )
     skip_environment_setup = _parse_bool(os.getenv("AF_SANDBOX_SKIP_ENVIRONMENT_SETUP"), default=True)
     preinstalled_libraries = frozenset(
         item.strip().lower()
@@ -48,6 +507,11 @@ def load_config() -> SandboxConfig:
         ).split(",")
         if item.strip()
     )
+    container_max_concurrency = int(os.getenv("AF_SANDBOX_CONTAINER_MAX_CONCURRENCY", "1"))
+    if container_max_concurrency < 1:
+        raise ValueError(
+            f"Invalid container_max_concurrency ({container_max_concurrency}): must be >= 1."
+        )
     # Pool config (default disabled for safe rollout)
     pool_enabled = _parse_bool(os.getenv("AF_SANDBOX_POOL_ENABLED"), default=False)
     pool_min_size = int(os.getenv("AF_SANDBOX_POOL_MIN_SIZE", "2"))
@@ -57,6 +521,24 @@ def load_config() -> SandboxConfig:
     pool_max_container_uses = _parse_int_or_none(os.getenv("AF_SANDBOX_POOL_MAX_CONTAINER_USES"))
     workspace_root = os.getenv("AF_SANDBOX_WORKSPACE_ROOT", "/sandbox/runs")
     compat_input_path_enabled = _parse_bool(os.getenv("AF_SANDBOX_COMPAT_INPUT_PATH"), default=True)
+    standard_memory_limit_bytes = int(os.getenv("AF_SANDBOX_STANDARD_MEMORY_BYTES", str(512 * 1024 * 1024)))
+    heavy_memory_limit_bytes = int(os.getenv("AF_SANDBOX_HEAVY_MEMORY_BYTES", str(1536 * 1024 * 1024)))
+    queue_wait_timeout_seconds = float(os.getenv("AF_SANDBOX_QUEUE_WAIT_TIMEOUT", "30"))
+    usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
+    task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
+    queue_max_size = int(os.getenv("AF_SANDBOX_QUEUE_MAX_SIZE", "128"))
+    # D14 (Q-14): default false = production refuse create without operation_id.
+    # Explicit true only for annotated non-production fixtures.
+    allow_create_without_operation_id = _parse_bool(
+        os.getenv("AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID"),
+        default=False,
+    )
+    # D13 (26Q3, codex 5457b713): finite/positive ceiling + canonical
+    # companion equivalence (MUST-FIX 1/2) are validated in the shared seam.
+    max_task_timeout_seconds = validate_max_task_timeout_binding(
+        os.getenv(MAX_TASK_TIMEOUT_SECONDS_ENV),
+        os.getenv(MAX_TASK_TIMEOUT_MILLIS_ENV),
+    )
 
     # Config validation
     if pool_enabled and pool_min_size > pool_max_size:
@@ -64,6 +546,39 @@ def load_config() -> SandboxConfig:
             f"Invalid pool config: pool_min_size ({pool_min_size}) > pool_max_size ({pool_max_size}). "
             f"Ensure AF_SANDBOX_POOL_MIN_SIZE <= AF_SANDBOX_POOL_MAX_SIZE."
         )
+    if standard_memory_limit_bytes <= 0 or heavy_memory_limit_bytes <= standard_memory_limit_bytes:
+        raise ValueError("Sandbox memory limits must be positive and HEAVY must exceed STANDARD")
+    if queue_wait_timeout_seconds <= 0:
+        raise ValueError("AF_SANDBOX_QUEUE_WAIT_TIMEOUT must be positive")
+    if usage_sampling_interval_millis <= 0:
+        raise ValueError("AF_SANDBOX_USAGE_SAMPLE_MILLIS must be positive")
+    if queue_max_size < 1:
+        raise ValueError("AF_SANDBOX_QUEUE_MAX_SIZE must be >= 1")
+    # D13 (26Q3, codex 5457b713 MUST-FIX 2): execution_timeout_seconds is
+    # the FINAL effective timeout for tasks created with both timeout fields
+    # absent (frozen at create time, see main.create_task). It must
+    # therefore be finite, positive and within the hard ceiling; a
+    # configured default above the ceiling is a startup-time contradiction,
+    # not a per-request discovery.
+    if not math.isfinite(execution_timeout) or execution_timeout <= 0:
+        raise ValueError(
+            "AF_SANDBOX_EXECUTION_TIMEOUT must be a finite positive number"
+        )
+    if execution_timeout > max_task_timeout_seconds:
+        raise ValueError(
+            f"AF_SANDBOX_EXECUTION_TIMEOUT ({execution_timeout}) must not exceed "
+            f"{MAX_TASK_TIMEOUT_SECONDS_ENV} ({max_task_timeout_seconds}): the "
+            "configured default execution timeout is the final effective timeout "
+            "for tasks created without an explicit timeout."
+        )
+    if container_max_concurrency > 1 and compat_input_path_enabled:
+        # The global /sandbox/input symlink would be overwritten by concurrent tasks.
+        logger.warning(
+            "container_max_concurrency=%s > 1 is incompatible with compat_input_path_enabled=True; "
+            "disabling compat_input_path_enabled automatically.",
+            container_max_concurrency,
+        )
+        compat_input_path_enabled = False
     return SandboxConfig(
         data_dir=data_dir,
         max_concurrency=max_concurrency,
@@ -74,8 +589,12 @@ def load_config() -> SandboxConfig:
         workdir=workdir,
         log_level=log_level,
         sandbox_image=sandbox_image,
+        container_user=container_user,
+        verify_mode=verify_mode,
+        image_tag_check=image_tag_check,
         skip_environment_setup=skip_environment_setup,
         preinstalled_libraries=preinstalled_libraries,
+        container_max_concurrency=container_max_concurrency,
         pool_enabled=pool_enabled,
         pool_min_size=pool_min_size,
         pool_max_size=pool_max_size,
@@ -84,6 +603,14 @@ def load_config() -> SandboxConfig:
         pool_max_container_uses=pool_max_container_uses,
         workspace_root=workspace_root,
         compat_input_path_enabled=compat_input_path_enabled,
+        standard_memory_limit_bytes=standard_memory_limit_bytes,
+        heavy_memory_limit_bytes=heavy_memory_limit_bytes,
+        queue_wait_timeout_seconds=queue_wait_timeout_seconds,
+        usage_sampling_interval_millis=usage_sampling_interval_millis,
+        task_store_path=task_store_path,
+        queue_max_size=queue_max_size,
+        max_task_timeout_seconds=max_task_timeout_seconds,
+        allow_create_without_operation_id=allow_create_without_operation_id,
     )
 
 

@@ -1,0 +1,60 @@
+base_url: "http://localhost:8090"
+username: "stress_test_1"
+password: "replace-with-password"
+question: "帮我分析沪深300最近走势，并说明可能用到的数据。"
+
+login_endpoint: "/api/auth/login"
+logout_endpoint: "/api/auth/logout"
+create_endpoint: "/api/agent/runs"
+stream_endpoint_template: "/api/agent/runs/{run_id}/stream"
+status_endpoint_template: "/api/agent/runs/{run_id}/status"
+events_endpoint_template: "/api/agent/runs/{run_id}/events"
+timeline_endpoint_template: "/api/agent/runs/{run_id}/timeline"
+result_endpoint_template: "/api/agent/runs/{run_id}/result"
+cancel_endpoint_template: "/api/agent/runs/{run_id}:cancel"
+observability_full_endpoint_template: "/api/agent/runs/{run_id}/observability/full"
+
+request_timeout_seconds: 30
+stream_idle_timeout_seconds: 300
+refresh_seconds: 0.5
+max_trace_lines: 14
+max_warning_lines: 4
+result_preview_chars: 280
+
+debug:
+  logs: false
+  output_root: "af_light_client/output"
+  tui_snapshots:
+    enabled: false
+    # Use either interval_seconds (> 1) or interval_ms (> 200).
+    interval_seconds: 2
+    # Roll to a new tui_batch0XX.txt file on this cadence.
+    batch_interval_ms: 60000
+
+llm:
+  # endpointName / modelName / provider 会直接进入 create run 请求体。
+  # stage_config 保持压测配置写法，发送请求时会序列化为 stage_config_json 字符串。
+  # 字段名和 test_scripts/agent-v1p0 的压测配置保持一致。
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: alibaba
+  stage_config:
+    planning:
+      endpointName: openrouter
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks, moonshotai/int4]
+    final_answer:
+      endpointName: openrouter
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks, moonshotai/int4]
+
+create_body:
+  # 高级覆盖层：这里的同名字段会覆盖 llm，适合临时调整或传递后端新增字段。
+  captureLlmRequests: true
+  context:
+    locale: zh-CN
+    timezone: Asia/Shanghai
+    config:
+      webSearch:
+        enabled: true
+        backend: auto

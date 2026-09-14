@@ -22,7 +22,7 @@ public class JudgeModelSelectorService {
     public List<Selection> selectCandidates() {
         AgentLlmProperties local = localConfigLoader.current().orElse(null);
         AgentLlmProperties.Judge judge = chooseJudge(properties, local);
-        if (judge == null || judge.getRoutes() == null || judge.getRoutes().isEmpty()) {
+        if (judge == null || Boolean.FALSE.equals(judge.getEnabled()) || judge.getRoutes() == null || judge.getRoutes().isEmpty()) {
             return List.of();
         }
         List<Selection> candidates = new ArrayList<>();

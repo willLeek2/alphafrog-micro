@@ -7,12 +7,14 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowExecutor;
-import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowExecutor;
+import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.execution.LangchainWorkflowRequest;
+import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
+import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 
 import java.util.ArrayList;
@@ -32,26 +34,21 @@ import static org.mockito.Mockito.when;
 class LangchainC1ParityIntegrationTest {
 
     private final LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-            LangchainTestFixtures.planner(),
             LangchainTestFixtures.todoNodeExecutor(),
             noopExecutionGuard(),
-            mock(AgentEventService.class)
+            mock(AgentRunEventService.class)
     );
 
     @Test
     void linear_simple_success_matchesLegacyOutcomeShape() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {
-                  "analysis": "single todo",
-                  "items": [{"id":"t1","sequence":1,"description":"查询 512800.SH 最近一周走势"}]
-                }
-                """,
                 "{\"ok\":true,\"data\":{\"dataset_id\":\"ds_etf_daily\"}}",
                 "512800.SH 最近一周呈震荡上行。"
         );
 
-        LangchainLinearWorkflowResult result = executor.execute(request(model, "查询 512800.SH 最近一周走势"));
+        LangchainWorkflowResult result = executor.executePlanned(
+                request(model, "查询 512800.SH 最近一周走势"),
+                singleTodoPlan("查询 512800.SH 最近一周走势"));
 
         assertLegacyAlignedSuccess(result, "512800.SH 最近一周呈震荡上行。");
         assertThat(result.getCompletedTodos()).hasSize(1);
@@ -61,14 +58,13 @@ class LangchainC1ParityIntegrationTest {
     @Test
     void empty_final_answer_failed_matchesLegacyFailureShape() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {"analysis":"x","items":[{"id":"t1","sequence":1,"description":"分析某只股票"}]}
-                """,
                 "{\"ok\":true,\"data\":{}}",
                 "   "
         );
 
-        LangchainLinearWorkflowResult result = executor.execute(request(model, "分析某只股票"));
+        LangchainWorkflowResult result = executor.executePlanned(
+                request(model, "分析某只股票"),
+                singleTodoPlan("分析某只股票"));
 
         assertLegacyAlignedFailure(result);
         assertThat(result.getFailureReason()).isEqualTo("empty_final_answer");
@@ -77,21 +73,20 @@ class LangchainC1ParityIntegrationTest {
     @Test
     void empty_todo_output_failed_matchesLegacyTodoFailureSemantics() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {"analysis":"x","items":[{"id":"t1","sequence":1,"description":"查询"}]}
-                """,
                 ""
         );
 
-        LangchainLinearWorkflowResult result = executor.execute(request(model, "查询"));
+        LangchainWorkflowResult result = executor.executePlanned(
+                request(model, "查询"),
+                singleTodoPlan("查询"));
 
         assertLegacyAlignedFailure(result);
-        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:t1");
+        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output_after_recovery:t1");
         assertThat(result.getFinalAnswer()).isBlank();
     }
 
-    private static LangchainLinearWorkflowRequest request(QueueChatModel model, String goal) {
-        return LangchainLinearWorkflowRequest.builder()
+    private static LangchainWorkflowRequest request(QueueChatModel model, String goal) {
+        return LangchainWorkflowRequest.builder()
                 .runId("run-parity-1")
                 .userId("u1")
                 .userGoal(goal)
@@ -99,7 +94,17 @@ class LangchainC1ParityIntegrationTest {
                 .build();
     }
 
-    private static void assertLegacyAlignedSuccess(LangchainLinearWorkflowResult result, String expectedAnswer) {
+    private static LangchainTodoPlan singleTodoPlan(String description) {
+        return LangchainTodoPlan.builder()
+                .items(List.of(TodoItem.builder()
+                        .id("t1")
+                        .sequence(1)
+                        .description(description)
+                        .build()))
+                .build();
+    }
+
+    private static void assertLegacyAlignedSuccess(LangchainWorkflowResult result, String expectedAnswer) {
         assertThat(result.isSuccess()).isTrue();
         assertThat(result.getFinalAnswer()).isEqualTo(expectedAnswer);
         assertThat(result.getFailureReason()).isNull();
@@ -107,7 +112,7 @@ class LangchainC1ParityIntegrationTest {
         assertThat(result.getPlan().getItems()).isNotEmpty();
     }
 
-    private static void assertLegacyAlignedFailure(LangchainLinearWorkflowResult result) {
+    private static void assertLegacyAlignedFailure(LangchainWorkflowResult result) {
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFinalAnswer()).isBlank();
         assertThat(result.getFailureReason()).isNotBlank();

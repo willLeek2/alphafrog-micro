@@ -5,7 +5,6 @@ bash domesticStockService/docker_build.sh
 bash domesticListedAssetService/docker_build.sh
 bash adminService/docker_build.sh
 bash portfolioService/docker_build.sh
-bash agentService/docker_build.sh
 bash pythonSandboxService/docker_build.sh
 bash pythonSandboxGatewayService/docker_build.sh
 bash frontend/docker_build.sh

@@ -10,5 +10,6 @@ public class AgentRunEvent {
     private Integer seq;
     private String eventType;
     private String payloadJson; // JSON string
+    private String dedupeKey;
     private OffsetDateTime createdAt;
 }

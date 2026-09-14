@@ -82,6 +82,7 @@ public class RagSearchServiceImpl {
                         // ingestion 侧 chunk 文本存于 "text" 字段
                         .setChunkText(getString(pl, "text"))
                         .setOssUrl(getString(pl, "oss_url"))
+                        .setChunkIndex(getInt(pl, "chunk_index"))
                         .build());
             }
             return RagSearchResponse.newBuilder()
@@ -97,6 +98,34 @@ public class RagSearchServiceImpl {
     private String getString(Map<String, Value> payload, String key) {
         Value v = payload.get(key);
         return v != null ? v.getStringValue() : "";
+    }
+
+    private int getInt(Map<String, Value> payload, String key) {
+        Value v = payload.get(key);
+        if (v == null) {
+            return 0;
+        }
+        if (v.hasIntegerValue()) {
+            long value = v.getIntegerValue();
+            if (value < Integer.MIN_VALUE) {
+                return Integer.MIN_VALUE;
+            }
+            if (value > Integer.MAX_VALUE) {
+                return Integer.MAX_VALUE;
+            }
+            return (int) value;
+        }
+        if (v.hasDoubleValue()) {
+            return (int) v.getDoubleValue();
+        }
+        if (!v.getStringValue().isBlank()) {
+            try {
+                return Integer.parseInt(v.getStringValue());
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
     }
 
     /**

@@ -16,6 +16,8 @@ public class AgentCallDetailBlobReader {
     private static final String PREFIX = "agent:run:";
     private static final String DETAIL_LLM = ":detail:llm:";
     private static final String DETAIL_TOOL = ":detail:tool:";
+    private static final String RAW_SUFFIX = ":raw";
+    private static final String RAW_META_SUFFIX = ":raw:meta";
 
     private final StringRedisTemplate redisTemplate;
 
@@ -27,11 +29,23 @@ public class AgentCallDetailBlobReader {
         return load(runId, toolCallId, DETAIL_TOOL);
     }
 
+    public Optional<String> loadLlmCallRawContent(String runId, String llmCallId) {
+        return load(runId, llmCallId, DETAIL_LLM, RAW_SUFFIX);
+    }
+
+    public Optional<String> loadLlmCallRawMeta(String runId, String llmCallId) {
+        return load(runId, llmCallId, DETAIL_LLM, RAW_META_SUFFIX);
+    }
+
     private Optional<String> load(String runId, String callId, String detailSegment) {
+        return load(runId, callId, detailSegment, "");
+    }
+
+    private Optional<String> load(String runId, String callId, String detailSegment, String suffix) {
         if (runId == null || runId.isBlank() || callId == null || callId.isBlank()) {
             return Optional.empty();
         }
-        String key = PREFIX + runId + detailSegment + callId;
+        String key = PREFIX + runId + detailSegment + callId + suffix;
         String json = redisTemplate.opsForValue().get(key);
         if (json == null || json.isBlank()) {
             return Optional.empty();

@@ -43,6 +43,17 @@ public interface SwIndustryClassifyDao {
     })
     List<SwIndustryClassify> getByLevelAndSrc(@Param("level") String level, @Param("src") String src);
 
+    @Select("SELECT industry_name FROM (" +
+            "  SELECT DISTINCT industry_name " +
+            "  FROM alphafrog_index_sw_classify " +
+            "  WHERE level = 'L3' " +
+            "    AND industry_name IS NOT NULL " +
+            "    AND industry_name <> ''" +
+            ") names " +
+            "ORDER BY random() " +
+            "LIMIT #{limit}")
+    List<String> getRandomL3IndustryNames(@Param("limit") int limit);
+
     @Delete("DELETE FROM alphafrog_index_sw_classify")
     int deleteAll();
 

@@ -44,13 +44,52 @@ public interface IndexInfoDao {
             "LIMIT #{limit} OFFSET #{offset}")
     List<IndexInfo> searchIndexInfo(@Param("query") String query, @Param("limit") int limit, @Param("offset") int offset);
 
+    @Select("SELECT i.*, CASE WHEN EXISTS (" +
+            "       SELECT 1 FROM alphafrog_index_daily d WHERE d.ts_code = i.ts_code LIMIT 1" +
+            "     ) THEN 1 ELSE 0 END AS has_daily " +
+            "FROM alphafrog_index_info i " +
+            "WHERE i.ts_code like CONCAT('%', #{query}, '%') " +
+            "   OR i.fullname like CONCAT('%', #{query}, '%') " +
+            "   OR i.name like CONCAT('%', #{query}, '%') " +
+            "ORDER BY " +
+            "   CASE WHEN EXISTS (" +
+            "       SELECT 1 FROM alphafrog_index_daily d WHERE d.ts_code = i.ts_code LIMIT 1" +
+            "     ) THEN 1 ELSE 0 END DESC, " +
+            "   CASE " +
+            "     WHEN i.ts_code = #{query} THEN 0 " +
+            "     WHEN i.name = #{query} THEN 1 " +
+            "     WHEN i.fullname = #{query} THEN 2 " +
+            "     WHEN i.ts_code like CONCAT(#{query}, '%') THEN 3 " +
+            "     WHEN i.name like CONCAT(#{query}, '%') THEN 4 " +
+            "     WHEN i.fullname like CONCAT(#{query}, '%') THEN 5 " +
+            "     ELSE 10 " +
+            "   END, " +
+            "   length(i.name) ASC, " +
+            "   i.ts_code ASC " +
+            "LIMIT #{limit} OFFSET #{offset}")
+    List<IndexInfo> searchIndexInfoWithDaily(@Param("query") String query, @Param("limit") int limit, @Param("offset") int offset);
+
     @Select("SELECT count(*) FROM alphafrog_index_info")
     int getIndexInfoCount();
 
     @Select("SELECT ts_code FROM alphafrog_index_info ORDER BY ts_code ASC LIMIT #{limit} OFFSET #{offset}")
     List<String> getAllIndexInfoTsCodes(@Param("offset") int offset,@Param("limit") int limit);
 
+    @Select("SELECT i.ts_code FROM alphafrog_index_info i " +
+            "WHERE EXISTS (" +
+            "  SELECT 1 FROM alphafrog_index_daily d WHERE d.ts_code = i.ts_code LIMIT 1" +
+            ") " +
+            "ORDER BY i.ts_code ASC LIMIT #{limit} OFFSET #{offset}")
+    List<String> getAllIndexInfoTsCodesWithDaily(@Param("offset") int offset, @Param("limit") int limit);
+
     @Select("SELECT * FROM alphafrog_index_info ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
     List<IndexInfo> getAllIndexInfo(@Param("offset") int offset, @Param("limit") int limit);
+
+    @Select("SELECT i.*, CASE WHEN EXISTS (" +
+            "       SELECT 1 FROM alphafrog_index_daily d WHERE d.ts_code = i.ts_code LIMIT 1" +
+            "     ) THEN 1 ELSE 0 END AS has_daily " +
+            "FROM alphafrog_index_info i " +
+            "ORDER BY i.ts_code LIMIT #{limit} OFFSET #{offset}")
+    List<IndexInfo> getAllIndexInfoWithDaily(@Param("offset") int offset, @Param("limit") int limit);
 
 }

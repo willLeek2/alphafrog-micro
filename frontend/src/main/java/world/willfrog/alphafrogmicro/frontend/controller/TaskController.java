@@ -6,13 +6,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import world.willfrog.alphafrogmicro.frontend.config.TaskProducerRabbitConfig;
+import world.willfrog.alphafrogmicro.frontend.service.AdminUserAccessService;
 import world.willfrog.alphafrogmicro.frontend.service.FetchTaskStatusService;
-import world.willfrog.alphafrogmicro.frontend.service.RagIngestAuthService;
 import world.willfrog.alphafrogmicro.frontend.service.RateLimitingService;
 
 import java.util.Map;
@@ -27,16 +28,17 @@ public class TaskController {
 
     private static final String DEFAULT_DIRECT_EXCHANGE = "";
 
-    /** 需要二次鉴权（ingest_token）的 RAG 任务名称集合。 */
+    /** 只允许管理员用户创建的 RAG 任务名称集合。 */
     private static final Set<String> RAG_TASK_NAMES = Set.of("rag_ann_fetch", "rag_report_fetch");
 
     private final RabbitTemplate rabbitTemplate;
     private final RateLimitingService rateLimitingService;
     private final FetchTaskStatusService fetchTaskStatusService;
-    private final RagIngestAuthService ragIngestAuthService;
+    private final AdminUserAccessService adminUserAccessService;
 
     @PostMapping("/create")
-    public ResponseEntity<String> createTask(@RequestBody Map<String, Object> taskConfig) {
+    public ResponseEntity<String> createTask(Authentication authentication,
+                                             @RequestBody Map<String, Object> taskConfig) {
         // 速率限制检查
         if (!rateLimitingService.tryAcquire("task")) {
             return ResponseEntity.status(429).body("{\"message\":\"Too many task creation requests, please try again later\"}");
@@ -64,13 +66,10 @@ public class TaskController {
 
         String taskName = taskConfigJSON.getString("task_name");
 
-        // RAG 任务二次鉴权：在常规 JWT 登录之上还需提供有效的 ingest_token
-        if (RAG_TASK_NAMES.contains(taskName)) {
-            String ingestToken = taskConfigJSON.getString("ingest_token");
-            if (!ragIngestAuthService.isAuthorized(ingestToken)) {
-                return ResponseEntity.status(403).body(
-                        "{\"error\":\"RAG ingest 二次鉴权失败，需要有效的 ingest_token\"}");
-            }
+        if (RAG_TASK_NAMES.contains(taskName)
+                && !adminUserAccessService.isActiveAdmin(authentication)) {
+            return ResponseEntity.status(403).body(
+                    "{\"error\":\"RAG 任务只允许启用状态的管理员用户创建\"}");
         }
 
         String exchange = getExchangeForTaskType(taskType);

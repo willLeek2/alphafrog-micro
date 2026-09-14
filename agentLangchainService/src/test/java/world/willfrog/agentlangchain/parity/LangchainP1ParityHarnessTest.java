@@ -15,7 +15,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * P1 batch-1 seed: langchain planner path with mock ChatModel (mirrors legacy parity intent).
+ * 生产默认两阶段规划的最小契约回归。
  */
 class LangchainP1ParityHarnessTest {
 
@@ -23,7 +23,11 @@ class LangchainP1ParityHarnessTest {
 
     @Test
     void linear_simple_success_plan() {
-        ChatModel model = new JsonChatModel("""
+        ChatModel model = new JsonChatModel(
+                """
+                {"overallPlan":{"mode":"LINEAR","detail":"简单任务"}}
+                """,
+                """
                 {
                   "analysis": "simple task",
                   "items": [
@@ -44,29 +48,33 @@ class LangchainP1ParityHarnessTest {
     }
 
     @Test
-    void empty_plan_fails_like_legacy_parity() {
-        ChatModel model = new JsonChatModel("""
-                {"analysis": "none", "items": []}
-                """);
+    void empty_plan_fails_afterConfiguredTwoStageRetries() {
+        ChatModel model = new JsonChatModel(
+                "{\"overallPlan\":{\"mode\":\"LINEAR\",\"detail\":\"无任务\"}}",
+                "{\"analysis\":\"none\",\"items\":[]}",
+                "{\"overallPlan\":{\"mode\":\"LINEAR\",\"detail\":\"无任务\"}}",
+                "{\"analysis\":\"none\",\"items\":[]}");
 
         assertThatThrownBy(() -> planner.plan(LangchainPlanningRequest.builder()
                 .userGoal("do nothing")
                 .model(model)
                 .build()))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("todo_plan_empty");
+                .hasMessageContaining("planning_retry_exhausted")
+                .hasMessageContaining("todo_plan_items_empty");
     }
 
     private static final class JsonChatModel implements ChatModel {
-        private final String response;
+        private final java.util.List<String> responses;
+        private int index;
 
-        private JsonChatModel(String response) {
-            this.response = response;
+        private JsonChatModel(String... responses) {
+            this.responses = java.util.List.of(responses);
         }
 
         @Override
         public ChatResponse doChat(ChatRequest request) {
-            return ChatResponse.builder().aiMessage(AiMessage.from(response)).build();
+            return ChatResponse.builder().aiMessage(AiMessage.from(responses.get(index++))).build();
         }
     }
 }

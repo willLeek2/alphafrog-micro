@@ -12,7 +12,7 @@ public interface AgentCreditApplicationDao {
             "application_id, user_id, amount, reason, contact, status, processed_by, process_reason, version, ext, processed_at" +
             ") VALUES (" +
             "#{applicationId}, #{userId}, #{amount}, #{reason}, #{contact}, #{status}, #{processedBy}, #{processReason}, #{version}, CAST(#{ext} AS jsonb), #{processedAt}" +
-            ")")
+            ") ON CONFLICT (application_id) DO NOTHING")
     int insert(AgentCreditApplication application);
 
     @Select("SELECT * FROM alphafrog_agent_credit_application WHERE application_id = #{applicationId}")

@@ -22,7 +22,11 @@ public final class AgentCallDetailPersistence {
         return blob != null && blob.size() > 2;
     }
 
-    public static Map<String, Object> toLlmDetailBlob(AgentObservabilityService.LlmTrace trace) {
+    public static boolean hasPersistableLlmRawContentBlob(Map<String, Object> blob) {
+        return blob != null && (blob.get("httpRequest") != null || blob.get("httpResponse") != null);
+    }
+
+    public static Map<String, Object> toLlmDetailBlob(AgentRunObservabilityService.LlmTrace trace) {
         Map<String, Object> blob = new LinkedHashMap<>();
         blob.put("type", "llm");
         blob.put("traceId", trace.getTraceId());
@@ -30,17 +34,21 @@ public final class AgentCallDetailPersistence {
         putIfPresent(blob, "outputText", trace.getOutputText());
         putIfPresent(blob, "reasoningText", trace.getReasoningText());
         putIfPresent(blob, "reasoningDetails", trace.getReasoningDetails());
-        putIfPresent(blob, "httpRequest", trace.getHttpRequest());
-        putIfPresent(blob, "httpResponse", trace.getHttpResponse());
-        putIfPresent(blob, "curlCommand", trace.getCurlCommand());
-        putIfPresent(blob, "attempts", trace.getAttempts());
-        putIfPresent(blob, "request", trace.getRequest());
         putIfPresent(blob, "responsePreview", trace.getResponsePreview());
-        putIfPresent(blob, "generationId", trace.getGenerationId());
         return blob;
     }
 
-    public static Map<String, Object> toToolDetailBlob(AgentObservabilityService.ToolTrace trace) {
+    public static Map<String, Object> toLlmRawContentBlob(String runId, AgentRunObservabilityService.LlmTrace trace) {
+        Map<String, Object> blob = new LinkedHashMap<>();
+        blob.put("type", "llm_raw_http");
+        blob.put("runId", runId);
+        blob.put("traceId", trace.getTraceId());
+        putIfPresent(blob, "httpRequest", trace.getHttpRequest());
+        putIfPresent(blob, "httpResponse", trace.getHttpResponse());
+        return blob;
+    }
+
+    public static Map<String, Object> toToolDetailBlob(AgentRunObservabilityService.ToolTrace trace) {
         Map<String, Object> blob = new LinkedHashMap<>();
         blob.put("type", "tool");
         blob.put("traceId", trace.getTraceId());
@@ -51,11 +59,11 @@ public final class AgentCallDetailPersistence {
         return blob;
     }
 
-    public static void scrubLlmTrace(AgentObservabilityService.LlmTrace trace) {
+    public static void scrubLlmTrace(AgentRunObservabilityService.LlmTrace trace) {
         scrubLlmTrace(trace, false);
     }
 
-    public static void scrubLlmTrace(AgentObservabilityService.LlmTrace trace, boolean detailBlobStored) {
+    public static void scrubLlmTrace(AgentRunObservabilityService.LlmTrace trace, boolean detailBlobStored) {
         if (trace == null) {
             return;
         }
@@ -70,16 +78,14 @@ public final class AgentCallDetailPersistence {
         trace.setCurlCommand(null);
         trace.setAttempts(null);
         trace.setRequest(null);
-        trace.setGenerationId(null);
-        trace.setEndpoint(null);
         trace.setDetailBlobStored(detailBlobStored);
     }
 
-    public static void scrubToolTrace(AgentObservabilityService.ToolTrace trace) {
+    public static void scrubToolTrace(AgentRunObservabilityService.ToolTrace trace) {
         scrubToolTrace(trace, false);
     }
 
-    public static void scrubToolTrace(AgentObservabilityService.ToolTrace trace, boolean detailBlobStored) {
+    public static void scrubToolTrace(AgentRunObservabilityService.ToolTrace trace, boolean detailBlobStored) {
         if (trace == null) {
             return;
         }
@@ -139,8 +145,6 @@ public final class AgentCallDetailPersistence {
         trace.remove("curlCommand");
         trace.remove("attempts");
         trace.remove("request");
-        trace.remove("generationId");
-        trace.remove("endpoint");
         String truncated = truncatePreview(preview == null ? null : String.valueOf(preview));
         if (truncated != null) {
             trace.put("responsePreview", truncated);

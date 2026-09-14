@@ -148,6 +148,10 @@ message CreditLedgerEntry {
   string idempotency_key = 10;
   string ext = 11;
   string created_at = 12;
+  string reason = 13;
+  string delta_decimal = 14;
+  string balance_before_decimal = 15;
+  string balance_after_decimal = 16;
 }
 
 message ListCreditLedgerRequest {
@@ -346,6 +350,35 @@ message AdjustUserCreditResponse {
   bool idempotent_replay = 10;
 }
 
+message AddUserCreditRequest {
+  string user_id = 1;
+  string username = 2;
+  string currency = 3;
+  string amount = 4;
+  string reason = 5;
+  string operator_id = 6;
+  string idempotency_key = 7;
+}
+
+message AddUserCreditResponse {
+  bool success = 1;
+  string message = 2;
+  string error_code = 3;
+  string user_id = 4;
+  string username = 5;
+  string currency = 6;
+  string original_amount = 7;
+  string exchange_rate_to_usd = 8;
+  string credit_amount = 9;
+  string balance_before = 10;
+  string balance_after = 11;
+  string ledger_id = 12;
+  string recharge_id = 13;
+  string audit_id = 14;
+  bool idempotent_replay = 15;
+  string idempotency_key = 16;
+}
+
 service AdminService {
   rpc validateAdminLogin(AdminLoginRequest) returns (AdminLoginResponse);
   rpc createAdmin(AdminCreateRequest) returns (AdminActionResponse);
@@ -371,4 +404,5 @@ service AdminService {
 
   // 用户额度直接调整
   rpc adjustUserCredit(AdjustUserCreditRequest) returns (AdjustUserCreditResponse);
+  rpc addUserCredit(AddUserCreditRequest) returns (AddUserCreditResponse);
 }

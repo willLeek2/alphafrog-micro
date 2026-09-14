@@ -32,7 +32,7 @@ public class CodeRefineLocalConfigLoader {
     private final StringRedisTemplate redisTemplate;
     private final CodeRefineProperties properties;
 
-    @Value("${spring.application.name:agent-service}")
+    @Value("${spring.application.name:agent-platform}")
     private String serviceName;
 
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")

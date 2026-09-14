@@ -72,15 +72,36 @@ class AgentAiServiceFactoryMaxTokensTest {
         assertEquals(4096, ReflectionTestUtils.getField(model, "maxTokens"));
     }
 
+    @Test
+    void buildChatModelWithProviderOrder_singaporeOpenRouterUrl_shouldStillUseRoutedModel() {
+        AgentAiServiceFactory factory = newFactory();
+        AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
+                "openrouter",
+                "https://llm.frogwch.com/openrouter/api/v1",
+                "moonshotai/kimi-k2.6",
+                "",
+                null,
+                List.of(),
+                null
+        );
+
+        ChatModel model = factory.buildChatModelWithProviderOrder(resolved, List.of(), 20000);
+
+        assertInstanceOf(OpenRouterProviderRoutedChatModel.class, model);
+        assertEquals(20000, ReflectionTestUtils.getField(model, "maxTokens"));
+        assertEquals("https://llm.frogwch.com/openrouter/api/v1", ReflectionTestUtils.getField(model, "baseUrl"));
+        assertEquals("openrouter", ReflectionTestUtils.getField(model, "endpointName"));
+    }
+
     private static AgentAiServiceFactory newFactory() {
         AgentAiServiceFactory factory = new AgentAiServiceFactory(
                 mock(AgentLlmResolver.class),
                 mock(AgentLlmProperties.class),
                 new ObjectMapper(),
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(AgentLlmLocalConfigLoader.class),
                 mock(LangchainLlmLatencyWindow.class)
         );

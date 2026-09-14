@@ -15,6 +15,29 @@
     "qwen3.5-flash",
     "accounts/fireworks/models/deepseek-v4-pro"
   ],
+  "dataFreshness": {
+    "startDate": "2020-01-01",
+    "endDate": "2026-05-25",
+    "asOfDate": "2026-05-25",
+    "description": "部署者指定的当前本地已爬取市场数据覆盖范围；业务逻辑默认这些日期正确"
+  },
+  "financeMethodResolver": {
+    "defaultRoute": {
+      "enabled": false,
+      "endpointName": "openrouter",
+      "modelName": "openai/gpt-5.2",
+      "providerOrder": ["moonshotai/int4", "fireworks"],
+      "temperature": 0.0,
+      "maxTokens": 2048,
+      "maxAttempts": 2,
+      "structuredOutput": true
+    },
+    "catalogPromptMaxBytes": 8192,
+    "catalogPromptMaxTokens": 2048,
+    "requestMaxBytes": 8192,
+    "responseMaxBytes": 16384,
+    "maxCandidates": 8
+  },
   "endpoints": {
     "openrouter": {
       "baseUrl": "https://openrouter.ai/api/v1",
@@ -294,6 +317,15 @@
         "minMessagesForSummary": 6,
         "summaryMaxMessages": 20
       }
+    },
+    "request": {
+      "max-retries": 3,
+      "retry": {
+        "backoff-type": "exponential",
+        "base-delay-ms": 1000,
+        "max-delay-ms": 4000,
+        "jitter-ms": 100
+      }
     }
   },
   "observability": {
@@ -327,12 +359,14 @@
     "threadNamePrefix": "agent-langchain-run-",
     "parallel": {
       "hard": {
+        "_restartNote": "修改 hard 值需滚动重启；hot-reload 只能在 hard 上限内缩小 current",
         "corePoolSize": 100,
         "maxPoolSize": 100,
         "queueCapacity": 1000,
         "threadNamePrefix": "agent-langchain-run-"
       },
       "current": {
+        "_restartNote": "修改此值超出 hard 上限会被 clamped，需滚动重启才能生效；threadNamePrefix 与 hard 不同也需重启",
         "corePoolSize": 10,
         "maxPoolSize": 10,
         "queueCapacity": 100,
@@ -344,8 +378,46 @@
     "redisFlushBatchSize": 20,
     "redisFlushStaleMs": 3000
   },
+  "agent": {
+    "call-raw-content": {
+      "ttl-seconds": 7200
+    },
+    "workspace": {
+      "dump": {
+        "ttl-hours": 12
+      }
+    },
+    "dataset": {
+      "ttl-hours": 12
+    }
+  },
+  "tools": {
+    "market-data": {
+      "dataset": {
+        "enabled": true
+      },
+      "batch": {
+        "emit-manifest": true
+      }
+    },
+    "result": {
+      "max-string-length": 2000,
+      "summary-model": "moonshotai/kimi-k2.5",
+      "summary-endpoint": "openrouter"
+    },
+    "summary": {
+      "max-retries": 3
+    },
+    "reread": {
+      "max-limit": 2000
+    },
+    "raw-ref": {
+      "ttl-hours": 12
+    }
+  },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",
+    "followUpSummarySystemPrompt": "file:prompts/agent/follow_up_summary_system.txt",
     "todoPlannerSystemPromptTemplate": "file:prompts/todo/todo_planner_system.txt",
     "workflowFinalSystemPrompt": "file:prompts/workflow/workflow_final_system.txt",
     "workflowTodoRecoverySystemPrompt": "file:prompts/workflow/workflow_todo_recovery_system.txt",
@@ -361,11 +433,25 @@
     "pythonRefineRequirementsFile": "prompts/python/python_refine_requirements.txt",
     "pythonRefineOutputInstruction": "file:prompts/python/python_refine_output_instruction.txt",
     "datasetFieldSpecsFile": "prompts/python/dataset_field_specs.json",
+    "financeMethodResolverSystemPromptFile": "file:prompts/finance/finance_method_resolver_system.txt",
     "orchestratorPlanningSystemPrompt": "file:prompts/orchestrator/orchestrator_planning_system.txt",
     "orchestratorSummarySystemPrompt": "file:prompts/orchestrator/orchestrator_summary_system.txt",
     "dagReactSystemPromptFile": "file:prompts/todo/dag_react_system.txt",
     "dagModeGuidancePromptFile": "file:prompts/todo/dag_mode_guidance.txt",
     "planningStrategyStageFile": "file:prompts/todo/planning_strategy_stage.txt",
-    "planningTodosStageFile": "file:prompts/todo/planning_todos_stage.txt"
+    "planningTodosStageFile": "file:prompts/todo/planning_todos_stage.txt",
+    "planningAnalysisStage": "file:prompts/todo/planning_analysis_stage.txt",
+    "planningStructuredStage": "file:prompts/todo/planning_structured_stage.txt",
+    "planningLinearModeGuidance": "file:prompts/todo/planning_linear_mode_guidance.txt",
+    "planningDagModeGuidance": "file:prompts/todo/planning_dag_mode_guidance.txt",
+    "planningLinearConstraint": "file:prompts/todo/planning_linear_constraint.txt",
+    "pythonRepairStageInstruction": "file:prompts/python/python_repair_stage.txt",
+    "emptyOutputRecoveryStageInstruction": "file:prompts/todo/empty_output_recovery_stage.txt",
+    "budgetLastMileStageInstruction": "file:prompts/agent/budget_last_mile_stage.txt",
+    "todoRetryContextInstruction": "file:prompts/todo/todo_retry_context.txt",
+    "pythonRepairContextInstruction": "file:prompts/python/python_repair_context.txt",
+    "toolSummarySystemPrompt": "file:prompts/tools/tool_summary_system.txt",
+    "toolSummaryUserPromptTemplate": "file:prompts/tools/tool_summary_user.txt",
+    "toolCapabilityCatalog": "file:prompts/tools/tool_capability_catalog.json"
   }
 }

@@ -9,6 +9,7 @@
         <result property="seq" column="seq"/>
         <result property="eventType" column="event_type"/>
         <result property="payloadJson" column="payload_json"/>
+        <result property="dedupeKey" column="dedupe_key"/>
         <result property="createdAt" column="created_at"/>
     </resultMap>
 
@@ -16,6 +17,20 @@
         INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, payload_json)
         VALUES (#{runId}, #{seq}, #{eventType}, CAST(#{payloadJson} AS jsonb))
     </insert>
+
+    <insert id="insertOnce" parameterType="world.willfrog.agent.platform.entity.AgentRunEvent"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, payload_json, dedupe_key)
+        VALUES (#{runId}, #{seq}, #{eventType}, CAST(#{payloadJson} AS jsonb), #{dedupeKey})
+        ON CONFLICT (run_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+    </insert>
+
+    <select id="findByRunIdAndDedupeKey" resultMap="AgentRunEventResultMap">
+        SELECT id, run_id, seq, event_type, payload_json::text AS payload_json, dedupe_key, created_at
+        FROM alphafrog_agent_run_event
+        WHERE run_id = #{runId} AND dedupe_key = #{dedupeKey}
+        LIMIT 1
+    </select>
 
     <select id="listByRunIdAfterSeq" resultMap="AgentRunEventResultMap">
         SELECT id,

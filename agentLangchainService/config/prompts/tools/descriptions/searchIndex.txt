@@ -1,0 +1,1 @@
+按关键词搜索指数；也支持 mode=advanced，通过 advancedQuery.conditions 做指数成分条件筛选。simple 模式继续使用 keyword。advanced 仅支持 has_stock 条件；日期必须传 YYYYMMDD 格式的日期字符串或 NONE。对 has_stock 的 NONE/NONE 默认取最新公告期完整快照，单边 NONE 表示不限制该侧边界。

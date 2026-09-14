@@ -7,6 +7,8 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.model.openrouter.GenerationResponse;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -15,6 +17,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashSet;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -22,14 +25,14 @@ import java.util.Set;
  *
  * <p>在 LLM 调用完成后，可选地异步查询 OpenRouter 的 Generation API
  * 获取真实费用信息（total_cost, upstream_inference_cost, cache_discount 等），
- * 并通过 {@link AgentObservabilityService#enrichLlmCallSpending} 补充到对应的 LLM Trace 中。</p>
+ * 并通过 {@link AgentRunObservabilityService#enrichLlmCallSpending} 补充到对应的 LLM Trace 中。</p>
  *
  * <p><b>启用条件：</b></p>
  * <ul>
  *   <li>{@code agent.observability.openrouter.cost-enrichment.enabled=true}</li>
  * </ul>
  *
- * @see AgentObservabilityService#enrichLlmCallSpending
+ * @see AgentRunObservabilityService#enrichLlmCallSpending
  * @see GenerationResponse
  */
 @Service
@@ -41,7 +44,7 @@ public class OpenRouterCostService {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     private final ObjectMapper objectMapper;
     private final AgentLlmLocalConfigLoader localConfigLoader;
 
@@ -58,7 +61,7 @@ public class OpenRouterCostService {
     @Value("${agent.observability.openrouter.cost-enrichment.retry-delay-ms:1000}")
     private int defaultRetryDelayMs;
 
-    public OpenRouterCostService(AgentObservabilityService observabilityService, 
+    public OpenRouterCostService(AgentRunObservabilityService observabilityService,
                                   ObjectMapper objectMapper,
                                   AgentLlmLocalConfigLoader localConfigLoader) {
         this.observabilityService = observabilityService;
@@ -118,14 +121,14 @@ public class OpenRouterCostService {
         if (runId == null || runId.isBlank() || !isCostEnrichmentEnabled()) {
             return 0;
         }
-        AgentObservabilityService.ObservabilityState state = observabilityService.forceFlush(runId);
+        AgentRunObservabilityService.ObservabilityState state = observabilityService.forceFlush(runId);
         if (state == null || state.getDiagnostics() == null || state.getDiagnostics().getLlmTraces() == null) {
             return 0;
         }
 
         Set<String> seenGenerationIds = new LinkedHashSet<>();
         int enriched = 0;
-        for (AgentObservabilityService.LlmTrace trace : state.getDiagnostics().getLlmTraces()) {
+        for (AgentRunObservabilityService.LlmTrace trace : state.getDiagnostics().getLlmTraces()) {
             if (trace == null || trace.getActualCost() != null) {
                 continue;
             }
@@ -140,14 +143,14 @@ public class OpenRouterCostService {
         return enriched;
     }
 
-    private String generationIdFromTrace(AgentObservabilityService.LlmTrace trace) {
+    private String generationIdFromTrace(AgentRunObservabilityService.LlmTrace trace) {
         if (trace == null) {
             return null;
         }
         if (trace.getGenerationId() != null && !trace.getGenerationId().isBlank()) {
             return trace.getGenerationId();
         }
-        AgentObservabilityService.RawHttpTrace response = trace.getHttpResponse();
+        AgentRunObservabilityService.RawHttpTrace response = trace.getHttpResponse();
         if (response == null || response.getBody() == null || response.getBody().isBlank()) {
             return null;
         }
@@ -175,24 +178,69 @@ public class OpenRouterCostService {
         if (!isCostEnrichmentEnabled()) {
             return false;
         }
-        if (generationId == null || generationId.isBlank()) {
+        Optional<GenerationResponse.GenerationData> data =
+                fetchGenerationData(generationId, apiKey, baseUrl, true);
+        if (data.isEmpty()) {
             return false;
+        }
+        GenerationResponse.GenerationData costData = data.get();
+        observabilityService.enrichLlmCallSpending(
+                runId,
+                traceId,
+                costData.getTotalCost(),
+                costData.getUpstreamInferenceCost(),
+                costData.getCacheDiscount(),
+                costData.getIsByok()
+        );
+        return true;
+    }
+
+    /**
+     * Fetches OpenRouter generation total cost in USD for credit settlement.
+     * Does not require observability cost-enrichment to be enabled.
+     */
+    /**
+     * Fetches OpenRouter billable cost in USD for credit settlement.
+     * For BYOK/provider-order scenarios total_cost may be 0 while upstream_inference_cost is non-zero.
+     * Priority: upstream_inference_cost > 0, then total_cost > 0.
+     */
+    public Optional<BigDecimal> fetchBillableCostUsd(String generationId, String apiKey, String baseUrl) {
+        Optional<GenerationResponse.GenerationData> data = fetchGenerationData(generationId, apiKey, baseUrl, false);
+        if (data.isEmpty()) {
+            return Optional.empty();
+        }
+        GenerationResponse.GenerationData costData = data.get();
+        Double upstream = costData.getUpstreamInferenceCost();
+        if (upstream != null && upstream > 0D) {
+            return Optional.of(BigDecimal.valueOf(upstream).setScale(6, RoundingMode.HALF_UP));
+        }
+        Double total = costData.getTotalCost();
+        if (total != null && total > 0D) {
+            return Optional.of(BigDecimal.valueOf(total).setScale(6, RoundingMode.HALF_UP));
+        }
+        return Optional.empty();
+    }
+
+    public Optional<BigDecimal> fetchTotalCostUsd(String generationId, String apiKey, String baseUrl) {
+        return fetchGenerationData(generationId, apiKey, baseUrl, false)
+                .map(GenerationResponse.GenerationData::getTotalCost)
+                .filter(cost -> cost != null && cost > 0D)
+                .map(cost -> BigDecimal.valueOf(cost).setScale(6, RoundingMode.HALF_UP));
+    }
+
+    private Optional<GenerationResponse.GenerationData> fetchGenerationData(String generationId,
+                                                                              String apiKey,
+                                                                              String baseUrl,
+                                                                              boolean respectFeatureFlag) {
+        if (respectFeatureFlag && !isCostEnrichmentEnabled()) {
+            return Optional.empty();
+        }
+        if (generationId == null || generationId.isBlank()) {
+            return Optional.empty();
         }
 
         try {
-            String normalizedBase = baseUrl != null ? baseUrl.trim() : "https://openrouter.ai/api/v1";
-            if (normalizedBase.endsWith("/")) {
-                normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
-            }
-            // Strip known sub-paths to get the base domain for the Generation API
-            // e.g. "https://openrouter.ai/api/v1" -> "https://openrouter.ai"
-            if (normalizedBase.endsWith("/api/v1")) {
-                normalizedBase = normalizedBase.substring(0, normalizedBase.length() - "/api/v1".length());
-            } else if (normalizedBase.endsWith("/v1")) {
-                normalizedBase = normalizedBase.substring(0, normalizedBase.length() - "/v1".length());
-            }
-            String url = normalizedBase + "/api/v1/generation?id=" + generationId;
-
+            String url = buildGenerationApiUrl(generationId, baseUrl);
             int timeoutMs = positiveOrDefault(getTimeoutMs(), 5000);
             int maxAttempts = getMaxAttempts();
             int retryDelayMs = getRetryDelayMs();
@@ -216,15 +264,7 @@ public class OpenRouterCostService {
                         GenerationResponse.GenerationData data = genResponse.getData();
                         if (data.getTotalCost() != null || data.getUpstreamInferenceCost() != null
                                 || data.getCacheDiscount() != null) {
-                            observabilityService.enrichLlmCallSpending(
-                                    runId,
-                                    traceId,
-                                    data.getTotalCost(),
-                                    data.getUpstreamInferenceCost(),
-                                    data.getCacheDiscount(),
-                                    data.getIsByok()
-                            );
-                            return true;
+                            return Optional.of(data);
                         }
                     }
                     log.debug("OpenRouter Generation API returned no cost data for generation {} on attempt {}/{}: {}",
@@ -244,6 +284,19 @@ public class OpenRouterCostService {
         } catch (Exception e) {
             log.warn("Failed to get cost info for generation {}: {}", generationId, e.getMessage());
         }
-        return false;
+        return Optional.empty();
+    }
+
+    private static String buildGenerationApiUrl(String generationId, String baseUrl) {
+        String normalizedBase = baseUrl != null ? baseUrl.trim() : "https://openrouter.ai/api/v1";
+        if (normalizedBase.endsWith("/")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
+        }
+        if (normalizedBase.endsWith("/api/v1")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - "/api/v1".length());
+        } else if (normalizedBase.endsWith("/v1")) {
+            normalizedBase = normalizedBase.substring(0, normalizedBase.length() - "/v1".length());
+        }
+        return normalizedBase + "/api/v1/generation?id=" + generationId;
     }
 }

@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://alphafrog.local/schema/finance/metric-record-v1.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "environmentId",
+    "value",
+    "unit",
+    "parameters",
+    "inputRefs",
+    "checks",
+    "evidence"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "1"},
+    "methodId": {"type": "string", "minLength": 1, "maxLength": 160},
+    "methodVersion": {"type": "string", "minLength": 1, "maxLength": 64},
+    "specDigest": {"type": "string", "pattern": "^sha256:[0-9A-Za-z._:-]+$", "maxLength": 160},
+    "sourceResolverToolCallId": {"type": "string", "minLength": 1, "maxLength": 160},
+    "environmentId": {"type": "string", "minLength": 1, "maxLength": 256},
+    "value": {"type": "number"},
+    "unit": {"type": "string", "minLength": 1, "maxLength": 96},
+    "parameters": {"type": "object", "maxProperties": 128},
+    "inputRefs": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {"type": "string", "minLength": 1, "maxLength": 512}
+    },
+    "checks": {"type": "object", "maxProperties": 128},
+    "formulaDescription": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "evidence": {
+      "enum": ["LIBRARY_CALL_DECLARED", "CUSTOM_WITH_CHECKS", "CUSTOM_UNVERIFIED"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"evidence": {"const": "LIBRARY_CALL_DECLARED"}}},
+      "then": {"required": ["methodId", "methodVersion", "specDigest"]},
+      "else": {"required": ["formulaDescription"]}
+    },
+    {
+      "if": {"required": ["methodId"]},
+      "then": {"required": ["methodVersion", "specDigest"]}
+    },
+    {
+      "if": {"required": ["methodVersion"]},
+      "then": {"required": ["methodId", "specDigest"]}
+    },
+    {
+      "if": {"required": ["specDigest"]},
+      "then": {"required": ["methodId", "methodVersion"]}
+    }
+  ],
+  "additionalProperties": false
+}

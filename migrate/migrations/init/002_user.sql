@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_user (
     register_time BIGINT NOT NULL,
     user_type INTEGER,
     user_level INTEGER,
-    credit INTEGER,
+    credit NUMERIC(20, 6),
     status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
     disabled_at TIMESTAMPTZ,
     disabled_reason TEXT,

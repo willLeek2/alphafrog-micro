@@ -2,6 +2,7 @@ package world.willfrog.agent.tools.router;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.Builder;
@@ -13,13 +14,23 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
+import world.willfrog.agent.platform.artifact.RawPayloadLocator;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
+import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -32,13 +43,17 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 工具调用统一路由器，是 LLM 决定调用工具后，所有业务工具（除 spawnSubAgent/waitForSubAgent
- * 这两个子代理控制工具外）的执行入口。
+ * 工具调用统一路由器，是 LLM 决定调用工具后，所有业务工具的执行入口。
  *
- * <p>面试里如果只看 agentLangchainService 的 {@code ToolRouterToolExecutor}，
- * 只能知道 LC4j 的 tool call 如何进入 Java；真正的业务语义在这里：是否允许调用、
- * 是否超预算、是否命中缓存、结果如何写 observability、异常如何包装成统一 JSON。
- * 因此本类是「模型工具调用」和「平台业务工具」之间的运行时边界。</p>
+ * <p>可路由工具名集合由 {@link AgentToolRegistry#declaredToolNames()} 派生，
+ * 本路由器只负责分发已在注册表中声明的工具。spawnSubAgent / waitForSubAgent
+ * 由 D06 的 {@link SubAgentControlHandler} 提供控制语义；声明、目录与路由同时生效。</p>
+ *
+ * <p>agentLangchainService 的 {@code ToolRouterToolExecutor} 只负责把 LC4j 的 tool call
+ * 接入本类；真正的业务语义在本类：是否允许调用、是否超预算、是否命中缓存、
+ * 结果如何写 observability、异常如何包装成统一 JSON。
+ * 因此本类是「模型工具调用」通往「平台业务工具」的唯一入口。讲解要点见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
  *
  * <p>Agent V2 前端接入后，工具调用还多了一层实时事件契约：
  * {@code ToolRouterToolExecutor} 负责发 {@code TOOL_CALL_STARTED/FINISHED}，
@@ -47,11 +62,9 @@ import java.util.concurrent.TimeUnit;
  * {@code runId + tool_call_id} 懒加载 safe detail，而不是扫描整份 trace。</p>
  *
  * <h3>位置与角色</h3>
- * 本路由器是 {@link world.willfrog.agent.workflow.ReactTodoExecutor} 在 ReAct 循环中
- * 处理 LLM 返回的 {@code tool_calls} 时的核心依赖：当 LLM 返回某个 tool_call 后，
- * ReactTodoExecutor 将工具名和参数交给 {@link #invokeWithMeta(String, Map)} 路由执行。
- * 在 agentLangchainService 中，{@code ToolRouterToolExecutor} 也会调用同一个入口，
- * 所以 legacy 与 langchain 两条执行链共享同一套工具预算、缓存和观测语义。
+ * 在 agentLangchainService 中，{@code ToolRouterToolExecutor} 将 LLM 返回的
+ * {@code tool_calls} 交给 {@link #invokeWithMeta(String, Map)}。业务工具与子代理控制工具
+ * 因而共享同一套预算、限流、缓存选择和观测入口，不依赖已删除的 legacy 执行器旁路。
  *
  * <h3>核心职责</h3>
  * <ol>
@@ -61,9 +74,9 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>能力校验</b>：在路由前检查 run 级能力开关（如 webSearch 未开启时拒绝 searchWeb）。</li>
  *   <li><b>预算检查</b>：调用 {@link AgentRunBudgetService#checkBeforeToolCall} 检查
  *       run 总额度/总耗时预算是否已用尽。</li>
- *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按用户或全局 scope
- *       做缓存复用，节省重复调用成本。</li>
- *   <li><b>观测记录</b>：通过 {@link AgentObservabilityService#recordToolCall} 记录每一次
+ *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按 user/run scope
+ *       做缓存复用（缺身份时 fail-closed 跳过共享缓存），节省重复调用成本。</li>
+ *   <li><b>观测记录</b>：通过 {@link AgentRunObservabilityService#recordToolCall} 记录每一次
  *       工具调用 trace（参数、结果摘要、耗时、是否命中缓存等），供 run 观测视图和
  *       safe detail 懒加载使用。</li>
  *   <li><b>并发权重限制</b>：通过 {@link ToolWeightedLimitService} 对批量工具调用按有效权重限流，
@@ -82,10 +95,9 @@ import java.util.concurrent.TimeUnit;
  * }
  * </pre>
  *
- * @see world.willfrog.agent.workflow.ReactTodoExecutor
  * @see world.willfrog.agentlangchain.tools.ToolRouterToolExecutor
  * @see ToolResultCacheService
- * @see AgentObservabilityService
+ * @see AgentRunObservabilityService
  */
 @Component
 @RequiredArgsConstructor
@@ -100,14 +112,22 @@ public class ToolRouter {
     private final SearchTools searchTools;
     /** Python 沙箱执行工具集（executePython） */
     private final PythonSandboxTools pythonSandboxTools;
+    /** 金融方法建议工具（resolveFinanceMethods），只读建议工具。 */
+    private final FinanceMethodTools financeMethodTools;
+    /** 平台工具指南加载工具（loadToolGuide） */
+    private final LoadToolGuideTool loadToolGuideTool;
+    /** 260623-harness-optimization-02: 列出当前 agent run 已落盘 dataset / manifest（listMyData） */
+    private final ListMyDataTool listMyDataTool;
     /** executePython 静态参数/代码预校验（B1） */
     private final PythonStaticPrecheckService pythonStaticPrecheckService;
     /** 运行时 LLM/执行配置（含 static-precheck-enabled） */
     private final AgentLlmProperties llmProperties;
     /** 工具结果缓存服务，按 toolName + params + scope 做去重缓存 */
     private final ToolResultCacheService toolResultCacheService;
+    /** rawRef 重读工具 */
+    private final RereadToolHandler rereadToolHandler;
     /** 观测数据服务，记录每次工具调用的 trace（参数、结果、耗时、缓存元数据等） */
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     /** JSON 序列化/反序列化，用于构建标准响应和判断工具成功状态 */
     private final ObjectMapper objectMapper;
     /** Micrometer 指标注册中心，用于按 toolName 标签上报工具调用耗时 */
@@ -116,6 +136,9 @@ public class ToolRouter {
     private final StressTestProperties stressTestProperties;
     /** 按 toolName 缓存 Timer 实例，避免每次调用重新构建（线程安全） */
     private final ConcurrentHashMap<String, Timer> toolCallTimers = new ConcurrentHashMap<>();
+    // D07：权重限流拒绝的独立低基数计数（toolName × layer，layer 当前恒为 weight_limit），
+    // 与成功 toolCalls 累加器分离；LC4j 层拒绝发生在进入 Router 之前，不经本计数器
+    private final ConcurrentHashMap<String, Counter> throttleRejectionCounters = new ConcurrentHashMap<>();
 
     /**
      * Run 级预算服务 — 可选注入（@Autowired(required = false)），
@@ -140,6 +163,14 @@ public class ToolRouter {
      */
     @Autowired(required = false)
     private ToolWeightedLimitService toolWeightedLimitService;
+
+    /**
+     * D06 子代理控制实现。共享 Router 不依赖 LangChain4j；生产实现由
+     * agentLangchainService 注入。缺少实现时返回稳定的不可用错误，绝不落到
+     * UNSUPPORTED_TOOL，也不会启动临时线程或使用进程内假实现。
+     */
+    @Autowired(required = false)
+    private SubAgentControlHandler subAgentControlHandler;
 
     /**
      * 简化入口：仅返回工具输出文本，丢弃成功标志、耗时、缓存元数据等。
@@ -217,17 +248,28 @@ public class ToolRouter {
          */
         Optional<ToolWeightedLimitService.WeightLease> weightLease = Optional.empty();
         if (toolWeightedLimitService != null) {
+            // toolCalls 预算按“模型发起了一次工具调用”计数，但真实资源占用可能远大于 1：
+            // 例如批量行情查询一次请求里带多个资产，executePython 会占用沙箱工作线程。
+            // WeightLease 让这些工具按有效权重参与限流，同时保持对模型暴露的工具调用次数语义不变。
             Optional<ToolWeightedLimitService.WeightLease> acquired = toolWeightedLimitService.tryAcquire(toolName, params);
             if (acquired.isEmpty()) {
                 int effectiveWeight = toolWeightedLimitService.previewEffectiveWeight(toolName, params);
                 String errorResult = weightLimitExceeded(toolName, effectiveWeight);
-                recordObservability(toolName, params, errorResult, 0, false, null);
-                getOrCreateToolCallTimer(nvl(toolName)).record(0, TimeUnit.MILLISECONDS);
+                /*
+                 * D07 口径：限流拒绝 ≠ 已执行工具调用。不调用 recordObservability——
+                 * 拒绝不得抬高 observability summary.toolCalls、不得消耗 maxToolCalls
+                 * 判定额度；权重层拒绝用独立的低基数 Micrometer 计数观测
+                 * （tool.call.throttle.rejected{toolName, layer=weight_limit}），
+                 * 与成功调用累加器完全分离。throttleRejected 标记随结果传给 executor，
+                 * 由其在 TOOL_CALL_FINISHED payload 写 creditsConsumed=0。
+                 */
+                getOrCreateThrottleRejectionCounter(nvl(toolName), "weight_limit").increment();
                 return ToolInvocationResult.builder()
                         .output(errorResult)
                         .success(false)
                         .durationMs(0)
                         .cacheMeta(null)
+                        .throttleRejected(true)
                         .build();
             }
             weightLease = acquired;
@@ -242,14 +284,15 @@ public class ToolRouter {
                 () -> executeDirect(toolName, params)
         );
         String result = nvl(cached.getResult());
+        String observabilityResult = isBlank(cached.getObservabilityResult()) ? result : cached.getObservabilityResult();
         boolean success = cached.isSuccess();
         long durationMs = Math.max(0L, cached.getDurationMs());
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
         // 记录观测 trace（参数、结果摘要、耗时、缓存命中信息）。
-        // AgentObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
+        // AgentRunObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
         // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计，也不提供展开详情。
         if (!"checkParallelLimits".equals(toolName)) {
-            recordObservability(toolName, params, result, durationMs, success, cacheMeta);
+            recordObservability(toolName, params, observabilityResult, durationMs, success, cacheMeta);
         }
 
         // 按 toolName 分桶上报耗时指标
@@ -288,46 +331,18 @@ public class ToolRouter {
     /**
      * 返回路由器支持的全部工具名集合。
      *
-     * <p>用于上游（如 Planner 提示词生成、能力校验）枚举可路由的业务工具。
-     * 注意：spawnSubAgent / waitForSubAgent 属于子代理控制工具，
-     * 由 ReactTodoExecutor 直接处理而不经过本路由器。</p>
+     * <p>集合内容由 {@link AgentToolRegistry#declaredToolNames()} 派生，代表平台的
+     * 生产声明面，而不是当前 run 一定可用的工具列表。 capability gate 以注册表元数据
+     * 为准；实际执行仍由 executeDirect 中的能力校验决定。</p>
+     *
+     * <p>语义注意：searchWeb 还要受 AgentContext.isWebSearchEnabled 控制；
+     * getEtfAdj 还要受 adjFactorEnabled 控制；checkParallelLimits 是元工具，
+     * 返回当前配置下的批量上限。</p>
      *
      * @return 不可变的工具名集合
      */
     public Set<String> supportedTools() {
-        /*
-         * 这是平台工具白名单，而不是当前 run 一定可用的工具列表：
-         * - searchWeb 还要受 AgentContext.isWebSearchEnabled 控制；
-         * - getEtfAdj 还要受 adjFactorEnabled 控制；
-         * - checkParallelLimits 是元工具，返回当前配置下的批量上限。
-         *
-         * Planner 和 tool catalog 可以用它了解「系统理论上支持什么」，实际执行仍以
-         * executeDirect 中的能力校验为准。
-         */
-        return Set.of(
-                "getStockInfo",
-                "getStockDaily",
-                "searchStock",
-                "searchFund",
-                "getIndexInfo",
-                "getIndexDaily",
-                "searchIndex",
-                "searchAssetInfo",
-                "checkParallelLimits",
-                "getTradingDaysSummary",
-                "isTradingDay",
-                "getExchangeAssetDaily",
-                "getOffExchangeAssetDaily",
-                "getEtfAdj",
-                "getListedAssetShareSize",
-                "getFinancialReport",
-                "ragSearch",
-                "loadDocument",
-                "searchWeb",
-                "executePython",
-                "spawnSubAgent",
-                "waitForSubAgent"
-        );
+        return AgentToolRegistry.declaredToolNames();
     }
 
     /**
@@ -339,6 +354,24 @@ public class ToolRouter {
         return toolCallTimers.computeIfAbsent(toolName, name ->
                 Timer.builder("tool.call")
                         .tag("toolName", name)
+                        .register(meterRegistry));
+    }
+
+    /**
+     * 获取或创建权重限流拒绝计数器（D07）。
+     *
+     * <p>拒绝计数与 {@code tool.call} 执行计时分离：被拒绝的调用没有执行，不计时、
+     * 不进成功累加器。tag 仅 toolName（注册表 25 名内）与 layer，基数有界。
+     * 本计数器只覆盖权重层，layer 当前恒为 {@code weight_limit}；LC4j 前台
+     * Semaphore 拒绝发生在进入本 Router 之前（ToolRouterToolExecutor 侧），其
+     * 低基数观测由 LangchainToolConcurrencyThrottle 自带 per-node 计数
+     * （timeoutCounts / waitMsTotal / waitCount，G7 冻结面）承担，不经本计数器。</p>
+     */
+    private Counter getOrCreateThrottleRejectionCounter(String toolName, String layer) {
+        return throttleRejectionCounters.computeIfAbsent(toolName + "|" + layer, key ->
+                Counter.builder("tool.call.throttle.rejected")
+                        .tag("toolName", toolName)
+                        .tag("layer", layer)
                         .register(meterRegistry));
     }
 
@@ -364,14 +397,17 @@ public class ToolRouter {
     private String invokeExecutePython(Map<String, Object> params) {
         /*
          * executePython 是最容易把上游数据、模型生成代码和沙箱执行耦合在一起的工具。
-         * 这里先收集 dataset ids，再做静态预校验，最后才交给 PythonSandboxTools。
-         * 这样可以在真正执行前拦截明显危险或无效的代码，失败结果也仍然走统一 JSON 格式。
+         * 260623-harness-optimization-02: dataset_ids / manifest_ids 是两个独立编号空间，
+         * 这里先分别收集，再做静态预校验（要求至少一个非空），最后才交给 PythonSandboxTools
+         * 的 5 形参 overload。这样可以在真正执行前拦截明显危险或无效的代码，
+         * 失败结果也仍然走统一 JSON 格式。
          */
         String code = str(params.get("code"), params.get("arg0"));
         String datasetIds = collectExecutePythonDatasetIds(params);
+        String manifestIds = collectExecutePythonManifestIds(params);
         if (isStaticPrecheckEnabled()) {
             PythonStaticPrecheckService.Result precheck =
-                    pythonStaticPrecheckService.check(code, datasetIds, params);
+                    pythonStaticPrecheckService.check(code, datasetIds, manifestIds, params);
             if (!precheck.isPassed()) {
                 return precheckFailure("executePython", precheck);
             }
@@ -379,6 +415,7 @@ public class ToolRouter {
         return pythonSandboxTools.executePython(
                 code,
                 datasetIds,
+                manifestIds,
                 str(params.get("libraries"), params.get("arg3")),
                 toNullableInt(params.get("timeout_seconds"), params.get("timeoutSeconds"), params.get("arg4"))
         );
@@ -456,6 +493,8 @@ public class ToolRouter {
         try {
             // 能力校验：searchWeb 必须显式开启 webSearch 能力，否则返回不可用响应
             if ("searchWeb".equals(toolName) && !AgentContext.isWebSearchEnabled()) {
+                // webSearch 是按 run 配置开放的能力，不是全局默认工具。
+                // 这里返回结构化不可用结果，让模型知道不能继续依赖搜索，而不是抛异常中断整个 run。
                 result = writeJson(Map.of(
                         "ok", false,
                         "tool", "searchWeb",
@@ -474,6 +513,8 @@ public class ToolRouter {
             }
             // 统一入口负责兼容参数别名（ts_code/code 等），工具实现层只接收标准参数。
             result = switch (toolName) {
+                // checkParallelLimits 是“给模型看的工具目录说明”，只读配置，不访问业务数据。
+                // 它必须和其它工具走同一个路由入口，模型才能通过 tool-calling 正常调用。
                 case "checkParallelLimits" -> marketDataTools.checkParallelLimits();
                 case "getStockInfo" -> marketDataTools.getStockInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
@@ -482,6 +523,9 @@ public class ToolRouter {
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                );
+                case "getStockSwIndustryInfo" -> marketDataTools.getStockSwIndustryInfo(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
                 );
                 case "searchStock" -> marketDataTools.searchStock(
                         str(params.get("keyword"), params.get("query"), params.get("arg0"))
@@ -497,13 +541,21 @@ public class ToolRouter {
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
                 );
-                case "searchIndex" -> marketDataTools.searchIndex(
-                        str(params.get("keyword"), params.get("query"), params.get("arg0"))
+                case "searchIndex" -> AdvancedSearchRequest.isAdvancedMap(params)
+                        ? marketDataTools.searchIndexAdvanced(params)
+                        : marketDataTools.searchIndex(
+                        str(params.get("keyword"), params.get("query"), params.get("arg0")),
+                        null,
+                        null
                 );
-                case "searchAssetInfo" -> marketDataTools.searchAssetInfo(
+                case "searchAssetInfo" -> AdvancedSearchRequest.isAdvancedMap(params)
+                        ? marketDataTools.searchAssetInfoAdvanced(params)
+                        : marketDataTools.searchAssetInfo(
                         str(params.get("query"), params.get("keyword"), params.get("arg0")),
                         str(params.get("assetTypes"), params.get("asset_types"), params.get("arg1")),
-                        str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic")
+                        str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic"),
+                        null,
+                        null
                 );
                 case "getTradingDaysSummary" -> marketDataTools.getTradingDaysSummary(
                         dateStr(params.get("startDate"), params.get("start_date"), params.get("startDateStr"), params.get("arg0")),
@@ -515,12 +567,22 @@ public class ToolRouter {
                                 params.get("trade_date"), params.get("trade_dates"), params.get("arg0")),
                         str(params.get("exchange"), params.get("arg1"), "SSE")
                 );
-                case "getExchangeAssetDaily" -> marketDataTools.getExchangeAssetDaily(
-                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                case "getExchangeAssetDaily" -> AdvancedSearchRequest.isAdvancedMap(params)
+                        ? marketDataTools.getExchangeAssetDailyAdvanced(
+                        params,
                         str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
                         dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3")),
                         str(params.get("priceMode"), params.get("price_mode"), params.get("arg4"), "raw_ohlc")
+                        )
+                        : marketDataTools.getExchangeAssetDaily(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3")),
+                        str(params.get("priceMode"), params.get("price_mode"), params.get("arg4"), "raw_ohlc"),
+                        null,
+                        null
                 );
                 case "getOffExchangeAssetDaily" -> marketDataTools.getOffExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
@@ -529,6 +591,8 @@ public class ToolRouter {
                 );
                 case "getEtfAdj" -> {
                     if (!isAdjFactorEnabled()) {
+                        // ETF 复权因子是可灰度关闭的功能。禁用时返回标准 JSON，
+                        // 保证前端和 LLM 都能读到明确的 CAPABILITY_DISABLED，而不是把它当作服务异常。
                         yield writeJson(Map.of(
                                 "ok", false,
                                 "tool", "getEtfAdj",
@@ -579,11 +643,66 @@ public class ToolRouter {
                         str(params.get("timeRangeEnd"), params.get("time_range_end"), params.get("arg7")),
                         toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8"))
                 );
+                case "resolveFinanceMethods" -> financeMethodTools.resolveFinanceMethods(
+                        str(params.get("query"), params.get("arg0")),
+                        str(params.get("context"), params.get("arg1"))
+                );
                 case "executePython" -> invokeExecutePython(params);
+                case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
+                        str(params.get("topic"), params.get("arg0"))
+                );
+                case "listMyData" -> listMyDataTool.listMyData(
+                        str(params.get("query_type"), params.get("arg0")),
+                        str(params.get("from_ts_code"), params.get("arg1")),
+                        str(params.get("grep"), params.get("arg2")),
+                        toIntOrNull(params.get("file_offset"), params.get("arg3")),
+                        toIntOrNull(params.get("file_limit"), params.get("arg4")),
+                        toIntOrNull(params.get("offset"), params.get("arg5")),
+                        toIntOrNull(params.get("limit"), params.get("arg6")),
+                        str(params.get("related_dataset_ids"), params.get("arg7"))
+                );
+                case "rereadToolResult" -> rereadToolHandler.reread(
+                        str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
+                        str(params.get("keyword"), params.get("arg1")),
+                        toIntOrNull(params.get("offset"), params.get("arg2")),
+                        toIntOrNull(params.get("limit"), params.get("arg3"))
+                );
+                case "spawnSubAgent" -> subAgentControlHandler == null
+                        ? subAgentUnavailable(toolName)
+                        : subAgentControlHandler.spawn(params);
+                case "waitForSubAgent" -> subAgentControlHandler == null
+                        ? subAgentUnavailable(toolName)
+                        : subAgentControlHandler.waitFor(params);
                 default -> unsupported(toolName);
             };
+        } catch (ExternalToolJobPendingException pending) {
+            // pending 是跨层控制信号，不是可缓存的工具失败结果。
+            // PythonSandboxTools 在抛出前已经把后台任务、reservation 与 WAITING_TOOL_JOB handoff
+            // 持久化；这里必须原样重抛，使 LangChain executor 能构造 suspended result 并让旧 worker
+            // 退出。若落入下面的通用 Exception 分支，信号会被改写成 JSON，旧执行链将错误地继续。
+            //
+            // 此处分层的完整因果链如下：
+            // 1. PythonSandboxTools 已经取得 operationId，并在 createTask 前抢占 PREPARING anchor；
+            // 2. Sandbox 接受后台任务后，anchor 记录 taskId、estimate 与 reservation；
+            // 3. fast-path 未得到终态时，单条 CAS 同时写 PENDING anchor 与 WAITING_TOOL_JOB；
+            // 4. 只有上述 CAS 成功，工具层才构造这个 pending 异常；
+            // 5. 当前 router 原样透传，禁止生成 ToolExecutionOutcome；
+            // 6. 上层 todo executor 捕获稳定身份并返回 suspended workflow result；
+            // 7. pipeline 保存 plan、completedTodos、dataset snapshot 与工具预算检查点；
+            // 8. scheduler 的 Runnable finally 最终归还 Agent worker；
+            // 9. terminal webhook/reconciler 后续独立接管结果并创建恢复租约；
+            // 10. resume launcher 重新经过同一个有界 scheduler 获取新 worker。
+            //
+            // 因此这里还刻意不做四件事：
+            // - 不记录普通失败指标，pending 并未失败；
+            // - 不写工具结果缓存，当前没有 terminal result；
+            // - 不清理 anchor，清理权属于带 token/version 的恢复消费者；
+            // - 不释放 Sandbox reservation，它会在 finalizer 确认终态后准确释放。
+            // 任一“方便的统一异常处理”都会破坏上述 durable handoff 顺序。
+            throw pending;
         } catch (Exception e) {
             // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息
+            // 具体堆栈仍在服务日志中，模型只拿到可解释的 error.message。
             debugLog("tool invoke exception: runId={}, tool={}, error={}",
                     AgentContext.getRunId(), nvl(toolName), nvl(e.getMessage()));
             result = invocationError(toolName, e.getMessage());
@@ -593,6 +712,17 @@ public class ToolRouter {
                 .durationMs(Math.max(0L, System.currentTimeMillis() - startedAt))
                 .success(isToolSuccess(result))
                 .build();
+    }
+
+    private String subAgentUnavailable(String toolName) {
+        return writeJson(Map.of(
+                "ok", false,
+                "tool", nvl(toolName),
+                "data", Map.of(),
+                "error", Map.of(
+                        "code", "SUB_AGENT_UNAVAILABLE",
+                        "message", "Sub-agent execution is unavailable in this runtime",
+                        "details", Map.of())));
     }
 
     /**
@@ -635,6 +765,39 @@ public class ToolRouter {
                 params.get("arg1")
         );
         return String.join(",", datasetIds);
+    }
+
+    /**
+     * 260623-harness-optimization-02: 收集 executePython 的 manifestIds 参数（兼容多种命名风格）。
+     *
+     * <p>与 {@link #collectExecutePythonDatasetIds} 形态一致，但走 manifest 命名空间：
+     * manifest_ids / manifestIds / manifests / manifest_refs / manifestRefs。
+     * 拼接为逗号分隔字符串供 {@code PythonStaticPrecheckService.check} 与
+     * {@code PythonSandboxTools.executePython} 5 形参 overload 使用。</p>
+     *
+     * <p><b>非对称契约（Cindy round 2 review cleanup 拍板）</b>：legacy 位置参数
+     * {@code arg1} <b>不</b>进 manifest 命名空间 — 历史上 dataset / manifest 共用
+     * {@code arg1} 时存在「同一 {@code arg1=1} 同时进 dataset_ids 和 manifest_ids」的
+     * 歧义。修正后：
+     * <ul>
+     *   <li>{@code arg1} 只进 {@link #collectExecutePythonDatasetIds}（向后兼容老 prompt 风格）</li>
+     *   <li>manifest_ids 只能由显式命名 key（{@code manifest_ids} / {@code manifestIds} /
+     *       {@code manifests} / {@code manifest_refs} / {@code manifestRefs}）触发</li>
+     * </ul>
+     * 这样 {@code arg1=1} 不会意外 leak 到 manifest_ids 空间，避免模型把 dataset 编号
+     * 错填成 manifest 编号。
+     */
+    private String collectExecutePythonManifestIds(Map<String, Object> params) {
+        LinkedHashSet<String> manifestIds = new LinkedHashSet<>();
+        addDatasetIds(manifestIds,
+                params.get("manifest_ids"),
+                params.get("manifestIds"),
+                params.get("manifests"),
+                params.get("manifest_refs"),
+                params.get("manifestRefs")
+                // arg1 故意不在此列表中 — 见 Javadoc 非对称契约
+        );
+        return String.join(",", manifestIds);
     }
 
     /**
@@ -715,6 +878,23 @@ public class ToolRouter {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    /** 解析可选整数参数，无有效值时返回 null。 */
+    private Integer toIntOrNull(Object... candidates) {
+        String value = str(candidates);
+        if (value.isEmpty()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private boolean isBlank(String text) {
+        return text == null || text.isBlank();
     }
 
     /**
@@ -880,17 +1060,23 @@ public class ToolRouter {
     }
 
     /**
-     * 解析工具结果缓存的 scope。
+     * 解析工具结果缓存的 scope（D07 Risks 3.3.2 口径）。
      *
-     * <p>默认按用户隔离（{@code user:<userId>}），无用户上下文时退化为 global，
-     * 后者意味着多个用户可能共享同一份结果（仅适用于完全无个人数据的工具）。</p>
+     * <p>优先按用户隔离（{@code user:<userId>}）；无用户上下文时按 run 隔离
+     * （{@code run:<runId>}），不同匿名 run 互不命中；二者皆无则返回空串，
+     * 由缓存层 fail-closed 跳过共享缓存读写，绝不退化为可跨租户串线的
+     * {@code global} 兜底。AgentContext 当前无 session 身份概念，run 即匿名隔离单元。</p>
      */
     private String resolveScope() {
         String userId = AgentContext.getUserId();
-        if (userId == null || userId.isBlank()) {
-            return "global";
+        if (userId != null && !userId.isBlank()) {
+            return "user:" + userId.trim();
         }
-        return "user:" + userId.trim();
+        String runId = AgentContext.getRunId();
+        if (runId != null && !runId.isBlank()) {
+            return "run:" + runId.trim();
+        }
+        return "";
     }
 
     /** 空安全：null 转为空字符串。 */
@@ -947,5 +1133,12 @@ public class ToolRouter {
         private long durationMs;
         /** 缓存元数据（是否符合缓存条件、是否命中、来源、剩余 TTL 等） */
         private ToolResultCacheService.CacheMeta cacheMeta;
+        /**
+         * D07：是否因权重限流被拒绝而未真正执行（不消耗成功预算、工具 credit 为 0，
+         * executor 据此写 FINISHED 契约字段 throttle_layer=weight_limit）。LC4j 前台
+         * Semaphore 拒绝发生在进入 Router 之前，不经本标记传递，由 executor 直接标注
+         * throttle_layer=lc4j_semaphore。
+         */
+        private boolean throttleRejected;
     }
 }

@@ -1,0 +1,31 @@
+# 沪深300 成分股 2024 年年报 冒烟测试
+# 用法: python run.py --task-config configs/csi300-2024-annual-report-smoke.yml
+#
+# 前提：DB 中已有 2024 年公告的元数据（先跑 test_scripts/config/rag-ann-metadata-2023-2025.yml 拉取）
+#
+# 筛选逻辑：
+#   - 指数成分股: 沪深300 (000300.SH)，member_date 覆盖 2024 全年
+#   - 日期范围: 2024-01-01 ~ 2024-12-31
+#   - title 过滤: 含 "年度报告", 排除 "摘要"
+#   - 冒烟测试: 仅处理 10 条
+
+scenarios:
+  - name: 沪深300-2024年报-冒烟测试
+    doc_type: ann
+    date_from: "20240101"
+    date_to: "20241231"
+    title_match:
+      mode: contains
+      include:
+        - "年度报告"
+      exclude:
+        - "摘要"
+    ts_code:
+      type: select
+      conditions:
+        index_codes:
+          - "000300.SH"
+        member_date_from: "20240101"
+        member_date_to: "20241231"
+    limit: 10
+    offset: 0

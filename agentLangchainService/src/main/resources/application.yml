@@ -18,11 +18,13 @@ agent:
     provider:
       enabled: false
     service:
-      version: P0-skeleton
+      version: UNKNOWN
   llm:
     config-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+    prompt-overlay-file: ${AF_AGENT_PROMPT_OVERLAY_FILE:}
     prompt-base-dir: ${AF_AGENT_LLM_PROMPT_BASE_DIR:}
     config-refresh-interval-ms: ${AF_AGENT_LLM_CONFIG_REFRESH_INTERVAL_MS:10000}
+    prompt-overlay-refresh-interval-ms: ${AF_AGENT_PROMPT_OVERLAY_REFRESH_INTERVAL_MS:10000}
     default-endpoint: ${AF_AGENT_DEFAULT_ENDPOINT:openrouter}
     default-model: ${AF_AGENT_DEFAULT_MODEL:openai/gpt-5.2}
     models: ${AF_AGENT_MODELS:openai/gpt-5.2,openai/gpt-5.1,google/gemini-3-pro-preview,moonshotai/kimi-k2.5,accounts/fireworks/models/kimi-k2p5}
@@ -39,6 +41,17 @@ agent:
     openrouter:
       http-referer: ${AF_OPENROUTER_HTTP_REFERER:}
       title: ${AF_OPENROUTER_TITLE:}
+  # 260814 scheduler-03: workspace export 总开关（默认关闭）。关闭时终态事件
+  # 监听器、polling observer、dump executor、磁盘 _dlq 与启动重放均不创建。
+  workspace:
+    export-enabled: ${AF_AGENT_WORKSPACE_EXPORT_ENABLED:false}
+  run:
+    # 260814 scheduler-03: rawRef 本地临时存储（当前 Run 生命周期）。
+    raw-ref:
+      root-dir: ${AF_AGENT_RAW_REF_ROOT_DIR:${java.io.tmpdir}/alphafrog-raw-ref}
+      max-entry-bytes: ${AF_AGENT_RAW_REF_MAX_ENTRY_BYTES:8388608}
+      max-entries-per-run: ${AF_AGENT_RAW_REF_MAX_ENTRIES_PER_RUN:512}
+      max-total-bytes-per-run: ${AF_AGENT_RAW_REF_MAX_TOTAL_BYTES_PER_RUN:536870912}
 
 langchain4j:
   open-ai:
@@ -53,7 +66,7 @@ langchain4j:
       exclude: ${AF_AGENT_REASONING_EXCLUDE:false}
       enabled: ${AF_AGENT_REASONING_ENABLED:#{null}}
 
-# Nacos 配置订阅（与 legacy agentService 一致：推送写本地文件 → LocalConfigLoader 热加载）
+# Nacos 配置订阅：推送写本地文件 → LocalConfigLoader 热加载
 alphafrog:
   config:
     nacos:
@@ -69,6 +82,12 @@ alphafrog:
         - data-id: ${AF_CONFIG_NACOS_AGENT_LLM_DATA_ID:agent-llm.json}
           group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
           target-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+        - data-id: ${AF_CONFIG_NACOS_PROMPT_OVERLAY_DATA_ID:agent-prompt-overlay.json}
+          group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
+          target-file: ${AF_AGENT_PROMPT_OVERLAY_FILE:}
+        - data-id: ${AF_CONFIG_NACOS_FINANCE_RECORD_DATA_ID:finance-record-channel.json}
+          group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
+          target-file: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:}
 
 stress:
   test:

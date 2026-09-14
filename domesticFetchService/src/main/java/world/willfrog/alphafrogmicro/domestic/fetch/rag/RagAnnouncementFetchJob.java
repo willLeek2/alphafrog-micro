@@ -107,6 +107,12 @@ public class RagAnnouncementFetchJob {
             } catch (Exception e) {
                 log.error("[RagAnnouncementFetchJob] 抓取 date={} 失败: {}", dateStr, e.getMessage(), e);
             }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
         return total;
     }
@@ -155,6 +161,12 @@ public class RagAnnouncementFetchJob {
 
             if (items.size() < DEFAULT_PAGE_LIMIT) break;
             offset += items.size();
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
 
         log.info("[RagAnnouncementFetchJob] date={} titleFilter={} totalInserted={}",

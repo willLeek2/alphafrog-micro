@@ -1,0 +1,22 @@
+[Unit]
+Description=AlphaFrog Beta deployment controller
+Wants=network-online.target
+Requires=docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=alphafrog-beta
+Group=alphafrog-beta
+SupplementaryGroups=docker
+WorkingDirectory=/opt/alphafrog-beta/controller
+EnvironmentFile=/etc/alphafrog-beta/controller.env
+ExecStart=/usr/bin/java -jar /opt/alphafrog-beta/controller/betaDeploymentController.jar
+Restart=always
+RestartSec=5s
+StateDirectory=alphafrog-beta
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

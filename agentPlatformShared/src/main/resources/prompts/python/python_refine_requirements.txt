@@ -1,12 +1,19 @@
-你可以在本轮修正 run_args，尤其是 dataset_ids（多数据集用逗号分隔）。
+你可以在本轮修正 run_args，尤其是 dataset_ids / manifest_ids（多编号用逗号分隔）。
 代码中不要假设未定义变量，必须从文件读取数据。
-数据文件路径固定为 /sandbox/input/<dataset_id>/<dataset_id>.csv（优先）或 /sandbox/input/<dataset_id>/data.csv（兼容）。
-读取数据时必须使用 pd.read_csv(f"/sandbox/input/{dataset_id}/{dataset_id}.csv")，禁止使用未定义的函数如 load_dataset() 或 get_dataset()。
-若存在 dataset_ids，请逐个读取对应 csv，不要写死 /mnt/data 等路径。
+数据文件路径不再固定为 /sandbox/input/<dataset_id>/<dataset_id>.csv；executePython 启动后会在 /sandbox/paths_dataset.csv 与 /sandbox/path_manifest.csv 中注入 run-level 编号到真实路径的映射。
+读取数据时应先读 CSV 索引：pd.read_csv("/sandbox/paths_dataset.csv") 或 pd.read_csv("/sandbox/path_manifest.csv")，根据 run-level 编号拿到 dataset_file_path / manifest_file_path，再用 pd.read_csv(path) 加载。
+也可使用 from af_dataset_loader import load_manifest, load_datasets；load_datasets("1") 按 run-level dataset 编号返回 dict[ts_code, DataFrame]；load_manifest("1") 按 run-level manifest 编号返回 DatasetLoadResult（含 frame / failed_members / skipped_members）。
+dataset_ids / manifest_ids 工具参数可用逗号分隔；Python 代码里推荐每次向 load_datasets / load_manifest 传一个编号，多个编号用循环逐个加载后合并。
+from_ts_code 字段可能为 UNCERTAIN，不代表数据损坏；若需按资产过滤，用 listMyData 查询。
 日期字段请先排序后再取首尾行，不要硬编码某个交易日一定存在。
-trade_date 可能是 YYYYMMDD（8位）或 13 位毫秒时间戳；必须先做长度判断：8 位用字符串排序或 to_datetime(format="%Y%m%d")，13 位必须用 pd.to_datetime(..., unit="ms", utc=True) 后转 Asia/Shanghai。
-严禁直接对原始整数执行 pd.to_datetime（会被当作纳秒导致 1970 年日期）；若发现 13 位时间戳未使用 unit="ms"，视为错误，必须立刻修正。
+行情类数据集的日期列（如 trade_date、nav_date）是毫秒时间戳整数；请用 pd.to_datetime(列, unit="ms") 转成日期，或直接按整数排序后取首尾行。
+财务报表数据集的 end_date/ann_date 是 YYYYMMDD 字符串，与行情日期列格式不同。不要用 format="%Y%m%d" 解析 trade_date；若上轮出现日期解析报错，本轮改用 unit="ms"。
 价格字段请优先使用 close/open 等数值列，避免把 ts_code 当作价格。
 ts_code 是数据库内区分不同资产的标识字段，不可用于涨跌幅数值计算。
 优先输出 JSON 结果，便于后续流程消费。
-若上轮报 dataset_ids 相关错误，必须优先修正 run_args 再生成代码。
+若上轮报 dataset_ids / manifest_ids 相关错误，必须优先调用 listMyData 获取合法编号并修正 run_args 再生成代码；连续 2 次同类失败后应停止重试并换策略。
+遇到金融指标或计算方法类问题时，可以把用户的原始自然语言表达直接交给 resolveFinanceMethods 建议工具，不要先把问题改写成固定字段。
+建议结果带有未解决表达（unresolvedTerms）时，先澄清或明确边界再计算；不能擅自把“这几年”等模糊时间词换算成年数或固定区间。
+候选带有兼容公共库样例时优先调用库函数，但不强制；库不可用或方法无库绑定时可以自行计算。
+自行计算时使用 report_custom() 按通用字段声明（formulaDescription、inputRefs、outputUnit、parameters、checks）。
+调用 report() 或 report_custom() 时，把建议工具结果根部的 resolverToolCallId 显式传给 source_resolver_tool_call_id；没有来源时不传，不要猜测最近一次建议。

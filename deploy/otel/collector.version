@@ -1,0 +1,4 @@
+# OpenTelemetry Collector Contrib 的固定镜像版本与配置摘要。
+OTEL_COLLECTOR_IMAGE=otel/opentelemetry-collector-contrib:0.159.0
+OTEL_COLLECTOR_CONFIG_FILE=otel-collector-config.yaml
+OTEL_COLLECTOR_CONFIG_SHA256=663e5e291d9517916b5e96270335bcf8ced3fe2e533598634a57f20c01f57b94

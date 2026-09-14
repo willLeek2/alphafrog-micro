@@ -159,10 +159,10 @@ public class DomesticIndexFetchServiceImpl extends DomesticIndexFetchServiceImpl
             indexOffset = request.getOffset();
             indexLimit = request.getLimit();
         }
-        List<String> allTsCode = indexInfoDao.getAllIndexInfoTsCodes(indexOffset, indexLimit);
+        List<String> allTsCode = indexInfoDao.getAllIndexInfoTsCodesWithDaily(indexOffset, indexLimit);
 
         if (allTsCode.isEmpty()) {
-            log.error("No index info found in the database.");
+            log.error("No index info found with daily data in the database.");
             return DomesticIndexDailyFetchByTradeDateResponse.newBuilder().setStatus("failure")
                     .setFetchedItemsCount(-1).build();
         }
@@ -231,10 +231,10 @@ public class DomesticIndexFetchServiceImpl extends DomesticIndexFetchServiceImpl
             indexLimit = request.getLimit();
         }
 
-        List<String> allTsCode = indexInfoDao.getAllIndexInfoTsCodes(indexOffset, indexLimit);
+        List<String> allTsCode = indexInfoDao.getAllIndexInfoTsCodesWithDaily(indexOffset, indexLimit);
 
         if (allTsCode.isEmpty()) {
-            log.error("No index info found in the database.");
+            log.error("No index info found with daily data in the database.");
             return DomesticIndexDailyFetchAllByDateRangeResponse.newBuilder().setStatus("failure")
                     .setFetchedItemsCount(-1).build();
         }

@@ -44,4 +44,20 @@ public class TraceDetailResponse {
     private String cacheKey;
     private String decisionLlmTraceId;
     private String decisionExcerpt;
+
+    private Map<String, Object> fullDetail;
+    private FullDetailParts fullDetailParts;
+
+    public record FullDetailParts(
+            String partsUrl,
+            Integer partSize,
+            Integer totalParts,
+            Long uncompressedSize,
+            Long compressedSize,
+            String compression,
+            String checksum,
+            Long createdAtMillis,
+            Long expiresAtMillis
+    ) {
+    }
 }

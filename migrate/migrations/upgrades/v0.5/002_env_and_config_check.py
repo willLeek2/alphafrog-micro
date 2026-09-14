@@ -13,7 +13,6 @@ import sys
 
 ENV_FILE = Path(".env")
 DOCKER_COMPOSE = Path("docker-compose.yml")
-OLD_SEARCH_LLM = Path("agentService/config/search-llm.local.json")
 NEW_SEARCH_LLM = Path("externalInfoService/config/search-llm.local.json")
 NEW_SEARCH_EXAMPLE = Path("externalInfoService/config/search-llm.local.example.json")
 
@@ -77,12 +76,7 @@ def check_search_llm():
         print(f"[OK] search-llm 配置已迁移至: {NEW_SEARCH_LLM}")
         return True
 
-    if OLD_SEARCH_LLM.exists():
-        print(f"[WARN] search-llm 配置仍在旧位置: {OLD_SEARCH_LLM}")
-        print("       v0.5 需要将 search-llm 配置迁移至 externalInfoService/config/")
-        print("       且配置结构需要从 providers 改为 feature+profiles 格式")
-    else:
-        print("[INFO] search-llm 配置未找到")
+    print("[INFO] search-llm 配置未找到")
 
     if NEW_SEARCH_EXAMPLE.exists():
         print(f"       请参考示例文件: {NEW_SEARCH_EXAMPLE}")

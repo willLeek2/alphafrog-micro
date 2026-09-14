@@ -14,7 +14,7 @@ import java.util.Set;
  * 用于配置原始 HTTP 请求/响应捕获、Provider 诊断等功能
  * 
  * @see world.willfrog.agent.platform.service.RawHttpLogger
- * @see world.willfrog.agent.platform.service.AgentObservabilityService
+ * @see world.willfrog.agent.platform.service.AgentRunObservabilityService
  */
 @Data
 @ConfigurationProperties(prefix = "agent.observability")
@@ -51,7 +51,7 @@ public class AgentObservabilityProperties {
         /**
          * 捕获 body 的最大字符数
          */
-        private int captureBodyMaxChars = 100000;
+        private int captureBodyMaxChars = 1572864;
         
         /**
          * 是否捕获请求/响应 headers

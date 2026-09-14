@@ -70,5 +70,8 @@ public class IndexInfo {
     @Column(name = "exp_date")
     Long expDate;
 
+    // Search-only metadata: 1 if alphafrog_index_daily has any row for this ts_code.
+    @Transient
+    Integer hasDaily;
 
 }

@@ -1,0 +1,11 @@
+schemaVersion: "1"
+methodId: finance.risk.annualized_volatility
+version: 1.0.0
+displayName: 年化波动率
+definition: 由一组周期收益率的样本标准差按每年期数平方根换算的年化波动率
+resolverHints:
+  aliases: [共享别名]
+parameters:
+  returns: {type: array, required: true, items: {type: number}}
+outputs:
+  - {name: vol, unit: ratio, description: 年化波动率}

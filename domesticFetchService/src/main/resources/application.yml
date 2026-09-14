@@ -25,6 +25,9 @@ spring:
       port: 6379
       password: ${AF_REDIS_PASSWORD:default}
 
+server:
+  port: ${AF_DOMESTIC_FETCH_HTTP_PORT:18082}
+
 af:
   fetch:
     concurrency: ${AF_FETCH_CONCURRENCY:3}

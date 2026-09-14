@@ -15,6 +15,8 @@ import world.willfrog.alphafrogmicro.frontend.config.JwtConfig;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.util.AuthCookieHelper;
 
+import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityManager;
+
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
@@ -35,6 +37,7 @@ class JwtAuthFilterContextSaveTest {
     private JwtConfig jwtConfig;
     private AuthService authService;
     private AuthCookieHelper authCookieHelper;
+    private AuthObservabilityManager authObservabilityManager;
     private JwtAuthFilter filter;
 
     @BeforeEach
@@ -45,7 +48,8 @@ class JwtAuthFilterContextSaveTest {
         jwtConfig.setTokenPrefix("Bearer");
         authService = mock(AuthService.class);
         authCookieHelper = mock(AuthCookieHelper.class);
-        filter = new JwtAuthFilter(jwtConfig, secretKey, authService, authCookieHelper);
+        authObservabilityManager = mock(AuthObservabilityManager.class);
+        filter = new JwtAuthFilter(jwtConfig, secretKey, authService, authCookieHelper, authObservabilityManager);
         SecurityContextHolder.clearContext();
     }
 

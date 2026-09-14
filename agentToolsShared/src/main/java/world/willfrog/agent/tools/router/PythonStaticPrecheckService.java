@@ -17,20 +17,31 @@ public class PythonStaticPrecheckService {
     private static final Pattern DATASET_ID_DEFINE_PATTERN = Pattern.compile("\\bdataset_id\\s*=");
     private static final Pattern FORBIDDEN_DATASETS_PATH_PATTERN = Pattern.compile("(?i)(^|[^A-Za-z0-9_])/datasets(/|\\b)");
 
-    public Result check(String code, String datasetIds, Map<String, Object> runArgs) {
+    public Result check(String code, String datasetIds, String manifestIds, Map<String, Object> runArgs) {
         List<String> issues = new ArrayList<>();
         Map<String, Object> report = new LinkedHashMap<>();
         String normalizedCode = code == null ? "" : code;
         String normalizedDatasetIds = datasetIds == null ? "" : datasetIds.trim();
+        String normalizedManifestIds = manifestIds == null ? "" : manifestIds.trim();
         List<String> parsedDatasetIds = parseDatasetIds(normalizedDatasetIds);
+        List<String> parsedManifestIds = parseDatasetIds(normalizedManifestIds);
 
         if (normalizedCode.isBlank()) {
             issues.add("code 不能为空");
         }
-        if (parsedDatasetIds.isEmpty()) {
-            issues.add("dataset_ids 不能为空");
-        } else if (parsedDatasetIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
-            issues.add("dataset_id 格式非法，仅允许字母数字._-");
+        if (parsedDatasetIds.isEmpty() && parsedManifestIds.isEmpty()) {
+            // 260623-harness-optimization-02: dataset_ids 与 manifest_ids 是两个独立编号空间，
+            // 至少传一个。两者都为空时直接报 MISSING_IDS（不细分是哪一侧缺，避免 LLM 反复尝试）。
+            issues.add("dataset_ids 与 manifest_ids 至少需要传一个");
+        } else {
+            if (!parsedDatasetIds.isEmpty()
+                    && parsedDatasetIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
+                issues.add("dataset_id 格式非法，仅允许字母数字._-");
+            }
+            if (!parsedManifestIds.isEmpty()
+                    && parsedManifestIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
+                issues.add("manifest_id 格式非法，仅允许字母数字._-");
+            }
         }
 
         if (!normalizedCode.isBlank() && FORBIDDEN_DATASETS_PATH_PATTERN.matcher(normalizedCode).find()) {
@@ -46,13 +57,18 @@ public class PythonStaticPrecheckService {
         report.put("code_length", normalizedCode.length());
         report.put("dataset_id", parsedDatasetIds.isEmpty() ? "" : parsedDatasetIds.get(0));
         report.put("dataset_ids", parsedDatasetIds);
+        report.put("manifest_id", parsedManifestIds.isEmpty() ? "" : parsedManifestIds.get(0));
+        report.put("manifest_ids", parsedManifestIds);
         report.put("run_args", runArgs == null ? Map.of() : runArgs);
         report.put("issues", issues);
 
         if (!issues.isEmpty()) {
-            String errorCode = parsedDatasetIds.isEmpty()
-                    ? "MISSING_DATASET_IDS"
-                    : "STATIC_PRECHECK_FAILED";
+            String errorCode;
+            if (parsedDatasetIds.isEmpty() && parsedManifestIds.isEmpty()) {
+                errorCode = "MISSING_IDS";
+            } else {
+                errorCode = "STATIC_PRECHECK_FAILED";
+            }
             return Result.builder()
                     .passed(false)
                     .category(TodoFailureCategory.STATIC)

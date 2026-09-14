@@ -36,8 +36,8 @@ class AgentRunResultCacheServiceTest {
 
     @Test
     void getRunResult_shouldCacheWithinTtl() {
-        AgentRunResultMessage first = cacheService.getRunResult("u1", "run-1");
-        AgentRunResultMessage second = cacheService.getRunResult("u1", "run-1");
+        AgentRunResultMessage first = cacheService.getRunResult("u1", "run-1", false);
+        AgentRunResultMessage second = cacheService.getRunResult("u1", "run-1", false);
 
         assertEquals(first, second);
         verify(agentDubboService, times(1)).getResult(any(GetAgentRunResultRequest.class));
@@ -45,10 +45,22 @@ class AgentRunResultCacheServiceTest {
 
     @Test
     void getRunResult_shouldUseDifferentKeysPerUserOrRun() {
-        cacheService.getRunResult("u1", "run-1");
-        cacheService.getRunResult("u2", "run-1");
-        cacheService.getRunResult("u1", "run-2");
+        cacheService.getRunResult("u1", "run-1", false);
+        cacheService.getRunResult("u2", "run-1", false);
+        cacheService.getRunResult("u1", "run-2", false);
 
         verify(agentDubboService, times(3)).getResult(any(GetAgentRunResultRequest.class));
+    }
+
+    @Test
+    void getRunResult_shouldIsolateAdminAndNonAdminEntriesForSameRun() {
+        cacheService.getRunResult("u1", "run-1", true);
+        cacheService.getRunResult("u1", "run-1", false);
+        cacheService.getRunResult("u1", "run-1", true);
+
+        var captor = org.mockito.ArgumentCaptor.forClass(GetAgentRunResultRequest.class);
+        verify(agentDubboService, times(2)).getResult(captor.capture());
+        assertEquals(true, captor.getAllValues().get(0).getIsAdmin());
+        assertEquals(false, captor.getAllValues().get(1).getIsAdmin());
     }
 }

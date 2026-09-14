@@ -4,13 +4,15 @@ import org.junit.jupiter.api.Test;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.FilterType;
+import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityProperties;
 
 @SpringBootTest(
         classes = FrontendApplicationTest.TestFrontendApplication.class,
-        webEnvironment = SpringBootTest.WebEnvironment.NONE,
+        webEnvironment = SpringBootTest.WebEnvironment.MOCK,
         properties = {
                 "AF_DB_MAIN_HOST=127.0.0.1",
                 "AF_DB_MAIN_PORT=5432",
@@ -23,7 +25,7 @@ import org.springframework.context.annotation.FilterType;
                 "spring.rabbitmq.listener.direct.auto-startup=false",
                 "spring.data.redis.host=127.0.0.1",
                 "spring.data.redis.port=6379",
-                "spring.data.redis.password=",
+                "spring.data.redis.password=Excited1s",
                 "spring.autoconfigure.exclude=" +
                         "org.apache.dubbo.spring.boot.autoconfigure.DubboAutoConfiguration," +
                         "org.apache.dubbo.spring.boot.autoconfigure.DubboRelaxedBindingAutoConfiguration," +
@@ -48,6 +50,7 @@ class FrontendApplicationTest {
             "world.willfrog.alphafrogmicro.frontend",
             "world.willfrog.alphafrogmicro.common"
     }, excludeFilters = @ComponentScan.Filter(type = FilterType.ASSIGNABLE_TYPE, classes = FrontendApplication.class))
+    @EnableConfigurationProperties(AuthObservabilityProperties.class)
     @MapperScan("world.willfrog.alphafrogmicro.common.dao")
     static class TestFrontendApplication {
     }

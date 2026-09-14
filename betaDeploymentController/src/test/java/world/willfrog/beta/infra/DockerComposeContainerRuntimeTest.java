@@ -1,0 +1,746 @@
+package world.willfrog.beta.infra;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import org.apache.dubbo.common.URL;
+import org.apache.dubbo.registry.integration.DefaultServiceURLCustomizer;
+import org.apache.dubbo.rpc.model.ApplicationModel;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import world.willfrog.beta.config.BetaControllerProperties;
+import world.willfrog.beta.core.ContainerRuntime;
+import world.willfrog.beta.core.ControllerException;
+import world.willfrog.beta.core.JsonSupport;
+
+import static org.apache.dubbo.common.constants.CommonConstants.EXTRA_KEYS_KEY;
+import static org.apache.dubbo.registry.Constants.SIMPLIFIED_KEY;
+
+class DockerComposeContainerRuntimeTest {
+    @TempDir Path temporary;
+    private ObjectMapper mapper;
+    private BetaControllerProperties properties;
+    private JsonNode manifest;
+    private JsonNode service;
+    private ContainerRuntime.CandidatePlan plan;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        mapper = new ObjectMapper();
+        properties = new BetaControllerProperties();
+        properties.getNacos().setServerAddress("nacos.internal:8848");
+        properties.getObservability().setTracesEndpoint(URI.create("http://jaeger.internal:4318"));
+        properties.setStateRoot(temporary.resolve("state"));
+        Path health = temporary.resolve("tcp-healthcheck");
+        Files.writeString(health, "#!/bin/sh\nexit 0\n");
+        health.toFile().setExecutable(true, true);
+        properties.setHealthcheckScript(health);
+        Path javaAgent = temporary.resolve("opentelemetry-javaagent.jar");
+        Files.writeString(javaAgent, "test java agent");
+        properties.getObservability().setJavaAgentJar(javaAgent);
+        Path environment = temporary.resolve("agent-service.env");
+        Files.writeString(environment, "SERVER_PORT=18080\n");
+        try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
+        template.setEnvFile(environment);
+        properties.setServices(Map.of("agent-service", template));
+        BetaControllerProperties.Machine machine = new BetaControllerProperties.Machine();
+        machine.setDockerHost(URI.create("unix:///var/run/docker.sock"));
+        machine.setBindIp("127.0.0.1");
+        machine.setRoutableAddress("10.0.0.8");
+        properties.setMachines(Map.of("beta-machine-1", machine));
+        manifest = mapper.readTree("""
+                {"deploymentId":"beta-main-001","trafficScopeId":"main-beta","gitCommit":"1111111111111111111111111111111111111111",
+                 "manifestVersion":1,"services":[{"serviceName":"agent-service","releaseId":"release-1","machineId":"beta-machine-1",
+                 "image":{"repositoryDigest":"registry.local/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                          "localImageId":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+                 "runtime":{"containerPort":18080,"hostPorts":[28080,28081],
+                            "shutdownProfile":"SPRING_BOOT_HTTP_DUBBO_V1","applicationDrainSeconds":60,
+                            "drainGraceSeconds":65,"readinessTimeoutSeconds":120},
+                 "registration":{"serviceName":"providers:com.alphafrog.AgentService::langchain",
+                    "groupName":"alphafrog-beta","namespaceId":"public","clusterName":"DEFAULT",
+                    "applicationName":"agent-langchain-service"}}]}
+                """);
+        service = manifest.path("services").path(0);
+        plan = new ContainerRuntime.CandidatePlan("beta-main-001", "main-beta", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+    }
+
+    @Test
+    void createsFromAnImmutableImageWithAContainerGraceBeyondTheApplicationBudget() throws Exception {
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+        runtime.validateManifest(manifest);
+
+        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan);
+
+        assertTrue(created.running());
+        assertEquals(28080, created.hostPort());
+        Path compose = temporary.resolve("state/compose/i-one.json");
+        String content = Files.readString(compose);
+        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
+        JsonNode effectiveRouting = mapper.readTree(mapper.readTree(content)
+                .path("services").path("app").path("environment").path("SPRING_APPLICATION_JSON").asText());
+        assertFalse(content.contains("RETIREMENT_TOKEN"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_ENABLED"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_NACOS_SERVER_ADDRESS"));
+        assertTrue(content.contains("AGENT_LANGCHAIN_GENERATION_REAPER_ABSENCE_CONFIRMATION_SECONDS"));
+        assertTrue(content.contains("OTEL_SERVICE_NAME"));
+        assertEquals("http://jaeger.internal:4318",
+                environmentNode.path("OTEL_EXPORTER_OTLP_ENDPOINT").asText());
+        assertEquals("http/protobuf", environmentNode.path("OTEL_EXPORTER_OTLP_PROTOCOL").asText());
+        assertEquals("otlp", environmentNode.path("OTEL_TRACES_EXPORTER").asText());
+        assertEquals("none", environmentNode.path("OTEL_METRICS_EXPORTER").asText());
+        assertEquals("none", environmentNode.path("OTEL_LOGS_EXPORTER").asText());
+        assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
+        assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
+        // 主 Beta 容器不带泳道名，配置候选链只查主 data-id，不去查 "main-beta.{dataId}"
+        assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
+        // agent 这类服务没有 HTTP 上游，compose 里不出现沙箱地址变量。
+        assertFalse(environmentNode.has("AF_SANDBOX_SERVICE_URL"));
+        assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
+        assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
+        assertFalse(content.contains("image.digest=registry.local"));
+        assertTrue(content.contains("alphafrog-beta"));
+        // 不注入 consumer.cluster：多注册中心外层合并由 Dubbo 默认给 zone-aware，
+        // 全局 consumer 写 zone-aware 会让单注册中心内层强转 ClassCastException
+        assertFalse(content.contains("zone-aware"));
+        assertFalse(effectiveRouting.path("dubbo").path("registry").path("register").asBoolean());
+        assertTrue(effectiveRouting.path("dubbo").path("registries").path("beta").path("register").asBoolean());
+        assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("register").asBoolean());
+        assertTrue(effectiveRouting.path("dubbo").path("registries").path("beta").path("preferred").asBoolean());
+        assertFalse(effectiveRouting.path("dubbo").path("registries").path("production").path("preferred").asBoolean());
+        assertTrue(effectiveRouting.path("dubbo").path("registries").path("production").path("address").asText()
+                .contains("group=DEFAULT_GROUP"));
+        for (String registry : List.of("beta", "production")) {
+            JsonNode named = effectiveRouting.path("dubbo").path("registries").path(registry);
+            assertTrue(named.path("simplified").asBoolean(), registry);
+            assertEquals(Arrays.asList("application", "zone", "dubbo.tag", "alphafrog.deployment-id",
+                    "alphafrog.traffic-scope-id", "alphafrog.release-id", "alphafrog.deployment-generation-id",
+                    "alphafrog.instance-id"), Arrays.asList(named.path("extra-keys").asText().split(",")),
+                    registry);
+        }
+        assertFalse(effectiveRouting.path("dubbo").has("consumer"));
+        assertTrue(content.contains("SERVER_SHUTDOWN"));
+        assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
+        assertEquals("10.0.0.8", environmentNode.path("DUBBO_IP_TO_REGISTRY").asText());
+        assertEquals("28080", environmentNode.path("DUBBO_PORT_TO_REGISTRY").asText());
+        assertFalse(environmentNode.has("AF_DUBBO_PORT_TO_REGISTRY"));
+        JsonNode composeNetworks = mapper.readTree(content).path("networks");
+        assertEquals("alphafrog-beta", composeNetworks.path("default").path("name").asText());
+        assertTrue(composeNetworks.path("default").path("external").asBoolean());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("network")
+                && command.contains("create") && command.contains("--subnet")
+                && command.contains("172.16.0.0/24") && command.contains("--gateway")
+                && command.contains("172.16.0.1") && command.contains("alphafrog-beta")));
+        JsonNode providerParameters = effectiveRouting.path("dubbo").path("provider").path("parameters");
+        assertEquals("beta-main-001", providerParameters.path("alphafrog.deployment-id").asText());
+        assertEquals("main-beta", providerParameters.path("alphafrog.traffic-scope-id").asText());
+        assertEquals("release-1", providerParameters.path("alphafrog.release-id").asText());
+        assertEquals(plan.generationId(), providerParameters.path("alphafrog.deployment-generation-id").asText());
+        assertEquals("i-one", providerParameters.path("alphafrog.instance-id").asText());
+        assertEquals("beta", providerParameters.path("zone").asText());
+        assertFalse(providerParameters.has("dubbo.tag"));
+        assertEquals("60", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
+        assertEquals("5", environmentNode.path(
+                "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
+        assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+        assertEquals("65s", mapper.readTree(content).path("services").path("app")
+                .path("stop_grace_period").asText());
+        JsonNode volumes = mapper.readTree(content).path("services").path("app").path("volumes");
+        assertTrue(containsVolume(volumes, properties.getObservability().getJavaAgentJar()
+                + ":/otel/javaagent.jar:ro"));
+        assertTrue(containsVolume(volumes, temporary.resolve("state/data/logs/agent-service") + ":/app/logs"));
+        assertTrue(Files.isDirectory(temporary.resolve("state/data/logs/agent-service")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
+        assertFalse(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void createsByLocalImageIdRegardlessOfWhatTheReadableTagPointsAt() throws Exception {
+        ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        // 校验和启动都用本机 Image ID：标签之后被挪到别的镜像也不影响已提交的部署。
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        assertEquals("sha256:" + "b".repeat(64), compose.path("services").path("app").path("image").asText());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("image")
+                && command.contains("inspect") && command.contains("sha256:" + "b".repeat(64))));
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("agent-langchain-service:local")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void acceptsNonEmptyMachineAddressNamesAndPassesThemThrough() throws Exception {
+        BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
+        machine.setBindIp("beta-bind.example.internal");
+        machine.setRoutableAddress("beta-route.example.internal");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.validateManifest(manifest);
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode app = compose.path("services").path("app");
+        assertEquals("beta-bind.example.internal", app.path("ports").path(0).path("host_ip").asText());
+        assertEquals("beta-route.example.internal",
+                app.path("environment").path("DUBBO_IP_TO_REGISTRY").asText());
+    }
+
+    @Test
+    void controllerManagedObservabilityOverridesEnvFileValuesAndPreservesConfiguredJvmOptions() throws Exception {
+        Path environment = properties.getServices().get("agent-service").getEnvFile();
+        Files.writeString(environment, """
+                OTEL_EXPORTER_OTLP_ENDPOINT=http://wrong.example:4318
+                OTEL_TRACES_EXPORTER=none
+                JAVA_TOOL_OPTIONS=-Xmx16m
+                """);
+        BetaControllerProperties.ServiceTemplate template = properties.getServices().get("agent-service");
+        template.setJavaToolOptions("-Xms256m -Xmx512m");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode app = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app");
+        assertEquals("http://jaeger.internal:4318",
+                app.path("environment").path("OTEL_EXPORTER_OTLP_ENDPOINT").asText());
+        assertEquals("otlp", app.path("environment").path("OTEL_TRACES_EXPORTER").asText());
+        assertEquals("-Xms256m -Xmx512m -javaagent:/otel/javaagent.jar",
+                app.path("environment").path("JAVA_TOOL_OPTIONS").asText());
+    }
+
+    @Test
+    void nonJvmServiceStillGetsExporterAndLogSettingsWithoutAJavaAgent() throws Exception {
+        BetaControllerProperties.ServiceTemplate template = properties.getServices().get("agent-service");
+        template.setJavaAgentEnabled(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode app = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app");
+        assertEquals("otlp", app.path("environment").path("OTEL_TRACES_EXPORTER").asText());
+        assertFalse(app.path("environment").has("JAVA_TOOL_OPTIONS"));
+        assertFalse(containsTarget(app.path("volumes"), "/otel/javaagent.jar"));
+        assertTrue(containsTarget(app.path("volumes"), "/app/logs"));
+    }
+
+    @Test
+    void refusesMissingOrConflictingControllerManagedObservabilitySettings() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        properties.getObservability().setTracesEndpoint(null);
+        assertEquals("OBSERVABILITY_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        properties.getObservability().setTracesEndpoint(URI.create("http://jaeger.internal:4318"));
+        BetaControllerProperties.ServiceTemplate template = properties.getServices().get("agent-service");
+        template.setVolumes(List.of("/tmp/custom:/app/logs"));
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        template.setVolumes(List.of());
+        template.setJavaToolOptions("-javaagent:/tmp/other.jar");
+        assertEquals("OBSERVABILITY_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        template.setJavaToolOptions("");
+        Files.delete(properties.getObservability().getJavaAgentJar());
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+    }
+
+    @Test
+    void startupPrerequisiteFailureNamesTheUnsafeHostFile() throws Exception {
+        Path missing = temporary.resolve("missing-healthcheck").toAbsolutePath();
+        properties.setHealthcheckScript(missing);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        ControllerException failure = assertThrows(ControllerException.class, runtime::validateHostPrerequisites);
+
+        assertEquals("SERVICE_CONFIG_INVALID", failure.code());
+        assertTrue(failure.getMessage().contains(missing.toString()));
+    }
+
+    @Test
+    void refusesBlankMachineAddresses() {
+        BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        machine.setBindIp(" ");
+        ControllerException blankBind = assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest));
+        assertEquals("MACHINE_CONFIG_INVALID", blankBind.code());
+
+        machine.setBindIp("beta-bind.example.internal");
+        machine.setRoutableAddress("\t");
+        ControllerException blankRoute = assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest));
+        assertEquals("MACHINE_CONFIG_INVALID", blankRoute.code());
+    }
+
+    @Test
+    void refusesToStartWhenTheLocalImageIdIsNotInstalled() {
+        FakeCommands commands = new FakeCommands(false);
+        commands.imageInspectFails = true;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.create(manifest, service, plan));
+
+        assertEquals("COMMAND_FAILED", failure.code());
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void everyBetaFrontendEnablesEntryWhileOnlyLanesInjectTheirScopeTag() throws Exception {
+        ObjectNode frontend = (ObjectNode) service;
+        frontend.put("serviceName", "frontend");
+        frontend.remove("registration");
+        Path environment = temporary.resolve("frontend.env");
+        Files.writeString(environment, "SERVER_PORT=18080\n");
+        try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
+        template.setEnvFile(environment);
+        properties.setServices(Map.of("frontend", template));
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        // 主 Beta frontend 是共用入口：入口打标开启，但不注入泳道名，靠请求头指定泳道。
+        runtime.create(manifest, frontend, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode environmentNode = compose.path("services").path("app").path("environment");
+        JsonNode routing = mapper.readTree(environmentNode.path("SPRING_APPLICATION_JSON").asText());
+        assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
+        assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
+        assertFalse(environmentNode.has("DUBBO_IP_TO_REGISTRY"));
+        assertFalse(environmentNode.has("DUBBO_PORT_TO_REGISTRY"));
+        assertFalse(routing.path("dubbo").has("provider"));
+        assertEquals("60s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("60000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+
+        // 泳道 frontend 是特判入口：入口开关与本部署的泳道名都注入。
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-two",
+                JsonSupport.deploymentGeneration(manifest), "A", 28081);
+        DockerComposeContainerRuntime laneRuntime =
+                new DockerComposeContainerRuntime(mapper, new FakeCommands(false), properties);
+        laneRuntime.create(manifest, frontend, plan);
+
+        compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-two.json")));
+        environmentNode = compose.path("services").path("app").path("environment");
+        assertEquals("true", environmentNode.path("AF_LANE_ENTRY_ENABLED").asText());
+        assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+    }
+
+    @Test
+    void sandboxGatewayGetsTheSandboxUrlFromTheCandidatePlan() throws Exception {
+        ObjectNode gateway = ((ObjectNode) service).deepCopy();
+        gateway.put("serviceName", "python-sandbox-gateway-service");
+        Path environment = temporary.resolve("sandbox-gateway.env");
+        Files.writeString(environment, "AF_SANDBOX_SERVICE_URL=http://127.0.0.1:18095\n");
+        try { Files.setPosixFilePermissions(environment, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        BetaControllerProperties.ServiceTemplate template = new BetaControllerProperties.ServiceTemplate();
+        template.setEnvFile(environment);
+        Map<String, BetaControllerProperties.ServiceTemplate> templates =
+                new java.util.HashMap<>(properties.getServices());
+        templates.put("python-sandbox-gateway-service", template);
+        properties.setServices(templates);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, gateway, new ContainerRuntime.CandidatePlan("beta-main-001", "main-beta",
+                "i-two", JsonSupport.deploymentGeneration(manifest), "A", 28080,
+                new ContainerRuntime.HttpUpstream("10.0.0.8", 18096)));
+
+        // environment 覆盖 env-file 里的回落值，容器里生效的是计划里沙箱的当前口。
+        JsonNode gatewayEnvironment = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-two.json")))
+                .path("services").path("app").path("environment");
+        assertEquals("http://10.0.0.8:18096", gatewayEnvironment.path("AF_SANDBOX_SERVICE_URL").asText());
+    }
+
+    @Test
+    void laneProviderRegistersItsOfficialDubboTag() throws Exception {
+        ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode environmentNode = compose.path("services").path("app").path("environment");
+        JsonNode routing = mapper.readTree(environmentNode.path("SPRING_APPLICATION_JSON").asText());
+        assertEquals("lane-a", routing.path("dubbo").path("provider").path("parameters")
+                .path("dubbo.tag").asText());
+        // 泳道容器（不只 frontend）都带泳道名：Nacos 配置桥/沙箱监听靠它构造
+        // "{scopeId}.{dataId}" 候选，漏注会让泳道容器读不到泳道覆盖配置
+        assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+    }
+
+    @Test
+    void nonDefaultAgentDeadlineKeepsOneFiveSecondFinalizationBudget() throws Exception {
+        ((ObjectNode) service.path("runtime")).put("applicationDrainSeconds", 30);
+        ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 35);
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode compose = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")));
+        JsonNode app = compose.path("services").path("app");
+        JsonNode environmentNode = app.path("environment");
+        assertEquals("35s", app.path("stop_grace_period").asText());
+        assertEquals("30", environmentNode.path("AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_AWAIT_SECONDS").asText());
+        assertEquals("5", environmentNode.path(
+                "AGENT_LANGCHAIN_RUN_EXECUTOR_SHUTDOWN_FINALIZATION_MARGIN_SECONDS").asText());
+        assertEquals("0s", environmentNode.path("SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE").asText());
+        assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
+    }
+
+    @Test
+    void validatesComposeSyntaxBeforeCreatingCandidate() throws Exception {
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan);
+
+        assertTrue(created.running());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
+        assertFalse(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void stopsBeforeCreatingCandidateWhenComposeSyntaxIsInvalid() {
+        FakeCommands commands = new FakeCommands(false);
+        commands.failComposeValidation = true;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.create(manifest, service, plan));
+
+        assertEquals("COMMAND_FAILED", failure.code());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
+        assertFalse(Files.exists(temporary.resolve("state/compose/i-one.json")));
+    }
+
+    @Test
+    void removesContainerAndComposeFileWhenPostCreateInspectionFails() {
+        FakeCommands commands = new FakeCommands(false);
+        commands.failInfoCall = 2;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.create(manifest, service, plan));
+
+        assertEquals("COMMAND_FAILED", failure.code());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("rm")
+                && command.contains(runtime.containerName(plan, "agent-service"))));
+        assertFalse(Files.exists(temporary.resolve("state/compose/i-one.json")));
+    }
+
+    @Test
+    void removesComposeFileAfterAnInstanceIsCleaned() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+        runtime.create(manifest, service, plan);
+        assertTrue(Files.exists(temporary.resolve("state/compose/i-one.json")));
+
+        runtime.removeCompose("i-one");
+
+        assertFalse(Files.exists(temporary.resolve("state/compose/i-one.json")));
+    }
+
+    @Test
+    void escapesEveryDollarInEnvironmentValuesSoComposeSkipsInterpolation() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        String content = Files.readString(temporary.resolve("state/compose/i-one.json"));
+        JsonNode environmentNode = mapper.readTree(content).path("services").path("app").path("environment");
+        // 文件层面：环境值里每个 $ 都必须成对写成 $$，否则 docker compose 会把
+        // ${AF_CONFIG_NACOS_USERNAME:} 当插值语法直接拒绝，整个部署卡死在建容器前。
+        List<String> names = new ArrayList<>();
+        environmentNode.fieldNames().forEachRemaining(names::add);
+        for (String name : names)
+            assertTrue(environmentNode.path(name).asText().matches("(?:[^$]|\\$\\$)*"), name);
+        // 容器层面：compose 把 $$ 还原成字面 $，Spring 照常解析这两个占位符。
+        assertTrue(environmentNode.path("SPRING_APPLICATION_JSON").asText()
+                .contains("$${AF_CONFIG_NACOS_USERNAME:}"));
+        assertTrue(environmentNode.path("SPRING_APPLICATION_JSON").asText()
+                .contains("$${AF_CONFIG_NACOS_PASSWORD:}"));
+    }
+
+    @Test
+    void refusesAnEnvironmentFileWhoseDigestDiffersFromTheManifest() {
+        ((ObjectNode) service).put("runtimeConfigSha256", "c".repeat(64));
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest));
+
+        assertEquals("RUNTIME_CONFIG_MISMATCH", failure.code());
+    }
+
+    @Test
+    void reusesTheDeterministicCandidateContainerNameAfterRestart() {
+        FakeCommands commands = new FakeCommands(true);
+        commands.returnOnlyObservedFields = true;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ContainerRuntime.ContainerObservation existing = runtime.create(manifest, service, plan);
+
+        assertTrue(existing.running());
+        assertTrue(commands.commands.stream().noneMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void refusesWholeProductionDotenvBeforeCreatingACandidate() throws Exception {
+        Path production = temporary.resolve(".env");
+        Files.writeString(production, "AF_DB_MAIN_PASSWORD=prod\n");
+        try { Files.setPosixFilePermissions(production, PosixFilePermissions.fromString("rw-------")); }
+        catch (UnsupportedOperationException ignored) { }
+        properties.getServices().get("agent-service").setEnvFile(production);
+        FakeCommands commands = new FakeCommands(false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ControllerException failure = assertThrows(ControllerException.class, () -> runtime.validateManifest(manifest));
+
+        assertEquals("ENV_FILE_WHOLE_PRODUCTION", failure.code());
+        assertTrue(commands.commands.isEmpty());
+    }
+
+    @Test
+    void boundsComposeAndContainerNamesWithoutLosingDeterminism() {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+        ContainerRuntime.CandidatePlan longPlan = new ContainerRuntime.CandidatePlan(
+                "d".repeat(64), "scope", "i-" + "x".repeat(120), plan.generationId(), "A", 28080);
+
+        String project = runtime.projectName(longPlan);
+        String container = runtime.containerName(longPlan, "s".repeat(96));
+
+        assertTrue(project.length() <= 63);
+        assertTrue(container.length() <= 128);
+        assertEquals(project, runtime.projectName(longPlan));
+        assertEquals(container, runtime.containerName(longPlan, "s".repeat(96)));
+    }
+
+    @Test
+    void simplifiedRegistrationKeepsRoutingKeysAndDropsMethodsBelowTheNacosLimit() throws Exception {
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        // extra-keys 直接取自渲染出的 SPRING_APPLICATION_JSON：键清单与控制器输出单一来源。
+        JsonNode routing = mapper.readTree(mapper.readTree(
+                        Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app").path("environment").path("SPRING_APPLICATION_JSON").asText());
+        String extraKeys = routing.path("dubbo").path("registries").path("beta").path("extra-keys").asText();
+
+        // admin-service 量级的注册 URL（36 个方法、methods 值约 720 字符，含 beta 注入的全部
+        // 路由参数）过 Dubbo 自己的裁剪器：simplified 后 Nacos 实例 metadata 应回到 1024 以内、
+        // 路由键全保留、methods 等大参数被丢掉。
+        StringBuilder methods = new StringBuilder();
+        for (int index = 0; index < 36; index++) {
+            if (index > 0) methods.append(',');
+            methods.append("queryImportantThing").append(index);
+        }
+        URL providerUrl = URL.valueOf("tri://10.0.0.8:50057/com.alphafrog.AdminService"
+                + "?application=admin-service&dubbo=2.0.2&release=3.3.2&side=provider"
+                + "&methods=" + methods
+                + "&timestamp=1700000000000&pid=12345"
+                + "&zone=beta&dubbo.tag=lane-a"
+                + "&alphafrog.deployment-id=beta-main-001&alphafrog.traffic-scope-id=lane-a"
+                + "&alphafrog.release-id=release-1&alphafrog.deployment-generation-id=" + "g".repeat(32)
+                + "&alphafrog.instance-id=i-beta-main-001-admin-service-00000001");
+        URL registered = new DefaultServiceURLCustomizer().customize(
+                providerUrl.putAttribute(SIMPLIFIED_KEY, true).putAttribute(EXTRA_KEYS_KEY, extraKeys),
+                ApplicationModel.defaultModel());
+
+        assertFalse(registered.hasParameter("methods"));
+        assertFalse(registered.hasParameter("timestamp"));
+        assertFalse(registered.hasParameter("pid"));
+        assertEquals("admin-service", registered.getParameter("application"));
+        assertEquals("beta", registered.getParameter("zone"));
+        assertEquals("lane-a", registered.getParameter("dubbo.tag"));
+        assertEquals("beta-main-001", registered.getParameter("alphafrog.deployment-id"));
+        assertEquals("lane-a", registered.getParameter("alphafrog.traffic-scope-id"));
+        assertEquals("release-1", registered.getParameter("alphafrog.release-id"));
+        assertTrue(registered.hasParameter("alphafrog.deployment-generation-id"));
+        assertEquals("i-beta-main-001-admin-service-00000001", registered.getParameter("alphafrog.instance-id"));
+        int metadataLength = registered.getParameters().entrySet().stream()
+                .mapToInt(entry -> entry.getKey().length() + entry.getValue().length() + 1).sum();
+        assertTrue(metadataLength < 1024, "registered metadata length=" + metadataLength);
+    }
+
+    @Test
+    void reusesTheExistingFixedNetworkWithoutCreatingAnotherOne() throws Exception {
+        FakeCommands commands = new FakeCommands(false);
+        commands.networkExists = true;
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        runtime.create(manifest, service, plan);
+
+        assertTrue(commands.commands.stream().noneMatch(command ->
+                command.contains("network") && command.contains("create")));
+        JsonNode composeNetworks = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("networks");
+        assertEquals("alphafrog-beta", composeNetworks.path("default").path("name").asText());
+        assertTrue(composeNetworks.path("default").path("external").asBoolean());
+    }
+
+    @Test
+    void rejectsMachineNetworkConfigOutsideThePgHbaRange() {
+        BetaControllerProperties.Machine machine = properties.getMachines().get("beta-machine-1");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        machine.setNetworkSubnet("192.168.0.0/20");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+
+        machine.setNetworkSubnet("172.32.0.0/16");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+
+        machine.setNetworkSubnet("172.16.0.0/24");
+        machine.setNetworkName(" ");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+
+        machine.setNetworkName("alphafrog-beta");
+        machine.setNetworkSubnet("not-a-cidr");
+        assertEquals("MACHINE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateHostPrerequisites()).code());
+    }
+
+    private final class FakeCommands extends CommandRunner {
+        private final boolean startsPresent;
+        private int inspectCalls;
+        private int infoCalls;
+        private final List<List<String>> commands = new ArrayList<>();
+        private boolean failComposeValidation;
+        private boolean returnOnlyObservedFields;
+        private int failInfoCall;
+        private boolean removed;
+        private boolean networkExists;
+        private boolean imageInspectFails;
+        private String imageInspectId = "sha256:" + "b".repeat(64);
+
+        private FakeCommands(boolean startsPresent) {
+            this.startsPresent = startsPresent;
+        }
+
+        @Override
+        public String run(List<String> arguments, Map<String, String> environment, Duration timeout) {
+            commands.add(List.copyOf(arguments));
+            if (arguments.contains("info")) {
+                infoCalls++;
+                if (failInfoCall == infoCalls) throw new ControllerException("COMMAND_FAILED", "docker unavailable");
+                return "27.0.0\n";
+            }
+            if (arguments.contains("network")) {
+                if (arguments.contains("inspect")) {
+                    if (!networkExists) throw new ControllerException("COMMAND_FAILED", "no such network");
+                    return "[{\"Name\":\"alphafrog-beta\"}]\n";
+                }
+                networkExists = true;
+                return "";
+            }
+            if (arguments.contains("inspect") && arguments.contains("image")) {
+                if (imageInspectFails) throw new ControllerException("COMMAND_FAILED", "no such image");
+                return imageInspectId + "\n";
+            }
+            if (arguments.contains("inspect")) {
+                inspectCalls++;
+                if (removed) throw new ControllerException("COMMAND_FAILED", "missing");
+                if (!startsPresent && inspectCalls == 1)
+                    throw new ControllerException("COMMAND_FAILED", "missing");
+                return inspectJson();
+            }
+            if (arguments.contains("rm")) {
+                removed = true;
+                return "";
+            }
+            if (arguments.contains("config") && arguments.contains("--quiet") && failComposeValidation)
+                throw new ControllerException("COMMAND_FAILED", "invalid compose");
+            return "";
+        }
+
+        private String inspectJson() {
+            String serviceName = service.path("serviceName").asText();
+            String name = "afb-" + plan.deploymentId() + '-' + serviceName + '-' + plan.instanceId();
+            if (returnOnlyObservedFields) {
+                return """
+                        [{"Id":"%s","Name":"/%s","Config":{"Labels":{"alphafrog.host-port":"%d"}},
+                          "State":{"Running":true,"Health":{"Status":"healthy"}}}]
+                        """.formatted("d".repeat(64), name, plan.hostPort());
+            }
+            return """
+                    [{"Id":"%s","Name":"/%s","Image":"%s",
+                      "Config":{"Labels":{"alphafrog.deployment-id":"%s","alphafrog.traffic-scope-id":"%s",
+                      "alphafrog.service-name":"%s","alphafrog.instance-id":"%s","alphafrog.release-id":"%s",
+                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"%d"}},"State":{"Running":true,"Health":{"Status":"healthy"}},
+                      "NetworkSettings":{"Ports":{"%d/tcp":[{"HostIp":"127.0.0.1","HostPort":"%d"}]}}}]
+                    """.formatted("d".repeat(64), name,
+                    service.path("image").path("localImageId").asText(), plan.deploymentId(), plan.trafficScopeId(),
+                    serviceName, "i-one", service.path("releaseId").asText(), plan.generationId(), plan.hostPort(),
+                    service.path("runtime").path("containerPort").asInt(), plan.hostPort());
+        }
+    }
+
+    private static boolean containsVolume(JsonNode volumes, String expected) {
+        for (JsonNode volume : volumes) {
+            if (expected.equals(volume.asText())) return true;
+        }
+        return false;
+    }
+
+    private static boolean containsTarget(JsonNode volumes, String target) {
+        for (JsonNode volume : volumes) {
+            if (volume.asText().contains(':' + target)) return true;
+        }
+        return false;
+    }
+}

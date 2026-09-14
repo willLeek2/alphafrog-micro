@@ -1,5 +1,6 @@
 package world.willfrog.agent.platform.config;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.ArrayList;
@@ -21,6 +22,10 @@ public class AgentLlmProperties {
     private OpenRouterConfig openrouter = new OpenRouterConfig();
     private ExecutorConfig executor = new ExecutorConfig();
     private EventStoreConfig eventStore = new EventStoreConfig();
+    private DataFreshness dataFreshness = new DataFreshness();
+    private Tools tools = new Tools();
+    private Agent agent = new Agent();
+    private FinanceMethodResolver financeMethodResolver = new FinanceMethodResolver();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -108,6 +113,395 @@ public class AgentLlmProperties {
 
     public void setEventStore(EventStoreConfig eventStore) {
         this.eventStore = eventStore == null ? new EventStoreConfig() : eventStore;
+    }
+
+    public DataFreshness getDataFreshness() {
+        return dataFreshness;
+    }
+
+    public void setDataFreshness(DataFreshness dataFreshness) {
+        this.dataFreshness = dataFreshness == null ? new DataFreshness() : dataFreshness;
+    }
+
+    public Tools getTools() {
+        return tools;
+    }
+
+    public void setTools(Tools tools) {
+        this.tools = tools == null ? new Tools() : tools;
+    }
+
+    public Agent getAgent() {
+        return agent;
+    }
+
+    public void setAgent(Agent agent) {
+        this.agent = agent == null ? new Agent() : agent;
+    }
+
+    public FinanceMethodResolver getFinanceMethodResolver() {
+        return financeMethodResolver;
+    }
+
+    public void setFinanceMethodResolver(FinanceMethodResolver financeMethodResolver) {
+        this.financeMethodResolver = financeMethodResolver == null ? new FinanceMethodResolver() : financeMethodResolver;
+    }
+
+    /**
+     * Agent-level feature toggles loaded from agent-llm.json. This intentionally mirrors
+     * production-facing {@code agent.*} config names so Nacos pushes can hot-reload them.
+     */
+    public static class Agent {
+        @JsonAlias({"call-raw-content", "call_raw_content"})
+        private CallRawContent callRawContent = new CallRawContent();
+        private Workspace workspace = new Workspace();
+        private Dataset dataset = new Dataset();
+
+        public CallRawContent getCallRawContent() {
+            return callRawContent;
+        }
+
+        public void setCallRawContent(CallRawContent callRawContent) {
+            this.callRawContent = callRawContent == null ? new CallRawContent() : callRawContent;
+        }
+
+        public Workspace getWorkspace() {
+            return workspace;
+        }
+
+        public void setWorkspace(Workspace workspace) {
+            this.workspace = workspace == null ? new Workspace() : workspace;
+        }
+
+        public Dataset getDataset() {
+            return dataset;
+        }
+
+        public void setDataset(Dataset dataset) {
+            this.dataset = dataset == null ? new Dataset() : dataset;
+        }
+    }
+
+    public static class CallRawContent {
+        @JsonAlias({"ttl-seconds", "ttl_seconds"})
+        private Long ttlSeconds;
+
+        public Long getTtlSeconds() {
+            return ttlSeconds;
+        }
+
+        public void setTtlSeconds(Long ttlSeconds) {
+            this.ttlSeconds = ttlSeconds;
+        }
+    }
+
+    public static class Workspace {
+        private Dump dump = new Dump();
+
+        public Dump getDump() {
+            return dump;
+        }
+
+        public void setDump(Dump dump) {
+            this.dump = dump == null ? new Dump() : dump;
+        }
+    }
+
+    public static class Dump {
+        @JsonAlias({"ttl-hours", "ttl_hours"})
+        private Integer ttlHours;
+
+        public Integer getTtlHours() {
+            return ttlHours;
+        }
+
+        public void setTtlHours(Integer ttlHours) {
+            this.ttlHours = ttlHours;
+        }
+    }
+
+    public static class Dataset {
+        @JsonAlias({"ttl-hours", "ttl_hours"})
+        private Integer ttlHours;
+
+        public Integer getTtlHours() {
+            return ttlHours;
+        }
+
+        public void setTtlHours(Integer ttlHours) {
+            this.ttlHours = ttlHours;
+        }
+    }
+
+    /**
+     * Tool-level feature toggles that must hot-reload from agent-llm.json.
+     */
+    public static class Tools {
+        @JsonAlias({"market-data", "market_data"})
+        private MarketData marketData = new MarketData();
+        private ToolResult result = new ToolResult();
+        private ToolSummary summary = new ToolSummary();
+        private ToolReread reread = new ToolReread();
+        @JsonAlias({"raw-ref", "raw_ref"})
+        private ToolRawRef rawRef = new ToolRawRef();
+        private Rag rag = new Rag();
+
+        public MarketData getMarketData() {
+            return marketData;
+        }
+
+        public void setMarketData(MarketData marketData) {
+            this.marketData = marketData == null ? new MarketData() : marketData;
+        }
+
+        public ToolResult getResult() {
+            return result;
+        }
+
+        public void setResult(ToolResult result) {
+            this.result = result == null ? new ToolResult() : result;
+        }
+
+        public ToolSummary getSummary() {
+            return summary;
+        }
+
+        public void setSummary(ToolSummary summary) {
+            this.summary = summary == null ? new ToolSummary() : summary;
+        }
+
+        public ToolReread getReread() {
+            return reread;
+        }
+
+        public void setReread(ToolReread reread) {
+            this.reread = reread == null ? new ToolReread() : reread;
+        }
+
+        public ToolRawRef getRawRef() {
+            return rawRef;
+        }
+
+        public void setRawRef(ToolRawRef rawRef) {
+            this.rawRef = rawRef == null ? new ToolRawRef() : rawRef;
+        }
+
+        public Rag getRag() {
+            return rag;
+        }
+
+        public void setRag(Rag rag) {
+            this.rag = rag == null ? new Rag() : rag;
+        }
+    }
+
+    public static class Rag {
+        @JsonAlias({"visible-chars", "visible_chars"})
+        private Integer visibleChars;
+        @JsonAlias({"preview-chars", "preview_chars"})
+        private Integer previewChars;
+        @JsonAlias({"snippet-cap-per-doc", "snippet_cap_per_doc"})
+        private Integer snippetCapPerDoc;
+        @JsonAlias({"short-doc-full-threshold", "short_doc_full_threshold"})
+        private Integer shortDocFullThreshold;
+
+        public Integer getVisibleChars() { return visibleChars; }
+        public void setVisibleChars(Integer visibleChars) { this.visibleChars = visibleChars; }
+        public Integer getPreviewChars() { return previewChars; }
+        public void setPreviewChars(Integer previewChars) { this.previewChars = previewChars; }
+        public Integer getSnippetCapPerDoc() { return snippetCapPerDoc; }
+        public void setSnippetCapPerDoc(Integer snippetCapPerDoc) { this.snippetCapPerDoc = snippetCapPerDoc; }
+        public Integer getShortDocFullThreshold() { return shortDocFullThreshold; }
+        public void setShortDocFullThreshold(Integer shortDocFullThreshold) { this.shortDocFullThreshold = shortDocFullThreshold; }
+    }
+
+    public static class ToolResult {
+        @JsonAlias({"max-string-length", "max_string_length"})
+        private Integer maxStringLength;
+        @JsonAlias({"summary-model", "summary_model"})
+        private String summaryModel;
+        @JsonAlias({"summary-endpoint", "summary_endpoint"})
+        private String summaryEndpoint;
+
+        public Integer getMaxStringLength() {
+            return maxStringLength;
+        }
+
+        public void setMaxStringLength(Integer maxStringLength) {
+            this.maxStringLength = maxStringLength;
+        }
+
+        public String getSummaryModel() {
+            return summaryModel;
+        }
+
+        public void setSummaryModel(String summaryModel) {
+            this.summaryModel = summaryModel;
+        }
+
+        public String getSummaryEndpoint() {
+            return summaryEndpoint;
+        }
+
+        public void setSummaryEndpoint(String summaryEndpoint) {
+            this.summaryEndpoint = summaryEndpoint;
+        }
+    }
+
+    public static class ToolSummary {
+        @JsonAlias({"max-retries", "max_retries"})
+        private Integer maxRetries;
+
+        public Integer getMaxRetries() {
+            return maxRetries;
+        }
+
+        public void setMaxRetries(Integer maxRetries) {
+            this.maxRetries = maxRetries;
+        }
+    }
+
+    public static class ToolReread {
+        @JsonAlias({"max-limit", "max_limit"})
+        private Integer maxLimit;
+        @JsonAlias({"keyword-char-limit", "keyword_char_limit"})
+        private Integer keywordCharLimit;
+        @JsonAlias({"range-max-limit", "range_max_limit"})
+        private Integer rangeMaxLimit;
+        @JsonAlias({"range-min-limit-without-keyword", "range_min_limit_without_keyword"})
+        private Integer rangeMinLimitWithoutKeyword;
+
+        public Integer getMaxLimit() { return maxLimit; }
+        public void setMaxLimit(Integer maxLimit) { this.maxLimit = maxLimit; }
+        public Integer getKeywordCharLimit() { return keywordCharLimit; }
+        public void setKeywordCharLimit(Integer keywordCharLimit) { this.keywordCharLimit = keywordCharLimit; }
+        public Integer getRangeMaxLimit() { return rangeMaxLimit; }
+        public void setRangeMaxLimit(Integer rangeMaxLimit) { this.rangeMaxLimit = rangeMaxLimit; }
+        public Integer getRangeMinLimitWithoutKeyword() { return rangeMinLimitWithoutKeyword; }
+        public void setRangeMinLimitWithoutKeyword(Integer rangeMinLimitWithoutKeyword) { this.rangeMinLimitWithoutKeyword = rangeMinLimitWithoutKeyword; }
+    }
+
+    public static class ToolRawRef {
+        @JsonAlias({"ttl-hours", "ttl_hours"})
+        private Integer ttlHours;
+        @JsonAlias({"ttl-seconds", "ttl_seconds"})
+        private Integer ttlSeconds;
+
+        public Integer getTtlHours() { return ttlHours; }
+        public void setTtlHours(Integer ttlHours) { this.ttlHours = ttlHours; }
+        public Integer getTtlSeconds() { return ttlSeconds; }
+        public void setTtlSeconds(Integer ttlSeconds) { this.ttlSeconds = ttlSeconds; }
+    }
+
+    public static class MarketData {
+        private MarketDataDataset dataset = new MarketDataDataset();
+        private MarketDataBatch batch = new MarketDataBatch();
+        private MarketDataAdvanced advanced = new MarketDataAdvanced();
+
+        public MarketDataDataset getDataset() {
+            return dataset;
+        }
+
+        public void setDataset(MarketDataDataset dataset) {
+            this.dataset = dataset == null ? new MarketDataDataset() : dataset;
+        }
+
+        public MarketDataBatch getBatch() {
+            return batch;
+        }
+
+        public void setBatch(MarketDataBatch batch) {
+            this.batch = batch == null ? new MarketDataBatch() : batch;
+        }
+
+        public MarketDataAdvanced getAdvanced() {
+            return advanced;
+        }
+
+        public void setAdvanced(MarketDataAdvanced advanced) {
+            this.advanced = advanced == null ? new MarketDataAdvanced() : advanced;
+        }
+    }
+
+    public static class MarketDataDataset {
+        private Boolean enabled;
+
+        public Boolean getEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(Boolean enabled) {
+            this.enabled = enabled;
+        }
+    }
+
+    public static class MarketDataBatch {
+        @JsonAlias({"emit-manifest", "emit_manifest"})
+        private Boolean emitManifest;
+
+        public Boolean getEmitManifest() {
+            return emitManifest;
+        }
+
+        public void setEmitManifest(Boolean emitManifest) {
+            this.emitManifest = emitManifest;
+        }
+    }
+
+    public static class MarketDataAdvanced {
+        @JsonAlias({"preview-rows", "preview_rows"})
+        private Integer previewRows;
+
+        public Integer getPreviewRows() {
+            return previewRows;
+        }
+
+        public void setPreviewRows(Integer previewRows) {
+            this.previewRows = previewRows;
+        }
+    }
+
+    public static class DataFreshness {
+        /** 部署者声明的本地已爬取数据起始日期，格式 YYYY-MM-DD。 */
+        private String startDate;
+        /** 部署者声明的本地已爬取数据截止日期，格式 YYYY-MM-DD。 */
+        private String endDate;
+        /** 可选：部署者声明的单点 as-of 日期，格式 YYYY-MM-DD。 */
+        private String asOfDate;
+        /** 可选：数据范围说明，例如覆盖的资产类型或口径。 */
+        private String description;
+
+        public String getStartDate() {
+            return startDate;
+        }
+
+        public void setStartDate(String startDate) {
+            this.startDate = startDate;
+        }
+
+        public String getEndDate() {
+            return endDate;
+        }
+
+        public void setEndDate(String endDate) {
+            this.endDate = endDate;
+        }
+
+        public String getAsOfDate() {
+            return asOfDate;
+        }
+
+        public void setAsOfDate(String asOfDate) {
+            this.asOfDate = asOfDate;
+        }
+
+        public String getDescription() {
+            return description;
+        }
+
+        public void setDescription(String description) {
+            this.description = description;
+        }
     }
 
     public static class Endpoint {
@@ -213,6 +607,7 @@ public class AgentLlmProperties {
         private MultiTurn multiTurn = new MultiTurn();
         private RunBudget runBudget = new RunBudget();
         private FinalAnswerStage finalAnswer = new FinalAnswerStage();
+        private Request request = new Request();
 
         public Resume getResume() {
             return resume;
@@ -292,6 +687,79 @@ public class AgentLlmProperties {
 
         public void setFinalAnswer(FinalAnswerStage finalAnswer) {
             this.finalAnswer = finalAnswer == null ? new FinalAnswerStage() : finalAnswer;
+        }
+
+        public Request getRequest() {
+            return request;
+        }
+
+        public void setRequest(Request request) {
+            this.request = request == null ? new Request() : request;
+        }
+    }
+
+    public static class Request {
+        @JsonAlias({"max-retries", "max_retries"})
+        private Integer maxRetries;
+        private Retry retry = new Retry();
+
+        public Integer getMaxRetries() {
+            return maxRetries;
+        }
+
+        public void setMaxRetries(Integer maxRetries) {
+            this.maxRetries = maxRetries;
+        }
+
+        public Retry getRetry() {
+            return retry;
+        }
+
+        public void setRetry(Retry retry) {
+            this.retry = retry == null ? new Retry() : retry;
+        }
+    }
+
+    public static class Retry {
+        @JsonAlias({"backoff-type", "backoff_type"})
+        private String backoffType;
+        @JsonAlias({"base-delay-ms", "base_delay_ms"})
+        private Long baseDelayMs;
+        @JsonAlias({"max-delay-ms", "max_delay_ms"})
+        private Long maxDelayMs;
+        @JsonAlias({"jitter-ms", "jitter_ms"})
+        private Long jitterMs;
+
+        public String getBackoffType() {
+            return backoffType;
+        }
+
+        public void setBackoffType(String backoffType) {
+            this.backoffType = backoffType;
+        }
+
+        public Long getBaseDelayMs() {
+            return baseDelayMs;
+        }
+
+        public void setBaseDelayMs(Long baseDelayMs) {
+            this.baseDelayMs = baseDelayMs;
+        }
+
+        public Long getMaxDelayMs() {
+            return maxDelayMs;
+        }
+
+        public void setMaxDelayMs(Long maxDelayMs) {
+            this.maxDelayMs = maxDelayMs;
+        }
+
+        public Long getJitterMs() {
+            return jitterMs;
+        }
+
+        public void setJitterMs(Long jitterMs) {
+            this.jitterMs = jitterMs;
         }
     }
 
@@ -652,6 +1120,10 @@ public class AgentLlmProperties {
         private Integer maxParallelSearchQueries;
         private Integer maxParallelDailyQueries;
         private Integer maxParallelCalendarQueries;
+        @JsonAlias({"max-parallel-queries-in-advanced-mode", "max_parallel_queries_in_advanced_mode"})
+        private Integer maxParallelQueriesInAdvancedMode;
+        @JsonAlias({"max-advanced-daily-constituent-stocks", "max_advanced_daily_constituent_stocks"})
+        private Integer maxAdvancedDailyConstituentStocks;
         private Integer dagThreadPoolSize;
         private ExternalSearch externalSearch = new ExternalSearch();
         private ToolWeightedLimit toolWeightedLimit = new ToolWeightedLimit();
@@ -680,6 +1152,22 @@ public class AgentLlmProperties {
             this.maxParallelCalendarQueries = maxParallelCalendarQueries;
         }
 
+        public Integer getMaxParallelQueriesInAdvancedMode() {
+            return maxParallelQueriesInAdvancedMode;
+        }
+
+        public void setMaxParallelQueriesInAdvancedMode(Object maxParallelQueriesInAdvancedMode) {
+            this.maxParallelQueriesInAdvancedMode = parseIntegerOrOne(maxParallelQueriesInAdvancedMode);
+        }
+
+        public Integer getMaxAdvancedDailyConstituentStocks() {
+            return maxAdvancedDailyConstituentStocks;
+        }
+
+        public void setMaxAdvancedDailyConstituentStocks(Integer maxAdvancedDailyConstituentStocks) {
+            this.maxAdvancedDailyConstituentStocks = maxAdvancedDailyConstituentStocks;
+        }
+
         public Integer getDagThreadPoolSize() {
             return dagThreadPoolSize;
         }
@@ -702,6 +1190,24 @@ public class AgentLlmProperties {
 
         public void setToolWeightedLimit(ToolWeightedLimit toolWeightedLimit) {
             this.toolWeightedLimit = toolWeightedLimit == null ? new ToolWeightedLimit() : toolWeightedLimit;
+        }
+    }
+
+    private static Integer parseIntegerOrOne(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        String raw = String.valueOf(value).trim();
+        if (raw.isEmpty()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException ignored) {
+            return 1;
         }
     }
 
@@ -1470,6 +1976,8 @@ public class AgentLlmProperties {
 
     public static class Prompts {
         private String agentRunSystemPrompt;
+        /** 多轮 follow-up 历史摘要的稳定 System Prompt；正文来自 shared classpath 权威资源。 */
+        private String followUpSummarySystemPrompt;
         private String todoPlannerSystemPromptTemplate;
         private String workflowFinalSystemPrompt;
         private String workflowTodoRecoverySystemPrompt;
@@ -1487,23 +1995,51 @@ public class AgentLlmProperties {
         private String pythonRefineOutputInstruction;
         private List<DatasetFieldSpec> datasetFieldSpecs = new ArrayList<>();
         private String datasetFieldSpecsFile;
+        private String financeMethodResolverSystemPrompt;
+        private String financeMethodResolverSystemPromptFile;
         private String orchestratorPlanningSystemPrompt;
         private String orchestratorSummarySystemPrompt;
         private String dagReactSystemPrompt;
         private String dagReactSystemPromptFile;
         private String dagModeGuidancePrompt;
         private String dagModeGuidancePromptFile;
-        /** 第一阶段统筹规划 prompt 文件路径（相对于 config 目录） */
-        private String planningStrategyStageFile = "prompts/todo/planning_strategy_stage.txt";
+        /** 第一阶段统筹规划 prompt 投影文件路径（相对于 config 目录）；缺省时由 classpath 权威正文提供。 */
+        private String planningStrategyStageFile;
         /** 第一阶段统筹规划 prompt 内容（由 loader 从文件读取） */
         private String planningStrategyStage;
-        /** 第二阶段任务拆解 prompt 文件路径（相对于 config 目录） */
-        private String planningTodosStageFile = "prompts/todo/planning_todos_stage.txt";
+        /** 第二阶段任务拆解 prompt 投影文件路径（相对于 config 目录）；缺省时由 classpath 权威正文提供。 */
+        private String planningTodosStageFile;
         /** 第二阶段任务拆解 prompt 内容（由 loader 从文件读取） */
         private String planningTodosStage;
-        /** DAG recovery judge prompt 文件路径（Nacos file: 前缀时由 loader 解析为内容）。默认 null，走 classpath 兜底。 */
+        /** D02：规划分析兼容阶段说明。 */
+        private String planningAnalysisStage;
+        /** D02：规划结构化输出阶段说明。 */
+        private String planningStructuredStage;
+        /** D02：LINEAR 模式说明。 */
+        private String planningLinearModeGuidance;
+        /** D02：DAG 模式说明。 */
+        private String planningDagModeGuidance;
+        /** D02：强制 LINEAR 时追加到 planning User 的约束。 */
+        private String planningLinearConstraint;
+        /** D02：executePython 修复轮次 User 阶段说明。 */
+        private String pythonRepairStageInstruction;
+        /** D02：空输出恢复 User 阶段说明。 */
+        private String emptyOutputRecoveryStageInstruction;
+        /** D02：预算 last-mile User 阶段说明模板。 */
+        private String budgetLastMileStageInstruction;
+        /** Todo 语义重试时追加到用户消息的上下文模板。 */
+        private String todoRetryContextInstruction;
+        /** 代码执行失败后修复轮次追加到用户消息的诊断上下文模板。 */
+        private String pythonRepairContextInstruction;
+        /** 工具结果摘要的系统说明。 */
+        private String toolSummarySystemPrompt;
+        /** 工具结果摘要的用户消息模板。 */
+        private String toolSummaryUserPromptTemplate;
+        /** D02：按工具名登记的能力说明 JSON。 */
+        private String toolCapabilityCatalog;
+        /** DAG recovery judge prompt 投影文件路径；loader 保留路径，并把校验后的正文写入 template 字段。 */
         private String dagRecoveryJudgeSystemPromptFile;
-        /** DAG recovery judge prompt 内容（由 loader 从 file: 解析或 Nacos 直接注入）。 */
+        /** DAG recovery judge prompt 内容（只能是 classpath 权威正文或其逐字一致投影）。 */
         private String dagRecoveryJudgeSystemPromptTemplate;
 
         public String getAgentRunSystemPrompt() {
@@ -1512,6 +2048,14 @@ public class AgentLlmProperties {
 
         public void setAgentRunSystemPrompt(String agentRunSystemPrompt) {
             this.agentRunSystemPrompt = agentRunSystemPrompt;
+        }
+
+        public String getFollowUpSummarySystemPrompt() {
+            return followUpSummarySystemPrompt;
+        }
+
+        public void setFollowUpSummarySystemPrompt(String followUpSummarySystemPrompt) {
+            this.followUpSummarySystemPrompt = followUpSummarySystemPrompt;
         }
 
         public String getTodoPlannerSystemPromptTemplate() {
@@ -1650,6 +2194,22 @@ public class AgentLlmProperties {
             this.datasetFieldSpecsFile = datasetFieldSpecsFile;
         }
 
+        public String getFinanceMethodResolverSystemPrompt() {
+            return financeMethodResolverSystemPrompt;
+        }
+
+        public void setFinanceMethodResolverSystemPrompt(String financeMethodResolverSystemPrompt) {
+            this.financeMethodResolverSystemPrompt = financeMethodResolverSystemPrompt;
+        }
+
+        public String getFinanceMethodResolverSystemPromptFile() {
+            return financeMethodResolverSystemPromptFile;
+        }
+
+        public void setFinanceMethodResolverSystemPromptFile(String financeMethodResolverSystemPromptFile) {
+            this.financeMethodResolverSystemPromptFile = financeMethodResolverSystemPromptFile;
+        }
+
         public String getOrchestratorPlanningSystemPrompt() {
             return orchestratorPlanningSystemPrompt;
         }
@@ -1728,6 +2288,110 @@ public class AgentLlmProperties {
 
         public void setPlanningTodosStage(String planningTodosStage) {
             this.planningTodosStage = planningTodosStage;
+        }
+
+        public String getPlanningAnalysisStage() {
+            return planningAnalysisStage;
+        }
+
+        public void setPlanningAnalysisStage(String planningAnalysisStage) {
+            this.planningAnalysisStage = planningAnalysisStage;
+        }
+
+        public String getPlanningStructuredStage() {
+            return planningStructuredStage;
+        }
+
+        public void setPlanningStructuredStage(String planningStructuredStage) {
+            this.planningStructuredStage = planningStructuredStage;
+        }
+
+        public String getPlanningLinearModeGuidance() {
+            return planningLinearModeGuidance;
+        }
+
+        public void setPlanningLinearModeGuidance(String planningLinearModeGuidance) {
+            this.planningLinearModeGuidance = planningLinearModeGuidance;
+        }
+
+        public String getPlanningDagModeGuidance() {
+            return planningDagModeGuidance;
+        }
+
+        public void setPlanningDagModeGuidance(String planningDagModeGuidance) {
+            this.planningDagModeGuidance = planningDagModeGuidance;
+        }
+
+        public String getPlanningLinearConstraint() {
+            return planningLinearConstraint;
+        }
+
+        public void setPlanningLinearConstraint(String planningLinearConstraint) {
+            this.planningLinearConstraint = planningLinearConstraint;
+        }
+
+        public String getPythonRepairStageInstruction() {
+            return pythonRepairStageInstruction;
+        }
+
+        public void setPythonRepairStageInstruction(String pythonRepairStageInstruction) {
+            this.pythonRepairStageInstruction = pythonRepairStageInstruction;
+        }
+
+        public String getEmptyOutputRecoveryStageInstruction() {
+            return emptyOutputRecoveryStageInstruction;
+        }
+
+        public void setEmptyOutputRecoveryStageInstruction(String emptyOutputRecoveryStageInstruction) {
+            this.emptyOutputRecoveryStageInstruction = emptyOutputRecoveryStageInstruction;
+        }
+
+        public String getBudgetLastMileStageInstruction() {
+            return budgetLastMileStageInstruction;
+        }
+
+        public void setBudgetLastMileStageInstruction(String budgetLastMileStageInstruction) {
+            this.budgetLastMileStageInstruction = budgetLastMileStageInstruction;
+        }
+
+        public String getTodoRetryContextInstruction() {
+            return todoRetryContextInstruction;
+        }
+
+        public void setTodoRetryContextInstruction(String todoRetryContextInstruction) {
+            this.todoRetryContextInstruction = todoRetryContextInstruction;
+        }
+
+        public String getPythonRepairContextInstruction() {
+            return pythonRepairContextInstruction;
+        }
+
+        public void setPythonRepairContextInstruction(String pythonRepairContextInstruction) {
+            this.pythonRepairContextInstruction = pythonRepairContextInstruction;
+        }
+
+        public String getToolSummarySystemPrompt() {
+            return toolSummarySystemPrompt;
+        }
+
+        public void setToolSummarySystemPrompt(String toolSummarySystemPrompt) {
+            this.toolSummarySystemPrompt = toolSummarySystemPrompt;
+        }
+
+        public String getToolSummaryUserPromptTemplate() {
+            return toolSummaryUserPromptTemplate;
+        }
+
+        public void setToolSummaryUserPromptTemplate(String toolSummaryUserPromptTemplate) {
+            this.toolSummaryUserPromptTemplate = toolSummaryUserPromptTemplate;
+        }
+
+        public String getToolCapabilityCatalog() {
+            return toolCapabilityCatalog;
+        }
+
+        public void setToolCapabilityCatalog(String toolCapabilityCatalog) {
+            this.toolCapabilityCatalog = toolCapabilityCatalog;
         }
 
         public String getDagRecoveryJudgeSystemPromptFile() {
@@ -1881,6 +2545,150 @@ public class AgentLlmProperties {
 
         public void setCurrent(ExecutorConfig current) {
             this.current = current;
+        }
+    }
+
+    /**
+     * Finance MethodSpec resolver configuration: dedicated lightweight default route
+     * and catalog budget limits. Never silently inherit the execution model.
+     */
+    public static class FinanceMethodResolver {
+        @JsonAlias({"default_route", "defaultRoute"})
+        private DefaultRoute defaultRoute = new DefaultRoute();
+        @JsonAlias({"catalog_prompt_max_bytes", "catalogPromptMaxBytes"})
+        private Integer catalogPromptMaxBytes = 8192;
+        @JsonAlias({"catalog_prompt_max_tokens", "catalogPromptMaxTokens"})
+        private Integer catalogPromptMaxTokens = 2048;
+        @JsonAlias({"request_max_bytes", "requestMaxBytes"})
+        private Integer requestMaxBytes = 8192;
+        @JsonAlias({"response_max_bytes", "responseMaxBytes"})
+        private Integer responseMaxBytes = 16384;
+        @JsonAlias({"max_candidates", "maxCandidates"})
+        private Integer maxCandidates = 8;
+
+        public DefaultRoute getDefaultRoute() {
+            return defaultRoute;
+        }
+
+        public void setDefaultRoute(DefaultRoute defaultRoute) {
+            this.defaultRoute = defaultRoute == null ? new DefaultRoute() : defaultRoute;
+        }
+
+        public Integer getCatalogPromptMaxBytes() {
+            return catalogPromptMaxBytes;
+        }
+
+        public void setCatalogPromptMaxBytes(Integer catalogPromptMaxBytes) {
+            this.catalogPromptMaxBytes = catalogPromptMaxBytes;
+        }
+
+        public Integer getCatalogPromptMaxTokens() {
+            return catalogPromptMaxTokens;
+        }
+
+        public void setCatalogPromptMaxTokens(Integer catalogPromptMaxTokens) {
+            this.catalogPromptMaxTokens = catalogPromptMaxTokens;
+        }
+
+        public Integer getRequestMaxBytes() {
+            return requestMaxBytes;
+        }
+
+        public void setRequestMaxBytes(Integer requestMaxBytes) {
+            this.requestMaxBytes = requestMaxBytes;
+        }
+
+        public Integer getResponseMaxBytes() {
+            return responseMaxBytes;
+        }
+
+        public void setResponseMaxBytes(Integer responseMaxBytes) {
+            this.responseMaxBytes = responseMaxBytes;
+        }
+
+        public Integer getMaxCandidates() {
+            return maxCandidates;
+        }
+
+        public void setMaxCandidates(Integer maxCandidates) {
+            this.maxCandidates = maxCandidates;
+        }
+
+        public static class DefaultRoute {
+            private Boolean enabled = false;
+            private String endpointName;
+            private String modelName;
+            @JsonAlias({"provider_order", "providers"})
+            private List<String> providerOrder;
+            private Double temperature = 0.0D;
+            private Integer maxTokens = 2048;
+            private Integer maxAttempts = 2;
+            @JsonAlias({"structured_output", "structuredOutput"})
+            private Boolean structuredOutput = true;
+
+            public Boolean getEnabled() {
+                return enabled;
+            }
+
+            public void setEnabled(Boolean enabled) {
+                this.enabled = enabled;
+            }
+
+            public String getEndpointName() {
+                return endpointName;
+            }
+
+            public void setEndpointName(String endpointName) {
+                this.endpointName = endpointName;
+            }
+
+            public String getModelName() {
+                return modelName;
+            }
+
+            public void setModelName(String modelName) {
+                this.modelName = modelName;
+            }
+
+            public List<String> getProviderOrder() {
+                return providerOrder;
+            }
+
+            public void setProviderOrder(List<String> providerOrder) {
+                this.providerOrder = providerOrder;
+            }
+
+            public Double getTemperature() {
+                return temperature;
+            }
+
+            public void setTemperature(Double temperature) {
+                this.temperature = temperature;
+            }
+
+            public Integer getMaxTokens() {
+                return maxTokens;
+            }
+
+            public void setMaxTokens(Integer maxTokens) {
+                this.maxTokens = maxTokens;
+            }
+
+            public Integer getMaxAttempts() {
+                return maxAttempts;
+            }
+
+            public void setMaxAttempts(Integer maxAttempts) {
+                this.maxAttempts = maxAttempts;
+            }
+
+            public Boolean getStructuredOutput() {
+                return structuredOutput;
+            }
+
+            public void setStructuredOutput(Boolean structuredOutput) {
+                this.structuredOutput = structuredOutput;
+            }
         }
     }
 }

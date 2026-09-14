@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 || -z "$1" || ! "$2" =~ ^[0-9]+$ || "$2" -lt 1 || "$2" -gt 65535 ]]; then
+  exit 2
+fi
+
+exec 3<>"/dev/tcp/$1/$2"
+exec 3>&-
+exec 3<&-

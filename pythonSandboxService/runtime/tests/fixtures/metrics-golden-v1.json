@@ -1,0 +1,335 @@
+{
+  "meta": {
+    "generatedBy": "gen_metrics_golden_v1.py",
+    "date": "2026-08-08",
+    "note": "expected values computed independently via statistics module; compare with math.isclose rel_tol=1e-12",
+    "note2": "parameters echoes include the canonical required returns sequence (contract 3.5 parameter table; codex 0c147646 ITEM 1); golden values themselves are unchanged"
+  },
+  "cases": [
+    {
+      "name": "cagr-spec-example",
+      "function": "cagr",
+      "args": {
+        "beginning_value": 100.0,
+        "ending_value": 160.0,
+        "periods": 4
+      },
+      "expected": {
+        "methodId": "finance.growth.cagr",
+        "value": 0.12468265038069815,
+        "unit": "ratio",
+        "parameters": {
+          "beginningValue": 100.0,
+          "endingValue": 160.0,
+          "periods": 4
+        }
+      }
+    },
+    {
+      "name": "cagr-single-period",
+      "function": "cagr",
+      "args": {
+        "beginning_value": 50.0,
+        "ending_value": 75.0,
+        "periods": 1
+      },
+      "expected": {
+        "methodId": "finance.growth.cagr",
+        "value": 0.5,
+        "unit": "ratio",
+        "parameters": {
+          "beginningValue": 50.0,
+          "endingValue": 75.0,
+          "periods": 1
+        }
+      }
+    },
+    {
+      "name": "cagr-int-inputs",
+      "function": "cagr",
+      "args": {
+        "beginning_value": 100,
+        "ending_value": 200,
+        "periods": 2
+      },
+      "expected": {
+        "methodId": "finance.growth.cagr",
+        "value": 0.41421356237309515,
+        "unit": "ratio",
+        "parameters": {
+          "beginningValue": 100.0,
+          "endingValue": 200.0,
+          "periods": 2
+        }
+      }
+    },
+    {
+      "name": "vol-full-sample",
+      "function": "annualized_volatility",
+      "args": {
+        "returns": [
+          0.01,
+          -0.02,
+          0.015,
+          0.005,
+          -0.01,
+          0.02
+        ],
+        "periods_per_year": 12,
+        "window": null
+      },
+      "expected": {
+        "methodId": "finance.risk.annualized_volatility",
+        "value": 0.05329165037789691,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.01,
+            -0.02,
+            0.015,
+            0.005,
+            -0.01,
+            0.02
+          ],
+          "periodsPerYear": 12
+        }
+      }
+    },
+    {
+      "name": "vol-trailing-window",
+      "function": "annualized_volatility",
+      "args": {
+        "returns": [
+          0.01,
+          -0.02,
+          0.015,
+          0.005,
+          -0.01,
+          0.02
+        ],
+        "periods_per_year": 12,
+        "window": 4
+      },
+      "expected": {
+        "methodId": "finance.risk.annualized_volatility",
+        "value": 0.0458257569495584,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.01,
+            -0.02,
+            0.015,
+            0.005,
+            -0.01,
+            0.02
+          ],
+          "periodsPerYear": 12,
+          "window": 4
+        }
+      }
+    },
+    {
+      "name": "sharpe-arithmetic-rf0",
+      "function": "sharpe",
+      "args": {
+        "returns": [
+          0.01,
+          -0.02,
+          0.015,
+          0.005,
+          -0.01,
+          0.02
+        ],
+        "risk_free_rate": 0.0,
+        "risk_free_rate_convention": "annual",
+        "ddof": 1,
+        "periods_per_year": 12,
+        "return_convention": "arithmetic"
+      },
+      "expected": {
+        "methodId": "finance.risk.sharpe_ratio",
+        "value": 0.7505866250408015,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.01,
+            -0.02,
+            0.015,
+            0.005,
+            -0.01,
+            0.02
+          ],
+          "riskFreeRate": 0.0,
+          "riskFreeRateConvention": "annual",
+          "ddof": 1,
+          "periodsPerYear": 12,
+          "returnConvention": "arithmetic"
+        }
+      }
+    },
+    {
+      "name": "sharpe-arithmetic-annual-rf",
+      "function": "sharpe",
+      "args": {
+        "returns": [
+          0.01,
+          -0.02,
+          0.015,
+          0.005,
+          -0.01,
+          0.02
+        ],
+        "risk_free_rate": 0.06,
+        "risk_free_rate_convention": "annual",
+        "ddof": 1,
+        "periods_per_year": 12,
+        "return_convention": "arithmetic"
+      },
+      "expected": {
+        "methodId": "finance.risk.sharpe_ratio",
+        "value": -0.3752933125204009,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.01,
+            -0.02,
+            0.015,
+            0.005,
+            -0.01,
+            0.02
+          ],
+          "riskFreeRate": 0.06,
+          "riskFreeRateConvention": "annual",
+          "ddof": 1,
+          "periodsPerYear": 12,
+          "returnConvention": "arithmetic"
+        }
+      }
+    },
+    {
+      "name": "sharpe-arithmetic-period-rf",
+      "function": "sharpe",
+      "args": {
+        "returns": [
+          0.01,
+          -0.02,
+          0.015,
+          0.005,
+          -0.01,
+          0.02
+        ],
+        "risk_free_rate": 0.005,
+        "risk_free_rate_convention": "period",
+        "ddof": 1,
+        "periods_per_year": 12,
+        "return_convention": "arithmetic"
+      },
+      "expected": {
+        "methodId": "finance.risk.sharpe_ratio",
+        "value": -0.3752933125204009,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.01,
+            -0.02,
+            0.015,
+            0.005,
+            -0.01,
+            0.02
+          ],
+          "riskFreeRate": 0.005,
+          "riskFreeRateConvention": "period",
+          "ddof": 1,
+          "periodsPerYear": 12,
+          "returnConvention": "arithmetic"
+        }
+      }
+    },
+    {
+      "name": "sharpe-ddof0",
+      "function": "sharpe",
+      "args": {
+        "returns": [
+          0.01,
+          -0.02,
+          0.015,
+          0.005,
+          -0.01,
+          0.02
+        ],
+        "risk_free_rate": 0.0,
+        "risk_free_rate_convention": "annual",
+        "ddof": 0,
+        "periods_per_year": 12,
+        "return_convention": "arithmetic"
+      },
+      "expected": {
+        "methodId": "finance.risk.sharpe_ratio",
+        "value": 0.822226451793038,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.01,
+            -0.02,
+            0.015,
+            0.005,
+            -0.01,
+            0.02
+          ],
+          "riskFreeRate": 0.0,
+          "riskFreeRateConvention": "annual",
+          "ddof": 0,
+          "periodsPerYear": 12,
+          "returnConvention": "arithmetic"
+        }
+      }
+    },
+    {
+      "name": "sharpe-daily-ppy252",
+      "function": "sharpe",
+      "args": {
+        "returns": [
+          0.0012,
+          -0.0008,
+          0.0005,
+          0.0019,
+          -0.002,
+          0.0009,
+          -0.0004,
+          0.0015,
+          -0.0011,
+          0.0007
+        ],
+        "risk_free_rate": 0.02,
+        "risk_free_rate_convention": "annual",
+        "ddof": 1,
+        "periods_per_year": 252,
+        "return_convention": "arithmetic"
+      },
+      "expected": {
+        "methodId": "finance.risk.sharpe_ratio",
+        "value": 2.0241214509306924,
+        "unit": "ratio_per_annum",
+        "parameters": {
+          "returns": [
+            0.0012,
+            -0.0008,
+            0.0005,
+            0.0019,
+            -0.002,
+            0.0009,
+            -0.0004,
+            0.0015,
+            -0.0011,
+            0.0007
+          ],
+          "riskFreeRate": 0.02,
+          "riskFreeRateConvention": "annual",
+          "ddof": 1,
+          "periodsPerYear": 252,
+          "returnConvention": "arithmetic"
+        }
+      }
+    }
+  ]
+}

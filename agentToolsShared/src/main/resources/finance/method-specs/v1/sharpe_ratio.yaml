@@ -1,0 +1,66 @@
+schemaVersion: "1"
+methodId: finance.risk.sharpe_ratio
+version: 1.0.0
+displayName: 夏普比率
+definition: 周期超额收益均值除以周期收益率标准差、再按每年期数平方根换算的年化夏普比率；缺省规范路径为算术平均 + 样本标准差（ddof=1）+ 年化无风险利率折算，显式参数可选择其他口径并按所传参数执行
+resolverHints:
+  aliases: [夏普比率, 夏普, Sharpe, Sharpe ratio]
+  commonPhrases: [每承担一份波动换来多少收益, 风险调整后的收益水平]
+  clarificationDimensions:
+    - id: rangeBoundary
+      question: 希望用哪个日期或交易日区间的收益率序列
+    - id: returnFrequency
+      question: 收益率序列按日、周、月还是其他频率
+    - id: riskFreeChoice
+      question: 无风险利率取哪个值，以及它是年化值还是每周期值
+parameters:
+  returns:
+    type: array
+    required: true
+    items: {type: number}
+    meaning: 周期收益率序列，按时间先后排列，长度至少为 2
+  riskFreeRate:
+    type: number
+    required: false
+    default: 0
+    meaning: 无风险利率数值
+  riskFreeRateConvention:
+    type: string
+    required: false
+    default: annual
+    enum: [annual, period]
+    meaning: annual 表示年化值，按 periodsPerYear 折算到每期；period 表示每周期值直接使用
+  periodsPerYear:
+    type: integer
+    required: false
+    default: 252
+    minimum: 1
+    meaning: 每年包含的期数
+  ddof:
+    type: integer
+    required: false
+    default: 1
+    minimum: 0
+    meaning: 样本标准差的自由度修正
+  returnConvention:
+    type: string
+    required: false
+    default: arithmetic
+    enum: [arithmetic, geometric]
+    meaning: 超额收益聚合方式；v1.0.0 规范路径为 arithmetic
+conventions:
+  period_arithmetic_excess_mean_over_stdev_annualized:
+    riskFreeHandling: 由 riskFreeRateConvention 参数决定——annual 时按 periodsPerYear 折算到每期后逐期相减，period 时直接使用
+    returnType: simple_period_returns
+    stdevDdof: 由 ddof 参数决定，规范路径取 1
+    returnAggregation: 由 returnConvention 参数决定，规范路径取 arithmetic
+    canonicalPath: arithmetic 聚合 + annual 折算 + ddof=1（参数缺省值即规范路径）
+    narrativeTemplate: 使用输入的{returns}，无风险利率 {riskFreeRate}（{riskFreeRateConvention} 口径），按 {returnConvention} 平均的周期超额收益除以样本标准差（ddof={ddof}），再乘以每年 {periodsPerYear} 期的平方根换算为年化夏普比率
+outputs:
+  - {name: sharpe, unit: ratio_per_annum, description: 年化夏普比率, displayFormat: number}
+libraryBinding:
+  package: alphafrog_finance
+  function: sharpe
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.risk.sharpe_ratio@1.0.0

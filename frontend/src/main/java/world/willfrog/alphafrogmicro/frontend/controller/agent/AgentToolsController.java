@@ -1,10 +1,8 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
-import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -19,10 +17,9 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentToolsRequest;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentConfigResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentToolResponse;
-import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -31,28 +28,16 @@ import java.util.List;
 @Slf4j
 public class AgentToolsController {
 
-    private static final int ADMIN_USER_TYPE = 1127;
-
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
 
-    @DubboReference(group = "legacy", check = false)
-    private AgentDubboService agentDubboServiceLegacy;
+    private final AgentAuthSupport authSupport;
 
-    @Autowired
-    private HttpServletRequest request;
-
-    private final AuthService authService;
-
-    public AgentToolsController(AuthService authService) {
-        this.authService = authService;
+    public AgentToolsController(AgentAuthSupport authSupport) {
+        this.authSupport = authSupport;
     }
 
     private AgentDubboService resolveService() {
-        String uri = request.getRequestURI();
-        if (uri != null && uri.startsWith("/api/agent-legacy")) {
-            return agentDubboServiceLegacy;
-        }
         return agentDubboServiceLangchain;
     }
 
@@ -61,22 +46,8 @@ public class AgentToolsController {
         return toolsInternal(authentication);
     }
 
-    /** @deprecated Use {@code GET /api/agent/tools}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/tools")
-    public ResponseWrapper<List<AgentToolResponse>> toolsLegacy(Authentication authentication) {
-        return toolsInternal(authentication);
-    }
-
     @GetMapping("/api/agent/config")
     public ResponseWrapper<AgentConfigResponse> config(Authentication authentication) {
-        return configInternal(authentication);
-    }
-
-    /** @deprecated Use {@code GET /api/agent/config}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/config")
-    public ResponseWrapper<AgentConfigResponse> configLegacy(Authentication authentication) {
         return configInternal(authentication);
     }
 
@@ -86,21 +57,13 @@ public class AgentToolsController {
         return downloadInternal(authentication, artifactId);
     }
 
-    /** @deprecated Use {@code GET /api/agent/artifacts/{artifactId}/download}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/artifacts/{artifactId}/download")
-    public ResponseEntity<byte[]> downloadLegacy(Authentication authentication,
-                                                 @PathVariable("artifactId") String artifactId) {
-        return downloadInternal(authentication, artifactId);
-    }
-
     private ResponseWrapper<List<AgentToolResponse>> toolsInternal(Authentication authentication) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            var resp = resolveService().listTools(ListAgentToolsRequest.newBuilder().setUserId(userId).build());
+            var resp = resolveService().listTools(ListAgentToolsRequest.newBuilder().setUserId(caller.userId()).build());
             List<AgentToolResponse> tools = new ArrayList<>();
             for (var t : resp.getItemsList()) {
                 tools.add(new AgentToolResponse(t.getName(), t.getDescription(), t.getParametersJson()));
@@ -116,14 +79,14 @@ public class AgentToolsController {
     }
 
     private ResponseWrapper<AgentConfigResponse> configInternal(Authentication authentication) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
             var resp = resolveService().getConfig(
                     GetAgentConfigRequest.newBuilder()
-                            .setUserId(userId)
+                            .setUserId(caller.userId())
                             .build()
             );
             AgentConfigResponse body = new AgentConfigResponse(
@@ -148,16 +111,16 @@ public class AgentToolsController {
     }
 
     private ResponseEntity<byte[]> downloadInternal(Authentication authentication, String artifactId) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseEntity.status(401).build();
         }
         try {
             DownloadAgentArtifactResponse resp = resolveService().downloadArtifact(
                     DownloadAgentArtifactRequest.newBuilder()
-                            .setUserId(userId)
+                            .setUserId(caller.userId())
                             .setArtifactId(artifactId)
-                            .setIsAdmin(isAdmin(authentication))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             HttpHeaders headers = new HttpHeaders();
@@ -197,28 +160,4 @@ public class AgentToolsController {
         }
     }
 
-    private String resolveUserId(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return null;
-        }
-        String username = authentication.getName();
-        User user = authService.getUserByUsername(username);
-        if (user == null || user.getUserId() == null) {
-            return null;
-        }
-        return String.valueOf(user.getUserId());
-    }
-
-    private boolean isAdmin(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return false;
-        }
-        String username = authentication.getName();
-        User user = authService.getUserByUsername(username);
-        if (user == null) {
-            return false;
-        }
-        Integer userType = user.getUserType();
-        return userType != null && userType == ADMIN_USER_TYPE;
-    }
 }
