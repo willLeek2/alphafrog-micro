@@ -10,7 +10,7 @@
    install -m 755 af-beta-shell /opt/alphafrog-beta/bin/af-beta-shell
    ```
 
-   白名单子命令写在脚本顶部的 `ALLOWED_SUBCOMMANDS`（当前 `status retry how-to-test lane main`），按《03-beta-机开发入口》增删。
+   白名单子命令写在脚本顶部的 `ALLOWED_SUBCOMMANDS`（当前 `status retry how-to-test lane main configs file-config`），按《03-beta-机开发入口》增删。仓库这份要与 Beta 本机 `/opt/alphafrog-beta/bin/af-beta-shell` 保持同一组子命令，避免按仓库覆盖安装时被抹掉。
 
 2. 收集各开发机的**公钥**。开发机各自生成专用钥匙，私钥不出机器：
 

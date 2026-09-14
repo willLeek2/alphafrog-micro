@@ -57,6 +57,7 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 - `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加。见上文硬性边界：必须用户明确要求。
 - `retry`：对失败部署重试。
 - `how-to-test`：拿到本次部署的验证指引，成功后原样转告用户。
+- `file-config --git <提交>`：把该提交里 agent-langchain 的 `prompts/` 同步到 Beta 挂载目录 `/var/lib/alphafrog-beta/data/agent-configs/prompts`（agent 服务按 `file:prompts/...` 读取这份目录，约 10 秒轮询一次；改动提示词资源后需要在 Beta 生效时用）。提交必须已经推到远端；成功后把命令输出（含 md5）原样转告用户。这条不是 `main roll`，不需要用户另一次同意滚动主环境。
 
 ## 联调前置
 
