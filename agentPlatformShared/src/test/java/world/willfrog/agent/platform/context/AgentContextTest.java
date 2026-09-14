@@ -3,7 +3,9 @@ package world.willfrog.agent.platform.context;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 
+import java.time.LocalDate;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -109,6 +111,30 @@ class AgentContextTest {
 
         latch.await();
         assertFalse(childHasFreshness.get());
+    }
+
+    @Test
+    void captureAndRestore_shouldPreservePromptRunSelectionInChildThread() throws Exception {
+        PromptRunSelection selection = new PromptRunSelection(
+                PromptRunSelection.SCHEMA_VERSION,
+                "default-v1", "control", "bundle-digest", "capability-digest",
+                LocalDate.of(2025, 2, 3));
+        AgentContext.setPromptRunSelection(selection);
+        AgentContext.ContextSnapshot snapshot = AgentContext.captureRunContext();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<PromptRunSelection> childSelection = new AtomicReference<>();
+        new Thread(() -> {
+            AgentContext.restoreRunContext(snapshot);
+            childSelection.set(AgentContext.getPromptRunSelection());
+            AgentContext.clear();
+            latch.countDown();
+        }).start();
+
+        latch.await();
+        assertEquals(selection, childSelection.get());
+        AgentContext.clear();
+        assertNull(AgentContext.getPromptRunSelection());
     }
 
     // ── debugObservabilitySessionId (task #62 A) ──

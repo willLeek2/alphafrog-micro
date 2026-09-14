@@ -94,8 +94,8 @@ class ToolJobFinalizerFinanceRecordTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-1"), any(),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.cancelFromStatuses(eq("run-1"), any(),
+                eq(AgentRunStatus.CANCELED))).thenReturn(true);
 
         ToolJobFinalizer finalizer = finalizerWithFinance(
                 anchorService, processor, configLoader, formatter, adapter);
@@ -123,8 +123,8 @@ class ToolJobFinalizerFinanceRecordTest {
                 eq(List.<FinanceToolResultFormatter.FinanceModelResult>of(modelResult)),
                 eq(List.<FinanceRecordExtractionResult.ModelNotice>of(notice)));
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(SUCCESS_JSON);
-        verify(anchorService).updateAnchorAndStatus(eq("run-1"), any(),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService).cancelFromStatuses(eq("run-1"), any(),
+                eq(AgentRunStatus.CANCELED));
     }
 
     /** SUCCEEDED + finance + processor exception → fail-closed with finance_processing_failed. */
@@ -422,8 +422,8 @@ class ToolJobFinalizerFinanceRecordTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-re"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(false).thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-re"), any(),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.cancelFromStatuses(eq("run-re"), any(),
+                eq(AgentRunStatus.CANCELED))).thenReturn(true);
 
         ToolJobFinalizer finalizer = finalizerWithFinance(anchorService, processor, configLoader, formatter,
                 reAdapter);
@@ -453,8 +453,8 @@ class ToolJobFinalizerFinanceRecordTest {
         finalizer.handleTerminal("run-re", anchor, "SUCCEEDED", resp, false);
         verify(processor, times(2)).process(any());
         verify(formatter, times(2)).formatSuccess(any(), any(), any());
-        verify(anchorService).updateAnchorAndStatus(eq("run-re"), any(),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService).cancelFromStatuses(eq("run-re"), any(),
+                eq(AgentRunStatus.CANCELED));
     }
 
     /** SUCCEEDED no finance → formatter.formatSuccess called with raw stdout, no processor. */

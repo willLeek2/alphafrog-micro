@@ -1,8 +1,11 @@
-FROM amazoncorretto:17
+FROM eclipse-temurin:17-jdk-noble
 WORKDIR /app
 
-# 安装网络工具（用于获取 IP 地址）和 curl（用于容器内出网/代理诊断）
-RUN yum install -y iproute curl ca-certificates && yum clean all
+# 只补 entrypoint.sh 用的 ip 命令（iproute2）；curl / ca-certificates Temurin
+# noble 底镜像已预装。从 Amazon Linux yum 换到 Ubuntu apt，与其余 Java 服务同一套底。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY target/externalInfoService-1.0-SNAPSHOT.jar app.jar
 COPY entrypoint.sh /entrypoint.sh

@@ -1,0 +1,7 @@
+[Stage: PLANNING_STRUCTURED]
+请将上述分析转化为简化的 Todo List JSON，只输出 JSON，不要包含其他文字。
+
+格式示例：
+{"analysis":"分析摘要","items":[{"id":"todo_1","sequence":1,"description":"查询目标资产代码","dependsOn":[]},{"id":"todo_2","sequence":2,"description":"获取所需数据","dependsOn":["todo_1"]},{"id":"todo_3","sequence":3,"description":"分析数据并回答用户问题","dependsOn":["todo_2"]}]}
+
+每个 Todo 只需要一至三句话的 description；不要预先填写 toolName 或 params。DAG 模式可以用 dependsOn 表达依赖，LINEAR 模式按 sequence 顺序执行。

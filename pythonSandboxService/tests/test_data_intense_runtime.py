@@ -46,7 +46,8 @@ class DataIntenseRuntimeTest(unittest.TestCase):
         # reference is always accepted (no dev-allow switch needed).
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32},
+            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32,
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             config = load_config()
@@ -95,15 +96,32 @@ class DataIntenseRuntimeTest(unittest.TestCase):
         class FakeSession:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
+                # Post-open non-root contract (260818): create_sandbox_session
+                # installs the root-exec guards and verifies the live
+                # identity, both against the container proxy.
+                self.container = types.SimpleNamespace(
+                    put_archive=lambda *a, **k: None,
+                    exec_run=lambda *a, **k: types.SimpleNamespace(exit_code=0),
+                )
 
             def open(self):
                 return None
+
+            def execute_command(self, command: str):
+                # create_sandbox_session verifies the container user's
+                # LIVE identity after open() (grace round-3).
+                flag = command.split()[-1]
+                uid_gid = {"-u": "10000", "-g": "10001"}.get(flag, "")
+                return types.SimpleNamespace(
+                    exit_code=0, stdout=uid_gid, stderr=""
+                )
 
         # Spec §12: AF_SANDBOX_IMAGE has no implicit default; a digest
         # reference is always accepted (no dev-allow switch needed).
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32},
+            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32,
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             config = load_config()
@@ -127,9 +145,30 @@ class DataIntenseRuntimeTest(unittest.TestCase):
             def __init__(self):
                 self.destinations = []
                 self.commands = []
+                # Non-root staging surface (260818): the temp-file copy now
+                # travels as a put_archive tar entry owned by the container
+                # user; record the destination the same way.
+                from tests.nonroot_fakes import prime_fake_session
+
+                prime_fake_session(self)
+
+                def recording_put(dest_dir, data):
+                    import io as _io
+                    import tarfile as _tarfile
+
+                    with _tarfile.open(fileobj=_io.BytesIO(data)) as tar:
+                        for member in tar.getmembers():
+                            self.destinations.append(
+                                f"{dest_dir.rstrip('/')}/{member.name}"
+                            )
+
+                self.container.put_archive = recording_put
 
             def copy_to_runtime(self, _source: str, dest_path: str):
-                self.destinations.append(dest_path)
+                raise AssertionError(
+                    "production must stage via container.put_archive "
+                    "(non-root contract, 260818)"
+                )
 
             def execute_command(self, command: str):
                 self.commands.append(command)
@@ -179,7 +218,8 @@ class ConfigImagePolicyTest(unittest.TestCase):
     def test_load_config_rejects_uppercase_digest_reference(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64.upper()}"},
+            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64.upper()}",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):
@@ -188,7 +228,8 @@ class ConfigImagePolicyTest(unittest.TestCase):
     def test_load_config_rejects_trailing_hex_after_digest(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64}a"},
+            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64}a",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):
@@ -197,7 +238,8 @@ class ConfigImagePolicyTest(unittest.TestCase):
     def test_load_config_rejects_undigested_ref_without_dev_switch(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest"},
+            {"AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):
@@ -210,6 +252,7 @@ class ConfigImagePolicyTest(unittest.TestCase):
                 {
                     "AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
                     "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": switch_value,
+                    "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release",
                 },
                 clear=True,
             ):
@@ -224,6 +267,7 @@ class ConfigImagePolicyTest(unittest.TestCase):
                 {
                     "AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
                     "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": switch_value,
+                    "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release",
                 },
                 clear=True,
             ):
@@ -283,7 +327,9 @@ class ConfigDevReferenceSharedVectorsTest(unittest.TestCase):
         for ref in VALID_DEV_REFERENCES:
             with patch.dict(
                 "os.environ",
-                {"AF_SANDBOX_IMAGE": ref, "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true"},
+                {"AF_SANDBOX_IMAGE": ref,
+             "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
                 clear=True,
             ):
                 config = load_config()
@@ -309,7 +355,8 @@ class ConfigDevReferenceSharedVectorsTest(unittest.TestCase):
     def test_load_config_rejects_empty_ref_even_with_dev_switch(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true"},
+            {"AF_SANDBOX_IMAGE": "", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):

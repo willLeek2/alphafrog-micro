@@ -85,7 +85,12 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lookup.found)
         self.assertEqual(lookup.task_id, first.task_id)
 
-    async def test_same_fingerprint_with_changed_payload_returns_conflict(self) -> None:
+    async def test_same_fingerprint_with_changed_payload_is_invalid_argument(self) -> None:
+        # D13 (26Q3, ccqwen 1f4e16d4 #1): a declared fingerprint that does not
+        # match the recomputed canonical fingerprint is self-contradictory
+        # CLIENT DATA → 400 (Gateway INVALID_ARGUMENT), not a 409 state
+        # conflict. Genuine conflicts (same operation_id, different payload,
+        # each with its own CORRECT fingerprint) stay 409 at the store layer.
         original = self.request()
         await main.create_task(original)
         changed = self.request(code="print(2)")
@@ -94,7 +99,7 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await main.create_task(changed)
 
-        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(self.queue.qsize(), 1)
 
     async def test_resource_class_memory_mismatch_is_rejected_before_persist(self) -> None:
@@ -114,6 +119,10 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             status=TaskStatus.QUEUED,
             request=ExecuteRequest(dataset_id="dataset-1", code="raise SystemExit(2)"),
         )
+        # D11 (task #108): process_task now gates on the store's QUEUED→RUNNING
+        # transition (begin_execution), which mirrors the real production flow
+        # (create_task persists BEFORE enqueue) — the task must be saved first.
+        self.store.save(task)
         runner_result = {
             "exit_code": 2,
             "stdout": "",
@@ -151,6 +160,8 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             status=TaskStatus.QUEUED,
             request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
         )
+        # D11: same begin_execution gate as the real production flow.
+        self.store.save(task)
 
         with patch.object(main, "pool", None), patch.object(
             main, "run_in_sandbox", side_effect=RuntimeError("runner failed before usage")
@@ -172,6 +183,8 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             status=TaskStatus.QUEUED,
             request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
         )
+        # D11: same begin_execution gate as the real production flow.
+        self.store.save(task)
         runner_exc = RuntimeError("wrapper boom after successful recollect")
         runner_exc.execution_environment = ExecutionEnvironment(
             environment_id="sha256:post-install",
@@ -229,7 +242,10 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await main.get_task_result(task.task_id)
 
-        self.assertEqual(raised.exception.status_code, 400)
+        # D13 (26Q3, ccqwen 1f4e16d4 #3): a terminal task without a persisted
+        # result is an execution-entry INTERNAL failure → JSON 500 (Gateway
+        # DOWNSTREAM_FAILURE), not a 400 client defect.
+        self.assertEqual(raised.exception.status_code, 500)
         self.assertIsNone(self.store.get(task.task_id).retryable)
 
 

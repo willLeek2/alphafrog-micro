@@ -48,6 +48,8 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
                     CREATE TABLE alphafrog_agent_run (
                         id VARCHAR(64) PRIMARY KEY,
                         user_id VARCHAR(64),
+                        deployment_id VARCHAR(64) NOT NULL,
+                        deployment_generation_id VARCHAR(68) NOT NULL,
                         status VARCHAR(32),
                         current_step INT DEFAULT 0,
                         max_steps INT DEFAULT 20,
@@ -59,6 +61,8 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         completed_at TIMESTAMPTZ,
                         ext JSONB NOT NULL DEFAULT '{}',
+                        execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                        restart_attempt INT NOT NULL DEFAULT 0,
                         tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'
                     )
                     """);
@@ -204,7 +208,7 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
             insertRun(mapper, "already-canceled", AgentRunStatus.CANCELED,
                     "user_canceled", proofAnchor("already-canceled"));
 
-            assertThat(mapper.listActiveToolJobAnchors(20))
+            assertThat(mapper.listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", 20))
                     .extracting(AgentRun::getId)
                     .contains("already-failed", "already-canceled");
             assertThat(mapper.updateDagCleanupToolJobAnchor(
@@ -299,6 +303,8 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId("user-1");
+        run.setDeploymentId("stable");
+        run.setDeploymentGenerationId("gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         run.setStatus(status);
         run.setCurrentStep(1);
         run.setMaxSteps(12);

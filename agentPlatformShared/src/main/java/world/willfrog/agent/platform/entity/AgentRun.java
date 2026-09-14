@@ -15,6 +15,12 @@ import java.time.OffsetDateTime;
 public class AgentRun {
     private String id;
     private String userId;
+    /** 创建 Run 的稳定部署标识；创建后不可修改。 */
+    private String deploymentId;
+    /** 创建 Run 的不可变执行代际；异步领取和恢复必须同时匹配此值。 */
+    private String deploymentGenerationId;
+    /** 创建请求携带的泳道标签；主 Beta 和生产流量为 null。 */
+    private String laneTag;
     /** 当前 Run 状态；WAITING_TOOL_JOB 表示内存 worker 已退出、但外部作业仍拥有后续恢复权。 */
     private AgentRunStatus status;
     private Integer currentStep;
@@ -30,6 +36,13 @@ public class AgentRun {
     private OffsetDateTime updatedAt;
     private OffsetDateTime completedAt;
     private String ext; // JSON string
+    /**
+     * 工作流级粗粒度恢复检查点。它只描述冻结 Plan 的执行边界，不保存长工具任务身份，
+     * 因此不能与 {@link #toolJobAnchorJson} 混用。
+     */
+    private String executionCheckpointJson;
+    /** 服务重启后自动重新执行的次数；与 LLM HTTP retry、Todo retry 分开计数。 */
+    private Integer restartAttempt;
     /**
      * 外部长工具的 durable anchor JSON。
      * 包含 operation/toolCall/attempt 身份、todo 坐标、已完成结果、dataset snapshot、工具预算、

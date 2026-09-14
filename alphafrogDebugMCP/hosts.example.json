@@ -1,0 +1,15 @@
+{
+  "_comment": "把本文件复制到 ~/.alphafrog/debug-mcp-hosts.json，权限设为 600。label 会返回给调用 MCP 的 agent，不要在 label 里写真实主机名或地址。",
+  "targets": [
+    {
+      "id": "test",
+      "label": "测试环境",
+      "ssh_host": "your-ssh-config-alias-test"
+    },
+    {
+      "id": "prod",
+      "label": "生产环境",
+      "ssh_host": "your-ssh-config-alias-prod"
+    }
+  ]
+}

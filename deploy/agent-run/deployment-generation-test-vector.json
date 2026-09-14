@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "manifestVersion": 7,
+  "gitCommit": "0123456789abcdef0123456789abcdef01234567",
+  "serviceImages": {
+    "service-b": "registry.local/b@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "service-a": "registry.local/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "canonicalUtf8Escaped": "alphafrog-deployment-generation-v1\nmanifest-version:7\ngit-commit:0123456789abcdef0123456789abcdef01234567\nservice:service-a\u0000registry.local/a@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nservice:service-b\u0000registry.local/b@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+  "deploymentGenerationId": "gen-f790b524a00bac28c4db1b7e63765be68a978170f184441a8d54ea3b36a9f26b"
+}

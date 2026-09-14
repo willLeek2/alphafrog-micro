@@ -4,7 +4,7 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.OpenRouterCostService;
 
 import java.util.LinkedHashMap;
@@ -70,7 +70,7 @@ public class EndpointCostAdapterRegistry {
                         .build());
     }
 
-    public static LlmCallBillingContext fromTrace(AgentObservabilityService.LlmTrace trace) {
+    public static LlmCallBillingContext fromTrace(AgentRunObservabilityService.LlmTrace trace) {
         if (trace == null) {
             return LlmCallBillingContext.builder().build();
         }

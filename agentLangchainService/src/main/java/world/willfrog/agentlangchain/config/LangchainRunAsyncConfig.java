@@ -25,14 +25,16 @@ public class LangchainRunAsyncConfig {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(hard.getCorePoolSize());
         executor.setMaxPoolSize(hard.getMaxPoolSize());
-        // 业务调度器维护唯一队列，物理线程池不得再藏一层无法热缩放、无法观测的 backlog。
+        // 业务调度器维护唯一队列，物理线程池的 queueCapacity 设为 0，
+        // 避免再出现一层无法热缩放、无法观测的积压。
         executor.setQueueCapacity(0);
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix(hard.getThreadNamePrefix());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(30);
-        executor.initialize();
+        // AgentServiceShutdownState 在自然处理窗口内保持执行器可用，窗口结束后主动
+        // 中断剩余任务并写失败终态。Bean 销毁阶段不得重新等待一遍完整处理期限。
+        executor.setWaitForTasksToCompleteOnShutdown(false);
+        executor.setAwaitTerminationSeconds(0);
         return executor;
     }
 }

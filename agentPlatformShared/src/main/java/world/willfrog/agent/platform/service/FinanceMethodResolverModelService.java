@@ -57,7 +57,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
     private final AgentAiServiceFactory aiServiceFactory;
     private final FinanceMethodResolverModelResolver resolverModelResolver;
     private final AgentPromptService promptService;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
 
     @Override
     public ResolverResult resolve(String query, String context, String catalogFragment) {
@@ -270,7 +270,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
         if (isDashScope(resolved) || baseUrl.contains("dashscope")) {
             return "dashscope";
         }
-        if (baseUrl.contains("openrouter.ai")) {
+        if (OpenRouterProviderRoutedChatModel.isOpenRouter(resolved.baseUrl(), resolved.endpointName())) {
             return "openrouter";
         }
         return "openai-compatible";

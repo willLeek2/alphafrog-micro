@@ -8,7 +8,7 @@ import world.willfrog.agent.platform.finance.FinanceMethodResolution;
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionQuery;
 import world.willfrog.agent.platform.finance.FinanceMetricRecord;
 import world.willfrog.agent.platform.finance.FinanceRecordQuery;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.tools.finance.FinanceMethodSpec;
 import world.willfrog.agent.tools.finance.FinanceMethodSpecCatalog;
 import world.willfrog.agent.tools.finance.FinanceResultModelProjector;
@@ -46,7 +46,7 @@ class FinanceResultComposerTest {
     private FinanceMethodResolutionQuery resolutionQuery;
     private FinanceResultModelProjector projector;
     private FinanceMethodSpecCatalog specCatalog;
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private FinanceResultComposer composer;
 
     @BeforeEach
@@ -55,7 +55,7 @@ class FinanceResultComposerTest {
         resolutionQuery = mock(FinanceMethodResolutionQuery.class);
         projector = mock(FinanceResultModelProjector.class);
         specCatalog = mock(FinanceMethodSpecCatalog.class);
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         composer = new FinanceResultComposer(
                 recordQuery, resolutionQuery, projector, specCatalog,
                 new FinanceResultBlockRenderer(), eventService, new ObjectMapper());

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+export D15_CALLER_ID="deploy_latest.sh"  # v14 MF3: caller tag for docker mock
 
 # 基础设施服务（不常重建）
 INFRA_SERVICES=(
@@ -10,6 +11,7 @@ INFRA_SERVICES=(
   rabbitmq
   nacos
   meilisearch
+  otel-collector
 )
 
 # Python沙箱服务（独立于Java服务）
@@ -53,6 +55,17 @@ Usage:
   ./deploy_latest.sh python-sandbox-runtime python-sandbox-service
   ./deploy_latest.sh --skip-maven     # skip Maven, still run docker_build.sh, then recreate containers
   ./deploy_latest.sh --deploy-only    # skip Maven and docker_build.sh, only recreate containers
+
+Before deploying (required in .env):
+  AF_DUBBO_REGISTRY_HOST_IP=<host private IP>
+  # Dubbo providers register this address into Nacos (with their published host
+  # ports), so cross-machine consumers (e.g. Beta fallback) can reach them.
+  # Missing or invalid value fails before any container is recreated.
+
+Typical release (production):
+  git checkout <target commit>
+  ./deploy_latest.sh <service>              # maven + image build + recreate
+  ./deploy_latest.sh --deploy-only <service>  # recreate only, image already built
 
 Services:
   # Business Services
@@ -253,6 +266,19 @@ fi
 
 echo "=== Selected services: ${SELECTED[*]} ==="
 
+# 采集器镜像版本写在 compose 中，配置内容另用固定摘要校验。101 与 Beta
+# 机器使用同一份 YAML，只通过环境变量改变 VictoriaLogs 地址。
+bash "$ROOT_DIR/deploy/otel/verify-collector-config.sh"
+
+# 所有 JVM 容器挂载同一份官方 Java Agent。部署脚本在构建和启动之前验证
+# 固定版本、字节数与摘要，缺失或被替换时停止。
+for selected_service in "${SELECTED[@]}"; do
+  if is_in_list "$selected_service" "${ALL_SERVICES[@]}"; then
+    bash "$ROOT_DIR/deploy/otel/verify-javaagent.sh"
+    break
+  fi
+done
+
 # MethodSpec V5 §12: 部署目标运行时镜像引用必须是 sha256 摘要引用（生产）。
 # 裸标签仅在显式 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true/1 时允许，且开发开关只放行
 # 【语法合法】的裸标签/引用（round-2 R2-4）：空值、空白/控制字符、大写仓库名、
@@ -279,6 +305,19 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   DEPLOY_SANDBOX_IMAGE="${AF_SANDBOX_IMAGE:-}"
   DEPLOY_DEV_ALLOW="${AF_SANDBOX_IMAGE_ALLOW_DEV_TAG:-}"
   DEPLOY_INCOMPLETE_DEV_ALLOW="${AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD:-}"
+  # 260814 scheduler-03: image verify-mode selection. local-image-id (default)
+  # is the single-machine contract: the configured value must BE the local
+  # Image ID (sha256:<64hex>) and docker inspect must resolve to exactly that
+  # ID. strict-release keeps the Spec §12 digest/mapping/Tier2a chain.
+  DEPLOY_VERIFY_MODE="${AF_SANDBOX_IMAGE_VERIFY_MODE:-local-image-id}"
+  case "$DEPLOY_VERIFY_MODE" in
+    local-image-id|strict-release) ;;
+    *)
+      echo "[deploy] ERROR: AF_SANDBOX_IMAGE_VERIFY_MODE must be local-image-id or strict-release; got '${DEPLOY_VERIFY_MODE}'." >&2
+      exit 1
+      ;;
+  esac
+  DEPLOY_TAG_CHECK="${AF_SANDBOX_IMAGE_TAG_CHECK:-}"
   # compose 自动读取 .env；进程环境未设置时回退解析 .env（与 compose 取值保持一致）
   if [[ -f "$ROOT_DIR/.env" ]]; then
     if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
@@ -302,15 +341,52 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   # 引用语法门禁（round-2 R2-4）：空值总是被拒绝（即使开了开发开关）；
   # digest 引用按全锚定/仅小写语义校验；开发开关只放行语法合法的裸引用，
   # 不是无条件豁免。
+  # DEPLOY_USING_BARE_DEV_REF：仅当「本次实际选用合法裸引用」时为 1。
+  # AF_SANDBOX_IMAGE_ALLOW_DEV_TAG 只是权限开关，不能单独跳过 Tier2a；
+  # 合法 digest 即使 permission=true 也必须跑完整 Tier2a/OCI gate。
+  DEPLOY_USING_BARE_DEV_REF=0
   if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
     echo "[deploy] ERROR: AF_SANDBOX_IMAGE 未设置或为空 (MethodSpec V5 §12)。" >&2
-    echo "  生产部署目标镜像必须是 repo/name@sha256:<64hex> 摘要引用（frog 发布时固定）。" >&2
-    echo "  开发环境可显式设置 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true 使用语法合法的裸标签。" >&2
+    echo "  local-image-id 模式要求 sha256:<64位小写hex> 本机 Image ID；" >&2
+    echo "  strict-release 模式要求 repo/name@sha256:<64hex> 摘要引用（frog 发布时固定）。" >&2
+    echo "  开发环境可显式设置 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true 使用语法合法的裸标签（仅 strict-release）。" >&2
     exit 1
   fi
-  if af_is_digest_reference "$DEPLOY_SANDBOX_IMAGE"; then
+  if [[ "$DEPLOY_VERIFY_MODE" == "local-image-id" ]]; then
+    # 260814 scheduler-03 local-image-id gate: the configured value must BE
+    # the local Image ID and docker inspect must resolve to exactly that ID.
+    # A mutable tag or a repo digest is rejected in this mode -- there is no
+    # dev-allow escape and the script never downgrades itself to tag mode.
+    if [[ ! "$DEPLOY_SANDBOX_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "[deploy] ERROR: local-image-id 模式要求 AF_SANDBOX_IMAGE=sha256:<64位小写hex>（本机 Image ID，不是标签也不是仓库摘要）；got '${DEPLOY_SANDBOX_IMAGE}'。" >&2
+      exit 1
+    fi
+    DEPLOY_INSPECTED_LOCAL_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_SANDBOX_IMAGE" 2>/dev/null || true)"
+    if [[ -z "$DEPLOY_INSPECTED_LOCAL_ID" ]]; then
+      echo "[deploy] ERROR: docker inspect 无法解析本机 Image ID ${DEPLOY_SANDBOX_IMAGE}（镜像缺失或 Docker socket 不可访问）。" >&2
+      exit 1
+    fi
+    if [[ "$DEPLOY_INSPECTED_LOCAL_ID" != "sha256:${DEPLOY_SANDBOX_IMAGE#sha256:}" ]]; then
+      echo "[deploy] ERROR: docker inspect 解析到不同镜像（${DEPLOY_INSPECTED_LOCAL_ID}）≠ 配置的 Image ID（${DEPLOY_SANDBOX_IMAGE}）。" >&2
+      exit 1
+    fi
+    if [[ -n "$DEPLOY_TAG_CHECK" ]]; then
+      DEPLOY_TAG_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_TAG_CHECK" 2>/dev/null || true)"
+      if [[ -z "$DEPLOY_TAG_ID" ]]; then
+        echo "[deploy] ERROR: AF_SANDBOX_IMAGE_TAG_CHECK '${DEPLOY_TAG_CHECK}' 无法解析。" >&2
+        exit 1
+      fi
+      if [[ "$DEPLOY_TAG_ID" != "$DEPLOY_INSPECTED_LOCAL_ID" ]]; then
+        echo "[deploy] ERROR: 标签 '${DEPLOY_TAG_CHECK}' 解析到 ${DEPLOY_TAG_ID}，与配置的 Image ID ${DEPLOY_SANDBOX_IMAGE} 不一致。" >&2
+        exit 1
+      fi
+      echo "[deploy] local-image-id 模式：标签复核通过（${DEPLOY_TAG_CHECK} -> ${DEPLOY_INSPECTED_LOCAL_ID}）。"
+    fi
+    echo "[deploy] local-image-id 模式：已校验本机 Image ID ${DEPLOY_SANDBOX_IMAGE}（docker inspect 精确匹配）。"
+  elif af_is_digest_reference "$DEPLOY_SANDBOX_IMAGE"; then
     : # 生产 digest 引用，合法。
   elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]] && af_is_valid_dev_reference "$DEPLOY_SANDBOX_IMAGE"; then
+    DEPLOY_USING_BARE_DEV_REF=1
     echo "[deploy] WARNING: AF_SANDBOX_IMAGE 是裸引用，仅因显式开关 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG 而放行（开发用途，勿用于生产）。" >&2
   elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]]; then
     echo "[deploy] ERROR: AF_SANDBOX_IMAGE 既不是合法的 sha256 摘要引用，也不是语法合法的裸引用 (MethodSpec V5 §12 R2-4)。" >&2
@@ -325,125 +401,6 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
     exit 1
   fi
 
-  # 发布门禁：目标绑定（round-2 R2-3，fail-closed）。映射文件必须存在且可解析；
-  # 所选引用经 docker inspect 解析为不可变 image ID；恰好一个映射条目与所选
-  # 目标对应，且该条目绑定的不可变 ID 与 inspect 结果相同；条目的五个摘要
-  # （base/lock/library/SBOM/MethodSpec）全部合法非占位符且 releasable=true。
-  DEPLOY_MAPPING_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-digest-mapping.json"
-  if [[ ! -f "$DEPLOY_MAPPING_FILE" ]]; then
-    echo "[deploy] ERROR: 构建产物映射文件缺失: ${DEPLOY_MAPPING_FILE} (MethodSpec V5 §12 R2-3)。" >&2
-    echo "  部署必须能证明目标镜像与一次经过验证的构建完全同一；先运行" >&2
-    echo "  pythonSandboxService/docker_build.sh runtime 生成映射（fail-closed）。" >&2
-    exit 1
-  fi
-  DEPLOY_INSPECTED_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_SANDBOX_IMAGE" 2>/dev/null || true)"
-  if [[ -z "$DEPLOY_INSPECTED_ID" ]]; then
-    echo "[deploy] ERROR: 无法通过 docker inspect 解析 ${DEPLOY_SANDBOX_IMAGE} 的不可变 image ID (MethodSpec V5 §12 R2-3)。" >&2
-    echo "  部署目标无法与映射条目证明同一性（fail-closed）。" >&2
-    exit 1
-  fi
-  if ! DEPLOY_GATE_VERDICT="$(python3 - "$DEPLOY_MAPPING_FILE" "$DEPLOY_SANDBOX_IMAGE" "$DEPLOY_INSPECTED_ID" <<'PY'
-import json, re, sys
-
-mapping_path, chosen_ref, inspected_id = sys.argv[1], sys.argv[2], sys.argv[3]
-_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-
-try:
-    with open(mapping_path, "r", encoding="utf-8") as fh:
-        mapping = json.load(fh)
-except Exception:
-    print("unparseable")
-    sys.exit(0)
-images = mapping.get("images") if isinstance(mapping, dict) else None
-if not isinstance(images, dict) or not images:
-    print("no-images")
-    sys.exit(0)
-
-# An entry CORRESPONDS to the chosen target when its key is the inspected
-# immutable image ID, or it records the chosen ref as imageRef.
-matches = []
-for key, entry in images.items():
-    if not isinstance(entry, dict):
-        continue
-    image_ref = entry.get("imageRef")
-    if key == inspected_id or (
-        isinstance(image_ref, str) and image_ref == chosen_ref
-    ):
-        matches.append((key, entry))
-if len(matches) == 0:
-    print("no-match")
-    sys.exit(0)
-if len(matches) > 1:
-    print("multiple-match")
-    sys.exit(0)
-key, entry = matches[0]
-if key != inspected_id:
-    # The entry exists (via its recorded imageRef) but binds a DIFFERENT
-    # immutable image ID than the inspected deploy target: identity NOT proven.
-    print("target-mismatch")
-    sys.exit(0)
-digest_fields = (
-    "baseImageDigest",
-    "lockDigest",
-    "librarySetDigest",
-    "sbomDigest",
-    "methodSpecIndexDigest",
-)
-bad = [
-    name
-    for name in digest_fields
-    if not (isinstance(entry.get(name), str) and _SHA256_RE.match(entry.get(name)))
-]
-if bad or entry.get("releasable") is not True:
-    print("not-releasable")
-    sys.exit(0)
-print("ok")
-PY
-)"; then
-    echo "[deploy] ERROR: 无法读取构建产物的发布状态: ${DEPLOY_MAPPING_FILE} (MethodSpec V5 §12)。" >&2
-    exit 1
-  fi
-  case "$DEPLOY_GATE_VERDICT" in
-    ok)
-      ;;
-    unparseable)
-      echo "[deploy] ERROR: 构建产物映射文件无法解析: ${DEPLOY_MAPPING_FILE} (MethodSpec V5 §12 R2-3, fail-closed)。" >&2
-      exit 1
-      ;;
-    no-images|no-match)
-      echo "[deploy] ERROR: ${DEPLOY_MAPPING_FILE} 没有任何条目绑定所选目标 ${DEPLOY_SANDBOX_IMAGE} (MethodSpec V5 §12 R2-3)。" >&2
-      echo "  映射中不存在与该引用/其不可变 image ID (${DEPLOY_INSPECTED_ID}) 对应的条目；" >&2
-      echo "  部署目标无法与经过验证的构建证明同一性（fail-closed）。" >&2
-      exit 1
-      ;;
-    multiple-match)
-      echo "[deploy] ERROR: ${DEPLOY_MAPPING_FILE} 有多个条目对应所选目标 ${DEPLOY_SANDBOX_IMAGE} (MethodSpec V5 §12 R2-3)。" >&2
-      echo "  目标绑定必须唯一（恰好一个条目）；无法确定部署的是哪一次构建（fail-closed）。" >&2
-      exit 1
-      ;;
-    target-mismatch)
-      echo "[deploy] ERROR: 映射条目记录的不可变 image ID 与 docker inspect 解析的 ${DEPLOY_INSPECTED_ID} 不一致 (MethodSpec V5 §12 R2-3)。" >&2
-      echo "  所选目标 ${DEPLOY_SANDBOX_IMAGE} 与映射条目绑定的不是同一个镜像；" >&2
-      echo "  部署目标同一性无法证明（fail-closed）。" >&2
-      exit 1
-      ;;
-    not-releasable)
-      if [[ "$DEPLOY_INCOMPLETE_DEV_ALLOW" == "1" ]]; then
-        echo "[deploy] WARNING: 构建产物 ${DEPLOY_MAPPING_FILE} 中该条目非 releasable（releasable=false 或含占位符/非法摘要）。" >&2
-        echo "  仅因显式开关 AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true/1 而继续部署（开发用途，勿用于生产）。" >&2
-      else
-        echo "[deploy] ERROR: 构建产物 ${DEPLOY_MAPPING_FILE} 中该条目非 releasable（releasable=false 或含占位符/非法摘要）(MethodSpec V5 §12)。" >&2
-        echo "  含 REPLACE_WITH_... 占位符或缺失发布输入的构建不得部署。" >&2
-        echo "  frog 补齐发布输入（基础镜像摘要/MethodSpec 索引摘要/SBOM）后重新构建；" >&2
-        echo "  开发环境可显式设置 AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true 豁免。" >&2
-        exit 1
-      fi
-      ;;
-    *)
-      echo "[deploy] ERROR: 发布门禁返回未知判定 '${DEPLOY_GATE_VERDICT}' (${DEPLOY_MAPPING_FILE}, fail-closed)。" >&2
-      exit 1
-      ;;
-  esac
 fi
 
 if [[ "$DEPLOY_ONLY" == true && "$SKIP_MAVEN" == true ]]; then
@@ -492,6 +449,97 @@ else
   echo "=== Deploy-only mode: skipping Maven and Docker image build ==="
 fi
 
+# 镜像已经构建或拉取完成、容器尚未启动。现在逐服务读取本地 Image ID，
+# 生成五个观测身份字段所需的环境变量。生产部署不接受 local/unknown；本机
+# 开发若直接运行 docker compose，则仍可使用 compose 中的占位默认值。
+OBSERVABILITY_SERVICES=()
+for svc in "${SELECTED[@]}"; do
+  if is_in_list "$svc" "${ALL_SERVICES[@]}"; then
+    OBSERVABILITY_SERVICES+=("$svc")
+  fi
+done
+if [[ ${#OBSERVABILITY_SERVICES[@]} -gt 0 ]]; then
+  bash "$ROOT_DIR/deploy/otel/prepare-runtime-env.sh" "${OBSERVABILITY_SERVICES[@]}"
+  set -a
+  # 该文件由上一步以 0600 权限原子生成，只包含已经校验的构建身份。
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/deploy/otel/runtime.env"
+  set +a
+  AF_OTEL_LOG_ROOT_DIR="$ROOT_DIR/data/logs" \
+    bash "$ROOT_DIR/deploy/otel/prepare-log-directories.sh" "${OBSERVABILITY_SERVICES[@]}"
+fi
+# === post-build / pre-deploy 唯一执行区间 (v14 MF2 frozen) ===
+if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then
+
+  # BEGIN_D15_MAPPING_VERIFIER (v14: prod+dev-tag 公共路径, v14 MF1 HARD gate 在前)
+  # 260814 scheduler-03: the mapping/Tier2a chain is strict-release evidence
+  # only. In local-image-id mode the deploy gate above (docker inspect exact
+  # match on the bare Image ID) already ran and this whole block is skipped.
+  if [[ "$DEPLOY_VERIFY_MODE" == "strict-release" ]]; then
+  DEPLOY_MAPPING_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-digest-mapping.json"
+  DEPLOY_IIDFILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-id"
+  DEPLOY_LIBSET_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/library-set.json"
+
+  [ -f "$DEPLOY_MAPPING_FILE" ] || {
+    echo "[deploy] ERROR: 构建产物映射文件缺失 (image-digest-mapping.json)" >&2
+    exit 1
+  }
+  [ -s "$DEPLOY_IIDFILE" ] || { echo "[deploy] ERROR: iidfile 缺失" >&2; exit 1; }
+  DEPLOY_INSPECTED_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_SANDBOX_IMAGE" 2>/dev/null || true)"
+  [ -n "$DEPLOY_INSPECTED_ID" ] || { echo "[deploy] ERROR: docker inspect failed" >&2; exit 1; }
+  DEPLOY_LIBSET_DIGEST="$(python3 -c \
+    'import json,sys,re; d=json.load(open(sys.argv[1],encoding="utf-8"))["librarySetDigest"]; \
+     assert isinstance(d,str) and re.fullmatch(r"^sha256:[0-9a-f]{64}$",d), d; print(d)' "$DEPLOY_LIBSET_FILE")" || {
+    echo "[deploy] ERROR: library-set.json missing/malformed" >&2; exit 1
+  }
+
+  DEPLOY_HARD_VERDICT="$(python3 "$ROOT_DIR/pythonSandboxService/scripts/d15_release_verify.py" \
+    verify-hard-target-binding \
+    --mapping "$DEPLOY_MAPPING_FILE" --inspected-id "$DEPLOY_INSPECTED_ID" \
+    --library-set-digest "$DEPLOY_LIBSET_DIGEST" --iidfile "$DEPLOY_IIDFILE")"
+  [ "$DEPLOY_HARD_VERDICT" = "ok" ] || {
+    echo "[deploy] ERROR: HARD target binding = $DEPLOY_HARD_VERDICT (R2-3 永不放宽; inspected=$DEPLOY_INSPECTED_ID)" >&2
+    exit 1
+  }
+
+  DEPLOY_GATE_VERDICT="$(python3 "$ROOT_DIR/pythonSandboxService/scripts/d15_release_verify.py" \
+    verify-mapping --mapping "$DEPLOY_MAPPING_FILE" \
+    --chosen-ref "$DEPLOY_SANDBOX_IMAGE" --inspected-id "$DEPLOY_INSPECTED_ID")"
+  case "$DEPLOY_GATE_VERDICT" in
+    ok) ;;
+    not-releasable)
+      if [[ "$DEPLOY_INCOMPLETE_DEV_ALLOW" == "1" ]]; then
+        echo "[deploy] WARNING: mapping=not-releasable + AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD bypass"
+      else
+        echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT (releasable)" >&2; exit 1
+      fi
+      ;;
+    target-mismatch)
+      echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT (R2-3; inspected=$DEPLOY_INSPECTED_ID)" >&2
+      exit 1
+      ;;
+    *) echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT" >&2; exit 1 ;;
+  esac
+  # END_D15_MAPPING_VERIFIER
+
+  # Tier2a 仅在「本次实际使用合法裸 dev ref」时可跳过；digest 发布路径始终执行。
+  if [[ "$DEPLOY_USING_BARE_DEV_REF" == "1" ]]; then
+    # BEGIN_D15_DEV_BYPASS
+    echo "[deploy] dev bypass active: bare AF_SANDBOX_IMAGE + AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true, skipping Tier2a gate (dev only)"
+    # END_D15_DEV_BYPASS
+  else
+    # BEGIN_D15_TIER2A_GATE
+    AF_SANDBOX_IMAGE="$DEPLOY_SANDBOX_IMAGE" \
+    AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="$( (( DEPLOY_INCOMPLETE_DEV_ALLOW == 1 )) && echo true || echo '' )" \
+      bash "$ROOT_DIR/pythonSandboxService/scripts/d15_tier2a_gate.sh" || {
+      echo "[deploy] ERROR: D15 Tier2a gate failed" >&2; exit 1
+    }
+    # END_D15_TIER2A_GATE
+  fi
+  fi  # strict-release only (260814 scheduler-03)
+fi
+
+
 # 检查 Docker Compose 命令
 if command -v docker >/dev/null 2>&1; then
   if docker compose version >/dev/null 2>&1; then
@@ -503,6 +551,36 @@ else
   echo "docker not found in PATH" >&2
   exit 1
 fi
+
+# Dubbo 注册地址 fail-closed：compose 里每个 Dubbo 提供者都引用
+# ${AF_DUBBO_REGISTRY_HOST_IP:?...}，缺值时任何 compose 命令都会失败。这里在
+# 调用 compose 之前先校验（进程环境优先，否则回退读仓库根 .env，与 sandbox
+# 段同款），避免构建完成后才发现容器起不来。compose 解析整份文件，即使本次
+# 只重建不含 Dubbo 提供者的服务，该变量也必须存在。
+AF_DUBBO_REGISTRY_HOST_IP_CHECK="${AF_DUBBO_REGISTRY_HOST_IP:-}"
+if [[ -z "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" && -f "$ROOT_DIR/.env" ]]; then
+  AF_DUBBO_REGISTRY_HOST_IP_CHECK="$(grep -E '^AF_DUBBO_REGISTRY_HOST_IP=' "$ROOT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+fi
+if [[ -z "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" ]]; then
+  echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 未设置（生产 .env 必填：本机私网 IP）。" >&2
+  echo "  Dubbo 提供者用它登记跨机可路由地址；缺失时 compose 会拒绝解析。" >&2
+  exit 1
+fi
+if [[ ! "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+  echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 必须是点分十进制 IPv4（不接受 0.0.0.0 / 127.0.0.1），got '${AF_DUBBO_REGISTRY_HOST_IP_CHECK}'。" >&2
+  exit 1
+fi
+for af_octet in "${BASH_REMATCH[@]:1}"; do
+  if (( 10#$af_octet > 255 )); then
+    echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 八位组越界（>255），got '${AF_DUBBO_REGISTRY_HOST_IP_CHECK}'。" >&2
+    exit 1
+  fi
+done
+if [[ "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" == "0.0.0.0" || "$AF_DUBBO_REGISTRY_HOST_IP_CHECK" == "127.0.0.1" ]]; then
+  echo "[deploy] ERROR: AF_DUBBO_REGISTRY_HOST_IP 不接受 0.0.0.0 / 127.0.0.1（生产跨机连不上），got '${AF_DUBBO_REGISTRY_HOST_IP_CHECK}'。" >&2
+  exit 1
+fi
+echo "[deploy] Dubbo 注册 IP: ${AF_DUBBO_REGISTRY_HOST_IP_CHECK}"
 
 wait_for_compose_service() {
   local svc="$1"

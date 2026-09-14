@@ -1,0 +1,1447 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://alphafrog.local/schemas/beta/controller-state.schema.json",
+  "title": "AlphaFrog Beta traffic controller state",
+  "description": "Validates the complete JSON object stored at /var/lib/alphafrog-beta/controller-state.json. The Beta deployment controller is the sole runtime writer. The file records accepted manifest identity, observed containers, drain deadlines, and current operations; it is not a request-routing source.",
+  "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time, ipv4, and ipv6. Treating format as annotation is not conforming.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "stateVersion",
+    "updatedAt",
+    "deployments"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "stateVersion": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "updatedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "deployments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/deploymentState"
+      }
+    }
+  },
+  "$defs": {
+    "deploymentId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^(?!stable$)[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
+    },
+    "deploymentGenerationId": {
+      "type": "string",
+      "pattern": "^gen-[a-f0-9]{64}$"
+    },
+    "shutdownProfile": {
+      "enum": [
+        "SPRING_BOOT_HTTP_DUBBO_V1",
+        "SPRING_BOOT_DUBBO_V1",
+        "SPRING_BOOT_HTTP_V1"
+      ]
+    },
+    "trafficScopeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^(?!stable$)[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$"
+    },
+    "serviceName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "dubboServiceKey": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^(?:[0-9A-Za-z._-]+/)?[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*(?::[0-9A-Za-z._-]+)?$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "nullableTimestamp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableOpaqueId": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/opaqueId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableVersion": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "ipAddress": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "ipv4"
+        },
+        {
+          "type": "string",
+          "format": "ipv6"
+        }
+      ]
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ownerId"
+      ],
+      "properties": {
+        "ownerId": {
+          "$ref": "#/$defs/opaqueId"
+        }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "address",
+        "port"
+      ],
+      "properties": {
+        "address": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^\\s\\u0000-\\u001f\\u007f-\\u009f]+$"
+        },
+        "port": {
+          "$ref": "#/$defs/port"
+        }
+      }
+    },
+    "instanceBase": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "instanceId",
+        "machineId",
+        "releaseId",
+        "deploymentGenerationId",
+        "shutdownProfile",
+        "applicationDrainSeconds",
+        "drainGraceSeconds",
+        "manifestVersion",
+        "serviceSpecSha256",
+        "containerName",
+        "containerId",
+        "portSlot",
+        "hostPort",
+        "endpoint"
+      ],
+      "properties": {
+        "instanceId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "machineId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "releaseId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "deploymentGenerationId": {
+          "$ref": "#/$defs/deploymentGenerationId"
+        },
+        "shutdownProfile": {
+          "$ref": "#/$defs/shutdownProfile"
+        },
+        "applicationDrainSeconds": {
+          "type": "integer",
+          "minimum": 6,
+          "maximum": 86395
+        },
+        "drainGraceSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "manifestVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "serviceSpecSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "containerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "containerId": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 128,
+          "pattern": "^[a-f0-9]+$"
+        },
+        "portSlot": {
+          "enum": [
+            "A",
+            "B"
+          ]
+        },
+        "hostPort": {
+          "$ref": "#/$defs/port"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "httpUpstream": {
+          "$ref": "#/$defs/endpoint"
+        }
+      }
+    },
+    "activeInstance": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/instanceBase"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "instanceId",
+            "machineId",
+            "releaseId",
+            "deploymentGenerationId",
+            "shutdownProfile",
+            "applicationDrainSeconds",
+            "drainGraceSeconds",
+            "manifestVersion",
+            "serviceSpecSha256",
+            "containerName",
+            "containerId",
+            "portSlot",
+            "hostPort",
+            "endpoint"
+          ],
+          "properties": {
+            "instanceId": true,
+            "machineId": true,
+            "releaseId": true,
+            "deploymentGenerationId": true,
+            "shutdownProfile": true,
+            "applicationDrainSeconds": true,
+            "drainGraceSeconds": true,
+            "manifestVersion": true,
+            "serviceSpecSha256": true,
+            "containerName": true,
+            "containerId": true,
+            "portSlot": true,
+            "hostPort": true,
+            "endpoint": true,
+            "httpUpstream": true
+          }
+        }
+      ]
+    },
+    "candidateInstance": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/instanceBase"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "instanceId",
+            "machineId",
+            "releaseId",
+            "deploymentGenerationId",
+            "shutdownProfile",
+            "applicationDrainSeconds",
+            "drainGraceSeconds",
+            "manifestVersion",
+            "serviceSpecSha256",
+            "containerName",
+            "containerId",
+            "portSlot",
+            "hostPort",
+            "endpoint",
+            "readiness",
+            "readinessObservedAt",
+            "readinessDeadline"
+          ],
+          "properties": {
+            "instanceId": true,
+            "machineId": true,
+            "releaseId": true,
+            "deploymentGenerationId": true,
+            "shutdownProfile": true,
+            "applicationDrainSeconds": true,
+            "drainGraceSeconds": true,
+            "manifestVersion": true,
+            "serviceSpecSha256": true,
+            "containerName": true,
+            "containerId": true,
+            "portSlot": true,
+            "hostPort": true,
+            "endpoint": true,
+            "httpUpstream": true,
+            "readiness": {
+              "enum": [
+                "STARTING",
+                "READY",
+                "FAILED",
+                "UNKNOWN"
+              ]
+            },
+            "readinessObservedAt": {
+              "$ref": "#/$defs/nullableTimestamp"
+            },
+            "readinessDeadline": {
+              "$ref": "#/$defs/timestamp"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "readiness": {
+                    "enum": [
+                      "READY",
+                      "FAILED",
+                      "UNKNOWN"
+                    ]
+                  }
+                },
+                "required": [
+                  "readiness"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "readinessObservedAt": {
+                    "$ref": "#/$defs/timestamp"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "drainingInstance": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/instanceBase"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "instanceId",
+            "machineId",
+            "releaseId",
+            "deploymentGenerationId",
+            "shutdownProfile",
+            "applicationDrainSeconds",
+            "drainGraceSeconds",
+            "manifestVersion",
+            "serviceSpecSha256",
+            "containerName",
+            "containerId",
+            "portSlot",
+            "hostPort",
+            "endpoint",
+            "stopSignalRequestedAt",
+            "stopDeadline"
+          ],
+          "properties": {
+            "instanceId": true,
+            "machineId": true,
+            "releaseId": true,
+            "deploymentGenerationId": true,
+            "shutdownProfile": true,
+            "applicationDrainSeconds": true,
+            "drainGraceSeconds": true,
+            "manifestVersion": true,
+            "serviceSpecSha256": true,
+            "containerName": true,
+            "containerId": true,
+            "portSlot": true,
+            "hostPort": true,
+            "endpoint": true,
+            "httpUpstream": true,
+            "stopSignalRequestedAt": {
+              "$ref": "#/$defs/nullableTimestamp"
+            },
+            "stopDeadline": {
+              "$ref": "#/$defs/nullableTimestamp"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "stopSignalRequestedAt": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "stopSignalRequestedAt"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "stopDeadline": {
+                    "type": "null"
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "stopDeadline": {
+                    "$ref": "#/$defs/timestamp"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "type",
+        "phase",
+        "candidateInstanceId",
+        "startedAt"
+      ],
+      "properties": {
+        "operationId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "type": {
+          "enum": [
+            "CREATE",
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        "phase": {
+          "enum": [
+            "STARTING_CANDIDATE",
+            "WAITING_CANDIDATE_READINESS",
+            "SWITCHING_TRAFFIC",
+            "DRAINING_PREVIOUS",
+            "REMOVING_TRAFFIC",
+            "DRAINING_ACTIVE"
+          ]
+        },
+        "candidateInstanceId": {
+          "$ref": "#/$defs/nullableOpaqueId"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "CREATE"
+            },
+            "phase": {
+              "enum": [
+                "STARTING_CANDIDATE",
+                "WAITING_CANDIDATE_READINESS",
+                "SWITCHING_TRAFFIC"
+              ]
+            },
+            "candidateInstanceId": {
+              "$ref": "#/$defs/opaqueId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "UPDATE"
+            },
+            "phase": {
+              "enum": [
+                "STARTING_CANDIDATE",
+                "WAITING_CANDIDATE_READINESS",
+                "SWITCHING_TRAFFIC"
+              ]
+            },
+            "candidateInstanceId": {
+              "$ref": "#/$defs/opaqueId"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "UPDATE"
+            },
+            "phase": {
+              "const": "DRAINING_PREVIOUS"
+            },
+            "candidateInstanceId": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "DELETE"
+            },
+            "phase": {
+              "enum": [
+                "REMOVING_TRAFFIC",
+                "DRAINING_ACTIVE"
+              ]
+            },
+            "candidateInstanceId": {
+              "type": "null"
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "at",
+        "failedOperationType",
+        "recoveryClass"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+        },
+        "at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "failedOperationType": {
+          "enum": [
+            "CREATE",
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        "recoveryClass": {
+          "enum": [
+            "CLEAN_RETRYABLE",
+            "FACTS_UNCERTAIN",
+            "DELETE_RETRYABLE"
+          ]
+        }
+      }
+    },
+    "serviceState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceName",
+        "dubboServiceKey",
+        "phase",
+        "targetManifestVersion",
+        "targetServiceSpecSha256",
+        "activeInstance",
+        "candidateInstance",
+        "drainingInstance",
+        "operation",
+        "failedManifestVersion",
+        "lastError"
+      ],
+      "properties": {
+        "serviceName": {
+          "$ref": "#/$defs/serviceName"
+        },
+        "dubboServiceKey": {
+          "$ref": "#/$defs/dubboServiceKey"
+        },
+        "phase": {
+          "enum": [
+            "CREATING",
+            "STABLE",
+            "UPDATING",
+            "DELETING",
+            "FAILED"
+          ]
+        },
+        "targetManifestVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targetServiceSpecSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "activeInstance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/activeInstance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidateInstance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/candidateInstance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drainingInstance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/drainingInstance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/operation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failedManifestVersion": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "failedManifestVersion": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "failedManifestVersion"
+            ]
+          },
+          "then": {
+            "properties": {
+              "lastError": {
+                "$ref": "#/$defs/error"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lastError": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "lastError"
+            ]
+          },
+          "then": {
+            "properties": {
+              "failedManifestVersion": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "const": "STABLE"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "activeInstance": {
+                "$ref": "#/$defs/activeInstance"
+              },
+              "candidateInstance": {
+                "type": "null"
+              },
+              "drainingInstance": {
+                "type": "null"
+              },
+              "operation": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "CREATING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "const": "WAITING_CANDIDATE_READINESS"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "candidateInstance": {
+                "$ref": "#/$defs/candidateInstance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "CREATING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "const": "SWITCHING_TRAFFIC"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "activeInstance": {
+                    "type": "null"
+                  },
+                  "candidateInstance": {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/candidateInstance"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "readiness": {
+                            "const": "READY"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "activeInstance": {
+                    "$ref": "#/$defs/activeInstance"
+                  },
+                  "candidateInstance": {
+                    "type": "null"
+                  },
+                  "drainingInstance": {
+                    "type": "null"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "UPDATING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "enum": [
+                      "STARTING_CANDIDATE",
+                      "WAITING_CANDIDATE_READINESS",
+                      "SWITCHING_TRAFFIC"
+                    ]
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "drainingInstance": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "UPDATING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "enum": [
+                      "WAITING_CANDIDATE_READINESS",
+                      "SWITCHING_TRAFFIC"
+                    ]
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "candidateInstance": {
+                "$ref": "#/$defs/candidateInstance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "UPDATING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "const": "SWITCHING_TRAFFIC"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "candidateInstance": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/candidateInstance"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "readiness": {
+                        "const": "READY"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "UPDATING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "const": "DRAINING_PREVIOUS"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "candidateInstance": {
+                "type": "null"
+              },
+              "drainingInstance": {
+                "$ref": "#/$defs/drainingInstance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "DELETING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "const": "REMOVING_TRAFFIC"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "activeInstance": {
+                "$ref": "#/$defs/activeInstance"
+              },
+              "candidateInstance": {
+                "type": "null"
+              },
+              "drainingInstance": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "DELETING"
+              },
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "const": "DRAINING_ACTIVE"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "activeInstance": {
+                "type": "null"
+              },
+              "candidateInstance": {
+                "type": "null"
+              },
+              "drainingInstance": {
+                "$ref": "#/$defs/drainingInstance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "const": "CREATING"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "activeInstance": {
+                    "type": "null"
+                  },
+                  "drainingInstance": {
+                    "type": "null"
+                  },
+                  "operation": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "allOf": [
+                          {
+                            "$ref": "#/$defs/operation"
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "type": {
+                                "const": "CREATE"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "activeInstance": {
+                    "$ref": "#/$defs/activeInstance"
+                  },
+                  "candidateInstance": {
+                    "type": "null"
+                  },
+                  "drainingInstance": {
+                    "type": "null"
+                  },
+                  "operation": {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/operation"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "type": {
+                            "const": "CREATE"
+                          },
+                          "phase": {
+                            "const": "SWITCHING_TRAFFIC"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "const": "CREATING"
+              },
+              "operation": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "phase",
+              "operation"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "candidateInstance": {
+                "type": "null"
+              },
+              "failedManifestVersion": {
+                "type": "null"
+              },
+              "lastError": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "const": "UPDATING"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/operation"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "const": "UPDATE"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "oneOf": [
+              {
+                "properties": {
+                  "activeInstance": {
+                    "$ref": "#/$defs/activeInstance"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "activeInstance": {
+                    "type": "null"
+                  },
+                  "candidateInstance": {
+                    "type": "null"
+                  },
+                  "drainingInstance": {
+                    "$ref": "#/$defs/drainingInstance"
+                  },
+                  "operation": {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "const": "DRAINING_PREVIOUS"
+                      }
+                    },
+                    "required": [
+                      "phase"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "const": "DELETING"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "candidateInstance": {
+                "type": "null"
+              },
+              "operation": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/operation"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "const": "DELETE"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "const": "FAILED"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "null"
+              },
+              "failedManifestVersion": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "lastError": {
+                "$ref": "#/$defs/error"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "deploymentState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deploymentId",
+        "trafficScopeId",
+        "phase",
+        "acceptedManifestVersion",
+        "manifestSha256",
+        "gitCommit",
+        "owner",
+        "expiresAt",
+        "services"
+      ],
+      "properties": {
+        "deploymentId": {
+          "$ref": "#/$defs/deploymentId"
+        },
+        "trafficScopeId": {
+          "$ref": "#/$defs/trafficScopeId"
+        },
+        "phase": {
+          "enum": [
+            "ACTIVE",
+            "DELETING"
+          ]
+        },
+        "acceptedManifestVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "manifestSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "gitCommit": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "owner": {
+          "$ref": "#/$defs/owner"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/serviceState"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "ACTIVE"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "services": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "DELETING"
+              }
+            },
+            "required": [
+              "phase"
+            ]
+          },
+          "then": {
+            "properties": {
+              "services": {
+                "type": "array",
+                "items": {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/serviceState"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "phase": {
+                          "enum": [
+                            "STABLE",
+                            "DELETING",
+                            "FAILED"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

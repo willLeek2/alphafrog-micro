@@ -30,8 +30,7 @@ runtime-environment schema belongs to work package D (runtime_environment.py);
 the wrapper only needs the capture semantics.
 
 Bounded outputs land under ``<wrapper-input dir>/capture/`` (created mode
-0700; P0-4: when the child runs unprivileged it must not be able to tamper
-with the capture artifacts at all)::
+0700)::
 
     stdout.bin                            ordinary stdout, marker lines removed,
                                           capped at stdoutMaxBytes
@@ -55,8 +54,10 @@ with the capture artifacts at all)::
                                           the combined stored bytes of both
                                           files never exceed it.
     capture-result.json                   the §7.1 summary: the ten frozen
-                                          fields plus three internal
-                                          unknown-marker counters
+                                          fields, the D11 cancelObserved
+                                          cancellation-evidence flag, plus
+                                          three internal unknown-marker
+                                          counters
                                           (unknownMarkerLines /
                                           unknownMarkerBytes /
                                           unknownMarkerTruncated) that stay
@@ -69,10 +70,17 @@ All capture files are opened BEFORE the child is spawned (``O_NOFOLLOW``,
 mode 0600) and the wrapper KEEPS the fds: the summary is written through its
 pre-opened fd and the readback (§7.1 step 7) reads EXACTLY those fds —
 ``capture_reader.read_capture_files_from_fds`` — so there is ZERO path
-resolution after the spawn (P0-4, codex 03b4d034 / d384119d): a malicious
-child that renames, unlinks, replaces or symlinks anything under the capture
-directory while it runs cannot influence the readback, because the paths are
-never consulted again.
+resolution after the spawn: a malicious child that renames, unlinks,
+replaces or symlinks anything under the capture directory while it runs
+cannot influence the readback, because the paths are never consulted again.
+Honest same-uid limit (260818 review, grace): the user child shares the
+wrapper's uid, so it CAN open the very same inodes and rewrite/truncate
+them in place — fd pinning defeats path replacement, not same-inode
+writes.  That tampering is caught, not trusted: the fail-closed readback
+cross-checks each file's byte length and the record digest against the
+summary, so an in-place rewrite converges to a task FAILURE instead of a
+forged result (and the child could write arbitrary content to its own
+stdout anyway).
 
 Over-limit semantics (§7.1 实施方式 4-5, contract §4.1/§4.2): when a limit is
 hit the wrapper keeps draining (the child must never see a full pipe) but
@@ -93,6 +101,33 @@ only.  Timeout (§7.1 实施方式 6): SIGKILL the entire process group so no or
 grandchild survives in the reused container, then still write
 ``capture-result.json`` — the timeout fact is carried by the non-zero
 ``exitCode`` (negative signal translation, e.g. -9 for SIGKILL).
+
+Cancel marker (260809-26Q3 D11, task #108, d6841a2e rules): when the wrapper
+input carries ``cancelMarkerPath``, the deadline loop polls that path every
+iteration.  OBSERVING the marker while the child is still alive is the ONLY
+valid cancellation evidence (rule 2): the wrapper kills the entire process
+group exactly like a timeout kill and reports ``cancelObserved=true`` in the
+summary.  A marker that appears only after the child already exited normally
+changes nothing (rule 3 — the genuine SUCCEEDED/FAILED result stands), and a
+kill issued anywhere outside this observation (or a stop request that never
+produced a marker) is NOT evidence (rule 4).  Before the spawn, main()
+fail-closed verifies that the marker path equals
+``<control_root>/<taskId>/cancel`` derived from ``scriptPath`` — the control
+root defaults to ``/sandbox/alphafrog-task-control`` inside the container
+(UNDER THE IMAGE'S WORLD-WRITABLE /sandbox: the container user must be able
+to create it; there is no root anymore to mkdir under /run), overridable via
+``AF_TASK_CONTROL_ROOT`` so host-side tests and the runner agree on ONE
+location.
+
+Honest cancel guarantee under same-uid (260818 review, grace): the wrapper,
+the user child and the control dir all share the container uid, so a
+MALICIOUS user child can delete or continuously clean its own marker file.
+The observable effect is not limited to self-cancellation: it can SUPPRESS
+an externally requested cancel, and the task then keeps occupying its
+container until the ordinary timeout (bounded by max task timeout).  The
+root-owned control chain that used to prevent this was removed with the
+privilege-drop machinery; accepting this residual risk is frog's documented
+trade-off for the non-root simplification.
 
 Process-tree cleanup (P0-2, codex b39f5e6b / 1d81ca85): a child that exits
 promptly can leave grandchildren that inherited the stdout/stderr pipes
@@ -125,39 +160,22 @@ newline.  Pending bytes never exceed ``max(len(marker family prefix),
 remaining record budget + slack)`` regardless of how long an unterminated
 line grows.
 
-UID privilege separation (P0-4, codex 03b4d034 / 76ee7296 / 691341d2):
-when ``AF_SANDBOX_CHILD_USER`` is set (the runner exports it into the exec
-environment), the wrapper resolves it via ``app.child_identity`` BEFORE the
-spawn and drops the child into that identity in ``preexec_fn`` in the
-kernel-mandated order ``setgroups([]) -> PR_SET_NO_NEW_PRIVS=1 ->
-PR_CAP_AMBIENT_CLEAR_ALL -> setgid -> setuid -> capset(empty) -> exec``
-(NO_NEW_PRIVS MUST succeed before any UID drop or exec; never attempt prctl
-only after setuid).  The capability drop is EXPLICIT, never left to setuid's
-implicit clearing (codex 02953ca7): after setuid the child writes empty
-inheritable/permitted/effective sets with ``capset`` — the inheritable set
-in particular is not covered by the uid transition's implicit behavior —
-and the drop is then VERIFIED, not assumed, by reading
-``/proc/self/status`` back in the child before exec: uid/gid must
-match, ``CapInh/CapPrm/CapEff/CapAmb`` must all be zero and ``NoNewPrivs``
-must be 1 — any mismatch raises, so Popen fails and the wrapper exits
-non-zero with NO child and NO summary (the verification is Linux-only;
-macOS dev mode has no ``/proc`` and claims no security boundary).  The
-capability BOUNDING set is deliberately left in place: it can only be
-dropped with CAP_SETPCAP, which the setuid drop itself removes, and with
-NoNewPrivs=1 plus no file-capability binaries it is unexploitable.  Running
-as root REQUIRES a resolvable non-root identity (uid AND gid both nonzero):
-refusal is a short stderr diagnostic and a non-zero exit, with no child and
-no summary.  When the wrapper is NOT root (dev mode), an unset variable
-keeps the historical same-UID behavior (no security boundary is claimed
-there), and a set variable is applied on a best-effort basis.
+UID model (260817 simplification, frog 9dab5e2d): the sandbox container
+itself is CREATED as the unprivileged user (docker ``--user`` semantics,
+set by the runner via ``AF_SANDBOX_CHILD_USER`` at container creation —
+uid 10000/gid 10001 ``alphafrog-sandbox`` in the runtime image).  Nothing
+inside the container ever runs as root, so the wrapper spawns the user
+child with its own (already unprivileged) identity and there is NO
+privilege-drop machinery here (no preexec_fn, no capset/prctl UID chain —
+the previous root->child drop was removed wholesale).
 
 Wrapper-tail envelope (work-package-C rework, P0 fix): after the user child
 exits and the capture files are finalized, the wrapper performs the bounded
 readback IN MEMORY through ``capture_reader`` and emits the returned
-envelope on its OWN stdout.  ``capture_reader`` and ``child_identity`` are
+envelope on its OWN stdout.  ``capture_reader`` is
 imported at wrapper process start, BEFORE the spawn (PIN 1): the staged
-copies live in the user-writable task workspace, and binding them pre-spawn —
-while no adversary is alive — is what makes them trusted; after user code
+copy lives in the user-writable task workspace, and binding it pre-spawn —
+while no adversary is alive — is what makes it trusted; after user code
 exits, NOTHING located in the task workspace is ever executed or re-imported
 again, so overwriting the staged files post-spawn is harmless.  The wrapper's
 stdout carries EXACTLY ONE bounded envelope JSON document and zero other
@@ -180,12 +198,13 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from app.output_capture import (
     MARKER_FAMILY_PREFIX_BYTES,
@@ -203,10 +222,15 @@ from app.output_capture import (
 # execute anything from the task workspace again; overwriting the staged
 # files post-spawn is harmless.
 from app import capture_reader
-from app.child_identity import (
-    CHILD_USER_ENV_NAME,
-    ChildIdentityError,
-    parse_child_spec,
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single payload contract
+# shared with models.BoundedExecRequest. payload_contract.py is stdlib-only
+# so importing it here does NOT break this wrapper's stdlib-only invariant
+# (it does NOT drag pydantic into the wrapper's import graph — pydantic is
+# only pulled in if app.models is imported, which this wrapper never does).
+from app.payload_contract import (
+    ALLOWED_TASK_ENV_KEYS,
+    PayloadContractError,
+    validate_payload_contract,
 )
 # === end work-package-C =====================================================
 
@@ -218,12 +242,16 @@ __all__ = [
     "UNKNOWN_MARKER_AUDIT_FILE_NAME",
     "CAPTURE_RESULT_FILE_NAME",
     "LIMIT_KEYS",
+    "CANCEL_MARKER_FILE_NAME",
+    "TASK_CONTROL_ROOT_ENV_NAME",
+    "TASK_CONTROL_ROOT_DEFAULT",
     "PROCESS_SWEEP_BUDGET_SECONDS",
     "SWEEP_TERM_GRACE_SECONDS",
     "SWEEP_POLL_INTERVAL_SECONDS",
     "WrapperInputError",
     "record_batch_digest",
     "parse_wrapper_input",
+    "expected_cancel_marker_path",
     "run_bounded_capture",
     "main",
 ]
@@ -235,6 +263,17 @@ RECORDS_FILE_NAME = "finance-records.jsonl"
 UNKNOWN_MARKER_AUDIT_FILE_NAME = "finance-records-unknown-marker.jsonl"
 CAPTURE_RESULT_FILE_NAME = "capture-result.json"
 
+# D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX core bug): the
+# wrapper writes a task-local LOADER bootstrap (loader_bootstrap.py) into
+# {task_workspace}/_bootstrap/ and runs the user script THROUGH that
+# bootstrap. The bootstrap inserts the loader workdir into sys.path AFTER
+# the Python interpreter's site init phase has finished, so a stale
+# sitecustomize.py left over in the loader workdir from a previous task can
+# NEVER be auto-imported at startup. See _write_loader_bootstrap and the
+# Popen argv in run_bounded_capture.
+LOADER_BOOTSTRAP_DIR_NAME = "_bootstrap"
+LOADER_BOOTSTRAP_FILE_NAME = "loader_bootstrap.py"
+
 # Contract §13 line 644: the four frozen Python-side limit snapshot keys.
 LIMIT_KEYS = (
     "stdoutMaxBytes",
@@ -242,6 +281,29 @@ LIMIT_KEYS = (
     "recordChannelMaxBytes",
     "recordChannelMaxRecords",
 )
+
+# === 260809-26Q3-stage1-w2 D11 (task #108): cancel marker polling ==========
+# The runner creates the control chain <control_root>/<taskId>/ inside the
+# container as the CONTAINER'S UNPRIVILEGED USER (260818 non-root
+# simplification: the old root:root 0700 chain and its lstat ownership
+# verification were removed with the privilege-drop machinery) and hands
+# the EXACT marker path via the wrapper input.  While the child runs, the
+# wrapper polls that path on every timeout loop turn; when it OBSERVES the
+# marker it kills its OWN child process group and reports
+# cancelObserved=true (d6841a2e rule 2 — the only evidence that justifies
+# CANCELED for a running child).  The binding is verified fail-closed
+# BEFORE spawn: the supplied path must equal the task-local derivation
+# <control_root>/<scriptDirName>/cancel.  Because the child shares the
+# container user's uid, malicious user code CAN delete its own marker and
+# thereby SUPPRESS an external cancel until the max task timeout — the
+# documented trade-off frog accepted on 2026-08-18 (see the UID-model
+# paragraph in this module's docstring).  AF_TASK_CONTROL_ROOT overrides
+# the default for host-side tests; the runner derives the same path from
+# the same env.
+CANCEL_MARKER_FILE_NAME = "cancel"
+TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
+TASK_CONTROL_ROOT_DEFAULT = "/sandbox/alphafrog-task-control"
+# === end D11 cancel marker polling ==========================================
 
 # Pipe read size: large enough to keep a flooding child from ever filling the
 # 64 KiB pipe buffer between scheduler turns.
@@ -262,36 +324,6 @@ _MARKER_LINE_SLACK = len(MARKER_V1_PREFIX_BYTES) + 1
 
 # prctl operations (Linux only; guarded everywhere else).
 _PR_SET_CHILD_SUBREAPER = 36
-_PR_SET_NO_NEW_PRIVS = 38
-# P0-4 capability floor (codex 76ee7296 + 02953ca7): clear the ambient set
-# BEFORE the gid/uid drop; AFTER setuid an explicit capset empties the
-# inheritable/permitted/effective sets — never rely on setuid's implicit
-# clearing, which does not cover the inheritable set by assumption — and
-# the drop is then VERIFIED (never assumed) by reading /proc/self/status.
-_PR_CAP_AMBIENT = 47
-_PR_CAP_AMBIENT_CLEAR_ALL = 2
-
-# Linux capability structures for the explicit post-setuid capset (codex
-# 02953ca7).  Version 3 addresses capability bits 0..63, so the kernel
-# expects the version-3 header plus TWO ``_CapData`` words (bits 0-31 and
-# 32-63).  All-zero data words = empty effective/permitted/inheritable.
-_LINUX_CAPABILITY_VERSION_3 = 0x20080522
-
-
-class _CapHeader(ctypes.Structure):
-    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
-
-
-class _CapData(ctypes.Structure):
-    _fields_ = [
-        ("effective", ctypes.c_uint32),
-        ("permitted", ctypes.c_uint32),
-        ("inheritable", ctypes.c_uint32),
-    ]
-
-# /proc/self/status fields that MUST all read zero hex after the root-path
-# privilege drop, plus the NoNewPrivs flag that must read 1.
-_CAP_STATUS_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapAmb")
 
 _EMPTY_BATCH_DIGEST = hashlib.sha256(b"").hexdigest()
 
@@ -342,107 +374,6 @@ def _set_child_subreaper() -> None:
         raise OSError(
             f"prctl(PR_SET_CHILD_SUBREAPER) failed: errno {ctypes.get_errno()}"
         )
-
-
-def _set_no_new_privs() -> None:
-    """Linux: PR_SET_NO_NEW_PRIVS for the child (blocks setuid re-escalation).
-
-    Raises ``OSError`` when the kernel refuses — under root that failure must
-    abort the spawn (the privilege drop is mandatory there).
-    """
-    if sys.platform != "linux":
-        return
-    libc = _libc()
-    if libc is None:
-        raise OSError("libc unavailable for prctl(PR_SET_NO_NEW_PRIVS)")
-    if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-        raise OSError("prctl(PR_SET_NO_NEW_PRIVS) failed")
-
-
-def _clear_ambient_caps() -> None:
-    """Linux: empty the ambient capability set BEFORE the gid/uid drop.
-
-    Ambient caps survive execve for unprivileged binaries and would hand the
-    child privileges the identity must not have.  NEVER clear the
-    permitted/effective sets explicitly before the drop: setuid itself
-    requires CAP_SETUID, so an early capset would break the mandatory drop
-    (ordering trap, codex 76ee7296).  The explicit emptying of the
-    inheritable/permitted/effective sets happens AFTER setuid instead, in
-    ``_drop_caps_explicit`` (codex 02953ca7).  Raises ``OSError`` when the
-    kernel refuses — under root that failure aborts the spawn.
-    """
-    if sys.platform != "linux":
-        return
-    libc = _libc()
-    if libc is None:
-        raise OSError("libc unavailable for prctl(PR_CAP_AMBIENT)")
-    if libc.prctl(_PR_CAP_AMBIENT, _PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0:
-        raise OSError("prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL) failed")
-
-
-def _drop_caps_explicit() -> None:
-    """Linux: explicitly empty CapInh/CapPrm/CapEff with ``capset``.
-
-    Codex 02953ca7 stop condition: the capability drop must NOT rely on
-    setuid's implicit clearing — the inheritable set in particular is not
-    guaranteed to be emptied by the root->non-root uid transition alone
-    (keepcaps-style semantics), and a security drop must be written, not
-    assumed.  So AFTER ``setuid`` (never before: the drop itself needs
-    CAP_SETUID) the child calls ``capset`` with all-zero data words —
-    dropping one's own capabilities requires no privilege — and the
-    subsequent ``_assert_privilege_drop_complete`` re-reads all four sets
-    from ``/proc/self/status`` in kernel truth.  Raises ``OSError`` when
-    libc is unavailable or the syscall refuses: under root the child then
-    never execs and the wrapper fails closed with no child and no summary.
-    """
-    if sys.platform != "linux":
-        return
-    libc = _libc()
-    if libc is None:
-        raise OSError("libc unavailable for capset")
-    header = _CapHeader(version=_LINUX_CAPABILITY_VERSION_3, pid=0)
-    data = (_CapData * 2)()  # zeroed: empty effective/permitted/inheritable
-    if libc.capset(ctypes.byref(header), ctypes.byref(data)) != 0:
-        raise OSError(f"capset failed: errno {ctypes.get_errno()}")
-
-
-def _assert_privilege_drop_complete(uid: int, gid: int) -> None:
-    """Verify the root-path privilege drop in KERNEL truth, never assume it.
-
-    Codex 76ee7296 stop condition: after ``setuid`` the child reads
-    ``/proc/self/status`` back BEFORE exec; ``CapInh/CapPrm/CapEff/CapAmb``
-    must ALL be zero hex and ``NoNewPrivs`` must be 1 (plus euid/egid
-    matching the requested identity).  Any mismatch raises — the forked
-    child then never execs and the wrapper fails closed with no child and
-    no summary.  Linux-only: macOS dev mode has no ``/proc`` and claims no
-    security boundary, so the check is skipped there.
-    """
-    if sys.platform != "linux":
-        return
-    if os.geteuid() != uid or os.getegid() != gid:
-        raise ChildIdentityError("post-drop uid/gid mismatch")
-    try:
-        with open("/proc/self/status", "r", encoding="ascii") as handle:
-            status_text = handle.read()
-    except OSError:
-        raise ChildIdentityError("cannot verify privilege drop") from None
-    fields: dict[str, str] = {}
-    for line in status_text.splitlines():
-        name, sep, value = line.partition(":")
-        if sep:
-            fields[name.strip()] = value.strip()
-    for key in _CAP_STATUS_FIELDS:
-        value = fields.get(key)
-        if value is None:
-            raise ChildIdentityError("cannot verify privilege drop")
-        try:
-            remaining = int(value, 16)
-        except ValueError:
-            raise ChildIdentityError("cannot verify privilege drop") from None
-        if remaining != 0:
-            raise ChildIdentityError("capabilities remain after drop")
-    if fields.get("NoNewPrivs") != "1":
-        raise ChildIdentityError("NoNewPrivs not set after drop")
 
 
 class WrapperInputError(ValueError):
@@ -1104,65 +1035,22 @@ def _sweep_process_tree(root_pid: int, threads, pipe_fds) -> bool:
 # === end P0-2 ================================================================
 
 
-def _kill_process_group(pgid: int) -> None:
-    """SIGKILL every current member of the process group (§7.1 实施方式 6)."""
+def _kill_process_group(pgid: int) -> bool:
+    """SIGKILL every current member of the process group (§7.1 实施方式 6).
+
+    Returns True iff the signal was delivered to a still-existing process
+    group.  ProcessLookupError means the group was already dead, which in
+    the cancel-marker loop is the narrow rule-3 window: the child exited
+    on its own between ``poll()`` and ``killpg()``, so the wrapper must
+    NOT claim ``cancelObserved=true``.
+    """
     try:
         os.killpg(pgid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
-        pass  # group already gone (or never fully started)
-
-
-def _make_preexec(child_identity):
-    """Build the child privilege-drop closure (P0-4, codex 03b4d034).
-
-    Runs in the forked child BEFORE exec, in the kernel-mandated order
-    (codex 76ee7296 + 02953ca7): ``setgroups([])`` (dump supplementary
-    groups first), ``prctl(PR_SET_NO_NEW_PRIVS, 1)`` (MUST succeed before
-    any UID drop or exec — it blocks setuid-binary re-escalation after the
-    capability drop), ``prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)``
-    (ambient caps survive execve and must be empty), ``setgid``, ``setuid``
-    (the point of no return; itself needs CAP_SETUID — never capset before
-    it), then ``capset`` with all-zero data words to EXPLICITLY empty the
-    inheritable/permitted/effective sets (never rely on setuid's implicit
-    clearing, which does not cover the inheritable set by assumption).
-    Under root every step is mandatory and the result is then VERIFIED by
-    ``_assert_privilege_drop_complete`` (all four cap sets zero +
-    NoNewPrivs=1 in kernel truth) — any failure raises and ``Popen`` fails,
-    so the wrapper exits non-zero with NO child and NO summary.  The
-    capability bounding set stays: dropping it needs CAP_SETPCAP, which the
-    setuid drop removes, and with NoNewPrivs=1 plus no file-capability
-    binaries it is unexploitable.  Not root (dev mode): best-effort — each
-    step that the kernel refuses is skipped (a non-root process can only
-    drop to identities it is already entitled to; no boundary is claimed).
-    """
-    if child_identity is None:
-        return None
-    uid, gid = child_identity
-
-    def _preexec() -> None:
-        if os.geteuid() == 0:
-            os.setgroups([])
-            _set_no_new_privs()
-            _clear_ambient_caps()
-            os.setgid(gid)
-            os.setuid(uid)
-            _drop_caps_explicit()
-            _assert_privilege_drop_complete(uid, gid)
-            return
-        for step in (
-            lambda: os.setgroups([]),
-            _set_no_new_privs,
-            _clear_ambient_caps,
-            lambda: os.setgid(gid),
-            lambda: os.setuid(uid),
-            _drop_caps_explicit,
-        ):
-            try:
-                step()
-            except OSError:
-                pass  # best-effort drop in dev mode
-
-    return _preexec
+        return False  # cannot signal at all
 
 
 def _close_quietly(fileobj) -> None:
@@ -1186,6 +1074,20 @@ def _flush_quietly(fileobj) -> None:
             fileobj.flush()
     except (OSError, ValueError):
         pass
+
+
+# D15 §4.2 (Scenario B): the four AF_TASK_* env vars that the wrapper must
+# see in taskEnvironment before it will spawn the user child. Missing any of
+# them is fail-closed (no spawn, no global sitecustomize fallback) per
+# D15 §6 red line 4.
+#
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): the canonical constant
+# and the validation logic now live in app.payload_contract (single source
+# of truth shared with models.BoundedExecRequest). The line below re-exports
+# the constant under this module's old name so existing imports keep
+# resolving during the transition; new code should import from
+# app.payload_contract directly.
+REQUIRED_TASK_ENV_KEYS = tuple(sorted(ALLOWED_TASK_ENV_KEYS))
 
 
 def parse_wrapper_input(path: Path) -> dict:
@@ -1225,14 +1127,354 @@ def parse_wrapper_input(path: Path) -> dict:
             )
         limits[key] = value
 
+    # D15 §4.2 (Scenario B): taskWorkspace + taskEnvironment are the
+    # task-local replacement for the old global /sandbox/sitecustomize.py.
+    # The wrapper resolves them here and rejects anything that would force a
+    # silent fallback to writing a global bootstrap file (D15 §6 red line 4).
+    task_workspace = payload.get("taskWorkspace")
+    if not isinstance(task_workspace, str) or not task_workspace:
+        raise WrapperInputError(
+            "taskWorkspace must be a non-empty string "
+            "(D15 §4.2: AF_TASK_* isolation requires a task-local workspace "
+            "path; missing it is fail-closed, not a fallback to the legacy "
+            "global sitecustomize.py)"
+        )
+
+    task_env_payload = payload.get("taskEnvironment")
+    if not isinstance(task_env_payload, dict):
+        raise WrapperInputError(
+            "taskEnvironment must be a JSON object of strings "
+            "(D15 §4.2: AF_TASK_* must travel in the task-local wrapper "
+            "input, not the shared global sitecustomize.py)"
+        )
+    task_environment: dict[str, str] = {}
+    for key, value in task_env_payload.items():
+        if not isinstance(value, str):
+            raise WrapperInputError(
+                f"taskEnvironment.{key} must be a string"
+            )
+        task_environment[key] = value
+    missing_keys = [
+        key for key in REQUIRED_TASK_ENV_KEYS if not task_environment.get(key)
+    ]
+    if missing_keys:
+        raise WrapperInputError(
+            "taskEnvironment is missing required keys: "
+            f"{', '.join(missing_keys)} (D15 §4.2: each AF_TASK_* variable "
+            "MUST be present and non-empty before the wrapper will spawn; "
+            "no silent fallback to a global sitecustomize.py is permitted)"
+        )
+
+    # D15 §4.2 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX #1 + #2):
+    # loaderPythonPath is the workdir the legacy sitecustomize used to
+    # prepend to sys.path so the user child can import af_dataset_loader
+    # and friends. It is REQUIRED: if it is missing or empty the user
+    # child would silently lose visibility of af_dataset_loader, which
+    # violates the D15 §4.2 "task environment cannot be established ->
+    # fail-closed" rule. There is no backwards-compat path: D15 is a new
+    # feature, every input must carry a real loader path.
+    loader_python_path = payload.get("loaderPythonPath")
+    if not isinstance(loader_python_path, str) or not loader_python_path:
+        raise WrapperInputError(
+            "loaderPythonPath must be a non-empty string "
+            "(D15 §4.2: the user child needs the loader workdir on "
+            "sys.path so it can import af_dataset_loader; missing or "
+            "empty is fail-closed, not a silent loss of import visibility)"
+        )
+
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single contract.
+    # Replaces the round-2 _validate_task_env_consistency helper. Calls
+    # the shared validate_payload_contract function in app.payload_contract
+    # so both this runtime parser and the pydantic model
+    # (models.BoundedExecRequest) enforce identical field-level invariants
+    # AND the wrapper-only filesystem-anchored invariants (workspace must
+    # equal wrapper-input.json parent dir; scriptPath must live at-or-inside
+    # workspace). The model validator calls the same function without
+    # wrapper_input_path (no fs context at HTTP validation time).
+    #
+    # What the contract closes (vs round-3):
+    #   * Whitelist: taskEnvironment may only carry the four AF_TASK_* keys;
+    #     PYTHONPATH/PYTHONHOME/PYTHONSTARTUP or any unknown key is rejected
+    #     so a stale sitecustomize cannot be re-activated via smuggled env.
+    #   * Containment anchor: taskWorkspace's realpath MUST equal the
+    #     wrapper-input.json parent dir's realpath. Without this, the
+    #     workspace could be "/", "..", or a symlink to an external target,
+    #     defeating every sub-path check below it.
+    #   * Strict-beneath: AF_TASK_ARTIFACT_DIR / TMP_DIR / METRICS_PATH must
+    #     be STRICTLY inside workspace (not equal to it).
+    #   * scriptPath at-or-inside workspace (filesystem-anchored).
+    try:
+        validate_payload_contract(payload, wrapper_input_path=str(path))
+    except PayloadContractError as exc:
+        raise WrapperInputError(str(exc)) from exc
+
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): filesystem existence
+    # and type checks the contract cannot do (it only resolves realpath;
+    # it does not assert the resolved path exists with the right type).
+    # These run AFTER the contract so the error message a caller sees is
+    # the contract violation first (whitelist / anchor / containment),
+    # then the filesystem evidence.
+    script_path_real = os.path.realpath(script_path)
+    if not os.path.isfile(script_path_real):
+        raise WrapperInputError(
+            f"scriptPath={script_path!r} must be an existing regular "
+            f"file inside taskWorkspace (D15 §4.2.3 round-4 codex "
+            f"56976668 MUST-FIX #2: a missing path, a directory, or a "
+            f"non-regular file is fail-closed — without this, a smuggled "
+            f"directory or special file could let the wrapper bootstrap "
+            f"an attacker-controlled loader)"
+        )
+    loader_python_path_real = os.path.realpath(loader_python_path)
+    if not os.path.isdir(loader_python_path_real):
+        raise WrapperInputError(
+            f"loaderPythonPath={loader_python_path!r} must be an existing "
+            f"directory (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: "
+            f"loaderPythonPath is the workdir the user child needs on "
+            f"sys.path so it can import af_dataset_loader; a missing path "
+            f"or a non-directory path is fail-closed — without this the "
+            f"user child would either silently lose import visibility or "
+            f"import from an attacker-controlled file)"
+        )
+
     # runtimeEnvironmentPath is part of the §7.1 input shape but belongs to
     # work package D's schema (runtime_environment.py); the wrapper does not
     # consume it.
+    # D11 (task #108): cancelMarkerPath is OPTIONAL for backward
+    # compatibility with pre-D11 inputs; when present it must be a
+    # non-empty string and is exact-bound-verified against the task-local
+    # control derivation in main() before anything runs.
+    cancel_marker_path = payload.get("cancelMarkerPath")
+    if cancel_marker_path is not None and (
+        not isinstance(cancel_marker_path, str) or not cancel_marker_path
+    ):
+        raise WrapperInputError(
+            "cancelMarkerPath must be a non-empty string when present"
+        )
     return {
         "script_path": script_path,
         "timeout_seconds": timeout_seconds,
         "limits": limits,
+        "task_workspace": task_workspace,
+        "task_environment": task_environment,
+        "loader_python_path": loader_python_path,
+        "cancel_marker_path": cancel_marker_path,
     }
+
+
+def _write_loader_bootstrap(
+    *, task_workspace: str, loader_path: str
+) -> Path:
+    """D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX core bug).
+
+    Write a per-task ``loader_bootstrap.py`` into
+    ``{task_workspace}/_bootstrap/`` and return its path. The bootstrap is
+    the entry point the user child runs as ``__main__``; AFTER Python's
+    site init phase has finished it inserts ``loader_path`` into
+    ``sys.path`` and then runs the user script via ``runpy.run_path``.
+
+    Why this design (and not "just delete the stale sitecustomize before
+    spawn"): the loader workdir is typically a CONTAINER-GLOBAL directory
+    like ``/sandbox``. The previous task may have left a
+    ``sitecustomize.py`` there if its cleanup failed. Deleting that file
+    right before spawn would still be (a) a write to a shared global path
+    racing with any sibling wrapper invocation and (b) a TOCTOU window
+    between unlink() and the child's site init. codex fe54d9f0 explicitly
+    forbids that "rm before spawn" pattern as a correctness fix.
+
+    The bootstrap approach instead makes the stale sitecustomize
+    HARMLESS: by giving the interpreter a bootstrap file that lives under
+    the per-task workspace (which the wrapper itself freshly created and
+    which therefore cannot host any prior task's sitecustomize), the
+    loader workdir is NEVER on the site-init sys.path. Site init finishes
+    with no auto-import of any sitecustomize. Only AFTER site init does
+    the bootstrap add ``loader_path`` to sys.path, which is enough for
+    ``import af_dataset_loader`` to work, while never exposing the
+    interpreter's startup to a stale sitecustomize.
+
+    Failure to write the bootstrap is fail-closed: the wrapper raises
+    rather than spawning the user child with a direct
+    ``[python, script]`` invocation (the latter would silently re-introduce
+    the very sitecustomize auto-import race this fix closes).
+    """
+    if not task_workspace:
+        raise WrapperInputError(
+            "taskWorkspace is required to stage the loader bootstrap "
+            "(D15 §4.2.3 round-2: the bootstrap lives under the per-task "
+            "workspace, never a shared global path)"
+        )
+    if not loader_path:
+        raise WrapperInputError(
+            "loaderPythonPath is required to stage the loader bootstrap "
+            "(D15 §4.2.3 round-2: the user child needs the loader workdir "
+            "on sys.path; missing or empty is fail-closed)"
+        )
+
+    bootstrap_dir = Path(task_workspace) / LOADER_BOOTSTRAP_DIR_NAME
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): if `_bootstrap` is
+    # already a symlink, do NOT follow it. The wrapper runs as root in
+    # production; a caller-planted symlink at `_bootstrap -> /etc/cron.d`
+    # would let mkdir(exist_ok=True) succeed (the target dir exists) and
+    # then let bootstrap_path.write_text / chmod land on an attacker-chosen
+    # EXTERNAL path. The is_symlink() check MUST run before mkdir because
+    # mkdir would silently follow the symlink.
+    if bootstrap_dir.is_symlink():
+        raise WrapperInputError(
+            f"refusing to stage loader bootstrap: {bootstrap_dir} is a "
+            f"symlink (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: a "
+            f"pre-planted symlink would let the root wrapper chmod/write "
+            f"an attacker-chosen external target via the symlink; "
+            f"fail-closed, no follow)"
+        )
+    bootstrap_dir.mkdir(parents=True, exist_ok=True)
+    # D15 §4.2.3 round-3 (codex c9fee2f9 MUST-FIX #1): bootstrap dir stays
+    # world-traversable (0o755) — a hardened permission here has no meaning
+    # since the wrapper and the user child share the same (non-root, container
+    # level) uid; the mode is kept for plain filesystem hygiene.
+    os.chmod(bootstrap_dir, 0o755)
+    bootstrap_path = bootstrap_dir / LOADER_BOOTSTRAP_FILE_NAME
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): defense in depth —
+    # also reject a pre-planted symlink at the bootstrap FILE path. mkdir
+    # already created _bootstrap as a real dir above, so the only way for
+    # loader_bootstrap.py to be a symlink now is if a concurrent actor
+    # planted it between mkdir and this check. The wrapper is pre-spawn
+    # at this point (no user child exists yet), so the attacker would have
+    # to be a sibling wrapper invocation or a process outside the sandbox
+    # — but the check is cheap and the consequence of following such a
+    # symlink (root write to attacker-chosen path) is severe enough to
+    # justify the belt-and-suspenders.
+    if bootstrap_path.is_symlink():
+        raise WrapperInputError(
+            f"refusing to stage loader bootstrap: {bootstrap_path} is a "
+            f"symlink (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: a "
+            f"pre-planted file symlink would let the root wrapper write "
+            f"attacker-chosen content to an external target; fail-closed, "
+            f"no follow)"
+        )
+
+    # Build the bootstrap body by plain string concatenation. Do NOT use
+    # textwrap.dedent on an f-string here: any change in indentation of
+    # the surrounding literal would silently shift the embedded code and
+    # break Python syntax. A flat template with a single .replace() for
+    # the loader path keeps the body readable AND indentation-safe.
+    body = (
+        "# Auto-generated by bounded_exec_wrapper "
+        "(D15 §4.2.3 Scenario B round-2 + round-3 fix).\n"
+        "#\n"
+        "# This bootstrap runs AFTER Python's site initialization phase\n"
+        "# has completed, so any stale sitecustomize.py that may still\n"
+        "# live in the loader workdir is NOT auto-imported at startup.\n"
+        "# Only AFTER site init does this bootstrap insert the loader\n"
+        "# workdir into sys.path, then run the user script via runpy.\n"
+        "#\n"
+        "# Round-3 (codex c9fee2f9 MUST-FIX #2): also restore direct-script\n"
+        "# sys.path semantics — `python user_script.py` puts user_script's\n"
+        "# parent directory at sys.path[0], enabling sibling imports like\n"
+        "# `import sibling_module` to find same-directory modules.\n"
+        "# runpy.run_path does NOT do this automatically; we replicate it\n"
+        "# here. User script dir wins over loader modules of same name\n"
+        "# (matches direct `python user_script.py` priority).\n"
+        "import sys\n"
+        "import runpy\n"
+        "import os\n"
+        "\n"
+        'LOADER_PATH = "__LOADER_PATH__"\n'
+        "USER_SCRIPT = sys.argv[1]\n"
+        "USER_ARGS = sys.argv[2:]\n"
+        "sys.argv = [USER_SCRIPT] + USER_ARGS\n"
+        "# Insert in reverse priority order so final order is\n"
+        "# [user_script_dir, LOADER_PATH, ...] — user script siblings win.\n"
+        "if LOADER_PATH:\n"
+        "    sys.path.insert(0, LOADER_PATH)\n"
+        "user_script_dir = os.path.dirname(os.path.abspath(USER_SCRIPT))\n"
+        "if user_script_dir:\n"
+        "    sys.path.insert(0, user_script_dir)\n"
+        'runpy.run_path(USER_SCRIPT, run_name="__main__")\n'
+    )
+    # The loader path may contain characters that need escaping inside a
+    # Python string literal (backslashes on Windows, quotes in pathological
+    # paths). Use repr() to obtain a safe Python-source representation,
+    # then strip the outer single quotes so we can embed it inside our own
+    # double-quoted literal deterministically. Re-validate by parsing the
+    # final body before writing: if ast.parse fails we abort the spawn.
+    safe_loader_literal = repr(loader_path)[1:-1]
+    body = body.replace("__LOADER_PATH__", safe_loader_literal)
+
+    import ast as _ast
+    try:
+        _ast.parse(body)
+    except SyntaxError as exc:
+        # Should be impossible given the construction above, but a
+        # pathological loader_path (e.g. one containing a literal newline
+        # after repr) could still trip us. Fail-closed: do NOT spawn with
+        # a broken bootstrap, do NOT silently fall back to direct mode.
+        raise WrapperInputError(
+            "internal error: generated loader bootstrap is not valid "
+            f"Python (loader_path={loader_path!r}): {exc}"
+        ) from exc
+
+    try:
+        # unlink before write so a stale bootstrap from a previous run in
+        # the same task_workspace (defensive: tests do this, production
+        # gets a fresh task_workspace each task) cannot survive. Errors
+        # from a missing file are ignored by unlink(missing_ok=True).
+        bootstrap_path.unlink(missing_ok=True)
+        bootstrap_path.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        raise WrapperInputError(
+            "failed to stage the loader bootstrap at "
+            f"{bootstrap_path}: {exc} (D15 §4.2.3 round-2: staging the "
+            "task-local bootstrap is a hard spawn gate, no fallback)"
+        ) from exc
+
+    # D15 §4.2.3 round-3 legacy hardening: keep the bootstrap read-only
+    # (0o444). The wrapper and the user child share the same container-level
+    # uid, so this is hygiene (accidental overwrite protection), not a
+    # privilege boundary.
+    try:
+        os.chmod(bootstrap_path, 0o444)
+    except OSError as exc:
+        raise WrapperInputError(
+            "failed to set read-only permissions on the loader bootstrap at "
+            f"{bootstrap_path}: {exc} (D15 §4.2.3 round-3: bootstrap stays "
+            "read-only for hygiene, fail-closed if chmod fails)"
+        ) from exc
+
+    return bootstrap_path
+
+
+def _task_control_root() -> str:
+    """The control root for cancel markers (env override aware)."""
+    override = os.environ.get(TASK_CONTROL_ROOT_ENV_NAME)
+    if override and override.strip():
+        return override.strip().rstrip("/")
+    return TASK_CONTROL_ROOT_DEFAULT
+
+
+def expected_cancel_marker_path(script_path: str) -> str:
+    """The ONLY cancel marker path this wrapper run may accept (D11).
+
+    The runner builds every task workspace as ``<workspace_root>/<taskId>``
+    (sandbox_runner ``_prepare_task_workspace``) and stages the user script
+    directly inside it, so the script's parent directory name IS the
+    taskId.  The marker must be exactly ``<control_root>/<taskId>/cancel`` —
+    any other path (another task's marker, a child-suggested location) is
+    rejected fail-closed by the binding check in main().
+    """
+    task_id = PurePosixPath(script_path).parent.name
+    return f"{_task_control_root()}/{task_id}/{CANCEL_MARKER_FILE_NAME}"
+
+
+def _cancel_marker_exists(marker_path: str) -> bool:
+    """True iff the cancel marker file is observable right now (D11).
+
+    Any error is treated as "no marker": cancellation is fail-observe — a
+    marker that cannot be stat'ed must not change the run, because only an
+    OBSERVED marker is cancellation evidence (d6841a2e rules 2/3).
+    """
+    try:
+        return os.path.exists(marker_path)
+    except OSError:
+        return False
 
 
 def run_bounded_capture(
@@ -1241,28 +1483,46 @@ def run_bounded_capture(
     timeout_seconds: float,
     limits: dict,
     capture_dir: Path,
-    child_identity: tuple | None = None,
+    task_workspace: str | None = None,
+    task_environment: dict[str, str] | None = None,
+    workdir_for_pythonpath: str | None = None,
+    cancel_marker_path: str | None = None,
 ) -> tuple:
     """Run the user script under bounded capture.
 
     Returns ``(summary, capture_files, sweep_ok)``:
 
-    * ``summary`` — the 13 frozen capture-result.json fields;
+    * ``summary`` — the 14 frozen capture-result.json fields;
     * ``capture_files`` — the STILL-OPEN pre-spawn capture file objects
       (name -> file object) the caller must read via
       ``capture_reader.read_capture_files_from_fds`` and then close;
     * ``sweep_ok`` — False when the post-exit process-tree sweep exceeded its
       budget: the caller must exit non-zero WITHOUT emitting the envelope.
 
+    ``cancel_marker_path`` (260809-26Q3 D11, task #108): when not None the
+    deadline loop polls this path on every iteration.  OBSERVING the marker
+    while the child is still alive is the ONLY valid cancellation evidence
+    (d6841a2e rule 2): the wrapper then kills the entire process group
+    exactly like a timeout and reports ``cancelObserved=true``.  A marker
+    observed only AFTER the child already exited changes nothing (rule 3 —
+    the genuine exit result stands, ``cancelObserved`` stays false).
+
     Writes ``capture-result.json`` through its pre-opened fd before
-    returning, EXCEPT when the spawn fails while a child identity is active
-    (P0-4: no child, no summary).  On any internal exception everything is
-    closed and the exception is re-raised.
+    returning.  If the spawn itself failed the wrapper exits non-zero and
+    leaves NO summary — no child ever ran, so no result may be reported
+    (codex 02953ca7 "no child, no summary").
+    On any internal exception everything is closed and the exception is
+    re-raised.
+
+    D15 §4.2 (Scenario B): ``task_workspace`` and ``task_environment`` carry
+    the AF_TASK_* variables that previously lived in the shared global
+    /sandbox/sitecustomize.py. The wrapper performs makedirs / chdir /
+    sys.path setup itself pre-spawn, then injects the env into the user
+    child via Popen(env=...). Fail-closed: caller guarantees both are
+    non-empty (parse_wrapper_input rejects missing required keys).
     """
     capture_path = Path(capture_dir)
     capture_path.mkdir(parents=True, exist_ok=True)
-    # P0-4: when the child runs unprivileged it must not be able to enter
-    # the capture directory at all (it is root-owned in that mode).
     os.chmod(capture_path, 0o700)
 
     summary = {
@@ -1282,6 +1542,12 @@ def run_bounded_capture(
         "unknownMarkerLines": 0,
         "unknownMarkerBytes": 0,
         "unknownMarkerTruncated": False,
+        # 260809-26Q3 D11 (task #108): the cancellation-evidence flag.  True
+        # ONLY when this wrapper OBSERVED the cancel marker while the child
+        # was still alive and therefore killed its process group itself
+        # (d6841a2e rule 2).  A kill issued anywhere else (or a marker that
+        # appeared after the child's normal exit) leaves it false — rules 3/4.
+        "cancelObserved": False,
     }
 
     capture_files: dict = {}
@@ -1290,10 +1556,12 @@ def run_bounded_capture(
     audit: _UnknownMarkerAudit | None = None
     proc: subprocess.Popen | None = None
     timed_out = False
+    # D11: set ONLY by the deadline loop when it observes the cancel marker
+    # while the child is still alive — the wrapper's own kill of its own
+    # process group is the cancellation evidence (d6841a2e rule 2).
+    canceled = False
     spawned = False
     success = False
-    # P0-4: with an active identity a FAILED spawn must leave no summary.
-    suppress_summary = child_identity is not None
 
     try:
         # --- pre-spawn capture file creation (fd-pinned readback, P0-4) ----
@@ -1351,24 +1619,83 @@ def run_bounded_capture(
         # this raises BEFORE any Popen: no child, no summary.
         _set_child_subreaper()
 
+        # D15 §4.2 (Scenario B): the wrapper performs the makedirs/chdir/
+        # sys.path setup that the legacy global sitecustomize.py used to do
+        # at import time. makedirs is idempotent; chdir is achieved by
+        # passing cwd= to Popen (the child resolves its own cwd on exec);
+        # sys.path gets the loader-module dir (workdir) via PYTHONPATH on
+        # the child env. All three are now per-task, in-wrapper, with no
+        # global file write.
+        if task_environment is not None:
+            for sub_dir in (
+                task_environment.get("AF_TASK_ARTIFACT_DIR"),
+                task_environment.get("AF_TASK_TMP_DIR"),
+            ):
+                if sub_dir:
+                    Path(sub_dir).mkdir(parents=True, exist_ok=True)
+        spawn_cwd = (
+            task_workspace
+            if task_workspace
+            else str(Path(script_path).resolve().parent)
+        )
+
+        # Build the child env: wrapper's own env + AF_TASK_* (task-scoped).
+        # D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX core bug):
+        # the loader workdir is NO LONGER placed on PYTHONPATH here. A
+        # directory on PYTHONPATH that contains a stale sitecustomize.py
+        # would have its sitecustomize auto-imported by the Python
+        # interpreter DURING site init (BEFORE any user code runs), and
+        # that legacy sitecustomize could overwrite AF_TASK_* back to a
+        # previous task's values. The user child instead receives the
+        # loader workdir via a task-local bootstrap (see below), which
+        # inserts the workdir into sys.path AFTER site init has finished.
+        child_env = os.environ.copy()
+        if task_environment:
+            for key, value in task_environment.items():
+                child_env[key] = value
+
+        # D15 §4.2.3 (Scenario B) round-2: write a task-local loader
+        # bootstrap into {task_workspace}/_bootstrap/loader_bootstrap.py
+        # and run the user script THROUGH it. The bootstrap is generated
+        # per-task, lives under the per-task workspace (which is freshly
+        # created for THIS task and can never host a stale sitecustomize
+        # from a previous task), and its only job is: AFTER Python's site
+        # init phase has ended (so any stale sitecustomize in the loader
+        # workdir has lost its chance to be auto-imported at startup),
+        # insert the loader workdir into sys.path, then run the user
+        # script via runpy.run_path under __main__ so user code sees the
+        # same __name__ / argv it would have seen under the direct
+        # `[python, script]` invocation. Failure to write the bootstrap
+        # is fail-closed: no Popen, no spawn, no silent fallback.
+        bootstrap_path = _write_loader_bootstrap(
+            task_workspace=task_workspace,
+            loader_path=workdir_for_pythonpath,
+        )
+
         try:
             # The child's stdout/stderr are the capture pipes ONLY: the child
             # never inherits or shares the wrapper's own stdout fd, which
             # later carries the single bounded envelope (PIN 2).
+            #
+            # D15 §4.2.3 round-2: the Python interpreter is given
+            # ``loader_bootstrap.py`` as __main__, NOT the user script. The
+            # user script path travels as bootstrap's argv[1]; the bootstrap
+            # runs it via runpy.run_path(..., run_name="__main__") so the
+            # user code still observes __name__ == "__main__" and the same
+            # sys.argv shape it would have seen under direct invocation.
             proc = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                [sys.executable, str(bootstrap_path), str(script_path)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=str(Path(script_path).resolve().parent),
+                cwd=spawn_cwd,
+                env=child_env,
                 start_new_session=True,  # child owns a new process group
-                preexec_fn=_make_preexec(child_identity),
             )
         except OSError:
             proc = None
             raise
         spawned = True
-        suppress_summary = False  # a child ran: the summary is mandatory
         pgid = proc.pid  # after setsid(), the child is its own group leader
 
         # Each drain thread owns its own objects (classifier/sinks/records/
@@ -1389,9 +1716,29 @@ def run_bounded_capture(
         stdout_thread.start()
         stderr_thread.start()
 
-        # Timeout monitoring on the main thread while the readers drain.
+        # Timeout + cancel-marker monitoring on the main thread while the
+        # readers drain.  The marker is polled at the head of every loop
+        # iteration (≤0.2s granularity, bounded by proc.wait below).
         deadline = time.monotonic() + float(timeout_seconds)
         while True:
+            if cancel_marker_path is not None and _cancel_marker_exists(
+                cancel_marker_path
+            ):
+                # d6841a2e rule 2: the wrapper OBSERVED the marker.  That
+                # observation is cancellation evidence ONLY when it causes
+                # this wrapper to kill its own still-running child group.
+                # Rule 3 narrow window: poll() says alive, but between
+                # poll() and killpg() the child exited — the kill returns
+                # False and canceled stays False so the genuine result
+                # stands (codex c6c49248 review).
+                if proc.poll() is None:
+                    if _kill_process_group(pgid):
+                        canceled = True
+                # Rule 3: the child already exited on its own (poll() is not
+                # None) — the marker arrived too late to matter.  Break with
+                # canceled still False so the genuine exit result stands; a
+                # late marker must NEVER rewrite a real SUCCEEDED/FAILED.
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -1403,7 +1750,9 @@ def run_bounded_capture(
             except subprocess.TimeoutExpired:
                 continue
 
-        if timed_out:
+        if timed_out or canceled:
+            # Same reap discipline for timeout kills and cancel kills: both
+            # SIGKILL the whole process group and must leave no survivor.
             try:
                 proc.wait(timeout=PROCESS_SWEEP_BUDGET_SECONDS)
             except subprocess.TimeoutExpired:
@@ -1446,14 +1795,19 @@ def run_bounded_capture(
                 # written (== joint-budget bytes used by the audit class).
                 "unknownMarkerBytes": audit.stored_bytes,
                 "unknownMarkerTruncated": audit.truncated,
+                # D11: whether THIS wrapper observed the marker and killed
+                # its own child group (the only cancellation evidence).
+                "cancelObserved": canceled,
             }
         )
 
         exit_code = proc.returncode
         if exit_code is None:
             exit_code = 1
-        elif timed_out and exit_code == 0:
-            exit_code = 124  # defensive: a timed-out run never reports success
+        elif (timed_out or canceled) and exit_code == 0:
+            # Defensive: a run the wrapper force-killed (timeout or cancel)
+            # never reports success, even if the kill raced a clean exit.
+            exit_code = 124
         summary["exitCode"] = exit_code
 
         # Presence in the envelope means "the wrapper held that fd": a
@@ -1467,7 +1821,11 @@ def run_bounded_capture(
         success = True
         return summary, capture_files, sweep_ok
     finally:
-        if not suppress_summary and result_file is not None:
+        # No child, no summary (codex 02953ca7 stop condition): when the
+        # spawn never happened a summary would fabricate a result.  Once a
+        # child ran, the summary is mandatory — even on internal failure it
+        # reports the frozen ``exitCode: 127`` spawn-failure state.
+        if result_file is not None and spawned:
             try:
                 _write_capture_result_to_handle(result_file, summary)
             except (OSError, ValueError):
@@ -1484,8 +1842,6 @@ def run_bounded_capture(
             if proc is not None:
                 _close_quietly(proc.stdout)
                 _close_quietly(proc.stderr)
-            # A failed spawn with an active identity leaves no summary.
-            _ = spawned
 
 
 def _write_capture_result_to_handle(handle, summary: dict) -> None:
@@ -1517,25 +1873,23 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"bounded_exec_wrapper: {exc}\n")
         return 2
 
-    # === P0-4 (codex 03b4d034): child identity gate, BEFORE anything runs ==
-    # Root MUST have a resolvable non-root identity: refusal is a short
-    # diagnostic and a non-zero exit — no child, no summary.  Not root:
-    # unset keeps dev-mode same-UID behavior; a set spec is parsed
-    # (fail-closed on garbage) and applied best-effort at spawn.
-    child_identity = None
-    spec = os.environ.get(CHILD_USER_ENV_NAME)
-    if spec is not None:
-        try:
-            child_identity = parse_child_spec(spec)
-        except ChildIdentityError as exc:
-            sys.stderr.write(f"bounded_exec_wrapper: {exc}\n")
-            return 1
-    elif os.geteuid() == 0:
-        sys.stderr.write(
-            "bounded_exec_wrapper: refusing to run the child as root: "
-            f"{CHILD_USER_ENV_NAME} is required\n"
-        )
-        return 1
+    # === 260809-26Q3 D11 (task #108): cancel-marker binding gate ============
+    # The runner passed the marker path it created for THIS task.  EXACT
+    # BINDING: the path must equal the control path derived from scriptPath
+    # (the script's parent directory name IS the taskId).  A mismatched path
+    # (another task's marker, a child-suggested location, a stale value) is
+    # rejected: exit 2, no child, no summary.
+    cancel_marker_path = parsed["cancel_marker_path"]
+    if cancel_marker_path is not None:
+        expected_marker_path = expected_cancel_marker_path(parsed["script_path"])
+        if cancel_marker_path != expected_marker_path:
+            # Diagnostics only — never user content (§18 stop condition).
+            sys.stderr.write(
+                "bounded_exec_wrapper: cancelMarkerPath does not match the "
+                "task control path derived from scriptPath\n"
+            )
+            return 2
+    # === end D11 gate ========================================================
 
     capture_dir = input_path.resolve().parent / CAPTURE_DIR_NAME
     try:
@@ -1544,8 +1898,18 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=parsed["timeout_seconds"],
             limits=parsed["limits"],
             capture_dir=capture_dir,
-            child_identity=child_identity,
+            task_workspace=parsed["task_workspace"],
+            task_environment=parsed["task_environment"],
+            workdir_for_pythonpath=parsed.get("loader_python_path"),
+            cancel_marker_path=cancel_marker_path,
         )
+    except WrapperInputError as exc:
+        # D15 §4.2.3 round-2: _write_loader_bootstrap raises WrapperInputError
+        # on staging failure (no spawn gate). Surface the diagnostic verbatim
+        # so the operator sees the underlying cause; never user content
+        # (§18 stop condition — paths only).
+        sys.stderr.write(f"bounded_exec_wrapper: {exc}\n")
+        return 2
     except Exception as exc:  # last-resort guard; type name only (§18)
         sys.stderr.write(
             f"bounded_exec_wrapper: internal error: {type(exc).__name__}\n"

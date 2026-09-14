@@ -12,6 +12,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import world.willfrog.agent.platform.dataanalysis.CapacityAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisAdmissionState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityRecoveryReport;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
@@ -25,7 +26,6 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceUsage;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope;
-import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl.CapacityAdmissionException;
 
 /**
  * P0-08: DEGRADED admission on restart with overconfigured capacity.

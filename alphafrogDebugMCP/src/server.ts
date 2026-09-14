@@ -9,6 +9,15 @@ import { fileURLToPath } from "node:url";
 
 import { buildDockerLogsRemoteArgs } from "./dockerLogs.js";
 import {
+  allSshHosts,
+  dataRootForTarget,
+  listPublicTargets,
+  loadHostCatalog,
+  redactHosts,
+  repoPathForTarget,
+  resolveTarget,
+} from "./hostCatalog.js";
+import {
   buildLogBody,
   buildLogFileName,
   formatSaveFileContent,
@@ -51,56 +60,15 @@ function loadEnv(): void {
 
 loadEnv();
 
-const HOST_RE = /^[A-Za-z0-9._-]+$/;
-
-function envList(key: string): string[] {
-  const raw = (process.env[key] ?? "").trim();
-  if (!raw) return [];
-  return raw.split(",").map((s) => s.trim()).filter(Boolean);
-}
+const hostCatalog = loadHostCatalog();
+const knownSshHosts = allSshHosts(hostCatalog);
 
 function resolveEnvToHost(env: string): { host: string } | { error: string } {
-  if (env !== "test" && env !== "prod") {
-    return { error: "env 必须为 test 或 prod" };
+  const resolved = resolveTarget(hostCatalog, env);
+  if ("error" in resolved) {
+    return resolved;
   }
-  const key = `ALPHAFROG_DEBUG_SSH_HOST_${env.toUpperCase()}`;
-  const resolved = (process.env[key] ?? "").trim();
-  if (!resolved) {
-    return {
-      error:
-        env === "test"
-          ? "测试环境远程访问尚未在服务端配置完成"
-          : "生产环境远程访问尚未在服务端配置完成",
-    };
-  }
-  if (!HOST_RE.test(resolved)) {
-    return { error: "服务端远程主机配置格式无效" };
-  }
-  const allowed = envList("ALPHAFROG_DEBUG_SSH_HOSTS");
-  if (allowed.length > 0 && !allowed.includes(resolved)) {
-    return { error: "远程主机不在服务端允许列表中" };
-  }
-  return { host: resolved };
-}
-
-function repoPathForEnv(
-  env: string,
-  repoPathOverride: string | null | undefined
-): { path: string } | { error: string } {
-  if (repoPathOverride?.trim()) {
-    return { path: repoPathOverride.trim() };
-  }
-  let p =
-    env === "test"
-      ? (process.env.ALPHAFROG_DEBUG_REPO_PATH_TEST ?? "").trim()
-      : (process.env.ALPHAFROG_DEBUG_REPO_PATH_PROD ?? "").trim();
-  if (!p) {
-    p = (process.env.ALPHAFROG_DEBUG_DEFAULT_REPO_PATH ?? "").trim();
-  }
-  if (!p) {
-    return { error: "远程仓库路径尚未在服务端配置完成" };
-  }
-  return { path: p };
+  return { host: resolved.target.sshHost };
 }
 
 function parseShellArgs(raw: string): string[] {
@@ -178,14 +146,12 @@ type SshRunResult = {
 
 function redactSshToolResult(result: SshRunResult, host: string): Omit<SshRunResult, "command"> {
   const { command: _c, ...rest } = result;
-  const out: Omit<SshRunResult, "command"> = { ...rest };
-  if (host && result.stderr) {
-    out.stderr = result.stderr.split(host).join("[远程主机已隐藏]");
-  }
-  if (host && result.stdout) {
-    out.stdout = result.stdout.split(host).join("[远程主机已隐藏]");
-  }
-  return out;
+  const hosts = host ? [host, ...knownSshHosts] : knownSshHosts;
+  return {
+    ...rest,
+    stdout: redactHosts(result.stdout, hosts),
+    stderr: redactHosts(result.stderr, hosts),
+  };
 }
 
 async function runSsh(
@@ -330,12 +296,6 @@ function validateSql(sql: string): string | null {
   return null;
 }
 
-function pgConfigErrorMessage(env: string): string {
-  return env === "test"
-    ? "所选测试环境尚未在服务端完成数据库连接配置"
-    : "所选生产环境尚未在服务端完成数据库连接配置";
-}
-
 function toolJson(data: Record<string, unknown>) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data) }],
@@ -419,17 +379,13 @@ const READ_CONTENT_OPERATIONS: ReadonlySet<DataOperation> = new Set([
   "find_content",
 ]);
 
-/** 远程 agent data 根目录（test/prod 分环境配置，均为可选；调用时按 env 校验）。 */
+/** 远程 agent data 根目录（按目标 id 配置，可选）。 */
 function dataRootForEnv(env: string): { path: string } | { error: string } {
-  const envVar =
-    env === "test" ? "ALPHAFROG_DEBUG_DATA_ROOT_TEST" : "ALPHAFROG_DEBUG_DATA_ROOT_PROD";
-  const p = (process.env[envVar] ?? "").trim();
-  if (!p) {
-    return {
-      error: `没配置 ${envVar} 环境变量，目前该工具不可用，请咨询人类用户获取信息`,
-    };
+  const resolved = resolveTarget(hostCatalog, env);
+  if ("error" in resolved) {
+    return resolved;
   }
-  return { path: p };
+  return dataRootForTarget(resolved.target);
 }
 
 /** 校验相对路径，拒绝绝对路径、.. 与 shell 元字符。 */
@@ -663,13 +619,34 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-const envSchema = z.enum(["test", "prod"]);
+const envIds = hostCatalog.targets.map((t) => t.id);
+const envSchema =
+  envIds.length > 0 ? z.enum(envIds as [string, ...string[]]) : z.string().min(1);
+
+server.registerTool(
+  "list_remote_targets",
+  {
+    description: `List logical remote targets this MCP can reach.
+Returns id, label, and which related tools are configured (docker, git, pg, redis, agent_data).
+Does not return SSH hostnames or addresses. Call this first, then pass the returned id as env to other tools.`,
+    inputSchema: {},
+  },
+  async () => {
+    if (hostCatalog.loadError) {
+      return toolJson({ ok: false, error: hostCatalog.loadError, targets: [] });
+    }
+    return toolJson({
+      ok: true,
+      targets: listPublicTargets(hostCatalog),
+    });
+  }
+);
 
 server.registerTool(
   "remote_docker_ps",
   {
     description: `List running docker containers on the remote host (compact output).
-env: Target environment. Must be "test" or "prod".`,
+env: Logical target id from list_remote_targets.`,
     inputSchema: {
       env: envSchema,
     },
@@ -713,7 +690,8 @@ env: Target environment. Must be "test" or "prod".`,
 server.registerTool(
   "remote_git_log",
   {
-    description: `Show recent git log on the remote host.`,
+    description: `Show recent git log on the remote host.
+env: Logical target id from list_remote_targets.`,
     inputSchema: {
       env: envSchema,
       repo_path: z.string().optional().nullable(),
@@ -721,11 +699,11 @@ server.registerTool(
     },
   },
   async ({ env, repo_path, limit }) => {
-    const resolved = resolveEnvToHost(env);
-    if ("error" in resolved) {
-      return toolJson({ ok: false, error: resolved.error });
+    const resolvedTarget = resolveTarget(hostCatalog, env);
+    if ("error" in resolvedTarget) {
+      return toolJson({ ok: false, error: resolvedTarget.error });
     }
-    const rp = repoPathForEnv(env, repo_path);
+    const rp = repoPathForTarget(resolvedTarget.target, repo_path);
     if ("error" in rp) {
       return toolJson({ ok: false, error: rp.error });
     }
@@ -739,15 +717,15 @@ server.registerTool(
       "--oneline",
       "--decorate",
     ];
-    const raw = await runSsh(resolved.host, remoteArgs);
-    return toolJson(redactSshToolResult(raw, resolved.host) as unknown as Record<string, unknown>);
+    const raw = await runSsh(resolvedTarget.target.sshHost, remoteArgs);
+    return toolJson(redactSshToolResult(raw, resolvedTarget.target.sshHost) as unknown as Record<string, unknown>);
   }
 );
 
 server.registerTool(
   "remote_docker_logs",
   {
-    description: `Fetch docker logs on the remote host (non-follow). Optional since/until filter logs by time window (RFC3339 or relative like 10m). When since or until is set and tail is omitted, returns the full window (--tail=all). Response stdout/stderr are capped at 5000 chars; set save_to_file=true (requires ALPHAFROG_DEBUG_LOG_SAVE_DIR) to persist up to 1MB to disk.`,
+    description: `Fetch docker logs on the remote host (non-follow). env: logical target id from list_remote_targets. Optional since/until filter logs by time window (RFC3339 or relative like 10m). When since or until is set and tail is omitted, returns the full window (--tail=all). Response stdout/stderr are capped at 5000 chars; set save_to_file=true (requires ALPHAFROG_DEBUG_LOG_SAVE_DIR) to persist up to 1MB to disk.`,
     inputSchema: {
       env: envSchema,
       container: z.string().default(""),
@@ -808,7 +786,7 @@ server.registerTool(
 server.registerTool(
   "remote_docker_follow",
   {
-    description: `Follow docker logs on the remote host for a limited time. Response stdout/stderr are capped at 5000 chars; set save_to_file=true (requires ALPHAFROG_DEBUG_LOG_SAVE_DIR) to persist up to 1MB to disk.`,
+    description: `Follow docker logs on the remote host for a limited time. env: logical target id from list_remote_targets. Response stdout/stderr are capped at 5000 chars; set save_to_file=true (requires ALPHAFROG_DEBUG_LOG_SAVE_DIR) to persist up to 1MB to disk.`,
     inputSchema: {
       env: envSchema,
       container: z.string().default(""),
@@ -864,6 +842,7 @@ server.registerTool(
   "remote_pg_query",
   {
     description: `Execute a read-only SELECT query against the alphafrog PostgreSQL database.
+env: Logical target id from list_remote_targets; requires a DSN configured for that id.
 Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; values above 100 are capped to 100. If no outer LIMIT is present, LIMIT 100 is appended. OFFSET is preserved.`,
     inputSchema: {
       env: envSchema,
@@ -871,9 +850,6 @@ Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; val
     },
   },
   async ({ env, sql }) => {
-    if (env !== "test" && env !== "prod") {
-      return toolJson({ ok: false, error: "env 必须为 test 或 prod" });
-    }
     const rejection = validateSql(sql);
     if (rejection) {
       return toolJson({ ok: false, error: rejection });
@@ -881,7 +857,7 @@ Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; val
     const dsnKey = `ALPHAFROG_PG_${env.toUpperCase()}_DSN`;
     const dsn = process.env[dsnKey];
     if (!dsn) {
-      return toolJson({ ok: false, error: pgConfigErrorMessage(env) });
+      return toolJson({ ok: false, error: "该目标尚未配置数据库连接" });
     }
 
     const { sql: safeSql, effectiveLimit } = applyRowLimit(sql);
@@ -917,7 +893,7 @@ server.registerTool(
   "remote_redis_query",
   {
     description: `Read-only Redis query on the remote host via docker exec redis-cli inside the Redis container.
-env: "test" or "prod". operation: scan_keys | get_values.
+env: Logical target id from list_remote_targets. operation: scan_keys | get_values.
 scan_keys: requires pattern; supports limit (default 100, max 500) and offset (default 0, max 10000).
 get_values: requires keys array (max 50); reads string/hash/list/set/zset with collection cap 100 items.
 Response is truncated to 2000 chars when too large; narrow pattern or reduce keys/limit if truncated.`,
@@ -1016,7 +992,7 @@ server.registerTool(
   "remote_agent_data_query",
   {
     description: `Read-only query of agent-related host data directories mounted into containers (e.g. agent_datasets, agent_workspaces).
-env: "test" or "prod". operation: list | tree | find_name | find_content | stat | du | head | tail | read_range.
+env: Logical target id from list_remote_targets. operation: list | tree | find_name | find_content | stat | du | head | tail | read_range.
 relative_path is relative to the configured data root. Content read and find_content are blocked for agent-configs and sensitive filenames.`,
     inputSchema: {
       env: envSchema,

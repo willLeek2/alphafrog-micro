@@ -107,6 +107,8 @@ class ToolJobReconcilerP004Test {
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ,
                     ext JSONB DEFAULT '{}',
+                    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                    restart_attempt INT NOT NULL DEFAULT 0,
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
         }
@@ -155,7 +157,8 @@ class ToolJobReconcilerP004Test {
         // listResumeReadyAnchors (status=RECEIVED), which does not match our
         // WAITING_TOOL_JOB run, so it is never invoked in this test.
         ToolJobResumeService resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, om);
+                anchorService, redisCache, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         // ToolJobFinalizer: stub — rebuildFromAnchors() never calls the finalizer.
         // DataAnalysisCapacityService methods are never invoked in this test.

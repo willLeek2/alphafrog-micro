@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
@@ -42,9 +43,9 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
 
     @Override
     public boolean captureAndSave(ToolJobCheckpointRequest request) {
-        // runId 是数据库行主键，也是所有后续 CAS 的第一重边界。
+        // runId 是数据库行主键，也是所有后续 CAS 的第一个校验条件。
         String runId = request.getRunId();
-        // 空 runId 无法建立 durable owner，直接拒绝。
+        // 空 runId 无法建立持久化的失败处置持有者，直接拒绝。
         if (runId == null || runId.isBlank()) {
             log.warn("Checkpoint rejected: blank runId");
             return false;

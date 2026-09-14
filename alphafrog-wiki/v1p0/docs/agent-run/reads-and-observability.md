@@ -1,5 +1,7 @@
 # 查询与观测接口
 
+查询结果和观测字段对应的 Run、ToolJob、容量与恢复状态见 [Agent 调度与长任务恢复](../agent-framework/scheduling-and-tooljob-recovery.md)。
+
 本页覆盖运行列表、当前状态、最终结果、成本、事件、timeline、可观测性和 trace 详情接口。
 
 ## 运行读取

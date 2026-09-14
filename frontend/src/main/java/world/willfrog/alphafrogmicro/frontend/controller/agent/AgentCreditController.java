@@ -1,39 +1,31 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
-import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.ApplyAgentCreditsRequest;
-import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCreditsApplyRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCreditsApplyResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCreditsResponse;
-import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCreditGateway;
 
 @RestController
 @Slf4j
 public class AgentCreditController {
 
-    @DubboReference(group = "langchain", check = false)
-    private AgentDubboService agentDubboServiceLangchain;
+    private final AgentAuthSupport authSupport;
+    private final AgentCreditGateway creditGateway;
 
-    private final AuthService authService;
-
-    public AgentCreditController(AuthService authService) {
-        this.authService = authService;
-    }
-
-    private AgentDubboService resolveService() {
-        return agentDubboServiceLangchain;
+    public AgentCreditController(AgentAuthSupport authSupport, AgentCreditGateway creditGateway) {
+        this.authSupport = authSupport;
+        this.creditGateway = creditGateway;
     }
 
     @GetMapping("/api/agent/credits")
@@ -48,14 +40,12 @@ public class AgentCreditController {
     }
 
     private ResponseWrapper<AgentCreditsResponse> creditsInternal(Authentication authentication) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            var resp = resolveService().getCredits(
-                    GetAgentCreditsRequest.newBuilder().setUserId(userId).build()
-            );
+            var resp = creditGateway.getCredits(caller.userId());
             return ResponseWrapper.success(new AgentCreditsResponse(
                     resp.getTotalCredits(),
                     resp.getRemainingCredits(),
@@ -74,8 +64,8 @@ public class AgentCreditController {
 
     private ResponseWrapper<AgentCreditsApplyResponse> applyCreditsInternal(Authentication authentication,
                                                                             AgentCreditsApplyRequest request) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         int amount = request == null || request.amount() == null ? 0 : request.amount();
@@ -85,9 +75,9 @@ public class AgentCreditController {
         String reason = request == null || request.reason() == null ? "" : request.reason();
         String contact = request == null || request.contact() == null ? "" : request.contact();
         try {
-            var resp = resolveService().applyCredits(
+            var resp = creditGateway.applyCredits(
                     ApplyAgentCreditsRequest.newBuilder()
-                            .setUserId(userId)
+                            .setUserId(caller.userId())
                             .setAmount(amount)
                             .setReason(reason)
                             .setContact(contact)
@@ -110,14 +100,4 @@ public class AgentCreditController {
         }
     }
 
-    private String resolveUserId(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return null;
-        }
-        User user = authService.getUserByUsername(authentication.getName());
-        if (user == null || user.getUserId() == null) {
-            return null;
-        }
-        return String.valueOf(user.getUserId());
-    }
 }

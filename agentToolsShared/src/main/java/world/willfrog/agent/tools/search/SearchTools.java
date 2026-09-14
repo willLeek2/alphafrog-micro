@@ -35,30 +35,7 @@ public class SearchTools {
         this.searchEvidenceJudgeService = searchEvidenceJudgeService;
     }
 
-    @Tool("""
-        通用网络搜索工具，用于查询互联网上的实时信息、新闻、资料等。
-
-        适用场景：
-          - 查询最新市场动态、财经新闻、政策变化
-          - 获取某家公司或行业的最新公开信息
-          - 查询实时数据、排行榜、事件进展等时效性强的内容
-          - 需要联网获取当前时间节点的信息，而本地知识库无法覆盖时
-
-        与 ragSearch 的区别：
-          - searchWeb：面向互联网实时信息，返回结构化搜索结果和 AI 综合答案
-          - ragSearch：面向本地知识库（公告/研报原文），返回向量检索片段
-
-        参数说明：
-          query            - 搜索查询文本，必填
-          scene            - 搜索场景："general"（通用）| "finance"（财经）| "news"（新闻），可选，默认"general"
-          backend          - 后端覆盖："perplexity" | "tavily" | "exa" | ""（自动选择），可选
-          strength         - 搜索强度档位，与 backend 相关，可选
-          skipHotCache     - 是否跳过热点缓存，默认 false，可选
-          skipRagPrefetch  - 是否跳过 RAG 预检，默认 false，可选
-          timeRangeStart   - 时间范围起始（ISO 8601），可选
-          timeRangeEnd     - 时间范围结束（ISO 8601），可选
-          maxResults       - 最大返回结果数（默认 5），可选
-        """)
+    @Tool
     public String searchWeb(@P(value = "搜索查询文本，必填", required = true) String query,
                             @P(value = "搜索场景：general、finance 或 news，可选", required = false) String scene,
                             @P(value = "后端或 preset 覆盖：perplexity、tavily、exa 或 preset 名，可选", required = false) String backend,

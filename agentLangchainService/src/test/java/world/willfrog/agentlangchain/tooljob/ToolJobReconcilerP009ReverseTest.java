@@ -136,6 +136,8 @@ class ToolJobReconcilerP009ReverseTest {
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ,
                     ext JSONB DEFAULT '{}',
+                    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                    restart_attempt INT NOT NULL DEFAULT 0,
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
         }
@@ -181,7 +183,8 @@ class ToolJobReconcilerP009ReverseTest {
         anchorService = new ToolJobAnchorService(mapper);
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, om);
+                anchorService, redisCache, config, om,
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
 
         // Stateful capacity ledger (pre-seeded later in the test with the
         // real DataAnalysisReservation)
@@ -431,6 +434,21 @@ class ToolJobReconcilerP009ReverseTest {
         @Override
         public CompletableFuture<GetTaskByOperationIdResponse> getTaskByOperationIdAsync(
                 GetTaskByOperationIdRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        // D11 cancelTask RPC (W2 task #102 — ccmax proto/Gateway 单 writer).
+        // 测试桩不在本波实现 cancelTask；与 PythonSandboxService 接口的其他 RPC 一致，
+        // 抛 UnsupportedOperationException 让任何意外调用立即失败。生产 Gateway 实现遵守
+        // D14 装配依赖（codex a3aee2ad 第 六 节裁定 4），DubboPythonSandboxServiceTriple
+        // 生成的默认 cancelTask 返回 UNIMPLEMENTED，不写假 override。
+        @Override
+        public CancelTaskResponse cancelTask(CancelTaskRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<CancelTaskResponse> cancelTaskAsync(CancelTaskRequest request) {
             throw new UnsupportedOperationException("Not implemented in stub");
         }
     }

@@ -4,7 +4,7 @@ v0.4 配置检查脚本
 检查以下内容：
 1. ADMIN_MAGIC_PASSWORD 环境变量
 2. agent-llm.local.json 结构是否为 v0.4 格式（endpoint/models 嵌套）
-3. prompts/ 目录是否存在
+3. 外置 prompts/ 投影是否与 agentPlatformShared classpath 权威正文一致
 """
 
 import json
@@ -16,6 +16,7 @@ ENV_FILE = Path(".env")
 CONFIG_FILE = Path("agentLangchainService/config/agent-llm.local.json")
 EXAMPLE_FILE = Path("agentLangchainService/config/agent-llm.local.example.json")
 PROMPTS_DIR = Path("agentLangchainService/config/prompts")
+AUTHORITY_PROMPTS_DIR = Path("agentPlatformShared/src/main/resources/prompts")
 
 def check_env():
     """检查 .env 中 ADMIN_MAGIC_PASSWORD"""
@@ -57,14 +58,48 @@ def check_agent_llm_config():
         return False
 
 def check_prompts_dir():
-    """检查 prompts 目录是否存在"""
-    if PROMPTS_DIR.exists():
-        print(f"[OK] Prompts 目录已存在: {PROMPTS_DIR}")
-        return True
-    else:
+    """逐文件检查外置 Prompt 投影；仅有目录不再算通过。"""
+    if not PROMPTS_DIR.exists():
         print(f"[WARN] Prompts 目录不存在: {PROMPTS_DIR}")
         print("       v0.4 需要外置 prompt 文件，请确保部署时包含 prompts/ 目录")
         return False
+    if not AUTHORITY_PROMPTS_DIR.exists():
+        print(f"[WARN] Prompt 权威目录不存在: {AUTHORITY_PROMPTS_DIR}")
+        return False
+
+    projection_files = {
+        path.relative_to(PROMPTS_DIR): path
+        for path in PROMPTS_DIR.rglob("*")
+        if path.is_file()
+    }
+    authority_files = {
+        path.relative_to(AUTHORITY_PROMPTS_DIR): path
+        for path in AUTHORITY_PROMPTS_DIR.rglob("*")
+        if path.is_file()
+    }
+    if not projection_files:
+        print(f"[WARN] Prompts 投影目录为空: {PROMPTS_DIR}")
+        return False
+
+    missing_authority = sorted(set(projection_files) - set(authority_files))
+    mismatched = sorted(
+        relative
+        for relative, projection in projection_files.items()
+        if relative in authority_files
+        and projection.read_bytes() != authority_files[relative].read_bytes()
+    )
+    if missing_authority or mismatched:
+        for relative in missing_authority:
+            print(f"[WARN] 外置 Prompt 没有 shared 权威文件: {relative}")
+        for relative in mismatched:
+            print(f"[WARN] 外置 Prompt 与 shared 权威正文不一致: {relative}")
+        return False
+
+    print(
+        f"[OK] Prompts 投影内容与 shared 权威正文一致: "
+        f"{len(projection_files)} 个文件"
+    )
+    return True
 
 def main():
     print("v0.4 配置检查")

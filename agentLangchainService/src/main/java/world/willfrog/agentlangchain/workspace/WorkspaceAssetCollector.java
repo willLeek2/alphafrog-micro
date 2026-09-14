@@ -2,7 +2,6 @@ package world.willfrog.agentlangchain.workspace;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
@@ -36,9 +35,6 @@ public class WorkspaceAssetCollector {
 
     private final AgentArtifactService artifactService;
     private final AgentRunMessageMapper messageMapper;
-
-    @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
-    private String datasetPath;
 
     /**
      * 收集指定 run 的所有 workspace 资产。

@@ -1,0 +1,1132 @@
+package world.willfrog.beta.core;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import world.willfrog.beta.config.BetaControllerProperties;
+import world.willfrog.beta.state.AtomicJsonStore;
+import world.willfrog.beta.validation.BetaContractValidator;
+
+@Service
+@ConditionalOnProperty(prefix = "alphafrog.beta-controller", name = "enabled", havingValue = "true")
+public class BetaDeploymentService {
+    private static final Logger log = LoggerFactory.getLogger(BetaDeploymentService.class);
+    private final ObjectMapper mapper;
+    private final AtomicJsonStore store;
+    private final BetaContractValidator validator;
+    private final ContainerRuntime containers;
+    private final CandidateRegistrationProbe registrationProbe;
+    private final BetaControllerProperties properties;
+    private final Clock clock;
+    private final ReentrantLock mutationLock = new ReentrantLock(true);
+
+    @Autowired
+    public BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
+                                 ContainerRuntime containers, CandidateRegistrationProbe registrationProbe,
+                                 BetaControllerProperties properties) {
+        this(mapper, store, validator, containers, registrationProbe, properties, Clock.systemUTC());
+    }
+
+    BetaDeploymentService(ObjectMapper mapper, AtomicJsonStore store, BetaContractValidator validator,
+                          ContainerRuntime containers, CandidateRegistrationProbe registrationProbe,
+                          BetaControllerProperties properties, Clock clock) {
+        this.mapper = mapper;
+        this.store = store;
+        this.validator = validator;
+        this.containers = containers;
+        this.registrationProbe = registrationProbe;
+        this.properties = properties;
+        this.clock = clock;
+    }
+
+    @PostConstruct
+    void verifyPersistentStateAtStartup() {
+        containers.validateHostPrerequisites();
+        recoverManifestLead();
+        validateAll(store.snapshot());
+    }
+
+    public ObjectNode submitManifest(ObjectNode manifest) {
+        mutationLock.lock();
+        try {
+            validator.validateManifest(manifest);
+            containers.validateManifest(manifest);
+            String deploymentId = manifest.path("deploymentId").asText();
+            store.read(state -> {
+                validateAll(state.deepCopy());
+                assertNoOtherScopeOwner(state, deploymentId, manifest.path("trafficScopeId").asText());
+                assertLaneHasMainBetaProviders(state, deploymentId, manifest);
+                assertManifestReservationsAvailable(state, deploymentId, manifest);
+                JsonNode existing = findDeployment(state, deploymentId);
+                if (existing != null) validateReplacement(existing, manifest);
+                return null;
+            });
+            store.writeManifest(deploymentId, manifest);
+            store.update(state -> {
+                ObjectNode deployment = (ObjectNode) findDeployment(state, deploymentId);
+                if (deployment == null) {
+                    deployment = newDeployment(manifest);
+                    ((ArrayNode) state.path("deployments")).add(deployment);
+                } else {
+                    acceptReplacement(deployment, manifest);
+                }
+                scheduleNext(state);
+                validateAll(state);
+                return null;
+            });
+            return statusByDeployment(deploymentId);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    public ObjectNode requestDelete(String deploymentId) {
+        mutationLock.lock();
+        try {
+            final boolean[] empty = new boolean[1];
+            store.update(state -> {
+                requireNoOperation(state);
+                ObjectNode deployment = requireDeployment(state, deploymentId);
+                if (!"ACTIVE".equals(deployment.path("phase").asText()))
+                    throw new ControllerException("DEPLOYMENT_BUSY", "A deployment deletion must be resumed through its failed service");
+                assertMainBetaDeletionSafe(state, deployment);
+                for (JsonNode service : deployment.path("services"))
+                    if ("FACTS_UNCERTAIN".equals(service.path("lastError").path("recoveryClass").asText()))
+                        throw new ControllerException("FACTS_UNCERTAIN", "Conflicting external facts must be repaired before deletion");
+                deployment.put("phase", "DELETING");
+                startNextDelete(deployment);
+                empty[0] = deployment.path("services").isEmpty();
+                validateAll(state);
+                return null;
+            });
+            if (empty[0]) {
+                finalizeEmptyDeployment(deploymentId);
+                ObjectNode deleted = mapper.createObjectNode();
+                deleted.put("deploymentId", deploymentId);
+                deleted.put("phase", "DELETED");
+                return deleted;
+            }
+            return statusByDeployment(deploymentId);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    public ObjectNode retry(String deploymentId, String serviceName) {
+        mutationLock.lock();
+        try {
+            store.update(state -> {
+                requireNoOperation(state);
+                ObjectNode deployment = requireDeployment(state, deploymentId);
+                ObjectNode service = requireService(deployment, serviceName);
+                if (service.path("lastError").isNull())
+                    throw new ControllerException("RETRY_NOT_ALLOWED", "Only a failed service can be retried");
+                String failedType = service.path("lastError").path("failedOperationType").asText();
+                service.putNull("failedManifestVersion");
+                service.putNull("lastError");
+                if ("CREATE".equals(failedType) && service.path("activeInstance").isObject()
+                        && service.path("candidateInstance").isNull() && service.path("drainingInstance").isNull()) {
+                    service.put("phase", "STABLE");
+                    service.putNull("operation");
+                    scheduleNext(state);
+                } else if (service.path("drainingInstance").isObject()) {
+                    boolean deleting = "DELETE".equals(failedType);
+                    service.put("phase", deleting ? "DELETING" : "UPDATING");
+                    service.set("operation", operation(failedType,
+                            deleting ? "DRAINING_ACTIVE" : "DRAINING_PREVIOUS", null));
+                } else if (service.path("candidateInstance").isObject()) {
+                    boolean create = service.path("activeInstance").isNull();
+                    service.put("phase", create ? "CREATING" : "UPDATING");
+                    JsonNode manifest = store.readManifest(deploymentId);
+                    JsonNode spec = findService(manifest, serviceName);
+                    if (spec == null)
+                        throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
+                    ObjectNode candidate = (ObjectNode) service.path("candidateInstance");
+                    candidate.put("readiness", "STARTING");
+                    candidate.putNull("readinessObservedAt");
+                    candidate.put("readinessDeadline", Instant.now(clock)
+                            .plusSeconds(spec.path("runtime").path("readinessTimeoutSeconds").asLong()).toString());
+                    service.set("operation", operation(create ? "CREATE" : "UPDATE",
+                            "WAITING_CANDIDATE_READINESS",
+                            candidate.path("instanceId").asText()));
+                } else if ("DELETE".equals(failedType)) {
+                    service.put("phase", "DELETING");
+                    service.set("operation", operation("DELETE", "REMOVING_TRAFFIC", null));
+                } else {
+                    boolean create = service.path("activeInstance").isNull();
+                    service.put("phase", create ? "CREATING" : "UPDATING");
+                    String instanceId = newInstanceId(deployment, service);
+                    service.set("operation", operation(create ? "CREATE" : "UPDATE",
+                            "STARTING_CANDIDATE", instanceId));
+                }
+                validateAll(state);
+                return null;
+            });
+            return statusByDeployment(deploymentId);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    @Scheduled(fixedDelayString = "${alphafrog.beta-controller.reconcile-delay:PT2S}")
+    public void scheduledReconcile() {
+        try {
+            reconcileOne();
+        } catch (Throwable failure) {
+            log.error("Beta deployment reconciliation failed unexpectedly; the next scheduled cycle will retry", failure);
+        }
+    }
+
+    public ObjectNode reconcileOne() {
+        mutationLock.lock();
+        try {
+            OperationRef ref = null;
+            try {
+                ref = store.read(this::currentOperation);
+                if (ref == null && store.read(state -> nextService(state) != null)) {
+                    store.update(state -> {
+                        scheduleNext(state);
+                        validateAll(state);
+                        return null;
+                    });
+                    ref = store.read(this::currentOperation);
+                }
+                if (ref == null) {
+                    String expired = store.read(this::firstExpiredDeployment);
+                    if (expired == null) return store.snapshot();
+                    requestDelete(expired);
+                    ref = store.read(this::currentOperation);
+                }
+                if (ref == null) return store.snapshot();
+                switch (ref.phase()) {
+                    case "STARTING_CANDIDATE" -> startCandidate(ref);
+                    case "WAITING_CANDIDATE_READINESS" -> observeCandidate(ref);
+                    case "SWITCHING_TRAFFIC" -> switchTraffic(ref);
+                    case "DRAINING_PREVIOUS", "DRAINING_ACTIVE" -> drain(ref);
+                    case "REMOVING_TRAFFIC" -> removeTraffic(ref);
+                    default -> throw new ControllerException("OPERATION_PHASE_INVALID", "Unknown operation phase");
+                }
+            } catch (ControllerException failure) {
+                if (ref == null) {
+                    log.error("Beta deployment reconciliation failed before an operation was selected", failure);
+                } else {
+                    fail(ref, failure);
+                }
+            } catch (RuntimeException failure) {
+                if (ref == null) {
+                    log.error("Beta deployment reconciliation failed before an operation was selected", failure);
+                } else {
+                    fail(ref, new ControllerException("EXTERNAL_OPERATION_FAILED", safeMessage(failure), failure));
+                }
+            }
+            return store.snapshot();
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    public ObjectNode status(String trafficScopeId, String serviceName) {
+        return store.read(state -> {
+            for (JsonNode deployment : state.path("deployments")) {
+                if (!trafficScopeId.equals(deployment.path("trafficScopeId").asText())) continue;
+                for (JsonNode service : deployment.path("services")) {
+                    if (serviceName.equals(service.path("serviceName").asText())) {
+                        ObjectNode result = service.deepCopy();
+                        result.put("deploymentId", deployment.path("deploymentId").asText());
+                        result.put("trafficScopeId", trafficScopeId);
+                        result.put("deploymentPhase", deployment.path("phase").asText());
+                        result.put("stateVersion", state.path("stateVersion").asLong());
+                        return result;
+                    }
+                }
+            }
+            throw new ControllerException("STATUS_NOT_FOUND", "No service state exists for this traffic scope");
+        });
+    }
+
+    public ObjectNode statusByDeployment(String deploymentId) {
+        return store.read(state -> requireDeployment(state, deploymentId).deepCopy());
+    }
+
+    private void startCandidate(OperationRef ref) {
+        JsonNode manifest = store.readManifest(ref.deploymentId());
+        JsonNode spec = findService(manifest, ref.serviceName());
+        if (spec == null) throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
+        ContainerRuntime.CandidatePlan plan = candidatePlan(ref, manifest, spec);
+        ContainerRuntime.ContainerObservation observation = containers.create(manifest, spec, plan);
+        Instant now = Instant.now(clock);
+        ObjectNode candidate = instance(spec, manifest, ref.candidateInstanceId(), plan.generationId(),
+                plan.portSlot(), observation, plan.httpUpstream());
+        candidate.put("readiness", "STARTING");
+        candidate.putNull("readinessObservedAt");
+        candidate.put("readinessDeadline", now.plusSeconds(spec.path("runtime").path("readinessTimeoutSeconds").asLong()).toString());
+        store.update(state -> {
+            ObjectNode service = checkedService(state, ref);
+            service.set("candidateInstance", candidate);
+            ((ObjectNode) service.path("operation")).put("phase", "WAITING_CANDIDATE_READINESS");
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void observeCandidate(OperationRef ref) {
+        JsonNode candidate = ref.service().path("candidateInstance");
+        JsonNode manifest = store.readManifest(ref.deploymentId());
+        JsonNode spec = findService(manifest, ref.serviceName());
+        ContainerRuntime.ContainerObservation observed = containers.inspect(
+                candidate.path("machineId").asText(), candidate.path("containerName").asText());
+        if ((!observed.containerId().isEmpty() && !observed.containerId().equals(candidate.path("containerId").asText()))
+                || (!observed.endpointAddress().isEmpty()
+                    && !observed.endpointAddress().equals(candidate.path("endpoint").path("address").asText()))
+                || (observed.hostPort() != 0 && observed.hostPort() != candidate.path("hostPort").asInt()))
+            throw new ControllerException("CONTAINER_IDENTITY_CONFLICT", "Observed candidate differs from the persisted instance");
+        boolean healthy = observed.running()
+                && observed.health() == ContainerRuntime.ContainerObservation.Health.HEALTHY;
+        boolean registered = !spec.path("registration").isObject();
+        if (!registered && healthy) {
+            try {
+                registered = registrationProbe.isVisible(
+                        spec,
+                        candidate.path("endpoint").path("address").asText(),
+                        candidate.path("hostPort").asInt());
+            } catch (ControllerException failure) {
+                if ("NACOS_QUERY_FAILED".equals(failure.code())) {
+                    registered = false;
+                } else if ("NACOS_NAMESPACE_MISMATCH".equals(failure.code())) {
+                    cleanupCandidate(candidate);
+                    markFailed(ref, failure.code(), failure.getMessage(), "CLEAN_RETRYABLE", true);
+                    return;
+                } else {
+                    throw failure;
+                }
+            }
+        }
+        boolean ready = healthy && registered;
+        boolean expired = !Instant.now(clock).isBefore(Instant.parse(candidate.path("readinessDeadline").asText()));
+        if (!ready && !expired && observed.health() != ContainerRuntime.ContainerObservation.Health.UNHEALTHY
+                && observed.health() != ContainerRuntime.ContainerObservation.Health.MISSING) return;
+        if (!ready) {
+            cleanupCandidate(candidate);
+            markFailed(ref, "CANDIDATE_NOT_READY", "Candidate did not become ready", "CLEAN_RETRYABLE", true);
+            return;
+        }
+        store.update(state -> {
+            ObjectNode service = checkedService(state, ref);
+            ObjectNode stored = (ObjectNode) service.path("candidateInstance");
+            stored.put("readiness", "READY");
+            stored.put("readinessObservedAt", Instant.now(clock).toString());
+            ((ObjectNode) service.path("operation")).put("phase", "SWITCHING_TRAFFIC");
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void switchTraffic(OperationRef ref) {
+        store.update(state -> {
+            ObjectNode service = checkedService(state, ref);
+            ObjectNode promoted = ((ObjectNode) service.path("candidateInstance")).deepCopy();
+            promoted.remove(java.util.List.of("readiness", "readinessObservedAt", "readinessDeadline"));
+            JsonNode storedPrevious = service.path("activeInstance").deepCopy();
+            service.set("activeInstance", promoted);
+            service.putNull("candidateInstance");
+            if (storedPrevious.isObject()) {
+                ObjectNode draining = ((ObjectNode) storedPrevious).deepCopy();
+                draining.putNull("stopSignalRequestedAt");
+                draining.putNull("stopDeadline");
+                service.set("drainingInstance", draining);
+                service.put("phase", "UPDATING");
+                ObjectNode operation = (ObjectNode) service.path("operation");
+                operation.put("phase", "DRAINING_PREVIOUS");
+                operation.putNull("candidateInstanceId");
+            } else {
+                service.putNull("drainingInstance");
+                stable(service);
+                scheduleNext(state);
+            }
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void removeTraffic(OperationRef ref) {
+        store.update(state -> {
+            ObjectNode service = checkedService(state, ref);
+            ObjectNode active = ((ObjectNode) service.path("activeInstance")).deepCopy();
+            active.putNull("stopSignalRequestedAt");
+            active.putNull("stopDeadline");
+            service.putNull("activeInstance");
+            service.set("drainingInstance", active);
+            ObjectNode operation = (ObjectNode) service.path("operation");
+            operation.put("phase", "DRAINING_ACTIVE");
+            operation.putNull("candidateInstanceId");
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void drain(OperationRef ref) {
+        JsonNode current = store.read(state -> checkedService(state, ref).deepCopy());
+        ObjectNode draining = (ObjectNode) current.path("drainingInstance");
+        ContainerRuntime.ContainerObservation beforeStop = containers.inspect(
+                draining.path("machineId").asText(), draining.path("containerName").asText());
+        if (beforeStop.running()) {
+            Instant requestedAt = Instant.now(clock);
+            if (draining.path("stopSignalRequestedAt").isNull()) {
+                String requested = requestedAt.toString();
+                String deadline = requestedAt.plusSeconds(draining.path("drainGraceSeconds").asLong()).toString();
+                store.update(state -> {
+                    ObjectNode value = (ObjectNode) checkedService(state, ref).path("drainingInstance");
+                    value.put("stopSignalRequestedAt", requested);
+                    value.put("stopDeadline", deadline);
+                    validateAll(state);
+                    return null;
+                });
+                draining = (ObjectNode) store.read(state -> checkedService(state, ref)
+                        .path("drainingInstance").deepCopy());
+            }
+            int remainingSeconds = remainingStopSeconds(requestedAt,
+                    Instant.parse(draining.path("stopDeadline").asText()));
+            containers.stop(draining.path("machineId").asText(), draining.path("containerName").asText(),
+                    remainingSeconds);
+        }
+        ContainerRuntime.ContainerObservation stopped = containers.inspect(
+                draining.path("machineId").asText(), draining.path("containerName").asText());
+        if (stopped.running()) throw new ControllerException("CONTAINER_STILL_RUNNING", "Container did not stop before cleanup");
+        containers.remove(draining.path("machineId").asText(), draining.path("containerName").asText());
+        containers.removeCompose(draining.path("instanceId").asText());
+        finishDrain(ref);
+    }
+
+    private void finishDrain(OperationRef ref) {
+        final boolean[] deploymentEmpty = new boolean[1];
+        store.update(state -> {
+            ObjectNode deployment = requireDeployment(state, ref.deploymentId());
+            ObjectNode service = checkedService(state, ref);
+            if ("DRAINING_ACTIVE".equals(ref.phase())) {
+                removeService(deployment, ref.serviceName());
+                startNextDelete(deployment);
+                deploymentEmpty[0] = deployment.path("services").isEmpty();
+            } else {
+                service.putNull("drainingInstance");
+                if (service.path("activeInstance").isNull()) {
+                    // frontend 同口替换：旧实例排空完已无活动实例，结束本次更新并回到
+                    // 创建路径在第一只宿主口拉新；操作必须先清空，下一次调度才能为该
+                    // 服务立新的创建操作。
+                    service.putNull("operation");
+                    service.putNull("failedManifestVersion");
+                    service.putNull("lastError");
+                    service.put("phase", "CREATING");
+                } else {
+                    stable(service);
+                }
+                scheduleNext(state);
+            }
+            validateAll(state);
+            return null;
+        });
+        if (deploymentEmpty[0]) {
+            finalizeEmptyDeployment(ref.deploymentId());
+        }
+    }
+
+    private void finalizeEmptyDeployment(String deploymentId) {
+        store.deleteManifest(deploymentId);
+        store.update(state -> {
+            ObjectNode deployment = requireDeployment(state, deploymentId);
+            if (!"DELETING".equals(deployment.path("phase").asText()) || !deployment.path("services").isEmpty())
+                throw new ControllerException("DELETE_STATE_INVALID", "Deployment is not ready for final removal");
+            removeDeployment(state, deploymentId);
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void fail(OperationRef ref, ControllerException failure) {
+        boolean candidateCleaned = false;
+        if ("STARTING_CANDIDATE".equals(ref.phase()) || "SWITCHING_TRAFFIC".equals(ref.phase())) {
+            candidateCleaned = cleanupFailedCandidate(ref);
+        }
+        String recovery = switch (ref.phase()) {
+            case "STARTING_CANDIDATE", "SWITCHING_TRAFFIC" -> candidateCleaned
+                    ? "CLEAN_RETRYABLE" : "FACTS_UNCERTAIN";
+            case "WAITING_CANDIDATE_READINESS" -> "FACTS_UNCERTAIN";
+            case "REMOVING_TRAFFIC" -> "DELETE_RETRYABLE";
+            default -> "FACTS_UNCERTAIN";
+        };
+        try {
+            markFailed(ref, failure.code(), failure.getMessage(), recovery, candidateCleaned);
+        } catch (RuntimeException stateFailure) {
+            log.error("Unable to persist Beta deployment failure for deployment {} service {} operation {}",
+                    ref.deploymentId(), ref.serviceName(), ref.operationId(), stateFailure);
+        }
+    }
+
+    private void markFailed(OperationRef ref, String code, String message, String recovery, boolean candidateCleaned) {
+        store.update(state -> {
+            ObjectNode service = checkedService(state, ref);
+            if (candidateCleaned) service.putNull("candidateInstance");
+            boolean oldInstanceStillServing = candidateCleaned && "UPDATE".equals(ref.type())
+                    && service.path("activeInstance").isObject();
+            service.put("phase", oldInstanceStillServing ? "STABLE" : "FAILED");
+            service.putNull("operation");
+            service.put("failedManifestVersion", service.path("targetManifestVersion").asLong());
+            ObjectNode error = mapper.createObjectNode();
+            error.put("code", code.replaceAll("[^A-Z0-9_]", "_"));
+            error.put("message", sanitize(message));
+            error.put("at", Instant.now(clock).toString());
+            error.put("failedOperationType", ref.type());
+            error.put("recoveryClass", recovery);
+            service.set("lastError", error);
+            scheduleNext(state);
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void cleanupCandidate(JsonNode candidate) {
+        containers.remove(candidate.path("machineId").asText(), candidate.path("containerName").asText());
+        containers.removeCompose(candidate.path("instanceId").asText());
+    }
+
+    private boolean cleanupFailedCandidate(OperationRef ref) {
+        try {
+            JsonNode candidate = ref.service().path("candidateInstance");
+            if (candidate.isObject()) {
+                cleanupCandidate(candidate);
+            } else {
+                JsonNode manifest = store.readManifest(ref.deploymentId());
+                JsonNode spec = findService(manifest, ref.serviceName());
+                if (spec == null)
+                    throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
+                ContainerRuntime.CandidatePlan plan = candidatePlan(ref, manifest, spec);
+                containers.remove(spec.path("machineId").asText(),
+                        containers.containerName(plan, spec.path("serviceName").asText()));
+                containers.removeCompose(plan.instanceId());
+            }
+            return true;
+        } catch (RuntimeException cleanupFailure) {
+            log.error("Unable to clean failed Beta candidate for deployment {} service {} operation {}",
+                    ref.deploymentId(), ref.serviceName(), ref.operationId(), cleanupFailure);
+            return false;
+        }
+    }
+
+    private ContainerRuntime.CandidatePlan candidatePlan(OperationRef ref, JsonNode manifest, JsonNode spec) {
+        JsonNode active = ref.service().path("activeInstance");
+        // frontend 是人直接访问的 HTTP 入口且不注册 Dubbo 提供者，蓝绿翻口后消费方
+        // 无法自动找到新口；跟随生产 force-recreate 语义固定占用第一只宿主口。
+        String slot = "frontend".equals(spec.path("serviceName").asText()) ? "A"
+                : active.isObject() && "A".equals(active.path("portSlot").asText()) ? "B" : "A";
+        int hostPort = spec.path("runtime").path("hostPorts").path("A".equals(slot) ? 0 : 1).asInt();
+        return new ContainerRuntime.CandidatePlan(ref.deploymentId(), ref.trafficScopeId(),
+                ref.candidateInstanceId(), JsonSupport.deploymentGeneration(manifest), slot, hostPort,
+                sandboxHttpUpstream(ref, manifest, spec));
+    }
+
+    // 沙箱网关的 HTTP 上游是同一部署里的 Python 沙箱。沙箱不向 Nacos 注册 HTTP 口，
+    // 蓝绿翻口后网关只能靠重建拿到新地址：启动网关候选时把沙箱当前活动宿主口算进
+    // 候选计划。同部署没有沙箱服务时不注入，沿用环境文件；沙箱还没有活动实例
+    // （同部署首次一起创建）时用沙箱部署单的第一只宿主口和机器可路由地址。
+    private ContainerRuntime.HttpUpstream sandboxHttpUpstream(OperationRef ref, JsonNode manifest, JsonNode spec) {
+        if (!"python-sandbox-gateway-service".equals(spec.path("serviceName").asText())) return null;
+        JsonNode sandboxSpec = findService(manifest, "python-sandbox-service");
+        if (sandboxSpec == null) return null;
+        JsonNode sandbox = findService(ref.deployment(), "python-sandbox-service");
+        JsonNode sandboxActive = sandbox == null ? null : sandbox.path("activeInstance");
+        if (sandboxActive != null && sandboxActive.isObject()) {
+            return new ContainerRuntime.HttpUpstream(sandboxActive.path("endpoint").path("address").asText(),
+                    sandboxActive.path("hostPort").asInt());
+        }
+        return new ContainerRuntime.HttpUpstream(
+                machineRoutableAddress(sandboxSpec.path("machineId").asText()),
+                sandboxSpec.path("runtime").path("hostPorts").path(0).asInt());
+    }
+
+    private String machineRoutableAddress(String machineId) {
+        BetaControllerProperties.Machine machine = properties.getMachines().get(machineId);
+        if (machine == null || machine.getRoutableAddress() == null || machine.getRoutableAddress().isBlank())
+            throw new ControllerException("MACHINE_UNKNOWN", "Beta machine is not fully configured: " + machineId);
+        return machine.getRoutableAddress();
+    }
+
+    private void validateAll(ObjectNode state) {
+        validator.validateState(state);
+        Set<String> deploymentIds = new HashSet<>();
+        Set<String> trafficScopes = new HashSet<>();
+        Set<String> reservedPorts = new HashSet<>();
+        Set<String> instanceIds = new HashSet<>();
+        Set<String> containerIds = new HashSet<>();
+        int operations = 0;
+        for (JsonNode deployment : state.path("deployments")) {
+            if (!deploymentIds.add(deployment.path("deploymentId").asText()))
+                throw new ControllerException("STATE_INVALID", "Deployment identifier is duplicated");
+            if (!trafficScopes.add(deployment.path("trafficScopeId").asText()))
+                throw new ControllerException("STATE_INVALID", "Traffic scope is owned by more than one deployment");
+            String deploymentId = deployment.path("deploymentId").asText();
+            if (!store.hasManifest(deploymentId)) {
+                if ("DELETING".equals(deployment.path("phase").asText()) && deployment.path("services").isEmpty()) continue;
+                throw new ControllerException("STATE_MANIFEST_MISMATCH", "Deployment manifest is missing");
+            }
+            JsonNode manifest = store.readManifest(deploymentId);
+            validator.validatePair(manifest, state);
+            for (JsonNode service : deployment.path("services")) {
+                if (service.path("operation").isObject() && ++operations > 1)
+                    throw new ControllerException("STATE_INVALID", "More than one deployment operation is active");
+                Set<String> usedSlots = new HashSet<>();
+                for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
+                    JsonNode instance = service.path(role);
+                    if (!instance.isObject()) continue;
+                    if (!instanceIds.add(instance.path("instanceId").asText()))
+                        throw new ControllerException("STATE_INVALID", "Instance identifier is duplicated");
+                    if (!containerIds.add(instance.path("containerId").asText()))
+                        throw new ControllerException("STATE_INVALID", "Container identifier is duplicated");
+                    if (!usedSlots.add(instance.path("portSlot").asText()))
+                        throw new ControllerException("STATE_INVALID", "Service instances reuse the same port slot");
+                }
+            }
+            for (JsonNode spec : manifest.path("services")) {
+                for (JsonNode port : spec.path("runtime").path("hostPorts")) {
+                    String key = spec.path("machineId").asText() + ':' + port.asInt();
+                    if (!reservedPorts.add(key))
+                        throw new ControllerException("STATE_INVALID", "Fixed host port is reserved more than once");
+                }
+            }
+        }
+        assertPersistedLaneTopology(state);
+    }
+
+    private void recoverManifestLead() {
+        ObjectNode before = store.snapshot();
+        Set<String> manifestIds = store.manifestDeploymentIds();
+        Map<String, ControllerException> isolated = new LinkedHashMap<>();
+        boolean recoveryNeeded = false;
+        for (String deploymentId : manifestIds) {
+            JsonNode manifest = store.readManifest(deploymentId);
+            validator.validateManifest(manifest);
+            try {
+                containers.validateManifestEnvironment(manifest);
+            } catch (ControllerException failure) {
+                isolated.put(deploymentId, failure);
+                recoveryNeeded = true;
+                log.error("Deployment {} is excluded from reconciliation because its runtime files are invalid: {}",
+                        deploymentId, failure.getMessage());
+            }
+            JsonNode deployment = findDeployment(before, deploymentId);
+            if (deployment == null
+                    || deployment.path("acceptedManifestVersion").asLong() < manifest.path("manifestVersion").asLong()) {
+                recoveryNeeded = true;
+            }
+        }
+        for (JsonNode deployment : before.path("deployments")) {
+            if ("DELETING".equals(deployment.path("phase").asText()) && deployment.path("services").isEmpty()
+                    && !manifestIds.contains(deployment.path("deploymentId").asText())) recoveryNeeded = true;
+        }
+        if (!recoveryNeeded) return;
+        store.update(state -> {
+            for (String deploymentId : manifestIds) {
+                JsonNode manifest = store.readManifest(deploymentId);
+                ObjectNode deployment = (ObjectNode) findDeployment(state, deploymentId);
+                if (deployment == null) {
+                    assertNoOtherScopeOwner(state, deploymentId, manifest.path("trafficScopeId").asText());
+                    deployment = newDeployment(manifest);
+                    ((ArrayNode) state.path("deployments")).add(deployment);
+                } else {
+                    long accepted = deployment.path("acceptedManifestVersion").asLong();
+                    long onDisk = manifest.path("manifestVersion").asLong();
+                    if (onDisk != accepted) {
+                        if (onDisk < accepted || hasOperation(deployment))
+                            throw new ControllerException("STATE_MANIFEST_MISMATCH", "Manifest lead cannot be recovered safely");
+                        assertRecoverableReplacement(deployment, manifest);
+                        acceptReplacement(deployment, manifest);
+                    }
+                }
+                ControllerException failure = isolated.get(deploymentId);
+                if (failure != null) isolateDeployment(deployment, failure);
+            }
+            java.util.List<String> completedDeletes = new java.util.ArrayList<>();
+            for (JsonNode deployment : state.path("deployments")) {
+                if ("DELETING".equals(deployment.path("phase").asText()) && deployment.path("services").isEmpty()
+                        && !manifestIds.contains(deployment.path("deploymentId").asText()))
+                    completedDeletes.add(deployment.path("deploymentId").asText());
+            }
+            completedDeletes.forEach(deploymentId -> removeDeployment(state, deploymentId));
+            scheduleNext(state);
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void isolateDeployment(ObjectNode deployment, ControllerException failure) {
+        for (JsonNode value : deployment.path("services")) {
+            ObjectNode service = (ObjectNode) value;
+            String failedType = service.path("operation").path("type").asText();
+            if (failedType.isEmpty()) {
+                failedType = "DELETING".equals(deployment.path("phase").asText())
+                        ? "DELETE"
+                        : service.path("activeInstance").isObject() ? "UPDATE" : "CREATE";
+            }
+            service.put("phase", "FAILED");
+            service.putNull("operation");
+            service.put("failedManifestVersion", service.path("targetManifestVersion").asLong());
+            ObjectNode error = mapper.createObjectNode();
+            error.put("code", failure.code().replaceAll("[^A-Z0-9_]", "_"));
+            error.put("message", sanitize(failure.getMessage()));
+            error.put("at", Instant.now(clock).toString());
+            error.put("failedOperationType", failedType);
+            error.put("recoveryClass", "FACTS_UNCERTAIN");
+            service.set("lastError", error);
+        }
+    }
+
+    private void assertRecoverableReplacement(JsonNode deployment, JsonNode manifest) {
+        for (JsonNode service : deployment.path("services")) {
+            JsonNode spec = findService(manifest, service.path("serviceName").asText());
+            if (spec == null)
+                throw new ControllerException("STATE_MANIFEST_MISMATCH", "Leading manifest removed a service");
+            if (!service.path("dubboServiceKey").equals(spec.path("dubboServiceKey")))
+                throw new ControllerException("STATE_MANIFEST_MISMATCH", "Leading manifest changed a Dubbo service key");
+            for (String role : new String[]{"activeInstance", "candidateInstance", "drainingInstance"}) {
+                JsonNode instance = service.path(role);
+                if (!instance.isObject()) continue;
+                if (!instance.path("machineId").equals(spec.path("machineId"))
+                        || !contains(spec.path("runtime").path("hostPorts"), instance.path("hostPort")))
+                    throw new ControllerException("STATE_MANIFEST_MISMATCH", "Leading manifest moved a live service");
+            }
+        }
+    }
+
+    private boolean contains(JsonNode array, JsonNode value) {
+        for (JsonNode item : array) if (item.equals(value)) return true;
+        return false;
+    }
+
+    private String firstExpiredDeployment(JsonNode state) {
+        if (currentOperation(state) != null) return null;
+        Instant now = Instant.now(clock);
+        return java.util.stream.StreamSupport.stream(state.path("deployments").spliterator(), false)
+                .filter(deployment -> "ACTIVE".equals(deployment.path("phase").asText()))
+                .filter(deployment -> !hasFailure(deployment))
+                .filter(deployment -> !now.isBefore(Instant.parse(deployment.path("expiresAt").asText())))
+                .map(deployment -> deployment.path("deploymentId").asText())
+                .sorted().findFirst().orElse(null);
+    }
+
+    private ObjectNode newDeployment(JsonNode manifest) {
+        ObjectNode deployment = mapper.createObjectNode();
+        deployment.put("deploymentId", manifest.path("deploymentId").asText());
+        deployment.put("trafficScopeId", manifest.path("trafficScopeId").asText());
+        deployment.put("phase", "ACTIVE");
+        copyManifestIdentity(deployment, manifest);
+        ArrayNode services = mapper.createArrayNode();
+        for (JsonNode spec : manifest.path("services")) services.add(newService(spec, manifest.path("manifestVersion").asLong()));
+        deployment.set("services", services);
+        return deployment;
+    }
+
+    private void acceptReplacement(ObjectNode deployment, JsonNode manifest) {
+        copyManifestIdentity(deployment, manifest);
+        Set<String> existing = new HashSet<>();
+        for (JsonNode serviceNode : deployment.path("services")) {
+            ObjectNode service = (ObjectNode) serviceNode;
+            JsonNode spec = findService(manifest, service.path("serviceName").asText());
+            existing.add(service.path("serviceName").asText());
+            service.put("targetManifestVersion", manifest.path("manifestVersion").asLong());
+            service.put("targetServiceSpecSha256", spec.path("serviceSpecSha256").asText());
+            service.put("dubboServiceKey", spec.path("dubboServiceKey").asText());
+            if ("CLEAN_RETRYABLE".equals(service.path("lastError").path("recoveryClass").asText())) {
+                service.put("phase", service.path("activeInstance").isObject() ? "STABLE" : "CREATING");
+                service.putNull("failedManifestVersion");
+                service.putNull("lastError");
+            }
+        }
+        for (JsonNode spec : manifest.path("services")) {
+            if (!existing.contains(spec.path("serviceName").asText()))
+                ((ArrayNode) deployment.path("services")).add(newService(spec, manifest.path("manifestVersion").asLong()));
+        }
+    }
+
+    private void copyManifestIdentity(ObjectNode deployment, JsonNode manifest) {
+        deployment.put("acceptedManifestVersion", manifest.path("manifestVersion").asLong());
+        deployment.put("manifestSha256", JsonSupport.sha256(mapper, manifest));
+        deployment.put("gitCommit", manifest.path("gitCommit").asText());
+        deployment.set("owner", manifest.path("owner").deepCopy());
+        deployment.put("expiresAt", manifest.path("expiresAt").asText());
+    }
+
+    private ObjectNode newService(JsonNode spec, long version) {
+        ObjectNode service = mapper.createObjectNode();
+        service.put("serviceName", spec.path("serviceName").asText());
+        service.put("dubboServiceKey", spec.path("dubboServiceKey").asText());
+        service.put("phase", "CREATING");
+        service.put("targetManifestVersion", version);
+        service.put("targetServiceSpecSha256", spec.path("serviceSpecSha256").asText());
+        service.putNull("activeInstance");
+        service.putNull("candidateInstance");
+        service.putNull("drainingInstance");
+        service.putNull("operation");
+        service.putNull("failedManifestVersion");
+        service.putNull("lastError");
+        return service;
+    }
+
+    private ObjectNode instance(JsonNode spec, JsonNode manifest, String instanceId, String generation, String slot,
+                                ContainerRuntime.ContainerObservation container,
+                                ContainerRuntime.HttpUpstream httpUpstream) {
+        ObjectNode result = mapper.createObjectNode();
+        result.put("instanceId", instanceId);
+        result.put("machineId", spec.path("machineId").asText());
+        result.put("releaseId", spec.path("releaseId").asText());
+        result.put("deploymentGenerationId", generation);
+        result.put("shutdownProfile", spec.path("runtime").path("shutdownProfile").asText());
+        result.put("applicationDrainSeconds", spec.path("runtime").path("applicationDrainSeconds").asInt());
+        result.put("drainGraceSeconds", spec.path("runtime").path("drainGraceSeconds").asInt());
+        result.put("manifestVersion", manifest.path("manifestVersion").asLong());
+        result.put("serviceSpecSha256", spec.path("serviceSpecSha256").asText());
+        result.put("containerName", container.containerName());
+        result.put("containerId", container.containerId());
+        result.put("portSlot", slot);
+        result.put("hostPort", container.hostPort());
+        ObjectNode endpoint = mapper.createObjectNode();
+        endpoint.put("address", container.endpointAddress());
+        endpoint.put("port", container.hostPort());
+        result.set("endpoint", endpoint);
+        // 网关实例记录带进来的 HTTP 上游，供后续判断沙箱翻口后是否需要重建网关。
+        if (httpUpstream != null) {
+            ObjectNode upstream = mapper.createObjectNode();
+            upstream.put("address", httpUpstream.address());
+            upstream.put("port", httpUpstream.port());
+            result.set("httpUpstream", upstream);
+        }
+        return result;
+    }
+
+    private ObjectNode operation(String type, String phase, String candidateId) {
+        ObjectNode operation = mapper.createObjectNode();
+        operation.put("operationId", "op-" + UUID.randomUUID());
+        operation.put("type", type);
+        operation.put("phase", phase);
+        if (candidateId == null) operation.putNull("candidateInstanceId");
+        else operation.put("candidateInstanceId", candidateId);
+        operation.put("startedAt", Instant.now(clock).toString());
+        return operation;
+    }
+
+    private void scheduleNext(ObjectNode state) {
+        ServiceRef item = nextService(state);
+        if (item == null) return;
+        if (!item.create() && "frontend".equals(item.service().path("serviceName").asText())) {
+            // frontend 更新走同口替换（与生产 force-recreate 同类）：先把活动实例移入排空并
+            // 停掉旧容器，排空结束后 finishDrain 回到创建路径在第一只宿主口拉新。
+            ObjectNode active = ((ObjectNode) item.service().path("activeInstance")).deepCopy();
+            active.putNull("stopSignalRequestedAt");
+            active.putNull("stopDeadline");
+            item.service().putNull("activeInstance");
+            item.service().set("drainingInstance", active);
+            item.service().put("phase", "UPDATING");
+            item.service().set("operation", operation("UPDATE", "DRAINING_PREVIOUS", null));
+            return;
+        }
+        String instanceId = newInstanceId(item.deployment(), item.service());
+        item.service().put("phase", item.create() ? "CREATING" : "UPDATING");
+        item.service().set("operation", operation(item.create() ? "CREATE" : "UPDATE", "STARTING_CANDIDATE", instanceId));
+    }
+
+    private ServiceRef nextService(JsonNode state) {
+        if (currentOperation(state) != null) return null;
+        java.util.List<ServiceRef> queue = new java.util.ArrayList<>();
+        for (JsonNode deployment : state.path("deployments")) {
+            if (!"ACTIVE".equals(deployment.path("phase").asText())) continue;
+            if (hasFailure(deployment)) continue;
+            for (JsonNode service : deployment.path("services")) {
+                boolean create = "CREATING".equals(service.path("phase").asText()) && service.path("operation").isNull();
+                // 按服务内容摘要而不是部署单版本号决定滚动：版本号升高但服务摘要没变的
+                // 服务保持当前容器，只有真正改过的服务进入蓝绿；网关在摘要没变时还
+                // 跟随同部署沙箱的活动宿主口，口不匹配也排进更新。
+                boolean update = "STABLE".equals(service.path("phase").asText())
+                        && (!service.path("targetServiceSpecSha256").asText()
+                                .equals(service.path("activeInstance").path("serviceSpecSha256").asText())
+                            || gatewayFollowsSandboxPort(deployment, service));
+                if (create || update) queue.add(new ServiceRef((ObjectNode) deployment, (ObjectNode) service, create));
+            }
+        }
+        // 同一部署里沙箱先于网关：网关候选要带沙箱翻口后的新宿主口，沙箱后滚会让
+        // 网关再被重建一次；网关排到队尾即可保证两者都在队列时的先后。
+        return queue.stream().min(Comparator.comparing((ServiceRef item) -> item.deployment().path("trafficScopeId").asText())
+                .thenComparing(item -> "python-sandbox-gateway-service"
+                        .equals(item.service().path("serviceName").asText()) ? 1 : 0)
+                .thenComparing(item -> item.service().path("serviceName").asText())).orElse(null);
+    }
+
+    // 网关把沙箱的 HTTP 口记录在实例的 httpUpstream 上；服务摘要没变，但记录和沙箱
+    // 当前活动口不一致（或旧实例还没有这个记录）时，网关也要重建去追新的口。
+    private boolean gatewayFollowsSandboxPort(JsonNode deployment, JsonNode service) {
+        if (!"python-sandbox-gateway-service".equals(service.path("serviceName").asText())) return false;
+        JsonNode sandbox = findService(deployment, "python-sandbox-service");
+        JsonNode gateway = service.path("activeInstance");
+        if (sandbox == null || !sandbox.path("activeInstance").isObject() || !gateway.isObject()) return false;
+        JsonNode upstream = gateway.path("httpUpstream");
+        return !upstream.isObject()
+                || upstream.path("port").asInt() != sandbox.path("activeInstance").path("hostPort").asInt();
+    }
+
+    private void startNextDelete(ObjectNode deployment) {
+        ArrayNode stored = (ArrayNode) deployment.path("services");
+        for (int index = stored.size() - 1; index >= 0; index--) {
+            JsonNode service = stored.path(index);
+            if (service.path("activeInstance").isNull() && service.path("candidateInstance").isNull()
+                    && service.path("drainingInstance").isNull()) stored.remove(index);
+        }
+        java.util.List<ObjectNode> services = new java.util.ArrayList<>();
+        deployment.path("services").forEach(node -> services.add((ObjectNode) node));
+        services.stream().filter(service -> service.path("operation").isNull())
+                .min(Comparator.comparing(service -> service.path("serviceName").asText())).ifPresent(service -> {
+                    service.put("phase", "DELETING");
+                    service.putNull("failedManifestVersion");
+                    service.putNull("lastError");
+                    service.set("operation", operation("DELETE", "REMOVING_TRAFFIC", null));
+                });
+    }
+
+    private void stable(ObjectNode service) {
+        service.put("phase", "STABLE");
+        service.putNull("operation");
+        service.putNull("failedManifestVersion");
+        service.putNull("lastError");
+    }
+
+    private void validateReplacement(JsonNode existing, JsonNode manifest) {
+        if (!"ACTIVE".equals(existing.path("phase").asText()))
+            throw new ControllerException("DEPLOYMENT_BUSY", "Deleting deployment cannot accept a manifest");
+        if (hasOperation(existing)) throw new ControllerException("DEPLOYMENT_BUSY", "Deployment has an unfinished operation");
+        for (JsonNode service : existing.path("services"))
+            if ("FACTS_UNCERTAIN".equals(service.path("lastError").path("recoveryClass").asText()))
+                throw new ControllerException("FACTS_UNCERTAIN", "Conflicting external facts must be repaired first");
+        if (manifest.path("manifestVersion").asLong() <= existing.path("acceptedManifestVersion").asLong())
+            throw new ControllerException("MANIFEST_VERSION_CONFLICT", "Manifest version must increase");
+        JsonNode previous = store.readManifest(existing.path("deploymentId").asText());
+        for (JsonNode oldSpec : previous.path("services")) {
+            JsonNode next = findService(manifest, oldSpec.path("serviceName").asText());
+            if (next == null) throw new ControllerException("SERVICE_REMOVAL_REQUIRES_DELETE", "Ordinary update cannot remove a service");
+            if (!oldSpec.path("machineId").equals(next.path("machineId"))
+                    || !oldSpec.path("runtime").path("containerPort").equals(next.path("runtime").path("containerPort"))
+                    || !oldSpec.path("runtime").path("hostPorts").equals(next.path("runtime").path("hostPorts"))) {
+                throw new ControllerException("SERVICE_LOCATION_IMMUTABLE", "Machine and fixed host ports cannot change during update");
+            }
+            if (!oldSpec.path("dubboServiceKey").equals(next.path("dubboServiceKey"))) {
+                throw new ControllerException("DUBBO_SERVICE_KEY_IMMUTABLE", "Dubbo service key cannot change during update");
+            }
+        }
+    }
+
+    private void assertNoOtherScopeOwner(JsonNode state, String deploymentId, String scope) {
+        for (JsonNode deployment : state.path("deployments")) {
+            if (scope.equals(deployment.path("trafficScopeId").asText())
+                    && !deploymentId.equals(deployment.path("deploymentId").asText()))
+                throw new ControllerException("TRAFFIC_SCOPE_CONFLICT", "Traffic scope already belongs to another deployment");
+        }
+    }
+
+    private void assertLaneHasMainBetaProviders(JsonNode state, String deploymentId, JsonNode candidate) {
+        if ("main-beta".equals(candidate.path("trafficScopeId").asText())) return;
+        for (JsonNode requestedService : candidate.path("services")) {
+            // frontend 不注册 Dubbo 提供者，泳道 frontend 不依赖主 Beta 的 Dubbo 提供者在场。
+            if ("frontend".equals(requestedService.path("serviceName").asText())) continue;
+            if (!hasActiveMainBetaProvider(state, deploymentId, requestedService.path("serviceName").asText(),
+                    requestedService.path("dubboServiceKey").asText())) {
+                throw new ControllerException("MAIN_BETA_PROVIDER_REQUIRED",
+                        "A lane service requires an active untagged main Beta provider");
+            }
+        }
+    }
+
+    private void assertPersistedLaneTopology(JsonNode state) {
+        for (JsonNode deployment : state.path("deployments")) {
+            if ("main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
+            for (JsonNode service : deployment.path("services")) {
+                // 主 Beta frontend 同口替换排空期间没有活动实例，不构成泳道依赖缺失。
+                if ("frontend".equals(service.path("serviceName").asText())) continue;
+                boolean hasInstance = service.path("activeInstance").isObject()
+                        || service.path("candidateInstance").isObject()
+                        || service.path("drainingInstance").isObject();
+                if (hasInstance && !hasActiveMainBetaProvider(state,
+                        deployment.path("deploymentId").asText(), service.path("serviceName").asText(),
+                        service.path("dubboServiceKey").asText())) {
+                    throw new ControllerException("STATE_INVALID",
+                            "A persisted lane provider has no active untagged main Beta provider");
+                }
+            }
+        }
+    }
+
+    private boolean hasActiveMainBetaProvider(JsonNode state, String excludedDeploymentId,
+                                              String serviceName, String dubboServiceKey) {
+        for (JsonNode deployment : state.path("deployments")) {
+            if (excludedDeploymentId.equals(deployment.path("deploymentId").asText())
+                    || !"main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
+            JsonNode service = findService(deployment, serviceName);
+            if (service != null && service.path("activeInstance").isObject()
+                    && dubboServiceKey.equals(service.path("dubboServiceKey").asText())) return true;
+        }
+        return false;
+    }
+
+    private void assertMainBetaDeletionSafe(JsonNode state, JsonNode target) {
+        if (!"main-beta".equals(target.path("trafficScopeId").asText())) return;
+        for (JsonNode mainService : target.path("services")) {
+            for (JsonNode deployment : state.path("deployments")) {
+                if (target.path("deploymentId").equals(deployment.path("deploymentId"))
+                        || "main-beta".equals(deployment.path("trafficScopeId").asText())) continue;
+                JsonNode laneService = findService(deployment, mainService.path("serviceName").asText());
+                if (laneService != null && mainService.path("dubboServiceKey").equals(laneService.path("dubboServiceKey"))
+                        && (laneService.path("activeInstance").isObject()
+                        || laneService.path("candidateInstance").isObject()
+                        || laneService.path("drainingInstance").isObject())) {
+                    throw new ControllerException("MAIN_BETA_PROVIDER_REQUIRED",
+                            "Main Beta cannot be deleted while a lane provider for the same service exists");
+                }
+            }
+        }
+    }
+
+    private int remainingStopSeconds(Instant now, Instant deadline) {
+        long remainingMillis = java.time.Duration.between(now, deadline).toMillis();
+        if (remainingMillis <= 0) return 0;
+        long roundedUp = (remainingMillis + 999L) / 1000L;
+        return (int) Math.min(Integer.MAX_VALUE, roundedUp);
+    }
+
+    private void assertManifestReservationsAvailable(JsonNode state, String deploymentId, JsonNode candidate) {
+        Set<String> requested = new HashSet<>();
+        for (JsonNode spec : candidate.path("services"))
+            for (JsonNode port : spec.path("runtime").path("hostPorts"))
+                requested.add(spec.path("machineId").asText() + ':' + port.asInt());
+        for (JsonNode deployment : state.path("deployments")) {
+            if (deploymentId.equals(deployment.path("deploymentId").asText())) continue;
+            JsonNode manifest = store.readManifest(deployment.path("deploymentId").asText());
+            for (JsonNode spec : manifest.path("services")) {
+                for (JsonNode port : spec.path("runtime").path("hostPorts")) {
+                    if (requested.contains(spec.path("machineId").asText() + ':' + port.asInt()))
+                        throw new ControllerException("HOST_PORT_CONFLICT", "A fixed host port belongs to another deployment");
+                }
+            }
+        }
+    }
+
+    private void requireNoOperation(JsonNode state) {
+        if (currentOperation(state) != null) throw new ControllerException("CONTROLLER_BUSY", "Another service operation is running");
+    }
+
+    private boolean hasFailure(JsonNode parent) {
+        if (parent.path("services").isArray()) {
+            for (JsonNode service : parent.path("services"))
+                if (!service.path("lastError").isNull()) return true;
+            return false;
+        }
+        for (JsonNode deployment : parent.path("deployments"))
+            if (hasFailure(deployment)) return true;
+        return false;
+    }
+
+    private boolean hasOperation(JsonNode deployment) {
+        for (JsonNode service : deployment.path("services")) if (!service.path("operation").isNull()) return true;
+        return false;
+    }
+
+    private OperationRef currentOperation(JsonNode state) {
+        OperationRef found = null;
+        for (JsonNode deployment : state.path("deployments")) {
+            for (JsonNode service : deployment.path("services")) {
+                JsonNode op = service.path("operation");
+                if (op.isNull()) continue;
+                if (found != null) throw new ControllerException("STATE_INVALID", "More than one operation is active");
+                found = new OperationRef(deployment.path("deploymentId").asText(), deployment.path("trafficScopeId").asText(),
+                        service.path("serviceName").asText(), op.path("operationId").asText(), op.path("type").asText(),
+                        op.path("phase").asText(), op.path("candidateInstanceId").asText(null), service.deepCopy(),
+                        deployment.deepCopy());
+            }
+        }
+        return found;
+    }
+
+    private ObjectNode checkedService(JsonNode state, OperationRef ref) {
+        ObjectNode deployment = requireDeployment(state, ref.deploymentId());
+        ObjectNode service = requireService(deployment, ref.serviceName());
+        JsonNode operation = service.path("operation");
+        if (!ref.operationId().equals(operation.path("operationId").asText())
+                || !ref.phase().equals(operation.path("phase").asText()))
+            throw new ControllerException("OPERATION_CHANGED", "Operation changed while an external step was running");
+        return service;
+    }
+
+    private ObjectNode requireDeployment(JsonNode state, String deploymentId) {
+        JsonNode deployment = findDeployment(state, deploymentId);
+        if (deployment == null) throw new ControllerException("DEPLOYMENT_NOT_FOUND", "Deployment does not exist");
+        return (ObjectNode) deployment;
+    }
+
+    private ObjectNode requireService(JsonNode deployment, String name) {
+        JsonNode service = findService(deployment, name);
+        if (service == null) throw new ControllerException("SERVICE_NOT_FOUND", "Service does not exist");
+        return (ObjectNode) service;
+    }
+
+    private JsonNode findDeployment(JsonNode state, String id) {
+        for (JsonNode deployment : state.path("deployments"))
+            if (id.equals(deployment.path("deploymentId").asText())) return deployment;
+        return null;
+    }
+
+    private JsonNode findService(JsonNode parent, String name) {
+        for (JsonNode service : parent.path("services"))
+            if (name.equals(service.path("serviceName").asText())) return service;
+        return null;
+    }
+
+    private void removeService(ObjectNode deployment, String name) {
+        ArrayNode services = (ArrayNode) deployment.path("services");
+        for (int i = 0; i < services.size(); i++) if (name.equals(services.path(i).path("serviceName").asText())) { services.remove(i); return; }
+    }
+
+    private void removeDeployment(ObjectNode state, String id) {
+        ArrayNode deployments = (ArrayNode) state.path("deployments");
+        for (int i = 0; i < deployments.size(); i++) if (id.equals(deployments.path(i).path("deploymentId").asText())) { deployments.remove(i); return; }
+    }
+
+    private String newInstanceId(JsonNode deployment, JsonNode service) {
+        return "i-" + prefix(deployment.path("deploymentId").asText(), 20) + '-'
+                + prefix(service.path("serviceName").asText(), 20) + '-'
+                + UUID.randomUUID().toString().substring(0, 12);
+    }
+
+    private String prefix(String value, int length) { return value.substring(0, Math.min(length, value.length())); }
+
+    private String safeMessage(Throwable failure) { return sanitize(failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage()); }
+    private String sanitize(String value) {
+        String clean = value.replaceAll("[\\p{Cntrl}]", " ").strip();
+        if (clean.isEmpty()) clean = "External operation failed";
+        return clean.substring(0, Math.min(1024, clean.length()));
+    }
+
+    private record OperationRef(String deploymentId, String trafficScopeId, String serviceName,
+                                String operationId, String type, String phase, String candidateInstanceId,
+                                JsonNode service, JsonNode deployment) {}
+    private record ServiceRef(ObjectNode deployment, ObjectNode service, boolean create) {}
+}

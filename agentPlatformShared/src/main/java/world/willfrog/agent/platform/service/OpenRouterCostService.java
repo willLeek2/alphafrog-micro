@@ -25,14 +25,14 @@ import java.util.Set;
  *
  * <p>在 LLM 调用完成后，可选地异步查询 OpenRouter 的 Generation API
  * 获取真实费用信息（total_cost, upstream_inference_cost, cache_discount 等），
- * 并通过 {@link AgentObservabilityService#enrichLlmCallSpending} 补充到对应的 LLM Trace 中。</p>
+ * 并通过 {@link AgentRunObservabilityService#enrichLlmCallSpending} 补充到对应的 LLM Trace 中。</p>
  *
  * <p><b>启用条件：</b></p>
  * <ul>
  *   <li>{@code agent.observability.openrouter.cost-enrichment.enabled=true}</li>
  * </ul>
  *
- * @see AgentObservabilityService#enrichLlmCallSpending
+ * @see AgentRunObservabilityService#enrichLlmCallSpending
  * @see GenerationResponse
  */
 @Service
@@ -44,7 +44,7 @@ public class OpenRouterCostService {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     private final ObjectMapper objectMapper;
     private final AgentLlmLocalConfigLoader localConfigLoader;
 
@@ -61,7 +61,7 @@ public class OpenRouterCostService {
     @Value("${agent.observability.openrouter.cost-enrichment.retry-delay-ms:1000}")
     private int defaultRetryDelayMs;
 
-    public OpenRouterCostService(AgentObservabilityService observabilityService, 
+    public OpenRouterCostService(AgentRunObservabilityService observabilityService,
                                   ObjectMapper objectMapper,
                                   AgentLlmLocalConfigLoader localConfigLoader) {
         this.observabilityService = observabilityService;
@@ -121,14 +121,14 @@ public class OpenRouterCostService {
         if (runId == null || runId.isBlank() || !isCostEnrichmentEnabled()) {
             return 0;
         }
-        AgentObservabilityService.ObservabilityState state = observabilityService.forceFlush(runId);
+        AgentRunObservabilityService.ObservabilityState state = observabilityService.forceFlush(runId);
         if (state == null || state.getDiagnostics() == null || state.getDiagnostics().getLlmTraces() == null) {
             return 0;
         }
 
         Set<String> seenGenerationIds = new LinkedHashSet<>();
         int enriched = 0;
-        for (AgentObservabilityService.LlmTrace trace : state.getDiagnostics().getLlmTraces()) {
+        for (AgentRunObservabilityService.LlmTrace trace : state.getDiagnostics().getLlmTraces()) {
             if (trace == null || trace.getActualCost() != null) {
                 continue;
             }
@@ -143,14 +143,14 @@ public class OpenRouterCostService {
         return enriched;
     }
 
-    private String generationIdFromTrace(AgentObservabilityService.LlmTrace trace) {
+    private String generationIdFromTrace(AgentRunObservabilityService.LlmTrace trace) {
         if (trace == null) {
             return null;
         }
         if (trace.getGenerationId() != null && !trace.getGenerationId().isBlank()) {
             return trace.getGenerationId();
         }
-        AgentObservabilityService.RawHttpTrace response = trace.getHttpResponse();
+        AgentRunObservabilityService.RawHttpTrace response = trace.getHttpResponse();
         if (response == null || response.getBody() == null || response.getBody().isBlank()) {
             return null;
         }

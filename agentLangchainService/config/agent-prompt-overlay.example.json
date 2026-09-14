@@ -1,0 +1,8 @@
+{
+  "formatVersion": 1,
+  "baseBundleDigest": "填写编辑时基于的默认版本整体指纹（应用日志或 PromptAuthority.baseBundleDigest() 可查；仅作溯源，不匹配时告警不拒绝）",
+  "prompts": {
+  },
+  "toolDescriptions": {
+  }
+}

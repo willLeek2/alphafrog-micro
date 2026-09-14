@@ -92,4 +92,42 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <!-- 版本沿用根 pom pluginManagement 中锁定的 3.2.5；useModulePath=false 同样从根 pom 继承 -->
+                <configuration>
+                    <!-- PersistentArtifactRegistryRedisIntegrationTest 依赖 Docker + 真 Redis，
+                         本机红线禁止拉起 Docker，故默认 mvn test 排除该类；
+                         需显式 -Predis-integration 方可运行（见下方 profile） -->
+                    <excludes>
+                        <exclude>**/PersistentArtifactRegistryRedisIntegrationTest.java</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- redis-integration：仅在有 Docker + 真 Redis 的受批准环境（CI / 其他开发机）显式启用，
+             用于解除上面对 PersistentArtifactRegistryRedisIntegrationTest 的默认排除 -->
+        <profile>
+            <id>redis-integration</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <!-- combine.self="override" 以空清单整体替换默认 excludes，从而恢复该类的运行 -->
+                            <excludes combine.self="override"/>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

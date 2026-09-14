@@ -8,14 +8,16 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
-import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
-import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.util.Map;
 
@@ -26,13 +28,13 @@ public class AgentLangchainRunService {
 
     private static final int ADMIN_USER_TYPE = 1127;
 
-    private final ObjectProvider<AgentEventService> eventServiceProvider;
+    private final ObjectProvider<AgentRunEventService> agentEventServiceProvider;
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentRunMapper runMapper;
-    private final LangchainSingleWriterGuard singleWriterGuard;
     private final AgentCreditService creditService;
     private final UserDao userDao;
+    private final RunOwnershipGateway ownershipGateway;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         String userId = request.getUserId();
@@ -43,12 +45,13 @@ public class AgentLangchainRunService {
         if (message == null || message.isBlank()) {
             throw new IllegalArgumentException("message is required");
         }
+        DeploymentIdentity deploymentIdentity = ownershipGateway.requireIdentity();
         if (!isAdminUser(userId) && !creditService.hasPositiveCredit(userId)) {
             throw new IllegalStateException("credit 余额不足，无法创建新任务");
         }
 
-        AgentEventService eventService = eventServiceProvider.getIfAvailable();
-        if (eventService == null) {
+        AgentRunEventService agentEventService = agentEventServiceProvider.getIfAvailable();
+        if (agentEventService == null) {
             throw new IllegalStateException("agent_event_service_unavailable");
         }
 
@@ -59,7 +62,7 @@ public class AgentLangchainRunService {
             reservation = runConcurrencyScheduler.reserve();
         }
         try {
-            run = eventService.createRun(
+            run = agentEventService.createRun(
                     userId,
                     message,
                     request.getContextJson(),
@@ -71,10 +74,12 @@ public class AgentLangchainRunService {
                     request.getPlannerCandidateCount(),
                     request.getDebugMode(),
                     request.getStageConfigJson(),
+                    deploymentIdentity.deploymentId(),
+                    deploymentIdentity.generationId(),
+                    LaneScopeGateway.currentLaneTag(),
+                    request.getGenerateArtifacts(),
                     isAdminUser(userId)
             );
-
-            run = singleWriterGuard.markLangchainOwner(run);
 
             if (pipeline != null) {
                 log.info("Launching langchain linear pipeline for run {}", run.getId());
@@ -89,7 +94,7 @@ public class AgentLangchainRunService {
                 runConcurrencyScheduler.release(reservation);
             }
             if (run != null) {
-                markEnqueueFailed(eventService, run, e);
+                markEnqueueFailed(agentEventService, run, e);
             }
             throw e;
         }
@@ -106,13 +111,14 @@ public class AgentLangchainRunService {
         return user != null && user.getUserType() != null && user.getUserType() == ADMIN_USER_TYPE;
     }
 
-    private void markEnqueueFailed(AgentEventService eventService, AgentRun run, RuntimeException error) {
+    private void markEnqueueFailed(AgentRunEventService agentEventService, AgentRun run, RuntimeException error) {
         try {
-            eventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
+            agentEventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
                     "engine", "agentLangchainService",
                     "reason", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()
             ));
-            runMapper.updateStatus(run.getId(), run.getUserId(), AgentRunStatus.FAILED);
+            runMapper.updateStatus(
+                    run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.FAILED);
         } catch (Exception markError) {
             log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
                     run.getId(), markError.getMessage());

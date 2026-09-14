@@ -1,3 +1,7 @@
+# IMAGE_TAG 或第一个参数可覆盖本次服务镜像的产物标签，未设置时保持 :latest
+#（生产现有调用不变；runtime 镜像标签不在此列）。
+IMAGE_TAG="${1:-${IMAGE_TAG:-alphafrog-python-sandbox:latest}}"
+
 #!/bin/bash
 # AlphaFrog pythonSandboxService image build orchestration.
 #
@@ -34,8 +38,11 @@
 #   6. first invocation of scripts/build_runtime_manifest.py writes
 #      library-set.json from the VERIFIED ACTUAL inventory and yields
 #      librarySetDigest;
-#   7. PHASE 2 `docker build --iidfile` FROM the phase-1 image ID bakes the
-#      canonical index.json (re-hashed INSIDE the image against the
+#   7. PHASE 2 `docker build --iidfile` FROM a process-unique local tag that
+#      is immediately verified against the phase-1 image ID. The tag exists
+#      only because BuildKit cannot use a bare local sha256:<Image ID> in
+#      FROM; it is removed after phase 2 and never becomes evidence. Phase 2
+#      bakes canonical index.json (re-hashed INSIDE the image against the
 #      host-computed methodSpecIndexDigest -- mismatch fails closed) plus the
 #      verified library-set.json, and sets the OCI labels (labels are static
 #      metadata, so librarySetDigest can only be set after verification);
@@ -310,6 +317,22 @@ build_runtime_image() {
     exit 1
   fi
 
+  # 260814 scheduler-03: verify-mode selection. local-image-id (default) is
+  # the officially supported single-machine mode: the build still runs the
+  # import checks, smoke gate and inventory gate, prints the final immutable
+  # Image ID for deploy config, and does NOT require the registry release
+  # inputs (base digest / SBOM / external mapping / Tier2a). strict-release
+  # keeps the full Spec §12 release chain as the build success condition.
+  local verify_mode="${AF_SANDBOX_IMAGE_VERIFY_MODE:-local-image-id}"
+  case "$verify_mode" in
+    local-image-id|strict-release) ;;
+    *)
+      echo "[pythonSandbox] ERROR: AF_SANDBOX_IMAGE_VERIFY_MODE must be local-image-id or strict-release; got '${verify_mode}'." >&2
+      exit 1
+      ;;
+  esac
+  echo "[pythonSandbox] verify-mode=${verify_mode}"
+
   # --- Release gate state (Spec §12 hardening: DEFAULT-FAIL / fail-closed) --
   # incomplete_inputs collects the release inputs that are missing or still
   # REPLACE_WITH_... placeholders. Non-empty => the build is NOT releasable;
@@ -328,14 +351,20 @@ build_runtime_image() {
   # 2) baseImageDigest: verified digest pinned by frog at release time (Spec §12).
   #    The REPLACE_WITH_... placeholder makes an unverified build impossible to
   #    mistake for a real one; the release gate fails until it is replaced.
+  #    260814 scheduler-03: a strict-release-only input. In local-image-id
+  #    mode the base digest is not part of the single-machine contract.
   local base_image_digest="${BASE_IMAGE_DIGEST:-REPLACE_WITH_VERIFIED_BASE_IMAGE_DIGEST}"
-  if is_missing_or_placeholder "$base_image_digest"; then
-    incomplete_inputs+=("BASE_IMAGE_DIGEST")
-    echo "[pythonSandbox] WARNING: BASE_IMAGE_DIGEST is missing or a REPLACE_WITH_... placeholder." >&2
-    echo "[pythonSandbox]   frog pins the verified base-image digest at release time (Spec §12);" >&2
-    echo "[pythonSandbox]   until then the build is NOT releasable." >&2
+  if [ "$verify_mode" = "strict-release" ]; then
+    if is_missing_or_placeholder "$base_image_digest"; then
+      incomplete_inputs+=("BASE_IMAGE_DIGEST")
+      echo "[pythonSandbox] WARNING: BASE_IMAGE_DIGEST is missing or a REPLACE_WITH_... placeholder." >&2
+      echo "[pythonSandbox]   frog pins the verified base-image digest at release time (Spec §12);" >&2
+      echo "[pythonSandbox]   until then the build is NOT releasable." >&2
+    else
+      require_sha256_value "BASE_IMAGE_DIGEST" "$base_image_digest"
+    fi
   else
-    require_sha256_value "BASE_IMAGE_DIGEST" "$base_image_digest"
+    echo "[pythonSandbox] local-image-id mode: BASE_IMAGE_DIGEST is not a build input."
   fi
 
   # 3) methodSpecIndexDigest: NOT a release input (round FINAL): it is
@@ -347,19 +376,27 @@ build_runtime_image() {
 
   # SBOM input: syft availability is known before the build. Without syft the
   # SBOM digest stays a placeholder -> incomplete input (fail-closed gate).
+  # 260814 scheduler-03: strict-release-only input; local-image-id builds do
+  # not generate or require a SBOM.
   local syft_available=0
-  if command -v syft >/dev/null 2>&1; then
-    syft_available=1
+  if [ "$verify_mode" = "strict-release" ]; then
+    if command -v syft >/dev/null 2>&1; then
+      syft_available=1
+    else
+      incomplete_inputs+=("SBOM_DIGEST")
+      echo "[pythonSandbox] WARNING: syft not installed - SBOM cannot be generated." >&2
+      echo "[pythonSandbox]   sbomDigest would stay the REPLACE_WITH_... placeholder; until frog" >&2
+      echo "[pythonSandbox]   produces the verified SBOM the build is NOT releasable." >&2
+    fi
   else
-    incomplete_inputs+=("SBOM_DIGEST")
-    echo "[pythonSandbox] WARNING: syft not installed - SBOM cannot be generated." >&2
-    echo "[pythonSandbox]   sbomDigest would stay the REPLACE_WITH_... placeholder; until frog" >&2
-    echo "[pythonSandbox]   produces the verified SBOM the build is NOT releasable." >&2
+    echo "[pythonSandbox] local-image-id mode: SBOM is not a build input."
   fi
 
   # RELEASE GATE: fail-closed. Incomplete inputs abort the build BEFORE any
   # `docker build` unless the explicit, independent dev switch is set.
-  if [ "${#incomplete_inputs[@]}" -gt 0 ]; then
+  # 260814 scheduler-03: strict-release-only gate; local-image-id builds have
+  # no registry release inputs and never enter this block.
+  if [ "$verify_mode" = "strict-release" ] && [ "${#incomplete_inputs[@]}" -gt 0 ]; then
     if [ "$allow_incomplete_dev" -ne 1 ]; then
       echo "[pythonSandbox] ERROR: release gate FAILED (Spec §12 fail-closed) - incomplete release inputs:" >&2
       local incomplete_name
@@ -472,20 +509,29 @@ print(match.group(1))
     build_revision="git:$(git -C "$REPO_ROOT" rev-parse --verify HEAD)"
   fi
 
-  # 7) FROM ref: the verified base image pinned by digest; ONLY with the
-  #    explicit dev switch and a placeholder base digest does the build fall
-  #    back to the bare base tag (structural dev build, releasable=false).
+  # 7) FROM ref: local-image-id mode intentionally uses the local base tag;
+  #    strict-release uses the verified digest and falls back to the bare tag
+  #    only behind its explicit incomplete-build development switch.
   local runtime_base_image_ref
   if is_missing_or_placeholder "$base_image_digest"; then
     runtime_base_image_ref="python:${RUNTIME_BASE_IMAGE_TAG:-3.13-slim}"
-    echo "[pythonSandbox] WARNING: dev structural build FROM bare base tag '${runtime_base_image_ref}'" >&2
-    echo "[pythonSandbox]   (placeholder base digest + explicit dev switch). NOT releasable." >&2
+    if [ "$verify_mode" = "local-image-id" ]; then
+      echo "[pythonSandbox] local-image-id mode: building FROM local base tag '${runtime_base_image_ref}'."
+    else
+      echo "[pythonSandbox] WARNING: dev structural build FROM bare base tag '${runtime_base_image_ref}'" >&2
+      echo "[pythonSandbox]   (placeholder base digest + explicit dev switch). NOT releasable." >&2
+    fi
   else
     runtime_base_image_ref="python:${RUNTIME_BASE_IMAGE_TAG:-3.13-slim}@${base_image_digest}"
   fi
 
   # 8) PHASE 1 build (runtime-install stage): installs the locked library set
   #    and pip-installs the REAL alphafrog_finance distribution from runtime/.
+  #    BuildKit parses every FROM before honoring --target. Give the phase-2
+  #    FROM a syntactically valid reference during phase 1 so the Dockerfile's
+  #    loud-fail default placeholder cannot abort parsing. The runtime-install
+  #    target never executes phase 2; a temporary local tag verified against
+  #    the real phase-1 immutable ID replaces this value in the second build.
   local iid_install_file="$out_dir/image-install-stage-id"
   rm -f "$iid_install_file"
   run_docker_build \
@@ -493,9 +539,11 @@ print(match.group(1))
     -f "$SCRIPT_DIR/Dockerfile.runtime" \
     --iidfile "$iid_install_file" \
     --build-arg "RUNTIME_BASE_IMAGE_REF=${runtime_base_image_ref}" \
+    --build-arg "AF_RUNTIME_INSTALL_IMAGE=${runtime_base_image_ref}" \
     "$SCRIPT_DIR"
   local install_image_id
   install_image_id="$(cat "$iid_install_file")"
+  require_sha256_value "phase-1 --iidfile image ID" "$install_image_id"
   echo "[pythonSandbox] install-stage image=${install_image_id} (immutable image ID via --iidfile)"
 
   # 9) SMOKE GATE (R2-1, fail-closed): assert inside the target interpreters
@@ -546,31 +594,64 @@ print(match.group(1))
   library_set_digest="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["librarySetDigest"])' "$out_dir/library-set.json")"
   echo "[pythonSandbox] librarySetDigest=${library_set_digest} (verified actual inventory)"
 
-  # 12) PHASE 2 build: FROM the phase-1 image by immutable ID; bakes the
-  #     canonical index.json (re-hashed in-image against the computed
-  #     methodSpecIndexDigest) plus the verified library-set.json and sets
-  #     the OCI labels. --iidfile captures the FINAL immutable image ID.
+  # 12) PHASE 2 build: BuildKit does not resolve a bare local sha256:<Image
+  #     ID> in FROM; it treats that text as a registry reference. Create a
+  #     process-unique local tag, verify immediately that it resolves to the
+  #     exact phase-1 ID, use only that tag as the FROM bridge, then remove it.
+  #     The tag is transient routing, never evidence: the phase-1 iidfile ID
+  #     remains the identity that passed smoke + inventory verification.
+  #
+  #     The phase-2 image bakes canonical index.json (re-hashed in-image
+  #     against the computed methodSpecIndexDigest) plus the verified
+  #     library-set.json and sets the OCI labels. --iidfile captures the
+  #     FINAL immutable image ID.
   #     The Dockerfile COPYs .runtime-build/index.json, so stage the SAME
   #     bytes the digest was computed from (never a re-serialization).
   cp "$canonical_dir/index.json" "$out_dir/index.json"
   local iid_file="$out_dir/image-id"
   rm -f "$iid_file"
+  local install_stage_ref="alphafrog-runtime-install:${install_image_id#sha256:}-$$"
+  if ! docker tag "$install_image_id" "$install_stage_ref"; then
+    echo "[pythonSandbox] ERROR: cannot create the temporary phase bridge tag '${install_stage_ref}'." >&2
+    exit 1
+  fi
+  local tagged_install_image_id
+  if ! tagged_install_image_id="$(docker image inspect --format '{{.Id}}' "$install_stage_ref")"; then
+    echo "[pythonSandbox] ERROR: cannot inspect the temporary phase bridge tag '${install_stage_ref}'." >&2
+    docker image rm "$install_stage_ref" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if [ "$tagged_install_image_id" != "$install_image_id" ]; then
+    echo "[pythonSandbox] ERROR: temporary phase bridge tag '${install_stage_ref}' resolves to" >&2
+    echo "[pythonSandbox]   ${tagged_install_image_id}, expected ${install_image_id}; refusing phase 2." >&2
+    docker image rm "$install_stage_ref" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  echo "[pythonSandbox] phase bridge tag verified: ${install_stage_ref} -> ${install_image_id}"
   # NOTE: the `-t alphafrog-sandbox-runtime:latest` tag is a NON-evidence
   # alias kept ONLY for local convenience (docker run by tag during dev). It
   # NEVER enters the SBOM, the external mapping, or the deploy chain: all
   # evidence below binds the immutable --iidfile image ID exclusively
   # (Spec §12 immutable same-origin; the tag can be retargeted by any
   # concurrent/manual build at any time).
-  run_docker_build \
+  if ! run_docker_build \
     -t alphafrog-sandbox-runtime:latest \
     -f "$SCRIPT_DIR/Dockerfile.runtime" \
     --iidfile "$iid_file" \
-    --build-arg "AF_RUNTIME_INSTALL_IMAGE=${install_image_id}" \
+    --build-arg "RUNTIME_BASE_IMAGE_REF=${runtime_base_image_ref}" \
+    --build-arg "AF_RUNTIME_INSTALL_IMAGE=${install_stage_ref}" \
     --build-arg "AF_BASE_IMAGE_DIGEST=${base_image_digest}" \
     --build-arg "AF_LOCK_DIGEST=${lock_digest}" \
     --build-arg "AF_METHOD_SPEC_INDEX_DIGEST=${method_spec_index_digest}" \
     --build-arg "AF_LIBRARY_SET_DIGEST=${library_set_digest}" \
-    "$SCRIPT_DIR"
+    "$SCRIPT_DIR"; then
+    echo "[pythonSandbox] ERROR: phase-2 runtime image build FAILED." >&2
+    docker image rm "$install_stage_ref" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if ! docker image rm "$install_stage_ref" >/dev/null; then
+    echo "[pythonSandbox] WARNING: built phase 2, but could not remove temporary tag '${install_stage_ref}'." >&2
+  fi
 
   local image_digest
   image_digest="$(cat "$iid_file")"
@@ -595,21 +676,25 @@ print(match.group(1))
   #     not a basis for SBOM binding either: the tag is a non-evidence
   #     local alias only.
   local sbom_digest="REPLACE_WITH_VERIFIED_SBOM_DIGEST"
-  if [ "$syft_available" -eq 1 ]; then
-    echo "[pythonSandbox] syft detected: generating SBOM for the immutable image ${image_digest}..."
-    if syft "docker:${image_digest}" -o json > "$out_dir/sbom.json"; then
-      sbom_digest="$(file_sha256 "$out_dir/sbom.json")"
-      echo "[pythonSandbox] sbomDigest=${sbom_digest} ($out_dir/sbom.json)"
+  if [ "$verify_mode" = "strict-release" ]; then
+    if [ "$syft_available" -eq 1 ]; then
+      echo "[pythonSandbox] syft detected: generating SBOM for the immutable image ${image_digest}..."
+      if syft "docker:${image_digest}" -o json > "$out_dir/sbom.json"; then
+        sbom_digest="$(file_sha256 "$out_dir/sbom.json")"
+        echo "[pythonSandbox] sbomDigest=${sbom_digest} ($out_dir/sbom.json)"
+      else
+        # syft present but failed -> SBOM input incomplete (fail-closed gate at
+        # the end of this function; the mapping still records releasable=false).
+        incomplete_inputs+=("SBOM_DIGEST")
+        echo "[pythonSandbox] WARNING: syft failed; sbomDigest stays placeholder '${sbom_digest}'." >&2
+      fi
     else
-      # syft present but failed -> SBOM input incomplete (fail-closed gate at
-      # the end of this function; the mapping still records releasable=false).
-      incomplete_inputs+=("SBOM_DIGEST")
-      echo "[pythonSandbox] WARNING: syft failed; sbomDigest stays placeholder '${sbom_digest}'." >&2
+      echo "[pythonSandbox] WARNING: syft not installed - SBOM NOT generated." >&2
+      echo "[pythonSandbox]   sbomDigest recorded as placeholder '${sbom_digest}' in the external mapping;" >&2
+      echo "[pythonSandbox]   frog generates the verified SBOM at release time (Spec §12)." >&2
     fi
   else
-    echo "[pythonSandbox] WARNING: syft not installed - SBOM NOT generated." >&2
-    echo "[pythonSandbox]   sbomDigest recorded as placeholder '${sbom_digest}' in the external mapping;" >&2
-    echo "[pythonSandbox]   frog generates the verified SBOM at release time (Spec §12)." >&2
+    echo "[pythonSandbox] local-image-id mode: skipping SBOM generation (strict-release only)."
   fi
 
   # 14) Second invocation: AFTER the image ID is known, write the external
@@ -632,23 +717,31 @@ print(match.group(1))
   for incomplete_name in ${incomplete_inputs[@]+"${incomplete_inputs[@]}"}; do
     incomplete_args+=(--incomplete-input "$incomplete_name")
   done
-  python3 "$manifest_script" \
-    --lock-digest "$lock_digest" \
-    --method-spec-index-digest "$method_spec_index_digest" \
-    --packages-file "$verified_packages_file" \
-    --output "$out_dir/library-set.json" \
-    --mapping-output "$out_dir/image-digest-mapping.json" \
-    --image-digest "$image_digest" \
-    --image-ref "${image_digest}" \
-    --base-image-digest "$base_image_digest" \
-    --sbom-digest "$sbom_digest" \
-    --build-revision "$build_revision" \
-    ${incomplete_args[@]+"${incomplete_args[@]}"}
+  # 260814 scheduler-03: the external digest mapping is strict-release
+  # evidence. In local-image-id mode it is not written at all -- the deploy
+  # contract for local mode is the bare Image ID, verified by docker inspect.
+  if [ "$verify_mode" = "strict-release" ]; then
+    python3 "$manifest_script" \
+      --lock-digest "$lock_digest" \
+      --method-spec-index-digest "$method_spec_index_digest" \
+      --packages-file "$verified_packages_file" \
+      --output "$out_dir/library-set.json" \
+      --mapping-output "$out_dir/image-digest-mapping.json" \
+      --image-digest "$image_digest" \
+      --image-ref "${image_digest}" \
+      --base-image-digest "$base_image_digest" \
+      --sbom-digest "$sbom_digest" \
+      --build-revision "$build_revision" \
+      ${incomplete_args[@]+"${incomplete_args[@]}"}
+  else
+    echo "[pythonSandbox] local-image-id mode: skipping external digest mapping (strict-release only)."
+  fi
 
   # FINAL RELEASE GATE: if any release input ended up incomplete (e.g. syft
   # failed during the build), the build fails closed AFTER the non-releasable
   # mapping was written for audit -- unless the explicit dev switch is set.
-  if [ "${#incomplete_inputs[@]}" -gt 0 ]; then
+  # 260814 scheduler-03: strict-release-only gate.
+  if [ "$verify_mode" = "strict-release" ] && [ "${#incomplete_inputs[@]}" -gt 0 ]; then
     if [ "$allow_incomplete_dev" -ne 1 ]; then
       echo "[pythonSandbox] ERROR: release gate FAILED after build (Spec §12 fail-closed) - incomplete release inputs:" >&2
       for incomplete_name in "${incomplete_inputs[@]}"; do
@@ -658,6 +751,17 @@ print(match.group(1))
       echo "[pythonSandbox] Set AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true (or 1) for a dev-only build." >&2
       exit 1
     fi
+  fi
+
+  if [ "$verify_mode" = "local-image-id" ]; then
+    echo "[pythonSandbox] === local-image-id mode ==="
+    echo "[pythonSandbox] verified local Image ID: ${image_digest}"
+    echo "[pythonSandbox] deploy config: AF_SANDBOX_IMAGE=${image_digest}"
+    echo "[pythonSandbox]               AF_SANDBOX_IMAGE_VERIFY_MODE=local-image-id"
+    echo "[pythonSandbox] STATUS: local single-machine build OK (strict-release chain not required in this mode)."
+    echo "[pythonSandbox] NOTE: image release (registry push) and production config changes"
+    echo "[pythonSandbox]       remain frog's final decision (Spec §12); this script never pushes."
+    return 0
   fi
 
   echo "[pythonSandbox] Spec §12 artifacts:"
@@ -680,8 +784,8 @@ if [ "$BUILD_TARGET" = "all" ] || [ "$BUILD_TARGET" = "runtime" ]; then
 fi
 
 if [ "$BUILD_TARGET" = "all" ] || [ "$BUILD_TARGET" = "service" ]; then
-  echo "[pythonSandbox] Building service image: alphafrog-python-sandbox:latest"
+  echo "[pythonSandbox] Building service image: $IMAGE_TAG"
   run_docker_build \
-    -t alphafrog-python-sandbox:latest \
+    -t "$IMAGE_TAG" \
     "$SCRIPT_DIR"
 fi

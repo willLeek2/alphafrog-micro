@@ -27,21 +27,22 @@ import world.willfrog.alphafrogmicro.common.config.nacos.NacosConfigBridge;
 public class LangchainProviderRuntimeConfiguration {
 
     /**
-     * 260623-agent-service-deprecation task #47 (P0-1)：
-     * agentToolsShared 通过 {@link AgentToolsAutoConfiguration} 拉进 {@code world.willfrog.agent.tools} 包，
-     * {@link AgentRunDatasetRegistry} 位于 {@code world.willfrog.agent.workflow}（agentPlatformShared），
-     * 不在本配置类 {@code @ComponentScan(basePackages = "world.willfrog.agent.platform")} 覆盖范围，
-     * 也不在 AgentToolsAutoConfiguration 的 {@code world.willfrog.agent.tools} 扫描范围内。
-     * 若不显式注册 bean，{@link world.willfrog.agent.tools.python.PythonSandboxTools} 和
-     * {@link world.willfrog.agent.tools.dataset.ListMyDataTool} 的
-     * {@code @Autowired(required=false) AgentRunDatasetRegistry} 启动时静默 null，
-     * executePython / listMyData 运行时抛 {@code RUN_LEVEL_IDS_UNAVAILABLE}。
+     * 为 {@link AgentRunDatasetRegistry} 显式注册 bean：它位于
+     * {@code world.willfrog.agent.workflow}（agentPlatformShared），不在本配置类
+     * {@code @ComponentScan(basePackages = "world.willfrog.agent.platform")} 的覆盖范围内，
+     * 也不在 {@link AgentToolsAutoConfiguration} 的 {@code world.willfrog.agent.tools}
+     * 扫描范围内，自动扫描不会创建它。
      *
-     * <p>此处显式 {@code @Bean} 而非扩大 {@code @ComponentScan}：
-     * {@code world.willfrog.agent.workflow} 包下还包含 agentService 专用的
-     * {@code TodoItem} / {@code TodoStatus} / {@code WorkflowState} / {@code PlanExecutionMode} /
-     * {@code TodoPlanner} / {@code WorkflowExecutor} 等类，扩大 scan 会把这些无关 bean 也拉进来，
-     * 破坏 agentLangchainService 与 agentService 的职责边界（task #47 验收口径）。
+     * <p>缺少这个 bean 时，{@link world.willfrog.agent.tools.python.PythonSandboxTools} 和
+     * {@link world.willfrog.agent.tools.dataset.ListMyDataTool} 里
+     * {@code @Autowired(required=false) AgentRunDatasetRegistry} 会在启动时静默保持 null，
+     * executePython / listMyData 运行时抛 {@code RUN_LEVEL_IDS_UNAVAILABLE}。</p>
+     *
+     * <p>扩大 {@code @ComponentScan} 的做法会把 {@code world.willfrog.agent.workflow}
+     * 包下 agentService 专用的 {@code TodoItem} / {@code TodoStatus} / {@code WorkflowState} /
+     * {@code PlanExecutionMode} / {@code TodoPlanner} / {@code WorkflowExecutor} 等类一并
+     * 拉进来，打乱 agentLangchainService 与 agentService 的职责划分，因此这里显式注册
+     * 单个 bean。</p>
      */
     @Bean
     public AgentRunDatasetRegistry agentRunDatasetRegistry() {

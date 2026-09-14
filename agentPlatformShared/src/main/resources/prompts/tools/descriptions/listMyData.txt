@@ -1,0 +1,21 @@
+列出当前 agent run 已落盘的 dataset / manifest，提供 raw file content grep 能力。
+
+用于：
+1. executePython 收到 ILLEGAL_RUN_LEVEL_IDS 错误时恢复（先 listMyData 查合法编号）
+2. 多步工作流中回顾前面步骤落下了什么数据
+3. 发现某个 manifest 包含哪些相关 dataset
+4. 在 dataset 原始文件里搜索某关键字（grep 模式）
+
+参数：
+  query_type          - 必填，取值 "dataset" 或 "manifest"
+  from_ts_code        - 可选，过滤 from_ts_code 包含该子串的条目（multi-ts-code 用 # 分隔）
+  grep                - 可选（仅 dataset 模式），对 dataset 原始文件全文做大小写不敏感子串搜索
+                        非 dataset 模式 / 空 grep 时走非 grep 路径
+  file_offset         - 可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）
+  file_limit          - 可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）
+  offset              - 可选，非 grep 模式分页起始（默认 0）
+  limit               - 可选，非 grep 模式单页返回上限（默认 50，上限 200）
+  related_dataset_ids - 可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest
+
+返回（grep 模式）：{ ok, data: { query_type, run_id, matched_count, file_offset, file_limit, matches: [...] }, error }
+返回（非 grep 模式）：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...] }, error }

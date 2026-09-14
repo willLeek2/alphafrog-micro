@@ -14,7 +14,7 @@ import java.util.Set;
  * 用于配置原始 HTTP 请求/响应捕获、Provider 诊断等功能
  * 
  * @see world.willfrog.agent.platform.service.RawHttpLogger
- * @see world.willfrog.agent.platform.service.AgentObservabilityService
+ * @see world.willfrog.agent.platform.service.AgentRunObservabilityService
  */
 @Data
 @ConfigurationProperties(prefix = "agent.observability")

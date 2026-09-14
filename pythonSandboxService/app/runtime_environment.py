@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from . import container_copy
 from .models import ExecutionEnvironment, SandboxPackageApi
 
 
@@ -105,9 +106,13 @@ def _read_installed_packages(session: Any) -> Tuple[List[dict], bool]:
         return [], False
     try:
         interpreter = shlex.quote(_resolve_target_interpreter(session))
+        # 260818: no trailing `2>/dev/null` — the exec path has no shell
+        # (docker-py shlex.splits the string), so a redirect would be a
+        # literal argument.  pip list happens to tolerate it, but keep the
+        # command operator-free by construction.
         command = (
             f"{interpreter} -m pip list --format=json "
-            "--disable-pip-version-check 2>/dev/null"
+            "--disable-pip-version-check"
         )
         output = session.execute_command(command)
         if getattr(output, "exit_code", 0) != 0:
@@ -303,7 +308,8 @@ def write_runtime_environment_to_container(
     env: ExecutionEnvironment,
     dest_path: str,
 ) -> str:
-    """Serialize env and push it into the execution container via copy_to_runtime.
+    """Serialize env and push it into the execution container via the
+    non-root staging path (container_copy → docker ``put_archive``).
 
     Spec §8 L1019 (codex rework 2026-08-08 22:49): the runtime-environment.json
     that user code (e.g., report()) reads MUST live inside the execution
@@ -315,7 +321,7 @@ def write_runtime_environment_to_container(
     container at dest_path. The tempfile is cleaned up regardless of outcome.
 
     Returns dest_path so callers can chain it (e.g., echo into log lines).
-    Raises whatever session.copy_to_runtime raises; callers may catch and
+    Raises whatever the non-root copy path raises; callers may catch and
     downgrade to a warning if best-effort, but Spec §8 treats the container
     file as the runtime-visible single source of truth for environmentId.
     """
@@ -327,7 +333,10 @@ def write_runtime_environment_to_container(
         ) as handle:
             json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
             temp_path = handle.name
-        session.copy_to_runtime(temp_path, dest_path)
+        # Non-root copy path (grace review): llm-sandbox copy_to_runtime
+        # ends with a root chown; container_copy stages the file as the
+        # container user with no root exec.
+        container_copy.copy_file_to_container(session, temp_path, dest_path)
         return dest_path
     finally:
         if temp_path is not None:

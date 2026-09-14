@@ -14,7 +14,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalRecorder;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisUpsertOutcome;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 
-/** 将 T3 durable terminal anchor 接到 T4 幂等 usage recorder。 */
+/** 把数据库里的终态 anchor 记录接到幂等 usage recorder，写入资源用量。 */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -26,7 +26,7 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
     @Override
     public boolean upsertUsage(String runId, ToolJobAnchor anchor) {
         try {
-            // 从 durable anchor 重建完整终态 envelope，不读取进程内临时 usage。
+            // 从数据库里的 anchor 重建完整终态 envelope，不读取进程内临时 usage。
             DataAnalysisTerminalEnvelope envelope = toEnvelope(runId, anchor);
             // recorder 按 operation identity 幂等写入。
             DataAnalysisUpsertOutcome outcome = recorder.upsert(envelope);
@@ -55,7 +55,7 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
         DataAnalysisReservation confirmed = new DataAnalysisReservation(
                 stored.reservationId(), stored.identity(), stored.resourceClass(), stored.capacityUnits(),
                 DataAnalysisReservationState.TERMINAL_CONFIRMED, stored.taskId(), stored.acquiredAt());
-        // estimate 与实际 usage 共同形成资源归因记录。
+        // estimate 与实际 usage 共同形成资源用量记录。
         DataAnalysisEstimate estimate = objectMapper.readValue(
                 anchor.getEstimateJson(), DataAnalysisEstimate.class);
         DataAnalysisResourceUsage usage = ToolJobResourceUsageParser.parse(

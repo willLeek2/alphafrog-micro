@@ -97,7 +97,7 @@ public class LangchainAdaptiveConcurrencyController {
         lastAdjustmentAt = System.currentTimeMillis();
     }
 
-    // ── 运维开关：只启停控制器，不直接修改 hard/max/queue ──
+    // ── 运维开关：控制这个自适应调节器的启停 ──
 
     public void setEnabled(boolean enabled) {
         this.enabled.set(enabled);

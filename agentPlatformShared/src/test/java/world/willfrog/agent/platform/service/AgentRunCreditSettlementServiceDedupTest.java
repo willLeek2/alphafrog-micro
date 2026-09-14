@@ -47,7 +47,7 @@ import static org.mockito.Mockito.when;
 class AgentRunCreditSettlementServiceDedupTest {
 
     @Mock
-    private AgentObservabilityService observabilityService;
+    private AgentRunObservabilityService observabilityService;
     @Mock
     private AgentRunMapper runMapper;
     @Mock

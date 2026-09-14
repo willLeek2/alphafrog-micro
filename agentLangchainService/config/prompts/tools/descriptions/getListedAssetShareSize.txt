@@ -1,0 +1,1 @@
+查询 ETF 份额规模时序。参数要求：tsCode、startDate、endDate；exchange 使用 SSE/SZSE/BSE。

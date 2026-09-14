@@ -3,7 +3,7 @@ package world.willfrog.agent.platform.dataanalysis;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 /**
- * 写入持久化 anchor 的已完成 Todo 快照。
+ * 写入持久化 ToolJob anchor 或工作流 checkpoint 的已完成 Todo 快照。
  *
  * <p>恢复线程不能依赖原 worker 的堆内对象，因此这里只保存重新构造
  * {@code LangchainCompletedTodo} 所需的稳定字段。恢复时按 sequence 还原顺序，

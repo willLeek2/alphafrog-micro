@@ -19,11 +19,11 @@ class AgentCallDetailPersistenceTest {
 
     @Test
     void scrubLlmTrace_removesRawFieldsAndSetsFlagOnlyWhenBlobStored() {
-        AgentObservabilityService.LlmTrace trace = new AgentObservabilityService.LlmTrace();
+        AgentRunObservabilityService.LlmTrace trace = new AgentRunObservabilityService.LlmTrace();
         trace.setTraceId("llm-1");
         trace.setOutputText("full output");
         trace.setInputMessages(Map.of("role", "user"));
-        trace.setHttpRequest(new AgentObservabilityService.RawHttpTrace());
+        trace.setHttpRequest(new AgentRunObservabilityService.RawHttpTrace());
         trace.setCurlCommand("curl secret");
         trace.setEndpoint("openrouter");
         trace.setGenerationId("gen-1");
@@ -41,7 +41,7 @@ class AgentCallDetailPersistenceTest {
 
     @Test
     void scrubLlmTrace_withoutBlobStored_doesNotSetFlag() {
-        AgentObservabilityService.LlmTrace trace = new AgentObservabilityService.LlmTrace();
+        AgentRunObservabilityService.LlmTrace trace = new AgentRunObservabilityService.LlmTrace();
         trace.setTraceId("llm-2");
         trace.setModel("qwen");
 
@@ -53,7 +53,7 @@ class AgentCallDetailPersistenceTest {
     @Test
     void scrubLlmTrace_capsLargePreviewInSnapshotShape() throws Exception {
         String huge = "x".repeat(50_000);
-        AgentObservabilityService.LlmTrace trace = new AgentObservabilityService.LlmTrace();
+        AgentRunObservabilityService.LlmTrace trace = new AgentRunObservabilityService.LlmTrace();
         trace.setTraceId("llm-3");
         trace.setOutputText(huge);
 
@@ -116,7 +116,7 @@ class AgentCallDetailPersistenceTest {
 
     @Test
     void toToolDetailBlob_capturesParamsAndOutput() {
-        AgentObservabilityService.ToolTrace trace = new AgentObservabilityService.ToolTrace();
+        AgentRunObservabilityService.ToolTrace trace = new AgentRunObservabilityService.ToolTrace();
         trace.setTraceId("tool-1");
         trace.setParams(Map.of("query", "茅台"));
         trace.setOutput("{\"hits\":[]}");

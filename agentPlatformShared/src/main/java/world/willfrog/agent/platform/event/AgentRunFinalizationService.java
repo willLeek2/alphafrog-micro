@@ -4,14 +4,14 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
-
-import java.util.Set;
+import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
 
 /**
  * 终态发布收敛服务（agentPlatformShared 公共入口）。
  *
- * <p>挂载点（v0）：AgentRunExecutor 和 LangchainLinearRunPipelineImpl 各分支调用 publishFinalizedEvent。
- * 成功/部分完成/失败/取消/过期 各调用一次。
+ * <p>挂载点（v0）：LangchainLinearRunPipelineImpl 发布成功、部分完成与失败；
+ * LangchainRunControlService / ToolJobFinalizer 发布普通取消与长工具收口后的取消；
+ * LangchainRunReadService 发布读时发现的过期。各路径都必须先持久化终态，再调用本服务。
  *
  * <p>放在 agentPlatformShared 是为了提供终态发布的共享入口。workspace 监听器已迁移到
  * agentLangchainService 侧，同 JVM 消费 langchain 主链路发布的终态事件；
@@ -29,11 +29,6 @@ import java.util.Set;
 @Slf4j
 public class AgentRunFinalizationService {
 
-    /** v0 处理的终态集合 */
-    public static final Set<String> TERMINAL_STATUSES = Set.of(
-            "COMPLETED", "PARTIAL", "FAILED", "CANCELED", "EXPIRED"
-    );
-
     private final ApplicationEventPublisher publisher;
 
     /**
@@ -48,8 +43,8 @@ public class AgentRunFinalizationService {
             log.warn("publishFinalizedEvent skipped: runId 为空, status={}", terminalStatus);
             return;
         }
-        String status = terminalStatus == null ? "" : terminalStatus.trim();
-        if (!TERMINAL_STATUSES.contains(status)) {
+        String status = AgentRunTerminalStatus.normalize(terminalStatus);
+        if (!AgentRunTerminalStatus.isTerminal(status)) {
             log.warn("publishFinalizedEvent skipped: 非终态 status={} runId={}", status, runId);
             return;
         }

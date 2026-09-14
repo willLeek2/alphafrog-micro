@@ -19,12 +19,14 @@ Covered here (MethodSpec V5 work package H, FINAL round):
   The fixture index.json digest is pinned verbatim.
 * ITEM D — dedicated unprivileged identity: the image creates a FIXED
   non-zero uid/gid user (alphafrog-sandbox, uid 10000 / gid 10001) as the
-  AF_SANDBOX_CHILD_USER contract identity for the work package C wrapper
-  (accepts username or uid:gid); compose + env example carry the entry.
+  AF_SANDBOX_CHILD_USER container-run identity (the service creates the
+  sandbox container AS this user; accepts username or uid:gid); compose
+  + env example carry the entry.
 * ITEM B — docker-gated three-stage E2E (skip unless AF_RUN_DOCKER_TESTS=1
-  AND a reachable docker daemon): phase-1 build, phase-2 build FROM the
-  phase-1 immutable ID, layer-prefix verification, in-image re-hash gate
-  (positive + negative), dist metadata + contract user verification.
+  AND a reachable docker daemon): phase-1 build, exact-ID verification of a
+  temporary local tag, phase-2 build FROM that bridge, layer-prefix
+  verification, in-image re-hash gate (positive + negative), dist metadata
+  + contract user verification.
 
 Run from pythonSandboxService/:
 
@@ -75,7 +77,12 @@ CANONICAL_FILES = (
     "sharpe_ratio.json",
 )
 
-_PLACEHOLDER_INSTALL_IMAGE = "REPLACE_WITH_RUNTIME_INSTALL_STAGE_IMAGE_ID"
+_PLACEHOLDER_BASE_IMAGE = (
+    "invalid.invalid/alphafrog/replace-with-verified-base-image-ref"
+)
+_PLACEHOLDER_INSTALL_IMAGE = (
+    "invalid.invalid/alphafrog/replace-with-runtime-install-stage-image-id"
+)
 
 
 def _dockerfile_lines() -> list:
@@ -133,6 +140,7 @@ class TestDockerfileArgScope(unittest.TestCase):
         ]
         self.assertEqual(len(declarations), 1)
         self.assertLess(declarations[0], first_from)
+        self.assertIn(_PLACEHOLDER_BASE_IMAGE, lines[declarations[0]])
 
     def test_exactly_two_froms_in_documented_phase_order(self):
         froms = [l for l in _dockerfile_lines() if re.match(r"^FROM\s", l)]
@@ -190,8 +198,9 @@ class TestChildIndexUserContract(unittest.TestCase):
         self.assertNotEqual(uid, 0, "contract user must NOT be root")
         self.assertNotEqual(gid, 0, "contract group must NOT be root")
         self.assertEqual((uid, gid), (10000, 10001))
-        # The image must NOT switch its default USER to the contract user:
-        # privilege dropping is the work package C wrapper's job.
+        # The image must NOT switch its default USER: build-time steps
+        # need root; the service passes the unprivileged user at
+        # container creation (docker --user) instead.
         self.assertIsNone(
             re.search(r"^USER\s", text, re.MULTILINE),
             "image default USER must stay root",
@@ -388,6 +397,8 @@ class TestThreeStageBuildDockerE2E(unittest.TestCase):
                 str(iid1),
                 "--build-arg",
                 f"RUNTIME_BASE_IMAGE_REF={self._BASE_TAG}",
+                "--build-arg",
+                f"AF_RUNTIME_INSTALL_IMAGE={self._BASE_TAG}",
             ],
             timeout=1800,
         )
@@ -399,14 +410,48 @@ class TestThreeStageBuildDockerE2E(unittest.TestCase):
         )
         install_id = iid1.read_text(encoding="utf-8").strip()
 
-        # --- phase 2: FROM the immutable phase-1 ID ---
+        # --- phase bridge: local tag verified against the immutable ID ---
+        # BuildKit interprets a bare local sha256:<Image ID> in FROM as a
+        # registry reference. Match docker_build.sh: create a unique local
+        # tag and immediately prove that it resolves to the exact phase-1 ID.
+        install_ref = (
+            "alphafrog-runtime-install-test:"
+            f"{install_id.removeprefix('sha256:')}-{os.getpid()}"
+        )
+        tagged = subprocess.run(
+            ["docker", "tag", install_id, install_ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(tagged.returncode, 0, tagged.stderr)
+        self.addCleanup(
+            subprocess.run,
+            ["docker", "image", "rm", install_ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        inspected = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", install_ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertEqual(inspected.stdout.strip(), install_id)
+
+        # --- phase 2: FROM the verified local bridge to the phase-1 ID ---
         phase2_args = [
             "-f",
             "Dockerfile.runtime",
             "--iidfile",
             str(iid2),
             "--build-arg",
-            f"AF_RUNTIME_INSTALL_IMAGE={install_id}",
+            f"RUNTIME_BASE_IMAGE_REF={self._BASE_TAG}",
+            "--build-arg",
+            f"AF_RUNTIME_INSTALL_IMAGE={install_ref}",
             "--build-arg",
             f"AF_BASE_IMAGE_DIGEST={self._TEST_BASE_DIGEST}",
             "--build-arg",

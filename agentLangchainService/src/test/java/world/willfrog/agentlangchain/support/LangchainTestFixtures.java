@@ -6,8 +6,8 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import org.springframework.beans.factory.ObjectProvider;
-import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
+import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningStructuredOutputSettings;
 
@@ -27,16 +27,18 @@ public final class LangchainTestFixtures {
         AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
         AgentLlmProperties.Planning planning = new AgentLlmProperties.Planning();
         AgentLlmProperties.StructuredOutput structuredOutput = new AgentLlmProperties.StructuredOutput();
-        structuredOutput.setStrategyStageEnabled(false);
         planning.setStructuredOutput(structuredOutput);
         runtime.setPlanning(planning);
         properties.setRuntime(runtime);
-        AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setAgentRunSystemPrompt("你是专业金融分析代理。");
-        prompts.setTodoPlannerSystemPromptTemplate(
-                "你是任务规划器。只输出 JSON。工具: {{toolWhitelist}}，最多 {{maxTodos}} 步。");
-        prompts.setDagReactSystemPrompt("你是金融分析代理，使用工具完成任务。");
-        properties.setPrompts(prompts);
+        // Prompt 正文统一从 agentPlatformShared classpath 权威目录加载；测试夹具不再造第二份正文。
+        properties.setPrompts(new AgentLlmProperties.Prompts());
+        return properties;
+    }
+
+    /** 仅供显式验证事故降级路径的测试配置。 */
+    public static AgentLlmProperties legacySingleStageLlmProperties() {
+        AgentLlmProperties properties = llmProperties();
+        properties.getRuntime().getPlanning().getStructuredOutput().setStrategyStageEnabled(false);
         return properties;
     }
 
@@ -52,6 +54,17 @@ public final class LangchainTestFixtures {
 
     public static LangchainAiPlanner planner() {
         return new LangchainAiPlanner(promptService(), structuredOutputSettings(), JsonMapper.builder().build());
+    }
+
+    /** 仅供带 legacy/fallback 语义的用例使用，不能作为生产规划回归夹具。 */
+    public static LangchainAiPlanner legacySingleStagePlanner() {
+        AgentLlmProperties properties = legacySingleStageLlmProperties();
+        ObjectMapper objectMapper = JsonMapper.builder().build();
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(objectMapper);
+        return new LangchainAiPlanner(
+                new AgentPromptService(properties, loader),
+                new LangchainPlanningStructuredOutputSettings(properties, loader),
+                objectMapper);
     }
 
     public static LangchainTodoNodeExecutor todoNodeExecutor() {

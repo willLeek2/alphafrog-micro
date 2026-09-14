@@ -54,6 +54,8 @@ class AgentRunMapperPostgresIntegrationTest {
                     CREATE TABLE alphafrog_agent_run (
                         id VARCHAR(64) PRIMARY KEY,
                         user_id VARCHAR(64),
+                        deployment_id VARCHAR(64) NOT NULL,
+                        deployment_generation_id VARCHAR(68) NOT NULL,
                         status VARCHAR(32),
                         current_step INT DEFAULT 0,
                         max_steps INT DEFAULT 20,
@@ -65,6 +67,8 @@ class AgentRunMapperPostgresIntegrationTest {
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         completed_at TIMESTAMPTZ,
                         ext JSONB NOT NULL DEFAULT '{}',
+                        execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                        restart_attempt INT NOT NULL DEFAULT 0,
                         tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'
                     )
                     """);
@@ -101,6 +105,8 @@ class AgentRunMapperPostgresIntegrationTest {
         AgentRun run = new AgentRun();
         run.setId("null-anchor-run");
         run.setUserId("user-1");
+        run.setDeploymentId("stable");
+        run.setDeploymentGenerationId("gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setCurrentStep(0);
         run.setMaxSteps(12);
@@ -113,7 +119,10 @@ class AgentRunMapperPostgresIntegrationTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
             assertThat(mapper.insert(run)).isEqualTo(1);
-            assertThat(mapper.findById(run.getId()).getToolJobAnchorJson()).isEqualTo("{}");
+            AgentRun stored = mapper.findById(run.getId());
+            assertThat(stored.getToolJobAnchorJson()).isEqualTo("{}");
+            assertThat(stored.getExecutionCheckpointJson()).isEqualTo("{}");
+            assertThat(stored.getRestartAttempt()).isZero();
         }
     }
 
@@ -249,7 +258,7 @@ class AgentRunMapperPostgresIntegrationTest {
             assertThat(mapper.casUpdateStatus(
                     "dag-preparing-abort", AgentRunStatus.FAILED, AgentRunStatus.EXECUTING))
                     .isEqualTo(1);
-            assertThat(mapper.listActiveToolJobAnchors(20))
+            assertThat(mapper.listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", 20))
                     .extracting(AgentRun::getId)
                     .contains("dag-preparing-abort");
             ToolJobAnchor cleanup = ToolJobAnchor.fromJson(
@@ -438,7 +447,7 @@ class AgentRunMapperPostgresIntegrationTest {
 
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
-            List<String> activeIds = mapper.listActiveToolJobAnchors(20).stream()
+            List<String> activeIds = mapper.listActiveToolJobAnchorsForDeployment("stable", "legacy-stable", 20).stream()
                     .map(AgentRun::getId)
                     .toList();
             // DAG cleanup CANCELED must still be included
@@ -555,6 +564,8 @@ class AgentRunMapperPostgresIntegrationTest {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId("user-1");
+        run.setDeploymentId("stable");
+        run.setDeploymentGenerationId("gen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         run.setStatus(status);
         run.setCurrentStep(0);
         run.setMaxSteps(12);

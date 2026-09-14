@@ -29,9 +29,9 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(AgentLlmProperties.class),
                 new ObjectMapper(),
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(AgentLlmLocalConfigLoader.class),
                 mock(LangchainLlmLatencyWindow.class)
         );
@@ -63,9 +63,9 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(AgentLlmProperties.class),
                 new ObjectMapper(),
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(AgentLlmLocalConfigLoader.class),
                 mock(LangchainLlmLatencyWindow.class)
         );
@@ -97,9 +97,9 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(AgentLlmProperties.class),
                 new ObjectMapper(),
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(AgentLlmLocalConfigLoader.class),
                 mock(LangchainLlmLatencyWindow.class)
         );

@@ -50,6 +50,9 @@ the exact flags the script passes. Fixture env hooks:
                                    ``docker build --iidfile`` emulation used
                                    by the docker_build.sh gate tests (BOTH
                                    build phases write the same ID);
+* ``FAKE_DOCKER_FAIL_RUNTIME_FINAL_BUILD`` set to ``1`` fails only the
+                                   phase-2 build, after the temporary local
+                                   bridge tag exists, so cleanup is testable;
 * ``FAKE_DOCKER_SMOKE_EXIT``       exit code of the fake ``docker run``
                                    smoke-gate invocations (default 0);
 * ``FAKE_DOCKER_INVENTORY_FILE``   inventory JSON document printed by the
@@ -95,6 +98,9 @@ DEPLOY_SCRIPT = REPO_ROOT / "deploy_latest.sh"
 DOCKER_BUILD_SCRIPT = SANDBOX_SERVICE_ROOT / "docker_build.sh"
 RUNTIME_BUILD_DIR = SANDBOX_SERVICE_ROOT / ".runtime-build"
 MAPPING_FILE = RUNTIME_BUILD_DIR / "image-digest-mapping.json"
+IIDFILE = RUNTIME_BUILD_DIR / "image-id"
+LIBRARY_SET_FILE = RUNTIME_BUILD_DIR / "library-set.json"
+OCI_LIBRARY_SET_LABEL = "com.alphafrog.librarySetDigest"
 
 # Shared accept/reject vectors (single source of truth pinning identical
 # semantics at every digest-validation entry point, Spec §12 hardening).
@@ -237,7 +243,13 @@ case "$cmd" in
       echo "fake docker: build failed" >&2
       exit 1
     fi
+    if [ "${FAKE_DOCKER_FAIL_RUNTIME_FINAL_BUILD:-}" = "1" ] && \
+       grep -q '^alphafrog-runtime-install:' "${FAKE_DOCKER_ALIASES_FILE:?}"; then
+      echo "fake docker: final runtime build failed" >&2
+      exit 1
+    fi
     iid=""
+    labels_json="{}"
     while [ "$#" -gt 0 ]; do
       arg="$1"
       shift
@@ -246,11 +258,100 @@ case "$cmd" in
         --iidfile)
           if [ "$#" -gt 0 ]; then iid="$1"; shift; fi
           ;;
+        --build-arg=*)
+          barg="${arg#--build-arg=}"
+          if [ "${barg%%=*}" = "AF_LIBRARY_SET_DIGEST" ]; then
+            labels_json="$(LABEL_KEY="com.alphafrog.librarySetDigest" LABEL_VAL="${barg#*=}" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+          fi
+          ;;
+        --build-arg)
+          if [ "$#" -gt 0 ]; then
+            barg="$1"; shift
+            if [ "${barg%%=*}" = "AF_LIBRARY_SET_DIGEST" ]; then
+              labels_json="$(LABEL_KEY="com.alphafrog.librarySetDigest" LABEL_VAL="${barg#*=}" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+            fi
+          fi
+          ;;
+        --label=*)
+          lab="${arg#--label=}"
+          key="${lab%%=*}"
+          val="${lab#*=}"
+          labels_json="$(LABEL_KEY="$key" LABEL_VAL="$val" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+          ;;
+        --label)
+          if [ "$#" -gt 0 ]; then
+            lab="$1"; shift
+            key="${lab%%=*}"
+            val="${lab#*=}"
+            labels_json="$(LABEL_KEY="$key" LABEL_VAL="$val" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+          fi
+          ;;
       esac
     done
+    image_id="${FAKE_DOCKER_BUILD_IMAGE_ID:-sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
     if [ -n "$iid" ]; then
-      printf '%s\n' "${FAKE_DOCKER_BUILD_IMAGE_ID:-sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}" > "$iid"
+      printf '%s\n' "$image_id" > "$iid"
     fi
+    if [ -n "${FAKE_DOCKER_IMAGES_FILE:-}" ]; then
+      if ! grep -qxF "$image_id" "$FAKE_DOCKER_IMAGES_FILE" 2>/dev/null; then
+        printf '%s\n' "$image_id" >> "$FAKE_DOCKER_IMAGES_FILE"
+      fi
+    fi
+    if [ -n "${FAKE_DOCKER_ALIASES_FILE:-}" ]; then
+      printf '%s %s\n' "$image_id" "$image_id" >> "$FAKE_DOCKER_ALIASES_FILE"
+    fi
+    # Persist OCI labels for subsequent `docker image inspect` (Tier2a gate).
+    if [ -n "${FAKE_DOCKER_LABELS_FILE:-}" ] && [ "$labels_json" != "{}" ]; then
+      FAKE_DOCKER_LABELS_FILE="$FAKE_DOCKER_LABELS_FILE" BUILD_ID="$image_id" BUILD_LABELS="$labels_json" python3 -c '
+import json, os
+path = os.environ["FAKE_DOCKER_LABELS_FILE"]
+image_id = os.environ["BUILD_ID"]
+new_labels = json.loads(os.environ["BUILD_LABELS"])
+rows = []
+found = False
+if os.path.exists(path):
+    for line in open(path, encoding="utf-8"):
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        if parts[0] == image_id:
+            existing = json.loads(parts[1]) if len(parts) > 1 else {}
+            existing.update(new_labels)
+            rows.append(image_id + " " + json.dumps(existing, separators=(",", ":")))
+            found = True
+        else:
+            rows.append(line)
+if not found:
+    rows.append(image_id + " " + json.dumps(new_labels, separators=(",", ":")))
+open(path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
+'
+    fi
+    ;;
+  tag)
+    # docker_build.sh uses a temporary, process-unique tag to bridge the
+    # phase-1 local image into BuildKit's phase-2 FROM. Record that alias so
+    # the immediate `docker image inspect` equality check can resolve it.
+    source_ref="${1:-}"
+    target_ref="${2:-}"
+    if [ -z "$source_ref" ] || [ -z "$target_ref" ]; then
+      echo "fake docker: tag requires source and target" >&2
+      exit 1
+    fi
+    canon=""
+    while read -r alias id; do
+      if [ "$alias" = "$source_ref" ]; then canon="$id"; break; fi
+    done < "${FAKE_DOCKER_ALIASES_FILE:?}"
+    if [ -z "$canon" ]; then
+      while IFS= read -r id; do
+        if [ "$id" = "$source_ref" ]; then canon="$id"; break; fi
+      done < "${FAKE_DOCKER_IMAGES_FILE:?}"
+    fi
+    if [ -z "$canon" ]; then
+      echo "fake docker: no such source image $source_ref" >&2
+      exit 1
+    fi
+    printf '%s %s\n' "$target_ref" "$canon" >> "${FAKE_DOCKER_ALIASES_FILE:?}"
     ;;
   run)
     # docker_build.sh round-2 gate tests: serve the smoke gate (R2-1) and the
@@ -297,7 +398,43 @@ case "$cmd" in
     fi
     cat "${FAKE_DOCKER_PS_FILE:?}"
     ;;
-  inspect)
+  image)
+    case "${1:-}" in
+      inspect)
+        # Used both by the phase-bridge equality check and the D15 Tier2a OCI
+        # label probe. Fall through into the shared inspect implementation.
+        shift
+        set -- inspect "$@"
+        cmd="inspect"
+        ;;
+      rm)
+        # Removing a tag must remove only that alias, not the underlying
+        # immutable image ID. The shell stub uses Python for literal matching.
+        shift
+        for ref in "$@"; do
+          FAKE_ALIAS_REF="$ref" python3 -c '
+import os
+path = os.environ["FAKE_DOCKER_ALIASES_FILE"]
+ref = os.environ["FAKE_ALIAS_REF"]
+rows = []
+if os.path.exists(path):
+    for line in open(path, encoding="utf-8"):
+        if line.rstrip("\n").split(" ", 1)[0] != ref:
+            rows.append(line)
+open(path, "w", encoding="utf-8").writelines(rows)
+'
+          echo "Untagged: $ref"
+        done
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+# Shared inspect path (also reached after rewriting `image inspect`).
+if [ "$cmd" = "inspect" ]; then
     if [ "${FAKE_DOCKER_FAIL:-}" = "inspect" ]; then
       echo "fake docker: inspect failed" >&2
       exit 1
@@ -309,6 +446,7 @@ case "$cmd" in
       arg="$1"
       shift
       case "$arg" in
+        inspect) ;;
         --type=*) typ="${arg#--type=}" ;;
         --type)
           if [ "$#" -gt 0 ]; then typ="$1"; shift; fi
@@ -360,6 +498,13 @@ case "$cmd" in
         continue
       fi
       case "$fmt" in
+        *librarySetDigest*)
+          labels="{}"
+          while read -r id lab; do
+            if [ "$id" = "$canon" ]; then labels="$lab"; break; fi
+          done < "${FAKE_DOCKER_LABELS_FILE:?}"
+          FAKE_LABELS_JSON="$labels" python3 -c 'import json,os; d=json.loads(os.environ["FAKE_LABELS_JSON"] or "{}"); print(d.get("com.alphafrog.librarySetDigest",""))'
+          ;;
         *Labels*)
           labels="null"
           while read -r id lab; do
@@ -373,7 +518,8 @@ case "$cmd" in
       esac
     done <<< "$refs"
     exit "$status"
-    ;;
+fi
+case "$cmd" in
   rmi)
     for ref in "$@"; do
       echo "Untagged: $ref"
@@ -503,6 +649,52 @@ class RuntimeImageRetentionTestBase(unittest.TestCase):
         with open(self.env["FAKE_DOCKER_ALIASES_FILE"], "a", encoding="utf-8") as fh:
             fh.write(f"{ref} {image_id}\n")
 
+    def register_image_id(self, image_id: str) -> None:
+        """Ensure bare immutable image IDs resolve in fake ``docker inspect``."""
+        images_path = Path(self.env["FAKE_DOCKER_IMAGES_FILE"])
+        existing = images_path.read_text(encoding="utf-8")
+        if image_id not in existing.splitlines():
+            images_path.write_text(existing.rstrip("\n") + "\n" + image_id + "\n", encoding="utf-8")
+        self.add_alias(image_id, image_id)
+
+    def set_image_labels(self, image_id: str, labels: dict) -> None:
+        """Merge ``labels`` into the fake docker Labels fixture for ``image_id``."""
+        path = Path(self.env["FAKE_DOCKER_LABELS_FILE"])
+        rows: list[str] = []
+        found = False
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split(" ", 1)
+                if parts[0] == image_id:
+                    existing = json.loads(parts[1]) if len(parts) > 1 else {}
+                    existing.update(labels)
+                    rows.append(image_id + " " + json.dumps(existing, separators=(",", ":")))
+                    found = True
+                else:
+                    rows.append(line)
+        if not found:
+            rows.append(image_id + " " + json.dumps(labels, separators=(",", ":")))
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def write_library_set_file(self, library_set_digest: str = LEGAL_ENTRY_DIGESTS["librarySetDigest"]) -> None:
+        RUNTIME_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        LIBRARY_SET_FILE.write_text(
+            json.dumps(
+                {
+                    "apiVersion": "1.0",
+                    "librarySetDigest": library_set_digest,
+                    "packages": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def write_iidfile(self, image_id: str = FAKE_BUILD_IMAGE_ID) -> None:
+        RUNTIME_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        IIDFILE.write_text(image_id + "\n", encoding="utf-8")
+
     def write_mapping_file(self, mapping) -> None:
         """Write the build-artifact image-digest-mapping.json consumed by the
         deploy_latest.sh R2-3 target-binding gate (str == raw bytes, dict ==
@@ -513,6 +705,38 @@ class RuntimeImageRetentionTestBase(unittest.TestCase):
         else:
             MAPPING_FILE.write_text(json.dumps(mapping), encoding="utf-8")
         self.addCleanup(shutil.rmtree, str(RUNTIME_BUILD_DIR), True)
+
+    def write_deploy_build_artifacts(
+        self,
+        mapping=None,
+        *,
+        image_id: str = FAKE_BUILD_IMAGE_ID,
+        library_set_digest: str | None = None,
+        install_oci_label: bool = True,
+    ) -> None:
+        """Write mapping + iidfile + library-set.json and optional OCI label.
+
+        D15-A deploy gates require all three build artifacts before the
+        historical mapping/releasable assertions can fire.
+        """
+        if mapping is None:
+            mapping = self.bound_mapping(image_id=image_id)
+        if library_set_digest is None:
+            if isinstance(mapping, dict):
+                entry = mapping.get("images", {}).get(image_id) or {}
+                library_set_digest = entry.get(
+                    "librarySetDigest", LEGAL_ENTRY_DIGESTS["librarySetDigest"]
+                )
+            else:
+                library_set_digest = LEGAL_ENTRY_DIGESTS["librarySetDigest"]
+        self.write_mapping_file(mapping)
+        self.write_iidfile(image_id)
+        self.write_library_set_file(library_set_digest)
+        self.register_image_id(image_id)
+        if install_oci_label:
+            self.set_image_labels(
+                image_id, {OCI_LIBRARY_SET_LABEL: library_set_digest}
+            )
 
     def bound_mapping(self, image_id: str = FAKE_BUILD_IMAGE_ID, **entry_overrides) -> dict:
         """A single-entry mapping whose entry BINDS ``image_id`` (its key) and
@@ -1026,7 +1250,7 @@ class DeployLatestImageGateTest(RuntimeImageRetentionTestBase):
         refs = [ACCEPT_REFS[0], "alphafrog-sandbox-runtime:latest", *VALID_DEV_REFERENCES]
         for ref in refs:
             self.add_alias(ref, FAKE_BUILD_IMAGE_ID)
-        self.write_mapping_file(self.bound_mapping())
+        self.write_deploy_build_artifacts(self.bound_mapping())
 
     def deploy_env(self, **overrides: str) -> dict:
         env = dict(self.env)
@@ -1034,8 +1258,14 @@ class DeployLatestImageGateTest(RuntimeImageRetentionTestBase):
             "AF_SANDBOX_IMAGE",
             "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG",
             "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
+            "AF_SANDBOX_IMAGE_TAG_CHECK",
         ):
             env.pop(key, None)
+        # These deploy tests pin the Spec §12 strict-release path; the
+        # 260814 default (local-image-id) is covered by
+        # DeployLocalImageIdModeTest below.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env.update(overrides)
         return env
 
@@ -1161,6 +1391,56 @@ class DeployLatestImageGateTest(RuntimeImageRetentionTestBase):
                 f"stdout={result.stdout}\nstderr={result.stderr}",
             )
 
+    def test_digest_ref_still_runs_tier2a_when_dev_allow_permission_set(self) -> None:
+        # Permission switch alone must NOT skip Tier2a for a digest publish.
+        env = self.deploy_env(
+            AF_SANDBOX_IMAGE=ACCEPT_REFS[0],
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        result = self.run_deploy(env, "--deploy-only", "python-sandbox-service")
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        combined = result.stdout + result.stderr
+        self.assertNotIn("skipping Tier2a gate", combined)
+        self.assertIn("D15_TIER2A_PASS", combined)
+        self.assertIn("Deployment completed", result.stdout)
+
+    def test_digest_ref_with_dev_allow_fails_on_oci_label_mismatch(self) -> None:
+        # Digest + leftover AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true must still
+        # enforce OCI librarySetDigest == library-set.json.
+        self.set_image_labels(
+            FAKE_BUILD_IMAGE_ID,
+            {OCI_LIBRARY_SET_LABEL: "sha256:" + "11" * 32},
+        )
+        env = self.deploy_env(
+            AF_SANDBOX_IMAGE=ACCEPT_REFS[0],
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        result = self.run_deploy(env, "--deploy-only", "python-sandbox-service")
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        combined = result.stdout + result.stderr
+        self.assertIn("Tier2a", combined)
+        self.assertIn("OCI label", combined)
+        self.assertNotIn("Deployment completed", result.stdout)
+
+    def test_bare_tag_with_dev_allow_skips_tier2a_only(self) -> None:
+        env = self.deploy_env(
+            AF_SANDBOX_IMAGE="alphafrog-sandbox-runtime:latest",
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        result = self.run_deploy(env, "--deploy-only", "python-sandbox-service")
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        combined = result.stdout + result.stderr
+        self.assertIn("skipping Tier2a gate", combined)
+        self.assertIn("Deployment completed", result.stdout)
+
 
 class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
     """Item 3 at the deploy entry point: deploy_latest.sh must refuse to
@@ -1181,12 +1461,20 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
         self.add_alias(ACCEPT_REFS[0], FAKE_BUILD_IMAGE_ID)
 
     def write_mapping(self, mapping) -> None:
-        RUNTIME_BUILD_DIR.mkdir(parents=True, exist_ok=True)
-        if isinstance(mapping, str):
-            MAPPING_FILE.write_text(mapping, encoding="utf-8")
-        else:
-            MAPPING_FILE.write_text(json.dumps(mapping), encoding="utf-8")
-        self.addCleanup(shutil.rmtree, str(RUNTIME_BUILD_DIR), True)
+        # Keep the historical helper name, but always install the D15-A
+        # iidfile + library-set + OCI label companions so reverse tests still
+        # reach their intended mapping/releasable assertions.
+        library_set_digest = LEGAL_ENTRY_DIGESTS["librarySetDigest"]
+        if isinstance(mapping, dict):
+            entry = (mapping.get("images") or {}).get(FAKE_BUILD_IMAGE_ID) or {}
+            digest = entry.get("librarySetDigest") if isinstance(entry, dict) else None
+            if isinstance(digest, str) and digest.startswith("sha256:") and len(digest) == 71:
+                library_set_digest = digest
+        self.write_deploy_build_artifacts(
+            mapping,
+            image_id=FAKE_BUILD_IMAGE_ID,
+            library_set_digest=library_set_digest,
+        )
 
     def mapping(self, releasable, incomplete=()) -> dict:
         entry = {
@@ -1206,6 +1494,8 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
         env = dict(self.env)
         for key in ("AF_SANDBOX_IMAGE", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG", "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD"):
             env.pop(key, None)
+        # These deploy-gate tests pin the Spec §12 strict-release path.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env["AF_SANDBOX_IMAGE"] = ACCEPT_REFS[0]
         env.update(extra_env)
         return subprocess.run(
@@ -1342,8 +1632,18 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
         # The entry corresponds to the chosen ref (via imageRef) but binds a
         # DIFFERENT immutable image ID than docker inspect resolves: the
         # deploy target is NOT the built image -> fail closed.
+        # D15-A HARD gate runs first and refuses because inspected_id has no
+        # mapping entry (R2-3 identity); diagnostics still carry the inspected
+        # immutable ID.
         self.write_mapping(
             self.bound_mapping(image_id=OTHER_IMAGE_ID, imageRef=ACCEPT_REFS[0])
+        )
+        # Companion artifacts bind the inspected ID; mapping identity still fails.
+        self.write_iidfile(FAKE_BUILD_IMAGE_ID)
+        self.write_library_set_file(LEGAL_ENTRY_DIGESTS["librarySetDigest"])
+        self.set_image_labels(
+            FAKE_BUILD_IMAGE_ID,
+            {OCI_LIBRARY_SET_LABEL: LEGAL_ENTRY_DIGESTS["librarySetDigest"]},
         )
         result = self.run_deploy_with_releasable_gate()
         self.assertEqual(
@@ -1361,7 +1661,7 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
     def test_deploy_rejects_unresolvable_target_image(self) -> None:
         # docker inspect cannot resolve the chosen ref -> no immutable ID to
         # bind -> fail closed.
-        self.write_mapping_file(self.bound_mapping())
+        self.write_deploy_build_artifacts(self.bound_mapping())
         self.env["FAKE_DOCKER_FAIL_INSPECT_REF"] = ACCEPT_REFS[0]
         result = self.run_deploy_with_releasable_gate()
         self.assertEqual(
@@ -1390,7 +1690,12 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
             "methodSpecIndexDigest",
         ):
             for bad in bad_values:
-                self.write_mapping_file(self.bound_mapping(**{field: bad}))
+                # Keep companion library-set.json legal so the failure lands on
+                # mapping/HARD integrity of the mapping entry itself.
+                self.write_deploy_build_artifacts(
+                    self.bound_mapping(**{field: bad}),
+                    library_set_digest=LEGAL_ENTRY_DIGESTS["librarySetDigest"],
+                )
                 result = self.run_deploy_with_releasable_gate()
                 self.assertEqual(
                     result.returncode,
@@ -1398,7 +1703,15 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
                     f"entry with bad {field}={bad!r} was deployed\n"
                     f"stdout={result.stdout}\nstderr={result.stderr}",
                 )
-                self.assertIn("releasable", result.stderr)
+                combined = result.stderr
+                self.assertTrue(
+                    ("releasable" in combined)
+                    or ("librarySetDigest" in combined)
+                    or ("HARD" in combined)
+                    or ("mismatch" in combined),
+                    f"expected integrity fail-closed marker missing for {field}={bad!r}\n"
+                    f"stderr={result.stderr}",
+                )
                 self.assertNotIn("Deployment completed", result.stdout)
 
 
@@ -1427,8 +1740,13 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             "BASE_IMAGE_DIGEST",
             "METHOD_SPEC_INDEX_DIGEST",
             "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
         ):
             env.pop(key, None)
+        # These build-gate tests pin the Spec §12 strict-release path; the
+        # 260814 default (local-image-id) is covered by
+        # DockerBuildLocalImageIdModeTest below.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env["USE_PROXY"] = "0"
         # Minimal PATH: stub docker + system dirs only. This keeps the
         # presence/absence of syft deterministic across machines.
@@ -1785,7 +2103,8 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
     def test_build_wiring_two_phase_order_smoke_inventory_then_bake(self) -> None:
         # R2-1/R2-2 wiring order: phase-1 build (runtime-install) -> smoke
         # gate under BOTH interpreters -> inventory query -> phase-2 bake FROM
-        # the phase-1 immutable ID with the verified librarySetDigest.
+        # a temporary local tag verified against the phase-1 immutable ID,
+        # with the verified librarySetDigest.
         env = self.build_env(AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="true")
         result = self.run_build(env)
         self.assertEqual(
@@ -1801,13 +2120,43 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             any(token.startswith("RUNTIME_BASE_IMAGE_REF=") for token in build_calls[0]),
             f"phase 1 missing RUNTIME_BASE_IMAGE_REF build arg: {build_calls[0]}",
         )
-        self.assertTrue(
-            any(
-                token == f"AF_RUNTIME_INSTALL_IMAGE={FAKE_BUILD_IMAGE_ID}"
-                for token in build_calls[1]
-            ),
-            f"phase 2 must build FROM the phase-1 immutable image ID: {build_calls[1]}",
+        phase1_base_ref = next(
+            token.split("=", 1)[1]
+            for token in build_calls[0]
+            if token.startswith("RUNTIME_BASE_IMAGE_REF=")
         )
+        self.assertIn(
+            f"AF_RUNTIME_INSTALL_IMAGE={phase1_base_ref}",
+            build_calls[0],
+            "BuildKit parses every FROM before honoring --target, so phase 1 "
+            "must override the phase-2 placeholder with a valid reference",
+        )
+        self.assertIn(
+            f"RUNTIME_BASE_IMAGE_REF={phase1_base_ref}",
+            build_calls[1],
+            "BuildKit parses the phase-1 FROM during phase 2, so the second "
+            "build must also carry the real base reference",
+        )
+        tag_calls = self.calls_for("tag")
+        self.assertEqual(len(tag_calls), 1, f"expected one temporary tag: {tag_calls}")
+        self.assertEqual(tag_calls[0][1], FAKE_BUILD_IMAGE_ID)
+        install_stage_ref = tag_calls[0][2]
+        self.assertRegex(
+            install_stage_ref,
+            rf"^alphafrog-runtime-install:{FAKE_BUILD_IMAGE_ID.removeprefix('sha256:')}-[0-9]+$",
+        )
+        self.assertIn(
+            f"AF_RUNTIME_INSTALL_IMAGE={install_stage_ref}",
+            build_calls[1],
+            "phase 2 must build FROM the temporary local tag verified against "
+            f"the phase-1 immutable image ID: {build_calls[1]}",
+        )
+        image_calls = self.calls_for("image")
+        self.assertIn(
+            ["image", "inspect", "--format", "{{.Id}}", install_stage_ref],
+            image_calls,
+        )
+        self.assertIn(["image", "rm", install_stage_ref], image_calls)
         self.assertTrue(
             any(token.startswith("AF_LIBRARY_SET_DIGEST=sha256:") for token in build_calls[1]),
             f"phase 2 missing the verified librarySetDigest label arg: {build_calls[1]}",
@@ -1869,13 +2218,46 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         )
         phase2 = first_index(
             lambda c: c[:1] == ["build"]
-            and any(t.startswith("AF_RUNTIME_INSTALL_IMAGE=") for t in c)
+            and f"AF_RUNTIME_INSTALL_IMAGE={install_stage_ref}" in c
+            and "runtime-install" not in c
         )
+        tag = first_index(lambda c: c[:2] == ["tag", FAKE_BUILD_IMAGE_ID])
+        tag_inspect = first_index(
+            lambda c: c[:4] == ["image", "inspect", "--format", "{{.Id}}"]
+            and install_stage_ref in c
+        )
+        untag = first_index(lambda c: c == ["image", "rm", install_stage_ref])
         self.assertLess(phase1, smoke_system, "smoke must run after phase 1")
         self.assertLess(phase1, smoke_venv, "venv smoke must run after phase 1")
         self.assertLess(smoke_system, inventory, "inventory gate must follow the smoke gate")
         self.assertLess(smoke_venv, inventory, "inventory gate must follow the smoke gate")
-        self.assertLess(inventory, phase2, "the bake must follow the inventory gate")
+        self.assertLess(inventory, tag, "the temporary tag must follow inventory verification")
+        self.assertLess(tag, tag_inspect, "the temporary tag must be inspected before use")
+        self.assertLess(tag_inspect, phase2, "phase 2 must follow exact-ID tag verification")
+        self.assertLess(phase2, untag, "the temporary tag must be removed after phase 2")
+
+    def test_phase2_failure_removes_temporary_bridge_tag(self) -> None:
+        env = self.build_env(
+            AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="true",
+            FAKE_DOCKER_FAIL_RUNTIME_FINAL_BUILD="1",
+        )
+        result = self.run_build(env)
+        self.assertEqual(
+            result.returncode,
+            1,
+            f"phase-2 failure must fail the build\nstdout={result.stdout}\nstderr={result.stderr}",
+        )
+        tag_calls = self.calls_for("tag")
+        self.assertEqual(len(tag_calls), 1, tag_calls)
+        install_stage_ref = tag_calls[0][2]
+        calls = self.docker_calls()
+        failed_build_index = max(i for i, call in enumerate(calls) if call[:1] == ["build"])
+        cleanup_index = next(
+            i for i, call in enumerate(calls) if call == ["image", "rm", install_stage_ref]
+        )
+        self.assertLess(failed_build_index, cleanup_index)
+        self.assertIn("phase-2 runtime image build FAILED", result.stderr)
+        self.assertFalse(MAPPING_FILE.exists())
 
 
 class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
@@ -1916,6 +2298,8 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
         ):
             env.pop(key, None)
         env["AF_SANDBOX_IMAGE"] = image
+        # These deploy-gate tests pin the Spec §12 strict-release path.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env.update(extra_env)
         self.assertTrue(DEPLOY_SCRIPT.is_file(), f"missing: {DEPLOY_SCRIPT}")
         return subprocess.run(
@@ -2015,7 +2399,7 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
         )
         self.assertIn("Deployment completed", result.stdout)
 
-    def test_malformed_phase2_iidfile_fails_closed_before_syft_and_mapping(self) -> None:
+    def test_malformed_iidfile_fails_closed_before_phase_bridge_syft_and_mapping(self) -> None:
         self.write_fake_syft(0)
         env = self.build_env(
             BASE_IMAGE_DIGEST=self.BASE_DIGEST,
@@ -2029,9 +2413,175 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
             f"malformed iidfile ID entered the evidence chain\n"
             f"stdout={result.stdout}\nstderr={result.stderr}",
         )
-        self.assertIn("phase-2 --iidfile image ID", result.stderr)
+        self.assertIn("phase-1 --iidfile image ID", result.stderr)
         self.assertEqual(self.syft_calls(), [])
         self.assertFalse(MAPPING_FILE.exists())
+
+
+class DeployLocalImageIdModeTest(RuntimeImageRetentionTestBase):
+    """260814 scheduler-03: deploy_latest.sh local-image-id mode (the new
+    default). The configured AF_SANDBOX_IMAGE must BE a bare local Image ID
+    (sha256:<64hex>) and docker inspect must resolve to exactly that ID; tags
+    and repo digests are rejected without any dev-allow escape, and the
+    strict-release mapping/Tier2a chain is not required."""
+
+    def run_deploy_local(self, **extra_env: str) -> subprocess.CompletedProcess:
+        env = dict(self.env)
+        for key in (
+            "AF_SANDBOX_IMAGE",
+            "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG",
+            "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
+            "AF_SANDBOX_IMAGE_TAG_CHECK",
+        ):
+            env.pop(key, None)
+        env.update(extra_env)
+        self.assertTrue(DEPLOY_SCRIPT.is_file(), f"missing: {DEPLOY_SCRIPT}")
+        return subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--deploy-only", "python-sandbox-service"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    def test_default_mode_accepts_matching_local_image_id(self) -> None:
+        # IMAGE_CURRENT is served by the fake `docker images` file, so a bare
+        # ID inspect resolves to itself. No verify-mode env -> default
+        # local-image-id. No mapping/iidfile artifacts exist in this fixture,
+        # so acceptance also proves the strict chain is not required.
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=IMAGE_CURRENT)
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("已校验本机 Image ID", result.stdout)
+        self.assertIn(IMAGE_CURRENT, result.stdout)
+
+    def test_explicit_local_mode_matches_same(self) -> None:
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_VERIFY_MODE="local-image-id",
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+    def test_bare_tag_rejected_even_with_dev_switch(self) -> None:
+        # local-image-id IS the single-machine contract; there is no
+        # AF_SANDBOX_IMAGE_ALLOW_DEV_TAG escape in this mode.
+        self.add_alias("alphafrog-sandbox-runtime:latest", IMAGE_CURRENT)
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE="alphafrog-sandbox-runtime:latest",
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("local-image-id 模式要求", result.stderr)
+
+    def test_repo_digest_rejected_in_local_mode(self) -> None:
+        digest = "registry.local/alphafrog/runtime@sha256:" + "a1" * 32
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=digest)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("local-image-id 模式要求", result.stderr)
+
+    def test_missing_image_fails_closed(self) -> None:
+        # Not in the fake images file and no alias -> inspect fails -> refuse.
+        missing_id = "sha256:" + "ff" * 32
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=missing_id)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("docker inspect", result.stderr)
+
+    def test_mismatched_resolution_fails_closed(self) -> None:
+        # Configured ID resolves (via alias) to a DIFFERENT image ID.
+        self.add_alias(IMAGE_CURRENT, IMAGE_OLD_RUNTIME)
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=IMAGE_CURRENT)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("解析到不同镜像", result.stderr)
+
+    def test_tag_check_matching_passes(self) -> None:
+        self.add_alias("alphafrog-sandbox-runtime:latest", IMAGE_CURRENT)
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_TAG_CHECK="alphafrog-sandbox-runtime:latest",
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("标签复核通过", result.stdout)
+
+    def test_tag_check_drift_fails_closed(self) -> None:
+        self.add_alias("alphafrog-sandbox-runtime:latest", IMAGE_OLD_RUNTIME)
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_TAG_CHECK="alphafrog-sandbox-runtime:latest",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("不一致", result.stderr)
+
+    def test_unknown_mode_rejected(self) -> None:
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_VERIFY_MODE="bogus",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("AF_SANDBOX_IMAGE_VERIFY_MODE", result.stderr)
+
+    def test_strict_release_does_not_accept_local_id(self) -> None:
+        # Cross-mode independence: a bare local Image ID is NOT a digest
+        # reference; strict-release must keep rejecting it.
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_VERIFY_MODE="strict-release",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+
+class DockerBuildLocalImageIdModeTest(RuntimeImageRetentionTestBase):
+    """260814 scheduler-03: docker_build.sh in local-image-id mode (default)
+    skips the strict-release inputs (base digest / SBOM / external mapping)
+    but keeps the real gates (smoke + inventory) and prints the final
+    immutable Image ID for deploy config."""
+
+    def build_env_local(self, **overrides: str) -> dict:
+        env = dict(self.env)
+        for key in (
+            "BASE_IMAGE_DIGEST",
+            "METHOD_SPEC_INDEX_DIGEST",
+            "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
+        ):
+            env.pop(key, None)
+        # Default mode (local-image-id) is exercised by NOT setting the mode.
+        env["USE_PROXY"] = "0"
+        env["PATH"] = str(self.stub_dir) + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
+        env["FAKE_DOCKER_BUILD_IMAGE_ID"] = FAKE_BUILD_IMAGE_ID
+        env["METHOD_SPEC_CANONICAL_DIR"] = str(CANONICAL_FIXTURES_DIR)
+        env.update(overrides)
+        return env
+
+    def run_build_local(self, env: dict) -> subprocess.CompletedProcess:
+        self.assertTrue(DOCKER_BUILD_SCRIPT.is_file(), f"missing: {DOCKER_BUILD_SCRIPT}")
+        return subprocess.run(
+            ["bash", str(DOCKER_BUILD_SCRIPT), "runtime"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    def test_local_mode_skips_release_inputs_and_prints_image_id(self) -> None:
+        # No BASE_IMAGE_DIGEST, no syft -> strict-release would fail closed;
+        # local-image-id (default) must succeed and print the frozen ID.
+        env = self.build_env_local()
+        result = self.run_build_local(env)
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("verified local Image ID: " + FAKE_BUILD_IMAGE_ID, result.stdout)
+        self.assertIn("AF_SANDBOX_IMAGE=" + FAKE_BUILD_IMAGE_ID, result.stdout)
+        self.assertIn("local-image-id mode: building FROM local base tag", result.stdout)
+        self.assertNotIn("placeholder base digest + explicit dev switch", result.stderr)
+        # The strict-release evidence mapping is not written in local mode.
+        self.assertFalse(MAPPING_FILE.exists())
+
+    def test_unknown_mode_fails_closed(self) -> None:
+        env = self.build_env_local(AF_SANDBOX_IMAGE_VERIFY_MODE="bogus")
+        result = self.run_build_local(env)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("AF_SANDBOX_IMAGE_VERIFY_MODE", result.stderr)
 
 
 if __name__ == "__main__":

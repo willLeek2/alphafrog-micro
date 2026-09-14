@@ -27,16 +27,10 @@ import java.util.stream.Collectors;
  * Phase 1 manifest 写侧。
  * 输入一批 atomic member，输出稳定 manifestId 并落盘 {@code {manifestId}.manifest.json} + .meta.json。
  * 哈希输入按 tsCode 排序，避免同一组资产只因输入顺序不同产生多个 manifest。
- *
- * 复用与 atomic 共用的 {@code agent.tools.market-data.dataset.path} 配置；不打散到独立根目录，
- * 方便 sandbox / workspace 在 dataset.path 下做统一扫描和回收。
  */
 @Component
 @Slf4j
 public class ManifestWriter {
-
-    @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
-    private String datasetPath;
 
     @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
     private String manifestsPath;

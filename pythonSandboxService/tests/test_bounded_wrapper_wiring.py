@@ -55,6 +55,19 @@ llm_sandbox_exceptions.SandboxTimeoutError = TimeoutError
 sys.modules.setdefault("llm_sandbox", llm_sandbox)
 sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 
+# D15 release-binding (codex a1b749ad) made AF_SANDBOX_IMAGE required at
+# config load (no implicit default, no silent 'latest' fallback). Set a
+# valid digest reference before any app.main import; same pattern as
+# test_main_d14_operation_id_gate.
+os.environ.setdefault(
+    "AF_SANDBOX_IMAGE",
+    "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
+)
+# The registry-form digest above only validates under strict-release; in a
+# full discovery run test_cancel_endpoint's module import sets this first,
+# but a standalone run of THIS file needs it too (default is local-image-id).
+os.environ.setdefault("AF_SANDBOX_IMAGE_VERIFY_MODE", "strict-release")
+
 _SERVICE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SERVICE_ROOT not in sys.path:
     sys.path.insert(0, _SERVICE_ROOT)
@@ -77,9 +90,15 @@ from app.config import SandboxConfig  # noqa: E402
 from app.models import BoundedExecRequest, EffectiveOutputLimits  # noqa: E402
 from app.output_capture import MARKER_V1_PREFIX, record_batch_digest  # noqa: E402
 from app.sandbox_runner import (  # noqa: E402
+    _create_task_control_dir,
+    _exec_checked_argv,
+    _exec_checked_script,
+    _log_in_container,
     _read_capture_from_container,
+    _read_runtime_size,
     _resolve_wrapper_interpreter,
     _run_bounded_wrapper_path,
+    _sh_script,
     _stage_bounded_wrapper,
     run_in_open_session,
     validate_effective_output_limits,
@@ -126,6 +145,37 @@ def _test_config(root: Path, *, skip_environment_setup: bool) -> SandboxConfig:
     )
 
 
+class HostArchiveContainer:
+    """Host-backed stand-in for the docker container's archive API.
+
+    ``put_archive(dest_dir, tar_bytes)`` extracts each tar member into the
+    literal host directory (fakes use host paths as container paths) and
+    records ``(dest_dir, name, uid, gid, mode, size)`` per entry so tests
+    can assert the non-root ownership contract of app.container_copy.
+    """
+
+    def __init__(self) -> None:
+        self.archive_entries: list = []
+
+    def put_archive(self, dest_dir: str, data: bytes) -> None:
+        import io as _io
+        import tarfile as _tarfile
+
+        entries = []
+        with _tarfile.open(fileobj=_io.BytesIO(data)) as tar:
+            for member in tar.getmembers():
+                entries.append(
+                    (dest_dir, member.name, member.uid, member.gid,
+                     member.mode, member.size)
+                )
+                # Host extraction runs as the dev uid; keep the recorded
+                # uid/gid as the assertion evidence and extract the bytes.
+                member.uid, member.gid = os.getuid(), os.getgid()
+                member.uname = member.gname = ""
+                tar.extract(member, dest_dir)
+        self.archive_entries.extend(entries)
+
+
 class FakeContainerSession:
     """Host-backed stand-in for llm_sandbox.SandboxSession.
 
@@ -152,6 +202,11 @@ class FakeContainerSession:
         self.python_executable_path = (
             f"{self.root}/sandbox/.sandbox-venv/bin/python"
         )
+        # Non-root copy path (grace review): a host-backed stand-in for the
+        # docker container object — put_archive extracts the staged tar into
+        # the literal host dir and RECORDS each entry's uid/gid/mode so tests
+        # can assert the ownership contract of app.container_copy.
+        self.container = HostArchiveContainer()
         if not skip_environment_setup:
             venv_python = Path(self.python_executable_path)
             venv_python.parent.mkdir(parents=True, exist_ok=True)
@@ -165,22 +220,61 @@ class FakeContainerSession:
         path.chmod(0o755)
 
     def copy_to_runtime(self, source: str, dest_path: str) -> None:
-        dest = Path(dest_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, dest)
+        # Non-root contract (grace review): production staging must use the
+        # put_archive path exclusively; reaching the llm-sandbox copy API
+        # here means a regression back to its root-chown copy path.
+        raise AssertionError(
+            "session.copy_to_runtime must never be called: staging goes "
+            "through app.container_copy (no-root contract)"
+        )
 
     def execute_command(self, command: str, workdir=None):
         self.executed_commands.append(command)
+        # 260818 (stress batch 20260818-152331): mirror the REAL execution
+        # semantics — llm-sandbox hands the string to docker exec_run and
+        # docker-py shlex.splits it into argv with NO shell.  The previous
+        # host-shell fake (subprocess shell=True) happily interpreted `&&`
+        # and masked the D11 mkdir-chaining bug for 8 days.
+        #
+        # 260818 grace round-3: the audit is STRUCTURAL, not a character
+        # blacklist (blacklists keep missing shell syntax and reject
+        # legitimate literal args like a quoted `*.csv`).  Production now
+        # goes through the structured helpers, so the only invariant left
+        # to police here is the shell-script form: a `sh -lc`/`sh -c`
+        # command must be EXACTLY three tokens (the one quoted script).
+        # Everything else is plain argv semantics and executes without a
+        # shell — a confused command (e.g. argv[0]="cd") then fails
+        # LOUDLY (exit 127), exactly like docker, instead of silently
+        # doing the wrong thing.
+        import shlex as _shlex
+
+        tokens = _shlex.split(command)
+        if (
+            len(tokens) >= 2
+            and tokens[0] == "sh"
+            and tokens[1] in ("-lc", "-c")
+            and len(tokens) != 3
+        ):
+            raise AssertionError(
+                f"`sh {tokens[1]}` command must carry the WHOLE script as "
+                f"ONE quoted argument (got {len(tokens)} tokens): "
+                f"{command!r} — production must use _exec_checked_script"
+            )
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
-        completed = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=90,
-        )
+        try:
+            completed = subprocess.run(
+                tokens,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=90,
+            )
+        except FileNotFoundError:
+            # docker returns 126/127 for a missing program; mirror that so
+            # shell-builtins ("cd") and env-prefix argv ("FOO=bar cmd")
+            # surface as loud exec failures, not host exceptions.
+            return SimpleNamespace(exit_code=127, stdout="", stderr="")
         return SimpleNamespace(
             exit_code=completed.returncode,
             stdout=completed.stdout,
@@ -252,8 +346,18 @@ class WrapperPathFunctionalTest(unittest.TestCase):
         # child's os.getcwd() reports the real path.
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11 (task #108): the host-backed fake session cannot create /run
+        # (read-only host root).  Point the task control root at a writable
+        # dir under this test's root; runner and wrapper read the SAME env
+        # (AF_TASK_CONTROL_ROOT), and the wrapper subprocess inherits it.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _run(self, code, *, limits=None, timeout_seconds=30, task_id="task-wire"):
@@ -401,6 +505,17 @@ class WrapperStagingTest(unittest.TestCase):
             runtimeEnvironmentPath=(
                 f"{self.config.workdir.rstrip('/')}/runtime-environment.json"
             ),
+            # D15 §4.2 (Scenario B): the four AF_TASK_* env vars now travel
+            # in the task-local wrapper-input.json instead of the shared
+            # global sitecustomize.py.
+            taskWorkspace=self.task_workspace,
+            taskEnvironment={
+                "AF_TASK_WORKSPACE": self.task_workspace,
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_workspace}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_workspace}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_workspace}/metrics/loader_metrics.jsonl",
+            },
+            loaderPythonPath=self.config.workdir.rstrip("/"),
         ).wrapper_input_payload()
         self.assertEqual(staged, expected)
         # sourceRevision is Task metadata, never part of the wrapper input.
@@ -442,6 +557,92 @@ class WrapperStagingTest(unittest.TestCase):
         os.unlink(self.session.python_executable_path)
         with self.assertRaises(RuntimeError):
             _resolve_wrapper_interpreter(self.session, self.config, "t")
+
+    def test_staged_wrapper_package_imports_cleanly_without_repo_source(self):
+        """D15-B round-5 (codex cc97f2e6 MUST-FIX): prove the staged wrapper
+        package is SELF-CONTAINED — actually IMPORT ``app.bounded_exec_wrapper``
+        from the staged pkg with NO repo source on sys.path.
+
+        Pre-round-5 regression: the round-4 commit added a new
+        ``app.payload_contract`` module that ``bounded_exec_wrapper.py``
+        imports at startup, but did not add it to
+        ``sandbox_runner.WRAPPER_MODULE_FILES``. The production staging
+        loop (sandbox_runner.py ``_stage_bounded_wrapper``) iterates that
+        list to decide which files to copy into the task-local
+        ``bounded-wrapper/app/`` dir, so ``payload_contract.py`` was NOT
+        staged. At child startup ``run_wrapper.py`` would have failed
+        with ``ModuleNotFoundError: app.payload_contract``.
+
+        The existing wiring check at lines 424-427
+        (``for name in WRAPPER_MODULE_FILES: assertTrue(pkg_dir/name)``)
+        did NOT catch this — it walks the SAME incomplete list production
+        uses to stage, so a file missing from the list is also missing
+        from the assertion set. The bug was a self-consistent check
+        masking an incomplete manifest.
+
+        The positive test below simulates production end-to-end:
+          1. Stage the wrapper via the real ``_stage_bounded_wrapper``.
+          2. Subprocess a python that adds the staged pkg dir to
+             sys.path[0] and imports ``app.bounded_exec_wrapper``.
+          3. Assert the import succeeds AND ``app.__file__`` resolves
+             inside the staged pkg (so a stray ``app`` package in
+             site-packages cannot give a false positive).
+
+        If a future change adds a new transitive dep to
+        ``bounded_exec_wrapper.py`` without updating
+        ``WRAPPER_MODULE_FILES``, this test fails immediately at the
+        import line.
+        """
+        # Stage the wrapper via the production code path.
+        _stage_bounded_wrapper(
+            self.session,
+            self.config,
+            "task-import-probe",
+            self.task_workspace,
+            "print('hi')",
+            30.0,
+            dict(_LIMITS),
+        )
+        staged_pkg_root = Path(self.task_workspace, "bounded-wrapper")
+
+        # Build a minimal clean env: drop inherited PYTHONPATH/PYTHONHOME
+        # so the test runner's own cwd (the repo source, where the full
+        # app/ package lives) cannot leak into the subprocess. -E below
+        # also ignores them, but belt-and-suspenders.
+        clean_env = {
+            "PATH": os.environ.get("PATH", ""),
+        }
+        # -E: ignore PYTHON* env vars; -c: run code string. The code
+        # explicitly adds the staged pkg to sys.path[0] (mirroring what
+        # production's run_wrapper.py does), then imports
+        # bounded_exec_wrapper + payload_contract + asserts the loaded
+        # `app` package came from the staged pkg, not site-packages.
+        result = subprocess.run(
+            [sys.executable, "-E", "-c",
+             "import sys; "
+             f"sys.path.insert(0, {str(staged_pkg_root)!r}); "
+             "import app; "
+             f"assert app.__file__ is not None and app.__file__.startswith("
+             f"{str(staged_pkg_root)!r}), "
+             f"'app loaded from wrong location: ' + (app.__file__ or 'None'); "
+             "import app.bounded_exec_wrapper; "
+             "from app import payload_contract; "
+             "print('imports OK from staged pkg')"],
+            cwd=str(staged_pkg_root.parent),
+            env=clean_env,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"staged wrapper package is NOT self-contained — a transitive "
+            f"import failed. This means WRAPPER_MODULE_FILES in "
+            f"sandbox_runner.py is missing a module that "
+            f"bounded_exec_wrapper.py imports at startup. In production "
+            f"(task-local staging) the wrapper would fail with the same "
+            f"ModuleNotFoundError at child startup. "
+            f"stderr={result.stderr.decode('utf-8', 'replace')[:2048]!r}",
+        )
 
 
 class CaptureReadbackTest(unittest.TestCase):
@@ -497,6 +698,8 @@ class CaptureReadbackTest(unittest.TestCase):
             "unknownMarkerLines": 0,
             "unknownMarkerBytes": 0,
             "unknownMarkerTruncated": False,
+            # D11: the 14th frozen key — a consistent capture carries it.
+            "cancelObserved": False,
         }
         document = json.dumps(
             {
@@ -573,24 +776,24 @@ class CaptureReaderModuleTest(unittest.TestCase):
         # pins the import to module-load time (no lazy post-exit import).
         import app.bounded_exec_wrapper as wrapper_module
         import app.capture_reader as reader_module
-        import app.child_identity as child_identity_module
 
         self.assertIs(wrapper_module.capture_reader, reader_module)
         self.assertTrue(callable(wrapper_module.capture_reader.read_capture_files))
-        # The production fd-pinned entry point AND the child-identity parser
-        # (P0-4) are top-level bindings too — held as function objects from
-        # module-load time, never re-imported after the child exits.
+        # The production fd-pinned entry point is a top-level binding too —
+        # held as a function object from module-load time, never re-imported
+        # after the child exits.
         self.assertTrue(
             callable(wrapper_module.capture_reader.read_capture_files_from_fds)
-        )
-        self.assertIs(
-            wrapper_module.parse_child_spec, child_identity_module.parse_child_spec
         )
 
 
 # --- spawn-time wiring facts (b3b28d1f item 2) ----------------------------
-# The capture files are pre-opened BEFORE the spawn (fd-pinned readback) and
-# must stay root-only: dir 0700 / files 0600.  The child may inherit ONLY
+# The capture files are pre-opened BEFORE the spawn (fd-pinned readback)
+# with dir 0700 / files 0600.  Same-uid note (260818): the child shares the
+# wrapper's uid, so the 0700/0600 bits are hygiene, NOT a boundary — the
+# real protections are fd-pinning (defeats path replacement) plus the
+# host-side byte-length/digest consistency checks (turn same-inode
+# tampering into a fail-closed task error).  The child may inherit ONLY
 # the capture pipes (stdin/stdout/stderr) — never the capture file fds
 # (no pass_fds leak).
 
@@ -620,14 +823,27 @@ class CaptureSpawnWiringTest(unittest.TestCase):
             timeout_seconds=30,
             limits=self._limits(),
             capture_dir=capture_dir,
-            child_identity=None,
+            # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+            # task_workspace + loader path. These wiring tests target
+            # capture-dir/pipe inheritance, not task isolation, but the
+            # spawn path now hard-requires them.
+            task_workspace=str(self.task_dir),
+            task_environment={
+                "AF_TASK_WORKSPACE": str(self.task_dir),
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+            },
+            workdir_for_pythonpath=str(self.task_dir),
         )
         try:
             self.assertTrue(sweep_ok)
             self.assertEqual(
                 stat.S_IMODE(capture_dir.stat().st_mode),
                 0o700,
-                "capture dir must be owner-only so the child cannot enter",
+                "capture dir must stay 0700 (hygiene; same-uid child is not "
+                "blocked by it — fd-pinning + consistency checks are the "
+                "boundary)",
             )
             for name, handle in capture_files.items():
                 mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
@@ -642,10 +858,13 @@ class CaptureSpawnWiringTest(unittest.TestCase):
 
         class RecordingPopen:
             def __init__(self, *args, **kwargs):
-                # Record ONLY the user-child spawn — it is the only Popen
-                # that carries preexec_fn (the sweep's lsof utility helper
-                # also calls Popen and must not overwrite the evidence).
-                if "preexec_fn" in kwargs:
+                # Record ONLY the user-child spawn: its argv runs the loader
+                # bootstrap (the sweep's lsof utility helper also calls
+                # Popen and must not overwrite the evidence).
+                argv = args[0] if args else kwargs.get("args")
+                if argv and any(
+                    "loader_bootstrap.py" in str(part) for part in argv
+                ):
                     captured_kwargs.update(kwargs)
                 self._proc = real_popen(*args, **kwargs)
 
@@ -659,7 +878,16 @@ class CaptureSpawnWiringTest(unittest.TestCase):
                 timeout_seconds=30,
                 limits=self._limits(),
                 capture_dir=capture_dir,
-                child_identity=None,
+                    # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+                # task_workspace + loader path; see the sibling test above.
+                task_workspace=str(self.task_dir),
+                task_environment={
+                    "AF_TASK_WORKSPACE": str(self.task_dir),
+                    "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                    "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                    "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+                },
+                workdir_for_pythonpath=str(self.task_dir),
             )
         try:
             self.assertTrue(sweep_ok)
@@ -677,6 +905,225 @@ class CaptureSpawnWiringTest(unittest.TestCase):
         finally:
             for handle in capture_files.values():
                 handle.close()
+
+
+class ExecCommandOperatorDisciplineTest(unittest.TestCase):
+    """260818 (stress batch 20260818-152331 + grace rounds): the container
+    exec path has NO shell — docker-py shlex.splits the command string
+    into argv, so the D11 ``mkdir -p X && chmod ...`` chain ran mkdir with
+    literal ``&&`` arguments and every task failed.  The discipline is now
+    STRUCTURAL (grace round-3: a character blacklist can never prove a
+    command shell-free):
+
+    * no-shell commands go through ``_exec_checked_argv`` as argv LISTS —
+      ``shlex.join`` quoting round-trips through docker's shlex.split
+      EXACTLY, so ``*``/``$``/``;`` inside a list element are unambiguous
+      plain arguments, and confused commands (``cd``, an env-prefix
+      element) fail LOUDLY (exit 127) instead of silently misbehaving;
+    * shell commands go through ``_exec_checked_script`` with ONE
+      complete script — the only place ``sh -lc`` is constructed;
+    * the wiring fake executes argv without a shell and rejects loose
+      ``sh -lc`` strings outright.
+    """
+
+    def setUp(self):
+        import shlex as _shlex
+
+        self._shlex = _shlex
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-opdisc-")
+        self.root = Path(self._tmp.name)
+
+        class RecordingSession:
+            def __init__(self):
+                self.commands = []
+
+            def execute_command(self, command, workdir=None):
+                self.commands.append(command)
+                return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+        self.session = RecordingSession()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_control_dir_is_three_argv_commands(self):
+        control_root = str(self.root / "ctl")
+        control_dir = f"{control_root}/task-opdisc"
+        expected_argv = [
+            ["mkdir", "-p", control_dir],
+            ["chmod", "0700", control_root],
+            ["chmod", "0700", control_dir],
+        ]
+        with mock.patch.dict(
+            os.environ, {"AF_TASK_CONTROL_ROOT": control_root}
+        ):
+            marker = _create_task_control_dir(self.session, "task-opdisc")
+        self.assertEqual(
+            self.session.commands,
+            [self._shlex.join(argv) for argv in expected_argv],
+            "control-dir creation must be THREE separate argv commands "
+            "(the old `mkdir && chmod && chmod` string is fatal without a "
+            "shell — see class docstring)",
+        )
+        # docker-side round-trip: every command parses back to exactly the
+        # intended argv — no shell semantics anywhere.
+        for command, argv in zip(self.session.commands, expected_argv):
+            self.assertEqual(self._shlex.split(command), argv)
+        self.assertTrue(marker.endswith("/task-opdisc/cancel"), marker)
+
+    def test_argv_carries_literal_globs_safely(self):
+        # A quoted `*.csv` inside an argv element is a PLAIN argument for
+        # find's own matching — grace's counterexample to the character
+        # blacklist, which rejected exactly this legitimate pattern.
+        _exec_checked_argv(
+            self.session, ["find", "/x", "-name", "*.csv"]
+        )
+        (command,) = self.session.commands
+        self.assertEqual(
+            self._shlex.split(command),
+            ["find", "/x", "-name", "*.csv"],
+            "shlex.join→docker-shlex.split must round-trip the argv "
+            "EXACTLY, keeping the glob a literal argument",
+        )
+
+    def test_argv_entry_type_contract(self):
+        # grace round-4: the container type is checked FIRST — a raw
+        # command STRING is iterable and would otherwise be silently
+        # exploded into one argument per character by shlex.join.
+        for bad in ("echo", ("mkdir", "-p", "/x"), b"echo", {"cmd": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "list of str"):
+                    _exec_checked_argv(self.session, bad)
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            _exec_checked_argv(self.session, [])
+        with self.assertRaisesRegex(ValueError, "list of str"):
+            _exec_checked_argv(self.session, ["mkdir", "-p", 42])
+        # Nothing reached the container on any rejected input.
+        self.assertEqual(self.session.commands, [])
+        # A valid list still round-trips completely.
+        _exec_checked_argv(self.session, ["echo", "a b", "c*d"])
+        (command,) = self.session.commands
+        self.assertEqual(
+            self._shlex.split(command), ["echo", "a b", "c*d"]
+        )
+
+    def test_env_prefix_and_cd_fail_loudly(self):
+        # Structured argv makes shell-only constructs impossible to
+        # disguise: an env-prefix element becomes argv[0]="AF_MODE=test"
+        # and `cd` has no binary — both fail as loud exec errors, never
+        # as silent misbehavior.
+        class NoShellSession:
+            def __init__(self):
+                self.commands = []
+
+            def execute_command(self, command, workdir=None):
+                import shlex as _shlex
+                import subprocess as _subprocess
+
+                self.commands.append(command)
+                try:
+                    completed = _subprocess.run(
+                        self._shlex_split(command),
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    return SimpleNamespace(
+                        exit_code=completed.returncode,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                    )
+                except FileNotFoundError:
+                    return SimpleNamespace(
+                        exit_code=127, stdout="", stderr="not found"
+                    )
+
+            @staticmethod
+            def _shlex_split(command):
+                import shlex as _shlex
+
+                return _shlex.split(command)
+
+        session = NoShellSession()
+        for argv in (
+            ["cd", "/sandbox"],
+            ["AF_MODE=test", "python", "-V"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Command failed"):
+                    _exec_checked_argv(session, argv)
+
+    def test_script_helper_is_the_only_sh_form(self):
+        script = "set -e\ncd /work\npython run.py input\n"
+        _exec_checked_script(self.session, script)
+        (command,) = self.session.commands
+        self.assertEqual(
+            self._shlex.split(command), ["sh", "-lc", script],
+            "_sh_script must serialize to EXACTLY ['sh', '-lc', <script>]",
+        )
+        # The helper is also usable for command STRINGS that need shell
+        # features (pipelines, appends) — always as one quoted script.
+        self.assertEqual(
+            self._shlex.split(_sh_script("echo hi >> /tmp/x")),
+            ["sh", "-lc", "echo hi >> /tmp/x"],
+        )
+
+    def test_wiring_fake_rejects_loose_sh_lc(self):
+        # The end-to-end fake polices the same invariant: a `sh -lc`
+        # command with more than three tokens is a hand-written string,
+        # not a helper product.
+        session = FakeContainerSession(
+            self.root, skip_environment_setup=True
+        )
+        with self.assertRaises(AssertionError):
+            session.execute_command("sh -lc echo hi")
+        # The strict three-token form executes through the inner shell.
+        output = session.execute_command(_sh_script("printf hello"))
+        self.assertEqual(output.exit_code, 0)
+        self.assertEqual(output.stdout, "hello")
+
+    def test_log_in_container_wraps_append_in_sh_lc(self):
+        from app.config import SandboxConfig  # local import keeps diff small
+
+        config = SandboxConfig(
+            data_dir=self.root / "data",
+            max_concurrency=1,
+            execution_timeout_seconds=5.0,
+            memory_limit="512m",
+            memswap_limit="512m",
+            docker_backend="docker",
+            workdir="/sandbox",
+            log_level="INFO",
+            sandbox_image="alphafrog-sandbox-runtime:latest",
+            skip_environment_setup=True,
+            preinstalled_libraries=frozenset(),
+            container_max_concurrency=1,
+            pool_enabled=False,
+            pool_min_size=0,
+            pool_max_size=1,
+            pool_acquire_timeout_seconds=30.0,
+            pool_idle_timeout_seconds=None,
+            pool_max_container_uses=None,
+            workspace_root=str(self.root / "runs"),
+            compat_input_path_enabled=True,
+        )
+        _log_in_container(self.session, "task-opdisc", config, "script_error error=X")
+        (command,) = self.session.commands
+        self.assertTrue(
+            command.startswith("sh -lc "),
+            f"the echo>> append must run inside sh -lc: {command!r}",
+        )
+        # Top-level tokens are exactly ["sh", "-lc", "<script>"] — the
+        # append operator lives INSIDE the quoted script.
+        self.assertEqual(len(self._shlex.split(command)), 3)
+        self.assertIn(">>", self._shlex.split(command)[2])
+
+    def test_read_runtime_size_wraps_pipeline_in_sh_lc(self):
+        self.session.commands.clear()
+        _read_runtime_size(self.session, str(self.root))
+        (command,) = self.session.commands
+        self.assertTrue(
+            command.startswith("sh -lc "), command
+        )
+        self.assertEqual(len(self._shlex.split(command)), 3)
 
 
 class SubreaperHardGateTest(unittest.TestCase):
@@ -709,8 +1156,8 @@ class SubreaperHardGateTest(unittest.TestCase):
         return {key: _LIMITS[key] for key in _LIMIT_KEYS}
 
     def _assert_gate_closed(self, capture_dir):
-        # The child never ran, and with an active identity a failed spawn
-        # leaves NO summary: the pre-opened summary file stays empty.
+        # The child never ran, and a failed spawn leaves NO summary: the
+        # pre-opened summary file stays empty (no child, no summary).
         self.assertFalse(
             self.marker.exists(), "the child must never be spawned"
         )
@@ -741,7 +1188,6 @@ class SubreaperHardGateTest(unittest.TestCase):
                     timeout_seconds=30,
                     limits=self._limits(),
                     capture_dir=capture_dir,
-                    child_identity=(1000, 10001),
                 )
         self._assert_gate_closed(capture_dir)
 
@@ -755,7 +1201,6 @@ class SubreaperHardGateTest(unittest.TestCase):
                     timeout_seconds=30,
                     limits=self._limits(),
                     capture_dir=capture_dir,
-                    child_identity=(1000, 10001),
                 )
         self._assert_gate_closed(capture_dir)
 
@@ -1000,8 +1445,15 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="af-tamper-test-")
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11: host fake session cannot create /run — see WrapperPathFunctionalTest.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _run(self, code, *, task_id="task-tamper", session_cls=None):
@@ -1119,6 +1571,23 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         self.assertNotIn(
             "finance-records-unknown-marker.jsonl", document["files"]
         )
+
+    def test_same_inode_append_fails_closed(self):
+        """Same-uid limit (260818 review, grace): fd pinning defeats path
+        REPLACEMENT, but the child shares the wrapper's uid and can open the
+        very same inode.  An in-place append makes the file longer than the
+        summary's ordinaryStdoutBytes, and the host-side consistency checks
+        must converge that into a fail-closed task error — never into a
+        task that reports tampered content as its stdout."""
+        code = (
+            "import os\n"
+            "with open(os.path.join('capture', 'stdout.bin'), 'ab') as fh:\n"
+            "    fh.write(b'EVIL-SAME-INODE-APPEND' * 100)\n"
+            "print('ordinary-line')\n"
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            self._run(code, session_cls=RecordingFakeContainerSession)
+        self.assertIn("task=task-tamper", str(raised.exception))
 
     def test_renamed_capture_dir_leaves_fd_pinned_readback_unaffected(self):
         """fd-pinning immunity: the child renames the ENTIRE capture
@@ -1251,6 +1720,17 @@ class CaptureTamperingWiringTest(unittest.TestCase):
                     "effectiveOutputLimits": {
                         key: self._TAMPER_LIMITS[key] for key in _LIMIT_KEYS
                     },
+                    # D15 §4.2 (Scenario B): taskWorkspace/taskEnvironment are
+                    # required by parse_wrapper_input, so supply valid ones
+                    # so the planted-symlink path is what trips the wrapper.
+                    "taskWorkspace": str(input_dir),
+                    "taskEnvironment": {
+                        "AF_TASK_WORKSPACE": str(input_dir),
+                        "AF_TASK_ARTIFACT_DIR": f"{input_dir}/artifacts",
+                        "AF_TASK_TMP_DIR": f"{input_dir}/tmp",
+                        "AF_TASK_METRICS_PATH": f"{input_dir}/metrics/x.jsonl",
+                    },
+                    "loaderPythonPath": str(input_dir),
                 }
             ),
             encoding="utf-8",
@@ -1316,6 +1796,17 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                 main_module.tasks,
                 main_module.dynamic_config,
             )
+            # D14 (task #112) made operation_id required at production. This
+            # pre-D14 test pins snapshot/store semantics, not operationId gate
+            # behavior, so toggle the in-memory config flag (read from
+            # main_module.config at create_task time, not at module import).
+            # config is a frozen dataclass so use object.__setattr__.
+            saved_allow_legacy = main_module.config.allow_create_without_operation_id
+            object.__setattr__(
+                main_module.config,
+                "allow_create_without_operation_id",
+                True,
+            )
             main_module.task_store = store
             main_module.tasks = store.tasks
             main_module.dynamic_config = dynamic
@@ -1363,12 +1854,12 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                     frozen_stdout,
                 )
 
-                # state.json round-trip: §7.1 bumped the store format to
-                # sandbox_task_store_v2 (v1 stays readable); reload restores
+                # state.json round-trip: D11 bumped the store format to
+                # sandbox_task_store_v3 (v1/v2 stay readable); reload restores
                 # the frozen snapshots and image refs.
                 document = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(
-                    document["schema_version"], "sandbox_task_store_v2"
+                    document["schema_version"], "sandbox_task_store_v3"
                 )
                 reloaded = main_module.DurableTaskStore(state_path)
                 self.assertEqual(
@@ -1384,6 +1875,11 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                     main_module.config.sandbox_image,
                 )
             finally:
+                object.__setattr__(
+                    main_module.config,
+                    "allow_create_without_operation_id",
+                    saved_allow_legacy,
+                )
                 (
                     main_module.task_store,
                     main_module.tasks,
@@ -1483,23 +1979,24 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                 ) = saved
 
 
-class TaskStoreSchemaV2Test(unittest.TestCase):
-    """§7.1: state.json upgraded to sandbox_task_store_v2, v1 readable."""
+class TaskStoreSchemaV3Test(unittest.TestCase):
+    """D11 (task #108): state.json upgraded to sandbox_task_store_v3
+    (cancel_requests binding map added); v1/v2 stay readable."""
 
     def _task(self):
         import app.main as main_module
 
         return main_module.Task(
-            task_id="task-v2",
+            task_id="task-v3",
             status=main_module.TaskStatus.QUEUED,
             request=main_module.ExecuteRequest(dataset_id="ds1", code="print(1)"),
         )
 
-    def test_writes_v2_reads_v1_rejects_unknown(self):
+    def test_writes_v3_reads_v1_rejects_unknown(self):
         import app.main as main_module
 
-        with tempfile.TemporaryDirectory(prefix="af-store-v2-") as tmp:
-            # Current writes are v2 and carry the frozen §7.2 fields.
+        with tempfile.TemporaryDirectory(prefix="af-store-v3-") as tmp:
+            # Current writes are v3 and carry the frozen §7.2 fields.
             state_path = Path(tmp) / "state.json"
             store = main_module.DurableTaskStore(state_path)
             task = self._task()
@@ -1515,16 +2012,17 @@ class TaskStoreSchemaV2Test(unittest.TestCase):
             )
             store.create(task)
             document = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(document["schema_version"], "sandbox_task_store_v2")
+            self.assertEqual(document["schema_version"], "sandbox_task_store_v3")
             self.assertEqual(
                 main_module.DurableTaskStore(state_path)
-                .get("task-v2")
+                .get("task-v3")
                 .effective_output_limits,
                 task.effective_output_limits,
             )
 
             # Legacy v1 documents (no frozen fields) still load.
             v1_payload = self._task().model_dump(mode="json")
+            v1_payload["task_id"] = "task-v1"
             v1_path = Path(tmp) / "state-v1.json"
             v1_path.write_text(
                 json.dumps(
@@ -1540,12 +2038,13 @@ class TaskStoreSchemaV2Test(unittest.TestCase):
             self.assertIsNone(legacy_task.effective_output_limits)
             self.assertIsNone(legacy_task.runtime_image_ref)
 
-            # Unknown versions fail closed (never silently migrate).
+            # Unknown versions fail closed (never silently migrate).  D11
+            # bumped the known versions to v1/v2/v3, so v4 is the unknown one.
             bad_path = Path(tmp) / "state-bad.json"
             bad_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": "sandbox_task_store_v3",
+                        "schema_version": "sandbox_task_store_v4",
                         "tasks": {},
                         "operations": {},
                     }
@@ -1570,8 +2069,15 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="af-ptask-test-")
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11: host fake session cannot create /run — see WrapperPathFunctionalTest.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _harness(self, session_cls):
@@ -1674,6 +2180,8 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
             "unknownMarkerLines": 0,
             "unknownMarkerBytes": 0,
             "unknownMarkerTruncated": False,
+            # D11: the 14th frozen key — a consistent capture carries it.
+            "cancelObserved": False,
         }
         tampered_document = json.dumps(
             {
@@ -1718,7 +2226,7 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task.error, task.result.stderr)
 
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v2")
+            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v3")
             saved_result = persisted["tasks"]["task-ptask-bad"]["result"]
             self.assertEqual(saved_result["stdout"], "")
             self.assertEqual(saved_result["stderr"], task.error)
@@ -1737,7 +2245,7 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(task.status, main_module.TaskStatus.SUCCEEDED)
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v2")
+            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v3")
             saved_task = persisted["tasks"]["task-ptask-ok"]
             saved_result = saved_task["result"]
             # The persisted stdout is EXACTLY the bounded §4.2 reassembly and
@@ -1856,8 +2364,15 @@ class SecurityFloorWiringTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="af-wiring-floor-")
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11: host fake session cannot create /run — see WrapperPathFunctionalTest.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _run_bounded(self, session, task_id, code, root=None):

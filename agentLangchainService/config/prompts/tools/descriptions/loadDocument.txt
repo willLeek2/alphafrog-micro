@@ -1,0 +1,4 @@
+根据 OSS URL 获取文档原文窗口。P0 起本工具按 loadDocumentSection 语义工作：
+短文档直接返回全文；长文档只返回 preview，并通过 data.rawRef + data.read_hints
+让你用 rereadToolResult 按 keyword 或 offset/limit 继续读取。
+注意：rawRef 只能传给 rereadToolResult，不能作为最终答案 citation。

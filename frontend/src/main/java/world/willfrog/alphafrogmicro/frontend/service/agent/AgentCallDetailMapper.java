@@ -109,6 +109,9 @@ public final class AgentCallDetailMapper {
             if (includeThinking) {
                 Map<String, Object> blob = parseDetailBlob(detailBlobJson.get());
                 reasoningContent = extractReasoningContent(blob);
+                reasoningContent = AgentExternalObservabilityMapper.safePreview(
+                        reasoningContent,
+                        Integer.MAX_VALUE);
                 if (reasoningContent == null) {
                     // blob 存在但没有 reasoningText（典型场景：非 thinking 模型没存该字段）
                     reasoningUnavailable = Boolean.TRUE;
@@ -199,7 +202,8 @@ public final class AgentCallDetailMapper {
 
         PreviewResult summaryPreview = limitText(summary, PREVIEW_MAX_CHARS);
 
-        DetailLlm.DetailLlmBuilder llmBuilder = DetailLlm.builder().model(emptyToNull(model));
+        DetailLlm.DetailLlmBuilder llmBuilder = DetailLlm.builder()
+                .model(emptyToNull(AgentExternalObservabilityMapper.safePreview(model, PREVIEW_MAX_CHARS)));
         if (reasoningContent != null) {
             llmBuilder.reasoningContent(reasoningContent);
         }
@@ -280,7 +284,7 @@ public final class AgentCallDetailMapper {
                 .status(success ? "success" : "failed")
                 .summary(summaryPreview.text())
                 .tool(DetailTool.builder()
-                        .name(emptyToNull(toolName))
+                        .name(emptyToNull(AgentExternalObservabilityMapper.safePreview(toolName, PREVIEW_MAX_CHARS)))
                         .paramsSummary(paramsPreview.text())
                         .outputPreview(outputResult.text())
                         .build())
@@ -489,11 +493,15 @@ public final class AgentCallDetailMapper {
         if (text == null) {
             return new PreviewResult("", false, AgentCallDetailResponse.KIND_AVAILABLE);
         }
-        if (text.length() <= maxChars) {
-            return new PreviewResult(text, false, AgentCallDetailResponse.KIND_AVAILABLE);
+        String scrubbed = AgentExternalObservabilityMapper.safePreview(text, Integer.MAX_VALUE);
+        if (scrubbed == null) {
+            return new PreviewResult("", false, AgentCallDetailResponse.KIND_AVAILABLE);
+        }
+        if (scrubbed.length() <= maxChars) {
+            return new PreviewResult(scrubbed, false, AgentCallDetailResponse.KIND_AVAILABLE);
         }
         return new PreviewResult(
-                text.substring(0, maxChars) + "...",
+                scrubbed.substring(0, maxChars) + "...",
                 true,
                 AgentCallDetailResponse.KIND_TRUNCATED);
     }

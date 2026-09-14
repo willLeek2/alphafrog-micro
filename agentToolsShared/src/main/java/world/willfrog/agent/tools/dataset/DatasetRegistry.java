@@ -48,9 +48,6 @@ public class DatasetRegistry {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
-    private String datasetPath;
-
     @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
     private String databaseFetchedPath;
 

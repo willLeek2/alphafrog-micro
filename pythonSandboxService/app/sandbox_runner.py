@@ -23,12 +23,9 @@ from .bounded_exec_wrapper import (
     STDOUT_FILE_NAME,
     UNKNOWN_MARKER_AUDIT_FILE_NAME,
 )
+from . import container_copy
+from .cancel_registry import registry as cancel_registry
 from .capture_reader import CAPTURE_FILE_NAMES
-from .child_identity import (
-    CHILD_USER_ENV_NAME,
-    ChildIdentityError,
-    validate_child_spec_host,
-)
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
 from .finance_record_channel import decode_capture_text, read_capture_artifacts
@@ -64,19 +61,19 @@ TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
 # === work-package-C: §7.1 bounded wrapper production wiring ================
 # The wrapper runs from a TASK-LOCAL copy of the app package staged under the
 # task workspace (zero global-path writes, so it stays safe under future
-# per-container concurrency; codex 56d28076 — the global sitecustomize.py
-# write/delete is what is NOT task-local yet, not this package).
+# per-container concurrency). D15 §4.2 (Scenario B) closed the last
+# global-path write — AF_TASK_* now travels via the task-local
+# wrapper-input.json and the wrapper injects it through Popen(env=...).
 # capture_reader.py is staged because the wrapper IMPORTS it pre-spawn
-# (PIN 1) for the in-memory wrapper-tail readback; child_identity.py is
-# staged because the wrapper imports it pre-spawn for the P0-4 privilege
-# drop.  Neither is ever executed as a process in-container — after user
-# code exits nothing in the task workspace runs again.
+# (PIN 1) for the in-memory wrapper-tail readback.  It is never executed as
+# a process in-container — after user code exits nothing in the task
+# workspace runs again.
 WRAPPER_MODULE_FILES = (
     "__init__.py",
     "output_capture.py",
     "bounded_exec_wrapper.py",
     "capture_reader.py",
-    "child_identity.py",
+    "payload_contract.py",
 )
 WRAPPER_DIR_NAME = "bounded-wrapper"
 
@@ -91,6 +88,34 @@ WRAPPER_BOOTSTRAP_NAME = "run_wrapper.py"
 WRAPPER_INPUT_FILE_NAME = "wrapper-input.json"
 USER_SCRIPT_FILE_NAME = "user_script.py"
 RUNTIME_ENVIRONMENT_FILE_NAME = "runtime-environment.json"
+
+# === 260809-26Q3-stage1-w2 D11 (task #108): task cancel control root =======
+# A RUNNING task's cancel marker file lives at a task-local control path
+# INSIDE the container:
+#     <control_root>/<taskId>/cancel
+# The runner creates the directory chain BEFORE the wrapper runs (as the
+# container user — there is no root anymore) and registers a marker writer
+# with the cancel registry; the wrapper binds the marker path EXACTLY to
+# this derivation before it trusts the marker (another task's marker or a
+# stale path is rejected fail-closed).
+# The default root lives UNDER THE IMAGE'S WORLD-WRITABLE /sandbox: the
+# container user must be able to mkdir it (the old /run default required
+# root).  Honest same-uid trade-off (260818 review, grace): the user child
+# shares the container uid, so a malicious child can delete its own marker
+# and thereby SUPPRESS an external cancel until the ordinary timeout —
+# accepting that residual risk is frog's documented decision for the
+# non-root simplification.  Containers are single-use on the
+# bounded-wrapper path (P0-5 recycle), so no OTHER task's child can
+# pre-plant or clean a marker in this tree.
+# AF_TASK_CONTROL_ROOT overrides the default for host-side tests (the
+# wrapper derives the SAME path from the SAME env var).
+TASK_CONTROL_ROOT_DEFAULT = "/sandbox/alphafrog-task-control"
+TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
+TASK_CONTROL_MARKER_NAME = "cancel"
+# A stale control dir after cleanup is a residue the single-use container
+# policy must not leave behind: cleanup failure recycles the container.
+RECYCLE_REASON_CONTROL_CLEANUP_FAILED = "control_cleanup_failed"
+# === end D11 cancel control root ============================================
 
 # Contract §13 line 644: the four frozen limit keys, verbatim.
 WRAPPER_LIMIT_KEYS = (
@@ -267,7 +292,13 @@ def _copy_dataset_file(
     source: Path,
     dest_path: str,
 ) -> None:
-    session.copy_to_runtime(str(source), dest_path)
+    """Stage one file as the container user (no root exec, no root chown).
+
+    Delegates to app.container_copy — llm-sandbox's copy_to_runtime ends
+    with a root ``chown -R``, which the non-root container contract
+    forbids; see container_copy's module docstring.
+    """
+    container_copy.copy_file_to_container(session, source, dest_path)
 
 
 def _copy_text_to_runtime(
@@ -294,9 +325,9 @@ def _atomic_copy_text_to_runtime(
 ) -> None:
     temp_dest = dest_path + ".tmp"
     _copy_text_to_runtime(session, content, temp_dest)
-    _exec_checked(
+    _exec_checked_argv(
         session,
-        f"mv {shlex.quote(temp_dest)} {shlex.quote(dest_path)}",
+        ["mv", temp_dest, dest_path],
         "atomic_metadata_rename",
     )
 
@@ -307,7 +338,9 @@ def _copy_runtime_loader_modules(
 ) -> None:
     """Copy af_dataset_loader helpers into the sandbox execution container."""
     sandbox_dir = config.workdir.rstrip("/")
-    _exec_checked(session, f"mkdir -p {sandbox_dir}", "create_sandbox_module_dir")
+    _exec_checked_argv(
+        session, ["mkdir", "-p", sandbox_dir], "create_sandbox_module_dir"
+    )
     for filename in SANDBOX_LOADER_FILES:
         source = APP_DIR / filename
         if not source.is_file():
@@ -338,8 +371,10 @@ def _loader_smoke_check_command(config: SandboxConfig) -> str:
         "from af_dataset_loader import load_manifest; "
         "print('sandbox_loader_ok')"
     )
-    script = f"set -e\ncd {shlex.quote(workdir)}\npython -c {shlex.quote(import_check)}"
-    return f"sh -lc {shlex.quote(script)}"
+    return (
+        f"set -e\ncd {shlex.quote(workdir)}\n"
+        f"python -c {shlex.quote(import_check)}"
+    )
 
 
 def _smoke_check_loader_modules(
@@ -348,7 +383,7 @@ def _smoke_check_loader_modules(
     task_id: str,
 ) -> None:
     """Verify copied loader modules are importable without rewriting user code."""
-    _exec_checked(
+    _exec_checked_script(
         session,
         _loader_smoke_check_command(config),
         f"loader_smoke_import task={task_id}",
@@ -363,9 +398,16 @@ def _log_in_container(
 ) -> None:
     """Write a timestamped log line inside the container for debugging."""
     log_path = f"{config.workspace_root}/{task_id}/task.log"
-    cmd = f"echo '[$(date -Iseconds)] {message}' >> {log_path}"
+    # 260818 fix: the exec path has no shell (see _exec_checked's operator
+    # guard), so redirection/command-substitution must live inside an
+    # explicit `sh -lc` script with the timestamp computed HOST-side.
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    script = (
+        f"echo {shlex.quote(f'[{timestamp}] {message}')} "
+        f">> {shlex.quote(log_path)}"
+    )
     try:
-        session.execute_command(cmd)
+        session.execute_command(_sh_script(script))
     except Exception:
         # Best-effort: container logging should not break the task
         pass
@@ -383,12 +425,83 @@ def _flush_container_log(
     """
     log_path = f"{config.workspace_root}/{task_id}/task.log"
     try:
-        output = session.execute_command(f"cat {log_path} 2>/dev/null || true")
+        output = session.execute_command(shlex.join(["cat", log_path]))
         if output.stdout:
             for line in output.stdout.strip().splitlines():
                 logger.info("[container-log] task=%s %s", task_id, line)
     except Exception:
         pass
+
+
+# 260818 (stress batch 20260818-152331): the container exec path has NO
+# shell.  llm-sandbox 0.3.33 hands the command string to docker
+# ``exec_run``, and docker-py's ``exec_create`` turns a string cmd into
+# argv via shlex.split — shell operators become LITERAL arguments (the D11
+# ``mkdir -p X && chmod ...`` chain died exactly this way: mkdir tried to
+# create directories named ``&&``/``chmod``/``0700`` in the container's
+# root-owned working directory).  Commands that genuinely need shell
+# features (pipelines, redirection) must wrap the whole script in an
+# explicitly quoted ``sh -lc`` argument — operators then live INSIDE one
+# argv element and are interpreted by that shell (the pattern already used
+# by the wrapper bootstrap and loader smoke check).
+# 260818 structured exec interface (grace round-3 on the guard): a
+# character blacklist can NEVER prove a command shell-free — it keeps
+# missing real shell syntax (env prefixes like `FOO=bar cmd`, `cd`,
+# `~`, brace expansion, unquoted globs, `#` comments) while rejecting
+# legitimate literal arguments (a quoted `*.csv` meant for
+# `find -name`).  The container exec path has NO shell (docker-py
+# shlex.splits the string into argv), so the two helpers below make the
+# intent STRUCTURAL instead:
+#
+# * ``_exec_checked_argv`` takes an argv LIST.  ``shlex.join`` quotes
+#   every element, and docker's shlex.split round-trips it EXACTLY —
+#   ``*``, ``$``, ``;`` inside a list element are unambiguously plain
+#   arguments.  A confused command (``["cd", "/x"]``, an env-prefix
+#   element) fails LOUDLY at exec time (no such program) instead of
+#   silently doing the wrong thing.
+# * ``_exec_checked_script`` takes ONE complete script text and is the
+#   ONLY place that constructs ``sh -lc <quoted script>``.  Callers can
+#   no longer hand-write loose ``sh -lc`` strings whose extra tokens
+#   become positional parameters.
+
+
+def _exec_checked_argv(
+    session: SandboxSession,
+    argv: "list[str]",
+    context: str = "",
+) -> None:
+    """Run one no-shell command given as an argv list, fail-closed.
+
+    Contract (grace round-4): argv must be a LIST of str — checked as a
+    container type FIRST.  A raw string is iterable, so without the
+    isinstance check `shlex.join("echo")` would silently expand into one
+    argument per character; the structured interface must reject a
+    hand-written command string at the call site instead.
+    """
+    if not isinstance(argv, list):
+        raise ValueError(
+            f"argv must be a list of str (got {type(argv).__name__}): "
+            f"{argv!r} — pass each argument as its own list element"
+        )
+    if not argv:
+        raise ValueError("argv must be a non-empty list of str")
+    if not all(isinstance(item, str) for item in argv):
+        raise ValueError(f"argv must be a list of str: {argv!r}")
+    _exec_checked(session, shlex.join(argv), context)
+
+
+def _sh_script(script: str) -> str:
+    """Serialize one complete shell script as a strict ``sh -lc`` command."""
+    return f"sh -lc {shlex.quote(script)}"
+
+
+def _exec_checked_script(
+    session: SandboxSession,
+    script: str,
+    context: str = "",
+) -> None:
+    """Run one COMPLETE shell script via ``sh -lc``, fail-closed."""
+    _exec_checked(session, _sh_script(script), context)
 
 
 def _exec_checked(
@@ -433,13 +546,23 @@ def _prepare_task_workspace(
     task_input = f"{task_workspace}/input"
 
     # Create workspace
-    _exec_checked(session, f"mkdir -p {task_input}", "create_task_workspace")
+    _exec_checked_argv(
+        session, ["mkdir", "-p", task_input], "create_task_workspace"
+    )
     _log_in_container(session, task_id, config, f"task_start workspace={task_workspace}")
 
     # Set up /sandbox/input compatibility symlink if enabled
     if config.compat_input_path_enabled:
-        _exec_checked(session, f"rm -rf {config.workdir}/input", "remove_old_input")
-        _exec_checked(session, f"ln -s {task_input} {config.workdir}/input", "create_input_symlink")
+        _exec_checked_argv(
+            session,
+            ["rm", "-rf", f"{config.workdir}/input"],
+            "remove_old_input",
+        )
+        _exec_checked_argv(
+            session,
+            ["ln", "-s", task_input, f"{config.workdir}/input"],
+            "create_input_symlink",
+        )
 
     # MF5 (260623-02 round 1 review fix): agent run 模式下，CSVs 非空表示 caller 显式
     # 选了 run-level dataset/manifest 路径，必须走 CSV source_path cp。如果 CSVs 给到了
@@ -511,7 +634,9 @@ def _prepare_task_workspace(
             dataset_dir = _resolve_dataset_dir(config, ds_id)
             files_to_copy = _list_files(dataset_dir, files)
             dataset_mount = f"{task_input}/{ds_id}"
-            _exec_checked(session, f"mkdir -p {dataset_mount}", "create_dataset_mount")
+            _exec_checked_argv(
+                session, ["mkdir", "-p", dataset_mount], "create_dataset_mount"
+            )
             for file_path in files_to_copy:
                 dest = f"{dataset_mount}/{file_path.name}"
                 _copy_dataset_file(session, file_path, dest)
@@ -543,25 +668,17 @@ def _prepare_task_workspace(
     metrics_path = f"{task_workspace}/metrics/loader_metrics.jsonl"
     artifact_dir = f"{task_workspace}/artifacts"
     temporary_dir = f"{task_workspace}/tmp"
-    sitecustomize = (
-        "import os, sys\n"
-        f"os.environ['AF_TASK_METRICS_PATH'] = {metrics_path!r}\n"
-        f"os.environ['AF_TASK_WORKSPACE'] = {task_workspace!r}\n"
-        f"os.environ['AF_TASK_ARTIFACT_DIR'] = {artifact_dir!r}\n"
-        f"os.environ['AF_TASK_TMP_DIR'] = {temporary_dir!r}\n"
-        # 260808-finance-methodspec-v5 work package D (codex (A) plan 2026-08-08
-        # 23:06): do NOT override AF_RUNTIME_ENVIRONMENT_FILE here. The
-        # container-creation env var (set by create_sandbox_session) points at
-        # the global <workdir>/runtime-environment.json that
-        # initialize_runtime_environment() wrote once per container. Each task
-        # in the same container reads the SAME file; concurrency=1 is enforced
-        # via validate_dynamic_install_safety so the venv state cannot drift.
-        f"os.makedirs({artifact_dir!r}, exist_ok=True)\n"
-        f"os.makedirs({temporary_dir!r}, exist_ok=True)\n"
-        f"sys.path.insert(0, {config.workdir.rstrip('/')!r})\n"
-        f"os.chdir({task_workspace!r})\n"
-    )
-    _copy_text_to_runtime(session, sitecustomize, f"{config.workdir.rstrip('/')}/sitecustomize.py")
+    # D15 §4.2 (Scenario B): the four AF_TASK_* env vars are no longer written
+    # into the shared global /sandbox/sitecustomize.py. The wrapper-input.json
+    # (staged at {task_workspace}/wrapper-input.json by _stage_bounded_wrapper,
+    # which is already task-local) now carries them as the taskEnvironment
+    # field, and bounded_exec_wrapper injects them via Popen(env=...) when
+    # spawning the user child. makedirs/chdir/sys.path for the user child are
+    # likewise performed by the wrapper pre-spawn. Removing the per-task write
+    # to the global sitecustomize.py eliminates the cross-task race that
+    # cleanup-failure / pool reuse previously exposed (D15 §6 red line 3).
+    # AF_RUNTIME_ENVIRONMENT_FILE is unchanged: still set once per container by
+    # create_sandbox_session and read by every task in that container.
 
     return task_workspace
 
@@ -851,7 +968,7 @@ def _materialize_none_manifest(
 
     Returns:
         物化成功：sandbox 内绝对路径（``<task_input>/_agent_run_manifest_<id>/manifest.json``）
-        物化失败（mkdir 失败 / JSON 失败 / copy_to_runtime 失败 / manifest_number 非数字）：返回
+        物化失败（mkdir 失败 / JSON 失败 / staging 失败 / manifest_number 非数字）：返回
         ``MANIFEST_NONE_MARKER`` 原文，让 sandbox 内 af_dataset_loader 报明确错误。
     """
     safe_id = (manifest_number or "").strip()
@@ -902,11 +1019,14 @@ def _materialize_none_manifest(
         "members": members,
     }
 
-    # 写临时 manifest.json：先 mkdir（copy_to_runtime 不创建父目录），再 copy_to_runtime
+    # 写临时 manifest.json：先 mkdir（staging 不创建父目录），再走非 root
+    # 拷贝通道（container_copy → put_archive，260818）
     temp_dir = f"{task_input_prefix}{TEMP_MANIFEST_DIR_PREFIX}{safe_id}"
     temp_path = f"{temp_dir}/manifest.json"
     try:
-        output = session.execute_command(f"mkdir -p {shlex.quote(temp_dir)}")
+        output = session.execute_command(
+            shlex.join(["mkdir", "-p", temp_dir])
+        )
         if getattr(output, "exit_code", 0) != 0:
             stderr = getattr(output, "stderr", "") or ""
             logger.warning(
@@ -933,7 +1053,7 @@ def _materialize_none_manifest(
         _copy_text_to_runtime(session, manifest_json, temp_path)
     except Exception as e:  # noqa: BLE001 — sandbox 写入容错
         logger.warning(
-            "agent_run NONE manifest copy_to_runtime 失败：path=%s err=%s",
+            "agent_run NONE manifest staging 失败：path=%s err=%s",
             temp_path, e,
         )
         return MANIFEST_NONE_MARKER
@@ -955,18 +1075,35 @@ def _cleanup_task_workspace(
     _log_in_container(session, task_id, config, "cleanup_start")
     try:
         # Remove task workspace
-        _exec_checked(session, f"rm -rf {task_workspace}", "cleanup_task_workspace")
+        _exec_checked_argv(
+            session, ["rm", "-rf", task_workspace],
+            "cleanup_task_workspace",
+        )
         # Remove compatibility symlink
         if config.compat_input_path_enabled:
-            _exec_checked(session, f"rm -rf {config.workdir}/input", "cleanup_input_symlink")
-        _exec_checked(
+            _exec_checked_argv(
+                session,
+                ["rm", "-rf", f"{config.workdir}/input"],
+                "cleanup_input_symlink",
+            )
+        # D15 §4.2.3 (Scenario B): this rm is DEFENSIVE ONLY. Correctness no
+        # longer depends on it — _prepare_task_workspace stopped writing the
+        # global /sandbox/sitecustomize.py per task. A pre-D15 container may
+        # still host a stale sitecustomize.py from an earlier task in the same
+        # container, so the rm is kept as best-effort cleanup. Removing it
+        # would not break task isolation because AF_TASK_* now travels via the
+        # task-local wrapper-input.json (D15 §6 red line 3 satisfied).
+        base = config.workdir.rstrip("/")
+        _exec_checked_argv(
             session,
-            "rm -f "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/sitecustomize.py')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/paths_dataset.csv')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/path_manifest.csv')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/paths_dataset_meta.json')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/path_manifest_meta.json')}",
+            [
+                "rm", "-f",
+                f"{base}/sitecustomize.py",
+                f"{base}/paths_dataset.csv",
+                f"{base}/path_manifest.csv",
+                f"{base}/paths_dataset_meta.json",
+                f"{base}/path_manifest_meta.json",
+            ],
             "cleanup_public_task_files",
         )
         return True
@@ -979,46 +1116,47 @@ def validate_dynamic_install_safety(config: SandboxConfig) -> None:
     """Spec §8 L1019 + codex (A) plan 2026-08-08 23:06 safety invariant.
 
     finance-methodspec-v5 enforces ``container_max_concurrency == 1`` for
-    every config (regardless of skip_environment_setup) because every
-    SandboxConfig writes a per-task bootstrap into the SHARED global file
-    ``/sandbox/sitecustomize.py`` (AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR /
-    AF_TASK_TMP_DIR / AF_TASK_METRICS_PATH) and deletes that same file on
-    cleanup. Concurrent tasks would race on that file even without dynamic
-    install — the bootstrap file is shared mutable state by construction.
+    every config (regardless of skip_environment_setup). D15 §4.2 (Scenario B)
+    removed the per-task write of AF_TASK_* into the SHARED global
+    ``/sandbox/sitecustomize.py``: those vars now travel inside the
+    task-local wrapper-input.json and the wrapper injects them per-child via
+    Popen(env=...). That eliminates the sitecustomize race as a concurrency
+    blocker. The cmc==1 invariant STILL holds, now driven solely by the
+    dynamic-install venv race described below — lifting cmc>1 is gated by
+    S3B-04 and out of scope for D15.
 
-    Dynamic install (skip_environment_setup=False) additionally mutates the
-    shared venv via ``session.install()``, which compounds the race:
-    ``PoolWorker.execution_environment`` is captured once at warm-up and
-    never refreshed, so a second task in the same worker would read the
-    baked environmentId while the container's actual venv had already been
-    mutated by ``session.install()`` from the previous task.
-
-    Both invariants collapse to the same rule: exactly one task per
-    worker container at a time. Raise ``ConfigurationError`` (with a stable
-    code) if the invariant is violated. Callers that mutate config
-    dynamically (Nacos hot-reload, pool_min_size adjustment, etc.) MUST
-    re-run this check before accepting the new config; failing closed
-    prevents silent throughput drift that would corrupt environment
-    identity under the surface.
+    Dynamic install (skip_environment_setup=False) mutates the shared venv
+    via ``session.install()``: ``PoolWorker.execution_environment`` is
+    captured once at warm-up and never refreshed, so a second task in the
+    same worker would read the baked environmentId while the container's
+    actual venv had already been mutated by ``session.install()`` from the
+    previous task. To prevent that drift, exactly one task per worker
+    container at a time. Raise ``ConfigurationError`` (with a stable code)
+    if the invariant is violated. Callers that mutate config dynamically
+    (Nacos hot-reload, pool_min_size adjustment, etc.) MUST re-run this
+    check before accepting the new config; failing closed prevents silent
+    throughput drift that would corrupt environment identity under the
+    surface.
 
     codex 2026-08-08 23:16 (bc11e841 item 2): the original plan only
-    enforced this for skip_environment_setup=False; sitecustomize.py races
-    even for preinstalled-only configs because the per-task AF_TASK_* env
-    vars are still written into the same global file. This invariant now
-    applies to ALL SandboxConfig instances.
+    enforced this for skip_environment_setup=False; the per-task bootstrap
+    race (now eliminated by D15 §4.2) required extending it to all configs.
+    The cmc==1 rule continues to apply to ALL SandboxConfig instances
+    because of the venv mutation race alone.
     """
     if config.container_max_concurrency != 1:
         raise ConfigurationError(
             "CONTAINER_MAX_CONCURRENCY_REQUIRES_ONE: "
             f"container_max_concurrency={config.container_max_concurrency} "
-            "is not allowed. SandboxConfig writes per-task bootstrap "
-            "(AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR / AF_TASK_TMP_DIR / "
-            "AF_TASK_METRICS_PATH) into the shared global file "
-            "/sandbox/sitecustomize.py and deletes that same file on cleanup; "
-            "concurrent tasks would race on the bootstrap. Dynamic install "
-            "(skip_environment_setup=False) additionally mutates the shared "
-            "venv via session.install(), which compounds the race. Both "
-            "invariants collapse to: one task per worker container at a time."
+            "is not allowed. Dynamic install (skip_environment_setup=False) "
+            "mutates the shared venv via session.install(); "
+            "PoolWorker.execution_environment is captured once at warm-up "
+            "and never refreshed, so a second task in the same worker would "
+            "read a stale environmentId while the container's venv had "
+            "already been mutated. (D15 §4.2 removed the historical "
+            "sitecustomize.py race as a concurrency blocker; lifting cmc>1 "
+            "is gated by S3B-04 and remains out of scope.) Both invariants "
+            "collapse to: one task per worker container at a time."
         )
 
 
@@ -1037,11 +1175,44 @@ def create_sandbox_session(
     The caller owns the returned session and must close it.
     """
     validate_dynamic_install_safety(config)
+    if not config.skip_environment_setup:
+        # Non-root contract (grace review on 874b77ad): llm-sandbox 0.3.33's
+        # session.open() environment_setup() path calls _ensure_ownership,
+        # which execs `chown -R` AS ROOT — and the image's
+        # /sandbox/.sandbox-venv + .sandbox-pip-cache are build-time
+        # root-owned, so dynamic install cannot work as uid 10000 either.
+        # Dynamic install stays supported only with the historical root
+        # container, which this configuration no longer creates.
+        raise ValueError(
+            "AF_SANDBOX_SKIP_ENVIRONMENT_SETUP=false is incompatible with "
+            "the non-root sandbox container (llm-sandbox environment_setup "
+            "execs chown as root and the baked venv is root-owned); the "
+            "supported non-root mode is skip_environment_setup=true"
+        )
     effective_memory_limit: int | str = memory_limit_bytes or config.memory_limit
     runtime_configs = {
         "mem_limit": effective_memory_limit,
         "memswap_limit": effective_memory_limit if memory_limit_bytes else config.memswap_limit,
         "labels": SANDBOX_WORKER_LABELS,
+        # 260817 non-root simplification (frog 9dab5e2d): the container is
+        # CREATED as the unprivileged user (docker --user semantics).  The
+        # user is resolved by the container runtime against the runtime
+        # image's passwd database (alphafrog-sandbox = uid 10000/gid 10001).
+        # Nothing inside the container ever runs as root, which replaced the
+        # old wrapper-side privilege-drop machinery wholesale.
+        "user": config.container_user,
+        # Container-boundary replacements for the two child-side protections
+        # the old drop chain enforced (grace review: non-root uid alone does
+        # not provide them — setuid/file-capability binaries in the image
+        # would remain an escalation path):
+        #   * no-new-privileges  == the old PR_SET_NO_NEW_PRIVS, now applied
+        #     to EVERY process in the container at the kernel level;
+        #   * cap_drop ALL       == the old explicit capset(empty), now the
+        #     container's bounding+effective sets start empty.
+        # Hardcoded on purpose: these are the contract, not deploy knobs —
+        # no environment variable may turn them off.
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
         # 260808-finance-methodspec-v5 work package D: contract with package
         # B/C (ccqwen). The Python finance library reads environmentId from
         # the read-only task environment file; the file path is communicated
@@ -1062,6 +1233,27 @@ def create_sandbox_session(
         skip_environment_setup=config.skip_environment_setup,
     )
     session.open()
+    # Non-root contract, enforced at runtime (grace review): replace
+    # llm-sandbox's root-chown hook with a raiser and guard exec_run against
+    # root requests, so "no root process ever starts in this container" is a
+    # checked fact rather than a code-review promise.  Grace round-3
+    # MUST-FIX 1/3: the container's LIVE identity is verified against the
+    # configured user (uid/gid 0 rejected, numeric specs matched exactly),
+    # and ANY failure in these post-open steps closes the just-started
+    # container before re-raising — the caller cannot reach this local
+    # session, so leaking it here would leak a Docker container.
+    try:
+        container_copy.install_no_root_guards(session)
+        container_copy.verify_container_identity(session, config.container_user)
+    except BaseException:
+        try:
+            session.close()
+        except Exception as close_error:  # noqa: BLE001 - best-effort cleanup
+            logger.warning(
+                "SANDBOX_SESSION_CLOSE_FAILED after non-root contract "
+                "failure: %s", close_error,
+            )
+        raise
     return session
 
 
@@ -1076,7 +1268,8 @@ def initialize_runtime_environment(
     Called once per container after create_sandbox_session(). The
     AF_RUNTIME_ENVIRONMENT_FILE env var was set at container creation to
     ``<workdir>/runtime-environment.json``; this function writes the file
-    at that path via ``copy_to_runtime`` so user code (e.g. ccqwen's
+    at that path via the non-root staging path (container_copy → docker
+    ``put_archive``) so user code (e.g. ccqwen's
     reporting library) reads it from inside the container. Failure to push
     the file into the container raises — the worker cannot become ready
     without an honest runtime environment file for user code to consult.
@@ -1158,8 +1351,9 @@ if [ -x {shlex.quote(config.workdir)}/.sandbox-venv/bin/python ]; then
 fi
 test -w {shlex.quote(config.workdir)}
 """
-    smoke_cmd = f"sh -lc {shlex.quote(script)}"
-    _exec_checked(session, smoke_cmd, f"ready_check container={container_id}")
+    _exec_checked_script(
+        session, script, f"ready_check container={container_id}"
+    )
 
 
 def _read_runtime_text(session: SandboxSession, command: str) -> str:
@@ -1171,11 +1365,17 @@ def _read_runtime_text(session: SandboxSession, command: str) -> str:
 
 
 def _read_runtime_size(session: SandboxSession, path: str) -> int:
-    text = _read_runtime_text(
-        session,
+    # 260818 fix: pipelines/redirection need a real shell — the exec path
+    # shlex.splits strings into argv with NO shell interpretation (see
+    # _exec_checked's operator guard), so the whole script is wrapped in an
+    # explicitly quoted `sh -lc` argument.
+    script = (
         f"if [ -e {shlex.quote(path)} ]; then "
         f"find {shlex.quote(path)} -type f -exec stat -c %s {{}} + 2>/dev/null | "
-        "awk '{total += $1} END {print total + 0}'; else echo 0; fi",
+        "awk '{total += $1} END {print total + 0}'; else echo 0; fi"
+    )
+    text = _read_runtime_text(
+        session, _sh_script(script),
     ).strip()
     try:
         return max(0, int(text.splitlines()[-1]))
@@ -1185,7 +1385,8 @@ def _read_runtime_size(session: SandboxSession, path: str) -> int:
 
 def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> int:
     quoted = shlex.quote(task_workspace)
-    command = (
+    # 260818 fix: see _read_runtime_size — pipeline wrapped in `sh -lc`.
+    script = (
         f"find {quoted} -type f "
         f"! -path {shlex.quote(task_workspace + '/input/*')} "
         f"! -path {shlex.quote(task_workspace + '/metrics/*')} "
@@ -1193,7 +1394,9 @@ def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> 
         f"! -name task.log -exec stat -c %s {{}} + 2>/dev/null | "
         "awk '{total += $1} END {print total + 0}'"
     )
-    text = _read_runtime_text(session, command).strip()
+    text = _read_runtime_text(
+        session, _sh_script(script),
+    ).strip()
     try:
         return max(0, int(text.splitlines()[-1]))
     except (ValueError, IndexError):
@@ -1307,118 +1510,121 @@ def _resolve_wrapper_interpreter(
     candidate = getattr(session, "python_executable_path", None) or (
         f"{config.workdir.rstrip('/')}/.sandbox-venv/bin/python"
     )
-    _exec_checked(
+    _exec_checked_argv(
         session,
-        f"test -x {shlex.quote(candidate)}",
+        ["test", "-x", candidate],
         f"wrapper_interpreter_check task={task_id}",
     )
     return candidate
 
 
-# === P0-4 (codex 03b4d034 / 087da672): runner-side child identity gate =====
-def _validate_runner_child_identity(child_spec: str | None, euid: int) -> None:
-    """Host-side gate for the wrapper child's identity (P0-4).
 
-    Pure apart from the explicit ``euid`` argument (unit-testable without
-    root).  Returns None; the ORIGINAL spec string travels verbatim into
-    the container (exec export), where it is resolved AUTHORITATIVELY twice
-    against the target's passwd database (chown snippet + wrapper pre-spawn
-    gate).  The host gate validates SYNTAX ONLY — ``validate_child_spec_host``
-    performs no OS lookups, because the service runs in a different
-    uid/username namespace than the target image (codex 087da672): a
-    host-side ``pwd.getpwnam`` would reject identities that exist only in
-    the container.  Raises ``RuntimeError`` — the task must FAIL CLOSED
-    before any staging/workspace preparation — when:
 
-    * the runner is root and ``child_spec`` is UNSET (refuse to run user
-      code as root);
-    * any euid and ``child_spec`` is set but malformed (garbage in = fail;
-      numeric forms with uid OR gid zero included — codex 691341d2).
 
-    Non-root with an UNSET spec keeps the historical same-UID dev behavior;
-    NO security boundary is claimed in dev mode — the isolation guarantee
-    exists only in the container where the wrapper runs as root and drops
-    the child into a non-root identity (uid AND gid both nonzero).
+# === 260809-26Q3-stage1-w2 D11 (task #108): cancel control path helpers ====
+
+
+def task_control_root() -> str:
+    """In-container control root for cancel markers (env override aware)."""
+    override = os.environ.get(TASK_CONTROL_ROOT_ENV_NAME)
+    if override and override.strip():
+        return override.strip().rstrip("/")
+    return TASK_CONTROL_ROOT_DEFAULT
+
+
+def task_control_paths(task_id: str) -> Tuple[str, str]:
+    """``(control_dir, marker_path)`` for one task's cancel marker."""
+    control_dir = f"{task_control_root()}/{task_id}"
+    return control_dir, f"{control_dir}/{TASK_CONTROL_MARKER_NAME}"
+
+
+def _create_task_control_dir(session: SandboxSession, task_id: str) -> str:
+    """Create the container-user-owned 0700 control dir chain for this task.
+
+    Runs as the container user (there is no root in the container), so the
+    control root must live under a writable location — the default is under
+    the image's world-writable /sandbox.  Fail-closed on any failure
+    (``_exec_checked`` raises): a bounded task that cannot get its control
+    directory cannot carry cancel evidence, so the runner surfaces the
+    problem immediately instead of starting a child whose marker path the
+    wrapper would reject.  Returns the marker path for the wrapper input.
     """
-    if child_spec is None:
-        if euid == 0:
-            raise RuntimeError(
-                f"{CHILD_USER_ENV_NAME} must be set when the runner is "
-                "root: refusing to run user code as root"
-            )
-        return None
+    root = task_control_root()
+    control_dir, marker_path = task_control_paths(task_id)
+    # 260818 fix (stress batch 20260818-152331): the execution path has NO
+    # shell — llm-sandbox hands the string to docker exec_run, and docker-py
+    # shlex.splits it into argv (see _exec_checked's operator guard).  The
+    # old `mkdir -p X && chmod ... && chmod ...` single string therefore ran
+    # mkdir with literal `&&`/`chmod`/`0700` arguments: masked for 8 days by
+    # the root container (root could create those junk dirs in /), fatal
+    # since the non-root switch.  One command per exec, no operators.
+    _exec_checked_argv(
+        session, ["mkdir", "-p", control_dir],
+        f"create_task_control_dir task={task_id}",
+    )
+    _exec_checked_argv(
+        session, ["chmod", "0700", root],
+        f"create_task_control_dir chmod root task={task_id}",
+    )
+    _exec_checked_argv(
+        session, ["chmod", "0700", control_dir],
+        f"create_task_control_dir chmod dir task={task_id}",
+    )
+    return marker_path
+
+
+def _cleanup_task_control_dir(session: SandboxSession, task_id: str) -> bool:
+    """Remove this task's control dir; best-effort like workspace cleanup."""
+    control_dir, _ = task_control_paths(task_id)
     try:
-        validate_child_spec_host(child_spec)
-    except ChildIdentityError as exc:
-        raise RuntimeError(str(exc)) from exc
+        _exec_checked_argv(
+            session,
+            ["rm", "-rf", control_dir],
+            f"cleanup_task_control_dir task={task_id}",
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "TASK_CONTROL_CLEANUP_FAILED task=%s dir=%s error=%s",
+            task_id, control_dir, exc,
+        )
+        return False
 
 
-# The chown step runs INSIDE the container because the container's passwd
-# database is authoritative for the child identity (host-side uid spaces
-# differ: macOS nobody=4294967294 vs Debian nobody=65534).  The snippet
-# mirrors app.child_identity.parse_child_spec verbatim — that module is not
-# staged yet at chown time (staging happens later); the wrapper re-resolves
-# the SAME spec against the SAME database before the spawn.
-_CHOWN_SNIPPET_TEMPLATE = (
-    "import os, pwd, sys\n"
-    "spec = {spec!r}\n"
-    "def fail(reason):\n"
-    "    sys.stderr.write('child identity chown failed: ' + reason + '\\n')\n"
-    "    sys.exit(1)\n"
-    "if spec != spec.strip() or not spec:\n"
-    "    fail('spec is empty or has surrounding whitespace')\n"
-    "if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in spec):\n"
-    "    fail('spec contains control characters')\n"
-    "if ':' in spec:\n"
-    "    parts = spec.split(':')\n"
-    "    if len(parts) != 2 or not parts[0] or not parts[1]:\n"
-    "        fail('numeric spec must be exactly uid:gid')\n"
-    "    if not all('0' <= c <= '9' for c in parts[0] + parts[1]):\n"
-    "        fail('numeric spec has a non-digit field')\n"
-    "    uid, gid = int(parts[0], 10), int(parts[1], 10)\n"
-    "else:\n"
-    "    try:\n"
-    "        entry = pwd.getpwnam(spec)\n"
-    "    except KeyError:\n"
-    "        fail('username does not exist in this container')\n"
-    "    uid, gid = entry.pw_uid, entry.pw_gid\n"
-    "if uid == 0 or gid == 0:\n"
-    "    fail('child uid and gid must both be nonzero')\n"
-    "for path in {paths!r}:\n"
-    "    os.makedirs(path, exist_ok=True)\n"
-    "    os.chown(path, uid, gid)\n"
-)
+def _make_marker_writer(session: SandboxSession, task_id: str):
+    """Build the cancel-marker write closure registered with the registry.
 
-
-def _chown_workspace_for_child(
-    session: SandboxSession,
-    config: SandboxConfig,
-    task_id: str,
-    task_workspace: str,
-    child_spec: str,
-) -> None:
-    """P0-4 workspace permissions when a child identity is active.
-
-    Chowns the task workspace root and the child-writable subdirs (tmp,
-    artifacts, metrics) to the child's uid:gid BEFORE the wrapper runs (the
-    wrapper's sitecustomize import would otherwise create them root-owned).
-    STAY ROOT-OWNED: the ``input/`` dataset subtree (read-only inputs,
-    world-readable) and the bounded-wrapper staging dir + capture dir
-    (written later by the root wrapper; the capture dir is created mode
-    0700 so the child cannot enter it at all).
+    The registry dispatches it on its dedicated marker-write pool when a
+    stop is requested for a RUNNING task.  codex 0113bc67: the writer only
+    ever touches the marker FILE itself (touch) — the control directory
+    chain (owned by the container's unprivileged user, 260818) was already
+    created and is never re-created or chmod'd here.  A
+    failed touch is logged and swallowed: per d6841a2e rule 3, when the
+    child finishes before the marker lands the task keeps its genuine result —
+    a failed cancel attempt is honest silence, never a forced CANCELED.
     """
-    paths = [
-        task_workspace,
-        f"{task_workspace}/tmp",
-        f"{task_workspace}/artifacts",
-        f"{task_workspace}/metrics",
-    ]
-    snippet = _CHOWN_SNIPPET_TEMPLATE.format(spec=child_spec, paths=paths)
-    command = f"python3 -c {shlex.quote(snippet)}"
-    _exec_checked(session, command, f"chown_workspace_for_child task={task_id}")
+    _, marker_path = task_control_paths(task_id)
+    marker_argv = ["touch", marker_path]
+
+    def _write_marker() -> None:
+        try:
+            _exec_checked_argv(
+                session, marker_argv, f"write_cancel_marker task={task_id}"
+            )
+            logger.info(
+                "CANCEL_MARKER_WRITTEN task=%s path=%s", task_id, marker_path
+            )
+        except Exception as exc:
+            logger.warning(
+                "CANCEL_MARKER_WRITE_FAILED_IN_CONTAINER task=%s path=%s"
+                " error=%s",
+                task_id, marker_path, exc,
+            )
+
+    return _write_marker
 
 
-# === end P0-4 ================================================================
+# === end D11 cancel control path helpers ====================================
 
 
 def _stage_bounded_wrapper(
@@ -1429,19 +1635,27 @@ def _stage_bounded_wrapper(
     code: str,
     timeout_seconds: float,
     limits: Dict[str, Any],
+    cancel_marker_path: str | None = None,
 ) -> str:
     """Stage the task-local wrapper package, user script and wrapper-input.json.
 
     Everything lands under ``{task_workspace}`` — no global paths are written,
     so concurrent tasks in one container can never race on wrapper code.
     Returns the wrapper-input.json path.
+
+    D11 (task #108): ``cancel_marker_path`` is the control path (owned by
+    the container's unprivileged user — a same-uid user child CAN delete
+    the marker and suppress a cancel, the trade-off frog accepted on
+    2026-08-18) the wrapper polls while the child runs; the wrapper
+    validates the exact task-local binding fail-closed.  Absent (None) for
+    pre-D11 callers.
     """
     workdir = config.workdir.rstrip("/")
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
     wrapper_pkg_dir = f"{wrapper_dir}/app"
-    _exec_checked(
+    _exec_checked_argv(
         session,
-        f"mkdir -p {shlex.quote(wrapper_pkg_dir)}",
+        ["mkdir", "-p", wrapper_pkg_dir],
         f"create_wrapper_dir task={task_id}",
     )
     for filename in WRAPPER_MODULE_FILES:
@@ -1456,6 +1670,24 @@ def _stage_bounded_wrapper(
     script_path = f"{task_workspace}/{USER_SCRIPT_FILE_NAME}"
     _copy_text_to_runtime(session, code, script_path)
 
+    # D15 §4.2 (Scenario B): AF_TASK_* env vars travel in the wrapper-input
+    # JSON (already task-local at {task_workspace}/wrapper-input.json) instead
+    # of being written into the shared global /sandbox/sitecustomize.py. The
+    # wrapper resolves them pre-spawn and injects via Popen(env=...), so task
+    # A's env cannot leak to task B even if cleanup of legacy files fails.
+    # loaderPythonPath is the workdir that the legacy sitecustomize used to
+    # prepend to sys.path so user code can import af_dataset_loader etc.;
+    # the wrapper prepends it to the child's PYTHONPATH at spawn.
+    metrics_path = f"{task_workspace}/metrics/loader_metrics.jsonl"
+    artifact_dir = f"{task_workspace}/artifacts"
+    temporary_dir = f"{task_workspace}/tmp"
+    task_environment = {
+        "AF_TASK_WORKSPACE": task_workspace,
+        "AF_TASK_ARTIFACT_DIR": artifact_dir,
+        "AF_TASK_TMP_DIR": temporary_dir,
+        "AF_TASK_METRICS_PATH": metrics_path,
+    }
+
     # §7.1 wrapper input; the four §13 limit keys verbatim.  sourceRevision is
     # Task metadata, not part of the wrapper input (models.BoundedExecRequest).
     wrapper_input = {
@@ -1463,7 +1695,14 @@ def _stage_bounded_wrapper(
         "timeoutSeconds": timeout_seconds,
         "effectiveOutputLimits": {key: limits[key] for key in WRAPPER_LIMIT_KEYS},
         "runtimeEnvironmentPath": f"{workdir}/{RUNTIME_ENVIRONMENT_FILE_NAME}",
+        "taskWorkspace": task_workspace,
+        "taskEnvironment": task_environment,
+        "loaderPythonPath": workdir,
     }
+    # D11 (task #108): the cancel marker the wrapper polls while the child
+    # runs; only present when the runner created the control dir.
+    if cancel_marker_path is not None:
+        wrapper_input["cancelMarkerPath"] = cancel_marker_path
     wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
     _copy_text_to_runtime(
         session,
@@ -1477,38 +1716,45 @@ def _wrapper_run_command(
     config: SandboxConfig,
     task_workspace: str,
     interpreter: str,
-    child_spec: str | None = None,
 ) -> str:
     """Build the in-container wrapper invocation.
 
-    ``PYTHONPATH={workdir}`` makes the sitecustomize.py written by
-    ``_prepare_task_workspace`` auto-import in the wrapper AND child
-    processes: AF_TASK_* env vars, the workdir sys.path entry (loader
-    modules) and the chdir into the task workspace — exact equivalence with
-    the legacy ``session.run`` path without rewriting any user code.
+    D15 §4.2 (Scenario B): the wrapper now receives AF_TASK_* via the
+    taskEnvironment field of wrapper-input.json (task-local, never shared)
+    and injects them into the user child via Popen(env=...). It also performs
+    makedirs/chdir/sys.path setup itself pre-spawn, so the global
+    /sandbox/sitecustomize.py is no longer written per task.
 
-    P0-4: when ``child_spec`` is given it is exported verbatim as
-    ``AF_SANDBOX_CHILD_USER`` for the wrapper's identity gate (the wrapper
-    resolves it against the CONTAINER's passwd database before the spawn).
+    D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 core bug): the user
+    child's sys.path entry for ``{workdir}`` (where af_dataset_loader and
+    other loader modules live) is NO LONGER added by the wrapper via
+    PYTHONPATH env on the child Popen. Putting it on PYTHONPATH would let
+    a stale sitecustomize.py left over in ``{workdir}`` from a previous
+    task be auto-imported by Python's site init phase BEFORE the user
+    script runs, and that stale sitecustomize could overwrite AF_TASK_*
+    back to a previous task's values. Instead, the wrapper stages a
+    per-task loader bootstrap at ``{task_workspace}/_bootstrap/`` that
+    inserts the loader workdir into sys.path AFTER site init finishes,
+    then runs the user script via runpy. PYTHONPATH on this Popen only
+    needs the wrapper's own bootstrap dir (so run_wrapper.py can locate
+    ``app.bounded_exec_wrapper``).
+
+    The container itself is created as the unprivileged user (see
+    ``create_sandbox_session``), so the wrapper and the user child simply
+    inherit that identity — no identity environment is exported here.
     """
     workdir = config.workdir.rstrip("/")
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
     bootstrap = f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
     wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
-    pythonpath = f"{workdir}:{wrapper_dir}"
-    export_lines = ""
-    if child_spec is not None:
-        export_lines = (
-            f"export {CHILD_USER_ENV_NAME}={shlex.quote(child_spec)}\n"
-        )
+    pythonpath = wrapper_dir
     script = (
         "set -e\n"
         f"cd {shlex.quote(task_workspace)}\n"
-        f"{export_lines}"
         f"PYTHONPATH={shlex.quote(pythonpath)} {shlex.quote(interpreter)} "
         f"{shlex.quote(bootstrap)} {shlex.quote(wrapper_input_path)}\n"
     )
-    return f"sh -lc {shlex.quote(script)}"
+    return _sh_script(script)
 
 
 def _read_capture_from_container(
@@ -1588,19 +1834,33 @@ def _run_bounded_wrapper_path(
     install_libraries: List[str],
     timeout_seconds: float,
     limits: Dict[str, Any],
-    child_spec: str | None = None,
-) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int]]:
+) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int], bool]:
     """§7.1 steps 1-2/7-8 production path: install -> stage -> wrapper -> readback.
 
-    Returns ``(result, finance_record_channel, phase_timings)`` where
-    ``result`` carries the child's exit code and the reassembled §4.2 bounded
-    stdout (ordinary bytes first, then the COMPLETE record lines)/stderr, and
-    the channel is the §5.1 snake_case dict built from the capture summary.
+    Returns ``(result, finance_record_channel, phase_timings, cancel_observed)``
+    where ``result`` carries the child's exit code and the reassembled §4.2
+    bounded stdout (ordinary bytes first, then the COMPLETE record
+    lines)/stderr, the channel is the §5.1 snake_case dict built from the
+    capture summary, and ``cancel_observed`` is True iff the wrapper OBSERVED
+    the D11 cancel marker and, because of it, killed its own child process
+    group (d6841a2e rule 2 — the only evidence that justifies CANCELED for a
+    task whose child was actually running).
     """
     # §13/codex f86c66f5: validate the frozen snapshot FIRST — before
     # interpreter resolution or any session interaction — so the runner never
     # indexes an unvalidated external dict.
     limits = validate_effective_output_limits(limits)
+    # D11 (task #108): create the control dir (owned by the container's
+    # unprivileged user) BEFORE staging and
+    # register the marker writer with this task's cancel handle.  A stop
+    # request that already landed is delivered immediately on attach
+    # (set_marker_writer checks the handle's stop flag), so no cancel can be
+    # lost to ordering.  Control-dir creation is fail-closed: the wrapper
+    # would reject an unverifiable marker path before spawn anyway.
+    cancel_marker_path = _create_task_control_dir(session, task_id)
+    handle = cancel_registry.get(task_id)
+    if handle is not None:
+        handle.set_marker_writer(_make_marker_writer(session, task_id))
     phase_timings: Dict[str, int] = {}
     if install_libraries:
         # llm-sandbox installs into the SHARED container venv — exactly why
@@ -1614,13 +1874,14 @@ def _run_bounded_wrapper_path(
 
     t_stage = time.monotonic()
     _stage_bounded_wrapper(
-        session, config, task_id, task_workspace, code, timeout_seconds, limits
+        session, config, task_id, task_workspace, code, timeout_seconds, limits,
+        cancel_marker_path=cancel_marker_path,
     )
     phase_timings["wrapper_stage_ms"] = int((time.monotonic() - t_stage) * 1000)
 
     t_exec = time.monotonic()
     output = session.execute_command(
-        _wrapper_run_command(config, task_workspace, interpreter, child_spec)
+        _wrapper_run_command(config, task_workspace, interpreter)
     )
     phase_timings["wrapper_exec_ms"] = int((time.monotonic() - t_exec) * 1000)
     if output.exit_code != 0:
@@ -1645,7 +1906,13 @@ def _run_bounded_wrapper_path(
         stdout=decode_capture_text(artifacts["stdout_bytes"]),
         stderr=decode_capture_text(artifacts["stderr_bytes"]),
     )
-    return result, artifacts["channel"], phase_timings
+    # D11 (task #108): the wrapper's own observation flag, re-validated like
+    # every other summary field by read_capture_artifacts (bool type, part of
+    # the frozen 14-key shape).  False when the marker was never observed —
+    # including the rule-3 case where the child finished before the stop
+    # took effect and kept its genuine result.
+    cancel_observed = bool(artifacts["summary"].get("cancelObserved", False))
+    return result, artifacts["channel"], phase_timings, cancel_observed
 
 
 # === end work-package-C =====================================================
@@ -1685,15 +1952,6 @@ def run_in_open_session(
     success, failure or dynamic install (one-task-per-container security
     floor; supersedes the earlier conditional recycle).
     """
-    # P0-4 (codex 03b4d034 / 087da672): gate the child identity BEFORE any
-    # staging or workspace preparation — a root runner without a usable
-    # identity fails the task closed before anything runs.  The host gate is
-    # syntax-only (no OS lookups); the container resolves the SAME spec
-    # against its OWN passwd database twice (chown snippet + wrapper
-    # pre-spawn gate).  The raw spec travels verbatim via the exec export.
-    child_spec = os.environ.get(CHILD_USER_ENV_NAME)
-    _validate_runner_child_identity(child_spec, os.geteuid())
-
     dataset_id_list = _normalize_dataset_ids(dataset_id, dataset_ids)
     timeout = timeout_seconds or config.execution_timeout_seconds
     requested_libraries = [lib.strip() for lib in (libraries or []) if lib and lib.strip()]
@@ -1725,6 +1983,11 @@ def run_in_open_session(
     oom_killed = False
     exit_reason = "UNKNOWN"
     resource_usage = None
+    # D11 (task #108): True only when the bounded wrapper OBSERVED the
+    # cancel marker and killed its own child because of it (set by the
+    # wrapper path below; stays False on the legacy path and every error
+    # path — an exception is never cancellation evidence, d6841a2e rule 4).
+    cancel_observed = False
     # Spec §8 L1019 + Kimi rework 2026-08-08: when this task actually installs
     # non-preinstalled packages, re-collect the runtime environment after the
     # install so the task's HTTP execution_environment field reflects the
@@ -1753,13 +2016,6 @@ def run_in_open_session(
             path_manifest_csv=path_manifest_csv,
             copy_loader_modules=prepare_loader_modules,
         )
-        if child_spec is not None:
-            # P0-4: hand the child-writable subtree to the child identity
-            # BEFORE the wrapper runs (input datasets and the wrapper
-            # staging dir stay root-owned).
-            _chown_workspace_for_child(
-                session, config, task_id, task_workspace, child_spec
-            )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
         # 260808-finance-methodspec-v5 work package D: ExecutionEnvironment was
@@ -1896,7 +2152,7 @@ def run_in_open_session(
             # an EMPTY list so llm-sandbox never installs twice (one-install) and
             # user code inside the wrapper reads the post-install env file
             # (same-environmentId).
-            result, finance_record_channel, wrapper_phase_timings = (
+            result, finance_record_channel, wrapper_phase_timings, cancel_observed = (
                 _run_bounded_wrapper_path(
                     session,
                     config,
@@ -1906,7 +2162,6 @@ def run_in_open_session(
                     [],
                     timeout,
                     effective_output_limits,
-                    child_spec,
                 )
             )
             timings.update(wrapper_phase_timings)
@@ -1920,7 +2175,14 @@ def run_in_open_session(
             f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')} "
             f"wrapper={'on' if finance_record_channel is not None else 'off'}",
         )
-        exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
+        # D11 (task #108): an observed cancel is its own exit reason; the
+        # child's real exit code and captured bytes stay untouched in the
+        # result (genuine observations, never fabricated — the terminal
+        # CANCELED classification itself happens in the store).
+        if cancel_observed:
+            exit_reason = "CANCELED"
+        else:
+            exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
 
         t_artifact_start = time.monotonic()
         _flush_container_log(session, task_id, config)
@@ -1943,17 +2205,31 @@ def run_in_open_session(
     finally:
         loader_metrics_jsonl = _read_runtime_text(
             session,
-            f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')} 2>/dev/null || true",
+            f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')}",
         )
         artifact_bytes_written = _read_runtime_size(session, task_workspace + "/artifacts")
         temporary_bytes_written = _read_task_temporary_bytes(session, task_workspace)
         oom_killed = _container_oom_killed(actual_container_id)
-        if oom_killed:
+        # D11 (task #108): an OBSERVED cancel keeps the CANCELED exit reason
+        # even if the container also shows an OOM mark — the cancellation is
+        # the evidenced terminal cause (the OOM mark may be stale/container-
+        # wide).  Without cancel evidence the pre-D11 OOM override stands.
+        if oom_killed and exit_reason != "CANCELED":
             exit_reason = "OOM_KILLED"
         t_cleanup_start = time.monotonic()
         cleanup_ok = True
         if workspace_created:
             cleanup_ok = _cleanup_task_workspace(session, task_id, config)
+            # D11 (task #108): remove this task's control dir alongside its
+            # workspace.  The root dir itself is reused across tasks; only
+            # the task subdir goes.  A failed cleanup recycles the container
+            # (single-use policy) but never changes the task outcome — the
+            # marker write window is over by now.
+            if bounded_path_selected:
+                if not _cleanup_task_control_dir(session, task_id):
+                    container_recycled = True
+                    if recycle_reason is None:
+                        recycle_reason = RECYCLE_REASON_CONTROL_CLEANUP_FAILED
         timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
         if not cleanup_ok:
             container_recycled = True
@@ -2036,6 +2312,10 @@ def run_in_open_session(
         # §5.1 write path: the snake_case channel built from the capture
         # summary, or None when the run did not go through the wrapper.
         "finance_record_channel": finance_record_channel,
+        # D11 (task #108): wrapper-observed cancellation evidence (d6841a2e
+        # rule 2).  False on the legacy path and every error path; the store
+        # turns MARKER_OBSERVED into the CANCELED terminal state.
+        "cancel_observed": cancel_observed,
         # 260808-finance-methodspec-v5 work package D: caller-supplied
         # ExecutionEnvironment instance is surfaced here on the HTTP
         # ExecuteResult; gateway presence-aware mapping then sets the proto

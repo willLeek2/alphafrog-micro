@@ -37,6 +37,8 @@ class LangchainToolCatalogServiceTest {
                 null,
                 null,
                 new ListMyDataTool(objectMapper),
+                null,
+                null,
                 objectMapper
         );
 
@@ -72,6 +74,8 @@ class LangchainToolCatalogServiceTest {
                 null,
                 null,
                 new ListMyDataTool(objectMapper),
+                null,
+                null,
                 objectMapper
         );
 
@@ -94,6 +98,8 @@ class LangchainToolCatalogServiceTest {
                 null,
                 null,
                 new ListMyDataTool(objectMapper),
+                null,
+                null,
                 objectMapper
         );
 

@@ -38,7 +38,7 @@ class AgentCreditServiceTest {
     @Mock
     private AgentRunMapper runMapper;
     @Mock
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     @Mock
     private AgentModelCatalogService modelCatalogService;
 

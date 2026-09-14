@@ -1,5 +1,7 @@
 package world.willfrog.agent.platform.dataanalysis;
 
+import world.willfrog.agent.platform.exception.AgentRunControlSignal;
+
 /**
  * 外部工具超过同步等待窗口后抛出的“主动让出执行权”信号。
  *
@@ -10,7 +12,7 @@ package world.willfrog.agent.platform.dataanalysis;
  * <p>返回值不是通过普通工具结果传递，是为了避免误写“工具已完成”事件、
  * 结果压缩和缓存。恢复端必须等终态结果持久化后，凭这三个字段找到原调用。</p>
  */
-public class ExternalToolJobPendingException extends RuntimeException {
+public class ExternalToolJobPendingException extends RuntimeException implements AgentRunControlSignal {
 
     // runId 把后台任务绑定到唯一 Agent Run，防止跨 run 误恢复。
     private final String runId;

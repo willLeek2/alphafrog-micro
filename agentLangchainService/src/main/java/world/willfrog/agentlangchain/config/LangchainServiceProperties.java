@@ -11,9 +11,7 @@ public class LangchainServiceProperties {
 
     @Data
     public static class Provider {
-        /**
-         * When false, Dubbo provider bean is not registered (P0 default).
-         */
+        /** 关闭时不注册 Dubbo provider，health 会报告 PROVIDER_DISABLED。 */
         private boolean enabled = false;
     }
 }

@@ -3,8 +3,9 @@ package world.willfrog.agentlangchain.config;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -15,9 +16,14 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 用公平 {@link Semaphore} 限制 executePython 的前台并发。
  *
- * <p>当前 allowlist 固定为 executePython，其他工具直接通过。permit 只保护工具调用入口，
- * 不能替代 durable capacity reservation，也不会让同步工具自动具备后台恢复能力。等待时间、
- * 超时数和执行耗时按工具累计，供观测与后续自适应使用。</p>
+ * <p>当前 allowlist 固定为 executePython，其他工具直接通过。permit 的作用范围是工具
+ * 调用入口，数据库里的持久容量预留由其他机制负责，同步工具也不会因此自动获得
+ * 后台恢复能力。等待时间、超时数和执行耗时按工具累计，供观测与后续自适应使用。</p>
+ *
+ * <p><b>作用域</b>：本类使用 <em>JVM 进程内</em> Semaphore；多实例部署时每个实例
+ * 各自计数、各自封顶，容量保证只覆盖单个进程。运维估算全局限流时使用公式：
+ * {@code 全局许可近似 ≈ 实例数 × 每实例 maxPermits}（本类默认/配置的每实例 permits）。
+ * 观测快照字段 {@code scope} 固定为 {@code "per-node"}，低基数、无用户/run 标识。</p>
  */
 @Component
 @Slf4j
@@ -43,7 +49,7 @@ public class LangchainToolConcurrencyThrottle {
         this.enabled = enabled;
         this.timeoutSeconds = timeoutSeconds;
         this.maxPermits = Math.max(1, maxConcurrent);
-        // 当前仅精确匹配 executePython；注释不得误导为已经支持配置化 allowlist。
+        // 当前固定只匹配 executePython 这一个工具名。
         this.throttledTools = Set.of("executePython");
         this.semaphore = new Semaphore(this.maxPermits, true); // 公平模式按等待顺序发 permit。
     }
@@ -96,7 +102,8 @@ public class LangchainToolConcurrencyThrottle {
     }
 
     /**
-     * 记录所有工具的执行耗时作为基线；等待/超时指标只覆盖被限流工具，这是有意的不对称。
+     * 记录所有工具的执行耗时作为基线；等待与超时指标按被限流的工具分别累计，
+     * 与全量耗时基线不同是设计使然。
      */
     public void recordExecution(String toolName, long durationMs) {
         if (durationMs <= 0) return;
@@ -106,19 +113,26 @@ public class LangchainToolConcurrencyThrottle {
 
     // ── 观测快照：返回副本/标量，调用方不能修改 semaphore 状态 ──
 
+    /**
+     * 返回本实例工具前台限流观测快照。
+     *
+     * <p>稳定字段 {@code scope} 恒为 {@code "per-node"}，标明计数仅覆盖本 JVM；
+     * 多实例时请按「实例数 × 每实例 maxPermits」估算全局许可，勿当作集群配额。</p>
+     */
     public Map<String, Object> throttleMetrics() {
-        return Map.of(
-                "enabled", enabled,
-                "maxPermits", maxPermits,
-                "availablePermits", semaphore.availablePermits(),
-                "queueLength", semaphore.getQueueLength(),
-                "timeoutSeconds", timeoutSeconds,
-                "timeoutCounts", toLongMap(timeoutCounts),
-                "waitMsTotal", toLongMap(waitMsTotal),
-                "waitCount", toLongMap(waitCount),
-                "execMsTotal", toLongMap(execMsTotal),
-                "execCount", toLongMap(execCount)
-        );
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("scope", "per-node");
+        metrics.put("enabled", enabled);
+        metrics.put("maxPermits", maxPermits);
+        metrics.put("availablePermits", semaphore.availablePermits());
+        metrics.put("queueLength", semaphore.getQueueLength());
+        metrics.put("timeoutSeconds", timeoutSeconds);
+        metrics.put("timeoutCounts", toLongMap(timeoutCounts));
+        metrics.put("waitMsTotal", toLongMap(waitMsTotal));
+        metrics.put("waitCount", toLongMap(waitCount));
+        metrics.put("execMsTotal", toLongMap(execMsTotal));
+        metrics.put("execCount", toLongMap(execCount));
+        return metrics;
     }
 
     private static Map<String, Long> toLongMap(Map<String, AtomicLong> source) {

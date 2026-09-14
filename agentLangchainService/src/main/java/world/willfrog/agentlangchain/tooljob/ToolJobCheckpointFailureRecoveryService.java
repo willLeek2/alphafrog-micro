@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -16,7 +17,7 @@ import java.util.Objects;
 /**
  * 为无法在旧 worker 内解决的 checkpoint 写失败建立持久化 owner。
  *
- * <p>目标不是盲目重试整份 anchor，而是在冻结的任务身份和版本上做窄合并；
+ * <p>本类只在冻结的任务身份和版本上做窄合并，整份 anchor 不重试；
  * 若并发写者已经产生等价或更新 checkpoint，则把本写者判为 superseded。
  * 若暂时无法写失败处置，则把完整请求编码进 last_error marker，交给 reconciler 重试。</p>
  */
@@ -41,7 +42,7 @@ public class ToolJobCheckpointFailureRecoveryService {
     public Outcome handleFailure(ToolJobCheckpointRequest request) {
         // 没有冻结请求就无法确认所有权，返回 UNOWNED 交给 pipeline 走缺 anchor 失败路径。
         if (request == null) return Outcome.UNOWNED;
-        // 首先检查是否已有并发写者落稳等价/更新 checkpoint，避免把健康 Run 标失败。
+        // 首先检查是否已有并发写者把等价或更新的 checkpoint 写进数据库，避免把健康 Run 标失败。
         if (hasEquivalentOrNewerCheckpoint(request)) return Outcome.HEALTHY_CHECKPOINT;
         try {
             // 第一次尝试在相同身份/版本上窄写 CHECKPOINT_FAILED disposition。
@@ -64,7 +65,7 @@ public class ToolJobCheckpointFailureRecoveryService {
         if (!hasSameFrozenOwner(request)) return Outcome.SUPERSEDED;
 
         // CAS 也可能因为同一 marker 已由另一个线程写入；读取 last_error 识别幂等成功。
-        AgentRun current = runMapper.findById(request.getRunId());
+        AgentRun current = findLocalRun(request.getRunId());
         if (current != null && markerOwnsSameTuple(current.getLastError(), request)) {
             return Outcome.RETRY_OWNED;
         }
@@ -86,7 +87,7 @@ public class ToolJobCheckpointFailureRecoveryService {
     /** @return true when no pending marker exists or this call durably resolved it. */
     public boolean retryPending(String runId) {
         // 重启/周期扫描从数据库读取 marker；Redis 不参与所有权判断。
-        AgentRun run = runMapper.findById(runId);
+        AgentRun run = findLocalRun(runId);
         // 没有 marker 代表无需重试，幂等返回 true。
         if (run == null || run.getLastError() == null
                 || !run.getLastError().startsWith(MARKER_PREFIX)) {
@@ -114,8 +115,9 @@ public class ToolJobCheckpointFailureRecoveryService {
             resolved = anchorService.markCheckpointFailed(
                     request, "durable_checkpoint_write_failed");
         }
-        // 只有处置已落稳且 last_error 仍等于原 marker 时才清理，避免删掉新错误。
-        return resolved && runMapper.clearToolJobCheckpointFailurePending(runId, marker) == 1;
+        // 只有失败处置已确认写入数据库、且 last_error 仍等于原 marker 时才清理，避免删掉新错误。
+        return resolved && runMapper.clearToolJobCheckpointFailurePending(
+                runId, marker) == 1;
     }
 
     private int writePendingMarker(ToolJobCheckpointRequest request, String marker) {
@@ -127,7 +129,7 @@ public class ToolJobCheckpointFailureRecoveryService {
     private boolean hasSameFrozenOwner(ToolJobCheckpointRequest request) {
         try {
             // 每次都从数据库读取当前 anchor，判断旧请求是否仍拥有同一元组。
-            AgentRun run = runMapper.findById(request.getRunId());
+            AgentRun run = findLocalRun(request.getRunId());
             if (run == null || run.getStatus() != AgentRunStatus.WAITING_TOOL_JOB
                     || blank(run.getToolJobAnchorJson())) {
                 return false;
@@ -146,6 +148,10 @@ public class ToolJobCheckpointFailureRecoveryService {
             // 分类异常时保守返回 true，避免把仍有效的失败 owner 错判为 superseded 后丢失处置。
             return true;
         }
+    }
+
+    private AgentRun findLocalRun(String runId) {
+        return runMapper.findById(runId);
     }
 
     private boolean markerOwnsSameTuple(String marker, ToolJobCheckpointRequest request) {

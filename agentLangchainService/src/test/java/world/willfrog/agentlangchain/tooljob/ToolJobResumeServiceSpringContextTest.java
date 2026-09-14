@@ -8,7 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.Mockito.mock;
 
 /**
- * 验证 Spring 生产上下文会选择四参数构造器，而不是测试专用的五参数构造器。
+ * 验证 Spring 生产上下文会选择带 gateway 的生产构造器，而不是测试专用的带 ownerId 构造器。
  */
 class ToolJobResumeServiceSpringContextTest {
 
@@ -19,6 +19,8 @@ class ToolJobResumeServiceSpringContextTest {
             context.registerBean(ToolJobRedisCache.class, () -> mock(ToolJobRedisCache.class));
             context.registerBean(ToolJobConfig.class, () -> mock(ToolJobConfig.class));
             context.registerBean(ObjectMapper.class, () -> new ObjectMapper());
+            context.registerBean(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class,
+                    () -> mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class));
             context.register(ToolJobResumeService.class);
             context.refresh();
 

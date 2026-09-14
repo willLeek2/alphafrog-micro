@@ -39,6 +39,10 @@ import static org.mockito.Mockito.when;
 
 class ToolJobStartupDagCleanupRecoveryTest {
 
+    private final world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+            org.mockito.Mockito.mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+
+
     @Test
     void startupTakesOverExpiredDagLeaseAndSchedulesCleanupWithoutWaitingTransition() throws Exception {
         Fixture fixture = fixture("RUNNING");
@@ -521,14 +525,15 @@ class ToolJobStartupDagCleanupRecoveryTest {
         DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
         PythonSandboxService sandbox = mock(PythonSandboxService.class);
         ToolJobStartupRecovery recovery = new ToolJobStartupRecovery(
-                anchorService, redisCache, capacity, properties, finalizer, resumeService, config);
+                anchorService, redisCache, capacity, properties, finalizer, resumeService, config,
+                ownershipGateway);
         inject(recovery, "sandboxService", sandbox);
 
         AgentRun run = new AgentRun();
         run.setId("run-dag");
         run.setStatus(runStatus);
-        when(anchorService.listActive(200)).thenReturn(List.of(run));
-        when(anchorService.listResumeReady(200)).thenReturn(List.of());
+        when(ownershipGateway.listActiveAnchors(200)).thenReturn(List.of(run));
+        when(ownershipGateway.listResumeReadyAnchors(200)).thenReturn(List.of());
         when(anchorService.loadAnchor("run-dag")).thenReturn(anchor);
         when(anchorService.promoteExpiredDagBlockingWorkerLost(
                 eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))

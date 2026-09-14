@@ -34,7 +34,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks"))
@@ -46,15 +49,15 @@ class PythonSandboxGatewayServiceImplTest {
                           "file_count":2,
                           "capacity_units":3,
                           "operation_id":"run-1:call-1:1",
-                          "request_fingerprint":"sha256:request",
-                          "memory_limit_bytes":1073741824,
+                          "request_fingerprint":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                          "memory_limit_bytes":1610612736,
                           "timeout_millis":30000,
                           "runtime_environment_version":"python-v1",
                           "canonical_spec_schema_version":"sandbox_create_v1",
-                          "code_hash":"sha256:code",
-                          "immutable_dataset_snapshot_digest":"sha256:dataset",
-                          "libraries_digest":"sha256:libraries",
-                          "sandbox_options_digest":"sha256:options"
+                          "code_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                          "immutable_dataset_snapshot_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                          "libraries_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                          "sandbox_options_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                         }
                         """, false))
                 .andRespond(withSuccess("""
@@ -62,7 +65,7 @@ class PythonSandboxGatewayServiceImplTest {
                           "task_id":"task-existing",
                           "status":"RUNNING",
                           "existing":true,
-                          "request_fingerprint":"sha256:request"
+                          "request_fingerprint":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                         }
                         """, MediaType.APPLICATION_JSON));
 
@@ -74,21 +77,21 @@ class PythonSandboxGatewayServiceImplTest {
                 .setFileCount(2)
                 .setCapacityUnits(3)
                 .setOperationId("run-1:call-1:1")
-                .setRequestFingerprint("sha256:request")
-                .setMemoryLimitBytes(1073741824L)
+                .setRequestFingerprint("sha256:" + "f".repeat(64))
+                .setMemoryLimitBytes(1536L * 1024L * 1024L)
                 .setTimeoutMillis(30000)
                 .setRuntimeEnvironmentVersion("python-v1")
                 .setCanonicalSpecSchemaVersion("sandbox_create_v1")
-                .setCodeHash("sha256:code")
-                .setImmutableDatasetSnapshotDigest("sha256:dataset")
-                .setLibrariesDigest("sha256:libraries")
-                .setSandboxOptionsDigest("sha256:options")
+                .setCodeHash("sha256:" + "a".repeat(64))
+                .setImmutableDatasetSnapshotDigest("sha256:" + "b".repeat(64))
+                .setLibrariesDigest("sha256:" + "c".repeat(64))
+                .setSandboxOptionsDigest("sha256:" + "d".repeat(64))
                 .build());
 
         server.verify();
         assertEquals("task-existing", response.getTaskId());
         assertTrue(response.getExisting());
-        assertEquals("sha256:request", response.getRequestFingerprint());
+        assertEquals("sha256:" + "f".repeat(64), response.getRequestFingerprint());
     }
 
     @Test
@@ -96,7 +99,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/operations/run-1:call-1:1"))
@@ -126,7 +132,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/operations/run%2F%E4%B8%AD%E6%96%87%20id"))
@@ -147,7 +156,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/operations/run-1:call-1:1"))
@@ -203,7 +215,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-1"))
@@ -254,7 +269,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-2"))
@@ -300,7 +318,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-oom"))
@@ -341,7 +362,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-cancel"))
@@ -422,7 +446,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-old"))
@@ -465,7 +492,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-v5"))
@@ -545,7 +575,10 @@ class PythonSandboxGatewayServiceImplTest {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
         PythonSandboxGatewayServiceImpl gateway =
-                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+                // 260809-26Q3-stage1-w3 D13: dual RestTemplate constructor. Tests use the same
+                // instance for both long and short beans since MockRestServiceServer intercepts
+                // at the request level regardless of which bean issued the call.
+                new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
 
         server.expect(once(), requestTo("http://sandbox/tasks/task-empty"))

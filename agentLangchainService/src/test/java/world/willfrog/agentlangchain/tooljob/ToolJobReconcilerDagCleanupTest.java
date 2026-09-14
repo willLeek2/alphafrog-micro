@@ -31,6 +31,7 @@ import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -44,10 +45,12 @@ class ToolJobReconcilerDagCleanupTest {
 
     @Test
     void acceptedLinearHandoffDoesNotReenterSandboxFinalizer() throws Exception {
+        // 260818（grace round-1）：真实状态是 ACCEPTED（isResultConsumed 从 resumeState
+        // 推导）。旧夹具写 LAUNCHING+setResultConsumed(true) 是失真的——该组合在生产
+        // 读取路径下永远 isResultConsumed()=false，正是协调器死分支的根因。
         ToolJobAnchor anchor = baseAnchor();
         anchor.setAutoResume(true);
-        anchor.setResumeState("LAUNCHING");
-        anchor.setResultConsumed(true);
+        anchor.setResumeState("ACCEPTED");
         Fixture fixture = fixture(anchor);
 
         fixture.reconciler.reconcileFromDue();
@@ -58,6 +61,38 @@ class ToolJobReconcilerDagCleanupTest {
         verifyNoInteractions(fixture.sandbox);
         verify(fixture.finalizer, never()).handleTerminal(
                 any(), any(), any(), any(), any(Boolean.class));
+    }
+
+    @Test
+    void canceledAcceptedHandoffStillEntersTerminalHandling() throws Exception {
+        // 260818（grace round-1）：autoResume=false 的 ACCEPTED（取消 disposition）不能
+        // 被快速路径吞掉——必须继续走 checkPausedTerminal 的终态确认与 CANCELED 收口。
+        ToolJobAnchor anchor = baseAnchor();
+        anchor.setAutoResume(false);
+        anchor.setAnchorState("TERMINAL");
+        anchor.setResumeState("ACCEPTED");
+        anchor.setRunDisposition("CANCELED");
+        Fixture fixture = fixture(anchor);
+        when(fixture.sandbox.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(fixture.sandbox.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(
+                TaskResultResponse.newBuilder()
+                        .setTaskId("task-dag")
+                        .setStatus("SUCCEEDED")
+                        .setStdout("ok")
+                        .setRetryable(false)
+                        .build());
+
+        fixture.reconciler.reconcileFromDue();
+
+        // 终态收口被调用（autoResume=false），不是交给恢复服务
+        verify(fixture.finalizer).handleTerminal(
+                eq("run-dag"), any(ToolJobAnchor.class), eq("SUCCEEDED"),
+                any(TaskResultResponse.class), eq(false));
+        verify(fixture.resumeService, never()).tryResume(any());
+        // 快速路径的清理没有发生（removeDue 由 finalizer 内部决定，mock 下无调用）
+        verify(fixture.redisCache, never()).removeDue("run-dag");
+        verify(fixture.redisCache, never()).deletePendingCache("run-dag");
     }
 
     @Test
@@ -81,8 +116,8 @@ class ToolJobReconcilerDagCleanupTest {
         AgentRun run = new AgentRun();
         run.setId("run-dag");
         run.setStatus(AgentRunStatus.EXECUTING);
-        when(fixture.anchorService.listActive(100)).thenReturn(List.of(run));
-        when(fixture.anchorService.listResumeReady(50)).thenReturn(List.of());
+        when(fixture.ownershipGateway.listActiveAnchors(100)).thenReturn(List.of(run));
+        when(fixture.ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
 
         fixture.reconciler.rebuildFromAnchors();
 
@@ -378,13 +413,20 @@ class ToolJobReconcilerDagCleanupTest {
         when(redisCache.fetchDue(20)).thenReturn(Set.of("run-dag"));
         when(anchorService.loadAnchor("run-dag")).thenReturn(anchor);
 
+        world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+                mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
+        when(ownershipGateway.owns(anyString())).thenReturn(true);
+        when(ownershipGateway.listActiveAnchors(100)).thenReturn(List.of());
+        when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
+        when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of());
         ToolJobReconciler reconciler = new ToolJobReconciler(
                 redisCache,
                 anchorService,
                 finalizer,
                 resumeService,
                 config,
-                capacityService);
+                capacityService,
+                ownershipGateway);
         inject(reconciler, "sandboxService", sandbox);
         return new Fixture(
                 reconciler,
@@ -393,7 +435,8 @@ class ToolJobReconcilerDagCleanupTest {
                 finalizer,
                 resumeService,
                 capacityService,
-                sandbox);
+                sandbox,
+                ownershipGateway);
     }
 
     private ToolJobAnchor liveAnchor() {
@@ -492,6 +535,7 @@ class ToolJobReconcilerDagCleanupTest {
             ToolJobFinalizer finalizer,
             ToolJobResumeService resumeService,
             DataAnalysisCapacityService capacityService,
-            PythonSandboxService sandbox) {
+            PythonSandboxService sandbox,
+            world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway) {
     }
 }

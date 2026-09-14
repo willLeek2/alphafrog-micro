@@ -40,19 +40,23 @@ Spec §12 line 1304: 基础镜像固定到已验证摘要，不使用裸 `python
 `Dockerfile.runtime`:
 
 ```dockerfile
-ARG RUNTIME_BASE_IMAGE_REF=REPLACE_WITH_VERIFIED_BASE_IMAGE_REF
+ARG RUNTIME_BASE_IMAGE_REF=invalid.invalid/alphafrog/replace-with-verified-base-image-ref
 FROM ${RUNTIME_BASE_IMAGE_REF}
 ```
 
-`REPLACE_WITH_VERIFIED_BASE_IMAGE_REF` is a placeholder, not an image
-reference: `docker build` fails at `FROM` until frog pins the verified value.
+The `invalid.invalid/...` value is a syntactically valid but unreachable
+placeholder. BuildKit parses every `FROM` before honoring `--target`, so an
+uppercase non-reference placeholder would abort parsing even when
+`docker_build.sh` supplied the other stage correctly. A direct build still
+fails closed against the reserved `.invalid` domain.
 `docker_build.sh` passes the pinned value as
 `--build-arg RUNTIME_BASE_IMAGE_REF=python:<tag>@sha256:<64 lowercase hex>`
 (env `BASE_IMAGE_DIGEST`, validated anchored/lowercase-only) and refuses to
-treat placeholder tokens or malformed digests as verified values. ONLY a dev
-structural build behind the explicit `AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD`
-switch may FROM the bare base tag instead — such a build is marked
-`releasable=false`.
+treat placeholder tokens or malformed digests as verified values. The
+single-machine `local-image-id` mode intentionally uses the local base tag;
+in `strict-release`, only an explicit
+`AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD` switch may fall back to that tag, and
+the result is marked `releasable=false`.
 
 ## 2. Runtime packages live in a lockfile, not inline Dockerfile text
 
@@ -303,7 +307,14 @@ TWO-PHASE build:
    `finance.risk.annualized_volatility` / `finance.risk.sharpe_ratio`, each
    methodVersion `1.0.0`, specDigests
    `sha256:cff05d88…`, `sha256:2843745f…`, `sha256:fccc1f0f…`). Any failure
-   aborts the build.
+   aborts the build;
+5. PHASE 2 cannot put the bare local `sha256:<Image ID>` directly in
+   Dockerfile `FROM`: BuildKit interprets it as a registry reference. The
+   script therefore creates a process-unique local tag from the phase-1 ID,
+   immediately verifies with `docker image inspect` that the tag resolves to
+   that exact ID, uses it only to bridge `FROM`, and removes it on success or
+   failure. The temporary tag is never written into SBOM, mapping, deploy
+   configuration, or other release evidence.
 
 ### R2-2 — verified ACTUAL inventory replaces lockfile inference
 
@@ -317,8 +328,8 @@ fail-closed against the expected set (lock pins + alphafrog_finance
 version/apiVersion from the runtime source): missing/extra managed package,
 version or apiVersion mismatch aborts the build. The verified inventory feeds
 `library-set.json`, the OCI `librarySetDigest` label (PHASE 2 bakes both,
-FROM the phase-1 immutable ID) and the external mapping — all three carry the
-SAME verified set.
+FROM the verified temporary local bridge to the phase-1 immutable ID) and the
+external mapping — all three carry the SAME verified set.
 
 ### R2-3 — deploy target binding
 
@@ -344,3 +355,49 @@ anything digest-shaped must satisfy the anchored lowercase digest grammar
 EVEN UNDER the switch. The shared vector sets `VALID_DEV_REFERENCES` /
 `MALFORMED_UNDER_DEV_REFS` in `tests/digest_reference_vectors.py` pin all
 three surfaces (config / manifest / deploy).
+
+## 7. 260814 scheduler-03: verify-mode selection (local-image-id vs strict-release)
+
+`AF_SANDBOX_IMAGE_VERIFY_MODE` selects which image reference contract
+applies; accepted values are `local-image-id` (default) and `strict-release`.
+The two modes are independent — enabling one never silently re-enables the
+other's escape hatches.
+
+### local-image-id（默认，单机正式模式）
+
+- `AF_SANDBOX_IMAGE` must BE the local Image ID: exactly `sha256:<64
+  lowercase hex>`, no repository prefix. Tags and repo digests are rejected;
+  `AF_SANDBOX_IMAGE_ALLOW_DEV_TAG` does not apply in this mode (there is no
+  dev-allow escape — local-image-id is itself the supported single-machine
+  contract).
+- The service (FastAPI lifespan) refuses to start unless the configured ID
+  exists on the host, verified through the mounted Docker socket
+  (`app/runtime_image_verify.py`). Missing image, unreachable socket or any
+  query failure fails CLOSED.
+- Optional `AF_SANDBOX_IMAGE_TAG_CHECK` (e.g.
+  `alphafrog-sandbox-runtime:latest`): resolved exactly ONCE at startup and
+  must point to the SAME Image ID. Task creation never re-resolves the tag;
+  the frozen ref comes from `AF_SANDBOX_IMAGE` only.
+- `docker_build.sh` in this mode runs the real gates (import checks, smoke
+  gate, inventory gate) and prints the final immutable Image ID for deploy
+  config; the strict-release inputs (base digest, SBOM, external mapping,
+  Tier2a) are not build success conditions and the mapping is not written.
+- `deploy_latest.sh` in this mode validates the ID shape and requires
+  `docker inspect` to resolve to EXACTLY the configured ID (plus the optional
+  tag check). The D15 mapping/Tier2a chain is skipped; the script never
+  downgrades itself to tag mode.
+
+### strict-release（未来仓库发布链，Spec §12）
+
+The pre-existing digest-reference policy (anchored lowercase
+`repo@sha256:<64hex>` + the explicit `AF_SANDBOX_IMAGE_ALLOW_DEV_TAG`
+switch) and the full D15 registry digest / SBOM / mapping / Tier2a chain
+remain unchanged, selected explicitly with
+`AF_SANDBOX_IMAGE_VERIFY_MODE=strict-release`. `AF_SANDBOX_IMAGE_TAG_CHECK`
+is rejected in this mode.
+
+No real Docker daemon, image or container is required by the unit tests:
+config vectors, the verify function (injectable docker client) and the
+build/deploy script gates are pinned with fake docker fixtures
+(`tests/test_config_image_mode.py`, `tests/test_runtime_image_verify.py`,
+`tests/test_runtime_image_retention.py` local-mode classes).

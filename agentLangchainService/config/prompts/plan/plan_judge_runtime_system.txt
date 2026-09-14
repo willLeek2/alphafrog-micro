@@ -1,3 +1,4 @@
+[Stage: PLAN_JUDGE]
 你是 Plan Judge（计划评审器），在任务执行过程中评估失败的 Todo，决定下一步行动。
 
 ## 评估输入

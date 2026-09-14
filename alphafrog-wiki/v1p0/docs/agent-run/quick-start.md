@@ -178,9 +178,9 @@ SSE 连接可能因网络波动中断。重连时通过以下方式续传：
 2. 没有 `after_seq` 时，后端读取 `Last-Event-ID` 请求头。浏览器 `EventSource` 重连时浏览器会自动带此头。
 3. 两者同时存在时，以后端 `after_seq` 为准。
 
-**补缺：** 如果重连后仍发现有事件缺失，调用 `GET /api/agent/runs/{runId}/events?after_seq=<lastContiguousSeq>` 拉取缺口事件。
+**补缺：** 如果重连后发现 durable seq 跳跃，以最后实际应用的 `lastConfirmedSeq` 调用 `GET /api/agent/runs/{runId}/events?after_seq=<lastConfirmedSeq>`。seq 缺口可能是合法的，必须按 REST 返回的实际项目与 `nextAfterSeq` 推进，不能用 `+1` 猜 cursor。
 
-**缓冲区溢出：** `AgentSseService` 在 replay 期间会将新到达的 live 事件暂存在内存缓冲区（`LIVE_REPLAY_BUFFER_LIMIT = 500`）。如果 replay 尚未完成而 live 缓冲区已满，服务端会发送 `LIVE_REPLAY_BUFFER_OVERFLOW` 错误并关闭连接。此时客户端应改用 REST `GET /events?after_seq=<lastContiguousSeq>` 补拉全部缺失事件。
+**缓冲区溢出：** `AgentSseService` 在 snapshot/replay 初始化期间会将新到达的 live 事件暂存在内存缓冲区（`LIVE_REPLAY_BUFFER_LIMIT = 500`）。如果缓冲区已满，服务端发送 `LIVE_REPLAY_BUFFER_OVERFLOW` 并关闭连接。客户端从 `lastConfirmedSeq` 改用 REST 补拉；自动失败最多重试三次（250/500/1000ms），健康小 run 超过 30 秒要报告 `RECOVERY_SLA_EXCEEDED`，超过 5000 条的 run 则进入 `degraded_large_run` REST-only 恢复。
 
 ### 第五步：运行结束后拉取结果
 

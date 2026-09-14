@@ -3,6 +3,7 @@ package world.willfrog.agent.tools.finance;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
 
 import java.util.HashSet;
 import java.util.Iterator;
@@ -16,6 +17,7 @@ import java.util.Set;
  * <p>校验失败返回可分类的错误码，供 {@link FinanceMethodTools} 决定是走别名兜底还是返回
  * RESOLVER_BAD_MODEL_OUTPUT。</p>
  */
+@Component
 @Slf4j
 public class FinanceMethodResolutionValidator {
 

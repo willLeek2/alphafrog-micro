@@ -47,8 +47,9 @@ def _load_fixture():
 
 
 def _summary(**overrides):
-    # The full frozen 13-key capture-result.json shape: the ten §7.1 fields
-    # plus the three internal unknown-marker audit counters (§4.1/§4.2).
+    # The full frozen 14-key capture-result.json shape: the ten §7.1 fields,
+    # the D11 cancelObserved cancellation-evidence flag (task #108), plus the
+    # three internal unknown-marker audit counters (§4.1/§4.2).
     base = {
         "exitCode": 0,
         "ordinaryStdoutBytes": 7,
@@ -63,6 +64,7 @@ def _summary(**overrides):
         "unknownMarkerLines": 0,
         "unknownMarkerBytes": 0,
         "unknownMarkerTruncated": False,
+        "cancelObserved": False,
     }
     base.update(overrides)
     return base

@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 
 import javax.sql.DataSource;
@@ -36,6 +37,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Testcontainers
 class ToolJobAnchorMapperIntegrationTest {
+
+    private static final String DEPLOYMENT_ID = "stable";
+    private static final String GENERATION_ID = "gen-" + "a".repeat(64);
+    private static final DeploymentIdentity LOCAL_IDENTITY =
+            new DeploymentIdentity(DEPLOYMENT_ID, GENERATION_ID);
 
     @Container
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15")
@@ -71,6 +77,9 @@ class ToolJobAnchorMapperIntegrationTest {
                 CREATE TABLE alphafrog_agent_run (
                     id VARCHAR(64) PRIMARY KEY,
                     user_id VARCHAR(64),
+                    deployment_id VARCHAR(64),
+                    deployment_generation_id VARCHAR(64),
+                    lane_tag VARCHAR(128),
                     status VARCHAR(32) NOT NULL,
                     current_step INT DEFAULT 0,
                     max_steps INT DEFAULT 20,
@@ -82,6 +91,8 @@ class ToolJobAnchorMapperIntegrationTest {
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ,
                     ext JSONB DEFAULT '{}',
+                    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                    restart_attempt INT NOT NULL DEFAULT 0,
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
         }
@@ -147,10 +158,15 @@ class ToolJobAnchorMapperIntegrationTest {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection();
              var ps = conn.prepareStatement(
-                     "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) VALUES (?, ?, CAST(? AS jsonb))")) {
+                     "INSERT INTO alphafrog_agent_run "
+                             + "(id, status, tool_job_anchor_json, deployment_id, "
+                             + "deployment_generation_id) "
+                             + "VALUES (?, ?, CAST(? AS jsonb), ?, ?)")) {
             ps.setString(1, id);
             ps.setString(2, status);
             ps.setString(3, anchorJson);
+            ps.setString(4, DEPLOYMENT_ID);
+            ps.setString(5, GENERATION_ID);
             ps.executeUpdate();
         }
     }
@@ -619,6 +635,137 @@ class ToolJobAnchorMapperIntegrationTest {
                 .doesNotContain("resume-token");
     }
 
+    // ========== 260818: batch 20260818-182948 root causes ==========
+
+    /**
+     * Root cause 1: production {@code markHandoffAccepted} advances the anchor to
+     * resumeState=ACCEPTED (resultConsumed=true) for the WHOLE resumed execution,
+     * so the second long tool necessarily meets an ACCEPTED handoff — the SQL
+     * previously matched only 'LAUNCHING' and both CAS paths failed
+     * (TOOL_JOB_ANCHOR_INVALID ×15, 5-17ms each).
+     */
+    @Test
+    void secondPreparingReplacesAcceptedStateHandoffDuringResumedExecution() throws Exception {
+        insertRun("run-accepted-handoff", "EXECUTING", """
+            {"operationId":"run-accepted-handoff:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"accepted-token","resumeLeaseVersion":11,
+             "resumeLauncherOwnerId":"owner-1",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true}""");
+        AgentRunMapper mapper = newMapper();
+        String nextPreparing = """
+            {"operationId":"run-accepted-handoff:call-2:1","anchorState":"PREPARING"}""";
+
+        // token/version fences stay intact under the widened resumeState match
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-handoff", nextPreparing, "stale-token", 11L)).isEqualTo(0);
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-handoff", nextPreparing, "accepted-token", 10L)).isEqualTo(0);
+        // the 260818 fix: exact credentials replace the ACCEPTED handoff
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-handoff", nextPreparing, "accepted-token", 11L)).isEqualTo(1);
+        assertThat(mapper.findById("run-accepted-handoff").getToolJobAnchorJson())
+                .contains("run-accepted-handoff:call-2:1", "PREPARING")
+                .doesNotContain("accepted-token");
+    }
+
+    @Test
+    void secondPreparingStillRejectedWhenAcceptedHandoffNotConsumed() throws Exception {
+        // resultConsumed=false means the terminal result is not durable yet —
+        // the handoff must NOT be replaceable (fail-closed retention).
+        insertRun("run-accepted-unconsumed", "EXECUTING", """
+            {"operationId":"run-accepted-unconsumed:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok","resumeLeaseVersion":3,
+             "resumeLauncherOwnerId":"owner-1",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":false}""");
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-unconsumed",
+                "{\"operationId\":\"run-accepted-unconsumed:call-2:1\",\"anchorState\":\"PREPARING\"}",
+                "tok", 3L)).isEqualTo(0);
+        assertThat(mapper.findById("run-accepted-unconsumed").getToolJobAnchorJson())
+                .contains("run-accepted-unconsumed:call-1:1");
+    }
+
+    /**
+     * Root cause 2: cancel landing after markHandoffAccepted leaves the run
+     * EXECUTING with a CANCELED-disposition anchor; the finalizer's terminal
+     * CAS previously required WAITING_TOOL_JOB only and retried forever
+     * (5s finalizer loop + ~60s resume takeover loop, resumeLeaseVersion → 27).
+     *
+     * <p>260913: the same class of gap between the finalizer CAS to RECEIVED and
+     * the resume handoff is also covered here (batch 20260913-012514, 5 runs
+     * stuck at RECEIVED with a 5s terminal_transition_failed retry loop).
+     */
+    @Test
+    void cancelTerminalCasAcceptsEveryCancelWindowStatusAndFencesOperation() throws Exception {
+        // EXECUTING + matching operationId → CANCELED lands (the fixed gap)
+        insertRun("run-cancel-exec", "EXECUTING", """
+            {"operationId":"run-cancel-exec:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok","resumeLeaseVersion":27,
+             "runDisposition":"CANCELED","resultConsumed":true}""");
+        AgentRunMapper mapper = newMapper();
+        String canceledAnchor = """
+            {"operationId":"run-cancel-exec:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok","resumeLeaseVersion":27,
+             "runDisposition":"CANCELED","finalizerStep":"CANCELED","resultConsumed":true}""";
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-exec", canceledAnchor, AgentRunStatus.CANCELED,
+                "run-cancel-exec:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-cancel-exec").getStatus())
+                .isEqualTo(AgentRunStatus.CANCELED);
+
+        // Wrong operationId (anchor replaced by a newer dispatch) → fenced out,
+        // neither status nor anchor changes
+        insertRun("run-cancel-fence", "EXECUTING", """
+            {"operationId":"run-cancel-fence:call-2:1","anchorState":"PREPARING"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-fence", canceledAnchor, AgentRunStatus.CANCELED,
+                "run-cancel-fence:call-1:1")).isEqualTo(0);
+        AgentRun fenced = mapper.findById("run-cancel-fence");
+        assertThat(fenced.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+        assertThat(fenced.getToolJobAnchorJson()).contains("call-2:1").doesNotContain("CANCELED");
+
+        // WAITING_TOOL_JOB regression: the normal background-wait cancel still lands
+        insertRun("run-cancel-wait", "WAITING_TOOL_JOB", """
+            {"operationId":"run-cancel-wait:call-1:1","anchorState":"PENDING",
+             "runDisposition":"CANCELED"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-wait",
+                "{\"operationId\":\"run-cancel-wait:call-1:1\",\"anchorState\":\"PENDING\","
+                        + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
+                AgentRunStatus.CANCELED, "run-cancel-wait:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-cancel-wait").getStatus())
+                .isEqualTo(AgentRunStatus.CANCELED);
+
+        // RECEIVED window regression (batch 20260913-012514): the finalizer CASed the
+        // run to RECEIVED and a resume worker already claimed it, but no handoff has
+        // landed yet — a cancel in this window must collect here, otherwise the
+        // finalizer retries terminal_transition_failed every 5s.
+        insertRun("run-cancel-received", "RECEIVED", """
+            {"operationId":"run-cancel-received:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"tok-r","runDisposition":"CANCELED"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-received",
+                "{\"operationId\":\"run-cancel-received:call-1:1\",\"anchorState\":\"TERMINAL\","
+                        + "\"resumeState\":\"LAUNCHING\",\"resumeToken\":\"tok-r\","
+                        + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
+                AgentRunStatus.CANCELED, "run-cancel-received:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-cancel-received").getStatus())
+                .isEqualTo(AgentRunStatus.CANCELED);
+
+        // Any other status (e.g. COMPLETED) → rejected
+        insertRun("run-cancel-other", "COMPLETED", """
+            {"operationId":"run-cancel-other:call-1:1","anchorState":"TERMINAL",
+             "runDisposition":"CANCELED"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-other",
+                "{\"operationId\":\"run-cancel-other:call-1:1\",\"anchorState\":\"TERMINAL\","
+                        + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
+                AgentRunStatus.CANCELED, "run-cancel-other:call-1:1")).isEqualTo(0);
+        assertThat(mapper.findById("run-cancel-other").getStatus())
+                .isEqualTo(AgentRunStatus.COMPLETED);
+    }
+
     @Test
     void acceptedExecutingHandoffWithLiveLeaseIsNotRequeuedOrTreatedAsDispatch() throws Exception {
         insertRun("run-resume-scan", "EXECUTING", """
@@ -629,12 +776,40 @@ class ToolJobAnchorMapperIntegrationTest {
              "resultConsumed":true}""");
         AgentRunMapper mapper = newMapper();
 
-        assertThat(mapper.listResumeReadyAnchors(10))
+        assertThat(mapper.listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-scan");
-        assertThat(mapper.listActiveToolJobAnchors(10))
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-scan");
+    }
+
+    /**
+     * 260818（grace round-1）：正常 autoResume（默认 true）的 EXECUTING+ACCEPTED+consumed
+     * handoff 由恢复 worker 持有，不能被 60s 补扫写回 due 再次进入 Sandbox finalizer；
+     * 取消后的 autoResume=false ACCEPTED 仍必须能被补扫发现并走终态收口。
+     */
+    @Test
+    void activeBackfillExcludesNormalAcceptedHandoffButKeepsCanceledAccepted() throws Exception {
+        // 正常恢复执行中：autoResume 缺省 = true → 排除
+        insertRun("run-accepted-normal", "EXECUTING", """
+            {"operationId":"run-accepted-normal:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-n","resumeLeaseVersion":5,
+             "resumeLauncherOwnerId":"owner-n",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true}""");
+        // 取消 disposition 落在恢复执行期：autoResume=false → 保留（终态收口要发现它）
+        insertRun("run-accepted-cancel", "EXECUTING", """
+            {"operationId":"run-accepted-cancel:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-c","resumeLeaseVersion":6,
+             "resumeLauncherOwnerId":"owner-c",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
+                .extracting(AgentRun::getId)
+                .doesNotContain("run-accepted-normal")
+                .contains("run-accepted-cancel");
     }
 
     @Test
@@ -652,18 +827,18 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(newMapper().claimResumeLauncher(
                 "run-resume-claim", launchingA,
                 AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
-                "ready-token", 1L, "owner-a", 30L)).isEqualTo(1);
+                "ready-token", 1L, "owner-a", 30L, LOCAL_IDENTITY)).isEqualTo(1);
         assertThat(newMapper().claimResumeLauncher(
                 "run-resume-claim", launchingB,
                 AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
-                "ready-token", 1L, "owner-b", 30L)).isZero();
+                "ready-token", 1L, "owner-b", 30L, LOCAL_IDENTITY)).isZero();
 
         ToolJobAnchor claimed = ToolJobAnchor.fromJson(
                 newMapper().findById("run-resume-claim").getToolJobAnchorJson());
         assertThat(claimed.getResumeLauncherOwnerId()).isEqualTo("owner-a");
         assertThat(claimed.getResumeLeaseVersion()).isEqualTo(2L);
         assertThat(claimed.getResumeLauncherLeaseUntil()).isNotNull();
-        assertThat(newMapper().listResumeReadyAnchors(10))
+        assertThat(newMapper().listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-claim");
     }
@@ -678,7 +853,7 @@ class ToolJobAnchorMapperIntegrationTest {
         updateUserId("run-resume-takeover", "user-1");
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listResumeReadyAnchors(10))
+        assertThat(mapper.listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(AgentRun::getId)
                 .contains("run-resume-takeover");
         assertThat(mapper.heartbeatResumeLauncher(
@@ -692,7 +867,7 @@ class ToolJobAnchorMapperIntegrationTest {
              "resumeLauncherOwnerId":"owner-new","resultConsumed":true}""";
         assertThat(mapper.takeoverExpiredResumeLauncher(
                 "run-resume-takeover", takeover, AgentRunStatus.EXECUTING,
-                "token-old", 6L, "owner-old", "owner-new", 30L, 120L)).isEqualTo(1);
+                "token-old", 6L, "owner-old", "owner-new", 30L, 120L, LOCAL_IDENTITY)).isEqualTo(1);
 
         assertThat(mapper.updateResumedTerminal(
                 "run-resume-takeover", "user-1", AgentRunStatus.COMPLETED,
@@ -720,7 +895,7 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-dispatch-active", "EXECUTING", """
             {"operationId":"run-dispatch-active:call-1:1","anchorState":"PREPARING"}""");
 
-        assertThat(newMapper().listActiveToolJobAnchors(10))
+        assertThat(newMapper().listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
                 .extracting(run -> run.getId())
                 .contains("run-dispatch-active");
     }
@@ -743,6 +918,428 @@ class ToolJobAnchorMapperIntegrationTest {
                 .contains("\"toolCallCount\": 1");
         assertThat(mapper.findDataAnalysisObservabilitySummaryJsonById("run-obs-1"))
                 .contains("\"toolCallCount\": 1");
+    }
+
+    /**
+     * 260818（grace round-2）：取消与恢复的三层封锁在数据库层的证明。
+     * 取消写（updateAnchor）不轮换 token/version——恢复线程持旧 autoResume=true 对象、
+     * 取消线程先落 autoResume=false+CANCELED 时，三个所有权 CAS（claim / takeover /
+     * accept）都必须因数据库 autoResume 栅栏返回 0，且取消字段保持不变。
+     */
+    @Test
+    void staleResumeWriterCannotOverwriteCancelDisposition() throws Exception {
+        AgentRunMapper mapper = newMapper();
+
+        // takeover 场景：EXECUTING+ACCEPTED+consumed，取消已落，租约已过期。
+        insertRun("run-race-takeover", "EXECUTING", """
+            {"operationId":"run-race-takeover:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-t","resumeLeaseVersion":7,
+             "resumeLauncherOwnerId":"owner-old",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        // 恢复线程手里的旧对象：autoResume 仍是 true，token/version 与数据库一致。
+        String staleTakeover = """
+            {"operationId":"run-race-takeover:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-t","resumeLeaseVersion":7,
+             "resumeLauncherOwnerId":"owner-old","resultConsumed":true,
+             "autoResume":true,"resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z"}""";
+        assertThat(mapper.takeoverExpiredResumeLauncher(
+                "run-race-takeover", staleTakeover, AgentRunStatus.EXECUTING,
+                "tok-t", 7L, "owner-old", "owner-new", 30L, 120L, LOCAL_IDENTITY)).isZero();
+        ToolJobAnchor afterTakeover = ToolJobAnchor.fromJson(
+                mapper.findById("run-race-takeover").getToolJobAnchorJson());
+        assertThat(afterTakeover.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterTakeover.isAutoResume()).isFalse();
+
+        // claim 场景：RECEIVED+READY，取消已落。
+        insertRun("run-race-claim", "RECEIVED", """
+            {"resumeState":"READY","resumeToken":"tok-r","resumeLeaseVersion":2,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        String staleClaim = """
+            {"resumeState":"LAUNCHING","resumeToken":"tok-r","resumeLeaseVersion":3,
+             "resumeLauncherOwnerId":"owner-new","autoResume":true}""";
+        assertThat(mapper.claimResumeLauncher(
+                "run-race-claim", staleClaim, AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
+                "tok-r", 2L, "owner-new", 30L, LOCAL_IDENTITY)).isZero();
+        ToolJobAnchor afterClaim = ToolJobAnchor.fromJson(
+                mapper.findById("run-race-claim").getToolJobAnchorJson());
+        assertThat(afterClaim.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterClaim.isAutoResume()).isFalse();
+
+        // accept 场景：RECEIVED+LAUNCHING 未消费、租约未过期，取消已落。
+        insertRun("run-race-accept", "RECEIVED", """
+            {"operationId":"run-race-accept:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"tok-a","resumeLeaseVersion":4,
+             "resumeLauncherOwnerId":"owner-live",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":false,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        String staleAccept = """
+            {"operationId":"run-race-accept:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-a","resumeLeaseVersion":4,
+             "resumeLauncherOwnerId":"owner-live","resultConsumed":true,
+             "autoResume":true}""";
+        assertThat(mapper.acceptResumeHandoff(
+                "run-race-accept", staleAccept, "tok-a", 4L, "owner-live", 30L)).isZero();
+        ToolJobAnchor afterAccept = ToolJobAnchor.fromJson(
+                mapper.findById("run-race-accept").getToolJobAnchorJson());
+        assertThat(afterAccept.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterAccept.isAutoResume()).isFalse();
+    }
+
+    @Test
+    void resumeReadyScanExcludesCanceledAnchorButKeepsNormalExpiredHandoff() throws Exception {
+        // 正常 autoResume 的过期 ACCEPTED handoff 仍要被恢复补扫发现（恢复服务接管重试）
+        insertRun("run-scan-normal", "EXECUTING", """
+            {"operationId":"run-scan-normal:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-n","resumeLeaseVersion":9,
+             "resumeLauncherOwnerId":"owner-n",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true}""");
+        // 取消锚点（autoResume=false）不进恢复补扫——由终态处理路径负责
+        insertRun("run-scan-cancel", "EXECUTING", """
+            {"operationId":"run-scan-cancel:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-c","resumeLeaseVersion":10,
+             "resumeLauncherOwnerId":"owner-c",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listResumeReadyAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 10))
+                .extracting(AgentRun::getId)
+                .contains("run-scan-normal")
+                .doesNotContain("run-scan-cancel");
+    }
+
+    /**
+     * 260818（grace round-3）：取消先落库后，身份完全匹配的旧恢复线程在
+     * 第二长工具接管 / 恢复终态写入 / 恢失败回滚三组入口都必须被数据库
+     * autoResume 栅栏拒绝，取消字段保持原样。
+     */
+    @Test
+    void cancelDispositionBlocksSecondPreparingTakeoverTerminalWriteAndRollback() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        updateUserId("run-r3", "user-1");
+
+        // ① 第二长工具接管：EXECUTING+ACCEPTED+consumed，取消已落，身份字段与旧对象一致
+        insertRun("run-r3", "EXECUTING", """
+            {"operationId":"run-r3:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-3","resumeLeaseVersion":9,
+             "resumeLauncherOwnerId":"owner-3",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        String secondPreparing = """
+            {"operationId":"run-r3:call-2:1","anchorState":"PREPARING"}""";
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-r3", secondPreparing, "tok-3", 9L)).isZero();
+
+        // ② 恢复终态写入：同锚点（仍 EXECUTING、租约未过期），旧工作流尝试写 COMPLETED
+        assertThat(mapper.updateResumedTerminal(
+                "run-r3", "user-1", AgentRunStatus.COMPLETED,
+                "{\"plan\":\"new\"}", "{\"snapshot\":\"done\"}", true, null,
+                "tok-3", 9L, "owner-3")).isZero();
+        assertThat(mapper.findById("run-r3").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+
+        // ③ 恢失败回滚：takeover 成功后的旧对象尝试退回 READY / ACCEPTED
+        //    （cancel 落在 claim/takeover 与回滚之间）
+        String rollbackJson = """
+            {"operationId":"run-r3:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"READY","resumeToken":"tok-3","resumeLeaseVersion":10,
+             "autoResume":true}""";
+        assertThat(mapper.casUpdateAnchorResumeState(
+                "run-r3", rollbackJson, AgentRunStatus.EXECUTING,
+                "ACCEPTED", "tok-3", 9L)).isZero();
+        String rollbackWithStatus = """
+            {"operationId":"run-r3:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"READY","resumeToken":"tok-3","resumeLeaseVersion":10,
+             "autoResume":true}""";
+        assertThat(mapper.casUpdateAnchorResumeStateAndStatus(
+                "run-r3", rollbackWithStatus, AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING,
+                "ACCEPTED", "tok-3", 9L)).isZero();
+
+        // 复读数据库：三组入口全部被拒，取消字段原样
+        ToolJobAnchor after = ToolJobAnchor.fromJson(
+                mapper.findById("run-r3").getToolJobAnchorJson());
+        assertThat(after.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(after.isAutoResume()).isFalse();
+        assertThat(after.getResumeState()).isEqualTo("ACCEPTED");
+        assertThat(mapper.findById("run-r3").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+    }
+
+    /**
+     * 260818（grace round-4）：取消写入自身的两个对称交错。
+     * ① 新工具先赢：第二个 PREPARING 已提交后，持旧 operationId 的取消请求必须被拒
+     *   （不能把第二个任务的持久身份整份抹回第一条 ACCEPTED）；对当前 operationId
+     *   的取消是 jsonb 窄合并，只写 autoResume=false+CANCELED，任务身份原样保留。
+     * ② 取消先写：持旧 autoResume=true 对象的 finalizer/reconciler 整份写入
+     *   （updateToolJobAnchor / updateToolJobAnchorAndStatus / updateActiveToolJobAnchor /
+     *   updateToolJobAnchorAndStatusByOperation）必须因读写一致性检查返回 0，
+     *   取消标记不被改回；取消后读取（autoResume=false）的写入者仍然可用。
+     */
+    @Test
+    void narrowCancelWriteSurvivesBothInterleavingsWithWholeAnchorWriters() throws Exception {
+        AgentRunMapper mapper = newMapper();
+
+        // ---------- ① 新工具先赢，取消后写 ----------
+        insertRun("run-r4", "EXECUTING", """
+            {"operationId":"run-r4:tc-2:1","anchorState":"PREPARING",
+             "resumeToken":"tok-4","resumeLeaseVersion":3}""");
+        // 取消线程读取时看到的是旧 operationId：必须返回 0，第二个任务的身份不动
+        assertThat(mapper.persistCancelDisposition(
+                "run-r4", AgentRunStatus.EXECUTING, "run-r4:tc-1:1")).isZero();
+        ToolJobAnchor untouched = ToolJobAnchor.fromJson(
+                mapper.findById("run-r4").getToolJobAnchorJson());
+        assertThat(untouched.getOperationId()).isEqualTo("run-r4:tc-2:1");
+        assertThat(untouched.getAnchorState()).isEqualTo("PREPARING");
+        assertThat(untouched.getRunDisposition()).isNull();
+        // 对当前 operationId 的取消：窄合并成功，PREPARING 身份保留
+        assertThat(mapper.persistCancelDisposition(
+                "run-r4", AgentRunStatus.EXECUTING, "run-r4:tc-2:1")).isEqualTo(1);
+        ToolJobAnchor canceled = ToolJobAnchor.fromJson(
+                mapper.findById("run-r4").getToolJobAnchorJson());
+        assertThat(canceled.getOperationId()).isEqualTo("run-r4:tc-2:1");
+        assertThat(canceled.getAnchorState()).isEqualTo("PREPARING");
+        assertThat(canceled.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(canceled.isAutoResume()).isFalse();
+
+        // ---------- ② 取消先写，普通整份写入后写 ----------
+        // 旧 finalizer/reconciler 对象：autoResume=true，其余身份与数据库一致
+        String staleWhole = """
+            {"operationId":"run-r4:tc-2:1","anchorState":"ATTACHED","taskId":"task-2",
+             "resumeToken":"tok-4","resumeLeaseVersion":3,"autoResume":true}""";
+        assertThat(mapper.updateToolJobAnchor(
+                "run-r4", staleWhole, AgentRunStatus.EXECUTING)).isZero();
+        assertThat(mapper.updateToolJobAnchorAndStatus(
+                "run-r4", staleWhole, AgentRunStatus.WAITING_TOOL_JOB,
+                AgentRunStatus.EXECUTING)).isZero();
+        assertThat(mapper.updateActiveToolJobAnchor(
+                "run-r4", staleWhole, AgentRunStatus.EXECUTING, "run-r4:tc-2:1")).isZero();
+        assertThat(mapper.updateToolJobAnchorAndStatusByOperation(
+                "run-r4", staleWhole, AgentRunStatus.WAITING_TOOL_JOB,
+                AgentRunStatus.EXECUTING, "run-r4:tc-2:1")).isZero();
+
+        ToolJobAnchor afterStaleWriters = ToolJobAnchor.fromJson(
+                mapper.findById("run-r4").getToolJobAnchorJson());
+        assertThat(afterStaleWriters.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterStaleWriters.isAutoResume()).isFalse();
+        assertThat(afterStaleWriters.getOperationId()).isEqualTo("run-r4:tc-2:1");
+        assertThat(mapper.findById("run-r4").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+
+        // 取消之后读取的写入者（对象里 autoResume=false）不受影响
+        String postCancelWriter = """
+            {"operationId":"run-r4:tc-2:1","anchorState":"ATTACHED","taskId":"task-2",
+             "resumeToken":"tok-4","resumeLeaseVersion":3,
+             "autoResume":false,"runDisposition":"CANCELED"}""";
+        assertThat(mapper.updateToolJobAnchor(
+                "run-r4", postCancelWriter, AgentRunStatus.EXECUTING)).isEqualTo(1);
+    }
+
+    @Test
+    void persistRepairAttemptMergesNewMapWithoutWipingCancelDisposition() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        insertRun("run-repair-merge", "EXECUTING", """
+            {"operationId":"run-repair:tc-1:1","anchorState":"PREPARING",
+             "pythonRepairAttempt":1,"pythonRepairPending":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+
+        assertThat(mapper.persistRepairAttempt(
+                "run-repair-merge", AgentRunStatus.EXECUTING, "run-repair:tc-1:1",
+                "executePython", 2, true, false)).isEqualTo(1);
+
+        ToolJobAnchor merged = ToolJobAnchor.fromJson(
+                mapper.findById("run-repair-merge").getToolJobAnchorJson());
+        assertThat(merged.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(merged.isAutoResume()).isFalse();
+        assertThat(merged.getAnchorState()).isEqualTo("PREPARING");
+        assertThat(merged.repairAttempt("executePython").getAttempt()).isEqualTo(2);
+        assertThat(merged.repairAttempt("executePython").isPending()).isTrue();
+        assertThat(merged.isPythonRepairPending()).isTrue();
+        String json = mapper.findById("run-repair-merge").getToolJobAnchorJson();
+        assertThat(json).doesNotContain("pythonRepairAttempt");
+        assertThat(json).contains("repairAttempts");
+
+        assertThat(mapper.persistRepairAttempt(
+                "run-repair-merge", AgentRunStatus.EXECUTING, "stale-operation",
+                "executePython", 9, false, true)).isZero();
+    }
+
+    /**
+     * 260819：终态 Run 残留取消锚点的兜底收口（e572 告警循环）。Run 已被其他写入方
+     * 落进业务终态后，正常取消 CAS 永远 0 行；本语句在 WHERE 内完整复核终态 status、
+     * 精确 operationId、runDisposition=CANCELED、显式 autoResume=false 与
+     * finalizerStep 已达 EVENT，只清锚点，不改写已落的业务终态。
+     */
+    @Test
+    void residualCanceledAnchorClosesOnTerminalRunAndKeepsBusinessStatus() throws Exception {
+        AgentRunMapper mapper = newMapper();
+
+        // e572 签名：FAILED + RESUME_READY 全步骤完成 + 取消处置
+        insertRun("run-e572", "FAILED", """
+            {"operationId":"run-e572:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-e","resumeLeaseVersion":9,
+             "resumeLauncherOwnerId":"owner-e","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-e572", "run-e572:call-1:1")).isEqualTo(1);
+        AgentRun closed = mapper.findById("run-e572");
+        assertThat(closed.getStatus()).isEqualTo(AgentRunStatus.FAILED);
+        assertThat(closed.getToolJobAnchorJson()).isEqualTo("{}");
+
+        // status=CANCELED + finalizerStep=CANCELED：正常取消 CAS 落库后的终态锚点
+        // （grace must-fix-2：CAS 写整份 JSON 不清锚点，历史存量也要能清）
+        insertRun("run-postcas", "CANCELED", """
+            {"operationId":"run-postcas:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"CANCELED"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-postcas", "run-postcas:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-postcas").getToolJobAnchorJson()).isEqualTo("{}");
+
+        // status=CANCELED（启动取消路径落库）同样允许收口
+        insertRun("run-startup-cancel", "CANCELED", """
+            {"operationId":"run-startup-cancel:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-startup-cancel", "run-startup-cancel:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-startup-cancel").getToolJobAnchorJson())
+                .isEqualTo("{}");
+
+        // finalizerStep=EVENT（刚好达线）允许；RELEASE/USAGE/ENVELOPE 未完成用量或事件 → 0 行
+        insertRun("run-res-event", "FAILED", """
+            {"operationId":"run-res-event:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"EVENT"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-event", "run-res-event:call-1:1")).isEqualTo(1);
+        for (String step : new String[] {"RELEASE", "USAGE", "ENVELOPE"}) {
+            String stepRun = "run-res-" + step.toLowerCase();
+            insertRun(stepRun, "FAILED", """
+                {"operationId":"%s:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"%s"}""".formatted(stepRun, step));
+            assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                    stepRun, stepRun + ":call-1:1"))
+                    .as("finalizerStep=%s must reject close", step)
+                    .isZero();
+        }
+
+        // finalizerStep 缺失 → 0 行
+        insertRun("run-res-nostep", "FAILED", """
+            {"operationId":"run-res-nostep:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-nostep", "run-res-nostep:call-1:1")).isZero();
+
+        // autoResume 缺省（COALESCE→true）→ 0 行：清理只服务显式取消的锚点
+        insertRun("run-res-noauto", "FAILED", """
+            {"operationId":"run-res-noauto:call-1:1",
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-noauto", "run-res-noauto:call-1:1")).isZero();
+
+        // 非终态（EXECUTING）必须仍然 0 行——那是正常取消 CAS 的领地
+        insertRun("run-res-exec", "EXECUTING", """
+            {"operationId":"run-res-exec:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-exec", "run-res-exec:call-1:1")).isZero();
+        assertThat(mapper.findById("run-res-exec").getToolJobAnchorJson())
+                .contains("run-res-exec:call-1:1");
+
+        // operationId 漂移（锚点已被替换）→ 0 行，不得清别人的锚点
+        insertRun("run-res-fence", "FAILED", """
+            {"operationId":"run-res-fence:call-2:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-fence", "run-res-fence:call-1:1")).isZero();
+        assertThat(mapper.findById("run-res-fence").getToolJobAnchorJson())
+                .contains("run-res-fence:call-2:1");
+
+        // 没有 CANCELED 处置（普通残留/暂停类）→ 0 行，兜底只服务取消处置
+        insertRun("run-res-nodisp", "FAILED", """
+            {"operationId":"run-res-nodisp:call-1:1","autoResume":false,
+             "finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-nodisp", "run-res-nodisp:call-1:1")).isZero();
+        assertThat(mapper.findById("run-res-nodisp").getToolJobAnchorJson())
+                .contains("run-res-nodisp:call-1:1");
+    }
+
+    /**
+     * 260819（grace must-fix-1 + round-2）：Redis due 丢失/重启后，终态取消残留必须能被
+     * listActiveToolJobAnchors 60s 补扫重新发现，且筛选与 closeResidualCanceledAnchorOnTerminalRun
+     * 的清理能力严格对齐：只有显式 autoResume=false 且 finalizerStep 已达 EVENT 及之后的
+     * 记录入选；早期步骤/autoResume 缺失或为 true 的记录不入选——它们在终态状态下无法
+     * 推进步骤，入选只会按 updated_at ASC 占满 LIMIT 批次饿死真正可清理的记录。
+     */
+    @Test
+    void activeBackfillDiscoversTerminalCanceledResiduals() throws Exception {
+        // 四种安全步骤全部入选
+        for (String step : new String[] {"EVENT", "CAS_STATUS", "RESUME_READY", "CANCELED"}) {
+            String runId = "run-scan-ok-" + step.toLowerCase().replace('_', '-');
+            insertRun(runId, "FAILED", """
+                {"operationId":"%s:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"%s"}""".formatted(runId, step));
+        }
+        // 正常取消落库签名（CANCELED + step=CANCELED）入选
+        insertRun("run-scan-postcas", "CANCELED", """
+            {"operationId":"run-scan-postcas:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"CANCELED"}""");
+
+        // 拒绝项：早期步骤、步骤缺失、autoResume 缺失/为 true、无取消处置
+        for (String step : new String[] {"ENVELOPE", "RELEASE", "USAGE"}) {
+            String runId = "run-scan-no-" + step.toLowerCase();
+            insertRun(runId, "FAILED", """
+                {"operationId":"%s:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"%s"}""".formatted(runId, step));
+        }
+        insertRun("run-scan-nostep", "FAILED", """
+            {"operationId":"run-scan-nostep:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED"}""");
+        insertRun("run-scan-noauto", "FAILED", """
+            {"operationId":"run-scan-noauto:call-1:1",
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        insertRun("run-scan-autotrue", "FAILED", """
+            {"operationId":"run-scan-autotrue:call-1:1","autoResume":true,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        insertRun("run-scan-nodisp", "FAILED", """
+            {"operationId":"run-scan-nodisp:call-1:1","autoResume":false,
+             "finalizerStep":"RESUME_READY"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 50))
+                .extracting(AgentRun::getId)
+                .contains("run-scan-ok-event", "run-scan-ok-cas-status",
+                        "run-scan-ok-resume-ready", "run-scan-ok-canceled",
+                        "run-scan-postcas")
+                .doesNotContain("run-scan-no-envelope", "run-scan-no-release",
+                        "run-scan-no-usage", "run-scan-nostep", "run-scan-noauto",
+                        "run-scan-autotrue", "run-scan-nodisp");
+    }
+
+    /**
+     * 260819（grace round-2）：100 条更旧的不可清理残留不能把合法 e572 记录挤出
+     * limit=100 批次——不可清理记录被 WHERE 排除，不占用批次名额。
+     */
+    @Test
+    void activeBackfillLimitBatchNotStarvedByUnclosableResiduals() throws Exception {
+        for (int i = 0; i < 100; i++) {
+            insertRun("run-starve-" + i, "FAILED", """
+                {"operationId":"run-starve-x:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"RELEASE"}"""
+                    .replace("run-starve-x", "run-starve-" + i));
+        }
+        insertRun("run-starve-valid", "FAILED", """
+            {"operationId":"run-starve-valid:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        // 不可清理记录标记为更旧，模拟长期滞留的 updated_at ASC 排序压力
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("UPDATE alphafrog_agent_run SET updated_at = '2020-01-01T00:00:00Z'"
+                    + " WHERE id LIKE 'run-starve-%' AND id <> 'run-starve-valid'");
+        }
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(DEPLOYMENT_ID, GENERATION_ID, 100))
+                .extracting(AgentRun::getId)
+                .contains("run-starve-valid")
+                .doesNotContain("run-starve-0", "run-starve-99");
     }
 
     // ========== Production service chain: version race ==========

@@ -31,7 +31,7 @@ test("redisConfigForEnv 缺少容器名时返回中文错误", () => {
   const result = redisConfigForEnv("test", () => undefined);
   assert.equal("error" in result, true);
   if ("error" in result) {
-    assert.match(result.error, /测试环境.*Redis 容器/);
+    assert.match(result.error, /尚未配置 Redis 容器/);
   }
 });
 
@@ -41,7 +41,7 @@ test("redisConfigForEnv 缺少密码时返回中文错误", () => {
   );
   assert.equal("error" in result, true);
   if ("error" in result) {
-    assert.match(result.error, /生产环境.*Redis 认证/);
+    assert.match(result.error, /尚未配置 Redis 认证/);
   }
 });
 

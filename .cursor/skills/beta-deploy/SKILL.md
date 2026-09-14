@@ -1,0 +1,64 @@
+---
+name: beta-deploy
+description: 开发机 Agent 通过 SSH 包装脚本调用 Beta 机本机接待命令 af-beta，完成泳道/主环境构建与滚动。只负责选对子命令和参数；镜像构建、部署单填写、端口和口令都在 Beta 本机完成。
+---
+
+# Beta 部署接待命令调用规范（开发机 Agent）
+
+## 适用场景
+
+当前分支需要在 Beta 环境验证时：开一条泳道（或经用户明确同意后更新主 Beta 环境），通过本仓库的 SSH 包装脚本调用 Beta 机本机接待命令 `af-beta`。
+
+## 硬性边界
+
+- 默认只做泳道（lane）操作。**更新主 Beta 环境（main roll）必须用户在当前对话里明确说了才允许调用**。
+- **开某个服务的泳道前，主 Beta 要先有该服务的活动实例**；主 Beta 没有（该服务还在回落生产）时，先让用户确认是否把它纳入主环境，不要直接开泳道。
+- 镜像构建、部署单填写、端口分配、口令读取都发生在 Beta 本机，由 `af-beta` 完成；开发机 Agent 的职责是选对子命令和参数（泳道名、服务短名、git 提交）。
+- 对 Beta 的访问只有包装脚本这一条路：专用受限钥匙（Beta 侧 authorized_keys 绑定强制命令 af-beta-shell，服务端只放行 af-beta 白名单子命令，拿不到 shell、不能端口转发）。**不得尝试用其它钥匙、其它用户、直接 ssh、scp、端口转发或任何方式连 Beta**。
+- 不读取、不修改 `/etc/alphafrog-beta/` 下的任何文件。
+- 不执行 `docker rm`、`systemctl` 等主机操作。
+- 不在对话里打印口令文件内容或任何密钥（包括专用私钥）。
+
+## 调用方式
+
+统一通过仓库内的 SSH 包装脚本，不自己拼 curl、不直接 ssh 进去执行别的命令：
+
+```bash
+bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
+```
+
+- 主机地址来自开发机环境变量 `AF_BETA_SSH`（每台开发机自己配置，例如 `user@beta-host`），专用私钥路径 `AF_BETA_KEY`（默认 `~/.ssh/af-beta-ed25519`）；仓库和对话里都不出现真实地址和密钥。
+- 成功后把 `how-to-test` 子命令的输出**原样**转告用户（那是 Beta 侧生成的验证指引）。
+- 失败时优先调用 `retry`；retry 无法解决或报错不在接待命令职责内时，把错误**原文**交给用户，不自行猜测修法。
+
+## 服务短名对照
+
+调用 `af-beta` 时用短名指定服务。短名在 Beta 机接待命令侧登记，未知短名会被拒收；对照表如下（12 个）：
+
+| 短名 | 部署单里的服务名 | 说明 |
+| --- | --- | --- |
+| stock | domestic-stock-service | 行情（Beta 本地） |
+| fetch | domestic-fetch-service | 抓取（Beta 本地） |
+| admin | admin-service | 管理 |
+| portfolio | portfolio-service | 组合 |
+| agent | agent-service | agent-langchain |
+| sandbox | python-sandbox-service | Python 沙箱执行 |
+| sandbox-gw | python-sandbox-gateway-service | 沙箱网关 |
+| frontend | frontend | 前端入口 |
+| index | domestic-index-service | 国内指数（默认回落生产，可拉起） |
+| fund | domestic-fund-service | 国内基金（默认回落生产，可拉起） |
+| listed | domestic-listed-asset-service | 国内上市资产（默认回落生产，可拉起） |
+| ext-info | external-info-service | 外部信息（默认回落生产，可拉起） |
+
+## 常用子命令
+
+- `status`：查看当前部署与滚动状态。
+- `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。
+- `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加。见上文硬性边界：必须用户明确要求。
+- `retry`：对失败部署重试。
+- `how-to-test`：拿到本次部署的验证指引，成功后原样转告用户。
+- `file-config --git <提交>`：把该提交里 agent-langchain 的 `prompts/` 同步到 Beta 挂载目录 `/var/lib/alphafrog-beta/data/agent-configs/prompts`（agent 服务按 `file:prompts/...` 读取这份目录，约 10 秒轮询一次；改动提示词资源后需要在 Beta 生效时用）。提交必须已经推到远端；成功后把命令输出（含 md5）原样转告用户。这条不是 `main roll`，不需要用户另一次同意滚动主环境。
+
+## 联调前置
+
+- Beta 本机接待命令 `af-beta` 就绪后，`bash deploy/beta/af-beta-remote.sh status` 能跑通即联调成功。

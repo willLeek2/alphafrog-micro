@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -14,6 +15,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Duration;
@@ -25,8 +27,12 @@ import java.util.Set;
  *
  * <p>Redis due 集合负责低延迟轮询，PostgreSQL anchor 周期补扫负责灾后恢复。
  * 本类只发现状态并调用 finalizer/resume service；所有持久化所有权仍由数据库 CAS 决定。</p>
+ *
+ * <p>仅在 {@code agent.tool-job.durable-recovery-enabled=true} 时创建；默认关闭时
+ * 由进程内 ToolJobContinuationTracker 承担发现职责，避免两套机制接管同一个 Run。</p>
  */
 @Service
+@ConditionalOnProperty(name = "agent.tool-job.durable-recovery-enabled", havingValue = "true")
 public class ToolJobReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobReconciler.class);
@@ -41,6 +47,7 @@ public class ToolJobReconciler {
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
     private final DataAnalysisCapacityService capacityService;
+    private final RunOwnershipGateway ownershipGateway;
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
 
@@ -53,20 +60,22 @@ public class ToolJobReconciler {
     public ToolJobReconciler(ToolJobRedisCache redisCache, ToolJobAnchorService anchorService,
                              ToolJobFinalizer finalizer, ToolJobResumeService resumeService,
                              ToolJobConfig config) {
-        this(redisCache, anchorService, finalizer, resumeService, config, null);
+        this(redisCache, anchorService, finalizer, resumeService, config, null, null);
     }
 
     @Autowired
     public ToolJobReconciler(ToolJobRedisCache redisCache, ToolJobAnchorService anchorService,
                              ToolJobFinalizer finalizer, ToolJobResumeService resumeService,
                              ToolJobConfig config,
-                             DataAnalysisCapacityService capacityService) {
+                             DataAnalysisCapacityService capacityService,
+                             RunOwnershipGateway ownershipGateway) {
         this.redisCache = redisCache;
         this.anchorService = anchorService;
         this.finalizer = finalizer;
         this.resumeService = resumeService;
         this.config = config;
         this.capacityService = capacityService;
+        this.ownershipGateway = ownershipGateway;
     }
 
     @Scheduled(fixedDelayString = "${agent.tool-job.reconciler-interval-ms:5000}")
@@ -74,8 +83,15 @@ public class ToolJobReconciler {
         try {
             // 每轮最多取 20 个到期 Run，限制单次调度耗时和 Sandbox 压力。
             Set<String> due = redisCache.fetchDue(20);
-            // 每个 runId 独立处理；单项异常由 processItem 捕获，不阻塞其他 Run。
-            for (String runId : due) processItem(runId);
+            // Redis 是跨部署代际共享的未分级来源：先判定归属，只处理本代际的 Run 才进入
+            // 后续认领/收尾。不属于本代际的条目留给原代际自己的 reconciler，不在这里清理。
+            for (String runId : due) {
+                if (ownershipGateway != null && !ownershipGateway.owns(runId)) {
+                    log.debug("Reconciler skips due item of another deployment generation: runId={}", runId);
+                    continue;
+                }
+                processItem(runId);
+            }
         } catch (Exception e) {
             log.error("Reconciler due-cycle error", e);
         }
@@ -85,7 +101,7 @@ public class ToolJobReconciler {
     public void rebuildFromAnchors() {
         try {
             // 第一段从 PostgreSQL 真相源重建 pending cache 与 due 索引。
-            for (AgentRun run : anchorService.listActive(100)) {
+            for (AgentRun run : ownershipGateway.listActiveAnchors(100)) {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
@@ -111,12 +127,21 @@ public class ToolJobReconciler {
         } catch (Exception e) { log.error("Reconciler rebuild error", e); }
         try {
             // 第二段专扫 READY/LAUNCHING，覆盖 finalizer 写 READY 后进程崩溃的窗口。
-            for (AgentRun run : anchorService.listResumeReady(50)) {
+            for (AgentRun run : ownershipGateway.listResumeReadyAnchors(50)) {
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 // 先补热副本，再由 ResumeService 执行 token/lease CAS claim。
                 if (a != null) { redisCache.atomicWritePendingAndDue(run.getId(), a); resumeService.tryResume(run.getId()); }
             }
         } catch (Exception e) { log.error("Resume-ready scan error", e); }
+        try {
+            // 第三段：补扫 CAS_STATUS→RESUME_READY 半状态。
+            // completeResumeReady 内部用精确旧值 CAS 保证只有一个实例推进成功。
+            for (AgentRun run : ownershipGateway.listStuckAtCasStatusAnchors(20)) {
+                ToolJobAnchor a = anchorService.loadAnchor(run.getId());
+                if (a == null) continue;
+                finalizer.completeResumeReady(run.getId(), a);
+            }
+        } catch (Exception e) { log.error("CAS_STATUS stuck scan error", e); }
     }
 
     private void processItem(String runId) {
@@ -131,7 +156,13 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
-            if ("LAUNCHING".equals(anchor.getResumeState()) && anchor.isResultConsumed()) {
+            // 已接受 handoff 的真实状态是 ACCEPTED（CONSUMED 同源）；
+            // 旧的 "LAUNCHING && isResultConsumed()" 组合在四态模型下永远为 false（死分支），
+            // 会让 EXECUTING+ACCEPTED 的 Run 被 60 秒补扫重新写回 due 并反复进入 Sandbox
+            // finalizer。isResultConsumed() 从 resumeState 推导（ACCEPTED/CONSUMED），是
+            // 可实际读取的字段；autoResume=false（取消/暂停锚点）必须继续走终态处理，
+            // 不能被这条快速路径提前返回。
+            if (anchor.isResultConsumed() && anchor.isAutoResume()) {
                 // 已接受 handoff 的 Run 处于 EXECUTING；旧 due 不能再次进入 Sandbox terminal finalizer。
                 redisCache.removeDue(runId);
                 redisCache.deletePendingCache(runId);
@@ -146,6 +177,20 @@ public class ToolJobReconciler {
             if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
                 // live worker 的 lease 未到期时只重排 expiry；过期后必须先赢 fenced CAS。
                 if (!recoverLiveDagBlocking(runId, anchor)) return;
+            }
+            // 终态取消残留的直接清理入口，不查 Sandbox。
+            // 旧任务结果过保存期后，checkPausedTerminal 的结果拉取流程可能永远走不到
+            // finalizer 的 CANCELED 分支；这里让数据库语句自己复核终态 status、任务
+            // 身份、取消处置、autoResume=false 与步骤完成度。非终态 Run（取消流程
+            // 还没走完）返回 0 行，继续走下面的 Sandbox 终态确认。
+            if (CANCELED.equals(anchor.getRunDisposition())
+                    && anchorService.closeResidualCanceledAnchor(
+                            runId, anchor.getOperationId())) {
+                log.warn("Residual CANCELED anchor closed via backfill for run={}, "
+                        + "operationId={}", runId, anchor.getOperationId());
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+                return;
             }
             // taskId 是查询 Sandbox 的真实任务主键。
             String taskId = anchor.getTaskId();
@@ -174,7 +219,7 @@ public class ToolJobReconciler {
                     GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
 
-            // 三个规范终态进入结果拉取与 finalizer 链路。
+            // 三个规范终态进入结果拉取与 finalizer 流程。
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
                 // fetchResult 还会核对 taskId/runId/expectedStatus，拒绝错配响应。
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
@@ -193,7 +238,12 @@ public class ToolJobReconciler {
                             anchor.setTerminalStatus("RESULT_LOST");
                             anchor.setTerminalAt(now);
                             log.error("Result permanently lost for run={}, taskId={}", runId, taskId);
-                            finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                            ToolJobFinalizer.FinalizerOutcome outcome =
+                                    finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                            if (!outcome.done()) {
+                                log.warn("RESULT_LOST finalizer incomplete for run={} step={} reason={}; "
+                                        + "relying on next rebuild cycle", runId, outcome.step(), outcome.reason());
+                            }
                             return;
                         }
                     } else {
@@ -217,7 +267,19 @@ public class ToolJobReconciler {
                     return;
                 }
                 // 结果体完整时进入可重入六步 finalizer，最终生成 READY 并重新入队。
-                finalizer.handleTerminal(runId, anchor, status, resultResp, true);
+                // finalizer 显式返回做没做完；没做完时显式重写 due（带上一步完成进度），
+                // 保证下一轮补扫从 anchor 的 finalizerStep 续跑，不靠日志猜。
+                ToolJobFinalizer.FinalizerOutcome outcome =
+                        finalizer.handleTerminal(runId, anchor, status, resultResp, true);
+                if (!outcome.done()) {
+                    log.warn("Reconciler finalizer incomplete for run={} step={} reason={}; "
+                            + "re-arming due for retry", runId, outcome.step(), outcome.reason());
+                    ToolJobAnchor after = anchorService.loadAnchor(runId);
+                    if (after != null) {
+                        after.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                        redisCache.upsertDue(runId, after);
+                    }
+                }
             } else if (NOT_FOUND.equals(status)) {
                 // NOT_FOUND 可能是传播延迟或结果保留过期，交给有界丢失判定。
                 finalizer.handleNotFound(runId, anchor);
@@ -238,7 +300,7 @@ public class ToolJobReconciler {
             // 只在已知终态后请求结果，减少大响应和无效轮询。
             TaskResultResponse resp = sandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
-            // validator 对任务身份与终态做 fail-closed 校验，错结果不会注入另一个 Run。
+            // validator 对任务身份与终态做严格校验，条件不满足就拒绝，错结果不会注入另一个 Run。
             return ToolJobResultValidator.validate(taskId, runId, resp, expectedStatus);
         } catch (Exception e) {
             log.error("Failed to fetch result for taskId={}, run={}", taskId, runId, e);
@@ -324,7 +386,18 @@ public class ToolJobReconciler {
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp != null) {
                     // 只执行 envelope/release/usage/event，不 CAS RECEIVED、不生成 READY。
-                    finalizer.handleTerminal(runId, anchor, status, resultResp, false);
+                    // 没做完（带步骤与原因）时显式重写 due，下一轮从 anchor 的 finalizerStep 续跑。
+                    ToolJobFinalizer.FinalizerOutcome outcome =
+                            finalizer.handleTerminal(runId, anchor, status, resultResp, false);
+                    if (!outcome.done()) {
+                        log.warn("Paused/canceled finalizer incomplete for run={} step={} reason={}; "
+                                + "re-arming due for retry", runId, outcome.step(), outcome.reason());
+                        ToolJobAnchor after = anchorService.loadAnchor(runId);
+                        if (after != null) {
+                            after.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                            redisCache.upsertDue(runId, after);
+                        }
+                    }
                 } else {
                     // 终态已确认但结果体不可用时也要有界重试，不能永久占用 DAG/暂停容量。
                     finalizer.handleNotFound(runId, anchor);
@@ -354,7 +427,7 @@ public class ToolJobReconciler {
         }
         Instant now = Instant.now();
         if (!DagBlockingWorkerLease.isExpired(anchor.getBlockingLeaseUntil(), now)) {
-            // 不写 PostgreSQL anchor；当前 live worker 仍拥有 durable lease。
+            // 不写 PostgreSQL anchor；当前 live worker 仍持有数据库里的 lease。
             anchor.setNextPollAt(anchor.getBlockingLeaseUntil());
             redisCache.atomicWritePendingAndDue(runId, anchor);
             return false;

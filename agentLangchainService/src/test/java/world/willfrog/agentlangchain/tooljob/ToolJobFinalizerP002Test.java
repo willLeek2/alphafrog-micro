@@ -80,6 +80,9 @@ class ToolJobFinalizerP002Test {
                 CREATE TABLE alphafrog_agent_run (
                     id VARCHAR(64) PRIMARY KEY,
                     user_id VARCHAR(64),
+                    deployment_id VARCHAR(64),
+                    deployment_generation_id VARCHAR(64),
+                    lane_tag VARCHAR(128),
                     status VARCHAR(32) NOT NULL,
                     current_step INT DEFAULT 0,
                     max_steps INT DEFAULT 20,
@@ -91,6 +94,8 @@ class ToolJobFinalizerP002Test {
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ,
                     ext JSONB DEFAULT '{}',
+                    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                    restart_attempt INT NOT NULL DEFAULT 0,
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
         }
@@ -163,15 +168,22 @@ class ToolJobFinalizerP002Test {
         return currentSession.getMapper(AgentRunMapper.class);
     }
 
+    private static final String DEPLOYMENT_ID = "stable";
+    private static final String GENERATION_ID = "gen-" + "a".repeat(64);
+
     private static void insertRun(String id, String status, String anchorJson) throws Exception {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection();
              var ps = conn.prepareStatement(
-                     "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) "
-                             + "VALUES (?, ?, CAST(? AS jsonb))")) {
+                     "INSERT INTO alphafrog_agent_run "
+                             + "(id, status, tool_job_anchor_json, deployment_id, "
+                             + "deployment_generation_id) "
+                             + "VALUES (?, ?, CAST(? AS jsonb), ?, ?)")) {
             ps.setString(1, id);
             ps.setString(2, status);
             ps.setString(3, anchorJson);
+            ps.setString(4, DEPLOYMENT_ID);
+            ps.setString(5, GENERATION_ID);
             ps.executeUpdate();
         }
     }
@@ -310,7 +322,8 @@ class ToolJobFinalizerP002Test {
         // listActive scans for non-empty anchors with status IN
         // ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
         AgentRunMapper mapper = newMapper();
-        java.util.List<AgentRun> active = mapper.listActiveToolJobAnchors(10);
+        java.util.List<AgentRun> active = mapper.listActiveToolJobAnchorsForDeployment(
+                DEPLOYMENT_ID, GENERATION_ID, 10);
         assertThat(active).isNotEmpty();
         assertThat(active.stream().anyMatch(r -> r.getId().equals(runId))).isTrue();
     }

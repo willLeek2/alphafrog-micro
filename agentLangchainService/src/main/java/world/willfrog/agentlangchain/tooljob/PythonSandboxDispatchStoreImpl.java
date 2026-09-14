@@ -1,27 +1,43 @@
 package world.willfrog.agentlangchain.tooljob;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 
 import java.time.Instant;
 
 /**
  * executePython 分发阶段的 PostgreSQL 真相源实现。
- * PREPARING、ATTACHED、PENDING 三次推进都先写 DB；只有 PENDING 成功后才派生 Redis 索引。
+ * PREPARING、ATTACHED、PENDING 三次推进都先写 DB；只有 PENDING 成功后才派生
+ * Redis 索引（跨进程恢复模式）或登记进程内 continuation tracker（默认模式）。
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStore {
 
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
+    private final ToolJobConfig config;
+    private final ObjectProvider<ToolJobContinuationTracker> trackerProvider;
+    private final LangchainSchedulerMetrics metrics;
+
+    public PythonSandboxDispatchStoreImpl(ToolJobAnchorService anchorService,
+                                          ToolJobRedisCache redisCache,
+                                          ToolJobConfig config,
+                                          ObjectProvider<ToolJobContinuationTracker> trackerProvider,
+                                          LangchainSchedulerMetrics metrics) {
+        this.anchorService = anchorService;
+        this.redisCache = redisCache;
+        this.config = config;
+        this.trackerProvider = trackerProvider;
+        this.metrics = metrics;
+    }
 
     @Override
     public boolean persistPreparing(String runId, ToolJobAnchor anchor) {
@@ -62,25 +78,39 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
 
     @Override
     public boolean transferToPending(String runId, ToolJobAnchor anchor) {
-        // 只有已经完成容量转交的 PENDING anchor 才能释放 Agent worker。
+        // PENDING anchor 已把占用的资源名额转给后台任务继续管理，此时才能释放 Agent worker。
         if (!"PENDING".equals(anchor.getAnchorState())) {
             return false;
         }
-        // 单条 CAS 同时写 anchor 和 EXECUTING→WAITING_TOOL_JOB，消除半状态窗口。
+        // 一条 SQL 同时更新 anchor 与 Run 状态（EXECUTING→WAITING_TOOL_JOB），要么都成功、要么都不改，消除半状态窗口。
         boolean durable = anchorService.updateActiveAndStatus(
                 runId, anchor, AgentRunStatus.WAITING_TOOL_JOB,
                 AgentRunStatus.EXECUTING, anchor.getOperationId());
         if (!durable) {
             return false;
         }
-        // DB 成功后才写 Redis；Redis 失败不回滚 durable pending。
-        try {
-            redisCache.atomicWritePendingAndDue(runId, anchor);
-        } catch (Exception cacheFailure) {
-            log.warn("Pending Redis derivative write failed for run={}, durable anchor will rebuild it: {}",
-                    runId, cacheFailure.getMessage());
+        // 写库成功后，上层会收到挂起信号（通知任务已转后台）并释放 worker 线程；两种模式都记指标。
+        metrics.recordWorkerReleased();
+        if (config.isDurableRecoveryEnabled()) {
+            // 跨进程恢复模式：写 Redis due，由 ToolJobReconciler 跨进程发现终态。
+            try {
+                redisCache.atomicWritePendingAndDue(runId, anchor);
+            } catch (Exception cacheFailure) {
+                log.warn("Pending Redis derivative write failed for run={}, durable anchor will rebuild it: {}",
+                        runId, cacheFailure.getMessage());
+            }
+        } else {
+            // 进程内续接模式：登记 tracker，它按 pollInterval 轮询 Sandbox 终态。
+            ToolJobContinuationTracker tracker = trackerProvider.getIfAvailable();
+            if (tracker == null) {
+                // 同一开关下 tracker bean 必然存在；缺失属于装配错误，直接判失败、不释放 worker。
+                log.error("Continuation tracker unavailable for run={} but durable recovery is off; "
+                        + "run will not be resumed in-process", runId);
+                return false;
+            }
+            tracker.register(runId, anchor);
         }
-        // true 是上层抛 pending 信号并释放 worker 的最终许可。
+        // 返回 true 后，上层抛出挂起信号（通知任务已转后台）并释放 worker 线程。
         return true;
     }
 
@@ -148,7 +178,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
         if (!promoted) {
             return false;
         }
-        // PostgreSQL 是 owner 真相；Redis 只加速 cleanup，失败后可由 fallback scan 重建。
+        // PostgreSQL 是 owner 的权威来源；Redis 只加速 cleanup，失败后可由备用扫描重建。
         try {
             redisCache.atomicWritePendingAndDue(runId, anchor);
         } catch (Exception cacheFailure) {

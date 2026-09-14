@@ -6,8 +6,8 @@
 dataset_ids / manifest_ids 工具参数可用逗号分隔；Python 代码里推荐每次向 load_datasets / load_manifest 传一个编号，多个编号用循环逐个加载后合并。
 from_ts_code 字段可能为 UNCERTAIN，不代表数据损坏；若需按资产过滤，用 listMyData 查询。
 日期字段请先排序后再取首尾行，不要硬编码某个交易日一定存在。
-trade_date 常见为 YYYYMMDD 数字串；优先使用 astype(str) 后提取 8 位数字并按字符串排序。
-非必要不要使用 pd.to_datetime；若上轮出现 to_datetime/Overflow/unconverted 错误，本轮必须改为字符串排序方案。
+行情类数据集的日期列（如 trade_date、nav_date）是毫秒时间戳整数；请用 pd.to_datetime(列, unit="ms") 转成日期，或直接按整数排序后取首尾行。
+财务报表数据集的 end_date/ann_date 是 YYYYMMDD 字符串，与行情日期列格式不同。不要用 format="%Y%m%d" 解析 trade_date；若上轮出现日期解析报错，本轮改用 unit="ms"。
 价格字段请优先使用 close/open 等数值列，避免把 ts_code 当作价格。
 ts_code 是数据库内区分不同资产的标识字段，不可用于涨跌幅数值计算。
 优先输出 JSON 结果，便于后续流程消费。

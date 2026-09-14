@@ -53,34 +53,7 @@ public class RagTools {
         this.localConfigLoader = localConfigLoader == null ? Optional.empty() : localConfigLoader;
     }
 
-    @Tool("""
-        【首选工具】查询公告、年报、研报原文内容。返回结构固定为 data.summary / data.top_refs / data.omitted_refs；
-        当命中内容超出可见预算时，结果会通过 data.rawRef + data.read_hints 让你用 rereadToolResult 定向补读。
-        
-        适用场景：
-          - 查询公司公告原文（如"募集资金变更"、"股权质押"、"重大合同"等）
-          - 查询年报/半年报特定章节内容（如"风险提示"、"业务展望"）
-          - 查询研报观点和数据
-        
-        与 getFinancialReport 的区别：
-          - ragSearch：查公告/研报原文、非结构化文本、事件描述
-          - getFinancialReport：查结构化财务数据（利润、资产负债等）
-        
-        参数说明：
-          queryText  - 查询内容（如"贵州茅台募集资金变更公告"），必填
-          docType    - 文档类型："announcement"（公告）| "research_report"（研报）| ""（不限），可选
-          tsCode     - 股票代码过滤（如"600519.SH"），可选，建议填写以提高准确度
-          indName    - 行业过滤（如"电子"、"电新"），可选，仅对研报有效
-          topK       - 检索候选条数（默认5，最大10），可选。工具会按预算只展示少量 preview。
-
-        返回字段要点：
-          - data.summary: hit_count / visible_count / omitted_count / visible_chars / budget_hit
-          - data.top_refs[].ref_id: 本次回答内引用 ID；最终答案 citation 应使用 <rag-cite ref="rag_ref_001" />
-          - data.top_refs[].source_key: 过渡证据定位字段，优先 oss_url + chunk_index
-          - data.top_refs[].preview: 命中原文片段，不是模型摘要
-          - data.rawRef: 仅用于 rereadToolResult 继续读取，不可作为 citation
-          - data.read_hints: keyword/range 两种合法 rereadToolResult 调用提示；不要传空 keyword
-        """)
+    @Tool
     public String ragSearch(String queryText, String docType, String tsCode, String indName, int topK) {
         try {
             int k = (topK <= 0 || topK > MAX_TOP_K) ? 5 : topK;
@@ -162,12 +135,7 @@ public class RagTools {
         }
     }
 
-    @Tool("""
-        根据 OSS URL 获取文档原文窗口。P0 起本工具按 loadDocumentSection 语义工作：
-        短文档直接返回全文；长文档只返回 preview，并通过 data.rawRef + data.read_hints
-        让你用 rereadToolResult 按 keyword 或 offset/limit 继续读取。
-        注意：rawRef 只能传给 rereadToolResult，不能作为最终答案 citation。
-        """)
+    @Tool
     public String loadDocument(String ossUrl) {
         try {
             if (ossUrl == null || ossUrl.isBlank()) {

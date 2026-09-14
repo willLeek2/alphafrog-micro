@@ -1,7 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 /**
- * resume service 与有界 Agent 调度器之间的启动边界。
+ * resume service 与有界 Agent 调度器之间的启动接口。
  *
  * <p>实现必须把恢复任务重新提交给与普通 Run 相同的 concurrency scheduler；提交成功才表示重新取得
  * worker 的请求已被接受，而不是当前调用线程直接继续旧 pipeline。这样慢工具等待期不占 worker，

@@ -14,6 +14,16 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Semaphore;
 
+/**
+ * 按工具权重在单节点内发放并行许可。
+ *
+ * <p><b>作用域（D25 / Risks 3.1.4）</b>：内部使用的是 <em>JVM 进程内</em>
+ * {@link Semaphore}；多实例部署时各节点各自按本节点 {@code maxWeight} 计数，
+ * <em>不是</em>分布式容量保证，也不得宣传为「全集群封顶」。运维估算时使用公式：
+ * {@code 全局权重许可近似 ≈ 实例数 × 每节点 maxWeight}。
+ * {@code checkParallelLimits} / {@code searchWeb} 等豁免路径不占权重；本类本轮不新增
+ * 公共观测 endpoint，权重/permit/超时/缓存/credit/路由行为保持不变。</p>
+ */
 @Service
 @RequiredArgsConstructor
 public class ToolWeightedLimitService {

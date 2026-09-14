@@ -1,0 +1,2 @@
+[Stage: BUDGET_LAST_MILE]
+本 Run 已使用 {{ratioPct}}% 的 {{dimension}} 预算（{{actual}}/{{limit}}）。请停止非必要的长推理和重复调用，优先基于已有信息完成当前任务并给出明确结论。

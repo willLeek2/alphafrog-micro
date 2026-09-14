@@ -1,0 +1,1 @@
+查询 ETF 复权因子时序。参数要求：tsCode/startDate/endDate；仅当 adjFactorEnabled=true 时可用。

@@ -47,8 +47,8 @@ class RunViewState:
         self._dag_nodes: Dict[str, Deque[str]] = {}
         self._warnings: Deque[str] = deque(maxlen=max_warnings)
         self._max_node_lines = max_node_lines
-        self._seen: set[Tuple[int, str]] = set()
-        self._seen_order: Deque[Tuple[int, str]] = deque()
+        self._seen: set[Tuple[str, int]] = set()
+        self._seen_order: Deque[Tuple[str, int]] = deque()
         self._seen_limit = 2000
 
     def add_warning(self, text: str) -> None:
@@ -77,14 +77,14 @@ class RunViewState:
             self.ingest_agent_event(data)
             return
         if event_type == "run.status":
-            self.status = str(data.get("status") or self.status)
+            self.status = normalize_status(data.get("status") or self.status)
             self.phase = str(data.get("phase") or self.phase)
             seq = _to_int(data.get("lastSeq") or data.get("seq"))
             if seq:
                 self.last_seq = max(self.last_seq, seq)
             return
         if event_type == "run.done":
-            self.status = str(data.get("status") or self.status)
+            self.status = normalize_status(data.get("status") or self.status)
             self.phase = "done"
             self.last_seq = max(self.last_seq, _to_int(data.get("lastSeq")))
             self._append_line("run done: " + self.status, node_id="")
@@ -94,10 +94,11 @@ class RunViewState:
 
     def ingest_agent_event(self, envelope: Dict[str, Any]) -> None:
         event = normalize_agent_event(envelope, current_workflow=self.workflow)
-        dedup_key = (event.seq, event.event_type)
-        if event.seq and dedup_key in self._seen:
+        durable = _is_durable(envelope)
+        dedup_key = (str(envelope.get("runId") or self.run_id), event.seq)
+        if durable and event.seq and dedup_key in self._seen:
             return
-        if event.seq:
+        if durable and event.seq:
             self._remember_seen(dedup_key)
             self.last_seq = max(self.last_seq, event.seq)
         if event.workflow in ("linear", "dag"):
@@ -126,7 +127,7 @@ class RunViewState:
 
     def _ingest_snapshot(self, data: Dict[str, Any]) -> None:
         self.run_id = str(data.get("runId") or self.run_id)
-        self.status = str(data.get("status") or self.status)
+        self.status = normalize_status(data.get("status") or self.status)
         self.phase = str(data.get("phase") or self.phase)
         self.last_seq = max(self.last_seq, _to_int(data.get("lastSeq")))
         events = data.get("events")
@@ -143,7 +144,7 @@ class RunViewState:
         else:
             self._trace.append(line)
 
-    def _remember_seen(self, key: Tuple[int, str]) -> None:
+    def _remember_seen(self, key: Tuple[str, int]) -> None:
         self._seen.add(key)
         self._seen_order.append(key)
         while len(self._seen_order) > self._seen_limit:
@@ -316,11 +317,12 @@ def normalize_sse_frame(event_type: str, data: Any, *, current_workflow: str = "
 
 
 def resolve_agent_payload(data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
-    payload = data.get("payload")
-    if isinstance(payload, dict):
-        return payload, "payload"
-    if isinstance(payload, list):
-        return {"value": payload}, "payload"
+    if "payload" in data:
+        payload = data.get("payload")
+        if isinstance(payload, dict):
+            return payload, "payload"
+        if payload is not None:
+            return {"value": payload}, "payload"
     raw = data.get("payloadJson") or data.get("payload_json")
     if isinstance(raw, dict):
         return raw, "payloadJson"
@@ -329,6 +331,8 @@ def resolve_agent_payload(data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 return parsed, "payloadJson"
+            if parsed is not None:
+                return {"value": parsed}, "payloadJson"
         except json.JSONDecodeError:
             pass
     return {}, "none"
@@ -346,16 +350,25 @@ def final_answer_from_result(result: Dict[str, Any]) -> str:
 
 
 def is_terminal(status: str) -> bool:
-    return str(status or "").upper() in {
-        "COMPLETED",
-        "PARTIAL",
-        "FAILED",
-        "CANCELED",
-        "CANCELLED",
-        "EXPIRED",
-        "TIMEOUT",
-        "TIMED_OUT",
-    }
+    return normalize_status(status) in {"COMPLETED", "PARTIAL", "FAILED", "CANCELED", "EXPIRED"}
+
+
+def normalize_status(status: Any) -> str:
+    value = str(status or "").strip().upper()
+    if value == "CANCELLED":
+        return "CANCELED"
+    if value in {"TIMEOUT", "TIMED_OUT"}:
+        return "EXPIRED"
+    return value
+
+
+def _is_durable(event: Dict[str, Any]) -> bool:
+    value = event.get("durable")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    return _to_int(event.get("seq")) >= 1
 
 
 def _workflow(payload: Dict[str, Any], current: str) -> str:

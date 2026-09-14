@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.workspace;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -23,6 +24,9 @@ import java.util.concurrent.ThreadPoolExecutor;
  * @author wang
  */
 @Configuration
+// 260814 scheduler-03: workspace export 总开关默认关闭；关闭时 dump executor
+// bean 不创建。
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}")
 public class WorkspaceConfig {
 
     @Bean(name = "workspaceDumpExecutor")

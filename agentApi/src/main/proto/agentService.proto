@@ -22,6 +22,9 @@ message AgentRunMessage {
   string updated_at = 11;
   string completed_at = 12;
   string ext = 13;
+  string deployment_id = 14;
+  string deployment_generation_id = 15;
+  string lane_tag = 16;
 }
 
 message CreateAgentRunRequest {
@@ -36,11 +39,15 @@ message CreateAgentRunRequest {
   int32 planner_candidate_count = 9;
   bool debug_mode = 10;
   string stage_config_json = 11;  // 各阶段 LLM 配置（包含 planning/execution/sub_agent）
+  bool generate_artifacts = 12;   // 默认 false；只控制用户可查询/下载的正式产物
+  string deployment_id = 13 [deprecated = true]; // 服务端忽略；由实际受理的 Agent 实例写入身份
+  string deployment_generation_id = 14 [deprecated = true]; // 服务端忽略
 }
 
 message GetAgentRunRequest {
   string user_id = 1;
   string id = 2;
+  bool is_admin = 3;
 }
 
 message UpdateAgentRunRequest {
@@ -94,6 +101,8 @@ message ResumeAgentRunRequest {
   string user_id = 1;
   string id = 2;
   string plan_override_json = 3;
+  string deployment_id = 4 [deprecated = true]; // 服务端忽略，使用 Run 已保存身份与本机身份核对
+  string deployment_generation_id = 5 [deprecated = true];
 }
 
 message AgentRunEventMessage {
@@ -111,6 +120,7 @@ message ListAgentRunEventsRequest {
   int32 after_seq = 3;
   int32 limit = 4;
   bool latest = 5; // true 时忽略 after_seq，返回最近 limit 条事件（按 seq 升序输出）
+  bool is_admin = 6;
 }
 
 message ListAgentRunEventsResponse {
@@ -171,6 +181,7 @@ message AgentRunCostMessage {
 message GetAgentRunStatusRequest {
   string user_id = 1;
   string id = 2;
+  bool is_admin = 3;
 }
 
 message AgentRunResultMessage {
@@ -233,6 +244,7 @@ message ListAgentArtifactsRequest {
   string user_id = 1;
   string id = 2;
   bool is_admin = 3;
+  bool skip_lazy_registration = 4;
 }
 
 message ListAgentArtifactsResponse {
@@ -340,7 +352,7 @@ message ApplyAgentCreditsResponse {
   string applied_at = 6;
 }
 
-// ---- 260612-01-04: 单次 run 的 credit 消耗明细查询 ----
+// 单次 Run 的 credit 消耗明细查询
 
 message GetAgentRunCreditsRequest {
   string user_id = 1;
@@ -447,6 +459,8 @@ message SendAgentMessageRequest {
   string content = 3;           // 用户消息内容
   string context_override = 4;  // 可选：上下文覆盖（仅 admin + debugMode 可用）
   bool stream = 5;              // 是否流式响应（预留）
+  string deployment_id = 6 [deprecated = true]; // 服务端忽略，使用 Run 已保存身份与本机身份核对
+  string deployment_generation_id = 7 [deprecated = true];
 }
 
 // 发送消息响应
@@ -465,6 +479,7 @@ message ListAgentMessagesRequest {
   int32 limit = 3;              // 默认 50，最大 200
   int32 offset = 4;             // 分页偏移
   bool include_initial = 5;     // 是否包含初始问题（默认 true）
+  bool is_admin = 6;
 }
 
 // 获取消息历史响应
@@ -506,7 +521,22 @@ message AgentSnapshotPartMessage {
   string compression = 6;
 }
 
+// 管理员诊断采集在触碰具体 Run 前先读取这组能力，避免新脚本连接到旧服务时
+// 误以为 GET 一定无副作用。该 RPC 本身不读取 Run，也不修改任何业务状态。
+message GetAgentDiagnosticReadCapabilitiesRequest {
+  string user_id = 1;
+  bool is_admin = 2;
+}
+
+message GetAgentDiagnosticReadCapabilitiesResponse {
+  bool admin_cross_user_read = 1;
+  bool no_touch_run_lifecycle = 2;
+  bool artifact_skip_lazy_registration = 3;
+}
+
 service AgentDubboService {
+  rpc GetDiagnosticReadCapabilities(GetAgentDiagnosticReadCapabilitiesRequest)
+      returns (GetAgentDiagnosticReadCapabilitiesResponse);
   rpc CreateRun(CreateAgentRunRequest) returns (AgentRunMessage);
   rpc GetRun(GetAgentRunRequest) returns (AgentRunMessage);
   rpc UpdateRun(UpdateAgentRunRequest) returns (AgentRunMessage);

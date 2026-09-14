@@ -30,7 +30,7 @@ import java.util.Map;
  * <ol>
  *   <li>Nacos 热加载：{@code agent-llm.local.json → runtime.runBudget.*}</li>
  *   <li>Spring 静态配置：{@code agent.llm.runtime.runBudget.*}</li>
- *   <li>启动默认值：{@code agent.run.budget.*}（本类 @Value 注解），硬编码 fallback</li>
+ *   <li>启动默认值：{@code agent.run.budget.*}（本类 @Value 注解），硬编码备用路径</li>
  * </ol>
  *
  * <h2>检查时机</h2>
@@ -53,15 +53,7 @@ import java.util.Map;
  * <p>封装了生效的五个预算维度值，每次调用 {@code check()} 时动态计算并读取。
  * 支持 Nacos 热加载——下一轮检查即可生效，无需重启 run。</p>
  *
- * <h2>面试常考点</h2>
- * <ul>
- *   <li>"为什么 llm_calls 和 tool_calls 分开检查？"→ 两者消耗模式不同：LLM 调用贵但低频，工具调用便宜但高频。
- *       分开计数可以更精细地控制预算分配。</li>
- *   <li>"tokens 为什么比 llm_calls 更容易超？"→ 一次复杂回测的 planning 阶段可能消耗 50K+ token，
- *       而 llm_calls 可能还不到 10 次。</li>
- *   <li>"预算超限后 run 怎么处理？"→ 抛异常 → TerminalToolErrorHandler 识别 → FailureMapper 分类 →
- *       Pipeline 写入失败事件 → 前端看到 RUN_BUDGET_EXCEEDED。</li>
- * </ul>
+ * <p>讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  *
  * @see OpenRouterProviderRoutedChatModel LLM 调用前检查的消费方
  * @see world.willfrog.agent.tools.router.ToolRouter 工具调用前检查的消费方
@@ -72,9 +64,10 @@ import java.util.Map;
 public class AgentRunBudgetService {
 
     private final AgentRunStateStore stateStore;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
     private final AgentLlmProperties llmProperties;
+    private final AgentPromptService promptService;
 
     /**
      * Nacos 热加载配置器（optional），用于读取 {@code runtime.runBudget.*}。
@@ -179,7 +172,7 @@ public class AgentRunBudgetService {
         //    这样在跨过 80% 的同一轮既能产出进度事件，也能在后续真正超限时正常抛 exceeded
         emitBudgetProgressIfNeeded(runId, userId, summary, budget, elapsed);
         // 0b. 90% last-mile 提示：跨过 90% 时写 BUDGET_LAST_MILE 事件 + 写入 AgentContext.lastMileHint，
-        //     下一次 LLM 调用时 chatRequestTransformer 会读取并注入到 SystemMessage 促使 LLM 尽快给出最终结论
+        //     下一次 LLM 调用时 chatRequestTransformer 会读取并作为 UserMessage 注入，保持 System 稳定
         emitBudgetLastMileIfNeeded(runId, userId, summary, budget, elapsed);
         // 1. 挂钟时间检查：从 run 启动到当前的毫秒数
         if (budget.maxWallClockMs() > 0 && elapsed > budget.maxWallClockMs()) {
@@ -273,7 +266,8 @@ public class AgentRunBudgetService {
     /**
      * 90% last-mile 提示 —— 对四个维度逐一检查首次跨过 90% 阈值的情况，
      * 对未提示过的 dimension 写入 {@code BUDGET_LAST_MILE} 事件并写入 {@link AgentContext#setLastMileHint} ThreadLocal，
-     * 促使 {@code LangchainTodoNodeExecutor} 下一次 {@code chatRequestTransformer} 把 hint 注入到 SystemMessage。
+     * 促使 {@code LangchainTodoNodeExecutor} 下一次 {@code chatRequestTransformer} 把 hint 作为 UserMessage 注入，
+     * 保持 System 稳定。
      * 阈值逻辑：{@code ratio ∈ [0.90, 1.00)} 触发一次；其它情况跳过。
      */
     private void emitBudgetLastMileIfNeeded(String runId, String userId,
@@ -320,20 +314,8 @@ public class AgentRunBudgetService {
      * advice 按维度区分：tokens 提示精简输出；tool_calls 提示精简工具调用；llm_calls 提示本轮直接给结论；wall_clock_ms 提示尽快完成。
      */
     private String buildLastMileHint(String dimension, long actual, long limit, long ratioPct) {
-        String advice;
-        if ("tokens".equals(dimension)) {
-            advice = "请精简回复，直接给出最终结论，避免长推理和重复工具调用。";
-        } else if ("tool_calls".equals(dimension)) {
-            advice = "请精简工具调用，必要时直接基于已有信息给出结论。";
-        } else if ("llm_calls".equals(dimension)) {
-            advice = "请尽量在当前调用内直接给出最终结论，避免再发起新一轮 LLM 调用。";
-        } else {
-            // wall_clock_ms
-            advice = "请尽快完成剩余 todo 并给出最终结论。";
-        }
-        return String.format(
-                "[last_mile_hint] 本 run 已使用 %d%% %s 预算（%d/%d），%s",
-                ratioPct, dimension, actual, limit, advice);
+        return promptService.budgetLastMileStageInstruction(
+                dimension, actual, limit, ratioPct);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */
@@ -385,7 +367,7 @@ public class AgentRunBudgetService {
 
     /**
      * 从 observability JSON 中加载当前 run 的累计统计（llmCalls / toolCalls / totalTokens / startedAtMillis）。
-     * 数据由 {@code AgentObservabilityService} 在每次 LLM 调用后写入。
+     * 数据由 {@code AgentRunObservabilityService} 在每次 LLM 调用后写入。
      */
     private Map<String, Object> loadSummary(String runId) {
         try {

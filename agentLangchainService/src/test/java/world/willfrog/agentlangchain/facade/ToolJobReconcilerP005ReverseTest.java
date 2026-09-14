@@ -23,11 +23,11 @@ import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.agentlangchain.tooljob.ToolJobConfig;
 import world.willfrog.agentlangchain.tooljob.ToolJobEventHook;
@@ -141,9 +141,9 @@ class ToolJobReconcilerP005ReverseTest {
 
     // Mocked dependencies for LangchainRunControlService
     private LangchainRunReadService readService;
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private AgentRunStateStore stateStore;
-    private AgentObservabilityService observabilityService;
+    private AgentRunObservabilityService observabilityService;
     private LangchainLinearRunPipeline pipeline;
     private AgentRunCreditSettlementService creditSettlementService;
 
@@ -170,6 +170,8 @@ class ToolJobReconcilerP005ReverseTest {
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ,
                     ext JSONB DEFAULT '{}',
+                    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                    restart_attempt INT NOT NULL DEFAULT 0,
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
         }
@@ -211,9 +213,9 @@ class ToolJobReconcilerP005ReverseTest {
 
         // ---- Mocked dependencies for LangchainRunControlService ----
         readService = mock(LangchainRunReadService.class);
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         stateStore = mock(AgentRunStateStore.class);
-        observabilityService = mock(AgentObservabilityService.class);
+        observabilityService = mock(AgentRunObservabilityService.class);
         pipeline = mock(LangchainLinearRunPipeline.class);
         creditSettlementService = mock(AgentRunCreditSettlementService.class);
 
@@ -249,12 +251,17 @@ class ToolJobReconcilerP005ReverseTest {
         ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
 
         // Construct LangchainRunControlService with REAL mapper + anchor service + mocked dependencies
+        world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
+                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive(
+                        mapper);
         controlService = new LangchainRunControlService(
                 readService, mapper, eventService, stateStore,
-                observabilityService, pipeline, creditSettlementService, anchorService);
+                observabilityService, pipeline, creditSettlementService, anchorService,
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                ownershipGateway);
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
-                anchorService, redisCache, config, om);
+                anchorService, redisCache, config, om, ownershipGateway);
 
         // Stateful capacity ledger (tracks release call count and ledger identity)
         capacityFake = new StatefulCapacityFake();
@@ -690,6 +697,20 @@ class ToolJobReconcilerP005ReverseTest {
         @Override
         public CompletableFuture<GetTaskByOperationIdResponse> getTaskByOperationIdAsync(
                 GetTaskByOperationIdRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        // 测试桩不实现 cancelTask；与 PythonSandboxService 接口的其他 RPC 一致，
+        // 抛 UnsupportedOperationException 让任何意外调用立即失败。生产 Gateway 实现遵守
+        // 既有装配依赖；DubboPythonSandboxServiceTriple 生成的默认 cancelTask 返回
+        // UNIMPLEMENTED，不写假 override。
+        @Override
+        public CancelTaskResponse cancelTask(CancelTaskRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<CancelTaskResponse> cancelTaskAsync(CancelTaskRequest request) {
             throw new UnsupportedOperationException("Not implemented in stub");
         }
     }

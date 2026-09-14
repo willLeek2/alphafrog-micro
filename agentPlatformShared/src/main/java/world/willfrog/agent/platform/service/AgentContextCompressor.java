@@ -387,8 +387,17 @@ public class AgentContextCompressor {
 
     private String buildSummarySystemPrompt(int maxChars) {
         int limit = maxChars > 0 ? maxChars : DEFAULT_SUMMARY_MAX_CHARS;
-        return "你是对话压缩助手，请将历史对话压缩成简洁摘要，保留关键事实、约束、结论、未解决问题与用户偏好。"
-                + "不要臆测或补充未出现的信息。输出中文，尽量控制在" + limit + "字以内。";
+        String template = PromptAuthority.shared().expectedText("followUpSummarySystemPrompt");
+        if (!template.contains("{{maxChars}}")) {
+            throw new PromptConfigurationException(
+                    "authority_template_invalid", "follow-up 摘要 Prompt 缺少 {{maxChars}} 占位符");
+        }
+        String rendered = template.replace("{{maxChars}}", Integer.toString(limit));
+        if (rendered.contains("{{maxChars}}")) {
+            throw new PromptConfigurationException(
+                    "authority_template_unresolved", "follow-up 摘要 Prompt 的 {{maxChars}} 未完成渲染");
+        }
+        return rendered;
     }
 
     private List<AgentRunMessage> applySummaryMessageLimit(List<AgentRunMessage> messages, int maxMessages) {

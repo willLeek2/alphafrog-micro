@@ -3,7 +3,16 @@
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run (
     id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'RECEIVED' CHECK (status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'COMPLETED', 'FAILED', 'CANCELED', 'EXPIRED')),
+    deployment_id VARCHAR(64) NOT NULL
+        CHECK (deployment_id ~ '^(stable|[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9]))$'),
+    deployment_generation_id VARCHAR(68) NOT NULL
+        CHECK (deployment_generation_id = 'legacy-stable'
+            OR deployment_generation_id ~ '^gen-[0-9a-f]{64}$'),
+    lane_tag VARCHAR(96),
+    status VARCHAR(32) NOT NULL DEFAULT 'RECEIVED' CHECK (status IN (
+        'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING_TOOL_JOB', 'WAITING',
+        'SUMMARIZING', 'COMPLETED', 'PARTIAL', 'FAILED', 'CANCELING', 'CANCELED', 'EXPIRED'
+    )),
     current_step INT NOT NULL DEFAULT 0,
     max_steps INT NOT NULL DEFAULT 12,
     plan_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -13,7 +22,9 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run (
     started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMPTZ,
-    ext JSONB NOT NULL DEFAULT '{}'::jsonb
+    ext JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    restart_attempt INT NOT NULL DEFAULT 0 CHECK (restart_attempt >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run_event (
@@ -218,6 +229,8 @@ CREATE TABLE IF NOT EXISTS alphafrog_admin_idempotency (
 CREATE INDEX IF NOT EXISTS idx_agent_run_user ON alphafrog_agent_run(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_run_status ON alphafrog_agent_run(status);
 CREATE INDEX IF NOT EXISTS idx_agent_run_updated ON alphafrog_agent_run(updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_run_deployment_generation_status
+    ON alphafrog_agent_run(deployment_id, deployment_generation_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_agent_run_user_started_desc ON alphafrog_agent_run(user_id, started_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_agent_run_event_run ON alphafrog_agent_run_event(run_id);

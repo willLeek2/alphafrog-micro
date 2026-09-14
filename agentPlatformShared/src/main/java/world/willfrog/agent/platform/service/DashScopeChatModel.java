@@ -63,11 +63,11 @@ public class DashScopeChatModel implements ChatModel {
     private final Double temperature;
     private final Integer maxTokens;
     private final RawHttpLogger httpLogger;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     private final String endpointName;
     private final boolean enableThinking;
     private final AgentLlmLocalConfigLoader localConfigLoader;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final LangchainLlmLatencyWindow latencyWindow;
 
     @Setter

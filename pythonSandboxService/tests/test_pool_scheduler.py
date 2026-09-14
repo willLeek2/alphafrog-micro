@@ -18,11 +18,25 @@ sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 
 from app.config import SandboxConfig
 from app.pool_scheduler import ContainerPoolScheduler, SandboxQueueTimeoutError
+from tests.nonroot_fakes import prime_fake_session
 
 
 class FakeSession:
+    def __init__(self) -> None:
+        # Non-root staging surface (260818): the pool worker's startup
+        # writes runtime-environment.json through container.put_archive,
+        # so the fake needs the container proxy + cached identity +
+        # an execute_command for the staging mkdir.
+        prime_fake_session(self)
+
+    def execute_command(self, command: str):
+        return types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+
     def copy_to_runtime(self, source: str, dest_path: str) -> None:
-        pass
+        raise AssertionError(
+            "production must stage via container.put_archive "
+            "(non-root contract, 260818)"
+        )
 
     def close(self) -> None:
         pass
@@ -444,14 +458,14 @@ class ContainerPoolSchedulerTest(unittest.TestCase):
         """
 
         class _TrackingSession:
+            # No container object on purpose: the non-root staging path
+            # (260818) fails closed during initialize_runtime_environment
+            # (NonRootContractError), which is this test's init failure.
             def __init__(self) -> None:
                 self.close_count = 0
 
             def close(self) -> None:
                 self.close_count += 1
-
-            def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                raise RuntimeError("container copy unreachable")
 
         tracking_session = _TrackingSession()
 

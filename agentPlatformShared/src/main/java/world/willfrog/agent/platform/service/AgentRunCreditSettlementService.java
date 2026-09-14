@@ -83,7 +83,7 @@ public class AgentRunCreditSettlementService {
     private static final String DEFAULT_CURRENCY = "USD";
     private static final int ADMIN_USER_TYPE = 1127;
 
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     private final AgentRunMapper runMapper;
     private final EndpointCostAdapterRegistry adapterRegistry;
     private final AgentRunLlmCallCreditDao llmCallCreditDao;
@@ -134,7 +134,7 @@ public class AgentRunCreditSettlementService {
         if (run != null) {
             observabilityJson = observabilityService.loadObservabilityJson(runId, run.getSnapshotJson());
         }
-        List<AgentObservabilityService.LlmTrace> traces = extractLlmTraces(observabilityJson);
+        List<AgentRunObservabilityService.LlmTrace> traces = extractLlmTraces(observabilityJson);
         if (traces.isEmpty()) {
             rebuildSummary(runId, userId, OffsetDateTime.now(ZoneOffset.UTC));
             return;
@@ -144,7 +144,7 @@ public class AgentRunCreditSettlementService {
         Map<String, AgentRunLlmCallCredit> effectiveByCallId = dedupByLatestAttempt(existingRecords);
 
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-        for (AgentObservabilityService.LlmTrace trace : traces) {
+        for (AgentRunObservabilityService.LlmTrace trace : traces) {
             if (trace == null || trace.getTraceId() == null || trace.getTraceId().isBlank()) {
                 continue;
             }
@@ -254,8 +254,8 @@ public class AgentRunCreditSettlementService {
 
         if (attempt == ATTEMPT_IMMEDIATE) {
             // attempt=1：拉 observability 全量 traces，逐个 quote + 写 per-call
-            List<AgentObservabilityService.LlmTrace> traces = extractLlmTraces(observabilityJson);
-            for (AgentObservabilityService.LlmTrace trace : traces) {
+            List<AgentRunObservabilityService.LlmTrace> traces = extractLlmTraces(observabilityJson);
+            for (AgentRunObservabilityService.LlmTrace trace : traces) {
                 if (trace == null || trace.getTraceId() == null || trace.getTraceId().isBlank()) {
                     continue;
                 }
@@ -529,7 +529,7 @@ public class AgentRunCreditSettlementService {
     }
 
     private AgentRunLlmCallCredit buildPerCallRecord(String runId, String userId, String llmCallId,
-                                                    AgentObservabilityService.LlmTrace trace,
+                                                    AgentRunObservabilityService.LlmTrace trace,
                                                     CostSettlementQuote quote, String status,
                                                     int attempt, OffsetDateTime now) {
         AgentRunLlmCallCredit record = new AgentRunLlmCallCredit();
@@ -577,7 +577,7 @@ public class AgentRunCreditSettlementService {
         return SETTLEMENT_STATUS_MISSING;
     }
 
-    private LlmCallBillingContext buildContext(String runId, AgentObservabilityService.LlmTrace trace) {
+    private LlmCallBillingContext buildContext(String runId, AgentRunObservabilityService.LlmTrace trace) {
         return LlmCallBillingContext.builder()
                 .runId(runId)
                 .callId(trace.getTraceId())
@@ -631,14 +631,14 @@ public class AgentRunCreditSettlementService {
         return record;
     }
 
-    private String resolveLlmCallId(AgentObservabilityService.LlmTrace trace) {
+    private String resolveLlmCallId(AgentRunObservabilityService.LlmTrace trace) {
         if (trace.getGenerationId() != null && !trace.getGenerationId().isBlank()) {
             return trace.getGenerationId();
         }
         return trace.getTraceId();
     }
 
-    private List<AgentObservabilityService.LlmTrace> extractLlmTraces(String observabilityJson) {
+    private List<AgentRunObservabilityService.LlmTrace> extractLlmTraces(String observabilityJson) {
         if (observabilityJson == null || observabilityJson.isBlank()) {
             return List.of();
         }
@@ -652,13 +652,13 @@ public class AgentRunCreditSettlementService {
             if (!(llmTraces instanceof List<?> list)) {
                 return List.of();
             }
-            List<AgentObservabilityService.LlmTrace> result = new ArrayList<>(list.size());
+            List<AgentRunObservabilityService.LlmTrace> result = new ArrayList<>(list.size());
             for (Object item : list) {
                 if (item == null) {
                     continue;
                 }
-                AgentObservabilityService.LlmTrace trace = objectMapper.convertValue(item,
-                        AgentObservabilityService.LlmTrace.class);
+                AgentRunObservabilityService.LlmTrace trace = objectMapper.convertValue(item,
+                        AgentRunObservabilityService.LlmTrace.class);
                 if (trace != null) {
                     result.add(trace);
                 }

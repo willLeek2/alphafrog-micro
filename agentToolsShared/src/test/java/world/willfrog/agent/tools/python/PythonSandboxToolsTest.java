@@ -63,6 +63,13 @@ class PythonSandboxToolsTest {
             java.lang.reflect.Field f = PythonSandboxTools.class.getDeclaredField("pythonSandboxService");
             f.setAccessible(true);
             f.set(tools, sandboxService);
+            // 本测试类锁定的是旧的 run-level dataset/manifest 编号翻译，不验证 D13/D14 容量接线。
+            // 生产默认仍然 fail-closed；这里只在测试夹具中显式开启非生产兼容路径，
+            // 避免缺少容量组件时在调用 CSV/挂载断言之前被新门禁拒绝。
+            java.lang.reflect.Field legacy = PythonSandboxTools.class
+                    .getDeclaredField("allowLegacyWithoutCapacity");
+            legacy.setAccessible(true);
+            legacy.setBoolean(tools, true);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

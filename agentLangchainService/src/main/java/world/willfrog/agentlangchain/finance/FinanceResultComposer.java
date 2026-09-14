@@ -9,7 +9,7 @@ import world.willfrog.agent.platform.finance.FinanceMethodResolution;
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionQuery;
 import world.willfrog.agent.platform.finance.FinanceMetricRecord;
 import world.willfrog.agent.platform.finance.FinanceRecordQuery;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.tools.finance.FinanceMethodSpecCatalog;
 import world.willfrog.agent.tools.finance.FinanceResultModelProjector;
 
@@ -74,7 +74,7 @@ public class FinanceResultComposer {
     private final FinanceResultModelProjector projector;
     private final FinanceMethodSpecCatalog specCatalog;
     private final FinanceResultBlockRenderer renderer;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
 
     public FinanceResultComposer(FinanceRecordQuery recordQuery,
@@ -82,7 +82,7 @@ public class FinanceResultComposer {
                                  FinanceResultModelProjector projector,
                                  FinanceMethodSpecCatalog specCatalog,
                                  FinanceResultBlockRenderer renderer,
-                                 AgentEventService eventService,
+                                 AgentRunEventService eventService,
                                  ObjectMapper objectMapper) {
         this.recordQuery = recordQuery;
         this.resolutionQuery = resolutionQuery;

@@ -2,57 +2,47 @@ package world.willfrog.agent.platform.artifact;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.Arrays;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+/**
+ * Run-scoped short-ID mapping layer for rawRef, backed by the local-disk
+ * {@link RunRawRefLocalStore} (260814 scheduler-03). The Redis hash mapping
+ * and the {@link PersistentArtifactRegistry} content path are no longer used
+ * by this store.
+ *
+ * <p>Agent-visible IDs follow the format {@code raw_ref_001}, {@code raw_ref_002}, etc.
+ * Ownership（归属校验）：短 ID 只证明该 ref 在此 run 下注册过；内容读取
+ * 一律经 {@link RunRawRefLocalStore#read(String, String, String)} 做严格
+ * runId+userId 归属校验——调用方的 runId 与 userId 必须与注册时严格相等，
+ * 任一空白或不一致 fail-closed 拒绝。</p>
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class RunRawRefStoreImpl implements RunRawRefStore {
 
-    private static final String MAPPING_KEY_PREFIX = "agent:raw-ref-mapping:";
-    private static final String ARTIFACT_TYPE = "raw-ref";
     private static final String SHORT_ID_PREFIX = "raw_ref_";
     private static final int DEFAULT_MAX_LIMIT = 4000;
 
-    private final PersistentArtifactRegistry artifactRegistry;
-    private final StringRedisTemplate redisTemplate;
+    private final RunRawRefLocalStore localStore;
 
     @Override
     public String register(String runId, String userId, String displayName, String content, long ttlSeconds) {
-        // Atomic sequence via Redis INCR, avoiding read-modify-write race.
-        String counterKey = "agent:raw-ref-counter:" + runId;
-        Long seq = redisTemplate.opsForValue().increment(counterKey);
-        redisTemplate.expire(counterKey, ttlSeconds, TimeUnit.SECONDS);
-        String shortId = SHORT_ID_PREFIX + String.format("%03d", seq);
-
-        long ttlHours = Math.max(1, (ttlSeconds + 3599) / 3600);
-        PersistentArtifactRegistration registration = artifactRegistry.register(
-                ARTIFACT_TYPE, runId, displayName, content, ttlHours);
-
-        String mappingKey = mappingKey(runId);
-        redisTemplate.opsForHash().put(mappingKey, shortId, registration.getArtifactId());
-        redisTemplate.expire(mappingKey, ttlSeconds, TimeUnit.SECONDS);
-
-        log.debug("Registered rawRef shortId={} -> artifactId={} for runId={} (seq={})",
-                shortId, registration.getArtifactId(), runId, seq);
-        return shortId;
+        return localStore.register(runId, userId, displayName, content, ttlSeconds, true);
     }
 
     @Override
-    public String read(String runId, String shortId) {
-        String artifactId = resolveArtifactId(runId, shortId);
-        return artifactRegistry.readContent(artifactId);
+    public String read(String runId, String userId, String shortId) {
+        return localStore.read(runId, userId, shortId);
     }
 
     @Override
-    public ToolOutputReadResult read(String runId, String shortId, int offset, int limit, String keyword) {
-        String artifactId = resolveArtifactId(runId, shortId);
-        String content = artifactRegistry.readContent(artifactId);
+    public ToolOutputReadResult read(String runId, String userId, String shortId,
+                                     int offset, int limit, String keyword) {
+        String content = localStore.read(runId, userId, shortId);
         String source = filterByKeyword(content, keyword);
         int total = source.length();
         int safeOffset = Math.max(0, Math.min(offset, total));
@@ -68,22 +58,7 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
 
     @Override
     public boolean belongsToRun(String runId, String shortId) {
-        if (runId == null || shortId == null) {
-            return false;
-        }
-        return Boolean.TRUE.equals(redisTemplate.opsForHash().hasKey(mappingKey(runId), shortId));
-    }
-
-    private String resolveArtifactId(String runId, String shortId) {
-        Object artifactId = redisTemplate.opsForHash().get(mappingKey(runId), shortId);
-        if (artifactId == null) {
-            throw new IllegalArgumentException("rawRef not found: " + shortId + " for run " + runId);
-        }
-        return artifactId.toString();
-    }
-
-    private String mappingKey(String runId) {
-        return MAPPING_KEY_PREFIX + runId;
+        return localStore.belongsToRun(runId, shortId);
     }
 
     private String filterByKeyword(String content, String keyword) {

@@ -173,6 +173,32 @@ class PythonSandboxToolsDataIntenseTest {
         verify(dispatchStore, times(2)).persistPreparing(eq("run-test"), any());
     }
 
+    /**
+     * 260818 (batch 20260818-182948): when both anchor CAS paths fail the tool
+     * must return a NON-retryable error carrying the operation_id — the LLM
+     * previously saw no stop signal and burned the whole 480s client budget
+     * retrying (7 attempts in run e572). Capacity reserved for the aborted
+     * dispatch must also be released (releasePreDispatch).
+     */
+    @Test
+    void anchorPersistenceFailureIsNonRetryableAndReleasesCapacity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.releaseReservation(any())).thenReturn(
+                DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(false);
+
+        String result = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(result)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"TOOL_JOB_ANCHOR_INVALID\"")
+                .contains("\"operation_id\":\"run-test:call-1:1\"")
+                .contains("\"retryable\":false");
+        verify(capacity, times(1)).releaseReservation(any());
+        verify(sandbox, never()).createTask(any());
+    }
+
     @Test
     void resumedSlowTaskConsumesExactOldHandoffBeforeSandboxCreate() throws Exception {
         fixtureDataset();
@@ -567,7 +593,9 @@ class PythonSandboxToolsDataIntenseTest {
     void legacyFailedTaskPreservesBoundedDiagnosticsInSharedFailureFormatter() throws Exception {
         fixtureDataset();
         // Force the legacy polling path while keeping the same sandbox/registry fixture.
+        // D14: legacy without capacity is non-production-only; opt in explicitly.
         inject("dataAnalysisCapacityService", null);
+        inject("allowLegacyWithoutCapacity", true);
         when(sandbox.createTask(any())).thenReturn(
                 ExecuteResponse.newBuilder().setTaskId("task-legacy-failed").build());
         when(sandbox.getTaskStatus(any())).thenReturn(
@@ -601,6 +629,7 @@ class PythonSandboxToolsDataIntenseTest {
             throws Exception {
         fixtureDataset();
         inject("dataAnalysisCapacityService", null);
+        inject("allowLegacyWithoutCapacity", true);
         when(sandbox.createTask(any())).thenReturn(
                 ExecuteResponse.newBuilder().setTaskId("task-legacy-finance").build());
         when(sandbox.getTaskStatus(any())).thenReturn(
@@ -1613,6 +1642,48 @@ class PythonSandboxToolsDataIntenseTest {
 
     private ToolJobAnchor snapshot(ToolJobAnchor anchor) {
         return ToolJobAnchor.fromJson(anchor.toJson());
+    }
+
+    @Test
+    void incompleteWiringWithoutLegacyAllowRefusesCreateAndNeverCallsGateway() throws Exception {
+        fixtureDataset();
+        inject("dataAnalysisCapacityService", null);
+        // Production default: allowLegacyWithoutCapacity=false
+        inject("allowLegacyWithoutCapacity", false);
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"SANDBOX_CAPACITY_WIRING_INCOMPLETE\"");
+        verify(sandbox, never()).createTask(any());
+    }
+
+    @Test
+    void eachMissingCapacityBeanAloneRefusesCreateWithoutLegacyAllow() throws Exception {
+        fixtureDataset();
+        inject("allowLegacyWithoutCapacity", false);
+
+        inject("dataAnalysisCapacityService", null);
+        assertThat(tools.executePython("print(1)", "1", null, null, 30))
+                .contains("SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+        inject("dataAnalysisCapacityService", capacity);
+
+        inject("dataAnalysisCapacityProperties", null);
+        assertThat(tools.executePython("print(1)", "1", null, null, 30))
+                .contains("SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+        inject("dataAnalysisCapacityProperties", new DataAnalysisCapacityProperties());
+
+        inject("pythonSandboxDispatchStore", null);
+        assertThat(tools.executePython("print(1)", "1", null, null, 30))
+                .contains("SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+        inject("pythonSandboxDispatchStore", dispatchStore);
+
+        inject("dataAnalysisTerminalRecorder", null);
+        assertThat(tools.executePython("print(1)", "1", null, null, 30))
+                .contains("SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+
+        verify(sandbox, never()).createTask(any());
     }
 
     private void inject(String fieldName, Object value) throws Exception {

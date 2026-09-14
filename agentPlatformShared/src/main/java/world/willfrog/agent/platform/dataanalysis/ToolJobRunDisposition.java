@@ -15,6 +15,12 @@ public final class ToolJobRunDisposition {
     public static final String DAG_BLOCKING_PREPARING_ABORT =
             "DAG_BLOCKING_PREPARING_ABORT";
 
+    /**
+     * 用户在长工具等待期暂停了 Run：锚点保留给收尾器做终态收尾（放配额、记账、发终态事件），
+     * 但终态到达后不自动恢复执行，等用户手动恢复。
+     */
+    public static final String PAUSED = "PAUSED";
+
     private ToolJobRunDisposition() {
     }
 

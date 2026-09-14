@@ -19,6 +19,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import org.mockito.ArgumentCaptor;
@@ -370,5 +371,61 @@ class ToolJobAnchorServiceTest {
         boolean result = anchorService.clearAnchorWithToken("run-1", "CONSUMED",
                 "token-v1", 3L);
         assertThat(result).isFalse();
+    }
+
+    // ===== 260818: CANCELED 终态收口专用 CAS（取消可落在恢复执行期） =====
+
+    @Test
+    void cancelFromStatusesDelegatesWithAnchorOperationIdFence() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-9:2");
+        when(agentRunMapper.cancelToolJobAnchorFromStatuses(
+                eq("run-1"), anyString(), eq(AgentRunStatus.CANCELED),
+                eq("run-1:tc-9:2")))
+                .thenReturn(1);
+
+        assertThat(anchorService.cancelFromStatuses("run-1", anchor, AgentRunStatus.CANCELED))
+                .isTrue();
+        verify(agentRunMapper).cancelToolJobAnchorFromStatuses(
+                eq("run-1"), anyString(), eq(AgentRunStatus.CANCELED), eq("run-1:tc-9:2"));
+    }
+
+    @Test
+    void cancelFromStatusesRejectsNonCanceledTargetStatus() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-9:2");
+
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> anchorService.cancelFromStatuses("run-1", anchor, AgentRunStatus.FAILED));
+        verify(agentRunMapper, never()).cancelToolJobAnchorFromStatuses(
+                anyString(), anyString(), any(), anyString());
+    }
+
+    // ===== 260819: 终态 Run 残留取消锚点兜底收口 =====
+
+    @Test
+    void closeResidualCanceledAnchorDelegatesWithOperationIdFence() {
+        when(agentRunMapper.closeResidualCanceledAnchorOnTerminalRun("run-1", "run-1:tc-9:2"))
+                .thenReturn(1);
+
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", "run-1:tc-9:2"))
+                .isTrue();
+        verify(agentRunMapper).closeResidualCanceledAnchorOnTerminalRun("run-1", "run-1:tc-9:2");
+    }
+
+    @Test
+    void closeResidualCanceledAnchorRejectsBlankOperationId() {
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", null)).isFalse();
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", " ")).isFalse();
+        verifyNoInteractions(agentRunMapper);
+    }
+
+    @Test
+    void closeResidualCanceledAnchorReturnsFalseWhenFenceRejects() {
+        when(agentRunMapper.closeResidualCanceledAnchorOnTerminalRun("run-1", "run-1:tc-9:2"))
+                .thenReturn(0);
+
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", "run-1:tc-9:2"))
+                .isFalse();
     }
 }

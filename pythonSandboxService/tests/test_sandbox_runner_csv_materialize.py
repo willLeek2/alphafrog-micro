@@ -66,24 +66,51 @@ class _ExecResult:
         self.stderr = stderr
 
 
+class _SessionContainer:
+    """非 root 拷贝路径的容器代理 fake（260818）：解析 put_archive 的
+    tar，把 (payload, dest) 记进所属 session 的 writes，语义与旧
+    copy_to_runtime 记录完全一致；不落盘。"""
+
+    def __init__(self, session: "_FakeSession") -> None:
+        self._session = session
+
+    def put_archive(self, dest_dir: str, data: bytes) -> None:
+        import io as _io
+        import tarfile as _tarfile
+
+        with _tarfile.open(fileobj=_io.BytesIO(data)) as tar:
+            for member in tar.getmembers():
+                payload = (
+                    tar.extractfile(member).read() if member.isfile() else b""
+                )
+                dest = f"{dest_dir.rstrip('/')}/{member.name}"
+                self._session.writes.append((payload, dest))
+                self._session.archive_entries.append(
+                    (dest_dir, member.name, member.uid, member.gid, member.mode)
+                )
+
+
 class _FakeSession:
-    """记录 copy_to_runtime / execute_command 调用，模拟 sandbox 写入。"""
+    """记录容器内文件写入（put_archive 通道）与 execute_command 调用。"""
 
     def __init__(self) -> None:
         self.writes: list[tuple[bytes, str]] = []
         self.copy_sources: list[str] = []
         self.exec_calls: list[str] = []
         self.exec_responses: dict[str, _ExecResult] = {}
+        self.archive_entries: list[tuple[str, str, int, int, int]] = []
+        self.container = _SessionContainer(self)
+        # 非 root 合同：生产在会话创建时预解析容器身份（uid 10000/gid 10001），
+        # 这里同样预置缓存，避免 fake 的 id -u/id -g 查询。
+        from app.container_copy import CONTAINER_IDENTITY_ATTR
+
+        setattr(self, CONTAINER_IDENTITY_ATTR, (10000, 10001))
 
     def copy_to_runtime(self, source_path: str, dest: str) -> None:
-        if isinstance(source_path, bytes):
-            raise TypeError(
-                "argument should be a str or an os.PathLike object where "
-                "__fspath__ returns a str, not 'bytes'"
-            )
-        self.copy_sources.append(str(source_path))
-        payload = Path(source_path).read_bytes()
-        self.writes.append((payload, dest))
+        raise AssertionError(
+            "production must stage via container.put_archive "
+            "(non-root contract, 260818): copy_to_runtime execs chown as root"
+        )
 
     def execute_command(self, cmd: str) -> _ExecResult:
         self.exec_calls.append(cmd)
@@ -819,17 +846,17 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         self.assertEqual(session.writes, [])
 
     def test_copy_exception_recorded_as_failure(self) -> None:
-        """MF-new-3: copy_to_runtime 抛异常 → 记入 failed_rows（reason=copy_failed:*）。
+        """MF-new-3: put_archive 抛异常 → 记入 failed_rows（reason=copy_failed:*）。
 
         helper 视角：count=0（实际没 cp 成功），expected=1，failed=[1 row]。
         """
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
-        # make copy_to_runtime raise
-        def _boom(payload, dest):
+        # make the non-root staging path raise (container-side failure)
+        def _boom(dest_dir, data):
             raise OSError("disk gone")
-        session.copy_to_runtime = _boom  # type: ignore[assignment]
+        session.container.put_archive = _boom  # type: ignore[assignment]
         ds_csv = (
             "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
             "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/ds-a/a.csv\n"
@@ -1075,9 +1102,9 @@ class SandboxRunnerPrepareWorkspaceFailLoudTest(unittest.TestCase):
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
 
-        def _boom(payload, dest):
+        def _boom(dest_dir, data):
             raise OSError("disk gone")
-        session.copy_to_runtime = _boom  # type: ignore[assignment]
+        session.container.put_archive = _boom  # type: ignore[assignment]
 
         ds_csv = (
             "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
@@ -1127,17 +1154,17 @@ class SandboxRunnerPrepareWorkspaceFailLoudTest(unittest.TestCase):
             tmp_src_b.write_text("b\n")
 
             real_fail_session = _FakeSession()
-            # Wrap copy_to_runtime 让第 3 次 cp 时抛异常（精确控制失败时机）
-            original_copy = real_fail_session.copy_to_runtime
+            # Wrap put_archive 让第 3 次 cp 时抛异常（精确控制失败时机）
+            original_put = real_fail_session.container.put_archive
             call_count = {"n": 0}
 
-            def _maybe_fail(payload, dest):
+            def _maybe_fail(dest_dir, data):
                 call_count["n"] += 1
                 if call_count["n"] == 3:  # 第 3 次 cp 失败
                     raise OSError("permission denied")
-                original_copy(payload, dest)
+                original_put(dest_dir, data)
 
-            real_fail_session.copy_to_runtime = _maybe_fail  # type: ignore[assignment]
+            real_fail_session.container.put_archive = _maybe_fail  # type: ignore[assignment]
 
             ds_csv = (
                 "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"

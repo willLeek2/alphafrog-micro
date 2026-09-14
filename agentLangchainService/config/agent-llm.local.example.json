@@ -359,12 +359,14 @@
     "threadNamePrefix": "agent-langchain-run-",
     "parallel": {
       "hard": {
+        "_restartNote": "修改 hard 值需滚动重启；hot-reload 只能在 hard 上限内缩小 current",
         "corePoolSize": 100,
         "maxPoolSize": 100,
         "queueCapacity": 1000,
         "threadNamePrefix": "agent-langchain-run-"
       },
       "current": {
+        "_restartNote": "修改此值超出 hard 上限会被 clamped，需滚动重启才能生效；threadNamePrefix 与 hard 不同也需重启",
         "corePoolSize": 10,
         "maxPoolSize": 10,
         "queueCapacity": 100,
@@ -415,6 +417,7 @@
   },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",
+    "followUpSummarySystemPrompt": "file:prompts/agent/follow_up_summary_system.txt",
     "todoPlannerSystemPromptTemplate": "file:prompts/todo/todo_planner_system.txt",
     "workflowFinalSystemPrompt": "file:prompts/workflow/workflow_final_system.txt",
     "workflowTodoRecoverySystemPrompt": "file:prompts/workflow/workflow_todo_recovery_system.txt",
@@ -436,6 +439,19 @@
     "dagReactSystemPromptFile": "file:prompts/todo/dag_react_system.txt",
     "dagModeGuidancePromptFile": "file:prompts/todo/dag_mode_guidance.txt",
     "planningStrategyStageFile": "file:prompts/todo/planning_strategy_stage.txt",
-    "planningTodosStageFile": "file:prompts/todo/planning_todos_stage.txt"
+    "planningTodosStageFile": "file:prompts/todo/planning_todos_stage.txt",
+    "planningAnalysisStage": "file:prompts/todo/planning_analysis_stage.txt",
+    "planningStructuredStage": "file:prompts/todo/planning_structured_stage.txt",
+    "planningLinearModeGuidance": "file:prompts/todo/planning_linear_mode_guidance.txt",
+    "planningDagModeGuidance": "file:prompts/todo/planning_dag_mode_guidance.txt",
+    "planningLinearConstraint": "file:prompts/todo/planning_linear_constraint.txt",
+    "pythonRepairStageInstruction": "file:prompts/python/python_repair_stage.txt",
+    "emptyOutputRecoveryStageInstruction": "file:prompts/todo/empty_output_recovery_stage.txt",
+    "budgetLastMileStageInstruction": "file:prompts/agent/budget_last_mile_stage.txt",
+    "todoRetryContextInstruction": "file:prompts/todo/todo_retry_context.txt",
+    "pythonRepairContextInstruction": "file:prompts/python/python_repair_context.txt",
+    "toolSummarySystemPrompt": "file:prompts/tools/tool_summary_system.txt",
+    "toolSummaryUserPromptTemplate": "file:prompts/tools/tool_summary_user.txt",
+    "toolCapabilityCatalog": "file:prompts/tools/tool_capability_catalog.json"
   }
 }

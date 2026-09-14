@@ -1,3 +1,4 @@
+[Stage: DAG_RECOVERY_JUDGE]
 你是 Agent Run 的恢复判定器。在 DAG 执行过程中，有节点失败了且确定不可修复。请根据用户目标、Todo 列表、依赖关系和已完成节点的产出摘要，判定此次 Agent Run 是否能在缺失部分节点的前提下，输出部分缺失但仍自圆其说的结论。
 
 必须只输出 JSON，禁止输出 markdown，格式严格如下：

@@ -7,6 +7,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.service.AgentSseService;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -21,7 +22,7 @@ class AgentSseControllerTest {
     void stream_shouldPreferAfterSeqOverLastEventId() {
         AgentSseService sseService = mock(AgentSseService.class);
         AuthService authService = mock(AuthService.class);
-        AgentSseController controller = new AgentSseController(sseService, authService);
+        AgentSseController controller = new AgentSseController(sseService, new AgentAuthSupport(authService));
         Authentication authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);
         when(authentication.getName()).thenReturn("u1");
@@ -32,14 +33,14 @@ class AgentSseControllerTest {
         controller.stream(authentication, "run-1", 7, "42");
 
         ArgumentCaptor<SseEmitter> emitterCaptor = ArgumentCaptor.forClass(SseEmitter.class);
-        verify(sseService).connect(eq("run-1"), eq("1127"), eq(7), emitterCaptor.capture());
+        verify(sseService).connect(eq("run-1"), eq("1127"), eq(false), eq(7), emitterCaptor.capture());
     }
 
     @Test
     void stream_shouldUseLastEventIdWhenAfterSeqMissing() {
         AgentSseService sseService = mock(AgentSseService.class);
         AuthService authService = mock(AuthService.class);
-        AgentSseController controller = new AgentSseController(sseService, authService);
+        AgentSseController controller = new AgentSseController(sseService, new AgentAuthSupport(authService));
         Authentication authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);
         when(authentication.getName()).thenReturn("u1");
@@ -49,12 +50,31 @@ class AgentSseControllerTest {
 
         controller.stream(authentication, "run-1", null, "42");
 
-        verify(sseService).connect(eq("run-1"), eq("1127"), eq(42), any(SseEmitter.class));
+        verify(sseService).connect(eq("run-1"), eq("1127"), eq(false), eq(42), any(SseEmitter.class));
+    }
+
+    @Test
+    void stream_shouldPassDatabaseBackedAdminView() {
+        AgentSseService sseService = mock(AgentSseService.class);
+        AuthService authService = mock(AuthService.class);
+        AgentSseController controller = new AgentSseController(sseService, new AgentAuthSupport(authService));
+        Authentication authentication = mock(Authentication.class);
+        when(authentication.isAuthenticated()).thenReturn(true);
+        when(authentication.getName()).thenReturn("admin");
+        User user = new User();
+        user.setUserId(1L);
+        user.setUserType(1127);
+        when(authService.getUserByUsername("admin")).thenReturn(user);
+
+        controller.stream(authentication, "run-1", 0, null);
+
+        verify(sseService).connect(eq("run-1"), eq("1"), eq(true), eq(0), any(SseEmitter.class));
     }
 
     @Test
     void resolveResumeAfterSeq_shouldIgnoreInvalidLastEventId() {
-        AgentSseController controller = new AgentSseController(mock(AgentSseService.class), mock(AuthService.class));
+        AgentSseController controller = new AgentSseController(mock(AgentSseService.class),
+                new AgentAuthSupport(mock(AuthService.class)));
 
         assertEquals(0, controller.resolveResumeAfterSeq(null, "not-a-seq"));
         assertEquals(0, controller.resolveResumeAfterSeq(null, null));
