@@ -2,7 +2,7 @@
 
 基于 **Node.js + TypeScript** 的 MCP 服务（stdio），用于通过 SSH 远程调试（`docker ps` / `docker logs` / `git log`）以及对 PostgreSQL 的只读查询。
 
-调用方（Agent）在工具参数中**仅选择** `test` 或 `prod`；真实 SSH 别名、数据库连接串等在 **MCP 进程环境** 中配置，勿写入可被误提交的仓库文件。
+调用方（Agent）先用 `list_remote_targets` 拿到逻辑 id（如 `test`、`prod`，也可自行增加），再把该 id 传给其它工具的 `env`。真实 SSH Host 别名写在本机保密文件里，由 MCP 进程读取。工具返回只含逻辑 id，不含 SSH 主机名。数据库连接串等仍在 **MCP 进程环境** 中配置，勿写入可被误提交的仓库文件。
 
 ## 环境要求
 
@@ -31,8 +31,9 @@ node dist/server.js
 
 ## 工具列表
 
-所有涉及远程 SSH 的工具均使用 **`env`**：`"test"` 或 `"prod"`。
+所有涉及远程 SSH / 分目标查询的工具均使用 **`env`**：值为 `list_remote_targets` 返回的逻辑 id。
 
+- `list_remote_targets()` — 列出当前可连接的逻辑目标：id、label、已配置能力（`docker` / `git` / `pg` / `redis` / `agent_data`）
 - `remote_docker_ps(env)` — 列出远程容器（name / image / status / ports）
 - `remote_git_log(env, repo_path?, limit?)` — 远程 `git log`
 - `remote_docker_logs(env, container, tail?, grep?, timestamps?, since?, until?, max_bytes?, timeout_seconds?, save_to_file?)` — 抓取容器日志
@@ -48,11 +49,11 @@ node dist/server.js
   - 文件读取：`head`、`tail`、`read_range`
   - 按内容查找：`find_content`（子串匹配，`grep -F` 语义）
   - `relative_path` 相对 data root，禁止绝对路径与 `..`；远程侧用 `realpath -m` 校验仍在 root 内
-  - `ALPHAFROG_DEBUG_DATA_ROOT_TEST` / `ALPHAFROG_DEBUG_DATA_ROOT_PROD` 均为可选；调用 `env=test|prod` 时若对应变量未配置，返回「没配置 xxx 环境变量，目前该工具不可用，请咨询人类用户获取信息」
+  - 清单里的 `data_root`，或环境变量 `ALPHAFROG_DEBUG_DATA_ROOT_<ID>`，均为可选；未配置时返回泛化错误，请咨询人类用户
   - `agent-configs` 及敏感文件名（`.env`、`*secret*`、`*credential*`、`*.pem`、`*.key`）禁止读内容与内容搜索
   - 默认限流：`max_depth`（`find_content` 默认 4，其余默认 2）、`limit`（默认 200）、`max_file_bytes`（默认 1MB）、`timeout_seconds`（默认 10）、`max_bytes`（默认 20000）
 
-失败时返回的 `error` 为泛化说明，**不包含**服务端内部环境变量名或真实 SSH 主机名。SSH 类成功返回中**不包含**本地执行的 `command` 字段。
+失败时返回的 `error` 为泛化说明。SSH 类成功返回不含本地执行的 `command` 字段；stdout / stderr 里若出现已知 host，会替换成 `[远程主机已隐藏]`。
 
 `grep` 支持子串；正则使用 `re:<pattern>`。
 
@@ -114,9 +115,6 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
       "args": ["/绝对路径/alphafrog-micro/alphafrogDebugMCP/dist/server.js"],
       "env": {
         "ALPHAFROG_DEBUG_SSH_CONFIG": "/你的用户名/.ssh/config",
-        "ALPHAFROG_DEBUG_SSH_HOSTS": "别名1,别名2",
-        "ALPHAFROG_DEBUG_SSH_HOST_TEST": "别名1",
-        "ALPHAFROG_DEBUG_SSH_HOST_PROD": "别名2",
         "ALPHAFROG_DEBUG_DEFAULT_REPO_PATH": "~/alphafrog/alphafrog-micro",
         "ALPHAFROG_DEBUG_DATA_ROOT_TEST": "/srv/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_DEBUG_DATA_ROOT_PROD": "/root/alphafrog/alphafrog-micro/data",
@@ -155,20 +153,67 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
 
 若使用 `ALPHAFROG_DEBUG_SSH_CONFIG`，请指向**本机**的 OpenSSH 配置文件（例如 `~/.ssh/config` 展开后的路径）。
 
+## 远程目标清单（本机保密文件）
+
+真实 SSH Host 别名放在本机 JSON 文件。仓库和 `mcp.json` 的 `env` 里只放路径或默认约定，不放 host 本身。
+
+加载顺序：
+
+1. 若设置了 `ALPHAFROG_DEBUG_HOSTS_FILE`，读取该路径（支持 `~/...`）。
+2. 否则若存在 `~/.alphafrog/debug-mcp-hosts.json`，读取该文件。
+3. 否则回退到旧版环境变量 `ALPHAFROG_DEBUG_SSH_HOST_TEST` / `ALPHAFROG_DEBUG_SSH_HOST_PROD`（以及可选白名单 `ALPHAFROG_DEBUG_SSH_HOSTS`）。
+
+使用文件（第 1 或第 2 步）时，文件就是允许连接的目标全集，环境变量里的 host 不再参与解析。改完文件后需要重启 MCP。
+
+文件格式见 [hosts.example.json](hosts.example.json)：
+
+```json
+{
+  "targets": [
+    {
+      "id": "test",
+      "label": "测试环境",
+      "ssh_host": "your-ssh-config-alias-test"
+    },
+    {
+      "id": "prod",
+      "label": "生产环境",
+      "ssh_host": "your-ssh-config-alias-prod",
+      "repo_path": "~/alphafrog/alphafrog-micro",
+      "data_root": "/root/alphafrog/alphafrog-micro/data"
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `id`：给 Agent 用的逻辑名，`[a-z][a-z0-9_]{0,31}`，对应其它工具的 `env`。
+- `label`：给 Agent 看的中文说明。label 里写主机名或 IP 会随 `list_remote_targets` 暴露出去。
+- `ssh_host`：`~/.ssh/config` 里的 Host 别名，只给 MCP 进程用来拼 `ssh`，工具返回不会带上它。
+- `repo_path` / `data_root`：可选；未写时仍可读 `ALPHAFROG_DEBUG_REPO_PATH_<ID>`、`ALPHAFROG_DEBUG_DATA_ROOT_<ID>` 或默认仓库路径。
+
+建议权限：`chmod 600 ~/.alphafrog/debug-mcp-hosts.json`。
+
+`list_remote_targets` 对调用 MCP 的 Agent 返回 `id`、`label`、`capabilities`（`docker` / `git` / `pg` / `redis` / `agent_data`）。PostgreSQL DSN、Redis 密码仍按 id 读环境变量：`ALPHAFROG_PG_<ID>_DSN`、`ALPHAFROG_REDIS_CONTAINER_<ID>`、`ALPHAFROG_REDIS_PASSWORD_<ID>`。
+
+MCP 工具的入参和返回不含 ssh host。本机若允许 Agent 直接读文件系统，Agent 仍可能按路径打开该 JSON。需要限制文件读取时，把该文件加入 Cursor 的忽略或拒绝读取列表。
+
 ## 附录：服务端环境变量（仅供人类运维）
 
 | 用途 | 变量名 |
 |------|--------|
-| 测试/生产 SSH Host 别名 | `ALPHAFROG_DEBUG_SSH_HOST_TEST`、`ALPHAFROG_DEBUG_SSH_HOST_PROD` |
-| 允许的 SSH 别名白名单（逗号分隔；非空则校验） | `ALPHAFROG_DEBUG_SSH_HOSTS` |
+| 远程目标清单文件路径（可选；默认 `~/.alphafrog/debug-mcp-hosts.json`） | `ALPHAFROG_DEBUG_HOSTS_FILE` |
+| 旧版：test/prod SSH Host 别名（无清单文件时才使用） | `ALPHAFROG_DEBUG_SSH_HOST_TEST`、`ALPHAFROG_DEBUG_SSH_HOST_PROD` |
+| 旧版：允许的 SSH 别名白名单（逗号分隔；非空则校验） | `ALPHAFROG_DEBUG_SSH_HOSTS` |
 | SSH config / 额外参数 / docker、git 命令前缀 | `ALPHAFROG_DEBUG_SSH_CONFIG`、`ALPHAFROG_DEBUG_SSH_ARGS`、`ALPHAFROG_DEBUG_DOCKER_CMD`、`ALPHAFROG_DEBUG_GIT_CMD` |
-| 远程 Redis 容器名（`remote_redis_query`） | `ALPHAFROG_REDIS_CONTAINER_TEST`、`ALPHAFROG_REDIS_CONTAINER_PROD` |
-| 远程 Redis 密码（`remote_redis_query`） | `ALPHAFROG_REDIS_PASSWORD_TEST`、`ALPHAFROG_REDIS_PASSWORD_PROD` |
+| 远程 Redis 容器名（`remote_redis_query`，按目标 id） | `ALPHAFROG_REDIS_CONTAINER_<ID>`，例如 `ALPHAFROG_REDIS_CONTAINER_TEST` |
+| 远程 Redis 密码（`remote_redis_query`，按目标 id） | `ALPHAFROG_REDIS_PASSWORD_<ID>` |
 | redis-cli 命令前缀（可选） | `ALPHAFROG_DEBUG_REDIS_CLI_CMD`（默认 `redis-cli`） |
-| 远程仓库路径 | `ALPHAFROG_DEBUG_REPO_PATH_TEST`、`ALPHAFROG_DEBUG_REPO_PATH_PROD`、`ALPHAFROG_DEBUG_DEFAULT_REPO_PATH` |
-| 远程 agent data 根目录（`remote_agent_data_query`；按 env 分别配置，均为可选；未配置时调用该工具会报错） | `ALPHAFROG_DEBUG_DATA_ROOT_TEST`、`ALPHAFROG_DEBUG_DATA_ROOT_PROD` |
+| 远程仓库路径 | `ALPHAFROG_DEBUG_REPO_PATH_<ID>`、`ALPHAFROG_DEBUG_DEFAULT_REPO_PATH` |
+| 远程 agent data 根目录（`remote_agent_data_query`；清单 `data_root` 或按 id 的环境变量，均为可选；未配置时调用该工具会报错） | `ALPHAFROG_DEBUG_DATA_ROOT_<ID>` |
 | Docker 日志落盘目录（`remote_docker_logs` / `remote_docker_follow` 的 `save_to_file=true`） | `ALPHAFROG_DEBUG_LOG_SAVE_DIR` |
-| PostgreSQL DSN | `ALPHAFROG_PG_TEST_DSN`、`ALPHAFROG_PG_PROD_DSN` |
+| PostgreSQL DSN | `ALPHAFROG_PG_<ID>_DSN` |
 
 ## 历史说明
 

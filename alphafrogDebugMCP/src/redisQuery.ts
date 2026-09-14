@@ -23,7 +23,7 @@ const KEY_PATTERN_MAX_LEN = 256;
 const REDIS_KEY_MAX_LEN = 512;
 const CONTAINER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-export type RedisEnv = "test" | "prod";
+export type RedisEnv = string;
 
 export type RedisOperation = "scan_keys" | "get_values";
 
@@ -101,23 +101,13 @@ export function redisConfigForEnv(
   const password = envGetter(`ALPHAFROG_REDIS_PASSWORD_${upper}`) ?? "";
 
   if (!container) {
-    return {
-      error:
-        env === "test"
-          ? "所选测试环境尚未在服务端完成 Redis 容器配置"
-          : "所选生产环境尚未在服务端完成 Redis 容器配置",
-    };
+    return { error: "该目标尚未配置 Redis 容器" };
   }
   if (!CONTAINER_NAME_RE.test(container)) {
     return { error: "服务端 Redis 容器名配置格式无效" };
   }
   if (!password) {
-    return {
-      error:
-        env === "test"
-          ? "所选测试环境尚未在服务端完成 Redis 认证配置"
-          : "所选生产环境尚未在服务端完成 Redis 认证配置",
-    };
+    return { error: "该目标尚未配置 Redis 认证" };
   }
   return { container, password };
 }
