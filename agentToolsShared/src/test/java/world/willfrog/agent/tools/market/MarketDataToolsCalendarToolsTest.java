@@ -101,8 +101,8 @@ class MarketDataToolsCalendarToolsTest {
         assertEquals("20240101", data.get("start_date"));
         assertEquals("20240331", data.get("end_date"));
         assertEquals(3, ((Number) data.get("trading_days_count")).intValue());
-        assertEquals("20240102", data.get("first_trading_date"));
-        assertEquals("20240105", data.get("last_trading_date"));
+        assertEquals(MS_20240102, ((Number) data.get("first_trading_date")).longValue());
+        assertEquals(MS_20240105, ((Number) data.get("last_trading_date")).longValue());
         assertEquals("alphafrog_trade_calendar", data.get("calendar_source"));
 
         // 小写 exchange 归一化为大写后下发
@@ -120,7 +120,7 @@ class MarketDataToolsCalendarToolsTest {
     }
 
     @Test
-    void summaryEmptyRangeReturnsNoneStrings() throws Exception {
+    void summaryEmptyRangeReturnsZeroTimestamps() throws Exception {
         when(indexService.getTradingDaysCountByDateRange(any()))
                 .thenReturn(DomesticTradingDaysCountResponse.newBuilder()
                         .setTradingDaysCount(0)
@@ -133,8 +133,8 @@ class MarketDataToolsCalendarToolsTest {
         assertEquals(Boolean.TRUE, response.get("ok"), "区间无交易日仍是成功响应");
         Map<String, Object> data = dataOf(response);
         assertEquals(0, ((Number) data.get("trading_days_count")).intValue());
-        assertEquals("NONE", data.get("first_trading_date"));
-        assertEquals("NONE", data.get("last_trading_date"));
+        assertEquals(0L, ((Number) data.get("first_trading_date")).longValue());
+        assertEquals(0L, ((Number) data.get("last_trading_date")).longValue());
         assertEquals("alphafrog_trade_calendar", data.get("calendar_source"));
     }
 

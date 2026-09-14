@@ -47,8 +47,9 @@ final class MarketDataCalendarTools {
             data.put("start_date", normalizedStart);
             data.put("end_date", normalizedEnd);
             data.put("trading_days_count", response.getTradingDaysCount());
-            data.put("first_trading_date", support.msTimestampToCompactDate(response.getFirstTradingDate()));
-            data.put("last_trading_date", support.msTimestampToCompactDate(response.getLastTradingDate()));
+            // 交易日值统一用毫秒时间戳（与行情数据集里的 trade_date 对齐）；区间无交易日时为 0。
+            data.put("first_trading_date", response.getFirstTradingDate());
+            data.put("last_trading_date", response.getLastTradingDate());
             data.put("calendar_source", "alphafrog_trade_calendar");
             return support.ok("getTradingDaysSummary", data);
         } catch (Exception e) {

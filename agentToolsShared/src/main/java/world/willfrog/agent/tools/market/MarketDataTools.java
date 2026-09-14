@@ -28,9 +28,7 @@ import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 
-import java.time.Instant;
 import java.time.LocalDate;
-import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
@@ -79,7 +77,6 @@ import java.util.function.Supplier;
 public class MarketDataTools {
 
     private static final DateTimeFormatter BASIC_DATE_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
-    private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final List<String> DAILY_DATASET_HEADERS = List.of(
             "ts_code", "trade_date", "open", "high", "low", "close",
             "pre_close", "change", "pct_chg", "vol", "amount"
@@ -852,8 +849,8 @@ public class MarketDataTools {
      * 查询A股指定区间内的交易日概览。
      *
      * <p>返回交易日总数、首个/最后交易日，所有日期均来自 alphafrog_trade_calendar。
-     * 当区间无交易日时，first_trading_date/last_trading_date 返回 NONE 而非空串，
-     * 便于调用方明确区分「无交易日」和「异常未返回」。</p>
+     * first_trading_date/last_trading_date 是毫秒时间戳（与行情数据集里的 trade_date 一致）；
+     * 当区间无交易日时为 0，便于调用方明确区分「无交易日」和「异常未返回」。</p>
      */
     @Tool
     public String getTradingDaysSummary(String startDate, String endDate, String exchange) {
@@ -2006,13 +2003,6 @@ public class MarketDataTools {
             return "SSE";
         }
         return normalized.toUpperCase(Locale.ROOT);
-    }
-
-    String msTimestampToCompactDate(long timestampMs) {
-        if (timestampMs <= 0) {
-            return "NONE";
-        }
-        return Instant.ofEpochMilli(timestampMs).atZone(CHINA_ZONE).toLocalDate().format(BASIC_DATE_FORMATTER);
     }
 
     String compactDate(String raw) {
