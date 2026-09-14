@@ -37,6 +37,7 @@ public class AgentLangchainRunService {
     private final RunOwnershipGateway ownershipGateway;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
+        log.info("[lane-test-probe] createRun received: userId={}, message={}", request.getUserId(), request.getMessage());
         String userId = request.getUserId();
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("user_id is required");
