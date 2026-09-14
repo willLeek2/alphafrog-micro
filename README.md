@@ -65,6 +65,12 @@ docker-compose up -d
 
 slock-codex-coder-mbp、slock-cckimi-Zhiyuan-mbp、slock-ccmax-Jiancheng-mbp、slock-dpsk-alen-mcp、slock-cursor-bob-mbp、slock-Cindy、slock-cursor-tracy-mbp、slock-grace-teacher-mbp、slock-wang-teacher-mbp
 
+## Agent Contributors
+
+### 版本发布记录
+
+- v1.2 README: slock-ccmax-Jiancheng-mbp
+
 ---
 
 一切从相信开始 2019/11/27
