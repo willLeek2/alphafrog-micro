@@ -814,23 +814,23 @@ public class PythonSandboxTools {
                     }
                     throw pollFailure;
                 }
-                if (!waitPolicy.durableSuspend()) {
-                    if (statusResp != null && !nvl(statusResp.getError()).isBlank()) {
-                        return promoteDagBlockingFailure(
-                                runId,
-                                anchor,
-                                "DAG_BLOCKING_POLL_FAILED",
-                                "DAG Sandbox status polling failed",
-                                toolStartMs,
-                                Map.of("task_id", taskId,
-                                        "message", nvl(statusResp.getError())));
-                    }
-                }
                 String status = statusResp == null ? "" : nvl(statusResp.getStatus());
                 if (isTerminal(status)) {
                     return finishTerminalByWaitPolicy(
                             runId, identity, estimate, reservation, anchor, status,
                             waitPolicy, toolStartMs);
+                }
+                if (!waitPolicy.durableSuspend()
+                        && statusResp != null
+                        && !nvl(statusResp.getError()).isBlank()) {
+                    return promoteDagBlockingFailure(
+                            runId,
+                            anchor,
+                            "DAG_BLOCKING_POLL_FAILED",
+                            "DAG Sandbox status polling failed",
+                            toolStartMs,
+                            Map.of("task_id", taskId,
+                                    "message", nvl(statusResp.getError())));
                 }
                 // 每次最多睡 100ms，并且不越过 fastDeadline。
                 try {
@@ -974,16 +974,6 @@ public class PythonSandboxTools {
                         toolStartMs,
                         Map.of("task_id", taskId, "message", nvl(pollFailure.getMessage())));
             }
-            if (statusResp != null && !nvl(statusResp.getError()).isBlank()) {
-                return promoteDagBlockingFailure(
-                        runId,
-                        anchor,
-                        "DAG_BLOCKING_POLL_FAILED",
-                        "DAG Sandbox status polling failed",
-                        toolStartMs,
-                        Map.of("task_id", taskId,
-                                "message", nvl(statusResp.getError())));
-            }
             String status = statusResp == null ? "" : nvl(statusResp.getStatus());
             if (pollIndex == 0 || !status.equals(lastRemoteStatus) || pollIndex % 5 == 0) {
                 emitSandboxEvent("sandbox_poll", Map.of(
@@ -999,6 +989,16 @@ public class PythonSandboxTools {
                 return finishTerminalByWaitPolicy(
                         runId, identity, estimate, reservation, anchor, status,
                         PythonWaitPolicy.BLOCKING_POLL, toolStartMs);
+            }
+            if (statusResp != null && !nvl(statusResp.getError()).isBlank()) {
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_POLL_FAILED",
+                        "DAG Sandbox status polling failed",
+                        toolStartMs,
+                        Map.of("task_id", taskId,
+                                "message", nvl(statusResp.getError())));
             }
 
             long remainingMillis = timeoutAt.toEpochMilli() - System.currentTimeMillis();

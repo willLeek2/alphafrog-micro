@@ -205,18 +205,17 @@ public class LangchainAiPlanner {
                             strategyValidation.category(), strategyValidation.message());
                 }
                 StructuredPlanningSupport.OverallPlan overallPlan = strategyValidation.data();
-                String effectiveStrategyMode = mode == PlanExecutionMode.LINEAR
-                        ? PlanExecutionMode.LINEAR.name()
-                        : overallPlan.mode();
-                if (mode == PlanExecutionMode.LINEAR) {
+                PlanExecutionMode effectiveStrategyMode = mode == PlanExecutionMode.AUTO
+                        ? PlanExecutionMode.valueOf(overallPlan.mode())
+                        : mode;
+                if (!effectiveStrategyMode.name().equals(overallPlan.mode())) {
                     /*
-                     * provider 可能忽略第一阶段的 LINEAR 指令而返回 DAG；这里先把
-                     * strategy 内容正规化为 LINEAR，避免把自相矛盾的 assistant 消息
-                     * 带入 Todo 阶段。
+                     * 显式 LINEAR / DAG 由用户请求决定。provider 如果返回另一种模式，
+                     * 这里先正规化 strategy，避免 Todo 阶段同时看到两套相互矛盾的模式。
                      */
                     var normalizedStrategy = objectMapper.createObjectNode();
                     var normalizedOverallPlan = normalizedStrategy.putObject("overallPlan");
-                    normalizedOverallPlan.put("mode", PlanExecutionMode.LINEAR.name());
+                    normalizedOverallPlan.put("mode", effectiveStrategyMode.name());
                     normalizedOverallPlan.put("detail", nvl(overallPlan.detail()));
                     ctx.addAssistantMessage(normalizedStrategy.toString());
                 } else {
@@ -224,7 +223,7 @@ public class LangchainAiPlanner {
                 }
 
                 String todosStage = promptService.planningTodosStageInstruction(
-                        effectiveStrategyMode, overallPlan.detail(), toolList, maxTodos);
+                        effectiveStrategyMode.name(), overallPlan.detail(), toolList, maxTodos);
                 ctx.addUserMessage(todosStage);
 
                 AgentContext.setStage("planning_todos");
@@ -237,7 +236,8 @@ public class LangchainAiPlanner {
                 );
                 ChatResponse todosResponse = request.getModel().chat(ctx.getMessages());
                 String todosRaw = todosResponse.aiMessage() == null ? "" : nvl(todosResponse.aiMessage().text());
-                LangchainTodoPlan plan = parseValidateTodoPlan(todosRaw, mode, maxTodos);
+                LangchainTodoPlan plan = parseValidateTodoPlan(
+                        todosRaw, effectiveStrategyMode, maxTodos);
                 if (overallPlan.detail() != null && !overallPlan.detail().isBlank()) {
                     plan = LangchainTodoPlan.builder()
                             .analysis(overallPlan.detail())

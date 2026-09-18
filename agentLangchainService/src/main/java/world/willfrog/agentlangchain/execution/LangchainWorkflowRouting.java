@@ -90,9 +90,9 @@ final class LangchainWorkflowRouting {
         return switch (requested) {
             case LINEAR -> effectivePlan(plan, true);
             case DAG -> copyWithMode(plan, PlanExecutionMode.DAG);
-            case AUTO -> copyWithMode(
-                    plan,
-                    shouldUseDag(plan) ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR);
+            case AUTO -> shouldUseDag(plan)
+                    ? copyWithMode(plan, PlanExecutionMode.DAG)
+                    : effectivePlan(plan, true);
         };
     }
 
