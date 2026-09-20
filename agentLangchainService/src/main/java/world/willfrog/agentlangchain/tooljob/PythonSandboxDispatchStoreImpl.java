@@ -59,6 +59,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                     DualPoolToolJobExecutionContext.current();
             return snapshot == null
                     || snapshot.identity() == null
+                    || !runId.equals(snapshot.identity().runId())
                     || snapshot.versions() == null
                     || snapshot.claimant() == null
                     || snapshot.claimant().isBlank();
@@ -71,7 +72,9 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
 
     @Override
     public boolean persistPreparing(String runId, ToolJobAnchor anchor) {
-        applyDualPoolIdentity(anchor);
+        if (!applyDualPoolIdentity(runId, anchor)) {
+            return false;
+        }
         // 调用方必须明确提供 PREPARING；claim SQL 还要求当前 Run anchor 为空。
         return "PREPARING".equals(anchor.getAnchorState())
                 && anchorService.claimPreparing(runId, anchor, AgentRunStatus.EXECUTING);
@@ -82,18 +85,29 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                                               ToolJobAnchor anchor,
                                               String expectedResumeToken,
                                               long expectedResumeLeaseVersion) {
-        applyDualPoolIdentity(anchor);
+        if (!applyDualPoolIdentity(runId, anchor)) {
+            return false;
+        }
         return "PREPARING".equals(anchor.getAnchorState())
                 && anchorService.claimPreparingFromResume(
                 runId, anchor, expectedResumeToken, expectedResumeLeaseVersion);
     }
 
-    private void applyDualPoolIdentity(ToolJobAnchor anchor) {
+    private boolean applyDualPoolIdentity(String runId, ToolJobAnchor anchor) {
         DualPoolToolJobExecutionContext.Snapshot snapshot =
                 DualPoolToolJobExecutionContext.current();
-        if (anchor == null || snapshot == null || snapshot.identity() == null
-                || snapshot.versions() == null) {
-            return;
+        if (anchor == null) {
+            return false;
+        }
+        if (snapshot == null) {
+            return true;
+        }
+        if (snapshot.identity() == null || snapshot.versions() == null
+                || runId == null || !runId.equals(snapshot.identity().runId())) {
+            log.error("Python sandbox dispatch rejected because the dual-pool work item belongs "
+                    + "to another Run: requestedRunId={} workItemRunId={}",
+                    runId, snapshot.identity() == null ? null : snapshot.identity().runId());
+            return false;
         }
         anchor.setWorkItemPlanGeneration(snapshot.identity().planGeneration());
         anchor.setWorkItemNodeId(snapshot.identity().nodeId());
@@ -104,6 +118,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
         anchor.setWorkItemClaimEpoch(snapshot.versions().claimEpoch());
         anchor.setWorkItemClaimedBy(snapshot.claimant());
         anchor.setWorkItemPayloadJson(snapshot.payloadJson());
+        return true;
     }
 
     @Override

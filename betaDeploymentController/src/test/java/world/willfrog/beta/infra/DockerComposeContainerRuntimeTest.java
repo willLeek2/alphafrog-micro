@@ -112,6 +112,10 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("none", environmentNode.path("OTEL_LOGS_EXPORTER").asText());
         assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
         assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
+        assertEquals("false", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("false", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
+        assertEquals("false", environmentNode.path(
+                "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
         // 主 Beta 容器不带泳道名，配置候选链只查主 data-id，不去查 "main-beta.{dataId}"
         assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
         // agent 这类服务没有 HTTP 上游，compose 里不出现沙箱地址变量。
@@ -396,6 +400,7 @@ class DockerComposeContainerRuntimeTest {
     @Test
     void laneProviderRegistersItsOfficialDubboTag() throws Exception {
         ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        ((ObjectNode) service.path("runtime")).put("allowToolJobProcessHalt", true);
         plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
                 JsonSupport.deploymentGeneration(manifest), "A", 28080);
         FakeCommands commands = new FakeCommands(false);
@@ -411,6 +416,29 @@ class DockerComposeContainerRuntimeTest {
         // 泳道容器（不只 frontend）都带泳道名：Nacos 配置桥/沙箱监听靠它构造
         // "{scopeId}.{dataId}" 候选，漏注会让泳道容器读不到泳道覆盖配置
         assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
+        assertEquals("true", environmentNode.path(
+                "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
+    }
+
+    @Test
+    void laneProcessHaltStaysDisabledWithoutTheManifestPermission() throws Exception {
+        ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode environmentNode = mapper.readTree(
+                Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app").path("environment");
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
+        assertEquals("false", environmentNode.path(
+                "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
     }
 
     @Test

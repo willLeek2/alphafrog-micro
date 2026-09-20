@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -98,6 +99,21 @@ class DualPoolToolJobCoordinatorTest {
     }
 
     @Test
+    void failedPromotionDoesNotMutateTheCallersAnchor() {
+        ToolJobAnchor anchor = anchor(3);
+        NodeWorkItem waiting = item("WAITING", 3);
+        when(store.findByIdentity(waiting.identity())).thenReturn(Optional.of(waiting));
+        when(store.promoteToolJobResumable(any(), any(), any(), any(), any()))
+                .thenReturn(new NodeWorkItemMutationResult(false, null));
+
+        assertThat(coordinator.promoteResumable("run-1", anchor)).isFalse();
+
+        assertThat(anchor.getResumeState()).isNull();
+        assertThat(anchor.getFinalizerStep()).isNull();
+        verify(dispatcher, never()).offerNode(any());
+    }
+
+    @Test
     void restartRequeuesClaimedResumeOnlyWithNextEpoch() {
         ToolJobAnchor anchor = anchor(3);
         anchor.setResumeState(DualPoolToolJobCoordinator.RESUME_STATE);
@@ -111,6 +127,30 @@ class DualPoolToolJobCoordinatorTest {
         verify(store).requeueInterruptedToolJob(
                 claimed.identity(), new NodeWorkItemVersions(7, 9, 4), "run-1:call-1:1");
         verify(dispatcher).offerNode(claimed.identity());
+    }
+
+    @Test
+    void repeatedResumeClaimCanRequeueThenCommitWithALaterEpoch() {
+        ToolJobAnchor anchor = anchor(3);
+        anchor.setResumeState(DualPoolToolJobCoordinator.RESUME_STATE);
+        NodeWorkItem firstClaim = item("EXECUTING", 4);
+        when(store.findByIdentity(firstClaim.identity())).thenReturn(Optional.of(firstClaim));
+        when(store.requeueInterruptedToolJob(any(), any(), any()))
+                .thenReturn(NodeWorkItemMutationResult.success());
+        when(store.commitResumedToolJobResult(any(), any(), any(), any(), any()))
+                .thenReturn(NodeWorkItemMutationResult.success());
+
+        assertThat(coordinator.recoverResumable("run-1", anchor)).isTrue();
+        NodeWorkItemMutationResult committed = coordinator.commitResumedResult(
+                firstClaim.identity(), new NodeWorkItemVersions(7, 9, 5),
+                "run-1:call-1:1", "{\"segmentResult\":{\"success\":true}}", null);
+
+        assertThat(committed.applied()).isTrue();
+        verify(store).requeueInterruptedToolJob(
+                firstClaim.identity(), new NodeWorkItemVersions(7, 9, 4), "run-1:call-1:1");
+        verify(store).commitResumedToolJobResult(
+                firstClaim.identity(), new NodeWorkItemVersions(7, 9, 5),
+                "run-1:call-1:1", "{\"segmentResult\":{\"success\":true}}", null);
     }
 
     @Test

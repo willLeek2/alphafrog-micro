@@ -271,11 +271,28 @@
     </update>
 
     <!--
-      工具结果收尾与恢复事件写入同一条数据库语句：Run 回到 EXECUTING，工作项进入 RESUMABLE，
-      锚点保存已经完成收尾的终态。任何身份或版本不一致都会让两边都保持原状。
+      工具结果收尾与恢复事件写入同一条数据库语句：先锁 Run、再锁工作项，随后让 Run 回到
+      EXECUTING、工作项进入 RESUMABLE。与恢复提交保持相同锁序；任何身份或版本不一致都会
+      让两边都保持原状。
     -->
     <update id="promoteToolJobResumable">
-        WITH item_locked AS (
+        WITH run_locked AS (
+            SELECT owner_run.id
+            FROM alphafrog_agent_run owner_run
+            WHERE owner_run.id = #{runId}
+              AND owner_run.status = 'WAITING_TOOL_JOB'
+              AND owner_run.plan_generation = #{planGeneration}
+              AND owner_run.run_control_version = #{runControlVersion}
+              AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+              AND owner_run.tool_job_anchor_json #>> '{workItemPlanGeneration}' = #{planGeneration}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemNodeId}' = #{nodeId}
+              AND owner_run.tool_job_anchor_json #>> '{workItemNodeAttempt}' = #{nodeAttempt}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemSegmentSequence}' = #{segmentSequence}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemContextVersion}' = #{contextVersion}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemRunControlVersion}' = #{runControlVersion}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}' = #{claimEpoch}::text
+            FOR UPDATE
+        ), item_locked AS (
             SELECT wi.id
             FROM alphafrog_agent_run_work_item wi
             WHERE <include refid="identityFence"/>
@@ -283,6 +300,7 @@
               AND wi.context_version = #{contextVersion}
               AND wi.run_control_version = #{runControlVersion}
               AND wi.claim_epoch = #{claimEpoch}
+              AND EXISTS (SELECT 1 FROM run_locked)
             FOR UPDATE
         ), run_advanced AS (
             UPDATE alphafrog_agent_run owner_run SET
@@ -334,7 +352,7 @@
               AND owner_run.run_control_version = #{runControlVersion}
               AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
               AND owner_run.tool_job_anchor_json #>> '{resumeState}' = 'DUAL_POOL_READY'
-              AND owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}' = (#{claimEpoch} - 1)::text
+              AND (owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}')::int &lt; #{claimEpoch}
             FOR UPDATE
         ), item_committed AS (
             UPDATE alphafrog_agent_run_work_item wi SET
@@ -361,8 +379,8 @@
     </update>
 
     <!--
-      进程可能在 RESUMABLE 被领取后、结果原子提交前退出。启动恢复只在 Run 仍由同一锚点
-      占有，且锚点记录的原领取代际正好比当前代际小一时，才把节点重新开放领取。
+      进程可能在 RESUMABLE 被领取后、结果原子提交前多次退出。启动恢复只在 Run 仍由同一
+      锚点占有，且当前领取代际严格晚于锚点记录的原领取代际时，才把节点重新开放领取。
     -->
     <update id="requeueInterruptedToolJob">
         UPDATE alphafrog_agent_run_work_item wi SET
@@ -385,7 +403,7 @@
                 AND owner_run.run_control_version = #{runControlVersion}
                 AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
                 AND owner_run.tool_job_anchor_json #>> '{resumeState}' = 'DUAL_POOL_READY'
-                AND (owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}')::int + 1 = #{claimEpoch})
+                AND (owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}')::int &lt; #{claimEpoch})
     </update>
 
     <update id="reportExecutionFailure">

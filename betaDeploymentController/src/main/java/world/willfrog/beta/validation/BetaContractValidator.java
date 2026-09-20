@@ -82,6 +82,14 @@ public class BetaContractValidator {
             if (drainGraceSeconds < minimumGraceSeconds)
                 throw new ControllerException("MANIFEST_INVALID",
                         "Container drain deadline is shorter than the service shutdown budget for " + name);
+            boolean allowToolJobProcessHalt = service.path("runtime")
+                    .path("allowToolJobProcessHalt").asBoolean(false);
+            if (allowToolJobProcessHalt
+                    && (!"agent-service".equals(name)
+                    || "main-beta".equals(manifest.path("trafficScopeId").asText()))) {
+                throw new ControllerException("MANIFEST_INVALID",
+                        "Tool-job process halt is allowed only for agent-service in an isolated lane");
+            }
             if (commonDrainSeconds == null) commonDrainSeconds = applicationDrainSeconds;
             else if (commonDrainSeconds != applicationDrainSeconds)
                 throw new ControllerException("MANIFEST_INVALID", "All services must use one common drain deadline");

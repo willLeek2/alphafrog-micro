@@ -110,14 +110,18 @@ public class DualPoolToolJobCoordinator {
             return true;
         }
 
-        anchor.setFinalizerStep("RESUME_READY");
-        anchor.setResumeState(RESUME_STATE);
-        anchor.setResumeToken(null);
-        anchor.setResumeLauncherOwnerId(null);
-        anchor.setResumeLauncherLeaseUntil(null);
-        NodeWorkItemVersions versions = versions(anchor);
+        // 先复制再生成待提交快照。数据库条件更新失败时，调用方持有的内存锚点仍表示
+        // 真实旧状态，下一轮 finalizer 不会被一个从未落库的 RESUME_READY 误导。
+        ToolJobAnchor resumableAnchor = ToolJobAnchor.fromJson(anchor.toJson());
+        resumableAnchor.setFinalizerStep("RESUME_READY");
+        resumableAnchor.setResumeState(RESUME_STATE);
+        resumableAnchor.setResumeToken(null);
+        resumableAnchor.setResumeLauncherOwnerId(null);
+        resumableAnchor.setResumeLauncherLeaseUntil(null);
+        NodeWorkItemVersions versions = versions(resumableAnchor);
         NodeWorkItemMutationResult promoted = workItemStore.promoteToolJobResumable(
-                identity, versions, anchor.getOperationId(), anchor.toJson(), resumePayload(anchor));
+                identity, versions, resumableAnchor.getOperationId(),
+                resumableAnchor.toJson(), resumePayload(resumableAnchor));
         if (!promoted.applied()) {
             log.warn("长工具终态未能推进原双池工作项: identity={} operationId={}",
                     identity.describe(), anchor.getOperationId());
@@ -179,6 +183,10 @@ public class DualPoolToolJobCoordinator {
             throw new IllegalArgumentException("dual_pool_tool_job_resume_payload_missing");
         }
         String terminalStatus = resume.path("terminalStatus").asText("");
+        if (!resume.has("toolCallsUsed") || !resume.path("toolCallsUsed").canConvertToInt()) {
+            log.warn("长工具恢复载荷缺少有效的工具调用总数，按 0 处理: operationId={}",
+                    resume.path("operationId").asText(""));
+        }
         int totalToolCalls = Math.max(0, resume.path("toolCallsUsed").asInt(0));
         int completedToolCalls = Math.max(0, payload.path("toolCallsUsed").asInt(0));
         int nodeToolCalls = Math.max(0, totalToolCalls - completedToolCalls);

@@ -238,6 +238,11 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 86400
+        },
+        "allowToolJobProcessHalt": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only an isolated Agent lane may turn a one-shot tool-job fault record into a process halt."
         }
       }
     },

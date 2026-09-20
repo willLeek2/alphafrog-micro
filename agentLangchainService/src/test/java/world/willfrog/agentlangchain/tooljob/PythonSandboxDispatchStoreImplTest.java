@@ -5,6 +5,9 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 
 import java.time.Instant;
@@ -40,6 +43,37 @@ class PythonSandboxDispatchStoreImplTest {
 
         assertThat(store.isInvocationBlocked("run-dual")).isTrue();
         assertThat(store.isInvocationBlocked("run-1")).isFalse();
+    }
+
+    @Test
+    void dualPoolRunRejectsAnotherRunsExecutionContextBeforeDispatchAndPersistence() {
+        when(anchorService.loadSchedulerVersion("run-b")).thenReturn("DUAL_POOL_V1");
+        ToolJobAnchor preparing = anchor("PREPARING");
+        try (DualPoolToolJobExecutionContext.Scope ignored = DualPoolToolJobExecutionContext.install(
+                new NodeWorkItemIdentity("run-a", 3, "todo-1", 0, 0),
+                new NodeWorkItemVersions(4L, 5L, 6), "worker-a", "{}")) {
+            assertThat(store.isInvocationBlocked("run-b")).isTrue();
+            assertThat(store.persistPreparing("run-b", preparing)).isFalse();
+        }
+        verify(anchorService, never()).claimPreparing(eq("run-b"), any(), any());
+        assertThat(preparing.getWorkItemNodeId()).isNull();
+    }
+
+    @Test
+    void dualPoolRunPersistsOnlyItsOwnExecutionContext() {
+        when(anchorService.loadSchedulerVersion("run-1")).thenReturn("DUAL_POOL_V1");
+        ToolJobAnchor preparing = anchor("PREPARING");
+        when(anchorService.claimPreparing("run-1", preparing, AgentRunStatus.EXECUTING))
+                .thenReturn(true);
+        try (DualPoolToolJobExecutionContext.Scope ignored = DualPoolToolJobExecutionContext.install(
+                new NodeWorkItemIdentity("run-1", 3, "todo-1", 0, 0),
+                new NodeWorkItemVersions(4L, 5L, 6), "worker-a", "{\"kind\":\"TODO\"}")) {
+            assertThat(store.isInvocationBlocked("run-1")).isFalse();
+            assertThat(store.persistPreparing("run-1", preparing)).isTrue();
+        }
+        assertThat(preparing.getWorkItemPlanGeneration()).isEqualTo(3);
+        assertThat(preparing.getWorkItemNodeId()).isEqualTo("todo-1");
+        assertThat(preparing.getWorkItemClaimEpoch()).isEqualTo(6);
     }
 
     @Test

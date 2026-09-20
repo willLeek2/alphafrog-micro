@@ -304,7 +304,9 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         app.put("pull_policy", "never");
         app.put("stop_signal", "SIGTERM");
         app.put("stop_grace_period", service.path("runtime").path("drainGraceSeconds").asInt() + "s");
-        if ("agent-service".equals(service.path("serviceName").asText())) {
+        boolean agentService = "agent-service".equals(service.path("serviceName").asText());
+        boolean laneDeployment = !"main-beta".equals(plan.trafficScopeId());
+        if (agentService) {
             // 长工具进程级故障演练会让 Agent 主进程立即退出。由 Docker 用原容器、原镜像和
             // 原环境重新拉起，避免把「恢复同一部署」误做成一次新的蓝绿发布。
             app.put("restart", "unless-stopped");
@@ -321,6 +323,17 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AF_DEPLOYMENT_ID", plan.deploymentId());
         environment.put("AF_DEPLOYMENT_GENERATION_ID", plan.generationId());
         environment.put("AF_LANE_TAG", plan.trafficScopeId());
+        if (agentService) {
+            // 持久恢复和一次性故障点只在隔离泳道打开。主 Beta 明确写 false，覆盖服务
+            // env-file 里的任何遗留值。进程终止还必须由部署清单单独授权。
+            environment.put("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED",
+                    Boolean.toString(laneDeployment));
+            environment.put("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED",
+                    Boolean.toString(laneDeployment));
+            environment.put("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT",
+                    Boolean.toString(laneDeployment
+                            && service.path("runtime").path("allowToolJobProcessHalt").asBoolean(false)));
+        }
         // 泳道配置链入口：Nacos 配置桥/沙箱监听读它构造 "{scopeId}.{dataId}" 候选；
         // 所有非主 Beta 的业务容器都要有（不只 frontend），否则泳道容器读不到泳道覆盖配置。
         // 主 Beta 不写，避免去查 "main-beta.{dataId}"。

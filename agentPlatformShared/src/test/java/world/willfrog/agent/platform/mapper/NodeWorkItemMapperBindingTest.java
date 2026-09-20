@@ -288,12 +288,16 @@ class NodeWorkItemMapperBindingTest {
 
         String promote = sql("promoteToolJobResumable");
         assertThat(promote)
-                .contains("WITH item_locked AS")
+                .contains("WITH run_locked AS")
+                .contains("item_locked AS")
                 .contains("FOR UPDATE")
                 .contains("run_advanced AS")
                 .contains("status = 'EXECUTING'")
                 .contains("state = 'RESUMABLE'")
                 .contains("EXISTS (SELECT 1 FROM run_advanced)");
+        assertThat(promote.indexOf("run_locked AS"))
+                .as("推进与提交必须统一为先锁 Run、再锁工作项")
+                .isLessThan(promote.indexOf("item_locked AS"));
 
         String commit = sql("commitResumedToolJobResult");
         assertThat(commit)
@@ -302,13 +306,14 @@ class NodeWorkItemMapperBindingTest {
                 .contains("item_committed AS")
                 .contains("state = 'RESULT_COMMITTED'")
                 .contains("tool_job_anchor_json = '{}'::jsonb")
-                .contains("'{resumeState}' = 'DUAL_POOL_READY'");
+                .contains("'{resumeState}' = 'DUAL_POOL_READY'")
+                .contains("'{workItemClaimEpoch}')::int < ?");
 
         String requeue = sql("requeueInterruptedToolJob");
         assertThat(requeue)
                 .contains("state IN ('CLAIMED', 'EXECUTING')")
                 .contains("state = 'RESUMABLE'")
-                .contains("'{workItemClaimEpoch}'");
+                .contains("'{workItemClaimEpoch}')::int < ?");
     }
 
     private String sql(String id) {
