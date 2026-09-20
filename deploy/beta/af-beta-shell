@@ -27,4 +27,4 @@ if [ "$subcommand" = "tool-job-test" ]; then
   exec /opt/alphafrog-beta/bin/af-beta-tool-job-test "${request[@]:2}"
 fi
 
-exec af-beta "${request[@]:1}"
+exec /opt/alphafrog-beta/bin/af-beta "${request[@]:1}"

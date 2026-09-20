@@ -556,8 +556,15 @@ class DockerComposeContainerRuntimeTest {
         // ${AF_CONFIG_NACOS_USERNAME:} 当插值语法直接拒绝，整个部署卡死在建容器前。
         List<String> names = new ArrayList<>();
         environmentNode.fieldNames().forEachRemaining(names::add);
-        for (String name : names)
-            assertTrue(environmentNode.path(name).asText().matches("(?:[^$]|\\$\\$)*"), name);
+        for (String name : names) {
+            String value = environmentNode.path(name).asText();
+            for (int index = 0; index < value.length(); index++) {
+                if (value.charAt(index) != '$')
+                    continue;
+                assertTrue(index + 1 < value.length() && value.charAt(index + 1) == '$', name);
+                index++;
+            }
+        }
         // 容器层面：compose 把 $$ 还原成字面 $，Spring 照常解析这两个占位符。
         assertTrue(environmentNode.path("SPRING_APPLICATION_JSON").asText()
                 .contains("$${AF_CONFIG_NACOS_USERNAME:}"));
