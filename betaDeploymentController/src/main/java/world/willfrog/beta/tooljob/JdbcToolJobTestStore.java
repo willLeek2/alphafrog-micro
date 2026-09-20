@@ -65,9 +65,11 @@ public class JdbcToolJobTestStore implements ToolJobTestStore {
             connection.setAutoCommit(false);
             connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
             configureTransaction(connection);
-            advisoryLock(connection, target.deploymentId() + ':' + target.generationId() + ':' + runId);
+            // 故障预置会影响同一个 Agent 容器。按部署代际统一串行化，避免两个不同
+            // Run 同时通过 PROCESS_HALT 冲突检查后，各自写入一条进程终止记录。
+            advisoryLock(connection, faultArmLockIdentity(target));
             requireMatchingRun(connection, target, runId);
-            requireNoPendingFault(connection, target, runId, checkpoint, action);
+            requireNoConflictingFault(connection, target, runId, action);
             try (PreparedStatement statement = connection.prepareStatement("""
                     INSERT INTO alphafrog_agent_tool_job_fault_injection
                       (lane_id, traffic_scope_id, run_id, scenario_id, checkpoint, action,
@@ -249,14 +251,13 @@ public class JdbcToolJobTestStore implements ToolJobTestStore {
         }
     }
 
-    private void requireNoPendingFault(Connection connection, ToolJobTestTarget target, String runId,
-                                       String checkpoint, String action) throws SQLException {
+    private void requireNoConflictingFault(Connection connection, ToolJobTestTarget target, String runId,
+                                           String action) throws SQLException {
         String sql = """
                 SELECT 1 FROM alphafrog_agent_tool_job_fault_injection
                  WHERE lane_id = ? AND traffic_scope_id = ? AND deployment_version = ?
                    AND enabled = TRUE
-                   AND ((run_id = ? AND checkpoint = ? AND consumed_at IS NULL
-                         AND expires_at > clock_timestamp())
+                   AND (run_id = ?
                      OR (? = 'PROCESS_HALT' AND action = 'PROCESS_HALT'
                          AND ((consumed_at IS NULL AND expires_at > clock_timestamp())
                            OR (consumed_at IS NOT NULL AND restart_observed_at IS NULL))))
@@ -267,13 +268,16 @@ public class JdbcToolJobTestStore implements ToolJobTestStore {
             statement.setString(2, target.trafficScopeId());
             statement.setString(3, target.generationId());
             statement.setString(4, runId);
-            statement.setString(5, checkpoint);
-            statement.setString(6, action);
+            statement.setString(5, action);
             try (ResultSet result = statement.executeQuery()) {
                 if (result.next()) throw new ControllerException("TOOL_JOB_TEST_FAULT_ALREADY_ARMED",
-                        "A conflicting fault scenario is already active");
+                        "This Run already has a fault scenario or a process-halt scenario is still active");
             }
         }
+    }
+
+    static String faultArmLockIdentity(ToolJobTestTarget target) {
+        return "tool-job-fault:" + target.deploymentId() + ':' + target.generationId();
     }
 
     private FaultRecord faultRecord(ToolJobTestTarget target, String runId, String checkpoint,
