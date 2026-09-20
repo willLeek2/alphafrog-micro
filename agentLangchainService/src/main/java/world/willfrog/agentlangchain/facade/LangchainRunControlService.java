@@ -216,7 +216,10 @@ public class LangchainRunControlService {
         if (canceledPersisted && schedulerMetrics != null) {
             schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
         }
-        if (canceledPersisted && dualPoolRun) {
+        // 双池工作项保存的是节点级执行责任，必须在用户取消生效时立即收口。
+        // 活跃长工具只需要把 Run 主记录留给 finalizer 完成容量释放和终态 CAS；
+        // 它不需要、也不应该让节点工作项继续停在 WAITING 等待下次进程启动清理。
+        if (dualPoolRun) {
             cancelDualPoolWorkItems(runId);
         }
         // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
@@ -270,7 +273,8 @@ public class LangchainRunControlService {
                 }
             }
         } catch (RuntimeException e) {
-            // Run 终态已经提交，不能因为清理失败回滚或伪装成未取消。遗留行会继续留作可观测事实。
+            // 取消意图已经生效，不能因为节点清理失败把 API 伪装成未取消。
+            // 遗留行会继续留作可观测事实，并由启动恢复再次收口。
             log.error("双池 Run 已取消，但工作项收口失败: runId={}", runId, e);
         }
     }
