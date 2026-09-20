@@ -48,8 +48,12 @@ public class JdbcToolJobTestStore implements ToolJobTestStore {
     public FaultRecord armFault(ToolJobTestTarget target, String runId, String checkpoint,
                                 String action, int ttlSeconds) {
         requireIdentifier(runId, "runId", 64);
-        if (!CHECKPOINTS.contains(checkpoint)) throw invalid("Unsupported fault checkpoint");
-        if (!ACTIONS.contains(action)) throw invalid("Unsupported fault action");
+        if (checkpoint == null || !CHECKPOINTS.contains(checkpoint)) {
+            throw invalid("Unsupported fault checkpoint");
+        }
+        if (action == null || !ACTIONS.contains(action)) {
+            throw invalid("Unsupported fault action");
+        }
         if (ttlSeconds < 10 || ttlSeconds > properties.getMaximumFaultTtlSeconds()) {
             throw invalid("Fault TTL is outside the configured range");
         }
