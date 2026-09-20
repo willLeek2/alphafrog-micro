@@ -30,6 +30,7 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
+import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
@@ -511,7 +512,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           Map<String, Object> failureMetadata,
                                           boolean recovered,
                                           String recoveryOutcome) {
-        emitTodoNodeEvent(runId, userId, eventType, item, reason, durationMs,
+        linearWorkflowExecutor.emitDualPoolTodoNodeEvent(runId, userId, eventType, item, reason, durationMs,
                 failureMetadata, recovered, recoveryOutcome);
     }
 

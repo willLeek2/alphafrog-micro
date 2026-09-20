@@ -397,7 +397,7 @@ class NodeWorkItemMapperBindingTest {
 
     private static List<String> quotedValues(String text) {
         List<String> values = new ArrayList<>();
-        Matcher matcher = Pattern.compile("'([A-Z_]+)'").matcher(text);
+        Matcher matcher = Pattern.compile("'([A-Z0-9_]+)'").matcher(text);
         while (matcher.find()) {
             values.add(matcher.group(1));
         }
@@ -405,6 +405,9 @@ class NodeWorkItemMapperBindingTest {
     }
 
     private static String normalized(String sql) {
-        return sql.replaceAll("\\s+", " ").trim();
+        return sql.replaceAll("\\s+", " ")
+                .replaceAll("\\(\\s+", "(")
+                .replaceAll("\\s+\\)", ")")
+                .trim();
     }
 }
