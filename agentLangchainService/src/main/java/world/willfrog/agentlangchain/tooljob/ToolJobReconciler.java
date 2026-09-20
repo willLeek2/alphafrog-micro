@@ -163,7 +163,8 @@ public class ToolJobReconciler {
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
             if (dualPoolToolJobCoordinator != null
                     && dualPoolToolJobCoordinator.supports(anchor)
-                    && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())) {
+                    && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())
+                    && anchor.isAutoResume()) {
                 if (!dualPoolToolJobCoordinator.dispatchOnlineResumable(runId, anchor)) {
                     log.warn("双池长工具恢复工作项仍未能重新开放: runId={}", runId);
                 }
