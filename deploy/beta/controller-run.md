@@ -33,6 +33,8 @@ sudo chown alphafrog-beta:alphafrog-beta /etc/alphafrog-beta/secrets/controller-
 
 控制器的固定 SQL 只需要以下权限：读取 Run 和工作项；只更新 Run 的 `plan_generation`、`updated_at`；在一次性故障表中插入和读取记录；使用故障表序列。数据库管理员应按这些对象授予最小权限，不给建表、删表、删除业务记录或更新其他 Run 字段的权限。Agent 服务继续使用自己的业务账号消费故障记录；控制器账号不代替 Agent 账号。
 
+真实故障样本必须使用不承接其他流量的专用泳道，并逐个 Run 串行执行。`PROCESS_HALT` 会立即终止整个 Agent 进程，因此同一容器中的其他 Run 也会一起中断；控制面会阻止同一部署代际同时存在两条进程终止记录，但不能把其他业务 Run 隔离到另一个 JVM。每个 Run 只允许预置一次故障，记录即使已经消费或过期，也不能在同一部署代际为该 Run 再次预置；需要重跑时应创建新的 Run。
+
 ## 控制器配置
 
 systemd 单元通过 `/etc/alphafrog-beta/controller.env` 注入开关、监听地址、状态目录、Nacos 和观测配置。`SPRING_CONFIG_ADDITIONAL_LOCATION` 再加载 `/etc/alphafrog-beta/controller.yml` 中的机器和服务映射；这种写法可以原样保留 `agent-service` 等带连字符的服务名。
