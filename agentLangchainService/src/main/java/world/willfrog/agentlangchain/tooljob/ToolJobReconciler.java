@@ -426,13 +426,17 @@ public class ToolJobReconciler {
             if (attached == null || attached.state() != DataAnalysisReservationState.TASK_ATTACHED) {
                 return;
             }
+            if (capacityService == null
+                    || capacityService.restoreReservation(attached) == DataAnalysisRestoreOutcome.CONFLICT) {
+                log.warn("PREPARING online recovery could not attach capacity: runId={}", runId);
+                return;
+            }
             DataAnalysisReservation pending = new DataAnalysisReservation(
                     attached.reservationId(), attached.identity(), attached.resourceClass(),
                     attached.capacityUnits(), DataAnalysisReservationState.PENDING_TRANSFERRED,
                     attached.taskId(), attached.acquiredAt());
-            if (capacityService == null
-                    || capacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
-                log.warn("PREPARING online recovery could not restore capacity: runId={}", runId);
+            if (capacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
+                log.warn("PREPARING online recovery could not transfer capacity: runId={}", runId);
                 return;
             }
             anchor.setAnchorState("PENDING");
