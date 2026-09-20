@@ -18,8 +18,10 @@ import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -94,7 +96,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      */
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
-        String toolCallId = resolveToolCallId(request);
+        String toolCallId = durableToolCallId(request.name(), resolveToolCallId(request));
         AgentContext.setToolCallId(toolCallId);
         try {
             Map<String, Object> params = parseArguments(request.arguments());
@@ -231,6 +233,28 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             return id;
         }
         return UUID.randomUUID().toString();
+    }
+
+    /**
+     * 模型返回的 tool call id 只保证在一轮模型回复内唯一。双池会为每个 Todo 单独调用模型，
+     * 因此两个不同工作项都可能得到 {@code executePython_2}；直接拿它生成 operationId 会让
+     * Sandbox 把第二个真实任务当成第一个任务的幂等重放。
+     *
+     * <p>executePython 的持久身份追加节点工作项的稳定五字段摘要。同一工作项中断、重启或
+     * 重新领取时摘要不变，不同计划代际、节点、节点尝试或执行分段则使用不同的摘要输入。
+     * 其他工具没有跨进程持久作业，继续保留模型原始 id。</p>
+     */
+    private String durableToolCallId(String toolName, String rawToolCallId) {
+        if (!"executePython".equals(toolName)) {
+            return rawToolCallId;
+        }
+        DualPoolToolJobExecutionContext.Snapshot snapshot = DualPoolToolJobExecutionContext.current();
+        if (snapshot == null || snapshot.identity() == null) {
+            return rawToolCallId;
+        }
+        String workItemScope = snapshot.identity().describe();
+        UUID workItemDigest = UUID.nameUUIDFromBytes(workItemScope.getBytes(StandardCharsets.UTF_8));
+        return rawToolCallId + "--wi-" + workItemDigest;
     }
 
     /**
