@@ -10,7 +10,7 @@ import world.willfrog.beta.core.ContainerRuntime;
 class JdbcToolJobTestStoreTest {
 
     @Test
-    void faultArmLockIsSharedByEveryRunInTheSameDeploymentGeneration() {
+    void faultArmLockIsStableForTheSameDeploymentGeneration() {
         ToolJobTestTarget first = target("beta-lane-a", "gen-a");
         ToolJobTestTarget second = target("beta-lane-a", "gen-a");
 

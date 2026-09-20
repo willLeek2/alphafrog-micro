@@ -67,7 +67,9 @@ public class JdbcToolJobTestStore implements ToolJobTestStore {
         Instant expiresAt = Instant.now().plusSeconds(ttlSeconds);
         try (Connection connection = connection()) {
             connection.setAutoCommit(false);
-            connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+            // PostgreSQL 的 READ COMMITTED 会为每条语句取得新快照。第二个 arm 在等待
+            // 部署代际锁后执行冲突查询时，必须看见第一个事务刚提交的故障记录。
+            connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
             configureTransaction(connection);
             // 故障预置会影响同一个 Agent 容器。按部署代际统一串行化，避免两个不同
             // Run 同时通过 PROCESS_HALT 冲突检查后，各自写入一条进程终止记录。
