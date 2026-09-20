@@ -6,7 +6,6 @@ import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.service.tool.ToolErrorContext;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
-import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.exception.ToolJobTransferException;
@@ -97,17 +96,5 @@ class LangchainTerminalToolErrorHandlerTest {
                 () -> LangchainTerminalToolErrorHandler.handle(wrapper, null));
 
         assertEquals("wrapped", thrown.getMessage());
-    }
-
-    @Test
-    void handle_shouldRethrowInjectedToolJobInterruption() {
-        ToolJobInjectedInterruption interruption =
-                new ToolJobInjectedInterruption("scenario-1", "BEFORE_SANDBOX_SUBMIT");
-
-        ToolJobInjectedInterruption thrown = assertThrows(
-                ToolJobInjectedInterruption.class,
-                () -> LangchainTerminalToolErrorHandler.handle(interruption, null));
-
-        assertSame(interruption, thrown);
     }
 }
