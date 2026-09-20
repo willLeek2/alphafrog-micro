@@ -26,6 +26,10 @@ agent:
     # reconciler/startup/heartbeat 只有显式开启后才注册，避免两套恢复链同时接管。
     durable-recovery-enabled: ${AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED:false}
     continuation-max-consecutive-poll-failures: ${AF_AGENT_TOOL_JOB_CONTINUATION_MAX_FAILURES:5}
+    fault-injection:
+      # 只供独占 Beta 验收泳道。普通部署保持关闭；进程终止还要单独打开第二道开关。
+      enabled: ${AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED:false}
+      allow-process-halt: ${AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT:false}
   # Production sub-agent execution. The executor is bounded and independent
   # from the main Agent worker pool. A task timeout is best-effort interrupt;
   # terminal state is persisted before any late completion can win.

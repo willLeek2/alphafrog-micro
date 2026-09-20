@@ -535,6 +535,7 @@ services:
     image: alphafrog-micro-agent-langchain-service:latest
     build: ./agentLangchainService
     container_name: alphafrog-agent-langchain-service
+    restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -570,6 +571,8 @@ services:
       AF_AGENT_PROMPT_OVERLAY_FILE: ${AF_AGENT_PROMPT_OVERLAY_FILE:-/app/config-dynamic/agent-prompt-overlay.local.json}
       AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:-/app/config-dynamic/finance-record-channel.local.json}
       AF_FINANCE_RECORD_CHANNEL_ENABLED: "false"
+      AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED: ${AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED:-false}
+      AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT: ${AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT:-false}
       AF_AGENT_LLM_PROMPT_BASE_DIR: ${AF_AGENT_LLM_PROMPT_BASE_DIR:-/app/config}
       AF_AGENT_API_KEY: ${AF_AGENT_API_KEY:-demo}
       AF_AGENT_DEFAULT_ENDPOINT: ${AF_AGENT_DEFAULT_ENDPOINT:-openrouter}

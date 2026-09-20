@@ -51,6 +51,41 @@ public interface NodeWorkItemStore {
                                                    String payloadPatchJson,
                                                    String externalSideEffectRef);
 
+    /**
+     * 长工具已经转入后台后，把当前执行分段持久化为等待态。Run 必须已经处于
+     * {@code WAITING_TOOL_JOB}，工具锚点必须仍绑定同一工作项身份与版本。
+     */
+    NodeWorkItemMutationResult suspendForToolJob(NodeWorkItemIdentity identity,
+                                                 NodeWorkItemVersions versions,
+                                                 String claimant,
+                                                 String operationId,
+                                                 String toolCallId,
+                                                 int attempt);
+
+    /**
+     * 工具终态完成收尾后，把 Run 恢复为执行中，并把原工作项推进到可恢复态。
+     * Run、工具锚点和工作项在一个数据库事务里一起推进。
+     */
+    NodeWorkItemMutationResult promoteToolJobResumable(NodeWorkItemIdentity identity,
+                                                       NodeWorkItemVersions versions,
+                                                       String operationId,
+                                                       String anchorJson,
+                                                       String resumePayloadJson);
+
+    /**
+     * 可恢复分段提交结果时，同时清理精确匹配的工具锚点。条件不匹配时两边都不改。
+     */
+    NodeWorkItemMutationResult commitResumedToolJobResult(NodeWorkItemIdentity identity,
+                                                          NodeWorkItemVersions versions,
+                                                          String operationId,
+                                                          String payloadPatchJson,
+                                                          String externalSideEffectRef);
+
+    /** 服务退出打断了恢复分段时，精确核对锚点与领取代际后重新开放领取。 */
+    NodeWorkItemMutationResult requeueInterruptedToolJob(NodeWorkItemIdentity identity,
+                                                         NodeWorkItemVersions versions,
+                                                         String operationId);
+
     /** 报执行失败：执行中 → 执行失败。只有执行基础设施自己出错走这条。 */
     NodeWorkItemMutationResult reportExecutionFailure(NodeWorkItemIdentity identity,
                                                       int claimEpoch,

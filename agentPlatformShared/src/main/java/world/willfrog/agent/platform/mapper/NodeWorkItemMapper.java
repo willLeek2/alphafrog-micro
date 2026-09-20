@@ -91,6 +91,52 @@ public interface NodeWorkItemMapper {
                             @Param("claimEpoch") int claimEpoch,
                             @Param("payloadPatchJson") String payloadPatchJson);
 
+    int suspendForToolJob(@Param("runId") String runId,
+                          @Param("planGeneration") int planGeneration,
+                          @Param("nodeId") String nodeId,
+                          @Param("nodeAttempt") int nodeAttempt,
+                          @Param("segmentSequence") int segmentSequence,
+                          @Param("contextVersion") long contextVersion,
+                          @Param("runControlVersion") long runControlVersion,
+                          @Param("claimEpoch") int claimEpoch,
+                          @Param("claimedBy") String claimedBy,
+                          @Param("operationId") String operationId,
+                          @Param("toolCallId") String toolCallId,
+                          @Param("attempt") int attempt);
+
+    int promoteToolJobResumable(@Param("runId") String runId,
+                                @Param("planGeneration") int planGeneration,
+                                @Param("nodeId") String nodeId,
+                                @Param("nodeAttempt") int nodeAttempt,
+                                @Param("segmentSequence") int segmentSequence,
+                                @Param("contextVersion") long contextVersion,
+                                @Param("runControlVersion") long runControlVersion,
+                                @Param("claimEpoch") int claimEpoch,
+                                @Param("operationId") String operationId,
+                                @Param("anchorJson") String anchorJson,
+                                @Param("resumePayloadJson") String resumePayloadJson);
+
+    int commitResumedToolJobResult(@Param("runId") String runId,
+                                   @Param("planGeneration") int planGeneration,
+                                   @Param("nodeId") String nodeId,
+                                   @Param("nodeAttempt") int nodeAttempt,
+                                   @Param("segmentSequence") int segmentSequence,
+                                   @Param("contextVersion") long contextVersion,
+                                   @Param("runControlVersion") long runControlVersion,
+                                   @Param("claimEpoch") int claimEpoch,
+                                   @Param("operationId") String operationId,
+                                   @Param("payloadPatchJson") String payloadPatchJson);
+
+    int requeueInterruptedToolJob(@Param("runId") String runId,
+                                  @Param("planGeneration") int planGeneration,
+                                  @Param("nodeId") String nodeId,
+                                  @Param("nodeAttempt") int nodeAttempt,
+                                  @Param("segmentSequence") int segmentSequence,
+                                  @Param("contextVersion") long contextVersion,
+                                  @Param("runControlVersion") long runControlVersion,
+                                  @Param("claimEpoch") int claimEpoch,
+                                  @Param("operationId") String operationId);
+
     /** 报执行失败：执行中 → 执行失败。只有执行基础设施自己出错走这条，工具返回的失败不算。 */
     int reportExecutionFailure(@Param("runId") String runId,
                                @Param("planGeneration") int planGeneration,

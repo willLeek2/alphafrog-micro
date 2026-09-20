@@ -10,12 +10,14 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisRestoreOutcome;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Duration;
@@ -53,6 +55,9 @@ public class ToolJobReconciler {
 
     @Autowired(required = false)
     private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
+
+    @Autowired(required = false)
+    private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -156,6 +161,14 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (dualPoolToolJobCoordinator != null
+                    && dualPoolToolJobCoordinator.supports(anchor)
+                    && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())) {
+                if (!dualPoolToolJobCoordinator.recoverResumable(runId, anchor)) {
+                    log.warn("双池长工具恢复工作项仍未能重新开放: runId={}", runId);
+                }
+                return;
+            }
             // 已接受 handoff 的真实状态是 ACCEPTED（CONSUMED 同源）；
             // 旧的 "LAUNCHING && isResultConsumed()" 组合在四态模型下永远为 false（死分支），
             // 会让 EXECUTING+ACCEPTED 的 Run 被 60 秒补扫重新写回 due 并反复进入 Sandbox
@@ -203,6 +216,8 @@ public class ToolJobReconciler {
                                 + "removing hot-loop due", runId);
                         redisCache.removeDue(runId);
                     }
+                } else if ("PREPARING".equals(anchor.getAnchorState())) {
+                    recoverPreparingDispatch(runId, anchor);
                 }
                 return;
             }
@@ -369,6 +384,71 @@ public class ToolJobReconciler {
          * 下一轮仍从 PG 读取最新 anchor，不信任当前对象。
          */
         redisCache.upsertDue(runId, anchor);
+    }
+
+    /**
+     * 服务持续运行时也修复普通 LINEAR 的 PREPARING，不再要求等下一次进程启动。
+     * 查询明确不存在时，共享解析器才会用原 operationId 和原请求重放创建。
+     */
+    private void recoverPreparingDispatch(String runId, ToolJobAnchor anchor) {
+        DataAnalysisReservation preparing;
+        try {
+            preparing = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules()
+                    .readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
+        } catch (Exception invalidReservation) {
+            log.error("PREPARING reservation is invalid for run={}; refusing online replay",
+                    runId, invalidReservation);
+            redisCache.removeDue(runId);
+            return;
+        }
+        ToolJobPreparingDispatchResolver.Resolution resolution =
+                ToolJobPreparingDispatchResolver.resolve(
+                        runId, anchor, preparing, sandboxService, anchorService);
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
+            transferRecoveredAttached(runId, anchor, resolution.reservation());
+            return;
+        }
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
+            log.error("PREPARING evidence is invalid for run={}; removing hot-loop due", runId);
+            redisCache.removeDue(runId);
+            return;
+        }
+        // 远端或数据库暂时不可决、或者另一恢复者已经赢得 CAS：只保留唤醒，下一轮重读 PG。
+        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+        redisCache.upsertDue(runId, anchor);
+    }
+
+    private void transferRecoveredAttached(String runId,
+                                             ToolJobAnchor anchor,
+                                             DataAnalysisReservation attached) {
+        try {
+            if (attached == null || attached.state() != DataAnalysisReservationState.TASK_ATTACHED) {
+                return;
+            }
+            DataAnalysisReservation pending = new DataAnalysisReservation(
+                    attached.reservationId(), attached.identity(), attached.resourceClass(),
+                    attached.capacityUnits(), DataAnalysisReservationState.PENDING_TRANSFERRED,
+                    attached.taskId(), attached.acquiredAt());
+            if (capacityService == null
+                    || capacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
+                log.warn("PREPARING online recovery could not restore capacity: runId={}", runId);
+                return;
+            }
+            anchor.setAnchorState("PENDING");
+            anchor.setReservationJson(new com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules().writeValueAsString(pending));
+            anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+            if (!anchorService.updateActiveAndStatus(
+                    runId, anchor, AgentRunStatus.WAITING_TOOL_JOB,
+                    AgentRunStatus.EXECUTING, anchor.getOperationId())) {
+                return;
+            }
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+        } catch (Exception failure) {
+            log.error("PREPARING online recovery transfer failed for run={}", runId, failure);
+            redisCache.upsertDue(runId, anchor);
+        }
     }
 
     private void checkPausedTerminal(String runId, ToolJobAnchor anchor) {

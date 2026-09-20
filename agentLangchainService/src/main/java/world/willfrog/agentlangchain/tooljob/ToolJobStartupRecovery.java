@@ -7,11 +7,13 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
@@ -43,6 +45,9 @@ public class ToolJobStartupRecovery {
     private final RunOwnershipGateway ownershipGateway;
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
+
+    @Autowired(required = false)
+    private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -257,6 +262,14 @@ public class ToolJobStartupRecovery {
                 // cleanup-only 可跨 EXECUTING/FAILED/CANCELED 重入；业务终态不能阻断容量收尾。
                 if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                     resolveActiveAnchor(run, anchor);
+                    continue;
+                }
+                if (dualPoolToolJobCoordinator != null
+                        && dualPoolToolJobCoordinator.supports(anchor)
+                        && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())) {
+                    if (!dualPoolToolJobCoordinator.recoverResumable(run.getId(), anchor)) {
+                        log.warn("Startup could not requeue dual-pool tool result for run={}", run.getId());
+                    }
                     continue;
                 }
                 // EXECUTING + active anchor 表示进程可能在工具已附着但 Run 尚未转 WAITING 时崩溃。

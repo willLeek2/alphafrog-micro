@@ -52,7 +52,8 @@ class NodeWorkItemMapperBindingTest {
             List.of("runId", "planGeneration", "nodeId", "nodeAttempt", "segmentSequence");
     private static final List<String> TRANSITION_STATEMENTS = List.of(
             "claim", "handOverClaim", "startExecution", "commitSegmentResult",
-            "reportExecutionFailure", "renewLease", "cancel", "markStale");
+            "suspendForToolJob", "promoteToolJobResumable", "commitResumedToolJobResult",
+            "requeueInterruptedToolJob", "reportExecutionFailure", "renewLease", "cancel", "markStale");
 
     private Configuration configuration;
     private String xml;
@@ -231,7 +232,8 @@ class NodeWorkItemMapperBindingTest {
         }
         String claimSql = normalized(configuration.getMappedStatement(NAMESPACE + ".claim")
                 .getSqlSource().getBoundSql(dummyParams("claim")).getSql());
-        assertThat(claimSql).as("领取只从可运行状态领").contains("state = 'RUNNABLE'");
+        assertThat(claimSql).as("领取只从首次可运行或长工具可恢复状态领")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
         assertThat(claimSql).as("领取要等到下次可领取时间").contains("next_visible_at <= CURRENT_TIMESTAMP");
         assertThat(claimSql).as("领取要按调度器版本过滤").contains("scheduler_version = ?");
         String handOverSql = normalized(configuration.getMappedStatement(NAMESPACE + ".handOverClaim")
@@ -274,6 +276,44 @@ class NodeWorkItemMapperBindingTest {
         Set<String> stale = boundParamNames(configuration.getMappedStatement(NAMESPACE + ".markStale"),
                 dummyParams("markStale"));
         assertThat(stale).as("标过期带上下文版本与控制版本").contains("contextVersion", "runControlVersion");
+    }
+
+    @Test
+    void longToolTransitionsFenceRunAnchorAndClaimEpoch() {
+        String suspend = sql("suspendForToolJob");
+        assertThat(suspend)
+                .contains("owner_run.status = 'WAITING_TOOL_JOB'")
+                .contains("'{workItemClaimEpoch}'")
+                .contains("wi.claim_epoch = ?");
+
+        String promote = sql("promoteToolJobResumable");
+        assertThat(promote)
+                .contains("WITH item_locked AS")
+                .contains("FOR UPDATE")
+                .contains("run_advanced AS")
+                .contains("status = 'EXECUTING'")
+                .contains("state = 'RESUMABLE'")
+                .contains("EXISTS (SELECT 1 FROM run_advanced)");
+
+        String commit = sql("commitResumedToolJobResult");
+        assertThat(commit)
+                .contains("WITH run_locked AS")
+                .contains("FOR UPDATE")
+                .contains("item_committed AS")
+                .contains("state = 'RESULT_COMMITTED'")
+                .contains("tool_job_anchor_json = '{}'::jsonb")
+                .contains("'{resumeState}' = 'DUAL_POOL_READY'");
+
+        String requeue = sql("requeueInterruptedToolJob");
+        assertThat(requeue)
+                .contains("state IN ('CLAIMED', 'EXECUTING')")
+                .contains("state = 'RESUMABLE'")
+                .contains("'{workItemClaimEpoch}'");
+    }
+
+    private String sql(String id) {
+        return normalized(configuration.getMappedStatement(NAMESPACE + "." + id)
+                .getSqlSource().getBoundSql(dummyParams(id)).getSql());
     }
 
     @Test

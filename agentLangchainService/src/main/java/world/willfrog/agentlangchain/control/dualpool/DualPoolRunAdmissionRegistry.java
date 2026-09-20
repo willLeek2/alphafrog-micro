@@ -2,9 +2,16 @@ package world.willfrog.agentlangchain.control.dualpool;
 
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLayer;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLedger;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
@@ -19,8 +26,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * 当前进程明确接纳的双池 Run 集合。
  *
- * <p>集合不从数据库恢复，因此进程重启后天然为空。这样旧的非终态双池记录只能读取、观察
- * 和显式取消，不会被提示扫描重新执行。只有当前进程成功创建的新 Run 才能加入集合。</p>
+ * <p>普通遗留工作项仍然失败关闭；只有带完整长工具锚点、且 Run 与工作项身份精确对应的
+ * 持久挂起记录会在启动时重新取得业务许可。这样服务重启能继续已在后台运行的工具，其他
+ * 来源不明的旧工作项仍不会被扫描执行。</p>
  */
 @Component
 @Slf4j
@@ -49,20 +57,105 @@ public class DualPoolRunAdmissionRegistry {
     private final AtomicLong admissionEpochSequence = new AtomicLong();
     private final SchedulerPermitLedger permitLedger;
     private final NodeWorkItemStore workItemStore;
+    private final AgentRunMapper runMapper;
     private volatile boolean startupResidueBlocked;
 
+    @Autowired
     public DualPoolRunAdmissionRegistry(SchedulerPermitLedger permitLedger,
-                                        NodeWorkItemStore workItemStore) {
+                                        NodeWorkItemStore workItemStore,
+                                        AgentRunMapper runMapper) {
         this.permitLedger = permitLedger;
         this.workItemStore = workItemStore;
+        this.runMapper = runMapper;
+    }
+
+    /** 兼容不需要启动恢复的窄单元测试。 */
+    public DualPoolRunAdmissionRegistry(SchedulerPermitLedger permitLedger,
+                                        NodeWorkItemStore workItemStore) {
+        this(permitLedger, workItemStore, null);
     }
 
     @PostConstruct
     void detectStartupResidue() {
-        startupResidueBlocked = workItemStore.hasResidueFor(SchedulerVersion.DUAL_POOL_V1);
-        if (startupResidueBlocked) {
-            log.error("检测到进程启动前遗留的双池工作项；本进程关闭 DUAL_POOL_V1 新建准入和执行扫描");
+        int residueCount = workItemStore.countUnfinishedBySchedulerVersion(SchedulerVersion.DUAL_POOL_V1);
+        if (residueCount == 0) {
+            startupResidueBlocked = false;
+            return;
         }
+        if (runMapper == null) {
+            startupResidueBlocked = true;
+            return;
+        }
+        boolean unsafeResidue = false;
+        int scanLimit = Math.max(1, residueCount);
+        Map<String, Set<NodeWorkItemIdentity>> identitiesByRun = new java.util.LinkedHashMap<>();
+        for (NodeWorkItem item : workItemStore.listUnfinishedBySchedulerVersion(
+                SchedulerVersion.DUAL_POOL_V1, scanLimit)) {
+            identitiesByRun.computeIfAbsent(item.getRunId(), ignored -> new LinkedHashSet<>())
+                    .add(item.identity());
+        }
+        if (identitiesByRun.values().stream().mapToInt(Set::size).sum() != residueCount) {
+            unsafeResidue = true;
+        }
+        for (Map.Entry<String, Set<NodeWorkItemIdentity>> entry : identitiesByRun.entrySet()) {
+            String runId = entry.getKey();
+            AgentRun run = runMapper.findById(runId);
+            ToolJobAnchor anchor = parseRecoverableAnchor(run);
+            // LINEAR 长工具挂起时只能有锚点指向的这一条未完成工作项。若同一 Run 还残留
+            // 其他未完成行，就无法证明它们也属于这次恢复，整个 Run 都保持失败关闭。
+            if (anchor == null || entry.getValue().size() != 1
+                    || !entry.getValue().contains(anchorIdentity(runId, anchor))) {
+                unsafeResidue = true;
+                continue;
+            }
+            knownRunIds.add(runId);
+            if (!activateNewRun(runId)) {
+                knownRunIds.remove(runId);
+                unsafeResidue = true;
+                log.error("恢复长工具 Run 时无法重新取得业务许可: runId={}", runId);
+            }
+        }
+        startupResidueBlocked = unsafeResidue;
+        if (startupResidueBlocked) {
+            log.error("检测到无法证明来源的双池遗留工作项；本进程关闭 DUAL_POOL_V1 新建准入，"
+                    + "已验证的长工具 Run 仍可继续恢复");
+        }
+    }
+
+    private ToolJobAnchor parseRecoverableAnchor(AgentRun run) {
+        if (run == null
+                || !SchedulerVersion.DUAL_POOL_V1.name().equals(run.getSchedulerVersion())
+                || (run.getStatus() != AgentRunStatus.EXECUTING
+                && run.getStatus() != AgentRunStatus.WAITING_TOOL_JOB)
+                || run.getToolJobAnchorJson() == null
+                || run.getToolJobAnchorJson().isBlank()) {
+            return null;
+        }
+        try {
+            ToolJobAnchor anchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
+            return hasWorkItemIdentity(anchor) ? anchor : null;
+        } catch (RuntimeException invalidAnchor) {
+            log.error("双池遗留 Run 的长工具锚点无法解析: runId={}", run.getId(), invalidAnchor);
+            return null;
+        }
+    }
+
+    private boolean hasWorkItemIdentity(ToolJobAnchor anchor) {
+        return anchor != null
+                && anchor.getWorkItemPlanGeneration() != null
+                && anchor.getWorkItemNodeId() != null
+                && !anchor.getWorkItemNodeId().isBlank()
+                && anchor.getWorkItemNodeAttempt() != null
+                && anchor.getWorkItemSegmentSequence() != null
+                && anchor.getWorkItemContextVersion() != null
+                && anchor.getWorkItemRunControlVersion() != null
+                && anchor.getWorkItemClaimEpoch() != null;
+    }
+
+    private NodeWorkItemIdentity anchorIdentity(String runId, ToolJobAnchor anchor) {
+        return new NodeWorkItemIdentity(runId, anchor.getWorkItemPlanGeneration(),
+                anchor.getWorkItemNodeId(), anchor.getWorkItemNodeAttempt(),
+                anchor.getWorkItemSegmentSequence());
     }
 
     public boolean admitNewRun(String runId) {
@@ -74,6 +167,34 @@ public class DualPoolRunAdmissionRegistry {
         }
         knownRunIds.add(runId);
         return activateNewRun(runId);
+    }
+
+    /**
+     * Beta 线程级故障演练只清除这一条 Run 的进程内准入与许可，不改数据库状态。
+     * 后续恢复必须重新从数据库证明长工具锚点与工作项身份，不能沿用当前线程的内存所有权。
+     */
+    public void forgetForFaultInjection(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        knownRunIds.remove(runId);
+        releaseBusinessPermit(runId);
+    }
+
+    /** 已经通过持久锚点和工作项身份校验的恢复路径重新取得业务许可。 */
+    public boolean restorePersistedToolJob(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return false;
+        }
+        knownRunIds.add(runId);
+        if (isAdmitted(runId)) {
+            return true;
+        }
+        if (activateNewRun(runId)) {
+            return true;
+        }
+        knownRunIds.remove(runId);
+        return false;
     }
 
     /** 同一进程内的追问或显式恢复可以重新占用业务名额；重启前未知的 Run 一律拒绝。 */

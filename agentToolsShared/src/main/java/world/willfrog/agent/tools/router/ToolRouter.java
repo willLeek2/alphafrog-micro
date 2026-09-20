@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
@@ -675,6 +676,9 @@ public class ToolRouter {
                         : subAgentControlHandler.waitFor(params);
                 default -> unsupported(toolName);
             };
+        } catch (ToolJobInjectedInterruption interruption) {
+            // 一次性故障演练要求当前 worker 直接退出，不能被统一异常协议改写成工具失败 JSON。
+            throw interruption;
         } catch (ExternalToolJobPendingException pending) {
             // pending 是跨层控制信号，不是可缓存的工具失败结果。
             // PythonSandboxTools 在抛出前已经把后台任务、reservation 与 WAITING_TOOL_JOB handoff

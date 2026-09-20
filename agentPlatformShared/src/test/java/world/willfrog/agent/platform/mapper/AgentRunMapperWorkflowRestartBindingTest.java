@@ -111,6 +111,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("deployment_generation_id = ?")
                 .contains("'WAITING_TOOL_JOB'")
                 .contains("'CANCELING'")
+                .contains("COALESCE(tool_job_anchor_json, '{}'::jsonb) <> '{}'::jsonb")
                 .doesNotContain("'WAITING'");
     }
 
@@ -151,7 +152,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
-    void restartClaimIsNarrowCasAndClearsOnlyLegacyToolAnchor() {
+    void restartClaimIsNarrowCasAndCannotClearAnActiveToolAnchor() {
         String sql = normalizedSql(statement("claimStartupRestartForDeployment").getBoundSql(Map.of(
                 "id", "run-1",
                 "deploymentId", "stable",
@@ -168,6 +169,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("restart_attempt < ?")
                 .contains("deployment_id = ?")
                 .contains("deployment_generation_id = ?")
+                .contains("COALESCE(tool_job_anchor_json, '{}'::jsonb) = '{}'::jsonb")
                 .doesNotContain("execution_checkpoint_json = '{}'::jsonb");
     }
 

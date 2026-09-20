@@ -304,6 +304,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         app.put("pull_policy", "never");
         app.put("stop_signal", "SIGTERM");
         app.put("stop_grace_period", service.path("runtime").path("drainGraceSeconds").asInt() + "s");
+        if ("agent-service".equals(service.path("serviceName").asText())) {
+            // 长工具进程级故障演练会让 Agent 主进程立即退出。由 Docker 用原容器、原镜像和
+            // 原环境重新拉起，避免把「恢复同一部署」误做成一次新的蓝绿发布。
+            app.put("restart", "unless-stopped");
+        }
         ObjectNode labels = app.putObject("labels");
         labels.put("alphafrog.deployment-id", plan.deploymentId());
         labels.put("alphafrog.traffic-scope-id", plan.trafficScopeId());

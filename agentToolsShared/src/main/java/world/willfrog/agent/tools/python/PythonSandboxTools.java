@@ -94,6 +94,9 @@ public class PythonSandboxTools {
     private PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
     @Autowired(required = false)
+    private ToolJobFaultInjector toolJobFaultInjector;
+
+    @Autowired(required = false)
     private DataAnalysisTerminalRecorder dataAnalysisTerminalRecorder;
 
     @Autowired(required = false)
@@ -432,6 +435,10 @@ public class PythonSandboxTools {
 
             emitSandboxToolTotal(toolStartMs, "TIMEOUT", "TIMEOUT");
             return fail("executePython", "TIMEOUT", "Sandbox task timed out after " + timeout + "s", Map.of("task_id", taskId));
+        } catch (ToolJobInjectedInterruption interruption) {
+            // 验收故障点表示当前 worker 必须立即退场。把它转换成普通工具失败会让模型
+            // 继续生成并提交节点结果，反而覆盖数据库里等待恢复的 PREPARING/READY 锚点。
+            throw interruption;
         } catch (ExternalToolJobPendingException pending) {
             throw pending;
         } catch (Exception e) {
@@ -656,6 +663,7 @@ public class PythonSandboxTools {
                     "Failed to persist PREPARING tool-job anchor",
                     Map.of("operation_id", identity.operationId(), "retryable", false));
         }
+        hitFaultPoint(runId, ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT);
 
         /*
          * 从数据库里的 PREPARING（准备中）抢占成功开始，DAG 线程的任何异常退场都必须先移交
@@ -765,6 +773,9 @@ public class PythonSandboxTools {
                             "createTask identity is unverified; PREPARING anchor retained");
                 }
             }
+
+            // 这个检查点位于 Sandbox 已确认接受、taskId 尚未写回 Agent 数据库的精确窗口。
+            hitFaultPoint(runId, ToolJobFaultInjector.AFTER_SANDBOX_ACCEPTED);
 
             // taskId 与 canonical fingerprint 同时确认后，才把 reservation 转为 TASK_ATTACHED。
             reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
@@ -1264,6 +1275,12 @@ public class PythonSandboxTools {
         throw new ExternalToolJobPendingException(
                 runId, anchor.getToolCallId(), anchor.getAttempt(),
                 "Python Sandbox task continues in background: " + taskId);
+    }
+
+    private void hitFaultPoint(String runId, String checkpoint) {
+        if (toolJobFaultInjector != null) {
+            toolJobFaultInjector.hit(runId, checkpoint);
+        }
     }
 
     private TaskResultResponse fetchTerminalResult(

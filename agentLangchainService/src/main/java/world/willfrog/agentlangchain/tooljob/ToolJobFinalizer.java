@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.finance.*;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
@@ -68,6 +69,9 @@ public class ToolJobFinalizer {
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
+
+    @Autowired(required = false)
+    private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
 
     /**
      * 认领处归属判定；Spring 装配必填。兼容旧单元测试的窄构造器传 null，
@@ -489,6 +493,15 @@ public class ToolJobFinalizer {
             // 暂停状态保留 WAITING_TOOL_JOB，不生成 READY，等待用户明确恢复。
             log.info("Terminal handled for paused run={}, not auto-resuming", runId);
             return FinalizerOutcome.completed();
+        }
+
+        // 双池 LINEAR Run 不重新走旧的 Run 级 launcher。终态收尾完成后，直接把原节点工作项
+        // 推进为 RESUMABLE；Run 状态、完整锚点和节点载荷由同一条数据库语句一起提交。
+        if (dualPoolToolJobCoordinator != null
+                && dualPoolToolJobCoordinator.supports(anchor)) {
+            return dualPoolToolJobCoordinator.promoteResumable(runId, anchor)
+                    ? FinalizerOutcome.completed()
+                    : FinalizerOutcome.incomplete(STEP_EVENT, "dual_pool_resume_promotion_failed");
         }
 
         // 第五步：把 finalizerStep 与 Run 状态从 WAITING_TOOL_JOB 原子推进到 RECEIVED。

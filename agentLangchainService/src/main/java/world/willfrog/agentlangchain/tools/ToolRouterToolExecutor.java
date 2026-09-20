@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -111,8 +112,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             if ("executePython".equals(request.name())
                     && pythonSandboxDispatchStore != null
                     && pythonSandboxDispatchStore.isInvocationBlocked(AgentContext.getRunId())) {
-                String output = "DUAL_POOL_PYTHON_TOOL_UNSUPPORTED: executePython is disabled for this "
-                        + "scheduler version because the call may require durable node resume";
+                String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: executePython requires a "
+                        + "persisted node identity before creating a Sandbox task";
                 emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
                 return output;
             }
@@ -146,6 +147,9 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                         throttleRejected = true;
                         throttleLayer = "weight_limit";
                     }
+                } catch (ToolJobInjectedInterruption interruption) {
+                    // 不发普通 FINISHED：当前 worker 要模拟在精确进程窗口退出，恢复链会接管。
+                    throw interruption;
                 } catch (ExternalToolJobPendingException pending) {
                     // 挂起异常表示 Sandbox 后台任务仍在运行，等待终态事件到来。
                     // 这里不能转成字符串 output，否则 LLM 会误以为工具已经完成。

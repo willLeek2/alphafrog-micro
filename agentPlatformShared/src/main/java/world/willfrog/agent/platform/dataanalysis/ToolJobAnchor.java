@@ -56,6 +56,17 @@ public class ToolJobAnchor {
     private String todoId;
     // sequence 保存该节点在原 plan 中的顺序，恢复时用于顺序校验。
     private int sequence;
+    // 以下字段把长工具锚点绑定到双池的一条节点工作项；为空表示旧调度器路径。
+    private Integer workItemPlanGeneration;
+    private String workItemNodeId;
+    private Integer workItemNodeAttempt;
+    private Integer workItemSegmentSequence;
+    private Long workItemContextVersion;
+    private Long workItemRunControlVersion;
+    private Integer workItemClaimEpoch;
+    private String workItemClaimedBy;
+    // 工具调用前冻结的节点载荷。它只用于崩溃恢复核对，不替代工作项表里的权威载荷。
+    private String workItemPayloadJson;
     // runDisposition 冻结 RUNNING、PAUSED、CANCELED 或 CHECKPOINT_FAILED 等处置。
     private String runDisposition;
     // blockingOwnerId 标识当前同步等待 DAG 工具结果的进程，防止其他实例抢占活 worker。
@@ -274,6 +285,41 @@ public class ToolJobAnchor {
 
     public int getSequence() { return sequence; }
     public void setSequence(int sequence) { this.sequence = sequence; }
+
+    public Integer getWorkItemPlanGeneration() { return workItemPlanGeneration; }
+    public void setWorkItemPlanGeneration(Integer workItemPlanGeneration) {
+        this.workItemPlanGeneration = workItemPlanGeneration;
+    }
+
+    public String getWorkItemNodeId() { return workItemNodeId; }
+    public void setWorkItemNodeId(String workItemNodeId) { this.workItemNodeId = workItemNodeId; }
+
+    public Integer getWorkItemNodeAttempt() { return workItemNodeAttempt; }
+    public void setWorkItemNodeAttempt(Integer workItemNodeAttempt) { this.workItemNodeAttempt = workItemNodeAttempt; }
+
+    public Integer getWorkItemSegmentSequence() { return workItemSegmentSequence; }
+    public void setWorkItemSegmentSequence(Integer workItemSegmentSequence) {
+        this.workItemSegmentSequence = workItemSegmentSequence;
+    }
+
+    public Long getWorkItemContextVersion() { return workItemContextVersion; }
+    public void setWorkItemContextVersion(Long workItemContextVersion) {
+        this.workItemContextVersion = workItemContextVersion;
+    }
+
+    public Long getWorkItemRunControlVersion() { return workItemRunControlVersion; }
+    public void setWorkItemRunControlVersion(Long workItemRunControlVersion) {
+        this.workItemRunControlVersion = workItemRunControlVersion;
+    }
+
+    public Integer getWorkItemClaimEpoch() { return workItemClaimEpoch; }
+    public void setWorkItemClaimEpoch(Integer workItemClaimEpoch) { this.workItemClaimEpoch = workItemClaimEpoch; }
+
+    public String getWorkItemClaimedBy() { return workItemClaimedBy; }
+    public void setWorkItemClaimedBy(String workItemClaimedBy) { this.workItemClaimedBy = workItemClaimedBy; }
+
+    public String getWorkItemPayloadJson() { return workItemPayloadJson; }
+    public void setWorkItemPayloadJson(String workItemPayloadJson) { this.workItemPayloadJson = workItemPayloadJson; }
 
     public String getRunDisposition() { return runDisposition; }
     public void setRunDisposition(String runDisposition) { this.runDisposition = runDisposition; }

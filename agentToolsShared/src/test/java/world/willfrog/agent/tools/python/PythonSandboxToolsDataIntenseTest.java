@@ -123,6 +123,24 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
+    void injectedInterruptionEscapesToolFailureConversion() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        inject("toolJobFaultInjector", (ToolJobFaultInjector) (runId, checkpoint) -> {
+            if (ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT.equals(checkpoint)) {
+                throw new ToolJobInjectedInterruption("scenario-1", checkpoint);
+            }
+        });
+
+        assertThrows(ToolJobInjectedInterruption.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(dispatchStore).persistPreparing(eq("run-test"), any());
+        verify(sandbox, never()).createTask(any());
+    }
+
+    @Test
     void repeatedFailedPythonRequestIsBlockedBeforeCapacityAndSandboxDispatch() throws Exception {
         fixtureDataset();
         AtomicReference<ToolJobAnchor> preparingAnchor = new AtomicReference<>();

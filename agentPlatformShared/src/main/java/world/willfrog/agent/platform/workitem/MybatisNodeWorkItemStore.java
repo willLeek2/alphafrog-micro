@@ -101,6 +101,61 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    public NodeWorkItemMutationResult suspendForToolJob(NodeWorkItemIdentity identity,
+                                                        NodeWorkItemVersions versions,
+                                                        String claimant,
+                                                        String operationId,
+                                                        String toolCallId,
+                                                        int attempt) {
+        requireClaimant(claimant);
+        int rows = mapper.suspendForToolJob(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
+                versions.runControlVersion(), versions.claimEpoch(), claimant, operationId, toolCallId, attempt);
+        return rows == 1 ? NodeWorkItemMutationResult.success()
+                : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
+    }
+
+    @Override
+    public NodeWorkItemMutationResult promoteToolJobResumable(NodeWorkItemIdentity identity,
+                                                              NodeWorkItemVersions versions,
+                                                              String operationId,
+                                                              String anchorJson,
+                                                              String resumePayloadJson) {
+        int rows = mapper.promoteToolJobResumable(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
+                versions.runControlVersion(), versions.claimEpoch(), operationId,
+                objectPayload(anchorJson), objectPayload(resumePayloadJson));
+        return rows == 1 ? NodeWorkItemMutationResult.success()
+                : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
+    }
+
+    @Override
+    public NodeWorkItemMutationResult commitResumedToolJobResult(NodeWorkItemIdentity identity,
+                                                                 NodeWorkItemVersions versions,
+                                                                 String operationId,
+                                                                 String payloadPatchJson,
+                                                                 String externalSideEffectRef) {
+        int rows = mapper.commitResumedToolJobResult(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
+                versions.runControlVersion(), versions.claimEpoch(), operationId,
+                objectPayload(payloadPatchJson));
+        return rows == 1 ? NodeWorkItemMutationResult.success()
+                : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), externalSideEffectRef);
+    }
+
+    @Override
+    public NodeWorkItemMutationResult requeueInterruptedToolJob(NodeWorkItemIdentity identity,
+                                                                NodeWorkItemVersions versions,
+                                                                String operationId) {
+        int rows = mapper.requeueInterruptedToolJob(
+                identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
+                versions.runControlVersion(), versions.claimEpoch(), operationId);
+        return rows == 1 ? NodeWorkItemMutationResult.success()
+                : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
+    }
+
+    @Override
     public NodeWorkItemMutationResult reportExecutionFailure(NodeWorkItemIdentity identity,
                                                              int claimEpoch,
                                                              String claimant,

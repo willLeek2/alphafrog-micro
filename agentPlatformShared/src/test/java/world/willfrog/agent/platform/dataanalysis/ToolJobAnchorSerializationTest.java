@@ -124,4 +124,30 @@ class ToolJobAnchorSerializationTest {
         assertThat(restored.getFinanceRecordLimitsJson())
                 .isEqualTo("{\"enabled\":false,\"recordCountMax\":128}");
     }
+
+    @Test
+    void roundTripsDualPoolWorkItemIdentityAndVersions() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setWorkItemPlanGeneration(3);
+        anchor.setWorkItemNodeId("todo-2");
+        anchor.setWorkItemNodeAttempt(1);
+        anchor.setWorkItemSegmentSequence(0);
+        anchor.setWorkItemContextVersion(7L);
+        anchor.setWorkItemRunControlVersion(9L);
+        anchor.setWorkItemClaimEpoch(4);
+        anchor.setWorkItemClaimedBy("node-worker-a");
+        anchor.setWorkItemPayloadJson("{\"kind\":\"TODO\"}");
+
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+        assertThat(restored.getWorkItemPlanGeneration()).isEqualTo(3);
+        assertThat(restored.getWorkItemNodeId()).isEqualTo("todo-2");
+        assertThat(restored.getWorkItemNodeAttempt()).isEqualTo(1);
+        assertThat(restored.getWorkItemSegmentSequence()).isZero();
+        assertThat(restored.getWorkItemContextVersion()).isEqualTo(7L);
+        assertThat(restored.getWorkItemRunControlVersion()).isEqualTo(9L);
+        assertThat(restored.getWorkItemClaimEpoch()).isEqualTo(4);
+        assertThat(restored.getWorkItemClaimedBy()).isEqualTo("node-worker-a");
+        assertThat(restored.getWorkItemPayloadJson()).isEqualTo("{\"kind\":\"TODO\"}");
+    }
 }

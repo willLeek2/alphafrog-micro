@@ -90,7 +90,7 @@
         SELECT <include refid="workItemColumns"/>
         FROM alphafrog_agent_run_work_item
         WHERE scheduler_version = #{schedulerVersion}
-          AND state = 'RUNNABLE'
+          AND state IN ('RUNNABLE', 'RESUMABLE')
           AND next_visible_at &lt;= CURRENT_TIMESTAMP
         ORDER BY next_visible_at, id
         LIMIT #{limit}
@@ -164,7 +164,7 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE <include refid="identityFence"/>
           AND scheduler_version = #{schedulerVersion}
-          AND state = 'RUNNABLE'
+          AND state IN ('RUNNABLE', 'RESUMABLE')
           AND next_visible_at &lt;= CURRENT_TIMESTAMP
           AND context_version = #{contextVersion}
           AND run_control_version = #{runControlVersion}
@@ -228,6 +228,164 @@
                 AND owner_run.run_control_version = #{runControlVersion}
                 AND owner_run.status = 'EXECUTING'
           )
+    </update>
+
+    <!--
+      长工具已经把 Run 原子切到 WAITING_TOOL_JOB 后，节点分段才可以交还执行许可。
+      锚点中的工作项身份与四类版本是外部调用前冻结的，防止迟到 worker 把新一轮工作项挂起。
+    -->
+    <update id="suspendForToolJob">
+        UPDATE alphafrog_agent_run_work_item wi SET
+            state = 'WAITING',
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            payload_json = wi.payload_json || jsonb_build_object(
+                'toolJobWait', jsonb_build_object(
+                    'operationId', #{operationId}::text,
+                    'toolCallId', #{toolCallId}::text,
+                    'attempt', #{attempt}::int)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND wi.state = 'EXECUTING'
+          AND wi.context_version = #{contextVersion}
+          AND wi.run_control_version = #{runControlVersion}
+          AND wi.claim_epoch = #{claimEpoch}
+          AND wi.claimed_by = #{claimedBy}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{runId}
+                AND owner_run.status = 'WAITING_TOOL_JOB'
+                AND owner_run.plan_generation = #{planGeneration}
+                AND owner_run.run_control_version = #{runControlVersion}
+                AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND owner_run.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND owner_run.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND owner_run.tool_job_anchor_json #>> '{workItemPlanGeneration}' = #{planGeneration}::text
+                AND owner_run.tool_job_anchor_json #>> '{workItemNodeId}' = #{nodeId}
+                AND owner_run.tool_job_anchor_json #>> '{workItemNodeAttempt}' = #{nodeAttempt}::text
+                AND owner_run.tool_job_anchor_json #>> '{workItemSegmentSequence}' = #{segmentSequence}::text
+                AND owner_run.tool_job_anchor_json #>> '{workItemContextVersion}' = #{contextVersion}::text
+                AND owner_run.tool_job_anchor_json #>> '{workItemRunControlVersion}' = #{runControlVersion}::text
+                AND owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}' = #{claimEpoch}::text)
+    </update>
+
+    <!--
+      工具结果收尾与恢复事件写入同一条数据库语句：Run 回到 EXECUTING，工作项进入 RESUMABLE，
+      锚点保存已经完成收尾的终态。任何身份或版本不一致都会让两边都保持原状。
+    -->
+    <update id="promoteToolJobResumable">
+        WITH item_locked AS (
+            SELECT wi.id
+            FROM alphafrog_agent_run_work_item wi
+            WHERE <include refid="identityFence"/>
+              AND wi.state IN ('WAITING', 'EXECUTING')
+              AND wi.context_version = #{contextVersion}
+              AND wi.run_control_version = #{runControlVersion}
+              AND wi.claim_epoch = #{claimEpoch}
+            FOR UPDATE
+        ), run_advanced AS (
+            UPDATE alphafrog_agent_run owner_run SET
+                status = 'EXECUTING',
+                tool_job_anchor_json = CAST(#{anchorJson} AS jsonb),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE owner_run.id = #{runId}
+              AND owner_run.status = 'WAITING_TOOL_JOB'
+              AND owner_run.plan_generation = #{planGeneration}
+              AND owner_run.run_control_version = #{runControlVersion}
+              AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+              AND owner_run.tool_job_anchor_json #>> '{workItemPlanGeneration}' = #{planGeneration}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemNodeId}' = #{nodeId}
+              AND owner_run.tool_job_anchor_json #>> '{workItemNodeAttempt}' = #{nodeAttempt}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemSegmentSequence}' = #{segmentSequence}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemContextVersion}' = #{contextVersion}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemRunControlVersion}' = #{runControlVersion}::text
+              AND owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}' = #{claimEpoch}::text
+              AND EXISTS (SELECT 1 FROM item_locked)
+            RETURNING owner_run.id
+        )
+        UPDATE alphafrog_agent_run_work_item wi SET
+            state = 'RESUMABLE',
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            next_visible_at = CURRENT_TIMESTAMP,
+            payload_json = wi.payload_json || jsonb_build_object(
+                'toolJobResume', CAST(#{resumePayloadJson} AS jsonb)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND wi.state IN ('WAITING', 'EXECUTING')
+          AND wi.context_version = #{contextVersion}
+          AND wi.run_control_version = #{runControlVersion}
+          AND wi.claim_epoch = #{claimEpoch}
+          AND EXISTS (SELECT 1 FROM run_advanced)
+    </update>
+
+    <!--
+      恢复分段提交与锚点清理不可拆开：若进程在两步之间退出，后续 executePython 会被旧锚点阻断。
+      CTE 与最终更新使用同一快照和同一组条件，只有精确的恢复领取者能同时完成两边。
+    -->
+    <update id="commitResumedToolJobResult">
+        WITH run_locked AS (
+            SELECT owner_run.id
+            FROM alphafrog_agent_run owner_run
+            WHERE owner_run.id = #{runId}
+              AND owner_run.status = 'EXECUTING'
+              AND owner_run.plan_generation = #{planGeneration}
+              AND owner_run.run_control_version = #{runControlVersion}
+              AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+              AND owner_run.tool_job_anchor_json #>> '{resumeState}' = 'DUAL_POOL_READY'
+              AND owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}' = (#{claimEpoch} - 1)::text
+            FOR UPDATE
+        ), item_committed AS (
+            UPDATE alphafrog_agent_run_work_item wi SET
+                state = 'RESULT_COMMITTED',
+                payload_json = wi.payload_json
+                    || COALESCE(CAST(#{payloadPatchJson} AS jsonb), '{}'::jsonb)
+                    || jsonb_build_object('toolJobConsumed', true),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE <include refid="identityFence"/>
+              AND wi.state = 'EXECUTING'
+              AND wi.context_version = #{contextVersion}
+              AND wi.run_control_version = #{runControlVersion}
+              AND wi.claim_epoch = #{claimEpoch}
+              AND EXISTS (SELECT 1 FROM run_locked)
+            RETURNING wi.run_id
+        )
+        UPDATE alphafrog_agent_run owner_run SET
+            tool_job_anchor_json = '{}'::jsonb,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE owner_run.id = #{runId}
+          AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND owner_run.tool_job_anchor_json #>> '{resumeState}' = 'DUAL_POOL_READY'
+          AND EXISTS (SELECT 1 FROM item_committed)
+    </update>
+
+    <!--
+      进程可能在 RESUMABLE 被领取后、结果原子提交前退出。启动恢复只在 Run 仍由同一锚点
+      占有，且锚点记录的原领取代际正好比当前代际小一时，才把节点重新开放领取。
+    -->
+    <update id="requeueInterruptedToolJob">
+        UPDATE alphafrog_agent_run_work_item wi SET
+            state = 'RESUMABLE',
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            next_visible_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND wi.state IN ('CLAIMED', 'EXECUTING')
+          AND wi.context_version = #{contextVersion}
+          AND wi.run_control_version = #{runControlVersion}
+          AND wi.claim_epoch = #{claimEpoch}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{runId}
+                AND owner_run.status = 'EXECUTING'
+                AND owner_run.plan_generation = #{planGeneration}
+                AND owner_run.run_control_version = #{runControlVersion}
+                AND owner_run.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND owner_run.tool_job_anchor_json #>> '{resumeState}' = 'DUAL_POOL_READY'
+                AND (owner_run.tool_job_anchor_json #>> '{workItemClaimEpoch}')::int + 1 = #{claimEpoch})
     </update>
 
     <update id="reportExecutionFailure">

@@ -166,6 +166,8 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
         assertEquals("65s", mapper.readTree(content).path("services").path("app")
                 .path("stop_grace_period").asText());
+        assertEquals("unless-stopped", mapper.readTree(content).path("services").path("app")
+                .path("restart").asText());
         JsonNode volumes = mapper.readTree(content).path("services").path("app").path("volumes");
         assertTrue(containsVolume(volumes, properties.getObservability().getJavaAgentJar()
                 + ":/otel/javaagent.jar:ro"));

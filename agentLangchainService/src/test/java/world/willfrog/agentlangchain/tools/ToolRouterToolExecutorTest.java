@@ -12,6 +12,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
@@ -188,7 +189,27 @@ class ToolRouterToolExecutorTest {
         verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), any());
         verify(eventService, never()).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), any());
         verify(eventService, never()).appendOnce(anyString(), anyString(), anyString(), anyString(), any());
-        verifyNoInteractions(pythonSandboxDispatchStore);
+        verify(pythonSandboxDispatchStore).isInvocationBlocked("run-123");
+        verifyNoMoreInteractions(pythonSandboxDispatchStore);
+    }
+
+    @Test
+    void execute_injectedInterruption_rethrowsWithoutFinishedEvent() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("tool-call-fault")
+                .name("executePython")
+                .arguments("{\"code\":\"print(1)\"}")
+                .build();
+        ToolJobInjectedInterruption interruption =
+                new ToolJobInjectedInterruption("scenario-1", "BEFORE_SANDBOX_SUBMIT");
+        when(toolRouter.invokeWithMeta("executePython", Map.of("code", "print(1)")))
+                .thenThrow(interruption);
+
+        assertSame(interruption, assertThrows(ToolJobInjectedInterruption.class,
+                () -> executor.execute(request, null)));
+
+        verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), any());
+        verify(eventService, never()).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), any());
     }
 
     @Test

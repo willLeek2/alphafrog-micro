@@ -414,6 +414,10 @@
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'CANCELING')
+          AND NOT (
+              status IN ('EXECUTING', 'WAITING_TOOL_JOB')
+              AND COALESCE(tool_job_anchor_json, '{}'::jsonb) &lt;&gt; '{}'::jsonb
+          )
         ORDER BY started_at ASC, id ASC
         LIMIT #{limit}
     </select>
@@ -430,6 +434,10 @@
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status = #{expectedStatus}
+          AND (
+              #{expectedStatus} NOT IN ('EXECUTING', 'WAITING_TOOL_JOB')
+              OR COALESCE(tool_job_anchor_json, '{}'::jsonb) = '{}'::jsonb
+          )
           AND restart_attempt = #{expectedRestartAttempt}
           AND restart_attempt &lt; #{maxRestartAttempts}
     </update>

@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 
 import java.time.Instant;
 
@@ -44,9 +45,23 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     @Override
     public boolean isInvocationBlocked(String runId) {
         try {
-            // 双池骨架当前没有 WAITING_TOOL_JOB 的节点续跑协议。必须在 createTask 之前拒绝，
-            // 不能先启动外部任务、再把 Run 留在一个双池无法恢复的中间状态。
-            return SchedulerVersion.fromWire(anchorService.loadSchedulerVersion(runId)).isDualPool();
+            SchedulerVersion schedulerVersion = SchedulerVersion.fromWire(
+                    anchorService.loadSchedulerVersion(runId));
+            if (!schedulerVersion.isDualPool()) {
+                return false;
+            }
+            if (!config.isDurableRecoveryEnabled()) {
+                return true;
+            }
+            // 双池长工具只在节点执行上下文完整时开放。缺少任一工作项身份时继续失败关闭，
+            // 避免外部任务已经创建，却没有可恢复的 WAITING/RESUMABLE 所有者。
+            DualPoolToolJobExecutionContext.Snapshot snapshot =
+                    DualPoolToolJobExecutionContext.current();
+            return snapshot == null
+                    || snapshot.identity() == null
+                    || snapshot.versions() == null
+                    || snapshot.claimant() == null
+                    || snapshot.claimant().isBlank();
         } catch (UnknownSchedulerVersionException e) {
             log.error("Python sandbox invocation rejected because scheduler version is unavailable: runId={}",
                     runId, e);
@@ -56,6 +71,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
 
     @Override
     public boolean persistPreparing(String runId, ToolJobAnchor anchor) {
+        applyDualPoolIdentity(anchor);
         // 调用方必须明确提供 PREPARING；claim SQL 还要求当前 Run anchor 为空。
         return "PREPARING".equals(anchor.getAnchorState())
                 && anchorService.claimPreparing(runId, anchor, AgentRunStatus.EXECUTING);
@@ -66,9 +82,28 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                                               ToolJobAnchor anchor,
                                               String expectedResumeToken,
                                               long expectedResumeLeaseVersion) {
+        applyDualPoolIdentity(anchor);
         return "PREPARING".equals(anchor.getAnchorState())
                 && anchorService.claimPreparingFromResume(
                 runId, anchor, expectedResumeToken, expectedResumeLeaseVersion);
+    }
+
+    private void applyDualPoolIdentity(ToolJobAnchor anchor) {
+        DualPoolToolJobExecutionContext.Snapshot snapshot =
+                DualPoolToolJobExecutionContext.current();
+        if (anchor == null || snapshot == null || snapshot.identity() == null
+                || snapshot.versions() == null) {
+            return;
+        }
+        anchor.setWorkItemPlanGeneration(snapshot.identity().planGeneration());
+        anchor.setWorkItemNodeId(snapshot.identity().nodeId());
+        anchor.setWorkItemNodeAttempt(snapshot.identity().nodeAttempt());
+        anchor.setWorkItemSegmentSequence(snapshot.identity().segmentSequence());
+        anchor.setWorkItemContextVersion(snapshot.versions().contextVersion());
+        anchor.setWorkItemRunControlVersion(snapshot.versions().runControlVersion());
+        anchor.setWorkItemClaimEpoch(snapshot.versions().claimEpoch());
+        anchor.setWorkItemClaimedBy(snapshot.claimant());
+        anchor.setWorkItemPayloadJson(snapshot.payloadJson());
     }
 
     @Override

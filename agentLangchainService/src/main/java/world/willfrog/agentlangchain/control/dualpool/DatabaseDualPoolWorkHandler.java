@@ -77,6 +77,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final DualPoolDispatcher dispatcher;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final SchedulerVersionPolicy schedulerVersionPolicy;
+    private final DualPoolToolJobCoordinator toolJobCoordinator;
     private final Duration claimLease;
     private final int perRunUnfinishedLimit;
     private final String claimant = "dual-pool-node-" + UUID.randomUUID();
@@ -94,6 +95,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             DualPoolDispatcher dispatcher,
             DualPoolRunAdmissionRegistry admissionRegistry,
             SchedulerVersionPolicy schedulerVersionPolicy,
+            DualPoolToolJobCoordinator toolJobCoordinator,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit) {
         this.runMapper = runMapper;
@@ -106,6 +108,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.dispatcher = dispatcher;
         this.admissionRegistry = admissionRegistry;
         this.schedulerVersionPolicy = schedulerVersionPolicy;
+        this.toolJobCoordinator = toolJobCoordinator;
         this.claimLease = Duration.ofSeconds(Math.max(1L, claimLeaseSeconds));
         this.perRunUnfinishedLimit = Math.max(1, perRunUnfinishedLimit);
     }
@@ -158,6 +161,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 persistInfrastructureFailure(run, null, List.of(), reason,
                         Map.of("stage", "advance_executing_run"));
             }
+            return;
+        }
+        if (status == AgentRunStatus.WAITING_TOOL_JOB && toolJobCoordinator.hasActiveWait(runId)) {
             return;
         }
         if (isTerminal(status) || status == AgentRunStatus.WAITING
@@ -432,7 +438,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         NodeWorkItem item = workItemStore.findByIdentity(identity).orElse(null);
-        if (item == null || item.stateEnum() != NodeWorkItemState.RUNNABLE
+        if (item == null || (item.stateEnum() != NodeWorkItemState.RUNNABLE
+                && item.stateEnum() != NodeWorkItemState.RESUMABLE)
                 || item.schedulerVersionEnum() != SchedulerVersion.DUAL_POOL_V1) {
             return;
         }
@@ -463,23 +470,52 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         try {
             JsonNode payload = objectMapper.readTree(item.getPayloadJson());
             String kind = payload.path("kind").asText("");
-            Map<String, Object> resultPatch = switch (kind) {
-                case KIND_PLANNING -> executePlanning(identity.runId());
-                case KIND_TODO -> executeTodo(identity.runId(), payload);
-                case KIND_FINAL_ANSWER -> executeFinalAnswer(identity.runId(), payload);
-                default -> throw new IllegalArgumentException("unknown_dual_pool_work_kind:" + kind);
-            };
             NodeWorkItemVersions submitted = new NodeWorkItemVersions(
                     value(item.getContextVersion()), value(item.getRunControlVersion()), claim.claimEpoch());
-            NodeWorkItemMutationResult committed = workItemStore.commitSegmentResult(
-                    identity, submitted, objectMapper.writeValueAsString(Map.of("segmentResult", resultPatch)),
-                    externalSideEffectRef(resultPatch));
+            Map<String, Object> resultPatch;
+            TodoExecution todoExecution = null;
+            try (DualPoolToolJobExecutionContext.Scope ignored =
+                         DualPoolToolJobExecutionContext.install(
+                                 identity, submitted, claimant, item.getPayloadJson())) {
+                if (KIND_TODO.equals(kind)) {
+                    todoExecution = executeTodo(identity.runId(), payload);
+                    if (todoExecution.result().isSuspended()) {
+                        NodeWorkItemMutationResult suspended = toolJobCoordinator.suspend(
+                                item, claim, payload, todoExecution.result(), todoExecution.totalToolCalls());
+                        if (!suspended.applied()) {
+                            reportRejection(identity.runId(), suspended);
+                        }
+                        return;
+                    }
+                    resultPatch = todoExecution.resultPatch();
+                } else {
+                    resultPatch = switch (kind) {
+                        case KIND_PLANNING -> executePlanning(identity.runId());
+                        case KIND_FINAL_ANSWER -> executeFinalAnswer(identity.runId(), payload);
+                        default -> throw new IllegalArgumentException("unknown_dual_pool_work_kind:" + kind);
+                    };
+                }
+            }
+            String patchJson = objectMapper.writeValueAsString(Map.of("segmentResult", resultPatch));
+            NodeWorkItemMutationResult committed = toolJobCoordinator.isResumePayload(payload)
+                    ? toolJobCoordinator.commitResumedResult(
+                            identity, submitted, toolJobCoordinator.resumeOperationId(payload),
+                            patchJson, externalSideEffectRef(resultPatch))
+                    : workItemStore.commitSegmentResult(
+                            identity, submitted, patchJson, externalSideEffectRef(resultPatch));
             if (committed.applied()) {
                 dispatcher.offerRun(new RunCoordinationHint(identity.runId(), RunCoordinationHint.Reason.NODE_RESULT));
             } else {
                 reportRejection(identity.runId(), committed);
             }
         } catch (Exception e) {
+            if (toolJobCoordinator.hasActiveWait(identity.runId())) {
+                // 外部任务已经取得持久锚点并把 Run 切到等待态。此时不能把原工作项写成
+                // EXECUTION_FAILED，否则终态对账器将失去可推进的 WAITING/EXECUTING 所有者。
+                log.error("双池长工具已持久挂起，节点交接尚未完成，保留原状态等待恢复: identity={}",
+                        identity.describe(), e);
+                return;
+            }
             NodeWorkItemMutationResult failed = workItemStore.reportExecutionFailure(
                     identity, claim.claimEpoch(), claimant, safeReason(e));
             if (!failed.applied()) {
@@ -511,7 +547,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         return result;
     }
 
-    private Map<String, Object> executeTodo(String runId, JsonNode payload) throws Exception {
+    private TodoExecution executeTodo(String runId, JsonNode payload) throws Exception {
         LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
                 freshRunPipeline.rebuildDualPoolNodeContext(runId);
         if (context == null) {
@@ -529,19 +565,27 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 runId, context.run().getUserId(), "TODO_NODE_STARTED", todo,
                 null, 0L, null, false, null);
         long startedAt = System.currentTimeMillis();
-        LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
-                context.workflowRequest(), todo, completed, datasetRefs, toolCalls);
+        boolean resumingToolJob = toolJobCoordinator.isResumePayload(payload);
+        LangchainTodoNodeResult nodeResult;
+        if (resumingToolJob) {
+            LangchainTodoNodeResult terminal = toolJobCoordinator.resumeResult(payload);
+            if (toolJobCoordinator.resumeTerminalSuccess(payload)) {
+                nodeResult = todoNodeExecutor.executeResumedToolResult(
+                        context.workflowRequest(), todo, completed, datasetRefs,
+                        toolJobCoordinator.resumeToolOutput(payload));
+                toolJobCoordinator.afterModelCompleted(runId);
+            } else {
+                nodeResult = terminal;
+            }
+        } else {
+            nodeResult = todoNodeExecutor.execute(
+                    context.workflowRequest(), todo, completed, datasetRefs, toolCalls);
+        }
+        if (resumingToolJob) {
+            toolCalls.set(toolJobCoordinator.resumeTotalToolCalls(payload));
+        }
         if (nodeResult.isSuspended()) {
-            nodeResult = LangchainTodoNodeResult.builder()
-                    .success(false)
-                    .failureReason("dual_pool_long_tool_resume_not_enabled")
-                    .summary("dual_pool_long_tool_resume_not_enabled")
-                    .output("")
-                    .toolCallsUsed(nodeResult.getToolCallsUsed())
-                    .pendingRunId(nodeResult.getPendingRunId())
-                    .pendingToolCallId(nodeResult.getPendingToolCallId())
-                    .pendingAttempt(nodeResult.getPendingAttempt())
-                    .build();
+            return new TodoExecution(Map.of(), nodeResult, toolCalls.get());
         }
         String eventType = nodeResult.isSuccess() ? "TODO_NODE_COMPLETED" : "TODO_NODE_FAILED";
         freshRunPipeline.emitDualPoolTodoNodeEvent(
@@ -550,7 +594,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                         nodeResult.getFailureReason(), nodeResult.getSummary()),
                 System.currentTimeMillis() - startedAt,
                 nodeResult.getFailureMetadata(), nodeResult.isRecovered(), nodeResult.getRecoveryOutcome());
-        return nodeResultPatch(KIND_TODO, nodeResult, toolCalls.get());
+        return new TodoExecution(
+                nodeResultPatch(KIND_TODO, nodeResult, toolCalls.get()),
+                nodeResult,
+                toolCalls.get());
     }
 
     private Map<String, Object> executeFinalAnswer(String runId, JsonNode payload) throws Exception {
@@ -577,7 +624,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
 
     @Override
     public List<RunCoordinationHint> scanRunnableRuns(int limit) {
-        if (limit <= 0 || admissionRegistry.startupResidueBlocked()) {
+        if (limit <= 0) {
             return List.of();
         }
         List<RunCoordinationHint> hints = new ArrayList<>();
@@ -597,7 +644,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
 
     @Override
     public List<NodeWorkItemIdentity> scanRunnableNodes(int limit) {
-        if (limit <= 0 || admissionRegistry.startupResidueBlocked()) {
+        if (limit <= 0) {
             return List.of();
         }
         return workItemStore.scanClaimable(SchedulerVersion.DUAL_POOL_V1, limit).stream()
@@ -734,6 +781,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             patch.put("pendingAttempt", result.getPendingAttempt());
         }
         return patch;
+    }
+
+    private record TodoExecution(Map<String, Object> resultPatch,
+                                 LangchainTodoNodeResult result,
+                                 int totalToolCalls) {
     }
 
     private JsonNode segmentResult(NodeWorkItem row) {
