@@ -10,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -508,6 +509,13 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             } else {
                 reportRejection(identity.runId(), committed);
             }
+        } catch (ToolJobInjectedInterruption interruption) {
+            // 这不是业务失败，而是 Beta 验收专门模拟“当前节点 worker 在持久写入后消失”。
+            // 保留 EXECUTING/锚点现场，交给长工具对账与恢复链继续推进；任何失败回写都会
+            // 把本来可恢复的 Run 提前终结，掩盖真实的进程退出语义。
+            log.warn("双池节点命中一次性中断，保留持久现场等待恢复: identity={} reason={}",
+                    identity.describe(), interruption.getMessage());
+            return;
         } catch (Exception e) {
             if (toolJobCoordinator.hasActiveWait(identity.runId())) {
                 // 外部任务已经取得持久锚点并把 Run 切到等待态。此时不能把原工作项写成
