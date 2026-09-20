@@ -53,6 +53,7 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 ## 常用子命令
 
 - `status`：查看当前部署与滚动状态。
+- `git fetch --branch <分支名>`：当前分支成功执行 `git push` 后，调用 `bash deploy/beta/af-beta-remote.sh git fetch --branch <分支名>`，让 Beta 本机拉取刚推送的分支。把命令输出原样转告用户，并使用输出里的 `commit=` 作为后续 `lane start` 或 `file-config` 的 `--git` 参数。分支名使用刚推送的当前分支；fetch 失败时把错误原文交给用户。这条不是 `main roll`，不需要用户另一次同意滚动主环境。
 - `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。
 - `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加。见上文硬性边界：必须用户明确要求。
 - `retry`：对失败部署重试。
