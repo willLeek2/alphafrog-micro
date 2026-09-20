@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobFaultInjector;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
@@ -22,6 +23,7 @@ import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
+import world.willfrog.agentlangchain.tooljob.ToolJobRedisCache;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -52,6 +54,9 @@ public class DualPoolToolJobCoordinator {
 
     @Autowired(required = false)
     private DualPoolRunAdmissionRegistry admissionRegistry;
+
+    @Autowired(required = false)
+    private ToolJobRedisCache redisCache;
 
     public boolean supports(ToolJobAnchor anchor) {
         return anchor != null
@@ -127,7 +132,17 @@ public class DualPoolToolJobCoordinator {
                     identity.describe(), anchor.getOperationId());
             return false;
         }
-        hitFaultPoint(runId, ToolJobFaultInjector.AFTER_RESUME_COMMITTED);
+        try {
+            hitFaultPoint(runId, ToolJobFaultInjector.AFTER_RESUME_COMMITTED);
+        } catch (ToolJobInjectedInterruption interruption) {
+            // 结果与 RESUMABLE 已经同事务提交。线程级故障只移除了进程内准入，立即按
+            // 持久结果重新取得许可并补投递；进程级故障不会返回到这里，由启动恢复接管。
+            if (!recoverResumable(runId, resumableAnchor)) {
+                log.warn("结果提交后的线程中断未能立即重新投递工作项: identity={} operationId={}",
+                        identity.describe(), anchor.getOperationId());
+            }
+            throw interruption;
+        }
         if (!ensureRecoveryAdmission(runId)) {
             return false;
         }
@@ -171,6 +186,39 @@ public class DualPoolToolJobCoordinator {
         }
         dispatcher.offerNode(identity);
         return true;
+    }
+
+    /**
+     * 当前节点线程在一次性故障点退出后，从持久状态补上恢复唤醒。
+     *
+     * <p>调用位置已经离开模型和工具调用栈，旧 worker 不会再产生业务副作用。本方法仍然只
+     * 接受与当前工作项身份和版本精确一致的锚点：结果已经提交时重新开放恢复分段；外部任务
+     * 尚在 PREPARING/ATTACHED/PENDING 时只写 Redis 派生唤醒，实际查询、幂等重放和结果收口
+     * 继续由长工具对账器从 PostgreSQL 真相源完成。</p>
+     */
+    public boolean recoverInterruptedWorker(NodeWorkItemIdentity identity,
+                                             NodeWorkItemVersions interruptedVersions) {
+        if (identity == null || interruptedVersions == null) {
+            return false;
+        }
+        ToolJobAnchor anchor = anchorService.loadAnchor(identity.runId());
+        NodeWorkItem current = workItemStore.findByIdentity(identity).orElse(null);
+        if (!matchesInterruptedWorker(identity, interruptedVersions, current, anchor)) {
+            return false;
+        }
+        if (RESUME_STATE.equals(anchor.getResumeState())) {
+            return recoverResumable(identity.runId(), anchor);
+        }
+        if (!ensureRecoveryAdmission(identity.runId()) || redisCache == null) {
+            return false;
+        }
+        try {
+            return redisCache.atomicWritePendingAndDue(identity.runId(), anchor);
+        } catch (RuntimeException cacheFailure) {
+            log.warn("双池中断恢复唤醒写入失败，保留 PostgreSQL 锚点等待补扫: identity={}",
+                    identity.describe(), cacheFailure);
+            return false;
+        }
     }
 
     public boolean isResumePayload(JsonNode payload) {
@@ -319,6 +367,26 @@ public class DualPoolToolJobCoordinator {
                 && item.getContextVersion().equals(anchor.getWorkItemContextVersion())
                 && item.getRunControlVersion().equals(anchor.getWorkItemRunControlVersion())
                 && claimEpoch == anchor.getWorkItemClaimEpoch();
+    }
+
+    private boolean matchesInterruptedWorker(NodeWorkItemIdentity identity,
+                                             NodeWorkItemVersions interruptedVersions,
+                                             NodeWorkItem current,
+                                             ToolJobAnchor anchor) {
+        if (!supports(anchor) || current == null
+                || (current.stateEnum() != NodeWorkItemState.CLAIMED
+                && current.stateEnum() != NodeWorkItemState.EXECUTING)
+                || !identity.equals(current.identity())
+                || !identity.equals(identity(identity.runId(), anchor))
+                || current.getContextVersion() != interruptedVersions.contextVersion()
+                || current.getRunControlVersion() != interruptedVersions.runControlVersion()
+                || current.getClaimEpoch() != interruptedVersions.claimEpoch()) {
+            return false;
+        }
+        if (RESUME_STATE.equals(anchor.getResumeState())) {
+            return interruptedVersions.claimEpoch() > anchor.getWorkItemClaimEpoch();
+        }
+        return interruptedVersions.claimEpoch() == anchor.getWorkItemClaimEpoch();
     }
 
     private NodeWorkItemIdentity identity(String runId, ToolJobAnchor anchor) {

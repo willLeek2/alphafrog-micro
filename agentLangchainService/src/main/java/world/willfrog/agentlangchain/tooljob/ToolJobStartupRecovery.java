@@ -12,13 +12,16 @@ import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 服务启动后的上下文切换灾后恢复入口。
@@ -48,6 +51,9 @@ public class ToolJobStartupRecovery {
 
     @Autowired(required = false)
     private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
+
+    @Autowired(required = false)
+    private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -87,7 +93,7 @@ public class ToolJobStartupRecovery {
 
     private void recoverCapacityLedger() {
         // 只扫描仍有 active anchor 的 Run，终态已清理 anchor 不再占用容量。
-        List<AgentRun> activeRuns = ownershipGateway.listActiveAnchors(200);
+        List<AgentRun> activeRuns = activeRunsForRecovery(200);
         // durableReservations 会一次性提交给容量服务重建。
         List<DataAnalysisReservation> durableReservations = new ArrayList<>();
         // 无法解析/确认的 reservation 必须隔离并阻止 admission 开放。
@@ -245,7 +251,7 @@ public class ToolJobStartupRecovery {
 
     private void recoverToolJobAnchors() {
         // activeRuns 用于恢复轮询/finalizer；resumeReadyRuns 用于恢复 launch handoff。
-        List<AgentRun> activeRuns = ownershipGateway.listActiveAnchors(200);
+        List<AgentRun> activeRuns = activeRunsForRecovery(200);
         List<AgentRun> resumeReadyRuns = ownershipGateway.listResumeReadyAnchors(200);
 
         for (AgentRun run : activeRuns) {
@@ -561,6 +567,32 @@ public class ToolJobStartupRecovery {
             log.error("Failed to transfer recovered dispatch for run={}", runId, failure);
             return false;
         }
+    }
+
+    /**
+     * 通用锚点列表之外，再合并启动准入阶段已经逐项证明安全的双池遗留 Run。
+     * 通用列表有固定 LIMIT，旧的异常锚点不能让本次进程退出留下的有效工作项长期饿死。
+     */
+    private List<AgentRun> activeRunsForRecovery(int limit) {
+        Map<String, AgentRun> runs = new LinkedHashMap<>();
+        for (AgentRun run : ownershipGateway.listActiveAnchors(limit)) {
+            if (run != null && run.getId() != null) {
+                runs.put(run.getId(), run);
+            }
+        }
+        if (dualPoolRunAdmissionRegistry == null) {
+            return new ArrayList<>(runs.values());
+        }
+        for (String runId : dualPoolRunAdmissionRegistry.startupRecoveredToolJobRunIds()) {
+            if (runs.containsKey(runId)) {
+                continue;
+            }
+            AgentRun run = ownershipGateway.findOwnedRun(runId);
+            if (run != null) {
+                runs.put(runId, run);
+            }
+        }
+        return new ArrayList<>(runs.values());
     }
 
     private void recoverPreparingAbort(String runId, ToolJobAnchor anchor) {

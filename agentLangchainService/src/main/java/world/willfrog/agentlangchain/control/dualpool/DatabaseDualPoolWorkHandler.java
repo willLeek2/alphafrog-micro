@@ -468,11 +468,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             reportRejection(identity.runId(), started);
             return;
         }
+        NodeWorkItemVersions submitted = new NodeWorkItemVersions(
+                value(item.getContextVersion()), value(item.getRunControlVersion()), claim.claimEpoch());
         try {
             JsonNode payload = objectMapper.readTree(item.getPayloadJson());
             String kind = payload.path("kind").asText("");
-            NodeWorkItemVersions submitted = new NodeWorkItemVersions(
-                    value(item.getContextVersion()), value(item.getRunControlVersion()), claim.claimEpoch());
             Map<String, Object> resultPatch;
             TodoExecution todoExecution = null;
             try (DualPoolToolJobExecutionContext.Scope ignored =
@@ -515,6 +515,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             // 把本来可恢复的 Run 提前终结，掩盖真实的进程退出语义。
             log.warn("双池节点命中一次性中断，保留持久现场等待恢复: identity={} reason={}",
                     identity.describe(), interruption.getMessage());
+            if (!toolJobCoordinator.recoverInterruptedWorker(identity, submitted)) {
+                log.warn("双池节点中断后未能立即补上恢复唤醒，保留持久现场等待周期补扫: identity={}",
+                        identity.describe());
+            }
             return;
         } catch (Exception e) {
             if (toolJobCoordinator.hasActiveWait(identity.runId())) {

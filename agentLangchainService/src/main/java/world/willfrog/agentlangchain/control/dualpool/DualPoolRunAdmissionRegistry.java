@@ -52,6 +52,8 @@ public class DualPoolRunAdmissionRegistry {
     }
 
     private final Set<String> knownRunIds = ConcurrentHashMap.newKeySet();
+    /** 启动时已用持久锚点和唯一工作项证明可恢复的 Run，供长工具恢复定向处理。 */
+    private final Set<String> startupRecoveredRunIds = ConcurrentHashMap.newKeySet();
     /** activeEpoch 是已持久化一轮的令牌；reservations 是尚未完成数据库条件更新的预留。 */
     private final Map<String, AdmissionState> admissionStates = new ConcurrentHashMap<>();
     private final AtomicLong admissionEpochSequence = new AtomicLong();
@@ -113,7 +115,9 @@ public class DualPoolRunAdmissionRegistry {
                 knownRunIds.remove(runId);
                 unsafeResidue = true;
                 log.error("恢复长工具 Run 时无法重新取得业务许可: runId={}", runId);
+                continue;
             }
+            startupRecoveredRunIds.add(runId);
         }
         startupResidueBlocked = unsafeResidue;
         if (startupResidueBlocked) {
@@ -287,6 +291,17 @@ public class DualPoolRunAdmissionRegistry {
 
     public boolean startupResidueBlocked() {
         return startupResidueBlocked;
+    }
+
+    /**
+     * 返回本进程启动时已经严格核对过的长工具 Run。
+     *
+     * <p>通用工具锚点扫描有批次上限，不能用它证明所有双池遗留工作项都进入了本轮恢复。
+     * 这里的集合来自无批次遗漏的工作项扫描，只包含锚点身份与唯一未完成工作项完全一致、
+     * 且已经重新取得业务许可的 Run。</p>
+     */
+    public Set<String> startupRecoveredToolJobRunIds() {
+        return Set.copyOf(startupRecoveredRunIds);
     }
 
     /** 仅在创建后的调度入口失败时撤销；正常终态仍保留，以便同进程追问继续走原版本。 */
