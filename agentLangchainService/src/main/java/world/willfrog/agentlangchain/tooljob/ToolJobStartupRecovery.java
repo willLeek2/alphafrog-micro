@@ -273,7 +273,7 @@ public class ToolJobStartupRecovery {
                 if (dualPoolToolJobCoordinator != null
                         && dualPoolToolJobCoordinator.supports(anchor)
                         && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())) {
-                    if (!dualPoolToolJobCoordinator.recoverResumable(run.getId(), anchor)) {
+                    if (!dualPoolToolJobCoordinator.recoverResumableAtStartup(run.getId(), anchor)) {
                         log.warn("Startup could not requeue dual-pool tool result for run={}", run.getId());
                     }
                     continue;

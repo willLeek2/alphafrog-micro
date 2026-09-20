@@ -43,7 +43,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -81,7 +80,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final DualPoolToolJobCoordinator toolJobCoordinator;
     private final Duration claimLease;
     private final int perRunUnfinishedLimit;
-    private final String claimant = "dual-pool-node-" + UUID.randomUUID();
+    private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
     /** 固定条带锁不会按 runId 增长，也不会在旧协调回合仍等待时被删除并创建第二把锁。 */
     private final Object[] runLockStripes = createRunLockStripes();
 

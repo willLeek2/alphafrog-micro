@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * LINEAR 双池节点与既有长工具状态机之间的持久交接层。
@@ -42,6 +43,11 @@ import java.util.Map;
 public class DualPoolToolJobCoordinator {
 
     public static final String RESUME_STATE = "DUAL_POOL_READY";
+    private static final String PROCESS_NODE_CLAIMANT = "dual-pool-node-" + UUID.randomUUID();
+
+    static String processNodeClaimant() {
+        return PROCESS_NODE_CLAIMANT;
+    }
 
     private final NodeWorkItemStore workItemStore;
     private final ToolJobAnchorService anchorService;
@@ -152,6 +158,22 @@ public class DualPoolToolJobCoordinator {
 
     /** 服务重启后恢复已经生成、但尚未提交的双池恢复分段。 */
     public boolean recoverResumable(String runId, ToolJobAnchor anchor) {
+        return recoverResumable(runId, anchor, false);
+    }
+
+    /**
+     * ApplicationReadyEvent 启动恢复使用的入口。
+     *
+     * <p>节点池的定时扫描可能在启动恢复回调之前先领取持久工作项。启动恢复只能接管上一
+     * 进程留下的领取；本进程已经领取时保持现状，避免再次开放后形成两个领取代际。</p>
+     */
+    public boolean recoverResumableAtStartup(String runId, ToolJobAnchor anchor) {
+        return recoverResumable(runId, anchor, true);
+    }
+
+    private boolean recoverResumable(String runId,
+                                     ToolJobAnchor anchor,
+                                     boolean preserveCurrentProcessClaim) {
         if (!supports(anchor) || !RESUME_STATE.equals(anchor.getResumeState())) {
             return false;
         }
@@ -170,6 +192,14 @@ public class DualPoolToolJobCoordinator {
         }
         if (state != NodeWorkItemState.CLAIMED && state != NodeWorkItemState.EXECUTING) {
             return false;
+        }
+        // Dispatcher 可能在 ApplicationReadyEvent 的启动恢复之前，已经由本进程领取了
+        // 持久化的 RESUMABLE 工作项。此时再次开放会提升领取代际，让同一 JVM 内两个
+        // worker 同时执行恢复分段；旧 worker 最终虽会被提交栅栏拒绝，但模型调用已经重复。
+        // 只有领取者属于上一进程时才执行重排；当前进程的领取说明恢复已经在进行。
+        if (preserveCurrentProcessClaim
+                && PROCESS_NODE_CLAIMANT.equals(current.getClaimedBy())) {
+            return true;
         }
         NodeWorkItemMutationResult requeued = workItemStore.requeueInterruptedToolJob(
                 identity,
