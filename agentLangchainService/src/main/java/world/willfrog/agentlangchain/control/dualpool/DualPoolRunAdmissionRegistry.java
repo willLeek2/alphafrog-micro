@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
@@ -136,12 +137,35 @@ public class DualPoolRunAdmissionRegistry {
      * <p>这条路径只处理本轮无遗漏扫描读到的 {@code DUAL_POOL_V1} 工作项。取消终态保留
      * {@code CANCELED} 语义；其他终态把工作项标成 {@code STALE}，表示父 Run 已经先结束。
      * 每一行仍使用五字段身份和当前版本做条件更新；取消还会核对领取代际。任何一行不能被
-     * 证明已经进入终态，就返回 false，让启动保护继续失败关闭。</p>
+     * 证明已经进入终态，就返回 false，让启动保护继续失败关闭。启动扫描与准入阻断本来
+     * 就按调度器版本覆盖全部部署，因此终态收口使用相同范围；父 Run 已终结后不再拥有执行权。</p>
      */
     private boolean closeTerminalResidue(AgentRun run, Set<NodeWorkItemIdentity> scannedIdentities) {
-        if (run == null || !SchedulerVersion.DUAL_POOL_V1.name().equals(run.getSchedulerVersion())
-                || !terminal(run.getStatus()) || scannedIdentities == null
-                || scannedIdentities.isEmpty()) {
+        int scannedCount = scannedIdentities == null ? 0 : scannedIdentities.size();
+        String scannedRunId = scannedRunId(scannedIdentities);
+        if (run == null) {
+            log.error("启动时无法收口双池遗留工作项: reason=run_missing runId={} unfinishedItemCount={} "
+                            + "scannedIdentities={}",
+                    scannedRunId, scannedCount, describeIdentities(scannedIdentities));
+            return false;
+        }
+        if (!SchedulerVersion.DUAL_POOL_V1.name().equals(run.getSchedulerVersion())) {
+            log.error("启动时无法收口双池遗留工作项: reason=scheduler_version_mismatch runId={} "
+                            + "schedulerVersion={} unfinishedItemCount={} scannedIdentities={}",
+                    run.getId(), run.getSchedulerVersion(), scannedCount,
+                    describeIdentities(scannedIdentities));
+            return false;
+        }
+        if (!terminal(run.getStatus())) {
+            log.error("启动时无法收口双池遗留工作项: reason=parent_run_nonterminal runId={} "
+                            + "runStatus={} unfinishedItemCount={} scannedIdentities={}",
+                    run.getId(), run.getStatus(), scannedCount, describeIdentities(scannedIdentities));
+            return false;
+        }
+        if (scannedIdentities == null || scannedIdentities.isEmpty()) {
+            log.error("启动时无法收口双池遗留工作项: reason=scanned_identity_set_empty runId={} "
+                            + "runStatus={} unfinishedItemCount={}",
+                    run.getId(), run.getStatus(), scannedCount);
             return false;
         }
         List<NodeWorkItem> unfinished = workItemStore.listUnfinishedByRun(run.getId());
@@ -152,22 +176,37 @@ public class DualPoolRunAdmissionRegistry {
             }
         }
         if (!itemsByIdentity.keySet().equals(scannedIdentities)) {
+            Set<NodeWorkItemIdentity> missingFromCurrent = new LinkedHashSet<>(scannedIdentities);
+            missingFromCurrent.removeAll(itemsByIdentity.keySet());
+            Set<NodeWorkItemIdentity> addedInCurrent = new LinkedHashSet<>(itemsByIdentity.keySet());
+            addedInCurrent.removeAll(scannedIdentities);
+            log.error("启动时无法收口双池遗留工作项: reason=identity_set_mismatch runId={} "
+                            + "runStatus={} unfinishedItemCount={} dualPoolItemCount={} scannedItemCount={} "
+                            + "missingFromCurrent={} addedInCurrent={}",
+                    run.getId(), run.getStatus(), unfinished.size(), itemsByIdentity.size(), scannedCount,
+                    describeIdentities(missingFromCurrent), describeIdentities(addedInCurrent));
             return false;
         }
         for (NodeWorkItem item : itemsByIdentity.values()) {
-            boolean applied;
+            NodeWorkItemMutationResult result;
             if (run.getStatus() == AgentRunStatus.CANCELED) {
-                applied = workItemStore.cancel(
+                result = workItemStore.cancel(
                         item.identity(), value(item.getRunControlVersion()), value(item.getClaimEpoch()),
-                        "parent_run_terminal_at_startup:CANCELED").applied();
+                        "parent_run_terminal_at_startup:CANCELED");
             } else {
-                applied = workItemStore.markStale(
+                result = workItemStore.markStale(
                         item.identity(), value(item.getContextVersion()), value(item.getRunControlVersion()),
-                        "parent_run_terminal_at_startup:" + run.getStatus().name()).applied();
+                        "parent_run_terminal_at_startup:" + run.getStatus().name());
             }
-            if (!applied) {
+            if (result == null || !result.applied()) {
                 NodeWorkItem current = workItemStore.findByIdentity(item.identity()).orElse(null);
                 if (current == null || !current.terminal()) {
+                    log.error("启动时无法收口双池遗留工作项: reason=conditional_update_rejected "
+                                    + "runId={} runStatus={} identity={} previousState={} currentState={} "
+                                    + "rejection={} unfinishedItemCount={}",
+                            run.getId(), run.getStatus(), item.identity().describe(), item.getState(),
+                            current == null ? "MISSING" : current.getState(), rejectionDescription(result),
+                            itemsByIdentity.size());
                     return false;
                 }
             }
@@ -175,6 +214,27 @@ public class DualPoolRunAdmissionRegistry {
         log.warn("启动时收口父 Run 已终结的双池工作项: runId={} status={} itemCount={}",
                 run.getId(), run.getStatus(), itemsByIdentity.size());
         return true;
+    }
+
+    private String scannedRunId(Set<NodeWorkItemIdentity> identities) {
+        if (identities == null || identities.isEmpty()) {
+            return "<unknown>";
+        }
+        return identities.iterator().next().runId();
+    }
+
+    private List<String> describeIdentities(Set<NodeWorkItemIdentity> identities) {
+        if (identities == null || identities.isEmpty()) {
+            return List.of();
+        }
+        return identities.stream().map(NodeWorkItemIdentity::describe).sorted().toList();
+    }
+
+    private String rejectionDescription(NodeWorkItemMutationResult result) {
+        if (result == null) {
+            return "mutation_result_missing";
+        }
+        return result.rejection() == null ? "reason_unknown" : result.rejection().describe();
     }
 
     private boolean terminal(AgentRunStatus status) {
