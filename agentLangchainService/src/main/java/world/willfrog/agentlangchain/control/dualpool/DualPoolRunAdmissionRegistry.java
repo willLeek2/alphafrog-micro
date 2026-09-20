@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -102,6 +103,9 @@ public class DualPoolRunAdmissionRegistry {
         for (Map.Entry<String, Set<NodeWorkItemIdentity>> entry : identitiesByRun.entrySet()) {
             String runId = entry.getKey();
             AgentRun run = runMapper.findById(runId);
+            if (closeTerminalResidue(run, entry.getValue())) {
+                continue;
+            }
             ToolJobAnchor anchor = parseRecoverableAnchor(run);
             // LINEAR 长工具挂起时只能有锚点指向的这一条未完成工作项。若同一 Run 还残留
             // 其他未完成行，就无法证明它们也属于这次恢复，整个 Run 都保持失败关闭。
@@ -124,6 +128,67 @@ public class DualPoolRunAdmissionRegistry {
             log.error("检测到无法证明来源的双池遗留工作项；本进程关闭 DUAL_POOL_V1 新建准入，"
                     + "已验证的长工具 Run 仍可继续恢复");
         }
+    }
+
+    /**
+     * 父 Run 已经提交终态后，遗留工作项不再具备任何执行权，可以在启动时按精确版本收口。
+     *
+     * <p>这条路径只处理本轮无遗漏扫描读到的 {@code DUAL_POOL_V1} 工作项。取消终态保留
+     * {@code CANCELED} 语义；其他终态把工作项标成 {@code STALE}，表示父 Run 已经先结束。
+     * 每一行仍使用五字段身份和当前版本做条件更新；取消还会核对领取代际。任何一行不能被
+     * 证明已经进入终态，就返回 false，让启动保护继续失败关闭。</p>
+     */
+    private boolean closeTerminalResidue(AgentRun run, Set<NodeWorkItemIdentity> scannedIdentities) {
+        if (run == null || !SchedulerVersion.DUAL_POOL_V1.name().equals(run.getSchedulerVersion())
+                || !terminal(run.getStatus()) || scannedIdentities == null
+                || scannedIdentities.isEmpty()) {
+            return false;
+        }
+        List<NodeWorkItem> unfinished = workItemStore.listUnfinishedByRun(run.getId());
+        Map<NodeWorkItemIdentity, NodeWorkItem> itemsByIdentity = new java.util.LinkedHashMap<>();
+        for (NodeWorkItem item : unfinished) {
+            if (item != null && SchedulerVersion.DUAL_POOL_V1.name().equals(item.getSchedulerVersion())) {
+                itemsByIdentity.put(item.identity(), item);
+            }
+        }
+        if (!itemsByIdentity.keySet().equals(scannedIdentities)) {
+            return false;
+        }
+        for (NodeWorkItem item : itemsByIdentity.values()) {
+            boolean applied;
+            if (run.getStatus() == AgentRunStatus.CANCELED) {
+                applied = workItemStore.cancel(
+                        item.identity(), value(item.getRunControlVersion()), value(item.getClaimEpoch()),
+                        "parent_run_terminal_at_startup:CANCELED").applied();
+            } else {
+                applied = workItemStore.markStale(
+                        item.identity(), value(item.getContextVersion()), value(item.getRunControlVersion()),
+                        "parent_run_terminal_at_startup:" + run.getStatus().name()).applied();
+            }
+            if (!applied) {
+                NodeWorkItem current = workItemStore.findByIdentity(item.identity()).orElse(null);
+                if (current == null || !current.terminal()) {
+                    return false;
+                }
+            }
+        }
+        log.warn("启动时收口父 Run 已终结的双池工作项: runId={} status={} itemCount={}",
+                run.getId(), run.getStatus(), itemsByIdentity.size());
+        return true;
+    }
+
+    private boolean terminal(AgentRunStatus status) {
+        return status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED
+                || status == AgentRunStatus.EXPIRED;
+    }
+
+    private long value(Long value) {
+        return value == null ? 0L : value;
+    }
+
+    private int value(Integer value) {
+        return value == null ? 0 : value;
     }
 
     private ToolJobAnchor parseRecoverableAnchor(AgentRun run) {
