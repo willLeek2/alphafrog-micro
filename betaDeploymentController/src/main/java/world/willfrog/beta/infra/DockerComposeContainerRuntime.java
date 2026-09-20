@@ -365,9 +365,6 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         app.put("stop_grace_period", service.path("runtime").path("drainGraceSeconds").asInt() + "s");
         boolean agentService = "agent-service".equals(service.path("serviceName").asText());
         boolean laneDeployment = !"main-beta".equals(plan.trafficScopeId());
-        boolean toolJobProcessHaltAllowed = agentService
-                && laneDeployment
-                && service.path("runtime").path("allowToolJobProcessHalt").asBoolean(false);
         if (agentService) {
             // 长工具进程级故障演练会让 Agent 主进程立即退出。由 Docker 用原容器、原镜像和
             // 原环境重新拉起，避免把「恢复同一部署」误做成一次新的蓝绿发布。
@@ -393,12 +390,8 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             environment.put("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED",
                     Boolean.toString(laneDeployment));
             environment.put("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT",
-                    Boolean.toString(toolJobProcessHaltAllowed));
-            // 进程终止演练只对双 Worker 池的持久恢复链有意义。部署单显式授权这一项时，
-            // 同一个专用泳道的新 Run 也必须固定进入 DUAL_POOL_V1，避免用旧串行链产出无效样本。
-            if (toolJobProcessHaltAllowed) {
-                environment.put("AF_AGENT_NEW_RUN_SCHEDULER_VERSION", "DUAL_POOL_V1");
-            }
+                    Boolean.toString(laneDeployment
+                            && service.path("runtime").path("allowToolJobProcessHalt").asBoolean(false)));
         }
         // 泳道配置链入口：Nacos 配置桥/沙箱监听读它构造 "{scopeId}.{dataId}" 候选；
         // 所有非主 Beta 的业务容器都要有（不只 frontend），否则泳道容器读不到泳道覆盖配置。

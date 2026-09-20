@@ -24,6 +24,12 @@ public class SchedulerVersionPolicy {
     }
 
     public String versionForNewRun() {
+        // 进程终止演练只对双 Worker 池的持久恢复链有意义。这个开关只由隔离的
+        // 长工具验收泳道显式授权；授权后强制新 Run 进入双池，避免旧串行链产出无效样本。
+        if (environment.getProperty(
+                "agent.tool-job.fault-injection.allow-process-halt", Boolean.class, false)) {
+            return DUAL_POOL_V1;
+        }
         return requireKnown(environment.getProperty(
                 "agent.langchain.dual-pool.new-run-scheduler-version", LEGACY));
     }
