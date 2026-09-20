@@ -327,6 +327,194 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
     }
 
+    /**
+     * 双池 Run 的首个协调回合：只完成运行前检查与规划，不执行任何 Todo 节点。
+     *
+     * <p>返回后协调线程必须立即释放。调用方用冻结 Plan 生成通用节点工作项；节点执行、
+     * 结果接入和下一轮协调都由后续独立回合完成。</p>
+     */
+    public DualPoolPlanPreparation prepareDualPoolRun(AgentRun initialRun) {
+        if (initialRun == null || isBlank(initialRun.getId())) {
+            return null;
+        }
+        AgentRun run = findLocalRun(initialRun.getId());
+        if (run == null || run.getStatus() != AgentRunStatus.RECEIVED) {
+            return null;
+        }
+        String runId = run.getId();
+        String userId = run.getUserId();
+        String userGoal = "";
+        String stage = "prepare_run_context";
+        try {
+            if (!prepareRunContext(run)) {
+                return null;
+            }
+            stage = "precheck_runnable";
+            if (!precheckRunnable(run)) {
+                return null;
+            }
+            emitExecutionStarted(run);
+            stage = "resolve_stage_inputs";
+            StageInputs inputs = resolveStageInputs(run);
+            userGoal = inputs.userGoal();
+            stage = "resolve_plan";
+            PlanResolution resolution = resolvePlan(run, inputs);
+            return new DualPoolPlanPreparation(
+                    run,
+                    resolution.plan(),
+                    resolution.useDag(),
+                    resolution.effectiveExecutionMode());
+        } catch (Exception e) {
+            log.error("双池 Run 的规划回合失败: runId={}", runId, e);
+            publishFailure(runId, userId, userGoal,
+                    LangchainWorkflowResult.builder()
+                            .success(false)
+                            .failureReason(e.getMessage())
+                            .toolCallsUsed(0)
+                            .build(),
+                    e, stage);
+            tryScheduleSettlement(runId, userId);
+            return null;
+        } finally {
+            AgentContext.clear();
+        }
+    }
+
+    /**
+     * 节点 Worker 在每个执行分段开始前从 Run 的持久化配置重建模型、工具和对话上下文。
+     * 不重新规划，也不改变 Run 状态。
+     */
+    public DualPoolNodeContext rebuildDualPoolNodeContext(String runId) throws Exception {
+        AgentRun run = findLocalRun(runId);
+        if (run == null || run.getStatus() != AgentRunStatus.EXECUTING) {
+            return null;
+        }
+        if (!prepareRunContext(run)) {
+            return null;
+        }
+        if (isBlank(run.getPlanJson())) {
+            throw new IllegalStateException("dual_pool_plan_missing");
+        }
+        StageInputs inputs = resolveStageInputs(run);
+        LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+        return new DualPoolNodeContext(
+                run,
+                plan,
+                inputs.userGoal(),
+                inputs.stageModels(),
+                inputs.workflowRequest());
+    }
+
+    /**
+     * Run 协调侧把已经由节点池汇总好的最终工作流结果写回原有终态出口。
+     * 这保证双池版本不会另造一套完成事件、消息、额度结算和终态快照语义。
+     */
+    public boolean persistDualPoolWorkflowResult(DualPoolNodeContext context,
+                                                 LangchainWorkflowResult result) {
+        if (context == null || context.run() == null || result == null) {
+            return false;
+        }
+        AgentRun run = context.run();
+        String runId = run.getId();
+        String userId = run.getUserId();
+        if (result.isSuspended()) {
+            result = LangchainWorkflowResult.builder()
+                    .success(false)
+                    .failureReason("dual_pool_long_tool_resume_not_enabled")
+                    .plan(context.plan())
+                    .completedTodos(result.getCompletedTodos())
+                    .toolCallsUsed(result.getToolCallsUsed())
+                    .build();
+        }
+        if (result.isInterrupted() || abortIfStopped(runId, userId, "dual_pool_before_persist")) {
+            return hasDurableStopState(runId);
+        }
+        updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, writeJson(result.getPlan()));
+        if (result.isSuccess()) {
+            return persistCompletedOutcome(
+                    run, context.userGoal(), context.stageModels(), result, null);
+        }
+        if (result.isPartial()) {
+            return persistPartialOutcome(
+                    run, context.userGoal(), context.stageModels(), result, null);
+        }
+        boolean durable = publishFailureInternal(
+                runId, userId, context.userGoal(), result, null, null, "dual_pool_persist");
+        if (durable) {
+            tryScheduleSettlement(runId, userId);
+        }
+        return durable;
+    }
+
+    /** 当前节点分段结束时清理线程本地上下文；数据库结果由工作项状态机负责。 */
+    public void clearDualPoolNodeContext() {
+        AgentContext.clear();
+    }
+
+    /** 节点池线程会被复用；这里只清线程本地变量，Run 级资源必须等终态统一关闭。 */
+    public void clearDualPoolNodeContext(String runId) {
+        AgentContext.clear();
+    }
+
+    /** Run 已确认进入数据库终态后，统一关闭会话并清理 Run 级编号状态。 */
+    public void completeDualPoolRunCleanup(String runId) {
+        try {
+            DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
+            if (debugObservabilityService != null && !isBlank(runId)) {
+                debugObservabilityService.closeRunSession(runId);
+            }
+        } catch (Exception debugCloseEx) {
+            log.warn("双池 Run 终态关闭调试会话失败: runId={} reason={}", runId, debugCloseEx.getMessage());
+        }
+        try {
+            AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
+            if (registry != null && !isBlank(runId)) {
+                registry.reset(runId);
+            }
+        } catch (Exception cleanupEx) {
+            log.warn("双池 Run 终态清理数据集编号状态失败: runId={} reason={}", runId, cleanupEx.getMessage());
+        } finally {
+            AgentContext.clear();
+        }
+    }
+
+    /** 规划工作项或冻结计划损坏时，不要求先构造一个不存在的计划对象。 */
+    public boolean persistDualPoolFailureWithoutPlan(AgentRun run,
+                                                     String reason,
+                                                     Map<String, Object> failureMetadata,
+                                                     int toolCallsUsed) {
+        if (run == null || run.getStatus() != AgentRunStatus.EXECUTING) {
+            return false;
+        }
+        boolean durable = publishFailureInternal(
+                run.getId(), run.getUserId(), "",
+                LangchainWorkflowResult.builder()
+                        .success(false)
+                        .failureReason(reason)
+                        .failureMetadata(failureMetadata)
+                        .toolCallsUsed(Math.max(0, toolCallsUsed))
+                        .build(),
+                null, null, "dual_pool_coordination");
+        if (durable) {
+            tryScheduleSettlement(run.getId(), run.getUserId());
+        }
+        return durable;
+    }
+
+    /** 双池节点沿用旧 LINEAR 的事件字段和失败即忽略策略，避免再手抄一套观测合同。 */
+    public void emitDualPoolTodoNodeEvent(String runId,
+                                          String userId,
+                                          String eventType,
+                                          TodoItem item,
+                                          String reason,
+                                          long durationMs,
+                                          Map<String, Object> failureMetadata,
+                                          boolean recovered,
+                                          String recoveryOutcome) {
+        emitTodoNodeEvent(runId, userId, eventType, item, reason, durationMs,
+                failureMetadata, recovered, recoveryOutcome);
+    }
+
     /** 当前执行形态的标识，进 EXECUTION_STARTED 事件的 workflow 字段；子类按形态覆盖。 */
     protected String formKind() {
         return "pending_plan";
@@ -543,6 +731,21 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                     boolean useDag,
                                     PlanExecutionMode effectiveExecutionMode,
                                     WorkflowExecutionCheckpoint restartCheckpoint) {
+    }
+
+    /** Run 协调回合冻结下来的计划，不携带只能在当前线程使用的模型对象。 */
+    public record DualPoolPlanPreparation(AgentRun run,
+                                         LangchainTodoPlan plan,
+                                         boolean useDag,
+                                         PlanExecutionMode effectiveExecutionMode) {
+    }
+
+    /** 节点 Worker 从数据库重建的本段执行上下文。 */
+    public record DualPoolNodeContext(AgentRun run,
+                                      LangchainTodoPlan plan,
+                                      String userGoal,
+                                      LangchainRunStageModelResolver.StageModels stageModels,
+                                      LangchainWorkflowRequest workflowRequest) {
     }
 
     boolean executeResumedRun(AgentRun initialRun,

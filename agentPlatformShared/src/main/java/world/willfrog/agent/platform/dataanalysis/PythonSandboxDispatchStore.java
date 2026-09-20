@@ -8,6 +8,16 @@ import java.time.Instant;
  */
 public interface PythonSandboxDispatchStore {
 
+    /**
+     * 当前 Run 是否必须在调用 Python 沙箱前失败关闭。
+     *
+     * <p>默认返回 {@code false}，兼容没有调度器版本概念的调用方。具体实现可以据 Run 的冻结调度器
+     * 版本阻止不支持的“后台长工具挂起”协议，避免已经产生外部副作用后才发现当前执行器无法恢复。</p>
+     */
+    default boolean isInvocationBlocked(String runId) {
+        return false;
+    }
+
     /** 在 createTask 前抢占空 anchor；成功后 PREPARING reservation 才有持久化 owner。 */
     boolean persistPreparing(String runId, ToolJobAnchor anchor);
 

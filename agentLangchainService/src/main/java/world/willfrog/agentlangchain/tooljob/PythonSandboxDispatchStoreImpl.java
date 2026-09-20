@@ -8,6 +8,8 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 
 import java.time.Instant;
@@ -37,6 +39,19 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
         this.config = config;
         this.trackerProvider = trackerProvider;
         this.metrics = metrics;
+    }
+
+    @Override
+    public boolean isInvocationBlocked(String runId) {
+        try {
+            // 双池骨架当前没有 WAITING_TOOL_JOB 的节点续跑协议。必须在 createTask 之前拒绝，
+            // 不能先启动外部任务、再把 Run 留在一个双池无法恢复的中间状态。
+            return SchedulerVersion.fromWire(anchorService.loadSchedulerVersion(runId)).isDualPool();
+        } catch (UnknownSchedulerVersionException e) {
+            log.error("Python sandbox invocation rejected because scheduler version is unavailable: runId={}",
+                    runId, e);
+            return true;
+        }
     }
 
     @Override

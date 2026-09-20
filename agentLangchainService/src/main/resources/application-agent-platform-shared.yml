@@ -74,6 +74,35 @@ agent:
       scheduler:
         max-capacity-units: ${AF_AGENT_RUN_SCHEDULER_MAX_CAPACITY_UNITS:4}
         advanced-diagnostics-enabled: ${AF_AGENT_RUN_SCHEDULER_ADVANCED_DIAGNOSTICS_ENABLED:false}
+    dual-pool:
+      # 只在创建 Run 时读取并冻结；LEGACY / DUAL_POOL_V1 之外的值失败关闭。
+      new-run-scheduler-version: ${AF_AGENT_NEW_RUN_SCHEDULER_VERSION:LEGACY}
+      business-admission-limit: ${AF_AGENT_DUAL_POOL_BUSINESS_ADMISSION_LIMIT:100}
+      # 每个 Run 同时存在的未完成工作项上限；创建工作项前按数据库实时计数。
+      per-run-unfinished-limit: ${AF_AGENT_DUAL_POOL_PER_RUN_UNFINISHED_LIMIT:256}
+      # 两个物理池都使用直接移交，不在 ThreadPoolTaskExecutor 内形成第二层队列。
+      # hint 队列只是延迟优化；数据库扫描负责在提示丢失后重新发现工作。
+      hint-drain-interval-ms: ${AF_AGENT_DUAL_POOL_HINT_DRAIN_INTERVAL_MS:50}
+      run-worker:
+        core-pool-size: ${AF_AGENT_RUN_COORDINATION_CORE_POOL_SIZE:2}
+        max-pool-size: ${AF_AGENT_RUN_COORDINATION_MAX_POOL_SIZE:2}
+        keep-alive-seconds: ${AF_AGENT_RUN_COORDINATION_KEEP_ALIVE_SECONDS:60}
+        thread-name-prefix: ${AF_AGENT_RUN_COORDINATION_THREAD_NAME_PREFIX:agent-run-coordination-}
+        hint-capacity: ${AF_AGENT_RUN_COORDINATION_HINT_CAPACITY:256}
+        submit-budget: ${AF_AGENT_RUN_COORDINATION_SUBMIT_BUDGET:32}
+        permit-limit: ${AF_AGENT_RUN_COORDINATION_PERMIT_LIMIT:2}
+      node-worker:
+        core-pool-size: ${AF_AGENT_NODE_WORKER_CORE_POOL_SIZE:4}
+        max-pool-size: ${AF_AGENT_NODE_WORKER_MAX_POOL_SIZE:4}
+        keep-alive-seconds: ${AF_AGENT_NODE_WORKER_KEEP_ALIVE_SECONDS:60}
+        thread-name-prefix: ${AF_AGENT_NODE_WORKER_THREAD_NAME_PREFIX:agent-node-}
+        hint-capacity: ${AF_AGENT_NODE_WORKER_HINT_CAPACITY:1024}
+        submit-budget: ${AF_AGENT_NODE_WORKER_SUBMIT_BUDGET:64}
+        permit-limit: ${AF_AGENT_NODE_WORKER_PERMIT_LIMIT:4}
+        claim-lease-seconds: ${AF_AGENT_NODE_WORKER_CLAIM_LEASE_SECONDS:300}
+      scan:
+        interval-ms: ${AF_AGENT_DUAL_POOL_SCAN_INTERVAL_MS:1000}
+        batch-size: ${AF_AGENT_DUAL_POOL_SCAN_BATCH_SIZE:100}
   tool-cache:
     version: ${AF_AGENT_TOOL_CACHE_VERSION:v1}
     search-ttl-seconds: ${AF_AGENT_TOOL_CACHE_SEARCH_TTL_SECONDS:3600}

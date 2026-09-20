@@ -108,6 +108,15 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             // emit STARTED
             emitToolCallStarted(toolCallId, request.name(), params);
 
+            if ("executePython".equals(request.name())
+                    && pythonSandboxDispatchStore != null
+                    && pythonSandboxDispatchStore.isInvocationBlocked(AgentContext.getRunId())) {
+                String output = "DUAL_POOL_PYTHON_TOOL_UNSUPPORTED: executePython is disabled for this "
+                        + "scheduler version because the call may require durable node resume";
+                emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
+                return output;
+            }
+
             Instant start = Instant.now();
             String output = null;
             boolean success = true;

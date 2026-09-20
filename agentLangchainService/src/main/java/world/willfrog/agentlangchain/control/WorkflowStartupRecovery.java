@@ -14,6 +14,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 
@@ -39,6 +40,7 @@ public class WorkflowStartupRecovery {
     private final AgentRunEventService eventService;
     private final AgentRunFinalizationService finalizationService;
     private final RunOwnershipGateway ownershipGateway;
+    private final SchedulerVersionPolicy schedulerVersionPolicy;
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
@@ -80,6 +82,22 @@ public class WorkflowStartupRecovery {
                     finalizationService.publishFinalizedEvent(
                             runId, userId, AgentRunStatus.CANCELED.name());
                 }
+                return;
+            }
+            // 双池第一阶段不具备跨进程恢复协议。这里必须在 claim 与状态修改之前跳过，
+            // 保留数据库记录供读取、观察和显式取消；不能错误接回 LEGACY 调度器。
+            boolean dualPool;
+            try {
+                dualPool = schedulerVersionPolicy.isDualPool(candidate);
+            } catch (IllegalStateException unknownVersion) {
+                // 未知版本不能被启动扫描改写成 LEGACY，也不能推进状态；保留原记录供人工检查。
+                log.error("Run 的调度器版本未知，启动恢复保持失败关闭: runId={} schedulerVersion={}",
+                        runId, candidate.getSchedulerVersion());
+                return;
+            }
+            if (dualPool) {
+                log.warn("双池 Run 在服务启动后保持失败关闭，不自动领取: runId={} status={}",
+                        runId, status);
                 return;
             }
             int attempt = candidate.getRestartAttempt() == null ? 0 : candidate.getRestartAttempt();

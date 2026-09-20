@@ -11,6 +11,8 @@ import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
@@ -35,6 +37,8 @@ public class AgentLangchainRunService {
     private final AgentCreditService creditService;
     private final UserDao userDao;
     private final RunOwnershipGateway ownershipGateway;
+    private final SchedulerVersionPolicy schedulerVersionPolicy;
+    private final DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         String userId = request.getUserId();
@@ -58,7 +62,15 @@ public class AgentLangchainRunService {
         LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
         LangchainRunConcurrencyScheduler.Reservation reservation = null;
         AgentRun run = null;
-        if (pipeline != null) {
+        // 版本在创建前选择并写进 Run。只有旧版本预占旧调度器名额；双池版本只在数据库
+        // 记录写稳后补发提示，提示丢失由扫描恢复。
+        String schedulerVersion = schedulerVersionPolicy.versionForNewRun();
+        if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)
+                && dualPoolRunAdmissionRegistry.startupResidueBlocked()) {
+            throw new world.willfrog.agentlangchain.control.LangchainRunRejectedException(
+                    "dual_pool_startup_residue_blocked", "startup_residue_blocked");
+        }
+        if (pipeline != null && SchedulerVersionPolicy.LEGACY.equals(schedulerVersion)) {
             reservation = runConcurrencyScheduler.reserve();
         }
         try {
@@ -77,16 +89,25 @@ public class AgentLangchainRunService {
                     deploymentIdentity.deploymentId(),
                     deploymentIdentity.generationId(),
                     LaneScopeGateway.currentLaneTag(),
+                    schedulerVersion,
                     request.getGenerateArtifacts(),
                     isAdminUser(userId)
             );
 
             if (pipeline != null) {
-                log.info("Launching langchain linear pipeline for run {}", run.getId());
+                if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
+                    // 只把当前进程新建且已经落库的 Run 加入双池；该集合不跨重启恢复。
+                    if (!dualPoolRunAdmissionRegistry.admitNewRun(run.getId())) {
+                        throw new world.willfrog.agentlangchain.control.LangchainRunRejectedException(
+                                "dual_pool_business_admission_full", "business_admission_full");
+                    }
+                }
+                log.info("Launching langchain pipeline for run {} with schedulerVersion={}",
+                        run.getId(), schedulerVersion);
                 pipeline.launchAsync(run, reservation);
                 reservation = null;
             } else {
-                log.warn("LangchainLinearRunPipeline not registered; run {} created but not executed", run.getId());
+                log.warn("Langchain run pipeline not registered; run {} created but not executed", run.getId());
             }
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         } catch (RuntimeException e) {
@@ -94,6 +115,9 @@ public class AgentLangchainRunService {
                 runConcurrencyScheduler.release(reservation);
             }
             if (run != null) {
+                if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
+                    dualPoolRunAdmissionRegistry.forgetFailedAdmission(run.getId());
+                }
                 markEnqueueFailed(agentEventService, run, e);
             }
             throw e;

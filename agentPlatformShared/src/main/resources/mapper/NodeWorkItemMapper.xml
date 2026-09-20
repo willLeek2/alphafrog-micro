@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.NodeWorkItemMapper">
+
+    <!--
+      通用节点工作项表。所有状态迁移都是带版本条件的更新语句：条件不匹配时影响行数为 0，
+      调用方据此判定「没写进去」，不允许先读后写。
+      终态取值只在这里声明一份（terminalStates），热扫描、部分索引与 Java 枚举三处必须一致；
+      NodeWorkItemMapperBindingTest 会把这份字面量与 NodeWorkItemState.terminalWireValues() 逐项比对。
+    -->
+
+    <resultMap id="NodeWorkItemResultMap" type="world.willfrog.agent.platform.workitem.NodeWorkItem">
+        <id property="id" column="id"/>
+        <result property="runId" column="run_id"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="nodeId" column="node_id"/>
+        <result property="nodeAttempt" column="node_attempt"/>
+        <result property="segmentSequence" column="segment_sequence"/>
+        <result property="state" column="state"/>
+        <result property="contextVersion" column="context_version"/>
+        <result property="runControlVersion" column="run_control_version"/>
+        <result property="claimEpoch" column="claim_epoch"/>
+        <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="claimedBy" column="claimed_by"/>
+        <result property="leaseExpiresAt" column="lease_expires_at"/>
+        <result property="nextVisibleAt" column="next_visible_at"/>
+        <result property="payloadJson" column="payload_json"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="workItemColumns">
+        id,
+        run_id,
+        plan_generation,
+        node_id,
+        node_attempt,
+        segment_sequence,
+        state,
+        context_version,
+        run_control_version,
+        claim_epoch,
+        scheduler_version,
+        claimed_by,
+        lease_expires_at,
+        next_visible_at,
+        payload_json::text AS payload_json,
+        created_at,
+        updated_at
+    </sql>
+
+    <sql id="identityFence">
+        run_id = #{runId}
+        AND plan_generation = #{planGeneration}
+        AND node_id = #{nodeId}
+        AND node_attempt = #{nodeAttempt}
+        AND segment_sequence = #{segmentSequence}
+    </sql>
+
+    <!-- 终态：分段结果已提交、执行失败、被取消、已过期。写成一行，免得拼接出多余空白影响部分索引匹配。 -->
+    <sql id="terminalStates">'RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE'</sql>
+
+    <!-- ==================== 创建 ==================== -->
+
+    <!-- 同一个身份已经有一行时返回 0：身份唯一靠这条唯一约束，不靠条件更新。 -->
+    <insert id="insert" parameterType="world.willfrog.agent.platform.workitem.NodeWorkItem">
+        INSERT INTO alphafrog_agent_run_work_item
+        (run_id, plan_generation, node_id, node_attempt, segment_sequence,
+         state, context_version, run_control_version, claim_epoch, scheduler_version,
+         claimed_by, lease_expires_at, next_visible_at, payload_json)
+        VALUES
+        (#{runId}, #{planGeneration}, #{nodeId}, #{nodeAttempt}, #{segmentSequence},
+         COALESCE(#{state}, 'RUNNABLE'), #{contextVersion}, #{runControlVersion},
+         COALESCE(#{claimEpoch}, 0), COALESCE(#{schedulerVersion}, 'DUAL_POOL_V1'),
+         #{claimedBy}, #{leaseExpiresAt}, COALESCE(#{nextVisibleAt}, CURRENT_TIMESTAMP),
+         COALESCE(CAST(#{payloadJson} AS jsonb), '{}'::jsonb))
+        ON CONFLICT (run_id, plan_generation, node_id, node_attempt, segment_sequence) DO NOTHING
+    </insert>
+
+    <!-- ==================== 读 ==================== -->
+
+    <select id="findByIdentity" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE <include refid="identityFence"/>
+    </select>
+
+    <select id="scanClaimable" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE scheduler_version = #{schedulerVersion}
+          AND state = 'RUNNABLE'
+          AND next_visible_at &lt;= CURRENT_TIMESTAMP
+        ORDER BY next_visible_at, id
+        LIMIT #{limit}
+    </select>
+
+    <select id="listUnfinishedByRun" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE run_id = #{runId}
+          AND state NOT IN (<include refid="terminalStates"/>)
+        ORDER BY plan_generation, node_attempt, segment_sequence, id
+    </select>
+
+    <select id="listUnfinishedBySchedulerVersion" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE scheduler_version = #{schedulerVersion}
+          AND state NOT IN (<include refid="terminalStates"/>)
+        ORDER BY id
+        LIMIT #{limit}
+    </select>
+
+    <select id="countUnfinished" resultType="int">
+        SELECT COUNT(*)
+        FROM alphafrog_agent_run_work_item
+        WHERE state NOT IN (<include refid="terminalStates"/>)
+    </select>
+
+    <select id="countUnfinishedByRun" resultType="int">
+        SELECT COUNT(*)
+        FROM alphafrog_agent_run_work_item
+        WHERE run_id = #{runId}
+          AND state NOT IN (<include refid="terminalStates"/>)
+    </select>
+
+    <select id="maxPlanGenerationByRun" resultType="int">
+        SELECT COALESCE(MAX(plan_generation), -1)
+        FROM alphafrog_agent_run_work_item
+        WHERE run_id = #{runId}
+    </select>
+
+    <select id="countUnfinishedBySchedulerVersion" resultType="int">
+        SELECT COUNT(*)
+        FROM alphafrog_agent_run_work_item
+        WHERE scheduler_version = #{schedulerVersion}
+          AND state NOT IN (<include refid="terminalStates"/>)
+    </select>
+
+    <select id="maxUnfinishedPerRun" resultType="int">
+        SELECT COALESCE(MAX(unfinished), 0)
+        FROM (
+            SELECT COUNT(*) AS unfinished
+            FROM alphafrog_agent_run_work_item
+            WHERE state NOT IN (<include refid="terminalStates"/>)
+            GROUP BY run_id
+        ) per_run
+    </select>
+
+    <!-- ==================== 状态迁移 ==================== -->
+
+    <!--
+      条件领取：可运行 + 三类期望版本（计划代际在身份里、上下文版本、控制版本）匹配。
+      领取代际在这里原子加一；返回 null 表示这次没领到，本次放弃。
+    -->
+    <select id="claim" resultType="java.lang.Integer" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'CLAIMED',
+            claim_epoch = claim_epoch + 1,
+            claimed_by = #{claimedBy},
+            lease_expires_at = #{leaseExpiresAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND scheduler_version = #{schedulerVersion}
+          AND state = 'RUNNABLE'
+          AND next_visible_at &lt;= CURRENT_TIMESTAMP
+          AND context_version = #{contextVersion}
+          AND run_control_version = #{runControlVersion}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{runId}
+                AND owner_run.plan_generation = #{planGeneration}
+                AND owner_run.run_control_version = #{runControlVersion}
+                AND owner_run.status IN ('RECEIVED', 'EXECUTING')
+          )
+        RETURNING claim_epoch
+    </select>
+
+    <!--
+      显式转交：只在验收控制面确认原执行者已经停止之后使用，不靠租约到期。
+      状态回到已领取，好让新的领取者从「开始执行」往下走。
+    -->
+    <select id="handOverClaim" resultType="java.lang.Integer" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'CLAIMED',
+            claim_epoch = claim_epoch + 1,
+            claimed_by = #{newOwner},
+            lease_expires_at = #{leaseExpiresAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('CLAIMED', 'EXECUTING')
+          AND claim_epoch = #{expectedClaimEpoch}
+        RETURNING claim_epoch
+    </select>
+
+    <update id="startExecution">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'EXECUTING',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state = 'CLAIMED'
+          AND claim_epoch = #{claimEpoch}
+          AND claimed_by = #{claimedBy}
+    </update>
+
+    <!--
+      提交分段结果：五个身份字段 + 四类版本全部参与条件。已过期的旧领取者带着旧代际来提交时，
+      这里影响行数为 0，这一行此刻属于新的领取者。
+    -->
+    <update id="commitSegmentResult">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'RESULT_COMMITTED',
+            payload_json = payload_json || COALESCE(CAST(#{payloadPatchJson} AS jsonb), '{}'::jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state = 'EXECUTING'
+          AND context_version = #{contextVersion}
+          AND run_control_version = #{runControlVersion}
+          AND claim_epoch = #{claimEpoch}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{runId}
+                AND owner_run.plan_generation = #{planGeneration}
+                AND owner_run.run_control_version = #{runControlVersion}
+                AND owner_run.status = 'EXECUTING'
+          )
+    </update>
+
+    <update id="reportExecutionFailure">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'EXECUTION_FAILED',
+            payload_json = payload_json || jsonb_build_object('executionFailure', COALESCE(#{reason}, '')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state = 'EXECUTING'
+          AND claim_epoch = #{claimEpoch}
+          AND claimed_by = #{claimedBy}
+    </update>
+
+    <!-- 续租只改租约到期时间：租约到期本身不换领取者、也不把工作项标成过期。 -->
+    <update id="renewLease">
+        UPDATE alphafrog_agent_run_work_item SET
+            lease_expires_at = #{leaseExpiresAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('CLAIMED', 'EXECUTING')
+          AND claim_epoch = #{claimEpoch}
+          AND claimed_by = #{claimedBy}
+    </update>
+
+    <!-- 控制取消：控制版本与领取代际两个条件都带上；终态工作项不会被这条语句改动。 -->
+    <update id="cancel">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'CANCELED',
+            payload_json = payload_json || jsonb_build_object('cancelReason', COALESCE(#{reason}, '')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state NOT IN (<include refid="terminalStates"/>)
+          AND run_control_version = #{runControlVersion}
+          AND claim_epoch = #{claimEpoch}
+    </update>
+
+    <!-- 判定版本失效：只用在还没进终态的工作项上；条件不匹配说明这行已经换了持有者，不要再动。 -->
+    <update id="markStale">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'STALE',
+            payload_json = payload_json || jsonb_build_object('staleReason', COALESCE(#{reason}, '')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state NOT IN (<include refid="terminalStates"/>)
+          AND context_version = #{contextVersion}
+          AND run_control_version = #{runControlVersion}
+    </update>
+
+</mapper>

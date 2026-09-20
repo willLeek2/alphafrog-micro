@@ -9,6 +9,8 @@ import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agent.platform.capacity.SchedulerBackpressureProbe;
 
 import java.util.Map;
 
@@ -39,6 +41,12 @@ class AgentLangchainHealthControllerTest {
 
     @MockBean
     private AgentLangchainOrchestrator orchestrator;
+
+    @MockBean
+    private DualPoolDispatcher dualPoolDispatcher;
+
+    @MockBean
+    private SchedulerBackpressureProbe schedulerBackpressureProbe;
 
     @Test
     void healthReportsProviderDisabledWithoutReadinessAlert() throws Exception {
@@ -82,6 +90,7 @@ class AgentLangchainHealthControllerTest {
 
     @Test
     void schedulerReturnsSnapshot() throws Exception {
+        when(dualPoolDispatcher.snapshot()).thenReturn(Map.of());
         when(concurrencyScheduler.schedulerSnapshot()).thenReturn(Map.ofEntries(
                 Map.entry("instanceId", "test-app@host-1@123"),
                 Map.entry("running", 3),

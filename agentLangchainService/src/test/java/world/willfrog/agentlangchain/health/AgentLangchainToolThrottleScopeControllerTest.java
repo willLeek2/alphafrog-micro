@@ -9,6 +9,8 @@ import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agent.platform.capacity.SchedulerBackpressureProbe;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -41,6 +43,12 @@ class AgentLangchainToolThrottleScopeControllerTest {
 
     @MockBean
     private AgentLangchainOrchestrator orchestrator;
+
+    @MockBean
+    private DualPoolDispatcher dualPoolDispatcher;
+
+    @MockBean
+    private SchedulerBackpressureProbe schedulerBackpressureProbe;
 
     @Test
     void toolThrottleExposesStablePerNodeScope() throws Exception {

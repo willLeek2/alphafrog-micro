@@ -49,6 +49,14 @@ public class ToolJobAnchorService {
     }
 
     /**
+     * 读取 Run 创建时冻结的调度器版本。工具分发入口用它在产生外部副作用前判定协议能力。
+     */
+    public String loadSchedulerVersion(String runId) {
+        AgentRun run = agentRunMapper.findById(runId);
+        return run == null ? null : run.getSchedulerVersion();
+    }
+
+    /**
      * CAS-update the anchor JSON only, requiring the run to be in {@code expectedStatus}.
      *
      * @return true if the update succeeded, false if the status had changed

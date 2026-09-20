@@ -9,10 +9,14 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.gateway.GatewayTestFixtures;
 
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -28,6 +32,7 @@ class WorkflowStartupRecoveryTest {
     private AgentRunEventService eventService;
     private AgentRunFinalizationService finalizationService;
     private LangchainSchedulerMetrics schedulerMetrics;
+    private SchedulerVersionPolicy schedulerVersionPolicy;
     private WorkflowStartupRecovery recovery;
 
     @BeforeEach
@@ -37,10 +42,12 @@ class WorkflowStartupRecoveryTest {
         eventService = mock(AgentRunEventService.class);
         finalizationService = mock(AgentRunFinalizationService.class);
         schedulerMetrics = mock(LangchainSchedulerMetrics.class);
+        schedulerVersionPolicy = mock(SchedulerVersionPolicy.class);
         // 归属判定由 gateway 承担；这里用真实判定 + 测试固定身份，扫描/认领语句参数保持原样。
         recovery = new WorkflowStartupRecovery(
                 runMapper, pipeline, eventService, finalizationService,
-                GatewayTestFixtures.withIdentity(runMapper, "stable", GENERATION));
+                GatewayTestFixtures.withIdentity(runMapper, "stable", GENERATION),
+                schedulerVersionPolicy);
         ReflectionTestUtils.setField(recovery, "schedulerMetrics", schedulerMetrics);
         ReflectionTestUtils.setField(recovery, "maxRestartAttempts", 1);
         ReflectionTestUtils.setField(recovery, "scanLimit", 100);
@@ -89,6 +96,19 @@ class WorkflowStartupRecoveryTest {
         verify(pipeline, never()).launchRestartedAsync(candidate);
         verify(finalizationService).publishFinalizedEvent("run-1", "user-1", "CANCELED");
         verify(schedulerMetrics).recordCompletion(AgentRunStatus.CANCELED);
+    }
+
+    @Test
+    void dualPoolRunIsNotClaimedAfterProcessRestart() {
+        AgentRun candidate = run(AgentRunStatus.EXECUTING, 0, "{\"items\":[]}");
+        when(schedulerVersionPolicy.isDualPool(candidate)).thenReturn(true);
+
+        recovery.recoverOne(candidate);
+
+        verify(runMapper, never()).claimStartupRestartForDeployment(
+                anyString(), anyString(), anyString(), any(), anyInt(), anyInt());
+        verify(pipeline, never()).launchAsync(any());
+        verify(pipeline, never()).launchRestartedAsync(any());
     }
 
     private AgentRun run(AgentRunStatus status, int restartAttempt, String planJson) {

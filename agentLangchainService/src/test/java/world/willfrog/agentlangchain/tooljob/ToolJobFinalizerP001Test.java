@@ -110,7 +110,10 @@ class ToolJobFinalizerP001Test {
                     ext JSONB DEFAULT '{}',
                     execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
                     restart_attempt INT NOT NULL DEFAULT 0,
-                    tool_job_anchor_json JSONB DEFAULT '{}'
+                    tool_job_anchor_json JSONB DEFAULT '{}',
+                    scheduler_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY',
+                    plan_generation INT NOT NULL DEFAULT -1,
+                    run_control_version BIGINT NOT NULL DEFAULT 0
                 )""");
             stmt.execute("""
                 CREATE TABLE alphafrog_agent_run_event (

@@ -21,6 +21,9 @@
         <result property="updatedAt" column="updated_at"/>
         <result property="completedAt" column="completed_at"/>
         <result property="ext" column="ext"/>
+        <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="runControlVersion" column="run_control_version"/>
         <result property="executionCheckpointJson" column="execution_checkpoint_json"/>
         <result property="restartAttempt" column="restart_attempt"/>
         <result property="toolJobAnchorJson" column="tool_job_anchor_json"/>
@@ -39,13 +42,16 @@
         INSERT INTO alphafrog_agent_run
         (id, user_id, deployment_id, deployment_generation_id, lane_tag,
          status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext,
-         execution_checkpoint_json, restart_attempt, tool_job_anchor_json)
+         execution_checkpoint_json, restart_attempt, tool_job_anchor_json, scheduler_version, plan_generation,
+         run_control_version)
         VALUES
         (#{id}, #{userId}, #{deploymentId}, #{deploymentGenerationId}, #{laneTag},
          #{status}, #{currentStep}, #{maxSteps},
          CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb),
          COALESCE(CAST(#{executionCheckpointJson} AS jsonb), '{}'::jsonb), COALESCE(#{restartAttempt}, 0),
-         COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb))
+         COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb),
+         COALESCE(#{schedulerVersion}, 'LEGACY'), COALESCE(#{planGeneration}, -1),
+         COALESCE(#{runControlVersion}, 0))
     </insert>
 
     <select id="findById" resultMap="AgentRunResultMap">
@@ -65,6 +71,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -90,6 +99,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -117,6 +129,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -143,6 +158,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -167,6 +185,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                COALESCE(
                        CASE
                            WHEN (snapshot_json #>> '{observability,summary,totalDurationMs}') ~ '^[0-9]+$'
@@ -246,6 +267,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -278,6 +302,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -338,6 +365,17 @@
           AND status = #{expectedStatus}
     </update>
 
+    <select id="advancePlanGeneration" resultType="java.lang.Integer" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run
+        SET plan_generation = GREATEST(plan_generation, #{observedWorkItemGeneration}) + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND status = #{expectedStatus}
+          AND plan_generation = #{expectedGeneration}
+        RETURNING plan_generation
+    </select>
+
     <!-- 恢复路径的唯一 checkpoint 写入口：条件只用业务字段，不再按部署身份分叉。 -->
     <update id="updateExecutionCheckpoint">
         UPDATE alphafrog_agent_run
@@ -365,6 +403,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -504,6 +545,10 @@
         UPDATE alphafrog_agent_run
         SET status = 'WAITING',
             snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
@@ -537,6 +582,10 @@
         UPDATE alphafrog_agent_run
         SET status = 'CANCELED',
             snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
@@ -548,6 +597,14 @@
         UPDATE alphafrog_agent_run
         SET status = 'RECEIVED',
             current_step = 0,
+            plan_generation = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN plan_generation + 1
+                ELSE plan_generation
+            END,
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             last_error = NULL,
             completed_at = NULL,
@@ -562,6 +619,14 @@
         SET status = 'RECEIVED',
             current_step = 0,
             plan_json = '{}'::jsonb,
+            plan_generation = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN plan_generation + 1
+                ELSE plan_generation
+            END,
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             last_error = NULL,
             completed_at = NULL,
@@ -1225,6 +1290,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -1295,6 +1363,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -1363,6 +1434,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,

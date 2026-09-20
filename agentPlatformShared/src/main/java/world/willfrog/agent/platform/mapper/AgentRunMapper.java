@@ -59,6 +59,16 @@ public interface AgentRunMapper {
                        @Param("expectedStatus") AgentRunStatus expectedStatus,
                        @Param("planJson") String planJson);
 
+    /**
+     * 为新一轮计划原子分配代际。Run 行是权威，工作项最大代际只作为防回退下限。
+     * 返回 null 表示 Run 状态或调用方读取的旧代际已经变化。
+     */
+    Integer advancePlanGeneration(@Param("id") String id,
+                                  @Param("userId") String userId,
+                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                  @Param("expectedGeneration") int expectedGeneration,
+                                  @Param("observedWorkItemGeneration") int observedWorkItemGeneration);
+
     /** 恢复路径唯一的 checkpoint 写入口：条件只用业务字段，不再按部署身份分叉。 */
     int updateExecutionCheckpoint(@Param("id") String id,
                                   @Param("userId") String userId,

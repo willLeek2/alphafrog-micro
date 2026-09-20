@@ -21,6 +21,15 @@ public class AgentRun {
     private String deploymentGenerationId;
     /** 创建请求携带的泳道标签；主 Beta 和生产流量为 null。 */
     private String laneTag;
+    /**
+     * 这个 Run 冻结的调度器版本，创建时一次写死、之后不再改；取值只有 LEGACY 与 DUAL_POOL_V1。
+     * 库里是原始字符串，读出来必须显式经过 {@code SchedulerVersion.fromWire}，未知取值失败关闭。
+     */
+    private String schedulerVersion;
+    /** 当前已经分配到的计划代际；尚未创建双池计划时为 -1。 */
+    private Integer planGeneration;
+    /** 暂停、恢复、取消等控制动作的持久版本；节点提交必须与当前值一致。 */
+    private Long runControlVersion;
     /** 当前 Run 状态；WAITING_TOOL_JOB 表示内存 worker 已退出、但外部作业仍拥有后续恢复权。 */
     private AgentRunStatus status;
     private Integer currentStep;

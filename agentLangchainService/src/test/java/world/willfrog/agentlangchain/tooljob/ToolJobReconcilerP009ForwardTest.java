@@ -82,7 +82,10 @@ class ToolJobReconcilerP009ForwardTest {
                     started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ, ext JSONB DEFAULT '{}',
-                    tool_job_anchor_json JSONB DEFAULT '{}'
+                    tool_job_anchor_json JSONB DEFAULT '{}',
+                    scheduler_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY',
+                    plan_generation INT NOT NULL DEFAULT -1,
+                    run_control_version BIGINT NOT NULL DEFAULT 0
                 )""");
         }
         redisConnectionFactory = new LettuceConnectionFactory(

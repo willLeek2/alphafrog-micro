@@ -14,6 +14,8 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunRejectedException;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
+import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
@@ -47,6 +49,10 @@ class AgentLangchainRunServiceTest {
     private UserDao userDao;
     @Mock
     private DeploymentIdentityProvider deploymentIdentityProvider;
+    @Mock
+    private SchedulerVersionPolicy schedulerVersionPolicy;
+    @Mock
+    private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
 
     private AgentLangchainRunService runService;
 
@@ -55,7 +61,10 @@ class AgentLangchainRunServiceTest {
         runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, scheduler, runMapper,
                 creditService, userDao,
                 world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
-                        withIdentity(runMapper, "stable", GENERATION));
+                        withIdentity(runMapper, "stable", GENERATION),
+                schedulerVersionPolicy, dualPoolRunAdmissionRegistry);
+        lenient().when(schedulerVersionPolicy.versionForNewRun())
+                .thenReturn(SchedulerVersionPolicy.LEGACY);
         lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
         lenient().when(deploymentIdentityProvider.current())
                 .thenReturn(new DeploymentIdentity("stable", GENERATION));
@@ -75,7 +84,7 @@ class AgentLangchainRunServiceTest {
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
-                anyBoolean(), anyBoolean())).thenReturn(run);
+                anyString(), anyBoolean(), anyBoolean())).thenReturn(run);
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("analyze stocks")
@@ -90,8 +99,34 @@ class AgentLangchainRunServiceTest {
         assertEquals("run123", message.getId());
         verify(eventService).createRun(eq("u1"), eq("analyze stocks"), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq("stable"), eq(GENERATION), eq("lane-a"),
-                eq(true), anyBoolean());
+                eq(SchedulerVersionPolicy.LEGACY), eq(true), anyBoolean());
         verify(pipeline).launchAsync(run, reservation);
+    }
+
+    @Test
+    void dualPoolRunFreezesVersionWithoutReservingLegacyScheduler() {
+        when(schedulerVersionPolicy.versionForNewRun())
+                .thenReturn(SchedulerVersionPolicy.DUAL_POOL_V1);
+        when(dualPoolRunAdmissionRegistry.admitNewRun("run-dual")).thenReturn(true);
+        when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
+        when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
+        AgentRun run = new AgentRun();
+        run.setId("run-dual");
+        run.setUserId("u1");
+        run.setSchedulerVersion(SchedulerVersionPolicy.DUAL_POOL_V1);
+        run.setStatus(AgentRunStatus.RECEIVED);
+        when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
+                eq(SchedulerVersionPolicy.DUAL_POOL_V1), anyBoolean(), anyBoolean())).thenReturn(run);
+
+        runService.createRun(CreateAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setMessage("dual pool")
+                .build());
+
+        verify(scheduler, never()).reserve();
+        verify(dualPoolRunAdmissionRegistry).admitNewRun("run-dual");
+        verify(pipeline).launchAsync(run, null);
     }
 
     @Test
@@ -110,7 +145,7 @@ class AgentLangchainRunServiceTest {
         assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
         verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
-                anyBoolean(), anyBoolean());
+                anyString(), anyBoolean(), anyBoolean());
         verify(pipeline, never()).launchAsync(any(), any());
     }
 
@@ -130,7 +165,7 @@ class AgentLangchainRunServiceTest {
         run.setUserId("u1");
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
-                anyBoolean(), anyBoolean())).thenReturn(run);
+                anyString(), anyBoolean(), anyBoolean())).thenReturn(run);
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("hello")
@@ -141,6 +176,6 @@ class AgentLangchainRunServiceTest {
         runService.createRun(request);
         verify(eventService).createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq("stable"), eq(GENERATION), isNull(),
-                anyBoolean(), anyBoolean());
+                eq(SchedulerVersionPolicy.LEGACY), anyBoolean(), anyBoolean());
     }
 }

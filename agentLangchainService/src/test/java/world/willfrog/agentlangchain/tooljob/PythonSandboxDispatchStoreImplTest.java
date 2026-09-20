@@ -31,6 +31,15 @@ class PythonSandboxDispatchStoreImplTest {
     {
         // 本测试类覆盖 durable Redis 派生路径；进程内 tracker 路径由专门测试覆盖。
         config.setDurableRecoveryEnabled(true);
+        when(anchorService.loadSchedulerVersion(any())).thenReturn("LEGACY");
+    }
+
+    @Test
+    void dualPoolRunBlocksPythonBeforeExternalDispatch() {
+        when(anchorService.loadSchedulerVersion("run-dual")).thenReturn("DUAL_POOL_V1");
+
+        assertThat(store.isInvocationBlocked("run-dual")).isTrue();
+        assertThat(store.isInvocationBlocked("run-1")).isFalse();
     }
 
     @Test

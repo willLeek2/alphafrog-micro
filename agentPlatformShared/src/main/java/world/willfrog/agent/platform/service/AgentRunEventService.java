@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
@@ -110,6 +111,9 @@ public class AgentRunEventService {
 
     /**
      * 创建并冻结部署身份。调用方只能传入当前服务实例已经验证过的可信值。
+     *
+     * <p>这个旧重载不接收调度器版本，固定按 {@link SchedulerVersion#DEFAULT_FOR_EXISTING_ROWS}（LEGACY）创建，
+     * 与存量 Run 的取值一致。要用新路径的调用方走带版本的重载。</p>
      */
     public AgentRun createRun(String userId,
                               String message,
@@ -147,7 +151,40 @@ public class AgentRunEventService {
                               String laneTag,
                               boolean generateArtifacts,
                               boolean isAdmin) {
-        log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
+        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson,
+                deploymentId, deploymentGenerationId, laneTag,
+                SchedulerVersion.DEFAULT_FOR_EXISTING_ROWS.name(), generateArtifacts, isAdmin);
+    }
+
+    /**
+     * 创建 Run 并显式冻结调度器版本。
+     *
+     * <p>调用方在创建入口读「此后新 Run 用哪个版本」的开关，把这个值传进来。取值在这里用
+     * {@link SchedulerVersion#fromWire(String)} 解析：认不出的取值直接抛
+     * {@link world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException}，失败关闭，
+     * 不落回 LEGACY。这个值只影响此后新建的 Run；存量 Run 与追问始终按库里已经冻结的取值路由。</p>
+     */
+    public AgentRun createRun(String userId,
+                              String message,
+                              String contextJson,
+                              String idempotencyKey,
+                              String modelName,
+                              String endpointName,
+                              boolean captureLlmRequests,
+                              String provider,
+                              int plannerCandidateCount,
+                              boolean debugMode,
+                              String stageConfigJson,
+                              String deploymentId,
+                              String deploymentGenerationId,
+                              String laneTag,
+                              String schedulerVersion,
+                              boolean generateArtifacts,
+                              boolean isAdmin) {
+        SchedulerVersion frozenSchedulerVersion = SchedulerVersion.fromWire(schedulerVersion);
+        log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}, schedulerVersion={}",
+                userId, stageConfigJson, isAdmin, frozenSchedulerVersion);
         // 生成无连字符 UUID 作为 runId
         String runId = java.util.UUID.randomUUID().toString().replace("-", "");
 
@@ -218,6 +255,10 @@ public class AgentRunEventService {
         run.setDeploymentGenerationId(
                 DeploymentIdentity.requireActiveGenerationId(deploymentGenerationId));
         run.setLaneTag(normalizeLaneTag(laneTag));
+        // 调度器版本在这里一次写死：整次运行只由认识该版本的一种调度器实现消费
+        run.setSchedulerVersion(frozenSchedulerVersion.name());
+        run.setPlanGeneration(-1);
+        run.setRunControlVersion(0L);
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setCurrentStep(0);
         run.setMaxSteps(12);
