@@ -18,6 +18,7 @@ public class BetaControllerProperties {
     private Path healthcheckScript = Path.of("/opt/alphafrog-beta/bin/tcp-healthcheck");
     private final Nacos nacos = new Nacos();
     private final Observability observability = new Observability();
+    private final ToolJobTestControl toolJobTestControl = new ToolJobTestControl();
     private Map<String, Machine> machines = new LinkedHashMap<>();
     private Map<String, ServiceTemplate> services = new LinkedHashMap<>();
 
@@ -37,6 +38,7 @@ public class BetaControllerProperties {
     public void setHealthcheckScript(Path healthcheckScript) { this.healthcheckScript = healthcheckScript; }
     public Nacos getNacos() { return nacos; }
     public Observability getObservability() { return observability; }
+    public ToolJobTestControl getToolJobTestControl() { return toolJobTestControl; }
     public Map<String, Machine> getMachines() { return machines; }
     public void setMachines(Map<String, Machine> machines) { this.machines = machines; }
     public Map<String, ServiceTemplate> getServices() { return services; }
@@ -100,5 +102,29 @@ public class BetaControllerProperties {
         public void setUsername(String username) { this.username = username; }
         public String getPassword() { return password; }
         public void setPassword(String password) { this.password = password; }
+    }
+
+    public static class ToolJobTestControl {
+        private boolean enabled;
+        private String jdbcUrl;
+        private String username;
+        private Path passwordFile = Path.of("/etc/alphafrog-beta/secrets/tool-job-test-db-password");
+        private int maximumFaultTtlSeconds = 1800;
+        private Duration restartTimeout = Duration.ofMinutes(2);
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public String getJdbcUrl() { return jdbcUrl; }
+        public void setJdbcUrl(String jdbcUrl) { this.jdbcUrl = jdbcUrl; }
+        public String getUsername() { return username; }
+        public void setUsername(String username) { this.username = username; }
+        public Path getPasswordFile() { return passwordFile; }
+        public void setPasswordFile(Path passwordFile) { this.passwordFile = passwordFile; }
+        public int getMaximumFaultTtlSeconds() { return maximumFaultTtlSeconds; }
+        public void setMaximumFaultTtlSeconds(int maximumFaultTtlSeconds) {
+            this.maximumFaultTtlSeconds = maximumFaultTtlSeconds;
+        }
+        public Duration getRestartTimeout() { return restartTimeout; }
+        public void setRestartTimeout(Duration restartTimeout) { this.restartTimeout = restartTimeout; }
     }
 }

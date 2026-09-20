@@ -15,6 +15,7 @@ mvn -pl betaDeploymentController -am install
 - 把 `betaDeploymentController/bin/tcp-healthcheck` 安装为 `/opt/alphafrog-beta/bin/tcp-healthcheck`，属主为运行账号，权限为 `0755`。
 - 运行 `deploy/otel/fetch-javaagent.sh` 和 `deploy/otel/verify-javaagent.sh`，再把校验通过的 `deploy/otel/opentelemetry-javaagent.jar` 安装为 `/opt/alphafrog-beta/otel/opentelemetry-javaagent.jar`，权限为 `0444`。
 - 把 `deploy/beta/alphafrog-beta-controller.service` 安装为 `/etc/systemd/system/alphafrog-beta-controller.service`。
+- 把 `deploy/beta/af-beta-tool-job-test` 安装为 `/opt/alphafrog-beta/bin/af-beta-tool-job-test`，权限为 `0755`。脚本只能通过受限 SSH 包装调用控制器回环接口。
 - 把 `deploy/beta/controller.env.example` 和 `deploy/beta/controller.yml.example` 分别复制为 `/etc/alphafrog-beta/controller.env` 和 `/etc/alphafrog-beta/controller.yml`，替换其中的地址占位值。
 
 安装前创建不允许登录的 `alphafrog-beta` 系统账号，以及控制器需要的目录。`/opt/alphafrog-beta/controller`、`/opt/alphafrog-beta/bin` 和 `/opt/alphafrog-beta/otel` 由该账号读取；`/etc/alphafrog-beta` 及其 `services`、`secrets` 子目录只允许 `root` 和该账号读取。systemd 会以 `0700` 创建 `/var/lib/alphafrog-beta`，控制器再在其中保存状态、Compose 文件和日志目录。目标机器使用的 Docker socket 如果不属于 `docker` 组，还要把单元文件中的 `SupplementaryGroups` 改为实际组名。
@@ -27,6 +28,10 @@ sudo chown alphafrog-beta:alphafrog-beta /etc/alphafrog-beta/secrets/controller-
 ```
 
 凭证文件的权限必须是 `0600`。`controller.env` 和每个服务的独立环境文件同样不得允许其他用户读取；服务环境文件名不能是 `.env`。安装完成后先用 `namei -l` 或等价工具逐层核对这些目录和文件没有符号链接、属主正确、权限没有放宽，再启动控制器。
+
+长工具真实故障验收还要单独创建数据库登录账号和 `0600` 密码文件 `/etc/alphafrog-beta/secrets/tool-job-test-db-password`。该账号只用于本机回环控制器，不写进服务环境文件或命令行。默认 `AF_BETA_TOOL_JOB_TEST_CONTROL_ENABLED=false`；只有迁移 `v1.5/005`、`v1.5/006` 已应用、账号权限已经限制到验收所需表后才打开。
+
+控制器的固定 SQL 只需要以下权限：读取 Run 和工作项；只更新 Run 的 `plan_generation`、`updated_at`；在一次性故障表中插入和读取记录；使用故障表序列。数据库管理员应按这些对象授予最小权限，不给建表、删表、删除业务记录或更新其他 Run 字段的权限。Agent 服务继续使用自己的业务账号消费故障记录；控制器账号不代替 Agent 账号。
 
 ## 控制器配置
 
@@ -45,6 +50,10 @@ systemd 单元通过 `/etc/alphafrog-beta/controller.env` 注入开关、监听�
 | `AF_CONFIG_NACOS_NAMESPACE` / `AF_CONFIG_NACOS_USERNAME` / `AF_CONFIG_NACOS_PASSWORD` | Nacos 命名空间和可选鉴权。 |
 | `AF_OTEL_TRACES_ENDPOINT` | Java 服务通过 Java Agent 发送轨迹时使用的生产 Jaeger OTLP HTTP 地址。控制器也会为非 Java 服务生成对应的 `OTEL_*` 环境变量；是否真正导出轨迹取决于服务自身实现。 |
 | `AF_BETA_OTEL_JAVAAGENT_JAR` | 宿主机上已经校验的 OpenTelemetry Java Agent 文件。 |
+| `AF_BETA_TOOL_JOB_TEST_CONTROL_ENABLED` | 是否装配长工具真实故障验收控制面，默认关闭。 |
+| `AF_BETA_TOOL_JOB_TEST_JDBC_URL` / `AF_BETA_TOOL_JOB_TEST_DB_USERNAME` / `AF_BETA_TOOL_JOB_TEST_DB_PASSWORD_FILE` | 控制面专用 PostgreSQL 连接与密码文件。密码不进入环境变量。 |
+| `AF_BETA_TOOL_JOB_TEST_MAXIMUM_FAULT_TTL_SECONDS` | 一次性故障记录允许的最长有效期，默认 1800 秒。 |
+| `AF_BETA_TOOL_JOB_TEST_RESTART_TIMEOUT` | 原地重启 Agent 后等待同一容器恢复健康的上限，默认两分钟。 |
 
 `controller.yml` 为八个主 Beta 服务分别指定环境文件，并按需指定业务数据卷。控制器统一生成以下观测设置，因此服务环境文件里的同名值会被 Compose 的 `environment` 段覆盖：
 

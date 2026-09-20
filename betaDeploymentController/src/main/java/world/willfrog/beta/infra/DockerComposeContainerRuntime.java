@@ -182,6 +182,65 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         return item.isMissingNode() ? missing(containerName) : observation(machineId, containerName, item);
     }
 
+    @Override
+    public ToolJobTestRuntime inspectToolJobTestRuntime(String machineId, String containerName) {
+        JsonNode item = inspectDocument(machineId, containerName);
+        if (item.isMissingNode()) {
+            throw new ControllerException("TOOL_JOB_TEST_CONTAINER_MISSING", "The active Agent container is missing");
+        }
+        Map<String, String> environment = new java.util.HashMap<>();
+        for (JsonNode entry : item.path("Config").path("Env")) {
+            String value = entry.asText();
+            int separator = value.indexOf('=');
+            if (separator > 0) environment.put(value.substring(0, separator), value.substring(separator + 1));
+        }
+        JsonNode labels = item.path("Config").path("Labels");
+        String restartPolicy = item.path("HostConfig").path("RestartPolicy").path("Name").asText();
+        return new ToolJobTestRuntime(
+                item.path("Id").asText(),
+                item.path("State").path("Running").asBoolean(),
+                "healthy".equals(item.path("State").path("Health").path("Status").asText()),
+                labels.path("alphafrog.deployment-id").asText(),
+                labels.path("alphafrog.traffic-scope-id").asText(),
+                labels.path("alphafrog.deployment-generation-id").asText(),
+                environment.getOrDefault("AF_GIT_COMMIT", ""),
+                Boolean.parseBoolean(environment.getOrDefault("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED", "false")),
+                Boolean.parseBoolean(environment.getOrDefault("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED", "false")),
+                Boolean.parseBoolean(environment.getOrDefault("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT", "false")),
+                "unless-stopped".equals(restartPolicy),
+                item.path("RestartCount").asLong(0),
+                item.path("State").path("StartedAt").asText(""));
+    }
+
+    @Override
+    public ContainerObservation restart(String machineId, String containerName, Duration timeout) {
+        JsonNode before = inspectDocument(machineId, containerName);
+        if (before.isMissingNode()) {
+            throw new ControllerException("TOOL_JOB_TEST_CONTAINER_MISSING", "The active Agent container is missing");
+        }
+        String expectedContainerId = before.path("Id").asText();
+        commands.run(docker(machineId, "restart", "--time", "0", containerName), Map.of(),
+                timeout.plusSeconds(15));
+        long deadline = System.nanoTime() + timeout.toNanos();
+        ContainerObservation latest = inspect(machineId, containerName);
+        while (System.nanoTime() < deadline) {
+            if (!expectedContainerId.equals(latest.containerId())) {
+                throw new ControllerException("CONTAINER_IDENTITY_CONFLICT",
+                        "The restarted Agent container identity changed");
+            }
+            if (latest.running() && latest.health() == ContainerObservation.Health.HEALTHY) return latest;
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new ControllerException("COMMAND_INTERRUPTED", "Waiting for Agent restart was interrupted", exception);
+            }
+            latest = inspect(machineId, containerName);
+        }
+        throw new ControllerException("TOOL_JOB_TEST_RESTART_TIMEOUT",
+                "The Agent container did not become healthy after the controlled restart");
+    }
+
     private ContainerObservation observation(String machineId, String containerName, JsonNode item) {
         try {
             String status = item.path("State").path("Health").path("Status").asText("missing");

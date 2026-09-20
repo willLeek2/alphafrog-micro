@@ -35,3 +35,10 @@ alphafrog:
     observability:
       traces-endpoint: ${AF_OTEL_TRACES_ENDPOINT:}
       java-agent-jar: ${AF_BETA_OTEL_JAVAAGENT_JAR:/opt/alphafrog-beta/otel/opentelemetry-javaagent.jar}
+    tool-job-test-control:
+      enabled: ${AF_BETA_TOOL_JOB_TEST_CONTROL_ENABLED:false}
+      jdbc-url: ${AF_BETA_TOOL_JOB_TEST_JDBC_URL:}
+      username: ${AF_BETA_TOOL_JOB_TEST_DB_USERNAME:}
+      password-file: ${AF_BETA_TOOL_JOB_TEST_DB_PASSWORD_FILE:/etc/alphafrog-beta/secrets/tool-job-test-db-password}
+      maximum-fault-ttl-seconds: ${AF_BETA_TOOL_JOB_TEST_MAXIMUM_FAULT_TTL_SECONDS:1800}
+      restart-timeout: ${AF_BETA_TOOL_JOB_TEST_RESTART_TIMEOUT:PT2M}

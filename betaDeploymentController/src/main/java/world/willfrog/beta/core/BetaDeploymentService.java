@@ -266,6 +266,106 @@ public class BetaDeploymentService {
         return store.read(state -> requireDeployment(state, deploymentId).deepCopy());
     }
 
+    public ToolJobTestTarget toolJobTestTarget(String deploymentId, String generationId,
+                                                boolean requireProcessHalt) {
+        mutationLock.lock();
+        try {
+            ToolJobTestTarget target = store.read(state -> {
+                ObjectNode deployment = requireDeployment(state, deploymentId);
+                if ("main-beta".equals(deployment.path("trafficScopeId").asText())) {
+                    throw new ControllerException("TOOL_JOB_TEST_MAIN_BETA_FORBIDDEN",
+                            "Tool-job fault controls are limited to an isolated lane");
+                }
+                if (!"ACTIVE".equals(deployment.path("phase").asText())) {
+                    throw new ControllerException("TOOL_JOB_TEST_DEPLOYMENT_BUSY",
+                            "The lane deployment is not active");
+                }
+                ObjectNode service = requireService(deployment, "agent-service");
+                if (!"STABLE".equals(service.path("phase").asText())
+                        || !service.path("activeInstance").isObject()
+                        || !service.path("candidateInstance").isNull()
+                        || !service.path("drainingInstance").isNull()
+                        || !service.path("operation").isNull()) {
+                    throw new ControllerException("TOOL_JOB_TEST_SERVICE_BUSY",
+                            "The lane Agent service is not in a single stable-instance state");
+                }
+                JsonNode active = service.path("activeInstance");
+                if (!generationId.equals(active.path("deploymentGenerationId").asText())) {
+                    throw new ControllerException("TOOL_JOB_TEST_GENERATION_MISMATCH",
+                            "The requested deployment generation is not active");
+                }
+                JsonNode manifest = store.readManifest(deploymentId);
+                JsonNode agentSpec = findService(manifest, "agent-service");
+                boolean manifestAllowsProcessHalt = agentSpec != null
+                        && agentSpec.path("runtime").path("allowToolJobProcessHalt").asBoolean(false);
+                if (requireProcessHalt && !manifestAllowsProcessHalt) {
+                    throw new ControllerException("TOOL_JOB_TEST_PROCESS_HALT_NOT_ALLOWED",
+                            "The lane manifest does not allow process-halt testing");
+                }
+                return new ToolJobTestTarget(deploymentId, deployment.path("trafficScopeId").asText(),
+                        generationId, manifest.path("gitCommit").asText(), active.path("machineId").asText(),
+                        active.path("containerName").asText(), active.path("containerId").asText(),
+                        manifestAllowsProcessHalt, null);
+            });
+            ContainerRuntime.ToolJobTestRuntime runtime = containers.inspectToolJobTestRuntime(
+                    target.machineId(), target.containerName());
+            requireMatchingToolJobTestRuntime(target, runtime, requireProcessHalt);
+            return new ToolJobTestTarget(target.deploymentId(), target.trafficScopeId(), target.generationId(),
+                    target.gitCommit(), target.machineId(), target.containerName(), target.containerId(),
+                    target.manifestAllowsProcessHalt(), runtime);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    public ToolJobTestTarget restartToolJobAgent(String deploymentId, String generationId) {
+        mutationLock.lock();
+        try {
+            ToolJobTestTarget target = toolJobTestTarget(deploymentId, generationId, true);
+            ContainerRuntime.ContainerObservation restarted = containers.restart(target.machineId(),
+                    target.containerName(), properties.getToolJobTestControl().getRestartTimeout());
+            if (!target.containerId().equals(restarted.containerId())) {
+                throw new ControllerException("CONTAINER_IDENTITY_CONFLICT",
+                        "The controlled restart replaced the Agent container");
+            }
+            ContainerRuntime.ToolJobTestRuntime runtime = containers.inspectToolJobTestRuntime(
+                    target.machineId(), target.containerName());
+            requireMatchingToolJobTestRuntime(target, runtime, true);
+            return new ToolJobTestTarget(target.deploymentId(), target.trafficScopeId(), target.generationId(),
+                    target.gitCommit(), target.machineId(), target.containerName(), target.containerId(),
+                    target.manifestAllowsProcessHalt(), runtime);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    private void requireMatchingToolJobTestRuntime(ToolJobTestTarget target,
+                                                   ContainerRuntime.ToolJobTestRuntime runtime,
+                                                   boolean requireProcessHalt) {
+        if (!runtime.running() || !runtime.healthy()
+                || !target.containerId().equals(runtime.containerId())
+                || !target.deploymentId().equals(runtime.deploymentId())
+                || !target.trafficScopeId().equals(runtime.trafficScopeId())
+                || !target.generationId().equals(runtime.generationId())
+                || !target.gitCommit().equals(runtime.gitCommit())) {
+            throw new ControllerException("TOOL_JOB_TEST_RUNTIME_MISMATCH",
+                    "The active Agent container does not match the persisted lane state");
+        }
+        if (!runtime.durableRecoveryEnabled() || !runtime.faultInjectionEnabled()) {
+            throw new ControllerException("TOOL_JOB_TEST_RUNTIME_DISABLED",
+                    "The active Agent container has not enabled durable recovery and fault injection");
+        }
+        if (requireProcessHalt && (!runtime.processHaltEnabled() || !runtime.restartUnlessStopped())) {
+            throw new ControllerException("TOOL_JOB_TEST_PROCESS_HALT_DISABLED",
+                    "The active Agent container is not configured for process-halt recovery");
+        }
+    }
+
+    public record ToolJobTestTarget(String deploymentId, String trafficScopeId, String generationId,
+                                    String gitCommit, String machineId, String containerName,
+                                    String containerId, boolean manifestAllowsProcessHalt,
+                                    ContainerRuntime.ToolJobTestRuntime runtime) { }
+
     private void startCandidate(OperationRef ref) {
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());

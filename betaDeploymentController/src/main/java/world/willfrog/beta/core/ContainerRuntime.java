@@ -11,6 +11,12 @@ public interface ContainerRuntime {
     }
     ContainerObservation create(JsonNode manifest, JsonNode service, CandidatePlan plan);
     ContainerObservation inspect(String machineId, String containerName);
+    default ToolJobTestRuntime inspectToolJobTestRuntime(String machineId, String containerName) {
+        throw new ControllerException("TOOL_JOB_TEST_UNAVAILABLE", "Tool-job test inspection is unavailable");
+    }
+    default ContainerObservation restart(String machineId, String containerName, java.time.Duration timeout) {
+        throw new ControllerException("TOOL_JOB_TEST_UNAVAILABLE", "Controlled Agent restart is unavailable");
+    }
     void stop(String machineId, String containerName, int timeoutSeconds);
     void remove(String machineId, String containerName);
     void removeCompose(String instanceId);
@@ -36,4 +42,11 @@ public interface ContainerRuntime {
                                 int hostPort, boolean running, Health health) {
         public enum Health { STARTING, HEALTHY, UNHEALTHY, MISSING }
     }
+
+    record ToolJobTestRuntime(String containerId, boolean running, boolean healthy,
+                              String deploymentId, String trafficScopeId, String generationId,
+                              String gitCommit, boolean durableRecoveryEnabled,
+                              boolean faultInjectionEnabled, boolean processHaltEnabled,
+                              boolean restartUnlessStopped, long restartCount,
+                              String startedAt) { }
 }

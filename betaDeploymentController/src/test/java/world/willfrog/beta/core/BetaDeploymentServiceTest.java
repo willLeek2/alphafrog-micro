@@ -212,6 +212,41 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void toolJobTestControlRejectsMainBeta() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        String generation = state().path("activeInstance").path("deploymentGenerationId").asText();
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> service.toolJobTestTarget("beta-main-001", generation, false));
+
+        assertEquals("TOOL_JOB_TEST_MAIN_BETA_FORBIDDEN", failure.code());
+    }
+
+    @Test
+    void toolJobTestControlBindsTheStableLaneGenerationAndRuntime() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        ObjectNode lane = manifest("beta-lane-a", 1, "release-1", '1', 'a', 'b', "lane-a", 38080);
+        ObjectNode agent = (ObjectNode) lane.path("services").path(0);
+        ((ObjectNode) agent.path("runtime")).put("allowToolJobProcessHalt", true);
+        agent.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, agent));
+        service.submitManifest(lane);
+        reconcile(3);
+        String generation = state("lane-a").path("activeInstance").path("deploymentGenerationId").asText();
+
+        BetaDeploymentService.ToolJobTestTarget target = service.toolJobTestTarget(
+                "beta-lane-a", generation, true);
+
+        assertEquals("lane-a", target.trafficScopeId());
+        assertEquals(generation, target.generationId());
+        assertTrue(target.runtime().durableRecoveryEnabled());
+        assertTrue(target.runtime().faultInjectionEnabled());
+        assertTrue(target.runtime().processHaltEnabled());
+        assertTrue(target.runtime().restartUnlessStopped());
+    }
+
+    @Test
     void healthyCandidateWaitsUntilItsSelfRegistrationIsVisible() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
@@ -674,6 +709,9 @@ class BetaDeploymentServiceTest {
     private final class FakeContainers implements ContainerRuntime {
         ContainerObservation.Health health = ContainerObservation.Health.HEALTHY;
         final Map<String, ContainerObservation> values = new LinkedHashMap<>();
+        final Map<String, CandidatePlan> plans = new LinkedHashMap<>();
+        final Map<String, String> commits = new LinkedHashMap<>();
+        final Map<String, Boolean> processHaltAllowed = new LinkedHashMap<>();
         final Map<String, Boolean> stopped = new LinkedHashMap<>();
         final java.util.Set<String> removedComposeInstanceIds = new java.util.LinkedHashSet<>();
         int stopTimeoutSeconds;
@@ -696,6 +734,9 @@ class BetaDeploymentServiceTest {
             ContainerObservation value = new ContainerObservation(String.format("%064x", ++createdContainers),
                     name, "10.0.0.8", plan.hostPort(), true, health);
             values.put(name, value);
+            plans.put(name, plan);
+            commits.put(name, manifest.path("gitCommit").asText());
+            processHaltAllowed.put(name, spec.path("runtime").path("allowToolJobProcessHalt").asBoolean(false));
             if (failAfterCreating) throw new ControllerException("CONTAINER_START_FAILED", "post-create check failed");
             return value;
         }
@@ -712,6 +753,21 @@ class BetaDeploymentServiceTest {
             if (!leaveRunningAfterStop) stopped.put(name, true);
         }
         @Override public void remove(String machineId, String name) { values.remove(name); }
+        @Override public ToolJobTestRuntime inspectToolJobTestRuntime(String machineId, String name) {
+            CandidatePlan plan = plans.get(name);
+            ContainerObservation container = values.get(name);
+            if (plan == null || container == null) {
+                throw new ControllerException("TOOL_JOB_TEST_CONTAINER_MISSING", "missing");
+            }
+            boolean lane = !"main-beta".equals(plan.trafficScopeId());
+            return new ToolJobTestRuntime(container.containerId(), true, true, plan.deploymentId(),
+                    plan.trafficScopeId(), plan.generationId(), commits.get(name), lane, lane,
+                    lane && Boolean.TRUE.equals(processHaltAllowed.get(name)), true, 0,
+                    "2026-09-20T00:00:00Z");
+        }
+        @Override public ContainerObservation restart(String machineId, String name, java.time.Duration timeout) {
+            return inspect(machineId, name);
+        }
         @Override public void removeCompose(String instanceId) { removedComposeInstanceIds.add(instanceId); }
         @Override public String containerName(CandidatePlan plan, String serviceName) {
             return "af-" + plan.instanceId();

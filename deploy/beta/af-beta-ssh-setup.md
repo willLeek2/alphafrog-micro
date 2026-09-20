@@ -8,9 +8,10 @@
 
    ```bash
    install -m 755 af-beta-shell /opt/alphafrog-beta/bin/af-beta-shell
+   install -m 755 af-beta-tool-job-test /opt/alphafrog-beta/bin/af-beta-tool-job-test
    ```
 
-   白名单子命令写在脚本顶部的 `ALLOWED_SUBCOMMANDS`（当前 `status retry how-to-test lane main configs file-config git`），按《03-beta-机开发入口》增删。仓库这份要与 Beta 本机 `/opt/alphafrog-beta/bin/af-beta-shell` 保持同一组子命令，避免按仓库覆盖安装时被抹掉。
+   白名单子命令写在脚本顶部的 `ALLOWED_SUBCOMMANDS`。`tool-job-test` 不进入通用 `af-beta`，包装脚本会把它固定转交给 `/opt/alphafrog-beta/bin/af-beta-tool-job-test`；后者只访问控制器回环地址，不接受 URL、请求头、SQL 或文件路径。仓库脚本要与 Beta 本机安装内容一致，避免覆盖安装时丢失限制。
 
 2. 收集各开发机的**公钥**。开发机各自生成专用钥匙，私钥不出机器：
 

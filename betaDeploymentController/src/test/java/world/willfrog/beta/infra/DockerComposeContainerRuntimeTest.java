@@ -442,6 +442,32 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void readsOnlyTheFixedToolJobRuntimeEvidenceAndRestartsTheSameContainer() {
+        ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        ((ObjectNode) service.path("runtime")).put("allowToolJobProcessHalt", true);
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        FakeCommands commands = new FakeCommands(true);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ContainerRuntime.ToolJobTestRuntime evidence = runtime.inspectToolJobTestRuntime(
+                "beta-machine-1", runtime.containerName(plan, "agent-service"));
+        ContainerRuntime.ContainerObservation restarted = runtime.restart("beta-machine-1",
+                runtime.containerName(plan, "agent-service"), Duration.ofSeconds(2));
+
+        assertEquals("beta-lane-a", evidence.deploymentId());
+        assertEquals("lane-a", evidence.trafficScopeId());
+        assertEquals(plan.generationId(), evidence.generationId());
+        assertTrue(evidence.durableRecoveryEnabled());
+        assertTrue(evidence.faultInjectionEnabled());
+        assertTrue(evidence.processHaltEnabled());
+        assertTrue(evidence.restartUnlessStopped());
+        assertEquals("d".repeat(64), restarted.containerId());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("restart")
+                && command.contains("--time") && command.contains("0")));
+    }
+
+    @Test
     void nonDefaultAgentDeadlineKeepsOneFiveSecondFinalizationBudget() throws Exception {
         ((ObjectNode) service.path("runtime")).put("applicationDrainSeconds", 30);
         ((ObjectNode) service.path("runtime")).put("drainGraceSeconds", 35);
@@ -747,15 +773,23 @@ class DockerComposeContainerRuntimeTest {
                           "State":{"Running":true,"Health":{"Status":"healthy"}}}]
                         """.formatted("d".repeat(64), name, plan.hostPort());
             }
+            boolean lane = !"main-beta".equals(plan.trafficScopeId());
+            boolean processHalt = lane && service.path("runtime").path("allowToolJobProcessHalt").asBoolean(false);
             return """
                     [{"Id":"%s","Name":"/%s","Image":"%s",
                       "Config":{"Labels":{"alphafrog.deployment-id":"%s","alphafrog.traffic-scope-id":"%s",
                       "alphafrog.service-name":"%s","alphafrog.instance-id":"%s","alphafrog.release-id":"%s",
-                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"%d"}},"State":{"Running":true,"Health":{"Status":"healthy"}},
+                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"%d"},
+                      "Env":["AF_GIT_COMMIT=%s","AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED=%s",
+                      "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED=%s",
+                      "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT=%s"]},
+                      "HostConfig":{"RestartPolicy":{"Name":"unless-stopped"}},"RestartCount":1,
+                      "State":{"Running":true,"StartedAt":"2026-09-20T00:00:00Z","Health":{"Status":"healthy"}},
                       "NetworkSettings":{"Ports":{"%d/tcp":[{"HostIp":"127.0.0.1","HostPort":"%d"}]}}}]
                     """.formatted("d".repeat(64), name,
                     service.path("image").path("localImageId").asText(), plan.deploymentId(), plan.trafficScopeId(),
                     serviceName, "i-one", service.path("releaseId").asText(), plan.generationId(), plan.hostPort(),
+                    manifest.path("gitCommit").asText(), lane, lane, processHalt,
                     service.path("runtime").path("containerPort").asInt(), plan.hostPort());
         }
     }

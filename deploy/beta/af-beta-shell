@@ -8,7 +8,7 @@
 # 白名单以《03-beta-机开发入口》的子命令清单为准增删。
 set -euo pipefail
 
-ALLOWED_SUBCOMMANDS="status retry how-to-test lane main configs file-config git"
+ALLOWED_SUBCOMMANDS="status retry how-to-test lane main configs file-config git tool-job-test"
 
 read -r -a request <<<"${SSH_ORIGINAL_COMMAND:-}"
 
@@ -21,6 +21,10 @@ subcommand="${request[1]:-}"
 if [ -z "$subcommand" ] || ! [[ " $ALLOWED_SUBCOMMANDS " == *" $subcommand "* ]]; then
   echo "af-beta-shell: 子命令不在白名单: ${subcommand:-<空>}（允许: ${ALLOWED_SUBCOMMANDS}）" >&2
   exit 111
+fi
+
+if [ "$subcommand" = "tool-job-test" ]; then
+  exec /opt/alphafrog-beta/bin/af-beta-tool-job-test "${request[@]:2}"
 fi
 
 exec af-beta "${request[@]:1}"
