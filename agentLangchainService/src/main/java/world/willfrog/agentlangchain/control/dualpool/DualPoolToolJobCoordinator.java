@@ -189,6 +189,35 @@ public class DualPoolToolJobCoordinator {
     }
 
     /**
+     * 在线对账只补投递尚未领取的恢复工作项，不接管正在执行的领取者。
+     *
+     * <p>{@link #recoverResumable(String, ToolJobAnchor)} 用于进程启动或已经明确捕获到 worker
+     * 中断的场景，可以把 CLAIMED/EXECUTING 重新开放；周期对账无法证明当前 worker 已经退出，
+     * 若复用该接管语义，会每轮抬高领取代际并使仍在运行的模型调用全部变成过期提交。
+     * 当前阶段的领取租约只参与条件更新，不作为在线接管信号；没有显式中断信号的线程消失
+     * 仍由下一次进程启动恢复处理。</p>
+     */
+    public boolean dispatchOnlineResumable(String runId, ToolJobAnchor anchor) {
+        if (!supports(anchor) || !RESUME_STATE.equals(anchor.getResumeState())) {
+            return false;
+        }
+        NodeWorkItemIdentity identity = identity(runId, anchor);
+        NodeWorkItem current = workItemStore.findByIdentity(identity).orElse(null);
+        if (current == null) {
+            return false;
+        }
+        NodeWorkItemState state = current.stateEnum();
+        if (state == NodeWorkItemState.CLAIMED || state == NodeWorkItemState.EXECUTING) {
+            return true;
+        }
+        if (state != NodeWorkItemState.RESUMABLE || !ensureRecoveryAdmission(runId)) {
+            return false;
+        }
+        dispatcher.offerNode(identity);
+        return true;
+    }
+
+    /**
      * 当前节点线程在一次性故障点退出后，从持久状态补上恢复唤醒。
      *
      * <p>调用位置已经离开模型和工具调用栈，旧 worker 不会再产生业务副作用。本方法仍然只

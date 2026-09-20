@@ -164,7 +164,7 @@ public class ToolJobReconciler {
             if (dualPoolToolJobCoordinator != null
                     && dualPoolToolJobCoordinator.supports(anchor)
                     && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())) {
-                if (!dualPoolToolJobCoordinator.recoverResumable(runId, anchor)) {
+                if (!dualPoolToolJobCoordinator.dispatchOnlineResumable(runId, anchor)) {
                     log.warn("双池长工具恢复工作项仍未能重新开放: runId={}", runId);
                 }
                 return;
