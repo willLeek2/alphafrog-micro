@@ -42,6 +42,17 @@ public interface WaitGroupStore {
     /** 取消一条等待链：组、还没结束的成员、下一段与还没被取走的通知一起停。 */
     WaitChainCancelResult cancelChain(long groupId);
 
+    /**
+     * 派发成功：成员从「已保存待派发」进入「已派发执行中」，并写上外部作业身份与下次查询时间。
+     *
+     * <p>只对还没派发的成员生效，重复派发返回 false。已经落终态的成员不会被改。</p>
+     */
+    boolean markMemberDispatched(long groupId,
+                                 String memberIdentity,
+                                 String externalOperationId,
+                                 OffsetDateTime nextPollAt,
+                                 long runControlVersion);
+
     /** 成员还在执行中时推后它的下次查询时间并累加轮询次数；已经落终态的成员不会被改。 */
     boolean rescheduleMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt, int maxBackoffStep);
 

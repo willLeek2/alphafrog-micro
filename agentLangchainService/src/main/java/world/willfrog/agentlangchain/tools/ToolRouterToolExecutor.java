@@ -245,16 +245,14 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * 其他工具没有跨进程持久作业，继续保留模型原始 id。</p>
      */
     private String durableToolCallId(String toolName, String rawToolCallId) {
-        if (!"executePython".equals(toolName)) {
+        if (!DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName)) {
             return rawToolCallId;
         }
         DualPoolToolJobExecutionContext.Snapshot snapshot = DualPoolToolJobExecutionContext.current();
         if (snapshot == null || snapshot.identity() == null) {
             return rawToolCallId;
         }
-        String workItemScope = snapshot.identity().describe();
-        UUID workItemDigest = UUID.nameUUIDFromBytes(workItemScope.getBytes(StandardCharsets.UTF_8));
-        return rawToolCallId + "--wi-" + workItemDigest;
+        return DurableToolCallIds.forTool(toolName, rawToolCallId, snapshot.identity());
     }
 
     /**

@@ -148,6 +148,25 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public boolean markMemberDispatched(long groupId,
+                                        String memberIdentity,
+                                        String externalOperationId,
+                                        OffsetDateTime nextPollAt,
+                                        long runControlVersion) {
+        if (groupId <= 0) {
+            throw new IllegalArgumentException("等待组编号必须为正数：" + groupId);
+        }
+        if (memberIdentity == null || memberIdentity.isBlank()) {
+            throw new IllegalArgumentException("成员稳定身份不能为空");
+        }
+        if (runControlVersion < 0) {
+            throw new IllegalArgumentException("控制版本不能是负数：" + runControlVersion);
+        }
+        return mapper.markMemberDispatched(
+                groupId, memberIdentity, externalOperationId, nextPollAt, runControlVersion) > 0;
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,

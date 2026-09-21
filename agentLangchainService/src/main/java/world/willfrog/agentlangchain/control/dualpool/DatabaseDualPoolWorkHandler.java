@@ -24,6 +24,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.ExecutionModeResolver;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
 import world.willfrog.agentlangchain.execution.LangchainCompletedTodo;
@@ -78,6 +79,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final SchedulerVersionPolicy schedulerVersionPolicy;
     private final DualPoolToolJobCoordinator toolJobCoordinator;
+    private final DualPoolWaitGroupNodeExecutor waitGroupNodeExecutor;
     private final Duration claimLease;
     private final int perRunUnfinishedLimit;
     private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
@@ -96,6 +98,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             DualPoolRunAdmissionRegistry admissionRegistry,
             SchedulerVersionPolicy schedulerVersionPolicy,
             DualPoolToolJobCoordinator toolJobCoordinator,
+            DualPoolWaitGroupNodeExecutor waitGroupNodeExecutor,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit) {
         this.runMapper = runMapper;
@@ -109,6 +112,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.admissionRegistry = admissionRegistry;
         this.schedulerVersionPolicy = schedulerVersionPolicy;
         this.toolJobCoordinator = toolJobCoordinator;
+        this.waitGroupNodeExecutor = waitGroupNodeExecutor;
         this.claimLease = Duration.ofSeconds(Math.max(1L, claimLeaseSeconds));
         this.perRunUnfinishedLimit = Math.max(1, perRunUnfinishedLimit);
     }
@@ -440,12 +444,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         NodeWorkItem item = workItemStore.findByIdentity(identity).orElse(null);
         if (item == null || (item.stateEnum() != NodeWorkItemState.RUNNABLE
                 && item.stateEnum() != NodeWorkItemState.RESUMABLE)
-                || item.schedulerVersionEnum() != SchedulerVersion.DUAL_POOL_V1) {
+                || !item.schedulerVersionEnum().isDualPoolFamily()) {
             return;
         }
+        SchedulerVersion version = item.schedulerVersionEnum();
+        boolean waitGroupVersion = version.usesWaitGroups();
         AgentRun run = runMapper.findById(identity.runId());
         boolean planning = PLANNING_NODE_ID.equals(identity.nodeId());
-        if (run == null || !schedulerVersionPolicy.isDualPool(run)
+        if (run == null || !schedulerVersionPolicy.isDualPoolFamily(run)
                 || run.getPlanGeneration() == null
                 || run.getPlanGeneration() != identity.planGeneration()
                 || run.getRunControlVersion() == null
@@ -456,7 +462,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         Optional<NodeWorkItemClaim> claimed = workItemStore.claim(
-                identity, item.versions(), claimant, claimLease, SchedulerVersion.DUAL_POOL_V1);
+                identity, item.versions(), claimant, claimLease, version);
         if (claimed.isEmpty()) {
             return;
         }
@@ -477,7 +483,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             try (DualPoolToolJobExecutionContext.Scope ignored =
                          DualPoolToolJobExecutionContext.install(
                                  identity, submitted, claimant, item.getPayloadJson())) {
-                if (KIND_TODO.equals(kind)) {
+                if (KIND_TODO.equals(kind) && waitGroupVersion) {
+                    Optional<Map<String, Object>> waitGroupPatch =
+                            executeWaitGroupSegment(identity, submitted, claim, payload);
+                    if (waitGroupPatch.isEmpty()) {
+                        // 这一段把整组工具交出去了（或已经不在自己手里）：挂起语句已经把它写成
+                        // 分段结果已提交，没有第二份结果要提交，节点执行名额在这里交还。
+                        return;
+                    }
+                    resultPatch = waitGroupPatch.get();
+                } else if (KIND_TODO.equals(kind)) {
                     todoExecution = executeTodo(identity.runId(), payload);
                     if (todoExecution.result().isSuspended()) {
                         NodeWorkItemMutationResult suspended = toolJobCoordinator.suspend(
@@ -556,6 +571,66 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                     ? current.getLastError() : "dual_pool_planning_not_completed");
         }
         return result;
+    }
+
+    /**
+     * 新调度器版本的节点分段：交给共用节点执行器跑一次模型回合。
+     *
+     * <p>返回空表示这一段把整组工具交了出去——挂起语句已经把它写成「分段结果已提交」，
+     * 没有第二份结果要提交，调用方只要交还节点执行名额。</p>
+     */
+    private Optional<Map<String, Object>> executeWaitGroupSegment(NodeWorkItemIdentity identity,
+                                                                  NodeWorkItemVersions versions,
+                                                                  NodeWorkItemClaim claim,
+                                                                  JsonNode payload) throws Exception {
+        LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
+                freshRunPipeline.rebuildDualPoolNodeContext(identity.runId());
+        if (context == null) {
+            throw new IllegalStateException("dual_pool_run_not_executing");
+        }
+        TodoItem todo = objectMapper.treeToValue(payload.path("todo"), TodoItem.class);
+        List<LangchainCompletedTodo> completed = completedContext(payload.path("completedContext"));
+        Map<String, String> datasetRefs = objectMapper.convertValue(
+                payload.path("datasetRefs"), new TypeReference<Map<String, String>>() { });
+        AgentContext.setPhase("dual_pool_node_execution");
+        AgentContext.setStage("todo_execution");
+        AgentContext.setWorkflow(payload.path("workflow").asText("linear").toLowerCase());
+        long startedAt = System.currentTimeMillis();
+        freshRunPipeline.emitDualPoolTodoNodeEvent(
+                identity.runId(), context.run().getUserId(), "TODO_NODE_STARTED", todo,
+                null, 0L, null, false, null);
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = waitGroupNodeExecutor.executeSegment(
+                new DualPoolWaitGroupNodeExecutor.SegmentExecution(
+                        identity, versions, claimant, context.workflowRequest(), todo, completed,
+                        datasetRefs, payload));
+        if (outcome instanceof DualPoolWaitGroupNodeExecutor.Outcome.Completed completedOutcome) {
+            Map<String, Object> patch = completedOutcome.resultPatch();
+            boolean success = Boolean.TRUE.equals(patch.get("success"));
+            freshRunPipeline.emitDualPoolTodoNodeEvent(
+                    identity.runId(), context.run().getUserId(),
+                    success ? "TODO_NODE_COMPLETED" : "TODO_NODE_FAILED", todo,
+                    success ? null : String.valueOf(patch.get("failureReason")),
+                    System.currentTimeMillis() - startedAt, failureMetadata(patch), false, null);
+            return Optional.of(patch);
+        }
+        if (outcome instanceof DualPoolWaitGroupNodeExecutor.Outcome.Suspended suspended) {
+            log.info("节点分段把整组工具交了出去：segment={} group={} turn={} members={}",
+                    identity.describe(), suspended.groupId(), suspended.modelTurn(), suspended.memberCount());
+            return Optional.empty();
+        }
+        DualPoolWaitGroupNodeExecutor.Outcome.NotOwned notOwned =
+                (DualPoolWaitGroupNodeExecutor.Outcome.NotOwned) outcome;
+        log.warn("节点分段已经不在本 Worker 手里，没有提交任何结果：segment={} detail={}",
+                identity.describe(), notOwned.detail());
+        return Optional.empty();
+    }
+
+    private Map<String, Object> failureMetadata(Map<String, Object> patch) {
+        Object metadata = patch.get("failureMetadata");
+        if (metadata instanceof Map<?, ?> map && !map.isEmpty()) {
+            return objectMapper.convertValue(map, new TypeReference<Map<String, Object>>() { });
+        }
+        return null;
     }
 
     private TodoExecution executeTodo(String runId, JsonNode payload) throws Exception {
@@ -658,7 +733,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (limit <= 0) {
             return List.of();
         }
-        return workItemStore.scanClaimable(SchedulerVersion.DUAL_POOL_V1, limit).stream()
+        List<NodeWorkItem> claimable = new ArrayList<>(
+                workItemStore.scanClaimable(SchedulerVersion.DUAL_POOL_V1, limit));
+        // 新版本的等待分段与恢复分段和旧版本共用同一个节点池。按 Run 分组、跨图轮转与「谁先谁后」
+        // 由后面的外层推进那一组来做；这里只保证新版本的行不会因为没人扫而一直躺着。
+        for (SchedulerVersion version : SchedulerVersion.values()) {
+            if (version.usesWaitGroups()) {
+                claimable.addAll(workItemStore.scanClaimable(version, limit));
+            }
+        }
+        return claimable.stream()
                 .map(NodeWorkItem::identity)
                 .filter(identity -> admissionRegistry.isAdmitted(identity.runId()))
                 .toList();

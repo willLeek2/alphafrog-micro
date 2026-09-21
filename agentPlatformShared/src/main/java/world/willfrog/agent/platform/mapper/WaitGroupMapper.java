@@ -99,6 +99,19 @@ public interface WaitGroupMapper {
     /** 组、还没结束的成员、下一段与还没被取走的通知一起停。 */
     WaitChainCancelRow cancelChain(@Param("groupId") long groupId);
 
+    // ===== 成员派发 =====
+
+    /**
+     * 派发成功：成员从待派发进入执行中，并把外部作业身份写上。
+     *
+     * <p>只对还没派发的成员生效，重复派发影响零行，调用方据此判断这一次是不是自己送出去的。</p>
+     */
+    int markMemberDispatched(@Param("groupId") long groupId,
+                             @Param("memberIdentity") String memberIdentity,
+                             @Param("externalOperationId") String externalOperationId,
+                             @Param("nextPollAt") OffsetDateTime nextPollAt,
+                             @Param("runControlVersion") long runControlVersion);
+
     // ===== 成员轮询 =====
 
     /** 成员还在执行中时推后下次查询时间；已经落终态的成员不会被改。 */

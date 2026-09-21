@@ -639,6 +639,33 @@
             (SELECT count(*) FROM notification_canceled) AS notifications_canceled
     </select>
 
+    <!-- ==================== 成员派发 ==================== -->
+
+    <!--
+      派发成功：成员从「已保存待派发」进入「已派发执行中」，同时把外部作业身份写上。
+
+      只对还没派发的成员生效，所以同一个成员被重复派发时第二次影响零行：调用方据返回值就能知道
+      「这一次是不是我把它送出去的」。已经落终态的成员不会被这条语句改动。
+
+      Run 必须还在执行中且控制版本没变：计划代际失效或取消之后，旧 Worker 不能再去改等待事实。
+    -->
+    <update id="markMemberDispatched">
+        UPDATE alphafrog_agent_run_wait_member m SET
+            state = 'RUNNING',
+            external_operation_id = COALESCE(#{externalOperationId}::varchar, m.external_operation_id),
+            next_poll_at = COALESCE(#{nextPollAt}, m.next_poll_at),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE m.group_id = #{groupId}
+          AND m.member_identity = #{memberIdentity}
+          AND m.state = 'PENDING'
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run r
+              WHERE r.id = m.run_id
+                AND r.status = 'EXECUTING'
+                AND r.run_control_version = #{runControlVersion})
+    </update>
+
     <!-- ==================== 成员轮询 ==================== -->
 
     <!--
