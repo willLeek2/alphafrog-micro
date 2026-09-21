@@ -85,7 +85,40 @@ class AgentRunEventServiceTest {
                         PromptRunSelection.SCHEMA_VERSION,
                         "default-v1", "control", "bundle-digest", "capability-digest",
                         LocalDate.of(2025, 2, 3)));
+        stubCanonicalEventReadBack(eventMapper);
     }
+
+    /**
+     * 让「写进去的那一条」和「读回来的那一条」是同一份内容。
+     *
+     * <p>投射按库里读回来的那一行做，所以这两条在测试里要指向同一份内容，断言看的才是投出去的东西。
+     * 真库上时间与负载文本由库决定（写入不写 created_at、负载存成 jsonb）——那部分行为由真库用例量。</p>
+     */
+    private static void mirrorPersistedEvent(java.util.Map<String, AgentRunEvent> persisted,
+                                             AgentRunEvent event) {
+        if (event != null && event.getRunId() != null && event.getSeq() != null) {
+            persisted.put(event.getRunId() + ":" + event.getSeq(), event);
+        }
+    }
+
+    private static void stubCanonicalEventReadBack(AgentRunEventMapper eventMapper) {
+        java.util.Map<String, AgentRunEvent> persisted = new java.util.concurrent.ConcurrentHashMap<>();
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            mirrorPersistedEvent(persisted, invocation.getArgument(0));
+            return 1;
+        }).when(eventMapper).insert(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            mirrorPersistedEvent(persisted, invocation.getArgument(0));
+            return 1;
+        }).when(eventMapper).insertOnce(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.lenient()
+                .when(eventMapper.findByRunIdAndSeq(
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyInt()))
+                .thenAnswer(invocation -> persisted.get(
+                        invocation.getArgument(0) + ":" + invocation.getArgument(1)));
+    }
+
 
     @Test
     void diagnosticDatabaseReadsDoNotFlushPendingRedisEventsButOrdinaryReadStillDoes() {
@@ -96,7 +129,7 @@ class AgentRunEventServiceTest {
         when(llmLocalConfigLoader.current()).thenReturn(Optional.of(properties));
 
         AgentRunEventRedisStore realRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, objectMapper, llmLocalConfigLoader);
+                redisTemplate, objectMapper, llmLocalConfigLoader, 7L);
         AgentRunEventService realService = new AgentRunEventService(
                 runMapper,
                 eventMapper,
@@ -144,7 +177,6 @@ class AgentRunEventServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(7L);
-        when(eventMapper.insert(any())).thenReturn(1);
 
         service.append("r1", "u1", "PLAN_READY", Map.of("ok", true));
 
@@ -165,7 +197,6 @@ class AgentRunEventServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
         doThrow(new RuntimeException("redis down"))
                 .when(redisTemplate)
                 .convertAndSend(anyString(), anyString());
@@ -178,7 +209,6 @@ class AgentRunEventServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run("r1", "u1"));
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(8L);
-        when(eventMapper.insertOnce(any())).thenReturn(1);
 
         boolean inserted = service.appendOnce(
                 "r1", "u1", "TOOL_CALL_FINISHED", "r1:tc1:logical_terminal", Map.of("success", true));
@@ -333,7 +363,6 @@ class AgentRunEventServiceTest {
         when(mockPromptService.snapshotDataFreshness()).thenReturn(freshness);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
 
         // 创建这条路不再回头读一次 Run：接收事实直接跟在刚插入的那一行后面写。
         AgentRun run = run("r-test", "u-test");
@@ -371,7 +400,6 @@ class AgentRunEventServiceTest {
         when(mockPromptService.snapshotDataFreshness()).thenReturn(null);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
 
         AgentRun run = run("r-test2", "u-test2");
         when(runMapper.findByIdAndUserForDeployment(
@@ -392,7 +420,6 @@ class AgentRunEventServiceTest {
     void createRun_shouldFreezeExplicitArtifactRequestInExt() throws Exception {
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(run("r-artifact", "u-artifact"));

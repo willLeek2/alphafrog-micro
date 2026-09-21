@@ -74,7 +74,40 @@ class AgentRunEventServiceIdempotencyTest {
                 PromptRunSelection.SCHEMA_VERSION, "default-v1", "control", "bundle-digest",
                 "capability-digest", LocalDate.of(2025, 2, 3)));
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotDataFreshness()).thenReturn(null);
+        stubCanonicalEventReadBack(eventMapper);
     }
+
+    /**
+     * 让「写进去的那一条」和「读回来的那一条」是同一份内容。
+     *
+     * <p>投射按库里读回来的那一行做，所以这两条在测试里要指向同一份内容，断言看的才是投出去的东西。
+     * 真库上时间与负载文本由库决定（写入不写 created_at、负载存成 jsonb）——那部分行为由真库用例量。</p>
+     */
+    private static void mirrorPersistedEvent(java.util.Map<String, AgentRunEvent> persisted,
+                                             AgentRunEvent event) {
+        if (event != null && event.getRunId() != null && event.getSeq() != null) {
+            persisted.put(event.getRunId() + ":" + event.getSeq(), event);
+        }
+    }
+
+    private static void stubCanonicalEventReadBack(AgentRunEventMapper eventMapper) {
+        java.util.Map<String, AgentRunEvent> persisted = new java.util.concurrent.ConcurrentHashMap<>();
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            mirrorPersistedEvent(persisted, invocation.getArgument(0));
+            return 1;
+        }).when(eventMapper).insert(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            mirrorPersistedEvent(persisted, invocation.getArgument(0));
+            return 1;
+        }).when(eventMapper).insertOnce(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.lenient()
+                .when(eventMapper.findByRunIdAndSeq(
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyInt()))
+                .thenAnswer(invocation -> persisted.get(
+                        invocation.getArgument(0) + ":" + invocation.getArgument(1)));
+    }
+
 
     @Test
     void sameKeyAndSameDigestReadBackTheOriginalRun() {
@@ -213,7 +246,6 @@ class AgentRunEventServiceIdempotencyTest {
                 .when(runMapper.findByUserIdempotencyKey(anyString(), anyString())).thenReturn(null);
         org.mockito.Mockito.lenient().when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         org.mockito.Mockito.lenient().when(valueOperations.increment(anyString())).thenReturn(1L);
-        org.mockito.Mockito.lenient().when(eventMapper.insert(any())).thenReturn(1);
         AgentRun created = new AgentRun();
         created.setId("r-new");
         created.setUserId(USER);

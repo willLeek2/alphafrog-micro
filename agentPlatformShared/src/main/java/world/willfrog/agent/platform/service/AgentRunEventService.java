@@ -522,7 +522,25 @@ public class AgentRunEventService {
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
         }
-        return event;
+        return canonicalEvent(runId, nextSeq, eventType);
+    }
+
+    /**
+     * 拿数据库里刚写进去的那一行当投射来源。
+     *
+     * <p>插入不写 {@code created_at}（用库自己的当前时间），负载又存成 jsonb：读回来的时间与文本
+     * 与 Java 对象里的那两样都不保证一样。事件流的成员里带着它们，于是「按 Java 对象投一次、
+     * 按库里的行再投一次」会写出两个不同的成员，同一个事件在流里出现两条。补投是按库里的行做的，
+     * 所以首次投射也要用库里的行——两条路取的必须是同一份值。</p>
+     */
+    private AgentRunEvent canonicalEvent(String runId, int seq, String eventType) {
+        AgentRunEvent persisted = eventMapper.findByRunIdAndSeq(runId, seq);
+        if (persisted == null) {
+            // 刚写进去却读不回来：往外投一个与库里不一致的成员，比在这里停下更糟。
+            throw new IllegalStateException("事件刚落库却读不回来: runId=" + runId
+                    + ", eventType=" + eventType + ", seq=" + seq);
+        }
+        return persisted;
     }
 
     /**
@@ -586,11 +604,15 @@ public class AgentRunEventService {
             return false;
         }
 
-        eventRedisStore.append(event);
+        // 同样按库里的那一行投射：这条路的另一半（去重冲突读回）本来就是按行投的，
+        // 两边取同一份值，同一个逻辑事件才不会在流里变成两个成员。
+        AgentRunEvent persisted = canonicalEvent(runId, event.getSeq(), eventType);
+        eventRedisStore.append(persisted);
         if (isTerminalEventType(eventType) || "TOOL_CALL_FINISHED".equals(eventType)) {
             eventRedisStore.flush(runId);
         }
-        publishLiveEvent(runId, event.getSeq(), eventType, event.getPayloadJson(), event.getCreatedAt());
+        publishLiveEvent(runId, persisted.getSeq(), eventType, persisted.getPayloadJson(),
+                persisted.getCreatedAt());
         return true;
     }
 

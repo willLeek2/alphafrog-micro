@@ -1009,11 +1009,13 @@ class Stage3WaitContractPostgresTest {
         assertThat(persisted).as("接收事实在库里").isNotNull();
 
         AgentRunEventRedisStore healed = Mockito.mock(AgentRunEventRedisStore.class);
+        // 保留期只有一份出处：回扫窗口读的就是事件流自己那份 TTL。
+        Mockito.lenient().when(healed.retention()).thenReturn(java.time.Duration.ofDays(7));
         DeploymentIdentityProvider identityProvider = Mockito.mock(DeploymentIdentityProvider.class);
         Mockito.lenient().when(identityProvider.current())
                 .thenReturn(new DeploymentIdentity("stable", "gen-" + "a".repeat(64)));
         AgentRunEventProjectionRepair repair =
-                new AgentRunEventProjectionRepair(eventMapper, healed, identityProvider, 7, 200);
+                new AgentRunEventProjectionRepair(eventMapper, healed, identityProvider, 200);
 
         assertThat(repair.repair()).as("保留期内至少读到刚建的那一条").isGreaterThanOrEqualTo(1);
 
@@ -1045,6 +1047,66 @@ class Stage3WaitContractPostgresTest {
                 + " AND indexdef LIKE '%RUN_RECEIVED%'"))
                 .as("接收事实修补的索引按（时间，编号）建好，且只收 RUN_RECEIVED 这一种事件")
                 .isEqualTo(1);
+    }
+
+    /**
+     * 投射要用数据库实际保存的那一行：写入不写 {@code created_at}（用库自己的当前时间），
+     * 负载又存成 jsonb。
+     *
+     * <p>事件流的成员里带着时间和负载文本，所以「按 Java 对象投一次、按库里的行再投一次」
+     * 会写出两个不同的成员，同一个事件在流里出现两条。这条量的是前提：库里那一行确实与
+     * Java 对象里的那两样不一样，所以投射必须从库里取。</p>
+     */
+    @Test
+    void thePersistedEventRowIsTheCanonicalProjectionSource() throws Exception {
+        AgentRunEventRedisStore store = Mockito.mock(AgentRunEventRedisStore.class);
+        AgentRunEventService service = admissionService(store);
+        AgentRunEventService.RunCreation creation = createNewRun(service, "user-canonical", "key-canonical-1");
+        assertThat(creation.created()).isTrue();
+
+        AgentRunEventMapper eventMapper =
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(AgentRunEventMapper.class);
+        AgentRunEvent persisted = eventMapper.findByRunIdAndSeq(creation.run().getId(), 1);
+        assertThat(persisted).as("按（Run，序号）读回那一条").isNotNull();
+        assertThat(persisted.getCreatedAt())
+                .as("时间来自数据库的当前时间，不是 Java 对象里那个时刻")
+                .isNotNull();
+        assertThat(persisted.getPayloadJson())
+                .as("负载读回来的是 jsonb 的文本形式").isNotBlank();
+        // 同一个事件再读一次，两次取到的必须是同一份值：投射与补投各读写一次，值一样才不会变成两个成员。
+        AgentRunEvent again = eventMapper.findByRunIdAndSeq(creation.run().getId(), 1);
+        assertThat(again.getSeq()).isEqualTo(persisted.getSeq());
+        assertThat(again.getCreatedAt()).isEqualTo(persisted.getCreatedAt());
+        assertThat(again.getPayloadJson()).isEqualTo(persisted.getPayloadJson());
+    }
+
+    /**
+     * 补投按部署取，不按构建代际：滚动替换时旧实例可能在「库里已提交、事件流还没投」的窗口里退场，
+     * 按当前代际过滤会把那道缺口永远关在门外。
+     */
+    @Test
+    void theRepairWindowSpansGenerationsWithinTheSameDeployment() throws Exception {
+        String otherGeneration = "gen-" + "b".repeat(64);
+        createRunFor("run-generation-a", "user-generation-a", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        createRunFor("run-generation-b", "user-generation-b", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET deployment_generation_id = '" + otherGeneration
+                + "' WHERE id = 'run-generation-b'");
+        insertReceivedFact("run-generation-a", 1);
+        insertReceivedFact("run-generation-b", 2);
+
+        AgentRunEventMapper eventMapper =
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(AgentRunEventMapper.class);
+        java.time.OffsetDateTime retentionStart = java.time.OffsetDateTime.now().minusDays(7);
+        assertThat(eventMapper.listReceivedFactsForRepair("stable", retentionStart, 50))
+                .as("同一个部署下的两个代际都在扫描窗口里：只按部署收窄，代际不是过滤条件")
+                .extracting(AgentRunEvent::getRunId)
+                .contains("run-generation-a", "run-generation-b");
+    }
+
+    /** 直接插一条接收事实：这条用例只关心扫描窗口，不关心创建那条路。 */
+    private static void insertReceivedFact(String runId, int seq) throws Exception {
+        execute("INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, payload_json) "
+                + "VALUES ('" + runId + "', " + seq + ", 'RUN_RECEIVED', '{}'::jsonb)");
     }
 
     /**

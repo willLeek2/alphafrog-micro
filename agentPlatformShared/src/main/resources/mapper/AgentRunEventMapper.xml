@@ -46,6 +46,13 @@
         LIMIT #{limit}
     </select>
 
+    <select id="findByRunIdAndSeq" resultMap="AgentRunEventResultMap">
+        SELECT id, run_id, seq, event_type, payload_json::text AS payload_json, dedupe_key, created_at
+        FROM alphafrog_agent_run_event
+        WHERE run_id = #{runId}
+          AND seq = #{seq}
+    </select>
+
     <select id="findFirstByRunIdAndType" resultMap="AgentRunEventResultMap">
         SELECT id, run_id, seq, event_type, payload_json::text AS payload_json, dedupe_key, created_at
         FROM alphafrog_agent_run_event
@@ -57,7 +64,10 @@
 
     <!--
       最近落库的接收事实：投射修补按它把「库里有、事件流里没有」的那一条补进去。
-      带部署身份，免得替别的部署补事件；窗口与条数都由调用方给，扫的是最近这一小段。
+
+      带部署身份，免得替别的部署补事件；不按构建代际收窄——滚动替换时旧实例可能在「库里已提交、
+      事件流还没投」的窗口里退场，按当前代际过滤会把那道缺口永远关在门外。「代际」在这条路上
+      不是该管的维度：缺口是按事实补的，事实属于哪个部署才是该看的。窗口与条数由调用方给。
     -->
     <select id="listReceivedFactsForRepair" resultMap="AgentRunEventResultMap">
         SELECT e.id, e.run_id, e.seq, e.event_type, e.payload_json::text AS payload_json,
@@ -67,7 +77,6 @@
         WHERE e.event_type = 'RUN_RECEIVED'
           AND e.created_at &gt; #{createdSince}
           AND r.deployment_id = #{deploymentId}
-          AND r.deployment_generation_id = #{deploymentGenerationId}
         ORDER BY e.created_at DESC, e.id DESC
         LIMIT #{limit}
     </select>
@@ -84,7 +93,6 @@
           AND e.created_at &gt; #{createdSince}
           AND (e.created_at, e.id) &gt; (#{cursorCreatedAt}, #{cursorId})
           AND r.deployment_id = #{deploymentId}
-          AND r.deployment_generation_id = #{deploymentGenerationId}
         ORDER BY e.created_at ASC, e.id ASC
         LIMIT #{limit}
     </select>

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.SessionCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
@@ -30,14 +31,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * flush via Redis pipeline; reads always flush pending first.</p>
  */
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class AgentRunEventRedisStore {
 
     /** ZSET key: {@code agent:run:events:<runId>} */
     static final String EVENTS_KEY_PREFIX = "agent:run:events:";
 
-    static final Duration EVENTS_TTL = Duration.ofDays(7);
+    /**
+     * 事件流在 Redis 里活多久。
+     *
+     * <p>这是这一份保留期的唯一出处：写事件流、算剩余寿命、以及按保留期回扫的补投器都读它，
+     * 免得两边各自维护一个「7 天」然后慢慢漂开——漂开之后「窗口里的都补过」就不再成立。</p>
+     */
+    private final Duration eventsTtl;
 
     private static final int DEFAULT_FLUSH_BATCH_SIZE = 1;
     private static final int DEFAULT_FLUSH_STALE_MS = 3_000;
@@ -45,6 +51,22 @@ public class AgentRunEventRedisStore {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
     private final AgentLlmLocalConfigLoader llmLocalConfigLoader;
+
+    public AgentRunEventRedisStore(
+            StringRedisTemplate redisTemplate,
+            ObjectMapper objectMapper,
+            AgentLlmLocalConfigLoader llmLocalConfigLoader,
+            @Value("${agent.event.redis-events-ttl-days:7}") long eventsTtlDays) {
+        this.redisTemplate = redisTemplate;
+        this.objectMapper = objectMapper;
+        this.llmLocalConfigLoader = llmLocalConfigLoader;
+        this.eventsTtl = Duration.ofDays(Math.max(1L, eventsTtlDays));
+    }
+
+    /** 事件流的保留期：补投器按它决定回扫窗口。 */
+    public Duration retention() {
+        return eventsTtl;
+    }
 
     private final ConcurrentHashMap<String, RunEventBuffer> pendingByRunId = new ConcurrentHashMap<>();
 
@@ -205,6 +227,65 @@ public class AgentRunEventRedisStore {
                 || "RUN_EXPIRED".equals(upper);
     }
 
+    /**
+     * 把一条「库里已经有、事件流里没有」的事件补进去：只补缺的那一个，别的一概不碰。
+     *
+     * <p>写法与普通写入刻意有三处不同。成员已经在时一个字节都不写——普通写入每批都会把整条 Run 的
+     * 事件 key 重新设成保留期，靠它补投等于每轮都把事件流的寿命往后推，保留期会越长越离谱。
+     * 补进去时用 {@code ZADD NX}：与并发写撞上时不去覆盖别人已经写好的成员。只有这一条把空 key
+     * 建起来（或 key 没有到期时间）时，才按事实自己的时间算一遍剩余寿命——给的是「这条事实本来
+     * 还能活多久」，不是从头再算一份完整保留期。</p>
+     *
+     * @return 真的补进去了返回 true；成员已经在里面、或者没有可补的内容返回 false
+     */
+    public boolean repairMissing(AgentRunEvent event) {
+        if (event == null || event.getRunId() == null || event.getRunId().isBlank()
+                || event.getSeq() == null) {
+            return false;
+        }
+        String runId = event.getRunId();
+        String key = eventsKey(runId);
+        String member;
+        try {
+            member = memberOf(event);
+        } catch (Exception e) {
+            throw new IllegalStateException("补投的事件成员构造不出来: runId=" + runId
+                    + ", seq=" + event.getSeq(), e);
+        }
+        try {
+            Long ttlBefore = redisTemplate.getExpire(key);
+            Boolean added = redisTemplate.opsForZSet()
+                    .addIfAbsent(key, member, event.getSeq().doubleValue());
+            if (!Boolean.TRUE.equals(added)) {
+                // 已经在里面：什么都不写，也不动这条 key 的到期时间。
+                return false;
+            }
+            boolean keyWasMissing = ttlBefore == null || ttlBefore == -2L;
+            boolean keyWithoutExpiry = ttlBefore == -1L;
+            if (keyWasMissing || keyWithoutExpiry) {
+                redisTemplate.expire(key, remainingRetention(event));
+            }
+            return true;
+        } catch (Exception e) {
+            String msg = String.format("补投事件到事件流失败: runId=%s, seq=%d", runId, event.getSeq());
+            log.error(msg, e);
+            throw new IllegalStateException(msg, e);
+        }
+    }
+
+    /** 这条事实自己还能在流里活多久：按它的发生时间算，不从此刻重新起算一份完整保留期。 */
+    Duration remainingRetention(AgentRunEvent event) {
+        if (event == null || event.getCreatedAt() == null) {
+            return eventsTtl;
+        }
+        Duration remaining = Duration.between(OffsetDateTime.now(), event.getCreatedAt().plus(eventsTtl));
+        return remaining.isNegative() || remaining.isZero() ? Duration.ofSeconds(1) : remaining;
+    }
+
+    private String memberOf(AgentRunEvent event) throws Exception {
+        return objectMapper.writeValueAsString(toPayload(event));
+    }
+
     private void writeBatch(String runId, List<AgentRunEvent> events) {
         if (events == null || events.isEmpty()) {
             return;
@@ -213,9 +294,7 @@ public class AgentRunEventRedisStore {
         try {
             List<ZSetOperations.TypedTuple<String>> tuples = new ArrayList<>(events.size());
             for (AgentRunEvent event : events) {
-                tuples.add(ZSetOperations.TypedTuple.of(
-                        objectMapper.writeValueAsString(toPayload(event)),
-                        event.getSeq().doubleValue()));
+                tuples.add(ZSetOperations.TypedTuple.of(memberOf(event), event.getSeq().doubleValue()));
             }
             redisTemplate.executePipelined(new SessionCallback<>() {
                 @Override
@@ -223,7 +302,7 @@ public class AgentRunEventRedisStore {
                 public Object execute(org.springframework.data.redis.core.RedisOperations operations) {
                     ZSetOperations<String, String> zset = operations.opsForZSet();
                     zset.add(key, new HashSet<>(tuples));
-                    operations.expire(key, EVENTS_TTL);
+                    operations.expire(key, eventsTtl);
                     return null;
                 }
             });

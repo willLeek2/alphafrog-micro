@@ -378,7 +378,7 @@ class PythonSandboxToolsP001FastPathTest {
         // Build real AgentRunEventService (spy for verification + InOrder)
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, om, llmConfigLoader);
+                redisTemplate, om, llmConfigLoader, 7L);
         AgentRunEventService realEventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
@@ -490,7 +490,7 @@ class PythonSandboxToolsP001FastPathTest {
         // Real AgentRunEventService (spy) + real ToolJobEventHookImpl
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, om, llmConfigLoader);
+                redisTemplate, om, llmConfigLoader, 7L);
         AgentRunEventService realEventSvc = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
@@ -715,7 +715,8 @@ class PythonSandboxToolsP001FastPathTest {
 
         // Real event hook for EVENT step
         AgentLlmLocalConfigLoader llmLoader1 = mock(AgentLlmLocalConfigLoader.class);
-        AgentRunEventRedisStore eventRedis1 = new AgentRunEventRedisStore(redisTemplate, om, llmLoader1);
+        AgentRunEventRedisStore eventRedis1 =
+                new AgentRunEventRedisStore(redisTemplate, om, llmLoader1, 7L);
         AgentRunEventService eventSvc1 = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedis1, om, redisTemplate,
                 llmLoader1, mock(AgentMessageService.class), mock(AgentPromptService.class),
@@ -922,7 +923,7 @@ class PythonSandboxToolsP001FastPathTest {
         ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, om, llmConfigLoader);
+                redisTemplate, om, llmConfigLoader, 7L);
         AgentRunEventService eventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
