@@ -111,6 +111,43 @@ class AcceptanceFixtureResolverTest {
         verifyNoInteractions(store);
     }
 
+    /**
+     * ext 自己读不出来时不按普通 Run 放过去。
+     *
+     * <p>ext 里出现夹具编号这个词、而 ext 读不回来（不是合法 JSON、不是对象、context_json 不是字符串），
+     * 就判不出这条 Run 到底是不是夹具 Run。判不出来还往下跑，一次本该跑夹具的验收会悄悄连上真实模型，
+     * 结果看起来像跑过了——所以这里当场拒绝，连夹具表都不去查。</p>
+     */
+    @Test
+    void anExtThatCannotBeReadIsRefusedInsteadOfRunningAgainstTheRealModel() {
+        // ext 不是合法 JSON：夹具编号在正文里出现过，但整条 ext 读不回来。
+        assertRefusedAsInvalid(rawRun("run-1", "{\"context_json\":\"{\\\"acceptanceFixtureId\\\":\\\"fx-1\\\"}\""));
+        // ext 是合法 JSON 但不是对象。
+        assertRefusedAsInvalid(rawRun("run-2", "[\"acceptanceFixtureId\"]"));
+        // ext 是对象，但 context_json 不是一个字符串（夹具编号写不到它里面）。
+        assertRefusedAsInvalid(rawRun("run-3", "{\"context_json\":{\"acceptanceFixtureId\":\"fx-1\"}}"));
+
+        verifyNoInteractions(store);
+        verifyNoInteractions(identityProvider);
+    }
+
+    private void assertRefusedAsInvalid(AgentRun run) {
+        assertThatThrownBy(() -> resolver.resolve(run))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_invalid"));
+    }
+
+    /** ext 原样写进去，故意写坏，用来验证「读不回来时不放过去」。 */
+    private AgentRun rawRun(String runId, String ext) {
+        AgentRun run = new AgentRun();
+        run.setId(runId);
+        run.setUserId("7");
+        run.setDeploymentId(LANE);
+        run.setDeploymentGenerationId(GENERATION);
+        run.setExt(ext);
+        return run;
+    }
+
     private AgentRun fixtureRun(String fixtureId) throws Exception {
         return ordinaryRun("{\"acceptanceFixtureId\":\"" + fixtureId + "\"}");
     }

@@ -2,15 +2,26 @@ package world.willfrog.agentlangchain.acceptance;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.time.OffsetDateTime;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -221,8 +232,7 @@ class AcceptanceFixtureModelRegistryTest {
     }
 
     @Test
-    void tooManyTrackedRunsIsRefusedInsteadOfDroppingALiveOne() throws Exception {
-        AcceptanceFixtureModelRegistry registry = registry();
+    void tooManyTrackedRunsIsRefusedInsteadOfDroppingALiveOne() throws Exception {        AcceptanceFixtureModelRegistry registry = registry();
         when(store.find(anyString(), anyString(), anyString()))
                 .thenReturn(Optional.of(row(true, future(), GOOD_SCRIPT)));
         for (int index = 0; index < AcceptanceFixtureModelRegistry.MAX_TRACKED_RUNS; index++) {
@@ -235,10 +245,124 @@ class AcceptanceFixtureModelRegistryTest {
                 .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_tracked_runs_full"));
     }
 
+    /**
+     * 终态事件走真的 Spring 事件通路把位置放掉。
+     *
+     * <p>只调方法测不出「监听有没有挂上」：注解删掉、Bean 没注册，直接调也照样通过。这里把注册表
+     * 当成 Bean 装起来，事件从上下文发出去，看位置是不是真的放了——放了就会重新建一份，没放就还是
+     * 原来那份。</p>
+     */
+    @Test
+    void aTerminalEventDropsThePositionThroughTheRealSpringPath() {
+        when(store.find(LANE, GENERATION, "fx-1"))
+                .thenReturn(Optional.of(row(true, future(), GOOD_SCRIPT)));
+        when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
+        AtomicReference<Object> before = new AtomicReference<>();
+        AtomicReference<Object> after = new AtomicReference<>();
+
+        new ApplicationContextRunner()
+                .withBean(AcceptanceFixtureResolver.class,
+                        () -> new AcceptanceFixtureResolver(store, identityProvider, objectMapper))
+                .withBean(ObjectMapper.class, () -> objectMapper)
+                .withBean(DualPoolSchedulerSettings.class, () -> TestSchedulerSettings.propertyOnly(
+                        DualPoolSchedulerSettings.KEY_PER_RUN_UNFINISHED_LIMIT, "1"))
+                .withUserConfiguration(AcceptanceFixtureModelRegistry.class)
+                .run(context -> {
+                    AcceptanceFixtureModelRegistry registry =
+                            context.getBean(AcceptanceFixtureModelRegistry.class);
+                    before.set(registry.stageForRun(fixtureRun("fx-1")).orElseThrow().model());
+                    context.publishEvent(new AgentRunFinalizedEvent(
+                            "run-1", 7L, AgentRunStatus.COMPLETED.name(), false));
+                    after.set(registry.stageForRun(fixtureRun("fx-1")).orElseThrow().model());
+                });
+
+        assertThat(after.get()).as("终态事件之后是重新建的一份，说明监听真的挂上了")
+                .isNotSameAs(before.get());
+    }
+
+    /**
+     * 两个线程同时为同一条 Run 要模型，两边拿到同一份位置。
+     *
+     * <p>这是脚本能按顺序消费的前提：各拿一份位置就会各自从头喂一遍脚本。</p>
+     */
+    @Test
+    void twoThreadsAskingAtOnceShareOnePosition() throws Exception {
+        AcceptanceFixtureModelRegistry registry = registry();
+        when(store.find(LANE, GENERATION, "fx-1"))
+                .thenReturn(Optional.of(row(true, future(), GOOD_SCRIPT)));
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Callable<ScriptedChatModel> ask = () -> {
+                start.await();
+                return registry.stageForRun(fixtureRun("fx-1")).orElseThrow().model();
+            };
+            Future<ScriptedChatModel> first = pool.submit(ask);
+            Future<ScriptedChatModel> second = pool.submit(ask);
+            start.countDown();
+
+            assertThat(first.get(10, TimeUnit.SECONDS)).isSameAs(second.get(10, TimeUnit.SECONDS));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private AcceptanceFixtureModelRegistry registry() {
+        return registry(TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.KEY_PER_RUN_UNFINISHED_LIMIT, "1"));
+    }
+
+    private AcceptanceFixtureModelRegistry registry(DualPoolSchedulerSettings settings) {
         when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
         return new AcceptanceFixtureModelRegistry(
-                new AcceptanceFixtureResolver(store, identityProvider, objectMapper), objectMapper);
+                new AcceptanceFixtureResolver(store, identityProvider, objectMapper), objectMapper,
+                settings);
+    }
+
+    /**
+     * 上限不是 1 就不给脚本：同一个 Run 同时跑两个分段时，两段谁先取到下一回合的回复说不准。
+     *
+     * <p>这条前提是可以运行期改的热配置，所以要在领脚本之前当场核对，不能靠约定。</p>
+     */
+    @Test
+    void aRunAllowedToHaveTwoWorkItemsInFlightIsRefusedInsteadOfHandedTheScript() throws Exception {
+        AcceptanceFixtureModelRegistry loose = registry(TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.KEY_PER_RUN_UNFINISHED_LIMIT, "2"));
+        when(store.find(LANE, GENERATION, "fx-1"))
+                .thenReturn(Optional.of(row(true, future(), GOOD_SCRIPT)));
+
+        assertThatThrownBy(() -> loose.stageForRun(fixtureRun("fx-1")))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(code(e))
+                        .isEqualTo("acceptance_fixture_needs_single_in_flight_work_item"))
+                .hasMessageContaining(DualPoolSchedulerSettings.KEY_PER_RUN_UNFINISHED_LIMIT);
+
+        // 上限调回 1 之后同一条 Run 照常拿到脚本：拒绝的是配置，不是这条 Run。
+        AcceptanceFixtureModelRegistry strict = registry();
+        when(store.find(LANE, GENERATION, "fx-1"))
+                .thenReturn(Optional.of(row(true, future(), GOOD_SCRIPT)));
+        assertThat(strict.stageForRun(fixtureRun("fx-1"))).isPresent();
+    }
+
+    /**
+     * 旧调度路径下不发脚本：那里一个节点内部是工具循环，一次模型调用换一个工具回合。
+     *
+     * <p>脚本按「一次模型调用 = 一个回合」排，喂给旧路径会与夹具作者写的先后错开，跑出来的结果
+     * 说不清是哪一次验收。版本是可运行期改的泳道热配置，所以按 Run 上冻结的那个版本核对。</p>
+     */
+    @Test
+    void aRunOnTheLegacySchedulerIsRefusedInsteadOfHandedTheScript() throws Exception {
+        AcceptanceFixtureModelRegistry registry = registry();
+        when(store.find(LANE, GENERATION, "fx-1"))
+                .thenReturn(Optional.of(row(true, future(), GOOD_SCRIPT)));
+        AgentRun run = fixtureRun("fx-1");
+        run.setSchedulerVersion(SchedulerVersion.LEGACY.name());
+
+        assertThatThrownBy(() -> registry.stageForRun(run))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(code(e))
+                        .isEqualTo("acceptance_fixture_scheduler_version_unusable"))
+                .hasMessageContaining("一个分段一次模型调用");
     }
 
     private AgentRun fixtureRun(String fixtureId) throws Exception {
@@ -255,6 +379,8 @@ class AcceptanceFixtureModelRegistryTest {
         run.setUserId("7");
         run.setDeploymentId(LANE);
         run.setDeploymentGenerationId(GENERATION);
+        // 夹具只在「一个分段一次模型调用」的调度器版本下跑：默认按那个版本造数据。
+        run.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
         run.setExt(objectMapper.writeValueAsString(Map.of("context_json", contextJson)));
         return run;
     }

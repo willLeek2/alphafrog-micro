@@ -53,7 +53,7 @@ COMMENT ON COLUMN alphafrog_agent_run_acceptance_fixture.plan_json IS
     '冻结计划；写计划时必须带 executionMode，Agent 侧拿它与请求的执行模式比对，不符即拒绝创建。';
 
 COMMENT ON COLUMN alphafrog_agent_run_acceptance_fixture.model_script_json IS
-    '冻结的模型回合，按顺序消费；工具调用的身份与原始顺序都在这里面。';
+    '冻结的模型回合，按顺序消费；工具调用的身份与原始顺序都在这里面。一个回合里 text 与 toolCalls 至少写一个，两个都写也可以。';
 
 COMMENT ON COLUMN alphafrog_agent_run_acceptance_fixture.dispatch_policy_json IS
     '结果放行与故障策略：延迟哪些成员、按什么顺序放行、哪些成员失败、注入哪种坏记录。';

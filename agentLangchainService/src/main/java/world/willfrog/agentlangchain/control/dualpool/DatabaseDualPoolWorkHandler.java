@@ -647,30 +647,23 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         try {
             int generation = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
             int totalToolCalls = totalCommittedToolCalls(run.getId(), generation, plan);
-            if (plan == null) {
-                boolean durable = freshRunPipeline.persistDualPoolFailureWithoutPlan(
-                        run, reason, failureMetadata, totalToolCalls);
-                if (durable || terminalNow(run.getId())) {
-                    if (cancelUnfinished(run.getId(), "run_failed")) {
-                        releaseRun(run.getId());
-                    }
-                }
-                return;
-            }
-            LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
-                    freshRunPipeline.rebuildDualPoolNodeContext(run.getId());
-            if (context == null) {
-                return;
-            }
-            boolean durable = freshRunPipeline.persistDualPoolWorkflowResult(context,
-                    LangchainWorkflowResult.builder()
-                            .success(false)
-                            .failureReason(reason)
-                            .failureMetadata(failureMetadata)
-                            .plan(plan)
-                            .completedTodos(completed)
-                            .toolCallsUsed(totalToolCalls)
-                            .build());
+            // 写失败这条路不解析阶段模型：模型解析会因为「这条 Run 自己的配置有问题」而拒绝（夹具中途
+            // 失效、脚本位置重建不了、请求上下文读不出来都是这一类），拿它挡着写失败，Run 就停在执行中。
+            LangchainLinearRunPipelineImpl.DualPoolNodeContext context = plan == null
+                    ? null : freshRunPipeline.rebuildDualPoolNodeContextForFailure(run.getId());
+            boolean durable = context == null
+                    // 计划读不回来：按「没有计划」那条路把失败写出去，总比不写强。
+                    ? freshRunPipeline.persistDualPoolFailureWithoutPlan(
+                            run, reason, failureMetadata, totalToolCalls)
+                    : freshRunPipeline.persistDualPoolWorkflowResult(context,
+                            LangchainWorkflowResult.builder()
+                                    .success(false)
+                                    .failureReason(reason)
+                                    .failureMetadata(failureMetadata)
+                                    .plan(plan)
+                                    .completedTodos(completed)
+                                    .toolCallsUsed(totalToolCalls)
+                                    .build());
             if (durable || terminalNow(run.getId())) {
                 if (cancelUnfinished(run.getId(), "run_failed")) {
                     releaseRun(run.getId());

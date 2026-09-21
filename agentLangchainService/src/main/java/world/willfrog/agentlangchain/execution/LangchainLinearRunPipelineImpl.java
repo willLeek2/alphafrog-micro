@@ -407,6 +407,42 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     /**
+     * 写终态失败时重建上下文：这条路不碰模型。
+     *
+     * <p>失败结果只用到 Run、计划与用户目标三样。阶段模型解析和 Prompt 身份核对都可能因为「这条 Run
+     * 自己的配置有问题」而拒绝——夹具在跑的中途被停用或过期、脚本位置重建不了、请求上下文里的夹具编号
+     * 读不出来、Prompt 身份对不上，都是这一类。拿这些拒绝去挡「把失败写出去」这一步，Run 就会停在执行
+     * 中：没有失败事件、没有失败原因，只能等过期或者人工收拾。</p>
+     *
+     * <p>所以这里只取写失败真正要用的东西：计划读不回来就返回空（调用方按「没有计划」那条路把失败写
+     * 出去），用户目标读不回来就用空串（失败原因与事件已经在 {@code reason} 里，不差这一句）。</p>
+     */
+    public DualPoolNodeContext rebuildDualPoolNodeContextForFailure(String runId) {
+        AgentRun run = findLocalRun(runId);
+        if (run == null || run.getStatus() != AgentRunStatus.EXECUTING || isBlank(run.getPlanJson())) {
+            return null;
+        }
+        // 写事件与快照要用线程级身份归因，这里补上与正常执行同一份；模型与工具目录都不解析。
+        AgentContext.setRunId(run.getId());
+        AgentContext.setUserId(run.getUserId());
+        LangchainTodoPlan plan;
+        try {
+            plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+        } catch (Exception e) {
+            log.warn("写终态失败时计划读不回来，改按没有计划那条路写: runId={} reason={}",
+                    runId, e.getMessage());
+            return null;
+        }
+        String userGoal = "";
+        try {
+            userGoal = followUpContextSupport.resolve(run).userGoal();
+        } catch (Exception e) {
+            log.warn("写终态失败时用户目标读不回来，按空目标写: runId={} reason={}", runId, e.getMessage());
+        }
+        return new DualPoolNodeContext(run, plan, userGoal, null, null);
+    }
+
+    /**
      * Run 协调侧把已经由节点池汇总好的最终工作流结果写回原有终态出口。
      * 这保证双池版本不会另造一套完成事件、消息、额度结算和终态快照语义。
      */
@@ -418,6 +454,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         AgentRun run = context.run();
         String runId = run.getId();
         String userId = run.getUserId();
+        if (context.stageModels() == null && (result.isSuccess() || result.isPartial())) {
+            // 写失败的上下文（见 rebuildDualPoolNodeContextForFailure）里没有阶段模型：拿它去写成功或
+            // 部分完成的结果，等于在没解析过模型的情况下广播终态。这里是代码走错了，说清楚并停住。
+            log.error("这份上下文是为写失败重建的，里面没有阶段模型，写不了成功结果: runId={}", runId);
+            return false;
+        }
         if (result.isSuspended()) {
             result = LangchainWorkflowResult.builder()
                     .success(false)

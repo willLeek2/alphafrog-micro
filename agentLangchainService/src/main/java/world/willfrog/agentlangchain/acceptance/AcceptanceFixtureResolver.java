@@ -18,7 +18,8 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  *
  * <p>编号从 Run 的 {@code ext.context_json} 里读（创建时随请求上下文一起存下来的），泳道与代际取
  * Run 上的那两个字段，并要求它们与本进程的部署身份一致；查回来的行逐条核对「还在、已启用、
- * 没过期」。任何一条不满足都当场报错，不悄悄当普通 Run 跑。</p>
+ * 没过期」。任何一条不满足都当场报错，不悄悄当普通 Run 跑。ext 读不回来、或者读出来分不清这条 Run
+ * 到底是不是夹具 Run，同样当场报错：那种情况下放它过去，一次本该跑夹具的验收会连上真实模型。</p>
  *
  * <p>模型回复与结果放行策略都走这一份实现：两边对「这条 Run 带的是哪条夹具、现在还能不能用」
  * 必须有同一个答案，各写一套迟早会分家。</p>
@@ -109,20 +110,46 @@ public class AcceptanceFixtureResolver {
         return row;
     }
 
-    /** 取 Run 的 ext 里原样存着的请求上下文；拿不到就是空（当成普通 Run 处理）。 */
+    /**
+     * 取 Run 的 ext 里原样存着的请求上下文。
+     *
+     * <p>只有「ext 读得出来、内容里根本没有 context_json 这个字段」才算普通 Run：ext 里还存着用户消息
+     * 正文，正文里提到夹具编号这个词，不代表这是一条夹具 Run（创建路径把上下文单独存成一个字符串，
+     * 见 {@code AgentRunEventService} 的 ext 组装）。</p>
+     *
+     * <p>读不回来的情况一律拒绝，不按普通 Run 往下跑：ext 读不回来、或者读出来不是对象、或者
+     * context_json 不是一个字符串，都说明这条 Run 的「是不是夹具 Run」判不出来。判不出来时按普通 Run
+     * 放过去，会让一次本该跑夹具的验收悄悄连上真实模型——那种结果看起来像跑过了，验收最不能有的就是
+     * 这个。这条口径与受理时的夹具门一致：那里遇到读不回来的上下文也是当场报错，不放过去。</p>
+     */
     private String contextJsonOf(AgentRun run) {
+        JsonNode root;
         try {
-            JsonNode root = objectMapper.readTree(run.getExt());
-            if (root == null || !root.isObject()) {
-                return null;
-            }
-            JsonNode context = root.get("context_json");
-            return context != null && context.isTextual() && !context.asText().isBlank()
-                    ? context.asText() : null;
+            root = objectMapper.readTree(run.getExt());
         } catch (Exception e) {
-            log.warn("Run 的 ext 读不回来，按普通 Run 处理: runId={} reason={}", run.getId(), e.getMessage());
+            throw refuse("acceptance_fixture_invalid",
+                    "这条 Run 的 ext 里出现了 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 这个词，"
+                            + "但 ext 整体读不回来（" + e.getMessage() + "）：分不清它是夹具 Run 还是"
+                            + "正文里提到这个词的普通 Run，按夹具这一侧拒绝，不按普通 Run 跑");
+        }
+        if (root == null || !root.isObject()) {
+            throw refuse("acceptance_fixture_invalid",
+                    "这条 Run 的 ext 里出现了 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 这个词，"
+                            + "但 ext 整体不是一个 JSON 对象：分不清它是夹具 Run 还是正文里提到这个词的"
+                            + "普通 Run，按夹具这一侧拒绝，不按普通 Run 跑");
+        }
+        JsonNode context = root.get("context_json");
+        if (context == null || context.isNull()) {
+            // ext 里没有这个字段：这条 Run 只是正文里提到了这个词，照普通 Run 处理。
             return null;
         }
+        if (!context.isTextual()) {
+            throw refuse("acceptance_fixture_invalid",
+                    "这条 Run 的 ext 里带 context_json，但它不是一个字符串（是 "
+                            + context.getNodeType() + "）：夹具编号就写在这个字符串里，读不出来就分不清"
+                            + "这条 Run 是不是夹具 Run");
+        }
+        return context.asText().isBlank() ? null : context.asText();
     }
 
     /** 上下文里写了夹具编号就要读出来；读不出来按不可用处理，不悄悄当普通 Run 跑。 */
