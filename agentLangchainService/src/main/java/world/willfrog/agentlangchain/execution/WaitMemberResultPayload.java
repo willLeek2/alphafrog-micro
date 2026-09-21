@@ -28,6 +28,16 @@ public final class WaitMemberResultPayload {
     }
 
     /**
+     * 结果正文是不是超过了上限。
+     *
+     * <p>写入方要用它决定成员落成功还是失败：载荷会把过大的结果改写成失败，成员行也必须是失败，
+     * 不能让两处对同一次调用给出两个结论。</p>
+     */
+    public static boolean tooLarge(String output, int maxChars) {
+        return maxChars > 0 && (output == null ? 0 : output.length()) > maxChars;
+    }
+
+    /**
      * 编码一份成员结果。
      *
      * @param toolName  工具名
@@ -45,7 +55,7 @@ public final class WaitMemberResultPayload {
                                 Map<String, Object> extra,
                                 int maxChars) {
         String text = output == null ? "" : output;
-        boolean tooLarge = maxChars > 0 && text.length() > maxChars;
+        boolean tooLarge = tooLarge(text, maxChars);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("toolName", toolName);
         payload.put("toolCallId", toolCallId);

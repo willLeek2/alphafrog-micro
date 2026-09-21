@@ -1937,6 +1937,17 @@ public class PythonSandboxTools {
     }
 
     /**
+     * 把一次已经确认终态的沙箱任务结果包成模型看到的那份 JSON。
+     *
+     * <p>同步执行与后台作业的结果接回必须写成同一个形状，所以这里给结果接收方一个入口，
+     * 不让第二处自己拼一遍。后台作业只跑 {@code executePython}，没有 finance 记录通道那一路，
+     * 所以按没有 finance 结果处理。</p>
+     */
+    public String formatTerminalResult(String status, TaskResultResponse result) {
+        return formatResult(status, result, null);
+    }
+
+    /**
      * 把沙箱执行结果转为工具统一的 JSON 响应。
      * 进程 exit code 为 0 时走 {@link #ok}；非零时仍附带 stdout/stderr 到 {@code data}，但 {@code ok=false}，
      * 方便 LLM 读取输出内容的同时识别执行失败。

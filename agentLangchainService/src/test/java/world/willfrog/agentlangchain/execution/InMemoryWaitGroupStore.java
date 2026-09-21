@@ -266,6 +266,20 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitMember> scanDueMembers(OffsetDateTime now, int limit) {
+        return members.values().stream()
+                .flatMap(java.util.Collection::stream)
+                .filter(row -> WaitMemberState.RUNNING.name().equals(row.state))
+                .filter(row -> row.nextPollAt != null && !row.nextPollAt.isAfter(now))
+                .sorted(java.util.Comparator
+                        .comparing((FakeMember row) -> row.nextPollAt)
+                        .thenComparingLong(row -> row.memberSeq))
+                .limit(limit)
+                .map(this::toMember)
+                .toList();
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,

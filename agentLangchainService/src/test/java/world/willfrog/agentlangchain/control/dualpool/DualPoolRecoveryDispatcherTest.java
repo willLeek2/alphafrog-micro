@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.wait.RecoveryConsumptionResult;
 import world.willfrog.agent.platform.wait.RecoveryNotification;
 import world.willfrog.agent.platform.wait.RecoveryNotificationState;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 
 import java.time.OffsetDateTime;
@@ -171,6 +172,12 @@ class DualPoolRecoveryDispatcherTest {
             notification.setCreatedAt(OffsetDateTime.now().minusSeconds(30));
             notifications.put(id, notification);
             due.add(id);
+        }
+
+        @Override
+        public List<WaitMember> scanDueMembers(OffsetDateTime now, int limit) {
+            // 成员结果接收不在这一组的用例范围里：给一个空扫描，够这个替身用。
+            return List.of();
         }
 
         @Override

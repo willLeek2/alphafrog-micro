@@ -194,6 +194,17 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitMember> scanDueMembers(OffsetDateTime now, int limit) {
+        if (now == null) {
+            throw new IllegalArgumentException("成员查询必须给出现在的时刻");
+        }
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.scanDueMembers(now, limit);
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,

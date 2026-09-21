@@ -57,6 +57,14 @@ public interface WaitGroupStore {
                                  OffsetDateTime nextPollAt,
                                  long runControlVersion);
 
+    /**
+     * 到点该查询外部作业状态的那些成员：还在执行中、下次查询时间已经到，等得最久的排最前。
+     *
+     * <p>结果接收方拿它决定这一轮去问哪些后台作业；查询时间由派发与上一次查询各自写上，
+     * 取一批候选、有界。</p>
+     */
+    List<WaitMember> scanDueMembers(OffsetDateTime now, int limit);
+
     /** 成员还在执行中时推后它的下次查询时间并累加轮询次数；已经落终态的成员不会被改。 */
     boolean rescheduleMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt, int maxBackoffStep);
 
