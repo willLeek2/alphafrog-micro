@@ -261,7 +261,8 @@ class Stage3GlobalStateMapperBindingTest {
         assertThat(RunCoordinationDeferReason.allWireValues())
                 .as("库里对延期原因有 CHECK 约束，枚举与它必须一致")
                 .containsExactly("RUN_COORDINATION_PERMIT_FULL", "PER_ROUND_NEW_NODE_LIMIT",
-                        "PER_RUN_UNFINISHED_LIMIT", "GLOBAL_UNFINISHED_PAUSED");
+                        "PER_RUN_UNFINISHED_LIMIT", "GLOBAL_UNFINISHED_PAUSED",
+                        "SERVICE_OWNERSHIP_ELSEWHERE");
         assertThat(RunCoordinationDeferReason.allWireValues())
                 .as("节点派发失败的原因记在工作项上，不能混进 Run 这一层")
                 .doesNotContain("HINT_QUEUE_FULL");

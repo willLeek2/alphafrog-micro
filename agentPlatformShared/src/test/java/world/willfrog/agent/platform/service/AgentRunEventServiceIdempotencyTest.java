@@ -61,14 +61,18 @@ class AgentRunEventServiceIdempotencyTest {
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
+    private world.willfrog.agent.platform.coordination.RunCoordinationStore coordinationStore;
     private AgentRunEventService service;
     private ObjectMapper objectMapper;
 
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
+        coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
+        org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
         service = new AgentRunEventService(runMapper, eventMapper, eventRedisStore, objectMapper,
-                redisTemplate, llmLocalConfigLoader, messageService, mockPromptService, transactionManager);
+                redisTemplate, llmLocalConfigLoader, messageService, mockPromptService, transactionManager,
+                coordinationStore);
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any())).thenReturn(new PromptRunSelection(
                 PromptRunSelection.SCHEMA_VERSION, "default-v1", "control", "bundle-digest",

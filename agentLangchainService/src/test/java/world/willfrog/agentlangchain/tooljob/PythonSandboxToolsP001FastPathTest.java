@@ -382,7 +382,8 @@ class PythonSandboxToolsP001FastPathTest {
         AgentRunEventService realEventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
-                mock(org.springframework.transaction.PlatformTransactionManager.class));
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(realEventService);
         AgentRunEventService eventService = spy(realEventService);
 
@@ -494,7 +495,8 @@ class PythonSandboxToolsP001FastPathTest {
         AgentRunEventService realEventSvc = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
-                mock(org.springframework.transaction.PlatformTransactionManager.class));
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(realEventSvc);
         AgentRunEventService eventServiceSpy = spy(realEventSvc);
 
@@ -720,7 +722,8 @@ class PythonSandboxToolsP001FastPathTest {
         AgentRunEventService eventSvc1 = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedis1, om, redisTemplate,
                 llmLoader1, mock(AgentMessageService.class), mock(AgentPromptService.class),
-                mock(org.springframework.transaction.PlatformTransactionManager.class));
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(eventSvc1);
         ToolJobEventHookImpl eventHook1 = new ToolJobEventHookImpl(newMapper(), eventSvc1);
 
@@ -927,7 +930,8 @@ class PythonSandboxToolsP001FastPathTest {
         AgentRunEventService eventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
-                mock(org.springframework.transaction.PlatformTransactionManager.class));
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(eventService);
 
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);

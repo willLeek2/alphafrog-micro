@@ -41,6 +41,7 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
     private final ThreadPoolTaskExecutor runExecutor;
     private final ThreadPoolTaskExecutor nodeExecutor;
     private final ObjectProvider<DualPoolWorkHandler> handlerProvider;
+    private final ObjectProvider<RunServiceLeaseKeeper> leaseKeeperProvider;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final SchedulerPermitLedger permitLedger;
     private final ArrayBlockingQueue<RunCoordinationHint> runHints;
@@ -73,6 +74,7 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
             @Qualifier("agentLangchainRunCoordinationTaskExecutor") ThreadPoolTaskExecutor runExecutor,
             @Qualifier("agentLangchainNodeTaskExecutor") ThreadPoolTaskExecutor nodeExecutor,
             ObjectProvider<DualPoolWorkHandler> handlerProvider,
+            ObjectProvider<RunServiceLeaseKeeper> leaseKeeperProvider,
             DualPoolRunAdmissionRegistry admissionRegistry,
             SchedulerPermitLedger permitLedger,
             @Value("${agent.langchain.dual-pool.run-worker.hint-capacity:256}") int runHintCapacity,
@@ -86,6 +88,7 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
         this.runExecutor = runExecutor;
         this.nodeExecutor = nodeExecutor;
         this.handlerProvider = handlerProvider;
+        this.leaseKeeperProvider = leaseKeeperProvider;
         this.admissionRegistry = admissionRegistry;
         this.permitLedger = permitLedger;
         this.runHints = new ArrayBlockingQueue<>(Math.max(1, runHintCapacity));
@@ -270,6 +273,12 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
         DualPoolWorkHandler handler = handlerProvider.getIfAvailable();
         if (handler != null) {
             snapshot.putAll(handler.routingSnapshot());
+        }
+        // 服务所有权续期的读数也放在这一份里：所有权是「谁该动这条 Run」的账，
+        // 看容量与候选的地方就应该能看到它续上没有、有没有丢。
+        RunServiceLeaseKeeper leaseKeeper = leaseKeeperProvider.getIfAvailable();
+        if (leaseKeeper != null) {
+            snapshot.putAll(leaseKeeper.snapshot());
         }
         return snapshot;
     }

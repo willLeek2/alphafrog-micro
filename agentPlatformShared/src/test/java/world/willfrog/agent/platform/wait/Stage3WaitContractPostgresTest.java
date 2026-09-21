@@ -35,6 +35,10 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
+import world.willfrog.agent.platform.lease.MybatisRunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.mapper.RunServiceLeaseMapper;
 import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
@@ -104,6 +108,8 @@ class Stage3WaitContractPostgresTest {
     private static final String DISPATCH_PROOF_SCRIPT = "008_agent_run_wait_member_dispatch_proof.sql";
     private static final String CONSUMED_BY_SCRIPT = "009_agent_run_recovery_consumed_by_check.sql";
     private static final String REPAIR_INDEX_SCRIPT = "010_agent_run_event_received_repair_index.sql";
+    private static final String SERVICE_LEASE_SCRIPT = "011_agent_run_service_lease.sql";
+    private static final String SHARED_CANDIDATE_SCRIPT = "012_agent_run_coordination_shared_candidate.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -196,6 +202,8 @@ class Stage3WaitContractPostgresTest {
                 .isEqualTo(3);
         expectRejected(insert + "('run-coord-v2', 'DUAL_POOL_V9', NULL)",
                 "alphafrog_agent_run_coordination_scheduler_version_check");
+        execute("UPDATE alphafrog_agent_run_coordination SET defer_reason = 'SERVICE_OWNERSHIP_ELSEWHERE' "
+                + "WHERE run_id = 'run-coord-old'");
         expectRejected("UPDATE alphafrog_agent_run_coordination SET defer_reason = 'HINT_QUEUE_FULL' "
                 + "WHERE run_id = 'run-coord-v2'",
                 "alphafrog_agent_run_coordination_defer_reason_check");
@@ -451,6 +459,43 @@ class Stage3WaitContractPostgresTest {
         assertThat(dueRunIds(store, mine))
                 .as("两条走同一份排序：先比服务轮次，再比下次可见时间，最后比 Run 编号")
                 .containsExactly("run-legacy-scan", "run-v2-scan");
+    }
+
+    /**
+     * 页首的旧版本行被推后之后，只剩下一条名额的扫描能轮到后面的双池 Run。
+     *
+     * <p>三个版本共用候选之后，旧版本的行也会被选出来。它接不了手（所有权不在本进程）时如果就
+     * 停在页首，页数一满，后面的双池 Run 永远看不见。这条量的是推后确实能把它移出页首：
+     * 名额只有一条，取到的必须是双池那一条。</p>
+     */
+    @Test
+    void aDeferredLegacyRowStopsBlockingTheSingleCandidateSlot() throws Exception {
+        createRunFor("run-legacy-blocking", "user-blocking", SchedulerVersion.LEGACY, 0, 0L);
+        createRunFor("run-v2-behind", "user-blocking", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        RunCoordinationStore store = coordinationStore();
+        assertThat(store.ensure("run-legacy-blocking")).isTrue();
+        assertThat(store.ensure("run-v2-behind")).isTrue();
+        // 整个用例类共用一个 schema：先把别的用例留下的候选推出一小时之外，这条只量本用例的两行。
+        execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP "
+                + "+ INTERVAL '1 hour' "
+                + "WHERE run_id NOT IN ('run-legacy-blocking', 'run-v2-behind')");
+        execute("UPDATE alphafrog_agent_run_coordination SET coordination_served_round = 0, "
+                + "next_visible_at = CURRENT_TIMESTAMP, defer_reason = NULL "
+                + "WHERE run_id IN ('run-legacy-blocking', 'run-v2-behind')");
+
+        // 旧版本排在前面（编号更小、轮次相同），名额只有一条时先取它。
+        assertThat(store.scanDue(1))
+                .extracting(RunCoordination::getRunId)
+                .containsExactly("run-legacy-blocking");
+
+        // 接不了手，按所有权原因推后：下一轮它让位，名额落到双池那条上。
+        assertThat(store.deferFor("run-legacy-blocking",
+                RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
+                OffsetDateTime.now().plusMinutes(1), 0, 0L)).isTrue();
+        assertThat(store.scanDue(1))
+                .as("推后之后一条名额也能轮到后面的双池 Run")
+                .extracting(RunCoordination::getRunId)
+                .containsExactly("run-v2-behind");
     }
 
     @Test
@@ -1051,6 +1096,53 @@ class Stage3WaitContractPostgresTest {
     }
 
     /**
+     * 表里塞满别的类型的事件之后，修补那条查询在真实规划器下也不做整表扫描。
+     *
+     * <p>上面那条只证明索引按对的列建好了；这条把库喂到「整表翻一遍明显更贵」的规模，再看规划器
+     * 给这条查询什么计划。断言只看一件事：事件表这一侧不被整表翻——这正是建这条索引的原因，
+     * 事件表只增不减，每半分钟一轮的扫描不能随着它一起变慢。计划全文放在失败消息里，
+     * 真跑出来不一样时能直接看到分歧在哪。</p>
+     */
+    @Test
+    void theRepairScanDoesNotWalkTheWholeEventTable() throws Exception {
+        String runId = "run-repair-plan";
+        createRun(runId, 0, 0L);
+        // 二十万条别的事件：它们不进偏索引，所以「整表翻」在这里看起来越来越划不来。
+        execute("INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, payload_json) "
+                + "SELECT '" + runId + "', seq, 'LLM_CALL_STARTED', '{}'::jsonb "
+                + "FROM generate_series(1, 200000) AS seq");
+        insertReceivedFact(runId, 200001);
+        execute("ANALYZE alphafrog_agent_run_event");
+
+        String plan = explain("SELECT e.id, e.run_id, e.seq, e.event_type, "
+                + "e.payload_json::text AS payload_json, e.created_at "
+                + "FROM alphafrog_agent_run_event e "
+                + "JOIN alphafrog_agent_run r ON r.id = e.run_id "
+                + "WHERE e.event_type = 'RUN_RECEIVED' "
+                + "AND e.created_at > now() - interval '7 days' "
+                + "AND (e.created_at, e.id) > (now() - interval '7 days', 0) "
+                + "AND r.deployment_id = 'stable' "
+                + "ORDER BY e.created_at ASC, e.id ASC LIMIT 200");
+
+        assertThat(plan)
+                .as("修补查询不能在事件表上整表扫描，实际计划：\n" + plan)
+                .doesNotContain("Seq Scan on alphafrog_agent_run_event");
+    }
+
+    /** 规划器怎么走这条查询：只要计划文本，不执行。 */
+    private static String explain(String sql) throws Exception {
+        StringBuilder plan = new StringBuilder();
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement();
+             var rows = statement.executeQuery("EXPLAIN (COSTS OFF) " + sql)) {
+            while (rows.next()) {
+                plan.append(rows.getString(1)).append('\n');
+            }
+        }
+        return plan.toString();
+    }
+
+    /**
      * 投射要用数据库实际保存的那一行：写入不写 {@code created_at}（用库自己的当前时间），
      * 负载又存成 jsonb。
      *
@@ -1110,6 +1202,179 @@ class Stage3WaitContractPostgresTest {
                 + "VALUES ('" + runId + "', " + seq + ", 'RUN_RECEIVED', '{}'::jsonb)");
     }
 
+    // ==================== Run 的服务所有权租约 ====================
+
+    /**
+     * 一条 Run 的服务所有权：领取、续期、让出、接手，以及换主人之后旧主人写不动。
+     *
+     * <p>这是「哪一代进程此刻可以动这条 Run」的持久事实：内存登记只能说明本进程自己在做什么，
+     * 按「多久没被改过」推断也不行——模型调用、工具等待期间本来就不写数据库。</p>
+     */
+    @Test
+    void serviceLeaseIsAcquiredRenewedTakenOverAndReleased() throws Exception {
+        createRun("run-lease", 0, 0L);
+        RunServiceLeaseStore store = leaseStore();
+        java.time.Duration ttl = java.time.Duration.ofMinutes(2);
+
+        RunServiceLease first = store.acquire("run-lease", "owner-a", ttl).orElseThrow();
+        assertThat(first.fencingToken()).as("第一次领取代际从 1 开始").isEqualTo(1L);
+        assertThat(first.ownerInstanceId()).isEqualTo("owner-a");
+
+        assertThat(store.acquire("run-lease", "owner-a", ttl).orElseThrow().fencingToken())
+                .as("同一位主人重复领取是续上，不是换代：换号会把自己在飞的操作一起作废")
+                .isEqualTo(1L);
+        assertThat(store.acquire("run-lease", "owner-b", ttl))
+                .as("别人正活着持有：领不到，也不该领到").isEmpty();
+        assertThat(store.renew("run-lease", "owner-b", 1L, ttl))
+                .as("续期要核对主人").isFalse();
+        assertThat(store.renew("run-lease", "owner-a", 1L, ttl)).isTrue();
+        assertThat(store.renew("run-lease", "owner-a", 2L, ttl))
+                .as("续期要核对代际：号对不上说明这条已经换了主人").isFalse();
+        assertThat(store.renewOwned("owner-a", ttl)).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
+        assertThat(store.renewOwned("owner-b", ttl)).as("别人的租约一条都不动").isZero();
+
+        // 到期之后可以被接手：代际加一，旧主人手里那个号立刻写不动。
+        execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP, "
+                + "renewed_at = CURRENT_TIMESTAMP - INTERVAL '1 minute' WHERE run_id = 'run-lease'");
+        RunServiceLease takenOver = store.acquire("run-lease", "owner-b", ttl).orElseThrow();
+        assertThat(takenOver.ownerInstanceId()).isEqualTo("owner-b");
+        assertThat(takenOver.fencingToken()).as("接手要换代，旧主人的号从此作废").isEqualTo(2L);
+        assertThat(store.renew("run-lease", "owner-a", 1L, ttl))
+                .as("旧主人迟到的续期写不动").isFalse();
+        assertThat(store.release("run-lease", "owner-a", 1L))
+                .as("旧主人迟到的让出也写不动").isFalse();
+
+        // 让出：立刻变成可以接手，但代际号留着继续往上涨，不会回到 1。
+        assertThat(store.release("run-lease", "owner-b", 2L)).isTrue();
+        RunServiceLease reacquired = store.acquire("run-lease", "owner-a", ttl).orElseThrow();
+        assertThat(reacquired.fencingToken())
+                .as("让出不删行：号要是回到 1，旧主人手里那个号有可能正好对上")
+                .isEqualTo(3L);
+    }
+
+    /** 三个代际的进程同时抢同一条 Run：只有一个领到，别的都领不到。 */
+    @Test
+    void concurrentAcquireLeavesExactlyOneOwner() throws Exception {
+        createRun("run-lease-race", 0, 0L);
+        List<java.util.Optional<RunServiceLease>> results = runConcurrently(4, slot -> {
+            RunServiceLeaseStore store = leaseStore();
+            return store.acquire("run-lease-race", "race-owner-" + slot,
+                    java.time.Duration.ofMinutes(5));
+        });
+        assertThat(results.stream().filter(java.util.Optional::isPresent).count())
+                .as("四个人同时领，只可能有一个领到")
+                .isEqualTo(1L);
+        assertThat(results.stream().flatMap(java.util.Optional::stream)
+                .map(RunServiceLease::fencingToken).toList())
+                .as("唯一领到的那一个代际是 1").containsExactly(1L);
+    }
+
+    /** 接手扫描只挑「已经到期、且这条 Run 还在跑」的那些：结束的 Run 谁接手都没意义。 */
+    @Test
+    void onlyExpiredLeasesOfStillRunningRunsShowUpForTakeover() throws Exception {
+        createRun("run-lease-live", 0, 0L);
+        createRunFor("run-lease-done", "user-lease-done", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET status = 'COMPLETED' WHERE id = 'run-lease-done'");
+        RunServiceLeaseStore store = leaseStore();
+        java.time.Duration ttl = java.time.Duration.ofMinutes(5);
+        store.acquire("run-lease-live", "owner-a", ttl).orElseThrow();
+        store.acquire("run-lease-done", "owner-a", ttl).orElseThrow();
+        execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP "
+                + "WHERE run_id IN ('run-lease-live', 'run-lease-done')");
+
+        assertThat(store.listExpiredWithLiveRun(java.time.OffsetDateTime.now(), 100))
+                .extracting(RunServiceLease::runId)
+                .as("到期的两行里只挑还在跑的那一条")
+                .contains("run-lease-live")
+                .doesNotContain("run-lease-done");
+    }
+
+    /**
+     * 批量续期只续「自己手上、Run 还在跑」的那些，别人手上的与已经结束的都不碰。
+     *
+     * <p>续期循环靠「清点几条、续上几条」对不对得上来发现租约被接手，两个数必须由同一份口径算出来：
+     * 清点少算一个状态，就会每轮都报一次假的「被接手」。这条把两种边界都放进真库：别人持有的、
+     * 以及自己持有的但 Run 已结束的。</p>
+     */
+    @Test
+    void renewOwnedOnlyTouchesMyLiveRuns() throws Exception {
+        createRun("run-renew-mine", 0, 0L);
+        createRun("run-renew-peer", 0, 0L);
+        createRun("run-renew-done", 0, 0L);
+        RunServiceLeaseStore store = leaseStore();
+        java.time.Duration ttl = java.time.Duration.ofMinutes(2);
+
+        store.acquire("run-renew-mine", "owner-renew", ttl).orElseThrow();
+        store.acquire("run-renew-peer", "owner-other", ttl).orElseThrow();
+        store.acquire("run-renew-done", "owner-renew", ttl).orElseThrow();
+        // 结束的 Run 上留着一条自己持有的租约，但续期与清点都不该算它。
+        execute("UPDATE alphafrog_agent_run SET status = 'COMPLETED' WHERE id = 'run-renew-done'");
+
+        assertThat(store.listOwnedWithLiveRun("owner-renew", 50))
+                .as("清点只看还在跑的：自己的两条里有一条已经结束了")
+                .extracting(RunServiceLease::runId)
+                .containsExactly("run-renew-mine");
+        assertThat(store.renewOwned("owner-renew", ttl))
+                .as("续上的条数与清点的一致，才不会每轮报假的「被接手」")
+                .isEqualTo(1);
+
+        java.time.OffsetDateTime before = store.find("run-renew-peer").orElseThrow().expiresAt();
+        assertThat(store.find("run-renew-peer").orElseThrow().expiresAt())
+                .as("别人持有的那条一点都不动")
+                .isEqualTo(before);
+        assertThat(store.renewOwned("owner-other", ttl)).as("别人续自己的那条照常").isEqualTo(1);
+    }
+
+    /**
+     * 被接手之后旧主人续不上，清点里也不再出现——这是「本进程已经不再持有」的机器事实。
+     */
+    @Test
+    void aTakenOverLeaseCannotBeRenewedByItsFormerOwner() throws Exception {
+        createRun("run-renew-taken", 0, 0L);
+        RunServiceLeaseStore store = leaseStore();
+        java.time.Duration ttl = java.time.Duration.ofMinutes(2);
+
+        RunServiceLease mine = store.acquire("run-renew-taken", "owner-first", ttl).orElseThrow();
+        // 让租约过期，让另一个持有者接手：代际号往前走一格。
+        execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'"
+                + " WHERE run_id = 'run-renew-taken'");
+        RunServiceLease taken = store.acquire("run-renew-taken", "owner-second", ttl).orElseThrow();
+        assertThat(taken.fencingToken()).isEqualTo(mine.fencingToken() + 1);
+
+        assertThat(store.renew("run-renew-taken", "owner-first", mine.fencingToken(), ttl))
+                .as("旧主人手里那个代际号续不动了")
+                .isFalse();
+        assertThat(store.renewOwned("owner-first", ttl))
+                .as("批量续期也一样：这条已经不归它")
+                .isZero();
+        assertThat(store.listOwnedWithLiveRun("owner-first", 50))
+                .as("清点里也不再出现：旧主人这轮的「该续几条」自然对得上")
+                .isEmpty();
+        assertThat(store.renewOwned("owner-second", ttl)).isEqualTo(1);
+    }
+
+    /**
+     * 新建的 Run 一出生就在共享候选里，不需要谁再补一次。
+     *
+     * <p>这是「三个版本共用一份候选」能成立的前提：候选表里没有位置，这条 Run 就永远不会被
+     * 任何版本的调度器看见。</p>
+     */
+    @Test
+    void aRunCreatedThroughTheServiceIsInTheSharedCandidateSetAtOnce() throws Exception {
+        AgentRunEventService service = admissionService();
+        AgentRunEventService.RunCreation creation =
+                createNewRun(service, "user-candidate-set", "key-candidate-set-1");
+        assertThat(creation.created()).isTrue();
+
+        RunCoordinationStore store = coordinationStore();
+        assertThat(store.find(creation.run().getId()))
+                .as("创建那条事务里就排进了共享候选")
+                .isPresent();
+        assertThat(store.find(creation.run().getId()).orElseThrow().getSchedulerVersion())
+                .as("资格行上的版本取自 Run 主表")
+                .isEqualTo(creation.run().getSchedulerVersion());
+    }
+
     /**
      * 真库上的服务对象：映射器与事务管理器都是真的，只有 Redis、消息、提示词这些外部协作者用替身。
      *
@@ -1147,7 +1412,9 @@ class Stage3WaitContractPostgresTest {
                 Mockito.mock(AgentLlmLocalConfigLoader.class),
                 Mockito.mock(AgentMessageService.class),
                 promptService,
-                new DataSourceTransactionManager(dataSource));
+                new DataSourceTransactionManager(dataSource),
+                // 创建那条事务里会往共享候选里排队：用真的资格表，量的才是「Run 一出生就在候选里」。
+                coordinationStore());
         // 这些值平时由配置注入，直接 new 出来是 0/空；显式给上，免得量的是个退化配置。
         ReflectionTestUtils.setField(service, "ttlMinutes", 60);
         ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
@@ -1217,7 +1484,7 @@ class Stage3WaitContractPostgresTest {
     private static void applyStage3ScriptsTwice() throws Exception {
         for (int round = 1; round <= 2; round++) {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
-                    REPAIR_INDEX_SCRIPT)) {
+                    REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -1241,6 +1508,7 @@ class Stage3WaitContractPostgresTest {
         for (String resource : List.of("mapper/WaitGroupMapper.xml", "mapper/NodeWorkItemMapper.xml",
                 "mapper/AgentRunMapper.xml", "mapper/AgentRunEventMapper.xml",
                 "mapper/RunCoordinationMapper.xml",
+                "mapper/RunServiceLeaseMapper.xml",
                 "mapper/SchedulerStateMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
@@ -1317,6 +1585,11 @@ class Stage3WaitContractPostgresTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             return session.getMapper(NodeWorkItemMapper.class).listLatestSegments(runId, planGeneration);
         }
+    }
+
+    private static RunServiceLeaseStore leaseStore() {
+        SqlSession session = sqlSessionFactory.openSession(true);
+        return new MybatisRunServiceLeaseStore(session.getMapper(RunServiceLeaseMapper.class));
     }
 
     private static RunCoordinationStore coordinationStore() {

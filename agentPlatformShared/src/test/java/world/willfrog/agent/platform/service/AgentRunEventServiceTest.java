@@ -62,12 +62,15 @@ class AgentRunEventServiceTest {
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
+    private world.willfrog.agent.platform.coordination.RunCoordinationStore coordinationStore;
     private AgentRunEventService service;
     private ObjectMapper objectMapper;
 
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
+        coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
+        org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
         service = new AgentRunEventService(
                 runMapper,
                 eventMapper,
@@ -77,7 +80,8 @@ class AgentRunEventServiceTest {
                 llmLocalConfigLoader,
                 messageService,
                 mockPromptService,
-                transactionManager
+                transactionManager,
+                coordinationStore
         );
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any()))
@@ -139,7 +143,8 @@ class AgentRunEventServiceTest {
                 llmLocalConfigLoader,
                 messageService,
                 mockPromptService,
-                transactionManager
+                transactionManager,
+                coordinationStore
         );
         AgentRunEvent pending = new AgentRunEvent();
         pending.setRunId("r1");
@@ -394,6 +399,29 @@ class AgentRunEventServiceTest {
         assertEquals("2026-06-24", df.get("end_date"));
         assertEquals("2026-06-24", df.get("as_of_date"));
         assertEquals("test snapshot", df.get("description"));
+    }
+
+    /**
+     * 新建的每一条 Run 都在共享候选里排队，不管它将来由哪一种调度器消费。
+     *
+     * <p>资格行缺了，这条 Run 在候选里没有位置；候选是三个版本共用的唯一入口，旧版本那条路
+     * 也不会来补它，所以这一步必须跟着创建走。断言按创建时的那个 runId 核。</p>
+     */
+    @Test
+    void createRun_shouldPutTheRunIntoTheSharedCandidateSet() throws Exception {
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        AgentRun run = run("r-candidate", "u-candidate");
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString())).thenReturn(run);
+
+        service.createRun("u-candidate", "hello", "{}",
+                "idem-candidate", "m", "e", false, "openrouter", 2, false, "{}",
+                DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        verify(coordinationStore).ensure(runCaptor.getValue().getId());
     }
 
     @Test

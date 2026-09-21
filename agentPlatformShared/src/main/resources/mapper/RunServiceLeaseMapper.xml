@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.RunServiceLeaseMapper">
+
+    <!--
+      还没进终态的 Run 有哪些状态：接手扫描、批量续期、续期前的清点三处都要用同一份。
+
+      三处必须逐字一致，少写一个状态就会出现「清点说该续 5 条、批量续期只续了 4 条」这种
+      自己骗自己的差数。所以放在一份里，谁也别各写一遍。
+
+      正在取消（CANCELING）也算在里面：那条 Run 还在收尾，做收尾的进程仍然该持有它的所有权，
+      租约不该在收尾中途过期。派发器另外按自己的状态闸门决定不给它派活，那是两件事。
+    -->
+    <sql id="liveRunStatuses">'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'CANCELING'</sql>
+
+    <resultMap id="RunServiceLeaseResultMap" type="world.willfrog.agent.platform.lease.RunServiceLease">
+        <constructor>
+            <idArg column="run_id" javaType="java.lang.String"/>
+            <arg column="owner_instance_id" javaType="java.lang.String"/>
+            <arg column="fencing_token" javaType="long"/>
+            <arg column="acquired_at" javaType="java.time.OffsetDateTime"/>
+            <arg column="renewed_at" javaType="java.time.OffsetDateTime"/>
+            <arg column="expires_at" javaType="java.time.OffsetDateTime"/>
+        </constructor>
+    </resultMap>
+
+    <!--
+      领取或续上这一条 Run 的服务所有权，三种情况合在一句里：
+
+      没有这一行：新建，代际从 1 开始。持有者还是自己：续上到期时间，代际不动——同一代进程每次
+      刷新都换号，会把自己手上在飞的操作一起作废。持有者是别人且已过期：接手，代际加一，
+      旧主人手里那个号从此写不动任何东西。
+
+      别人正活着持有（条件不成立）时不写、也不返回行，调用方拿到空就知道这条 Run 不归自己动。
+      Run 不存在时同样不建行：给一条不存在的 Run 发所有权没有意义。
+    -->
+    <select id="acquire" resultMap="RunServiceLeaseResultMap">
+        INSERT INTO alphafrog_agent_run_service_lease
+            (run_id, owner_instance_id, fencing_token, acquired_at, renewed_at, expires_at)
+        SELECT #{runId}, #{owner}, 1,
+               CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+               CURRENT_TIMESTAMP + #{ttlMillis} * INTERVAL '1 millisecond'
+        WHERE EXISTS (SELECT 1 FROM alphafrog_agent_run r WHERE r.id = #{runId})
+        ON CONFLICT (run_id) DO UPDATE SET
+            fencing_token = CASE
+                WHEN alphafrog_agent_run_service_lease.owner_instance_id = EXCLUDED.owner_instance_id
+                    THEN alphafrog_agent_run_service_lease.fencing_token
+                ELSE alphafrog_agent_run_service_lease.fencing_token + 1
+            END,
+            owner_instance_id = EXCLUDED.owner_instance_id,
+            renewed_at = CURRENT_TIMESTAMP,
+            expires_at = EXCLUDED.expires_at
+        WHERE alphafrog_agent_run_service_lease.expires_at &lt;= CURRENT_TIMESTAMP
+           OR alphafrog_agent_run_service_lease.owner_instance_id = EXCLUDED.owner_instance_id
+        RETURNING run_id, owner_instance_id, fencing_token, acquired_at, renewed_at, expires_at
+    </select>
+
+    <update id="renew">
+        UPDATE alphafrog_agent_run_service_lease SET
+            renewed_at = CURRENT_TIMESTAMP,
+            expires_at = CURRENT_TIMESTAMP + #{ttlMillis} * INTERVAL '1 millisecond'
+        WHERE run_id = #{runId}
+          AND owner_instance_id = #{owner}
+          AND fencing_token = #{fencingToken}
+    </update>
+
+    <!--
+      这一位持有的租约一起续：调用方是本进程的续期循环，一轮一条语句，不按 Run 逐条刷。
+
+      已经结束的 Run 不再续：它的所有权交不交回来都不影响别人，继续续下去只会让这张表里
+      堆着永远不过期的行、并把「本进程还持有几条活租约」这个数越算越大。
+    -->
+    <update id="renewOwned">
+        UPDATE alphafrog_agent_run_service_lease l SET
+            renewed_at = CURRENT_TIMESTAMP,
+            expires_at = CURRENT_TIMESTAMP + #{ttlMillis} * INTERVAL '1 millisecond'
+        WHERE l.owner_instance_id = #{owner}
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run r
+                      WHERE r.id = l.run_id
+                        AND r.status IN (<include refid="liveRunStatuses"/>))
+    </update>
+
+    <!--
+      这一位持有的、对应 Run 还没结束的租约。
+
+      续期循环用它算「本该续上几条」：续上的行数少于这个数，说明其中有租约已经被别人按过期接手了，
+      本进程在那几条 Run 上不再有发言权。只取有界一页。
+    -->
+    <select id="listOwnedWithLiveRun" resultMap="RunServiceLeaseResultMap">
+        SELECT l.run_id, l.owner_instance_id, l.fencing_token, l.acquired_at, l.renewed_at, l.expires_at
+        FROM alphafrog_agent_run_service_lease l
+        JOIN alphafrog_agent_run r ON r.id = l.run_id
+        WHERE l.owner_instance_id = #{owner}
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+        ORDER BY l.acquired_at, l.run_id
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      让出：把到期时间置成此刻，别人下一轮就能按条件接走。
+
+      这一行不删：代际号跟着这一行留下来继续往上涨，删掉再建会让号回到 1，旧主人手里那个号
+      有可能正好对上。让出之后这一行仍然是「这一代曾经持有过」的记录。
+    -->
+    <update id="release">
+        UPDATE alphafrog_agent_run_service_lease SET
+            expires_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId}
+          AND owner_instance_id = #{owner}
+          AND fencing_token = #{fencingToken}
+    </update>
+
+    <select id="find" resultMap="RunServiceLeaseResultMap">
+        SELECT run_id, owner_instance_id, fencing_token, acquired_at, renewed_at, expires_at
+        FROM alphafrog_agent_run_service_lease
+        WHERE run_id = #{runId}
+    </select>
+
+    <!--
+      到期、且对应 Run 还没进终态的那些租约：接手扫描按到期时间升序取有界的一页。
+
+      已经结束的 Run 不该被接手：它的所有权交不交回来都不影响别人。正在取消的 Run 会出现
+      在这份清单里（它还在收尾、做收尾的进程该继续持有），但派发器按自己的状态闸门不会给它派活，
+      取消由取消路径自己推进。
+    -->
+    <select id="listExpiredWithLiveRun" resultMap="RunServiceLeaseResultMap">
+        SELECT l.run_id, l.owner_instance_id, l.fencing_token, l.acquired_at, l.renewed_at, l.expires_at
+        FROM alphafrog_agent_run_service_lease l
+        JOIN alphafrog_agent_run r ON r.id = l.run_id
+        WHERE l.expires_at &lt;= #{now}
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+        ORDER BY l.expires_at, l.run_id
+        LIMIT #{limit}
+    </select>
+</mapper>

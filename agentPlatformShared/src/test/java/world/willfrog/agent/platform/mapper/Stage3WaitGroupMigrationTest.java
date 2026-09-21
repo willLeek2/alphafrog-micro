@@ -189,7 +189,7 @@ class Stage3WaitGroupMigrationTest {
     @Test
     void waitGroupStateCheckMatchesEnum() {
         assertThat(MigrationScripts.constraintValues(
-                script, "alphafrog_agent_run_wait_group_state_check"))
+                "alphafrog_agent_run_wait_group_state_check"))
                 .as("等待组状态取值应与 WaitGroupState 逐项一致")
                 .containsExactlyElementsOf(WaitGroupState.allWireValues());
     }
@@ -197,7 +197,7 @@ class Stage3WaitGroupMigrationTest {
     @Test
     void waitMemberStateCheckMatchesEnum() {
         assertThat(MigrationScripts.constraintValues(
-                script, "alphafrog_agent_run_wait_member_state_check"))
+                "alphafrog_agent_run_wait_member_state_check"))
                 .as("等待成员状态取值应与 WaitMemberState 逐项一致")
                 .containsExactlyElementsOf(WaitMemberState.allWireValues());
     }
@@ -205,7 +205,7 @@ class Stage3WaitGroupMigrationTest {
     @Test
     void recoveryNotificationStateCheckMatchesEnum() {
         assertThat(MigrationScripts.constraintValues(
-                script, "alphafrog_agent_run_recovery_notification_state_check"))
+                "alphafrog_agent_run_recovery_notification_state_check"))
                 .as("恢复通知状态取值应与 RecoveryNotificationState 逐项一致")
                 .containsExactlyElementsOf(RecoveryNotificationState.allWireValues());
     }
@@ -213,11 +213,11 @@ class Stage3WaitGroupMigrationTest {
     @Test
     void coordinationDeferReasonCheckMatchesEnum() {
         assertThat(MigrationScripts.constraintValues(
-                script, "alphafrog_agent_run_coordination_defer_reason_check"))
+                "alphafrog_agent_run_coordination_defer_reason_check"))
                 .as("协调延期原因应与 RunCoordinationDeferReason 逐项一致")
                 .containsExactlyElementsOf(RunCoordinationDeferReason.allWireValues());
         assertThat(MigrationScripts.constraintValues(
-                script, "alphafrog_agent_run_coordination_defer_reason_check"))
+                "alphafrog_agent_run_coordination_defer_reason_check"))
                 .as("节点派发的失败原因不属于 Run 协调这一层")
                 .doesNotContain("HINT_QUEUE_FULL");
     }
@@ -225,9 +225,62 @@ class Stage3WaitGroupMigrationTest {
     @Test
     void workItemDispatchDeferReasonCheckMatchesEnum() {
         assertThat(MigrationScripts.constraintValues(
-                script, "alphafrog_agent_run_work_item_dispatch_defer_reason_check"))
+                "alphafrog_agent_run_work_item_dispatch_defer_reason_check"))
                 .as("节点派发延期原因应与 NodeDispatchDeferReason 逐项一致")
                 .containsExactlyElementsOf(NodeDispatchDeferReason.allWireValues());
+    }
+
+    // ===== 阶段三后补的三份脚本（真库验证在真库探针里，这里盯住不连库也看得出的形状） =====
+
+    /**
+     * 事件修补的索引只能普通建：迁移工具每个脚本都在一个事务里跑，并发建索引
+     * （{@code CONCURRENTLY}）在事务块里会直接报错，整份脚本都落不下去。
+     *
+     * <p>代价要说清楚：普通建索引期间对这张表加写锁，建完为止。事件表只增不减，表越大这一步越久，
+     * 大表上要留出维护窗口。</p>
+     */
+    @Test
+    void theRepairIndexIsBuiltWithoutConcurrentBuild() {
+        String script = MigrationScripts.lastContaining("idx_agent_run_event_received_created");
+        assertThat(script.toUpperCase())
+                .as("迁移工具一个脚本一个事务，并发建索引在事务块里跑不了")
+                .doesNotContain("CONCURRENTLY");
+        assertThat(script)
+                .as("建的必须是那条偏索引：只收接收事实，按（时间，编号）排序")
+                .contains("CREATE INDEX IF NOT EXISTS idx_agent_run_event_received_created")
+                .contains("(created_at, id)")
+                .contains("RUN_RECEIVED");
+    }
+
+    /** 服务所有权租约表：主键就是 Run，换主人时令牌必须往前走，过期时间有索引好查。 */
+    @Test
+    void theServiceLeaseTableCarriesItsOwnGuard() {
+        String script = MigrationScripts.lastContaining("alphafrog_agent_run_service_lease");
+        assertThat(script)
+                .as("建表要幂等").contains("CREATE TABLE IF NOT EXISTS alphafrog_agent_run_service_lease");
+        assertThat(script)
+                .as("Run 是主键：一条 Run 在库里只能有一份所有权记录")
+                .contains("run_id").contains("PRIMARY KEY");
+        assertThat(script)
+                .as("令牌与主人不能是空的：空值会让「换主人了没有」判断不了")
+                .contains("fencing_token > 0")
+                .contains("btrim(owner_instance_id)");
+        assertThat(script)
+                .as("按过期时间取可接手的那些，要有索引")
+                .contains("idx_agent_run_service_lease_expiry");
+    }
+
+    /** 共享候选的配套索引按全局排序建：先比最近被服务的轮次，再比下次可见时间，最后比编号。 */
+    @Test
+    void theSharedCandidateIndexFollowsTheGlobalOrder() {
+        String script = MigrationScripts.lastContaining("idx_agent_run_coordination_shared_due");
+        assertThat(script)
+                .as("候选的三个版本共用一份排序，索引要按这份排序的前两列建")
+                .contains("idx_agent_run_coordination_shared_due")
+                .contains("ON alphafrog_agent_run_coordination(next_visible_at, coordination_served_round, run_id)");
+        assertThat(script)
+                .as("延期原因多了一个「所有权不在我手上」，与枚举逐项一致（上面那条用例按最后一份定义比）")
+                .contains("SERVICE_OWNERSHIP_ELSEWHERE");
     }
 
     // ===== 组与成员的状态不变量 =====

@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException;
 import world.willfrog.agent.platform.idempotency.RunRequestDigest;
 import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
+import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
@@ -96,6 +97,13 @@ public class AgentRunEventService {
     private final AgentPromptService agentPromptService;
     /** 事务管理器：Run 主记录与它的事件必须在同一条事务里落库 */
     private final PlatformTransactionManager transactionManager;
+    /**
+     * 共享候选资格表：三个版本的调度器共用一份候选，资格行是「这条 Run 排在里面」的凭据。
+     *
+     * <p>它必须与 Run 同时出现，所以写在创建那条事务里；放在这个类里而不是别处，是因为
+     * Run 主记录只有这一处插入点。</p>
+     */
+    private final RunCoordinationStore coordinationStore;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -307,6 +315,12 @@ public class AgentRunEventService {
         try {
             received = transactionTemplate().execute(status -> {
                 runMapper.insert(run);
+                // 排进共享候选与创建同一条事务：资格行缺了，这条 Run 在候选里就没有位置，
+                // 而候选是三个版本共用的唯一入口——旧版本的 Run 也没有第二条路会来补它。
+                // 与版本无关：记的是这条 Run 自己冻结的版本，新建的每一条都在候选里。
+                if (!coordinationStore.ensure(runId)) {
+                    log.warn("这条 Run 建出来却没有排进共享候选，需要人看一眼: runId={}", runId);
+                }
                 // 接收事实与 Run 主记录同一条事务：只落库，投射留到提交之后。
                 return persistEvent(runId, "RUN_RECEIVED", ext);
             });

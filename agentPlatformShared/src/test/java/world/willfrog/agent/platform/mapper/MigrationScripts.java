@@ -111,6 +111,16 @@ final class MigrationScripts {
         return quotedValues(tail.substring(valueStart, valueEnd));
     }
 
+    /**
+     * 某条约束现在的取值：在最后一份定义它的脚本里取。
+     *
+     * <p>比对 Java 枚举与库里取值时用这一条，不要拿「建表那一份」去比：后来的迁移会宽化取值，
+     * 老断言会一直比着旧清单，宽化到库里就没人看着。</p>
+     */
+    static List<String> constraintValues(String constraintName) {
+        return constraintValues(lastContaining("CONSTRAINT " + constraintName), constraintName);
+    }
+
     /** 正文里全部单引号大写标识，按出现顺序。 */
     static List<String> quotedValues(String text) {
         List<String> values = new ArrayList<>();

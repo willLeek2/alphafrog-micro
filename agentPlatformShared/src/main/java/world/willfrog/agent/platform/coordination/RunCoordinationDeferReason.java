@@ -25,7 +25,15 @@ public enum RunCoordinationDeferReason {
     PER_RUN_UNFINISHED_LIMIT,
 
     /** 全局未完成工作项到了高水位，新增已经暂停：要等回落到低水位才恢复。 */
-    GLOBAL_UNFINISHED_PAUSED;
+    GLOBAL_UNFINISHED_PAUSED,
+
+    /**
+     * 这条 Run 的服务所有权不在本进程手上：候选是三个版本共用的，但能不能动它由所有权决定。
+     *
+     * <p>写这个原因是为了把它按退避推后：不推后它会一直停在候选页首，页数一满，
+     * 排在它后面的 Run 永远看不见。别的进程还在服务它、或者刚接手就被拒，都属于这一类。</p>
+     */
+    SERVICE_OWNERSHIP_ELSEWHERE;
 
     /** 库里全部取值，顺序固定，便于契约测试与迁移脚本逐项比对。 */
     public static List<String> allWireValues() {

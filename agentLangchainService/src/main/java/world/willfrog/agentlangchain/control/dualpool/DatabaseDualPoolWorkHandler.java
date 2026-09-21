@@ -18,6 +18,9 @@ import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
@@ -31,6 +34,8 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import org.springframework.beans.factory.ObjectProvider;
+import world.willfrog.agentlangchain.control.LegacyRunHandoff;
 import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.ExecutionModeResolver;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
@@ -100,15 +105,23 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final int globalHighWatermark;
     private final int globalLowWatermark;
     private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
-    /**
-     * 共享候选里出现、但共享分发器还接不了手的旧版本 Run。
-     *
-     * <p>数量摆在这里是为了让「旧版本一直在候选里排队却没被服务」这件事看得见：
-     * 看不到就会以为它只是还没轮到。</p>
-     */
-    private final AtomicLong legacyCandidatesNotTaken = new AtomicLong();
-    /** 版本读不出来、或不属于任何已知执行层的候选条数：只记账，不动这些 Run 的任何状态。 */
+    private final RunServiceLeaseStore leaseStore;
+    private final ProcessInstanceIdentity processIdentity;
+    private final ObjectProvider<LegacyRunHandoff> legacyHandoff;
+    private final Duration serviceLeaseTtl;
+
+    /** 交出去的旧版本 Run 累计条数（反复扫描同一行的重复命中也算，是「次数」不是「当前候选数」）。 */
+    private final AtomicLong legacyHandedOff = new AtomicLong();
+    /** 旧版本 Run 这一轮没接手、按所有权原因推后的累计次数。 */
+    private final AtomicLong legacyDeferred = new AtomicLong();
+    /** 服务所有权在别的进程手上、这一轮不接手的累计次数（双池那一路）。 */
+    private final AtomicLong leaseNotAcquired = new AtomicLong();
+    /** 版本读不出来、或不属于任何已知执行层的候选累计次数：只记账，不动这些 Run 的任何状态。 */
     private final AtomicLong routingIsolated = new AtomicLong();
+    /** 最近一轮的当前条数：与上面的累计值分开，读数里两个都要看得见。 */
+    private volatile long legacyCandidatesLastRound;
+    private volatile long leaseNotAcquiredLastRound;
+    private volatile long routingIsolatedLastRound;
     /** 固定条带锁不会按 runId 增长，也不会在旧协调回合仍等待时被删除并创建第二把锁。 */
     private final Object[] runLockStripes = createRunLockStripes();
 
@@ -127,13 +140,17 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             DualPoolWaitGroupNodeExecutor waitGroupNodeExecutor,
             RunCoordinationStore coordinationStore,
             SchedulerStateStore stateStore,
+            RunServiceLeaseStore leaseStore,
+            ProcessInstanceIdentity processIdentity,
+            ObjectProvider<LegacyRunHandoff> legacyHandoff,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit,
             @Value("${agent.langchain.dual-pool.per-turn-new-node-limit:8}") int perTurnNewNodeLimit,
             @Value("${agent.langchain.dual-pool.global-unfinished-high-watermark:128}") int globalHighWatermark,
             @Value("${agent.langchain.dual-pool.global-unfinished-low-watermark:96}") int globalLowWatermark,
             @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
-            @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs) {
+            @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
+            @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceLeaseTtlSeconds) {
         this.runMapper = runMapper;
         this.freshRunPipeline = freshRunPipeline;
         this.workItemStore = workItemStore;
@@ -155,6 +172,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.perTurnNewNodeLimit = Math.max(1, perTurnNewNodeLimit);
         this.globalHighWatermark = Math.max(0, globalHighWatermark);
         this.globalLowWatermark = Math.max(0, Math.min(globalLowWatermark, this.globalHighWatermark));
+        this.leaseStore = leaseStore;
+        this.processIdentity = processIdentity;
+        this.legacyHandoff = legacyHandoff;
+        this.serviceLeaseTtl = Duration.ofSeconds(Math.max(5L, serviceLeaseTtlSeconds));
     }
 
     @Override
@@ -951,64 +972,167 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return List.of();
         }
         refreshRoundCounters();
-        LinkedHashSet<String> runIds = new LinkedHashSet<>();
-        // 一次全局扫描：三个调度器版本排在同一份候选顺序里，选出来之后按每一行记录的冻结版本路由。
-        // 候选是共享的，谁能被接手不共享：能不能动这条 Run，由各版本自己那套所有权事实说了算。
+        long round = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
+        LinkedHashMap<String, AgentRun> candidates = new LinkedHashMap<>();
+        long legacyThisRound = 0L;
+        long leaseMissThisRound = 0L;
+        long isolatedThisRound = 0L;
+        // 一次全局扫描：三个调度器版本排在同一份候选顺序里，选出来之后按每一行冻结的版本路由。
+        // 候选是共享的，谁能被接手不共享：能不能动这条 Run，由它自己的服务所有权说了算。
         for (RunCoordination due : coordinationStore.scanDue(limit)) {
-            SchedulerVersion version;
-            try {
-                version = SchedulerVersion.fromWire(due.getSchedulerVersion());
-            } catch (RuntimeException unknownVersion) {
-                // 冻结版本读不出来：这条 Run 归哪套执行层都不知道，谁都不许动它的状态。
-                long isolated = routingIsolated.incrementAndGet();
-                if (isolated == 1L || isolated % 1000L == 0L) {
-                    // 一条读不出版本的行留在候选里会每轮都撞上：只按累计条数报，免得日志被它刷满。
-                    log.error("协调候选里的调度器版本读不出来，保持失败关闭: runId={} version={} 累计{}条",
-                            due.getRunId(), due.getSchedulerVersion(), isolated);
+            AgentRun run = runMapper.findById(due.getRunId());
+            if (run == null) {
+                // 资格行指向一条读不回来的 Run：不动它的状态，也不接手。
+                isolatedThisRound++;
+                routingIsolated.incrementAndGet();
+                if (routingIsolated.get() == 1L || routingIsolated.get() % 1000L == 0L) {
+                    log.error("协调候选指向一条读不回来的 Run，保持失败关闭: runId={} 累计{}条",
+                            due.getRunId(), routingIsolated.get());
                 }
                 continue;
             }
-            if (version == SchedulerVersion.LEGACY) {
-                // 旧版本的 Run 只有已经握着旧执行权的那条路径能继续跑它。共享分发器手上还没有
-                // 「另一个进程也能核对、会过期、能原子转交」的所有权事实，凭一条候选就接手，
-                // 会在滚动部署新旧并存的窗口里对着旧进程正在跑的图再启动一次。这里只记账、不动状态。
-                long notTaken = legacyCandidatesNotTaken.incrementAndGet();
-                if (notTaken == 1L || notTaken % 1000L == 0L) {
-                    // 旧版本的行会一直留在候选里：按累计条数报，别把每一轮的每一条都写进日志。
-                    log.info("旧版本的 Run 进了共享候选，但共享分发器还没有可跨进程核对的持久所有权事实，"
-                            + "这一轮不接手: runId={} 累计{}条", due.getRunId(), notTaken);
+            SchedulerVersion version;
+            try {
+                version = SchedulerVersion.fromWire(run.getSchedulerVersion());
+            } catch (RuntimeException unknownVersion) {
+                // 冻结版本读不出来：这条 Run 归哪套执行层都不知道，谁都不许动它的状态。
+                isolatedThisRound++;
+                long isolated = routingIsolated.incrementAndGet();
+                if (isolated == 1L || isolated % 1000L == 0L) {
+                    log.error("协调候选里的调度器版本读不出来，保持失败关闭: runId={} version={} 累计{}条",
+                            due.getRunId(), run.getSchedulerVersion(), isolated);
                 }
+                continue;
+            }
+            if (!Objects.equals(due.getSchedulerVersion(), run.getSchedulerVersion())) {
+                // 资格行上的版本只是一份镜像，算数的是 Run 主表上冻结的那一个：两边不一致说明
+                // 有人绕开写入路径改过，这里按主表走并留一条记录，不按镜像路由。
+                log.warn("资格行上的调度器版本与 Run 主表不一致，按主表路由: runId={} coordination={} run={}",
+                        due.getRunId(), due.getSchedulerVersion(), run.getSchedulerVersion());
+            }
+            if (version == SchedulerVersion.LEGACY) {
+                legacyThisRound++;
+                handOffLegacyRun(run, due, round);
                 continue;
             }
             if (!version.isDualPoolFamily()) {
-                routingIsolated.incrementAndGet();
-                log.error("协调候选里的版本不属于任何已知执行层，保持失败关闭: runId={} version={}",
-                        due.getRunId(), due.getSchedulerVersion());
+                isolatedThisRound++;
+                long isolated = routingIsolated.incrementAndGet();
+                if (isolated == 1L || isolated % 1000L == 0L) {
+                    log.error("协调候选里的版本不属于任何已知执行层，保持失败关闭: runId={} version={} 累计{}条",
+                            due.getRunId(), run.getSchedulerVersion(), isolated);
+                }
                 continue;
             }
-            runIds.add(due.getRunId());
+            if (!holdsServiceOwnership(run.getId())) {
+                // 别的进程正活着持有这条 Run：这一轮不碰它，也不改它的轮次位置。
+                leaseMissThisRound++;
+                leaseNotAcquired.incrementAndGet();
+                continue;
+            }
+            candidates.put(run.getId(), run);
         }
-        LinkedHashSet<String> localRuns = new LinkedHashSet<>(admissionRegistry.snapshotRunIds());
-        runIds.addAll(localRuns);
+        legacyCandidatesLastRound = legacyThisRound;
+        leaseNotAcquiredLastRound = leaseMissThisRound;
+        routingIsolatedLastRound = isolatedThisRound;
+
+        for (String locallyAdmitted : admissionRegistry.snapshotRunIds()) {
+            candidates.computeIfAbsent(locallyAdmitted, runMapper::findById);
+        }
 
         List<RunCoordinationHint> hints = new ArrayList<>();
-        for (String runId : runIds) {
+        for (Map.Entry<String, AgentRun> entry : candidates.entrySet()) {
             if (hints.size() >= limit) {
                 break;
             }
-            AgentRun run = runMapper.findById(runId);
+            String runId = entry.getKey();
+            AgentRun run = entry.getValue();
             if (run == null || !schedulerVersionPolicy.isDualPoolFamily(run)) {
                 releaseRun(runId);
                 continue;
             }
-            if (!admissionRegistry.isAdmitted(runId)) {
-                // 库里有资格记录但这个进程没受理它：内存提示它不是本进程的活，交给启动恢复那一组
-                // 用持久事实重新取得许可，而不是在这里凭一次扫描就执行。
+            if (!admissionRegistry.isAdmitted(runId)
+                    && !admissionRegistry.restorePersistedToolJob(runId)) {
+                // 库里有资格记录但这个进程没有受理它，而且持久事实也不足以证明可以恢复：
+                // 不在这里凭一次扫描就执行。
                 continue;
             }
             hints.add(new RunCoordinationHint(runId, RunCoordinationHint.Reason.SCAN_REDISCOVERED));
         }
         return List.copyOf(hints);
+    }
+
+    /**
+     * 旧版本 Run 的处理：拿到服务所有权之后才交给旧入口，拿不到就按所有权原因推后。
+     *
+     * <p>三道都要过。第一道是所有权：候选是三个版本共用的，但「能不能动这条 Run」由它自己的
+     * 所有权决定——没有可跨进程核对、会过期、能原子转交的持久事实，凭一条候选就接手，会在滚动
+     * 部署新旧并存的窗口里对着旧进程正在跑的图再启动一次。第二道是旧入口在不在（它随配置开关）。
+     * 第三道是旧入口自己的领取条件（领取语句会核对状态与重试次数）。</p>
+     *
+     * <p>没接手的要推后：不推后它会一直停在候选页首，页数一满，排在它后面的双池 Run 永远看不见。</p>
+     */
+    private void handOffLegacyRun(AgentRun run, RunCoordination due, long round) {
+        String runId = run.getId();
+        if (!holdsServiceOwnership(runId)) {
+            deferLegacyRun(due, "所有权不在本进程");
+            return;
+        }
+        LegacyRunHandoff handoff = legacyHandoff.getIfAvailable();
+        if (handoff == null) {
+            deferLegacyRun(due, "旧入口没有启用");
+            return;
+        }
+        if (!handoff.handOff(runId)) {
+            deferLegacyRun(due, "旧入口没有接手");
+            return;
+        }
+        legacyHandedOff.incrementAndGet();
+        // 交出去了：记下这一轮服务过它，它从此排在别的候选后面。
+        boolean marked = coordinationStore.markCoordinationServed(runId, round, planGeneration(due));
+        if (!marked) {
+            log.info("旧版本 Run 已经交给旧入口，但轮次位置没有写进去（可能刚换了计划代际）: runId={}", runId);
+        }
+    }
+
+    /** 按所有权原因推后一条旧版本候选，让它从页首让开。 */
+    private void deferLegacyRun(RunCoordination due, String why) {
+        legacyDeferred.incrementAndGet();
+        boolean deferred = coordinationStore.deferFor(due.getRunId(),
+                RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
+                OffsetDateTime.now().plus(coordinationDeferRetry),
+                planGeneration(due), servedRound(due));
+        if (!deferred) {
+            log.debug("旧版本 Run 的推后没有生效（轮次或代际已经变了）: runId={}", due.getRunId());
+        }
+        if (legacyDeferred.get() == 1L || legacyDeferred.get() % 1000L == 0L) {
+            log.info("旧版本 Run 这一轮不接手（{}），按所有权原因推后: runId={} 累计{}次",
+                    why, due.getRunId(), legacyDeferred.get());
+        }
+    }
+
+    /**
+     * 本进程现在是不是这条 Run 的服务所有者。
+     *
+     * <p>先读一次：已经是自己的、还没过期就直接算持有，免得每一轮扫描都为同一批 Run 写一遍。
+     * 需要的时候才去领——没建立过、或者上一代已经过期，两种都靠领取语句按条件决定。</p>
+     */
+    private boolean holdsServiceOwnership(String runId) {
+        String owner = processIdentity.value();
+        RunServiceLease current = leaseStore.find(runId).orElse(null);
+        if (current != null && owner.equals(current.ownerInstanceId())
+                && !current.expiredAt(OffsetDateTime.now())) {
+            return true;
+        }
+        return leaseStore.acquire(runId, owner, serviceLeaseTtl).isPresent();
+    }
+
+    private static int planGeneration(RunCoordination due) {
+        return due.getPlanGeneration() == null ? -1 : due.getPlanGeneration();
+    }
+
+    private static long servedRound(RunCoordination due) {
+        return due.getCoordinationServedRound() == null ? 0L : due.getCoordinationServedRound();
     }
 
     /** 每轮边界：把上一轮结束时该记的轮数刷新掉，再进到这一轮。刷新针对同一份全局候选集合。 */
@@ -1433,15 +1557,21 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     }
 
     /**
-     * 路由的读数：共享候选里出现了多少条旧版本的 Run 还没被接手、多少条因为版本读不出来被隔离。
+     * 路由的读数：交出去的旧版本、没接手而推后的、因为所有权在别人手上而跳过的、版本读不出来隔离的。
      *
-     * <p>旧版本那一条只增不减，看到它一直涨说明「候选里有它、但没人能服务它」的状态没变。</p>
+     * <p>累计值是「反复扫描同一行的命中次数」，不是当前候选数——两个含义分开报，免得把
+     * 「同一行被扫了很多轮」看成「候选里堆了很多条」。当前条数单独一组。</p>
      */
     @Override
     public Map<String, Object> routingSnapshot() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
-        snapshot.put("legacyCandidatesNotTakenTotal", legacyCandidatesNotTaken.get());
+        snapshot.put("legacyHandedOffTotal", legacyHandedOff.get());
+        snapshot.put("legacyDeferredTotal", legacyDeferred.get());
+        snapshot.put("leaseNotAcquiredTotal", leaseNotAcquired.get());
         snapshot.put("routingIsolatedTotal", routingIsolated.get());
+        snapshot.put("legacyCandidatesLastRound", legacyCandidatesLastRound);
+        snapshot.put("leaseNotAcquiredLastRound", leaseNotAcquiredLastRound);
+        snapshot.put("routingIsolatedLastRound", routingIsolatedLastRound);
         return snapshot;
     }
 }
