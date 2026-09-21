@@ -37,6 +37,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 
 /**
  * 共享候选按行路由：三个版本排在同一份候选里，选出来之后按每一行冻结的版本分别对待。
@@ -91,7 +92,9 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 leaseStore,
                 identity,
                 handoffProvider,
-                300, 256, 8, 128, 96, 1000, 5000, 120);
+                // 上限与水位按默认值；这一份用例量的是路由，不是参数解析。
+                TestSchedulerSettings.propertyOnly(),
+                300, 1000, 5000, 120);
     }
 
     /** 本进程已经握着这条 Run 的租约：读一次就够，不必再写一遍。 */

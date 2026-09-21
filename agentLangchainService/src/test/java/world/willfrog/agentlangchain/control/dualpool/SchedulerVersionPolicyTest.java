@@ -19,7 +19,9 @@ class SchedulerVersionPolicyTest {
     private static final String HALT_KEY = "agent.tool-job.fault-injection.allow-process-halt";
 
     private static SchedulerVersionPolicy policy(MockEnvironment environment) {
-        return new SchedulerVersionPolicy(environment);
+        // 与生产同一条路：版本由设置解析组件按「热配置 → 环境属性 → 代码默认」取，这里只给环境属性。
+        return new SchedulerVersionPolicy(environment,
+                new DualPoolSchedulerSettings(null, environment));
     }
 
     @Test

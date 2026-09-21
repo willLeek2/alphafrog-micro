@@ -35,6 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 
 /**
  * 共用节点执行器的行为自检：一次领取只发一次模型请求；有工具请求就先落整组再派发；同步结果当场写终态；
@@ -67,7 +68,9 @@ class DualPoolWaitGroupNodeExecutorTest {
         dispatcher = new ScriptedDispatcher();
         publisher = new RecordingPublisher(store);
         executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher, publisher,
-                objectMapper, 16, 1024 * 1024, 2000L);
+                objectMapper, TestSchedulerSettings.propertyOnly(
+                        "agent.langchain.dual-pool.wait-group.max-members", "16"),
+                1024 * 1024, 2000L);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         when(promptService.reactSystemPrompt()).thenReturn("系统提示");
         when(promptService.dagReactStageInstruction(any())).thenReturn("阶段说明");

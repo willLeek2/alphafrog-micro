@@ -44,6 +44,9 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
+import org.springframework.mock.env.MockEnvironment;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 
 /**
  * 等待成员的结果接收：问一次外部作业，按结论写成员终态或推后。
@@ -81,7 +84,12 @@ class WaitMemberResultReceiverTest {
         recoveryDispatcher = Mockito.mock(DualPoolRecoveryDispatcher.class);
         receiver = new WaitMemberResultReceiver(waitGroupStore, runMapper, nodeWorkItemStore,
                 sandboxService, pythonSandboxTools, settlement, recoveryDispatcher, objectMapper,
-                8, 1000L, 15000L, 6, 4096, 1000L);
+                TestSchedulerSettings.propertyOnly(
+                        "agent.langchain.wait-member.receiver.batch-size", "8",
+                        "agent.langchain.wait-member.receiver.backoff-base-ms", "1000",
+                        "agent.langchain.wait-member.receiver.backoff-max-ms", "15000",
+                        "agent.langchain.wait-member.receiver.max-backoff-step", "6"),
+                4096, 1000L);
         Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
 
@@ -89,6 +97,24 @@ class WaitMemberResultReceiverTest {
                 .thenReturn(true);
         Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(anyString(), any()))
                 .thenReturn("{\"ok\":true,\"stdout\":\"done\"}");
+    }
+
+    /** 按回合读的参数改完下一轮就生效：批次从 8 改成 3，下一次扫描就按 3 要。 */
+    @Test
+    void aChangedReceiverBatchSizeTakesEffectOnTheNextRound() {
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty("agent.langchain.wait-member.receiver.batch-size", "8");
+        Mockito.lenient().when(waitGroupStore.scanDueMembers(any(), anyInt())).thenReturn(List.of());
+        WaitMemberResultReceiver live = new WaitMemberResultReceiver(waitGroupStore, runMapper,
+                nodeWorkItemStore, sandboxService, pythonSandboxTools, settlement, recoveryDispatcher,
+                objectMapper, new DualPoolSchedulerSettings(null, environment), 4096, 1000L);
+
+        live.round();
+        verify(waitGroupStore).scanDueMembers(any(), eq(8));
+
+        environment.setProperty("agent.langchain.wait-member.receiver.batch-size", "3");
+        live.round();
+        verify(waitGroupStore).scanDueMembers(any(), eq(3));
     }
 
     /** 还在跑的作业：推后下次查询时间，不写任何终态。 */

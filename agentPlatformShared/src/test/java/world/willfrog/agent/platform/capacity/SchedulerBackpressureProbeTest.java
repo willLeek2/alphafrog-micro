@@ -42,7 +42,7 @@ class SchedulerBackpressureProbeTest {
         when(store.countUnfinished()).thenReturn(3);
         when(store.maxUnfinishedPerRun()).thenReturn(2);
 
-        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(1, 0), 4);
+        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(1, 0), () -> 4);
         SchedulerBackpressureSnapshot snapshot = probe.snapshot();
 
         assertThat(snapshot.unfinishedWorkItemsInDb()).isEqualTo(3);
@@ -60,7 +60,7 @@ class SchedulerBackpressureProbeTest {
         when(store.countUnfinished()).thenReturn(1);
         when(store.maxUnfinishedPerRun()).thenReturn(1);
 
-        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(0, 0), 4,
+        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(0, 0), () -> 4,
                 Duration.ofMinutes(1));
         probe.snapshot();
         probe.snapshot();
@@ -74,7 +74,7 @@ class SchedulerBackpressureProbeTest {
         when(store.countUnfinished()).thenReturn(1, 2);
         when(store.maxUnfinishedPerRun()).thenReturn(1, 2);
 
-        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(0, 0), 4,
+        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(0, 0), () -> 4,
                 Duration.ofMinutes(1));
         assertThat(probe.snapshot().unfinishedWorkItemsInDb()).isEqualTo(1);
         assertThat(probe.refresh().unfinishedWorkItemsInDb()).isEqualTo(2);
@@ -85,14 +85,25 @@ class SchedulerBackpressureProbeTest {
     void missingHintQueueSourceIsTreatedAsZeroNotAsAValue() {
         when(store.countUnfinished()).thenReturn(0);
         when(store.maxUnfinishedPerRun()).thenReturn(0);
-        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, null, 4);
+        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, null, () -> 4);
         assertThat(probe.snapshot().hintQueueDepth()).isZero();
         assertThat(probe.snapshot().reservedNotEnqueued()).isZero();
     }
 
     @Test
-    void perRunLimitMustBePositive() {
-        assertThatThrownBy(() -> new SchedulerBackpressureProbe(store, queue(0, 0), 0))
+    void thePerRunLimitIsReadWhenItIsUsed() {
+        // 上限允许在运行期改：读数取的是「现在」的值，不是构造时冻住的那个。
+        int[] limit = {4};
+        SchedulerBackpressureProbe probe = new SchedulerBackpressureProbe(store, queue(0, 0), () -> limit[0],
+                Duration.ZERO);
+        assertThat(probe.snapshot().perRunUnfinishedLimit()).isEqualTo(4);
+        limit[0] = 9;
+        assertThat(probe.refresh().perRunUnfinishedLimit()).isEqualTo(9);
+    }
+
+    @Test
+    void aMissingPerRunLimitSourceIsRejected() {
+        assertThatThrownBy(() -> new SchedulerBackpressureProbe(store, queue(0, 0), null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 }

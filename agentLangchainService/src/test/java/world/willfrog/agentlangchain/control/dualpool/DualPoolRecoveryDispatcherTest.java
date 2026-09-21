@@ -32,6 +32,8 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
+import org.springframework.mock.env.MockEnvironment;
 
 /**
  * 恢复分发器每一轮做什么：数据库补扫每轮都有固定名额、内存提醒只在剩下的预算里跑；
@@ -65,7 +67,7 @@ class DualPoolRecoveryDispatcherTest {
         lenient().when(dispatcher.isReady()).thenReturn(true);
         // 默认每轮给数据库补扫留 1 个名额，其余预算给内存提醒。
         recovery = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher, intake,
-                BATCH, 500L, 5_000L, 4, 1, 1024);
+                recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024));
     }
 
     @Test
@@ -262,11 +264,27 @@ class DualPoolRecoveryDispatcherTest {
                 .containsEntry("recoveryConsumedTotal", 3L);
     }
 
+    /** 按回合读的参数改完下一轮就生效：批次从 1 改成 2，下一次补扫就按 2 向数据库要。 */
+    @Test
+    void aChangedBatchSizeTakesEffectOnTheNextRound() {
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty("agent.langchain.dual-pool.recovery.batch-size", "1");
+        DualPoolRecoveryDispatcher live = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher, intake,
+                new DualPoolSchedulerSettings(null, environment));
+
+        live.rediscover();
+        assertThat(store.lastScanLimit).isEqualTo(1);
+
+        environment.setProperty("agent.langchain.dual-pool.recovery.batch-size", "2");
+        live.rediscover();
+        assertThat(store.lastScanLimit).as("改了配置不用重启，下一轮就用新批次").isEqualTo(2);
+    }
+
     /** 提醒队列有上限：满了就丢提醒，数据库事实不受影响。 */
     @Test
     void aFullReminderQueueDropsRemindersInsteadOfGrowing() {
         DualPoolRecoveryDispatcher bounded = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
-                intake, BATCH, 500L, 5_000L, 4, 1, 3);
+                intake, recoverySettings(BATCH, 500L, 5_000L, 4, 1, 3));
         assertThat(bounded.wake(1L)).isTrue();
         assertThat(bounded.wake(2L)).isTrue();
         assertThat(bounded.wake(3L)).isTrue();
@@ -293,6 +311,34 @@ class DualPoolRecoveryDispatcherTest {
 
         verify(dispatcher, never()).offerNode(any());
         assertThat(recovery.snapshot()).containsEntry("recoveryHintFailedTotal", 1L);
+    }
+
+    /** 恢复那一组参数：与生产同一套解析，只是把值写成环境属性。 */
+    private static DualPoolSchedulerSettings recoverySettings(int batchSize, long backoffBaseMs, long backoffMaxMs,
+                                                              int startupPages, int scanQuota, int wakeupCapacity) {
+        return TestSchedulerSettings.propertyOnly(
+                "agent.langchain.dual-pool.recovery.batch-size", String.valueOf(batchSize),
+                "agent.langchain.dual-pool.recovery.backoff-base-ms", String.valueOf(backoffBaseMs),
+                "agent.langchain.dual-pool.recovery.backoff-max-ms", String.valueOf(backoffMaxMs),
+                "agent.langchain.dual-pool.recovery.startup-pages", String.valueOf(startupPages),
+                "agent.langchain.dual-pool.recovery.scan-quota", String.valueOf(scanQuota),
+                "agent.langchain.dual-pool.recovery.wakeup-capacity", String.valueOf(wakeupCapacity));
+    }
+
+    /** 扫描配额比这一轮的总上限还大时，一轮处理的条数与向数据库索要的条数都不许越过上限。 */
+    @Test
+    void aScanQuotaLargerThanTheRoundBudgetStaysInsideTheBudget() {
+        DualPoolRecoveryDispatcher wideQuota = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
+                intake, recoverySettings(1, 500L, 5_000L, 4, 4, 1024));
+        store.addNotification(41L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
+        store.addNotification(42L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
+        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(intake.take(any(), any(), anyString()))
+                .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
+                        WaitGroupRecoveryIntake.Outcome.DEFERRED, null, null, "admission_unavailable"));
+
+        assertThat(wideQuota.safeRound(1)).as("一轮最多处理一条").isEqualTo(1);
+        assertThat(store.lastScanLimit).as("向数据库索要的也不超过一轮上限").isEqualTo(1);
     }
 
     private static AgentRun runningRun() {
@@ -348,8 +394,12 @@ class DualPoolRecoveryDispatcherTest {
             return Optional.ofNullable(notifications.get(notificationId));
         }
 
+        /** 最近一次向数据库索要的条数：用来核对一轮预算没有被配额撑破。 */
+        private volatile int lastScanLimit;
+
         @Override
         public List<RecoveryNotification> scanDueRecoveryNotifications(int limit) {
+            lastScanLimit = limit;
             // 与真语句同一个口径：只取还在等待态、且已经到了下次可见时间的那批。
             OffsetDateTime now = OffsetDateTime.now();
             return notifications.values().stream()

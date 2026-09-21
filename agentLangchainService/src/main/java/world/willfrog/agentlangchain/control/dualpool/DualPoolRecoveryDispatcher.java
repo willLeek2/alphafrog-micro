@@ -1,7 +1,6 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -55,13 +54,12 @@ public class DualPoolRecoveryDispatcher {
     private final AgentRunMapper runMapper;
     private final DualPoolDispatcher dispatcher;
     private final WaitGroupRecoveryIntake intake;
-    private final RecoveryBackoff backoff;
-    private final int batchSize;
-    private final int startupPages;
-    /** 每轮留给数据库补扫的固定名额：内存提醒再多也挤不掉它。 */
-    private final int scanQuota;
-    /** 内存提醒最多压这么多条；满了就丢提醒——数据库才是事实来源。 */
-    private final int wakeupCapacity;
+    /** 每轮读一次的参数：批次、配额、提醒容量与退避都允许在运行期改，改完下一轮生效。 */
+    private final DualPoolSchedulerSettings settings;
+    /** 最近一次构造退避用的初值与上限；配置变了就按新值重建，不用重启。 */
+    private volatile RecoveryBackoff backoff;
+    private volatile long backoffBaseMs;
+    private volatile long backoffMaxMs;
 
     /** 提交后唤醒的提醒：只带通知编号，取之前回库读权威状态。 */
     private final ConcurrentLinkedQueue<Long> wakeups = new ConcurrentLinkedQueue<>();
@@ -83,22 +81,26 @@ public class DualPoolRecoveryDispatcher {
             AgentRunMapper runMapper,
             DualPoolDispatcher dispatcher,
             WaitGroupRecoveryIntake intake,
-            @Value("${agent.langchain.dual-pool.recovery.batch-size:8}") int batchSize,
-            @Value("${agent.langchain.dual-pool.recovery.backoff-base-ms:500}") long backoffBaseMs,
-            @Value("${agent.langchain.dual-pool.recovery.backoff-max-ms:5000}") long backoffMaxMs,
-            @Value("${agent.langchain.dual-pool.recovery.startup-pages:8}") int startupPages,
-            @Value("${agent.langchain.dual-pool.recovery.scan-quota:4}") int scanQuota,
-            @Value("${agent.langchain.dual-pool.recovery.wakeup-capacity:1024}") int wakeupCapacity) {
+            DualPoolSchedulerSettings settings) {
         this.waitGroupStore = waitGroupStore;
         this.runMapper = runMapper;
         this.dispatcher = dispatcher;
         this.intake = intake;
-        this.backoff = new RecoveryBackoff(Duration.ofMillis(Math.max(1L, backoffBaseMs)),
-                Duration.ofMillis(Math.max(Math.max(1L, backoffBaseMs), backoffMaxMs)));
-        this.batchSize = Math.max(1, batchSize);
-        this.startupPages = Math.max(1, startupPages);
-        this.scanQuota = Math.max(1, scanQuota);
-        this.wakeupCapacity = Math.max(1, wakeupCapacity);
+        this.settings = settings;
+    }
+
+    /** 退避参数按当前配置取；配置改了就用新值重建一个，读数与推后用的是同一个。 */
+    private RecoveryBackoff backoff() {
+        long base = settings.recoveryBackoffBaseMs().longValue();
+        long max = settings.recoveryBackoffMaxMs().longValue();
+        RecoveryBackoff current = backoff;
+        if (current == null || base != backoffBaseMs || max != backoffMaxMs) {
+            current = new RecoveryBackoff(Duration.ofMillis(base), Duration.ofMillis(max));
+            backoff = current;
+            backoffBaseMs = base;
+            backoffMaxMs = max;
+        }
+        return current;
     }
 
     /**
@@ -115,7 +117,7 @@ public class DualPoolRecoveryDispatcher {
             if (pendingWakeups.contains(notificationId)) {
                 return false;
             }
-            if (pendingWakeups.size() >= wakeupCapacity) {
+            if (pendingWakeups.size() >= settings.recoveryWakeupCapacity().intValue()) {
                 // 提醒满了就丢提醒：它只是「快一点」的优化，数据库补扫才是保证。
                 // 丢掉一条不会丢事实——那条通知还在库里等着到期被扫到。
                 droppedWakeups.incrementAndGet();
@@ -133,7 +135,7 @@ public class DualPoolRecoveryDispatcher {
         if (!dispatcher.isReady()) {
             return;
         }
-        safeRound(batchSize);
+        safeRound(settings.recoveryBatchSize().intValue());
     }
 
     /**
@@ -148,7 +150,8 @@ public class DualPoolRecoveryDispatcher {
             return;
         }
         int total = 0;
-        for (int page = 0; page < startupPages; page++) {
+        int batchSize = settings.recoveryBatchSize().intValue();
+        for (int page = 0; page < settings.recoveryStartupPages().intValue(); page++) {
             int handled = safeRound(batchSize);
             total += handled;
             if (handled < batchSize) {
@@ -174,6 +177,9 @@ public class DualPoolRecoveryDispatcher {
     private int round(int limit) {
         rounds.incrementAndGet();
         int budget = Math.max(1, limit);
+        // 扫描配额同时受两个东西约束：配的那个值、以及这一轮的总上限。配额比总上限还大的话，
+        // 「一轮最多处理这么多条」这条合同就被配额破了；启动分页也会因为每页实际超过上限而失真。
+        int scanQuota = Math.max(1, Math.min(settings.recoveryScanQuota().intValue(), budget));
         // 数据库先走，而且至少拿到固定名额：提醒再多也占不住它那一份。提醒少的时候不去浪费预算——
         // 提醒就那么多条，剩下的整份都给补扫，一轮的吞吐不因为保底而变小。
         int hintShare = Math.min(pendingWakeupDepth(), Math.max(0, budget - scanQuota));
@@ -280,7 +286,7 @@ public class DualPoolRecoveryDispatcher {
      */
     private void defer(RecoveryNotification notification, AgentRun run,
                        WaitGroupRecoveryIntake.IntakeResult result) {
-        OffsetDateTime nextVisibleAt = backoff.nextVisibleAt(OffsetDateTime.now(),
+        OffsetDateTime nextVisibleAt = backoff().nextVisibleAt(OffsetDateTime.now(),
                 notification.getId(), notification.getCreatedAt());
         boolean pushedLater = waitGroupStore.deferRecoveryNotification(notification.getId(), nextVisibleAt);
         deferred.incrementAndGet();
@@ -333,14 +339,14 @@ public class DualPoolRecoveryDispatcher {
         snapshot.put("recoveryClosedTotal", closed.get());
         snapshot.put("recoveryLostRaceTotal", lostRaces.get());
         snapshot.put("recoveryDroppedWakeupsTotal", droppedWakeups.get());
-        snapshot.put("recoveryBatchSize", batchSize);
-        snapshot.put("recoveryScanQuota", scanQuota);
-        snapshot.put("recoveryWakeupCapacity", wakeupCapacity);
+        snapshot.put("recoveryBatchSize", settings.recoveryBatchSize().value());
+        snapshot.put("recoveryScanQuota", settings.recoveryScanQuota().value());
+        snapshot.put("recoveryWakeupCapacity", settings.recoveryWakeupCapacity().value());
         // 提醒深度与刷新窗口在同一把锁里读：并发提醒与出队时不能读到一个看不见的组合。
         synchronized (wakeupLock) {
             snapshot.put("recoveryPendingWakeups", pendingWakeups.size());
         }
-        snapshot.put("recoveryBackoff", backoff.describe());
+        snapshot.put("recoveryBackoff", backoff().describe());
         snapshot.putAll(intake.snapshot());
         return snapshot;
     }

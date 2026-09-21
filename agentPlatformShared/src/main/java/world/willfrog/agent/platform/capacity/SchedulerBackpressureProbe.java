@@ -4,6 +4,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.function.IntSupplier;
 
 /**
  * 读背压四个数：数据库未完成工作项数、提示队列元素数、已预留未入队数、每个 Run 的未完成工作项上限。
@@ -20,26 +21,27 @@ public class SchedulerBackpressureProbe {
 
     private final NodeWorkItemStore store;
     private final HintQueueDepthSource hintQueue;
-    private final int perRunUnfinishedLimit;
+    /** 每个 Run 的未完成工作项上限：按需取，不在这里冻结——这个值允许在运行期改。 */
+    private final IntSupplier perRunUnfinishedLimit;
     private final Duration cacheTtl;
 
     private volatile SchedulerBackpressureSnapshot cached;
 
     public SchedulerBackpressureProbe(NodeWorkItemStore store,
                                       HintQueueDepthSource hintQueue,
-                                      int perRunUnfinishedLimit) {
+                                      IntSupplier perRunUnfinishedLimit) {
         this(store, hintQueue, perRunUnfinishedLimit, DEFAULT_CACHE_TTL);
     }
 
     public SchedulerBackpressureProbe(NodeWorkItemStore store,
                                       HintQueueDepthSource hintQueue,
-                                      int perRunUnfinishedLimit,
+                                      IntSupplier perRunUnfinishedLimit,
                                       Duration cacheTtl) {
         if (store == null) {
             throw new IllegalArgumentException("工作项存储不能为空");
         }
-        if (perRunUnfinishedLimit <= 0) {
-            throw new IllegalArgumentException("每个 Run 的未完成工作项上限必须为正数：" + perRunUnfinishedLimit);
+        if (perRunUnfinishedLimit == null) {
+            throw new IllegalArgumentException("每个 Run 的未完成工作项上限取不到");
         }
         this.store = store;
         this.hintQueue = hintQueue == null ? HintQueueDepthSource.empty() : hintQueue;
@@ -62,7 +64,7 @@ public class SchedulerBackpressureProbe {
                 store.countUnfinished(),
                 hintQueue.hintQueueDepth(),
                 hintQueue.reservedNotEnqueued(),
-                perRunUnfinishedLimit,
+                perRunUnfinishedLimit.getAsInt(),
                 store.maxUnfinishedPerRun(),
                 OffsetDateTime.now());
         cached = fresh;
@@ -70,6 +72,6 @@ public class SchedulerBackpressureProbe {
     }
 
     public int perRunUnfinishedLimit() {
-        return perRunUnfinishedLimit;
+        return perRunUnfinishedLimit.getAsInt();
     }
 }

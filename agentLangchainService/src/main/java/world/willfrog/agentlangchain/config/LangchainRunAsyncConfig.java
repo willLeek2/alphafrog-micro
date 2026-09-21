@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.capacity.SchedulerCapacityMetrics;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLedger;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -77,8 +78,10 @@ public class LangchainRunAsyncConfig {
     public SchedulerBackpressureProbe schedulerBackpressureProbe(
             NodeWorkItemStore store,
             DualPoolDispatcher dispatcher,
-            @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit) {
-        return new SchedulerBackpressureProbe(store, dispatcher, perRunUnfinishedLimit);
+            DualPoolSchedulerSettings settings) {
+        // 上限按需取：这个值允许在运行期改，读数与协调回合看到的必须是同一个数。
+        return new SchedulerBackpressureProbe(store, dispatcher,
+                () -> settings.perRunUnfinishedLimit().intValue());
     }
 
     @Bean

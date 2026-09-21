@@ -21,6 +21,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.RecoveryBackoff;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
@@ -76,9 +77,12 @@ public class WaitMemberResultReceiver {
     private final WaitMemberSettlement settlement;
     private final DualPoolRecoveryDispatcher recoveryDispatcher;
     private final ObjectMapper objectMapper;
-    private final RecoveryBackoff backoff;
-    private final int batchSize;
-    private final int maxBackoffStep;
+    /** 每轮读一次的参数：批次、退避与最多翻几步都允许在运行期改，改完下一轮生效。 */
+    private final DualPoolSchedulerSettings settings;
+    /** 最近一次构造退避用的初值与上限；配置变了就按新值重建，不用重启。 */
+    private volatile RecoveryBackoff backoff;
+    private volatile long backoffBaseMs;
+    private volatile long backoffMaxMs;
     private final int maxMemberResultChars;
     private final long pollIntervalMs;
 
@@ -101,10 +105,7 @@ public class WaitMemberResultReceiver {
             WaitMemberSettlement settlement,
             DualPoolRecoveryDispatcher recoveryDispatcher,
             ObjectMapper objectMapper,
-            @Value("${agent.langchain.wait-member.receiver.batch-size:8}") int batchSize,
-            @Value("${agent.langchain.wait-member.receiver.backoff-base-ms:1000}") long backoffBaseMs,
-            @Value("${agent.langchain.wait-member.receiver.backoff-max-ms:15000}") long backoffMaxMs,
-            @Value("${agent.langchain.wait-member.receiver.max-backoff-step:6}") int maxBackoffStep,
+            DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
             int maxMemberResultChars,
             @Value("${agent.langchain.wait-member.receiver.poll-interval-ms:1000}") long pollIntervalMs) {
@@ -116,12 +117,23 @@ public class WaitMemberResultReceiver {
         this.settlement = settlement;
         this.recoveryDispatcher = recoveryDispatcher;
         this.objectMapper = objectMapper;
-        this.backoff = new RecoveryBackoff(Duration.ofMillis(Math.max(1L, backoffBaseMs)),
-                Duration.ofMillis(Math.max(Math.max(1L, backoffBaseMs), backoffMaxMs)));
-        this.batchSize = Math.max(1, batchSize);
-        this.maxBackoffStep = Math.max(1, maxBackoffStep);
+        this.settings = settings;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.pollIntervalMs = Math.max(1L, pollIntervalMs);
+    }
+
+    /** 退避参数按当前配置取；配置改了就用新值重建一个，读数与推后用的是同一个。 */
+    private RecoveryBackoff backoff() {
+        long base = settings.memberReceiverBackoffBaseMs().longValue();
+        long max = settings.memberReceiverBackoffMaxMs().longValue();
+        RecoveryBackoff current = backoff;
+        if (current == null || base != backoffBaseMs || max != backoffMaxMs) {
+            current = new RecoveryBackoff(Duration.ofMillis(base), Duration.ofMillis(max));
+            backoff = current;
+            backoffBaseMs = base;
+            backoffMaxMs = max;
+        }
+        return current;
     }
 
     /** 周期接结果：按成员行的下次查询时间取一批到点的成员。 */
@@ -145,7 +157,8 @@ public class WaitMemberResultReceiver {
     public int round() {
         rounds.incrementAndGet();
         OffsetDateTime now = OffsetDateTime.now();
-        List<WaitMember> due = waitGroupStore.scanDueMembers(now, batchSize);
+        List<WaitMember> due = waitGroupStore.scanDueMembers(now,
+                settings.memberReceiverBatchSize().intValue());
         scanned.addAndGet(due.size());
         int handled = 0;
         for (WaitMember member : due) {
@@ -339,9 +352,9 @@ public class WaitMemberResultReceiver {
     /** 到点的成员还没结论：按退避推后下次查询时间。 */
     private void defer(WaitMember member, OffsetDateTime now, String reason) {
         long memberId = member.getId() == null ? 0L : member.getId();
-        OffsetDateTime nextVisibleAt = backoff.nextVisibleAt(now, memberId, member.getCreatedAt());
+        OffsetDateTime nextVisibleAt = backoff().nextVisibleAt(now, memberId, member.getCreatedAt());
         boolean pushed = waitGroupStore.rescheduleMember(member.getGroupId(), member.getMemberIdentity(),
-                nextVisibleAt, maxBackoffStep);
+                nextVisibleAt, settings.memberReceiverMaxBackoffStep().intValue());
         deferred.incrementAndGet();
         if (pushed) {
             log.debug("成员结果这一轮还没结论，推后到 {}：group={} member={} reason={}",
@@ -427,9 +440,9 @@ public class WaitMemberResultReceiver {
         snapshot.put("waitMemberReceiverWakeupsTotal", wakeups.get());
         snapshot.put("waitMemberReceiverSettlementFailuresTotal", settlementFailures.get());
         snapshot.put("waitMemberReceiverFailuresTotal", failures.get());
-        snapshot.put("waitMemberReceiverBatchSize", batchSize);
+        snapshot.put("waitMemberReceiverBatchSize", settings.memberReceiverBatchSize().value());
         snapshot.put("waitMemberReceiverPollIntervalMs", pollIntervalMs);
-        snapshot.put("waitMemberReceiverBackoff", backoff.describe());
+        snapshot.put("waitMemberReceiverBackoff", backoff().describe());
         return snapshot;
     }
 }

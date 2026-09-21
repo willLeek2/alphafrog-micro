@@ -100,10 +100,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final Duration claimLease;
     private final Duration coordinationDeferRetry;
     private final Duration hintQueueFullRetry;
-    private final int perRunUnfinishedLimit;
-    private final int perTurnNewNodeLimit;
-    private final int globalHighWatermark;
-    private final int globalLowWatermark;
+    /** 每个回合读一次的参数：上限与水位允许在运行期改，改完只影响之后新建的节点。 */
+    private final DualPoolSchedulerSettings settings;
     private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
     private final RunServiceLeaseStore leaseStore;
     private final ProcessInstanceIdentity processIdentity;
@@ -143,11 +141,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             RunServiceLeaseStore leaseStore,
             ProcessInstanceIdentity processIdentity,
             ObjectProvider<LegacyRunHandoff> legacyHandoff,
+            DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
-            @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit,
-            @Value("${agent.langchain.dual-pool.per-turn-new-node-limit:8}") int perTurnNewNodeLimit,
-            @Value("${agent.langchain.dual-pool.global-unfinished-high-watermark:128}") int globalHighWatermark,
-            @Value("${agent.langchain.dual-pool.global-unfinished-low-watermark:96}") int globalLowWatermark,
             @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
             @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
             @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceLeaseTtlSeconds) {
@@ -168,10 +163,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.claimLease = Duration.ofSeconds(Math.max(1L, claimLeaseSeconds));
         this.coordinationDeferRetry = Duration.ofMillis(Math.max(1L, coordinationDeferRetryMs));
         this.hintQueueFullRetry = Duration.ofMillis(Math.max(1L, hintQueueFullRetryMs));
-        this.perRunUnfinishedLimit = Math.max(1, perRunUnfinishedLimit);
-        this.perTurnNewNodeLimit = Math.max(1, perTurnNewNodeLimit);
-        this.globalHighWatermark = Math.max(0, globalHighWatermark);
-        this.globalLowWatermark = Math.max(0, Math.min(globalLowWatermark, this.globalHighWatermark));
+        this.settings = settings;
         this.leaseStore = leaseStore;
         this.processIdentity = processIdentity;
         this.legacyHandoff = legacyHandoff;
@@ -481,13 +473,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
      * 规划节点、普通节点、最终回答节点一视同仁：共同计数、共用名额，才谈得上「谁也不能绕过」。</p>
      */
     private int newNodesAllowed(String runId, CoordinationTurn turn) {
-        int perRunRoom = Math.max(0, perRunUnfinishedLimit - workItemStore.countUnfinishedByRun(runId));
+        int perRunRoom = Math.max(0, settings.perRunUnfinishedLimit().intValue()
+                - workItemStore.countUnfinishedByRun(runId));
         if (perRunRoom == 0) {
             turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
             return 0;
         }
         SchedulerPauseDecision pause = stateStore.decideAndRecord(
-                workItemStore.countUnfinished(), globalHighWatermark, globalLowWatermark);
+                workItemStore.countUnfinished(), settings.globalUnfinishedHighWatermark().intValue(),
+                settings.globalUnfinishedLowWatermark().intValue());
         if (pause.paused()) {
             // 暂停标记是持久事实：进程重启后也只按库里那一条继续判断，不拿当前数量重新起算。
             turn.defer(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
@@ -522,6 +516,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (perRunRoom == 0) {
             return;
         }
+        int perTurnNewNodeLimit = settings.perTurnNewNodeLimit().intValue();
         int allowed = Math.min(Math.min(drafts.size(), perTurnNewNodeLimit), perRunRoom);
         Map<String, String> datasetRefs = datasetRefs(completed);
         int toolCallsUsed = completed.stream().mapToInt(todo -> resultToolCalls(
@@ -1180,7 +1175,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                                Map<String, Object> payload,
                                String schedulerVersion,
                                CoordinationTurn turn) {
-        if (workItemStore.countUnfinishedByRun(identity.runId()) >= perRunUnfinishedLimit) {
+        if (workItemStore.countUnfinishedByRun(identity.runId())
+                >= settings.perRunUnfinishedLimit().intValue()) {
             turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
             return;
         }

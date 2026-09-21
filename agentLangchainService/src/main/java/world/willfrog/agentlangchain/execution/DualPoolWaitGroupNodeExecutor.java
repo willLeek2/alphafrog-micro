@@ -34,6 +34,7 @@ import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -72,7 +73,8 @@ public class DualPoolWaitGroupNodeExecutor {
     private final NodeToolDispatcher toolDispatcher;
     private final ResumedSegmentPublisher resumedSegmentPublisher;
     private final ObjectMapper objectMapper;
-    private final int maxMembers;
+    /** 等待组成员上限按组读取：这个值允许在运行期改，改完只影响之后新建的等待组。 */
+    private final DualPoolSchedulerSettings settings;
     private final int maxMemberResultChars;
     private final long memberPollDelayMs;
 
@@ -82,8 +84,7 @@ public class DualPoolWaitGroupNodeExecutor {
                                          NodeToolDispatcher toolDispatcher,
                                          ResumedSegmentPublisher resumedSegmentPublisher,
                                          ObjectMapper objectMapper,
-                                         @Value("${agent.langchain.dual-pool.wait-group.max-members:16}")
-                                         int maxMembers,
+                                         DualPoolSchedulerSettings settings,
                                          @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
                                          int maxMemberResultChars,
                                          @Value("${agent.langchain.dual-pool.wait-group.member-poll-delay-ms:2000}")
@@ -94,7 +95,7 @@ public class DualPoolWaitGroupNodeExecutor {
         this.toolDispatcher = toolDispatcher;
         this.resumedSegmentPublisher = resumedSegmentPublisher;
         this.objectMapper = objectMapper;
-        this.maxMembers = Math.max(1, maxMembers);
+        this.settings = settings;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.memberPollDelayMs = Math.max(1L, memberPollDelayMs);
     }
@@ -288,6 +289,7 @@ public class DualPoolWaitGroupNodeExecutor {
                                         List<ChatMessage> messages,
                                         AiMessage reply,
                                         List<ToolExecutionRequest> calls) {
+        int maxMembers = settings.waitGroupMaxMembers().intValue();
         if (calls.size() > maxMembers) {
             return new Outcome.Completed(failurePatch(input, checkpoint,
                     "wait_group_member_limit_exceeded:" + calls.size() + "/" + maxMembers, null));

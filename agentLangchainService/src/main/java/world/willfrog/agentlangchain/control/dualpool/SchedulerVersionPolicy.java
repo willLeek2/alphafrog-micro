@@ -19,14 +19,17 @@ public class SchedulerVersionPolicy {
     public static final String DUAL_POOL_V2 = SchedulerVersion.DUAL_POOL_V2.name();
 
     private final Environment environment;
+    private final DualPoolSchedulerSettings settings;
 
-    public SchedulerVersionPolicy(Environment environment) {
+    public SchedulerVersionPolicy(Environment environment, DualPoolSchedulerSettings settings) {
         this.environment = environment;
+        this.settings = settings;
     }
 
     public String versionForNewRun() {
-        String configuredVersion = requireKnown(environment.getProperty(
-                "agent.langchain.dual-pool.new-run-scheduler-version", LEGACY));
+        // 版本从这里读一次：热配置（泳道覆盖只影响该泳道）→ 环境属性 → 代码默认。已经创建的 Run
+        // 只认自己记录里的版本，热配置怎么改都不会影响它们。
+        String configuredVersion = requireKnown(settings.newRunSchedulerVersion().textValue());
         // 完整 DAG 与等待组的执行链还没接通：数据合同与迁移已经准备好，但节点执行层、外层推进与
         // 恢复分发器还是只认 DUAL_POOL_V1 的单工具锚点。这时若把新 Run 标成 DUAL_POOL_V2，它会带着
         // 一个没人认识的版本卡在原地。所以这里失败关闭，等执行链接通的那次提交再放开。

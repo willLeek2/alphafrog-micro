@@ -14,6 +14,7 @@ import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -30,6 +31,7 @@ public class AgentLangchainHealthController {
     private final DualPoolRecoveryDispatcher dualPoolRecoveryDispatcher;
     private final SchedulerBackpressureProbe schedulerBackpressureProbe;
     private final LangchainToolConcurrencyThrottle toolThrottle;
+    private final DualPoolSchedulerSettings schedulerSettings;
 
     @Value("${agent.langchain.service.version:UNKNOWN}")
     private String serviceVersion;
@@ -55,6 +57,9 @@ public class AgentLangchainHealthController {
         Map<String, Object> dualPool = new LinkedHashMap<>(dualPoolDispatcher.snapshot());
         dualPool.putAll(dualPoolRecoveryDispatcher.snapshot());
         dualPool.put("backpressure", schedulerBackpressureProbe.snapshot());
+        // 生效的双池参数：每个值都带来源（热配置／环境属性／代码默认）、改了要不要重启，
+        // 以及被丢掉的值与原因。验收与排查都从这一份读，不靠猜某个泳道配了什么。
+        dualPool.put("settings", schedulerSettings.snapshot());
         snapshot.put("dualPool", dualPool);
         return snapshot;
     }
