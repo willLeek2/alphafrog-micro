@@ -13,6 +13,7 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvide
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -38,8 +39,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * 游标往后取一页。启动时先补一轮，之后按间隔周期补。</p>
  *
  * <p>游标只活在内存里，重启后从保留期起点重扫；重投是幂等的，代价只是多查几页。上一轮没走完
- * 时这一拍直接跳过：两个入口（启动与周期）不并发改同一个游标。单行失败只隔离那一行、游标停在
- * 它前面，下一轮从同一位置再来，不让一个坏行挡住更老的缺口。</p>
+ * 时这一拍直接跳过：两个入口（启动与周期）不并发改同一个游标。</p>
+ *
+ * <p>一轮不只走一页：只要这一轮还有时间（{@code agent.event.received-projection-repair-round-budget-ms}）
+ * 且没到最多页数（{@code agent.event.received-projection-repair-max-pages-per-round}），就继续往后走。
+ * 这样一轮能扫多少由这两项决定，而不是被写死成「一拍一页」——一拍一页时，只要新事实来的速度比
+ * 扫的速度快，游标就会一直落在保留期窗口的中段：它前面的行还没扫到就先过期了，而每拍都只补最新一页，
+ * 中间这一段永远轮不到。每轮条数、拍间隔、每轮页数三个旋钮要按峰值写入速度配。</p>
+ *
+ * <p>某一行补不进去（比如这条事实的负载在库里被人改坏了）时：它进一份有界的重试清单，
+ * 每一轮开头重新读回库里那一行再试一次；扫描游标照常往前走，不停在它前面。坏行要是长期补不进去，
+ * 清单满了就丢最老的并记一笔——扫描继续往下走比守着一个坏行重要，丢掉的这些也在读数里看得见。</p>
  */
 @Component
 @Slf4j
@@ -49,6 +59,10 @@ public class AgentRunEventProjectionRepair {
     private final AgentRunEventRedisStore eventRedisStore;
     private final DeploymentIdentityProvider identityProvider;
     private final int limit;
+    /** 一轮最多往后走几页。 */
+    private final int maxPagesPerRound;
+    /** 一轮最多走多久；到点就收工，剩下的留给下一拍，别占着调度线程。 */
+    private final long roundBudgetMs;
 
     /** 游标：上一页扫到哪一行。只活在内存里，重启后从保留期起点重扫。 */
     private volatile OffsetDateTime cursorCreatedAt;
@@ -59,6 +73,11 @@ public class AgentRunEventProjectionRepair {
     /** 一轮只走一份：启动入口与周期入口不并发改同一个游标。 */
     private final AtomicBoolean roundInFlight = new AtomicBoolean();
 
+    /** 补不进去的那些行：下一轮重新从库里读回来再试，不让它们挡住扫描。 */
+    private final LinkedHashSet<FailedRow> failedRows = new LinkedHashSet<>();
+    /** 重试清单的上限：满了先丢最老的，丢掉的在读数里记一笔。 */
+    private static final int FAILED_ROWS_LIMIT = 512;
+
     private final AtomicLong rounds = new AtomicLong();
     private final AtomicLong skippedRounds = new AtomicLong();
     private final AtomicLong examined = new AtomicLong();
@@ -66,16 +85,24 @@ public class AgentRunEventProjectionRepair {
     private final AtomicLong alreadyPresent = new AtomicLong();
     private final AtomicLong failed = new AtomicLong();
     private final AtomicLong cycles = new AtomicLong();
+    private final AtomicLong failedRetried = new AtomicLong();
+    private final AtomicLong failedAbandoned = new AtomicLong();
+    /** 最近一轮往后走了几页：配合每轮条数，够不够跟上写入速度看这个数。 */
+    private volatile int pagesThisRound;
 
     public AgentRunEventProjectionRepair(
             AgentRunEventMapper eventMapper,
             AgentRunEventRedisStore eventRedisStore,
             DeploymentIdentityProvider identityProvider,
-            @Value("${agent.event.received-projection-repair-limit:200}") int limit) {
+            @Value("${agent.event.received-projection-repair-limit:200}") int limit,
+            @Value("${agent.event.received-projection-repair-max-pages-per-round:16}") int maxPagesPerRound,
+            @Value("${agent.event.received-projection-repair-round-budget-ms:2000}") long roundBudgetMs) {
         this.eventMapper = eventMapper;
         this.eventRedisStore = eventRedisStore;
         this.identityProvider = identityProvider;
         this.limit = Math.max(1, limit);
+        this.maxPagesPerRound = Math.max(1, maxPagesPerRound);
+        this.roundBudgetMs = Math.max(1L, roundBudgetMs);
     }
 
     /** 进程起来先补一轮：重启前那一刻投射失败的接收事实，等下一个周期就太久了。 */
@@ -114,8 +141,21 @@ public class AgentRunEventProjectionRepair {
         rounds.incrementAndGet();
         OffsetDateTime retentionStart = OffsetDateTime.now().minus(retention);
 
-        int repaired = repairNewestPage(deploymentId, retentionStart);
-        repaired += repairCursorPage(deploymentId, retentionStart);
+        int repaired = retryFailedRows();
+        repaired += repairNewestPage(deploymentId, retentionStart);
+
+        // 往后走：一轮里能走几页就尽量走，直到扫到尾巴、用满页数、或者这一轮的时间用完。
+        long deadlineNanos = System.nanoTime() + Duration.ofMillis(roundBudgetMs).toNanos();
+        int pages = 0;
+        while (pages < maxPagesPerRound && System.nanoTime() < deadlineNanos) {
+            PageResult walked = repairCursorPage(deploymentId, retentionStart);
+            repaired += walked.repaired();
+            pages++;
+            if (walked.exhausted()) {
+                break;
+            }
+        }
+        pagesThisRound = pages;
 
         warnIfCycleTooSlow(retention);
         return repaired;
@@ -130,16 +170,16 @@ public class AgentRunEventProjectionRepair {
             log.warn("接收事实修补读最新一页失败，这一页这一轮跳过: reason={}", e.getMessage(), e);
             return 0;
         }
-        return appendMissing(newest, null);
+        return appendMissing(newest);
     }
 
     /**
      * 游标往后一页：把保留期内剩下的扫完，扫到尾巴就回到起点。
      *
-     * <p>游标只推进到最后一个成功的行上：中间有一行失败时，下一轮从它前面重来，
-     * 不让一个反复失败的坏行把更老的缺口挡在外面。</p>
+     * <p>返回「补进去多少条」和「窗口是不是扫到头了」：扫到头就该停，没扫到头还能接着往后走。
+     * 中间有行失败不影响游标前进——失败的行进重试清单，扫描不等它。</p>
      */
-    private int repairCursorPage(String deploymentId, OffsetDateTime retentionStart) {
+    private PageResult repairCursorPage(String deploymentId, OffsetDateTime retentionStart) {
         OffsetDateTime cursorAt = cursorCreatedAt;
         long cursorRow = cursorId;
         boolean fromStart = cursorAt == null;
@@ -149,47 +189,35 @@ public class AgentRunEventProjectionRepair {
                     fromStart ? retentionStart : cursorAt, fromStart ? 0L : cursorRow, limit);
         } catch (RuntimeException e) {
             log.warn("接收事实修补读游标页失败，这一页这一轮跳过: reason={}", e.getMessage(), e);
-            return 0;
+            // 读不了也当成「这一段先走不下去」，免得在一个读不出东西的位置上把这一轮的时间用光。
+            return new PageResult(0, true);
         }
-        CursorProgress progress = new CursorProgress();
-        int repaired = appendMissing(page, progress);
-        if (progress.halted) {
-            // 有行失败：能补的已经补了，但游标只推进到第一个失败位置之前的最后一行，
-            // 下一轮从那里重来——失败的行不会被跳过，更老的缺口也不会被它挡住。
-            AgentRunEvent lastOk = progress.lastContiguousSuccess;
-            if (lastOk != null) {
-                cursorCreatedAt = lastOk.getCreatedAt();
-                cursorId = lastOk.getId() == null ? 0L : lastOk.getId();
-                if (cursorStartedAt == null) {
-                    cursorStartedAt = OffsetDateTime.now();
-                }
-            }
-            return repaired;
-        }
+        int repaired = appendMissing(page);
         if (page.size() < limit) {
             // 这一段扫到尾巴了：下一轮从保留期起点重新开始。
             cursorCreatedAt = null;
             cursorId = 0L;
             cursorStartedAt = null;
             cycles.incrementAndGet();
-        } else {
-            AgentRunEvent last = page.get(page.size() - 1);
-            cursorCreatedAt = last.getCreatedAt();
-            cursorId = last.getId() == null ? 0L : last.getId();
-            if (cursorStartedAt == null) {
-                cursorStartedAt = OffsetDateTime.now();
-            }
+            return new PageResult(repaired, true);
         }
-        return repaired;
+        AgentRunEvent last = page.get(page.size() - 1);
+        cursorCreatedAt = last.getCreatedAt();
+        cursorId = last.getId() == null ? 0L : last.getId();
+        if (cursorStartedAt == null) {
+            cursorStartedAt = OffsetDateTime.now();
+        }
+        return new PageResult(repaired, false);
+    }
+
+    /** 一页走下来的结果：补进去多少条、窗口有没有扫到头。 */
+    private record PageResult(int repaired, boolean exhausted) {
     }
 
     /**
-     * 逐行补投；返回真正补进去的条数。
-     *
-     * <p>{@code progress} 非空时用于记录「游标能不能越过这一页」：某一行为止处理失败就把它标成
-     * 停住，调用方据此不推进游标。</p>
+     * 逐行补投；返回真正补进去的条数。补不进去的行进重试清单，扫描不停在它前面。
      */
-    private int appendMissing(List<AgentRunEvent> events, CursorProgress progress) {
+    private int appendMissing(List<AgentRunEvent> events) {
         int repaired = 0;
         for (AgentRunEvent event : events) {
             examined.incrementAndGet();
@@ -201,20 +229,77 @@ public class AgentRunEventProjectionRepair {
                     // 已经在流里：这一行什么都不用做，重复扫到它是正常现象。
                     alreadyPresent.incrementAndGet();
                 }
-                if (progress != null && !progress.halted) {
-                    // 游标只越过连续成功的那些行；一旦有行失败，后面的成功行补上，但游标停在前面。
-                    progress.lastContiguousSuccess = event;
-                }
             } catch (RuntimeException e) {
                 failed.incrementAndGet();
-                log.warn("接收事实补投这一行失败，先隔离、不带走整页: runId={} seq={} reason={}",
+                rememberFailed(event);
+                log.warn("接收事实补投这一行失败，先记下来下一轮再试、扫描继续往前走: runId={} seq={} reason={}",
                         event.getRunId(), event.getSeq(), e.getMessage());
-                if (progress != null) {
-                    progress.halted = true;
-                }
             }
         }
         return repaired;
+    }
+
+    /**
+     * 把这一轮补不进去的行重新试一遍：从库里读回那一行再补。
+     *
+     * <p>重新读是有意的：重试用的是库里的当前内容，不是第一次失败时抓在手里的那份——负载要是被人
+     * 改坏了，改回来之后下一轮就能补上。</p>
+     */
+    private int retryFailedRows() {
+        List<FailedRow> batch;
+        synchronized (failedRows) {
+            batch = List.copyOf(failedRows).stream().limit(limit).toList();
+        }
+        int repaired = 0;
+        for (FailedRow row : batch) {
+            examined.incrementAndGet();
+            AgentRunEvent event = eventMapper.findByRunIdAndSeq(row.runId(), row.seq());
+            if (event == null) {
+                // 这一行在库里已经读不回来了：没有可补的东西，从清单里去掉。
+                synchronized (failedRows) {
+                    failedRows.remove(row);
+                }
+                continue;
+            }
+            try {
+                if (eventRedisStore.repairMissing(event)) {
+                    added.incrementAndGet();
+                    repaired++;
+                } else {
+                    alreadyPresent.incrementAndGet();
+                }
+                synchronized (failedRows) {
+                    failedRows.remove(row);
+                }
+                failedRetried.incrementAndGet();
+            } catch (RuntimeException e) {
+                failed.incrementAndGet();
+                log.debug("重试仍然补不进去，留在清单里等下一轮: runId={} seq={} reason={}",
+                        row.runId(), row.seq(), e.getMessage());
+            }
+        }
+        return repaired;
+    }
+
+    /** 记住一条补不进去的行；清单满了丢最老的并记一笔。 */
+    private void rememberFailed(AgentRunEvent event) {
+        FailedRow row = new FailedRow(event.getRunId(), event.getSeq(),
+                event.getId() == null ? 0L : event.getId());
+        synchronized (failedRows) {
+            if (failedRows.contains(row)) {
+                return;
+            }
+            while (failedRows.size() >= FAILED_ROWS_LIMIT) {
+                FailedRow oldest = failedRows.iterator().next();
+                failedRows.remove(oldest);
+                failedAbandoned.incrementAndGet();
+            }
+            failedRows.add(row);
+        }
+    }
+
+    /** 补不进去的那一行：只记定位它的三样，内容下一轮从库里重新读。 */
+    private record FailedRow(String runId, int seq, long id) {
     }
 
     /**
@@ -235,12 +320,6 @@ public class AgentRunEventProjectionRepair {
         }
     }
 
-    /** 一轮里的游标进度：有没有在中途停住、停住之前连续成功到哪一行。 */
-    private static final class CursorProgress {
-        private AgentRunEvent lastContiguousSuccess;
-        private boolean halted;
-    }
-
     /** 修补的读数：扫过多少、真正补进去多少、已经在里面多少、失败多少，以及游标走到哪。 */
     public Map<String, Object> snapshot() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
@@ -250,6 +329,11 @@ public class AgentRunEventProjectionRepair {
         snapshot.put("receivedProjectionRepairAddedTotal", added.get());
         snapshot.put("receivedProjectionRepairAlreadyPresentTotal", alreadyPresent.get());
         snapshot.put("receivedProjectionRepairFailedTotal", failed.get());
+        snapshot.put("receivedProjectionRepairFailedRetriedTotal", failedRetried.get());
+        snapshot.put("receivedProjectionRepairFailedAbandonedTotal", failedAbandoned.get());
+        synchronized (failedRows) {
+            snapshot.put("receivedProjectionRepairFailedPending", failedRows.size());
+        }
         snapshot.put("receivedProjectionRepairCycles", cycles.get());
         snapshot.put("receivedProjectionRepairCursor",
                 cursorCreatedAt == null ? "start" : cursorCreatedAt.toString());
@@ -258,6 +342,9 @@ public class AgentRunEventProjectionRepair {
                 startedAt == null ? 0L : Duration.between(startedAt, OffsetDateTime.now()).toMillis());
         snapshot.put("receivedProjectionRetentionDays", eventRedisStore.retention().toDays());
         snapshot.put("receivedProjectionRepairLimit", limit);
+        snapshot.put("receivedProjectionRepairPagesThisRound", pagesThisRound);
+        snapshot.put("receivedProjectionRepairMaxPagesPerRound", maxPagesPerRound);
+        snapshot.put("receivedProjectionRepairRoundBudgetMs", roundBudgetMs);
         return snapshot;
     }
 }

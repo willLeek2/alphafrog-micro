@@ -241,7 +241,8 @@ class AgentRunEventServiceTest {
                 "r1", "u1", "TOOL_CALL_FINISHED", "r1:tc1:logical_terminal", Map.of("success", true));
 
         assertFalse(inserted);
-        verify(eventRedisStore).append(persisted);
+        verify(eventRedisStore).repairMissing(persisted);
+        verify(eventRedisStore, never()).append(any());
         verify(eventRedisStore, never()).flush(anyString());
         verify(redisTemplate, never()).convertAndSend(anyString(), anyString());
     }

@@ -6,6 +6,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.SessionCallback;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -44,6 +45,28 @@ public class AgentRunEventRedisStore {
      * 免得两边各自维护一个「7 天」然后慢慢漂开——漂开之后「窗口里的都补过」就不再成立。</p>
      */
     private final Duration eventsTtl;
+
+    /**
+     * 补投：一次服务端执行里做完「有就不动、缺了才补、只在新建或本来没有到期时间时设剩余寿命」。
+     *
+     * <p>返回 1 表示真的补进去了，0 表示成员已经在里面（一个字节都没写，也没动到期时间）。</p>
+     */
+    private static final DefaultRedisScript<Long> REPAIR_SCRIPT = new DefaultRedisScript<>("""
+            local key = KEYS[1]
+            local member = ARGV[1]
+            local score = ARGV[2]
+            local remainingMs = tonumber(ARGV[3])
+            if redis.call('ZSCORE', key, member) then
+              return 0
+            end
+            local existed = redis.call('EXISTS', key)
+            redis.call('ZADD', key, score, member)
+            local ttl = redis.call('PTTL', key)
+            if (existed == 0 or ttl < 0) and remainingMs > 0 then
+              redis.call('PEXPIRE', key, remainingMs)
+            end
+            return 1
+            """, Long.class);
 
     private static final int DEFAULT_FLUSH_BATCH_SIZE = 1;
     private static final int DEFAULT_FLUSH_STALE_MS = 3_000;
@@ -228,13 +251,16 @@ public class AgentRunEventRedisStore {
     }
 
     /**
-     * 把一条「库里已经有、事件流里没有」的事件补进去：只补缺的那一个，别的一概不碰。
+     * 补投的写法：成员已经在就一个字节都不写；缺了才补；只有这条 key 是刚建起来的、或者原先
+     * 就没有到期时间时，才按这条事实自己的时间设一遍剩余寿命。
      *
-     * <p>写法与普通写入刻意有三处不同。成员已经在时一个字节都不写——普通写入每批都会把整条 Run 的
-     * 事件 key 重新设成保留期，靠它补投等于每轮都把事件流的寿命往后推，保留期会越长越离谱。
-     * 补进去时用 {@code ZADD NX}：与并发写撞上时不去覆盖别人已经写好的成员。只有这一条把空 key
-     * 建起来（或 key 没有到期时间）时，才按事实自己的时间算一遍剩余寿命——给的是「这条事实本来
-     * 还能活多久」，不是从头再算一份完整保留期。</p>
+     * <p>三件事必须在同一次服务端执行里做完。分三步做会出两种事故：补进去之后、设到期时间之前
+     * 进程退出，留下一条永远不会过期的事件流，而下一轮看到成员已经在里面就提前返回，
+     * 这条 key 再也没人管；并发普通写入时，修补先读到 key 不存在，普通写随后建好 key 并设了
+     * 完整保留期，修补最后又按旧事实的剩余寿命覆盖它，反而把整条新事件流的寿命改短。</p>
+     *
+     * <p>剩余寿命由调用方按事实自己的时间算好传进来：给的是「这条事实本来还能活多久」，
+     * 不是从头再算一份完整保留期。</p>
      *
      * @return 真的补进去了返回 true；成员已经在里面、或者没有可补的内容返回 false
      */
@@ -252,20 +278,11 @@ public class AgentRunEventRedisStore {
             throw new IllegalStateException("补投的事件成员构造不出来: runId=" + runId
                     + ", seq=" + event.getSeq(), e);
         }
+        long remainingMs = remainingRetention(event).toMillis();
         try {
-            Long ttlBefore = redisTemplate.getExpire(key);
-            Boolean added = redisTemplate.opsForZSet()
-                    .addIfAbsent(key, member, event.getSeq().doubleValue());
-            if (!Boolean.TRUE.equals(added)) {
-                // 已经在里面：什么都不写，也不动这条 key 的到期时间。
-                return false;
-            }
-            boolean keyWasMissing = ttlBefore == null || ttlBefore == -2L;
-            boolean keyWithoutExpiry = ttlBefore == -1L;
-            if (keyWasMissing || keyWithoutExpiry) {
-                redisTemplate.expire(key, remainingRetention(event));
-            }
-            return true;
+            Long added = redisTemplate.execute(REPAIR_SCRIPT, List.of(key), member,
+                    String.valueOf(event.getSeq()), String.valueOf(remainingMs));
+            return added != null && added > 0L;
         } catch (Exception e) {
             String msg = String.format("补投事件到事件流失败: runId=%s, seq=%d", runId, event.getSeq());
             log.error(msg, e);

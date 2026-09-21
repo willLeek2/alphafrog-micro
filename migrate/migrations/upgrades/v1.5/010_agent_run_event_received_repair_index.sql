@@ -7,6 +7,10 @@
 --
 -- 索引列顺序与两条查询的排序一致（时间在前、编号在后）：同一毫秒落下的多行靠编号才排得稳定，
 -- 正着扫是从旧到新翻页，反着扫就是最新一页。
+--
+-- 这一步用普通建索引：迁移工具把每个脚本放在一个事务里跑，并发建索引在事务块里直接报错。
+-- 代价是建的这段时间这张表上的写被挡住。表小的时候是一眨眼的事，表大就要留出维护窗口——
+-- 上线前先看一眼这张表现在多大（行数与占用空间），再决定什么时候跑这一步。
 CREATE INDEX IF NOT EXISTS idx_agent_run_event_received_created
     ON alphafrog_agent_run_event (created_at, id)
     WHERE event_type = 'RUN_RECEIVED';

@@ -1009,18 +1009,19 @@ class Stage3WaitContractPostgresTest {
         assertThat(persisted).as("接收事实在库里").isNotNull();
 
         AgentRunEventRedisStore healed = Mockito.mock(AgentRunEventRedisStore.class);
+        Mockito.lenient().when(healed.repairMissing(Mockito.any())).thenReturn(true);
         // 保留期只有一份出处：回扫窗口读的就是事件流自己那份 TTL。
         Mockito.lenient().when(healed.retention()).thenReturn(java.time.Duration.ofDays(7));
         DeploymentIdentityProvider identityProvider = Mockito.mock(DeploymentIdentityProvider.class);
         Mockito.lenient().when(identityProvider.current())
                 .thenReturn(new DeploymentIdentity("stable", "gen-" + "a".repeat(64)));
         AgentRunEventProjectionRepair repair =
-                new AgentRunEventProjectionRepair(eventMapper, healed, identityProvider, 200);
+                new AgentRunEventProjectionRepair(eventMapper, healed, identityProvider, 200, 16, 2000);
 
         assertThat(repair.repair()).as("保留期内至少读到刚建的那一条").isGreaterThanOrEqualTo(1);
 
         ArgumentCaptor<AgentRunEvent> appended = ArgumentCaptor.forClass(AgentRunEvent.class);
-        Mockito.verify(healed, Mockito.atLeastOnce()).append(appended.capture());
+        Mockito.verify(healed, Mockito.atLeastOnce()).repairMissing(appended.capture());
         AgentRunEvent repaired = appended.getAllValues().stream()
                 .filter(event -> creation.run().getId().equals(event.getRunId()))
                 .findFirst().orElseThrow();

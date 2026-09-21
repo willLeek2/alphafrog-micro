@@ -361,14 +361,16 @@ public class AgentRunEventService {
      * 读回一条已经存在的 Run 时，把它的接收事实补投一次。
      *
      * <p>投射挪到提交之后，就有「库里有、事件流里没有」的可能。同键重试正是最可能碰上这种情况的
-     * 请求：它当时就在场，而且上一次多半刚失败过。补投只写持久事件流，不重发实时事件，
-     * 所以对已经看过这条事件的读者没有影响；补投失败也不影响返回，周期修补还会再试。</p>
+     * 请求：它当时就在场，而且上一次多半刚失败过。走的是补投那条写入（缺了才补、已有不动、
+     * 也不续期），不是普通投射——普通写入会把整条 Run 的事件重新设成完整保留期，用户反复用同一个
+     * 请求键重试就能让这条事件流一直不过期。补投只写持久事件流，不重发实时事件；失败不影响返回，
+     * 周期修补还会再试。</p>
      */
     private AgentRun reprojectReceivedFact(AgentRun run) {
         try {
             AgentRunEvent received = eventMapper.findFirstByRunIdAndType(run.getId(), "RUN_RECEIVED");
             if (received != null) {
-                eventRedisStore.append(received);
+                eventRedisStore.repairMissing(received);
             }
         } catch (Exception e) {
             log.warn("读回 Run 时补投接收事实失败，周期修补会再试: runId={}, error={}",
@@ -600,7 +602,9 @@ public class AgentRunEventService {
                 throw new IllegalStateException("Dedupe conflict without persisted event: runId=" + runId
                         + ", dedupeKey=" + event.getDedupeKey());
             }
-            eventRedisStore.append(existing);
+            // 这里也是「按已落库的事实补缺」，不是普通投射：普通写入会顺手把整条 Run 的事件
+            // 重新设成完整保留期，重复写同一个逻辑事件就能一次次把它续满。
+            eventRedisStore.repairMissing(existing);
             return false;
         }
 

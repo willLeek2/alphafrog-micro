@@ -49,7 +49,8 @@ class AgentRunEventProjectionRepairTest {
         identityProvider = Mockito.mock(DeploymentIdentityProvider.class);
         Mockito.lenient().when(identityProvider.current()).thenReturn(IDENTITY);
         Mockito.lenient().when(eventRedisStore.retention()).thenReturn(RETENTION);
-        repair = new AgentRunEventProjectionRepair(eventMapper, eventRedisStore, identityProvider, 200);
+        repair = new AgentRunEventProjectionRepair(
+                eventMapper, eventRedisStore, identityProvider, 200, 16, 2000);
         Mockito.lenient().when(eventMapper.listReceivedFactsAfterCursor(
                 anyString(), any(), any(), Mockito.anyLong(), anyInt()))
                 .thenReturn(List.of());
@@ -126,7 +127,8 @@ class AgentRunEventProjectionRepairTest {
         when(eventRedisStore.repairMissing(any())).thenReturn(true);
         // 只有一页（limit=1），所以这一页就是「取满」，游标前进。
         AgentRunEventProjectionRepair singleRowRepair =
-                new AgentRunEventProjectionRepair(eventMapper, eventRedisStore, identityProvider, 1);
+                new AgentRunEventProjectionRepair(
+                        eventMapper, eventRedisStore, identityProvider, 1, 16, 2000);
         singleRowRepair.repair();
         assertThat(singleRowRepair.snapshot())
                 .as("游标停在这一页最后一行上，下一轮从这里往后扫")
@@ -145,11 +147,13 @@ class AgentRunEventProjectionRepairTest {
     }
 
     /**
-     * 一个反复失败的坏行不能把更老的缺口挡在外面：这一行隔离掉，后面的行照旧处理，
-     * 游标停在它前面等下一轮重试。
+     * 一个补不进去的坏行不能把扫描挡住：这一行记下来，游标照常往前走。
+     *
+     * <p>满页里出现坏行时游标仍然推进到这一页末尾——满页外的下一页必须能被看到，
+     * 不然一个永远补不进去的行会把保留期里更老的所有缺口一起关在门外。</p>
      */
     @Test
-    void aFailingRowIsIsolatedAndTheCursorStopsBeforeIt() {
+    void aFailingRowDoesNotStopTheScan() {
         AgentRunEvent bad = received("run-bad", 1, 31L);
         AgentRunEvent good = received("run-good", 1, 32L);
         when(eventMapper.listReceivedFactsForRepair(anyString(), any(), anyInt()))
@@ -162,16 +166,131 @@ class AgentRunEventProjectionRepairTest {
                 .isEqualTo(1);
         assertThat(repair.snapshot())
                 .containsEntry("receivedProjectionRepairFailedTotal", 1L)
-                .containsEntry("receivedProjectionRepairAddedTotal", 1L);
+                .containsEntry("receivedProjectionRepairAddedTotal", 1L)
+                .as("最新一页里失败的行也进重试清单")
+                .containsEntry("receivedProjectionRepairFailedPending", 1);
 
-        // 游标页里出现失败时游标不前进：下一轮从同一位置重来。
+        // 游标页取满且带一个坏行：游标仍然走到这一页末尾，不停在坏行前面。
         when(eventMapper.listReceivedFactsAfterCursor(
                 anyString(), any(), any(), Mockito.anyLong(), anyInt()))
                 .thenReturn(List.of(bad));
+        AgentRunEventProjectionRepair singleRowRepair =
+                new AgentRunEventProjectionRepair(
+                        eventMapper, eventRedisStore, identityProvider, 1, 16, 2000);
+        when(eventMapper.listReceivedFactsForRepair(anyString(), any(), anyInt())).thenReturn(List.of());
+        singleRowRepair.repair();
+        assertThat(singleRowRepair.snapshot())
+                .as("游标走到这一页末尾：坏行不会把满页外的下一页挡在外面")
+                .containsEntry("receivedProjectionRepairCursor", bad.getCreatedAt().toString());
+    }
+
+    /**
+     * 坏行的重试走的是库里当前那一行：下一轮重新读回来再补，补上就从清单里去掉。
+     */
+    @Test
+    void aFailedRowIsRetriedFromTheDatabaseOnTheNextRound() {
+        AgentRunEvent bad = received("run-bad", 1, 31L);
+        when(eventMapper.listReceivedFactsForRepair(anyString(), any(), anyInt()))
+                .thenReturn(List.of(bad));
+        when(eventRedisStore.repairMissing(bad)).thenThrow(new IllegalStateException("这一行写不进去"));
         repair.repair();
+        assertThat(repair.snapshot()).containsEntry("receivedProjectionRepairFailedPending", 1);
+
+        // 库里那一行还是能被读回来的：下一轮读回换了个对象再补一次，这次成功。
+        AgentRunEvent freshCopy = received("run-bad", 1, 31L);
+        when(eventMapper.findByRunIdAndSeq("run-bad", 1)).thenReturn(freshCopy);
+        when(eventRedisStore.repairMissing(freshCopy)).thenReturn(true);
+        when(eventMapper.listReceivedFactsForRepair(anyString(), any(), anyInt())).thenReturn(List.of());
+
+        assertThat(repair.repair())
+                .as("重试补上的也算这一轮补投")
+                .isEqualTo(1);
         assertThat(repair.snapshot())
-                .as("有行失败时游标停在它前面，不让一个坏行挡住更老的缺口")
+                .containsEntry("receivedProjectionRepairFailedRetriedTotal", 1L)
+                .containsEntry("receivedProjectionRepairFailedPending", 0);
+    }
+
+    /** 清单里那一行在库中已经读不回来：没有可补的东西，从清单里去掉，不当成失败。 */
+    @Test
+    void aRowThatIsGoneFromTheDatabaseLeavesTheRetryList() {
+        AgentRunEvent bad = received("run-vanished", 1, 33L);
+        when(eventMapper.listReceivedFactsForRepair(anyString(), any(), anyInt()))
+                .thenReturn(List.of(bad));
+        when(eventRedisStore.repairMissing(bad)).thenThrow(new IllegalStateException("这一行写不进去"));
+        repair.repair();
+
+        when(eventMapper.findByRunIdAndSeq("run-vanished", 1)).thenReturn(null);
+        when(eventMapper.listReceivedFactsForRepair(anyString(), any(), anyInt())).thenReturn(List.of());
+        assertThat(repair.repair()).isZero();
+        assertThat(repair.snapshot())
+                .containsEntry("receivedProjectionRepairFailedPending", 0)
+                .containsEntry("receivedProjectionRepairFailedAbandonedTotal", 0L);
+    }
+
+    /**
+     * 一轮里能往后走多页：一拍一页时，只要新事实来得比扫得快，游标就永远落在窗口中段，
+     * 中间那一截轮不到就被保留期甩掉。这一轮走两页，两页都在同一轮里补上了。
+     */
+    @Test
+    void oneRoundWalksSeveralCursorPages() {
+        AgentRunEvent first = received("run-p1", 1, 61L);
+        AgentRunEvent second = received("run-p2", 1, 62L);
+        AgentRunEvent third = received("run-p3", 1, 63L);
+        when(eventRedisStore.repairMissing(any())).thenReturn(true);
+        when(eventMapper.listReceivedFactsAfterCursor(
+                anyString(), any(), any(), Mockito.anyLong(), anyInt()))
+                .thenReturn(List.of(first, second), List.of(third));
+        AgentRunEventProjectionRepair walker = new AgentRunEventProjectionRepair(
+                eventMapper, eventRedisStore, identityProvider, 2, 16, 2000);
+
+        assertThat(walker.repair())
+                .as("一轮里把两页都补了，不是只补一页")
+                .isEqualTo(3);
+        // 第一页取满、第二页没取满 ⇒ 扫到尾巴，游标回到起点等下一轮。
+        assertThat(walker.snapshot())
+                .containsEntry("receivedProjectionRepairPagesThisRound", 2)
+                .containsEntry("receivedProjectionRepairCycles", 1L)
                 .containsEntry("receivedProjectionRepairCursor", "start");
+    }
+
+    /** 页数上限真的会拦住这一轮：到了就收工，剩下的留给下一拍。 */
+    @Test
+    void aRoundStopsAtItsPageBudget() {
+        AgentRunEvent row = received("run-pages", 1, 71L);
+        when(eventRedisStore.repairMissing(any())).thenReturn(true);
+        when(eventMapper.listReceivedFactsAfterCursor(
+                anyString(), any(), any(), Mockito.anyLong(), anyInt()))
+                .thenReturn(List.of(row));
+        AgentRunEventProjectionRepair bounded = new AgentRunEventProjectionRepair(
+                eventMapper, eventRedisStore, identityProvider, 1, 3, 2000);
+
+        bounded.repair();
+        verify(eventMapper, Mockito.times(3)).listReceivedFactsAfterCursor(
+                anyString(), any(), any(), Mockito.anyLong(), anyInt());
+        assertThat(bounded.snapshot())
+                .as("到了页数上限就停，不是无限往后走")
+                .containsEntry("receivedProjectionRepairPagesThisRound", 3)
+                .containsEntry("receivedProjectionRepairMaxPagesPerRound", 3);
+    }
+
+    /** 一轮的时间用完也停：不能为了追进度一直占着调度线程。 */
+    @Test
+    void aRoundStopsWhenItsTimeIsUp() {
+        when(eventRedisStore.repairMissing(any())).thenReturn(true);
+        when(eventMapper.listReceivedFactsAfterCursor(
+                anyString(), any(), any(), Mockito.anyLong(), anyInt()))
+                .thenAnswer(invocation -> {
+                    Thread.sleep(40);
+                    return List.of(received("run-slow-page", 1, 81L));
+                });
+        AgentRunEventProjectionRepair timeBoxed = new AgentRunEventProjectionRepair(
+                eventMapper, eventRedisStore, identityProvider, 1, 16, 20);
+
+        timeBoxed.repair();
+        assertThat(timeBoxed.snapshot())
+                .as("一页就超过了整轮的预算：走完这一页就收工")
+                .containsEntry("receivedProjectionRepairPagesThisRound", 1)
+                .containsEntry("receivedProjectionRepairRoundBudgetMs", 20L);
     }
 
     @Test

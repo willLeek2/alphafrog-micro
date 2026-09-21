@@ -215,7 +215,7 @@ class AgentRunEventServiceIdempotencyTest {
                 false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
         assertThat(creation.created()).isFalse();
-        verify(eventRedisStore).append(received);
+        verify(eventRedisStore).repairMissing(received);
         verify(redisTemplate, never()).convertAndSend(anyString(), anyString());
     }
 
