@@ -35,6 +35,7 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -88,7 +89,8 @@ public class DualPoolWaitGroupNodeExecutor {
                                          @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
                                          int maxMemberResultChars,
                                          @Value("${agent.langchain.dual-pool.wait-group.member-poll-delay-ms:2000}")
-                                         long memberPollDelayMs) {
+                                         long memberPollDelayMs,
+                                         FrozenEffectiveSettings frozenEffectiveSettings) {
         this.promptService = promptService;
         this.executionGuard = executionGuard;
         this.waitGroupStore = waitGroupStore;
@@ -98,6 +100,12 @@ public class DualPoolWaitGroupNodeExecutor {
         this.settings = settings;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.memberPollDelayMs = Math.max(1L, memberPollDelayMs);
+        // 登记归一化之后真正在用的值，读数才不会报出一个这里根本没有采用的数。
+        String component = "DualPoolWaitGroupNodeExecutor";
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_WAIT_GROUP_MAX_MEMBER_RESULT_CHARS,
+                component, this.maxMemberResultChars);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_WAIT_GROUP_MEMBER_POLL_DELAY_MS,
+                component, this.memberPollDelayMs);
     }
 
     /**

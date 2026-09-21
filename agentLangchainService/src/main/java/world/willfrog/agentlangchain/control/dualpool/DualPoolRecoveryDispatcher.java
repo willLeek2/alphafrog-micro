@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -60,6 +61,9 @@ public class DualPoolRecoveryDispatcher {
     private volatile RecoveryBackoff backoff;
     private volatile long backoffBaseMs;
     private volatile long backoffMaxMs;
+    /** 最近一轮实际用的扫描配额（配的值超过本轮总上限时会被压低），以及这一轮是什么时候跑的。 */
+    private volatile int scanQuotaLastRound;
+    private volatile OffsetDateTime lastRoundAt;
 
     /** 提交后唤醒的提醒：只带通知编号，取之前回库读权威状态。 */
     private final ConcurrentLinkedQueue<Long> wakeups = new ConcurrentLinkedQueue<>();
@@ -81,18 +85,26 @@ public class DualPoolRecoveryDispatcher {
             AgentRunMapper runMapper,
             DualPoolDispatcher dispatcher,
             WaitGroupRecoveryIntake intake,
-            DualPoolSchedulerSettings settings) {
+            DualPoolSchedulerSettings settings,
+            @Value("${agent.langchain.dual-pool.recovery.scan-interval-ms:1000}") long scanIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.waitGroupStore = waitGroupStore;
         this.runMapper = runMapper;
         this.dispatcher = dispatcher;
         this.intake = intake;
         this.settings = settings;
+        // 补扫的间隔与 @Scheduled 上那个属性名在启动时各解析一次，取到的是同一个数；报出来是为了
+        // 让读数与定时任务对得上，不是另立一份配置。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RECOVERY_SCAN_INTERVAL_MS,
+                "DualPoolRecoveryDispatcher", Math.max(1L, scanIntervalMs));
     }
 
     /** 退避参数按当前配置取；配置改了就用新值重建一个，读数与推后用的是同一个。 */
     private RecoveryBackoff backoff() {
-        long base = settings.recoveryBackoffBaseMs().longValue();
-        long max = settings.recoveryBackoffMaxMs().longValue();
+        // 初值与上限从同一份解析结果里取，不会一个新版一个旧版拼成一个谁都没配过的组合。
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        long base = round.recoveryBackoffBaseMs().longValue();
+        long max = round.recoveryBackoffMaxMs().longValue();
         RecoveryBackoff current = backoff;
         if (current == null || base != backoffBaseMs || max != backoffMaxMs) {
             current = new RecoveryBackoff(Duration.ofMillis(base), Duration.ofMillis(max));
@@ -149,9 +161,11 @@ public class DualPoolRecoveryDispatcher {
         if (!dispatcher.isReady()) {
             return;
         }
+        // 每页多少条与翻几页从同一份解析结果里取：两个参数不该一个新版一个旧版。
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
         int total = 0;
-        int batchSize = settings.recoveryBatchSize().intValue();
-        for (int page = 0; page < settings.recoveryStartupPages().intValue(); page++) {
+        int batchSize = round.recoveryBatchSize().intValue();
+        for (int page = 0; page < round.recoveryStartupPages().intValue(); page++) {
             int handled = safeRound(batchSize);
             total += handled;
             if (handled < batchSize) {
@@ -176,10 +190,14 @@ public class DualPoolRecoveryDispatcher {
 
     private int round(int limit) {
         rounds.incrementAndGet();
+        lastRoundAt = OffsetDateTime.now();
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
         int budget = Math.max(1, limit);
         // 扫描配额同时受两个东西约束：配的那个值、以及这一轮的总上限。配额比总上限还大的话，
         // 「一轮最多处理这么多条」这条合同就被配额破了；启动分页也会因为每页实际超过上限而失真。
-        int scanQuota = Math.max(1, Math.min(settings.recoveryScanQuota().intValue(), budget));
+        int scanQuota = Math.max(1, Math.min(round.recoveryScanQuota().intValue(), budget));
+        // 读数里记下这一轮实际用的配额：配的值比总上限大时两者不一样，只看配置值会以为配额生效了。
+        scanQuotaLastRound = scanQuota;
         // 数据库先走，而且至少拿到固定名额：提醒再多也占不住它那一份。提醒少的时候不去浪费预算——
         // 提醒就那么多条，剩下的整份都给补扫，一轮的吞吐不因为保底而变小。
         int hintShare = Math.min(pendingWakeupDepth(), Math.max(0, budget - scanQuota));
@@ -339,9 +357,13 @@ public class DualPoolRecoveryDispatcher {
         snapshot.put("recoveryClosedTotal", closed.get());
         snapshot.put("recoveryLostRaceTotal", lostRaces.get());
         snapshot.put("recoveryDroppedWakeupsTotal", droppedWakeups.get());
-        snapshot.put("recoveryBatchSize", settings.recoveryBatchSize().value());
-        snapshot.put("recoveryScanQuota", settings.recoveryScanQuota().value());
-        snapshot.put("recoveryWakeupCapacity", settings.recoveryWakeupCapacity().value());
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        snapshot.put("recoveryBatchSize", round.recoveryBatchSize().value());
+        snapshot.put("recoveryScanQuota", round.recoveryScanQuota().value());
+        // 配的值与本轮真正用的值分开报：配额比这一轮总上限大时会被压低，只报配置值看不出这件事。
+        snapshot.put("recoveryScanQuotaLastRound", scanQuotaLastRound);
+        snapshot.put("recoveryLastRoundAt", lastRoundAt == null ? null : lastRoundAt.toString());
+        snapshot.put("recoveryWakeupCapacity", round.recoveryWakeupCapacity().value());
         // 提醒深度与刷新窗口在同一把锁里读：并发提醒与出队时不能读到一个看不见的组合。
         synchronized (wakeupLock) {
             snapshot.put("recoveryPendingWakeups", pendingWakeups.size());

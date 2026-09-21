@@ -22,6 +22,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
@@ -89,7 +90,7 @@ class WaitMemberResultReceiverTest {
                         "agent.langchain.wait-member.receiver.backoff-base-ms", "1000",
                         "agent.langchain.wait-member.receiver.backoff-max-ms", "15000",
                         "agent.langchain.wait-member.receiver.max-backoff-step", "6"),
-                4096, 1000L);
+                4096, 1000L, new FrozenEffectiveSettings());
         Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
 
@@ -107,7 +108,8 @@ class WaitMemberResultReceiverTest {
         Mockito.lenient().when(waitGroupStore.scanDueMembers(any(), anyInt())).thenReturn(List.of());
         WaitMemberResultReceiver live = new WaitMemberResultReceiver(waitGroupStore, runMapper,
                 nodeWorkItemStore, sandboxService, pythonSandboxTools, settlement, recoveryDispatcher,
-                objectMapper, new DualPoolSchedulerSettings(null, environment), 4096, 1000L);
+                objectMapper, new DualPoolSchedulerSettings(null, environment), 4096, 1000L,
+                new FrozenEffectiveSettings());
 
         live.round();
         verify(waitGroupStore).scanDueMembers(any(), eq(8));

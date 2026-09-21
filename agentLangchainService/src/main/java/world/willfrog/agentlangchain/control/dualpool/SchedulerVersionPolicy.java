@@ -1,6 +1,5 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
-import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
@@ -10,6 +9,10 @@ import world.willfrog.agent.platform.workitem.SchedulerVersion;
  *
  * <p>新 Run 的开关只在创建时读取一次并写进数据库。已经创建的 Run 只相信记录自身的
  * {@code schedulerVersion}，不会因热配置变化在执行中途切换调度器。未知值直接失败关闭。</p>
+ *
+ * <p>「配置写的是什么、实际生效的是什么」由设置解析组件一起算出来（热配置 → 环境属性 → 代码默认，
+ * 以及进程终止演练开关对默认值的覆盖），这里只负责认出这个版本名并把认不出的当场拒掉。演练开关
+ * 只覆盖代码默认值：显式配置的版本（包括显式写的 LEGACY）是操作人的选择，不被别的开关改写。</p>
  */
 @Component
 public class SchedulerVersionPolicy {
@@ -18,31 +21,20 @@ public class SchedulerVersionPolicy {
     public static final String DUAL_POOL_V1 = SchedulerVersion.DUAL_POOL_V1.name();
     public static final String DUAL_POOL_V2 = SchedulerVersion.DUAL_POOL_V2.name();
 
-    private final Environment environment;
     private final DualPoolSchedulerSettings settings;
 
-    public SchedulerVersionPolicy(Environment environment, DualPoolSchedulerSettings settings) {
-        this.environment = environment;
+    public SchedulerVersionPolicy(DualPoolSchedulerSettings settings) {
         this.settings = settings;
     }
 
     public String versionForNewRun() {
-        // 版本从这里读一次：热配置（泳道覆盖只影响该泳道）→ 环境属性 → 代码默认。已经创建的 Run
-        // 只认自己记录里的版本，热配置怎么改都不会影响它们。
-        String configuredVersion = requireKnown(settings.newRunSchedulerVersion().textValue());
+        // 版本从这里读一次：热配置（泳道覆盖只影响该泳道）→ 环境属性 → 代码默认，演练开关也在这里
+        // 生效。已经创建的 Run 只认自己记录里的版本，热配置怎么改都不会影响它们。
+        String effectiveVersion = requireKnown(settings.newRunSchedulerVersion().textValue());
         // 认不出的值在这里失败关闭（既不是旧路径，也不是任何一个双池版本），不悄悄回落到旧版本。
         // 三个已知版本都可以给新 Run 用：完整 DAG 那一版的执行链已经接通（分段执行、等待组、
         // 结果接收、恢复分发与启动恢复都在），但要不要用由配置决定——没配置时仍是旧路径。
-        //
-        // 版本判断放在演练开关之前：显式配置的版本必须先被检查，不能被另一个开关悄悄改掉。
-        // 进程终止演练只对双 Worker 池的持久恢复链有意义。这个开关只由隔离的
-        // 长工具验收泳道显式授权；它只改默认值：配置停在没有指定双池版本（LEGACY 或未配置）时才把新 Run
-        // 推进双池，显式写下的版本不被它改写。避免旧串行链产出无效样本。
-        if (LEGACY.equals(configuredVersion) && environment.getProperty(
-                "agent.tool-job.fault-injection.allow-process-halt", Boolean.class, false)) {
-            return DUAL_POOL_V1;
-        }
-        return configuredVersion;
+        return effectiveVersion;
     }
 
     public String versionOf(AgentRun run) {

@@ -84,7 +84,10 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
             @Value("${agent.langchain.dual-pool.node-worker.submit-budget:64}") int nodeSubmitBudget,
             @Value("${agent.langchain.dual-pool.business-admission-limit:100}") int businessAdmissionLimit,
             @Value("${agent.langchain.dual-pool.run-worker.permit-limit:2}") int runPermitLimit,
-            @Value("${agent.langchain.dual-pool.node-worker.permit-limit:4}") int nodePermitLimit) {
+            @Value("${agent.langchain.dual-pool.node-worker.permit-limit:4}") int nodePermitLimit,
+            @Value("${agent.langchain.dual-pool.scan.interval-ms:1000}") long scanIntervalMs,
+            @Value("${agent.langchain.dual-pool.hint-drain-interval-ms:50}") long hintDrainIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.runExecutor = runExecutor;
         this.nodeExecutor = nodeExecutor;
         this.handlerProvider = handlerProvider;
@@ -102,6 +105,29 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
                 Math.max(1, runPermitLimit));
         this.permitLedger.setLimit(SchedulerPermitLayer.NODE_EXECUTION_SEGMENT,
                 Math.max(1, nodePermitLimit));
+        // 这一层登记的是构造完之后真正在用的值：容量做过「至少 1」的归一化，许可上限从台账里读回来，
+        // 两个定时扫描的间隔与 @Scheduled 上那个属性名在启动时解析出来的是同一个数。
+        String component = "DualPoolDispatcher";
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RUN_WORKER_HINT_CAPACITY,
+                component, this.runHints.remainingCapacity());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_HINT_CAPACITY,
+                component, this.nodeHintCapacity);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SCAN_BATCH_SIZE,
+                component, this.scanBatchSize);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RUN_WORKER_SUBMIT_BUDGET,
+                component, this.runSubmitBudget);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_SUBMIT_BUDGET,
+                component, this.nodeSubmitBudget);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_BUSINESS_ADMISSION_LIMIT,
+                component, this.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).limit());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RUN_WORKER_PERMIT_LIMIT,
+                component, this.permitLedger.usage(SchedulerPermitLayer.RUN_COORDINATION_TURN).limit());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_PERMIT_LIMIT,
+                component, this.permitLedger.usage(SchedulerPermitLayer.NODE_EXECUTION_SEGMENT).limit());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SCAN_INTERVAL_MS,
+                component, Math.max(1L, scanIntervalMs));
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_HINT_DRAIN_INTERVAL_MS,
+                component, Math.max(1L, hintDrainIntervalMs));
     }
 
     /**

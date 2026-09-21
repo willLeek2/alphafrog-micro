@@ -67,7 +67,7 @@ class DualPoolRecoveryDispatcherTest {
         lenient().when(dispatcher.isReady()).thenReturn(true);
         // 默认每轮给数据库补扫留 1 个名额，其余预算给内存提醒。
         recovery = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher, intake,
-                recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024));
+                recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024), 1000L, new FrozenEffectiveSettings());
     }
 
     @Test
@@ -270,7 +270,7 @@ class DualPoolRecoveryDispatcherTest {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("agent.langchain.dual-pool.recovery.batch-size", "1");
         DualPoolRecoveryDispatcher live = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher, intake,
-                new DualPoolSchedulerSettings(null, environment));
+                new DualPoolSchedulerSettings(null, environment), 1000L, new FrozenEffectiveSettings());
 
         live.rediscover();
         assertThat(store.lastScanLimit).isEqualTo(1);
@@ -284,7 +284,8 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aFullReminderQueueDropsRemindersInsteadOfGrowing() {
         DualPoolRecoveryDispatcher bounded = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
-                intake, recoverySettings(BATCH, 500L, 5_000L, 4, 1, 3));
+                intake, recoverySettings(BATCH, 500L, 5_000L, 4, 1, 3), 1000L,
+                new FrozenEffectiveSettings());
         assertThat(bounded.wake(1L)).isTrue();
         assertThat(bounded.wake(2L)).isTrue();
         assertThat(bounded.wake(3L)).isTrue();
@@ -329,7 +330,8 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aScanQuotaLargerThanTheRoundBudgetStaysInsideTheBudget() {
         DualPoolRecoveryDispatcher wideQuota = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
-                intake, recoverySettings(1, 500L, 5_000L, 4, 4, 1024));
+                intake, recoverySettings(1, 500L, 5_000L, 4, 4, 1024), 1000L,
+                new FrozenEffectiveSettings());
         store.addNotification(41L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
         store.addNotification(42L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
         when(runMapper.findById(RUN_ID)).thenReturn(runningRun());

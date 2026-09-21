@@ -22,6 +22,7 @@ import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.RecoveryBackoff;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
@@ -108,7 +109,8 @@ public class WaitMemberResultReceiver {
             DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
             int maxMemberResultChars,
-            @Value("${agent.langchain.wait-member.receiver.poll-interval-ms:1000}") long pollIntervalMs) {
+            @Value("${agent.langchain.wait-member.receiver.poll-interval-ms:1000}") long pollIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.waitGroupStore = waitGroupStore;
         this.runMapper = runMapper;
         this.nodeWorkItemStore = nodeWorkItemStore;
@@ -120,12 +122,21 @@ public class WaitMemberResultReceiver {
         this.settings = settings;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.pollIntervalMs = Math.max(1L, pollIntervalMs);
+        // 登记归一化之后真正在用的值；轮询间隔与 @Scheduled 上那个属性名在启动时各解析一次，
+        // 取到的是同一个数。
+        String component = "WaitMemberResultReceiver";
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_WAIT_GROUP_MAX_MEMBER_RESULT_CHARS,
+                component, this.maxMemberResultChars);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_MEMBER_RECEIVER_POLL_INTERVAL_MS,
+                component, this.pollIntervalMs);
     }
 
     /** 退避参数按当前配置取；配置改了就用新值重建一个，读数与推后用的是同一个。 */
     private RecoveryBackoff backoff() {
-        long base = settings.memberReceiverBackoffBaseMs().longValue();
-        long max = settings.memberReceiverBackoffMaxMs().longValue();
+        // 初值与上限从同一份解析结果里取：热更新落在两次读之间也不会拼出谁都没配过的组合。
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        long base = round.memberReceiverBackoffBaseMs().longValue();
+        long max = round.memberReceiverBackoffMaxMs().longValue();
         RecoveryBackoff current = backoff;
         if (current == null || base != backoffBaseMs || max != backoffMaxMs) {
             current = new RecoveryBackoff(Duration.ofMillis(base), Duration.ofMillis(max));

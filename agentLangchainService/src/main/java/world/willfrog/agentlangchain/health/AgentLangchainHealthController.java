@@ -15,7 +15,9 @@ import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 
+import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -32,6 +34,7 @@ public class AgentLangchainHealthController {
     private final SchedulerBackpressureProbe schedulerBackpressureProbe;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final DualPoolSchedulerSettings schedulerSettings;
+    private final FrozenEffectiveSettings frozenEffectiveSettings;
 
     @Value("${agent.langchain.service.version:UNKNOWN}")
     private String serviceVersion;
@@ -60,6 +63,11 @@ public class AgentLangchainHealthController {
         // 生效的双池参数：每个值都带来源（热配置／环境属性／代码默认）、改了要不要重启，
         // 以及被丢掉的值与原因。验收与排查都从这一份读，不靠猜某个泳道配了什么。
         dualPool.put("settings", schedulerSettings.snapshot());
+        // 启动冻结的那些参数，各组件此刻真正在用的值，按参数名分组：一个参数只有一个消费者时值就是
+        // 一个数，几个消费者用的数不一样时（租约时长这种）并排列出。setting 那一份里同一个参数报的是
+        // 同一个值，两处对得上说明读数就是系统在用的东西。
+        dualPool.put("settingsInUse", frozenEffectiveSettings.all());
+        dualPool.put("settingsSampledAt", OffsetDateTime.now().toString());
         snapshot.put("dualPool", dualPool);
         return snapshot;
     }

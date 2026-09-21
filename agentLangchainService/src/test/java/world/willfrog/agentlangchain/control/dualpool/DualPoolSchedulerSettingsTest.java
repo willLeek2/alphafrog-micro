@@ -1,8 +1,10 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.mock.env.MockEnvironment;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -11,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -83,20 +86,55 @@ class DualPoolSchedulerSettingsTest {
         assertThat(setting.rejection()).contains("不合法");
     }
 
-    /** 低水位高于高水位：这组组合不成立，用高水位并把原因写清楚。 */
+    /** 热配置里低水位高于高水位：这一层跳过，用下一层那个站得住的值，并把原因写清楚。 */
     @Test
-    void aLowWatermarkAboveTheHighOneIsReportedAndNotSilentlyKept() {
+    void aHotLowWatermarkAboveTheHighOneFallsThroughToTheNextLayer() {
         AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
         scheduler.setGlobalUnfinishedHighWatermark(100);
         scheduler.setGlobalUnfinishedLowWatermark(150);
-        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler);
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler,
+                HIGH, "128", LOW, "96");
 
         DualPoolSchedulerSettings.Setting low = settings.globalUnfinishedLowWatermark();
         DualPoolSchedulerSettings.Setting high = settings.globalUnfinishedHighWatermark();
 
-        assertThat(high.intValue()).isEqualTo(100);
+        assertThat(high.intValue()).as("高水位取热配置那一份").isEqualTo(100);
+        assertThat(low.intValue()).as("热配置的 150 高于 100：跳到环境属性那一层的 96")
+                .isEqualTo(96);
+        assertThat(low.source()).as("来源是真正给出这个数的那一层，不是被跳过的那一层")
+                .isEqualTo(DualPoolSchedulerSettings.SOURCE_PROPERTY);
+        assertThat(low.rejection()).contains("低水位").contains("150");
+    }
+
+    /** 低水位与高水位相等是成立的组合：含义是「降到高水位才恢复」。 */
+    @Test
+    void aLowWatermarkEqualToTheHighOneIsAValidCombination() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setGlobalUnfinishedHighWatermark(100);
+        scheduler.setGlobalUnfinishedLowWatermark(100);
+
+        DualPoolSchedulerSettings.Setting low = TestSchedulerSettings.hot(scheduler)
+                .globalUnfinishedLowWatermark();
+
         assertThat(low.intValue()).isEqualTo(100);
-        assertThat(low.rejection()).contains("低水位高于高水位");
+        assertThat(low.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_HOT_CONFIG);
+        assertThat(low.rejection()).isNull();
+    }
+
+    /** 三层都没有成立的组合：回落到高水位，来源如实标成保守回退，不冒充某一层。 */
+    @Test
+    void whenNoLayerHasAValidCombinationTheFallbackIsLabelledAsSuch() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setGlobalUnfinishedHighWatermark(40);
+        scheduler.setGlobalUnfinishedLowWatermark(150);
+        // 环境属性那一层的低水位也高于热配置的高水位 40；代码默认的 96 同样高于它。
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler, LOW, "90");
+
+        DualPoolSchedulerSettings.Setting low = settings.globalUnfinishedLowWatermark();
+
+        assertThat(low.intValue()).as("回落到高水位本身：含义是「降到高水位才恢复」").isEqualTo(40);
+        assertThat(low.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_FALLBACK);
+        assertThat(low.rejection()).contains("热配置").contains("环境属性").contains("代码默认");
     }
 
     /** 热配置里的退避上限小于初值：跳过它、用下一层里那个站得住的值，并把原因写清楚。 */
@@ -114,7 +152,7 @@ class DualPoolSchedulerSettingsTest {
         assertThat(ceiling.rejection()).contains("不合法").contains("退避初值");
     }
 
-    /** 初值本身就比任何一层能给出的上限都大：上限取初值，并把原因写清楚。 */
+    /** 初值本身就比任何一层能给出的上限都大：上限取初值，来源标成保守回退。 */
     @Test
     void aBackoffCeilingBelowItsFloorIsReported() {
         AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
@@ -124,7 +162,98 @@ class DualPoolSchedulerSettingsTest {
         DualPoolSchedulerSettings.Setting ceiling = settings.recoveryBackoffMaxMs();
 
         assertThat(ceiling.longValue()).as("上限不能小于初值").isEqualTo(9000L);
-        assertThat(ceiling.rejection()).contains("退避上限小于初值");
+        assertThat(ceiling.source()).as("初值不是代码默认那一层给的，来源不能写成 default")
+                .isEqualTo(DualPoolSchedulerSettings.SOURCE_FALLBACK);
+        assertThat(ceiling.rejection()).contains("退避初值");
+    }
+
+    /**
+     * 成对的参数从同一份热配置快照里取：热更新落在两次读之间时，不会拼出一个谁都没配过的组合。
+     *
+     * <p>做法是让热配置在读第二个参数时换一份：解析器在这一次解析里只认第一份，两个数因此还是
+     * 同一个版本里的。</p>
+     */
+    @Test
+    void pairedParametersComeFromOneHotSnapshotPerResolution() {
+        AgentLlmProperties firstVersion = new AgentLlmProperties();
+        firstVersion.getRuntime().getScheduler().setRecoveryBackoffBaseMs(2000L);
+        firstVersion.getRuntime().getScheduler().setRecoveryBackoffMaxMs(6000L);
+        AgentLlmProperties secondVersion = new AgentLlmProperties();
+        secondVersion.getRuntime().getScheduler().setRecoveryBackoffBaseMs(5000L);
+        secondVersion.getRuntime().getScheduler().setRecoveryBackoffMaxMs(2000L);
+        AgentLlmLocalConfigLoader loader = Mockito.mock(AgentLlmLocalConfigLoader.class);
+        // 第一次取给新版本、之后一直给旧版本：一次解析里只该读一次热配置。
+        Mockito.when(loader.current()).thenReturn(Optional.of(firstVersion), Optional.of(secondVersion));
+
+        DualPoolSchedulerSettings.RoundSettings round = new DualPoolSchedulerSettings(
+                loader, new MockEnvironment()).round();
+
+        assertThat(round.recoveryBackoffBaseMs().longValue()).isEqualTo(2000L);
+        assertThat(round.recoveryBackoffMaxMs().longValue())
+                .as("上限来自同一份快照，不会拿新版本的初值去配旧版本的上限")
+                .isEqualTo(6000L);
+    }
+
+    /** 启动冻结的参数报的是组件在用的值，不是后来从属性源读回来的请求值。 */
+    @Test
+    void startupFrozenValuesReportWhatTheComponentsActuallyUse() {
+        FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
+        inUse.register("agent.langchain.dual-pool.node-worker.core-pool-size",
+                "agentLangChainNodeTaskExecutor", 2);
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty("agent.langchain.dual-pool.node-worker.core-pool-size", "8");
+        DualPoolSchedulerSettings settings = new DualPoolSchedulerSettings(null, environment, inUse);
+
+        DualPoolSchedulerSettings.Setting core = settings.snapshot()
+                .get("agent.langchain.dual-pool.node-worker.core-pool-size");
+
+        assertThat(core.intValue()).as("请求了 8，线程池真正在用 2").isEqualTo(2);
+        assertThat(core.requested()).as("请求值单独留一份").isEqualTo(8);
+        assertThat(core.inUseBy()).containsEntry("agentLangChainNodeTaskExecutor", 2);
+        assertThat(core.rejection()).as("两个数不一样要说出来").contains("请求值与实际生效值不同");
+        assertThat(core.hotChangeable()).isFalse();
+    }
+
+    /** 同一个参数被几个组件读、用的数不一样：并排列出，不替它们挑一个。 */
+    @Test
+    void aFrozenValueWithSeveralConsumersKeepsEveryConsumersNumber() {
+        FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
+        inUse.register("agent.langchain.dual-pool.service-lease-ttl-seconds", "DatabaseDualPoolWorkHandler", 120L);
+        inUse.register("agent.langchain.dual-pool.service-lease-ttl-seconds", "RunServiceLeaseKeeper", 60L);
+        DualPoolSchedulerSettings settings = new DualPoolSchedulerSettings(
+                null, new MockEnvironment(), inUse);
+
+        DualPoolSchedulerSettings.Setting ttl = settings.snapshot()
+                .get("agent.langchain.dual-pool.service-lease-ttl-seconds");
+
+        assertThat(ttl.inUseBy())
+                .containsEntry("DatabaseDualPoolWorkHandler", 120L)
+                .containsEntry("RunServiceLeaseKeeper", 60L);
+        assertThat(ttl.value()).isInstanceOf(Map.class);
+    }
+
+    /** 没有组件登记过的启动冻结参数：报请求值，并写明它只是请求值。 */
+    @Test
+    void aFrozenValueNobodyRegisteredIsLabelledAsARequestOnly() {
+        DualPoolSchedulerSettings.Setting drain = TestSchedulerSettings.propertyOnly().snapshot()
+                .get("agent.langchain.dual-pool.hint-drain-interval-ms");
+
+        assertThat(drain.intValue()).isEqualTo(50);
+        assertThat(drain.rejection()).contains("没有组件登记它在用的值");
+        assertThat(drain.inUseBy()).isNull();
+    }
+
+    /** 启动补扫页数标成要重启：运行期改它不会触发新的补扫。 */
+    @Test
+    void startupPagesAreMarkedAsNeedingARestart() {
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                "agent.langchain.dual-pool.recovery.startup-pages", "3");
+
+        DualPoolSchedulerSettings.Setting pages = settings.snapshot()
+                .get("agent.langchain.dual-pool.recovery.startup-pages");
+
+        assertThat(pages.intValue()).isEqualTo(3);
+        assertThat(pages.hotChangeable()).as("只在启动补扫那一刻读一次").isFalse();
     }
 
     /** 环境属性写了个不是数字的值：用默认值，并把原因写清楚。 */

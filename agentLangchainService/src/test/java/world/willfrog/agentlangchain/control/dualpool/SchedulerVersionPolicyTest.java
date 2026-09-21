@@ -20,8 +20,7 @@ class SchedulerVersionPolicyTest {
 
     private static SchedulerVersionPolicy policy(MockEnvironment environment) {
         // 与生产同一条路：版本由设置解析组件按「热配置 → 环境属性 → 代码默认」取，这里只给环境属性。
-        return new SchedulerVersionPolicy(environment,
-                new DualPoolSchedulerSettings(null, environment));
+        return new SchedulerVersionPolicy(new DualPoolSchedulerSettings(null, environment));
     }
 
     @Test
@@ -41,6 +40,33 @@ class SchedulerVersionPolicyTest {
         assertThat(policy(environment).versionForNewRun())
                 .as("泳道显式授权进程终止演练时，没配置版本的新 Run 进双池")
                 .isEqualTo("DUAL_POOL_V1");
+    }
+
+    @Test
+    void haltSwitchDoesNotRewriteAnExplicitLegacy() {
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty(HALT_KEY, "true")
+                .withProperty(VERSION_KEY, "LEGACY");
+        assertThat(policy(environment).versionForNewRun())
+                .as("显式写了 LEGACY 就是要在旧入口上跑：演练开关只改默认值，不改操作人写下的版本")
+                .isEqualTo("LEGACY");
+    }
+
+    /**
+     * 演练开关改了默认值时，读数里要能看出「配置没写、生效的是演练后的版本」。
+     *
+     * <p>健康接口显示配置值、新 Run 却落库另一个版本，操作人会按错的版本验收。</p>
+     */
+    @Test
+    void theSettingsReportBothTheConfiguredValueAndTheDrilledOne() {
+        MockEnvironment environment = new MockEnvironment().withProperty(HALT_KEY, "true");
+        DualPoolSchedulerSettings.Setting version =
+                new DualPoolSchedulerSettings(null, environment).newRunSchedulerVersion();
+
+        assertThat(version.textValue()).isEqualTo("DUAL_POOL_V1");
+        assertThat(version.requested()).as("请求值：一层都没配，用代码默认").isEqualTo("LEGACY");
+        assertThat(version.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
+        assertThat(version.rejection()).contains("演练开关");
     }
 
     @Test
