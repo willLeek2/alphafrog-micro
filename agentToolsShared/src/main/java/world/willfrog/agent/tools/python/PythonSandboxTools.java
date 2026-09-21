@@ -20,6 +20,9 @@ import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
+import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
@@ -59,6 +62,13 @@ public class PythonSandboxTools {
             DagBlockingWorkerLease.LEASE_DURATION.toMillis() / 2L;
     /** schema 2 起保证 estimate 与 reservation 同源；旧错配兼容只能处理 schema 1。 */
     private static final int DATA_INTENSE_ANCHOR_SCHEMA_VERSION = 2;
+    /**
+     * 数据分析调用的尝试轮次。
+     *
+     * <p>新旧两条路径都从第一轮开始：同一段里重试换的是工具调用身份（模型给出的调用编号），
+     * 身份变了外部作业也就换了，不需要靠轮次区分。</p>
+     */
+    private static final int DATA_ANALYSIS_ATTEMPT = 1;
 
     /**
      * 写给模型的完整说明只维护在 classpath 权威文件里。
@@ -347,6 +357,13 @@ public class PythonSandboxTools {
             requestBuilder.setPathManifestCsv(pathManifestCsv);
 
             ExecuteRequest legacyRequest = requestBuilder.build();
+            // 新调度器版本：这次调用是某个等待组里的一名成员，建好后台任务就交出去，不等结果。
+            WaitGroupMemberExecutionContext.Snapshot waitGroupMember =
+                    WaitGroupMemberExecutionContext.current();
+            if (waitGroupMember != null) {
+                return submitForWaitGroup(waitGroupMember, subSnapshot, allDatasets,
+                        resolvedManifests, legacyRequest, timeout, toolStartMs);
+            }
             if (dataIntenseWiringAvailable()) {
                 return executeDataIntense(
                         runId, subSnapshot, allDatasets, resolvedManifests,
@@ -441,6 +458,10 @@ public class PythonSandboxTools {
             throw interruption;
         } catch (ExternalToolJobPendingException pending) {
             throw pending;
+        } catch (WaitGroupMemberPendingException pending) {
+            // 等待成员的后台作业已经交出去了。把它转成工具失败文本会让模型以为这次调用结束，
+            // 而库里还没有记下这个成员已经派发，所以原样上抛，由派发器写进成员行。
+            throw pending;
         } catch (Exception e) {
             log.error("Execute python tool error", e);
             emitSandboxToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
@@ -453,6 +474,373 @@ public class PythonSandboxTools {
                 && dataAnalysisCapacityProperties != null
                 && pythonSandboxDispatchStore != null
                 && dataAnalysisTerminalRecorder != null;
+    }
+
+    // ==================== 两条路径共用的冻结事实 ====================
+
+    /**
+     * 一次数据分析调用在建沙箱任务之前冻结下来的事实：预估值、资源档位、canonical 请求规格与请求指纹。
+     *
+     * <p>旧路径把这些写进 Run 级的长工具进度记录，新调度器版本把它们写进成员行的派发证明。
+     * 两边用的是同一份结果，所以只留一处算法。</p>
+     */
+    private record CapacityPlan(DataAnalysisEstimate estimate,
+                                DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision decision,
+                                CanonicalSandboxCreateSpec spec,
+                                String pythonRequestFingerprint,
+                                PythonRepairContext repairContext) {
+    }
+
+    /**
+     * 「这次调用在冻结事实这一步就被拒绝」时抛的内部异常。
+     *
+     * <p>冻结这一步只有计算，不占名额、不碰沙箱，所以拒绝就是给模型一段可解释的失败文本。
+     * 用异常传出来，是为了让两条路径共用同一段计算，又不必把失败文本从计算里层层返回。</p>
+     */
+    private static final class DataIntenseRefusal extends RuntimeException {
+
+        private final String code;
+        private final Map<String, Object> details;
+
+        DataIntenseRefusal(String code, String message, Map<String, Object> details) {
+            super(message);
+            this.code = code;
+            this.details = details == null ? Map.of() : details;
+        }
+
+        String code() {
+            return code;
+        }
+
+        Map<String, Object> details() {
+            return details;
+        }
+    }
+
+    /**
+     * 冻结这次调用的事实：数据集预估值、资源档位、canonical 请求规格与请求指纹。
+     *
+     * <p>只有计算，没有副作用。算不出来时抛 {@link DataIntenseRefusal}：元数据缺失、超过硬上限、
+     * 计数溢出，以及同一份代码加同一组有效参数刚刚失败过。</p>
+     */
+    private CapacityPlan planCapacity(String operationId,
+                                      AgentRunDatasetSnapshot datasetSnapshot,
+                                      List<AgentRunDatasetEntry> datasets,
+                                      List<AgentRunDatasetEntry> manifests,
+                                      ExecuteRequest baseRequest,
+                                      int timeoutSeconds) {
+        DataAnalysisEstimate estimate;
+        DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision decision;
+        try {
+            // 聚合所有输入数据集的行数与字节数，不能只看用户传入的逻辑数量。
+            long rows = 0L;
+            long bytes = 0L;
+            for (AgentRunDatasetEntry dataset : datasets) {
+                // 元数据不完整时直接拒绝，避免低估资源占用后把超出承载能力的任务放进沙箱。
+                DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
+                if (metadata.rowCount() == null || metadata.bytes() == null) {
+                    throw new DataIntenseRefusal("DATA_ANALYSIS_ESTIMATE_UNAVAILABLE",
+                            "Dataset row/byte metadata is required before Sandbox admission",
+                            Map.of("dataset_id", dataset.originalId(),
+                                    "metadata_status", metadata.metadataStatus()));
+                }
+                rows = Math.addExact(rows, metadata.rowCount());
+                bytes = Math.addExact(bytes, metadata.bytes());
+            }
+            int manifestMembers = manifests.stream()
+                    .mapToInt(entry -> entry.relatedDatasetIds().size())
+                    .sum();
+            /*
+             * heavyOperationHints 只能描述“代码将执行高成本操作”这一事实，例如全量排序、
+             * 大规模 join 或模型训练；它不是依赖库列表。旧实现把 numpy/pandas 等 libraries
+             * 直接塞进 hints，导致任何声明依赖库的小任务先被判为 HEAVY/3，随后容量服务又根据
+             * 被清空的 hints 判成 STANDARD/1。estimate 与 reservation 的 class/units 因而漂移，
+             * terminal envelope 无法通过一致性校验，容量也永远无法 RELEASE。
+             *
+             * 当前工具协议尚未提供可信的重操作提示，因此这里显式使用空列表。以后如果要增加
+             * 静态代码分析或调用方声明，必须先得到同一个 immutable hints 列表，再同时用于
+             * classify 和 DataAnalysisEstimate；严禁在两个阶段分别推断。
+             */
+            List<String> heavyOperationHints = List.of();
+            // 资源档位只在这里冻结一次；后续名额预留、沙箱请求和终态证明都复用它。
+            decision = dataAnalysisCapacityProperties.classify(rows, bytes, heavyOperationHints);
+            if (decision.outcome()
+                    == DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision.Outcome.REJECTED) {
+                throw new DataIntenseRefusal("DATA_ANALYSIS_TASK_TOO_LARGE",
+                        "Dataset estimate exceeds Sandbox hard limits",
+                        Map.of("estimated_rows", rows, "estimated_bytes", bytes));
+            }
+            // 构造 immutable estimate，后续写入进度记录或派发证明，并在终态处理时再使用。
+            estimate = new DataAnalysisEstimate(
+                    rows, bytes, datasets.size(), 1.0d, manifestMembers, heavyOperationHints,
+                    decision.resourceClass(), decision.capacityUnits());
+        } catch (ArithmeticException overflow) {
+            throw new DataIntenseRefusal("DATA_ANALYSIS_TASK_TOO_LARGE",
+                    "Dataset estimate overflowed admission counters", Map.of());
+        }
+
+        long timeoutMillis = timeoutSeconds * 1000L;
+        CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
+                CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
+                operationId,
+                sha256(baseRequest.getCode()),
+                datasetSnapshot.immutableDigest(),
+                decision.resourceClass(),
+                decision.memoryLimitBytes(),
+                timeoutMillis,
+                runtimeEnvironmentVersion,
+                sha256(baseRequest.getLibrariesList().stream().sorted().collect(Collectors.joining("\n"))),
+                sha256(""));
+        // 修复判重必须在名额预留与 Sandbox create 之前完成，避免原样重放占用配额。
+        String pythonRequestFingerprint = spec.repairRequestFingerprint();
+        PythonRepairContext repairContext = AgentContext.getPythonRepairContext();
+        if (repairContext != null && repairContext.hasFailed(pythonRequestFingerprint)) {
+            throw new DataIntenseRefusal("REPEATED_FAILED_PYTHON_ATTEMPT",
+                    "The same Python code and effective parameters already failed in this Todo; "
+                            + "change the code or meaningful parameters before retrying",
+                    Map.of("python_repair_attempt", repairContext.repairAttempt(),
+                            "request_fingerprint", pythonRequestFingerprint));
+        }
+        return new CapacityPlan(estimate, decision, spec, pythonRequestFingerprint, repairContext);
+    }
+
+    /** 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。 */
+    private static ExecuteRequest withCapacityRequest(ExecuteRequest baseRequest,
+                                                      DataAnalysisReservation reservation,
+                                                      DataAnalysisEstimate estimate,
+                                                      CanonicalSandboxCreateSpec spec) {
+        return baseRequest.toBuilder()
+                .setResourceClass(reservation.resourceClass().name())
+                .setEstimatedRows(estimate.estimatedRows())
+                .setEstimatedBytes(estimate.estimatedBytes())
+                .setFileCount(estimate.fileCount())
+                .setCapacityUnits(estimate.capacityUnits())
+                .setOperationId(spec.operationId())
+                .setRequestFingerprint(spec.requestFingerprint())
+                .setMemoryLimitBytes(spec.memoryLimitBytes())
+                .setTimeoutMillis(spec.timeoutMillis())
+                .setRuntimeEnvironmentVersion(spec.runtimeEnvironmentVersion())
+                .setCanonicalSpecSchemaVersion(spec.schemaVersion())
+                .setCodeHash(spec.codeHash())
+                .setImmutableDatasetSnapshotDigest(spec.immutableDatasetSnapshotDigest())
+                .setLibrariesDigest(spec.librariesDigest())
+                .setSandboxOptionsDigest(spec.sandboxOptionsDigest())
+                .build();
+    }
+
+    // ==================== 等待成员：建后台任务并把派发证明交出去 ====================
+
+    /**
+     * 新调度器版本上的一次 {@code executePython}：把这次调用建成沙箱后台任务，然后立刻交出去。
+     *
+     * <p>与旧路径的差别都在「事实写在哪」：旧路径把任务凭证、名额预留与运行状态写进一条 Run 级的
+     * 长工具进度记录，一条 Run 同时只放得下一个；这里把同样的事实装进派发证明，由派发器写进这个
+     * 成员自己的行。这次调用也从不等待结果——建好任务就抛出挂起信号，当前线程把节点执行名额交还。</p>
+     *
+     * <p>返回字符串时表示这次调用当场就结束了，内容是给模型看的失败文本（{@code ok=false} 的 JSON）；
+     * 建好任务、或建任务结果还不明确时用挂起信号返回，不走这里。</p>
+     */
+    private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
+                                      AgentRunDatasetSnapshot datasetSnapshot,
+                                      List<AgentRunDatasetEntry> datasets,
+                                      List<AgentRunDatasetEntry> manifests,
+                                      ExecuteRequest baseRequest,
+                                      int timeoutSeconds,
+                                      long toolStartMs) {
+        // 容量账本是写派发证明的前提：没有它就没有名额凭证可写，也没有人能把名额还回去。
+        if (!dataIntenseWiringAvailable()) {
+            log.error("waitGroup.withoutCapacity: 成员调用缺少容量接线，拒绝建任务 member={}",
+                    member.describe());
+            emitSandboxToolTotal(toolStartMs, "ERROR", "SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+            return fail("executePython", "SANDBOX_CAPACITY_WIRING_INCOMPLETE",
+                    "Python sandbox production wiring incomplete; a wait-group member "
+                            + "requires capacity reservation and a durable dispatch proof",
+                    Map.of());
+        }
+        // 外部作业身份由调度侧算好、整组落库时已经写进成员行。这里按同一份输入拼出身份对象，
+        // 与成员行上的值不一致就什么都不做：建一个库里认不回来的后台任务，比不建更糟。
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
+                member.runId(), member.durableToolCallId(), DATA_ANALYSIS_ATTEMPT);
+        if (!identity.operationId().equals(member.expectedOperationId())) {
+            emitSandboxToolTotal(toolStartMs, "ERROR", "WAIT_GROUP_OPERATION_IDENTITY_MISMATCH");
+            return fail("executePython", "WAIT_GROUP_OPERATION_IDENTITY_MISMATCH",
+                    "The member's external operation identity does not match the persisted one",
+                    Map.of("expected_operation_id", member.expectedOperationId(),
+                            "derived_operation_id", identity.operationId()));
+        }
+        CapacityPlan plan;
+        try {
+            plan = planCapacity(identity.operationId(), datasetSnapshot, datasets, manifests,
+                    baseRequest, timeoutSeconds);
+        } catch (DataIntenseRefusal refusal) {
+            return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
+        }
+        DataAnalysisReservation reservation;
+        try {
+            reservation = dataAnalysisCapacityService.reserve(identity, plan.estimate());
+        } catch (CapacityAdmissionException admission) {
+            String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                    ? "DATA_ANALYSIS_TASK_TOO_LARGE"
+                    : "DATA_ANALYSIS_SERVER_BUSY";
+            return fail("executePython", code, admission.getMessage(), Map.of("retryable",
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+        }
+        ExecuteRequest request = withCapacityRequest(baseRequest, reservation, plan.estimate(), plan.spec());
+        long createStartMs = System.currentTimeMillis();
+        CreateVerdict verdict;
+        try {
+            installDebugRpcAttachments();
+            verdict = verdictOf(pythonSandboxService.createTask(request), plan.spec());
+        } catch (Exception createFailure) {
+            verdict = verdictOf(createFailure, plan.spec());
+        }
+        if (verdict instanceof CreateVerdict.Absent absent) {
+            // 权威答复说这次调用没有建出任务：名额还回去，这个成员按失败记，
+            // 模型在下一段读到失败文本后自己决定下一步。
+            if (!releasePreDispatch(reservation)) {
+                log.error("成员建任务被权威否定，但名额没有还回去：{} reservation={}",
+                        member.describe(), reservation.reservationId());
+            }
+            emitSandboxToolTotal(toolStartMs, "ERROR", "CREATE_TASK_FAILED");
+            return fail("executePython", "CREATE_TASK_FAILED",
+                    "Sandbox create failed and the operation was authoritatively absent",
+                    Map.of("operation_id", identity.operationId(), "message", nvl(absent.detail())));
+        }
+        if (verdict instanceof CreateVerdict.Unknown unknown) {
+            // 还没有结论：名额留着，成员照样按执行中记，由结果接收侧按外部作业身份回查。
+            // 这条路上既不能释放名额，也不能把成员记成失败——两种做法都会让一个可能真实存在的
+            // 后台任务无人负责。
+            log.warn("成员建任务的结果还没被证实，先按执行中记，由结果接收侧回查：{} 原因={}",
+                    member.describe(), unknown.detail());
+            throw pendingForWaitGroup(member, plan, reservation, null);
+        }
+        String taskId = ((CreateVerdict.Confirmed) verdict).taskId();
+        // 任务编号与 canonical 指纹都确认之后，名额凭证从「准备中」改成绑在这个任务上。
+        DataAnalysisReservation attached = transitionReservation(
+                reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
+        // 容量账本必须接受同一份名额的附着状态，这道检查与旧路径一致。账本不接受时不能当成派发失败：
+        // 沙箱任务已经真实存在，把这次调用记成失败就再也没人认领它。所以证明照写、成员照转后台，
+        // 冲突只留在日志里，由结果接收侧按证明收尾时再遇到。
+        if (dataAnalysisCapacityService.restoreReservation(attached) == DataAnalysisRestoreOutcome.CONFLICT) {
+            log.error("等待成员的名额附着被容量账本拒绝，仍按执行中记：{} taskId={}",
+                    member.describe(), taskId);
+        }
+        emitSandboxEvent("sandbox_create_task", Map.of(
+                "durationMs", System.currentTimeMillis() - createStartMs,
+                "status", "OK",
+                "taskId", taskId,
+                "operationId", identity.operationId()));
+        throw pendingForWaitGroup(member, plan, attached, taskId);
+    }
+
+    /** 建沙箱任务的三种结论。 */
+    private sealed interface CreateVerdict {
+
+        /** 已经确认这个后台任务属于这次调用。 */
+        record Confirmed(String taskId) implements CreateVerdict {
+        }
+
+        /** 权威答复说这次调用没有建出任务。 */
+        record Absent(String detail) implements CreateVerdict {
+        }
+
+        /** 还没有结论：既没有确认，也没有「没建出来」的证明。 */
+        record Unknown(String detail) implements CreateVerdict {
+        }
+    }
+
+    /**
+     * 读建任务响应：确认、没建出来，还是还没有结论。
+     *
+     * <p>响应里的 canonical 指纹是任务编号的身份凭据。指纹为空或漂移时先用外部作业身份做一次
+     * 权威回读，只有任务编号相同、指纹精确且非空才认。</p>
+     */
+    private CreateVerdict verdictOf(ExecuteResponse createResp, CanonicalSandboxCreateSpec spec) {
+        if (createResp == null
+                || (createResp.getError() != null && !createResp.getError().isEmpty())
+                || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
+            return new CreateVerdict.Absent(createResp == null ? "empty response" : nvl(createResp.getError()));
+        }
+        String taskId = createResp.getTaskId();
+        if (!createResp.getRequestFingerprint().isBlank()
+                && spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
+            return new CreateVerdict.Confirmed(taskId);
+        }
+        GetTaskByOperationIdResponse lookup;
+        try {
+            lookup = pythonSandboxService.getTaskByOperationId(GetTaskByOperationIdRequest.newBuilder()
+                    .setOperationId(spec.operationId()).build());
+        } catch (Exception lookupFailure) {
+            log.error("沙箱建任务的身份回读失败：operationId={} taskId={}",
+                    spec.operationId(), taskId, lookupFailure);
+            return new CreateVerdict.Unknown("create identity lookup failed");
+        }
+        boolean confirmed = lookup != null && lookup.getFound()
+                && taskId.equals(lookup.getTaskId())
+                && !lookup.getRequestFingerprint().isBlank()
+                && spec.requestFingerprint().equals(lookup.getRequestFingerprint());
+        return confirmed
+                ? new CreateVerdict.Confirmed(taskId)
+                : new CreateVerdict.Unknown("create identity unverified");
+    }
+
+    /**
+     * 建任务抛异常时的三种判定。
+     *
+     * <p>RPC 抛异常不代表服务端没建：先按外部作业身份回读。只有权威答复「没找到、且查询本身没有
+     * 报错」才能当成没建出来；查询也失败时保留名额，留给结果接收侧继续回查。</p>
+     */
+    private CreateVerdict verdictOf(Exception createFailure, CanonicalSandboxCreateSpec spec) {
+        GetTaskByOperationIdResponse lookup;
+        try {
+            lookup = pythonSandboxService.getTaskByOperationId(GetTaskByOperationIdRequest.newBuilder()
+                    .setOperationId(spec.operationId()).build());
+        } catch (Exception lookupFailure) {
+            createFailure.addSuppressed(lookupFailure);
+            return new CreateVerdict.Unknown("create failed and the operation lookup also failed");
+        }
+        if (lookup != null && lookup.getFound() && !lookup.getTaskId().isBlank()
+                && !lookup.getRequestFingerprint().isBlank()
+                && spec.requestFingerprint().equals(lookup.getRequestFingerprint())) {
+            return new CreateVerdict.Confirmed(lookup.getTaskId());
+        }
+        if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()) {
+            return new CreateVerdict.Absent(nvl(createFailure.getMessage()));
+        }
+        return new CreateVerdict.Unknown("create outcome is ambiguous");
+    }
+
+    /**
+     * 把这次后台作业整理成挂起信号：证明里带上 canonical 规格、预估值、名额凭证与任务编号。
+     *
+     * <p>这些事实是结果接收侧收尾的全部依据，所以在这里一次拼完整再带出去。任务编号为空表示
+     * 建任务的结果还没有被证实。</p>
+     */
+    private WaitGroupMemberPendingException pendingForWaitGroup(
+            WaitGroupMemberExecutionContext.Snapshot member,
+            CapacityPlan plan,
+            DataAnalysisReservation reservation,
+            String taskId) {
+        WaitMemberDispatchProof proof = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
+                reservation.identity().operationId(),
+                taskId,
+                plan.spec().requestFingerprint(),
+                toJsonOrThrow("canonical 请求规格", plan.spec()),
+                toJsonOrThrow("预估值", plan.estimate()),
+                toJsonOrThrow("名额预留凭证", reservation),
+                Instant.now().toString());
+        return new WaitGroupMemberPendingException(proof,
+                "wait group member dispatched: " + member.describe());
+    }
+
+    /** 序列化不成功就抛错：写不出派发证明时宁可让这次调用失败，也不能交出一份不完整的证明。 */
+    private String toJsonOrThrow(String what, Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new IllegalStateException(what + "写不成 JSON", e);
+        }
     }
 
     private String executeDataIntense(
@@ -479,86 +867,22 @@ public class PythonSandboxTools {
             return fail("executePython", "TOOL_JOB_IDENTITY_UNAVAILABLE",
                     "executePython requires a stable tool call id", Map.of("run_id", runId));
         }
-        // 首次调用从 attempt=1 开始；后续重试必须使用新轮次。
-        int attempt = 1;
         // operationId 由 runId/toolCallId/attempt 确定性派生，Sandbox create 可据此幂等查找。
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
-                runId, toolCallId, attempt);
+                runId, toolCallId, DATA_ANALYSIS_ATTEMPT);
 
-        // estimate 同时用于准入、reservation 和终态 release proof，必须在分发前冻结。
-        DataAnalysisEstimate estimate;
-        DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision decision;
+        // 预估值、资源档位与 canonical 请求规格在分发之前一次冻结：准入、名额预留、
+        // 沙箱请求与终态释放证明都用这同一份结果。
+        CapacityPlan plan;
         try {
-            // 聚合所有输入数据集的行数与字节数，不能只看用户传入的逻辑数量。
-            long rows = 0L;
-            long bytes = 0L;
-            for (AgentRunDatasetEntry dataset : datasets) {
-                // 元数据不完整时直接拒绝，避免低估资源占用后把超出承载能力的任务放进沙箱。
-                DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
-                if (metadata.rowCount() == null || metadata.bytes() == null) {
-                    return fail("executePython", "DATA_ANALYSIS_ESTIMATE_UNAVAILABLE",
-                            "Dataset row/byte metadata is required before Sandbox admission",
-                            Map.of("dataset_id", dataset.originalId(),
-                                    "metadata_status", metadata.metadataStatus()));
-                }
-                rows = Math.addExact(rows, metadata.rowCount());
-                bytes = Math.addExact(bytes, metadata.bytes());
-            }
-            int manifestMembers = manifests.stream()
-                    .mapToInt(entry -> entry.relatedDatasetIds().size())
-                    .sum();
-            /*
-             * heavyOperationHints 只能描述“代码将执行高成本操作”这一事实，例如全量排序、
-             * 大规模 join 或模型训练；它不是依赖库列表。旧实现把 numpy/pandas 等 libraries
-             * 直接塞进 hints，导致任何声明依赖库的小任务先被判为 HEAVY/3，随后容量服务又根据
-             * 被清空的 hints 判成 STANDARD/1。estimate 与 reservation 的 class/units 因而漂移，
-             * terminal envelope 无法通过一致性校验，容量也永远无法 RELEASE。
-             *
-             * 当前工具协议尚未提供可信的重操作提示，因此这里显式使用空列表。以后如果要增加
-             * 静态代码分析或调用方声明，必须先得到同一个 immutable hints 列表，再同时用于
-             * classify 和 DataAnalysisEstimate；严禁在两个阶段分别推断。
-             */
-            List<String> heavyOperationHints = List.of();
-            // 资源档位只在这里冻结一次；后续 reservation、Sandbox request 和终态证明都复用它。
-            decision = dataAnalysisCapacityProperties.classify(
-                    rows, bytes, heavyOperationHints);
-            if (decision.outcome()
-                    == DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision.Outcome.REJECTED) {
-                return fail("executePython", "DATA_ANALYSIS_TASK_TOO_LARGE",
-                        "Dataset estimate exceeds Sandbox hard limits",
-                        Map.of("estimated_rows", rows, "estimated_bytes", bytes));
-            }
-            // 构造 immutable estimate，后续写入 anchor 并在 finalizer 再使用。
-            estimate = new DataAnalysisEstimate(
-                    rows, bytes, datasets.size(), 1.0d, manifestMembers, heavyOperationHints,
-                    decision.resourceClass(), decision.capacityUnits());
-        } catch (ArithmeticException overflow) {
-            return fail("executePython", "DATA_ANALYSIS_TASK_TOO_LARGE",
-                    "Dataset estimate overflowed admission counters", Map.of());
+            plan = planCapacity(identity.operationId(), datasetSnapshot, datasets, manifests,
+                    baseRequest, timeoutSeconds);
+        } catch (DataIntenseRefusal refusal) {
+            return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
         }
-
-        // 修复判重必须在容量 reserve 和 Sandbox create 之前完成，避免原样重放占用配额。
-        long timeoutMillis = timeoutSeconds * 1000L;
-        CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
-                CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
-                identity.operationId(),
-                sha256(baseRequest.getCode()),
-                datasetSnapshot.immutableDigest(),
-                decision.resourceClass(),
-                decision.memoryLimitBytes(),
-                timeoutMillis,
-                runtimeEnvironmentVersion,
-                sha256(baseRequest.getLibrariesList().stream().sorted().collect(Collectors.joining("\n"))),
-                sha256(""));
-        String pythonRequestFingerprint = spec.repairRequestFingerprint();
-        PythonRepairContext repairContext = AgentContext.getPythonRepairContext();
-        if (repairContext != null && repairContext.hasFailed(pythonRequestFingerprint)) {
-            return fail("executePython", "REPEATED_FAILED_PYTHON_ATTEMPT",
-                    "The same Python code and effective parameters already failed in this Todo; "
-                            + "change the code or meaningful parameters before retrying",
-                    Map.of("python_repair_attempt", repairContext.repairAttempt(),
-                            "request_fingerprint", pythonRequestFingerprint));
-        }
+        DataAnalysisEstimate estimate = plan.estimate();
+        CanonicalSandboxCreateSpec spec = plan.spec();
+        String pythonRequestFingerprint = plan.pythonRequestFingerprint();
 
         // reservation（资源名额凭证）拿到手之后，任何退出路径都必须把它释放掉，
         // 或者过户给后台任务继续管理，否则名额会一直占着。
@@ -575,23 +899,7 @@ public class PythonSandboxTools {
         }
 
         // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
-        ExecuteRequest request = baseRequest.toBuilder()
-                .setResourceClass(reservation.resourceClass().name())
-                .setEstimatedRows(estimate.estimatedRows())
-                .setEstimatedBytes(estimate.estimatedBytes())
-                .setFileCount(estimate.fileCount())
-                .setCapacityUnits(estimate.capacityUnits())
-                .setOperationId(identity.operationId())
-                .setRequestFingerprint(spec.requestFingerprint())
-                .setMemoryLimitBytes(spec.memoryLimitBytes())
-                .setTimeoutMillis(spec.timeoutMillis())
-                .setRuntimeEnvironmentVersion(spec.runtimeEnvironmentVersion())
-                .setCanonicalSpecSchemaVersion(spec.schemaVersion())
-                .setCodeHash(spec.codeHash())
-                .setImmutableDatasetSnapshotDigest(spec.immutableDatasetSnapshotDigest())
-                .setLibrariesDigest(spec.librariesDigest())
-                .setSandboxOptionsDigest(spec.sandboxOptionsDigest())
-                .build();
+        ExecuteRequest request = withCapacityRequest(baseRequest, reservation, estimate, spec);
 
         // 在调用 createTask 之前先构造完整 PREPARING anchor，覆盖 RPC 成败不确定窗口。
         ToolJobAnchor anchor = new ToolJobAnchor();
@@ -604,9 +912,9 @@ public class PythonSandboxTools {
         // 新请求已经写了自己的数据库进度记录，上一轮终态后等待启动的修复阶段到此结束。
         anchor.setPythonRepairPending(false);
         anchor.setPythonRepairExhausted(false);
-        if (repairContext != null) {
-            anchor.setPythonRepairAttempt(repairContext.repairAttempt());
-            anchor.setPythonFailedRequestFingerprints(repairContext.failedRequestFingerprints());
+        if (plan.repairContext() != null) {
+            anchor.setPythonRepairAttempt(plan.repairContext().repairAttempt());
+            anchor.setPythonFailedRequestFingerprints(plan.repairContext().failedRequestFingerprints());
         }
         anchor.setCanonicalCreateSpecJson(objectMapper.writeValueAsString(spec));
         // createRequestJson 允许进程在 RPC 前后崩溃后重放同一 canonical 请求。
@@ -615,7 +923,7 @@ public class PythonSandboxTools {
         // PREPARING 表示容量已占用，但 Sandbox taskId 尚未确认附着。
         anchor.setAnchorState("PREPARING");
         anchor.setToolCallId(toolCallId);
-        anchor.setAttempt(attempt);
+        anchor.setAttempt(DATA_ANALYSIS_ATTEMPT);
         // 保存当前 Todo 位置，后续 pipeline 完整 checkpoint 会补充已完成前缀。
         anchor.setTodoId(AgentContext.getTodoId());
         anchor.setSequence(AgentContext.getTodoSequence() == null ? 0 : AgentContext.getTodoSequence());
@@ -630,7 +938,7 @@ public class PythonSandboxTools {
         anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
         anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
         // timeoutAt 和 nextPollAt 都写进了数据库，重启后不重新计时。
-        anchor.setTimeoutAt(Instant.now().plusMillis(timeoutMillis));
+        anchor.setTimeoutAt(Instant.now().plusMillis(spec.timeoutMillis()));
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
         if (!waitPolicy.durableSuspend()) {
             // ownerId 在 JVM 生命周期内稳定；租约从第一次数据库抢占前开始计时。

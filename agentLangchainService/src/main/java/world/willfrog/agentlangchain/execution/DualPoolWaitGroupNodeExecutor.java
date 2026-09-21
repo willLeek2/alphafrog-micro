@@ -35,6 +35,7 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -73,6 +74,7 @@ public class DualPoolWaitGroupNodeExecutor {
     private final ObjectMapper objectMapper;
     private final int maxMembers;
     private final int maxMemberResultChars;
+    private final long memberPollDelayMs;
 
     public DualPoolWaitGroupNodeExecutor(AgentPromptService promptService,
                                          LangchainRunExecutionGuard executionGuard,
@@ -83,7 +85,9 @@ public class DualPoolWaitGroupNodeExecutor {
                                          @Value("${agent.langchain.dual-pool.wait-group.max-members:16}")
                                          int maxMembers,
                                          @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
-                                         int maxMemberResultChars) {
+                                         int maxMemberResultChars,
+                                         @Value("${agent.langchain.dual-pool.wait-group.member-poll-delay-ms:2000}")
+                                         long memberPollDelayMs) {
         this.promptService = promptService;
         this.executionGuard = executionGuard;
         this.waitGroupStore = waitGroupStore;
@@ -92,6 +96,17 @@ public class DualPoolWaitGroupNodeExecutor {
         this.objectMapper = objectMapper;
         this.maxMembers = Math.max(1, maxMembers);
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
+        this.memberPollDelayMs = Math.max(1L, memberPollDelayMs);
+    }
+
+    /**
+     * 成员刚转后台时的第一次查询时间。
+     *
+     * <p>库里的待查索引只收录「执行中且写了下次查询时间」的成员，所以派发成功时必须写一个时间，
+     * 否则这个成员永远不会被结果接收方扫到。</p>
+     */
+    private OffsetDateTime firstPollAt() {
+        return OffsetDateTime.now().plusNanos(memberPollDelayMs * 1_000_000L);
     }
 
     /**
@@ -353,7 +368,8 @@ public class DualPoolWaitGroupNodeExecutor {
                 NodeToolDispatcher.DispatchOutcome outcome = toolDispatcher.dispatch(
                         new NodeToolDispatcher.DispatchRequest(
                                 input.identity().runId(), input.identity(), groupId, member.getMemberSeq(),
-                                member.getToolCallId(), member.getToolName(), call.arguments()));
+                                member.getMemberIdentity(), member.getToolCallId(), member.getToolName(),
+                                call.arguments()));
                 if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Completed completed) {
                     notificationId = keepNotification(notificationId, completeMember(
                             input, member, true, completed.output(), Map.of()));
@@ -361,11 +377,17 @@ public class DualPoolWaitGroupNodeExecutor {
                     notificationId = keepNotification(notificationId, completeMember(
                             input, member, false, failed.reason(), Map.of()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Pending pending) {
+                    // 后台作业已经建出来了。成员从「待派发」进入「执行中」，并把派发证明与下次查询
+                    // 时间写上：证明留给结果接收方收尾，查询时间让接收方能找到这个成员。
                     boolean marked = waitGroupStore.markMemberDispatched(groupId, member.getMemberIdentity(),
-                            pending.operationId(), null, input.versions().runControlVersion());
+                            pending.operationId(), pending.dispatchProofJson(), firstPollAt(),
+                            input.versions().runControlVersion());
                     if (!marked) {
-                        log.warn("成员已经在别处派发过，这一次不重复标记：group={} member={}",
-                                groupId, member.getMemberIdentity());
+                        log.warn("成员已经在别处派发过，这一次不重复标记：group={} member={} task={}",
+                                groupId, member.getMemberIdentity(), pending.taskId());
+                    } else {
+                        log.info("等待成员已转后台：group={} member={} seq={} {}",
+                                groupId, member.getMemberIdentity(), member.getMemberSeq(), pending.taskId());
                     }
                 }
             }

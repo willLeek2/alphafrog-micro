@@ -26,6 +26,11 @@ public class WaitMember {
     private String state;
     /** 结果引用：指向持久结果载荷的位置，不是结果正文。 */
     private String resultRefJson;
+    /**
+     * 后台派发证明：canonical 请求规格、预估值、名额预留与后台任务编号。
+     * 只有转后台的成员有值；没转后台的成员为 null。
+     */
+    private String dispatchProofJson;
     private OffsetDateTime nextPollAt;
     private Integer pollCount;
     private Integer backoffStep;

@@ -595,14 +595,25 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         AgentContext.setPhase("dual_pool_node_execution");
         AgentContext.setStage("todo_execution");
         AgentContext.setWorkflow(payload.path("workflow").asText("linear").toLowerCase());
+        // 取工具目录时网页搜索开关按「调用参数 → 线程上下文 → 默认值」取值，而派发这一层不经过调用参数，
+        // 所以这里要把规划阶段写进请求的开关落到上下文，否则派发时算出来的目录会比模型看到的那份少。
+        AgentContext.setWebSearchEnabled(
+                Boolean.TRUE.equals(context.workflowRequest().getWebSearchEnabled()));
         long startedAt = System.currentTimeMillis();
         freshRunPipeline.emitDualPoolTodoNodeEvent(
                 identity.runId(), context.run().getUserId(), "TODO_NODE_STARTED", todo,
                 null, 0L, null, false, null);
-        DualPoolWaitGroupNodeExecutor.Outcome outcome = waitGroupNodeExecutor.executeSegment(
-                new DualPoolWaitGroupNodeExecutor.SegmentExecution(
-                        identity, versions, claimant, context.workflowRequest(), todo, completed,
-                        datasetRefs, payload));
+        DualPoolWaitGroupNodeExecutor.Outcome outcome;
+        // 这一段执行的工具调用事件要带上节点归属，与旧节点路径一致；跑完就清掉，不留在线程上。
+        AgentContext.setTodoContext(todo.getId(), todo.getSequence());
+        try {
+            outcome = waitGroupNodeExecutor.executeSegment(
+                    new DualPoolWaitGroupNodeExecutor.SegmentExecution(
+                            identity, versions, claimant, context.workflowRequest(), todo, completed,
+                            datasetRefs, payload));
+        } finally {
+            AgentContext.clearTodoContext();
+        }
         if (outcome instanceof DualPoolWaitGroupNodeExecutor.Outcome.Completed completedOutcome) {
             Map<String, Object> patch = completedOutcome.resultPatch();
             boolean success = Boolean.TRUE.equals(patch.get("success"));

@@ -102,13 +102,14 @@ public interface WaitGroupMapper {
     // ===== 成员派发 =====
 
     /**
-     * 派发成功：成员从待派发进入执行中，并把外部作业身份写上。
+     * 派发成功：成员从待派发进入执行中，并把外部作业身份与派发证明写上。
      *
      * <p>只对还没派发的成员生效，重复派发影响零行，调用方据此判断这一次是不是自己送出去的。</p>
      */
     int markMemberDispatched(@Param("groupId") long groupId,
                              @Param("memberIdentity") String memberIdentity,
                              @Param("externalOperationId") String externalOperationId,
+                             @Param("dispatchProofJson") String dispatchProofJson,
                              @Param("nextPollAt") OffsetDateTime nextPollAt,
                              @Param("runControlVersion") long runControlVersion);
 

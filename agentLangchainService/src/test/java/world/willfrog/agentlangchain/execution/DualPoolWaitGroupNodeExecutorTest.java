@@ -67,7 +67,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         dispatcher = new ScriptedDispatcher();
         publisher = new RecordingPublisher(store);
         executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher, publisher,
-                objectMapper, 16, 1024 * 1024);
+                objectMapper, 16, 1024 * 1024, 2000L);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         when(promptService.reactSystemPrompt()).thenReturn("系统提示");
         when(promptService.dagReactStageInstruction(any())).thenReturn("阶段说明");
@@ -174,11 +174,14 @@ class DualPoolWaitGroupNodeExecutorTest {
                 toolCall("call-b", "searchWeb", "{}"),
                 toolCall("call-c", "getIndexDaily", "{}"))));
         dispatcher.pending.put("getStockDaily", new NodeToolDispatcher.DispatchOutcome.Pending(
-                RUN_ID + ":call-a:1", "task-a"));
+                RUN_ID + ":call-a:1", "task-a",
+                dispatchProof(RUN_ID + ":call-a:1", "task-a")));
         dispatcher.pending.put("searchWeb", new NodeToolDispatcher.DispatchOutcome.Pending(
-                RUN_ID + ":call-b:1", "task-b"));
+                RUN_ID + ":call-b:1", "task-b",
+                dispatchProof(RUN_ID + ":call-b:1", "task-b")));
         dispatcher.pending.put("getIndexDaily", new NodeToolDispatcher.DispatchOutcome.Pending(
-                RUN_ID + ":call-c:1", "task-c"));
+                RUN_ID + ":call-c:1", "task-c",
+                dispatchProof(RUN_ID + ":call-c:1", "task-c")));
         DualPoolWaitGroupNodeExecutor.Outcome first = executor.executeSegment(firstSegment(List.of()));
         long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) first).groupId();
         assertThat(store.memberRows(groupId)).extracting(row -> row.state)
@@ -224,7 +227,8 @@ class DualPoolWaitGroupNodeExecutorTest {
         // 第二段又把另一个工具请求交给后台，于是产生第二个等待组。
         model.enqueue(AiMessage.from(List.of(toolCall("call-b", "searchWeb", "{}"))));
         dispatcher.pending.put("searchWeb", new NodeToolDispatcher.DispatchOutcome.Pending(
-                RUN_ID + ":call-b:1", "task-b"));
+                RUN_ID + ":call-b:1", "task-b",
+                dispatchProof(RUN_ID + ":call-b:1", "task-b")));
 
         DualPoolWaitGroupNodeExecutor.Outcome second = executor.executeSegment(
                 segment(segmentIdentity(1), nextPayload));
@@ -296,7 +300,8 @@ class DualPoolWaitGroupNodeExecutorTest {
                 toolCall("call-b", "executePython", "{}"))));
         dispatcher.outputs.put("getStockDaily", "日线数据");
         dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
-                RUN_ID + ":call-b:1", "task-b"));
+                RUN_ID + ":call-b:1", "task-b",
+                dispatchProof(RUN_ID + ":call-b:1", "task-b")));
 
         DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
 
@@ -304,7 +309,34 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.memberRows(groupId)).extracting(row -> row.state)
                 .containsExactly(WaitMemberState.SUCCEEDED.name(), WaitMemberState.RUNNING.name());
         assertThat(store.memberRows(groupId).get(1).externalOperationId).isEqualTo(RUN_ID + ":call-b:1");
+        assertThat(store.memberRows(groupId).get(1).dispatchProofJson)
+                .as("派发证明原样写进成员行，结果接收方靠它收尾")
+                .isEqualTo(dispatchProof(RUN_ID + ":call-b:1", "task-b"));
+        assertThat(store.memberRows(groupId).get(1).nextPollAt)
+                .as("转后台的成员必须写下一次查询时间，否则接收方扫不到它")
+                .isNotNull();
         assertThat(publisher.published).as("还有一个成员没结束，不能放行下一段").isEmpty();
+    }
+
+    @Test
+    void aMemberThatReportsAnotherOperationIdentityKeepsThePersistedOne() {
+        model.enqueue(AiMessage.from(List.of(toolCall("call-b", "executePython", "{}"))));
+        dispatcher.requiresOperationId = true;
+        // 派发层报回一个别的身份：成员行上的身份不能被换掉，写入因此不生效。
+        dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":someone-else:1", "task-b",
+                dispatchProof(RUN_ID + ":someone-else:1", "task-b")));
+
+        executor.executeSegment(firstSegment(List.of()));
+
+        long groupId = store.groupRows().get(0).id;
+        assertThat(store.memberRows(groupId).get(0).externalOperationId)
+                .as("成员行上的外部作业身份保持整组落库时写下的值")
+                .isEqualTo(RUN_ID + ":call-b:1");
+        assertThat(store.memberRows(groupId).get(0).dispatchProofJson)
+                .as("身份对不上时不写派发证明").isNull();
+        assertThat(store.memberRows(groupId).get(0).state)
+                .as("没写进去就还是待派发状态，由上层按未派发处理").isEqualTo(WaitMemberState.PENDING.name());
     }
 
     @Test
@@ -322,6 +354,25 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     // ==================== 测试脚手架 ====================
+
+    /**
+     * 造一份派发证明正文。
+     *
+     * <p>用真证明类型序列化出来，而不是手写一段 JSON：这样「执行器把证明原样写进成员行」这件事
+     * 在类型这一层就成立，将来证明加字段也不会让这段用例悄悄失去意义。</p>
+     */
+    private String dispatchProof(String operationId, String taskId) {
+        return new world.willfrog.agent.platform.wait.WaitMemberDispatchProof(
+                world.willfrog.agent.platform.wait.WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
+                operationId,
+                taskId,
+                "sha256:tests",
+                "{\"schemaVersion\":\"sandbox_create_v1\"}",
+                "{\"estimatedRows\":1}",
+                "{\"reservationId\":\"" + operationId + "\"}",
+                "2026-09-22T00:00:00Z")
+                .toJson(objectMapper);
+    }
 
     /** 读出某一次挂起写给下一段的载荷：它就是下一位 Worker 领取这一段时看到的东西。 */
     private JsonNode nextPayload(int previousSegment, int groupTurn) {

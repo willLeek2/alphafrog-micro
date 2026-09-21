@@ -151,6 +151,7 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     public boolean markMemberDispatched(long groupId,
                                         String memberIdentity,
                                         String externalOperationId,
+                                        String dispatchProofJson,
                                         OffsetDateTime nextPollAt,
                                         long runControlVersion) {
         if (groupId <= 0) {
@@ -162,8 +163,8 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
         if (runControlVersion < 0) {
             throw new IllegalArgumentException("控制版本不能是负数：" + runControlVersion);
         }
-        return mapper.markMemberDispatched(
-                groupId, memberIdentity, externalOperationId, nextPollAt, runControlVersion) > 0;
+        return mapper.markMemberDispatched(groupId, memberIdentity, externalOperationId,
+                dispatchProofJson, nextPollAt, runControlVersion) > 0;
     }
 
     @Override

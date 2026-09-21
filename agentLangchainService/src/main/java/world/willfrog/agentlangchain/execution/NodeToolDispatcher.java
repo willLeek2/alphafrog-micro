@@ -40,18 +40,20 @@ public interface NodeToolDispatcher {
     /**
      * 一次工具调用的输入。
      *
-     * @param runId         这条 Run
-     * @param segment       当前执行分段的五字段身份
-     * @param groupId       这次调用所属的等待组
-     * @param memberSeq     它在整组请求里的原始序号
-     * @param toolCallId    模型给出的工具调用身份，可能为空
-     * @param toolName      工具名
-     * @param argumentsJson 模型给出的参数 JSON
+     * @param runId          这条 Run
+     * @param segment        当前执行分段的五字段身份
+     * @param groupId        这次调用所属的等待组
+     * @param memberSeq      它在整组请求里的原始序号
+     * @param memberIdentity 成员稳定身份，供工具层写日志与排查时使用
+     * @param toolCallId     模型给出的工具调用身份，可能为空
+     * @param toolName       工具名
+     * @param argumentsJson  模型给出的参数 JSON
      */
     record DispatchRequest(String runId,
                            NodeWorkItemIdentity segment,
                            long groupId,
                            int memberSeq,
+                           String memberIdentity,
                            String toolCallId,
                            String toolName,
                            String argumentsJson) {
@@ -64,8 +66,24 @@ public interface NodeToolDispatcher {
         record Completed(String output) implements DispatchOutcome {
         }
 
-        /** 已经交给后台作业：外部作业身份与后台任务编号一并返回。 */
-        record Pending(String operationId, String taskId) implements DispatchOutcome {
+        /**
+         * 已经交给后台作业：外部作业身份、后台任务编号与派发证明一并返回。
+         *
+         * @param operationId      外部作业身份；必须与整组落库时写进成员行的值一致
+         * @param taskId           后台任务编号；为空表示建任务的结果还没被证实，接收侧按外部作业身份回查
+         * @param dispatchProofJson 派发证明正文，写进成员行
+         */
+        record Pending(String operationId, String taskId, String dispatchProofJson) implements DispatchOutcome {
+
+            public Pending {
+                if (operationId == null || operationId.isBlank()) {
+                    throw new IllegalArgumentException("转后台的结果必须带外部作业身份");
+                }
+                if (dispatchProofJson == null || dispatchProofJson.isBlank()) {
+                    throw new IllegalArgumentException("转后台的结果必须带派发证明");
+                }
+                taskId = taskId == null || taskId.isBlank() ? null : taskId.trim();
+            }
         }
 
         /** 工具自己报了失败：失败文本交给调用方写进成员行，恢复后由模型决定下一步。 */

@@ -43,13 +43,17 @@ public interface WaitGroupStore {
     WaitChainCancelResult cancelChain(long groupId);
 
     /**
-     * 派发成功：成员从「已保存待派发」进入「已派发执行中」，并写上外部作业身份与下次查询时间。
+     * 派发成功：成员从「已保存待派发」进入「已派发执行中」，并写上外部作业身份、派发证明与下次查询时间。
+     *
+     * <p>派发证明是这次后台作业的完整事实（canonical 请求规格、预估值、名额预留、后台任务编号），
+     * 结果接收方要靠它构造终态信封并释放名额。空值表示这一次不更新已有证明。</p>
      *
      * <p>只对还没派发的成员生效，重复派发返回 false。已经落终态的成员不会被改。</p>
      */
     boolean markMemberDispatched(long groupId,
                                  String memberIdentity,
                                  String externalOperationId,
+                                 String dispatchProofJson,
                                  OffsetDateTime nextPollAt,
                                  long runControlVersion);
 

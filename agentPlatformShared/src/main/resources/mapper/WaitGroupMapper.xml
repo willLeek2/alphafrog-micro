@@ -43,6 +43,7 @@
         <result property="externalOperationId" column="external_operation_id"/>
         <result property="state" column="state"/>
         <result property="resultRefJson" column="result_ref_json"/>
+        <result property="dispatchProofJson" column="dispatch_proof_json"/>
         <result property="nextPollAt" column="next_poll_at"/>
         <result property="pollCount" column="poll_count"/>
         <result property="backoffStep" column="backoff_step"/>
@@ -169,6 +170,7 @@
                external_operation_id,
                state,
                result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
                next_poll_at,
                poll_count,
                backoff_step,
@@ -191,6 +193,7 @@
                external_operation_id,
                state,
                result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
                next_poll_at,
                poll_count,
                backoff_step,
@@ -213,6 +216,7 @@
                external_operation_id,
                state,
                result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
                next_poll_at,
                poll_count,
                backoff_step,
@@ -642,7 +646,7 @@
     <!-- ==================== 成员派发 ==================== -->
 
     <!--
-      派发成功：成员从「已保存待派发」进入「已派发执行中」，同时把外部作业身份写上。
+      派发成功：成员从「已保存待派发」进入「已派发执行中」，同时把外部作业身份与派发证明写上。
 
       只对还没派发的成员生效，所以同一个成员被重复派发时第二次影响零行：调用方据返回值就能知道
       「这一次是不是我把它送出去的」。已经落终态的成员不会被这条语句改动。
@@ -653,11 +657,17 @@
         UPDATE alphafrog_agent_run_wait_member m SET
             state = 'RUNNING',
             external_operation_id = COALESCE(#{externalOperationId}::varchar, m.external_operation_id),
+            dispatch_proof_json = COALESCE(CAST(#{dispatchProofJson} AS jsonb), m.dispatch_proof_json),
             next_poll_at = COALESCE(#{nextPollAt}, m.next_poll_at),
             updated_at = CURRENT_TIMESTAMP
         WHERE m.group_id = #{groupId}
           AND m.member_identity = #{memberIdentity}
           AND m.state = 'PENDING'
+          -- 已经在库里的外部作业身份不能被另一个值换掉：整组落库时写下的身份是结果接收方
+          -- 找回这个成员的唯一凭据，派发阶段只能沿用同一个值。
+          AND (m.external_operation_id IS NULL
+               OR #{externalOperationId}::varchar IS NULL
+               OR m.external_operation_id = #{externalOperationId}::varchar)
           AND EXISTS (
               SELECT 1
               FROM alphafrog_agent_run r

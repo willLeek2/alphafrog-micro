@@ -49,6 +49,7 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
         String externalOperationId;
         String state = WaitMemberState.PENDING.name();
         String resultRefJson;
+        String dispatchProofJson;
         OffsetDateTime finishedAt;
         OffsetDateTime nextPollAt;
         int pollCount;
@@ -96,6 +97,10 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
 
     List<FakeMember> memberRows(long groupId) {
         return List.copyOf(members.getOrDefault(groupId, List.of()));
+    }
+
+    List<FakeGroup> groupRows() {
+        return List.copyOf(groups.values());
     }
 
     @Override
@@ -229,6 +234,7 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
     public boolean markMemberDispatched(long groupId,
                                         String memberIdentity,
                                         String externalOperationId,
+                                        String dispatchProofJson,
                                         OffsetDateTime nextPollAt,
                                         long runControlVersion) {
         FakeMember member = memberRows(groupId).stream()
@@ -237,9 +243,17 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
         if (!WaitMemberState.PENDING.name().equals(member.state)) {
             return false;
         }
+        // 与真库语句同一套条件：已经在库里的外部作业身份不能被另一个值替换。
+        if (externalOperationId != null && member.externalOperationId != null
+                && !externalOperationId.equals(member.externalOperationId)) {
+            return false;
+        }
         member.state = WaitMemberState.RUNNING.name();
         if (externalOperationId != null) {
             member.externalOperationId = externalOperationId;
+        }
+        if (dispatchProofJson != null) {
+            member.dispatchProofJson = dispatchProofJson;
         }
         member.nextPollAt = nextPollAt;
         member.timeline.add("dispatched");
