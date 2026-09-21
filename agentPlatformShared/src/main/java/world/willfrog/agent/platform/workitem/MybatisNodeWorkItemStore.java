@@ -152,6 +152,23 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    public NodeWorkItemMutationResult requeueAbandonedClaim(NodeWorkItemIdentity identity,
+                                                            int expectedClaimEpoch,
+                                                            long contextVersion,
+                                                            long runControlVersion) {
+        int rows = mapper.requeueAbandonedClaim(identity.runId(), identity.planGeneration(),
+                identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(),
+                contextVersion, runControlVersion, expectedClaimEpoch);
+        if (rows == 1) {
+            log.warn("启动恢复把一段被放弃的分段放回可领取: {} 原代际 {}", identity.describe(), expectedClaimEpoch);
+            return NodeWorkItemMutationResult.success();
+        }
+        return rejectWithEpochCheck(identity,
+                new NodeWorkItemVersions(contextVersion, runControlVersion, expectedClaimEpoch),
+                expectedClaimEpoch, null);
+    }
+
+    @Override
     public NodeWorkItemMutationResult requeueInterruptedToolJob(NodeWorkItemIdentity identity,
                                                                 NodeWorkItemVersions versions,
                                                                 String operationId) {

@@ -110,6 +110,8 @@ class Stage3WaitContractPostgresTest {
     private static final String REPAIR_INDEX_SCRIPT = "010_agent_run_event_received_repair_index.sql";
     private static final String SERVICE_LEASE_SCRIPT = "011_agent_run_service_lease.sql";
     private static final String SHARED_CANDIDATE_SCRIPT = "012_agent_run_coordination_shared_candidate.sql";
+    private static final String RECOVERY_CLOSE_SCRIPT =
+            "013_agent_run_recovery_notification_close.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -1626,7 +1628,8 @@ class Stage3WaitContractPostgresTest {
     private static void applyStage3ScriptsTwice() throws Exception {
         for (int round = 1; round <= 2; round++) {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
-                    REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT)) {
+                    REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
+                    RECOVERY_CLOSE_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {

@@ -54,7 +54,8 @@ class NodeWorkItemMapperBindingTest {
     private static final List<String> TRANSITION_STATEMENTS = List.of(
             "claim", "handOverClaim", "startExecution", "commitSegmentResult",
             "suspendForToolJob", "promoteToolJobResumable", "commitResumedToolJobResult",
-            "requeueInterruptedToolJob", "reportExecutionFailure", "renewLease", "cancel", "markStale");
+            "requeueInterruptedToolJob", "requeueAbandonedClaim", "reportExecutionFailure",
+            "renewLease", "cancel", "markStale");
 
     private Configuration configuration;
     private String xml;
@@ -323,9 +324,39 @@ class NodeWorkItemMapperBindingTest {
         assertThat(problems).as("每条状态迁移都要带齐五个身份字段").isEmpty();
     }
 
+    /**
+     * 启动恢复把死在领取态的分段放回可领取：只动领取态的行，放回时代际加一、清掉领取者与租约。
+     *
+     * <p>代际加一是这道语句的全部价值：旧执行者万一还活着，提交结果时会因为代际对不上被拒。</p>
+     */
+    @Test
+    void abandonedClaimRequeueOnlyTouchesClaimedStatesAndMovesEpochForward() {
+        String requeue = sql("requeueAbandonedClaim");
+        assertThat(requeue)
+                .as("只有已领取或执行中的行会被放回")
+                .contains("state IN ('CLAIMED', 'EXECUTING')")
+                .as("放回成可运行")
+                .contains("state = 'RUNNABLE'")
+                .as("代际加一，旧领取者的提交会被拒")
+                .contains("claim_epoch = claim_epoch + 1")
+                .as("领取者与领取租约都要清掉")
+                .contains("claimed_by = NULL")
+                .contains("lease_expires_at = NULL")
+                .as("放回之后立刻可领取")
+                .contains("next_visible_at = CURRENT_TIMESTAMP")
+                .as("期望代际、上下文版本、控制版本三样都要对上")
+                .contains("claim_epoch = ?")
+                .contains("context_version = ?")
+                .contains("run_control_version = ?");
+        Set<String> used = boundParamNames(configuration.getMappedStatement(NAMESPACE + ".requeueAbandonedClaim"),
+                dummyParams("requeueAbandonedClaim"));
+        assertThat(used).as("放回带期望代际做条件").contains("claimEpoch");
+    }
+
     @Test
     void submitAndFailureAndRenewCarryClaimEpoch() {
-        for (String id : List.of("commitSegmentResult", "reportExecutionFailure", "renewLease")) {
+        for (String id : List.of("commitSegmentResult", "reportExecutionFailure", "renewLease",
+                "requeueAbandonedClaim")) {
             Set<String> used = boundParamNames(configuration.getMappedStatement(NAMESPACE + "." + id),
                     dummyParams(id));
             assertThat(used).as(id + " 必须带领取代际做条件").contains("claimEpoch");

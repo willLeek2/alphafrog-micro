@@ -146,6 +146,21 @@ public interface NodeWorkItemMapper {
                                   @Param("claimEpoch") int claimEpoch,
                                   @Param("operationId") String operationId);
 
+    /**
+     * 把一段死在「已领取/执行中」的分段放回可领取状态（启动恢复专用）。
+     *
+     * <p>代际在这里加一：旧领取者再提交结果时代际对不上，写不进去。调用方必须先拿到这条 Run 的
+     * 服务租约——那才是「旧执行者已经不在了」的凭据；领取租约到期本身不算凭据。</p>
+     */
+    int requeueAbandonedClaim(@Param("runId") String runId,
+                              @Param("planGeneration") int planGeneration,
+                              @Param("nodeId") String nodeId,
+                              @Param("nodeAttempt") int nodeAttempt,
+                              @Param("segmentSequence") int segmentSequence,
+                              @Param("contextVersion") long contextVersion,
+                              @Param("runControlVersion") long runControlVersion,
+                              @Param("claimEpoch") int claimEpoch);
+
     /** 报执行失败：执行中 → 执行失败。只有执行基础设施自己出错走这条，工具返回的失败不算。 */
     int reportExecutionFailure(@Param("runId") String runId,
                                @Param("planGeneration") int planGeneration,

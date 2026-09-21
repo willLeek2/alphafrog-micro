@@ -236,6 +236,27 @@
         RETURNING claim_epoch
     </select>
 
+    <!--
+      启动恢复：把一段死在「已领取/执行中」的分段放回可领取状态（RUNNABLE），让节点池重新领取从头执行。
+      代际加一是为了废掉旧领取者：它若还活着，提交结果时会因为代际对不上被拒。
+      与「显式转交」的区别是这条不指定新主人，也不需要旧执行者先停下——调用方拿到的服务租约
+      才是「旧执行者已经不在了」的凭据。
+    -->
+    <update id="requeueAbandonedClaim">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'RUNNABLE',
+            claim_epoch = claim_epoch + 1,
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            next_visible_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('CLAIMED', 'EXECUTING')
+          AND claim_epoch = #{claimEpoch}
+          AND context_version = #{contextVersion}
+          AND run_control_version = #{runControlVersion}
+    </update>
+
     <update id="startExecution">
         UPDATE alphafrog_agent_run_work_item SET
             state = 'EXECUTING',

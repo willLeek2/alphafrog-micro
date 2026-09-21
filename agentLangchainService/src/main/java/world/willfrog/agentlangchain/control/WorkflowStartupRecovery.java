@@ -92,20 +92,22 @@ public class WorkflowStartupRecovery {
                 }
                 return false;
             }
-            // 双池第一阶段不具备跨进程恢复协议。这里必须在 claim 与状态修改之前跳过，
-            // 保留数据库记录供读取、观察和显式取消；不能错误接回 LEGACY 调度器。
-            boolean dualPool;
+            // 双池家族的 Run 由双池那套协议接管（服务所有权 + 分段行事实），不是「不具备恢复协议」。
+            // 这里必须在 claim 与状态修改之前跳过，把记录留给双池的启动受理：接回 LEGACY 调度器
+            // 会让一段图在旧串行链上再跑一遍。
+            boolean dualPoolFamily;
             try {
-                dualPool = schedulerVersionPolicy.isDualPool(candidate);
+                dualPoolFamily = schedulerVersionPolicy.isDualPoolFamily(candidate);
             } catch (IllegalStateException unknownVersion) {
                 // 未知版本不能被启动扫描改写成 LEGACY，也不能推进状态；保留原记录供人工检查。
                 log.error("Run 的调度器版本未知，启动恢复保持失败关闭: runId={} schedulerVersion={}",
                         runId, candidate.getSchedulerVersion());
                 return false;
             }
-            if (dualPool) {
-                log.warn("双池 Run 在服务启动后保持失败关闭，不自动领取: runId={} status={}",
-                        runId, status);
+            if (dualPoolFamily) {
+                log.warn("双池家族的 Run 由双池启动受理决定接不接手，这里不动它: runId={} status={} "
+                                + "schedulerVersion={}",
+                        runId, status, candidate.getSchedulerVersion());
                 return false;
             }
             int attempt = candidate.getRestartAttempt() == null ? 0 : candidate.getRestartAttempt();

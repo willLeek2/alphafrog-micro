@@ -201,6 +201,25 @@ class MybatisNodeWorkItemStoreTest {
     }
 
     @Test
+    void abandonedClaimRequeueReportsSuccessOnlyWhenOneRowMoved() {
+        when(mapper.requeueAbandonedClaim(anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyLong(), anyLong(), anyInt())).thenReturn(1);
+        assertThat(store.requeueAbandonedClaim(IDENTITY, 2, 7L, 3L).applied()).isTrue();
+    }
+
+    @Test
+    void abandonedClaimRequeueOnMovedEpochIsReportedAsStaleSubmission() {
+        when(mapper.requeueAbandonedClaim(anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyLong(), anyLong(), anyInt())).thenReturn(0);
+        when(mapper.findByIdentity(anyString(), anyInt(), anyString(), anyInt(), anyInt()))
+                .thenReturn(row("CLAIMED", 3));
+
+        NodeWorkItemMutationResult result = store.requeueAbandonedClaim(IDENTITY, 2, 7L, 3L);
+
+        assertThat(result.rejection().reason()).isEqualTo(NodeWorkItemRejectionReason.STALE_SUBMISSION);
+    }
+
+    @Test
     void residueCheckReadsCountForVersion() {
         when(mapper.countUnfinishedBySchedulerVersion(eq(SchedulerVersion.DUAL_POOL_V1.name()))).thenReturn(3);
         assertThat(store.hasResidueFor(SchedulerVersion.DUAL_POOL_V1)).isTrue();

@@ -11,7 +11,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * 新 Run 调度器版本的解析规则。
  *
- * <p>盯两件事：没接通执行链的版本必须失败关闭；进程终止演练开关只能改默认值，不能改写显式配置的版本。</p>
+ * <p>盯两件事：认不出的版本必须失败关闭；进程终止演练开关只能改默认值，不能改写显式配置的版本。</p>
  */
 class SchedulerVersionPolicyTest {
 
@@ -52,22 +52,35 @@ class SchedulerVersionPolicyTest {
     }
 
     @Test
-    void dualPoolV2FailsClosedWithTheHaltSwitchOff() {
+    void explicitDualPoolV2IsKept() {
         MockEnvironment environment = new MockEnvironment().withProperty(VERSION_KEY, "DUAL_POOL_V2");
-        assertThatThrownBy(() -> policy(environment).versionForNewRun())
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("DUAL_POOL_V2 的执行链尚未接通");
+        assertThat(policy(environment).versionForNewRun())
+                .as("显式配置的新版本要原样用上：执行链已接通，用不用由配置决定")
+                .isEqualTo("DUAL_POOL_V2");
     }
 
     @Test
-    void dualPoolV2FailsClosedEvenWithTheHaltSwitchOn() {
+    void explicitDualPoolV2IsNotRewrittenByTheHaltSwitch() {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty(VERSION_KEY, "DUAL_POOL_V2")
                 .withProperty(HALT_KEY, "true");
-        assertThatThrownBy(() -> policy(environment).versionForNewRun())
+        assertThat(policy(environment).versionForNewRun())
                 .as("演练开关不得把显式配置的版本悄悄改成另一个版本")
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("DUAL_POOL_V2 的执行链尚未接通");
+                .isEqualTo("DUAL_POOL_V2");
+    }
+
+    @Test
+    void everyDualPoolVersionIsRecognisedAsTheSameExecutionLayer() {
+        SchedulerVersionPolicy policy = policy(new MockEnvironment());
+        assertThat(policy.isDualPoolFamily("DUAL_POOL_V1")).isTrue();
+        assertThat(policy.isDualPoolFamily("DUAL_POOL_V2"))
+                .as("完整 DAG 也在双池执行层里：创建路径按家族受理，不是只认旧骨架")
+                .isTrue();
+        assertThat(policy.isDualPoolFamily("LEGACY")).isFalse();
+        AgentRun v2 = new AgentRun();
+        v2.setSchedulerVersion("DUAL_POOL_V2");
+        assertThat(policy.isDualPoolFamily(v2)).isTrue();
+        assertThat(policy.isDualPool(v2)).as("但它不是旧骨架，没有 Run 级单工具锚点").isFalse();
     }
 
     @Test

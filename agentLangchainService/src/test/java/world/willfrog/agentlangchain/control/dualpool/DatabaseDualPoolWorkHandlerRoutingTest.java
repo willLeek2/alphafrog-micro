@@ -73,7 +73,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         Mockito.lenient().when(stateStore.currentRound(any())).thenReturn(1L);
         Mockito.lenient().when(identity.value()).thenReturn("test-instance");
         Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
-        Mockito.lenient().when(versionPolicy.isDualPoolFamily(any())).thenReturn(true);
+        Mockito.lenient().when(versionPolicy.isDualPoolFamily(any(world.willfrog.agent.platform.entity.AgentRun.class)))
+                .thenReturn(true);
         handler = new DatabaseDualPoolWorkHandler(
                 runMapper,
                 Mockito.mock(FreshRunPipeline.class),

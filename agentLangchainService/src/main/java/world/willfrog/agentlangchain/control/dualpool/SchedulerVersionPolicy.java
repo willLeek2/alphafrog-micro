@@ -30,16 +30,11 @@ public class SchedulerVersionPolicy {
         // 版本从这里读一次：热配置（泳道覆盖只影响该泳道）→ 环境属性 → 代码默认。已经创建的 Run
         // 只认自己记录里的版本，热配置怎么改都不会影响它们。
         String configuredVersion = requireKnown(settings.newRunSchedulerVersion().textValue());
-        // 完整 DAG 与等待组的执行链还没接通：数据合同与迁移已经准备好，但节点执行层、外层推进与
-        // 恢复分发器还是只认 DUAL_POOL_V1 的单工具锚点。这时若把新 Run 标成 DUAL_POOL_V2，它会带着
-        // 一个没人认识的版本卡在原地。所以这里失败关闭，等执行链接通的那次提交再放开。
+        // 认不出的值在这里失败关闭（既不是旧路径，也不是任何一个双池版本），不悄悄回落到旧版本。
+        // 三个已知版本都可以给新 Run 用：完整 DAG 那一版的执行链已经接通（分段执行、等待组、
+        // 结果接收、恢复分发与启动恢复都在），但要不要用由配置决定——没配置时仍是旧路径。
         //
-        // 这一判断放在演练开关之前：显式配置的版本必须先被检查，不能被另一个开关悄悄改掉。
-        if (DUAL_POOL_V2.equals(configuredVersion)) {
-            throw new IllegalStateException(
-                    "DUAL_POOL_V2 的执行链尚未接通：当前只落地了数据合同与迁移，"
-                            + "请先用 LEGACY 或 DUAL_POOL_V1；等执行链提交上线后再把新 Run 交给新版本");
-        }
+        // 版本判断放在演练开关之前：显式配置的版本必须先被检查，不能被另一个开关悄悄改掉。
         // 进程终止演练只对双 Worker 池的持久恢复链有意义。这个开关只由隔离的
         // 长工具验收泳道显式授权；它只改默认值：配置停在没有指定双池版本（LEGACY 或未配置）时才把新 Run
         // 推进双池，显式写下的版本不被它改写。避免旧串行链产出无效样本。
@@ -79,7 +74,16 @@ public class SchedulerVersionPolicy {
 
     /** 这个 Run 是不是走双池执行层（DUAL_POOL_V1 或 DUAL_POOL_V2）。 */
     public boolean isDualPoolFamily(AgentRun run) {
-        return SchedulerVersion.fromWire(versionOf(run)).isDualPoolFamily();
+        return isDualPoolFamily(versionOf(run));
+    }
+
+    /**
+     * 按版本名判断是不是走双池执行层。
+     *
+     * <p>创建路径上还没有 Run 行可读，只能拿版本名判；两个入口共用同一份判断，不许各写一套。</p>
+     */
+    public boolean isDualPoolFamily(String versionName) {
+        return SchedulerVersion.fromWire(versionName).isDualPoolFamily();
     }
 
     /** 这个 Run 的等待事实是不是存在等待组里（只有 DUAL_POOL_V2 成立）。 */

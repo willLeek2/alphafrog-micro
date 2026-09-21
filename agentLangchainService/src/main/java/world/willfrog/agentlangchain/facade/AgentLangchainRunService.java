@@ -66,8 +66,8 @@ public class AgentLangchainRunService {
         // 版本在创建前选择并写进 Run。只有旧版本预占旧调度器名额；双池版本只在数据库
         // 记录写稳后补发提示，提示丢失由扫描恢复。
         String schedulerVersion = schedulerVersionPolicy.versionForNewRun();
-        if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)
-                && dualPoolRunAdmissionRegistry.startupResidueBlocked()) {
+        boolean dualPoolFamily = schedulerVersionPolicy.isDualPoolFamily(schedulerVersion);
+        if (dualPoolFamily && dualPoolRunAdmissionRegistry.startupResidueBlockedFor(schedulerVersion)) {
             throw new world.willfrog.agentlangchain.control.LangchainRunRejectedException(
                     "dual_pool_startup_residue_blocked", "startup_residue_blocked");
         }
@@ -109,9 +109,13 @@ public class AgentLangchainRunService {
             }
 
             if (pipeline != null) {
-                if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
-                    // 只把当前进程新建且已经落库的 Run 加入双池；该集合不跨重启恢复。
-                    if (!dualPoolRunAdmissionRegistry.admitNewRun(run.getId())) {
+                if (dualPoolFamily) {
+                    // 持久交接凭据不在这里补写：协调资格由创建那一条事务一起写（见
+                    // AgentRunEventService.createRun 里 Run 主记录、协调资格、接收事实同一次提交），
+                    // 所以「Run 已经落库、却没有资格记录」这个窗口不存在，再写一次只会多出一个
+                    // 看起来像是保证来源的第二次写入。
+                    // 这里只把当前进程新建且已经落库的 Run 加入双池；该集合不跨重启恢复。
+                    if (!dualPoolRunAdmissionRegistry.admitNewRun(run.getId(), schedulerVersion)) {
                         throw new world.willfrog.agentlangchain.control.LangchainRunRejectedException(
                                 "dual_pool_business_admission_full", "business_admission_full");
                     }
@@ -131,7 +135,7 @@ public class AgentLangchainRunService {
             // 只有这次真的新建了 Run 才收尾：幂等读回的旧 Run 属于别人的执行流程，
             // 一次重复提交的失败不该把它改成失败态。
             if (run != null && createdNow) {
-                if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
+                if (dualPoolFamily) {
                     dualPoolRunAdmissionRegistry.forgetFailedAdmission(run.getId());
                 }
                 markEnqueueFailed(agentEventService, run, e);

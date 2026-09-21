@@ -65,6 +65,13 @@ class AgentLangchainRunServiceTest {
                 schedulerVersionPolicy, dualPoolRunAdmissionRegistry);
         lenient().when(schedulerVersionPolicy.versionForNewRun())
                 .thenReturn(SchedulerVersionPolicy.LEGACY);
+        // 版本家族判断按版本名如实回答：假的策略不能把双池版本说成不是双池，否则这里测的就不是创建路径了。
+        lenient().when(schedulerVersionPolicy.isDualPoolFamily(anyString()))
+                .thenAnswer(invocation -> {
+                    String version = invocation.getArgument(0);
+                    return SchedulerVersionPolicy.DUAL_POOL_V1.equals(version)
+                            || SchedulerVersionPolicy.DUAL_POOL_V2.equals(version);
+                });
         lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
         lenient().when(deploymentIdentityProvider.current())
                 .thenReturn(new DeploymentIdentity("stable", GENERATION));
@@ -108,7 +115,7 @@ class AgentLangchainRunServiceTest {
     void dualPoolRunFreezesVersionWithoutReservingLegacyScheduler() {
         when(schedulerVersionPolicy.versionForNewRun())
                 .thenReturn(SchedulerVersionPolicy.DUAL_POOL_V1);
-        when(dualPoolRunAdmissionRegistry.admitNewRun("run-dual")).thenReturn(true);
+        when(dualPoolRunAdmissionRegistry.admitNewRun(eq("run-dual"), anyString())).thenReturn(true);
         when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
         when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
         AgentRun run = new AgentRun();
@@ -127,7 +134,7 @@ class AgentLangchainRunServiceTest {
                 .build());
 
         verify(scheduler, never()).reserve();
-        verify(dualPoolRunAdmissionRegistry).admitNewRun("run-dual");
+        verify(dualPoolRunAdmissionRegistry).admitNewRun(eq("run-dual"), anyString());
         verify(pipeline).launchAsync(run, null);
     }
 
@@ -185,7 +192,7 @@ class AgentLangchainRunServiceTest {
 
         assertEquals("run-original", message.getId());
         verify(pipeline, never()).launchAsync(any(), any());
-        verify(dualPoolRunAdmissionRegistry, never()).admitNewRun(anyString());
+        verify(dualPoolRunAdmissionRegistry, never()).admitNewRun(anyString(), anyString());
         verify(scheduler).release(reservation);
     }
 

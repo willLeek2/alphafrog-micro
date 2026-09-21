@@ -90,6 +90,17 @@ public interface NodeWorkItemStore {
                                                           String payloadPatchJson,
                                                           String externalSideEffectRef);
 
+    /**
+     * 启动恢复专用：把一段死在「已领取/执行中」的分段放回可领取状态，并把领取代际加一废掉旧领取者。
+     *
+     * <p>只在调用方已经取得这条 Run 的服务租约之后使用。分段的执行路径由载荷与等待组事实决定，
+     * 不由状态决定，所以放回可运行状态就是要从头再执行一遍这一段。</p>
+     */
+    NodeWorkItemMutationResult requeueAbandonedClaim(NodeWorkItemIdentity identity,
+                                                     int expectedClaimEpoch,
+                                                     long contextVersion,
+                                                     long runControlVersion);
+
     /** 服务退出打断了恢复分段时，精确核对锚点与领取代际后重新开放领取。 */
     NodeWorkItemMutationResult requeueInterruptedToolJob(NodeWorkItemIdentity identity,
                                                          NodeWorkItemVersions versions,
