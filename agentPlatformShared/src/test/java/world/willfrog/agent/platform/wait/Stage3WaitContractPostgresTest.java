@@ -20,6 +20,7 @@ import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -54,8 +55,11 @@ import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunEventRedisStore;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.workitem.MybatisNodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
@@ -310,25 +314,25 @@ class Stage3WaitContractPostgresTest {
                 .as("一次全局扫描：三个版本排在同一份候选里，按每行的冻结版本路由")
                 .containsExactlyInAnyOrder("run-cold", "run-warm", "run-hot", "run-legacy");
 
-        store.markCoordinationServed("run-cold", 1, 0);
-        store.markCoordinationServed("run-warm", 7, 0);
-        store.markCoordinationServed("run-hot", 9, 0);
-        store.markCoordinationServed("run-legacy", 10, 0);
+        store.markCoordinationServed("run-cold", 1, 0, fenceFor("run-cold"));
+        store.markCoordinationServed("run-warm", 7, 0, fenceFor("run-warm"));
+        store.markCoordinationServed("run-hot", 9, 0, fenceFor("run-hot"));
+        store.markHandoffServed("run-legacy", 10, 0);
         assertThat(dueRunIds(store, ROTATION_RUNS))
                 .as("按最近被服务的轮次升序：越久没被服务的越靠前，旧版本一样排在里面")
                 .containsExactly("run-cold", "run-warm", "run-hot", "run-legacy");
 
         // 轮次位置只许前进：迟到的旧轮次写进来影响 0 行，不能把新事实改回旧事实。
-        assertThat(store.markCoordinationServed("run-hot", 3, 0)).isFalse();
+        assertThat(store.markCoordinationServed("run-hot", 3, 0, fenceFor("run-hot"))).isFalse();
         assertThat(store.find("run-hot").orElseThrow().getCoordinationServedRound()).isEqualTo(9);
 
         // 延期要写清原因与下次可见时间，并带上这一轮读到的计划代际与轮次做条件。
         assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
-                OffsetDateTime.now().plusMinutes(5), 0, 0L))
+                OffsetDateTime.now().plusMinutes(5), 0, 0L, fenceFor("run-cold")))
                 .as("轮次对不上：这是旧观察，写进去只会把新事实拉回旧事实")
                 .isFalse();
         assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
-                OffsetDateTime.now().plusMinutes(5), 0, 1L)).isTrue();
+                OffsetDateTime.now().plusMinutes(5), 0, 1L, fenceFor("run-cold"))).isTrue();
         assertThat(store.find("run-cold").orElseThrow().deferReasonEnum())
                 .isEqualTo(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
         assertThat(dueRunIds(store, ROTATION_RUNS))
@@ -336,19 +340,19 @@ class Stage3WaitContractPostgresTest {
 
         // Run 推进计划代际：资格记录跟着走，只许前进，也不许写一个不属于 Run 的代际。
         execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = 'run-cold'");
-        assertThat(store.syncPlanGeneration("run-cold", 0)).as("代际倒退不写").isFalse();
-        assertThat(store.syncPlanGeneration("run-cold", 2))
+        assertThat(store.syncPlanGeneration("run-cold", 0, fenceFor("run-cold"))).as("代际倒退不写").isFalse();
+        assertThat(store.syncPlanGeneration("run-cold", 2, fenceFor("run-cold")))
                 .as("声明的这一代必须就是 Run 主表上的当前一代")
                 .isFalse();
-        assertThat(store.syncPlanGeneration("run-cold", 1)).isTrue();
+        assertThat(store.syncPlanGeneration("run-cold", 1, fenceFor("run-cold"))).isTrue();
         assertThat(store.find("run-cold").orElseThrow().getPlanGeneration()).isEqualTo(1);
         assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
-                OffsetDateTime.now().plusMinutes(5), 0, 1L))
+                OffsetDateTime.now().plusMinutes(5), 0, 1L, fenceFor("run-cold")))
                 .as("父 Run 已经升到第 1 代而记录还停在第 0 代：拿旧代际写的延期不生效")
                 .isFalse();
 
         // 成功推进：延期原因清掉、轮次位置更新，于是它排到最后（这一轮别人先来）。
-        assertThat(store.markCoordinationServed("run-cold", 11, 1)).isTrue();
+        assertThat(store.markCoordinationServed("run-cold", 11, 1, fenceFor("run-cold"))).isTrue();
         RunCoordination served = store.find("run-cold").orElseThrow();
         assertThat(served.getDeferReason()).isNull();
         assertThat(served.getCoordinationServedRound()).isEqualTo(11);
@@ -369,7 +373,7 @@ class Stage3WaitContractPostgresTest {
 
         // 主动延期一小时：这段间隔里它根本没排队，刷新一轮都不该算到它头上。
         assertThat(store.deferFor("run-competing", RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT,
-                OffsetDateTime.now().plusHours(1), 0, 0L)).isTrue();
+                OffsetDateTime.now().plusHours(1), 0, 0L, fenceFor("run-competing"))).isTrue();
         for (long round = 2; round <= 6; round++) {
             store.refreshCoordinationMissedRounds(round);
         }
@@ -390,7 +394,7 @@ class Stage3WaitContractPostgresTest {
                 .isEqualTo(3);
 
         // 被服务：清零；已经服务过的这一轮不算没被服务。
-        assertThat(store.markCoordinationServed("run-competing", 9, 0)).isTrue();
+        assertThat(store.markCoordinationServed("run-competing", 9, 0, fenceFor("run-competing"))).isTrue();
         assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds()).isZero();
         store.refreshCoordinationMissedRounds(9);
         assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
@@ -421,7 +425,7 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds())
                 .as("连续两轮有可领节点都没轮到：加两轮")
                 .isEqualTo(3);
-        assertThat(store.markDispatchServed("run-competing-node", 24, 0)).isTrue();
+        assertThat(store.markDispatchServed("run-competing-node", 24, 0, fenceFor("run-competing-node"))).isTrue();
         assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds()).isZero();
     }
 
@@ -439,12 +443,12 @@ class Stage3WaitContractPostgresTest {
 
         // Run 推进到下一代，资格记录还没同步：这一回合的三种写都不许生效。
         execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = 'run-fence'");
-        assertThat(store.markCoordinationServed("run-fence", 5, 0))
+        assertThat(store.markCoordinationServed("run-fence", 5, 0, fenceFor("run-fence")))
                 .as("父 Run 已经升代，旧回合的成功写不生效").isFalse();
-        assertThat(store.markDispatchServed("run-fence", 5, 0))
+        assertThat(store.markDispatchServed("run-fence", 5, 0, fenceFor("run-fence")))
                 .as("派发那一组同样按父 Run 的当前代际拦").isFalse();
         assertThat(store.deferFor("run-fence", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
-                OffsetDateTime.now().plusMinutes(5), 0, 0L))
+                OffsetDateTime.now().plusMinutes(5), 0, 0L, fenceFor("run-fence")))
                 .as("延期也要核父 Run 的当前代际，子记录没同步不算数").isFalse();
         RunCoordination untouched = store.find("run-fence").orElseThrow();
         assertThat(untouched.getCoordinationServedRound()).isZero();
@@ -452,11 +456,11 @@ class Stage3WaitContractPostgresTest {
         assertThat(untouched.getDeferReason()).isNull();
 
         // 记录同步到当前代际之后，带着这一代的写就能落地。
-        assertThat(store.syncPlanGeneration("run-fence", 1)).isTrue();
-        assertThat(store.markCoordinationServed("run-fence", 5, 1)).isTrue();
-        assertThat(store.markDispatchServed("run-fence", 6, 1)).isTrue();
+        assertThat(store.syncPlanGeneration("run-fence", 1, fenceFor("run-fence"))).isTrue();
+        assertThat(store.markCoordinationServed("run-fence", 5, 1, fenceFor("run-fence"))).isTrue();
+        assertThat(store.markDispatchServed("run-fence", 6, 1, fenceFor("run-fence"))).isTrue();
         assertThat(store.deferFor("run-fence", RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT,
-                OffsetDateTime.now().plusMinutes(5), 1, 5L)).isTrue();
+                OffsetDateTime.now().plusMinutes(5), 1, 5L, fenceFor("run-fence"))).isTrue();
         RunCoordination written = store.find("run-fence").orElseThrow();
         assertThat(written.getCoordinationServedRound()).isEqualTo(5);
         assertThat(written.getDispatchServedRound()).isEqualTo(6);
@@ -525,7 +529,7 @@ class Stage3WaitContractPostgresTest {
                 .containsExactly("run-legacy-blocking");
 
         // 接不了手，按所有权原因推后：下一轮它让位，名额落到双池那条上。
-        assertThat(store.deferFor("run-legacy-blocking",
+        assertThat(store.deferHandoff("run-legacy-blocking",
                 RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
                 OffsetDateTime.now().plusMinutes(1), 0, 0L)).isTrue();
         assertThat(store.scanDue(1))
@@ -715,13 +719,15 @@ class Stage3WaitContractPostgresTest {
         String runId = "run-stale";
         createRun(runId, 0, 0L);
         createSegment(runId, 0, "node-1", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
-        NodeWorkItemIdentity identity = new NodeWorkItemIdentity(runId, 0, "node-1", 0, 0);
+        ServiceOwnershipFence fence = fenceFor(runId);
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             NodeWorkItemMapper mapper = session.getMapper(NodeWorkItemMapper.class);
-            assertThat(mapper.claim(runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L,
+            assertThat(mapper.claim(fence.ownerInstanceId(), fence.fencingToken(),
+                    runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L,
                     "worker-1", java.time.OffsetDateTime.now().plusMinutes(1)))
                     .as("第一次领取成功").isEqualTo(1);
-            assertThat(mapper.claim(runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L,
+            assertThat(mapper.claim(fence.ownerInstanceId(), fence.fencingToken(),
+                    runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L,
                     "worker-2", java.time.OffsetDateTime.now().plusMinutes(1)))
                     .as("重复领取加不到行").isNull();
             assertThat(mapper.startExecution(runId, 0, "node-1", 0, 0, 1, "worker-1")).isEqualTo(1);
@@ -1640,6 +1646,208 @@ class Stage3WaitContractPostgresTest {
         assertThat(globalPaused()).isFalse();
     }
 
+    // ==================== 服务所有权闸门 ====================
+
+    /**
+     * 别人接手这条 Run 之后，原来的持有者连「把死掉的分段放回可领取」这一步也做不了。
+     *
+     * <p>取到所有权与动手改行之间隔着一段时间，这段时间里租约可能到期、别的进程可能接手。
+     * 所以放回领取态这句写入自己就核服务所有权（持有人 + 代际号 + 没过期），不是先查再写。</p>
+     */
+    @Test
+    void aFormerLeaseOwnerCannotRequeueAfterAnotherProcessTakesTheRunOver() throws Exception {
+        String runId = "run-takeover-requeue";
+        createRun(runId, 0, 0L);
+        ServiceOwnershipFence former = fenceFor(runId);
+        createSegment(runId, 0, "node-1", 0, 0, 1, former.ownerInstanceId(), 1L, 0L, "EXECUTING");
+
+        execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP, "
+                + "renewed_at = CURRENT_TIMESTAMP - INTERVAL '1 minute' WHERE run_id = '" + runId + "'");
+        String successor = "stage3-successor";
+        long successorToken = ownRun(runId, successor);
+        ServiceOwnershipFence takenOver = new ServiceOwnershipFence(successor, successorToken);
+        assertThat(takenOver.fencingToken()).as("接手换代：旧凭据从这一刻起是废的")
+                .isEqualTo(former.fencingToken() + 1);
+
+        NodeWorkItemIdentity identity = new NodeWorkItemIdentity(runId, 0, "node-1", 0, 0);
+        NodeWorkItemVersions versions = new NodeWorkItemVersions(1L, 0L, 1);
+        NodeWorkItemStore store = workItemStore();
+        assertThat(store.requeueAbandonedClaim(identity, versions, former, SchedulerVersion.DUAL_POOL_V2)
+                .applied())
+                .as("旧持有者拿着过期凭据放回分段：一行都写不进去").isFalse();
+        assertThat(stateOf(runId, "node-1")).as("被拒之后这一行保持原样").isEqualTo("EXECUTING");
+        assertThat(store.requeueAbandonedClaim(identity, versions, takenOver, SchedulerVersion.DUAL_POOL_V2)
+                .applied())
+                .as("现在的持有者放得回去").isTrue();
+        assertThat(stateOf(runId, "node-1")).isEqualTo("RUNNABLE");
+    }
+
+    /**
+     * 恢复扫描读到一行之后、动手之前，控制面把这条 Run 的控制版本推了一代：旧回合这条写入作废。
+     *
+     * <p>取消、追问、计划推进都会让控制版本往前走。没有这一条，一次读到旧版本再慢慢写入的恢复，
+     * 会把已经被取消或已经被替代的那一段放回可领取，接着跑起来。</p>
+     */
+    @Test
+    void aRecoveryWriteFromBeforeTheControlVersionAdvanceUpdatesNothing() throws Exception {
+        String runId = "run-ctrl-advance";
+        createRun(runId, 0, 2L);
+        ServiceOwnershipFence fence = fenceFor(runId);
+        createSegment(runId, 0, "node-1", 0, 0, 1, "worker-1", 1L, 2L, "EXECUTING");
+
+        execute("UPDATE alphafrog_agent_run SET run_control_version = 3 WHERE id = '" + runId + "'");
+
+        NodeWorkItemIdentity identity = new NodeWorkItemIdentity(runId, 0, "node-1", 0, 0);
+        NodeWorkItemStore store = workItemStore();
+        assertThat(store.requeueAbandonedClaim(identity, new NodeWorkItemVersions(1L, 2L, 1), fence,
+                SchedulerVersion.DUAL_POOL_V2).applied())
+                .as("旧控制版本的恢复写入：一行都写不进去").isFalse();
+        assertThat(stateOf(runId, "node-1")).isEqualTo("EXECUTING");
+        assertThat(store.requeueAbandonedClaim(identity, new NodeWorkItemVersions(1L, 3L, 1), fence,
+                SchedulerVersion.DUAL_POOL_V2).applied())
+                .as("换成当前控制版本也进不去：这一行自己记的还是旧版本，它属于谁都不该再放回去")
+                .isFalse();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + runId + "' AND claim_epoch = 1 AND state = 'EXECUTING'"))
+                .as("两次被拒之后这一行原样留着，等失效闸门收尾").isEqualTo(1);
+    }
+
+    /**
+     * 一条 V2 的 Run 下面混着一行 V1 的未完成分段：按 Run 取行的扫描必须把它读出来，
+     * 而这一行哪个版本都领不走。
+     *
+     * <p>证明「这条 Run 的全部未完成分段都属于这一版」的前提是先把它们读全。按行自己的版本先筛，
+     * 被筛掉的行根本看不见，那个全称判断就成了永远为真。读出来之后逐行比对才发现版本不一致，
+     * 结论是整条 Run 隔离，而不是让这一行在别的版本下被执行。</p>
+     */
+    @Test
+    void aMixedVersionRowUnderOneRunIsVisibleToTheRunScanAndClaimableFromNoVersion() throws Exception {
+        String runId = "run-mixed-version";
+        createRunFor(runId, "user-mixed-version", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        ServiceOwnershipFence fence = fenceFor(runId);
+        createSegment(runId, 0, "node-v2", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        createSegment(runId, 0, "node-v1", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        execute("UPDATE alphafrog_agent_run_work_item SET scheduler_version = 'DUAL_POOL_V1' "
+                + "WHERE run_id = '" + runId + "' AND node_id = 'node-v1'");
+
+        NodeWorkItemStore store = workItemStore();
+        assertThat(store.listUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2, 10))
+                .filteredOn(item -> runId.equals(item.getRunId()))
+                .as("按 Run 的调度器版本取行时，行自己的版本不参与筛选：混在里面的 V1 行也看得见")
+                .extracting(NodeWorkItem::getNodeId)
+                .containsExactlyInAnyOrder("node-v1", "node-v2");
+        assertThat(store.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2))
+                .as("读全的条数与按同样口径的计数对得上，调用方才能判断有没有漏行")
+                .isGreaterThanOrEqualTo(2);
+
+        assertThat(claim(runId, "node-v1", "DUAL_POOL_V2", fence))
+                .as("拿这条 Run 的版本去领那一行：行自己的版本对不上，领不走").isNull();
+        assertThat(claim(runId, "node-v1", "DUAL_POOL_V1", fence))
+                .as("反过来拿行自己的版本去领：父 Run 冻结的不是这一版，也领不走").isNull();
+        assertThat(claim(runId, "node-v2", "DUAL_POOL_V2", fence))
+                .as("同一条 Run 里版本一致的那一行领得走：上面两个空不是别的原因造成的")
+                .isEqualTo(1);
+    }
+
+    /**
+     * 协调资格的写入只有两种结果：写进去一条，或者影响 0 行。
+     *
+     * <p>写不进的那一次不该顺手补一行出来——「这个 Run 有没有资格记录」本身就是一个事实，
+     * 读取侧靠它决定要不要排队，凭空多出来的行会让一条从来没进过双池的 Run 出现在候选里。</p>
+     */
+    @Test
+    void aRejectedCoordinationWriteLeavesTheEntitlementRowUntouched() throws Exception {
+        String runId = "run-entitlement-rows";
+        createRun(runId, 0, 0L);
+        RunCoordinationStore store = coordinationStore();
+        assertThat(store.ensure(runId)).as("第一条资格记录建出来").isTrue();
+        assertThat(store.ensure(runId)).as("再调一次不重复建行").isTrue();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination WHERE run_id = '"
+                + runId + "'")).as("一个 Run 一条资格记录").isEqualTo(1);
+
+        ServiceOwnershipFence fence = fenceFor(runId);
+        assertThat(store.deferFor(runId, RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
+                OffsetDateTime.now().plusMinutes(5), 7, 0L, fence))
+                .as("拿一个对不上的计划代际来延期：影响 0 行").isFalse();
+        assertThat(store.markCoordinationServed(runId, 4, 0, fence)).isTrue();
+        assertThat(store.deferFor(runId, RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
+                OffsetDateTime.now().plusMinutes(5), 0, 1L, fence))
+                .as("轮次对不上的延期同样写不进去").isFalse();
+        assertThat(deferReasonOf(runId)).as("两次被拒都没有留下延期原因").isNull();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination WHERE run_id = '"
+                + runId + "'")).as("拒绝不建行、也不复制行").isEqualTo(1);
+        assertThat(store.markCoordinationServed(runId, 5, 0, fence)).isTrue();
+        assertThat(store.find(runId).orElseThrow().getCoordinationServedRound()).isEqualTo(5L);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination WHERE run_id = '"
+                + runId + "'")).as("成功的写入也还是那一行").isEqualTo(1);
+    }
+
+    /**
+     * 启动隔离的输入每次都从库里重算，结论本身不落表。
+     *
+     * <p>两次独立的读各自新开会话，模拟两个进程看到同一份库：读到的分段行与逐行比对用的数据
+     * （行自己的版本、计划代际、控制版本）必须一模一样。库里也没有任何一列记着「这条 Run 被隔离」——
+     * 所以重启之后结论是重算出来的，不依赖上一次进程的内存。</p>
+     */
+    @Test
+    void isolationInputsAreRecomputedFromTheDatabaseAndTheConclusionIsNotPersisted() throws Exception {
+        String runId = "run-isolation-recompute";
+        createRunFor(runId, "user-isolation-recompute", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        ServiceOwnershipFence fence = fenceFor(runId);
+        createSegment(runId, 0, "node-v2", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        createSegment(runId, 0, "node-v1", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        execute("UPDATE alphafrog_agent_run_work_item SET scheduler_version = 'DUAL_POOL_V1' "
+                + "WHERE run_id = '" + runId + "' AND node_id = 'node-v1'");
+
+        List<String> firstRead = isolationInputsOf(runId);
+        List<String> secondRead = isolationInputsOf(runId);
+        assertThat(secondRead).as("两次独立的读给出同样的输入").isEqualTo(firstRead);
+        assertThat(firstRead)
+                .as("混在 V2 Run 下面的 V1 行也读得出来，两边带着各自的版本与代际供逐行比对")
+                .containsExactly("node-v1:DUAL_POOL_V1:plan=0:ctrl=0",
+                        "node-v2:DUAL_POOL_V2:plan=0:ctrl=0");
+        assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                + "WHERE table_schema = current_schema() AND column_name ILIKE '%isolat%'"))
+                .as("隔离是这个进程当时的结论，库里没有记它的列").isZero();
+        assertThat(fence.fencingToken()).as("造数据这件事本身也要有活着的服务所有者").isPositive();
+    }
+
+    /** 一个 Run 的未完成分段按「读出来要比对的数据」排好序：节点身份、行自己的版本、两个代际。 */
+    private static List<String> isolationInputsOf(String runId) {
+        return workItemStore()
+                .listUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2, 100).stream()
+                .filter(item -> runId.equals(item.getRunId()))
+                .map(item -> item.getNodeId() + ":" + item.getSchedulerVersion()
+                        + ":plan=" + item.getPlanGeneration() + ":ctrl=" + item.getRunControlVersion())
+                .sorted()
+                .toList();
+    }
+
+    /** 资格记录建到一半的事务回滚：库里不留半条记录；同一个入口再来一次并提交，留下恰好一条。 */
+    @Test
+    void aRolledBackEntitlementWriteLeavesNoRowBehind() throws Exception {
+        String runId = "run-entitlement-rollback";
+        createRun(runId, 0, 0L);
+        // 会话要挂在 Spring 事务上：直接 new 出来的会话不参与回滚，量出来的是假的。
+        RunCoordinationMapper mapper = new SqlSessionTemplate(sqlSessionFactory)
+                .getMapper(RunCoordinationMapper.class);
+        TransactionTemplate template = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+
+        Integer affected = template.execute(status -> {
+            int rows = mapper.ensure(runId);
+            status.setRollbackOnly();
+            return rows;
+        });
+        assertThat(affected).as("事务里那条语句确实建了行").isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination WHERE run_id = '"
+                + runId + "'")).as("回滚之后不留行").isZero();
+
+        Integer secondAttempt = template.execute(status -> mapper.ensure(runId));
+        assertThat(secondAttempt).as("同一个入口再来一次：语句还是建了行").isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination WHERE run_id = '"
+                + runId + "'")).as("提交之后恰好一条").isEqualTo(1);
+    }
+
     // ==================== 语句与工具 ====================
 
     /** 真实升级链：先建表脚本，再按版本顺序升到 006；这样验证的是部署时真正会走的路径。 */
@@ -1694,6 +1902,15 @@ class Stage3WaitContractPostgresTest {
             }
         }
         return new SqlSessionFactoryBuilder().build(configuration);
+    }
+
+    /**
+     * 一条 Run 的服务所有权凭据：真库上必须是确实存在、没过期的那一行，
+     * 语句里的所有权条件（持有人 + 代际号 + 未过期）才过得去。
+     */
+    private static ServiceOwnershipFence fenceFor(String runId) {
+        String owner = "stage3-fence-owner";
+        return new ServiceOwnershipFence(owner, ownRun(runId, owner));
     }
 
     /** 造一条 Run：走真实插入语句，列集合与约束由映射文件保证，不手写一大串列名。 */
@@ -1754,9 +1971,27 @@ class Stage3WaitContractPostgresTest {
                 : java.time.OffsetDateTime.now().plusMinutes(5));
         item.setNextVisibleAt(java.time.OffsetDateTime.now().minusSeconds(1));
         item.setPayloadJson("{}");
+        ServiceOwnershipFence fence = ownershipForInsert(runId);
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
-            assertThat(session.getMapper(NodeWorkItemMapper.class).insert(item)).isEqualTo(1);
+            assertThat(session.getMapper(NodeWorkItemMapper.class)
+                    .insert(item, fence.ownerInstanceId(), fence.fencingToken())).isEqualTo(1);
         }
+    }
+
+    /**
+     * 造分段之前先确认这条 Run 有活着的服务所有者：已经有活着的持有人就沿用它，没有才以测试
+     * 自己的身份取一次。插入语句核的是「此刻确实有一行没过期的租约」，造数据不该把别人手里的
+     * 所有权抢回来——那是接管测试要单独摆出来的事。
+     */
+    private static ServiceOwnershipFence ownershipForInsert(String runId) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            RunServiceLease existing = session.getMapper(RunServiceLeaseMapper.class).find(runId);
+            if (existing != null && !existing.expiredAt(java.time.OffsetDateTime.now())) {
+                return new ServiceOwnershipFence(existing.ownerInstanceId(), existing.fencingToken());
+            }
+        }
+        String owner = "stage3-fence-owner";
+        return new ServiceOwnershipFence(owner, ownRun(runId, owner));
     }
 
     /** 读每个逻辑节点的最新分段：复用产品代码里那条查询。 */
@@ -1784,6 +2019,35 @@ class Stage3WaitContractPostgresTest {
     private static RunCoordinationStore coordinationStore() {
         SqlSession session = sqlSessionFactory.openSession(true);
         return new MybatisRunCoordinationStore(session.getMapper(RunCoordinationMapper.class));
+    }
+
+    private static NodeWorkItemStore workItemStore() {
+        SqlSession session = sqlSessionFactory.openSession(true);
+        return new MybatisNodeWorkItemStore(session.getMapper(NodeWorkItemMapper.class));
+    }
+
+    /** 一条分段此刻的状态；用例用它核对被拒的写入确实没改动这一行。 */
+    private static String stateOf(String runId, String nodeId) throws Exception {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return session.getMapper(NodeWorkItemMapper.class)
+                    .findByIdentity(runId, 0, nodeId, 0, 0).getState();
+        }
+    }
+
+    /** 按指定的调度器版本领一条分段：返回新领取代际，领不到返回 null。 */
+    private static Integer claim(String runId, String nodeId, String schedulerVersion,
+                                 ServiceOwnershipFence fence) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return session.getMapper(NodeWorkItemMapper.class).claim(
+                    fence.ownerInstanceId(), fence.fencingToken(), runId, 0, nodeId, 0, 0,
+                    schedulerVersion, 1L, 0L, "stage3-claimer",
+                    java.time.OffsetDateTime.now().plusMinutes(1));
+        }
+    }
+
+    /** 资格记录上的延期原因：没被延期过就是 null。 */
+    private static String deferReasonOf(String runId) {
+        return coordinationStore().find(runId).map(RunCoordination::getDeferReason).orElse(null);
     }
 
     private record GroupFixture(String runId, long groupId, long runControlVersion) {

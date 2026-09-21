@@ -19,6 +19,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -39,12 +40,32 @@ import static org.mockito.Mockito.when;
 
 class DualPoolRunAdmissionRegistryTest {
 
+    /** 替身里那条活着的服务所有权：持有人 test-instance、代际 1，与 {@code leaseAcquired()} 对应。 */
+    private static final ServiceOwnershipFence FENCE = new ServiceOwnershipFence("test-instance", 1L);
+
+    /**
+     * 只量名额语义的替身：服务所有权交给一条「取一次就成功」的租约。受理这条路本来就要先拿到
+     * 这条 Run 的服务所有权，拿不到的进程不该受理它，所以替身也必须把这一关摆出来。
+     */
+    private static DualPoolRunAdmissionRegistry registryThatCanOwnRuns(
+            SchedulerPermitLedger permitLedger, NodeWorkItemStore workItems, AgentRunMapper runs) {
+        RunServiceLeaseStore leaseStore = mock(RunServiceLeaseStore.class);
+        ProcessInstanceIdentity identity = mock(ProcessInstanceIdentity.class);
+        when(identity.value()).thenReturn("test-instance");
+        when(leaseStore.acquire(anyString(), anyString(), any())).thenAnswer(invocation ->
+                Optional.of(new RunServiceLease(invocation.getArgument(0, String.class), "test-instance", 1L,
+                        OffsetDateTime.now(), OffsetDateTime.now(),
+                        OffsetDateTime.now().plusMinutes(2))));
+        when(leaseStore.find(anyString())).thenReturn(Optional.empty());
+        return new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L);
+    }
+
     @Test
     void oldLifecycleCannotReleaseNewFollowUpAdmission() {
         SchedulerPermitLedger permitLedger = new SchedulerPermitLedger();
         permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
-        DualPoolRunAdmissionRegistry registry = new DualPoolRunAdmissionRegistry(
-                permitLedger, mock(NodeWorkItemStore.class));
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                permitLedger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class));
 
         assertThat(registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
         long oldEpoch = registry.currentAdmissionEpoch("run-1");
@@ -71,8 +92,8 @@ class DualPoolRunAdmissionRegistryTest {
     void losingLaterReservationCannotRemoveEarlierDurableWinner() {
         SchedulerPermitLedger permitLedger = new SchedulerPermitLedger();
         permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
-        DualPoolRunAdmissionRegistry registry = new DualPoolRunAdmissionRegistry(
-                permitLedger, mock(NodeWorkItemStore.class));
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                permitLedger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class));
 
         assertThat(registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
         DualPoolRunAdmissionRegistry.Admission earlier =
@@ -112,13 +133,12 @@ class DualPoolRunAdmissionRegistryTest {
 
         NodeWorkItem owner = item("run-1", 3, "todo-1", 0, 1);
         NodeWorkItem unrelated = item("run-1", 3, "todo-2", 0, 2);
-        when(workItems.countUnfinishedBySchedulerVersion(SchedulerVersion.DUAL_POOL_V1)).thenReturn(2);
-        when(workItems.listUnfinishedBySchedulerVersion(SchedulerVersion.DUAL_POOL_V1, 2))
+        when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V1)).thenReturn(2);
+        when(workItems.listUnfinishedByRunSchedulerVersion(eq(SchedulerVersion.DUAL_POOL_V1), anyInt()))
                 .thenReturn(List.of(owner, unrelated));
         when(runs.findById("run-1")).thenReturn(run);
 
-        DualPoolRunAdmissionRegistry registry = new DualPoolRunAdmissionRegistry(
-                permitLedger, workItems, runs);
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(permitLedger, workItems, runs);
         registry.detectStartupResidue();
 
         assertThat(registry.startupResidueBlocked()).isTrue();
@@ -151,9 +171,10 @@ class DualPoolRunAdmissionRegistryTest {
 
         // 只有死在领取态的那一段被放回可领取；等待中的那一段由恢复通知那一套驱动，不动它。
         verify(fixture.workItems).requeueAbandonedClaim(
-                new NodeWorkItemIdentity("run-2", 3, "todo-1", 0, 1), 4, 7L, 2L);
+                new NodeWorkItemIdentity("run-2", 3, "todo-1", 0, 1),
+                new NodeWorkItemVersions(7L, 2L, 4), FENCE, SchedulerVersion.DUAL_POOL_V2);
         verify(fixture.workItems, never()).requeueAbandonedClaim(
-                eq(new NodeWorkItemIdentity("run-2", 3, "todo-2", 0, 0)), anyInt(), anyLong(), anyLong());
+                eq(new NodeWorkItemIdentity("run-2", 3, "todo-2", 0, 0)), any(), any(), any());
         assertThat(fixture.registry.isAdmitted("run-2")).isTrue();
         assertThat(fixture.registry.startupRecoveredWaitGroupRunIds()).containsExactly("run-2");
         assertThat(fixture.registry.startupResidueBlockedFor(SchedulerVersion.DUAL_POOL_V2.name())).isFalse();
@@ -162,6 +183,75 @@ class DualPoolRunAdmissionRegistryTest {
                 .containsEntry("recoveredWaitGroupRunCount", 1)
                 .containsEntry("requeuedAbandonedClaimTotal", 1L)
                 .containsEntry("isolatedRunCount", 0);
+    }
+
+    /**
+     * 一条 V2 的 Run 下面混着一行 V1 的未完成分段：整条 Run 隔离，那一行也不会被别的版本领走。
+     *
+     * <p>扫描按 Run 的版本取行（行自己的版本不参与筛选），所以这行读得出来；逐行比对时发现
+     * 版本不一致，就没法证明「这条 Run 的未完成分段都属于这一版」，只能隔离这一条 Run。</p>
+     */
+    @Test
+    void aRunWhoseResidueCarriesAnotherVersionsRowIsIsolatedAsAWhole() {
+        Fixture fixture = new Fixture();
+        NodeWorkItem v2Row = item("run-2", 3, "todo-1", 0, 0);
+        v2Row.setState(NodeWorkItemState.RUNNABLE.name());
+        v2Row.setClaimEpoch(0);
+        v2Row.setContextVersion(7L);
+        v2Row.setRunControlVersion(2L);
+        v2Row.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        NodeWorkItem v1Row = item("run-2", 3, "todo-2", 0, 0);
+        v1Row.setState(NodeWorkItemState.CLAIMED.name());
+        v1Row.setClaimEpoch(1);
+        v1Row.setContextVersion(7L);
+        v1Row.setRunControlVersion(2L);
+        v1Row.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V1.name());
+        fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(v2Row, v1Row));
+        fixture.run(waitGroupRun(AgentRunStatus.EXECUTING));
+
+        fixture.registry.detectStartupResidue();
+
+        assertThat(fixture.isolationReasonOf("run-2")).isEqualTo("item_scheduler_version_mismatch");
+        assertThat(fixture.registry.isAdmitted("run-2")).isFalse();
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+        assertThat(fixture.registry.reserveForRecovery("run-2").admitted()).isFalse();
+        verify(fixture.workItems, never()).requeueAbandonedClaim(any(), any(), any(), any());
+        verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
+        assertThat(fixture.registry.startupResidueBlockedFor(SchedulerVersion.DUAL_POOL_V2.name()))
+                .as("说清不的是这一条 Run，不是整个版本：别的 Run 照常").isFalse();
+    }
+
+    /**
+     * 父 Run 已经进终态、收口又没能证明那些分段也已终结：隔离这一条，不许借恢复接回执行链。
+     *
+     * <p>终态 Run 没有执行权。收口失败时如果落进普通恢复流程，它会被当成「说得清的遗留」重新取得
+     * 租约与业务名额，接回来继续跑一张已经结束的图。</p>
+     */
+    @Test
+    void terminalResidueThatCannotBeClosedIsIsolatedInsteadOfRecovered() {
+        Fixture fixture = new Fixture();
+        NodeWorkItem left = item("run-2", 3, "todo-1", 0, 0);
+        left.setState(NodeWorkItemState.CLAIMED.name());
+        left.setClaimEpoch(2);
+        left.setContextVersion(7L);
+        left.setRunControlVersion(2L);
+        left.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(left));
+        fixture.run(waitGroupRun(AgentRunStatus.FAILED));
+        when(fixture.workItems.listUnfinishedByRun("run-2")).thenReturn(List.of(left));
+        when(fixture.workItems.markStale(any(), anyLong(), anyLong(), anyString()))
+                .thenReturn(NodeWorkItemMutationResult.rejected(NodeWorkItemRejection.of(
+                        NodeWorkItemRejectionReason.CONDITION_MISMATCH, left.identity(),
+                        new NodeWorkItemVersions(7L, 2L, 2), null)));
+        when(fixture.workItems.findByIdentity(left.identity())).thenReturn(Optional.of(left));
+
+        fixture.registry.detectStartupResidue();
+
+        assertThat(fixture.isolationReasonOf("run-2")).isEqualTo("run_status_not_recoverable");
+        assertThat(fixture.registry.isAdmitted("run-2")).isFalse();
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+        verify(fixture.workItems, never()).requeueAbandonedClaim(any(), any(), any(), any());
+        verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
     }
 
     @Test
@@ -184,7 +274,7 @@ class DualPoolRunAdmissionRegistryTest {
         assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
         assertThat(fixture.registry.reserveForRecovery("run-2").admitted()).isFalse();
         verify(fixture.workItems, never()).requeueAbandonedClaim(
-                any(), anyInt(), anyLong(), anyLong());
+                any(), any(), any(), any());
         verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
         assertThat(fixture.isolationReasonOf("run-2")).isEqualTo("item_plan_generation_stale");
     }
@@ -233,7 +323,7 @@ class DualPoolRunAdmissionRegistryTest {
                 .containsEntry("leaseHeldElsewhereTotal", 1L)
                 .containsEntry("isolatedRunCount", 0);
         verify(fixture.workItems, never()).requeueAbandonedClaim(
-                any(), anyInt(), anyLong(), anyLong());
+                any(), any(), any(), any());
     }
 
     @Test
@@ -248,7 +338,7 @@ class DualPoolRunAdmissionRegistryTest {
         fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(claimed));
         fixture.run(waitGroupRun(AgentRunStatus.EXECUTING));
         fixture.leaseAcquired();
-        when(fixture.workItems.requeueAbandonedClaim(any(), anyInt(), anyLong(), anyLong()))
+        when(fixture.workItems.requeueAbandonedClaim(any(), any(), any(), any()))
                 .thenReturn(NodeWorkItemMutationResult.rejected(NodeWorkItemRejection.of(
                         NodeWorkItemRejectionReason.CONDITION_MISMATCH,
                         claimed.identity(), new NodeWorkItemVersions(7L, 2L, 2), null)));
@@ -298,26 +388,29 @@ class DualPoolRunAdmissionRegistryTest {
         private Fixture() {
             permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 4);
             when(identity.value()).thenReturn("test-instance");
-            when(workItems.countUnfinishedBySchedulerVersion(SchedulerVersion.DUAL_POOL_V1)).thenReturn(0);
-            when(workItems.countUnfinishedBySchedulerVersion(SchedulerVersion.DUAL_POOL_V2)).thenReturn(0);
+            when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V1)).thenReturn(0);
+            when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2)).thenReturn(0);
             when(leaseStore.find(anyString())).thenReturn(Optional.empty());
+            // 默认这条 Run 的服务所有权取得得到；「在别人手上」的用例再单独把这一条改掉。
+            when(leaseStore.acquire(anyString(), anyString(), any())).thenAnswer(invocation ->
+                    Optional.of(new RunServiceLease(invocation.getArgument(0, String.class), "test-instance",
+                            1L, OffsetDateTime.now(), OffsetDateTime.now(),
+                            OffsetDateTime.now().plusMinutes(2))));
             registry = new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L);
         }
 
         private void residue(SchedulerVersion version, List<NodeWorkItem> items) {
-            when(workItems.countUnfinishedBySchedulerVersion(version)).thenReturn(items.size());
-            when(workItems.listUnfinishedBySchedulerVersion(eq(version), anyInt())).thenReturn(items);
+            when(workItems.countUnfinishedByRunSchedulerVersion(version)).thenReturn(items.size());
+            when(workItems.listUnfinishedByRunSchedulerVersion(eq(version), anyInt())).thenReturn(items);
         }
 
         private void run(AgentRun run) {
             when(runs.findById(run.getId())).thenReturn(run);
         }
 
+        /** 放回领取态这一段答「放回去了」；服务所有权取得得到已经是这个替身的默认。 */
         private void leaseAcquired() {
-            when(leaseStore.acquire(anyString(), anyString(), any())).thenReturn(
-                    Optional.of(new RunServiceLease("run-2", "test-instance", 1L,
-                            OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
-            when(workItems.requeueAbandonedClaim(any(), anyInt(), anyLong(), anyLong()))
+            when(workItems.requeueAbandonedClaim(any(), any(), any(), any()))
                     .thenReturn(NodeWorkItemMutationResult.success());
         }
 

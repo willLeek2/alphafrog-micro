@@ -1,5 +1,7 @@
 package world.willfrog.agent.platform.coordination;
 
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
+
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -26,9 +28,12 @@ public interface RunCoordinationStore {
      *
      * @param expectedPlanGeneration  这一轮开始时读到的计划代际；父 Run 或资格记录任一已经变了就返回 false
      * @param expectedCoordinationRound 这一轮开始时读到的最近协调轮次
+     * @param fence 此刻的服务所有权凭据：这四类推进都是 Run 级写入，只有现在还在服务这条 Run 的
+     *              进程写得进去；凭据为空或已经换人，写入影响 0 行
      */
     boolean deferFor(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt,
-                     int expectedPlanGeneration, long expectedCoordinationRound);
+                     int expectedPlanGeneration, long expectedCoordinationRound,
+                     ServiceOwnershipFence fence);
 
     /**
      * 记一次 Run 协调成功推进：清掉延期原因、把最近协调轮次改成这一轮、连续未获协调轮数归零。
@@ -38,7 +43,8 @@ public interface RunCoordinationStore {
      * @param expectedPlanGeneration 这一回合开始时读到的计划代际；父 Run 或资格记录任一已经变了就返回
      *                               false，计划推进之后的旧回合不许清延期原因、不许改轮转位置
      */
-    boolean markCoordinationServed(String runId, long roundNumber, int expectedPlanGeneration);
+    boolean markCoordinationServed(String runId, long roundNumber, int expectedPlanGeneration,
+                                   ServiceOwnershipFence fence);
 
     /**
      * 记一次节点派发成功推进：把最近派发轮次改成这一轮、连续未获派发轮数归零。
@@ -48,7 +54,20 @@ public interface RunCoordinationStore {
      *
      * @param expectedPlanGeneration 这一回合开始时读到的计划代际；条件与协调那一组相同</p>
      */
-    boolean markDispatchServed(String runId, long roundNumber, int expectedPlanGeneration);
+    boolean markDispatchServed(String runId, long roundNumber, int expectedPlanGeneration,
+                               ServiceOwnershipFence fence);
+
+    /**
+     * 旧版本 Run 交给旧入口这一步的记账：与 {@link #markCoordinationServed} 同形，但不带服务所有权凭据。
+     *
+     * <p>它写的是「本进程刚把这条旧 Run 交给旧入口」这件事，双池这一层对旧版本 Run 从来没有所有权，
+     * 拿不出凭据也不该被要求拿出凭据；语句在映射文件里单独一条，事项清楚。</p>
+     */
+    boolean markHandoffServed(String runId, long roundNumber, int expectedPlanGeneration);
+
+    /** 旧版本候选按所有权原因推后的记账：同上，不带服务所有权凭据。 */
+    boolean deferHandoff(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt,
+                         int expectedPlanGeneration, long expectedCoordinationRound);
 
     /**
      * 把计划代际同步到资格记录上，让提醒去重键与 Run 主记录保持一致。
@@ -56,7 +75,7 @@ public interface RunCoordinationStore {
      * <p>只在前移时生效：调用方声明的这一代必须是 Run 主表上的当前一代，且必须比记录里的新；
      * 拿着旧代际来写、或者想让代际倒退，都返回 false 且不写。</p>
      */
-    boolean syncPlanGeneration(String runId, int planGeneration);
+    boolean syncPlanGeneration(String runId, int planGeneration, ServiceOwnershipFence fence);
 
     /**
      * 取这一轮可以被协调的 Run：全局一份候选，不按调度器版本分池——旧版本、V1、V2 一起排序竞争，

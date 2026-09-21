@@ -23,8 +23,13 @@ public interface NodeWorkItemMapper {
     /**
      * 创建一条工作项。同一个身份已经有一行时返回 0（唯一约束上 {@code DO NOTHING}），
      * 不是异常：条件更新管不了「同一个身份出现两行」，这条唯一约束才是那道闸。
+     *
+     * <p>它同时是 Run 级写入：同一句里核服务所有权（持有人 + 代际号 + 未过期），
+     * 没有凭据或者凭据已经被换掉时返回 0。</p>
      */
-    int insert(NodeWorkItem item);
+    int insert(@Param("item") NodeWorkItem item,
+               @Param("ownerInstanceId") String ownerInstanceId,
+               @Param("fencingToken") long fencingToken);
 
     /** 按五个身份字段读一行。 */
     NodeWorkItem findByIdentity(@Param("runId") String runId,
@@ -53,7 +58,9 @@ public interface NodeWorkItemMapper {
      * 条件领取：状态必须是可运行，三类期望版本（计划代际、上下文版本、控制版本）必须匹配。
      * 领取成功把领取代际加一并返回新值；返回 {@code null} 表示这次没领到。
      */
-    Integer claim(@Param("runId") String runId,
+    Integer claim(@Param("ownerInstanceId") String ownerInstanceId,
+                  @Param("fencingToken") long fencingToken,
+                  @Param("runId") String runId,
                   @Param("planGeneration") int planGeneration,
                   @Param("nodeId") String nodeId,
                   @Param("nodeAttempt") int nodeAttempt,
@@ -147,10 +154,12 @@ public interface NodeWorkItemMapper {
                                   @Param("operationId") String operationId);
 
     /**
-     * 把一段死在「已领取/执行中」的分段放回可领取状态（启动恢复专用）。
+     * 把一段死在「已领取/执行中」的分段放回可领取状态（启动恢复与遗留接管专用）。
      *
-     * <p>代际在这里加一：旧领取者再提交结果时代际对不上，写不进去。调用方必须先拿到这条 Run 的
-     * 服务租约——那才是「旧执行者已经不在了」的凭据；领取租约到期本身不算凭据。</p>
+     * <p>代际在这里加一：旧领取者再提交结果时代际对不上，写不进去。这条语句自己核对两件事，而且
+     * 在同一条写入里核对：调用方此刻仍持有这条 Run 的服务租约且令牌没被换掉，以及父 Run 的版本、
+     * 计划代际、控制版本与状态都还是调用方读到的样子。先查后写会在两次操作之间留下时间窗，
+     * 那段时间里别的进程可能已经接手。</p>
      */
     int requeueAbandonedClaim(@Param("runId") String runId,
                               @Param("planGeneration") int planGeneration,
@@ -159,7 +168,10 @@ public interface NodeWorkItemMapper {
                               @Param("segmentSequence") int segmentSequence,
                               @Param("contextVersion") long contextVersion,
                               @Param("runControlVersion") long runControlVersion,
-                              @Param("claimEpoch") int claimEpoch);
+                              @Param("claimEpoch") int claimEpoch,
+                              @Param("ownerInstanceId") String ownerInstanceId,
+                              @Param("fencingToken") long fencingToken,
+                              @Param("schedulerVersion") String schedulerVersion);
 
     /** 报执行失败：执行中 → 执行失败。只有执行基础设施自己出错走这条，工具返回的失败不算。 */
     int reportExecutionFailure(@Param("runId") String runId,
@@ -254,4 +266,17 @@ public interface NodeWorkItemMapper {
 
     /** 某个调度器版本下未完成的工作项数量。 */
     int countUnfinishedBySchedulerVersion(@Param("schedulerVersion") String schedulerVersion);
+
+    /**
+     * 按「Run 的调度器版本」取未完成分段：版本条件加在 Run 主表上，行自己的版本不参与筛选。
+     *
+     * <p>启动残留与遗留接管必须用这一条：按行版本先筛再分组，会让「这条 Run 的全部未完成分段
+     * 都属于这一版」变成永远为真的判断——被筛掉的行根本看不见。读全之后由调用方逐行比对版本。</p>
+     */
+    List<NodeWorkItem> listUnfinishedByRunSchedulerVersion(
+            @Param("schedulerVersion") String schedulerVersion,
+            @Param("limit") int limit);
+
+    /** 按 Run 的调度器版本统计未完成分段，与上面那条配套做「有没有读全」的核对。 */
+    int countUnfinishedByRunSchedulerVersion(@Param("schedulerVersion") String schedulerVersion);
 }

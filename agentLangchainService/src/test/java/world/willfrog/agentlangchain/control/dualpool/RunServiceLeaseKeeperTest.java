@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
@@ -36,15 +37,17 @@ class RunServiceLeaseKeeperTest {
     private static final String OWNER = "instance-under-test";
 
     private RunServiceLeaseStore leaseStore;
+    private DualPoolRunAdmissionRegistry admissionRegistry;
     private ProcessInstanceIdentity identity;
     private RunServiceLeaseKeeper keeper;
 
     @BeforeEach
     void setUp() {
         leaseStore = Mockito.mock(RunServiceLeaseStore.class);
+        admissionRegistry = Mockito.mock(DualPoolRunAdmissionRegistry.class);
         identity = Mockito.mock(ProcessInstanceIdentity.class);
         Mockito.lenient().when(identity.value()).thenReturn(OWNER);
-        keeper = new RunServiceLeaseKeeper(leaseStore, identity, 120L, 512, 40_000L);
+        keeper = new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, 120L, 512, 40_000L);
     }
 
     /** 平常一轮：清点几条、批量续几条，两边对上就不再逐条看。 */
@@ -80,6 +83,7 @@ class RunServiceLeaseKeeperTest {
         when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(1);
         when(leaseStore.renew(eq("run-mine"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
         when(leaseStore.renew(eq("run-taken"), eq(OWNER), eq(3L), any(Duration.class))).thenReturn(false);
+        when(admissionRegistry.revokeOwnership("run-taken", 3L)).thenReturn(true);
 
         assertThat(keeper.renewOwnedOnce()).isEqualTo(1);
 
@@ -87,7 +91,30 @@ class RunServiceLeaseKeeperTest {
                 .as("被接手的那一条记在读数里，能查")
                 .containsEntry("serviceLeaseOwnedLastRound", 2)
                 .containsEntry("serviceLeaseRenewedLastRound", 1)
-                .containsEntry("serviceLeaseLostTotal", 1L);
+                .containsEntry("serviceLeaseLostTotal", 1L)
+                .containsEntry("serviceLeaseLostRevokedTotal", 1L);
+        verify(admissionRegistry).revokeOwnership("run-taken", 3L);
+        verify(admissionRegistry, never()).revokeOwnership(eq("run-mine"), anyLong());
+    }
+
+    /**
+     * 撤销按代际号条件生效：本进程先被别人接手、之后又重新拿到这条 Run 时，旧代际号的撤销
+     * 不该把新的生命周期删掉。
+     */
+    @Test
+    void aRevocationThatDoesNotMatchTheCurrentTokenLeavesTheNewerLifecycleAlone() {
+        when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
+                .thenReturn(List.of(lease("run-back", 9L)));
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(0);
+        when(leaseStore.renew(eq("run-back"), eq(OWNER), eq(9L), any(Duration.class))).thenReturn(false);
+        when(admissionRegistry.revokeOwnership("run-back", 9L)).thenReturn(false);
+
+        keeper.renewOwnedOnce();
+
+        assertThat(keeper.snapshot())
+                .as("没撤掉的不算撤销数")
+                .containsEntry("serviceLeaseLostRevokedTotal", 0L);
+        verify(admissionRegistry).revokeOwnership("run-back", 9L);
     }
 
     /** 手上没有活租约时不发那条批量续期语句：每 40 秒白写一次没意义。 */
@@ -152,7 +179,8 @@ class RunServiceLeaseKeeperTest {
     /** 清点条数上限由配置给：一次只认领有界的一页，不把整张表读进内存。 */
     @Test
     void theOwnedListingIsBounded() {
-        RunServiceLeaseKeeper bounded = new RunServiceLeaseKeeper(leaseStore, identity, 60L, 7, 20_000L);
+        RunServiceLeaseKeeper bounded = new RunServiceLeaseKeeper(
+                leaseStore, admissionRegistry, identity, 60L, 7, 20_000L);
         when(leaseStore.listOwnedWithLiveRun(OWNER, 7)).thenReturn(List.of());
         bounded.renewOwnedOnce();
         verify(leaseStore).listOwnedWithLiveRun(OWNER, 7);

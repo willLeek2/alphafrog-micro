@@ -21,7 +21,10 @@ public enum NodeWorkItemRejectionReason {
     DUPLICATE_IDENTITY("同一个身份已经有一行"),
 
     /** 这一行不存在。 */
-    NOT_FOUND("这一行不存在");
+    NOT_FOUND("这一行不存在"),
+
+    /** 这条 Run 的服务所有权已经不在本进程：Run 级写入被语句里的所有权条件挡下。 */
+    OWNERSHIP_LOST("这条 Run 的服务所有权已经不在本进程");
 
     private final String detail;
 

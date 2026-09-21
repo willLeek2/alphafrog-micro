@@ -19,7 +19,9 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -70,6 +72,14 @@ public class DualPoolRunAdmissionRegistry {
     private final Set<String> startupRecoveredWaitGroupRunIds = ConcurrentHashMap.newKeySet();
     /** activeEpoch 是已持久化一轮的令牌；reservations 是尚未完成数据库条件更新的预留。 */
     private final Map<String, AdmissionState> admissionStates = new ConcurrentHashMap<>();
+    /**
+     * 本进程此刻服务一条 Run 的凭据：准入生命周期一建就绑定，丢了租约就按这个令牌条件撤销。
+     *
+     * <p>只有凭据在手才能推进这条 Run——协调、领取、Run 级写入都先看这里。租约本身在数据库里，
+     * 这里记的是「本进程认为自己据有哪一代」，两者一旦不一致就以数据库为准（写入会因条件不匹配落空）。
+     * </p>
+     */
+    private final Map<String, ServiceOwnershipFence> ownershipByRun = new ConcurrentHashMap<>();
     private final AtomicLong admissionEpochSequence = new AtomicLong();
     /** 启动扫描判定「说不清该怎么恢复」的 Run 与原因；只在启动扫描里写，受理层对这些 Run 一律拒绝。 */
     private final Map<String, String> isolatedRunReasons = new ConcurrentHashMap<>();
@@ -104,18 +114,6 @@ public class DualPoolRunAdmissionRegistry {
         this.serviceLeaseTtl = Duration.ofSeconds(Math.max(1L, serviceLeaseTtlSeconds));
     }
 
-    /** 兼容不需要启动恢复的窄单元测试。 */
-    public DualPoolRunAdmissionRegistry(SchedulerPermitLedger permitLedger,
-                                        NodeWorkItemStore workItemStore) {
-        this(permitLedger, workItemStore, null, null, null, 120L);
-    }
-
-    public DualPoolRunAdmissionRegistry(SchedulerPermitLedger permitLedger,
-                                        NodeWorkItemStore workItemStore,
-                                        AgentRunMapper runMapper) {
-        this(permitLedger, workItemStore, runMapper, null, null, 120L);
-    }
-
     /**
      * 两个双池版本的启动残留处理，一个版本一遍。
      *
@@ -131,13 +129,17 @@ public class DualPoolRunAdmissionRegistry {
     /**
      * 一个版本的启动残留处理：把该版本未完成的工作项读出来，按 Run 分组，逐条 Run 判定。
      *
+     * <p>扫描按「Run 的调度器版本」取行、行自己的版本不参与筛选：这一步读出来的就是这条 Run 的全部
+     * 未完成分段，逐条比对版本才有意义。按行版本先筛再分组会漏掉与 Run 版本不一致的那些行，
+     * 让「全部都属于这一版」这个判断永远为真。</p>
+     *
      * <p>两种结局分得很清。能归到具体 Run、只是证明不了它该怎么恢复的，只隔离这一条 Run：不占业务
      * 名额、不投递任何提示，恢复受理对它一律拒绝，其余 Run 照常。连归到哪条 Run 都做不到的（Run
      * 读不回来、行上的版本与 Run 对不上、扫描没有把该版本的未完成行读全），这个版本失败关闭，
      * 本进程不再接受该版本的新建。</p>
      */
     private void detectResidueFor(SchedulerVersion version) {
-        int residueCount = workItemStore.countUnfinishedBySchedulerVersion(version);
+        int residueCount = workItemStore.countUnfinishedByRunSchedulerVersion(version);
         if (residueCount == 0) {
             publishResidue(version, false, "no_residue", Map.of());
             return;
@@ -146,7 +148,7 @@ public class DualPoolRunAdmissionRegistry {
             publishResidue(version, true, "run_mapper_unavailable", Map.of());
             return;
         }
-        List<NodeWorkItem> scanned = workItemStore.listUnfinishedBySchedulerVersion(
+        List<NodeWorkItem> scanned = workItemStore.listUnfinishedByRunSchedulerVersion(
                 version, Math.max(1, residueCount));
         Map<String, List<NodeWorkItem>> itemsByRun = new LinkedHashMap<>();
         Set<NodeWorkItemIdentity> allIdentities = new LinkedHashSet<>();
@@ -232,9 +234,20 @@ public class DualPoolRunAdmissionRegistry {
                 || !identities.contains(anchorIdentity(runId, anchor))) {
             return false;
         }
+        ServiceOwnershipFence before = ownershipByRun.get(runId);
+        Optional<RunServiceLease> acquired = acquireOwnership(runId);
+        if (acquired.isEmpty()) {
+            // 所有权在别的进程手上：这条 Run 已经有人在服务，本进程不接手，也不算证明不了。
+            startupLeaseHeldElsewhere.incrementAndGet();
+            log.warn("这条 Run 的服务所有权在别人手上，不接手: runId={}", runId);
+            return true;
+        }
         knownRunIds.add(runId);
         if (!activateNewRun(runId)) {
             knownRunIds.remove(runId);
+            releaseOwnershipIfFreshlyTaken(runId,
+                    new ServiceOwnershipFence(acquired.get().ownerInstanceId(), acquired.get().fencingToken()),
+                    before != null);
             log.error("恢复长工具 Run 时无法重新取得业务许可: runId={}", runId);
             return false;
         }
@@ -255,12 +268,17 @@ public class DualPoolRunAdmissionRegistry {
             // 正在取消的图不该被接回来跑：它的分段由取消那一套收口。
             return "run_canceling";
         }
+        if (!recoverableStatus(run.getStatus())) {
+            // 终态（含父 Run 已终结但收口没成功那一种）不许借恢复重新拿到租约与业务名额：
+            // 它已经没有执行权，接回来只会在被拒之后污染许可与观测。
+            return "run_status_not_recoverable";
+        }
         if (run.getPlanGeneration() == null || run.getRunControlVersion() == null) {
             return "run_version_fields_missing";
         }
         Set<String> activeSegments = new LinkedHashSet<>();
         for (NodeWorkItem item : items) {
-            if (!SchedulerVersion.DUAL_POOL_V2.name().equals(item.getSchedulerVersion())) {
+            if (!run.getSchedulerVersion().equals(item.getSchedulerVersion())) {
                 return "item_scheduler_version_mismatch";
             }
             if (!run.getPlanGeneration().equals(item.getPlanGeneration())) {
@@ -305,10 +323,10 @@ public class DualPoolRunAdmissionRegistry {
         boolean alreadyMine = leaseStore.find(runId)
                 .map(existing -> instanceIdentity.value().equals(existing.ownerInstanceId()))
                 .orElse(false);
-        Optional<RunServiceLease> acquired = leaseStore.acquire(runId, instanceIdentity.value(), serviceLeaseTtl);
+        Optional<RunServiceLease> acquired = acquireOwnership(runId);
         if (acquired.isEmpty()) {
             startupLeaseHeldElsewhere.incrementAndGet();
-            log.warn("这条 Run 的服务所有权在别人手上，启动不接手: runId={}", runId);
+            log.warn("这条 Run 的服务所有权在别人手上，本进程不接手: runId={}", runId);
             return null;
         }
         if (!requeueAbandonedClaims(run, items)) {
@@ -332,11 +350,19 @@ public class DualPoolRunAdmissionRegistry {
      * 把死在领取态的分段放回可领取状态，并核对没有哪一条还留在领取态。
      *
      * <p>服务所有权就是「旧执行者已经不在了」的凭据；放回时代际加一，旧执行者万一还活着，
-     * 提交结果时会因为代际对不上被拒。</p>
+     * 提交结果时会因为代际对不上被拒。凭据本身也进语句：租约在两次操作之间到期并被别人接管时，
+     * 这一写会因所有权条件不匹配影响 0 行，而不是替新主人改行。</p>
      *
      * @return true 表示这条 Run 已经没有留在领取态的分段
      */
     private boolean requeueAbandonedClaims(AgentRun run, List<NodeWorkItem> items) {
+        SchedulerVersion version = SchedulerVersion.fromWire(run.getSchedulerVersion());
+        ServiceOwnershipFence fence = ownershipByRun.get(run.getId());
+        if (fence == null) {
+            // 没有凭据就不该走到这里：放回领取态是「我接手了」的动作，先有所有权再动手。
+            log.error("没有服务所有权凭据，拒绝放回领取态的分段: runId={}", run.getId());
+            return false;
+        }
         boolean clean = true;
         for (NodeWorkItem item : items) {
             NodeWorkItemState state = item.stateEnum();
@@ -344,8 +370,7 @@ public class DualPoolRunAdmissionRegistry {
                 continue;
             }
             NodeWorkItemMutationResult result = workItemStore.requeueAbandonedClaim(
-                    item.identity(), value(item.getClaimEpoch()), value(item.getContextVersion()),
-                    value(item.getRunControlVersion()));
+                    item.identity(), NodeWorkItemVersions.of(item), fence, version);
             if (result != null && result.applied()) {
                 requeuedAbandonedClaims.incrementAndGet();
                 continue;
@@ -569,8 +594,25 @@ public class DualPoolRunAdmissionRegistry {
         if (startupResidueBlockedFor(versionName)) {
             return false;
         }
+        // 先取得这条 Run 的服务所有权：一条 Run 同一时刻只由一个进程服务，这件事必须是数据库里的事实，
+        // 不能只是本进程的一个集合。拿不到说明别的进程正在服务它，这次不受理。
+        ServiceOwnershipFence before = ownershipByRun.get(runId);
+        Optional<RunServiceLease> acquired = acquireOwnership(runId);
+        if (acquired.isEmpty()) {
+            log.error("这条 Run 的服务所有权在别人手上，本进程不受理: runId={} version={}", runId, versionName);
+            return false;
+        }
+        boolean alreadyMine = before != null;
         knownRunIds.add(runId);
-        return activateNewRun(runId);
+        if (activateNewRun(runId)) {
+            return true;
+        }
+        // 业务名额没拿到：把刚取得的租约让出去，别握着租约空占这条 Run。
+        knownRunIds.remove(runId);
+        releaseOwnershipIfFreshlyTaken(runId,
+                new ServiceOwnershipFence(acquired.get().ownerInstanceId(), acquired.get().fencingToken()),
+                alreadyMine);
+        return false;
     }
 
     /**
@@ -585,19 +627,40 @@ public class DualPoolRunAdmissionRegistry {
         releaseBusinessPermit(runId);
     }
 
-    /** 已经通过持久锚点和工作项身份校验的恢复路径重新取得业务许可。 */
+    /**
+     * 工具作业那几条路径（提升、提交、中断）把一条 Run 重新接回执行链时用：它们手里有一条持久事实
+     * （工具锚点与工作项身份），但这不是「凭一次扫描就执行」的理由，所以仍然要过两道门——
+     * 这条 Run 没有被启动扫描隔离，以及本进程能取得它的服务所有权。
+     *
+     * <p>遗留 Run 的接管不走这里：普通扫描用的是 {@link #takeoverLegacyRun(String)}，
+     * 那条路会把 Run 与它全部未完成分段读回来，按与启动恢复同一套证明重新判定。</p>
+     */
     public boolean restorePersistedToolJob(String runId) {
         if (runId == null || runId.isBlank()) {
             return false;
         }
-        knownRunIds.add(runId);
+        String isolation = isolatedRunReasons.get(runId);
+        if (isolation != null) {
+            log.warn("这条 Run 被隔离，工具作业的持久事实也不足以受理它: runId={} reason={}", runId, isolation);
+            return false;
+        }
         if (isAdmitted(runId)) {
             return true;
         }
+        ServiceOwnershipFence before = ownershipByRun.get(runId);
+        Optional<RunServiceLease> acquired = acquireOwnership(runId);
+        if (acquired.isEmpty()) {
+            log.warn("这条 Run 的服务所有权在别人手上，工具作业这条路径不受理: runId={}", runId);
+            return false;
+        }
+        knownRunIds.add(runId);
         if (activateNewRun(runId)) {
             return true;
         }
         knownRunIds.remove(runId);
+        releaseOwnershipIfFreshlyTaken(runId,
+                new ServiceOwnershipFence(acquired.get().ownerInstanceId(), acquired.get().fencingToken()),
+                before != null);
         return false;
     }
 
@@ -615,6 +678,11 @@ public class DualPoolRunAdmissionRegistry {
         if (isolation != null) {
             // 启动扫描判定这条 Run 的恢复事实说不清：不许借着一次恢复受理把它接回执行链。
             log.warn("这条 Run 在启动时被隔离，恢复受理一律拒绝: runId={} reason={}", runId, isolation);
+            return Admission.rejected();
+        }
+        if (!holdsOwnership(runId) && acquireOwnership(runId).isEmpty()) {
+            // 所有权在别人手上：这次恢复消费不该发生，也不该占预留。
+            log.warn("这条 Run 的服务所有权在别人手上，恢复受理拒绝: runId={}", runId);
             return Admission.rejected();
         }
         knownRunIds.add(runId);
@@ -635,6 +703,12 @@ public class DualPoolRunAdmissionRegistry {
      */
     public Admission admitExistingRunWithLease(String runId) {
         if (!knownRunIds.contains(runId)) {
+            return Admission.rejected();
+        }
+        if (!holdsOwnership(runId)) {
+            // 没有服务所有权就不该受理：受理之后每一次推进都会因为凭据不匹配落空，
+            // 与其造一个写不动的生命周期，不如在这里就拒绝。
+            log.error("没有服务所有权凭据，拒绝受理这条 Run: runId={}", runId);
             return Admission.rejected();
         }
         long reservationEpoch = admissionEpochSequence.incrementAndGet();
@@ -772,11 +846,176 @@ public class DualPoolRunAdmissionRegistry {
         snapshot.put("recoveredToolJobRunCount", startupRecoveredRunIds.size());
         snapshot.put("recoveredWaitGroupRunCount", startupRecoveredWaitGroupRunIds.size());
         snapshot.put("isolatedRunCount", isolatedRunReasons.size());
+        // 运行期（遗留接管）也会隔离：这里报的是此刻全部被隔离的 Run 与原因，不只是启动时算出来的。
+        snapshot.put("isolatedRunReasons", Map.copyOf(isolatedRunReasons));
+        // 本进程此刻服务着哪些 Run：凭据里的代际号是「第几次服务」，换人之后旧的写不进去。
+        Map<String, String> owned = new LinkedHashMap<>();
+        ownershipByRun.forEach((runId, fence) -> owned.put(runId, fence.describe()));
+        snapshot.put("ownedRunCount", owned.size());
+        snapshot.put("ownedRuns", owned);
         snapshot.put("requeuedAbandonedClaimTotal", requeuedAbandonedClaims.get());
         snapshot.put("requeueFailureTotal", requeueFailures.get());
         snapshot.put("leaseHeldElsewhereTotal", startupLeaseHeldElsewhere.get());
         snapshot.put("admissionUnavailableTotal", startupAdmissionUnavailable.get());
         return snapshot;
+    }
+
+    /**
+     * 取得这条 Run 的服务所有权，并把凭据绑到本进程这次准入上。
+     *
+     * <p>拿不到（别人正拿着且没过期）就返回空：那条 Run 此刻归别的进程服务，本进程既不能受理它，
+     * 也不能在没有所有权的情况下推进它。凭据里的代际号是「第几次服务」：同一个进程后来重新取得
+     * 也会拿到新的号，写操作只认号，旧生命周期在换人之后写不动任何一行。</p>
+     */
+    private Optional<RunServiceLease> acquireOwnership(String runId) {
+        if (leaseStore == null || instanceIdentity == null) {
+            log.error("没有服务所有权存储，双池的受理做不了: runId={}", runId);
+            return Optional.empty();
+        }
+        Optional<RunServiceLease> acquired = leaseStore.acquire(runId, instanceIdentity.value(), serviceLeaseTtl);
+        acquired.ifPresent(lease -> ownershipByRun.put(runId,
+                new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken())));
+        return acquired;
+    }
+
+    /** 本进程此刻是不是这条 Run 的服务方。 */
+    public boolean holdsOwnership(String runId) {
+        return runId != null && ownershipByRun.containsKey(runId);
+    }
+
+    /** 本进程此刻对这条 Run 的服务所有权凭据；协调、领取与 Run 级写入都从这里取。 */
+    public Optional<ServiceOwnershipFence> currentOwnershipFence(String runId) {
+        return runId == null ? Optional.empty() : Optional.ofNullable(ownershipByRun.get(runId));
+    }
+
+    /**
+     * 续期循环发现这条 Run 的所有权已经不在本进程时调用。
+     *
+     * <p>按令牌条件撤销：只有当前绑定的代际号就是调用方说的那一代才撤。同一进程后来重新取得这条 Run
+     * 时会绑定新的号，旧续期回调带着旧号回来就不该把新的生命周期删掉。</p>
+     *
+     * @return true 表示确实撤销了这一次生命周期
+     */
+    public boolean revokeOwnership(String runId, long fencingToken) {
+        if (runId == null || runId.isBlank()) {
+            return false;
+        }
+        ServiceOwnershipFence current = ownershipByRun.get(runId);
+        if (current == null || current.fencingToken() != fencingToken) {
+            return false;
+        }
+        long epoch = currentAdmissionEpoch(runId);
+        ownershipByRun.remove(runId);
+        knownRunIds.remove(runId);
+        if (epoch >= 0L) {
+            releaseBusinessPermitIfCurrent(runId, epoch);
+        } else {
+            // 还停在预留上（数据库条件更新没成功）：按 runId 清掉预留与它占的名额。
+            releaseBusinessPermit(runId);
+        }
+        log.warn("这条 Run 的服务所有权已经不在本进程，撤销本进程的准入: runId={} fence={}",
+                runId, current.describe());
+        return true;
+    }
+
+    /**
+     * 普通扫描遇到「库里有资格记录、本进程还没受理」的 Run 时走这里：接管一条遗留 Run。
+     *
+     * <p>它不是「凭一次扫描重新准入」：接管要把 Run 与它全部未完成分段读回来，按与启动恢复同一套
+     * 证明判定——旧骨架认 Run 级长工具锚点与唯一未完成分段，完整 DAG 认分段行本身。证明不了就隔离
+     * （不占名额、不投递提示），证明得了才取租约、把死在领取态的分段放回可领取、再占业务名额。
+     * 这样启动扫描放过的 Run 不会在下一轮普通扫描里绕过同一套判定。</p>
+     *
+     * @return true 表示这条 Run 现在归本进程服务
+     */
+    public boolean takeoverLegacyRun(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return false;
+        }
+        if (isAdmitted(runId)) {
+            return true;
+        }
+        String isolation = isolatedRunReasons.get(runId);
+        if (isolation != null) {
+            log.warn("这条 Run 已经被隔离，普通扫描不接手: runId={} reason={}", runId, isolation);
+            return false;
+        }
+        if (runMapper == null) {
+            log.error("没有 Run 读取入口，遗留接管做不了: runId={}", runId);
+            return false;
+        }
+        AgentRun run = runMapper.findById(runId);
+        if (run == null) {
+            log.error("遗留接管读不到这条 Run: runId={}", runId);
+            return false;
+        }
+        SchedulerVersion version;
+        try {
+            version = SchedulerVersion.fromWire(run.getSchedulerVersion());
+        } catch (RuntimeException unknownVersion) {
+            log.error("遗留接管的 Run 版本认不出来: runId={} schedulerVersion={}",
+                    runId, run.getSchedulerVersion(), unknownVersion);
+            return false;
+        }
+        if (!version.isDualPoolFamily()) {
+            // 旧引擎的 Run 不归这套接管：它有自己的扫描与恢复。
+            return false;
+        }
+        if (startupResidueBlockedFor(version.name())) {
+            log.error("这一版在启动时被判为失败关闭，普通扫描不接管: runId={} version={}", runId, version);
+            return false;
+        }
+        List<NodeWorkItem> items = workItemStore.listUnfinishedByRun(runId);
+        if (version == SchedulerVersion.DUAL_POOL_V1) {
+            if (!recoverAnchoredToolJobRun(run, identitiesOf(items))) {
+                log.error("这条旧骨架 Run 的锚点证明不成立，普通扫描不接手: runId={} 未完成分段={}",
+                        runId, items.size());
+                return false;
+            }
+            return isAdmitted(runId);
+        }
+        String refusal = waitGroupRunRecoveryRefusal(run, items);
+        if (refusal != null) {
+            isolate(runId, version, refusal, new LinkedHashMap<>());
+            return false;
+        }
+        String recoveryRefusal = recoverWaitGroupRun(run, items);
+        if (recoveryRefusal != null) {
+            isolate(runId, version, recoveryRefusal, new LinkedHashMap<>());
+            return false;
+        }
+        return isAdmitted(runId);
+    }
+
+    /** 一条 Run 现在还能接着跑的状态：非终态、也不是「取消中」。 */
+    private boolean recoverableStatus(AgentRunStatus status) {
+        if (status == null) {
+            return false;
+        }
+        return switch (status) {
+            case RECEIVED, PLANNING, EXECUTING, WAITING, SUMMARIZING, WAITING_TOOL_JOB -> true;
+            case COMPLETED, PARTIAL, FAILED, CANCELED, EXPIRED, CANCELING -> false;
+        };
+    }
+
+    private Set<NodeWorkItemIdentity> identitiesOf(List<NodeWorkItem> items) {
+        Set<NodeWorkItemIdentity> identities = new LinkedHashSet<>();
+        for (NodeWorkItem item : items) {
+            if (item != null) {
+                identities.add(item.identity());
+            }
+        }
+        return identities;
+    }
+
+    /** 刚取得、还没用上的租约要让出去：握着不服务的租约会被续期循环一直续住，别人接不了手。 */
+    private void releaseOwnershipIfFreshlyTaken(String runId, ServiceOwnershipFence fence, boolean alreadyMine) {
+        ownershipByRun.remove(runId);
+        if (alreadyMine || fence == null) {
+            return;
+        }
+        boolean released = leaseStore.release(runId, fence.ownerInstanceId(), fence.fencingToken());
+        log.warn("这条 Run 没有受理就先把刚取得的服务所有权让出去: runId={} released={}", runId, released);
     }
 
     /** 仅在创建后的调度入口失败时撤销；正常终态仍保留，以便同进程追问继续走原版本。 */

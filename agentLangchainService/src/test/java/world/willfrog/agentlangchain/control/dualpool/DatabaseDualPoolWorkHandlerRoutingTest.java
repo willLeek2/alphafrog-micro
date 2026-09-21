@@ -117,8 +117,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 .as("旧版本不交给双池那两个池")
                 .isEmpty();
         verify(legacyHandoff).handOff("run-legacy");
-        verify(coordinationStore).markCoordinationServed(eq("run-legacy"), anyLong(), eq(0));
-        verify(coordinationStore, never()).deferFor(anyString(), any(), any(), anyInt(), anyLong());
+        verify(coordinationStore).markHandoffServed(eq("run-legacy"), anyLong(), eq(0));
+        verify(coordinationStore, never()).deferHandoff(anyString(), any(), any(), anyInt(), anyLong());
         assertThat(handler.routingSnapshot())
                 .containsEntry("legacyHandedOffTotal", 1L)
                 .containsEntry("legacyDeferredTotal", 0L)
@@ -138,7 +138,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
 
         assertThat(handler.scanRunnableRuns(10)).isEmpty();
         verify(legacyHandoff, never()).handOff(anyString());
-        verify(coordinationStore).deferFor(eq("run-legacy-busy"),
+        verify(coordinationStore).deferHandoff(eq("run-legacy-busy"),
                 eq(RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE), any(), eq(0), eq(0L));
         assertThat(handler.routingSnapshot()).containsEntry("legacyDeferredTotal", 1L);
     }
@@ -151,7 +151,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         when(legacyHandoff.handOff("run-legacy-stuck")).thenReturn(false);
 
         handler.scanRunnableRuns(10);
-        verify(coordinationStore).deferFor(eq("run-legacy-stuck"),
+        verify(coordinationStore).deferHandoff(eq("run-legacy-stuck"),
                 eq(RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE), any(), eq(0), eq(0L));
         assertThat(handler.routingSnapshot())
                 .containsEntry("legacyHandedOffTotal", 0L)
@@ -229,7 +229,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         when(runMapper.findById("run-v2")).thenReturn(run);
         ownedByThisProcess("run-v2");
         when(admissionRegistry.isAdmitted("run-v2")).thenReturn(false);
-        when(admissionRegistry.restorePersistedToolJob("run-v2")).thenReturn(false);
+        when(admissionRegistry.takeoverLegacyRun("run-v2")).thenReturn(false);
 
         assertThat(handler.scanRunnableRuns(10))
                 .as("库里有资格记录、持久事实也不足以恢复：不凭一次扫描就执行")
@@ -246,7 +246,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         when(leaseStore.acquire(eq("run-dead-peer"), anyString(), any(Duration.class)))
                 .thenReturn(Optional.of(new RunServiceLease("run-dead-peer", "test-instance", 2L,
                         OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
-        when(admissionRegistry.restorePersistedToolJob("run-dead-peer")).thenReturn(true);
+        when(admissionRegistry.takeoverLegacyRun("run-dead-peer")).thenReturn(true);
 
         assertThat(handler.scanRunnableRuns(10))
                 .extracting(RunCoordinationHint::runId)

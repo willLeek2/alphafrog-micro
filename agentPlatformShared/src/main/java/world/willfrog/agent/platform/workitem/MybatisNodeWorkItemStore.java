@@ -25,10 +25,11 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     private final NodeWorkItemMapper mapper;
 
     @Override
-    public NodeWorkItemMutationResult create(NodeWorkItem item) {
+    public NodeWorkItemMutationResult create(NodeWorkItem item, ServiceOwnershipFence fence) {
         if (item == null) {
             throw new IllegalArgumentException("工作项不能为空");
         }
+        requireFence(fence);
         if (item.getSchedulerVersion() == null || item.getSchedulerVersion().isBlank()) {
             throw new IllegalArgumentException("工作项必须带调度器版本，不能靠默认值兜");
         }
@@ -39,14 +40,25 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
             item.setClaimEpoch(0);
         }
         item.setPayloadJson(objectPayload(item.getPayloadJson()));
-        int rows = mapper.insert(item);
+        int rows = mapper.insert(item, fence.ownerInstanceId(), fence.fencingToken());
         if (rows == 1) {
             return NodeWorkItemMutationResult.success();
         }
         NodeWorkItemIdentity identity = NodeWorkItemIdentity.of(item);
-        log.warn("同一个身份已经有工作项，创建被唯一约束拒绝：{}", identity.describe());
+        // 影响 0 行有两种可能：同一个身份已经有一行（唯一约束挡下），或者这条 Run 的服务所有权
+        // 已经不在本进程手上（语句里的所有权条件挡下）。回读一次把两者分开，不然日志会指错方向。
+        if (mapper.findByIdentity(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence()) != null) {
+            log.warn("同一个身份已经有工作项，创建被唯一约束拒绝：{}", identity.describe());
+            return NodeWorkItemMutationResult.rejected(NodeWorkItemRejection.of(
+                    NodeWorkItemRejectionReason.DUPLICATE_IDENTITY, identity,
+                    NodeWorkItemVersions.of(item), null));
+        }
+        log.error("这条 Run 的服务所有权已经不在本进程，工作项创建被拒: fence={} identity={}",
+                fence.describe(), identity.describe());
         return NodeWorkItemMutationResult.rejected(NodeWorkItemRejection.of(
-                NodeWorkItemRejectionReason.DUPLICATE_IDENTITY, identity, NodeWorkItemVersions.of(item), null));
+                NodeWorkItemRejectionReason.OWNERSHIP_LOST, identity, NodeWorkItemVersions.of(item),
+                fence.describe()));
     }
 
     @Override
@@ -71,11 +83,14 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                                              NodeWorkItemVersions expected,
                                              String claimant,
                                              Duration lease,
-                                             SchedulerVersion schedulerVersion) {
+                                             SchedulerVersion schedulerVersion,
+                                             ServiceOwnershipFence fence) {
         requireVersion(schedulerVersion);
         requireClaimant(claimant);
+        requireFence(fence);
         OffsetDateTime leaseExpiresAt = leaseExpiry(lease);
-        Integer newEpoch = mapper.claim(identity.runId(), identity.planGeneration(), identity.nodeId(),
+        Integer newEpoch = mapper.claim(fence.ownerInstanceId(), fence.fencingToken(),
+                identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), schedulerVersion.name(),
                 expected.contextVersion(), expected.runControlVersion(), claimant, leaseExpiresAt);
         if (newEpoch == null) {
@@ -153,19 +168,21 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
 
     @Override
     public NodeWorkItemMutationResult requeueAbandonedClaim(NodeWorkItemIdentity identity,
-                                                            int expectedClaimEpoch,
-                                                            long contextVersion,
-                                                            long runControlVersion) {
+                                                            NodeWorkItemVersions versions,
+                                                            ServiceOwnershipFence fence,
+                                                            SchedulerVersion schedulerVersion) {
+        requireVersion(schedulerVersion);
+        requireFence(fence);
         int rows = mapper.requeueAbandonedClaim(identity.runId(), identity.planGeneration(),
                 identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(),
-                contextVersion, runControlVersion, expectedClaimEpoch);
+                versions.contextVersion(), versions.runControlVersion(), versions.claimEpoch(),
+                fence.ownerInstanceId(), fence.fencingToken(), schedulerVersion.name());
         if (rows == 1) {
-            log.warn("启动恢复把一段被放弃的分段放回可领取: {} 原代际 {}", identity.describe(), expectedClaimEpoch);
+            log.warn("恢复把一段被放弃的分段放回可领取: {} 原代际 {}", identity.describe(),
+                    versions.claimEpoch());
             return NodeWorkItemMutationResult.success();
         }
-        return rejectWithEpochCheck(identity,
-                new NodeWorkItemVersions(contextVersion, runControlVersion, expectedClaimEpoch),
-                expectedClaimEpoch, null);
+        return rejectWithEpochCheck(identity, versions, versions.claimEpoch(), null);
     }
 
     @Override
@@ -313,6 +330,22 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         return mapper.countUnfinishedBySchedulerVersion(schedulerVersion.name());
     }
 
+    @Override
+    public List<NodeWorkItem> listUnfinishedByRunSchedulerVersion(SchedulerVersion schedulerVersion,
+                                                                  int limit) {
+        requireVersion(schedulerVersion);
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.listUnfinishedByRunSchedulerVersion(schedulerVersion.name(), limit);
+    }
+
+    @Override
+    public int countUnfinishedByRunSchedulerVersion(SchedulerVersion schedulerVersion) {
+        requireVersion(schedulerVersion);
+        return mapper.countUnfinishedByRunSchedulerVersion(schedulerVersion.name());
+    }
+
     /**
      * 提交类语句被拒时，区分「这一行已经属于新的领取者」与其它条件不匹配。
      * 只有领取代际确实变了才算陈旧提交，这一个判断决定要不要上报
@@ -414,6 +447,16 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
 
     private static String brief(String text) {
         return text.length() <= 32 ? text : text.substring(0, 32) + "…";
+    }
+
+    /**
+     * Run 级写入（新建工作项、领取）必须带服务所有权凭据：没有凭据就不是「我该写」这件事，
+     * 与其写进去再解释，不如在这里直接拒掉。
+     */
+    private static void requireFence(ServiceOwnershipFence fence) {
+        if (fence == null) {
+            throw new IllegalArgumentException("Run 级写入必须带服务所有权凭据");
+        }
     }
 
     private static void requireVersion(SchedulerVersion schedulerVersion) {

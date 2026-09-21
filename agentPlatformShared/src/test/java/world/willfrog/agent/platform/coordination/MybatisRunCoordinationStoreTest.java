@@ -6,6 +6,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -28,6 +29,9 @@ import static org.mockito.Mockito.when;
  */
 @ExtendWith(MockitoExtension.class)
 class MybatisRunCoordinationStoreTest {
+
+    /** Run 级写入要带的服务所有权凭据：这里只证明它被原样交给语句。 */
+    private static final ServiceOwnershipFence FENCE = new ServiceOwnershipFence("instance-a", 7L);
 
     @Mock
     private RunCoordinationMapper mapper;
@@ -52,38 +56,39 @@ class MybatisRunCoordinationStoreTest {
     @Test
     void deferCarriesTheFencesItWasGiven() {
         OffsetDateTime nextVisibleAt = OffsetDateTime.now().plusSeconds(5);
-        when(mapper.deferFor(anyString(), anyString(), any(), anyInt(), anyLong())).thenReturn(1);
+        when(mapper.deferFor(anyString(), anyString(), any(), anyInt(), anyLong(), anyString(), anyLong())).thenReturn(1);
 
         assertThat(store.deferFor("run-1", RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT,
-                nextVisibleAt, 3, 7L)).isTrue();
+                nextVisibleAt, 3, 7L, FENCE)).isTrue();
 
-        verify(mapper).deferFor("run-1", "PER_RUN_UNFINISHED_LIMIT", nextVisibleAt, 3, 7L);
+        verify(mapper).deferFor("run-1", "PER_RUN_UNFINISHED_LIMIT", nextVisibleAt, 3, 7L,
+                FENCE.ownerInstanceId(), FENCE.fencingToken());
     }
 
     @Test
     void deferWithoutAnEligibilityRowReportsFalse() {
-        when(mapper.deferFor(anyString(), anyString(), any(), anyInt(), anyLong())).thenReturn(0);
+        when(mapper.deferFor(anyString(), anyString(), any(), anyInt(), anyLong(), anyString(), anyLong())).thenReturn(0);
         assertThat(store.deferFor("run-1", RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT,
-                OffsetDateTime.now(), 0, 0L)).isFalse();
+                OffsetDateTime.now(), 0, 0L, FENCE)).isFalse();
     }
 
     @Test
     void coordinationServedRoundOnlyTouchesTheCoordinationSpace() {
-        when(mapper.markCoordinationServed(anyString(), anyLong(), anyInt())).thenReturn(1);
-        assertThat(store.markCoordinationServed("run-1", 7L, 4)).isTrue();
-        verify(mapper).markCoordinationServed("run-1", 7L, 4);
+        when(mapper.markCoordinationServed(anyString(), anyLong(), anyInt(), anyString(), anyLong())).thenReturn(1);
+        assertThat(store.markCoordinationServed("run-1", 7L, 4, FENCE)).isTrue();
+        verify(mapper).markCoordinationServed("run-1", 7L, 4, FENCE.ownerInstanceId(), FENCE.fencingToken());
         // 这一路只碰协调那一组轮转位置，两个轮次空间各记各的。
-        verify(mapper, never()).markDispatchServed(anyString(), anyLong(), anyInt());
+        verify(mapper, never()).markDispatchServed(anyString(), anyLong(), anyInt(), anyString(), anyLong());
     }
 
     @Test
     void dispatchServedRoundOnlyTouchesTheDispatchSpace() {
-        when(mapper.markDispatchServed(anyString(), anyLong(), anyInt())).thenReturn(0);
-        assertThat(store.markDispatchServed("run-1", 9L, 4))
+        when(mapper.markDispatchServed(anyString(), anyLong(), anyInt(), anyString(), anyLong())).thenReturn(0);
+        assertThat(store.markDispatchServed("run-1", 9L, 4, FENCE))
                 .as("迟到的旧轮次写进去影响 0 行，返回 false")
                 .isFalse();
-        verify(mapper).markDispatchServed("run-1", 9L, 4);
-        verify(mapper, never()).markCoordinationServed(anyString(), anyLong(), anyInt());
+        verify(mapper).markDispatchServed("run-1", 9L, 4, FENCE.ownerInstanceId(), FENCE.fencingToken());
+        verify(mapper, never()).markCoordinationServed(anyString(), anyLong(), anyInt(), anyString(), anyLong());
     }
 
     @Test
@@ -111,12 +116,12 @@ class MybatisRunCoordinationStoreTest {
 
     @Test
     void syncOnlyForwardsThePlanGeneration() {
-        when(mapper.syncPlanGeneration(anyString(), anyInt())).thenReturn(1);
-        assertThat(store.syncPlanGeneration("run-1", 2)).isTrue();
-        verify(mapper).syncPlanGeneration("run-1", 2);
+        when(mapper.syncPlanGeneration(anyString(), anyInt(), anyString(), anyLong())).thenReturn(1);
+        assertThat(store.syncPlanGeneration("run-1", 2, FENCE)).isTrue();
+        verify(mapper).syncPlanGeneration("run-1", 2, FENCE.ownerInstanceId(), FENCE.fencingToken());
 
-        when(mapper.syncPlanGeneration(anyString(), anyInt())).thenReturn(0);
-        assertThat(store.syncPlanGeneration("run-1", 1))
+        when(mapper.syncPlanGeneration(anyString(), anyInt(), anyString(), anyLong())).thenReturn(0);
+        assertThat(store.syncPlanGeneration("run-1", 1, FENCE))
                 .as("代际倒退或与 Run 主表不一致时影响 0 行")
                 .isFalse();
     }
@@ -124,32 +129,59 @@ class MybatisRunCoordinationStoreTest {
     @Test
     void invalidArgumentsNeverReachTheMapper() {
         assertThatThrownBy(() -> store.ensure(" ")).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.deferFor("run-1", null, OffsetDateTime.now(), 0, 0L))
+        assertThatThrownBy(() -> store.deferFor("run-1", null, OffsetDateTime.now(), 0, 0L, FENCE))
                 .as("延期必须带原因")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.deferFor("run-1",
-                RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT, null, 0, 0L))
+                RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT, null, 0, 0L, FENCE))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.deferFor("run-1",
-                RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT, OffsetDateTime.now(), -2, 0L))
+                RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT, OffsetDateTime.now(), -2, 0L, FENCE))
                 .as("计划代际最小只能是 -1（还没有计划）")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.deferFor("run-1",
-                RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT, OffsetDateTime.now(), 0, -1L))
+                RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT, OffsetDateTime.now(), 0, -1L, FENCE))
                 .as("轮次号不能是负数")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.scanDue(0)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.markCoordinationServed("run-1", -1L, 0))
+        assertThatThrownBy(() -> store.markCoordinationServed("run-1", -1L, 0, FENCE))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.markDispatchServed("run-1", 3L, -2))
+        assertThatThrownBy(() -> store.markDispatchServed("run-1", 3L, -2, FENCE))
                 .as("计划代际最小只能是 -1（还没有计划）")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.refreshDispatchMissedRounds(-1L))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.syncPlanGeneration("run-1", -2))
+        assertThatThrownBy(() -> store.syncPlanGeneration("run-1", -2, FENCE))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.find(" ")).isInstanceOf(IllegalArgumentException.class);
         verify(mapper, never()).scanDue(anyInt());
+    }
+
+    @Test
+    void runLevelWritesRefuseToGoWithoutAnOwnershipFence() {
+        assertThatThrownBy(() -> store.deferFor("run-1",
+                RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT, OffsetDateTime.now(), 0, 0L, null))
+                .as("Run 级推进没有所有权凭据时当场拒绝，不交给语句")
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.markCoordinationServed("run-1", 1L, 0, null))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.markDispatchServed("run-1", 1L, 0, null))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.syncPlanGeneration("run-1", 0, null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void handoffBookkeepingDoesNotCarryOwnership() {
+        // 旧版本 Run 交给旧入口这一步由「派发决定」授权，不是所有权：它走单独的语句，不带凭据。
+        when(mapper.markHandoffServed(anyString(), anyLong(), anyInt())).thenReturn(1);
+        when(mapper.deferHandoff(anyString(), anyString(), any(), anyInt(), anyLong())).thenReturn(1);
+
+        assertThat(store.markHandoffServed("run-legacy", 5L, 2)).isTrue();
+        assertThat(store.deferHandoff("run-legacy", RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
+                OffsetDateTime.now(), 2, 5L)).isTrue();
+
+        verify(mapper).markHandoffServed("run-legacy", 5L, 2);
     }
 
     private static RunCoordination row(String runId, String schedulerVersion) {

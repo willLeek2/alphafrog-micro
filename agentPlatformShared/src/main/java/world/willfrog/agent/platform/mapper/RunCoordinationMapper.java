@@ -35,7 +35,7 @@ public interface RunCoordinationMapper {
     int ensure(@Param("runId") String runId);
 
     /**
-     * 记一次协调延期，必须带这一轮开始时读到的计划代际与协调轮次。
+     * 记一次协调延期，必须带这一轮开始时读到的计划代际与协调轮次，以及此刻的服务所有权凭据。
      *
      * <p>期望值对不上说明这张图已经被服务过或换了计划代际，这次延期是旧观察，写进去只会把
      * 新事实拉回旧事实，所以影响 0 行。计划代际既比资格记录上的，也比父 Run 上的当前值。</p>
@@ -44,7 +44,9 @@ public interface RunCoordinationMapper {
                  @Param("deferReason") String deferReason,
                  @Param("nextVisibleAt") OffsetDateTime nextVisibleAt,
                  @Param("expectedPlanGeneration") int expectedPlanGeneration,
-                 @Param("expectedServedRound") long expectedServedRound);
+                 @Param("expectedServedRound") long expectedServedRound,
+                 @Param("ownerInstanceId") String ownerInstanceId,
+                 @Param("fencingToken") long fencingToken);
 
     /**
      * Run 协调这一轮服务了这个 Run：清延期原因、记协调轮次、协调未获轮数归零；轮次只许前进。
@@ -53,7 +55,9 @@ public interface RunCoordinationMapper {
      * 计划推进之后的旧回合不许清延期原因、不许改轮转位置。</p>
      */
     int markCoordinationServed(@Param("runId") String runId, @Param("roundNumber") long roundNumber,
-                               @Param("expectedPlanGeneration") int expectedPlanGeneration);
+                               @Param("expectedPlanGeneration") int expectedPlanGeneration,
+                               @Param("ownerInstanceId") String ownerInstanceId,
+                               @Param("fencingToken") long fencingToken);
 
     /**
      * 节点派发这一轮服务了这个 Run：只记派发轮次与派发未获轮数，不动延期原因；同样只许前进。
@@ -61,7 +65,9 @@ public interface RunCoordinationMapper {
      * <p>计划代际的条件与协调那一组相同：换了计划之后，旧回合的领取不该再改写轮转位置。</p>
      */
     int markDispatchServed(@Param("runId") String runId, @Param("roundNumber") long roundNumber,
-                           @Param("expectedPlanGeneration") int expectedPlanGeneration);
+                           @Param("expectedPlanGeneration") int expectedPlanGeneration,
+                           @Param("ownerInstanceId") String ownerInstanceId,
+                           @Param("fencingToken") long fencingToken);
 
     /**
      * 把资格记录上的计划代际同步成 Run 主表的当前值。
@@ -69,7 +75,25 @@ public interface RunCoordinationMapper {
      * <p>调用方声明的这一代必须就是 Run 上的当前一代，且必须比记录上的新：拿着旧读到的代际
      * 写描述、或者让代际倒退，都要影响 0 行。</p>
      */
-    int syncPlanGeneration(@Param("runId") String runId, @Param("planGeneration") int planGeneration);
+    int syncPlanGeneration(@Param("runId") String runId, @Param("planGeneration") int planGeneration,
+                           @Param("ownerInstanceId") String ownerInstanceId,
+                           @Param("fencingToken") long fencingToken);
+
+    /**
+     * 旧版本 Run 交给旧入口这一步的记账：与上面两条同形，但不带服务所有权条件。
+     *
+     * <p>授权来源不同：这一笔由「本进程刚决定把这条旧 Run 交给旧入口」这个动作授权，
+     * 双池这一层对它从来没有所有权，所以没有 token 可核。</p>
+     */
+    int markHandoffServed(@Param("runId") String runId, @Param("roundNumber") long roundNumber,
+                          @Param("expectedPlanGeneration") int expectedPlanGeneration);
+
+    /** 旧版本候选按所有权原因推后一步的记账：同上，不带服务所有权条件。 */
+    int deferHandoff(@Param("runId") String runId,
+                     @Param("deferReason") String deferReason,
+                     @Param("nextVisibleAt") OffsetDateTime nextVisibleAt,
+                     @Param("expectedPlanGeneration") int expectedPlanGeneration,
+                     @Param("expectedServedRound") long expectedServedRound);
 
     /**
      * 这一轮可以被协调的 Run：双池家族一份候选，按最近协调轮次升序，已结束与取消中的 Run 不参与。

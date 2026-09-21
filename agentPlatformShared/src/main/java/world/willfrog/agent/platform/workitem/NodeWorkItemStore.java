@@ -19,8 +19,13 @@ import java.util.Optional;
  */
 public interface NodeWorkItemStore {
 
-    /** 创建一条工作项。同一个身份已经有一行时返回被拒事实（原因 {@code DUPLICATE_IDENTITY}）。 */
-    NodeWorkItemMutationResult create(NodeWorkItem item);
+    /**
+     * 创建一条工作项。同一个身份已经有一行时返回被拒事实（原因 {@code DUPLICATE_IDENTITY}）。
+     *
+     * <p>这是 Run 级写入：{@code fence} 是本进程此刻的服务所有权凭据，语句里核持有人与代际号；
+     * 没有凭据、或凭据已经被别人换掉时写不进去，返回被拒事实。</p>
+     */
+    NodeWorkItemMutationResult create(NodeWorkItem item, ServiceOwnershipFence fence);
 
     /** 扫描可领取的工作项，按调度器版本过滤。按版本查看进度时用它；节点派发不要用，见下一个方法。 */
     List<NodeWorkItem> scanClaimable(SchedulerVersion schedulerVersion, int limit);
@@ -43,7 +48,8 @@ public interface NodeWorkItemStore {
                                       NodeWorkItemVersions expected,
                                       String claimant,
                                       Duration lease,
-                                      SchedulerVersion schedulerVersion);
+                                      SchedulerVersion schedulerVersion,
+                                      ServiceOwnershipFence fence);
 
     /** 已领取 → 执行中：领取者与领取代际都要匹配，不匹配立即停止。 */
     NodeWorkItemMutationResult startExecution(NodeWorkItemIdentity identity, int claimEpoch, String claimant);
@@ -95,11 +101,14 @@ public interface NodeWorkItemStore {
      *
      * <p>只在调用方已经取得这条 Run 的服务租约之后使用。分段的执行路径由载荷与等待组事实决定，
      * 不由状态决定，所以放回可运行状态就是要从头再执行一遍这一段。</p>
+     *
+     * <p>服务所有权凭据与父 Run 的版本状态写在同一句里核：先查租约再写，中间隔着租约到期与
+     * 别人接管的时间窗，那个窗口里旧所有者不该还能改这一行。</p>
      */
     NodeWorkItemMutationResult requeueAbandonedClaim(NodeWorkItemIdentity identity,
-                                                     int expectedClaimEpoch,
-                                                     long contextVersion,
-                                                     long runControlVersion);
+                                                     NodeWorkItemVersions versions,
+                                                     ServiceOwnershipFence fence,
+                                                     SchedulerVersion schedulerVersion);
 
     /** 服务退出打断了恢复分段时，精确核对锚点与领取代际后重新开放领取。 */
     NodeWorkItemMutationResult requeueInterruptedToolJob(NodeWorkItemIdentity identity,
@@ -183,6 +192,17 @@ public interface NodeWorkItemStore {
     List<NodeWorkItem> listUnfinishedBySchedulerVersion(SchedulerVersion schedulerVersion, int limit);
 
     int countUnfinishedBySchedulerVersion(SchedulerVersion schedulerVersion);
+
+    /**
+     * 按「Run 的调度器版本」取这个 Run 上的全部未完成分段，行自己的版本不参与筛选。
+     *
+     * <p>启动残留与遗留接管用它把一条 Run 的未完成行读全，再逐行比对版本；按行版本先筛会漏掉
+     * 与 Run 版本不一致的那些行，让「全部都属于这一版」这个判断失去意义。</p>
+     */
+    List<NodeWorkItem> listUnfinishedByRunSchedulerVersion(SchedulerVersion schedulerVersion, int limit);
+
+    /** 按 Run 的调度器版本统计未完成分段，与上面那条配套做「有没有读全」的核对。 */
+    int countUnfinishedByRunSchedulerVersion(SchedulerVersion schedulerVersion);
 
     /** 某个调度器版本是否有遗留记录——有就必须禁止该版本的执行扫描、暂停该版本的新建准入。 */
     default boolean hasResidueFor(SchedulerVersion schedulerVersion) {

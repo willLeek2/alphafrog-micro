@@ -26,9 +26,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * 容得下两次失败。</p>
  *
  * <p>续期的结果还能当体检用：先清点「本该续上几条」，再批量续，续上的比清点的少，说明其中
- * 有租约已经被别人按过期接手了。这种时候本进程在那几条 Run 上已经没有发言权，要留一条能查的
- * 记录点名是哪些——派发器下一轮会因为这些 Run 不再属于自己而不再碰它们（见
- * {@code DatabaseDualPoolWorkHandler} 里的所有权闸门），在飞的那一段执行则按代际号收尾。</p>
+ * 有租约已经被别人按过期接手了。这种时候本进程在那几条 Run 上已经没有发言权，必须**撤销本进程
+ * 的准入生命周期**（按 Run 与代际号条件撤销，见 {@link DualPoolRunAdmissionRegistry#revokeOwnership}），
+ * 不只是记一条日志：撤销之后协调回合与节点领取不会再为它们发起，已经领取在执行的那一段则由
+ * 领取代际收尾（接手方重新排队时加一，旧执行者提交结果会因代际不匹配失败）。</p>
  *
  * <p>退出时不主动让出：进程退出的一瞬间可能还有正在跑的节点执行没有收尾，提前把所有权交出去
  * 会让接手方马上开始，两个进程撞在一条 Run 上。让租约自然过期更稳——最坏也就是多等一个有效期。</p>
@@ -38,6 +39,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class RunServiceLeaseKeeper {
 
     private final RunServiceLeaseStore leaseStore;
+    private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final ProcessInstanceIdentity instanceIdentity;
     private final Duration serviceTtl;
     private final int ownedLimit;
@@ -50,6 +52,7 @@ public class RunServiceLeaseKeeper {
     private final AtomicLong skippedRounds = new AtomicLong();
     private final AtomicLong renewedTotal = new AtomicLong();
     private final AtomicLong lostTotal = new AtomicLong();
+    private final AtomicLong lostRevokedTotal = new AtomicLong();
     private final AtomicLong failures = new AtomicLong();
 
     /** 最近一轮的读数：清点到几条、续上几条。 */
@@ -58,11 +61,13 @@ public class RunServiceLeaseKeeper {
 
     public RunServiceLeaseKeeper(
             RunServiceLeaseStore leaseStore,
+            DualPoolRunAdmissionRegistry admissionRegistry,
             ProcessInstanceIdentity instanceIdentity,
             @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceTtlSeconds,
             @Value("${agent.langchain.dual-pool.service-lease-owned-limit:512}") int ownedLimit,
             @Value("${agent.langchain.dual-pool.service-lease-renew-interval-ms:40000}") long renewIntervalMs) {
         this.leaseStore = leaseStore;
+        this.admissionRegistry = admissionRegistry;
         this.instanceIdentity = instanceIdentity;
         this.serviceTtl = Duration.ofSeconds(Math.max(1L, serviceTtlSeconds));
         this.ownedLimit = Math.max(1, ownedLimit);
@@ -122,8 +127,22 @@ public class RunServiceLeaseKeeper {
             }
             if (!lost.isEmpty()) {
                 lostTotal.addAndGet(lost.size());
-                log.warn("本进程已经不再持有这些 Run 的服务所有权，别的进程接手了它们在跑；"
-                                + "派发器下一轮不会再动它们，在飞的那一段按代际号收尾: count={} runIds={}",
+                // 光记日志不够：本进程必须立刻不再把自己当成这些 Run 的服务方，否则协调回合与节点
+                // 领取还会继续发起（虽然数据库那一层会因凭据不匹配挡下，但那是白跑）。
+                // 撤销按「Run + 代际号」条件做：这条 Run 若已经被本进程用新代际重新取得，
+                // 新生命周期不会被旧回调删掉。
+                for (RunServiceLease lease : owned) {
+                    if (!lost.contains(lease.runId())) {
+                        continue;
+                    }
+                    boolean revoked = admissionRegistry != null
+                            && admissionRegistry.revokeOwnership(lease.runId(), lease.fencingToken());
+                    lostRevokedTotal.addAndGet(revoked ? 1 : 0);
+                    log.warn("本进程已经不再持有这条 Run 的服务所有权，撤销本进程的准入: runId={} fence={} 撤销={}",
+                            lease.runId(), lease.describe(), revoked);
+                }
+                log.warn("本进程丢掉了这些 Run 的服务所有权，别的进程接手了它们在跑；"
+                                + "已经领取在执行的那一段按领取代际收尾: count={} runIds={}",
                         lost.size(), lost);
             }
         }
@@ -138,6 +157,7 @@ public class RunServiceLeaseKeeper {
         snapshot.put("serviceLeaseOwnedLastRound", ownedLastRound);
         snapshot.put("serviceLeaseRenewedLastRound", renewedLastRound);
         snapshot.put("serviceLeaseRenewedTotal", renewedTotal.get());
+        snapshot.put("serviceLeaseLostRevokedTotal", lostRevokedTotal.get());
         snapshot.put("serviceLeaseLostTotal", lostTotal.get());
         snapshot.put("serviceLeaseRenewFailuresTotal", failures.get());
         snapshot.put("serviceLeaseTtlSeconds", serviceTtl.toSeconds());

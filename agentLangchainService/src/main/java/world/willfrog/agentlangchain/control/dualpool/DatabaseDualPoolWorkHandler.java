@@ -31,6 +31,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
@@ -180,10 +181,17 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (admissionEpoch < 0L) {
             return;
         }
+        if (!admissionRegistry.holdsOwnership(hint.runId())) {
+            // 服务所有权不在本进程：这条 Run 现在归别的进程服务，本进程不推进它。
+            // 这一步只是少做无用功，真正的闸门在每条写入的语句里（凭据不匹配就影响 0 行）。
+            log.warn("这条 Run 的服务所有权不在本进程，不协调它: runId={}", hint.runId());
+            return;
+        }
         Object lock = runLockFor(hint.runId());
         synchronized (lock) {
             // 提示可能在等待条带锁期间跨过终态与追问/恢复边界；旧 epoch 不能协调新一轮。
-            if (admissionRegistry.currentAdmissionEpoch(hint.runId()) != admissionEpoch) {
+            if (admissionRegistry.currentAdmissionEpoch(hint.runId()) != admissionEpoch
+                    || !admissionRegistry.holdsOwnership(hint.runId())) {
                 return;
             }
             coordinationTurn(hint.runId());
@@ -239,7 +247,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return created;
         }
         if (value(existing.getPlanGeneration()) != generation) {
-            if (coordinationStore.syncPlanGeneration(run.getId(), generation)) {
+            ServiceOwnershipFence fence = ownershipFence(run.getId());
+            if (fence == null) {
+                log.warn("没有服务所有权凭据，不把资格记录的计划代际同步到 Run 当前值: runId={} 期望代际={}",
+                        run.getId(), generation);
+            } else if (coordinationStore.syncPlanGeneration(run.getId(), generation, fence)) {
                 existing.setPlanGeneration(generation);
             }
         }
@@ -254,16 +266,24 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
      * 确实占到了协调机会，下一轮可以先让别人来。</p>
      */
     private void recordTurn(CoordinationTurn turn) {
+        ServiceOwnershipFence fence = ownershipFence(turn.runId);
+        if (fence == null) {
+            // 记账也要带凭据：这一轮是不是本进程服务的、服务到哪一轮，不能由已经没有所有权的
+            // 回合来写。写不进去就少记一轮，别的进程下一轮会补上，不影响执行事实。
+            log.warn("没有服务所有权凭据，这一轮的记账不写: runId={} turnRound={}", turn.runId, turn.turnRound);
+            return;
+        }
         if (!turn.progressed && turn.deferReason != null) {
             OffsetDateTime nextVisibleAt = OffsetDateTime.now().plus(coordinationDeferRetry);
             if (coordinationStore.deferFor(turn.runId, turn.deferReason, nextVisibleAt,
-                    turn.planGeneration, turn.coordinationServedRound)) {
+                    turn.planGeneration, turn.coordinationServedRound, fence)) {
                 log.info("Run 协调延期: runId={} reason={} nextVisibleAt={}",
                         turn.runId, turn.deferReason, nextVisibleAt);
             }
             return;
         }
-        if (!coordinationStore.markCoordinationServed(turn.runId, turn.turnRound, turn.planGeneration)) {
+        if (!coordinationStore.markCoordinationServed(turn.runId, turn.turnRound, turn.planGeneration,
+                fence)) {
             // 计划代际已经变了、或者资格记录已经被别的回合推进过：这次成功写不生效。
             log.info("Run 协调的成功推进没有写进去（计划代际或轮次已经变化）: runId={} turnRound={}",
                     turn.runId, turn.turnRound);
@@ -318,6 +338,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             workItemStore.markStale(old.identity(), value(old.getContextVersion()),
                     value(old.getRunControlVersion()), "new_plan_generation");
         }
+        ServiceOwnershipFence fence = ownershipFence(run.getId());
+        if (fence == null) {
+            log.warn("没有服务所有权凭据，不开新计划: runId={}", run.getId());
+            return;
+        }
         int expectedGeneration = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
         int observedWorkItemGeneration = workItemStore.maxPlanGenerationByRun(run.getId());
         int generation;
@@ -328,7 +353,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         } else {
             Integer advanced = runMapper.advancePlanGeneration(
                     run.getId(), run.getUserId(), AgentRunStatus.RECEIVED,
-                    expectedGeneration, observedWorkItemGeneration);
+                    expectedGeneration, observedWorkItemGeneration,
+                    fence.ownerInstanceId(), fence.fencingToken());
             if (advanced == null) {
                 return;
             }
@@ -662,6 +688,13 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (identity == null || !admissionRegistry.isAdmitted(identity.runId())) {
             return;
         }
+        ServiceOwnershipFence fence = ownershipFence(identity.runId());
+        if (fence == null) {
+            // 服务所有权不在本进程：这一段的领取与执行都不该由本进程发起。
+            log.warn("这条 Run 的服务所有权不在本进程，不领取它的分段: runId={} identity={}",
+                    identity.runId(), identity.describe());
+            return;
+        }
         NodeWorkItem item = workItemStore.findByIdentity(identity).orElse(null);
         if (item == null || (item.stateEnum() != NodeWorkItemState.RUNNABLE
                 && item.stateEnum() != NodeWorkItemState.RESUMABLE)
@@ -686,7 +719,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         Optional<NodeWorkItemClaim> claimed = workItemStore.claim(
-                identity, item.versions(), claimant, claimLease, version);
+                identity, item.versions(), claimant, claimLease, version, fence);
         if (claimed.isEmpty()) {
             return;
         }
@@ -694,7 +727,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         // 领取成功才算这张图真的拿到了节点执行机会：写失败只记日志，不影响这次执行。
         try {
             coordinationStore.markDispatchServed(identity.runId(), dispatchTurnRound,
-                    run.getPlanGeneration());
+                    run.getPlanGeneration(), fence);
         } catch (RuntimeException e) {
             log.warn("记录节点派发轮转位置失败: runId={} reason={}",
                     identity.runId(), safeReason(e));
@@ -1047,9 +1080,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 continue;
             }
             if (!admissionRegistry.isAdmitted(runId)
-                    && !admissionRegistry.restorePersistedToolJob(runId)) {
-                // 库里有资格记录但这个进程没有受理它，而且持久事实也不足以证明可以恢复：
-                // 不在这里凭一次扫描就执行。
+                    && !admissionRegistry.takeoverLegacyRun(runId)) {
+                // 库里有资格记录但这个进程还没有受理它：接管要按与启动恢复同一套证明重新判定
+                // （证明不了就隔离），不在这里凭一次扫描就无条件受理。
                 continue;
             }
             hints.add(new RunCoordinationHint(runId, RunCoordinationHint.Reason.SCAN_REDISCOVERED));
@@ -1084,7 +1117,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
         legacyHandedOff.incrementAndGet();
         // 交出去了：记下这一轮服务过它，它从此排在别的候选后面。
-        boolean marked = coordinationStore.markCoordinationServed(runId, round, planGeneration(due));
+        boolean marked = coordinationStore.markHandoffServed(runId, round, planGeneration(due));
         if (!marked) {
             log.info("旧版本 Run 已经交给旧入口，但轮次位置没有写进去（可能刚换了计划代际）: runId={}", runId);
         }
@@ -1093,7 +1126,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     /** 按所有权原因推后一条旧版本候选，让它从页首让开。 */
     private void deferLegacyRun(RunCoordination due, String why) {
         legacyDeferred.incrementAndGet();
-        boolean deferred = coordinationStore.deferFor(due.getRunId(),
+        boolean deferred = coordinationStore.deferHandoff(due.getRunId(),
                 RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
                 OffsetDateTime.now().plus(coordinationDeferRetry),
                 planGeneration(due), servedRound(due));
@@ -1175,6 +1208,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                                Map<String, Object> payload,
                                String schedulerVersion,
                                CoordinationTurn turn) {
+        ServiceOwnershipFence fence = ownershipFence(identity.runId());
+        if (fence == null) {
+            // 没有服务所有权就没有「往这条 Run 里建分段」这件事：这一轮不推进，等所有权回来。
+            log.warn("没有服务所有权凭据，不新建工作项: runId={} identity={}",
+                    identity.runId(), identity.describe());
+            turn.defer(RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE);
+            return;
+        }
         if (workItemStore.countUnfinishedByRun(identity.runId())
                 >= settings.perRunUnfinishedLimit().intValue()) {
             turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
@@ -1196,7 +1237,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         } catch (Exception e) {
             throw new IllegalStateException("dual_pool_work_payload_encode_failed", e);
         }
-        NodeWorkItemMutationResult created = workItemStore.create(item);
+        NodeWorkItemMutationResult created = workItemStore.create(item, fence);
         if (!created.applied()) {
             reportRejection(identity.runId(), created);
             throw new IllegalStateException("dual_pool_work_identity_conflict:" + identity.describe());
@@ -1480,6 +1521,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             stripes[index] = new Object();
         }
         return stripes;
+    }
+
+    /**
+     * 这条 Run 此刻归本进程服务时的凭据；没有就说明所有权已经不在本进程。
+     *
+     * <p>协调入口、节点领取与所有 Run 级写入都先取它：入口这一层是为了少做无用功，
+     * 真正管住并发的是每条语句里对持有人、代际号与有效期的核对。</p>
+     */
+    private ServiceOwnershipFence ownershipFence(String runId) {
+        return admissionRegistry.currentOwnershipFence(runId).orElse(null);
     }
 
     private static boolean isTerminal(AgentRunStatus status) {
