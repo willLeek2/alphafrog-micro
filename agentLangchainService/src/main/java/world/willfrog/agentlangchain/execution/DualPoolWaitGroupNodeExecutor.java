@@ -443,6 +443,8 @@ public class DualPoolWaitGroupNodeExecutor {
                 success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
                 resultJson,
                 member.getExternalOperationId(),
+                input.identity().planGeneration(),
+                input.versions().contextVersion(),
                 input.versions().runControlVersion()));
         if (!result.applied()) {
             log.info("成员结果没有写进去（重复上报或已落终态）：group={} member={}",

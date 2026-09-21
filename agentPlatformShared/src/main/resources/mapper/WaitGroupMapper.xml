@@ -90,6 +90,7 @@
         <result property="recoveryGeneration" column="recovery_generation"/>
         <result property="notificationId" column="notification_id"/>
         <result property="writtenMembers" column="written_members"/>
+        <result property="writtenSiblings" column="written_siblings"/>
     </resultMap>
 
     <!-- 恢复消费语句的返回：通知取走了没有、下一段放行了没有。 -->
@@ -270,6 +271,11 @@
             FROM alphafrog_agent_run r
             WHERE r.id = #{runId}
               AND r.status = 'EXECUTING'
+              -- 计划代际与控制版本都在这里比对：计划推进之后控制版本可能还没变，只比控制版本
+              -- 会让旧计划的执行者把已经作废的分段交出去、建出没人认领的等待组。
+              AND r.plan_generation = #{planGeneration}
+              -- 冻结的调度器版本也要对上：这份等待事实只属于等待组那一套执行层。
+              AND r.scheduler_version = #{schedulerVersion}
               AND r.run_control_version = #{runControlVersion}
             FOR UPDATE
         ),
@@ -301,8 +307,6 @@
                    #{modelTurn}::int, #{schedulerVersion}::varchar, s.segment_sequence + 1,
                    'WAITING', (SELECT count(*) FROM member_input)::int, 0
             FROM segment_closed s
-            ON CONFLICT (run_id, plan_generation, node_id, node_attempt, segment_sequence, model_turn)
-                DO NOTHING
             RETURNING id, run_id, plan_generation, node_id, node_attempt, segment_sequence,
                       next_segment_sequence
         ),
@@ -326,8 +330,6 @@
                    #{schedulerVersion}::varchar, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
                    CAST(#{nextSegmentPayloadJson} AS jsonb)
             FROM group_created g
-            ON CONFLICT (run_id, plan_generation, node_id, node_attempt, segment_sequence)
-                DO NOTHING
             RETURNING 1
         )
         SELECT
@@ -342,13 +344,19 @@
                 AND model_turn = #{modelTurn}) AS existing_group_id,
             (SELECT count(*) FROM members_written) AS written_members,
             (SELECT count(*) FROM next_segment_created) AS written_next_segments,
-            (SELECT next_segment_sequence FROM alphafrog_agent_run_wait_group
-              WHERE run_id = #{runId}
-                AND plan_generation = #{planGeneration}
-                AND node_id = #{nodeId}
-                AND node_attempt = #{nodeAttempt}
-                AND segment_sequence = #{segmentSequence}
-                AND model_turn = #{modelTurn}) AS next_segment_sequence
+            -- 首次挂起时这一行是刚插进去的，同一条语句的主查询看不到它（数据修改 CTE 与主查询
+            -- 用同一份快照），只能从 group_created 的 RETURNING 里取；幂等重试路径没有新插入，
+            -- 才回基础表里读已经存在的组。
+            COALESCE(
+                (SELECT next_segment_sequence FROM group_created),
+                (SELECT next_segment_sequence FROM alphafrog_agent_run_wait_group
+                  WHERE run_id = #{runId}
+                    AND plan_generation = #{planGeneration}
+                    AND node_id = #{nodeId}
+                    AND node_attempt = #{nodeAttempt}
+                    AND segment_sequence = #{segmentSequence}
+                    AND model_turn = #{modelTurn})
+            ) AS next_segment_sequence
     </select>
 
     <!-- ==================== 成员结束 ==================== -->
@@ -365,9 +373,22 @@
             SELECT r.id AS run_id, r.run_control_version
             FROM alphafrog_agent_run r
             JOIN alphafrog_agent_run_wait_group g ON g.id = #{groupId} AND g.run_id = r.id
+            -- 归属这一段的那条工作项也要对上：只核对组号时，计划推进或换段之后
+            -- 旧成员仍能把旧组推进成齐备，接着放出已经作废的下一段。
+            JOIN alphafrog_agent_run_work_item wi
+                 ON wi.run_id = g.run_id
+                AND wi.plan_generation = g.plan_generation
+                AND wi.node_id = g.node_id
+                AND wi.node_attempt = g.node_attempt
+                AND wi.segment_sequence = g.segment_sequence
             WHERE r.status = 'EXECUTING'
+              AND r.plan_generation = g.plan_generation
+              AND r.plan_generation = #{planGeneration}
               AND r.run_control_version = #{runControlVersion}
-            FOR UPDATE
+              -- 上下文版本是挂起那一刻这一段的上下文：对不上说明这一段已经不属于这条链了。
+              AND wi.context_version = #{contextVersion}
+              AND wi.run_control_version = #{runControlVersion}
+            FOR UPDATE OF r
         ),
         member_done AS (
             UPDATE alphafrog_agent_run_wait_member m SET
@@ -378,8 +399,10 @@
                 updated_at = CURRENT_TIMESTAMP
             WHERE m.group_id = #{groupId}
               AND m.member_identity = #{memberIdentity}
-              AND (CAST(#{externalOperationId} AS varchar) IS NULL
-                   OR m.external_operation_id = CAST(#{externalOperationId} AS varchar))
+              -- 外部作业身份必须逐字对上，包括「两边都是空」这一种：
+              -- 允许空值覆盖会把「不是这次作业的结果」也算成它的结果。
+              AND ((m.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
+                   OR m.external_operation_id = #{externalOperationId}::varchar)
               AND m.state IN ('PENDING', 'RUNNING')
               AND EXISTS (SELECT 1 FROM run_fence)
             RETURNING m.id, m.group_id, m.member_seq, m.state
@@ -411,7 +434,7 @@
             SELECT r.id, r.run_id, r.recovery_generation, 'WAITING', CURRENT_TIMESTAMP
             FROM group_ready r
             ON CONFLICT (group_id, recovery_generation) DO NOTHING
-            RETURNING 1
+            RETURNING id
         )
         SELECT
             COALESCE(
@@ -439,18 +462,36 @@
                 (SELECT expected_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId})
             ) AS expected_members,
             (SELECT recovery_generation FROM group_ready) AS recovery_generation,
-            (SELECT 1 FROM notification_written) AS notification_id,
+            -- 通知编号要返回真实主键：常量 1 只在空库第一条上碰巧是对的，
+            -- 第二条会把错误编号交给恢复消费，真正的通知永远留在等待态。
+            (SELECT id FROM notification_written) AS notification_id,
             (SELECT count(*) FROM member_done) AS written_members
     </select>
 
     <!--
-      迟到结果留档：成员行改成迟到。迟到意味着这条等待链已经不可能给出完整结果，所以同一条
-      语句把组、下一段和还没被取走的通知一起停下，避免其他成员还在等的时候组永远停在等待态。
+      迟到结果留档。
+
+      三种情况一次说清：
+
+      1. 成员还在等（待派发/执行中）：改成迟到，并停掉这条链。链停不下来时兄弟成员会一直等在
+         等待态，最后谁也不推进。
+      2. 成员已经被取消（取消先落地、结果随后才回来）：只补审计字段，状态迁到迟到。
+         `result_ref_json`、外部作业身份、结束时间都只在还是空的时候写一次——
+         重复上报不能把第一次留下的审计结果覆盖掉。
+      3. 报上来的身份与这一行对不上（组号或成员身份传错）：什么都不做。错的身份不该有权停掉
+         另一条链。
+
+      停链只在 Run 还在这一代执行、控制版本没变时发生；版本已经变了的旧链由它自己的终结路径
+      处理，这里只留审计。
     -->
     <select id="reportLateMember" resultMap="WaitMemberCompletionResultMap"
             affectData="true" flushCache="true">
         WITH run_fence AS (
-            SELECT r.id AS run_id
+            -- 先锁 Run 行，再动任何子行：这条语句自带一段「取消之后再补审计」的成员更新，
+            -- 那段审计不挑 Run 的版本（版本已经变了才更需要留痕），但锁的顺序必须和其他写入一致，
+            -- 否则同一张图上的并发写入会互相锁出死结。
+            SELECT r.id AS run_id, r.status, r.plan_generation AS run_plan_generation,
+                   r.run_control_version AS run_control_version
             FROM alphafrog_agent_run r
             JOIN alphafrog_agent_run_wait_group g ON g.id = #{groupId} AND g.run_id = r.id
             FOR UPDATE OF r
@@ -458,13 +499,17 @@
         member_late AS (
             UPDATE alphafrog_agent_run_wait_member m SET
                 state = 'LATE',
-                result_ref_json = CAST(#{resultRefJson} AS jsonb),
+                result_ref_json = COALESCE(m.result_ref_json, CAST(#{resultRefJson} AS jsonb)),
                 external_operation_id = COALESCE(m.external_operation_id, #{externalOperationId}::varchar),
-                finished_at = CURRENT_TIMESTAMP,
+                finished_at = COALESCE(m.finished_at, CURRENT_TIMESTAMP),
                 updated_at = CURRENT_TIMESTAMP
             WHERE m.group_id = #{groupId}
               AND m.member_identity = #{memberIdentity}
-              AND m.state IN ('PENDING', 'RUNNING')
+              -- 外部作业身份逐字对上才算这个成员的结果；两边都是空也只在同一成员上成立。
+              AND ((m.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
+                   OR m.external_operation_id = #{externalOperationId}::varchar)
+              -- 已经落过终态的不再改：迟到结果只补审计，重复上报不许覆盖先到的那一份。
+              AND m.state IN ('PENDING', 'RUNNING', 'CANCELED')
               AND EXISTS (SELECT 1 FROM run_fence)
             RETURNING m.id, m.group_id, m.member_seq, m.state
         ),
@@ -472,11 +517,28 @@
             UPDATE alphafrog_agent_run_wait_group g SET
                 state = 'CANCELED',
                 updated_at = CURRENT_TIMESTAMP
-            FROM member_late d
+            FROM member_late d, run_fence f
             WHERE g.id = d.group_id
+              AND g.id = #{groupId}
+              AND f.run_id = g.run_id
               AND g.state IN ('WAITING', 'READY')
+              -- 停链要 Run 还在这一代执行：计划代际与控制版本都得对上。版本来不及对上的旧链
+              -- 由它自己的终结路径处理，这一条只留审计，不推进组、不碰分段。
+              AND f.status = 'EXECUTING'
+              AND f.run_plan_generation = g.plan_generation
+              AND f.run_control_version = #{runControlVersion}
             RETURNING g.id, g.run_id, g.plan_generation, g.node_id, g.node_attempt,
                       g.next_segment_sequence
+        ),
+        siblings_canceled AS (
+            UPDATE alphafrog_agent_run_wait_member m SET
+                state = 'CANCELED',
+                finished_at = COALESCE(m.finished_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE m.group_id = s.id
+              AND m.state IN ('PENDING', 'RUNNING')
+            RETURNING 1
         ),
         segment_canceled AS (
             UPDATE alphafrog_agent_run_work_item wi SET
@@ -512,52 +574,48 @@
             (SELECT completed_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId}) AS completed_members,
             (SELECT expected_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId}) AS expected_members,
             NULL::int AS recovery_generation,
-            NULL::int AS notification_id,
-            (SELECT count(*) FROM member_late) AS written_members
+            NULL::bigint AS notification_id,
+            (SELECT count(*) FROM member_late) AS written_members,
+            (SELECT count(*) FROM siblings_canceled) AS written_siblings
     </select>
 
     <!-- ==================== 恢复消费 ==================== -->
 
     <!--
-      恢复消费：取走一条通知的同时把下一段放成可恢复。Run 必须还是执行中、控制版本没变，
-      否则整条语句什么都不做（通知不会被取走，留待取消路径处理）。
+      恢复消费：把下一段放成可恢复、组改成已恢复、通知改成已消费，三件事一次做完。
 
-      「旧领取提交为零」也落在这里：放行只是把等待态改成可恢复，谁能执行还要另外按领取代际
-      条件领取；这条语句本身对同一代际只能成功一次。
+      三步用 RETURNING 串起来（下一段 → 组 → 通知），后面的每一步都必须拿到前一步写出的行才可能命中，
+      所以只有两种结局：三件都成，或者一件都不写。不允许出现「通知已经算消费掉、下一段却没放行」——
+      恢复资格只有一条，丢了就永远不再出现，等待链会一直停在那里。
+
+      能进这段的条件一次给全：Run 还在执行且计划代际没推进、控制版本没变，通知没到期不取，
+      通知的恢复代际必须等于组当前的恢复代际（旧代际的通知作废），组必须已经齐备，
+      并且下一段必须确实还在等待态。
     -->
     <select id="consumeRecovery" resultMap="RecoveryConsumptionResultMap"
             affectData="true" flushCache="true">
         WITH run_fence AS (
-            SELECT r.id AS run_id, r.plan_generation
+            SELECT r.id AS run_id, g.id AS group_id, g.recovery_generation
             FROM alphafrog_agent_run r
-            JOIN alphafrog_agent_run_recovery_notification n ON n.run_id = r.id
-            WHERE n.id = #{notificationId}
-              AND n.state = 'WAITING'
+            JOIN alphafrog_agent_run_recovery_notification n
+                 ON n.id = #{notificationId} AND n.run_id = r.id
+            JOIN alphafrog_agent_run_wait_group g ON g.id = n.group_id
+            WHERE n.state = 'WAITING'
               AND n.next_visible_at &lt;= CURRENT_TIMESTAMP
-              AND r.status = 'EXECUTING'
-              AND r.run_control_version = #{runControlVersion}
-            FOR UPDATE OF r
-        ),
-        notification_consumed AS (
-            UPDATE alphafrog_agent_run_recovery_notification n SET
-                state = 'CONSUMED',
-                consumed_at = CURRENT_TIMESTAMP,
-                consumed_by = #{dispatcherId},
-                updated_at = CURRENT_TIMESTAMP
-            WHERE n.id = #{notificationId}
-              AND n.state = 'WAITING'
-              AND EXISTS (SELECT 1 FROM run_fence)
-            RETURNING n.id, n.group_id, n.run_id
-        ),
-        group_resumed AS (
-            UPDATE alphafrog_agent_run_wait_group g SET
-                state = 'RESUMED',
-                updated_at = CURRENT_TIMESTAMP
-            FROM notification_consumed c
-            WHERE g.id = c.group_id
+              AND n.recovery_generation = g.recovery_generation
               AND g.state = 'READY'
-            RETURNING g.id, g.run_id, g.plan_generation, g.node_id, g.node_attempt,
-                      g.next_segment_sequence
+              AND r.status = 'EXECUTING'
+              AND r.plan_generation = g.plan_generation
+              AND r.run_control_version = #{runControlVersion}
+              AND EXISTS (
+                  SELECT 1 FROM alphafrog_agent_run_work_item wi
+                  WHERE wi.run_id = g.run_id
+                    AND wi.plan_generation = g.plan_generation
+                    AND wi.node_id = g.node_id
+                    AND wi.node_attempt = g.node_attempt
+                    AND wi.segment_sequence = g.next_segment_sequence
+                    AND wi.state = 'WAITING')
+            FOR UPDATE OF r
         ),
         segment_promoted AS (
             UPDATE alphafrog_agent_run_work_item wi SET
@@ -565,14 +623,38 @@
                 runnable_since = CURRENT_TIMESTAMP,
                 next_visible_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
-            FROM group_resumed r
-            WHERE wi.run_id = r.run_id
-              AND wi.plan_generation = r.plan_generation
-              AND wi.node_id = r.node_id
-              AND wi.node_attempt = r.node_attempt
-              AND wi.segment_sequence = r.next_segment_sequence
+            FROM run_fence f
+            WHERE wi.run_id = f.run_id
               AND wi.state = 'WAITING'
-            RETURNING wi.segment_sequence
+              AND EXISTS (
+                  SELECT 1 FROM alphafrog_agent_run_wait_group g
+                  WHERE g.id = f.group_id
+                    AND wi.plan_generation = g.plan_generation
+                    AND wi.node_id = g.node_id
+                    AND wi.node_attempt = g.node_attempt
+                    AND wi.segment_sequence = g.next_segment_sequence)
+            RETURNING wi.segment_sequence, f.group_id AS group_id
+        ),
+        group_resumed AS (
+            UPDATE alphafrog_agent_run_wait_group g SET
+                state = 'RESUMED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM segment_promoted p
+            WHERE g.id = p.group_id
+              AND g.state = 'READY'
+            RETURNING g.id AS group_id
+        ),
+        notification_consumed AS (
+            UPDATE alphafrog_agent_run_recovery_notification n SET
+                state = 'CONSUMED',
+                consumed_at = CURRENT_TIMESTAMP,
+                consumed_by = #{dispatcherId},
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_resumed r
+            WHERE n.id = #{notificationId}
+              AND n.group_id = r.group_id
+              AND n.state = 'WAITING'
+            RETURNING n.id
         )
         SELECT
             (SELECT count(*) FROM notification_consumed) AS consumed,

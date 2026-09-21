@@ -16,7 +16,12 @@ public class WaitMemberDraft {
     /** 模型给出的工具调用身份，可能为空。 */
     private final String toolCallId;
     private final String toolName;
-    /** 异步外部作业身份，可能为空；同一个 Run 内唯一。 */
+    /**
+     * 异步外部作业身份，可能为空。
+     *
+     * <p>唯一范围是全局，不是同一个 Run 内：库里对它有全局唯一约束，跨 Run 撞同一个身份会被拒。
+     * {@code runId + externalOperationId} 这条查询里，Run 是额外的身份核对，不是唯一性范围。</p>
+     */
     private final String externalOperationId;
 
     public WaitMemberDraft(int memberSeq, String toolCallId, String toolName, String externalOperationId) {

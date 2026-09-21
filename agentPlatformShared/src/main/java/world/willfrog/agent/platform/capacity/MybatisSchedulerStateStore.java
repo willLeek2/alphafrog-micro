@@ -3,6 +3,8 @@ package world.willfrog.agent.platform.capacity;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
 
 /**
@@ -10,6 +12,10 @@ import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
  *
  * <p>判定走 {@link SchedulerPausePolicy}，输入里的暂停标记来自数据库，不是内存推断；写入后把库里的
  * 实际状态读回来返回，调用方据此上报指标与事件。</p>
+ *
+ * <p>判定本身在一个独立事务里完成，并且先锁住全局那一行：容量状态是「读—判定—写」三步，
+ * 只读不锁时两个线程会各自拿着同一份旧标记判定，后写的那个可以把前一个刚做出的暂停或恢复撤销掉。
+ * 用独立事务是因为它可能与调用方的事务并存，行锁要一直持到判定写回为止。</p>
  */
 @Service
 @RequiredArgsConstructor
@@ -27,10 +33,11 @@ public class MybatisSchedulerStateStore implements SchedulerStateStore {
     }
 
     @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public SchedulerPauseDecision decideAndRecord(long unfinishedCount,
                                                   int highWatermark,
                                                   int lowWatermark) {
-        SchedulerCapacityState current = mapper.loadCapacityState(GLOBAL_SCOPE);
+        SchedulerCapacityState current = mapper.lockCapacityState(GLOBAL_SCOPE);
         if (current == null) {
             throw new IllegalStateException(
                     "全局容量状态记录不存在：迁移里应当已经写入 GLOBAL 这一行，缺了说明库没建好");
@@ -71,6 +78,11 @@ public class MybatisSchedulerStateStore implements SchedulerStateStore {
             throw new IllegalArgumentException("轮转作用域不能为空");
         }
         Long current = mapper.currentRound(scope.name());
-        return current == null ? 0L : current;
+        if (current == null) {
+            // 与 advanceRound 同一种语义：缺种子行说明迁移没跑完，不能把 0 当成「第一轮」混过去。
+            throw new IllegalStateException(
+                    "轮次记录不存在：" + scope + "；迁移里应当已经写入这个作用域，缺了说明库没建好");
+        }
+        return current;
     }
 }

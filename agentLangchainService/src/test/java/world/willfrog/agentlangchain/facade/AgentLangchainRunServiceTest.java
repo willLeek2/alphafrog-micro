@@ -84,7 +84,8 @@ class AgentLangchainRunServiceTest {
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
-                anyString(), anyBoolean(), anyBoolean())).thenReturn(run);
+                anyString(), anyBoolean(), anyBoolean())).thenReturn(
+                new AgentRunEventService.RunCreation(run, true));
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("analyze stocks")
@@ -117,7 +118,8 @@ class AgentLangchainRunServiceTest {
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
-                eq(SchedulerVersionPolicy.DUAL_POOL_V1), anyBoolean(), anyBoolean())).thenReturn(run);
+                eq(SchedulerVersionPolicy.DUAL_POOL_V1), anyBoolean(), anyBoolean())).thenReturn(
+                new AgentRunEventService.RunCreation(run, true));
 
         runService.createRun(CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
@@ -157,6 +159,36 @@ class AgentLangchainRunServiceTest {
         assertThrows(IllegalArgumentException.class, () -> runService.createRun(request));
     }
 
+    /**
+     * 幂等键命中旧 Run 时：本次不启动 pipeline、不占用业务准入名额，为这次临时预留下的名额当场还回去。
+     * 同一次请求被重复提交，不应该让模型和工具再跑一遍。
+     */
+    @Test
+    void idempotentReadBackNeverLaunchesThePipelineAgain() {
+        when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
+        when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
+        LangchainRunConcurrencyScheduler.Reservation reservation =
+                mock(LangchainRunConcurrencyScheduler.Reservation.class);
+        when(scheduler.reserve()).thenReturn(reservation);
+        AgentRun existing = new AgentRun();
+        existing.setId("run-original");
+        existing.setUserId("u1");
+        when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
+                anyString(), anyBoolean(), anyBoolean())).thenReturn(
+                new AgentRunEventService.RunCreation(existing, false));
+
+        var message = runService.createRun(CreateAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setMessage("analyze stocks")
+                .build());
+
+        assertEquals("run-original", message.getId());
+        verify(pipeline, never()).launchAsync(any(), any());
+        verify(dualPoolRunAdmissionRegistry, never()).admitNewRun(anyString());
+        verify(scheduler).release(reservation);
+    }
+
     @Test
     void createRunIgnoresCallerDeploymentIdentityAndUsesReceivingAgentIdentity() {
         when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
@@ -165,7 +197,8 @@ class AgentLangchainRunServiceTest {
         run.setUserId("u1");
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
-                anyString(), anyBoolean(), anyBoolean())).thenReturn(run);
+                anyString(), anyBoolean(), anyBoolean())).thenReturn(
+                new AgentRunEventService.RunCreation(run, true));
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("hello")

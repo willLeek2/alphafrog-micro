@@ -44,6 +44,9 @@ public final class RunRequestDigest {
         ordered.put("endpointName", fingerprint.endpointName());
         ordered.put("provider", fingerprint.provider());
         ordered.put("captureLlmRequests", fingerprint.captureLlmRequests());
+        ordered.put("plannerCandidateCount", fingerprint.plannerCandidateCount());
+        ordered.put("debugMode", fingerprint.debugMode());
+        ordered.put("generateArtifacts", fingerprint.generateArtifacts());
         ordered.put("stageConfigJson", canonicalizeText(fingerprint.stageConfigJson(), objectMapper));
         String canonical;
         try {

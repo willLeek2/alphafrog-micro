@@ -46,8 +46,32 @@ class RunRequestDigestTest {
         assertThat(RunRequestDigest.digest(fingerprint("hello!", "{}"), objectMapper)).isNotEqualTo(base);
         assertThat(RunRequestDigest.digest(fingerprint("hello", "{\"a\":1}"), objectMapper)).isNotEqualTo(base);
         RunRequestFingerprint other = new RunRequestFingerprint(
-                "u-1", "hello", "{}", "other-model", "e", "p", false, "{}");
+                "u-1", "hello", "{}", "other-model", "e", "p", false, 3, false, true, "{}");
         assertThat(RunRequestDigest.digest(other, objectMapper)).isNotEqualTo(base);
+    }
+
+    /**
+     * 三个客户端可控、会改变产出的字段必须参与摘要：同一个幂等键换掉其中任何一个都不算同一次请求，
+     * 否则重复提交会被当成同一次读回旧 Run，用户看到的是另一次运行的产出。
+     */
+    @Test
+    void clientFieldsThatChangeTheOutcomeChangeTheDigest() {
+        String base = RunRequestDigest.digest(fingerprint("hello", "{}"), objectMapper);
+        assertThat(RunRequestDigest.digest(
+                new RunRequestFingerprint("u-1", "hello", "{}", "m", "e", "p", false, 5, false, true, "{}"),
+                objectMapper))
+                .as("候选计划数量变了，算出来的东西也不一样")
+                .isNotEqualTo(base);
+        assertThat(RunRequestDigest.digest(
+                new RunRequestFingerprint("u-1", "hello", "{}", "m", "e", "p", false, 3, true, true, "{}"),
+                objectMapper))
+                .as("调试模式变了")
+                .isNotEqualTo(base);
+        assertThat(RunRequestDigest.digest(
+                new RunRequestFingerprint("u-1", "hello", "{}", "m", "e", "p", false, 3, false, false, "{}"),
+                objectMapper))
+                .as("是否生成产物变了")
+                .isNotEqualTo(base);
     }
 
     @Test
@@ -59,6 +83,6 @@ class RunRequestDigestTest {
     }
 
     private static RunRequestFingerprint fingerprint(String message, String contextJson) {
-        return new RunRequestFingerprint("u-1", message, contextJson, "m", "e", "p", false, "{}");
+        return new RunRequestFingerprint("u-1", message, contextJson, "m", "e", "p", false, 3, false, true, "{}");
     }
 }

@@ -22,8 +22,16 @@ public interface NodeWorkItemStore {
     /** 创建一条工作项。同一个身份已经有一行时返回被拒事实（原因 {@code DUPLICATE_IDENTITY}）。 */
     NodeWorkItemMutationResult create(NodeWorkItem item);
 
-    /** 扫描可领取的工作项，按调度器版本过滤。 */
+    /** 扫描可领取的工作项，按调度器版本过滤。按版本查看进度时用它；节点派发不要用，见下一个方法。 */
     List<NodeWorkItem> scanClaimable(SchedulerVersion schedulerVersion, int limit);
+
+    /**
+     * 节点派发的一次全局扫描：双池家族的到期可领取分段放在同一份候选里取回，每条记录带着自己的冻结版本。
+     *
+     * <p>派发器必须用这一个：新旧版本共用同一个节点池，按版本各扫一次等于每种版本各取一份名额，
+     * 轮转顺序就散了。顺序里排在第一位的是这张图最近被派发的轮次，从没被派发过的排最前。</p>
+     */
+    List<NodeWorkItem> scanClaimableAcrossDualPool(int limit);
 
     /**
      * 条件领取：状态可运行、三类期望版本匹配，成功时返回新的领取代际。
@@ -134,6 +142,15 @@ public interface NodeWorkItemStore {
                                               Duration lease);
 
     Optional<NodeWorkItem> findByIdentity(NodeWorkItemIdentity identity);
+
+    /**
+     * 一个计划代际下每个逻辑节点的最新分段：同一个节点按尝试次数、分段序号取最大的那一行。
+     *
+     * <p>一次等待会把自己的分段写成已提交、同时建出下一段，所以判断「这个节点做完了没有」必须看最新分段：
+     * 拿第一段去问，会得到一个「已提交但没有成功结果」的中间行。返回的每一行都带它自己的分段身份，
+     * 提交结果与取消都按这一行来。</p>
+     */
+    List<NodeWorkItem> listLatestSegments(String runId, int planGeneration);
 
     List<NodeWorkItem> listUnfinishedByRun(String runId);
 

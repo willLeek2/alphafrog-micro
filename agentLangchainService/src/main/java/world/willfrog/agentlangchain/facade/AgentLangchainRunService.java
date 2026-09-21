@@ -62,6 +62,7 @@ public class AgentLangchainRunService {
         LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
         LangchainRunConcurrencyScheduler.Reservation reservation = null;
         AgentRun run = null;
+        boolean createdNow = false;
         // 版本在创建前选择并写进 Run。只有旧版本预占旧调度器名额；双池版本只在数据库
         // 记录写稳后补发提示，提示丢失由扫描恢复。
         String schedulerVersion = schedulerVersionPolicy.versionForNewRun();
@@ -74,7 +75,7 @@ public class AgentLangchainRunService {
             reservation = runConcurrencyScheduler.reserve();
         }
         try {
-            run = agentEventService.createRun(
+            AgentRunEventService.RunCreation creation = agentEventService.createRun(
                     userId,
                     message,
                     request.getContextJson(),
@@ -93,6 +94,19 @@ public class AgentLangchainRunService {
                     request.getGenerateArtifacts(),
                     isAdminUser(userId)
             );
+            run = creation.run();
+            createdNow = creation.created();
+            if (!createdNow) {
+                // 幂等键命中：这条 Run 早就建好、也早就交给执行入口了，这次只是一次重复提交。
+                // 既不预留名额，也不启动 pipeline；本次为它临时占下的名额当场还回去。
+                log.info("幂等键命中，本次不启动 pipeline: runId={} schedulerVersion={}",
+                        run.getId(), schedulerVersion);
+                if (reservation != null) {
+                    runConcurrencyScheduler.release(reservation);
+                    reservation = null;
+                }
+                return AgentLangchainRunMessageMapper.toRunMessage(run);
+            }
 
             if (pipeline != null) {
                 if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
@@ -114,7 +128,9 @@ public class AgentLangchainRunService {
             if (reservation != null) {
                 runConcurrencyScheduler.release(reservation);
             }
-            if (run != null) {
+            // 只有这次真的新建了 Run 才收尾：幂等读回的旧 Run 属于别人的执行流程，
+            // 一次重复提交的失败不该把它改成失败态。
+            if (run != null && createdNow) {
                 if (SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
                     dualPoolRunAdmissionRegistry.forgetFailedAdmission(run.getId());
                 }

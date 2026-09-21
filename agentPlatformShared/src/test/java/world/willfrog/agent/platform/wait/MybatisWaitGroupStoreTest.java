@@ -55,7 +55,7 @@ class MybatisWaitGroupStoreTest {
 
         when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
                 anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(suspensionRow(1, 77L, null, 3, 1, 3));
+                .thenReturn(suspensionRow(1, 77L, null, 2, 1, 3));
         WaitSuspensionResult suspended = store.suspendSegment(request);
         assertThat(suspended.outcome()).isEqualTo(WaitSuspensionOutcome.SUSPENDED);
         assertThat(suspended.groupId()).isEqualTo(77L);
@@ -112,8 +112,9 @@ class MybatisWaitGroupStoreTest {
 
     @Test
     void memberCompletionReportsAppliedAndReadyFlag() {
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), any(), anyLong()))
-                .thenReturn(memberRow(1, "SUCCEEDED", "READY", 3, 3, 1, 9));
+        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
+                any(), anyLong()))
+                .thenReturn(memberRow(1, "SUCCEEDED", "READY", 3, 3, 1, 9L));
         MemberCompletionResult ready = store.completeMember(completion("SUCCEEDED"));
         assertThat(ready.applied()).isTrue();
         assertThat(ready.groupBecameReady()).isTrue();
@@ -122,7 +123,8 @@ class MybatisWaitGroupStoreTest {
         assertThat(ready.groupState()).isEqualTo(WaitGroupState.READY);
         assertThat(ready.notificationId()).isEqualTo(9L);
 
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), any(), anyLong()))
+        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
+                any(), anyLong()))
                 .thenReturn(memberRow(0, "SUCCEEDED", "WAITING", 2, 3, null, null));
         MemberCompletionResult duplicate = store.completeMember(completion("SUCCEEDED"));
         assertThat(duplicate.applied()).isFalse();
@@ -132,7 +134,8 @@ class MybatisWaitGroupStoreTest {
 
     @Test
     void failureAlsoCountsAsOneCompletion() {
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), any(), anyLong()))
+        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
+                any(), anyLong()))
                 .thenReturn(memberRow(1, "FAILED", "WAITING", 1, 3, null, null));
         MemberCompletionResult result = store.completeMember(completion("FAILED"));
         assertThat(result.applied()).isTrue();
@@ -142,7 +145,8 @@ class MybatisWaitGroupStoreTest {
 
     @Test
     void unknownStateFromDatabaseFailsClosed() {
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), any(), anyLong()))
+        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
+                any(), anyLong()))
                 .thenReturn(memberRow(1, "SUCCEEDED", "DONE", 1, 3, null, null));
         assertThatThrownBy(() -> store.completeMember(completion("SUCCEEDED")))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -151,10 +155,11 @@ class MybatisWaitGroupStoreTest {
 
     @Test
     void lateResultStopsTheChainAndKeepsOnlyAudit() {
-        when(mapper.reportLateMember(anyLong(), anyString(), anyString(), any()))
+        when(mapper.reportLateMember(anyLong(), anyString(), anyString(), any(), anyLong()))
                 .thenReturn(memberRow(1, "LATE", "CANCELED", 0, 3, null, null));
         MemberCompletionResult result = store.reportLateMember(
-                new LateMemberRequest(77L, "call_1", "{\"kind\":\"LATE\"}", null));
+                new LateMemberRequest(77L, "call_1", "{\"kind\":\"LATE\"}", null, 3L));
+        verify(mapper).reportLateMember(77L, "call_1", "{\"kind\":\"LATE\"}", null, 3L);
         assertThat(result.applied()).isTrue();
         assertThat(result.memberState()).isEqualTo(WaitMemberState.LATE);
         assertThat(result.groupState()).isEqualTo(WaitGroupState.CANCELED);
@@ -181,7 +186,10 @@ class MybatisWaitGroupStoreTest {
 
         when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L)))
                 .thenReturn(consumption(1, 0, 77L, null));
-        assertThat(store.consumeRecovery(5L, "dispatcher-1", 3L).inconsistent()).isTrue();
+        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 3L))
+                .as("三条写入是串起来的，半成品说明库里的东西跟这套假设对不上，必须当场报出来")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("半成品");
     }
 
     // ===== 取消与读取 =====
@@ -233,13 +241,21 @@ class MybatisWaitGroupStoreTest {
         assertThatThrownBy(() -> store.findMemberByOperation("run-1", " "))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
-                WaitMemberState.LATE, "{}", null, 3L))
+                WaitMemberState.LATE, "{}", null, 0, 3L, 3L))
                 .as("正常结束只允许成功或失败")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
-                WaitMemberState.SUCCEEDED, " ", null, 3L))
+                WaitMemberState.SUCCEEDED, " ", null, 0, 3L, 3L))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new LateMemberRequest(77L, " ", "{}", null))
+        assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
+                WaitMemberState.SUCCEEDED, "{}", null, -1, 3L, 3L))
+                .as("计划代际从 -1 起，负数直接拒")
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
+                WaitMemberState.SUCCEEDED, "{}", null, 0, -1L, 3L))
+                .as("上下文版本不能是负数")
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new LateMemberRequest(77L, " ", "{}", null, 3L))
                 .isInstanceOf(IllegalArgumentException.class);
         verify(mapper, never()).cancelChain(anyLong());
     }
@@ -274,12 +290,12 @@ class MybatisWaitGroupStoreTest {
 
     private static MemberCompletionRequest completion(String state) {
         return new MemberCompletionRequest(77L, "call_1", WaitMemberState.fromWire(state),
-                "{\"kind\":\"INLINE\"}", "op-1", 3L);
+                "{\"kind\":\"INLINE\"}", "op-1", 0, 3L, 3L);
     }
 
     private static WaitMemberCompletionRow memberRow(Integer written, String memberState, String groupState,
                                                      Integer completed, Integer expected,
-                                                     Integer generation, Integer notificationId) {
+                                                     Integer generation, Long notificationId) {
         WaitMemberCompletionRow row = new WaitMemberCompletionRow();
         row.setMemberId(1L);
         row.setMemberSeq(0);

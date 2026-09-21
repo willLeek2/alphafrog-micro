@@ -57,6 +57,8 @@ class AgentRunEventServiceIdempotencyTest {
     private AgentRunEventRedisStore eventRedisStore;
     @Mock
     private AgentPromptService mockPromptService;
+    @Mock
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
     private AgentRunEventService service;
     private ObjectMapper objectMapper;
@@ -65,7 +67,7 @@ class AgentRunEventServiceIdempotencyTest {
     void setUp() {
         objectMapper = new ObjectMapper();
         service = new AgentRunEventService(runMapper, eventMapper, eventRedisStore, objectMapper,
-                redisTemplate, llmLocalConfigLoader, messageService, mockPromptService);
+                redisTemplate, llmLocalConfigLoader, messageService, mockPromptService, transactionManager);
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any())).thenReturn(new PromptRunSelection(
                 PromptRunSelection.SCHEMA_VERSION, "default-v1", "control", "bundle-digest",
@@ -78,10 +80,13 @@ class AgentRunEventServiceIdempotencyTest {
         AgentRun existing = existingRun("r-original", digest("hello", "{}"));
         when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(existing);
 
-        AgentRun returned = service.createRun(USER, "hello", "{}", KEY, "m", "e", false,
-                "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
-        assertThat(returned).isSameAs(existing);
+        assertThat(creation.run()).isSameAs(existing);
+        assertThat(creation.created())
+                .as("读回原来那条 Run 不算新建：上层据此不再准入、不再启动")
+                .isFalse();
         verify(runMapper, never()).insert(any());
         verify(eventMapper, never()).insert(any());
         verify(messageService, never()).createInitialMessage(anyString(), anyString());
@@ -116,10 +121,11 @@ class AgentRunEventServiceIdempotencyTest {
         when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(null, winner);
         when(runMapper.insert(any())).thenThrow(new DuplicateKeyException("同键并发"));
 
-        AgentRun returned = service.createRun(USER, "hello", "{}", KEY, "m", "e", false,
-                "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
-        assertThat(returned).isSameAs(winner);
+        assertThat(creation.run()).isSameAs(winner);
+        assertThat(creation.created()).isFalse();
         verify(runMapper).insert(any());
     }
 
@@ -127,9 +133,10 @@ class AgentRunEventServiceIdempotencyTest {
     void blankKeyBehavesLikeNoKeyAtAll() {
         stubFreshCreate();
 
-        service.createRun(USER, "hello", "{}", "   ", "m", "e", false,
-                "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", "   ", "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
+        assertThat(creation.created()).isTrue();
         verify(runMapper, never()).findByUserIdempotencyKey(anyString(), anyString());
         ArgumentCaptor<AgentRun> captor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(captor.capture());
@@ -141,9 +148,10 @@ class AgentRunEventServiceIdempotencyTest {
     void newRunWithKeyStoresKeyAndDigest() {
         stubFreshCreate();
 
-        service.createRun(USER, "hello", "{}", KEY, "m", "e", false,
-                "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
+        assertThat(creation.created()).isTrue();
         ArgumentCaptor<AgentRun> captor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(captor.capture());
         assertThat(captor.getValue().getIdempotencyKey()).isEqualTo(KEY);
@@ -171,7 +179,7 @@ class AgentRunEventServiceIdempotencyTest {
 
     private static String digest(String message, String contextJson) {
         return RunRequestDigest.digest(new RunRequestFingerprint(USER, message, contextJson, "m", "e",
-                "openrouter", false, "{}"), new ObjectMapper());
+                "openrouter", false, 2, false, false, "{}"), new ObjectMapper());
     }
 
     private static AgentRun existingRun(String runId, String requestDigest) {

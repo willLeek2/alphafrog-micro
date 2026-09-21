@@ -59,6 +59,14 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    public List<NodeWorkItem> scanClaimableAcrossDualPool(int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.scanClaimableAcrossDualPool(limit);
+    }
+
+    @Override
     public Optional<NodeWorkItemClaim> claim(NodeWorkItemIdentity identity,
                                              NodeWorkItemVersions expected,
                                              String claimant,
@@ -238,6 +246,11 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     public Optional<NodeWorkItem> findByIdentity(NodeWorkItemIdentity identity) {
         return Optional.ofNullable(mapper.findByIdentity(identity.runId(), identity.planGeneration(),
                 identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence()));
+    }
+
+    @Override
+    public List<NodeWorkItem> listLatestSegments(String runId, int planGeneration) {
+        return mapper.listLatestSegments(runId, planGeneration);
     }
 
     @Override

@@ -20,7 +20,9 @@ public class WaitMemberCompletionRow {
     private Integer expectedMembers;
     /** 这次刚好让组齐备时，新产生的恢复代际；没齐备时为 null。 */
     private Integer recoveryGeneration;
-    /** 这次刚好让组齐备时，写出的恢复通知编号；没齐备时为 null。 */
-    private Integer notificationId;
+    /** 这次刚好让组齐备时，写出的恢复通知编号；没齐备时为 null。与库里的自增主键一样用 Long。 */
+    private Long notificationId;
     private Integer writtenMembers;
+    /** 这次连带停掉的兄弟成员数：只有迟到这条路径会用到。 */
+    private Integer writtenSiblings;
 }

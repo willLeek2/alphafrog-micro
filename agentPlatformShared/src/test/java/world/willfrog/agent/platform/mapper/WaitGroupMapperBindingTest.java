@@ -191,9 +191,11 @@ class WaitGroupMapperBindingTest {
                 .contains("wi.node_id = ?")
                 .contains("wi.node_attempt = ?")
                 .contains("wi.segment_sequence = ?");
-        assertThat(sql).as("组身份唯一靠这条冲突子句")
-                .contains("ON CONFLICT (run_id, plan_generation, node_id, node_attempt, "
-                        + "segment_sequence, model_turn)");
+        assertThat(sql).as("计划代际与冻结版本都要在栅栏里")
+                .contains("r.plan_generation = ?")
+                .contains("r.scheduler_version = ?");
+        assertThat(sql).as("同一身份的下一段已经存在时让整条语句失败，不做静默跳过")
+                .doesNotContain("ON CONFLICT");
         assertThat(sql).as("当前分段以「分段结果已提交」收尾，节点是否完成另按最新分段判断")
                 .contains("state = 'RESULT_COMMITTED'");
         assertThat(sql).as("下一段建成等待态、领取代际归零，绝不能在保存挂起时就变成可执行")
@@ -223,19 +225,34 @@ class WaitGroupMapperBindingTest {
                 .contains("INSERT INTO alphafrog_agent_run_recovery_notification");
         assertThat(sql).as("通知只写一条靠唯一约束兜底")
                 .contains("ON CONFLICT (group_id, recovery_generation) DO NOTHING");
-        assertThat(sql).as("外部作业身份给了就必须对上")
-                .contains("m.external_operation_id = CAST(? AS varchar)");
+        assertThat(sql).as("外部作业身份给了就必须对上，两边都是空也只算同一成员")
+                .contains("m.external_operation_id = ?::varchar")
+                .contains("m.external_operation_id IS NULL AND ?::varchar IS NULL");
+        assertThat(sql).as("Run 的当前计划代际与这一段的上下文版本都要在同一写入里核对")
+                .contains("r.plan_generation = ?")
+                .contains("wi.context_version = ?")
+                .contains("wi.run_control_version = ?");
     }
 
     @Test
     void lateResultStopsTheWholeChain() {
         String sql = sql("reportLateMember");
         assertThat(sql).contains("state = 'LATE'")
-                .contains("state IN ('PENDING', 'RUNNING')")
                 .contains("g.state IN ('WAITING', 'READY')")
                 .contains("state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')")
                 .doesNotContain("INSERT")
                 .doesNotContain("completed_members = completed_members + 1");
+        // 已经被取消的成员也要能补审计：否则取消之后真到的结果连引用都留不下来。
+        assertThat(sql).as("迟到结果允许从「已取消」补一次审计")
+                .contains("m.state IN ('PENDING', 'RUNNING', 'CANCELED')");
+        // 审计只写一次：结果引用与外部作业身份都只在还是空的时候写。
+        assertThat(sql).as("重复上报不许覆盖先到的审计")
+                .contains("result_ref_json = COALESCE(m.result_ref_json,")
+                .contains("finished_at = COALESCE(m.finished_at,");
+        assertThat(sql).as("停链要 Run 还在这一代执行，版本对不上只留审计")
+                .contains("f.status = 'EXECUTING'")
+                .contains("f.run_plan_generation = g.plan_generation")
+                .contains("f.run_control_version = ?");
     }
 
     // ===== 恢复消费 =====
@@ -250,10 +267,15 @@ class WaitGroupMapperBindingTest {
                 .contains("wi.state = 'WAITING'")
                 .contains("state = 'RESUMABLE'")
                 .contains("r.run_control_version = ?")
-                .contains("wi.segment_sequence = r.next_segment_sequence")
+                .contains("wi.segment_sequence = g.next_segment_sequence")
                 .contains("runnable_since = CURRENT_TIMESTAMP");
-        assertThat(sql).as("消费是一次条件更新，同一个代际只有一次机会")
-                .contains("AND n.state = 'WAITING'");
+        assertThat(sql).as("通知的恢复代际要与组当前那一代逐字对上")
+                .contains("n.recovery_generation = g.recovery_generation");
+        assertThat(sql).as("Run 的当前计划代际要与组的计划代际对上")
+                .contains("r.plan_generation = g.plan_generation");
+        assertThat(sql).as("三条写入用 RETURNING 串起来，只有全成或全不写")
+                .contains("FROM segment_promoted")
+                .contains("FROM group_resumed");
     }
 
     @Test

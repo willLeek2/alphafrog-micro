@@ -48,12 +48,28 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
         }
         int closed = value(row.getClosedSegments());
         if (closed == 1 && row.getCreatedGroupId() != null) {
+            // 新写一条等待组时，成员与下一段必须一条不少地跟着落库：语句里它们是同一个 WITH 的三段，
+            // 计数不对说明写进去的不是我们以为的那份东西，这种「成功」不能交给调用方。
+            int expectedMembers = request.members().size();
+            if (value(row.getWrittenMembers()) != expectedMembers
+                    || value(row.getWrittenNextSegments()) != 1
+                    || row.getNextSegmentSequence() == null) {
+                throw new IllegalStateException("整组挂起写出的成员或下一段数量不对："
+                        + "期望成员 " + expectedMembers + "、下一段 1，实际成员 "
+                        + row.getWrittenMembers() + "、下一段 " + row.getWrittenNextSegments()
+                        + "，分段 " + request.segment().describe());
+            }
             return new WaitSuspensionResult(
                     WaitSuspensionOutcome.SUSPENDED, row.getCreatedGroupId(), row.getNextSegmentSequence());
         }
         if (closed == 0 && row.getExistingGroupId() != null) {
+            // 幂等重试：组是上一次就写好的，成员与下一段这一次都不会再插一次，所以不看那两个计数。
             log.info("同一次模型回合的等待组已经保存过，这次不重复写入：{} turn={}",
                     request.segment().describe(), request.modelTurn());
+            if (row.getNextSegmentSequence() == null) {
+                throw new IllegalStateException("已有的等待组上没有下一段序号："
+                        + request.segment().describe());
+            }
             return new WaitSuspensionResult(
                     WaitSuspensionOutcome.ALREADY_SUSPENDED, row.getExistingGroupId(),
                     row.getNextSegmentSequence());
@@ -78,6 +94,8 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                 request.memberIdentity(),
                 request.memberState().name(),
                 request.resultRefJson(),
+                request.planGeneration(),
+                request.contextVersion(),
                 request.externalOperationId(),
                 request.runControlVersion());
         int written = value(row == null ? null : row.getWrittenMembers());
@@ -97,10 +115,14 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                 request.groupId(),
                 request.memberIdentity(),
                 request.resultRefJson(),
-                request.externalOperationId());
+                request.externalOperationId(),
+                request.runControlVersion());
         int written = value(row == null ? null : row.getWrittenMembers());
         if (written > 0) {
-            log.warn("迟到结果只留档，这条等待链已经停下：group={} member={}",
+            log.warn("迟到结果只留档，这条等待链已经停下：group={} member={} 连带停掉的兄弟成员={}",
+                    request.groupId(), request.memberIdentity(), value(row.getWrittenSiblings()));
+        } else {
+            log.info("迟到结果的身份或版本对不上，什么都没有改：group={} member={}",
                     request.groupId(), request.memberIdentity());
         }
         return toCompletionResult(row, written > 0);
@@ -113,6 +135,9 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
         if (notificationId <= 0) {
             throw new IllegalArgumentException("恢复通知编号必须为正数：" + notificationId);
         }
+        if (dispatcherId == null || dispatcherId.isBlank()) {
+            throw new IllegalArgumentException("恢复消费必须留下消费方标识");
+        }
         RecoveryConsumptionRow row = mapper.consumeRecovery(notificationId, dispatcherId, runControlVersion);
         if (row == null) {
             throw new IllegalStateException("恢复消费语句没有返回结果行：notification=" + notificationId);
@@ -123,10 +148,11 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                 row.getGroupId(),
                 row.getNextSegmentSequence());
         if (result.inconsistent()) {
-            log.error("恢复消费只完成了一半：通知已取走但下一段没有放行。"
-                            + "通知与下一段的状态在写入时是成对判断的，出现这种组合说明数据被改坏了："
-                            + "notification={} group={} consumed={} promoted={}",
-                    notificationId, row.getGroupId(), row.getConsumed(), row.getPromoted());
+            // 三条写入在语句里是用 RETURNING 串起来的，只可能全成或全不写。出现半成品说明库里的
+            // 事实与这段代码的假设对不上，必须当场报出来——恢复资格只有一条，放过去就再也找不回。
+            throw new IllegalStateException("恢复消费出现半成品：notification=" + notificationId
+                    + " group=" + row.getGroupId() + " consumed=" + row.getConsumed()
+                    + " promoted=" + row.getPromoted());
         }
         return result;
     }
@@ -174,6 +200,9 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                                     int maxBackoffStep) {
         if (groupId <= 0) {
             throw new IllegalArgumentException("等待组编号必须为正数：" + groupId);
+        }
+        if (memberIdentity == null || memberIdentity.isBlank()) {
+            throw new IllegalArgumentException("成员稳定身份不能为空");
         }
         if (nextPollAt == null) {
             throw new IllegalArgumentException("推后查询必须给出下次查询时间");
@@ -268,7 +297,7 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
         WaitGroupState groupState = WaitGroupState.fromWire(row.getGroupState());
         int completed = value(row.getCompletedMembers());
         int expected = value(row.getExpectedMembers());
-        Long notificationId = row.getNotificationId() == null ? null : row.getNotificationId().longValue();
+        Long notificationId = row.getNotificationId();
         return new MemberCompletionResult(
                 applied, memberState, groupState, completed, expected, notificationId);
     }

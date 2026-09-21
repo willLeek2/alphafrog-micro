@@ -11,6 +11,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class NodeWorkPlanAdapterTest {
 
+    private static final String VERSION = SchedulerVersionPolicy.DUAL_POOL_V2;
+
     private final NodeWorkPlanAdapter adapter = new NodeWorkPlanAdapter();
 
     @Test
@@ -21,7 +23,7 @@ class NodeWorkPlanAdapterTest {
                 todo("todo-3", 3, List.of()));
 
         List<NodeWorkDraft> drafts = adapter.runnableLinear(
-                "run-1", 3, plan, Set.of("todo-1"), Set.of(), 7, 9);
+                "run-1", 3, plan, Set.of("todo-1"), Set.of(), 7, 9, VERSION);
 
         assertThat(drafts).hasSize(1);
         assertThat(drafts.get(0).identity().nodeId()).isEqualTo("todo-2");
@@ -38,7 +40,7 @@ class NodeWorkPlanAdapterTest {
                 todo("join", 4, List.of("left", "right")));
 
         List<NodeWorkDraft> drafts = adapter.runnableDag(
-                "run-1", 4, plan, Set.of("root"), Set.of(), 8, 10);
+                "run-1", 4, plan, Set.of("root"), Set.of(), 8, 10, VERSION);
 
         assertThat(drafts).extracting(draft -> draft.identity().nodeId())
                 .containsExactly("left", "right");
@@ -50,9 +52,22 @@ class NodeWorkPlanAdapterTest {
         LangchainTodoPlan plan = plan(todo("todo-1", 1, List.of()));
 
         assertThat(adapter.runnableLinear(
-                "run-1", 0, plan, Set.of(), Set.of("todo-1"), 0, 0)).isEmpty();
+                "run-1", 0, plan, Set.of(), Set.of("todo-1"), 0, 0, VERSION)).isEmpty();
         assertThat(adapter.runnableDag(
-                "run-1", 0, plan, Set.of(), Set.of("todo-1"), 0, 0)).isEmpty();
+                "run-1", 0, plan, Set.of(), Set.of("todo-1"), 0, 0, VERSION)).isEmpty();
+    }
+
+    @Test
+    void draftCarriesTheRunsSchedulerVersion() {
+        LangchainTodoPlan plan = plan(todo("todo-1", 1, List.of()));
+
+        List<NodeWorkDraft> v2 = adapter.runnableDag("run-1", 0, plan, Set.of(), Set.of(), 0, 0,
+                SchedulerVersionPolicy.DUAL_POOL_V2);
+        List<NodeWorkDraft> v1 = adapter.runnableDag("run-1", 0, plan, Set.of(), Set.of(), 0, 0,
+                SchedulerVersionPolicy.DUAL_POOL_V1);
+
+        assertThat(v2.get(0).schedulerVersion()).isEqualTo(SchedulerVersionPolicy.DUAL_POOL_V2);
+        assertThat(v1.get(0).schedulerVersion()).isEqualTo(SchedulerVersionPolicy.DUAL_POOL_V1);
     }
 
     private LangchainTodoPlan plan(TodoItem... items) {

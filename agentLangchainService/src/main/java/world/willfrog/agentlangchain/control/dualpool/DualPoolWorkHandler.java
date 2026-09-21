@@ -23,4 +23,12 @@ public interface DualPoolWorkHandler {
 
     /** 从数据库重新发现可以领取的节点工作项；返回值仅用于补发提示。 */
     List<NodeWorkItemIdentity> scanRunnableNodes(int limit);
+
+    /**
+     * 内存提示没能送出去时留下延期事实：写清楚原因，并把下次可见时间推后。
+     *
+     * <p>内存队列允许丢提示，因为数据库才是权威；但「这条工作项这一轮没被派发、下次什么时候再看」
+     * 必须能被读到，否则排队的图看上去与从没被调度过没有区别。</p>
+     */
+    void deferHintDelivery(NodeWorkItemIdentity identity);
 }

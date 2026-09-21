@@ -66,7 +66,12 @@ public interface WaitGroupStore {
 
     List<WaitMember> listMembers(long groupId);
 
-    /** 按外部作业身份找成员：结果接收路径的入口，同一个 Run 内唯一。 */
+    /**
+     * 按外部作业身份找成员：结果接收路径的入口。
+     *
+     * <p>外部作业身份在库里是全局唯一的，这里带上 Run 是额外的身份核对：拿到行之后还要确认它确实
+     * 属于这条 Run，不能只凭作业身份就往回接结果。</p>
+     */
     Optional<WaitMember> findMemberByOperation(String runId, String externalOperationId);
 
     Optional<WaitMember> findMemberByIdentity(long groupId, String memberIdentity);

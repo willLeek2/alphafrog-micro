@@ -4,7 +4,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
-import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -24,28 +23,29 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
     private final RunCoordinationMapper mapper;
 
     @Override
-    public boolean ensure(String runId, SchedulerVersion schedulerVersion, int planGeneration) {
+    public boolean ensure(String runId) {
         if (runId == null || runId.isBlank()) {
             throw new IllegalArgumentException("协调资格必须挂在某个 Run 上");
         }
-        if (schedulerVersion == null) {
-            throw new IllegalArgumentException("协调资格必须带调度器版本");
-        }
-        if (planGeneration < -1) {
-            throw new IllegalArgumentException("计划代际不能小于 -1：" + planGeneration);
-        }
-        return mapper.ensure(runId, schedulerVersion.name(), planGeneration) > 0;
+        // 版本与计划代际由语句从 Run 主表取，这里不传：调用方手上那份可能是滚动部署期间的旧值。
+        return mapper.ensure(runId) > 0;
     }
 
     @Override
-    public boolean deferFor(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt) {
+    public boolean deferFor(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt,
+                            int expectedPlanGeneration, long expectedCoordinationRound) {
         if (reason == null) {
             throw new IllegalArgumentException("延期必须给出原因，否则观测里看不出为什么没推进");
         }
         if (nextVisibleAt == null) {
             throw new IllegalArgumentException("延期必须给出下次可见时间");
         }
-        return mapper.deferFor(runId, reason.name(), nextVisibleAt) > 0;
+        if (expectedPlanGeneration < -1) {
+            throw new IllegalArgumentException("计划代际不能小于 -1：" + expectedPlanGeneration);
+        }
+        requireRoundNumber(expectedCoordinationRound);
+        return mapper.deferFor(runId, reason.name(), nextVisibleAt,
+                expectedPlanGeneration, expectedCoordinationRound) > 0;
     }
 
     @Override
@@ -61,34 +61,31 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
     }
 
     @Override
-    public boolean updatePlanGeneration(String runId, int planGeneration) {
+    public boolean syncPlanGeneration(String runId, int planGeneration) {
         if (planGeneration < -1) {
             throw new IllegalArgumentException("计划代际不能小于 -1：" + planGeneration);
         }
-        return mapper.updatePlanGeneration(runId, planGeneration) > 0;
+        return mapper.syncPlanGeneration(runId, planGeneration) > 0;
     }
 
     @Override
-    public List<RunCoordination> scanDue(SchedulerVersion schedulerVersion, int limit) {
-        if (schedulerVersion == null) {
-            throw new IllegalArgumentException("扫描候选 Run 必须带调度器版本");
-        }
+    public List<RunCoordination> scanDue(int limit) {
         if (limit <= 0) {
             throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
         }
-        return mapper.scanDue(schedulerVersion.name(), limit);
+        return mapper.scanDue(limit);
     }
 
     @Override
-    public int refreshCoordinationMissedRounds(SchedulerVersion schedulerVersion, long roundNumber) {
-        requireRefresh(schedulerVersion, roundNumber);
-        return mapper.refreshCoordinationMissedRounds(schedulerVersion.name(), roundNumber);
+    public int refreshCoordinationMissedRounds(long roundNumber) {
+        requireRoundNumber(roundNumber);
+        return mapper.refreshCoordinationMissedRounds(roundNumber);
     }
 
     @Override
-    public int refreshDispatchMissedRounds(SchedulerVersion schedulerVersion, long roundNumber) {
-        requireRefresh(schedulerVersion, roundNumber);
-        return mapper.refreshDispatchMissedRounds(schedulerVersion.name(), roundNumber);
+    public int refreshDispatchMissedRounds(long roundNumber) {
+        requireRoundNumber(roundNumber);
+        return mapper.refreshDispatchMissedRounds(roundNumber);
     }
 
     @Override
@@ -105,10 +102,4 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
         }
     }
 
-    private static void requireRefresh(SchedulerVersion schedulerVersion, long roundNumber) {
-        if (schedulerVersion == null) {
-            throw new IllegalArgumentException("刷新轮数必须带调度器版本");
-        }
-        requireRoundNumber(roundNumber);
-    }
 }

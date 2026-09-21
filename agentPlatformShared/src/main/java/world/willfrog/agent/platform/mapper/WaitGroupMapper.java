@@ -72,24 +72,37 @@ public interface WaitGroupMapper {
     /**
      * 成员落终态一次，并在它让整组刚好齐备时写出恢复通知。
      *
-     * <p>{@code externalOperationId} 非空时会额外要求与库里的值一致，防止别的作业的结果接到这个成员上。</p>
+     * <p>身份与版本在一条语句里一起核对：组必须属于这条 Run、计划代际与这一段一直在用的上下文版本
+     * 都必须对得上，外部作业身份要求逐字一致（两边都是空也算一致）。</p>
      */
     WaitMemberCompletionRow completeMember(@Param("groupId") long groupId,
                                            @Param("memberIdentity") String memberIdentity,
                                            @Param("memberState") String memberState,
                                            @Param("resultRefJson") String resultRefJson,
+                                           @Param("planGeneration") int planGeneration,
+                                           @Param("contextVersion") long contextVersion,
                                            @Param("externalOperationId") String externalOperationId,
                                            @Param("runControlVersion") long runControlVersion);
 
-    /** 迟到结果留档：成员改成迟到，并把这条链一起停下。 */
+    /**
+     * 迟到结果留档：成员改成迟到，并把这条链一起停下。
+     *
+     * <p>已经在等的成员改成迟到并停链；已经被取消的成员只补审计字段（结果引用、外部作业身份、
+     * 结束时间只在还是空的时候写一次）；身份对不上的上报什么都不做。</p>
+     */
     WaitMemberCompletionRow reportLateMember(@Param("groupId") long groupId,
                                              @Param("memberIdentity") String memberIdentity,
                                              @Param("resultRefJson") String resultRefJson,
-                                             @Param("externalOperationId") String externalOperationId);
+                                             @Param("externalOperationId") String externalOperationId,
+                                             @Param("runControlVersion") long runControlVersion);
 
     // ===== 恢复消费 =====
 
-    /** 取走一条通知并把下一段放成可恢复；Run 状态或控制版本不符时整条语句什么都不做。 */
+    /**
+     * 放行下一段、把组改成已恢复、再把通知改成已消费；三步用 RETURNING 串起来，只有全成或全不写。
+     *
+     * <p>Run 状态、计划代际、控制版本、通知的恢复代际与下一段的等待态都必须同时成立。</p>
+     */
     RecoveryConsumptionRow consumeRecovery(@Param("notificationId") long notificationId,
                                            @Param("dispatcherId") String dispatcherId,
                                            @Param("runControlVersion") long runControlVersion);

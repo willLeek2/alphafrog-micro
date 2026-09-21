@@ -15,7 +15,8 @@ import java.util.Set;
  * 四项都要匹配才允许交出这一段；不匹配说明这一段已经不归调用方所有。</p>
  *
  * <p>成员的稳定身份在这里一次算好（见 {@link WaitMemberIdentity}），跟成员一起落库；重试时读库里的值，
- * 不再重新生成。</p>
+ * 不再重新生成。原始序号必须从 0 开始连续铺满一整段：恢复时按原始序号把结果接回模型消息，
+ * 缺号会让接回去的顺序出现空洞。</p>
  *
  * @param segment                当前执行分段的身份
  * @param versions               当前执行分段上的版本与领取代际
@@ -65,6 +66,12 @@ public record WaitSuspensionRequest(
             }
             if (!sequences.add(member.getMemberSeq())) {
                 throw new IllegalArgumentException("成员原始序号重复：" + member.getMemberSeq());
+            }
+        }
+        for (int expected = 0; expected < members.size(); expected++) {
+            if (!sequences.contains(expected)) {
+                throw new IllegalArgumentException(
+                        "成员原始序号必须从 0 开始连续：" + sequences + "，缺 " + expected);
             }
         }
         if (suspensionPayloadJson == null || suspensionPayloadJson.isBlank()) {

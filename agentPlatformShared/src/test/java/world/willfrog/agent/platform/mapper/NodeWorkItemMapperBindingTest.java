@@ -398,6 +398,26 @@ class NodeWorkItemMapperBindingTest {
         }
     }
 
+    /**
+     * 节点派发的那一次全局扫描：新旧双池版本的到期分段放在一份候选里，一次取回；
+     * 顺序里排第一位的是这张图最近被派发的轮次，从没被派发过的排最前。
+     */
+    @Test
+    void globalDispatchScanIsOneCandidateSetOrderedByDispatchRotation() {
+        String sql = normalized(configuration.getMappedStatement(NAMESPACE + ".scanClaimableAcrossDualPool")
+                .getSqlSource().getBoundSql(dummyParams("scanClaimableAcrossDualPool")).getSql());
+        assertThat(sql).as("双池家族的版本列在同一份候选里，不是每种版本各扫一次")
+                .contains("scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2')")
+                .doesNotContain("scheduler_version = ?");
+        assertThat(sql).as("只取到期可领取的分段")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')")
+                .contains("next_visible_at <= CURRENT_TIMESTAMP");
+        assertThat(sql).as("轮转位置排第一位：没被派发过的按 0 算，排最前")
+                .contains("ORDER BY COALESCE((SELECT c.dispatch_served_round");
+        assertThat(sql).as("还没有协调资格记录的图按 0 处理，不因此被跳过")
+                .contains("), 0)");
+    }
+
     // ===== 参数绑定 =====
 
     @Test

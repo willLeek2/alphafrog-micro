@@ -41,6 +41,15 @@ public interface NodeWorkItemMapper {
                                      @Param("limit") int limit);
 
     /**
+     * 节点派发的一次全局扫描：双池家族的到期可领取分段放在同一份候选里，一次取回，
+     * 顺序按这张图最近被派发的轮次升序（从没被派发过的排最前），再按到期时间与行号。
+     *
+     * <p>它不按版本分池：分池时每种版本各取一份 {@code LIMIT}，谁先谁后由各自的池子决定，
+     * 谈不上共用一个节点池的轮转。调用方拿到的每一行都带着自己的冻结版本。</p>
+     */
+    List<NodeWorkItem> scanClaimableAcrossDualPool(@Param("limit") int limit);
+
+    /**
      * 条件领取：状态必须是可运行，三类期望版本（计划代际、上下文版本、控制版本）必须匹配。
      * 领取成功把领取代际加一并返回新值；返回 {@code null} 表示这次没领到。
      */
@@ -198,6 +207,13 @@ public interface NodeWorkItemMapper {
                        @Param("nodeId") String nodeId,
                        @Param("nodeAttempt") int nodeAttempt,
                        @Param("segmentSequence") int segmentSequence);
+
+    /**
+     * 某个计划代际下每个逻辑节点的最新分段：同一个节点里尝试次数与分段序号最大的那一行。
+     * 外层推进判断节点是否做完、以及拿哪一段的结果回复上游，都用这一行。
+     */
+    List<NodeWorkItem> listLatestSegments(@Param("runId") String runId,
+                                          @Param("planGeneration") int planGeneration);
 
     /** 某个 Run 上还没完成的工作项（清理准入与背压读数用）。 */
     List<NodeWorkItem> listUnfinishedByRun(@Param("runId") String runId);

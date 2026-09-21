@@ -12,11 +12,25 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.mybatis.spring.SqlSessionTemplate;
 import org.postgresql.ds.PGSimpleDataSource;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+import world.willfrog.agent.platform.capacity.MybatisSchedulerStateStore;
+import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
+import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
+import world.willfrog.agent.platform.coordination.RunCoordination;
+import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
+import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.mapper.MigrationStatements;
 import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
+import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
+import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
@@ -27,13 +41,12 @@ import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import javax.sql.DataSource;
 import java.io.InputStream;
 import java.net.URI;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.time.OffsetDateTime;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -48,14 +61,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 阶段三数据合同与等待链在真实 PostgreSQL 上的验证。
  *
  * <p>只在给了外部连接串时才跑：环境变量 {@code AF_STAGE3_PG_DSN}（形如
- * {@code postgresql://user:pass@host:5432/db}，或直接给 {@code jdbc:postgresql://...} 再加
- * {@code AF_STAGE3_PG_USER}/{@code AF_STAGE3_PG_PASSWORD}）。本机禁止起 Docker，所以本地一律跳过；
+ * {@code postgresql://host:5432/db} 或 {@code jdbc:postgresql://...}；账号口令只从
+ * {@code AF_STAGE3_PG_USER} / {@code AF_STAGE3_PG_PASSWORD} 读，连接串里带 userinfo 会直接失败）。本机禁止起 Docker，所以本地一律跳过；
  * 证据要在负责人授权的外部 PostgreSQL 上跑出来。</p>
  *
- * <p>做法：建一个临时 schema，把连接串的 {@code currentSchema} 指到它 → 走真实升级链（init 建表脚本加
- * 各版本升级脚本，一路升到 006）→ 把 007 脚本的语句整份执行两遍（第二遍要一样通过，证明脚本可重复
- * 执行）→ 逐条插反例确认被约束拒绝 → 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生
- * 一次恢复资格、组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
+ * <p>做法：建一个临时 schema，用数据源自己的 schema 属性指到它（建表之前先读回
+ * {@code current_schema()} 确认写入落在这里）→ 走真实升级链（init 建表脚本加各版本升级脚本，一路升到
+ * 006）→ 把这一阶段的 007 与 008 两份脚本按顺序整份执行两遍（第二遍要一样通过，证明脚本可重复执行）
+ * → 逐条插反例确认被约束拒绝 → 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次
+ * 恢复资格、组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
+ *
+ * <p>正式出证据时要同时置上 {@code AF_STAGE3_PG_DSN} 与 {@code AF_STAGE3_PG_REQUIRED}：后者让缺连接串
+ * 变成一条失败用例，而不是一次「跳过」——跳过的报告照样能让 Maven 以 0 退出，光看退出码会把没跑当跑过。</p>
  *
  * <p>夹具（Run、节点分段、等待组）都走真实写入语句，不手写列清单：列集合与约束由映射文件保证，
  * 免得真库上一份手写的前置表把合同测成了另一回事。</p>
@@ -66,8 +83,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 class Stage3WaitContractPostgresTest {
 
     private static final String STAGE3_SCRIPT = "007_agent_run_dag_wait_group.sql";
+    private static final String DISPATCH_PROOF_SCRIPT = "008_agent_run_wait_member_dispatch_proof.sql";
     private static final String SCHEMA = "stage3_contract_" + UUID.randomUUID().toString().replace("-", "");
     private static final int CONCURRENT_THREADS = 4;
+    private static final int HIGH_WATERMARK = 128;
+    private static final int LOW_WATERMARK = 96;
 
     private static DataSource dataSource;
     private static SqlSessionFactory sqlSessionFactory;
@@ -77,16 +97,30 @@ class Stage3WaitContractPostgresTest {
     @BeforeAll
     static void setUp() throws Exception {
         String dsn = env("AF_STAGE3_PG_DSN");
-        Assumptions.assumeTrue(dsn != null && !dsn.isBlank(),
-                "未提供 AF_STAGE3_PG_DSN：真库合同验证要在负责人授权的 PostgreSQL 上执行，本机不跑");
+        if (dsn == null || dsn.isBlank()) {
+            // 正式出证据时把 AF_STAGE3_PG_REQUIRED 置上：那时缺连接串是配置错误，必须是一条红色用例。
+            // 没有这个开关就跳过：本机禁止起 Docker，开发机上跑不出真库，跳过才不至于把红当常态。
+            if (flag("AF_STAGE3_PG_REQUIRED")) {
+                throw new IllegalStateException(
+                        "AF_STAGE3_PG_REQUIRED 已经要求真库验证，但没有给 AF_STAGE3_PG_DSN");
+            }
+            Assumptions.assumeTrue(false,
+                    "未提供 AF_STAGE3_PG_DSN：真库合同验证要在负责人授权的 PostgreSQL 上执行，本机不跑");
+        }
         Target target = resolveTarget(dsn);
         try (Connection connection = open(target, null).getConnection();
              Statement statement = connection.createStatement()) {
             statement.execute("CREATE SCHEMA " + SCHEMA);
         }
         dataSource = open(target, SCHEMA);
+        // 先确认连接真的落在本次随机临时 schema 里再动任何脚本：连接串自带 currentSchema 或
+        // search_path 参数时，后面的建表与升级会写到别的 schema，而报告看起来仍然是通过的。
+        assertThat(currentSchema()).as("所有连接都必须落在本次随机临时 schema 里").isEqualTo(SCHEMA);
         applyUpgradeChain();
-        applyStage3ScriptTwice();
+        applyStage3ScriptsTwice();
+        // 空表与列形状的检查放在这里：这些用例共用同一个 schema，JUnit 又不保证方法顺序，
+        // 放到某一条用例里断言「表还是空的」会变成顺序依赖。
+        assertFreshlyMigratedSchema();
         sqlSessionFactory = buildSessionFactory(dataSource);
     }
 
@@ -99,15 +133,6 @@ class Stage3WaitContractPostgresTest {
              Statement statement = connection.createStatement()) {
             statement.execute("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
         }
-    }
-
-    // ==================== 脚本可重复执行 ====================
-
-    @Test
-    void stage3ScriptOnlyAddsStructures() throws Exception {
-        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_group")).isZero();
-        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_scheduler_round")).isEqualTo(2);
-        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_scheduler_capacity_state")).isEqualTo(1);
     }
 
     // ==================== 反例约束 ====================
@@ -150,6 +175,116 @@ class Stage3WaitContractPostgresTest {
         expectRejected("UPDATE alphafrog_agent_run_coordination SET defer_reason = 'HINT_QUEUE_FULL' "
                 + "WHERE run_id = 'run-coord-v2'",
                 "alphafrog_agent_run_coordination_defer_reason_check");
+    }
+
+    @Test
+    void latestSegmentWinsForEachLogicalNode() throws Exception {
+        String runId = "run-latest";
+        createRun(runId, 2, 0L);
+        // 第一段把整组工具交出去之后已提交：节点没完成，下一段才是它现在的样子。
+        createSegment(runId, 2, "node-1", 0, 0, 3, "worker-1", 3L, 0L, "RESULT_COMMITTED");
+        execute("UPDATE alphafrog_agent_run_work_item SET payload_json = payload_json || "
+                + "'{\"waitGroup\":{\"modelTurn\":0,\"nextSegmentSequence\":1,\"memberCount\":2}}'::jsonb "
+                + "WHERE run_id = '" + runId + "' AND node_id = 'node-1' AND segment_sequence = 0");
+        createSegment(runId, 2, "node-1", 0, 1, 0, null, 3L, 0L, "WAITING");
+        // 同一个逻辑节点被重做过一次：最新尝试里的最新分段才算数。
+        createSegment(runId, 2, "node-1", 1, 0, 0, null, 3L, 0L, "RUNNABLE");
+        createSegment(runId, 2, "node-2", 0, 0, 0, null, 3L, 0L, "RUNNABLE");
+        // 另一个计划代际的行不属于这一次读取。
+        createSegment(runId, 3, "node-1", 0, 0, 0, null, 3L, 0L, "RUNNABLE");
+
+        List<NodeWorkItem> latest = latestSegments(runId, 2);
+        assertThat(latest).extracting(NodeWorkItem::getNodeId)
+                .containsExactlyInAnyOrder("node-1", "node-2");
+        NodeWorkItem node = latest.stream()
+                .filter(item -> "node-1".equals(item.getNodeId())).findFirst().orElseThrow();
+        assertThat(node.getNodeAttempt()).as("同一个节点取尝试次数最大的那次").isEqualTo(1);
+        assertThat(node.getSegmentSequence()).isZero();
+    }
+
+    /**
+     * 三种已知版本在同一份候选里竞争，谁等得久谁先被服务。
+     *
+     * <p>资格记录上的版本必须是从 Run 主表派生出来的：造数据时给父 Run 定版本，不再另外插一条
+     * 版本不一致的子记录，否则「父子一致」这件事根本没被测到。</p>
+     */
+    @Test
+    void coordinationRotationServesTheLongestWaitingRunFirstAcrossEveryVersion() throws Exception {
+        createRunFor("run-cold", "user-1", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        createRunFor("run-warm", "user-1", SchedulerVersion.DUAL_POOL_V1, 0, 0L);
+        createRunFor("run-hot", "user-1", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        createRunFor("run-legacy", "user-1", SchedulerVersion.LEGACY, 0, 0L);
+        RunCoordinationStore store = coordinationStore();
+
+        assertThat(store.ensure("run-cold")).isTrue();
+        assertThat(store.ensure("run-warm")).isTrue();
+        assertThat(store.ensure("run-hot")).isTrue();
+        // 同一个 Run 再写一次不改任何东西：资格记录一个 Run 只有一行。
+        assertThat(store.ensure("run-hot")).isFalse();
+        assertThat(store.ensure("run-legacy"))
+                .as("协调名额与轮转是新旧版本共用的入口，老 Run 也要能建出这一行")
+                .isTrue();
+        assertThat(store.ensure("run-missing"))
+                .as("Run 不存在时建不出资格记录，影响 0 行")
+                .isFalse();
+        assertThat(store.find("run-legacy").orElseThrow().getSchedulerVersion())
+                .as("记录上的版本取自 Run 主表，不由调用方指定")
+                .isEqualTo("LEGACY");
+        assertThat(store.find("run-legacy").orElseThrow().getPlanGeneration()).isZero();
+
+        // 插入时间各自不同，抹平之后这一轮的所有图都在同一份候选里。
+        execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP");
+        assertThat(store.scanDue(10))
+                .as("一次全局扫描：旧版本与两个双池版本排在同一份候选里，按每行的冻结版本路由")
+                .extracting(RunCoordination::getRunId)
+                .containsExactlyInAnyOrder("run-cold", "run-warm", "run-hot", "run-legacy");
+
+        store.markCoordinationServed("run-cold", 1);
+        store.markCoordinationServed("run-warm", 7);
+        store.markCoordinationServed("run-hot", 9);
+        assertThat(store.scanDue(10))
+                .as("从没被服务过的排最前，其余按最近被服务的轮次升序")
+                .extracting(RunCoordination::getRunId)
+                .containsExactly("run-legacy", "run-cold", "run-warm", "run-hot");
+
+        // 轮次位置只许前进：迟到的旧轮次写进来影响 0 行，不能把新事实改回旧事实。
+        assertThat(store.markCoordinationServed("run-hot", 3)).isFalse();
+        assertThat(store.find("run-hot").orElseThrow().getCoordinationServedRound()).isEqualTo(9);
+
+        // 延期要写清原因与下次可见时间，并带上这一轮读到的计划代际与轮次做条件。
+        assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
+                OffsetDateTime.now().plusMinutes(5), 0, 0L))
+                .as("轮次对不上：这是旧观察，写进去只会把新事实拉回旧事实")
+                .isFalse();
+        assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
+                OffsetDateTime.now().plusMinutes(5), 0, 1L)).isTrue();
+        assertThat(store.find("run-cold").orElseThrow().deferReasonEnum())
+                .isEqualTo(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
+        assertThat(store.scanDue(10))
+                .extracting(RunCoordination::getRunId)
+                .containsExactly("run-legacy", "run-warm", "run-hot");
+
+        // Run 推进计划代际：资格记录跟着走，只许前进，也不许写一个不属于 Run 的代际。
+        execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = 'run-cold'");
+        assertThat(store.syncPlanGeneration("run-cold", 0)).as("代际倒退不写").isFalse();
+        assertThat(store.syncPlanGeneration("run-cold", 2))
+                .as("声明的这一代必须就是 Run 主表上的当前一代")
+                .isFalse();
+        assertThat(store.syncPlanGeneration("run-cold", 1)).isTrue();
+        assertThat(store.find("run-cold").orElseThrow().getPlanGeneration()).isEqualTo(1);
+        assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
+                OffsetDateTime.now().plusMinutes(5), 0, 1L))
+                .as("计划代际已经变了，拿旧代际写的延期不生效")
+                .isFalse();
+
+        // 成功推进：延期原因清掉、轮次位置更新，于是它排到最后（这一轮别人先来）。
+        assertThat(store.markCoordinationServed("run-cold", 11)).isTrue();
+        RunCoordination served = store.find("run-cold").orElseThrow();
+        assertThat(served.getDeferReason()).isNull();
+        assertThat(served.getCoordinationServedRound()).isEqualTo(11);
+        assertThat(store.scanDue(10))
+                .extracting(RunCoordination::getRunId)
+                .containsExactly("run-legacy", "run-warm", "run-hot", "run-cold");
     }
 
     @Test
@@ -380,6 +515,208 @@ class Stage3WaitContractPostgresTest {
         }
     }
 
+    // ==================== 恢复资格的真实主键 ====================
+
+    /**
+     * 第二条及以后的恢复通知必须返回自己的真实主键。
+     *
+     * <p>只断言「编号非空」的话，第一条通知在空库里碰巧就是 1，把常量当主键也看不出来；这里让同一个
+     * schema 里出现第二条通知，再用它去消费。</p>
+     */
+    @Test
+    void everyRecoveryNotificationKeepsItsOwnPrimaryKey() throws Exception {
+        GroupFixture first = suspendSimpleGroup("run-notify-a", 1, 0L);
+        Long firstId = completeMember(first.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                first.runControlVersion()).notificationId();
+        assertThat(firstId).isNotNull();
+
+        GroupFixture second = suspendSimpleGroup("run-notify-b", 2, 0L);
+        completeMember(second.groupId(), "call-a", WaitMemberState.SUCCEEDED, second.runControlVersion());
+        Long secondId = completeMember(second.groupId(), "call-b", WaitMemberState.SUCCEEDED,
+                second.runControlVersion()).notificationId();
+
+        assertThat(secondId).as("第二条通知不能返回一个常量").isNotNull().isNotEqualTo(firstId);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id = " + secondId + " AND group_id = " + second.groupId()
+                + " AND state = 'WAITING'"))
+                .as("返回的编号必须真的指向这条链自己那条通知")
+                .isEqualTo(1);
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            RecoveryConsumptionResult result = store.consumeRecovery(secondId, "dispatcher-2",
+                    second.runControlVersion());
+            assertThat(result.consumed()).isTrue();
+            assertThat(result.promoted()).isTrue();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + second.runId() + "' AND segment_sequence = 1 AND state = 'RESUMABLE'"))
+                .as("消费第二条通知把第二条链的下一段放行")
+                .isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id = " + firstId + " AND state = 'WAITING'"))
+                .as("第一条链的恢复资格不受影响：两条链各拿各的号")
+                .isEqualTo(1);
+    }
+
+    // ==================== 计划代际的栅栏 ====================
+
+    /**
+     * Run 推进计划代际之后，旧计划的挂起、成员结果、恢复消费都必须影响 0 行。
+     *
+     * <p>控制版本这一个条件挡不住这种情形：计划代际已经往前走，控制版本可能还没变。三处写入都要
+     * 各自核对 Run 当前计划代际。</p>
+     */
+    @Test
+    void oldPlanGenerationCannotSuspendCompleteOrConsume() throws Exception {
+        GroupFixture suspending = suspendSimpleGroup("run-gen-suspend", 2, 0L);
+        execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = '" + suspending.runId() + "'");
+        WaitSuspensionResult again = suspendAgain(suspending.runId(), 0, suspending.runControlVersion());
+        assertThat(again.suspended()).as("旧计划的挂起整条不生效").isFalse();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_group WHERE run_id = '"
+                + suspending.runId() + "'"))
+                .as("不能因此再建第二条链")
+                .isEqualTo(1);
+
+        MemberCompletionResult staleMember = completeMember(suspending.groupId(), "call-a",
+                WaitMemberState.SUCCEEDED, suspending.runControlVersion());
+        assertThat(staleMember.applied()).as("旧计划的成员结果不算数").isFalse();
+        assertThat(groupCompletedMembers(suspending.groupId())).isZero();
+        assertThat(memberCount(suspending.groupId(), "call-a", "SUCCEEDED")).isZero();
+
+        // 另一条链先把恢复资格挣到手，再推进计划代际：这时旧通知不该被取走。
+        GroupFixture consuming = suspendSimpleGroup("run-gen-consume", 1, 0L);
+        long notificationId = completeMember(consuming.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                consuming.runControlVersion()).notificationId();
+        execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = '" + consuming.runId() + "'");
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            RecoveryConsumptionResult result = store.consumeRecovery(notificationId, "dispatcher-3",
+                    consuming.runControlVersion());
+            assertThat(result.consumed()).as("计划代际已经变了，这条恢复资格取不走").isFalse();
+            assertThat(result.promoted()).isFalse();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id = " + notificationId + " AND state = 'WAITING'"))
+                .as("通知留在等待态，没有变成「已消费但没放行」")
+                .isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + consuming.runId() + "' AND segment_sequence = 1 AND state = 'WAITING'"))
+                .as("下一段还在等待态，没有被提前放行")
+                .isEqualTo(1);
+    }
+
+    /**
+     * 下一段不可放行时，通知必须留在等待态：既不能消费掉，也不能把下一段改成可恢复。
+     */
+    @Test
+    void notificationStaysWaitingWhenTheNextSegmentCannotBeReleased() throws Exception {
+        // (a) 下一段不是等待态。
+        GroupFixture movedAhead = suspendSimpleGroup("run-block-a", 1, 0L);
+        long notificationA = completeMember(movedAhead.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                movedAhead.runControlVersion()).notificationId();
+        execute("UPDATE alphafrog_agent_run_work_item SET state = 'RUNNABLE' WHERE run_id = '"
+                + movedAhead.runId() + "' AND segment_sequence = 1");
+
+        // (b) 组的恢复代际已经往前走了一格，这条通知落后了。
+        GroupFixture newerGeneration = suspendSimpleGroup("run-block-b", 1, 0L);
+        long notificationB = completeMember(newerGeneration.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                newerGeneration.runControlVersion()).notificationId();
+        execute("UPDATE alphafrog_agent_run_wait_group SET recovery_generation = recovery_generation + 1 "
+                + "WHERE id = " + newerGeneration.groupId());
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            assertThat(store.consumeRecovery(notificationA, "dispatcher-a",
+                    movedAhead.runControlVersion()).consumed()).isFalse();
+            assertThat(store.consumeRecovery(notificationB, "dispatcher-b",
+                    newerGeneration.runControlVersion()).consumed()).isFalse();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id IN (" + notificationA + ", " + notificationB + ") AND state = 'WAITING'"))
+                .as("两条通知都留着，等下一轮再来")
+                .isEqualTo(2);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id IN ('"
+                + movedAhead.runId() + "', '" + newerGeneration.runId() + "') AND state = 'RESUMABLE'"))
+                .as("两条链的下一段都没有被放行")
+                .isZero();
+    }
+
+    /**
+     * 取消之后结果才到：只留审计，组与分段都不复活；同组其他成员也不再出现在到期扫描的口径里。
+     */
+    @Test
+    void afterCancelALateResultOnlyLeavesAudit() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-cancel", 2, 0L);
+        // 一个成员看起来已经在外面跑：结果到达时它是要留审计的那一个。
+        execute("UPDATE alphafrog_agent_run_wait_member SET state = 'RUNNING', "
+                + "external_operation_id = 'op-late' WHERE group_id = " + fixture.groupId()
+                + " AND member_seq = 0");
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            WaitChainCancelResult canceled = store.cancelChain(fixture.groupId());
+            assertThat(canceled.canceled()).isTrue();
+            assertThat(canceled.membersCanceled())
+                    .as("同组还没结束的成员一起停，不能漏下")
+                    .isEqualTo(2);
+
+            MemberCompletionResult late = store.reportLateMember(new LateMemberRequest(fixture.groupId(),
+                    "call-a", "{\"note\":\"late-1\"}", "op-late", fixture.runControlVersion()));
+            assertThat(late.memberState()).isEqualTo(WaitMemberState.LATE);
+            assertThat(groupById(fixture.groupId()).getState())
+                    .as("迟到结果不重新激活组")
+                    .isEqualTo(WaitGroupState.CANCELED.name());
+
+            // 再报一次：审计字段只写一次，后到的不能覆盖先到的。
+            store.reportLateMember(new LateMemberRequest(fixture.groupId(), "call-a",
+                    "{\"note\":\"late-2\"}", "op-late", fixture.runControlVersion()));
+            assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_member WHERE group_id = "
+                    + fixture.groupId() + " AND member_identity = 'call-a' "
+                    + "AND result_ref_json->>'note' = 'late-1'"))
+                    .as("第一次留下的引子不许被后来的上报覆盖")
+                    .isEqualTo(1);
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_member WHERE group_id = "
+                + fixture.groupId() + " AND state IN ('PENDING', 'RUNNING')"))
+                .as("取消之后没有成员还留在待派发或执行中的状态，不会有下一次派发")
+                .isZero();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + fixture.runId() + "' AND state = 'RESUMABLE'"))
+                .as("下一段没有被放行")
+                .isZero();
+    }
+
+    // ==================== 全局容量的并发判定 ====================
+
+    /**
+     * 两个线程同时跨越水位：最终暂停状态必须等于库里的值，而不是各写各的。
+     *
+     * <p>这里用一小段 Spring 上下文把存储层包起来跑：{@code @Transactional} 与行锁只有在真实的代理
+     * 后面才成立，直接 new 一个存储对象是量不出并发行为的。</p>
+     */
+    @Test
+    void twoThreadsCrossingTheWatermarkEndWithTheDatabaseValue() throws Exception {
+        SchedulerStateStore store = proxiedCapacityStore();
+        execute("UPDATE alphafrog_agent_scheduler_capacity_state SET add_paused = FALSE, paused_since = NULL, "
+                + "unfinished_count = 0 WHERE scope_key = 'GLOBAL'");
+
+        List<SchedulerPauseDecision> pausing = runConcurrently(2,
+                ignored -> store.decideAndRecord(HIGH_WATERMARK + 4, HIGH_WATERMARK, LOW_WATERMARK));
+        assertThat(pausing).allSatisfy(decision -> assertThat(decision.paused()).isTrue());
+        assertThat(pausing.stream().filter(SchedulerPauseDecision::changed).count())
+                .as("两个线程同时判「该停」，只有一个能把标记真的从没停改成停")
+                .isEqualTo(1);
+        assertThat(globalPaused()).as("库里留下的就是最终状态").isTrue();
+
+        List<SchedulerPauseDecision> resuming = runConcurrently(2,
+                ignored -> store.decideAndRecord(LOW_WATERMARK - 4, HIGH_WATERMARK, LOW_WATERMARK));
+        assertThat(resuming).allSatisfy(decision -> assertThat(decision.paused()).isFalse());
+        assertThat(resuming.stream().filter(SchedulerPauseDecision::changed).count())
+                .as("回落到底水位以下时，也只有一次是真的恢复")
+                .isEqualTo(1);
+        assertThat(globalPaused()).isFalse();
+    }
+
     // ==================== 语句与工具 ====================
 
     /** 真实升级链：先建表脚本，再按版本顺序升到 006；这样验证的是部署时真正会走的路径。 */
@@ -398,16 +735,19 @@ class Stage3WaitContractPostgresTest {
         }
     }
 
-    /** 整份执行两遍：第二遍必须一样通过，证明脚本可以重复执行。 */
-    private static void applyStage3ScriptTwice() throws Exception {
-        List<String> statements = MigrationStatements.split(MigrationStatements.read(STAGE3_SCRIPT));
-        assertThat(statements).as("脚本要能被切成可执行语句").isNotEmpty();
+    /** 每份脚本整份执行两遍：第二遍必须一样通过，证明脚本可以重复执行。 */
+    private static void applyStage3ScriptsTwice() throws Exception {
         for (int round = 1; round <= 2; round++) {
-            for (String statement : statements) {
-                try {
-                    execute(statement);
-                } catch (SQLException e) {
-                    throw new IllegalStateException("第 " + round + " 遍执行脚本失败：" + statement, e);
+            for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT)) {
+                List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
+                assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
+                for (String statement : statements) {
+                    try {
+                        execute(statement);
+                    } catch (SQLException e) {
+                        throw new IllegalStateException(
+                                "第 " + round + " 遍执行 " + script + " 失败：" + statement, e);
+                    }
                 }
             }
         }
@@ -417,7 +757,8 @@ class Stage3WaitContractPostgresTest {
         Configuration configuration = new Configuration(
                 new Environment("stage3-postgres", new JdbcTransactionFactory(), source));
         for (String resource : List.of("mapper/WaitGroupMapper.xml", "mapper/NodeWorkItemMapper.xml",
-                "mapper/AgentRunMapper.xml")) {
+                "mapper/AgentRunMapper.xml", "mapper/RunCoordinationMapper.xml",
+                "mapper/SchedulerStateMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
             }
@@ -433,6 +774,15 @@ class Stage3WaitContractPostgresTest {
     /** 指定用户的 Run：幂等唯一约束按用户分组，造数据时要能把用户分开。 */
     private static void createRunFor(String runId, String userId, int planGeneration,
                                      long runControlVersion) {
+        createRunFor(runId, userId, SchedulerVersion.DUAL_POOL_V2, planGeneration, runControlVersion);
+    }
+
+    /**
+     * 指定冻结版本的 Run：协调资格记录上的版本要从这里派生，不能由测试另外插一份子记录，
+     * 否则「父子版本一致」这件事就测不到了。
+     */
+    private static void createRunFor(String runId, String userId, SchedulerVersion schedulerVersion,
+                                     int planGeneration, long runControlVersion) {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId(userId);
@@ -446,7 +796,7 @@ class Stage3WaitContractPostgresTest {
         run.setTtlExpiresAt(java.time.OffsetDateTime.now().plusHours(1));
         run.setExt("{}");
         run.setToolJobAnchorJson("{}");
-        run.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        run.setSchedulerVersion(schedulerVersion.name());
         run.setPlanGeneration(planGeneration);
         run.setRunControlVersion(runControlVersion);
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
@@ -477,6 +827,18 @@ class Stage3WaitContractPostgresTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             assertThat(session.getMapper(NodeWorkItemMapper.class).insert(item)).isEqualTo(1);
         }
+    }
+
+    /** 读每个逻辑节点的最新分段：复用产品代码里那条查询。 */
+    private static List<NodeWorkItem> latestSegments(String runId, int planGeneration) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return session.getMapper(NodeWorkItemMapper.class).listLatestSegments(runId, planGeneration);
+        }
+    }
+
+    private static RunCoordinationStore coordinationStore() {
+        SqlSession session = sqlSessionFactory.openSession(true);
+        return new MybatisRunCoordinationStore(session.getMapper(RunCoordinationMapper.class));
     }
 
     private record GroupFixture(String runId, long groupId, long runControlVersion) {
@@ -510,7 +872,7 @@ class Stage3WaitContractPostgresTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
             return store.completeMember(new MemberCompletionRequest(groupId, memberIdentity, state,
-                    "{\"result\":\"ok\"}", null, runControlVersion));
+                    "{\"result\":\"ok\"}", null, 0, 2L, runControlVersion));
         }
     }
 
@@ -591,42 +953,123 @@ class Stage3WaitContractPostgresTest {
         throw new AssertionError("这条语句本该被约束拒绝，却写进去了：" + sql);
     }
 
+    /**
+     * 迁移刚做完时的形状检查：脚本只加结构，不写业务数据。
+     *
+     * <p>它在 {@code setUp} 里跑，不是某一条用例的断言：共用 schema 的用例之间没有固定顺序。</p>
+     */
+    private static void assertFreshlyMigratedSchema() throws Exception {
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_group")).isZero();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_scheduler_round")).isEqualTo(2);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_scheduler_capacity_state")).isEqualTo(1);
+        // 008 加的那一列：重复执行两遍之后仍然只有一列，且类型就是 JSONB。
+        assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                + "WHERE table_schema = current_schema() "
+                + "AND table_name = 'alphafrog_agent_run_wait_member' "
+                + "AND column_name = 'dispatch_proof_json' AND data_type = 'jsonb'"))
+                .as("等待成员表要有后台派发证明列").isEqualTo(1);
+    }
+
+    /** 再报一次同一段的挂起：用来验「旧计划的挂起整条不生效」。 */
+    private static WaitSuspensionResult suspendAgain(String runId, int planGeneration, long runControlVersion) {
+        List<WaitMemberDraft> members = List.of(
+                new WaitMemberDraft(0, "call-a", "executePython", null),
+                new WaitMemberDraft(1, "call-b", "executePython", null));
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            return store.suspendSegment(new WaitSuspensionRequest(
+                    new NodeWorkItemIdentity(runId, planGeneration, "node-1", 0, 0),
+                    new NodeWorkItemVersions(2L, runControlVersion, 3),
+                    "worker-1", 0, SchedulerVersion.DUAL_POOL_V2, members,
+                    "{\"waitSuspension\":true}", "{\"checkpoint\":\"c-1\"}"));
+        }
+    }
+
+    /** 库里全局那一行的暂停标记：并发判定的最终状态以它为准。 */
+    private static boolean globalPaused() throws Exception {
+        return countRows("SELECT count(*) FROM alphafrog_agent_scheduler_capacity_state "
+                + "WHERE scope_key = 'GLOBAL' AND add_paused") == 1;
+    }
+
+    /**
+     * 用一小段 Spring 上下文把容量存储层包起来：{@code @Transactional} 与行锁只有在代理后面才成立。
+     * 直接 new 出来的存储对象上没有事务，量不出并发行为。
+     */
+    private static SchedulerStateStore proxiedCapacityStore() {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        context.registerBean("probeDataSource", DataSource.class, () -> dataSource);
+        context.registerBean(PlatformTransactionManager.class, () -> new DataSourceTransactionManager(dataSource));
+        context.registerBean(SchedulerStateMapper.class,
+                () -> new SqlSessionTemplate(sqlSessionFactory).getMapper(SchedulerStateMapper.class));
+        context.registerBean(MybatisSchedulerStateStore.class);
+        context.register(TransactionManagementEnablement.class);
+        context.refresh();
+        return context.getBean(SchedulerStateStore.class);
+    }
+
+    /** 只为了给上面那段上下文打开注解事务管理。 */
+    @org.springframework.context.annotation.Configuration
+    @EnableTransactionManagement
+    static class TransactionManagementEnablement {
+    }
+
     // ==================== 连接串 ====================
 
     private record Target(String jdbcUrl, String user, String password) {
     }
 
-    /** 支持 postgres(ql)://user:pass@host:port/db 与已经写好的 jdbc:postgresql:// 两种写法。 */
+    /**
+     * 连接信息只从环境变量来：连接串里不许带账号口令。
+     *
+     * <p>带 userinfo 的连接串会把明文口令留在进程参数、shell 历史或日志里，解析失败时还会被整串
+     * 带进异常消息。所以这里见到 userinfo（或 JDBC 串里的 {@code user=}/{@code password=} 参数）直接
+     * 失败关闭，并且报错里不回显原串；账号口令一律走 {@code AF_STAGE3_PG_USER} 与
+     * {@code AF_STAGE3_PG_PASSWORD} 两个环境变量。</p>
+     *
+     * <p>两种写法都支持：{@code postgres(ql)://host:port/db} 与已经写好的
+     * {@code jdbc:postgresql://...}。前一种只取主机、端口、库名与查询参数，不会把整串照搬过去。</p>
+     */
     private static Target resolveTarget(String dsn) {
         String user = env("AF_STAGE3_PG_USER");
         String password = env("AF_STAGE3_PG_PASSWORD");
         if (dsn.startsWith("jdbc:")) {
+            String lowered = dsn.toLowerCase(java.util.Locale.ROOT);
+            if (lowered.contains("user=") || lowered.contains("password=")) {
+                throw new IllegalStateException("连接串里不许带账号口令：请改用 AF_STAGE3_PG_USER 与 "
+                        + "AF_STAGE3_PG_PASSWORD 两个环境变量传入");
+            }
             return new Target(dsn, user, password);
         }
-        URI uri = URI.create(dsn);
-        String userInfo = uri.getUserInfo();
-        if (userInfo != null) {
-            int separator = userInfo.indexOf(':');
-            if (user == null && separator > 0) {
-                user = decode(userInfo.substring(0, separator));
-            }
-            if (password == null && separator > 0) {
-                password = decode(userInfo.substring(separator + 1));
-            }
+        URI uri;
+        try {
+            uri = URI.create(dsn);
+        } catch (IllegalArgumentException e) {
+            // 解析异常的消息通常带着原串，这里只报「解析不了」，不把可能含口令的串带进日志。
+            throw new IllegalStateException("AF_STAGE3_PG_DSN 解析不了：请用 "
+                    + "postgresql://host:port/db 或 jdbc:postgresql://host:port/db 的写法");
+        }
+        if (uri.getUserInfo() != null) {
+            throw new IllegalStateException("AF_STAGE3_PG_DSN 里不许带账号口令：请改用 "
+                    + "AF_STAGE3_PG_USER 与 AF_STAGE3_PG_PASSWORD 两个环境变量传入");
         }
         String host = uri.getHost() == null ? "127.0.0.1" : uri.getHost();
         int port = uri.getPort() == -1 ? 5432 : uri.getPort();
         String database = uri.getPath() == null || uri.getPath().isEmpty() ? "/postgres" : uri.getPath();
-        return new Target("jdbc:postgresql://" + host + ":" + port + database, user, password);
+        // 查询参数原样带上（ssl 之类的设置不能丢），但不重建连接串里的凭证部分。
+        String query = uri.getQuery() == null || uri.getQuery().isEmpty() ? "" : "?" + uri.getQuery();
+        return new Target("jdbc:postgresql://" + host + ":" + port + database + query, user, password);
     }
 
+    /**
+     * 打开数据源：临时 schema 用数据源自己的 schema 属性指定，不往连接串后面拼参数——
+     * 连接串里已经带了同名参数时，拼上去会各说一套。
+     */
     private static DataSource open(Target target, String schema) {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
-        String url = target.jdbcUrl();
+        dataSource.setUrl(target.jdbcUrl());
         if (schema != null) {
-            url = url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema;
+            dataSource.setCurrentSchema(schema);
         }
-        dataSource.setUrl(url);
         if (target.user() != null) {
             dataSource.setUser(target.user());
         }
@@ -636,11 +1079,26 @@ class Stage3WaitContractPostgresTest {
         return dataSource;
     }
 
-    private static String decode(String raw) {
-        return URLDecoder.decode(raw, StandardCharsets.UTF_8);
-    }
-
     private static String env(String name) {
         return System.getenv(name);
+    }
+
+    /** 布尔开关：只认 1/true/yes（大小写不敏感），其余都当没开。 */
+    private static boolean flag(String name) {
+        String raw = env(name);
+        if (raw == null) {
+            return false;
+        }
+        String trimmed = raw.strip().toLowerCase(java.util.Locale.ROOT);
+        return "1".equals(trimmed) || "true".equals(trimmed) || "yes".equals(trimmed);
+    }
+
+    /** 当前连接的默认 schema，用来证明写入没有被连接串参数带到别处。 */
+    private static String currentSchema() throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement();
+             java.sql.ResultSet rows = statement.executeQuery("SELECT current_schema()")) {
+            return rows.next() ? rows.getString(1) : null;
+        }
     }
 }

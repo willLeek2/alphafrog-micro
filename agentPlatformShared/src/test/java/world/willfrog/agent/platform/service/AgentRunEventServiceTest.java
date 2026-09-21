@@ -59,6 +59,8 @@ class AgentRunEventServiceTest {
     private AgentRunEventRedisStore eventRedisStore;
     @Mock
     private AgentPromptService mockPromptService;
+    @Mock
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
     private AgentRunEventService service;
     private ObjectMapper objectMapper;
@@ -74,7 +76,8 @@ class AgentRunEventServiceTest {
                 redisTemplate,
                 llmLocalConfigLoader,
                 messageService,
-                mockPromptService
+                mockPromptService,
+                transactionManager
         );
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any()))
@@ -102,7 +105,8 @@ class AgentRunEventServiceTest {
                 redisTemplate,
                 llmLocalConfigLoader,
                 messageService,
-                mockPromptService
+                mockPromptService,
+                transactionManager
         );
         AgentRunEvent pending = new AgentRunEvent();
         pending.setRunId("r1");

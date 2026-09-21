@@ -388,7 +388,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         String resultJson = WaitMemberResultPayload.encode(objectMapper, toolCallId, toolCallId, true,
                 output, Map.of(), 1024 * 1024);
         return store.completeMember(new MemberCompletionRequest(groupId, toolCallId,
-                WaitMemberState.SUCCEEDED, resultJson, null, 0L)).notificationId();
+                WaitMemberState.SUCCEEDED, resultJson, null, GENERATION, 0L, 0L)).notificationId();
     }
 
     private static ToolExecutionRequest toolCall(String id, String name, String arguments) {

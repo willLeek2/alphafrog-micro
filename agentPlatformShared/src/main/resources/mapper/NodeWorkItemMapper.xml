@@ -101,12 +101,45 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+      节点派发的一次全局扫描：双池家族的到期可领取分段放在同一份候选里，再按这张图最近一次
+      被派发的轮次升序排（从没被派发过的算 0，排最前），然后才是到期时间与行号。
+      版本条件的写法与按版本取那一条不同：这里是一份候选、一个 LIMIT，写法上把两个双池版本
+      列成清单，而不是每种版本各扫一次；旧路径（LEGACY）的分段不属于节点池。
+      轮转位置在协调资格表上，这张图还没有资格记录时按 0 处理——没被派发过就该排在前面。
+    -->
+    <select id="scanClaimableAcrossDualPool" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2')
+          AND state IN ('RUNNABLE', 'RESUMABLE')
+          AND next_visible_at &lt;= CURRENT_TIMESTAMP
+        ORDER BY COALESCE((SELECT c.dispatch_served_round
+                           FROM alphafrog_agent_run_coordination c
+                           WHERE c.run_id = alphafrog_agent_run_work_item.run_id), 0),
+                 next_visible_at, id
+        LIMIT #{limit}
+    </select>
+
     <select id="listUnfinishedByRun" resultMap="NodeWorkItemResultMap">
         SELECT <include refid="workItemColumns"/>
         FROM alphafrog_agent_run_work_item
         WHERE run_id = #{runId}
           AND state NOT IN (<include refid="terminalStates"/>)
         ORDER BY plan_generation, node_attempt, segment_sequence, id
+    </select>
+
+    <!--
+      每个逻辑节点的最新分段：一个节点一次等待会把自己的分段写成已提交并建出下一段，
+      所以「这个节点做完了没有」只能看最新那一行。取最大尝试次数、再取最大分段序号，
+      最后用 id 兜底，保证同一身份下排序稳定。
+    -->
+    <select id="listLatestSegments" resultMap="NodeWorkItemResultMap">
+        SELECT DISTINCT ON (node_id) <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE run_id = #{runId}
+          AND plan_generation = #{planGeneration}
+        ORDER BY node_id, node_attempt DESC, segment_sequence DESC, id DESC
     </select>
 
     <select id="listUnfinishedBySchedulerVersion" resultMap="NodeWorkItemResultMap">

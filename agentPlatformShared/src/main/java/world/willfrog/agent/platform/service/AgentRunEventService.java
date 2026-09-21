@@ -7,6 +7,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -92,6 +94,8 @@ public class AgentRunEventService {
     private final AgentMessageService messageService;
     /** 提示词服务：用于在 run 创建时快照当前 dataFreshness */
     private final AgentPromptService agentPromptService;
+    /** 事务管理器：Run 主记录与它的事件必须在同一条事务里落库 */
+    private final PlatformTransactionManager transactionManager;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -119,7 +123,7 @@ public class AgentRunEventService {
      * <p>这个旧重载不接收调度器版本，固定按 {@link SchedulerVersion#DEFAULT_FOR_EXISTING_ROWS}（LEGACY）创建，
      * 与存量 Run 的取值一致。要用新路径的调用方走带版本的重载。</p>
      */
-    public AgentRun createRun(String userId,
+    public RunCreation createRun(String userId,
                               String message,
                               String contextJson,
                               String idempotencyKey,
@@ -139,7 +143,7 @@ public class AgentRunEventService {
                 deploymentId, deploymentGenerationId, null, generateArtifacts, isAdmin);
     }
 
-    public AgentRun createRun(String userId,
+    public RunCreation createRun(String userId,
                               String message,
                               String contextJson,
                               String idempotencyKey,
@@ -173,7 +177,7 @@ public class AgentRunEventService {
      * {@link RunIdempotencyConflictException}，两种情况都不会新建第二条 Run。读回发生在写任何东西之前，
      * 所以重复提交不会多出事件、消息或提示词快照。</p>
      */
-    public AgentRun createRun(String userId,
+    public RunCreation createRun(String userId,
                               String message,
                               String contextJson,
                               String idempotencyKey,
@@ -194,14 +198,15 @@ public class AgentRunEventService {
         String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
         String requestDigest = normalizedIdempotencyKey == null ? null : RunRequestDigest.digest(
                 new RunRequestFingerprint(userId, message, contextJson, modelName, endpointName,
-                        provider, captureLlmRequests, stageConfigJson),
+                        provider, captureLlmRequests, plannerCandidateCount, debugMode,
+                        generateArtifacts, stageConfigJson),
                 objectMapper);
         if (normalizedIdempotencyKey != null) {
             AgentRun existing = runMapper.findByUserIdempotencyKey(userId, normalizedIdempotencyKey);
             if (existing != null) {
                 log.info("[AgentRunEventService] 幂等键命中，读回原来的 Run: userId={}, runId={}",
                         userId, existing.getId());
-                return requireSameRequestDigest(existing, requestDigest, userId);
+                return new RunCreation(requireSameRequestDigest(existing, requestDigest, userId), false);
             }
         }
         log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}, schedulerVersion={}",
@@ -294,8 +299,13 @@ public class AgentRunEventService {
 
         run.setIdempotencyKey(normalizedIdempotencyKey);
         run.setRequestDigest(requestDigest);
+        // Run 主记录与 RUN_RECEIVED 事件在同一条事务里落库：进程恰好在两者之间退出时，库里不会留下
+        // 「有 Run、没有接收事实」的半成品——那种记录会被幂等重试直接读回，缺失的事实再也没人补。
         try {
-            runMapper.insert(run);
+            transactionTemplate().executeWithoutResult(status -> {
+                runMapper.insert(run);
+                append(runId, userId, "RUN_RECEIVED", ext);
+            });
         } catch (DuplicateKeyException duplicate) {
             // 同一瞬间两个请求带着同一个键一起进来：唯一索引只放行一条，另一条在这里读回同一个 Run。
             if (normalizedIdempotencyKey == null) {
@@ -308,12 +318,11 @@ public class AgentRunEventService {
             }
             log.info("[AgentRunEventService] 幂等键并发命中，读回先写入的那条 Run: userId={}, runId={}",
                     userId, raced.getId());
-            return requireSameRequestDigest(raced, requestDigest, userId);
+            return new RunCreation(requireSameRequestDigest(raced, requestDigest, userId), false);
         }
-        // 紧接着写入 RUN_RECEIVED 事件,保留 ext 全文作为事件 payload 便于审计
-        append(runId, userId, "RUN_RECEIVED", ext);
 
-        // 写入首条用户消息（initial）
+        // 写入首条用户消息（initial）。它不在上面那条事务里，写失败只记日志：这是明确保留的
+        // 用户可见缺口——Run 已经可执行，而首条用户消息可能缺失。
         try {
             messageService.createInitialMessage(runId, message);
         } catch (Exception e) {
@@ -322,8 +331,26 @@ public class AgentRunEventService {
         }
 
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
-        return runMapper.findByIdAndUserForDeployment(
+        AgentRun persisted = runMapper.findByIdAndUserForDeployment(
                 runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
+        if (persisted == null) {
+            throw new IllegalStateException("Run 刚刚写入却读不回来：runId=" + runId);
+        }
+        return new RunCreation(persisted, true);
+    }
+
+    /**
+     * 一次创建请求的结果。
+     *
+     * <p>{@code created} 区分「这次真的建了一条新 Run」与「幂等键命中，读回原来那条」。调用方只有拿到
+     * 新建的那条才允许准入与启动：读回的 Run 已经在别处跑着，再启动一次会让同一次请求执行两遍。</p>
+     */
+    public record RunCreation(AgentRun run, boolean created) {
+    }
+
+    /** 事务模板按需构造：它只是配置的载体，每次调用新建一个比放进字段更省心。 */
+    private TransactionTemplate transactionTemplate() {
+        return new TransactionTemplate(transactionManager);
     }
 
     /** 空串与纯空白都按「没有带幂等键」处理：历史客户端会把空串传进来。 */

@@ -151,7 +151,8 @@ class Stage3GlobalStateMapperBindingTest {
         assertThat(sql).as("候选取的是协调轮的进度，不能拿派发轮的进度来排序")
                 .doesNotContain("dispatch_served_round, c.next_visible_at");
         assertThat(sql).as("只取到期的记录").contains("c.next_visible_at <= CURRENT_TIMESTAMP");
-        assertThat(sql).as("按调度器版本过滤").contains("c.scheduler_version = ?");
+        assertThat(sql).as("一次全局扫描：不按调度器版本分池，版本由每行记录自己带着，由调用方路由")
+                .doesNotContain("c.scheduler_version =");
     }
 
     @Test
@@ -184,7 +185,10 @@ class Stage3GlobalStateMapperBindingTest {
                 .doesNotContain("dispatch_served_round").doesNotContain("dispatch_missed_rounds");
         String refresh = sql("RunCoordinationMapper", "refreshCoordinationMissedRounds");
         assertThat(refresh).as("连续未获协调轮数按「当前轮次减上次协调轮次减一」算，只增不减")
-                .contains("GREATEST(? - coordination_served_round - 1, 0)");
+                .contains("GREATEST(? - c.coordination_served_round - 1, 0)")
+                .contains("> c.coordination_missed_rounds");
+        assertThat(refresh).as("刷新口径与扫描一致：一次全局刷新，不按版本分池")
+                .doesNotContain("c.scheduler_version =");
     }
 
     @Test
@@ -196,8 +200,11 @@ class Stage3GlobalStateMapperBindingTest {
                 .doesNotContain("defer_reason");
         String refresh = sql("RunCoordinationMapper", "refreshDispatchMissedRounds");
         assertThat(refresh).as("派发轮的连续未获轮数按自己的上次派发轮次算")
-                .contains("GREATEST(? - dispatch_served_round - 1, 0)")
-                .doesNotContain("coordination_served_round");
+                .contains("GREATEST(? - c.dispatch_served_round - 1, 0)")
+                .doesNotContain("coordination_served_round")
+                .contains("> c.dispatch_missed_rounds");
+        assertThat(refresh).as("这一组的候选取「此刻确实有到期可领取节点」的 Run")
+                .contains("wi.state IN ('RUNNABLE', 'RESUMABLE')");
     }
 
     @Test

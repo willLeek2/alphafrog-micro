@@ -7,6 +7,17 @@
       Run 协调资格。取候选 Run 时把「最近协调轮次」放在排序第一位，同一轮里先按最早可见时间，
       最后按 Run 身份稳定排序：这样从没被服务过的 Run 排最前，服务过的往后排，
       任何一张图都不会连续错过两个完整轮次。
+
+      三件纪律写在下面每条语句里：
+
+      1. 一次扫描就是一次全局扫描。旧版本、V1、V2 一起排在同一份候选里，不再按版本分池——
+         分成三池时每种版本各取一份 LIMIT，谁先谁后由各自的池子决定，谈不上共用轮转。
+         路由由调用方按记录里的冻结版本决定。
+      2. 版本与计划代际从 Run 主表派生，不信调用方传进来的值：滚动部署期间同一条 Run 的
+         冻结版本只有一个出处，协调子记录不许跟主记录说两套话。
+      3. 所有推进与延期都带期望值做条件更新，并且只前进不后退：迟到的旧线程、旧轮次、
+         旧计划代际写进来必须影响 0 行，而不是把新事实改回旧事实。
+
       协调与派发各有一组轮转位置，各自的写入与刷新语句只碰自己那一组。
     -->
 
@@ -26,36 +37,58 @@
     </resultMap>
 
     <sql id="coordinationColumns">
-        run_id,
-        scheduler_version,
-        plan_generation,
-        defer_reason,
-        next_visible_at,
-        coordination_served_round,
-        coordination_missed_rounds,
-        dispatch_served_round,
-        dispatch_missed_rounds,
-        created_at,
-        updated_at
+        c.run_id,
+        c.scheduler_version,
+        c.plan_generation,
+        c.defer_reason,
+        c.next_visible_at,
+        c.coordination_served_round,
+        c.coordination_missed_rounds,
+        c.dispatch_served_round,
+        c.dispatch_missed_rounds,
+        c.created_at,
+        c.updated_at
     </sql>
 
+    <!--
+      只留还没结束、也不是「取消中」的 Run：终态与取消中的 Run 不再参与协调轮转。
+      这段清单与 AgentRunStatus 逐项对应，扫描与轮次刷新共用同一份口径，
+      免得「谁算这一轮的候选」在两处各说一套。
+    -->
+    <sql id="liveRunStatuses">
+        'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'WAITING_TOOL_JOB'
+    </sql>
+
+    <!--
+      建一条资格记录：版本与计划代际直接取 Run 主表上的值，调用方传什么都没用。
+      Run 不存在时影响 0 行，调用方据此知道「这条 Run 不在库里」。
+    -->
     <insert id="ensure">
         INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version, plan_generation)
-        VALUES (#{runId}, #{schedulerVersion}, #{planGeneration})
+        SELECT r.id, r.scheduler_version, COALESCE(r.plan_generation, -1)
+        FROM alphafrog_agent_run r
+        WHERE r.id = #{runId}
         ON CONFLICT (run_id) DO NOTHING
     </insert>
 
+    <!--
+      延期：必须带这一轮开始时读到的计划代际与协调轮次做条件。
+      条件不满足说明这张图已经被服务过（轮次前进）或者已经换了计划代际，这次延期是旧观察，
+      写进去只会把新事实拉回旧事实。
+    -->
     <update id="deferFor">
-        UPDATE alphafrog_agent_run_coordination SET
+        UPDATE alphafrog_agent_run_coordination c SET
             defer_reason = #{deferReason},
             next_visible_at = #{nextVisibleAt},
             updated_at = CURRENT_TIMESTAMP
-        WHERE run_id = #{runId}
+        WHERE c.run_id = #{runId}
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND c.coordination_served_round = #{expectedServedRound}
     </update>
 
     <!--
       协调成功推进：清掉延期原因、记下这一轮服务过它、连续未获协调轮数归零。
-      next_visible_at 立刻回到当前时间，让这张图在下一轮同样有资格被取到。
+      轮次只许前进，迟到的旧轮次写进来影响 0 行。
     -->
     <update id="markCoordinationServed">
         UPDATE alphafrog_agent_run_coordination SET
@@ -65,10 +98,12 @@
             coordination_missed_rounds = 0,
             updated_at = CURRENT_TIMESTAMP
         WHERE run_id = #{runId}
+          AND coordination_served_round &lt; #{roundNumber}
     </update>
 
     <!--
       派发成功推进：只动派发那一组轮转位置。延期原因是协调层的事实，派发不替它做主。
+      同样只许前进。
     -->
     <update id="markDispatchServed">
         UPDATE alphafrog_agent_run_coordination SET
@@ -76,66 +111,83 @@
             dispatch_missed_rounds = 0,
             updated_at = CURRENT_TIMESTAMP
         WHERE run_id = #{runId}
-    </update>
-
-    <update id="updatePlanGeneration">
-        UPDATE alphafrog_agent_run_coordination SET
-            plan_generation = #{planGeneration},
-            updated_at = CURRENT_TIMESTAMP
-        WHERE run_id = #{runId}
+          AND dispatch_served_round &lt; #{roundNumber}
     </update>
 
     <!--
-      这一轮可以被协调的 Run。status 清单与 AgentRunStatus 逐项对应，只留还没结束的状态：
-      已结束的 Run 不再需要协调，取消中的 Run 交给取消路径推进。
+      把计划代际同步成 Run 主表上的当前值。三个条件缺一不可：调用方声明的这一代必须就是
+      Run 上的当前一代（防止拿着旧读到的代际推描述）、必须是往前推进（不许倒退）、
+      确实和库里记录的不一样（没变就不写）。
+    -->
+    <update id="syncPlanGeneration">
+        UPDATE alphafrog_agent_run_coordination c SET
+            plan_generation = r.plan_generation,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND r.plan_generation = #{planGeneration}
+          AND c.plan_generation &lt; #{planGeneration}
+    </update>
+
+    <!--
+      这一轮可以被协调的 Run，一次全局扫描：不按调度器版本分池，旧版本、V1、V2 排在同一份候选里，
+      调用方按每行记录的冻结版本路由。已结束的 Run 不再需要协调，取消中的 Run 交给取消路径推进。
     -->
     <select id="scanDue" resultMap="RunCoordinationResultMap">
-        SELECT c.run_id,
-               c.scheduler_version,
-               c.plan_generation,
-               c.defer_reason,
-               c.next_visible_at,
-               c.coordination_served_round,
-               c.coordination_missed_rounds,
-               c.dispatch_served_round,
-               c.dispatch_missed_rounds,
-               c.created_at,
-               c.updated_at
+        SELECT <include refid="coordinationColumns"/>
         FROM alphafrog_agent_run_coordination c
         JOIN alphafrog_agent_run r ON r.id = c.run_id
-        WHERE c.scheduler_version = #{schedulerVersion}
-          AND c.next_visible_at &lt;= CURRENT_TIMESTAMP
-          AND r.status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING',
-                           'WAITING_TOOL_JOB')
+        WHERE c.next_visible_at &lt;= CURRENT_TIMESTAMP
+          AND r.status IN (<include refid="liveRunStatuses"/>)
         ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id
         LIMIT #{limit}
     </select>
 
     <!--
-      一轮结束时刷新连续未获协调的轮数：这一轮没被服务过的记录，它的轮数就是「当前轮次 - 上次协调轮次 - 1」。
-      只增不减，给公平性观测与验收证据用。
+      一轮结束时刷新「连续未获协调轮数」。
+
+      只统计这一轮真正有资格竞争的 Run：还活着的、且已经到下次可见时间的（主动延期等待中的图
+      这一轮根本没参加竞争，不该记它「没被服务」）。计数只增不减：轮次号可能因为跨实例的
+      先后到达而回退，直接把差值写回去会把已有的轮数改小。
     -->
     <update id="refreshCoordinationMissedRounds">
-        UPDATE alphafrog_agent_run_coordination SET
-            coordination_missed_rounds = GREATEST(#{roundNumber} - coordination_served_round - 1, 0),
+        UPDATE alphafrog_agent_run_coordination c SET
+            coordination_missed_rounds = GREATEST(#{roundNumber} - c.coordination_served_round - 1, 0),
             updated_at = CURRENT_TIMESTAMP
-        WHERE scheduler_version = #{schedulerVersion}
-          AND coordination_served_round &lt; #{roundNumber}
+        FROM alphafrog_agent_run r
+        WHERE r.id = c.run_id
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+          AND c.next_visible_at &lt;= CURRENT_TIMESTAMP
+          AND c.coordination_served_round &lt; #{roundNumber}
+          AND GREATEST(#{roundNumber} - c.coordination_served_round - 1, 0) &gt; c.coordination_missed_rounds
     </update>
 
-    <!-- 派发那一组的刷新，口径相同、字段不同。 -->
+    <!--
+      派发那一组的刷新，口径相同、字段不同。这一组的「有资格竞争」还要求这张图此刻确实有到期
+      可领取的节点：没有可领节点的图谈不上被派发机会漏掉。
+    -->
     <update id="refreshDispatchMissedRounds">
-        UPDATE alphafrog_agent_run_coordination SET
-            dispatch_missed_rounds = GREATEST(#{roundNumber} - dispatch_served_round - 1, 0),
+        UPDATE alphafrog_agent_run_coordination c SET
+            dispatch_missed_rounds = GREATEST(#{roundNumber} - c.dispatch_served_round - 1, 0),
             updated_at = CURRENT_TIMESTAMP
-        WHERE scheduler_version = #{schedulerVersion}
-          AND dispatch_served_round &lt; #{roundNumber}
+        FROM alphafrog_agent_run r
+        WHERE r.id = c.run_id
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+          AND c.dispatch_served_round &lt; #{roundNumber}
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_work_item wi
+              WHERE wi.run_id = c.run_id
+                AND wi.state IN ('RUNNABLE', 'RESUMABLE')
+                AND wi.next_visible_at &lt;= CURRENT_TIMESTAMP
+          )
+          AND GREATEST(#{roundNumber} - c.dispatch_served_round - 1, 0) &gt; c.dispatch_missed_rounds
     </update>
 
     <select id="find" resultMap="RunCoordinationResultMap">
         SELECT <include refid="coordinationColumns"/>
-        FROM alphafrog_agent_run_coordination
-        WHERE run_id = #{runId}
+        FROM alphafrog_agent_run_coordination c
+        WHERE c.run_id = #{runId}
     </select>
 
 </mapper>

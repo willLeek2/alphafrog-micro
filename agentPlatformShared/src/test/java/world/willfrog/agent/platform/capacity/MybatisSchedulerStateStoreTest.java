@@ -19,7 +19,10 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link MybatisSchedulerStateStore} 的判定接线：暂停标记从库里读出来当输入，写进去的是判定结果。
+ * {@link MybatisSchedulerStateStore} 的判定接线：暂停标记从库里锁定读出来当输入，写进去的是判定结果。
+ *
+ * <p>这里只能证明「取哪个值当输入、把哪几个值交给写入语句」。两个线程同时跨越水位时最终状态等于
+ * 库里当前值，靠真库场景验。</p>
  */
 @ExtendWith(MockitoExtension.class)
 class MybatisSchedulerStateStoreTest {
@@ -49,7 +52,7 @@ class MybatisSchedulerStateStoreTest {
 
     @Test
     void pausedStateFromDatabaseIsTheInputOfTheDecision() {
-        when(mapper.loadCapacityState(anyString())).thenReturn(state(true));
+        when(mapper.lockCapacityState(anyString())).thenReturn(state(true));
         when(mapper.applyCapacityDecision(anyString(), anyLong(), anyBoolean(), anyInt(), anyInt()))
                 .thenReturn(state(true));
         SchedulerPauseDecision decision = store.decideAndRecord(100, HIGH, LOW);
@@ -57,12 +60,13 @@ class MybatisSchedulerStateStoreTest {
                 .as("库里已经暂停且数量还在高低水位之间，必须保持暂停")
                 .isTrue();
         assertThat(decision.changed()).isFalse();
+        verify(mapper).lockCapacityState(MybatisSchedulerStateStore.GLOBAL_SCOPE);
         verify(mapper).applyCapacityDecision(MybatisSchedulerStateStore.GLOBAL_SCOPE, 100L, true, HIGH, LOW);
     }
 
     @Test
     void fallingToLowWatermarkResumesAndWritesTheFlag() {
-        when(mapper.loadCapacityState(anyString())).thenReturn(state(true));
+        when(mapper.lockCapacityState(anyString())).thenReturn(state(true));
         when(mapper.applyCapacityDecision(anyString(), anyLong(), anyBoolean(), anyInt(), anyInt()))
                 .thenReturn(state(false));
         SchedulerPauseDecision decision = store.decideAndRecord(10, HIGH, LOW);
@@ -73,7 +77,7 @@ class MybatisSchedulerStateStoreTest {
 
     @Test
     void missingGlobalRowFailsClosed() {
-        when(mapper.loadCapacityState(anyString())).thenReturn(null);
+        when(mapper.lockCapacityState(anyString())).thenReturn(null);
         assertThatThrownBy(() -> store.decideAndRecord(1, HIGH, LOW))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("GLOBAL");
@@ -82,7 +86,7 @@ class MybatisSchedulerStateStoreTest {
 
     @Test
     void storedValueDisagreeingWithTheDecisionFailsClosed() {
-        when(mapper.loadCapacityState(anyString())).thenReturn(state(false));
+        when(mapper.lockCapacityState(anyString())).thenReturn(state(false));
         when(mapper.applyCapacityDecision(anyString(), anyLong(), anyBoolean(), anyInt(), anyInt()))
                 .thenReturn(state(false));
         assertThatThrownBy(() -> store.decideAndRecord(200, HIGH, LOW))
@@ -94,15 +98,17 @@ class MybatisSchedulerStateStoreTest {
     void roundAdvanceReturnsTheDatabaseValue() {
         when(mapper.advanceRound(eq(SchedulerRoundScope.NODE_DISPATCH.name()))).thenReturn(12L);
         assertThat(store.advanceRound(SchedulerRoundScope.NODE_DISPATCH)).isEqualTo(12L);
-        when(mapper.currentRound(eq(SchedulerRoundScope.RUN_COORDINATION.name()))).thenReturn(null);
-        assertThat(store.currentRound(SchedulerRoundScope.RUN_COORDINATION))
-                .as("还没有记录时按第 0 轮算")
-                .isZero();
+        when(mapper.currentRound(eq(SchedulerRoundScope.RUN_COORDINATION.name()))).thenReturn(7L);
+        assertThat(store.currentRound(SchedulerRoundScope.RUN_COORDINATION)).isEqualTo(7L);
         assertThatThrownBy(() -> store.advanceRound(null))
                 .isInstanceOf(IllegalArgumentException.class);
         when(mapper.advanceRound(eq(SchedulerRoundScope.RUN_COORDINATION.name()))).thenReturn(null);
         assertThatThrownBy(() -> store.advanceRound(SchedulerRoundScope.RUN_COORDINATION))
                 .as("轮次记录不存在时不能猜一个轮次号")
+                .isInstanceOf(IllegalStateException.class);
+        when(mapper.currentRound(eq(SchedulerRoundScope.NODE_DISPATCH.name()))).thenReturn(null);
+        assertThatThrownBy(() -> store.currentRound(SchedulerRoundScope.NODE_DISPATCH))
+                .as("读轮次与推进轮次同一种语义：缺种子行就失败关闭")
                 .isInstanceOf(IllegalStateException.class);
     }
 }

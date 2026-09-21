@@ -9,13 +9,16 @@ package world.willfrog.agent.platform.wait;
  * @param groupId             等待组编号
  * @param memberIdentity      成员的稳定身份
  * @param resultRefJson       结果引用，留档用
- * @param externalOperationId 外部作业身份，可为空
+ * @param externalOperationId 外部作业身份；要求与库里的值逐字一致（两边都是空也算一致）
+ * @param runControlVersion   上报时看到的 Run 控制版本：只有它仍然一致，这次上报才有权停掉这条链；
+ *                            版本已经变了的旧链只留审计
  */
 public record LateMemberRequest(
         long groupId,
         String memberIdentity,
         String resultRefJson,
-        String externalOperationId) {
+        String externalOperationId,
+        long runControlVersion) {
 
     public LateMemberRequest {
         if (groupId <= 0) {
@@ -26,6 +29,9 @@ public record LateMemberRequest(
         }
         if (resultRefJson == null || resultRefJson.isBlank()) {
             throw new IllegalArgumentException("迟到结果也要留下引用，否则审计看不到它");
+        }
+        if (runControlVersion < 0) {
+            throw new IllegalArgumentException("控制版本不能是负数：" + runControlVersion);
         }
     }
 }
