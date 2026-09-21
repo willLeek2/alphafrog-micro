@@ -38,10 +38,50 @@ public final class MigrationStatements {
     /** 读脚本正文。 */
     public static String read(String fileName) {
         Path path = locate(fileName);
+        return read(path);
+    }
+
+    /** 读某一份脚本正文。 */
+    public static String read(Path path) {
         try {
             return Files.readString(path);
         } catch (IOException e) {
             throw new IllegalStateException("读取迁移脚本失败：" + path, e);
+        }
+    }
+
+    /**
+     * 真实的升级链：先按文件名顺序排 {@code migrate/migrations/init} 下的建表脚本，
+     * 再按「版本目录、文件名」顺序排升级脚本，直到指定的那一份（含）为止。
+     *
+     * <p>真库用例用它把库升到目标脚本之前的状态，再单独应用目标脚本：这样验证的是真实升级路径，
+     * 不是一份手写的简化前置表。</p>
+     */
+    public static List<Path> upgradeChainUpTo(String lastFileName) {
+        List<Path> chain = new ArrayList<>();
+        chain.addAll(initScripts());
+        for (Path path : MigrationScripts.pathsInOrder()) {
+            chain.add(path);
+            if (path.getFileName().toString().equals(lastFileName)) {
+                return chain;
+            }
+        }
+        throw new IllegalStateException("升级链里没有找到收尾脚本：" + lastFileName);
+    }
+
+    /** {@code migrate/migrations/init} 下的脚本，按文件名升序。 */
+    public static List<Path> initScripts() {
+        Path init = findUpgradesDir().getParent().resolve("init");
+        if (!Files.isDirectory(init)) {
+            throw new IllegalStateException("没有找到初始化脚本目录：" + init);
+        }
+        try (Stream<Path> stream = Files.list(init)) {
+            return stream.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(".sql"))
+                    .sorted()
+                    .toList();
+        } catch (IOException e) {
+            throw new IllegalStateException("列初始化脚本失败：" + init, e);
         }
     }
 

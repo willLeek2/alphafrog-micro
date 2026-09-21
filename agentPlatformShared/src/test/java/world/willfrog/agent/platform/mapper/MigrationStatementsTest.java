@@ -43,6 +43,22 @@ class MigrationStatementsTest {
     }
 
     @Test
+    void upgradeChainRunsFromTheInitScriptsUpToTheScriptBeforeStage3() {
+        List<java.nio.file.Path> chain = MigrationStatements.upgradeChainUpTo(
+                "006_agent_tool_job_test_control.sql");
+        assertThat(chain).as("升级链要从建表脚本开始，不能只手工摆几张前置表").hasSizeGreaterThan(30);
+        List<String> names = chain.stream().map(path -> path.getFileName().toString()).toList();
+        assertThat(names.subList(0, MigrationStatements.initScripts().size()))
+                .as("链的开头是 init 目录里的建表脚本，按文件名升序")
+                .containsExactlyElementsOf(MigrationStatements.initScripts().stream()
+                        .map(path -> path.getFileName().toString())
+                        .toList());
+        assertThat(names).endsWith("006_agent_tool_job_test_control.sql");
+        assertThat(names).as("阶段三脚本要单独应用，不混在升级链里").doesNotContain(SCRIPT);
+        assertThat(names).contains("004_agent_run_work_item.sql");
+    }
+
+    @Test
     void semicolonsInsideQuotesDoNotSplitStatements() {
         assertThat(MigrationStatements.split("SELECT 'a;b'; SELECT 1;"))
                 .containsExactly("SELECT 'a;b'", "SELECT 1");

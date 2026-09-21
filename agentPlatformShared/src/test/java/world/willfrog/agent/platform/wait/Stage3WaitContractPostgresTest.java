@@ -13,9 +13,13 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.mapper.MigrationStatements;
 import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
@@ -48,10 +52,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code AF_STAGE3_PG_USER}/{@code AF_STAGE3_PG_PASSWORD}）。本机禁止起 Docker，所以本地一律跳过；
  * 证据要在负责人授权的外部 PostgreSQL 上跑出来。</p>
  *
- * <p>做法：建一个临时 schema，把连接串的 {@code currentSchema} 指到它 → 按 004 的形状造两张前置表
- * （Run 与工作项）→ 把 007 脚本的语句整份执行两遍（第二遍要一样通过，证明脚本可重复执行）→ 逐条插反例
- * 确认被约束拒绝 → 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次恢复资格、
- * 组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
+ * <p>做法：建一个临时 schema，把连接串的 {@code currentSchema} 指到它 → 走真实升级链（init 建表脚本加
+ * 各版本升级脚本，一路升到 006）→ 把 007 脚本的语句整份执行两遍（第二遍要一样通过，证明脚本可重复
+ * 执行）→ 逐条插反例确认被约束拒绝 → 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生
+ * 一次恢复资格、组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
+ *
+ * <p>夹具（Run、节点分段、等待组）都走真实写入语句，不手写列清单：列集合与约束由映射文件保证，
+ * 免得真库上一份手写的前置表把合同测成了另一回事。</p>
  *
  * <p>全程只碰临时 schema：所有连接都通过 {@code currentSchema} 落在它里面，既有库表一行都不动；
  * 万一中途进程被杀，残留的 schema 名字都带 {@code stage3_contract_} 前缀，可以直接删掉。</p>
@@ -78,7 +85,7 @@ class Stage3WaitContractPostgresTest {
             statement.execute("CREATE SCHEMA " + SCHEMA);
         }
         dataSource = open(target, SCHEMA);
-        createPrerequisities();
+        applyUpgradeChain();
         applyStage3ScriptTwice();
         sqlSessionFactory = buildSessionFactory(dataSource);
     }
@@ -107,8 +114,7 @@ class Stage3WaitContractPostgresTest {
 
     @Test
     void runIdempotencyColumnsArePairedAndUniquePerUser() throws Exception {
-        String base = "INSERT INTO alphafrog_agent_run (id, user_id, status, scheduler_version) VALUES ";
-        execute(base + "('run-idem-1', 'user-idem', 'RECEIVED', 'LEGACY')");
+        createRunFor("run-idem-1", "user-idem", 0, 0L);
         // 键与摘要必须成对：只给键不给摘要、只给摘要不给键都要被拒。
         expectRejected("UPDATE alphafrog_agent_run SET idempotency_key = 'k-1' WHERE id = 'run-idem-1'",
                 "alphafrog_agent_run_idempotency_pair_check");
@@ -117,11 +123,11 @@ class Stage3WaitContractPostgresTest {
         execute("UPDATE alphafrog_agent_run SET idempotency_key = 'k-1', request_digest = 'd-1' "
                 + "WHERE id = 'run-idem-1'");
         // 同一个用户下同一个键只能有一条。
-        execute(base + "('run-idem-2', 'user-idem', 'RECEIVED', 'LEGACY')");
+        createRunFor("run-idem-2", "user-idem", 0, 0L);
         expectRejected("UPDATE alphafrog_agent_run SET idempotency_key = 'k-1', request_digest = 'd-2' "
                 + "WHERE id = 'run-idem-2'", "uq_agent_run_user_idempotency_key");
         // 另一个用户用同一个键是允许的：唯一范围按用户分组。
-        execute(base + "('run-idem-3', 'user-other', 'RECEIVED', 'LEGACY')");
+        createRunFor("run-idem-3", "user-other", 0, 0L);
         execute("UPDATE alphafrog_agent_run SET idempotency_key = 'k-1', request_digest = 'd-3' "
                 + "WHERE id = 'run-idem-3'");
     }
@@ -376,44 +382,20 @@ class Stage3WaitContractPostgresTest {
 
     // ==================== 语句与工具 ====================
 
-    private static void createPrerequisities() throws Exception {
-        execute("""
-                CREATE TABLE alphafrog_agent_run (
-                    id VARCHAR(64) PRIMARY KEY,
-                    user_id VARCHAR(64),
-                    status VARCHAR(32) NOT NULL DEFAULT 'RECEIVED',
-                    scheduler_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY',
-                    plan_generation INT NOT NULL DEFAULT -1,
-                    run_control_version BIGINT NOT NULL DEFAULT 0,
-                    CONSTRAINT alphafrog_agent_run_scheduler_version_check
-                        CHECK (scheduler_version IN ('LEGACY', 'DUAL_POOL_V1'))
-                )
-                """);
-        execute("""
-                CREATE TABLE alphafrog_agent_run_work_item (
-                    id BIGSERIAL PRIMARY KEY,
-                    run_id VARCHAR(64) NOT NULL REFERENCES alphafrog_agent_run(id) ON DELETE CASCADE,
-                    plan_generation INT NOT NULL,
-                    node_id VARCHAR(256) NOT NULL,
-                    node_attempt INT NOT NULL DEFAULT 0,
-                    segment_sequence INT NOT NULL DEFAULT 0,
-                    state VARCHAR(32) NOT NULL DEFAULT 'RUNNABLE',
-                    context_version BIGINT NOT NULL,
-                    run_control_version BIGINT NOT NULL,
-                    claim_epoch INT NOT NULL DEFAULT 0,
-                    scheduler_version VARCHAR(32) NOT NULL DEFAULT 'DUAL_POOL_V1',
-                    claimed_by VARCHAR(128),
-                    lease_expires_at TIMESTAMPTZ,
-                    next_visible_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT alphafrog_agent_run_work_item_identity_key
-                        UNIQUE (run_id, plan_generation, node_id, node_attempt, segment_sequence),
-                    CONSTRAINT alphafrog_agent_run_work_item_scheduler_version_check
-                        CHECK (scheduler_version IN ('LEGACY', 'DUAL_POOL_V1'))
-                )
-                """);
+    /** 真实升级链：先建表脚本，再按版本顺序升到 006；这样验证的是部署时真正会走的路径。 */
+    private static void applyUpgradeChain() throws Exception {
+        List<java.nio.file.Path> chain = MigrationStatements.upgradeChainUpTo(
+                "006_agent_tool_job_test_control.sql");
+        assertThat(chain).as("升级链不能是手工摆的简化前置表").hasSizeGreaterThan(30);
+        for (java.nio.file.Path path : chain) {
+            for (String statement : MigrationStatements.split(MigrationStatements.read(path))) {
+                try {
+                    execute(statement);
+                } catch (SQLException e) {
+                    throw new IllegalStateException("升级链在这一份脚本上失败：" + path.getFileName(), e);
+                }
+            }
+        }
     }
 
     /** 整份执行两遍：第二遍必须一样通过，证明脚本可以重复执行。 */
@@ -434,7 +416,8 @@ class Stage3WaitContractPostgresTest {
     private static SqlSessionFactory buildSessionFactory(DataSource source) throws Exception {
         Configuration configuration = new Configuration(
                 new Environment("stage3-postgres", new JdbcTransactionFactory(), source));
-        for (String resource : List.of("mapper/WaitGroupMapper.xml", "mapper/NodeWorkItemMapper.xml")) {
+        for (String resource : List.of("mapper/WaitGroupMapper.xml", "mapper/NodeWorkItemMapper.xml",
+                "mapper/AgentRunMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
             }
@@ -442,22 +425,58 @@ class Stage3WaitContractPostgresTest {
         return new SqlSessionFactoryBuilder().build(configuration);
     }
 
-    private static void createRun(String runId, int planGeneration, long runControlVersion) throws Exception {
-        execute("INSERT INTO alphafrog_agent_run (id, user_id, status, scheduler_version, "
-                + "plan_generation, run_control_version) VALUES ('" + runId + "', 'user-1', "
-                + "'EXECUTING', 'DUAL_POOL_V2', " + planGeneration + ", " + runControlVersion + ")");
+    /** 造一条 Run：走真实插入语句，列集合与约束由映射文件保证，不手写一大串列名。 */
+    private static void createRun(String runId, int planGeneration, long runControlVersion) {
+        createRunFor(runId, "user-1", planGeneration, runControlVersion);
     }
 
+    /** 指定用户的 Run：幂等唯一约束按用户分组，造数据时要能把用户分开。 */
+    private static void createRunFor(String runId, String userId, int planGeneration,
+                                     long runControlVersion) {
+        AgentRun run = new AgentRun();
+        run.setId(runId);
+        run.setUserId(userId);
+        run.setDeploymentId("stable");
+        run.setDeploymentGenerationId("gen-" + "a".repeat(64));
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setCurrentStep(0);
+        run.setMaxSteps(20);
+        run.setPlanJson("{}");
+        run.setSnapshotJson("{}");
+        run.setTtlExpiresAt(java.time.OffsetDateTime.now().plusHours(1));
+        run.setExt("{}");
+        run.setToolJobAnchorJson("{}");
+        run.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        run.setPlanGeneration(planGeneration);
+        run.setRunControlVersion(runControlVersion);
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            assertThat(session.getMapper(AgentRunMapper.class).insert(run)).isEqualTo(1);
+        }
+    }
+
+    /** 造一个节点分段：同样走真实插入语句。 */
     private static void createSegment(String runId, int planGeneration, String nodeId, int nodeAttempt,
                                       int segmentSequence, int claimEpoch, String claimedBy,
-                                      long contextVersion, long runControlVersion, String state)
-            throws Exception {
-        execute("INSERT INTO alphafrog_agent_run_work_item (run_id, plan_generation, node_id, "
-                + "node_attempt, segment_sequence, state, context_version, run_control_version, "
-                + "claim_epoch, claimed_by, scheduler_version) VALUES ('" + runId + "', "
-                + planGeneration + ", '" + nodeId + "', " + nodeAttempt + ", " + segmentSequence + ", '"
-                + state + "', " + contextVersion + ", " + runControlVersion + ", " + claimEpoch + ", "
-                + (claimedBy == null ? "NULL" : "'" + claimedBy + "'") + ", 'DUAL_POOL_V2')");
+                                      long contextVersion, long runControlVersion, String state) {
+        NodeWorkItem item = new NodeWorkItem();
+        item.setRunId(runId);
+        item.setPlanGeneration(planGeneration);
+        item.setNodeId(nodeId);
+        item.setNodeAttempt(nodeAttempt);
+        item.setSegmentSequence(segmentSequence);
+        item.setState(state);
+        item.setContextVersion(contextVersion);
+        item.setRunControlVersion(runControlVersion);
+        item.setClaimEpoch(claimEpoch);
+        item.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        item.setClaimedBy(claimedBy);
+        item.setLeaseExpiresAt(claimedBy == null ? null
+                : java.time.OffsetDateTime.now().plusMinutes(5));
+        item.setNextVisibleAt(java.time.OffsetDateTime.now().minusSeconds(1));
+        item.setPayloadJson("{}");
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            assertThat(session.getMapper(NodeWorkItemMapper.class).insert(item)).isEqualTo(1);
+        }
     }
 
     private record GroupFixture(String runId, long groupId, long runControlVersion) {
