@@ -4,6 +4,7 @@ import world.willfrog.agent.platform.wait.LateMemberRequest;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.MemberCompletionResult;
 import world.willfrog.agent.platform.wait.RecoveryConsumptionResult;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.wait.RecoveryNotification;
 import world.willfrog.agent.platform.wait.WaitChainCancelResult;
 import world.willfrog.agent.platform.wait.WaitGroup;
@@ -212,7 +213,10 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
                 group.identity.nodeId(), group.identity.nodeAttempt(),
                 group.identity.segmentSequence() + 1, group.identity.modelTurn()));
         events.add("recovery_consumed:notification=" + notificationId + " group=" + group.id);
-        return new RecoveryConsumptionResult(true, true, group.id, group.nextSegmentSequence);
+        return new RecoveryConsumptionResult(true, true, group.id,
+                new NodeWorkItemIdentity(group.identity.runId(), group.identity.planGeneration(),
+                        group.identity.nodeId(), group.identity.nodeAttempt(),
+                        group.nextSegmentSequence));
     }
 
     @Override
@@ -309,6 +313,34 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
         return memberRows(groupId).stream()
                 .filter(member -> member.memberIdentity.equals(memberIdentity))
                 .findFirst().map(this::toMember);
+    }
+
+    @Override
+    public java.util.Optional<RecoveryNotification> findNotification(long notificationId) {
+        return java.util.Optional.ofNullable(notifications.get(notificationId));
+    }
+
+    @Override
+    public List<RecoveryNotification> scanDueRecoveryNotifications(int limit) {
+        return notifications.values().stream()
+                .filter(notification -> "WAITING".equals(notification.getState()))
+                .limit(limit)
+                .toList();
+    }
+
+    @Override
+    public boolean deferRecoveryNotification(long notificationId, OffsetDateTime nextVisibleAt) {
+        RecoveryNotification notification = notifications.get(notificationId);
+        if (notification == null || !"WAITING".equals(notification.getState())) {
+            return false;
+        }
+        if (notification.getNextVisibleAt() != null
+                && !nextVisibleAt.isAfter(notification.getNextVisibleAt())) {
+            return false;
+        }
+        notification.setNextVisibleAt(nextVisibleAt);
+        events.add("recovery_deferred:notification=" + notificationId);
+        return true;
     }
 
     @Override

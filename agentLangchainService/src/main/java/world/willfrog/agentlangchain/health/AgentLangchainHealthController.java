@@ -13,6 +13,7 @@ import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -26,6 +27,7 @@ public class AgentLangchainHealthController {
     private final AgentLangchainOrchestrator orchestrator;
     private final LangchainRunConcurrencyScheduler concurrencyScheduler;
     private final DualPoolDispatcher dualPoolDispatcher;
+    private final DualPoolRecoveryDispatcher dualPoolRecoveryDispatcher;
     private final SchedulerBackpressureProbe schedulerBackpressureProbe;
     private final LangchainToolConcurrencyThrottle toolThrottle;
 
@@ -51,6 +53,7 @@ public class AgentLangchainHealthController {
         // 保留旧调度器字段在顶层，避免现有观测调用方失效；双池数据以独立子树追加。
         Map<String, Object> snapshot = new LinkedHashMap<>(concurrencyScheduler.schedulerSnapshot());
         Map<String, Object> dualPool = new LinkedHashMap<>(dualPoolDispatcher.snapshot());
+        dualPool.putAll(dualPoolRecoveryDispatcher.snapshot());
         dualPool.put("backpressure", schedulerBackpressureProbe.snapshot());
         snapshot.put("dualPool", dualPool);
         return snapshot;

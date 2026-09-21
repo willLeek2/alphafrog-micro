@@ -77,4 +77,22 @@ public interface WaitGroupStore {
     Optional<WaitMember> findMemberByIdentity(long groupId, String memberIdentity);
 
     List<RecoveryNotification> listNotifications(long groupId);
+
+    /** 按编号读一条恢复通知；内存提示只带编号，取之前必须回库里读一次权威状态。 */
+    Optional<RecoveryNotification> findNotification(long notificationId);
+
+    /**
+     * 到期的恢复通知：还没被取走、已经到了下次可见时间，等得最久的排最前。
+     *
+     * <p>周期补扫与启动扫描用它把通知重新发现：内存提示可以丢，库里这条通知还在就得有人来取。</p>
+     */
+    List<RecoveryNotification> scanDueRecoveryNotifications(int limit);
+
+    /**
+     * 把一条通知推后到某个时刻：取不走时按退避推迟，避免同一批候选被反复捞。
+     *
+     * <p>返回 false 表示这条通知已经不在等待态，或者新时间不比原来的晚（迟到的延期写入不许把
+     * 时间拉回来）。</p>
+     */
+    boolean deferRecoveryNotification(long notificationId, OffsetDateTime nextVisibleAt);
 }

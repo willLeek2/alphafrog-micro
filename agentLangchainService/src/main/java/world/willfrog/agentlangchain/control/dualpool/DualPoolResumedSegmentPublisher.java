@@ -14,8 +14,8 @@ import world.willfrog.agentlangchain.execution.ResumedSegmentPublisher;
  * 下一段立刻重新进入节点池。
  *
  * <p>只有这一条路是不够的：进程退出、通知写出来时没人守着、内存提示丢了这些情况都需要周期补扫与
- * 启动扫描。那一套（每轮处理上限、退避与抖动、启动分页重建）属于阶段三第四组，届时把这一条并进去，
- * 不在这里另起一套。</p>
+ * 启动扫描，那一套在 {@link DualPoolRecoveryDispatcher}。这里消费不成时叫它一声，让它下一轮先试这条
+ * 通知；它自己也会按数据库把到期的通知重新发现。</p>
  */
 @Service
 @RequiredArgsConstructor
@@ -26,6 +26,7 @@ public class DualPoolResumedSegmentPublisher implements ResumedSegmentPublisher 
 
     private final WaitGroupStore waitGroupStore;
     private final DualPoolDispatcher dispatcher;
+    private final DualPoolRecoveryDispatcher recoveryDispatcher;
 
     @Autowired(required = false)
     private DualPoolRunAdmissionRegistry admissionRegistry;
@@ -43,10 +44,11 @@ public class DualPoolResumedSegmentPublisher implements ResumedSegmentPublisher 
             return false;
         }
         if (!consumed.succeeded()) {
-            // Run 已经不在执行中（取消、暂停、计划代际失效）或控制版本变了：通知留在原地，
-            // 由取消路径或下一次补扫处理，这一次不放行。
+            // Run 已经不在执行中（取消、暂停、计划代际失效）或控制版本变了：通知留在原地。
+            // 叫一次周期补扫的「马上再试一次」，比等下一个扫描节拍快；叫不动也不影响结果落库。
             log.info("这条恢复通知暂时不能消费：notification={} runControlVersion={}",
                     notificationId, runControlVersion);
+            recoveryDispatcher.wake(notificationId);
             return false;
         }
         if (admissionRegistry != null

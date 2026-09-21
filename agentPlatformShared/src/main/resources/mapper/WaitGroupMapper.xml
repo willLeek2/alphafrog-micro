@@ -99,6 +99,10 @@
         <result property="consumed" column="consumed"/>
         <result property="promoted" column="promoted"/>
         <result property="groupId" column="group_id"/>
+        <result property="nextRunId" column="next_run_id"/>
+        <result property="nextPlanGeneration" column="next_plan_generation"/>
+        <result property="nextNodeId" column="next_node_id"/>
+        <result property="nextNodeAttempt" column="next_node_attempt"/>
         <result property="nextSegmentSequence" column="next_segment_sequence"/>
     </resultMap>
 
@@ -244,6 +248,62 @@
         WHERE group_id = #{groupId}
         ORDER BY recovery_generation
     </select>
+
+    <select id="findNotificationById" resultMap="RecoveryNotificationResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               recovery_generation,
+               state,
+               next_visible_at,
+               consumed_at,
+               consumed_by,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_recovery_notification
+        WHERE id = #{notificationId}
+    </select>
+
+    <!--
+      到期的恢复通知：还没被取走、已经到了下次可见时间，等得最久的排最前。
+
+      这里不预判「能不能取走」：能不能取走由消费那条语句里的条件说了算（Run 还在执行、计划代际
+      与控制版本、通知代际等于组当前代际、下一段还在等待态）。扫描先取一批候选，逐条去试，
+      试不成的由调用方按退避推后下次可见时间——把一个取不走的通知在每一轮里反复捞出来，
+      只会让同一批里别的通知轮不到。
+    -->
+    <select id="scanDueRecoveryNotifications" resultMap="RecoveryNotificationResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               recovery_generation,
+               state,
+               next_visible_at,
+               consumed_at,
+               consumed_by,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_recovery_notification
+        WHERE state = 'WAITING'
+          AND next_visible_at &lt;= CURRENT_TIMESTAMP
+        ORDER BY next_visible_at, id
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      把一条通知推后：只对还在等待态、且新时间确实更晚的才写。
+
+      只许往后推：迟到的延期写入不能把已经提前的时间拉回来，否则同一批候选会被反复捞。
+      已经取走或取消的通知不受影响——它的状态已经变了，这条写入影响 0 行。
+    -->
+    <update id="deferRecoveryNotification">
+        UPDATE alphafrog_agent_run_recovery_notification SET
+            next_visible_at = #{nextVisibleAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{notificationId}
+          AND state = 'WAITING'
+          AND next_visible_at &lt; #{nextVisibleAt}
+    </update>
 
     <!-- ==================== 整组挂起 ==================== -->
 
@@ -638,7 +698,8 @@
                     AND wi.node_id = g.node_id
                     AND wi.node_attempt = g.node_attempt
                     AND wi.segment_sequence = g.next_segment_sequence)
-            RETURNING wi.segment_sequence, f.group_id AS group_id
+            RETURNING wi.run_id, wi.plan_generation, wi.node_id, wi.node_attempt,
+                      wi.segment_sequence, f.group_id AS group_id
         ),
         group_resumed AS (
             UPDATE alphafrog_agent_run_wait_group g SET
@@ -667,6 +728,12 @@
             (SELECT count(*) FROM notification_consumed) AS consumed,
             (SELECT count(*) FROM segment_promoted) AS promoted,
             (SELECT group_id FROM notification_consumed) AS group_id,
+            -- 放行出来的那一段的完整身份随结果一起返回：周期补扫这一路手上只有通知，
+            -- 拿不到身份就没法把下一段投给节点池，而为了拿身份再读一次库会和别的写入赛跑。
+            (SELECT run_id FROM segment_promoted) AS next_run_id,
+            (SELECT plan_generation FROM segment_promoted) AS next_plan_generation,
+            (SELECT node_id FROM segment_promoted) AS next_node_id,
+            (SELECT node_attempt FROM segment_promoted) AS next_node_attempt,
             (SELECT segment_sequence FROM segment_promoted) AS next_segment_sequence
     </select>
 

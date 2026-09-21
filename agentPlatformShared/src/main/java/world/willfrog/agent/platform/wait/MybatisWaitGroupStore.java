@@ -146,7 +146,7 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                 value(row.getConsumed()) > 0,
                 value(row.getPromoted()) > 0,
                 row.getGroupId(),
-                row.getNextSegmentSequence());
+                row.nextSegment());
         if (result.inconsistent()) {
             // 三条写入在语句里是用 RETURNING 串起来的，只可能全成或全不写。出现半成品说明库里的
             // 事实与这段代码的假设对不上，必须当场报出来——恢复资格只有一条，放过去就再也找不回。
@@ -256,6 +256,33 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
             throw new IllegalArgumentException("成员稳定身份不能为空");
         }
         return Optional.ofNullable(mapper.findMemberByIdentity(groupId, memberIdentity));
+    }
+
+    @Override
+    public Optional<RecoveryNotification> findNotification(long notificationId) {
+        if (notificationId <= 0) {
+            throw new IllegalArgumentException("恢复通知编号必须为正数：" + notificationId);
+        }
+        return Optional.ofNullable(mapper.findNotificationById(notificationId));
+    }
+
+    @Override
+    public List<RecoveryNotification> scanDueRecoveryNotifications(int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.scanDueRecoveryNotifications(limit);
+    }
+
+    @Override
+    public boolean deferRecoveryNotification(long notificationId, OffsetDateTime nextVisibleAt) {
+        if (notificationId <= 0) {
+            throw new IllegalArgumentException("恢复通知编号必须为正数：" + notificationId);
+        }
+        if (nextVisibleAt == null) {
+            throw new IllegalArgumentException("推后恢复通知必须给出下次可见时间");
+        }
+        return mapper.deferRecoveryNotification(notificationId, nextVisibleAt) > 0;
     }
 
     @Override

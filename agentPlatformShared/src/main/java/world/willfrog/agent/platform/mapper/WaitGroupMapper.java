@@ -45,6 +45,24 @@ public interface WaitGroupMapper {
 
     List<RecoveryNotification> listNotifications(@Param("groupId") long groupId);
 
+    /** 按编号读一条恢复通知；内存提示只带编号，取之前必须回库里读一次权威状态。 */
+    RecoveryNotification findNotificationById(@Param("notificationId") long notificationId);
+
+    /**
+     * 到期的恢复通知：还没被取走、已经到了下次可见时间，等得最久的排最前。
+     *
+     * <p>不预判能不能取走：那是消费语句里那些条件的事。扫描只负责把候选按顺序取出来，
+     * 逐条去试，试不成的由调用方按退避推后下次可见时间。</p>
+     */
+    List<RecoveryNotification> scanDueRecoveryNotifications(@Param("limit") int limit);
+
+    /**
+     * 把一条通知推后：只对还在等待态、且新时间确实更晚的才写。
+     * 已经取走或取消的通知影响 0 行，迟到的延期写入也不会把时间拉回来。
+     */
+    int deferRecoveryNotification(@Param("notificationId") long notificationId,
+                                  @Param("nextVisibleAt") OffsetDateTime nextVisibleAt);
+
     // ===== 整组挂起 =====
 
     /**
