@@ -36,12 +36,6 @@
         <result property="updatedAt" column="updated_at"/>
     </resultMap>
 
-    <!--
-      双池家族的冻结版本取值。写成一份共享片段：语句里凡是按家族收窄候选的地方都引它，
-      免得一处改了另一处漏掉。契约测试会拿它和 Java 枚举逐字比对。
-    -->
-    <sql id="dualPoolWireValues">'DUAL_POOL_V1', 'DUAL_POOL_V2'</sql>
-
     <sql id="coordinationColumns">
         c.run_id,
         c.scheduler_version,
@@ -69,16 +63,15 @@
       建一条资格记录：版本与计划代际直接取 Run 主表上的值，调用方传什么都没用。
       Run 不存在时影响 0 行，调用方据此知道「这条 Run 不在库里」。
 
-      只有双池家族的 Run 能建出这一行。这张表是双池执行层的入口：旧版本的 Run 走旧引擎，
-      它那份执行入口根本不读这里，给旧 Run 建行只会让它在候选里排队却没人来服务，
-      一次扫描的条数还会被这些永远轮不到的行占满。
+      三个调度器版本共用这一张表、共用同一份候选排序：旧版本、两个双池版本排在一起按轮次竞争，
+      谁先轮到谁先被服务。选出来之后按每一行自己冻结的版本交给对应入口，扫描的这一步不按版本分家。
+      给某一个版本单独开一份候选，等于让它按另一套轮次单独插队，两边的公平性都无从比较。
     -->
     <insert id="ensure">
         INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version, plan_generation)
         SELECT r.id, r.scheduler_version, COALESCE(r.plan_generation, -1)
         FROM alphafrog_agent_run r
         WHERE r.id = #{runId}
-          AND r.scheduler_version IN (<include refid="dualPoolWireValues"/>)
         ON CONFLICT (run_id) DO NOTHING
     </insert>
 
@@ -172,7 +165,6 @@
         JOIN alphafrog_agent_run r ON r.id = c.run_id
         WHERE c.next_visible_at &lt;= CURRENT_TIMESTAMP
           AND r.status IN (<include refid="liveRunStatuses"/>)
-          AND r.scheduler_version IN (<include refid="dualPoolWireValues"/>)
         ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id
         LIMIT #{limit}
     </select>

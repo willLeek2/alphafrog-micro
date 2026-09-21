@@ -267,6 +267,10 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
         snapshot.put("startupResidueBlocked", admissionRegistry.startupResidueBlocked());
         snapshot.put("permits", permitLedger.snapshot());
         snapshot.put("workHandlerReady", isReady());
+        DualPoolWorkHandler handler = handlerProvider.getIfAvailable();
+        if (handler != null) {
+            snapshot.putAll(handler.routingSnapshot());
+        }
         return snapshot;
     }
 

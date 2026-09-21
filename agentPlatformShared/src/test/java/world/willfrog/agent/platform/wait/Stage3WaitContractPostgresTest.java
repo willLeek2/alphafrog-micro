@@ -104,6 +104,9 @@ class Stage3WaitContractPostgresTest {
     private static final String DISPATCH_PROOF_SCRIPT = "008_agent_run_wait_member_dispatch_proof.sql";
     private static final String CONSUMED_BY_SCRIPT = "009_agent_run_recovery_consumed_by_check.sql";
     private static final String REPAIR_INDEX_SCRIPT = "010_agent_run_event_received_repair_index.sql";
+    /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
+    private static final List<String> ROTATION_RUNS =
+            List.of("run-cold", "run-warm", "run-hot", "run-legacy");
     private static final String SCHEMA = "stage3_contract_" + UUID.randomUUID().toString().replace("-", "");
     private static final int CONCURRENT_THREADS = 4;
     private static final int HIGH_WATERMARK = 128;
@@ -187,7 +190,8 @@ class Stage3WaitContractPostgresTest {
         execute(insert + "('run-coord-v2', 'DUAL_POOL_V2', 'PER_ROUND_NEW_NODE_LIMIT')");
         execute(insert + "('run-coord-v1', 'DUAL_POOL_V1', NULL)");
         execute(insert + "('run-coord-old', 'LEGACY', NULL)");
-        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination"))
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination "
+                + "WHERE run_id IN ('run-coord-v2', 'run-coord-v1', 'run-coord-old')"))
                 .as("旧版本也要能建出协调资格：协调名额与轮转是新旧版本共用的入口")
                 .isEqualTo(3);
         expectRejected(insert + "('run-coord-v2', 'DUAL_POOL_V9', NULL)",
@@ -223,11 +227,11 @@ class Stage3WaitContractPostgresTest {
     }
 
     /**
-     * 两个双池版本在同一份候选里竞争，谁等得久谁先被服务。
+     * 三个版本在同一份候选里竞争，谁等得久谁先被服务。
      *
      * <p>资格记录上的版本必须是从 Run 主表派生出来的：造数据时给父 Run 定版本，不再另外插一条
-     * 版本不一致的子记录，否则「父子一致」这件事根本没被测到。旧版本不在这份候选里，
-     * 它的行连建都建不出来，另有用例单独量。</p>
+     * 版本不一致的子记录，否则「父子一致」这件事根本没被测到。旧版本的行也在这一份候选里占一个
+     * 位置、跟着同一套轮次走；它能不能被接手是另一回事。</p>
      */
     @Test
     void coordinationRotationServesTheLongestWaitingRunFirstAcrossEveryVersion() throws Exception {
@@ -243,8 +247,8 @@ class Stage3WaitContractPostgresTest {
         // 同一个 Run 再写一次不改任何东西：资格记录一个 Run 只有一行。
         assertThat(store.ensure("run-hot")).isFalse();
         assertThat(store.ensure("run-legacy"))
-                .as("旧版本的 Run 不归这张表：它由旧引擎服务，建行只会白占候选名额")
-                .isFalse();
+                .as("旧版本的 Run 也在这张表里排队：候选是三个版本共用的")
+                .isTrue();
         assertThat(store.ensure("run-missing"))
                 .as("Run 不存在时建不出资格记录，影响 0 行")
                 .isFalse();
@@ -258,18 +262,17 @@ class Stage3WaitContractPostgresTest {
 
         // 插入时间各自不同，抹平之后这一轮的所有图都在同一份候选里。
         execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP");
-        assertThat(store.scanDue(10))
-                .as("一次全局扫描：两个双池版本排在同一份候选里，按每行的冻结版本路由")
-                .extracting(RunCoordination::getRunId)
-                .containsExactlyInAnyOrder("run-cold", "run-warm", "run-hot");
+        assertThat(dueRunIds(store, ROTATION_RUNS))
+                .as("一次全局扫描：三个版本排在同一份候选里，按每行的冻结版本路由")
+                .containsExactlyInAnyOrder("run-cold", "run-warm", "run-hot", "run-legacy");
 
         store.markCoordinationServed("run-cold", 1, 0);
         store.markCoordinationServed("run-warm", 7, 0);
         store.markCoordinationServed("run-hot", 9, 0);
-        assertThat(store.scanDue(10))
-                .as("按最近被服务的轮次升序：越久没被服务的越靠前")
-                .extracting(RunCoordination::getRunId)
-                .containsExactly("run-cold", "run-warm", "run-hot");
+        store.markCoordinationServed("run-legacy", 10, 0);
+        assertThat(dueRunIds(store, ROTATION_RUNS))
+                .as("按最近被服务的轮次升序：越久没被服务的越靠前，旧版本一样排在里面")
+                .containsExactly("run-cold", "run-warm", "run-hot", "run-legacy");
 
         // 轮次位置只许前进：迟到的旧轮次写进来影响 0 行，不能把新事实改回旧事实。
         assertThat(store.markCoordinationServed("run-hot", 3, 0)).isFalse();
@@ -284,9 +287,8 @@ class Stage3WaitContractPostgresTest {
                 OffsetDateTime.now().plusMinutes(5), 0, 1L)).isTrue();
         assertThat(store.find("run-cold").orElseThrow().deferReasonEnum())
                 .isEqualTo(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
-        assertThat(store.scanDue(10))
-                .extracting(RunCoordination::getRunId)
-                .containsExactly("run-warm", "run-hot");
+        assertThat(dueRunIds(store, ROTATION_RUNS))
+                .containsExactly("run-warm", "run-hot", "run-legacy");
 
         // Run 推进计划代际：资格记录跟着走，只许前进，也不许写一个不属于 Run 的代际。
         execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = 'run-cold'");
@@ -306,9 +308,8 @@ class Stage3WaitContractPostgresTest {
         RunCoordination served = store.find("run-cold").orElseThrow();
         assertThat(served.getDeferReason()).isNull();
         assertThat(served.getCoordinationServedRound()).isEqualTo(11);
-        assertThat(store.scanDue(10))
-                .extracting(RunCoordination::getRunId)
-                .containsExactly("run-warm", "run-hot", "run-cold");
+        assertThat(dueRunIds(store, ROTATION_RUNS))
+                .containsExactly("run-warm", "run-hot", "run-legacy", "run-cold");
     }
 
     @Test
@@ -420,34 +421,36 @@ class Stage3WaitContractPostgresTest {
     }
 
     /**
-     * 旧版本的 Run 既不进资格表，也不会占掉扫描条数。
+     * 三个版本共用一份候选：旧版本的 Run 一样建得出资格记录，也一样按同一份排序参与竞争。
      *
-     * <p>资格表是双池执行层的入口：旧版本的 Run 走旧引擎，它不读这张表。要塞进一行旧记录，
-     * 那行永远没人接走，却会一直占着一次扫描的名额，排在它后面的双池 Run 连被看见的机会都没有。</p>
+     * <p>选出来之后按每一行自己冻结的版本交给对应入口；候选这一步不按版本分家——给某一版单独开
+     * 一份候选，等于让它在另一套轮次里插队，「谁等得更久」就没有可比性了。旧版本的行进了候选，
+     * 只是共享分发器现在还不接手它：那要有能跨进程核对、会过期、能原子转交的所有权事实，
+     * 这件事留到持久所有权那一组。</p>
      */
     @Test
-    void legacyRunsNeitherGetACoordinationRowNorEatTheScanBudget() throws Exception {
+    void everySchedulerVersionSharesTheSameCoordinationCandidates() throws Exception {
+        List<String> mine = List.of("run-legacy-scan", "run-v2-scan");
         createRunFor("run-legacy-scan", "user-legacy-scan", SchedulerVersion.LEGACY, 0, 0L);
-        RunCoordinationStore store = coordinationStore();
-        assertThat(store.ensure("run-legacy-scan"))
-                .as("旧版本的 Run 建不出资格记录，影响 0 行").isFalse();
-        assertThat(store.find("run-legacy-scan")).isEmpty();
-
-        // 绕过创建入口硬塞一行旧记录，模拟历史残留。
-        execute("INSERT INTO alphafrog_agent_run_coordination "
-                + "(run_id, scheduler_version, plan_generation) VALUES ('run-legacy-scan', 'LEGACY', 0)");
         createRunFor("run-v2-scan", "user-v2-scan", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
-        assertThat(store.ensure("run-v2-scan")).isTrue();
-        execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP");
+        RunCoordinationStore store = coordinationStore();
 
-        assertThat(store.scanDue(1))
-                .as("只给一条名额：拿到的必须是双池那条，旧记录不占坑")
-                .extracting(RunCoordination::getRunId)
-                .containsExactly("run-v2-scan");
-        assertThat(store.scanDue(10))
-                .as("多给几条名额也不放旧记录进来")
-                .extracting(RunCoordination::getRunId)
-                .doesNotContain("run-legacy-scan");
+        assertThat(store.ensure("run-legacy-scan"))
+                .as("旧版本的 Run 也建得出资格记录").isTrue();
+        assertThat(store.ensure("run-v2-scan")).isTrue();
+        assertThat(store.find("run-legacy-scan").orElseThrow().getSchedulerVersion())
+                .as("记录上的版本取自 Run 主表，不由调用方指定").isEqualTo("LEGACY");
+        assertThat(store.find("run-v2-scan").orElseThrow().getSchedulerVersion())
+                .isEqualTo("DUAL_POOL_V2");
+
+        // 插入时间各自不同，抹平之后这一轮两条都在候选里。
+        execute("UPDATE alphafrog_agent_run_coordination SET coordination_served_round = 0, "
+                + "next_visible_at = CURRENT_TIMESTAMP "
+                + "WHERE run_id IN ('run-legacy-scan', 'run-v2-scan')");
+
+        assertThat(dueRunIds(store, mine))
+                .as("两条走同一份排序：先比服务轮次，再比下次可见时间，最后比 Run 编号")
+                .containsExactly("run-legacy-scan", "run-v2-scan");
     }
 
     @Test
@@ -1345,6 +1348,19 @@ class Stage3WaitContractPostgresTest {
              Statement statement = connection.createStatement()) {
             statement.execute(sql);
         }
+    }
+
+    /**
+     * 候选里属于本用例的那几条，按扫描给出的先后排列。
+     *
+     * <p>整个真库用例类共用一个 schema、方法顺序又不固定：别的用例留下的候选行可能还在窗口里，
+     * 直接对整份扫描结果断言先后，就会变成依赖执行顺序。这里先把不属于本用例的行滤掉。</p>
+     */
+    private static List<String> dueRunIds(RunCoordinationStore store, List<String> mine) {
+        return store.scanDue(500).stream()
+                .map(RunCoordination::getRunId)
+                .filter(mine::contains)
+                .toList();
     }
 
     private static long countRows(String sql) throws Exception {

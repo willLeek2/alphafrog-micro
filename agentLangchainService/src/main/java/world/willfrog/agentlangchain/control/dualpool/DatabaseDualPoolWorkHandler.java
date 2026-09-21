@@ -54,6 +54,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 双 Worker 池的数据库实现。
@@ -99,6 +100,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final int globalHighWatermark;
     private final int globalLowWatermark;
     private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
+    /**
+     * 共享候选里出现、但共享分发器还接不了手的旧版本 Run。
+     *
+     * <p>数量摆在这里是为了让「旧版本一直在候选里排队却没被服务」这件事看得见：
+     * 看不到就会以为它只是还没轮到。</p>
+     */
+    private final AtomicLong legacyCandidatesNotTaken = new AtomicLong();
+    /** 版本读不出来、或不属于任何已知执行层的候选条数：只记账，不动这些 Run 的任何状态。 */
+    private final AtomicLong routingIsolated = new AtomicLong();
     /** 固定条带锁不会按 runId 增长，也不会在旧协调回合仍等待时被删除并创建第二把锁。 */
     private final Object[] runLockStripes = createRunLockStripes();
 
@@ -942,13 +952,37 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
         refreshRoundCounters();
         LinkedHashSet<String> runIds = new LinkedHashSet<>();
-        // 一次全局扫描：两个双池版本排在同一份候选顺序里，按每行记录的冻结版本路由。
-        // 候选集合本身就只含双池家族（扫描语句里收窄），所以这里的条数不会被永远轮不到的行占满。
+        // 一次全局扫描：三个调度器版本排在同一份候选顺序里，选出来之后按每一行记录的冻结版本路由。
+        // 候选是共享的，谁能被接手不共享：能不能动这条 Run，由各版本自己那套所有权事实说了算。
         for (RunCoordination due : coordinationStore.scanDue(limit)) {
-            if (!SchedulerVersion.fromWire(due.getSchedulerVersion()).isDualPoolFamily()) {
-                // 收窄之后这里不该出现旧版本的行；真出现了说明有人绕过创建入口写了旧行，
-                // 那是数据问题，记一条错误而不是安静丢掉。
-                log.error("协调候选里出现非双池版本的行: runId={} version={}",
+            SchedulerVersion version;
+            try {
+                version = SchedulerVersion.fromWire(due.getSchedulerVersion());
+            } catch (RuntimeException unknownVersion) {
+                // 冻结版本读不出来：这条 Run 归哪套执行层都不知道，谁都不许动它的状态。
+                long isolated = routingIsolated.incrementAndGet();
+                if (isolated == 1L || isolated % 1000L == 0L) {
+                    // 一条读不出版本的行留在候选里会每轮都撞上：只按累计条数报，免得日志被它刷满。
+                    log.error("协调候选里的调度器版本读不出来，保持失败关闭: runId={} version={} 累计{}条",
+                            due.getRunId(), due.getSchedulerVersion(), isolated);
+                }
+                continue;
+            }
+            if (version == SchedulerVersion.LEGACY) {
+                // 旧版本的 Run 只有已经握着旧执行权的那条路径能继续跑它。共享分发器手上还没有
+                // 「另一个进程也能核对、会过期、能原子转交」的所有权事实，凭一条候选就接手，
+                // 会在滚动部署新旧并存的窗口里对着旧进程正在跑的图再启动一次。这里只记账、不动状态。
+                long notTaken = legacyCandidatesNotTaken.incrementAndGet();
+                if (notTaken == 1L || notTaken % 1000L == 0L) {
+                    // 旧版本的行会一直留在候选里：按累计条数报，别把每一轮的每一条都写进日志。
+                    log.info("旧版本的 Run 进了共享候选，但共享分发器还没有可跨进程核对的持久所有权事实，"
+                            + "这一轮不接手: runId={} 累计{}条", due.getRunId(), notTaken);
+                }
+                continue;
+            }
+            if (!version.isDualPoolFamily()) {
+                routingIsolated.incrementAndGet();
+                log.error("协调候选里的版本不属于任何已知执行层，保持失败关闭: runId={} version={}",
                         due.getRunId(), due.getSchedulerVersion());
                 continue;
             }
@@ -1396,5 +1430,18 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
 
     private static String firstNonBlank(String first, String second) {
         return first != null && !first.isBlank() ? first : (second == null ? "" : second);
+    }
+
+    /**
+     * 路由的读数：共享候选里出现了多少条旧版本的 Run 还没被接手、多少条因为版本读不出来被隔离。
+     *
+     * <p>旧版本那一条只增不减，看到它一直涨说明「候选里有它、但没人能服务它」的状态没变。</p>
+     */
+    @Override
+    public Map<String, Object> routingSnapshot() {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("legacyCandidatesNotTakenTotal", legacyCandidatesNotTaken.get());
+        snapshot.put("routingIsolatedTotal", routingIsolated.get());
+        return snapshot;
     }
 }

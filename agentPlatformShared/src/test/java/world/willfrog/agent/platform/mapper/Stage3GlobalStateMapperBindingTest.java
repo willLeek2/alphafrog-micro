@@ -152,11 +152,10 @@ class Stage3GlobalStateMapperBindingTest {
         assertThat(sql).as("候选取的是协调轮的进度，不能拿派发轮的进度来排序")
                 .doesNotContain("dispatch_served_round, c.next_visible_at");
         assertThat(sql).as("只取到期的记录").contains("c.next_visible_at <= CURRENT_TIMESTAMP");
-        assertThat(sql).as("一次全局扫描：两个双池版本排在同一份候选里，不各取一份批次")
+        assertThat(sql).as("一次全局扫描：三个版本排在同一份候选里，不按版本各取一批")
                 .doesNotContain("c.scheduler_version =")
-                .contains("r.scheduler_version IN")
-                .contains("'DUAL_POOL_V1'")
-                .contains("'DUAL_POOL_V2'");
+                .doesNotContain("r.scheduler_version IN")
+                .contains("c.scheduler_version");
     }
 
     @Test
@@ -220,34 +219,34 @@ class Stage3GlobalStateMapperBindingTest {
                 .contains("wi.state IN ('RUNNABLE', 'RESUMABLE')");
     }
 
+    /**
+     * 冻结合同：三个调度器版本共用一份候选，选出来之后按每一行自己冻结的版本交给对应入口。
+     *
+     * <p>给某一个版本单独开一份候选，等于让它在另一套轮次里插队：两边的先后没有可比性，
+     * 「谁等得更久」也就无从判断。所以建资格记录与收候选这两步都不按版本分家。</p>
+     */
     @Test
-    void onlyTheDualPoolFamilyGetsACoordinationRowOrACandidateSlot() {
-        Set<String> dualPool = new LinkedHashSet<>();
-        for (SchedulerVersion version : SchedulerVersion.values()) {
-            if (version.isDualPoolFamily()) {
-                dualPool.add(version.name());
-            }
-        }
-        assertThat(dualPool).as("双池家族至少要有两个版本，否则这条断言证明不了什么")
-                .contains("DUAL_POOL_V1", "DUAL_POOL_V2");
+    void theCandidateSetIsSharedByEverySchedulerVersion() {
+        assertThat(java.util.Arrays.stream(SchedulerVersion.values()).map(Enum::name))
+                .as("合同里的三种版本；多出一种时这条断言会挡下来，路由要显式决定它走哪条路")
+                .contains("LEGACY", "DUAL_POOL_V1", "DUAL_POOL_V2");
 
         String ensure = sql("RunCoordinationMapper", "ensure");
-        assertThat(versionLiterals(ensure))
-                .as("只有双池家族的 Run 建得出资格记录：旧版本的 Run 走旧引擎，不该在这张表里排队")
-                .containsExactlyInAnyOrderElementsOf(dualPool);
-        String scan = sql("RunCoordinationMapper", "scanDue");
-        assertThat(versionLiterals(scan))
-                .as("候选里也只放双池家族：旧行混进来只会白占扫描条数")
-                .containsExactlyInAnyOrderElementsOf(dualPool);
-    }
+        assertThat(ensure)
+                .as("建资格记录不按版本分家")
+                .doesNotContain("scheduler_version IN")
+                .doesNotContain("c.scheduler_version =");
+        assertThat(ensure).as("版本写的是 Run 主表上的冻结值，不由调用方决定")
+                .contains("SELECT r.id, r.scheduler_version,");
 
-    /** 语句里 `r.scheduler_version IN (...)` 那一小段括号里的取值集合。 */
-    private static List<String> versionLiterals(String sql) {
-        int start = sql.indexOf("r.scheduler_version IN (");
-        assertThat(start).as("这条语句应当按冻结版本收窄：").isGreaterThanOrEqualTo(0);
-        int from = sql.indexOf("(", start);
-        int to = sql.indexOf(")", from);
-        return quotedValues(sql.substring(from, to));
+        String scan = sql("RunCoordinationMapper", "scanDue");
+        assertThat(scan)
+                .as("候选的排序与收条数对三个版本是同一份")
+                .doesNotContain("scheduler_version IN")
+                .doesNotContain("c.scheduler_version =");
+        assertThat(scan).as("选出后由调用方按每一行自己的冻结版本路由")
+                .contains("c.scheduler_version")
+                .contains("ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id");
     }
 
     @Test
