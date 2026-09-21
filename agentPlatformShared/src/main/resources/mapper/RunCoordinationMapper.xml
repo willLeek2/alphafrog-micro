@@ -36,6 +36,12 @@
         <result property="updatedAt" column="updated_at"/>
     </resultMap>
 
+    <!--
+      双池家族的冻结版本取值。写成一份共享片段：语句里凡是按家族收窄候选的地方都引它，
+      免得一处改了另一处漏掉。契约测试会拿它和 Java 枚举逐字比对。
+    -->
+    <sql id="dualPoolWireValues">'DUAL_POOL_V1', 'DUAL_POOL_V2'</sql>
+
     <sql id="coordinationColumns">
         c.run_id,
         c.scheduler_version,
@@ -62,12 +68,17 @@
     <!--
       建一条资格记录：版本与计划代际直接取 Run 主表上的值，调用方传什么都没用。
       Run 不存在时影响 0 行，调用方据此知道「这条 Run 不在库里」。
+
+      只有双池家族的 Run 能建出这一行。这张表是双池执行层的入口：旧版本的 Run 走旧引擎，
+      它那份执行入口根本不读这里，给旧 Run 建行只会让它在候选里排队却没人来服务，
+      一次扫描的条数还会被这些永远轮不到的行占满。
     -->
     <insert id="ensure">
         INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version, plan_generation)
         SELECT r.id, r.scheduler_version, COALESCE(r.plan_generation, -1)
         FROM alphafrog_agent_run r
         WHERE r.id = #{runId}
+          AND r.scheduler_version IN (<include refid="dualPoolWireValues"/>)
         ON CONFLICT (run_id) DO NOTHING
     </insert>
 
@@ -75,43 +86,61 @@
       延期：必须带这一轮开始时读到的计划代际与协调轮次做条件。
       条件不满足说明这张图已经被服务过（轮次前进）或者已经换了计划代际，这次延期是旧观察，
       写进去只会把新事实拉回旧事实。
+
+      父 Run 上的当前代际也要一起核：子记录可能还没来得及跟着同步，只比子记录会让升代之后的
+      旧延期照样写进去，把已经作废的那一轮说成还在排队。
     -->
     <update id="deferFor">
         UPDATE alphafrog_agent_run_coordination c SET
             defer_reason = #{deferReason},
             next_visible_at = #{nextVisibleAt},
             updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
         WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
           AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
           AND c.coordination_served_round = #{expectedServedRound}
     </update>
 
     <!--
       协调成功推进：清掉延期原因、记下这一轮服务过它、连续未获协调轮数归零。
       轮次只许前进，迟到的旧轮次写进来影响 0 行。
+
+      父 Run 与资格记录上的计划代际都要还是调用方这一回合开始时读到的那一代：计划已经推进之后，
+      旧回合的成功写不许清掉延期原因、不许改轮转位置，否则等于拿旧回合冒充新回合。
     -->
     <update id="markCoordinationServed">
-        UPDATE alphafrog_agent_run_coordination SET
+        UPDATE alphafrog_agent_run_coordination c SET
             defer_reason = NULL,
             next_visible_at = CURRENT_TIMESTAMP,
             coordination_served_round = #{roundNumber},
             coordination_missed_rounds = 0,
             updated_at = CURRENT_TIMESTAMP
-        WHERE run_id = #{runId}
-          AND coordination_served_round &lt; #{roundNumber}
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.coordination_served_round &lt; #{roundNumber}
     </update>
 
     <!--
       派发成功推进：只动派发那一组轮转位置。延期原因是协调层的事实，派发不替它做主。
-      同样只许前进。
+      同样只许前进，同样要核父 Run 与资格记录上的计划代际：换了计划之后，旧回合的领取
+      不该再改写轮转位置。
     -->
     <update id="markDispatchServed">
-        UPDATE alphafrog_agent_run_coordination SET
+        UPDATE alphafrog_agent_run_coordination c SET
             dispatch_served_round = #{roundNumber},
             dispatch_missed_rounds = 0,
             updated_at = CURRENT_TIMESTAMP
-        WHERE run_id = #{runId}
-          AND dispatch_served_round &lt; #{roundNumber}
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.dispatch_served_round &lt; #{roundNumber}
     </update>
 
     <!--
@@ -131,8 +160,11 @@
     </update>
 
     <!--
-      这一轮可以被协调的 Run，一次全局扫描：不按调度器版本分池，旧版本、V1、V2 排在同一份候选里，
+      这一轮可以被协调的 Run，一次全局扫描：两个双池版本不各自分池，排在同一份候选里，
       调用方按每行记录的冻结版本路由。已结束的 Run 不再需要协调，取消中的 Run 交给取消路径推进。
+
+      候选里只放双池家族：旧版本的 Run 由旧引擎服务，它不读这张表。把旧行留在候选里会白占
+      扫描条数——排在前面的旧行永远没人接走，后面的双池 Run 连被看见的机会都没有。
     -->
     <select id="scanDue" resultMap="RunCoordinationResultMap">
         SELECT <include refid="coordinationColumns"/>
@@ -140,6 +172,7 @@
         JOIN alphafrog_agent_run r ON r.id = c.run_id
         WHERE c.next_visible_at &lt;= CURRENT_TIMESTAMP
           AND r.status IN (<include refid="liveRunStatuses"/>)
+          AND r.scheduler_version IN (<include refid="dualPoolWireValues"/>)
         ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id
         LIMIT #{limit}
     </select>

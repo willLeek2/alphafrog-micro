@@ -15,7 +15,8 @@ public interface RunCoordinationStore {
      * 确保这个 Run 有协调资格记录；已经有了就什么都不做。
      *
      * <p>记录里的调度器版本与计划代际由存储层从 Run 主表派生，调用方不传：滚动部署期间同一条 Run
-     * 的冻结版本只有一个出处，让调用方说话就会出现主记录与子记录各说一套。</p>
+     * 的冻结版本只有一个出处，让调用方说话就会出现主记录与子记录各说一套。只有双池家族的 Run
+     * 建得出来：这张表是双池执行层的入口，旧版本的 Run 走旧引擎，不该在这里排队。</p>
      */
     boolean ensure(String runId);
 
@@ -23,7 +24,7 @@ public interface RunCoordinationStore {
      * 记一次 Run 协调延期：写原因与下次可见时间。返回 false 表示这个 Run 没有资格记录，
      * 或者这次延期是旧观察（期望的计划代际或协调轮次已经对不上）。
      *
-     * @param expectedPlanGeneration  这一轮开始时读到的计划代际
+     * @param expectedPlanGeneration  这一轮开始时读到的计划代际；父 Run 或资格记录任一已经变了就返回 false
      * @param expectedCoordinationRound 这一轮开始时读到的最近协调轮次
      */
     boolean deferFor(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt,
@@ -33,16 +34,21 @@ public interface RunCoordinationStore {
      * 记一次 Run 协调成功推进：清掉延期原因、把最近协调轮次改成这一轮、连续未获协调轮数归零。
      *
      * <p>它不碰节点派发的轮转位置：那两个数属于另一个轮次空间，各记各的。</p>
+     *
+     * @param expectedPlanGeneration 这一回合开始时读到的计划代际；父 Run 或资格记录任一已经变了就返回
+     *                               false，计划推进之后的旧回合不许清延期原因、不许改轮转位置
      */
-    boolean markCoordinationServed(String runId, long roundNumber);
+    boolean markCoordinationServed(String runId, long roundNumber, int expectedPlanGeneration);
 
     /**
      * 记一次节点派发成功推进：把最近派发轮次改成这一轮、连续未获派发轮数归零。
      *
      * <p>它不改延期原因：延期原因是 Run 协调这一层的事实，节点派发失败的原因记在工作项自己身上。
      * 读取侧的派发扫描随派发器一起落地，这里先把写入位置备好，免得两个轮次空间共用一个字段。</p>
+     *
+     * @param expectedPlanGeneration 这一回合开始时读到的计划代际；条件与协调那一组相同</p>
      */
-    boolean markDispatchServed(String runId, long roundNumber);
+    boolean markDispatchServed(String runId, long roundNumber, int expectedPlanGeneration);
 
     /**
      * 把计划代际同步到资格记录上，让提醒去重键与 Run 主记录保持一致。

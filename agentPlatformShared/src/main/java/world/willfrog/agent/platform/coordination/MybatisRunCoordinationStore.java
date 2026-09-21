@@ -40,31 +40,29 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
         if (nextVisibleAt == null) {
             throw new IllegalArgumentException("延期必须给出下次可见时间");
         }
-        if (expectedPlanGeneration < -1) {
-            throw new IllegalArgumentException("计划代际不能小于 -1：" + expectedPlanGeneration);
-        }
+        requirePlanGeneration(expectedPlanGeneration);
         requireRoundNumber(expectedCoordinationRound);
         return mapper.deferFor(runId, reason.name(), nextVisibleAt,
                 expectedPlanGeneration, expectedCoordinationRound) > 0;
     }
 
     @Override
-    public boolean markCoordinationServed(String runId, long roundNumber) {
+    public boolean markCoordinationServed(String runId, long roundNumber, int expectedPlanGeneration) {
         requireRoundNumber(roundNumber);
-        return mapper.markCoordinationServed(runId, roundNumber) > 0;
+        requirePlanGeneration(expectedPlanGeneration);
+        return mapper.markCoordinationServed(runId, roundNumber, expectedPlanGeneration) > 0;
     }
 
     @Override
-    public boolean markDispatchServed(String runId, long roundNumber) {
+    public boolean markDispatchServed(String runId, long roundNumber, int expectedPlanGeneration) {
         requireRoundNumber(roundNumber);
-        return mapper.markDispatchServed(runId, roundNumber) > 0;
+        requirePlanGeneration(expectedPlanGeneration);
+        return mapper.markDispatchServed(runId, roundNumber, expectedPlanGeneration) > 0;
     }
 
     @Override
     public boolean syncPlanGeneration(String runId, int planGeneration) {
-        if (planGeneration < -1) {
-            throw new IllegalArgumentException("计划代际不能小于 -1：" + planGeneration);
-        }
+        requirePlanGeneration(planGeneration);
         return mapper.syncPlanGeneration(runId, planGeneration) > 0;
     }
 
@@ -94,6 +92,12 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
             throw new IllegalArgumentException("协调资格必须挂在某个 Run 上");
         }
         return Optional.ofNullable(mapper.find(runId));
+    }
+
+    private static void requirePlanGeneration(int planGeneration) {
+        if (planGeneration < -1) {
+            throw new IllegalArgumentException("计划代际不能小于 -1：" + planGeneration);
+        }
     }
 
     private static void requireRoundNumber(long roundNumber) {

@@ -159,6 +159,24 @@ class AgentRunEventServiceIdempotencyTest {
     }
 
     /**
+     * 接收事实先落库、再投射到事件流：反过来会在库回滚时留下不存在的 Run 的事件。
+     *
+     * <p>投射放在提交之后，所以顺序必须是「先数据库、后 Redis」。创建这条路走的是同一份实现
+     * （{@code persistEvent} 加 {@code projectAppended}），这里量的就是它。</p>
+     */
+    @Test
+    void theReceivedFactIsPersistedBeforeItIsProjected() {
+        stubFreshCreate();
+
+        service.createRun(USER, "hello", "{}", KEY, "m", "e", false, "openrouter", 2, false, "{}",
+                DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+
+        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(eventMapper, eventRedisStore);
+        inOrder.verify(eventMapper).insert(any());
+        inOrder.verify(eventRedisStore).append(any());
+    }
+
+    /**
      * 新建 Run 这条路上用到的桩。两种情形（带键与不带键）走到的分支略有不同，
      * 共用一份桩并把它们设成宽松：用不到的那几个不算测试失败的理由。
      */

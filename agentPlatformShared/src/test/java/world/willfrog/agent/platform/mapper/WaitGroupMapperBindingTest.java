@@ -204,6 +204,9 @@ class WaitGroupMapperBindingTest {
                 .contains("s.segment_sequence + 1");
         assertThat(sql).as("期望成员数按实际提交的成员算，不另外传一个数进来")
                 .contains("(SELECT count(*) FROM member_input)");
+        assertThat(sql).as("读回已有的组也要过同一道 Run 栅栏，否则升代之后旧工人会把作废的组当成自己的")
+                .contains("JOIN run_fence f ON f.run_id = g.run_id")
+                .contains("existing_group_id");
         assertThat(xml).as("成员逐条写入时用的是集合参数").contains("<foreach collection=\"members\"");
     }
 
@@ -276,6 +279,8 @@ class WaitGroupMapperBindingTest {
         assertThat(sql).as("三条写入用 RETURNING 串起来，只有全成或全不写")
                 .contains("FROM segment_promoted")
                 .contains("FROM group_resumed");
+        assertThat(sql).as("消费那条语句要把组号一起返回：主查询要按它回报放行的是哪条链")
+                .contains("RETURNING n.id, n.group_id");
     }
 
     @Test

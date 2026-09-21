@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.capacity.SchedulerRoundScope;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
 import java.io.StringReader;
 import java.lang.reflect.Method;
@@ -151,8 +152,11 @@ class Stage3GlobalStateMapperBindingTest {
         assertThat(sql).as("候选取的是协调轮的进度，不能拿派发轮的进度来排序")
                 .doesNotContain("dispatch_served_round, c.next_visible_at");
         assertThat(sql).as("只取到期的记录").contains("c.next_visible_at <= CURRENT_TIMESTAMP");
-        assertThat(sql).as("一次全局扫描：不按调度器版本分池，版本由每行记录自己带着，由调用方路由")
-                .doesNotContain("c.scheduler_version =");
+        assertThat(sql).as("一次全局扫描：两个双池版本排在同一份候选里，不各取一份批次")
+                .doesNotContain("c.scheduler_version =")
+                .contains("r.scheduler_version IN")
+                .contains("'DUAL_POOL_V1'")
+                .contains("'DUAL_POOL_V2'");
     }
 
     @Test
@@ -183,6 +187,10 @@ class Stage3GlobalStateMapperBindingTest {
                 .contains("coordination_missed_rounds = 0");
         assertThat(sql).as("协调这一轮不改派发轮的进度")
                 .doesNotContain("dispatch_served_round").doesNotContain("dispatch_missed_rounds");
+        assertThat(sql).as("父 Run 与资格记录上的计划代际都要对得上：换了计划之后旧回合不许改写轮转位置")
+                .contains("r.plan_generation = ?")
+                .contains("c.plan_generation = ?")
+                .contains("r.id = c.run_id");
         String refresh = sql("RunCoordinationMapper", "refreshCoordinationMissedRounds");
         assertThat(refresh).as("连续未获协调轮数每轮加一：不按全局轮次差补算，延期期间它没在竞争")
                 .contains("coordination_missed_rounds = c.coordination_missed_rounds + 1")
@@ -199,6 +207,9 @@ class Stage3GlobalStateMapperBindingTest {
                 .contains("dispatch_missed_rounds = 0");
         assertThat(sql).as("延期原因是协调层的事实，派发不许替它清掉")
                 .doesNotContain("defer_reason");
+        assertThat(sql).as("计划代际的条件与协调那一组相同")
+                .contains("r.plan_generation = ?")
+                .contains("c.plan_generation = ?");
         String refresh = sql("RunCoordinationMapper", "refreshDispatchMissedRounds");
         assertThat(refresh).as("派发轮的连续未获轮数同样每轮加一，且只看自己的上次派发轮次")
                 .contains("dispatch_missed_rounds = c.dispatch_missed_rounds + 1")
@@ -210,10 +221,44 @@ class Stage3GlobalStateMapperBindingTest {
     }
 
     @Test
+    void onlyTheDualPoolFamilyGetsACoordinationRowOrACandidateSlot() {
+        Set<String> dualPool = new LinkedHashSet<>();
+        for (SchedulerVersion version : SchedulerVersion.values()) {
+            if (version.isDualPoolFamily()) {
+                dualPool.add(version.name());
+            }
+        }
+        assertThat(dualPool).as("双池家族至少要有两个版本，否则这条断言证明不了什么")
+                .contains("DUAL_POOL_V1", "DUAL_POOL_V2");
+
+        String ensure = sql("RunCoordinationMapper", "ensure");
+        assertThat(versionLiterals(ensure))
+                .as("只有双池家族的 Run 建得出资格记录：旧版本的 Run 走旧引擎，不该在这张表里排队")
+                .containsExactlyInAnyOrderElementsOf(dualPool);
+        String scan = sql("RunCoordinationMapper", "scanDue");
+        assertThat(versionLiterals(scan))
+                .as("候选里也只放双池家族：旧行混进来只会白占扫描条数")
+                .containsExactlyInAnyOrderElementsOf(dualPool);
+    }
+
+    /** 语句里 `r.scheduler_version IN (...)` 那一小段括号里的取值集合。 */
+    private static List<String> versionLiterals(String sql) {
+        int start = sql.indexOf("r.scheduler_version IN (");
+        assertThat(start).as("这条语句应当按冻结版本收窄：").isGreaterThanOrEqualTo(0);
+        int from = sql.indexOf("(", start);
+        int to = sql.indexOf(")", from);
+        return quotedValues(sql.substring(from, to));
+    }
+
+    @Test
     void deferReasonLiteralsExistInTheJavaEnum() {
         String sql = sql("RunCoordinationMapper", "deferFor");
         assertThat(sql).as("延期只写原因与时间").contains("defer_reason = ?")
                 .contains("next_visible_at = ?");
+        assertThat(sql).as("父 Run 上的当前代际也要一起核：子记录还没同步时，旧延期不许写进去")
+                .contains("r.id = c.run_id")
+                .contains("r.plan_generation = ?")
+                .contains("c.plan_generation = ?");
         assertThat(RunCoordinationDeferReason.allWireValues())
                 .as("库里对延期原因有 CHECK 约束，枚举与它必须一致")
                 .containsExactly("RUN_COORDINATION_PERMIT_FULL", "PER_ROUND_NEW_NODE_LIMIT",

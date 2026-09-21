@@ -301,10 +301,12 @@ public class AgentRunEventService {
         run.setRequestDigest(requestDigest);
         // Run 主记录与 RUN_RECEIVED 事件在同一条事务里落库：进程恰好在两者之间退出时，库里不会留下
         // 「有 Run、没有接收事实」的半成品——那种记录会被幂等重试直接读回，缺失的事实再也没人补。
+        AgentRunEvent received;
         try {
-            transactionTemplate().executeWithoutResult(status -> {
+            received = transactionTemplate().execute(status -> {
                 runMapper.insert(run);
-                append(runId, userId, "RUN_RECEIVED", ext);
+                // 接收事实与 Run 主记录同一条事务：只落库，投射留到提交之后。
+                return persistEvent(runId, "RUN_RECEIVED", ext);
             });
         } catch (DuplicateKeyException duplicate) {
             // 同一瞬间两个请求带着同一个键一起进来：唯一索引只放行一条，另一条在这里读回同一个 Run。
@@ -320,6 +322,10 @@ public class AgentRunEventService {
                     userId, raced.getId());
             return new RunCreation(requireSameRequestDigest(raced, requestDigest, userId), false);
         }
+
+        // 事务已经提交，Run 与接收事实都在库里了，这时才把接收事实投射到 Redis 与实时频道。
+        // 投射失败不回退创建：数据库那一行是权威，事件流可以由它重建。
+        projectAppended(received);
 
         // 写入首条用户消息（initial）。它不在上面那条事务里，写失败只记日志：这是明确保留的
         // 用户可见缺口——Run 已经可执行，而首条用户消息可能缺失。
@@ -444,6 +450,10 @@ public class AgentRunEventService {
      * 也能保证事件顺序唯一。落库失败时直接抛 {@link IllegalStateException} fail-fast,
      * 避免静默丢事件导致数据流缺失。</p>
      *
+     * <p>顺序是先落库、再把这份事实投射到 Redis 与实时频道。反过来先投 Redis 的话，落库失败时
+     * 回滚不掉已经发出去的那条，读者会看到一条不存在的 Run 的事件；数据库这一行才是权威，
+     * 投射失败可以从它重建。</p>
+     *
      * @param runId     任务 ID
      * @param userId    用户 ID
      * @param eventType 事件类型
@@ -454,6 +464,19 @@ public class AgentRunEventService {
         if (run == null) {
             return;
         }
+        projectAppended(persistEvent(runId, eventType, payload));
+    }
+
+    /**
+     * 只把事件写进数据库，不碰 Redis 与实时频道；返回落库后的那一行。
+     *
+     * <p>给创建 Run 那条路用：它要在同一条事务里写 Run 与接收事实，投射必须等事务提交之后再做，
+     * 否则事务回滚会把已经发出去的事件留在外面。</p>
+     *
+     * <p>事件序号仍然是 Redis 的自增计数：它只是一次号码预留，不发布任何内容，事务回滚最多浪费
+     * 一个号，不会在读者那边留下孤儿事件。</p>
+     */
+    private AgentRunEvent persistEvent(String runId, String eventType, Object payload) {
         // 事件序号采用 Redis 原子递增，避免并发落库时 seq 冲突。
         int nextSeq = nextSeq(runId);
         AgentRunEvent event = new AgentRunEvent();
@@ -462,15 +485,8 @@ public class AgentRunEventService {
         event.setEventType(eventType);
         // payload 已经是字符串则直接使用,否则序列化为 JSON
         String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
-        String normalizedPayloadJson = normalizePayloadJson(eventType, payloadJson);
-        event.setPayloadJson(normalizedPayloadJson);
-        OffsetDateTime publishedAt = OffsetDateTime.now();
-        event.setCreatedAt(publishedAt);
-        eventRedisStore.append(event);
-        // Terminal events flush the pending buffer immediately so no events are lost.
-        if (isTerminalEventType(eventType)) {
-            eventRedisStore.flush(runId);
-        }
+        event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
+        event.setCreatedAt(OffsetDateTime.now());
         // TRANSITIONAL: dual-write to PostgreSQL until all readers are Redis-only.
         // This database insert will be removed in a near-term release.
         try {
@@ -483,7 +499,28 @@ public class AgentRunEventService {
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
         }
-        publishLiveEvent(runId, nextSeq, eventType, normalizedPayloadJson, publishedAt);
+        return event;
+    }
+
+    /**
+     * 把已经落库的事件投射到 Redis 与实时频道。
+     *
+     * <p>投射失败不抛错：数据库那一行已经是权威，事件流可以由它重建（{@link #appendOnce} 的重复调用
+     * 就是按已落库的行补齐 Redis 的那条路），这里把失败记清楚就够，不能让已经提交的事实变成一次失败。</p>
+     */
+    private void projectAppended(AgentRunEvent event) {
+        try {
+            eventRedisStore.append(event);
+            // Terminal events flush the pending buffer immediately so no events are lost.
+            if (isTerminalEventType(event.getEventType())) {
+                eventRedisStore.flush(event.getRunId());
+            }
+            publishLiveEvent(event.getRunId(), event.getSeq(), event.getEventType(),
+                    event.getPayloadJson(), event.getCreatedAt());
+        } catch (Exception e) {
+            log.warn("事件已落库但投射失败（可由已落库的行重建）: runId={}, eventType={}, seq={}, error={}",
+                    event.getRunId(), event.getEventType(), event.getSeq(), e.getMessage());
+        }
     }
 
     /**

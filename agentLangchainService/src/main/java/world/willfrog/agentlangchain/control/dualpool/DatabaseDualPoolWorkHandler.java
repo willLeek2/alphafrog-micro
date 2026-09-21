@@ -187,7 +187,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         RunCoordination coordination = prepareCoordinationRow(run);
-        CoordinationTurn turn = new CoordinationTurn(run, coordination);
+        // 轮次在回合开始时取一次：这一回合被服务的是哪一轮，由它说话。
+        long turnRound = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
+        CoordinationTurn turn = new CoordinationTurn(run, coordination, turnRound);
         try {
             coordinateLocked(run, turn);
         } finally {
@@ -238,8 +240,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             }
             return;
         }
-        long round = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
-        coordinationStore.markCoordinationServed(turn.runId, round);
+        if (!coordinationStore.markCoordinationServed(turn.runId, turn.turnRound, turn.planGeneration)) {
+            // 计划代际已经变了、或者资格记录已经被别的回合推进过：这次成功写不生效。
+            log.info("Run 协调的成功推进没有写进去（计划代际或轮次已经变化）: runId={} turnRound={}",
+                    turn.runId, turn.turnRound);
+        }
     }
 
     private void coordinateLocked(AgentRun run, CoordinationTurn turn) {
@@ -639,6 +644,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
         SchedulerVersion version = item.schedulerVersionEnum();
         boolean waitGroupVersion = version.usesWaitGroups();
+        // 这一回合归属的轮次在回合开始时取一次：领取成功时记的是「这一回合被服务」，
+        // 写到一半再去读全局轮次会把拖久了的回合说成更晚才被服务。
+        long dispatchTurnRound = stateStore.currentRound(SchedulerRoundScope.NODE_DISPATCH);
         AgentRun run = runMapper.findById(identity.runId());
         boolean planning = PLANNING_NODE_ID.equals(identity.nodeId());
         if (run == null || !schedulerVersionPolicy.isDualPoolFamily(run)
@@ -659,8 +667,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         NodeWorkItemClaim claim = claimed.get();
         // 领取成功才算这张图真的拿到了节点执行机会：写失败只记日志，不影响这次执行。
         try {
-            coordinationStore.markDispatchServed(identity.runId(),
-                    stateStore.currentRound(SchedulerRoundScope.NODE_DISPATCH));
+            coordinationStore.markDispatchServed(identity.runId(), dispatchTurnRound,
+                    run.getPlanGeneration());
         } catch (RuntimeException e) {
             log.warn("记录节点派发轮转位置失败: runId={} reason={}",
                     identity.runId(), safeReason(e));
@@ -934,11 +942,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
         refreshRoundCounters();
         LinkedHashSet<String> runIds = new LinkedHashSet<>();
-        // 一次全局扫描：旧版本与两个双池版本排在同一份候选顺序里，按每行记录的冻结版本路由。
-        // 版本认不出来时 fromWire 直接抛错，不猜成任何一池。
+        // 一次全局扫描：两个双池版本排在同一份候选顺序里，按每行记录的冻结版本路由。
+        // 候选集合本身就只含双池家族（扫描语句里收窄），所以这里的条数不会被永远轮不到的行占满。
         for (RunCoordination due : coordinationStore.scanDue(limit)) {
             if (!SchedulerVersion.fromWire(due.getSchedulerVersion()).isDualPoolFamily()) {
-                // 协调资格表是旧、新版本共用的入口，旧路径的 Run 不归这个处理器协调。
+                // 收窄之后这里不该出现旧版本的行；真出现了说明有人绕过创建入口写了旧行，
+                // 那是数据问题，记一条错误而不是安静丢掉。
+                log.error("协调候选里出现非双池版本的行: runId={} version={}",
+                        due.getRunId(), due.getSchedulerVersion());
                 continue;
             }
             runIds.add(due.getRunId());
@@ -1333,17 +1344,25 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private static final class CoordinationTurn {
 
         private final String runId;
-        /** 这一轮开始时读到的计划代际：延期写入要带它做条件，旧的观察不许覆盖新事实。 */
+        /** 这一回合开始时读到的计划代际：延期与成功写都要带它做条件，旧的观察不许覆盖新事实。 */
         private final int planGeneration;
         /** 这一轮开始时读到的协调轮次：同样作为延期的条件，图已经被服务过时这次延期不写。 */
         private final long coordinationServedRound;
+        /**
+         * 这一回合归属的轮次，在回合开始时取一次。
+         *
+         * <p>成功写记的是「这一回合被服务」，所以记的是这个值。写到一半再去读全局轮次的话，
+         * 一个拖了很久的回合会拿到一个更大的轮次号，等于把旧回合说成新回合。</p>
+         */
+        private final long turnRound;
         private RunCoordinationDeferReason deferReason;
         private boolean progressed;
 
-        private CoordinationTurn(AgentRun run, RunCoordination coordination) {
+        private CoordinationTurn(AgentRun run, RunCoordination coordination, long turnRound) {
             this.runId = run.getId();
             this.planGeneration = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
             this.coordinationServedRound = value(coordination.getCoordinationServedRound());
+            this.turnRound = turnRound;
         }
 
         private void served() {

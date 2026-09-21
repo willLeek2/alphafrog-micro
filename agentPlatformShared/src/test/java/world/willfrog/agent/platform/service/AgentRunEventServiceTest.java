@@ -335,8 +335,8 @@ class AgentRunEventServiceTest {
         when(valueOperations.increment(anyString())).thenReturn(1L);
         when(eventMapper.insert(any())).thenReturn(1);
 
+        // 创建这条路不再回头读一次 Run：接收事实直接跟在刚插入的那一行后面写。
         AgentRun run = run("r-test", "u-test");
-        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString())).thenReturn(run);
 
@@ -374,7 +374,6 @@ class AgentRunEventServiceTest {
         when(eventMapper.insert(any())).thenReturn(1);
 
         AgentRun run = run("r-test2", "u-test2");
-        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString())).thenReturn(run);
 
@@ -394,8 +393,6 @@ class AgentRunEventServiceTest {
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
         when(eventMapper.insert(any())).thenReturn(1);
-        when(runMapper.findByIdAndUser(anyString(), anyString()))
-                .thenReturn(run("r-artifact", "u-artifact"));
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(run("r-artifact", "u-artifact"));

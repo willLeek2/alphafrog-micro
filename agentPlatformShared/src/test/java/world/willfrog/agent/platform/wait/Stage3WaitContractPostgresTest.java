@@ -217,10 +217,11 @@ class Stage3WaitContractPostgresTest {
     }
 
     /**
-     * 三种已知版本在同一份候选里竞争，谁等得久谁先被服务。
+     * 两个双池版本在同一份候选里竞争，谁等得久谁先被服务。
      *
      * <p>资格记录上的版本必须是从 Run 主表派生出来的：造数据时给父 Run 定版本，不再另外插一条
-     * 版本不一致的子记录，否则「父子一致」这件事根本没被测到。</p>
+     * 版本不一致的子记录，否则「父子一致」这件事根本没被测到。旧版本不在这份候选里，
+     * 它的行连建都建不出来，另有用例单独量。</p>
      */
     @Test
     void coordinationRotationServesTheLongestWaitingRunFirstAcrossEveryVersion() throws Exception {
@@ -236,33 +237,36 @@ class Stage3WaitContractPostgresTest {
         // 同一个 Run 再写一次不改任何东西：资格记录一个 Run 只有一行。
         assertThat(store.ensure("run-hot")).isFalse();
         assertThat(store.ensure("run-legacy"))
-                .as("协调名额与轮转是新旧版本共用的入口，老 Run 也要能建出这一行")
-                .isTrue();
+                .as("旧版本的 Run 不归这张表：它由旧引擎服务，建行只会白占候选名额")
+                .isFalse();
         assertThat(store.ensure("run-missing"))
                 .as("Run 不存在时建不出资格记录，影响 0 行")
                 .isFalse();
-        assertThat(store.find("run-legacy").orElseThrow().getSchedulerVersion())
+        assertThat(store.find("run-cold").orElseThrow().getSchedulerVersion())
                 .as("记录上的版本取自 Run 主表，不由调用方指定")
-                .isEqualTo("LEGACY");
-        assertThat(store.find("run-legacy").orElseThrow().getPlanGeneration()).isZero();
+                .isEqualTo("DUAL_POOL_V2");
+        assertThat(store.find("run-warm").orElseThrow().getSchedulerVersion())
+                .as("同一个双池家族里的另一个版本也一样，各记各的冻结版本")
+                .isEqualTo("DUAL_POOL_V1");
+        assertThat(store.find("run-cold").orElseThrow().getPlanGeneration()).isZero();
 
         // 插入时间各自不同，抹平之后这一轮的所有图都在同一份候选里。
         execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP");
         assertThat(store.scanDue(10))
-                .as("一次全局扫描：旧版本与两个双池版本排在同一份候选里，按每行的冻结版本路由")
+                .as("一次全局扫描：两个双池版本排在同一份候选里，按每行的冻结版本路由")
                 .extracting(RunCoordination::getRunId)
-                .containsExactlyInAnyOrder("run-cold", "run-warm", "run-hot", "run-legacy");
+                .containsExactlyInAnyOrder("run-cold", "run-warm", "run-hot");
 
-        store.markCoordinationServed("run-cold", 1);
-        store.markCoordinationServed("run-warm", 7);
-        store.markCoordinationServed("run-hot", 9);
+        store.markCoordinationServed("run-cold", 1, 0);
+        store.markCoordinationServed("run-warm", 7, 0);
+        store.markCoordinationServed("run-hot", 9, 0);
         assertThat(store.scanDue(10))
-                .as("从没被服务过的排最前，其余按最近被服务的轮次升序")
+                .as("按最近被服务的轮次升序：越久没被服务的越靠前")
                 .extracting(RunCoordination::getRunId)
-                .containsExactly("run-legacy", "run-cold", "run-warm", "run-hot");
+                .containsExactly("run-cold", "run-warm", "run-hot");
 
         // 轮次位置只许前进：迟到的旧轮次写进来影响 0 行，不能把新事实改回旧事实。
-        assertThat(store.markCoordinationServed("run-hot", 3)).isFalse();
+        assertThat(store.markCoordinationServed("run-hot", 3, 0)).isFalse();
         assertThat(store.find("run-hot").orElseThrow().getCoordinationServedRound()).isEqualTo(9);
 
         // 延期要写清原因与下次可见时间，并带上这一轮读到的计划代际与轮次做条件。
@@ -276,7 +280,7 @@ class Stage3WaitContractPostgresTest {
                 .isEqualTo(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
         assertThat(store.scanDue(10))
                 .extracting(RunCoordination::getRunId)
-                .containsExactly("run-legacy", "run-warm", "run-hot");
+                .containsExactly("run-warm", "run-hot");
 
         // Run 推进计划代际：资格记录跟着走，只许前进，也不许写一个不属于 Run 的代际。
         execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = 'run-cold'");
@@ -288,17 +292,17 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.find("run-cold").orElseThrow().getPlanGeneration()).isEqualTo(1);
         assertThat(store.deferFor("run-cold", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
                 OffsetDateTime.now().plusMinutes(5), 0, 1L))
-                .as("计划代际已经变了，拿旧代际写的延期不生效")
+                .as("父 Run 已经升到第 1 代而记录还停在第 0 代：拿旧代际写的延期不生效")
                 .isFalse();
 
         // 成功推进：延期原因清掉、轮次位置更新，于是它排到最后（这一轮别人先来）。
-        assertThat(store.markCoordinationServed("run-cold", 11)).isTrue();
+        assertThat(store.markCoordinationServed("run-cold", 11, 1)).isTrue();
         RunCoordination served = store.find("run-cold").orElseThrow();
         assertThat(served.getDeferReason()).isNull();
         assertThat(served.getCoordinationServedRound()).isEqualTo(11);
         assertThat(store.scanDue(10))
                 .extracting(RunCoordination::getRunId)
-                .containsExactly("run-legacy", "run-warm", "run-hot", "run-cold");
+                .containsExactly("run-warm", "run-hot", "run-cold");
     }
 
     @Test
@@ -335,7 +339,7 @@ class Stage3WaitContractPostgresTest {
                 .isEqualTo(3);
 
         // 被服务：清零；已经服务过的这一轮不算没被服务。
-        assertThat(store.markCoordinationServed("run-competing", 9)).isTrue();
+        assertThat(store.markCoordinationServed("run-competing", 9, 0)).isTrue();
         assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds()).isZero();
         store.refreshCoordinationMissedRounds(9);
         assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
@@ -366,8 +370,78 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds())
                 .as("连续两轮有可领节点都没轮到：加两轮")
                 .isEqualTo(3);
-        assertThat(store.markDispatchServed("run-competing-node", 24)).isTrue();
+        assertThat(store.markDispatchServed("run-competing-node", 24, 0)).isTrue();
         assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds()).isZero();
+    }
+
+    /**
+     * 成功写与延期写都要核这一回合开始时读到的计划代际，父 Run 与资格记录上任一已经变了就不写。
+     *
+     * <p>旧回合拿着旧代际去写成功，会把延期原因清掉、把轮转位置往前挪，等于拿旧回合冒充新回合；
+     * 延期也一样，子记录还没跟着同步时旧延期不许写进去。</p>
+     */
+    @Test
+    void servedAndDeferredWritesAreFencedByBothPlanGenerations() throws Exception {
+        createRunFor("run-fence", "user-fence", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        RunCoordinationStore store = coordinationStore();
+        assertThat(store.ensure("run-fence")).isTrue();
+
+        // Run 推进到下一代，资格记录还没同步：这一回合的三种写都不许生效。
+        execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = 'run-fence'");
+        assertThat(store.markCoordinationServed("run-fence", 5, 0))
+                .as("父 Run 已经升代，旧回合的成功写不生效").isFalse();
+        assertThat(store.markDispatchServed("run-fence", 5, 0))
+                .as("派发那一组同样按父 Run 的当前代际拦").isFalse();
+        assertThat(store.deferFor("run-fence", RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED,
+                OffsetDateTime.now().plusMinutes(5), 0, 0L))
+                .as("延期也要核父 Run 的当前代际，子记录没同步不算数").isFalse();
+        RunCoordination untouched = store.find("run-fence").orElseThrow();
+        assertThat(untouched.getCoordinationServedRound()).isZero();
+        assertThat(untouched.getDispatchServedRound()).isZero();
+        assertThat(untouched.getDeferReason()).isNull();
+
+        // 记录同步到当前代际之后，带着这一代的写就能落地。
+        assertThat(store.syncPlanGeneration("run-fence", 1)).isTrue();
+        assertThat(store.markCoordinationServed("run-fence", 5, 1)).isTrue();
+        assertThat(store.markDispatchServed("run-fence", 6, 1)).isTrue();
+        assertThat(store.deferFor("run-fence", RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT,
+                OffsetDateTime.now().plusMinutes(5), 1, 5L)).isTrue();
+        RunCoordination written = store.find("run-fence").orElseThrow();
+        assertThat(written.getCoordinationServedRound()).isEqualTo(5);
+        assertThat(written.getDispatchServedRound()).isEqualTo(6);
+        assertThat(written.deferReasonEnum())
+                .isEqualTo(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
+    }
+
+    /**
+     * 旧版本的 Run 既不进资格表，也不会占掉扫描条数。
+     *
+     * <p>资格表是双池执行层的入口：旧版本的 Run 走旧引擎，它不读这张表。要塞进一行旧记录，
+     * 那行永远没人接走，却会一直占着一次扫描的名额，排在它后面的双池 Run 连被看见的机会都没有。</p>
+     */
+    @Test
+    void legacyRunsNeitherGetACoordinationRowNorEatTheScanBudget() throws Exception {
+        createRunFor("run-legacy-scan", "user-legacy-scan", SchedulerVersion.LEGACY, 0, 0L);
+        RunCoordinationStore store = coordinationStore();
+        assertThat(store.ensure("run-legacy-scan"))
+                .as("旧版本的 Run 建不出资格记录，影响 0 行").isFalse();
+        assertThat(store.find("run-legacy-scan")).isEmpty();
+
+        // 绕过创建入口硬塞一行旧记录，模拟历史残留。
+        execute("INSERT INTO alphafrog_agent_run_coordination "
+                + "(run_id, scheduler_version, plan_generation) VALUES ('run-legacy-scan', 'LEGACY', 0)");
+        createRunFor("run-v2-scan", "user-v2-scan", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        assertThat(store.ensure("run-v2-scan")).isTrue();
+        execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP");
+
+        assertThat(store.scanDue(1))
+                .as("只给一条名额：拿到的必须是双池那条，旧记录不占坑")
+                .extracting(RunCoordination::getRunId)
+                .containsExactly("run-v2-scan");
+        assertThat(store.scanDue(10))
+                .as("多给几条名额也不放旧记录进来")
+                .extracting(RunCoordination::getRunId)
+                .doesNotContain("run-legacy-scan");
     }
 
     @Test
@@ -588,6 +662,9 @@ class Stage3WaitContractPostgresTest {
                     fixture.runControlVersion());
             assertThat(first.consumed()).isTrue();
             assertThat(first.promoted()).isTrue();
+            assertThat(first.groupId())
+                    .as("消费结果要带回放行的是哪条链：这条数从消费语句里取，取不到就说明语句点错了列")
+                    .isEqualTo(fixture.groupId());
             RecoveryConsumptionResult second = store.consumeRecovery(notificationId, "dispatcher-2",
                     fixture.runControlVersion());
             assertThat(second.consumed())
@@ -656,6 +733,9 @@ class Stage3WaitContractPostgresTest {
         execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = '" + suspending.runId() + "'");
         WaitSuspensionResult again = suspendAgain(suspending.runId(), 0, suspending.runControlVersion());
         assertThat(again.suspended()).as("旧计划的挂起整条不生效").isFalse();
+        assertThat(again.outcome())
+                .as("回报的是「这个分段不归你」，不能是「已经挂起过」：后者会让执行者以为分段交出去了")
+                .isEqualTo(WaitSuspensionOutcome.SEGMENT_NOT_MATCHED);
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_group WHERE run_id = '"
                 + suspending.runId() + "'"))
                 .as("不能因此再建第二条链")
@@ -874,12 +954,45 @@ class Stage3WaitContractPostgresTest {
     }
 
     /**
+     * 事件流投射失败不回退已经提交的创建：数据库那一行才是权威。
+     *
+     * <p>投射挪到事务提交之后，就不会再出现「Redis 里有、库里没有」的孤儿事件；反过来，
+     * 投射失败也不能把已经落库的 Run 与接收事实说成没建成，事件流可以由库里那一行重建。</p>
+     */
+    @Test
+    void aFailedProjectionDoesNotUndoTheCommittedRun() throws Exception {
+        AgentRunEventRedisStore throwing = Mockito.mock(AgentRunEventRedisStore.class);
+        Mockito.doThrow(new IllegalStateException("事件流写不进去")).when(throwing)
+                .append(Mockito.any());
+        AgentRunEventService service = admissionService(throwing);
+
+        AgentRunEventService.RunCreation creation = createNewRun(service, "user-projection",
+                "key-projection-1");
+        assertThat(creation.created()).as("投射失败发生在提交之后，不该让创建失败").isTrue();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run WHERE id = '"
+                + creation.run().getId() + "'"))
+                .as("Run 已经提交，投射失败不能把它抹掉")
+                .isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_event WHERE run_id = '"
+                + creation.run().getId() + "' AND event_type = 'RUN_RECEIVED'"))
+                .as("接收事实也在库里：投射失败时它就是重建事件流的那份来源")
+                .isEqualTo(1);
+    }
+
+    /**
      * 真库上的服务对象：映射器与事务管理器都是真的，只有 Redis、消息、提示词这些外部协作者用替身。
      *
      * <p>要量的是事务与唯一约束的行为，映射器和事务管理器就不能是替身；Redis 顺手用替身，
      * 事件序号按固定 1 返回，正好覆盖「每条链只写一条接收事实」。</p>
      */
     private static AgentRunEventService admissionService() {
+        return admissionService(Mockito.mock(AgentRunEventRedisStore.class));
+    }
+
+    /**
+     * 同上，但把事件流的投射端换成调用方给的那一个，用来量「投射失败」这一路。
+     */
+    private static AgentRunEventService admissionService(AgentRunEventRedisStore eventRedisStore) {
         SqlSessionTemplate template = new SqlSessionTemplate(sqlSessionFactory);
         StringRedisTemplate redisTemplate = Mockito.mock(StringRedisTemplate.class);
         @SuppressWarnings("unchecked")
@@ -897,7 +1010,7 @@ class Stage3WaitContractPostgresTest {
         AgentRunEventService service = new AgentRunEventService(
                 template.getMapper(AgentRunMapper.class),
                 template.getMapper(AgentRunEventMapper.class),
-                Mockito.mock(AgentRunEventRedisStore.class),
+                eventRedisStore,
                 new ObjectMapper(),
                 redisTemplate,
                 Mockito.mock(AgentLlmLocalConfigLoader.class),

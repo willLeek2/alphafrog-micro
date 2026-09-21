@@ -69,21 +69,21 @@ class MybatisRunCoordinationStoreTest {
 
     @Test
     void coordinationServedRoundOnlyTouchesTheCoordinationSpace() {
-        when(mapper.markCoordinationServed(anyString(), anyLong())).thenReturn(1);
-        assertThat(store.markCoordinationServed("run-1", 7L)).isTrue();
-        verify(mapper).markCoordinationServed("run-1", 7L);
+        when(mapper.markCoordinationServed(anyString(), anyLong(), anyInt())).thenReturn(1);
+        assertThat(store.markCoordinationServed("run-1", 7L, 4)).isTrue();
+        verify(mapper).markCoordinationServed("run-1", 7L, 4);
         // 这一路只碰协调那一组轮转位置，两个轮次空间各记各的。
-        verify(mapper, never()).markDispatchServed(anyString(), anyLong());
+        verify(mapper, never()).markDispatchServed(anyString(), anyLong(), anyInt());
     }
 
     @Test
     void dispatchServedRoundOnlyTouchesTheDispatchSpace() {
-        when(mapper.markDispatchServed(anyString(), anyLong())).thenReturn(0);
-        assertThat(store.markDispatchServed("run-1", 9L))
+        when(mapper.markDispatchServed(anyString(), anyLong(), anyInt())).thenReturn(0);
+        assertThat(store.markDispatchServed("run-1", 9L, 4))
                 .as("迟到的旧轮次写进去影响 0 行，返回 false")
                 .isFalse();
-        verify(mapper).markDispatchServed("run-1", 9L);
-        verify(mapper, never()).markCoordinationServed(anyString(), anyLong());
+        verify(mapper).markDispatchServed("run-1", 9L, 4);
+        verify(mapper, never()).markCoordinationServed(anyString(), anyLong(), anyInt());
     }
 
     @Test
@@ -139,7 +139,10 @@ class MybatisRunCoordinationStoreTest {
                 .as("轮次号不能是负数")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.scanDue(0)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.markCoordinationServed("run-1", -1L))
+        assertThatThrownBy(() -> store.markCoordinationServed("run-1", -1L, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.markDispatchServed("run-1", 3L, -2))
+                .as("计划代际最小只能是 -1（还没有计划）")
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.refreshDispatchMissedRounds(-1L))
                 .isInstanceOf(IllegalArgumentException.class);

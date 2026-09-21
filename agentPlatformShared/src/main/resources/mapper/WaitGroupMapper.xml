@@ -254,7 +254,8 @@
       之后每一步都从上一个 CTE 的 RETURNING 取行，所以分段没交出去时后面一行都不会写。
 
       重试是同一条语句：分段已经结束、组已经存在时只有 existing_group_id 有值，成员与下一段
-      都不会被重复创建。
+      都不会被重复创建。这条读回也走同一道 Run 栅栏（代际、控制版本、冻结调度器版本）：栅栏过不去
+      时它一个字段都不返回，调用方看到的是「这个分段不归你」。
     -->
     <select id="suspendSegment" resultMap="WaitSuspensionResultMap" affectData="true" flushCache="true">
         WITH member_input AS (
@@ -335,13 +336,16 @@
         SELECT
             (SELECT count(*) FROM segment_closed) AS closed_segments,
             (SELECT id FROM group_created) AS created_group_id,
-            (SELECT id FROM alphafrog_agent_run_wait_group
-              WHERE run_id = #{runId}
-                AND plan_generation = #{planGeneration}
-                AND node_id = #{nodeId}
-                AND node_attempt = #{nodeAttempt}
-                AND segment_sequence = #{segmentSequence}
-                AND model_turn = #{modelTurn}) AS existing_group_id,
+            -- 读回已有的组也要过同一道 Run 栅栏：计划已经推进之后，旧工人重试同一个身份
+            -- 读到的是一份作废的组，把它当成「已经挂起过」就会让执行者以为分段交出去了。
+            (SELECT g.id FROM alphafrog_agent_run_wait_group g
+              JOIN run_fence f ON f.run_id = g.run_id
+              WHERE g.run_id = #{runId}
+                AND g.plan_generation = #{planGeneration}
+                AND g.node_id = #{nodeId}
+                AND g.node_attempt = #{nodeAttempt}
+                AND g.segment_sequence = #{segmentSequence}
+                AND g.model_turn = #{modelTurn}) AS existing_group_id,
             (SELECT count(*) FROM members_written) AS written_members,
             (SELECT count(*) FROM next_segment_created) AS written_next_segments,
             -- 首次挂起时这一行是刚插进去的，同一条语句的主查询看不到它（数据修改 CTE 与主查询
@@ -349,13 +353,14 @@
             -- 才回基础表里读已经存在的组。
             COALESCE(
                 (SELECT next_segment_sequence FROM group_created),
-                (SELECT next_segment_sequence FROM alphafrog_agent_run_wait_group
-                  WHERE run_id = #{runId}
-                    AND plan_generation = #{planGeneration}
-                    AND node_id = #{nodeId}
-                    AND node_attempt = #{nodeAttempt}
-                    AND segment_sequence = #{segmentSequence}
-                    AND model_turn = #{modelTurn})
+                (SELECT g.next_segment_sequence FROM alphafrog_agent_run_wait_group g
+                  JOIN run_fence f ON f.run_id = g.run_id
+                  WHERE g.run_id = #{runId}
+                    AND g.plan_generation = #{planGeneration}
+                    AND g.node_id = #{nodeId}
+                    AND g.node_attempt = #{nodeAttempt}
+                    AND g.segment_sequence = #{segmentSequence}
+                    AND g.model_turn = #{modelTurn})
             ) AS next_segment_sequence
     </select>
 
@@ -654,7 +659,9 @@
             WHERE n.id = #{notificationId}
               AND n.group_id = r.group_id
               AND n.state = 'WAITING'
-            RETURNING n.id
+            -- 组号要与通知主键一起返回：主查询要按它回报这次消费放行的是哪条链，
+            -- 只返回主键的话主查询点不到 group_id 这一列。
+            RETURNING n.id, n.group_id
         )
         SELECT
             (SELECT count(*) FROM notification_consumed) AS consumed,
