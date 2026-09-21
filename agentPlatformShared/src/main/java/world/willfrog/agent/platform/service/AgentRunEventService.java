@@ -206,7 +206,9 @@ public class AgentRunEventService {
             if (existing != null) {
                 log.info("[AgentRunEventService] 幂等键命中，读回原来的 Run: userId={}, runId={}",
                         userId, existing.getId());
-                return new RunCreation(requireSameRequestDigest(existing, requestDigest, userId), false);
+                return new RunCreation(
+                        reprojectReceivedFact(requireSameRequestDigest(existing, requestDigest, userId)),
+                        false);
             }
         }
         log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}, schedulerVersion={}",
@@ -320,7 +322,8 @@ public class AgentRunEventService {
             }
             log.info("[AgentRunEventService] 幂等键并发命中，读回先写入的那条 Run: userId={}, runId={}",
                     userId, raced.getId());
-            return new RunCreation(requireSameRequestDigest(raced, requestDigest, userId), false);
+            return new RunCreation(
+                    reprojectReceivedFact(requireSameRequestDigest(raced, requestDigest, userId)), false);
         }
 
         // 事务已经提交，Run 与接收事实都在库里了，这时才把接收事实投射到 Redis 与实时频道。
@@ -352,6 +355,26 @@ public class AgentRunEventService {
      * 新建的那条才允许准入与启动：读回的 Run 已经在别处跑着，再启动一次会让同一次请求执行两遍。</p>
      */
     public record RunCreation(AgentRun run, boolean created) {
+    }
+
+    /**
+     * 读回一条已经存在的 Run 时，把它的接收事实补投一次。
+     *
+     * <p>投射挪到提交之后，就有「库里有、事件流里没有」的可能。同键重试正是最可能碰上这种情况的
+     * 请求：它当时就在场，而且上一次多半刚失败过。补投只写持久事件流，不重发实时事件，
+     * 所以对已经看过这条事件的读者没有影响；补投失败也不影响返回，周期修补还会再试。</p>
+     */
+    private AgentRun reprojectReceivedFact(AgentRun run) {
+        try {
+            AgentRunEvent received = eventMapper.findFirstByRunIdAndType(run.getId(), "RUN_RECEIVED");
+            if (received != null) {
+                eventRedisStore.append(received);
+            }
+        } catch (Exception e) {
+            log.warn("读回 Run 时补投接收事实失败，周期修补会再试: runId={}, error={}",
+                    run.getId(), e.getMessage());
+        }
+        return run;
     }
 
     /** 事务模板按需构造：它只是配置的载体，每次调用新建一个比放进字段更省心。 */

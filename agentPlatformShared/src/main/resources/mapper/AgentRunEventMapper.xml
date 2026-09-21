@@ -46,6 +46,49 @@
         LIMIT #{limit}
     </select>
 
+    <select id="findFirstByRunIdAndType" resultMap="AgentRunEventResultMap">
+        SELECT id, run_id, seq, event_type, payload_json::text AS payload_json, dedupe_key, created_at
+        FROM alphafrog_agent_run_event
+        WHERE run_id = #{runId}
+          AND event_type = #{eventType}
+        ORDER BY seq ASC
+        LIMIT 1
+    </select>
+
+    <!--
+      最近落库的接收事实：投射修补按它把「库里有、事件流里没有」的那一条补进去。
+      带部署身份，免得替别的部署补事件；窗口与条数都由调用方给，扫的是最近这一小段。
+    -->
+    <select id="listReceivedFactsForRepair" resultMap="AgentRunEventResultMap">
+        SELECT e.id, e.run_id, e.seq, e.event_type, e.payload_json::text AS payload_json,
+               e.dedupe_key, e.created_at
+        FROM alphafrog_agent_run_event e
+        JOIN alphafrog_agent_run r ON r.id = e.run_id
+        WHERE e.event_type = 'RUN_RECEIVED'
+          AND e.created_at &gt; #{createdSince}
+          AND r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+        ORDER BY e.created_at DESC, e.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      游标往后取一页：整条语句就是「保留期内、本部署、这一页」，按 (created_at, id) 稳定前进。
+    -->
+    <select id="listReceivedFactsAfterCursor" resultMap="AgentRunEventResultMap">
+        SELECT e.id, e.run_id, e.seq, e.event_type, e.payload_json::text AS payload_json,
+               e.dedupe_key, e.created_at
+        FROM alphafrog_agent_run_event e
+        JOIN alphafrog_agent_run r ON r.id = e.run_id
+        WHERE e.event_type = 'RUN_RECEIVED'
+          AND e.created_at &gt; #{createdSince}
+          AND (e.created_at, e.id) &gt; (#{cursorCreatedAt}, #{cursorId})
+          AND r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+        ORDER BY e.created_at ASC, e.id ASC
+        LIMIT #{limit}
+    </select>
+
     <select id="findMaxSeq" resultType="int">
         SELECT COALESCE(MAX(seq), 0)
         FROM alphafrog_agent_run_event

@@ -8,6 +8,7 @@ import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.SqlSession;
 import org.apache.ibatis.session.SqlSessionFactory;
 import org.apache.ibatis.session.SqlSessionFactoryBuilder;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.mybatis.spring.transaction.SpringManagedTransactionFactory;
 import org.junit.jupiter.api.AfterAll;
@@ -27,7 +28,11 @@ import world.willfrog.agent.platform.capacity.MybatisSchedulerStateStore;
 import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
+import world.willfrog.agent.platform.service.AgentRunEventProjectionRepair;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
 import world.willfrog.agent.platform.coordination.RunCoordination;
@@ -98,6 +103,7 @@ class Stage3WaitContractPostgresTest {
     private static final String STAGE3_SCRIPT = "007_agent_run_dag_wait_group.sql";
     private static final String DISPATCH_PROOF_SCRIPT = "008_agent_run_wait_member_dispatch_proof.sql";
     private static final String CONSUMED_BY_SCRIPT = "009_agent_run_recovery_consumed_by_check.sql";
+    private static final String REPAIR_INDEX_SCRIPT = "010_agent_run_event_received_repair_index.sql";
     private static final String SCHEMA = "stage3_contract_" + UUID.randomUUID().toString().replace("-", "");
     private static final int CONCURRENT_THREADS = 4;
     private static final int HIGH_WATERMARK = 128;
@@ -980,6 +986,65 @@ class Stage3WaitContractPostgresTest {
     }
 
     /**
+     * 补投：库里有接收事实、事件流里没有时，周期修补按数据库那一行再投一次。
+     *
+     * <p>用的是行里原来的序号、时间与负载：事件流按 seq 记成员，重投要让成员与分数和当初那条逐字一致，
+     * 否则同一条事实会在流里变成两条。这一条就是「谁是那个消费者」的真库证据——不靠重试运气，
+     * 靠一个按数据库事实重扫的修补。</p>
+     */
+    @Test
+    void theRepairReappendsThePersistedReceivedFactVerbatim() throws Exception {
+        AgentRunEventRedisStore broken = Mockito.mock(AgentRunEventRedisStore.class);
+        Mockito.doThrow(new IllegalStateException("事件流写不进去")).when(broken).append(Mockito.any());
+        AgentRunEventService service = admissionService(broken);
+        AgentRunEventService.RunCreation creation = createNewRun(service, "user-repair", "key-repair-1");
+        assertThat(creation.created()).as("投射失败不影响创建").isTrue();
+
+        AgentRunEventMapper eventMapper =
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(AgentRunEventMapper.class);
+        AgentRunEvent persisted = eventMapper.findFirstByRunIdAndType(creation.run().getId(), "RUN_RECEIVED");
+        assertThat(persisted).as("接收事实在库里").isNotNull();
+
+        AgentRunEventRedisStore healed = Mockito.mock(AgentRunEventRedisStore.class);
+        DeploymentIdentityProvider identityProvider = Mockito.mock(DeploymentIdentityProvider.class);
+        Mockito.lenient().when(identityProvider.current())
+                .thenReturn(new DeploymentIdentity("stable", "gen-" + "a".repeat(64)));
+        AgentRunEventProjectionRepair repair =
+                new AgentRunEventProjectionRepair(eventMapper, healed, identityProvider, 7, 200);
+
+        assertThat(repair.repair()).as("保留期内至少读到刚建的那一条").isGreaterThanOrEqualTo(1);
+
+        ArgumentCaptor<AgentRunEvent> appended = ArgumentCaptor.forClass(AgentRunEvent.class);
+        Mockito.verify(healed, Mockito.atLeastOnce()).append(appended.capture());
+        AgentRunEvent repaired = appended.getAllValues().stream()
+                .filter(event -> creation.run().getId().equals(event.getRunId()))
+                .findFirst().orElseThrow();
+        assertThat(repaired.getSeq())
+                .as("序号取自行里的原值，不重新生成").isEqualTo(persisted.getSeq());
+        assertThat(repaired.getCreatedAt())
+                .as("时间也取自行里的原值").isEqualTo(persisted.getCreatedAt());
+        assertThat(repaired.getPayloadJson())
+                .as("负载逐字一致：事件流的成员必须和当初那条一样").isEqualTo(persisted.getPayloadJson());
+    }
+
+    /**
+     * 修补的扫描要有自己的索引：事件表只增不减，每半分钟一轮的扫描不能全表翻一遍。
+     *
+     * <p>断言的是索引定义本身（列顺序与固定条件），不是「规划器在这一刻选了它」——表里只有几行时
+     * 全表扫更便宜，规划器选哪条路取决于数据量，那种断言会随数据量变。</p>
+     */
+    @Test
+    void theRepairScanHasItsOwnIndex() throws Exception {
+        assertThat(countRows("SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema()"
+                + " AND tablename = 'alphafrog_agent_run_event'"
+                + " AND indexname = 'idx_agent_run_event_received_created'"
+                + " AND indexdef LIKE '%(created_at, id)%'"
+                + " AND indexdef LIKE '%RUN_RECEIVED%'"))
+                .as("接收事实修补的索引按（时间，编号）建好，且只收 RUN_RECEIVED 这一种事件")
+                .isEqualTo(1);
+    }
+
+    /**
      * 真库上的服务对象：映射器与事务管理器都是真的，只有 Redis、消息、提示词这些外部协作者用替身。
      *
      * <p>要量的是事务与唯一约束的行为，映射器和事务管理器就不能是替身；Redis 顺手用替身，
@@ -1085,7 +1150,8 @@ class Stage3WaitContractPostgresTest {
     /** 每份脚本整份执行两遍：第二遍必须一样通过，证明脚本可以重复执行。 */
     private static void applyStage3ScriptsTwice() throws Exception {
         for (int round = 1; round <= 2; round++) {
-            for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT)) {
+            for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
+                    REPAIR_INDEX_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {

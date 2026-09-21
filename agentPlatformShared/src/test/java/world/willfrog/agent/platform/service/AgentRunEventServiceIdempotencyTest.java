@@ -12,6 +12,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException;
 import world.willfrog.agent.platform.idempotency.RunRequestDigest;
 import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
@@ -156,6 +157,33 @@ class AgentRunEventServiceIdempotencyTest {
         verify(runMapper).insert(captor.capture());
         assertThat(captor.getValue().getIdempotencyKey()).isEqualTo(KEY);
         assertThat(captor.getValue().getRequestDigest()).isEqualTo(digest("hello", "{}"));
+    }
+
+    /**
+     * 同键读回时把接收事实补投一次：这是「库里有、事件流里没有」最容易碰上的那条路。
+     *
+     * <p>补投发生在读回路径上，所以只写持久事件流，不再发一次实时事件——订阅端已经看过的
+     * 那一条不该因为补投再出现一次。</p>
+     */
+    @Test
+    void sameKeyReadBackAlsoReprojectsTheReceivedFact() {
+        AgentRun existing = existingRun("r-original", digest("hello", "{}"));
+        when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(existing);
+        AgentRunEvent received = new AgentRunEvent();
+        received.setId(7L);
+        received.setRunId("r-original");
+        received.setSeq(1);
+        received.setEventType("RUN_RECEIVED");
+        received.setPayloadJson("{}");
+        received.setCreatedAt(java.time.OffsetDateTime.now());
+        when(eventMapper.findFirstByRunIdAndType("r-original", "RUN_RECEIVED")).thenReturn(received);
+
+        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+
+        assertThat(creation.created()).isFalse();
+        verify(eventRedisStore).append(received);
+        verify(redisTemplate, never()).convertAndSend(anyString(), anyString());
     }
 
     /**
