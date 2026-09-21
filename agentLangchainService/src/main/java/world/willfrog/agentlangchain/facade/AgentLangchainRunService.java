@@ -9,6 +9,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
@@ -39,6 +40,7 @@ public class AgentLangchainRunService {
     private final RunOwnershipGateway ownershipGateway;
     private final SchedulerVersionPolicy schedulerVersionPolicy;
     private final DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
+    private final AcceptanceFixtureGate acceptanceFixtureGate;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         String userId = request.getUserId();
@@ -58,6 +60,13 @@ public class AgentLangchainRunService {
         if (agentEventService == null) {
             throw new IllegalStateException("agent_event_service_unavailable");
         }
+
+        // 验收夹具的门在所有写库动作之前：上下文里带了夹具编号，就要么按这条夹具跑，
+        // 要么当场报错，不存在「夹具不可用就照普通请求跑一遍」这条路。不带编号的请求
+        // 在这里连夹具表都不会查，行为与从前一致。夹具内容本身由执行层从 Run 的 ext 里
+        // 读回来（请求上下文原样存在那里），这里只负责确认这次请求可以用它。
+        acceptanceFixtureGate.admitRequestContext(
+                request.getContextJson(), deploymentIdentity.deploymentId(), deploymentIdentity.generationId());
 
         LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
         LangchainRunConcurrencyScheduler.Reservation reservation = null;

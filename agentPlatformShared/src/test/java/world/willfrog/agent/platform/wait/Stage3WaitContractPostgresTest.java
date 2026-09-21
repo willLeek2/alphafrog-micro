@@ -112,6 +112,8 @@ class Stage3WaitContractPostgresTest {
     private static final String SHARED_CANDIDATE_SCRIPT = "012_agent_run_coordination_shared_candidate.sql";
     private static final String RECOVERY_CLOSE_SCRIPT =
             "013_agent_run_recovery_notification_close.sql";
+    private static final String ACCEPTANCE_FIXTURE_SCRIPT =
+            "014_agent_run_acceptance_fixture.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -209,6 +211,38 @@ class Stage3WaitContractPostgresTest {
         expectRejected("UPDATE alphafrog_agent_run_coordination SET defer_reason = 'HINT_QUEUE_FULL' "
                 + "WHERE run_id = 'run-coord-v2'",
                 "alphafrog_agent_run_coordination_defer_reason_check");
+    }
+
+    @Test
+    void acceptanceFixturePairsEnablementUseAndIdentity() throws Exception {
+        String insert = "INSERT INTO alphafrog_agent_run_acceptance_fixture (fixture_id, lane_id, "
+                + "traffic_scope_id, deployment_version, scenario_id, model_script_json, expires_at, "
+                + "enabled, enabled_at, use_count, last_used_at) VALUES ";
+        String expires = "CURRENT_TIMESTAMP + interval '1 day'";
+        String ready = "'fx-1', 'lane-a', 'lane-a', 'gen-1', 'scenario-a', '{}'::jsonb, " + expires
+                + ", TRUE, CURRENT_TIMESTAMP, 0, NULL";
+        execute(insert + "(" + ready + ")");
+        // 启用与启用时间成对：只写一个都会被拒，因为「这条夹具什么时候被打开的」必须说得清。
+        expectRejected(insert + "('fx-2', 'lane-a', 'lane-a', 'gen-1', 'scenario-a', '{}'::jsonb, "
+                        + expires + ", TRUE, NULL, 0, NULL)",
+                "alphafrog_agent_run_acceptance_fixture_enablement_check");
+        expectRejected(insert + "('fx-3', 'lane-a', 'lane-a', 'gen-1', 'scenario-a', '{}'::jsonb, "
+                        + expires + ", FALSE, CURRENT_TIMESTAMP, 0, NULL)",
+                "alphafrog_agent_run_acceptance_fixture_enablement_check");
+        // 使用次数与最后一次使用时间成对：证据里「用过几次、最后一次什么时候」不能只留一半。
+        expectRejected(insert + "('fx-4', 'lane-a', 'lane-a', 'gen-1', 'scenario-a', '{}'::jsonb, "
+                        + expires + ", TRUE, CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP)",
+                "alphafrog_agent_run_acceptance_fixture_use_check");
+        expectRejected(insert + "('fx-5', 'lane-a', 'lane-a', 'gen-1', 'scenario-a', '{}'::jsonb, "
+                        + expires + ", TRUE, CURRENT_TIMESTAMP, 3, NULL)",
+                "alphafrog_agent_run_acceptance_fixture_use_check");
+        // 同一个泳道、同一个部署代际下，一个编号只能有一份夹具：查回来的内容必须唯一。
+        expectRejected(insert + "(" + ready + ")", "alphafrog_agent_run_acceptance_fixture_identity_key");
+        // 换个泳道或换个代际，同一个编号可以各有各的一份：作用域必须按泳道与代际分开。
+        execute(insert + "('fx-1', 'lane-b', 'lane-b', 'gen-1', 'scenario-a', '{}'::jsonb, "
+                + expires + ", TRUE, CURRENT_TIMESTAMP, 0, NULL)");
+        execute(insert + "('fx-1', 'lane-a', 'lane-a', 'gen-2', 'scenario-a', '{}'::jsonb, "
+                + expires + ", TRUE, CURRENT_TIMESTAMP, 0, NULL)");
     }
 
     @Test
@@ -1629,7 +1663,7 @@ class Stage3WaitContractPostgresTest {
         for (int round = 1; round <= 2; round++) {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
-                    RECOVERY_CLOSE_SCRIPT)) {
+                    RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -1892,6 +1926,19 @@ class Stage3WaitContractPostgresTest {
                 + "AND table_name = 'alphafrog_agent_run_wait_member' "
                 + "AND column_name = 'dispatch_proof_json' AND data_type = 'jsonb'"))
                 .as("等待成员表要有后台派发证明列").isEqualTo(1);
+        // 014 那张验收夹具表：脚本只加结构不写数据；三份内容都是 JSONB（读取时要按 JSON 取文本）；
+        // 只对待用的行建索引，未启用的夹具不进索引。
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_acceptance_fixture")).isZero();
+        assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                + "WHERE table_schema = current_schema() "
+                + "AND table_name = 'alphafrog_agent_run_acceptance_fixture' "
+                + "AND column_name IN ('plan_json', 'model_script_json', 'dispatch_policy_json') "
+                + "AND data_type = 'jsonb'"))
+                .as("夹具表的三份内容列都应当是 JSONB").isEqualTo(3);
+        assertThat(countRows("SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                + "AND indexname = 'idx_agent_run_acceptance_fixture_ready' "
+                + "AND indexdef LIKE '%enabled%'"))
+                .as("夹具表要有只含待用行的索引").isEqualTo(1);
     }
 
     /** 再报一次同一段的挂起：用来验「旧计划的挂起整条不生效」。 */

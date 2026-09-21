@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunRejectedException;
@@ -53,6 +54,8 @@ class AgentLangchainRunServiceTest {
     private SchedulerVersionPolicy schedulerVersionPolicy;
     @Mock
     private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
+    @Mock
+    private AcceptanceFixtureGate acceptanceFixtureGate;
 
     private AgentLangchainRunService runService;
 
@@ -62,7 +65,7 @@ class AgentLangchainRunServiceTest {
                 creditService, userDao,
                 world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
                         withIdentity(runMapper, "stable", GENERATION),
-                schedulerVersionPolicy, dualPoolRunAdmissionRegistry);
+                schedulerVersionPolicy, dualPoolRunAdmissionRegistry, acceptanceFixtureGate);
         lenient().when(schedulerVersionPolicy.versionForNewRun())
                 .thenReturn(SchedulerVersionPolicy.LEGACY);
         // 版本家族判断按版本名如实回答：假的策略不能把双池版本说成不是双池，否则这里测的就不是创建路径了。
@@ -152,6 +155,31 @@ class AgentLangchainRunServiceTest {
                 .build();
 
         assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
+        verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
+                anyString(), anyBoolean(), anyBoolean());
+        verify(pipeline, never()).launchAsync(any(), any());
+    }
+
+    /**
+     * 带了验收夹具编号但夹具用不了：当场报错，既不预留调度名额，也不创建 Run。
+     * 「不创建」是硬要求——静默退回普通规划会让一次本该失败的验收看起来跑过了。
+     */
+    @Test
+    void rejectedAcceptanceFixtureStopsBeforeAnyRunIsCreated() {
+        when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
+        when(acceptanceFixtureGate.admitRequestContext(any(), any(), any()))
+                .thenThrow(new LangchainRunRejectedException("acceptance_fixture_expired: fx-1",
+                        "acceptance_fixture_expired"));
+
+        CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setMessage("acceptance run")
+                .setContextJson("{\"acceptanceFixtureId\":\"fx-1\"}")
+                .build();
+
+        assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
+        verify(scheduler, never()).reserve();
         verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
                 anyString(), anyBoolean(), anyBoolean());
