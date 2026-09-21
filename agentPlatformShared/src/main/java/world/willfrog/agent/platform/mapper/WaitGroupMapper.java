@@ -169,4 +169,9 @@ public interface WaitGroupMapper {
                          @Param("memberIdentity") String memberIdentity,
                          @Param("nextPollAt") OffsetDateTime nextPollAt,
                          @Param("maxBackoffStep") int maxBackoffStep);
+
+    /** 按验收夹具的放行策略压住成员：只推下次查询时间，不动轮询次数与退避步数。 */
+    int holdMember(@Param("groupId") long groupId,
+                   @Param("memberIdentity") String memberIdentity,
+                   @Param("nextPollAt") OffsetDateTime nextPollAt);
 }

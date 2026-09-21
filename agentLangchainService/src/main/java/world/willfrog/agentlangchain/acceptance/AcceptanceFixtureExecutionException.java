@@ -19,6 +19,11 @@ public class AcceptanceFixtureExecutionException extends RuntimeException {
         this.code = code;
     }
 
+    /** 造一个拒绝：夹具这条路上的调用方都这么写，错误码与说明的拼接只有一处。 */
+    public static AcceptanceFixtureExecutionException refuse(String code, String detail) {
+        return new AcceptanceFixtureExecutionException(code, detail);
+    }
+
     /** 稳定的错误码：同一类拒绝在日志、节点失败原因与验收证据里是同一个值。 */
     public String code() {
         return code;

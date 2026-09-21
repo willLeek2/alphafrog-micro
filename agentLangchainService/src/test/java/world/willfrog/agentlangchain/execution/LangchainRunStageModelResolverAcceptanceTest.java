@@ -12,6 +12,8 @@ import world.willfrog.agent.platform.service.StageConfigResolver;
 import world.willfrog.agent.platform.service.StageConfigValidator;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
 import world.willfrog.agentlangchain.acceptance.FrozenModelScript;
 import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
 
@@ -37,10 +39,12 @@ class LangchainRunStageModelResolverAcceptanceTest {
     private final AgentRunEventService eventService = mock(AgentRunEventService.class);
     private final AcceptanceFixtureModelRegistry acceptanceFixtureModels =
             mock(AcceptanceFixtureModelRegistry.class);
+    private final AcceptanceRunPolicyRegistry acceptancePolicies =
+            mock(AcceptanceRunPolicyRegistry.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final LangchainRunStageModelResolver resolver = new LangchainRunStageModelResolver(
             stageConfigResolver, stageConfigValidator, aiServiceFactory, eventService,
-            objectMapper, acceptanceFixtureModels);
+            objectMapper, acceptanceFixtureModels, acceptancePolicies);
 
     @Test
     void aFixtureRunGetsTheScriptedModelForAllThreeStages() {
@@ -77,6 +81,32 @@ class LangchainRunStageModelResolverAcceptanceTest {
         assertThat(models.executionModel()).isSameAs(realModel);
         assertThat(models.planningModel()).isSameAs(realModel);
         assertThat(models.finalAnswerModel()).isSameAs(realModel);
+        // 不是夹具 Run 就不该带任何放行策略：普通 Run 上不许出现「被压住的成员」。
+        assertThat(models.acceptanceReleasePolicy()).isNull();
+        verifyNoInteractions(acceptancePolicies);
+    }
+
+    @Test
+    void aFixtureRunCarriesTheReleasePolicyToTheNodeExecutor() {
+        when(acceptanceFixtureModels.stageForRun(any())).thenReturn(Optional.of(scriptedStage()));
+        AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1",
+                "{\"members\":{\"call-1\":{\"fail\":\"沙箱那边回不来了\"}}}", objectMapper).orElseThrow();
+        when(acceptancePolicies.policyForRun(any())).thenReturn(Optional.of(policy));
+
+        LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());
+
+        // 节点执行器在「工具当场完成」那一步要用它给被点名的成员写失败，所以必须跟着模型一起带出来。
+        assertThat(models.acceptanceReleasePolicy()).isSameAs(policy);
+    }
+
+    @Test
+    void aFixtureRunWithoutAPolicyCarriesNothing() {
+        when(acceptanceFixtureModels.stageForRun(any())).thenReturn(Optional.of(scriptedStage()));
+        when(acceptancePolicies.policyForRun(any())).thenReturn(Optional.empty());
+
+        LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());
+
+        assertThat(models.acceptanceReleasePolicy()).isNull();
     }
 
     @Test

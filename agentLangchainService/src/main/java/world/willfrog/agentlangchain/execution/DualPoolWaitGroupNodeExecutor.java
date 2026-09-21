@@ -32,6 +32,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
@@ -445,6 +446,25 @@ public class DualPoolWaitGroupNodeExecutor {
                                 boolean success,
                                 String output,
                                 Map<String, Object> extra) {
+        AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
+        Optional<String> designated = policy == null || member.getToolCallId() == null
+                ? Optional.empty()
+                : policy.designatedFailure(member.getToolCallId());
+        if (designated.isPresent()) {
+            // 验收夹具点名这条成员按失败收尾：工具当场真的成功了也记成失败，这正是这个场景要造出来的
+            // 「有一条成员失败、其余的照常」。工具的真实输出留在成员行里，失败原因单独写清楚。
+            success = false;
+            extra = new LinkedHashMap<>(extra);
+            extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
+            extra.put("errorDetail", designated.get());
+        } else if (policy != null && member.getToolCallId() != null
+                && policy.covers(member.getToolCallId())) {
+            // 压住结果与等兄弟成员先落终态这两种规则，针对的是「结果以后才回来」的成员。
+            // 这条成员在本次调用里当场就把结果拿回来了，那两条规则在这里没有可等的东西，
+            // 只留一行记录，不放行也不压住。
+            log.info("放行策略点名的这条成员当场就结束了，压住与等兄弟成员在这里不适用：group={} member={} toolCall={}",
+                    member.getGroupId(), member.getMemberIdentity(), member.getToolCallId());
+        }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
         MemberCompletionResult result = waitGroupStore.completeMember(new MemberCompletionRequest(

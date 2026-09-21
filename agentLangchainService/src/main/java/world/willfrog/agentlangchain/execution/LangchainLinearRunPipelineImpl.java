@@ -927,6 +927,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .planningEndpointName(stageModels.planningEndpointName())
                 .planningModelName(stageModels.planningModelName())
                 .planningProviderOrder(stageModels.planningProviderOrder())
+                .acceptanceReleasePolicy(stageModels.acceptanceReleasePolicy())
                 .toolSpecifications(toolSpecifications)
                 .webSearchEnabled(runConfig.webSearchEnabled())
                 .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())

@@ -983,4 +983,18 @@
           AND state = 'RUNNING'
     </update>
 
+    <!--
+      验收夹具按放行策略压住这条成员：只推下次查询时间，不动轮询次数与退避步数。
+      被压住不是「问不到结论」，退避步数涨上去会让放行之后还要多等一个退避周期才接回来。
+      只对还在执行中的成员生效：已经落终态的成员不会被改。
+    -->
+    <update id="holdMember">
+        UPDATE alphafrog_agent_run_wait_member SET
+            next_poll_at = #{nextPollAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE group_id = #{groupId}
+          AND member_identity = #{memberIdentity}
+          AND state = 'RUNNING'
+    </update>
+
 </mapper>

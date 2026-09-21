@@ -16,6 +16,7 @@ import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
+import world.willfrog.agentlangchain.tooljob.WaitMemberResultReceiver;
 
 import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
@@ -35,6 +36,7 @@ public class AgentLangchainHealthController {
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final DualPoolSchedulerSettings schedulerSettings;
     private final FrozenEffectiveSettings frozenEffectiveSettings;
+    private final WaitMemberResultReceiver waitMemberResultReceiver;
 
     @Value("${agent.langchain.service.version:UNKNOWN}")
     private String serviceVersion;
@@ -59,6 +61,9 @@ public class AgentLangchainHealthController {
         Map<String, Object> snapshot = new LinkedHashMap<>(concurrencyScheduler.schedulerSnapshot());
         Map<String, Object> dualPool = new LinkedHashMap<>(dualPoolDispatcher.snapshot());
         dualPool.putAll(dualPoolRecoveryDispatcher.snapshot());
+        // 结果接收方的读数：接回多少成员、推后多少、被夹具策略压住多少、被点名按失败收尾多少。
+        // 验收看的就是这几个数，所以和双池其余读数放在同一棵树里。
+        dualPool.putAll(waitMemberResultReceiver.snapshot());
         dualPool.put("backpressure", schedulerBackpressureProbe.snapshot());
         // 生效的双池参数：每个值都带来源（热配置／环境属性／代码默认）、改了要不要重启，
         // 以及被丢掉的值与原因。验收与排查都从这一份读，不靠猜某个泳道配了什么。

@@ -14,6 +14,8 @@ import world.willfrog.agent.platform.service.AgentLlmResolver;
 import world.willfrog.agent.platform.service.StageConfigResolver;
 import world.willfrog.agent.platform.service.StageConfigValidator;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -55,6 +57,7 @@ public class LangchainRunStageModelResolver {
     private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
     private final AcceptanceFixtureModelRegistry acceptanceFixtureModels;
+    private final AcceptanceRunPolicyRegistry acceptancePolicies;
 
     /**
      * 解析一次 run 的三阶段 ChatModel。
@@ -80,7 +83,8 @@ public class LangchainRunStageModelResolver {
         Optional<AcceptanceFixtureModelRegistry.ScriptedStage> scripted =
                 acceptanceFixtureModels.stageForRun(run);
         if (scripted.isPresent()) {
-            return acceptanceFixtureStageModels(scripted.get());
+            return acceptanceFixtureStageModels(scripted.get(),
+                    acceptancePolicies.policyForRun(run).orElse(null));
         }
         RunStageConfig stageConfig = stageConfigResolver.resolve(run.getExt());
         stageConfigValidator.validate(stageConfig);
@@ -134,7 +138,8 @@ public class LangchainRunStageModelResolver {
                 finalAnswerModel,
                 planningEndpointName,
                 planningModelName,
-                planningProviderOrder);
+                planningProviderOrder,
+                null);
     }
 
     /**
@@ -145,8 +150,12 @@ public class LangchainRunStageModelResolver {
      * 客户端构建、provider 顺序在这里一件都不做，所以这一次执行碰不到真实模型。</p>
      *
      * <p>规划端点的两个名字写成夹具的标记：事件、读数与调试界面里一眼看得出这次用的不是供应商。</p>
+     *
+     * <p>结果放行策略跟着一起带上：节点执行器在工具当场完成、直接给成员写终态那一步要用它。
+     * 夹具没写放行策略时是空，成员照原来的方式立刻收尾。</p>
      */
-    private StageModels acceptanceFixtureStageModels(AcceptanceFixtureModelRegistry.ScriptedStage stage) {
+    private StageModels acceptanceFixtureStageModels(AcceptanceFixtureModelRegistry.ScriptedStage stage,
+                                                     AcceptanceReleasePolicy releasePolicy) {
         ChatModel scripted = stage.model();
         return new StageModels(
                 scripted,
@@ -154,7 +163,8 @@ public class LangchainRunStageModelResolver {
                 scripted,
                 AcceptanceFixtureModelRegistry.ScriptedStage.ENDPOINT_NAME,
                 stage.modelName(),
-                List.of());
+                List.of(),
+                releasePolicy);
     }
 
     /**
@@ -164,6 +174,10 @@ public class LangchainRunStageModelResolver {
      * 不返回 execution 和 final-answer 的？
      * 因为 observability 和 event 系统主要关注 planning 阶段的模型信息（它决定了计划的生成质量），
      * execution 和 final-answer 的模型信息可以在需要时从 run.ext 中重新提取。</p>
+     *
+     * <p>最后的 {@code acceptanceReleasePolicy} 只有验收夹具 Run 会带上（夹具没写放行策略时也是空），
+     * 普通 Run 一律为空：它决定「工具当场完成时被点名的那条成员要不要按失败收尾」，不参与模型解析。
+     * 压住结果那种规则走的是结果接收方，读的是同一份策略，不经过这个字段。</p>
      */
     public record StageModels(
             ChatModel planningModel,
@@ -171,7 +185,21 @@ public class LangchainRunStageModelResolver {
             ChatModel finalAnswerModel,
             String planningEndpointName,
             String planningModelName,
-            List<String> planningProviderOrder) {
+            List<String> planningProviderOrder,
+            AcceptanceReleasePolicy acceptanceReleasePolicy) {
+
+        /**
+         * 不带放行策略的那一版：普通 Run 用这个形状就够了，调用方不必写一个用不到的 null。
+         */
+        public StageModels(ChatModel planningModel,
+                           ChatModel executionModel,
+                           ChatModel finalAnswerModel,
+                           String planningEndpointName,
+                           String planningModelName,
+                           List<String> planningProviderOrder) {
+            this(planningModel, executionModel, finalAnswerModel,
+                    planningEndpointName, planningModelName, planningProviderOrder, null);
+        }
     }
 
     /**

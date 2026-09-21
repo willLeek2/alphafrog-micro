@@ -1,0 +1,97 @@
+package world.willfrog.agentlangchain.acceptance;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 按 Run 取回「这条 Run 的结果放行策略」。
+ *
+ * <p>策略来自夹具的 {@code dispatch_policy_json}：不带夹具编号的 Run、或者夹具没写放行策略的 Run
+ * 拿到空，成员结果照原来的方式立刻收尾。夹具本身由 {@link AcceptanceFixtureResolver} 查回来并核对，
+ * 所以夹具在跑的中途失效时，读策略这一步会跟着停下——不会出现「夹具不让用了，但压住的成员还被
+ * 悄悄放过去」。</p>
+ */
+@Component
+@Slf4j
+public class AcceptanceRunPolicyRegistry {
+
+    /** 进程里最多同时记住这么多条 Run 的策略；到顶时拒绝新的夹具 Run，不去挤掉正在跑的那些。 */
+    static final int MAX_TRACKED_RUNS = 128;
+
+    private final AcceptanceFixtureResolver fixtureResolver;
+    private final ObjectMapper objectMapper;
+    private final Map<String, AcceptanceReleasePolicy> policyByRun = new ConcurrentHashMap<>();
+    private final Map<String, String> fixtureIdByRun = new ConcurrentHashMap<>();
+
+    public AcceptanceRunPolicyRegistry(AcceptanceFixtureResolver fixtureResolver,
+                                       ObjectMapper objectMapper) {
+        this.fixtureResolver = fixtureResolver;
+        this.objectMapper = objectMapper;
+    }
+
+    /**
+     * 这条 Run 的结果放行策略。
+     *
+     * @param run 正在执行的 Run
+     * @return 不带夹具编号、或者夹具没写放行策略时返回空
+     * @throws AcceptanceFixtureExecutionException 带了编号但夹具现在不能用、或者策略读不出来
+     */
+    public Optional<AcceptanceReleasePolicy> policyForRun(AgentRun run) {
+        Optional<AcceptanceFixtureRow> row = fixtureResolver.resolve(run);
+        if (row.isEmpty()) {
+            return Optional.empty();
+        }
+        String runId = run.getId();
+        String fixtureId = row.get().fixtureId();
+        String knownFixtureId = fixtureIdByRun.get(runId);
+        if (knownFixtureId != null && !knownFixtureId.equals(fixtureId)) {
+            throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_identity_changed",
+                    "这条 Run 一开始用的是夹具 " + knownFixtureId + "，现在请求上下文里写着 "
+                            + fixtureId + "：同一条 Run 的夹具身份不许中途换");
+        }
+        AcceptanceReleasePolicy cached = policyByRun.get(runId);
+        if (cached != null) {
+            return Optional.of(cached);
+        }
+        Optional<AcceptanceReleasePolicy> parsed =
+                AcceptanceReleasePolicy.parse(fixtureId, row.get().dispatchPolicyJson(), objectMapper);
+        if (parsed.isEmpty()) {
+            return Optional.empty();
+        }
+        if (policyByRun.size() >= MAX_TRACKED_RUNS) {
+            throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_tracked_runs_full",
+                    "本进程记住的夹具 Run 已经到 " + MAX_TRACKED_RUNS + " 条：这个数只会在终态事件漏掉时涨起来，"
+                            + "先查这些 Run 为什么没走到终态");
+        }
+        fixtureIdByRun.putIfAbsent(runId, fixtureId);
+        AcceptanceReleasePolicy winner = policyByRun.putIfAbsent(runId, parsed.get());
+        log.info("验收夹具的放行策略生效: runId={} fixture={} scenario={} members={}",
+                runId, fixtureId, row.get().scenarioId(), parsed.get().size());
+        return Optional.of(winner == null ? parsed.get() : winner);
+    }
+
+    /** 放掉一条 Run 的策略；没有这条 Run 就是空动作。 */
+    public void evict(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        fixtureIdByRun.remove(runId);
+        policyByRun.remove(runId);
+    }
+
+    /** Run 走到终态就把策略放掉，与模型脚本位置同一个时机。 */
+    @EventListener
+    public void onRunFinalized(AgentRunFinalizedEvent event) {
+        if (event != null) {
+            evict(event.runId());
+        }
+    }
+}

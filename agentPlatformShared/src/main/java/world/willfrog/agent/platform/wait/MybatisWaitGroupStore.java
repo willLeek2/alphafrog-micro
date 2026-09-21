@@ -255,6 +255,20 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public boolean holdMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt) {
+        if (groupId <= 0) {
+            throw new IllegalArgumentException("等待组编号必须为正数：" + groupId);
+        }
+        if (memberIdentity == null || memberIdentity.isBlank()) {
+            throw new IllegalArgumentException("成员稳定身份不能为空");
+        }
+        if (nextPollAt == null) {
+            throw new IllegalArgumentException("压住成员必须给出下次查询时间");
+        }
+        return mapper.holdMember(groupId, memberIdentity, nextPollAt) > 0;
+    }
+
+    @Override
     public Optional<WaitGroup> findGroup(WaitGroupIdentity identity) {
         if (identity == null) {
             throw new IllegalArgumentException("等待组身份不能为空");

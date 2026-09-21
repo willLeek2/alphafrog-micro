@@ -4,6 +4,7 @@ import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.ChatModel;
 import lombok.Builder;
 import lombok.Data;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -34,6 +35,13 @@ public class LangchainWorkflowRequest {
     private String planningEndpointName;
     private String planningModelName;
     private List<String> planningProviderOrder;
+    /**
+     * 验收夹具的结果放行策略；不带夹具编号的 Run 为空。
+     *
+     * <p>节点执行器在工具当场完成、直接给成员写终态那一步要用它（被点名的成员按失败收尾）。
+     * 走结果接收路径的后台成员自己按 Run 查策略，不依赖这个字段。</p>
+     */
+    private AcceptanceReleasePolicy acceptanceReleasePolicy;
 
     public ChatModel planningModelOrDefault() {
         return planningModel == null ? model : planningModel;

@@ -21,6 +21,9 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
@@ -72,6 +75,8 @@ class WaitMemberResultReceiverTest {
     private PythonSandboxTools pythonSandboxTools;
     private WaitMemberSettlement settlement;
     private DualPoolRecoveryDispatcher recoveryDispatcher;
+    private AcceptanceRunPolicyRegistry acceptancePolicies;
+    private AcceptanceReleasePointStore releasePoints;
     private WaitMemberResultReceiver receiver;
 
     @BeforeEach
@@ -83,6 +88,8 @@ class WaitMemberResultReceiverTest {
         pythonSandboxTools = Mockito.mock(PythonSandboxTools.class);
         settlement = Mockito.mock(WaitMemberSettlement.class);
         recoveryDispatcher = Mockito.mock(DualPoolRecoveryDispatcher.class);
+        acceptancePolicies = Mockito.mock(AcceptanceRunPolicyRegistry.class);
+        releasePoints = Mockito.mock(AcceptanceReleasePointStore.class);
         receiver = new WaitMemberResultReceiver(waitGroupStore, runMapper, nodeWorkItemStore,
                 sandboxService, pythonSandboxTools, settlement, recoveryDispatcher, objectMapper,
                 TestSchedulerSettings.propertyOnly(
@@ -90,7 +97,7 @@ class WaitMemberResultReceiverTest {
                         "agent.langchain.wait-member.receiver.backoff-base-ms", "1000",
                         "agent.langchain.wait-member.receiver.backoff-max-ms", "15000",
                         "agent.langchain.wait-member.receiver.max-backoff-step", "6"),
-                4096, 1000L, new FrozenEffectiveSettings());
+                4096, 1000L, new FrozenEffectiveSettings(), acceptancePolicies, releasePoints);
         Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
 
@@ -109,7 +116,7 @@ class WaitMemberResultReceiverTest {
         WaitMemberResultReceiver live = new WaitMemberResultReceiver(waitGroupStore, runMapper,
                 nodeWorkItemStore, sandboxService, pythonSandboxTools, settlement, recoveryDispatcher,
                 objectMapper, new DualPoolSchedulerSettings(null, environment), 4096, 1000L,
-                new FrozenEffectiveSettings());
+                new FrozenEffectiveSettings(), acceptancePolicies, releasePoints);
 
         live.round();
         verify(waitGroupStore).scanDueMembers(any(), eq(8));
@@ -388,6 +395,142 @@ class WaitMemberResultReceiverTest {
                 .isEqualTo("{\"ok\":true,\"stdout\":\"done\"}");
     }
 
+    // ===== 验收夹具的结果放行策略 =====
+
+    /** 夹具点名要等放行点：这一轮连沙箱都不去问，只把下次查询时间推一小步。 */
+    @Test
+    void aMemberHeldByAReleasePointIsNotCollectedYet() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"holdUntilPoint\":\"point-a\"}}}");
+        when(releasePoints.isOpened(RUN_ID, "point-a")).thenReturn(false);
+        Mockito.lenient().when(waitGroupStore.holdMember(eq(GROUP_ID), eq(MEMBER_IDENTITY), any()))
+                .thenReturn(true);
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+
+        assertThat(receiver.round()).isEqualTo(1);
+
+        assertThat(capturedHeldNextPoll()).as("压住要推下次查询时间，而且推到将来").isAfter(OffsetDateTime.now());
+        verify(sandboxService, never()).getTaskStatus(any(GetTaskStatusRequest.class));
+        verify(waitGroupStore, never()).completeMember(any());
+        verify(waitGroupStore, never()).rescheduleMember(anyLong(), anyString(), any(), anyInt());
+        assertThat(receiver.snapshot())
+                .containsEntry("waitMemberReceiverHoldPushesTotal", 1L)
+                .containsEntry("waitMemberReceiverHeldNow", 1)
+                .containsEntry("waitMemberReceiverDeferredTotal", 0L);
+    }
+
+    /** 放行点被控制面标成已放行之后，这条成员照常收尾；已经不再压它。 */
+    @Test
+    void aHeldMemberIsCollectedOnceItsReleasePointOpens() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"holdUntilPoint\":\"point-a\"}}}");
+        when(releasePoints.isOpened(RUN_ID, "point-a")).thenReturn(true);
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        verify(waitGroupStore, never()).holdMember(anyLong(), anyString(), any());
+        assertThat(receiver.snapshot())
+                .containsEntry("waitMemberReceiverCompletedTotal", 1L)
+                .containsEntry("waitMemberReceiverHoldPushesTotal", 0L);
+    }
+
+    /** 等兄弟成员先落终态：名单里还有没落的就先压住，全落了就照常接结果。 */
+    @Test
+    void aMemberWaitingForItsPeersHoldsUntilTheyAllFinish() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"releaseAfter\":[\"tc-2\"]}}}");
+        WaitMember peer = member();
+        peer.setMemberIdentity("peer-member");
+        peer.setToolCallId("tc-2");
+        peer.setState(WaitMemberState.RUNNING.name());
+        Mockito.lenient().when(waitGroupStore.listMembers(anyLong())).thenReturn(List.of(peer));
+        Mockito.lenient().when(waitGroupStore.holdMember(eq(GROUP_ID), eq(MEMBER_IDENTITY), any()))
+                .thenReturn(true);
+
+        assertThat(receiver.round()).isEqualTo(1);
+        verify(waitGroupStore, never()).completeMember(any());
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverHoldPushesTotal", 1L);
+
+        // 兄弟成员落了终态：这一轮不再压，照常把结果接回来。
+        peer.setState(WaitMemberState.SUCCEEDED.name());
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        assertThat(receiver.round()).isEqualTo(1);
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+    }
+
+    /** 夹具点名按失败收尾：沙箱明明成功，成员也落失败，原因写清是这个场景点名的。 */
+    @Test
+    void aDesignatedMemberFailsEvenWhenTheSandboxSucceeded() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"fail\":\"这个场景要造一条失败成员\"}}}");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        MemberCompletionRequest request = capturedRequest();
+        assertThat(request.memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(request.resultRefJson())
+                .as("结论是失败，但拿回来的东西不丢：" + request.resultRefJson())
+                .contains("acceptance_fixture_designated_failure")
+                .contains("这个场景要造一条失败成员")
+                .contains("done");
+        // 名额与用量照常收尾：被点名按失败收尾不等于这次调用没发生过。
+        verify(settlement).settle(any(), any(), any(), any(), any());
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDesignatedFailuresTotal", 1L);
+    }
+
+    /** 策略点了这个等待组里没有的成员：夹具写错了，成员按失败收尾，不许压住干等。 */
+    @Test
+    void aPolicyPointingAtAnUnknownPeerFailsTheMember() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"releaseAfter\":[\"tc-missing\"]}}}");
+        Mockito.lenient().when(waitGroupStore.listMembers(anyLong())).thenReturn(List.of());
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().resultRefJson())
+                .contains("acceptance_fixture_policy_peer_unknown")
+                .contains("tc-missing");
+        verify(waitGroupStore, never()).holdMember(anyLong(), anyString(), any());
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverPolicyRefusalsTotal", 1L);
+    }
+
+    /** 压过兜底时限还没人放行：照常收尾，读数里单独记一笔，别把「没人放行」当成「被放行」。 */
+    @Test
+    void aMemberHeldTooLongIsReleased() throws Exception {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"holdUntilPoint\":\"point-a\"}},\"maxHoldSeconds\":1}");
+        when(releasePoints.isOpened(RUN_ID, "point-a")).thenReturn(false);
+        Mockito.lenient().when(waitGroupStore.holdMember(eq(GROUP_ID), eq(MEMBER_IDENTITY), any()))
+                .thenReturn(true);
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        assertThat(receiver.round()).isEqualTo(1);
+        verify(waitGroupStore, never()).completeMember(any());
+
+        // 兜底时限是秒级，这里只能真的等过去：压住的起点是上一轮第一次压住的那一刻。
+        Thread.sleep(1100L);
+        assertThat(receiver.round()).isEqualTo(1);
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        assertThat(receiver.snapshot())
+                .containsEntry("waitMemberReceiverReleasedOnHoldTimeoutTotal", 1L)
+                .containsEntry("waitMemberReceiverCompletedTotal", 1L);
+    }
+
     // ===== 造数据 =====
 
     private void givenDueMember() {
@@ -437,6 +580,19 @@ class WaitMemberResultReceiverTest {
     private void completion(boolean applied, WaitMemberState state, Long notificationId) {
         Mockito.lenient().when(waitGroupStore.completeMember(any())).thenReturn(
                 new MemberCompletionResult(applied, state, WaitGroupState.READY, 1, 1, notificationId));
+    }
+
+    /** 让这条 Run 拿到一份真的放行策略：策略读法与写进库里的那份 JSON 是同一套。 */
+    private void policyOf(String policyJson) {
+        Mockito.lenient().when(acceptancePolicies.policyForRun(any())).thenReturn(Optional.of(
+                AcceptanceReleasePolicy.parse("fx-receiver", policyJson, objectMapper).orElseThrow()));
+    }
+
+    /** 压住这条成员时推给库里的下次查询时间。 */
+    private OffsetDateTime capturedHeldNextPoll() {
+        ArgumentCaptor<OffsetDateTime> nextPoll = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(waitGroupStore).holdMember(eq(GROUP_ID), eq(MEMBER_IDENTITY), nextPoll.capture());
+        return nextPoll.getValue();
     }
 
     private MemberCompletionRequest capturedRequest() {

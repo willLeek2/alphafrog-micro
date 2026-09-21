@@ -86,6 +86,14 @@ public interface WaitGroupStore {
     /** 成员还在执行中时推后它的下次查询时间并累加轮询次数；已经落终态的成员不会被改。 */
     boolean rescheduleMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt, int maxBackoffStep);
 
+    /**
+     * 按验收夹具的放行策略压住一条成员：只推下次查询时间，不累加轮询次数与退避步数。
+     *
+     * <p>被压住与「问不到结论」是两回事：退避步数只在真的问不到结论时才涨，被压住的成员放行之后
+     * 最多等一个轮询间隔就会被接回来。只对还在执行中的成员生效。</p>
+     */
+    boolean holdMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt);
+
     Optional<WaitGroup> findGroup(WaitGroupIdentity identity);
 
     Optional<WaitGroup> findGroup(long groupId);

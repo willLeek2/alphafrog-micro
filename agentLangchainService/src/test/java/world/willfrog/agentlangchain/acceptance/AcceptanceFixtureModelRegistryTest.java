@@ -237,7 +237,8 @@ class AcceptanceFixtureModelRegistryTest {
 
     private AcceptanceFixtureModelRegistry registry() {
         when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
-        return new AcceptanceFixtureModelRegistry(store, identityProvider, objectMapper);
+        return new AcceptanceFixtureModelRegistry(
+                new AcceptanceFixtureResolver(store, identityProvider, objectMapper), objectMapper);
     }
 
     private AgentRun fixtureRun(String fixtureId) throws Exception {

@@ -315,6 +315,19 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public boolean holdMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt) {
+        FakeMember member = memberRows(groupId).stream()
+                .filter(row -> row.memberIdentity.equals(memberIdentity))
+                .findFirst().orElseThrow(() -> new IllegalArgumentException("成员不存在：" + memberIdentity));
+        if (!WaitMemberState.RUNNING.name().equals(member.state)) {
+            return false;
+        }
+        // 与库里的语句一致：只推下次查询时间，轮询次数与退避步数都不动。
+        member.nextPollAt = nextPollAt;
+        return true;
+    }
+
+    @Override
     public Optional<WaitGroup> findGroup(WaitGroupIdentity identity) {
         return groups.values().stream()
                 .filter(group -> group.identity.equals(identity))

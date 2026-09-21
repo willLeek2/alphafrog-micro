@@ -93,7 +93,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <p>做法：建一个临时 schema，用数据源自己的 schema 属性指到它（建表之前先读回
  * {@code current_schema()} 确认写入落在这里）→ 走真实升级链（init 建表脚本加各版本升级脚本，一路升到
- * 006）→ 把这一阶段的 007 与 008 两份脚本按顺序整份执行两遍（第二遍要一样通过，证明脚本可重复执行）
+ * 006）→ 把这一阶段的各份脚本按顺序整份执行两遍（第二遍要一样通过，证明脚本可重复执行）
  * → 逐条插反例确认被约束拒绝 → 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次
  * 恢复资格、组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
  *
@@ -118,6 +118,7 @@ class Stage3WaitContractPostgresTest {
             "013_agent_run_recovery_notification_close.sql";
     private static final String ACCEPTANCE_FIXTURE_SCRIPT =
             "014_agent_run_acceptance_fixture.sql";
+    private static final String RELEASE_POINT_SCRIPT = "015_agent_run_release_point.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -247,6 +248,79 @@ class Stage3WaitContractPostgresTest {
                 + expires + ", TRUE, CURRENT_TIMESTAMP, 0, NULL)");
         execute(insert + "('fx-1', 'lane-a', 'lane-a', 'gen-2', 'scenario-a', '{}'::jsonb, "
                 + expires + ", TRUE, CURRENT_TIMESTAMP, 0, NULL)");
+    }
+
+    @Test
+    void aReleasePointIsOpenedOnlyByTheControlPlaneAndItsEvidenceIsPaired() throws Exception {
+        String insert = "INSERT INTO alphafrog_agent_run_release_point (run_id, release_key, lane_id, "
+                + "deployment_version) VALUES ";
+        createRun("run-release", 0, 0L);
+        // 行还没建出来时按「没放行」处理：夹具策略点名的放行点必须先由控制面建出来。
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
+                + "WHERE run_id = 'run-release'")).isZero();
+        execute(insert + "('run-release', 'point-a', 'lane-a', 'gen-1')");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
+                + "WHERE run_id = 'run-release' AND release_key = 'point-a' AND opened_at IS NULL"))
+                .as("建出来但没标放行时仍是等待态").isEqualTo(1);
+        // 放行时刻与放行人成对：只写一半都要被拒，放行的证据说不清就不算放行。
+        expectRejected("UPDATE alphafrog_agent_run_release_point SET opened_at = CURRENT_TIMESTAMP "
+                        + "WHERE run_id = 'run-release' AND release_key = 'point-a'",
+                "alphafrog_agent_run_release_point_open_check");
+        expectRejected("INSERT INTO alphafrog_agent_run_release_point (run_id, release_key, lane_id, "
+                        + "deployment_version, opened_by) VALUES ('run-release', 'point-c', 'lane-a', "
+                        + "'gen-1', 'control-plane')",
+                "alphafrog_agent_run_release_point_open_check");
+        // 同一个 Run 的同一个放行点只能有一行：查回来的是哪一行必须唯一。
+        expectRejected(insert + "('run-release', 'point-a', 'lane-b', 'gen-2')",
+                "alphafrog_agent_run_release_point_identity_key");
+        // 放行点挂在一条不存在的 Run 上要被外键拒掉。
+        expectRejected(insert + "('run-release-missing', 'point-a', 'lane-a', 'gen-1')",
+                "alphafrog_agent_run_release_point_run_id_fkey");
+        // 控制面把点标成已放行之后，读到的就是已放行；重复读一样，放行按许可而不是按取走一次。
+        execute("UPDATE alphafrog_agent_run_release_point SET opened_at = CURRENT_TIMESTAMP, "
+                + "opened_by = 'control-plane' WHERE run_id = 'run-release' "
+                + "AND release_key = 'point-a'");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
+                + "WHERE run_id = 'run-release' AND release_key = 'point-a' "
+                + "AND opened_at IS NOT NULL AND opened_by = 'control-plane'"))
+                .as("放行之后这一行同时带着时刻与放行人").isEqualTo(1);
+        // 另一个放行点不受影响：一条策略点几个点，放哪个点由控制面一个一个决定。
+        execute(insert + "('run-release', 'point-b', 'lane-a', 'gen-1')");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
+                + "WHERE run_id = 'run-release' AND opened_at IS NULL")).isEqualTo(1);
+    }
+
+    @Test
+    void holdingAMemberOnlyPushesItsNextQueryTime() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-hold", 2, 0L);
+        assertThat(dispatchMember(fixture.groupId(), "call-a", fixture.runControlVersion()))
+                .as("成员先要真的转成执行中").isTrue();
+        WaitMember before = memberByIdentity(fixture.groupId(), "call-a");
+        assertThat(before.getState()).isEqualTo(WaitMemberState.RUNNING.name());
+
+        OffsetDateTime heldUntil = OffsetDateTime.now().plusSeconds(5);
+        assertThat(holdMember(fixture.groupId(), "call-a", heldUntil)).as("压住要写进去").isTrue();
+
+        WaitMember after = memberByIdentity(fixture.groupId(), "call-a");
+        assertThat(after.getNextPollAt().toInstant()).as("下次查询时间按压住给的那一刻走")
+                .isEqualTo(heldUntil.toInstant());
+        assertThat(after.getPollCount()).as("被压住不算「问过一轮」")
+                .isEqualTo(before.getPollCount());
+        assertThat(after.getBackoffStep()).as("被压住与「问不到结论」是两回事，退避步数不涨")
+                .isEqualTo(before.getBackoffStep());
+        assertThat(after.getState()).as("压住不改成员状态").isEqualTo(WaitMemberState.RUNNING.name());
+
+        // 另外一个成员一点都不受影响：压住的写法只落在被点名的那一行。
+        assertThat(memberByIdentity(fixture.groupId(), "call-b").getNextPollAt())
+                .as("没被点名的成员下次查询时间不变").isNull();
+
+        // 已经落终态的成员压不住：这时它已经在别人手里收尾了。
+        assertThat(completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                fixture.runControlVersion()).applied()).isTrue();
+        assertThat(holdMember(fixture.groupId(), "call-a", heldUntil.plusSeconds(60)))
+                .as("落终态之后压住写不进去").isFalse();
+        assertThat(memberByIdentity(fixture.groupId(), "call-a").getNextPollAt().toInstant())
+                .as("没写进去就不能改已经落定的那一行").isEqualTo(heldUntil.toInstant());
     }
 
     @Test
@@ -1871,7 +1945,7 @@ class Stage3WaitContractPostgresTest {
         for (int round = 1; round <= 2; round++) {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
-                    RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT)) {
+                    RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -2085,6 +2159,30 @@ class Stage3WaitContractPostgresTest {
         }
     }
 
+    /** 把一个还没派发的成员转成执行中：压住只对执行中的成员生效，这一步不能省。 */
+    private static boolean dispatchMember(long groupId, String memberIdentity, long runControlVersion) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            return store.markMemberDispatched(groupId, memberIdentity, "op-" + memberIdentity,
+                    "{\"taskId\":\"t-" + memberIdentity + "\"}", OffsetDateTime.now(), runControlVersion);
+        }
+    }
+
+    /** 按成员身份读一行成员：读回来的是库里现在的样子。 */
+    private static WaitMember memberByIdentity(long groupId, String memberIdentity) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class))
+                    .findMemberByIdentity(groupId, memberIdentity).orElseThrow();
+        }
+    }
+
+    private static boolean holdMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class))
+                    .holdMember(groupId, memberIdentity, nextPollAt);
+        }
+    }
+
     private static WaitGroup groupById(long groupId) {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             return new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class))
@@ -2203,6 +2301,18 @@ class Stage3WaitContractPostgresTest {
                 + "AND indexname = 'idx_agent_run_acceptance_fixture_ready' "
                 + "AND indexdef LIKE '%enabled%'"))
                 .as("夹具表要有只含待用行的索引").isEqualTo(1);
+        // 015 那张放行点表：同样只加结构不写数据；放行的判断按「Run + 放行点」精确命中，
+        // 没放行的行不进索引。
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point")).isZero();
+        assertThat(countRows("SELECT count(*) FROM pg_constraint WHERE connamespace = "
+                + "current_schema()::regnamespace AND conname IN ("
+                + "'alphafrog_agent_run_release_point_identity_key', "
+                + "'alphafrog_agent_run_release_point_open_check')"))
+                .as("放行点表要有「一个放行点一行」与「时刻与放行人成对」两条约束").isEqualTo(2);
+        assertThat(countRows("SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                + "AND indexname = 'idx_agent_run_release_point_opened' "
+                + "AND indexdef LIKE '%opened_at IS NOT NULL%'"))
+                .as("放行点表要有只含已放行行的索引").isEqualTo(1);
     }
 
     /** 再报一次同一段的挂起：用来验「旧计划的挂起整条不生效」。 */

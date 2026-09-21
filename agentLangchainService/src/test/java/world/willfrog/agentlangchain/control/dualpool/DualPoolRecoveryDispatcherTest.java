@@ -473,6 +473,11 @@ class DualPoolRecoveryDispatcherTest {
         }
 
         @Override
+        public boolean holdMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public Optional<world.willfrog.agent.platform.wait.WaitGroup> findGroup(
                 world.willfrog.agent.platform.wait.WaitGroupIdentity identity) {
             throw new UnsupportedOperationException();

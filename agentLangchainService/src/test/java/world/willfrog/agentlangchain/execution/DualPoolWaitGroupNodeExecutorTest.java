@@ -168,6 +168,51 @@ class DualPoolWaitGroupNodeExecutorTest {
                 .as("等待组被消费成已交接，下一段放成可恢复").isTrue();
     }
 
+    /** 夹具点名按失败收尾：工具当场成功，写进成员行的也是失败，并写清是场景点名的。 */
+    @Test
+    void aDesignatedMemberFailsEvenThoughItsToolSucceededInPlace() {
+        model.enqueue(AiMessage.from(List.of(
+                toolCall("call-a", "getStockDaily", "{}"),
+                toolCall("call-b", "searchWeb", "{}"))));
+        world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy policy =
+                world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"members\":{\"call-a\":{\"fail\":\"这个场景要造一条失败成员\"}}}",
+                                objectMapper)
+                        .orElseThrow();
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome =
+                executor.executeSegment(firstSegment(List.of(), policy));
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
+        assertThat(store.memberRows(groupId)).as("被点名的那条落失败，没被点名的照常成功")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.FAILED.name(), WaitMemberState.SUCCEEDED.name());
+        assertThat(store.memberRows(groupId).get(0).resultRefJson)
+                .as("失败原因写清是验收场景点名的")
+                .contains("acceptance_fixture_designated_failure")
+                .contains("这个场景要造一条失败成员");
+        assertThat(store.memberRows(groupId).get(1).resultRefJson).doesNotContain("designated_failure");
+        assertThat(store.events()).as("被点名的那条也算一条已结束的成员，组照样齐备")
+                .anyMatch(event -> event.startsWith("group_ready:"));
+    }
+
+    /** 策略点名要压住：工具当场就结束了，压住没有可等的东西，成员照常成功，只留一行记录。 */
+    @Test
+    void aHoldRuleOnAnInPlaceMemberDoesNotChangeItsOutcome() {
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
+        world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy policy =
+                world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"members\":{\"call-a\":{\"holdUntilPoint\":\"point-a\"}}}", objectMapper)
+                        .orElseThrow();
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome =
+                executor.executeSegment(firstSegment(List.of(), policy));
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
+        assertThat(store.memberRows(groupId)).extracting(row -> row.state)
+                .containsExactly(WaitMemberState.SUCCEEDED.name());
+    }
+
     // ==================== 结果按原始序号接回 ====================
 
     @Test
@@ -407,6 +452,12 @@ class DualPoolWaitGroupNodeExecutorTest {
         return segment(segmentIdentity(0), startPayload(), specifications);
     }
 
+    private DualPoolWaitGroupNodeExecutor.SegmentExecution firstSegment(
+            List<ToolSpecification> specifications,
+            world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy releasePolicy) {
+        return segment(segmentIdentity(0), startPayload(), specifications, releasePolicy);
+    }
+
     private DualPoolWaitGroupNodeExecutor.SegmentExecution segment(NodeWorkItemIdentity identity, JsonNode payload) {
         return segment(identity, payload, List.of());
     }
@@ -414,6 +465,14 @@ class DualPoolWaitGroupNodeExecutorTest {
     private DualPoolWaitGroupNodeExecutor.SegmentExecution segment(NodeWorkItemIdentity identity,
                                                                   JsonNode payload,
                                                                   List<ToolSpecification> specifications) {
+        return segment(identity, payload, specifications, null);
+    }
+
+    private DualPoolWaitGroupNodeExecutor.SegmentExecution segment(
+            NodeWorkItemIdentity identity,
+            JsonNode payload,
+            List<ToolSpecification> specifications,
+            world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy releasePolicy) {
         return new DualPoolWaitGroupNodeExecutor.SegmentExecution(
                 identity,
                 new NodeWorkItemVersions(0L, 0L, 1),
@@ -423,6 +482,7 @@ class DualPoolWaitGroupNodeExecutorTest {
                         .userId("user-1")
                         .userGoal("把这件事做完")
                         .executionModel(model)
+                        .acceptanceReleasePolicy(releasePolicy)
                         .toolSpecifications(new ArrayList<>(specifications))
                         .build(),
                 TodoItem.builder().id(NODE_ID).sequence(1).description("第一个待办").build(),

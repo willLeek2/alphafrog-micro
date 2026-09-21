@@ -20,6 +20,9 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
@@ -35,10 +38,12 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -69,6 +74,8 @@ public class WaitMemberResultReceiver {
     private static final String RESULT_LOST = "RESULT_LOST";
     /** 按外部作业身份回查、权威地说「这个后台作业不存在」时给成员写的错误码。 */
     private static final String TASK_NOT_FOUND = "wait_member_task_not_found";
+    /** 夹具策略点了同一个等待组里不存在的成员时写的错误码。 */
+    private static final String POLICY_PEER_UNKNOWN = "acceptance_fixture_policy_peer_unknown";
 
     private final WaitGroupStore waitGroupStore;
     private final AgentRunMapper runMapper;
@@ -86,6 +93,17 @@ public class WaitMemberResultReceiver {
     private volatile long backoffMaxMs;
     private final int maxMemberResultChars;
     private final long pollIntervalMs;
+    /** 验收夹具的结果放行策略与放行点：不带夹具编号的 Run 拿到空，成员照原来的方式立刻收尾。 */
+    private final AcceptanceRunPolicyRegistry acceptancePolicies;
+    private final AcceptanceReleasePointStore releasePoints;
+
+    /** 每压住一轮记一次（同一条成员被压住多轮就记多笔），不是「压住过几条成员」。 */
+    private final AtomicLong holdPushes = new AtomicLong();
+    private final AtomicLong releasedOnHoldTimeout = new AtomicLong();
+    private final AtomicLong designatedFailures = new AtomicLong();
+    private final AtomicLong policyRefusals = new AtomicLong();
+    /** 被压住的成员从哪一刻起被压：兜底放行按这个时刻算；不再被压时清掉，只留正在压的那些。 */
+    private final Map<String, OffsetDateTime> heldSinceByMember = new ConcurrentHashMap<>();
 
     private final AtomicLong rounds = new AtomicLong();
     private final AtomicLong scanned = new AtomicLong();
@@ -110,7 +128,9 @@ public class WaitMemberResultReceiver {
             @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
             int maxMemberResultChars,
             @Value("${agent.langchain.wait-member.receiver.poll-interval-ms:1000}") long pollIntervalMs,
-            FrozenEffectiveSettings frozenEffectiveSettings) {
+            FrozenEffectiveSettings frozenEffectiveSettings,
+            AcceptanceRunPolicyRegistry acceptancePolicies,
+            AcceptanceReleasePointStore releasePoints) {
         this.waitGroupStore = waitGroupStore;
         this.runMapper = runMapper;
         this.nodeWorkItemStore = nodeWorkItemStore;
@@ -120,6 +140,8 @@ public class WaitMemberResultReceiver {
         this.recoveryDispatcher = recoveryDispatcher;
         this.objectMapper = objectMapper;
         this.settings = settings;
+        this.acceptancePolicies = acceptancePolicies;
+        this.releasePoints = releasePoints;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.pollIntervalMs = Math.max(1L, pollIntervalMs);
         // 登记归一化之后真正在用的值；轮询间隔与 @Scheduled 上那个属性名在启动时各解析一次，
@@ -237,6 +259,13 @@ public class WaitMemberResultReceiver {
             return;
         }
 
+        // 验收夹具的放行策略：被压住的成员这一轮不去接结果，放行点被控制面标成已放行之后才继续。
+        // 放在问沙箱之前，免得压住的每一轮都去拉一次已经有结论的结果。
+        Optional<AcceptanceReleasePolicy> policy = acceptancePolicies.policyForRun(run);
+        if (policy.isPresent() && holdByPolicy(policy.get(), member, group, segment, run, proof)) {
+            return;
+        }
+
         String taskId = proof.taskId();
         if (taskId == null) {
             TaskLookup lookup = lookupByOperation(proof.operationId());
@@ -244,7 +273,8 @@ public class WaitMemberResultReceiver {
                 if (lookup.notFound()) {
                     // 权威地说「没建出来」：这次后台作业不存在，成员按失败落终态，
                     // 否则等待链会一直等一个永远不会有的结果。
-                    finish(member, group, segment, run, proof, null, TASK_NOT_FOUND, "task_not_found");
+                    finish(member, group, segment, run, proof, null, TASK_NOT_FOUND, "task_not_found",
+                            policy.orElse(null));
                     return;
                 }
                 defer(member, now, "task_lookup_unavailable");
@@ -268,7 +298,110 @@ public class WaitMemberResultReceiver {
             defer(member, now, "result_unavailable");
             return;
         }
-        finish(member, group, segment, run, proof, new Terminal(taskId, statusName, result), null, null);
+        finish(member, group, segment, run, proof, new Terminal(taskId, statusName, result), null, null,
+                policy.orElse(null));
+    }
+
+    /**
+     * 这条成员现在该不该被夹具的放行策略压住。
+     *
+     * <p>压住 = 这一轮不去接它的结果：成员保持执行中，只把下次查询时间推一小步，下一轮再看。
+     * 两种放行条件：等同一个等待组里的另外几条成员先落终态，或者等某个放行点被控制面标成已放行。
+     * 成员没有被点名时立刻放行；策略点了这个组里不存在的成员，按成员失败收尾并把原因写清楚——
+     * 那种情况是夹具写错了，压住不动只会让人以为结果还没回来。</p>
+     *
+     * @return true 表示这一轮已经处理完这条成员（压住、或者按策略让它失败）
+     */
+    private boolean holdByPolicy(AcceptanceReleasePolicy policy,
+                                 WaitMember member,
+                                 WaitGroup group,
+                                 NodeWorkItem segment,
+                                 AgentRun run,
+                                 WaitMemberDispatchProof proof) {
+        String toolCallId = member.getToolCallId();
+        String memberKey = member.getMemberIdentity();
+        if (toolCallId == null || toolCallId.isBlank() || !policy.covers(toolCallId)) {
+            heldSinceByMember.remove(memberKey);
+            return false;
+        }
+        List<String> waitingFor = new ArrayList<>();
+        List<String> unknownPeers = new ArrayList<>();
+        collectWaitingPeers(policy.releaseAfter(toolCallId), group, waitingFor, unknownPeers);
+        if (!unknownPeers.isEmpty()) {
+            policyRefusals.incrementAndGet();
+            log.warn("夹具策略点了这个等待组里没有的成员，这条成员按失败收尾：group={} member={} peers={}",
+                    group.getId(), memberKey, String.join(",", unknownPeers));
+            finish(member, group, segment, run, proof, null, POLICY_PEER_UNKNOWN,
+                    "策略里点名的成员不在这个等待组里：" + String.join(",", unknownPeers), policy);
+            return true;
+        }
+        if (!waitingFor.isEmpty()) {
+            return hold(member, "waiting_for:" + String.join(",", waitingFor));
+        }
+        Optional<String> releaseKey = policy.releasePointKey(toolCallId);
+        if (releaseKey.isPresent() && !releasePoints.isOpened(run.getId(), releaseKey.get())) {
+            if (heldTooLong(member, memberKey, policy)) {
+                // 兜底：压过时限还没人放行就照常收尾，读数里单独记一笔，别把「没人放行」当成「被放行」。
+                releasedOnHoldTimeout.incrementAndGet();
+                heldSinceByMember.remove(memberKey);
+                log.warn("夹具策略压住这条成员超过兜底时限，照常收尾：group={} member={} key={}",
+                        group.getId(), memberKey, releaseKey.get());
+                return false;
+            }
+            return hold(member, "waiting_release_point:" + releaseKey.get());
+        }
+        heldSinceByMember.remove(memberKey);
+        return false;
+    }
+
+    /** 按名字找出「还没落终态」的成员，以及这个组里根本没有的名字。 */
+    private void collectWaitingPeers(List<String> names,
+                                     WaitGroup group,
+                                     List<String> waitingFor,
+                                     List<String> unknownPeers) {
+        if (names.isEmpty()) {
+            return;
+        }
+        Map<String, WaitMemberState> statesByToolCallId = new LinkedHashMap<>();
+        for (WaitMember peer : waitGroupStore.listMembers(group.getId())) {
+            if (peer.getToolCallId() != null && !peer.getToolCallId().isBlank()) {
+                statesByToolCallId.put(peer.getToolCallId(), peer.stateEnum());
+            }
+        }
+        for (String name : names) {
+            WaitMemberState state = statesByToolCallId.get(name);
+            if (state == null) {
+                unknownPeers.add(name);
+            } else if (state != WaitMemberState.SUCCEEDED && state != WaitMemberState.FAILED) {
+                waitingFor.add(name);
+            }
+        }
+    }
+
+    /** 压住这条成员：只推下次查询时间，不动退避计数；读数里记一笔。 */
+    private boolean hold(WaitMember member, String reason) {
+        heldSinceByMember.putIfAbsent(member.getMemberIdentity(), OffsetDateTime.now());
+        boolean pushed = waitGroupStore.holdMember(member.getGroupId(), member.getMemberIdentity(),
+                OffsetDateTime.now().plus(Duration.ofMillis(pollIntervalMs)));
+        holdPushes.incrementAndGet();
+        log.debug("夹具策略压住这条成员，等放行：group={} member={} reason={} pushed={}",
+                member.getGroupId(), member.getMemberIdentity(), reason, pushed);
+        return true;
+    }
+
+    /**
+     * 压住的时间超过策略给的兜底时限了吗；策略没写兜底就一直压着。
+     *
+     * <p>计时从本进程第一次压住这条成员那一刻算起，压在库里的只有「下次查询时间」——进程重启会从零
+     * 重新计时。夹具的压住是一场验收里的短时行为，兜底是防止没人放行时整条链停在那里；真要卡
+     * 「压了多久」的硬上限，起点就得写进库里，那是另一件事。</p>
+     */
+    private boolean heldTooLong(WaitMember member, String memberKey, AcceptanceReleasePolicy policy) {
+        if (policy.maxHoldSeconds() <= 0) {
+            return false;
+        }
+        OffsetDateTime since = heldSinceByMember.computeIfAbsent(memberKey, key -> OffsetDateTime.now());
+        return since.plusSeconds(policy.maxHoldSeconds()).isBefore(OffsetDateTime.now());
     }
 
     /**
@@ -284,7 +417,8 @@ public class WaitMemberResultReceiver {
                         WaitMemberDispatchProof proof,
                         Terminal terminal,
                         String failureCode,
-                        String reason) {
+                        String reason,
+                        AcceptanceReleasePolicy policy) {
         String output = terminal == null ? "" : pythonSandboxTools.formatTerminalResult(
                 terminal.statusName(), terminal.result());
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
@@ -295,7 +429,16 @@ public class WaitMemberResultReceiver {
         if (terminal != null) {
             extra.put("taskId", terminal.taskId());
         }
-        if (!success) {
+        String designated = policy == null || member.getToolCallId() == null
+                ? null : policy.designatedFailure(member.getToolCallId()).orElse(null);
+        if (designated != null) {
+            // 夹具点名这条成员按失败收尾：照常走失败路径（名额与用量照旧结算），
+            // 已经把结果拿回来的话也把结果留在成员行里，失败原因单独写清楚。
+            success = false;
+            designatedFailures.incrementAndGet();
+            extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
+            extra.put("errorDetail", designated);
+        } else if (!success) {
             extra.put("errorCode", failureCode != null ? failureCode : errorCodeOf(terminal.statusName()));
             if (reason != null) {
                 extra.put("errorDetail", reason);
@@ -328,6 +471,9 @@ public class WaitMemberResultReceiver {
                 group.getPlanGeneration(),
                 segment.getContextVersion(),
                 run.getRunControlVersion()));
+        // 这条成员有结论了，压住的计时不再需要。成员终态只落一次，这一条在上面那条语句返回 0 行时
+        // 也照样清掉：那时它已经在别处落过终态，计时留着只会白占内存。
+        heldSinceByMember.remove(member.getMemberIdentity());
         if (!result.applied()) {
             // 已经被别人写过（重复上报、或者这条成员已经落过终态）：不重复放行下一段。
             duplicates.incrementAndGet();
@@ -454,6 +600,11 @@ public class WaitMemberResultReceiver {
         snapshot.put("waitMemberReceiverBatchSize", settings.memberReceiverBatchSize().value());
         snapshot.put("waitMemberReceiverPollIntervalMs", pollIntervalMs);
         snapshot.put("waitMemberReceiverBackoff", backoff().describe());
+        snapshot.put("waitMemberReceiverHoldPushesTotal", holdPushes.get());
+        snapshot.put("waitMemberReceiverHeldNow", heldSinceByMember.size());
+        snapshot.put("waitMemberReceiverReleasedOnHoldTimeoutTotal", releasedOnHoldTimeout.get());
+        snapshot.put("waitMemberReceiverDesignatedFailuresTotal", designatedFailures.get());
+        snapshot.put("waitMemberReceiverPolicyRefusalsTotal", policyRefusals.get());
         return snapshot;
     }
 }

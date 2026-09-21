@@ -10,6 +10,10 @@ import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
+import world.willfrog.agentlangchain.tooljob.WaitMemberResultReceiver;
 import world.willfrog.agent.platform.capacity.SchedulerBackpressureProbe;
 
 import java.util.Map;
@@ -47,6 +51,20 @@ class AgentLangchainHealthControllerTest {
 
     @MockBean
     private SchedulerBackpressureProbe schedulerBackpressureProbe;
+
+    // 下面这几个是 /scheduler 那棵树里的读数来源：控制器少一个都建不出来，
+    // 所以这里的替身要与构造器的入参一一对上。
+    @MockBean
+    private DualPoolRecoveryDispatcher dualPoolRecoveryDispatcher;
+
+    @MockBean
+    private DualPoolSchedulerSettings dualPoolSchedulerSettings;
+
+    @MockBean
+    private FrozenEffectiveSettings frozenEffectiveSettings;
+
+    @MockBean
+    private WaitMemberResultReceiver waitMemberResultReceiver;
 
     @Test
     void healthReportsProviderDisabledWithoutReadinessAlert() throws Exception {
