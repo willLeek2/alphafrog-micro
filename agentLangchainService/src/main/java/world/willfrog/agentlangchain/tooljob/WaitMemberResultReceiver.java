@@ -53,9 +53,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>还没到终态就按退避推后下次查询时间：短任务几秒内就问到了，长任务稀疏下来，不让一批长任务
  * 每一轮都占满查询名额。推后只写成员行自己的时间，不影响别的成员。</p>
  *
- * <p>没落终态的成员不会被这条扫描看见（它只收执行中的），所以这里只做「接结果」这一件事。名额释放与
- * 用量结算跟着成员终态走，不在这一路里做：这条扫描够不到它们，混在一起会让「接结果」这件事被
- * 名额和账目的问题拖住。</p>
+ * <p>写成员终态之前先把这次后台作业的名额与用量收尾（{@link WaitMemberSettlement}）：名额还回去、
+ * 用量记下来。收尾没成就不写终态、把这条成员按退避推后，下一轮拿同一份证明重来——反过来先写终态
+ * 再收尾的话，进程在两步之间退出就再也没人回来收尾了（落了终态的成员不在「执行中」的扫描口径里）。</p>
  */
 @Component
 @Slf4j
@@ -73,6 +73,7 @@ public class WaitMemberResultReceiver {
     private final NodeWorkItemStore nodeWorkItemStore;
     private final PythonSandboxService sandboxService;
     private final PythonSandboxTools pythonSandboxTools;
+    private final WaitMemberSettlement settlement;
     private final DualPoolRecoveryDispatcher recoveryDispatcher;
     private final ObjectMapper objectMapper;
     private final RecoveryBackoff backoff;
@@ -88,6 +89,7 @@ public class WaitMemberResultReceiver {
     private final AtomicLong duplicates = new AtomicLong();
     private final AtomicLong isolated = new AtomicLong();
     private final AtomicLong wakeups = new AtomicLong();
+    private final AtomicLong settlementFailures = new AtomicLong();
     private final AtomicLong failures = new AtomicLong();
 
     public WaitMemberResultReceiver(
@@ -96,6 +98,7 @@ public class WaitMemberResultReceiver {
             NodeWorkItemStore nodeWorkItemStore,
             PythonSandboxService sandboxService,
             PythonSandboxTools pythonSandboxTools,
+            WaitMemberSettlement settlement,
             DualPoolRecoveryDispatcher recoveryDispatcher,
             ObjectMapper objectMapper,
             @Value("${agent.langchain.wait-member.receiver.batch-size:8}") int batchSize,
@@ -110,6 +113,7 @@ public class WaitMemberResultReceiver {
         this.nodeWorkItemStore = nodeWorkItemStore;
         this.sandboxService = sandboxService;
         this.pythonSandboxTools = pythonSandboxTools;
+        this.settlement = settlement;
         this.recoveryDispatcher = recoveryDispatcher;
         this.objectMapper = objectMapper;
         this.backoff = new RecoveryBackoff(Duration.ofMillis(Math.max(1L, backoffBaseMs)),
@@ -216,7 +220,7 @@ public class WaitMemberResultReceiver {
                 if (lookup.notFound()) {
                     // 权威地说「没建出来」：这次后台作业不存在，成员按失败落终态，
                     // 否则等待链会一直等一个永远不会有的结果。
-                    finish(member, group, segment, run, null, TASK_NOT_FOUND, "task_not_found");
+                    finish(member, group, segment, run, proof, null, TASK_NOT_FOUND, "task_not_found");
                     return;
                 }
                 defer(member, now, "task_lookup_unavailable");
@@ -240,7 +244,7 @@ public class WaitMemberResultReceiver {
             defer(member, now, "result_unavailable");
             return;
         }
-        finish(member, group, segment, run, new Terminal(taskId, statusName, result), null, null);
+        finish(member, group, segment, run, proof, new Terminal(taskId, statusName, result), null, null);
     }
 
     /**
@@ -253,6 +257,7 @@ public class WaitMemberResultReceiver {
                         WaitGroup group,
                         NodeWorkItem segment,
                         AgentRun run,
+                        WaitMemberDispatchProof proof,
                         Terminal terminal,
                         String failureCode,
                         String reason) {
@@ -274,6 +279,21 @@ public class WaitMemberResultReceiver {
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
+
+        // 先把这次后台作业的账收干净再写成员终态：名额还回去、用量记下来。收尾没成时这条成员
+        // 保持执行中，下一轮拿同一份证明重来（两步都是幂等的），绝不出现「成员已经落终态、
+        // 名额还挂在账上」这种没人会再回来处理的状态。
+        WaitMemberSettlement.Outcome settled = settlement.settle(member, proof,
+                terminal == null ? null : terminal.statusName(),
+                terminal == null ? null : terminal.result(),
+                output);
+        if (!settled.ok()) {
+            settlementFailures.incrementAndGet();
+            log.warn("成员的结果已经拿到，但名额与用量还没收干净，先把这条成员推后：member={} reason={}",
+                    member.getMemberIdentity(), settled.reason());
+            defer(member, OffsetDateTime.now(), "settlement:" + settled.reason());
+            return;
+        }
 
         MemberCompletionResult result = waitGroupStore.completeMember(new MemberCompletionRequest(
                 member.getGroupId(),
@@ -405,6 +425,7 @@ public class WaitMemberResultReceiver {
         snapshot.put("waitMemberReceiverDuplicateTotal", duplicates.get());
         snapshot.put("waitMemberReceiverIsolatedTotal", isolated.get());
         snapshot.put("waitMemberReceiverWakeupsTotal", wakeups.get());
+        snapshot.put("waitMemberReceiverSettlementFailuresTotal", settlementFailures.get());
         snapshot.put("waitMemberReceiverFailuresTotal", failures.get());
         snapshot.put("waitMemberReceiverBatchSize", batchSize);
         snapshot.put("waitMemberReceiverPollIntervalMs", pollIntervalMs);

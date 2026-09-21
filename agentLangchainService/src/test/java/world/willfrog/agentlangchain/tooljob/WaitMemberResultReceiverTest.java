@@ -66,6 +66,7 @@ class WaitMemberResultReceiverTest {
     private NodeWorkItemStore nodeWorkItemStore;
     private PythonSandboxService sandboxService;
     private PythonSandboxTools pythonSandboxTools;
+    private WaitMemberSettlement settlement;
     private DualPoolRecoveryDispatcher recoveryDispatcher;
     private WaitMemberResultReceiver receiver;
 
@@ -76,10 +77,13 @@ class WaitMemberResultReceiverTest {
         nodeWorkItemStore = Mockito.mock(NodeWorkItemStore.class);
         sandboxService = Mockito.mock(PythonSandboxService.class);
         pythonSandboxTools = Mockito.mock(PythonSandboxTools.class);
+        settlement = Mockito.mock(WaitMemberSettlement.class);
         recoveryDispatcher = Mockito.mock(DualPoolRecoveryDispatcher.class);
         receiver = new WaitMemberResultReceiver(waitGroupStore, runMapper, nodeWorkItemStore,
-                sandboxService, pythonSandboxTools, recoveryDispatcher, objectMapper,
+                sandboxService, pythonSandboxTools, settlement, recoveryDispatcher, objectMapper,
                 8, 1000L, 15000L, 6, 4096, 1000L);
+        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(true, null));
 
         Mockito.lenient().when(waitGroupStore.rescheduleMember(anyLong(), anyString(), any(), anyInt()))
                 .thenReturn(true);
@@ -316,6 +320,44 @@ class WaitMemberResultReceiverTest {
         assertThat(receiver.snapshot())
                 .containsEntry("waitMemberReceiverIsolatedTotal", 1L)
                 .containsEntry("waitMemberReceiverCompletedTotal", 1L);
+    }
+
+    /** 名额与用量还没收干净：不写成员终态，把这条成员推后，下一轮重来。 */
+    @Test
+    void aMemberWhoseSettlementIsNotDoneIsNotWritten() {
+        givenDueMember();
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(false, "release:NOT_FOUND"));
+
+        receiver.round();
+
+        verify(waitGroupStore, never()).completeMember(any());
+        verify(recoveryDispatcher, never()).wake(anyLong());
+        verify(waitGroupStore).rescheduleMember(eq(GROUP_ID), eq(MEMBER_IDENTITY), any(), eq(6));
+        assertThat(receiver.snapshot())
+                .containsEntry("waitMemberReceiverSettlementFailuresTotal", 1L)
+                .containsEntry("waitMemberReceiverCompletedTotal", 0L);
+    }
+
+    /** 收尾拿到了这次调用的完整事实：终态名、结果体、以及要交给模型的那份正文。 */
+    @Test
+    void theSettlementSeesTheTerminalFacts() {
+        givenDueMember();
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+
+        ArgumentCaptor<String> statusName = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> preview = ArgumentCaptor.forClass(String.class);
+        verify(settlement).settle(any(), any(), statusName.capture(), any(), preview.capture());
+        assertThat(statusName.getValue()).isEqualTo("SUCCEEDED");
+        assertThat(preview.getValue())
+                .as("交给收尾的正文与写进成员结果的是同一份")
+                .isEqualTo("{\"ok\":true,\"stdout\":\"done\"}");
     }
 
     // ===== 造数据 =====
