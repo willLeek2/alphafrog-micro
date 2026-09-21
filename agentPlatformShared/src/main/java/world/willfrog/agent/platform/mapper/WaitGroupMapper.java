@@ -119,11 +119,25 @@ public interface WaitGroupMapper {
     /**
      * 放行下一段、把组改成已恢复、再把通知改成已消费；三步用 RETURNING 串起来，只有全成或全不写。
      *
-     * <p>Run 状态、计划代际、控制版本、通知的恢复代际与下一段的等待态都必须同时成立。</p>
+     * <p>要成立的条件：这条 Run 的服务所有权还在这位持有者手上（持有者与代际都对得上、租约还没过期）、
+     * Run 状态、计划代际、控制版本、通知的恢复代际、下一段自身的控制版本与等待态。租约行与 Run 行
+     * 在同一句里一起锁住，所以判断和写入之间不会被人接手。</p>
+     *
+     * <p>没消费成时返回明确原因，调用方按原因决定推后还是收口，不用拿自己手上的旧快照猜。</p>
      */
     RecoveryConsumptionRow consumeRecovery(@Param("notificationId") long notificationId,
                                            @Param("dispatcherId") String dispatcherId,
-                                           @Param("runControlVersion") long runControlVersion);
+                                           @Param("runControlVersion") long runControlVersion,
+                                           @Param("ownerInstanceId") String ownerInstanceId,
+                                           @Param("fencingToken") long fencingToken);
+
+    /**
+     * 把一条不可能再被服务的通知收口：只对还在等待态、且给了原因的才写。
+     *
+     * <p>已经取走、已经关闭或者随组取消的通知影响 0 行——收口不是覆盖，抢不到就是别人先处理了。</p>
+     */
+    int closeRecoveryNotification(@Param("notificationId") long notificationId,
+                                  @Param("reason") String reason);
 
     // ===== 取消 =====
 

@@ -23,6 +23,10 @@ public class RecoveryNotification {
     private OffsetDateTime nextVisibleAt;
     private OffsetDateTime consumedAt;
     private String consumedBy;
+    /** 被关闭的原因（短文本）；只有关闭态才有值。 */
+    private String closeReason;
+    /** 被关闭的时刻；只有关闭态才有值。 */
+    private OffsetDateTime closedAt;
     private OffsetDateTime createdAt;
     private OffsetDateTime updatedAt;
 
@@ -32,5 +36,10 @@ public class RecoveryNotification {
 
     public boolean consumable() {
         return stateEnum() == RecoveryNotificationState.WAITING;
+    }
+
+    /** 这条通知是不是已经被收口成关闭态。 */
+    public boolean closed() {
+        return stateEnum() == RecoveryNotificationState.CLOSED;
     }
 }

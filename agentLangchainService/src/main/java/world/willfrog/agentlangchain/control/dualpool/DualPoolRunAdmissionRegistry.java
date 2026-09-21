@@ -326,6 +326,23 @@ public class DualPoolRunAdmissionRegistry {
         return false;
     }
 
+    /**
+     * 恢复路径的受理预留：已经有活的准入生命周期就直接返回「已受理」，否则占一个可回滚的预留。
+     *
+     * <p>返回值里的 {@code epoch} 为 -1 表示这一次没有新占预留（本来就已经受理），调用方不需要
+     * 激活，也不需要回滚。恢复消费是一锤子买卖，预留必须在这之前拿到手：拿不到就不消费。</p>
+     */
+    public Admission reserveForRecovery(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return Admission.rejected();
+        }
+        knownRunIds.add(runId);
+        if (isAdmitted(runId)) {
+            return new Admission(true, -1L);
+        }
+        return admitExistingRunWithLease(runId);
+    }
+
     /** 同一进程内的追问或显式恢复可以重新占用业务名额；重启前未知的 Run 一律拒绝。 */
     public boolean admitExistingRun(String runId) {
         Admission admission = admitExistingRunWithLease(runId);

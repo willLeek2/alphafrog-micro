@@ -37,7 +37,25 @@ public interface WaitGroupStore {
      *
      * <p>Run 的状态或控制版本不符时整条语句什么都不做（通知留在原地），调用方不得把这种情况当成成功。</p>
      */
-    RecoveryConsumptionResult consumeRecovery(long notificationId, String dispatcherId, long runControlVersion);
+    /**
+     * 消费一条恢复通知：放行下一段、组改成已恢复、通知改成已消费。
+     *
+     * <p>调用方必须带着自己手上的服务所有权（持有者与代际）进来：语句会把租约行与 Run 行一起锁住，
+     * 非所有者、过期代际、以及判断与写入之间被接手的情形都影响 0 行。</p>
+     */
+    RecoveryConsumptionResult consumeRecovery(long notificationId,
+                                              String dispatcherId,
+                                              long runControlVersion,
+                                              String ownerInstanceId,
+                                              long fencingToken);
+
+    /**
+     * 把一条不可能再被服务的通知收口成关闭态并写明原因；只对还在等待态的通知生效。
+     *
+     * <p>用于 Run 已经终态、计划或控制版本已经作废、下一段已经不在等待态这些情形：继续退避只会
+     * 让它永久占用固定扫描名额。返回 false 表示这条通知已经被别人取走、关闭或取消。</p>
+     */
+    boolean closeRecoveryNotification(long notificationId, String reason);
 
     /** 取消一条等待链：组、还没结束的成员、下一段与还没被取走的通知一起停。 */
     WaitChainCancelResult cancelChain(long groupId);

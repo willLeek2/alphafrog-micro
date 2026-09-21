@@ -170,26 +170,53 @@ class MybatisWaitGroupStoreTest {
 
     @Test
     void recoveryConsumptionDistinguishesNotMineFromHalfDone() {
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L)))
+        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
                 .thenReturn(consumption(1, 1, 77L, 3));
-        RecoveryConsumptionResult done = store.consumeRecovery(5L, "dispatcher-1", 3L);
+        RecoveryConsumptionResult done = store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L);
         assertThat(done.succeeded()).isTrue();
         assertThat(done.inconsistent()).isFalse();
 
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L)))
-                .thenReturn(consumption(0, 0, null, null));
-        RecoveryConsumptionResult skipped = store.consumeRecovery(5L, "dispatcher-1", 3L);
+        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
+                .thenReturn(consumption(0, 0, null, null, "LEASE_NOT_OWNED", "owner-2"));
+        RecoveryConsumptionResult skipped = store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L);
         assertThat(skipped.succeeded()).isFalse();
         assertThat(skipped.inconsistent())
                 .as("什么都没做不算不一致，只有取走了通知却没放行下一段才算")
                 .isFalse();
+        assertThat(skipped.rejection())
+                .as("取不走的原因由语句给出，调用方不用自己猜")
+                .isEqualTo(RecoveryRejection.LEASE_NOT_OWNED);
+        assertThat(skipped.permanent()).as("所有权不在手上只是暂时取不走").isFalse();
 
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L)))
+        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
+                .thenReturn(consumption(0, 0, null, null, "RUN_TERMINAL", "COMPLETED"));
+        RecoveryConsumptionResult terminal = store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L);
+        assertThat(terminal.permanent()).as("Run 已经终态：该收口关闭，不再退避").isTrue();
+        assertThat(terminal.rejection().closeReason("COMPLETED")).isEqualTo("run_terminal:COMPLETED");
+
+        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
                 .thenReturn(consumption(1, 0, 77L, null));
-        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 3L))
+        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L))
                 .as("三条写入是串起来的，半成品说明库里的东西跟这套假设对不上，必须当场报出来")
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("半成品");
+
+        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
+                .thenReturn(consumption(1, 1, 77L, null));
+        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L))
+                .as("放行了下一段却没带回完整身份：通知已经不可逆地取走，这种结果不能当成成功")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("身份");
+    }
+
+    @Test
+    void closingANotificationOnlyAppliesToWaitingOnes() {
+        when(mapper.closeRecoveryNotification(eq(5L), eq("run_terminal:COMPLETED"))).thenReturn(1);
+        assertThat(store.closeRecoveryNotification(5L, "run_terminal:COMPLETED")).isTrue();
+
+        when(mapper.closeRecoveryNotification(eq(6L), anyString())).thenReturn(0);
+        assertThat(store.closeRecoveryNotification(6L, "next_segment_missing"))
+                .as("已经被取走或关闭的通知收口影响 0 行").isFalse();
     }
 
     // ===== 取消与读取 =====
@@ -232,8 +259,14 @@ class MybatisWaitGroupStoreTest {
 
     @Test
     void invalidRequestsNeverReachTheMapper() {
-        assertThatThrownBy(() -> store.consumeRecovery(0L, "dispatcher-1", 1L))
+        assertThatThrownBy(() -> store.consumeRecovery(0L, "dispatcher-1", 1L, "owner-1", 9L))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 1L, " ", 9L))
+                .as("没有服务所有权就不许消费").isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 1L, "owner-1", 0L))
+                .as("代际号无效就不许消费").isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> store.closeRecoveryNotification(5L, " "))
+                .as("收口必须写明原因").isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.cancelChain(0L))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.rescheduleMember(77L, "call_1", null, 9))
@@ -312,11 +345,26 @@ class MybatisWaitGroupStoreTest {
 
     private static RecoveryConsumptionRow consumption(Integer consumed, Integer promoted,
                                                       Long groupId, Integer nextSequence) {
+        return consumption(consumed, promoted, groupId, nextSequence, null, null);
+    }
+
+    private static RecoveryConsumptionRow consumption(Integer consumed, Integer promoted,
+                                                      Long groupId, Integer nextSequence,
+                                                      String rejection, String rejectionDetail) {
         RecoveryConsumptionRow row = new RecoveryConsumptionRow();
         row.setConsumed(consumed);
         row.setPromoted(promoted);
         row.setGroupId(groupId);
-        row.setNextSegmentSequence(nextSequence);
+        if (nextSequence != null) {
+            // 放行成功时五个身份字段必须齐全，缺一个存储层就要报出来。
+            row.setNextRunId("run-1");
+            row.setNextPlanGeneration(0);
+            row.setNextNodeId("node-1");
+            row.setNextNodeAttempt(0);
+            row.setNextSegmentSequence(nextSequence);
+        }
+        row.setRejection(rejection);
+        row.setRejectionDetail(rejectionDetail);
         return row;
     }
 }
