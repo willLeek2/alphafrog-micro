@@ -6,6 +6,8 @@ import world.willfrog.agent.platform.wait.MemberCompletionResult;
 import world.willfrog.agent.platform.wait.RecoveryConsumptionResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.wait.RecoveryNotification;
+import world.willfrog.agent.platform.wait.RecoveryNotificationState;
+import world.willfrog.agent.platform.wait.RecoveryRejection;
 import world.willfrog.agent.platform.wait.WaitChainCancelResult;
 import world.willfrog.agent.platform.wait.WaitGroup;
 import world.willfrog.agent.platform.wait.WaitGroupIdentity;
@@ -201,10 +203,13 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
     @Override
     public RecoveryConsumptionResult consumeRecovery(long notificationId,
                                                      String dispatcherId,
-                                                     long runControlVersion) {
+                                                     long runControlVersion,
+                                                     String ownerInstanceId,
+                                                     long fencingToken) {
         RecoveryNotification notification = notifications.get(notificationId);
         if (notification == null || !"WAITING".equals(notification.getState())) {
-            return new RecoveryConsumptionResult(false, false, null, null);
+            return new RecoveryConsumptionResult(false, false, null, null,
+                    RecoveryRejection.NOTIFICATION_NOT_WAITING, null);
         }
         notification.setState("CONSUMED");
         FakeGroup group = groups.get(notification.getGroupId());
@@ -216,7 +221,20 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
         return new RecoveryConsumptionResult(true, true, group.id,
                 new NodeWorkItemIdentity(group.identity.runId(), group.identity.planGeneration(),
                         group.identity.nodeId(), group.identity.nodeAttempt(),
-                        group.nextSegmentSequence));
+                        group.nextSegmentSequence), null, null);
+    }
+
+    @Override
+    public boolean closeRecoveryNotification(long notificationId, String reason) {
+        RecoveryNotification notification = notifications.get(notificationId);
+        if (notification == null || !"WAITING".equals(notification.getState())) {
+            return false;
+        }
+        notification.setState(RecoveryNotificationState.CLOSED.name());
+        notification.setCloseReason(reason);
+        notification.setClosedAt(OffsetDateTime.now());
+        events.add("recovery_closed:notification=" + notificationId + " reason=" + reason);
+        return true;
     }
 
     @Override

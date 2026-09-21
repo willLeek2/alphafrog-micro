@@ -131,14 +131,24 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     @Override
     public RecoveryConsumptionResult consumeRecovery(long notificationId,
                                                      String dispatcherId,
-                                                     long runControlVersion) {
+                                                     long runControlVersion,
+                                                     String ownerInstanceId,
+                                                     long fencingToken) {
         if (notificationId <= 0) {
             throw new IllegalArgumentException("恢复通知编号必须为正数：" + notificationId);
         }
         if (dispatcherId == null || dispatcherId.isBlank()) {
             throw new IllegalArgumentException("恢复消费必须留下消费方标识");
         }
-        RecoveryConsumptionRow row = mapper.consumeRecovery(notificationId, dispatcherId, runControlVersion);
+        if (ownerInstanceId == null || ownerInstanceId.isBlank()) {
+            // 没有所有权就不该走到这里：消费必须在「这条 Run 归我动」的前提下进行。
+            throw new IllegalArgumentException("恢复消费必须带上服务所有权持有者");
+        }
+        if (fencingToken <= 0) {
+            throw new IllegalArgumentException("恢复消费必须带上有效的服务所有权代际：" + fencingToken);
+        }
+        RecoveryConsumptionRow row = mapper.consumeRecovery(notificationId, dispatcherId,
+                runControlVersion, ownerInstanceId, fencingToken);
         if (row == null) {
             throw new IllegalStateException("恢复消费语句没有返回结果行：notification=" + notificationId);
         }
@@ -146,7 +156,9 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                 value(row.getConsumed()) > 0,
                 value(row.getPromoted()) > 0,
                 row.getGroupId(),
-                row.nextSegment());
+                row.nextSegment(),
+                RecoveryRejection.fromWire(row.getRejection()),
+                row.getRejectionDetail());
         if (result.inconsistent()) {
             // 三条写入在语句里是用 RETURNING 串起来的，只可能全成或全不写。出现半成品说明库里的
             // 事实与这段代码的假设对不上，必须当场报出来——恢复资格只有一条，放过去就再也找不回。
@@ -154,7 +166,25 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                     + " group=" + row.getGroupId() + " consumed=" + row.getConsumed()
                     + " promoted=" + row.getPromoted());
         }
+        if ((result.consumed() || result.promoted()) && result.nextSegment() == null) {
+            // 放行了下一段却拿不到完整身份：通知已经不可逆地取走，调用方却不知道该投哪一段。
+            // 这种结果绝不能当成成功返回，必须当场报出来。
+            throw new IllegalStateException("恢复消费放行了下一段但没有返回完整身份：notification="
+                    + notificationId + " group=" + row.getGroupId()
+                    + " consumed=" + row.getConsumed() + " promoted=" + row.getPromoted());
+        }
         return result;
+    }
+
+    @Override
+    public boolean closeRecoveryNotification(long notificationId, String reason) {
+        if (notificationId <= 0) {
+            throw new IllegalArgumentException("恢复通知编号必须为正数：" + notificationId);
+        }
+        if (reason == null || reason.isBlank()) {
+            throw new IllegalArgumentException("关闭恢复通知必须写明原因");
+        }
+        return mapper.closeRecoveryNotification(notificationId, reason.strip()) > 0;
     }
 
     @Override

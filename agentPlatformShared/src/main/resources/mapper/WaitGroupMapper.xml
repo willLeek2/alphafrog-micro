@@ -62,6 +62,8 @@
         <result property="nextVisibleAt" column="next_visible_at"/>
         <result property="consumedAt" column="consumed_at"/>
         <result property="consumedBy" column="consumed_by"/>
+        <result property="closeReason" column="close_reason"/>
+        <result property="closedAt" column="closed_at"/>
         <result property="createdAt" column="created_at"/>
         <result property="updatedAt" column="updated_at"/>
     </resultMap>
@@ -75,6 +77,8 @@
         <result property="writtenMembers" column="written_members"/>
         <result property="writtenNextSegments" column="written_next_segments"/>
         <result property="nextSegmentSequence" column="next_segment_sequence"/>
+        <result property="rejection" column="rejection"/>
+        <result property="rejectionDetail" column="rejection_detail"/>
     </resultMap>
 
     <!-- 成员结束语句的返回：这一次结束有没有算进组，组现在处在哪一步。 -->
@@ -274,6 +278,8 @@
                next_visible_at,
                consumed_at,
                consumed_by,
+               close_reason,
+               closed_at,
                created_at,
                updated_at
         FROM alphafrog_agent_run_recovery_notification
@@ -290,6 +296,8 @@
                next_visible_at,
                consumed_at,
                consumed_by,
+               close_reason,
+               closed_at,
                created_at,
                updated_at
         FROM alphafrog_agent_run_recovery_notification
@@ -313,6 +321,8 @@
                next_visible_at,
                consumed_at,
                consumed_by,
+               close_reason,
+               closed_at,
                created_at,
                updated_at
         FROM alphafrog_agent_run_recovery_notification
@@ -335,6 +345,22 @@
         WHERE id = #{notificationId}
           AND state = 'WAITING'
           AND next_visible_at &lt; #{nextVisibleAt}
+    </update>
+
+    <!--
+      把一条通知收口成关闭态：只对还在等待态的通知生效，并且必须写明原因。
+
+      收口是条件更新，不是覆盖：已经取走的、已经关闭的、随组取消的通知都影响 0 行。关闭不删行，
+      原因留在这一行上，事后能查这条资格为什么没有被服务。
+    -->
+    <update id="closeRecoveryNotification">
+        UPDATE alphafrog_agent_run_recovery_notification SET
+            state = 'CLOSED',
+            close_reason = #{reason},
+            closed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{notificationId}
+          AND state = 'WAITING'
     </update>
 
     <!-- ==================== 整组挂起 ==================== -->
@@ -685,9 +711,16 @@
       所以只有两种结局：三件都成，或者一件都不写。不允许出现「通知已经算消费掉、下一段却没放行」——
       恢复资格只有一条，丢了就永远不再出现，等待链会一直停在那里。
 
-      能进这段的条件一次给全：Run 还在执行且计划代际没推进、控制版本没变，通知没到期不取，
-      通知的恢复代际必须等于组当前的恢复代际（旧代际的通知作废），组必须已经齐备，
-      并且下一段必须确实还在等待态。
+      能进这段的条件一次给全：
+      - 这条 Run 的服务所有权确实在这位调用者手上：租约行的持有者与代际都对得上、并且还没过期。
+        租约行与 Run 行在同一句里一起锁住，核对与写入之间不会被人接手；非所有者或旧代际一行都改不动。
+      - Run 还在执行、计划代际没推进、控制版本没变。
+      - 通知没被取走、已经到了时间、恢复代际等于组当前代际（旧代际的通知作废）、组已经齐备。
+      - 下一段确实还在等待态，而且它自己保存的控制版本与 Run 当前控制版本一致：段是旧控制代际的
+        产物时不能放行，否则「暂停过又继续」的 Run 会把作废的那一段当成新的一段放出去。
+
+      取不成时把原因一起带回去：调用方按原因决定推后还是收口关闭，不用拿自己手上的旧快照猜。
+      原因与判断出自同一份库状态，只读不写，不参与结果。
     -->
     <select id="consumeRecovery" resultMap="RecoveryConsumptionResultMap"
             affectData="true" flushCache="true">
@@ -697,6 +730,11 @@
             JOIN alphafrog_agent_run_recovery_notification n
                  ON n.id = #{notificationId} AND n.run_id = r.id
             JOIN alphafrog_agent_run_wait_group g ON g.id = n.group_id
+            JOIN alphafrog_agent_run_service_lease l
+                 ON l.run_id = r.id
+                AND l.owner_instance_id = #{ownerInstanceId}
+                AND l.fencing_token = #{fencingToken}
+                AND l.expires_at > CURRENT_TIMESTAMP
             WHERE n.state = 'WAITING'
               AND n.next_visible_at &lt;= CURRENT_TIMESTAMP
               AND n.recovery_generation = g.recovery_generation
@@ -711,8 +749,9 @@
                     AND wi.node_id = g.node_id
                     AND wi.node_attempt = g.node_attempt
                     AND wi.segment_sequence = g.next_segment_sequence
-                    AND wi.state = 'WAITING')
-            FOR UPDATE OF r
+                    AND wi.state = 'WAITING'
+                    AND wi.run_control_version = r.run_control_version)
+            FOR UPDATE OF r, n, l
         ),
         segment_promoted AS (
             UPDATE alphafrog_agent_run_work_item wi SET
@@ -723,6 +762,12 @@
             FROM run_fence f
             WHERE wi.run_id = f.run_id
               AND wi.state = 'WAITING'
+              -- 放行那一步自己也再核对一遍控制代际：这一段必须属于 Run 当前的控制版本。
+              AND EXISTS (
+                  SELECT 1 FROM alphafrog_agent_run r
+                  WHERE r.id = f.run_id
+                    AND r.status = 'EXECUTING'
+                    AND r.run_control_version = wi.run_control_version)
               AND EXISTS (
                   SELECT 1 FROM alphafrog_agent_run_wait_group g
                   WHERE g.id = f.group_id
@@ -755,6 +800,60 @@
             -- 组号要与通知主键一起返回：主查询要按它回报这次消费放行的是哪条链，
             -- 只返回主键的话主查询点不到 group_id 这一列。
             RETURNING n.id, n.group_id
+        ),
+        -- 这一条通知现在为什么取不走：与上面的判断用同一份库状态，从最前面的条件开始逐条问，
+        -- 第一个不成立的就是原因。全部成立时原因为空——那说明这次消费本该成功。
+        diagnosis AS (
+            SELECT
+                CASE
+                    WHEN n.state &lt;&gt; 'WAITING' THEN 'NOTIFICATION_NOT_WAITING'
+                    WHEN n.next_visible_at &gt; CURRENT_TIMESTAMP THEN 'NOTIFICATION_NOT_DUE'
+                    WHEN r.id IS NULL THEN 'RUN_MISSING'
+                    WHEN g.id IS NULL THEN 'GROUP_MISSING'
+                    WHEN n.recovery_generation &lt;&gt; g.recovery_generation THEN 'GENERATION_STALE'
+                    WHEN g.state = 'CANCELED' THEN 'GROUP_CANCELED'
+                    WHEN g.state = 'RESUMED' THEN 'GROUP_ALREADY_RESUMED'
+                    WHEN g.state &lt;&gt; 'READY' THEN 'GROUP_NOT_READY'
+                    WHEN r.status IN ('COMPLETED', 'FAILED', 'CANCELED', 'EXPIRED', 'PARTIAL')
+                        THEN 'RUN_TERMINAL'
+                    WHEN r.status = 'CANCELING' THEN 'RUN_CANCELING'
+                    WHEN r.status &lt;&gt; 'EXECUTING' THEN 'RUN_NOT_EXECUTING'
+                    WHEN r.plan_generation &lt;&gt; g.plan_generation THEN 'PLAN_GENERATION_STALE'
+                    WHEN r.run_control_version &lt;&gt; #{runControlVersion}
+                        THEN 'RUN_CONTROL_VERSION_CHANGED'
+                    WHEN wi.id IS NULL THEN 'NEXT_SEGMENT_MISSING'
+                    WHEN wi.run_control_version &lt;&gt; r.run_control_version
+                        THEN 'SEGMENT_CONTROL_VERSION_STALE'
+                    WHEN wi.state IN ('RESUMABLE', 'RUNNABLE', 'CLAIMED', 'EXECUTING')
+                        THEN 'NEXT_SEGMENT_ACTIVE'
+                    WHEN wi.state &lt;&gt; 'WAITING' THEN 'NEXT_SEGMENT_TERMINAL'
+                    WHEN l.run_id IS NULL
+                         OR l.owner_instance_id &lt;&gt; #{ownerInstanceId}
+                         OR l.fencing_token &lt;&gt; #{fencingToken}
+                         OR l.expires_at &lt;= CURRENT_TIMESTAMP
+                        THEN 'LEASE_NOT_OWNED'
+                    ELSE 'UNKNOWN'
+                END AS rejection,
+                CASE
+                    WHEN n.state &lt;&gt; 'WAITING' THEN n.state
+                    WHEN r.id IS NULL OR g.id IS NULL THEN NULL
+                    WHEN g.state = 'CANCELED' OR g.state = 'RESUMED' THEN g.state
+                    WHEN r.status &lt;&gt; 'EXECUTING' THEN r.status
+                    WHEN wi.id IS NULL THEN NULL
+                    WHEN wi.state &lt;&gt; 'WAITING' THEN wi.state
+                    ELSE NULL
+                END AS rejection_detail
+            FROM alphafrog_agent_run_recovery_notification n
+            LEFT JOIN alphafrog_agent_run_wait_group g ON g.id = n.group_id
+            LEFT JOIN alphafrog_agent_run r ON r.id = n.run_id
+            LEFT JOIN alphafrog_agent_run_service_lease l ON l.run_id = n.run_id
+            LEFT JOIN alphafrog_agent_run_work_item wi
+                   ON wi.run_id = g.run_id
+                  AND wi.plan_generation = g.plan_generation
+                  AND wi.node_id = g.node_id
+                  AND wi.node_attempt = g.node_attempt
+                  AND wi.segment_sequence = g.next_segment_sequence
+            WHERE n.id = #{notificationId}
         )
         SELECT
             (SELECT count(*) FROM notification_consumed) AS consumed,
@@ -766,7 +865,10 @@
             (SELECT plan_generation FROM segment_promoted) AS next_plan_generation,
             (SELECT node_id FROM segment_promoted) AS next_node_id,
             (SELECT node_attempt FROM segment_promoted) AS next_node_attempt,
-            (SELECT segment_sequence FROM segment_promoted) AS next_segment_sequence
+            (SELECT segment_sequence FROM segment_promoted) AS next_segment_sequence,
+            -- 取不成的那些：原因与补充状态一起带回去。
+            (SELECT rejection FROM diagnosis) AS rejection,
+            (SELECT rejection_detail FROM diagnosis) AS rejection_detail
     </select>
 
     <!-- ==================== 整链取消 ==================== -->

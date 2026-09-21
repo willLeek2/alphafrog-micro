@@ -21,6 +21,10 @@ public class RecoveryConsumptionRow {
     private String nextNodeId;
     private Integer nextNodeAttempt;
     private Integer nextSegmentSequence;
+    /** 没消费成的原因（语句里的枚举名）；消费成功时为 {@code null}。 */
+    private String rejection;
+    /** 与原因同一行读到的补充状态，可空。 */
+    private String rejectionDetail;
 
     /** 放行出来的分段身份；没放行时为 {@code null}。 */
     public NodeWorkItemIdentity nextSegment() {

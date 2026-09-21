@@ -706,23 +706,27 @@ class Stage3WaitContractPostgresTest {
                 WaitMemberState.SUCCEEDED, fixture.runControlVersion());
         assertThat(completion.notificationId()).isNotNull();
         long notificationId = completion.notificationId();
+        long token = ownRun(fixture.runId(), "dispatcher-1");
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
             RecoveryConsumptionResult wrongVersion = store.consumeRecovery(notificationId, "dispatcher-1",
-                    fixture.runControlVersion() + 7);
+                    fixture.runControlVersion() + 7, "dispatcher-1", token);
             assertThat(wrongVersion.consumed())
                     .as("控制版本不符时通知取不走，下一段也不会被放行").isFalse();
             RecoveryConsumptionResult first = store.consumeRecovery(notificationId, "dispatcher-1",
-                    fixture.runControlVersion());
+                    fixture.runControlVersion(), "dispatcher-1", token);
             assertThat(first.consumed()).isTrue();
             assertThat(first.promoted()).isTrue();
             assertThat(first.groupId())
                     .as("消费结果要带回放行的是哪条链：这条数从消费语句里取，取不到就说明语句点错了列")
                     .isEqualTo(fixture.groupId());
-            RecoveryConsumptionResult second = store.consumeRecovery(notificationId, "dispatcher-2",
-                    fixture.runControlVersion());
+            RecoveryConsumptionResult second = store.consumeRecovery(notificationId, "dispatcher-1",
+                    fixture.runControlVersion(), "dispatcher-1", token);
             assertThat(second.consumed())
                     .as("同一代际的恢复资格只能被取走一次").isFalse();
+            assertThat(second.rejection())
+                    .as("取不走的原因由语句给出：这条资格已经有主")
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection.NOTIFICATION_NOT_WAITING);
             assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item "
                     + "WHERE run_id = '" + fixture.runId() + "' AND state = 'RESUMABLE'"))
                     .as("下一段只被放行一次").isEqualTo(1);
@@ -758,8 +762,9 @@ class Stage3WaitContractPostgresTest {
 
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            long token = ownRun(second.runId(), "dispatcher-2");
             RecoveryConsumptionResult result = store.consumeRecovery(secondId, "dispatcher-2",
-                    second.runControlVersion());
+                    second.runControlVersion(), "dispatcher-2", token);
             assertThat(result.consumed()).isTrue();
             assertThat(result.promoted()).isTrue();
         }
@@ -808,10 +813,17 @@ class Stage3WaitContractPostgresTest {
         execute("UPDATE alphafrog_agent_run SET plan_generation = 1 WHERE id = '" + consuming.runId() + "'");
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            long token = ownRun(consuming.runId(), "dispatcher-3");
             RecoveryConsumptionResult result = store.consumeRecovery(notificationId, "dispatcher-3",
-                    consuming.runControlVersion());
+                    consuming.runControlVersion(), "dispatcher-3", token);
             assertThat(result.consumed()).as("计划代际已经变了，这条恢复资格取不走").isFalse();
             assertThat(result.promoted()).isFalse();
+            assertThat(result.rejection())
+                    .as("原因是计划代际已经推进，不是「还没轮到我」")
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection.PLAN_GENERATION_STALE);
+            assertThat(result.permanent())
+                    .as("计划代际推进之后这条资格不会再有下一次：该收口，不该一直退避")
+                    .isTrue();
         }
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
                 + "WHERE id = " + notificationId + " AND state = 'WAITING'"))
@@ -844,10 +856,21 @@ class Stage3WaitContractPostgresTest {
 
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
-            assertThat(store.consumeRecovery(notificationA, "dispatcher-a",
-                    movedAhead.runControlVersion()).consumed()).isFalse();
-            assertThat(store.consumeRecovery(notificationB, "dispatcher-b",
-                    newerGeneration.runControlVersion()).consumed()).isFalse();
+            long tokenA = ownRun(movedAhead.runId(), "dispatcher-a");
+            RecoveryConsumptionResult blockedA = store.consumeRecovery(notificationA, "dispatcher-a",
+                    movedAhead.runControlVersion(), "dispatcher-a", tokenA);
+            assertThat(blockedA.consumed()).isFalse();
+            assertThat(blockedA.rejection())
+                    .as("下一段已经在执行链上，这条资格已经用掉了")
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection.NEXT_SEGMENT_ACTIVE);
+
+            long tokenB = ownRun(newerGeneration.runId(), "dispatcher-b");
+            RecoveryConsumptionResult blockedB = store.consumeRecovery(notificationB, "dispatcher-b",
+                    newerGeneration.runControlVersion(), "dispatcher-b", tokenB);
+            assertThat(blockedB.consumed()).isFalse();
+            assertThat(blockedB.rejection())
+                    .as("通知的恢复代际落后于组当前代际")
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection.GENERATION_STALE);
         }
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
                 + "WHERE id IN (" + notificationA + ", " + notificationB + ") AND state = 'WAITING'"))
@@ -857,6 +880,125 @@ class Stage3WaitContractPostgresTest {
                 + movedAhead.runId() + "', '" + newerGeneration.runId() + "') AND state = 'RESUMABLE'"))
                 .as("两条链的下一段都没有被放行")
                 .isZero();
+    }
+
+    // ==================== 服务所有权与关闭态 ====================
+
+    /**
+     * 不是所有者 / 旧代际拿不走恢复资格；合法接手之后新主人拿得走。
+     *
+     * <p>恢复消费是「把下一段放成可恢复」这种不可逆的动作，所以它必须与 Run 的服务所有权绑在一起：
+     * 消费语句在同一次条件更新里核对持有者与代际，并在同一句里锁住租约行，判断与写入之间不被接手。</p>
+     */
+    @Test
+    void onlyTheLeaseOwnerCanConsumeTheRecoveryEntitlement() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-lease-consume", 1, 0L);
+        long notificationId = completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                fixture.runControlVersion()).notificationId();
+        long firstToken = ownRun(fixture.runId(), "owner-a");
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            RecoveryConsumptionResult notMine = store.consumeRecovery(notificationId, "dispatcher-b",
+                    fixture.runControlVersion(), "owner-b", firstToken);
+            assertThat(notMine.consumed()).as("不是所有者：一行都改不动").isFalse();
+            assertThat(notMine.rejection())
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection.LEASE_NOT_OWNED);
+            assertThat(notMine.permanent())
+                    .as("所有权在别人手上只是暂时取不走，不该收口").isFalse();
+        }
+
+        // 让租约过期，由另一个持有者接手：代际加一，旧代际立刻作废。
+        execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP "
+                + "- interval '1 minute' WHERE run_id = '" + fixture.runId() + "'");
+        long secondToken = ownRun(fixture.runId(), "owner-b");
+        assertThat(secondToken).as("接手之后代际往前走了").isEqualTo(firstToken + 1);
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            RecoveryConsumptionResult staleToken = store.consumeRecovery(notificationId, "dispatcher-a",
+                    fixture.runControlVersion(), "owner-a", firstToken);
+            assertThat(staleToken.consumed())
+                    .as("旧代际在业务写入上写不动任何一行").isFalse();
+            assertThat(staleToken.rejection())
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection.LEASE_NOT_OWNED);
+
+            RecoveryConsumptionResult mine = store.consumeRecovery(notificationId, "dispatcher-b",
+                    fixture.runControlVersion(), "owner-b", secondToken);
+            assertThat(mine.consumed()).as("接手之后新主人能正常消费").isTrue();
+            assertThat(mine.nextSegment()).as("消费成功必须带回完整的下一段身份").isNotNull();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + fixture.runId() + "' AND segment_sequence = 1 AND state = 'RESUMABLE'")).isEqualTo(1);
+    }
+
+    /**
+     * 下一段自己保存的控制版本与 Run 当前控制版本不一致时不许放行。
+     *
+     * <p>暂停、取消这些控制动作会让旧控制代际的工作项作废。只核对外层传进来的控制版本挡不住它：
+     * 外层刚读到的就是「当前版本」，作废的是那一段自己存着的版本。</p>
+     */
+    @Test
+    void aSegmentFromAnOldControlGenerationCannotBeReleased() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-seg-version", 1, 0L);
+        long notificationId = completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                fixture.runControlVersion()).notificationId();
+        execute("UPDATE alphafrog_agent_run_work_item SET run_control_version = run_control_version + 1 "
+                + "WHERE run_id = '" + fixture.runId() + "' AND segment_sequence = 1");
+        long token = ownRun(fixture.runId(), "dispatcher-seg");
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            RecoveryConsumptionResult result = store.consumeRecovery(notificationId, "dispatcher-seg",
+                    fixture.runControlVersion(), "dispatcher-seg", token);
+            assertThat(result.consumed()).as("作废的那一段不能当新的一段放出去").isFalse();
+            assertThat(result.rejection())
+                    .isEqualTo(world.willfrog.agent.platform.wait.RecoveryRejection
+                            .SEGMENT_CONTROL_VERSION_STALE);
+            assertThat(result.permanent()).as("这种资格不会再有下一次").isTrue();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id = " + notificationId + " AND state = 'WAITING'"))
+                .as("通知留在等待态：收口是调用方拿着原因去做的，语句本身不改状态")
+                .isEqualTo(1);
+    }
+
+    /**
+     * 收口成关闭态：只对等待态生效，原因与时刻都落库，重复收口影响 0 行。
+     */
+    @Test
+    void closingANotificationWritesReasonAndStopsAtTerminalStates() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-close", 1, 0L);
+        long notificationId = completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                fixture.runControlVersion()).notificationId();
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            assertThat(store.closeRecoveryNotification(notificationId, "run_terminal:COMPLETED"))
+                    .as("等待态的通知可以收口").isTrue();
+            assertThat(store.closeRecoveryNotification(notificationId, "run_terminal:COMPLETED"))
+                    .as("已经关闭的通知再收口影响 0 行").isFalse();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id = " + notificationId + " AND state = 'CLOSED' "
+                + "AND close_reason = 'run_terminal:COMPLETED' AND closed_at IS NOT NULL"))
+                .as("关闭状态、原因与时刻一起落库").isEqualTo(1);
+
+        // 已经取走或随组取消的通知不能被收口改状态：收口是条件更新，不是覆盖。
+        GroupFixture consumed = suspendSimpleGroup("run-close-consumed", 1, 0L);
+        long consumedId = completeMember(consumed.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                consumed.runControlVersion()).notificationId();
+        long token = ownRun(consumed.runId(), "dispatcher-close");
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
+            assertThat(store.consumeRecovery(consumedId, "dispatcher-close",
+                    consumed.runControlVersion(), "dispatcher-close", token).consumed()).isTrue();
+            assertThat(store.closeRecoveryNotification(consumedId, "run_terminal:COMPLETED"))
+                    .as("已经取走的通知不会被收口改成关闭态").isFalse();
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_recovery_notification "
+                + "WHERE id = " + consumedId + " AND state = 'CONSUMED'"))
+                .as("取走就是取走，不能被后来的收口覆盖").isEqualTo(1);
     }
 
     /**
@@ -1584,6 +1726,16 @@ class Stage3WaitContractPostgresTest {
     private static List<NodeWorkItem> latestSegments(String runId, int planGeneration) {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             return session.getMapper(NodeWorkItemMapper.class).listLatestSegments(runId, planGeneration);
+        }
+    }
+
+    /** 让这条 Run 的服务所有权归某个持有者，返回代际号；恢复消费必须先有这条事实。 */
+    private static long ownRun(String runId, String owner) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return new MybatisRunServiceLeaseStore(session.getMapper(RunServiceLeaseMapper.class))
+                    .acquire(runId, owner, java.time.Duration.ofMinutes(2))
+                    .orElseThrow(() -> new IllegalStateException("没能取得服务所有权：" + runId))
+                    .fencingToken();
         }
     }
 

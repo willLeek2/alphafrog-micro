@@ -193,7 +193,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         completeMember(groupId, "call-a", "第一个结果");
         Long notificationId = completeMember(groupId, "call-b", "第二个结果");
         assertThat(notificationId).as("最后一个成员让整组齐备").isNotNull();
-        store.consumeRecovery(notificationId, "test-dispatcher", 0L);
+        store.consumeRecovery(notificationId, "test-dispatcher", 0L, "test-owner", 1L);
 
         JsonNode nextPayload = nextPayload(0, 0);
         model.enqueue(AiMessage.from("汇总完成"));
@@ -524,7 +524,8 @@ class DualPoolWaitGroupNodeExecutorTest {
         @Override
         public boolean publish(long notificationId, long runControlVersion, NodeWorkItemIdentity nextSegment) {
             published.add(new Published(notificationId, runControlVersion, nextSegment));
-            return store.consumeRecovery(notificationId, "test-publisher", runControlVersion).succeeded();
+            return store.consumeRecovery(notificationId, "test-publisher", runControlVersion,
+                    "test-owner", 1L).succeeded();
         }
     }
 }

@@ -8,7 +8,8 @@ import java.util.List;
  *
  * <p>通知是「这个等待组的结果齐备了、可以恢复了」这条事实的持久载体。{@link #WAITING} 等待被恢复分发器取走；
  * {@link #CONSUMED} 已经被取走一次，同一代际不再有第二次机会；{@link #CANCELED} 随组一起取消，
- * 迟到的结果不会再唤醒任何东西。</p>
+ * 迟到的结果不会再唤醒任何东西；{@link #CLOSED} 是「不可能再被服务」的收口：Run 已经终态、计划或控制
+ * 版本已经作废、下一段已经不在等待态这些情形，继续退避只会永久占用扫描名额，所以落成关闭态并写明原因。</p>
  *
  * <p>消费是一次条件更新，不是先读后写：只有把 {@code WAITING} 改成 {@code CONSUMED} 的那一次调用算消费成功，
  * 并发的第二个分发器会得到影响行数 0。这也是「最后一个成员只产生一次恢复资格」能被证明的地方。</p>
@@ -17,7 +18,8 @@ public enum RecoveryNotificationState {
 
     WAITING("待恢复分发器取走", false),
     CONSUMED("已被取走一次", true),
-    CANCELED("已随组取消", true);
+    CANCELED("已随组取消", true),
+    CLOSED("不可能再被服务，已收口", true);
 
     private final String label;
     private final boolean terminal;
