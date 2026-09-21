@@ -6,6 +6,7 @@ import world.willfrog.agent.platform.wait.RecoveryNotificationState;
 import world.willfrog.agent.platform.wait.WaitGroupState;
 import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.platform.workitem.NodeDispatchDeferReason;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -169,16 +170,18 @@ class Stage3WaitGroupMigrationTest {
     }
 
     @Test
-    void waitFactsAreOwnedByTheNewSchedulerVersionOnly() {
-        String normalized = normalize(script);
-        assertThat(normalized)
+    void waitGroupFactsAreV2OnlyWhileRunCoordinationIsShared() {
+        assertThat(normalize(script))
                 .as("等待组只属于 DUAL_POOL_V2；老版本走各自的锚点，不写等待事实")
                 .contains("CONSTRAINT alphafrog_agent_run_wait_group_scheduler_version_check "
                         + "CHECK (scheduler_version = 'DUAL_POOL_V2')");
-        assertThat(normalized)
-                .as("Run 协调资格同样只属于 DUAL_POOL_V2")
-                .contains("CONSTRAINT alphafrog_agent_run_coordination_scheduler_version_check "
-                        + "CHECK (scheduler_version = 'DUAL_POOL_V2')");
+        assertThat(MigrationScripts.constraintValues(script,
+                "alphafrog_agent_run_coordination_scheduler_version_check"))
+                .as("Run 协调资格是旧、新版本共用的入口：老 Run 也要能建出资格行参与公平轮转，"
+                        + "这里不能跟着等待组一起收窄")
+                .containsExactlyElementsOf(java.util.Arrays.stream(SchedulerVersion.values())
+                        .map(Enum::name)
+                        .toList());
     }
 
     // ===== Java 枚举与库里约束一致 =====

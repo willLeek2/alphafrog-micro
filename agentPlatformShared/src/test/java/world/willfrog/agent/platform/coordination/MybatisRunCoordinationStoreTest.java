@@ -45,6 +45,18 @@ class MybatisRunCoordinationStoreTest {
     }
 
     @Test
+    void ensureWorksForEveryKnownVersionBecauseCoordinationIsShared() {
+        when(mapper.ensure(anyString(), anyString(), anyInt())).thenReturn(1);
+        for (SchedulerVersion version : SchedulerVersion.values()) {
+            assertThat(store.ensure("run-shared", version, 0))
+                    .as("协调资格是新旧版本共用的入口，老 Run 也要能建出这一行：" + version)
+                    .isTrue();
+        }
+        verify(mapper).ensure("run-shared", "LEGACY", 0);
+        verify(mapper).ensure("run-shared", "DUAL_POOL_V2", 0);
+    }
+
+    @Test
     void deferWithoutAnEligibilityRowReportsFalse() {
         when(mapper.deferFor(anyString(), anyString(), org.mockito.ArgumentMatchers.any()))
                 .thenReturn(0);

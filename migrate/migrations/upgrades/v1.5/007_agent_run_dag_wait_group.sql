@@ -104,6 +104,10 @@ COMMENT ON COLUMN alphafrog_agent_run_work_item.dispatch_defer_reason IS
 -- 阶段三直接使用已有的 Run 身份分组，不另外造一份分组身份；这一行只承载调度侧的资格事实。
 -- plan_generation 跟随 Run 主记录：还没有计划时是 -1，计划建好或代际推进时一起改写。
 --
+-- 版本列允许三种已知版本：Run 协调是旧、新版本共用的入口（共用协调名额、共用按 Run 分组的
+-- 轮转），老 Run 也要能建出一行协调资格来参与公平轮转。等待组那张表的版本列则只允许新版本，
+-- 两者不要混为一谈。
+--
 -- 轮转位置分两组：Run 协调与节点派发各走一个轮次空间，各记各的进度。合成一组会让两个
 -- 调度器互相改写对方的进度，公平性就无从算起。
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run_coordination (
@@ -119,7 +123,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run_coordination (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT alphafrog_agent_run_coordination_scheduler_version_check
-        CHECK (scheduler_version = 'DUAL_POOL_V2'),
+        CHECK (scheduler_version IN ('LEGACY', 'DUAL_POOL_V1', 'DUAL_POOL_V2')),
     CONSTRAINT alphafrog_agent_run_coordination_plan_generation_check
         CHECK (plan_generation >= -1),
     CONSTRAINT alphafrog_agent_run_coordination_defer_reason_check

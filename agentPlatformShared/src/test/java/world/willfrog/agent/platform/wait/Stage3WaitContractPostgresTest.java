@@ -127,17 +127,23 @@ class Stage3WaitContractPostgresTest {
     }
 
     @Test
-    void coordinationRejectsNodeDispatchReasonAndOldVersions() throws Exception {
-        createRun("run-coord", 0, 0L);
-        expectRejected("INSERT INTO alphafrog_agent_run_coordination "
-                + "(run_id, scheduler_version, defer_reason) "
-                + "VALUES ('run-coord', 'DUAL_POOL_V2', 'HINT_QUEUE_FULL')",
-                "alphafrog_agent_run_coordination_defer_reason_check");
-        expectRejected("INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version) "
-                + "VALUES ('run-coord', 'DUAL_POOL_V1')",
+    void coordinationAcceptsEveryKnownVersionAndRejectsNodeDispatchReason() throws Exception {
+        String insert = "INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version, "
+                + "defer_reason) VALUES ";
+        createRun("run-coord-v2", 0, 0L);
+        createRun("run-coord-v1", 0, 0L);
+        createRun("run-coord-old", 0, 0L);
+        execute(insert + "('run-coord-v2', 'DUAL_POOL_V2', 'PER_ROUND_NEW_NODE_LIMIT')");
+        execute(insert + "('run-coord-v1', 'DUAL_POOL_V1', NULL)");
+        execute(insert + "('run-coord-old', 'LEGACY', NULL)");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination"))
+                .as("旧版本也要能建出协调资格：协调名额与轮转是新旧版本共用的入口")
+                .isEqualTo(3);
+        expectRejected(insert + "('run-coord-v2', 'DUAL_POOL_V9', NULL)",
                 "alphafrog_agent_run_coordination_scheduler_version_check");
-        execute("INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version, defer_reason) "
-                + "VALUES ('run-coord', 'DUAL_POOL_V2', 'PER_ROUND_NEW_NODE_LIMIT')");
+        expectRejected("UPDATE alphafrog_agent_run_coordination SET defer_reason = 'HINT_QUEUE_FULL' "
+                + "WHERE run_id = 'run-coord-v2'",
+                "alphafrog_agent_run_coordination_defer_reason_check");
     }
 
     @Test
