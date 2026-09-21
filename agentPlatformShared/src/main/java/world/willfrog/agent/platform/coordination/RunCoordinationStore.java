@@ -59,10 +59,14 @@ public interface RunCoordinationStore {
      */
     List<RunCoordination> scanDue(int limit);
 
-    /** 一轮结束时刷新连续未获协调的轮数，给公平性观测用；只统计本轮有资格的候选，计数只增不减。 */
+    /**
+     * 一轮结束时刷新连续未获协调的轮数，给公平性观测用：这一轮有资格却没被服务的各加一轮。
+     *
+     * <p>按轮递增而不是按轮次差补算，否则延期等待一段时间后重新可见，会把没竞争的轮数一次算进去。</p>
+     */
     int refreshCoordinationMissedRounds(long roundNumber);
 
-    /** 一轮结束时刷新连续未获派发的轮数，口径与协调那一组相同、空间不同。 */
+    /** 一轮结束时刷新连续未获派发的轮数，口径与协调那一组相同（每轮加一）、空间不同。 */
     int refreshDispatchMissedRounds(long roundNumber);
 
     Optional<RunCoordination> find(String runId);

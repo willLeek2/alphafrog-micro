@@ -1,5 +1,6 @@
 package world.willfrog.agent.platform.wait;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.ibatis.builder.xml.XMLMapperBuilder;
 import org.apache.ibatis.io.Resources;
 import org.apache.ibatis.mapping.Environment;
@@ -7,7 +8,8 @@ import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.SqlSession;
 import org.apache.ibatis.session.SqlSessionFactory;
 import org.apache.ibatis.session.SqlSessionFactoryBuilder;
-import org.apache.ibatis.transaction.jdbc.JdbcTransactionFactory;
+import org.mockito.Mockito;
+import org.mybatis.spring.transaction.SpringManagedTransactionFactory;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
@@ -17,11 +19,15 @@ import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
 import world.willfrog.agent.platform.capacity.MybatisSchedulerStateStore;
 import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
 import world.willfrog.agent.platform.coordination.RunCoordination;
@@ -33,6 +39,12 @@ import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
 import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.service.AgentMessageService;
+import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.platform.service.AgentRunEventRedisStore;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
@@ -56,6 +68,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * 阶段三数据合同与等待链在真实 PostgreSQL 上的验证。
@@ -84,6 +97,7 @@ class Stage3WaitContractPostgresTest {
 
     private static final String STAGE3_SCRIPT = "007_agent_run_dag_wait_group.sql";
     private static final String DISPATCH_PROOF_SCRIPT = "008_agent_run_wait_member_dispatch_proof.sql";
+    private static final String CONSUMED_BY_SCRIPT = "009_agent_run_recovery_consumed_by_check.sql";
     private static final String SCHEMA = "stage3_contract_" + UUID.randomUUID().toString().replace("-", "");
     private static final int CONCURRENT_THREADS = 4;
     private static final int HIGH_WATERMARK = 128;
@@ -285,6 +299,75 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.scanDue(10))
                 .extracting(RunCoordination::getRunId)
                 .containsExactly("run-legacy", "run-warm", "run-hot", "run-cold");
+    }
+
+    @Test
+    void missedRoundsCountOnlyTheRoundsTheRunWasActuallyCompeting() throws Exception {
+        createRunFor("run-competing", "user-missed", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        RunCoordinationStore store = coordinationStore();
+        assertThat(store.ensure("run-competing")).isTrue();
+
+        // 第一轮它在候选里没被服务：记一轮。
+        store.refreshCoordinationMissedRounds(1);
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
+                .isEqualTo(1);
+
+        // 主动延期一小时：这段间隔里它根本没排队，刷新一轮都不该算到它头上。
+        assertThat(store.deferFor("run-competing", RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT,
+                OffsetDateTime.now().plusHours(1), 0, 0L)).isTrue();
+        for (long round = 2; round <= 6; round++) {
+            store.refreshCoordinationMissedRounds(round);
+        }
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
+                .as("延期等待中的记录不在候选里，这五轮不算「没被服务」")
+                .isEqualTo(1);
+
+        // 重新可见：只加真正排队的这一轮。用轮次差补算会一次写出 6，那是它没在竞争的轮数。
+        execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP "
+                + "WHERE run_id = 'run-competing'");
+        store.refreshCoordinationMissedRounds(7);
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
+                .as("重新具备资格的第一轮只加一轮")
+                .isEqualTo(2);
+        store.refreshCoordinationMissedRounds(8);
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
+                .as("连续两轮站着排队都没轮到：加两轮")
+                .isEqualTo(3);
+
+        // 被服务：清零；已经服务过的这一轮不算没被服务。
+        assertThat(store.markCoordinationServed("run-competing", 9)).isTrue();
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds()).isZero();
+        store.refreshCoordinationMissedRounds(9);
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
+                .as("服务轮次就是刚结束这一轮：它被服务了，不加")
+                .isZero();
+        store.refreshCoordinationMissedRounds(10);
+        assertThat(store.find("run-competing").orElseThrow().getCoordinationMissedRounds())
+                .isEqualTo(1);
+
+        // 派发那一组：候选资格看的是「此刻确实有到期可领取的节点」。
+        createRunFor("run-competing-node", "user-missed-node", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        assertThat(store.ensure("run-competing-node")).isTrue();
+        createSegment("run-competing-node", 0, "node-1", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        store.refreshDispatchMissedRounds(20);
+        assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds())
+                .isEqualTo(1);
+        execute("UPDATE alphafrog_agent_run_work_item "
+                + "SET next_visible_at = CURRENT_TIMESTAMP + INTERVAL '1 hour' "
+                + "WHERE run_id = 'run-competing-node'");
+        store.refreshDispatchMissedRounds(21);
+        assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds())
+                .as("没有到期可领节点的图谈不上被派发机会漏掉")
+                .isEqualTo(1);
+        execute("UPDATE alphafrog_agent_run_work_item SET next_visible_at = CURRENT_TIMESTAMP "
+                + "WHERE run_id = 'run-competing-node'");
+        store.refreshDispatchMissedRounds(22);
+        store.refreshDispatchMissedRounds(23);
+        assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds())
+                .as("连续两轮有可领节点都没轮到：加两轮")
+                .isEqualTo(3);
+        assertThat(store.markDispatchServed("run-competing-node", 24)).isTrue();
+        assertThat(store.find("run-competing-node").orElseThrow().getDispatchMissedRounds()).isZero();
     }
 
     @Test
@@ -686,6 +769,157 @@ class Stage3WaitContractPostgresTest {
                 .isZero();
     }
 
+    // ==================== 恢复通知的消费方 ====================
+
+    /**
+     * 消费方标识写进去就必须有意义：空白字符串、以及「状态说已消费却没有消费方」都要被数据库挡住。
+     *
+     * <p>恢复通知是等待链唯一的一次放行资格，谁取走的必须查得到，否则事后只剩一条「有消费时刻、
+     * 没有消费方」的审计记录。这条约束来自 009 脚本，它已经放进同一份升级链里整份跑过两遍。</p>
+     */
+    @Test
+    void recoveryNotificationConsumedByMustBeMeaningful() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-consumed-by", 1, 0L);
+        Long notificationId = completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
+                fixture.runControlVersion()).notificationId();
+        assertThat(notificationId).isNotNull();
+        String notification = "alphafrog_agent_run_recovery_notification WHERE id = " + notificationId;
+
+        expectRejected("UPDATE " + notification + " SET consumed_by = '   '",
+                "alphafrog_agent_run_recovery_notification_consumed_by_check");
+        expectRejected("UPDATE " + notification + " SET consumed_by = ''",
+                "alphafrog_agent_run_recovery_notification_consumed_by_check");
+        expectRejected("UPDATE " + notification + " SET state = 'CONSUMED', "
+                        + "consumed_at = CURRENT_TIMESTAMP",
+                "alphafrog_agent_run_recovery_notification_consumed_by_check");
+
+        // 还没被取走时留空是常态，约束不许把它当成错的。
+        execute("UPDATE " + notification + " SET consumed_by = NULL");
+        // 正常取走：状态、时刻、消费方三样齐全，写进去。
+        execute("UPDATE " + notification + " SET state = 'CONSUMED', "
+                + "consumed_at = CURRENT_TIMESTAMP, consumed_by = 'dispatcher-1'");
+        assertThat(countRows("SELECT count(*) FROM " + notification
+                + " AND state = 'CONSUMED' AND consumed_by = 'dispatcher-1'"))
+                .isEqualTo(1);
+    }
+
+    // ==================== Run 创建与接收事实 ====================
+
+    /**
+     * Run 主记录与 RUN_RECEIVED 接收事实必须落在同一条事务里：接收事实写不进去时，Run 也不许留下。
+     *
+     * <p>做法是把事件表临时改名，让那条插入必然失败，再回头看 Run 主表有没有残留。留下的半成品
+     * （有 Run、没有接收事实）会被幂等重试直接读回，缺失的事实再也没人补，所以这一条要在真库上量。
+     * 名字改回来之后同一个幂等键必须还能正常建：回滚不许留下挡住重试的东西。</p>
+     */
+    @Test
+    void aRunWithoutItsReceivedFactIsRolledBack() throws Exception {
+        AgentRunEventService service = admissionService();
+        String key = "key-rollback-1";
+        execute("ALTER TABLE alphafrog_agent_run_event RENAME TO alphafrog_agent_run_event_hidden");
+        try {
+            assertThatThrownBy(() -> createNewRun(service, "user-rollback", key))
+                    .as("接收事实写不进去，创建必须整体失败")
+                    .isInstanceOf(IllegalStateException.class);
+        } finally {
+            execute("ALTER TABLE alphafrog_agent_run_event_hidden "
+                    + "RENAME TO alphafrog_agent_run_event");
+        }
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run WHERE user_id = 'user-rollback' "
+                + "AND idempotency_key = '" + key + "'"))
+                .as("事件没写成，Run 主记录也不许留下")
+                .isZero();
+
+        AgentRunEventService.RunCreation retried = createNewRun(service, "user-rollback", key);
+        assertThat(retried.created()).as("回滚之后同一个键还能正常建").isTrue();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run WHERE user_id = 'user-rollback' "
+                + "AND idempotency_key = '" + key + "'")).isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_event WHERE run_id = '"
+                + retried.run().getId() + "' AND event_type = 'RUN_RECEIVED'"))
+                .as("新建的 Run 恰好一条接收事实")
+                .isEqualTo(1);
+    }
+
+    /**
+     * 同一个幂等键的两个请求同时到达：库里只留一条 Run、一条接收事实，其中一个请求拿到「新建」。
+     *
+     * <p>另一条走的是并发分支——要么在唯一索引上撞车后读回先写入的那条，要么在插入之前就查到它。
+     * 两条路都只允许读回，不许再建一条：同一次请求执行两遍的根子就在这里。返回的 {@code created}
+     * 就是上层据此决定「要不要准入、要不要启动」的那个标志。</p>
+     */
+    @Test
+    void twoRequestsWithTheSameKeyLeaveExactlyOneRunAndOneReceivedFact() throws Exception {
+        AgentRunEventService service = admissionService();
+        String key = "key-race-1";
+        List<AgentRunEventService.RunCreation> results = runConcurrently(2,
+                ignored -> createNewRun(service, "user-race", key));
+
+        assertThat(results).hasSize(2);
+        assertThat(results.stream().filter(AgentRunEventService.RunCreation::created).count())
+                .as("同时到达的同键请求只有一个真的新建")
+                .isEqualTo(1);
+        assertThat(results).extracting(result -> result.run().getId())
+                .as("两条路返回的必须是同一条 Run")
+                .containsOnly(results.get(0).run().getId());
+
+        String runId = results.get(0).run().getId();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run WHERE user_id = 'user-race' "
+                + "AND idempotency_key = '" + key + "'"))
+                .as("库里只留一条 Run")
+                .isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_event WHERE run_id = '" + runId
+                + "' AND event_type = 'RUN_RECEIVED'"))
+                .as("库里只留一条接收事实：读回的那条不许再写一次")
+                .isEqualTo(1);
+    }
+
+    /**
+     * 真库上的服务对象：映射器与事务管理器都是真的，只有 Redis、消息、提示词这些外部协作者用替身。
+     *
+     * <p>要量的是事务与唯一约束的行为，映射器和事务管理器就不能是替身；Redis 顺手用替身，
+     * 事件序号按固定 1 返回，正好覆盖「每条链只写一条接收事实」。</p>
+     */
+    private static AgentRunEventService admissionService() {
+        SqlSessionTemplate template = new SqlSessionTemplate(sqlSessionFactory);
+        StringRedisTemplate redisTemplate = Mockito.mock(StringRedisTemplate.class);
+        @SuppressWarnings("unchecked")
+        ValueOperations<String, String> valueOperations = Mockito.mock(ValueOperations.class);
+        Mockito.lenient().when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        Mockito.lenient().when(valueOperations.increment(Mockito.anyString())).thenReturn(1L);
+        AgentPromptService promptService = Mockito.mock(AgentPromptService.class);
+        Mockito.lenient().when(promptService.snapshotPromptSelection(
+                        Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(new PromptRunSelection(PromptRunSelection.SCHEMA_VERSION, "default-v1",
+                        "control", "bundle-digest", "capability-digest",
+                        java.time.LocalDate.of(2025, 2, 3)));
+        Mockito.lenient().when(promptService.snapshotDataFreshness()).thenReturn(null);
+
+        AgentRunEventService service = new AgentRunEventService(
+                template.getMapper(AgentRunMapper.class),
+                template.getMapper(AgentRunEventMapper.class),
+                Mockito.mock(AgentRunEventRedisStore.class),
+                new ObjectMapper(),
+                redisTemplate,
+                Mockito.mock(AgentLlmLocalConfigLoader.class),
+                Mockito.mock(AgentMessageService.class),
+                promptService,
+                new DataSourceTransactionManager(dataSource));
+        // 这些值平时由配置注入，直接 new 出来是 0/空；显式给上，免得量的是个退化配置。
+        ReflectionTestUtils.setField(service, "ttlMinutes", 60);
+        ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
+        ReflectionTestUtils.setField(service, "payloadMaxChars", 10000);
+        ReflectionTestUtils.setField(service, "payloadPreviewChars", 4096);
+        return service;
+    }
+
+    /** 一次正常的创建请求：内容固定，便于同键请求算出同一份请求摘要。 */
+    private static AgentRunEventService.RunCreation createNewRun(AgentRunEventService service,
+                                                                String userId, String idempotencyKey) {
+        return service.createRun(userId, "真库探针创建请求", "{}", idempotencyKey, "m", "e", false,
+                "openrouter", 2, false, "{}", "stable", "gen-" + "a".repeat(64), null,
+                SchedulerVersion.DUAL_POOL_V2.name(), false, false);
+    }
+
     // ==================== 全局容量的并发判定 ====================
 
     /**
@@ -738,7 +972,7 @@ class Stage3WaitContractPostgresTest {
     /** 每份脚本整份执行两遍：第二遍必须一样通过，证明脚本可以重复执行。 */
     private static void applyStage3ScriptsTwice() throws Exception {
         for (int round = 1; round <= 2; round++) {
-            for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT)) {
+            for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -754,10 +988,14 @@ class Stage3WaitContractPostgresTest {
     }
 
     private static SqlSessionFactory buildSessionFactory(DataSource source) throws Exception {
+        // 事务工厂用 Spring 那一套：容量并发用例走 SqlSessionTemplate + DataSourceTransactionManager，
+        // 会话要能挂进当前事务。直接用 JdbcTransactionFactory 建出来的工厂接不上 Spring 的事务，
+        // 用例会在「代理后面才有行锁」这件事上量了个空。
         Configuration configuration = new Configuration(
-                new Environment("stage3-postgres", new JdbcTransactionFactory(), source));
+                new Environment("stage3-postgres", new SpringManagedTransactionFactory(), source));
         for (String resource : List.of("mapper/WaitGroupMapper.xml", "mapper/NodeWorkItemMapper.xml",
-                "mapper/AgentRunMapper.xml", "mapper/RunCoordinationMapper.xml",
+                "mapper/AgentRunMapper.xml", "mapper/AgentRunEventMapper.xml",
+                "mapper/RunCoordinationMapper.xml",
                 "mapper/SchedulerStateMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
@@ -1015,7 +1253,8 @@ class Stage3WaitContractPostgresTest {
 
     // ==================== 连接串 ====================
 
-    private record Target(String jdbcUrl, String user, String password) {
+    /** 解析出来的连接信息；包内可见，好让不需要真库的守卫用例直接调解析函数。 */
+    record Target(String jdbcUrl, String user, String password) {
     }
 
     /**
@@ -1027,17 +1266,15 @@ class Stage3WaitContractPostgresTest {
      * {@code AF_STAGE3_PG_PASSWORD} 两个环境变量。</p>
      *
      * <p>两种写法都支持：{@code postgres(ql)://host:port/db} 与已经写好的
-     * {@code jdbc:postgresql://...}。前一种只取主机、端口、库名与查询参数，不会把整串照搬过去。</p>
+     * {@code jdbc:postgresql://...}。前一种只取主机、端口、库名与查询参数，不会把整串照搬过去。
+     * 两种写法都要查查询参数：{@code ?user=...&password=...} 会一路交给驱动，等于把口令带进连接。</p>
      */
-    private static Target resolveTarget(String dsn) {
+    static Target resolveTarget(String dsn) {
         String user = env("AF_STAGE3_PG_USER");
         String password = env("AF_STAGE3_PG_PASSWORD");
         if (dsn.startsWith("jdbc:")) {
-            String lowered = dsn.toLowerCase(java.util.Locale.ROOT);
-            if (lowered.contains("user=") || lowered.contains("password=")) {
-                throw new IllegalStateException("连接串里不许带账号口令：请改用 AF_STAGE3_PG_USER 与 "
-                        + "AF_STAGE3_PG_PASSWORD 两个环境变量传入");
-            }
+            rejectUserInfo(dsn.substring("jdbc:".length()), "AF_STAGE3_PG_DSN");
+            rejectCredentialParams(rawQueryOf(dsn));
             return new Target(dsn, user, password);
         }
         URI uri;
@@ -1048,16 +1285,65 @@ class Stage3WaitContractPostgresTest {
             throw new IllegalStateException("AF_STAGE3_PG_DSN 解析不了：请用 "
                     + "postgresql://host:port/db 或 jdbc:postgresql://host:port/db 的写法");
         }
-        if (uri.getUserInfo() != null) {
-            throw new IllegalStateException("AF_STAGE3_PG_DSN 里不许带账号口令：请改用 "
-                    + "AF_STAGE3_PG_USER 与 AF_STAGE3_PG_PASSWORD 两个环境变量传入");
-        }
+        rejectUserInfo(dsn, "AF_STAGE3_PG_DSN");
+        rejectCredentialParams(uri.getRawQuery());
         String host = uri.getHost() == null ? "127.0.0.1" : uri.getHost();
         int port = uri.getPort() == -1 ? 5432 : uri.getPort();
         String database = uri.getPath() == null || uri.getPath().isEmpty() ? "/postgres" : uri.getPath();
-        // 查询参数原样带上（ssl 之类的设置不能丢），但不重建连接串里的凭证部分。
-        String query = uri.getQuery() == null || uri.getQuery().isEmpty() ? "" : "?" + uri.getQuery();
+        // 查询参数用原始串带上（ssl 之类不能丢，编码也原样保留），但不重建连接串里的凭证部分。
+        String rawQuery = uri.getRawQuery();
+        String query = rawQuery == null || rawQuery.isEmpty() ? "" : "?" + rawQuery;
         return new Target("jdbc:postgresql://" + host + ":" + port + database + query, user, password);
+    }
+
+    /** 连接串的主机前面有没有 {@code user:pass@}。解析不了的串在这里当没有，交给参数检查那一关。 */
+    private static void rejectUserInfo(String url, String variableName) {
+        try {
+            if (URI.create(url).getUserInfo() != null) {
+                throw new IllegalStateException(variableName + " 里不许带账号口令：请改用 "
+                        + "AF_STAGE3_PG_USER 与 AF_STAGE3_PG_PASSWORD 两个环境变量传入");
+            }
+        } catch (IllegalArgumentException ignored) {
+            // 结构不对的串在这里不拦：真正的失败会在连接时报出来。
+        }
+    }
+
+    /**
+     * 连接串的查询参数里不许有账号口令。
+     *
+     * <p>参数按原始查询串拆，不先解码整串：先解码会把 {@code %26} 这类编码拆成新的分隔符，
+     * 参数边界就变了。参数名解码之后再比，大小写不同的 {@code USER=}/{@code Password=} 一样挡住。</p>
+     */
+    private static void rejectCredentialParams(String rawQuery) {
+        if (rawQuery == null || rawQuery.isEmpty()) {
+            return;
+        }
+        for (String pair : rawQuery.split("&")) {
+            int equals = pair.indexOf('=');
+            String rawName = equals < 0 ? pair : pair.substring(0, equals);
+            String name;
+            try {
+                name = java.net.URLDecoder.decode(rawName, java.nio.charset.StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException e) {
+                name = rawName;
+            }
+            String lowered = name.strip().toLowerCase(java.util.Locale.ROOT);
+            if ("user".equals(lowered) || "password".equals(lowered)) {
+                throw new IllegalStateException("连接串里不许带账号口令：请改用 AF_STAGE3_PG_USER 与 "
+                        + "AF_STAGE3_PG_PASSWORD 两个环境变量传入");
+            }
+        }
+    }
+
+    /** 从连接串里取出原始查询串（解码之前），没有就返回空串。 */
+    private static String rawQueryOf(String url) {
+        int question = url.indexOf('?');
+        if (question < 0) {
+            return "";
+        }
+        String rest = url.substring(question + 1);
+        int hash = rest.indexOf('#');
+        return hash < 0 ? rest : rest.substring(0, hash);
     }
 
     /**

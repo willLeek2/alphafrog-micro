@@ -145,31 +145,33 @@
     </select>
 
     <!--
-      一轮结束时刷新「连续未获协调轮数」。
+      一轮结束时，给「这一轮确实站着排队却没轮到」的记录各加一轮。
 
-      只统计这一轮真正有资格竞争的 Run：还活着的、且已经到下次可见时间的（主动延期等待中的图
-      这一轮根本没参加竞争，不该记它「没被服务」）。计数只增不减：轮次号可能因为跨实例的
-      先后到达而回退，直接把差值写回去会把已有的轮数改小。
+      口径是每轮加一，不按全局轮次差补算。差值法会把「没在竞争的那段时间」也算成没被服务：
+      一张图延期一百轮之后重新可见，差值是 99，可它这九十九轮根本没排队。按轮递增只数真正
+      有资格却没拿到机会的轮数。
+
+      有资格的条件与扫描同一份：还活着、且已经到下次可见时间。这一轮里被服务过的
+      （服务轮次就是刚结束这一轮）不加，主动延期等待中的不加。计数只增不减。
     -->
     <update id="refreshCoordinationMissedRounds">
         UPDATE alphafrog_agent_run_coordination c SET
-            coordination_missed_rounds = GREATEST(#{roundNumber} - c.coordination_served_round - 1, 0),
+            coordination_missed_rounds = c.coordination_missed_rounds + 1,
             updated_at = CURRENT_TIMESTAMP
         FROM alphafrog_agent_run r
         WHERE r.id = c.run_id
           AND r.status IN (<include refid="liveRunStatuses"/>)
           AND c.next_visible_at &lt;= CURRENT_TIMESTAMP
           AND c.coordination_served_round &lt; #{roundNumber}
-          AND GREATEST(#{roundNumber} - c.coordination_served_round - 1, 0) &gt; c.coordination_missed_rounds
     </update>
 
     <!--
-      派发那一组的刷新，口径相同、字段不同。这一组的「有资格竞争」还要求这张图此刻确实有到期
-      可领取的节点：没有可领节点的图谈不上被派发机会漏掉。
+      派发那一组的刷新，口径相同（每轮加一）、字段不同。这一组的「有资格竞争」还要求这张图此刻
+      确实有到期可领取的节点：没有可领节点的图谈不上被派发机会漏掉。
     -->
     <update id="refreshDispatchMissedRounds">
         UPDATE alphafrog_agent_run_coordination c SET
-            dispatch_missed_rounds = GREATEST(#{roundNumber} - c.dispatch_served_round - 1, 0),
+            dispatch_missed_rounds = c.dispatch_missed_rounds + 1,
             updated_at = CURRENT_TIMESTAMP
         FROM alphafrog_agent_run r
         WHERE r.id = c.run_id
@@ -181,7 +183,6 @@
                 AND wi.state IN ('RUNNABLE', 'RESUMABLE')
                 AND wi.next_visible_at &lt;= CURRENT_TIMESTAMP
           )
-          AND GREATEST(#{roundNumber} - c.dispatch_served_round - 1, 0) &gt; c.dispatch_missed_rounds
     </update>
 
     <select id="find" resultMap="RunCoordinationResultMap">

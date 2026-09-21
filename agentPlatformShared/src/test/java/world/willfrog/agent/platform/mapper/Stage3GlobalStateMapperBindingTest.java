@@ -184,9 +184,10 @@ class Stage3GlobalStateMapperBindingTest {
         assertThat(sql).as("协调这一轮不改派发轮的进度")
                 .doesNotContain("dispatch_served_round").doesNotContain("dispatch_missed_rounds");
         String refresh = sql("RunCoordinationMapper", "refreshCoordinationMissedRounds");
-        assertThat(refresh).as("连续未获协调轮数按「当前轮次减上次协调轮次减一」算，只增不减")
-                .contains("GREATEST(? - c.coordination_served_round - 1, 0)")
-                .contains("> c.coordination_missed_rounds");
+        assertThat(refresh).as("连续未获协调轮数每轮加一：不按全局轮次差补算，延期期间它没在竞争")
+                .contains("coordination_missed_rounds = c.coordination_missed_rounds + 1")
+                .doesNotContain("GREATEST")
+                .contains("c.coordination_served_round < ?");
         assertThat(refresh).as("刷新口径与扫描一致：一次全局刷新，不按版本分池")
                 .doesNotContain("c.scheduler_version =");
     }
@@ -199,10 +200,11 @@ class Stage3GlobalStateMapperBindingTest {
         assertThat(sql).as("延期原因是协调层的事实，派发不许替它清掉")
                 .doesNotContain("defer_reason");
         String refresh = sql("RunCoordinationMapper", "refreshDispatchMissedRounds");
-        assertThat(refresh).as("派发轮的连续未获轮数按自己的上次派发轮次算")
-                .contains("GREATEST(? - c.dispatch_served_round - 1, 0)")
+        assertThat(refresh).as("派发轮的连续未获轮数同样每轮加一，且只看自己的上次派发轮次")
+                .contains("dispatch_missed_rounds = c.dispatch_missed_rounds + 1")
                 .doesNotContain("coordination_served_round")
-                .contains("> c.dispatch_missed_rounds");
+                .doesNotContain("GREATEST")
+                .contains("c.dispatch_served_round < ?");
         assertThat(refresh).as("这一组的候选取「此刻确实有到期可领取节点」的 Run")
                 .contains("wi.state IN ('RUNNABLE', 'RESUMABLE')");
     }

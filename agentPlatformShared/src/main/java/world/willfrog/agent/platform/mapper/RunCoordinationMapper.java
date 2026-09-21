@@ -59,10 +59,14 @@ public interface RunCoordinationMapper {
     /** 这一轮可以被协调的 Run：全局一份候选，按最近协调轮次升序，已结束与取消中的 Run 不参与。 */
     List<RunCoordination> scanDue(@Param("limit") int limit);
 
-    /** 一轮结束时刷新连续未获协调的轮数：只统计本轮有资格的候选，计数只增不减。 */
+    /**
+     * 一轮结束时刷新连续未获协调的轮数：这一轮确实站着排队却没轮到的各加一轮。
+     *
+     * <p>按轮递增，不按全局轮次差补算：延期等待的那段时间它没在竞争，不该被算成没被服务。</p>
+     */
     int refreshCoordinationMissedRounds(@Param("roundNumber") long roundNumber);
 
-    /** 派发那一组的刷新：口径相同、字段不同；只统计此刻确实有到期可领取节点的 Run。 */
+    /** 派发那一组的刷新：口径相同（每轮加一）、字段不同；只统计此刻确实有到期可领取节点的 Run。 */
     int refreshDispatchMissedRounds(@Param("roundNumber") long roundNumber);
 
     /** 读一条资格记录；没有就返回空。 */
