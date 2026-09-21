@@ -200,6 +200,24 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    public NodeWorkItemMutationResult deferDispatch(NodeWorkItemIdentity identity,
+                                                    NodeDispatchDeferReason reason,
+                                                    OffsetDateTime nextVisibleAt) {
+        NodeDispatchDeferReason required = requireDispatchReason(reason);
+        OffsetDateTime dueAt = requireDueTime(nextVisibleAt);
+        int rows = mapper.deferDispatch(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence(), required.name(), dueAt);
+        return rows == 1 ? NodeWorkItemMutationResult.success() : rejectByCurrentRow(identity, null, null);
+    }
+
+    @Override
+    public NodeWorkItemMutationResult markDispatched(NodeWorkItemIdentity identity) {
+        int rows = mapper.markDispatched(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence());
+        return rows == 1 ? NodeWorkItemMutationResult.success() : rejectByCurrentRow(identity, null, null);
+    }
+
+    @Override
     public Optional<NodeWorkItemClaim> handOverClaim(NodeWorkItemIdentity identity,
                                                      int expectedClaimEpoch,
                                                      String newOwner,
@@ -385,5 +403,19 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
             throw new IllegalArgumentException("租约时长必须为正数");
         }
         return OffsetDateTime.now().plus(lease);
+    }
+
+    private static NodeDispatchDeferReason requireDispatchReason(NodeDispatchDeferReason reason) {
+        if (reason == null) {
+            throw new IllegalArgumentException("派发延期原因不能为空：没有原因就不要写这一列");
+        }
+        return reason;
+    }
+
+    private static OffsetDateTime requireDueTime(OffsetDateTime nextVisibleAt) {
+        if (nextVisibleAt == null) {
+            throw new IllegalArgumentException("派发失败必须给出下次可见时间，否则这条工作项会一直不可见");
+        }
+        return nextVisibleAt;
     }
 }

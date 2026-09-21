@@ -25,6 +25,8 @@
         <result property="claimedBy" column="claimed_by"/>
         <result property="leaseExpiresAt" column="lease_expires_at"/>
         <result property="nextVisibleAt" column="next_visible_at"/>
+        <result property="runnableSince" column="runnable_since"/>
+        <result property="dispatchDeferReason" column="dispatch_defer_reason"/>
         <result property="payloadJson" column="payload_json"/>
         <result property="createdAt" column="created_at"/>
         <result property="updatedAt" column="updated_at"/>
@@ -45,6 +47,8 @@
         claimed_by,
         lease_expires_at,
         next_visible_at,
+        runnable_since,
+        dispatch_defer_reason,
         payload_json::text AS payload_json,
         created_at,
         updated_at
@@ -68,12 +72,13 @@
         INSERT INTO alphafrog_agent_run_work_item
         (run_id, plan_generation, node_id, node_attempt, segment_sequence,
          state, context_version, run_control_version, claim_epoch, scheduler_version,
-         claimed_by, lease_expires_at, next_visible_at, payload_json)
+         claimed_by, lease_expires_at, next_visible_at, runnable_since, payload_json)
         VALUES
         (#{runId}, #{planGeneration}, #{nodeId}, #{nodeAttempt}, #{segmentSequence},
          COALESCE(#{state}, 'RUNNABLE'), #{contextVersion}, #{runControlVersion},
          COALESCE(#{claimEpoch}, 0), COALESCE(#{schedulerVersion}, 'DUAL_POOL_V1'),
          #{claimedBy}, #{leaseExpiresAt}, COALESCE(#{nextVisibleAt}, CURRENT_TIMESTAMP),
+         COALESCE(#{runnableSince}, CURRENT_TIMESTAMP),
          COALESCE(CAST(#{payloadJson} AS jsonb), '{}'::jsonb))
         ON CONFLICT (run_id, plan_generation, node_id, node_attempt, segment_sequence) DO NOTHING
     </insert>
@@ -161,6 +166,7 @@
             claim_epoch = claim_epoch + 1,
             claimed_by = #{claimedBy},
             lease_expires_at = #{leaseExpiresAt},
+            dispatch_defer_reason = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE <include refid="identityFence"/>
           AND scheduler_version = #{schedulerVersion}
@@ -189,6 +195,7 @@
             claim_epoch = claim_epoch + 1,
             claimed_by = #{newOwner},
             lease_expires_at = #{leaseExpiresAt},
+            dispatch_defer_reason = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE <include refid="identityFence"/>
           AND state IN ('CLAIMED', 'EXECUTING')
@@ -450,6 +457,32 @@
           AND state NOT IN (<include refid="terminalStates"/>)
           AND context_version = #{contextVersion}
           AND run_control_version = #{runControlVersion}
+    </update>
+
+    <!--
+      派发失败留痕：这次没能把这条工作项送出去，写下原因并把下次可见时间推后。
+      只对可派发的两种状态生效（可运行、可恢复）：已经有人领走的行不再由派发路径触碰。
+      这条只解释「为什么它一直坐在这里」，能不能被取到由 next_visible_at 决定。
+    -->
+    <update id="deferDispatch">
+        UPDATE alphafrog_agent_run_work_item SET
+            dispatch_defer_reason = #{reason},
+            next_visible_at = #{nextVisibleAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('RUNNABLE', 'RESUMABLE')
+    </update>
+
+    <!--
+      派发成功留痕：这次把它送出去了，清掉上一次的失败原因。
+      与 deferDispatch 是同一个字段的两个方向，条件与它对称。
+    -->
+    <update id="markDispatched">
+        UPDATE alphafrog_agent_run_work_item SET
+            dispatch_defer_reason = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('RUNNABLE', 'RESUMABLE')
     </update>
 
 </mapper>

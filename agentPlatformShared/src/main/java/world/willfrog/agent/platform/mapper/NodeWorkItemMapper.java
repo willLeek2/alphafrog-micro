@@ -180,6 +180,25 @@ public interface NodeWorkItemMapper {
                   @Param("runControlVersion") long runControlVersion,
                   @Param("reason") String reason);
 
+    /**
+     * 派发失败：写下原因并把下次可见时间推后，只对可派发的两种状态生效。
+     * 影响行数为 0 表示这条工作项此刻不可派发（已被领走或已进终态），调用方不要当成成功。
+     */
+    int deferDispatch(@Param("runId") String runId,
+                      @Param("planGeneration") int planGeneration,
+                      @Param("nodeId") String nodeId,
+                      @Param("nodeAttempt") int nodeAttempt,
+                      @Param("segmentSequence") int segmentSequence,
+                      @Param("reason") String reason,
+                      @Param("nextVisibleAt") OffsetDateTime nextVisibleAt);
+
+    /** 派发成功：清掉上一次的失败原因，条件与 {@link #deferDispatch} 对称。 */
+    int markDispatched(@Param("runId") String runId,
+                       @Param("planGeneration") int planGeneration,
+                       @Param("nodeId") String nodeId,
+                       @Param("nodeAttempt") int nodeAttempt,
+                       @Param("segmentSequence") int segmentSequence);
+
     /** 某个 Run 上还没完成的工作项（清理准入与背压读数用）。 */
     List<NodeWorkItem> listUnfinishedByRun(@Param("runId") String runId);
 

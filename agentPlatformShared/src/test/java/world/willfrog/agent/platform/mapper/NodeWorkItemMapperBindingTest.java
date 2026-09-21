@@ -11,6 +11,7 @@ import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.LocalCacheScope;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.workitem.NodeDispatchDeferReason;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
@@ -136,6 +137,16 @@ class NodeWorkItemMapperBindingTest {
                 "在 " + upgradesDirs + " 下找不到 *_agent_run_work_item.sql：建表迁移必须跟着代码一起在仓库里");
     }
 
+    /**
+     * 读出「最后一份定义了某个约束的迁移脚本」。
+     *
+     * <p>约束会被后续迁移重写（宽化取值、补列），只比对第一份脚本会漏掉漂移；具体排序与查找规则
+     * 在 {@link MigrationScripts} 里，迁移相关测试共用一份。</p>
+     */
+    private static String readLastMigrationContaining(String marker) {
+        return MigrationScripts.lastContaining(marker);
+    }
+
     @Test
     void interfaceAndXmlStatementsMatch() {
         List<String> missing = new ArrayList<>();
@@ -168,7 +179,7 @@ class NodeWorkItemMapperBindingTest {
 
     @Test
     void migrationStateCheckCoversExactlyAllWireValues() {
-        String migration = readMigration();
+        String migration = readLastMigrationContaining("alphafrog_agent_run_work_item_state_check");
         String check = slice(migration, "alphafrog_agent_run_work_item_state_check",
                 "scheduler_version_check");
         assertThat(quotedValues(check))
@@ -177,17 +188,40 @@ class NodeWorkItemMapperBindingTest {
     }
 
     @Test
+    void migrationRunnableSinceColumnIsAddedAndBackfilled() {
+        String migration = readLastMigrationContaining("runnable_since");
+        assertThat(migration).as("加列要幂等").contains("ADD COLUMN IF NOT EXISTS runnable_since");
+        assertThat(migration).as("存量行要回填，退避中的行取当前时间，别回填出将来的起点")
+                .contains("SET runnable_since = LEAST(next_visible_at, CURRENT_TIMESTAMP)");
+        assertThat(migration).as("存量值是近似值，注释里要说清楚，免得拿它当精确排队起点")
+                .contains("近似值");
+        assertThat(migration).as("加完要收紧成非空").contains("ALTER COLUMN runnable_since SET NOT NULL");
+    }
+
+    @Test
+    void migrationDispatchDeferReasonColumnMatchesEnum() {
+        String migration = readLastMigrationContaining("dispatch_defer_reason");
+        assertThat(migration).as("加列要幂等")
+                .contains("ADD COLUMN IF NOT EXISTS dispatch_defer_reason");
+        assertThat(MigrationScripts.constraintValues(migration,
+                "alphafrog_agent_run_work_item_dispatch_defer_reason_check"))
+                .as("节点派发延期原因应与 NodeDispatchDeferReason 逐项一致")
+                .containsExactlyElementsOf(NodeDispatchDeferReason.allWireValues());
+    }
+
+    @Test
     void migrationSchedulerVersionCheckMatchesEnum() {
-        String migration = readMigration();
         List<String> expected = List.of(SchedulerVersion.values()).stream().map(Enum::name).toList();
-        String workItemCheck = slice(migration, "alphafrog_agent_run_work_item_scheduler_version_check",
-                "alphafrog_agent_run_work_item_counter_check");
-        assertThat(quotedValues(workItemCheck))
-                .as("工作项表的调度器版本约束应与枚举取值一致")
+        String workItemScript =
+                readLastMigrationContaining("alphafrog_agent_run_work_item_scheduler_version_check");
+        assertThat(MigrationScripts.constraintValues(workItemScript,
+                "alphafrog_agent_run_work_item_scheduler_version_check"))
+                .as("工作项表的调度器版本约束应与枚举取值一致（含后续迁移的宽化）")
                 .containsExactlyElementsOf(expected);
-        String runCheck = slice(migration, "alphafrog_agent_run_scheduler_version_check", "CREATE TABLE");
-        assertThat(quotedValues(runCheck))
-                .as("Run 表的调度器版本约束应与枚举取值一致")
+        String runScript = readLastMigrationContaining("alphafrog_agent_run_scheduler_version_check");
+        assertThat(MigrationScripts.constraintValues(runScript,
+                "alphafrog_agent_run_scheduler_version_check"))
+                .as("Run 表的调度器版本约束应与枚举取值一致（含后续迁移的宽化）")
                 .containsExactlyElementsOf(expected);
     }
 
@@ -211,8 +245,36 @@ class NodeWorkItemMapperBindingTest {
         assertThat(mappedColumns).as("结果映射应覆盖这些列").contains(
                 "run_id", "plan_generation", "node_id", "node_attempt", "segment_sequence",
                 "state", "context_version", "run_control_version", "claim_epoch", "scheduler_version",
-                "claimed_by", "lease_expires_at", "next_visible_at", "payload_json");
+                "claimed_by", "lease_expires_at", "next_visible_at", "runnable_since",
+                "dispatch_defer_reason", "payload_json");
         assertThat(xml).as("id 列也要映射").contains("<id property=\"id\" column=\"id\"/>");
+    }
+
+    // ===== 派发成功与失败的留痕 =====
+
+    @Test
+    void dispatchDeferAndSuccessWriteTheSameColumnInOppositeDirections() {
+        String defer = sql("deferDispatch");
+        assertThat(defer).as("派发失败写下原因并推后可见时间")
+                .contains("dispatch_defer_reason = ?")
+                .contains("next_visible_at = ?");
+        assertThat(defer).as("只有可派发的两种状态会被这条路碰到")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
+        assertThat(defer).as("这条不做状态迁移，别把状态一起改了").doesNotContain("state = '");
+        String dispatched = sql("markDispatched");
+        assertThat(dispatched).as("派发成功清掉上一次的原因")
+                .contains("dispatch_defer_reason = NULL");
+        assertThat(dispatched).as("两个方向的条件要对称，否则成功清不掉失败写下的值")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
+        assertThat(dispatched).as("清原因不改可见时间").doesNotContain("next_visible_at =");
+    }
+
+    @Test
+    void claimingAnItemClearsTheStaleDispatchFailure() {
+        for (String id : List.of("claim", "handOverClaim")) {
+            assertThat(sql(id)).as(id + " 成功之后这条工作项已经有人接手，上一次派发失败的原因不再成立")
+                    .contains("dispatch_defer_reason = NULL");
+        }
     }
 
     // ===== 领取与转交的 SQL 形状 =====
@@ -232,8 +294,10 @@ class NodeWorkItemMapperBindingTest {
         }
         String claimSql = normalized(configuration.getMappedStatement(NAMESPACE + ".claim")
                 .getSqlSource().getBoundSql(dummyParams("claim")).getSql());
-        assertThat(claimSql).as("领取只从首次可运行或长工具可恢复状态领")
-                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
+        String claimable = String.join(", ",
+                NodeWorkItemState.claimableWireValues().stream().map(v -> "'" + v + "'").toList());
+        assertThat(claimSql).as("领取只从首次可运行与结果齐备可恢复两个状态领")
+                .contains("state IN (" + claimable + ")");
         assertThat(claimSql).as("领取要等到下次可领取时间").contains("next_visible_at <= CURRENT_TIMESTAMP");
         assertThat(claimSql).as("领取要按调度器版本过滤").contains("scheduler_version = ?");
         String handOverSql = normalized(configuration.getMappedStatement(NAMESPACE + ".handOverClaim")

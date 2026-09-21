@@ -79,7 +79,8 @@ agent:
         max-capacity-units: ${AF_AGENT_RUN_SCHEDULER_MAX_CAPACITY_UNITS:4}
         advanced-diagnostics-enabled: ${AF_AGENT_RUN_SCHEDULER_ADVANCED_DIAGNOSTICS_ENABLED:false}
     dual-pool:
-      # 只在创建 Run 时读取并冻结；LEGACY / DUAL_POOL_V1 之外的值失败关闭。
+      # 只在创建 Run 时读取并冻结；认不出的值失败关闭。
+      # DUAL_POOL_V2 的数据合同已经就绪，但执行链还没接通，配成它会在创建 Run 时明确报错。
       new-run-scheduler-version: ${AF_AGENT_NEW_RUN_SCHEDULER_VERSION:LEGACY}
       business-admission-limit: ${AF_AGENT_DUAL_POOL_BUSINESS_ADMISSION_LIMIT:100}
       # 每个 Run 同时存在的未完成工作项上限；创建工作项前按数据库实时计数。

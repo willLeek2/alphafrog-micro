@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.workitem;
 
 import java.time.Duration;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -109,6 +110,19 @@ public interface NodeWorkItemStore {
                                          long contextVersion,
                                          long runControlVersion,
                                          String reason);
+
+    /**
+     * 派发失败留痕：写下原因并把下次可见时间推后，只对可运行、可恢复两种状态生效。
+     *
+     * <p>这条不是「挡住的开关」：能不能再次被取到由 nextVisibleAt 决定。被拒说明这条工作项此刻
+     * 不可派发（已经被领走或已进终态），调用方按拒绝处理，不要重试到把它当成成功。</p>
+     */
+    NodeWorkItemMutationResult deferDispatch(NodeWorkItemIdentity identity,
+                                             NodeDispatchDeferReason reason,
+                                             OffsetDateTime nextVisibleAt);
+
+    /** 派发成功留痕：清掉上一次的失败原因；被拒说明这条工作项此刻不可派发。 */
+    NodeWorkItemMutationResult markDispatched(NodeWorkItemIdentity identity);
 
     /**
      * 显式转交所有权，只给验收控制面用：调用方必须先确认原执行者已经停止，再走这一步；

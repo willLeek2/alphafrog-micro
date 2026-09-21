@@ -16,6 +16,7 @@ public class SchedulerVersionPolicy {
 
     public static final String LEGACY = SchedulerVersion.LEGACY.name();
     public static final String DUAL_POOL_V1 = SchedulerVersion.DUAL_POOL_V1.name();
+    public static final String DUAL_POOL_V2 = SchedulerVersion.DUAL_POOL_V2.name();
 
     private final Environment environment;
 
@@ -26,9 +27,20 @@ public class SchedulerVersionPolicy {
     public String versionForNewRun() {
         String configuredVersion = requireKnown(environment.getProperty(
                 "agent.langchain.dual-pool.new-run-scheduler-version", LEGACY));
+        // 完整 DAG 与等待组的执行链还没接通：数据合同与迁移已经准备好，但节点执行层、外层推进与
+        // 恢复分发器还是只认 DUAL_POOL_V1 的单工具锚点。这时若把新 Run 标成 DUAL_POOL_V2，它会带着
+        // 一个没人认识的版本卡在原地。所以这里失败关闭，等执行链接通的那次提交再放开。
+        //
+        // 这一判断放在演练开关之前：显式配置的版本必须先被检查，不能被另一个开关悄悄改掉。
+        if (DUAL_POOL_V2.equals(configuredVersion)) {
+            throw new IllegalStateException(
+                    "DUAL_POOL_V2 的执行链尚未接通：当前只落地了数据合同与迁移，"
+                            + "请先用 LEGACY 或 DUAL_POOL_V1；等执行链提交上线后再把新 Run 交给新版本");
+        }
         // 进程终止演练只对双 Worker 池的持久恢复链有意义。这个开关只由隔离的
-        // 长工具验收泳道显式授权；授权后强制新 Run 进入双池，避免旧串行链产出无效样本。
-        if (environment.getProperty(
+        // 长工具验收泳道显式授权；它只改默认值：配置停在没有指定双池版本（LEGACY 或未配置）时才把新 Run
+        // 推进双池，显式写下的版本不被它改写。避免旧串行链产出无效样本。
+        if (LEGACY.equals(configuredVersion) && environment.getProperty(
                 "agent.tool-job.fault-injection.allow-process-halt", Boolean.class, false)) {
             return DUAL_POOL_V1;
         }
@@ -51,7 +63,24 @@ public class SchedulerVersionPolicy {
         return LEGACY.equals(versionOf(run));
     }
 
+    /**
+     * 这个 Run 是不是双池骨架（DUAL_POOL_V1）。
+     *
+     * <p>注意它不等于「属于双池家族」：完整 DAG 的 DUAL_POOL_V2 也走双池执行层，但它不用 Run 级单工具锚点。
+     * 判断「能不能按单工具锚点恢复」「要不要写 Run 级锚点」时用这个方法；判断「走不走双池入口」时用
+     * {@link #isDualPoolFamily(AgentRun)}。</p>
+     */
     public boolean isDualPool(AgentRun run) {
         return DUAL_POOL_V1.equals(versionOf(run));
+    }
+
+    /** 这个 Run 是不是走双池执行层（DUAL_POOL_V1 或 DUAL_POOL_V2）。 */
+    public boolean isDualPoolFamily(AgentRun run) {
+        return SchedulerVersion.fromWire(versionOf(run)).isDualPoolFamily();
+    }
+
+    /** 这个 Run 的等待事实是不是存在等待组里（只有 DUAL_POOL_V2 成立）。 */
+    public boolean usesWaitGroups(AgentRun run) {
+        return SchedulerVersion.fromWire(versionOf(run)).usesWaitGroups();
     }
 }
