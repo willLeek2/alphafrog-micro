@@ -9,8 +9,9 @@
 -- 若改成「取走一次」，进程在取走与落终态之间退出，这次放行就丢了，被压住的成员要再等一轮没人
 -- 会再触发的事件。同一条成员终态只会写一次，由成员状态机自己的条件更新保证。
 --
--- 与夹具表同一套作用域口径：lane_id 列放部署编号 deploymentId，deployment_version 列放部署代际
--- generationId；查回来的必须是本泳道本代际下的那一行。
+-- lane_id 与 deployment_version 两列与夹具表同一套作用域口径（部署编号与部署代际），作为「这个点
+-- 是哪个泳道哪个代际下开的」的证据随行保存；判断本身按 run_id + release_key 命中——Run 自己的泳道
+-- 与代际在取夹具那一步已经核对过，同一条 Run 的放行点不会串到别的泳道去。
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run_release_point (
     id BIGSERIAL PRIMARY KEY,
     run_id VARCHAR(64) NOT NULL REFERENCES alphafrog_agent_run(id) ON DELETE CASCADE,
@@ -30,7 +31,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run_release_point (
             OR (opened_at IS NOT NULL AND opened_by IS NOT NULL))
 );
 
--- 放行判断按「Run + 放行点」精确命中，未放行的行不进索引。
+-- 放行判断（Agent 侧唯一那条读语句）按「Run + 放行点」精确命中，未放行的行不进索引。
 CREATE INDEX IF NOT EXISTS idx_agent_run_release_point_opened
     ON alphafrog_agent_run_release_point(run_id, release_key)
     WHERE opened_at IS NOT NULL;

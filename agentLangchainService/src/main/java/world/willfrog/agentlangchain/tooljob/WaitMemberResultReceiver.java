@@ -3,9 +3,11 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
@@ -20,6 +22,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
@@ -76,6 +79,21 @@ public class WaitMemberResultReceiver {
     private static final String TASK_NOT_FOUND = "wait_member_task_not_found";
     /** 夹具策略点了同一个等待组里不存在的成员时写的错误码。 */
     private static final String POLICY_PEER_UNKNOWN = "acceptance_fixture_policy_peer_unknown";
+    /**
+     * 夹具这一侧读不出来（身份中途变了、本进程记住的夹具 Run 满了）时写的错误码。
+     *
+     * <p>这类结论是「这次验收说不下去了」，不是「再等等就会好」：推后重试只会一轮一轮地重来，
+     * 永远不给这条成员一个结论。按失败收尾、原因照实写，人和验收证据当场看得见。</p>
+     */
+    private static final String POLICY_UNREADABLE = "acceptance_fixture_policy_unreadable";
+    /**
+     * 被夹具压住的成员，下一次查询时间往前推多少。
+     *
+     * <p>比一轮的轮询间隔长：压住的成员每一轮都会被扫到，推得太短会让一批被压住的成员把每一轮的
+     * 扫描名额占满，同一批里别的 Run 的成员就排不上（扫描按下次查询时间排序取一批）。推后这么久
+     * 的代价是放行之后最多等这么久才被接回来，验收看得见、几秒钟的延迟可以接受。</p>
+     */
+    private static final long HOLD_POLL_DELAY_MS = 5000L;
 
     private final WaitGroupStore waitGroupStore;
     private final AgentRunMapper runMapper;
@@ -102,8 +120,8 @@ public class WaitMemberResultReceiver {
     private final AtomicLong releasedOnHoldTimeout = new AtomicLong();
     private final AtomicLong designatedFailures = new AtomicLong();
     private final AtomicLong policyRefusals = new AtomicLong();
-    /** 被压住的成员从哪一刻起被压：兜底放行按这个时刻算；不再被压时清掉，只留正在压的那些。 */
-    private final Map<String, OffsetDateTime> heldSinceByMember = new ConcurrentHashMap<>();
+    /** 被压住的成员从哪一刻起被压：兜底放行按这个时刻算；不再被压、成员落终态、Run 进终态时清掉。 */
+    private final Map<String, HeldSince> heldSinceByMember = new ConcurrentHashMap<>();
 
     private final AtomicLong rounds = new AtomicLong();
     private final AtomicLong scanned = new AtomicLong();
@@ -261,9 +279,24 @@ public class WaitMemberResultReceiver {
 
         // 验收夹具的放行策略：被压住的成员这一轮不去接结果，放行点被控制面标成已放行之后才继续。
         // 放在问沙箱之前，免得压住的每一轮都去拉一次已经有结论的结果。
-        Optional<AcceptanceReleasePolicy> policy = acceptancePolicies.policyForRun(run);
-        if (policy.isPresent() && holdByPolicy(policy.get(), member, group, segment, run, proof)) {
-            return;
+        AcceptanceReleasePolicy policy = null;
+        PolicyOutcome outcome = PolicyOutcome.none();
+        try {
+            policy = acceptancePolicies.policyForRun(run).orElse(null);
+            if (policy != null) {
+                PolicyAction action = policyAction(policy, member, group);
+                if (action.hold()) {
+                    return;
+                }
+                outcome = action.outcome();
+            }
+        } catch (AcceptanceFixtureExecutionException e) {
+            // 策略读不出来：这条成员按失败收尾，原因写成夹具这一侧给的错误码。**照样走正常那条路**，
+            // 先问沙箱拿到真实终态、把名额与用量收干净，再落失败——绕开真实终态收尾会让已经派发的
+            // 名额永远还回去，这条成员也就永远停在这里。
+            outcome = PolicyOutcome.refused(new ForcedFailure(POLICY_UNREADABLE, e.getMessage()));
+            log.warn("夹具这一侧读不出来，这条成员按失败收尾：group={} member={} 原因={}",
+                    group.getId(), memberKey(member), e.getMessage());
         }
 
         String taskId = proof.taskId();
@@ -274,7 +307,7 @@ public class WaitMemberResultReceiver {
                     // 权威地说「没建出来」：这次后台作业不存在，成员按失败落终态，
                     // 否则等待链会一直等一个永远不会有的结果。
                     finish(member, group, segment, run, proof, null, TASK_NOT_FOUND, "task_not_found",
-                            policy.orElse(null));
+                            policy, outcome);
                     return;
                 }
                 defer(member, now, "task_lookup_unavailable");
@@ -299,59 +332,110 @@ public class WaitMemberResultReceiver {
             return;
         }
         finish(member, group, segment, run, proof, new Terminal(taskId, statusName, result), null, null,
-                policy.orElse(null));
+                policy, outcome);
+    }
+
+    /** 这一轮对一条成员的处置：压住、照常接结果、或者照常接结果但按策略拒绝收成失败。 */
+    private record PolicyAction(boolean hold, PolicyOutcome outcome) {
+
+        static PolicyAction proceed() {
+            return new PolicyAction(false, PolicyOutcome.none());
+        }
+
+        static PolicyAction held() {
+            return new PolicyAction(true, PolicyOutcome.none());
+        }
+
+        static PolicyAction refuse(String code, String detail) {
+            return new PolicyAction(false, PolicyOutcome.refused(new ForcedFailure(code, detail)));
+        }
     }
 
     /**
-     * 这条成员现在该不该被夹具的放行策略压住。
+     * 策略这一轮定下的事，等结果真的写进库里再记读数。
+     *
+     * <p>读数是给验收看板看的「发生过几次」，所以按落库成功计数：拒绝或压过时限之后如果收尾没成、
+     * 这条成员下一轮还会被同一条规则再判一次，决策处就计数会把一次事故记成好几次。</p>
+     */
+    private record PolicyOutcome(ForcedFailure refusal, boolean holdTimeoutRelease) {
+
+        static PolicyOutcome none() {
+            return new PolicyOutcome(null, false);
+        }
+
+        static PolicyOutcome refused(ForcedFailure refusal) {
+            return new PolicyOutcome(refusal, false);
+        }
+
+        static PolicyOutcome holdTimeout() {
+            return new PolicyOutcome(null, true);
+        }
+    }
+
+    /** 按策略把一条成员收成失败：错误码与说明由策略拒绝给出。 */
+    private record ForcedFailure(String code, String detail) {
+    }
+
+    /**
+     * 一条被压住的成员在计时表里的键。
+     *
+     * <p>成员身份按现有合同只在同一个等待组内唯一，所以键要带上组：不同 Run、不同等待组复用同一个
+     * 工具调用编号时，只用成员身份做键会让两条成员的计时互相覆盖或互相删掉，兜底放行就会提前或延后。</p>
+     */
+    private static String memberKey(WaitMember member) {
+        return member.getGroupId() + "|" + member.getMemberIdentity();
+    }
+
+    /**
+     * 这条成员这一轮该怎么办：压住、照常接结果、还是照常接结果但收成失败。
      *
      * <p>压住 = 这一轮不去接它的结果：成员保持执行中，只把下次查询时间推一小步，下一轮再看。
-     * 两种放行条件：等同一个等待组里的另外几条成员先落终态，或者等某个放行点被控制面标成已放行。
-     * 成员没有被点名时立刻放行；策略点了这个组里不存在的成员，按成员失败收尾并把原因写清楚——
-     * 那种情况是夹具写错了，压住不动只会让人以为结果还没回来。</p>
+     * 两种放行条件：等同一个等待组里的另外几条成员先落终态，或者等某个放行点被控制面标成已放行；
+     * 两种都受 {@code maxHoldSeconds} 兜底，压过时限还没人放行就照常接结果，读数里单独记一笔。</p>
      *
-     * @return true 表示这一轮已经处理完这条成员（压住、或者按策略让它失败）
+     * <p>策略点了这个等待组里不存在的成员，说明夹具写错了：这条成员要按失败收尾并把原因写清楚，
+     * 压住不动只会让人以为结果还没回来。**它仍然要走「先问沙箱、再结算、再写终态」那条正常路**——
+     * 已经派发的成员名额挂在沙箱任务上，绕开真实终态去收尾会让名额永远还不回去，这条成员也就
+     * 永远停在这里。所以这里只把「要收成失败」这个决定交回调用方，真正的收尾还是那条正常路。</p>
      */
-    private boolean holdByPolicy(AcceptanceReleasePolicy policy,
-                                 WaitMember member,
-                                 WaitGroup group,
-                                 NodeWorkItem segment,
-                                 AgentRun run,
-                                 WaitMemberDispatchProof proof) {
+    private PolicyAction policyAction(AcceptanceReleasePolicy policy, WaitMember member, WaitGroup group) {
         String toolCallId = member.getToolCallId();
-        String memberKey = member.getMemberIdentity();
+        String key = memberKey(member);
         if (toolCallId == null || toolCallId.isBlank() || !policy.covers(toolCallId)) {
-            heldSinceByMember.remove(memberKey);
-            return false;
+            heldSinceByMember.remove(key);
+            return PolicyAction.proceed();
         }
         List<String> waitingFor = new ArrayList<>();
         List<String> unknownPeers = new ArrayList<>();
         collectWaitingPeers(policy.releaseAfter(toolCallId), group, waitingFor, unknownPeers);
         if (!unknownPeers.isEmpty()) {
-            policyRefusals.incrementAndGet();
             log.warn("夹具策略点了这个等待组里没有的成员，这条成员按失败收尾：group={} member={} peers={}",
-                    group.getId(), memberKey, String.join(",", unknownPeers));
-            finish(member, group, segment, run, proof, null, POLICY_PEER_UNKNOWN,
-                    "策略里点名的成员不在这个等待组里：" + String.join(",", unknownPeers), policy);
-            return true;
+                    group.getId(), key, String.join(",", unknownPeers));
+            heldSinceByMember.remove(key);
+            return PolicyAction.refuse(POLICY_PEER_UNKNOWN,
+                    "策略里点名的成员不在这个等待组里：" + String.join(",", unknownPeers));
         }
-        if (!waitingFor.isEmpty()) {
-            return hold(member, "waiting_for:" + String.join(",", waitingFor));
-        }
+        boolean waitingForPeers = !waitingFor.isEmpty();
+        boolean waitingForPoint = false;
         Optional<String> releaseKey = policy.releasePointKey(toolCallId);
-        if (releaseKey.isPresent() && !releasePoints.isOpened(run.getId(), releaseKey.get())) {
-            if (heldTooLong(member, memberKey, policy)) {
-                // 兜底：压过时限还没人放行就照常收尾，读数里单独记一笔，别把「没人放行」当成「被放行」。
-                releasedOnHoldTimeout.incrementAndGet();
-                heldSinceByMember.remove(memberKey);
-                log.warn("夹具策略压住这条成员超过兜底时限，照常收尾：group={} member={} key={}",
-                        group.getId(), memberKey, releaseKey.get());
-                return false;
-            }
-            return hold(member, "waiting_release_point:" + releaseKey.get());
+        if (!waitingForPeers && releaseKey.isPresent()) {
+            waitingForPoint = !releasePoints.isOpened(member.getRunId(), releaseKey.get());
         }
-        heldSinceByMember.remove(memberKey);
-        return false;
+        if (waitingForPeers || waitingForPoint) {
+            if (heldTooLong(member, policy)) {
+                // 兜底：压过时限还没人放行就照常接结果，读数里单独记一笔，别把「没人放行」当成「被放行」。
+                heldSinceByMember.remove(key);
+                log.warn("夹具策略压住这条成员超过兜底时限，照常接结果：group={} member={} 等兄弟={} 等放行点={}",
+                        group.getId(), key, String.join(",", waitingFor),
+                        releaseKey.orElse("<无>"));
+                return new PolicyAction(false, PolicyOutcome.holdTimeout());
+            }
+            return hold(member, waitingForPeers
+                    ? "waiting_for:" + String.join(",", waitingFor)
+                    : "waiting_release_point:" + releaseKey.orElse(""));
+        }
+        heldSinceByMember.remove(key);
+        return PolicyAction.proceed();
     }
 
     /** 按名字找出「还没落终态」的成员，以及这个组里根本没有的名字。 */
@@ -372,21 +456,31 @@ public class WaitMemberResultReceiver {
             WaitMemberState state = statesByToolCallId.get(name);
             if (state == null) {
                 unknownPeers.add(name);
-            } else if (state != WaitMemberState.SUCCEEDED && state != WaitMemberState.FAILED) {
+            } else if (!state.isTerminal()) {
+                // 「还会不会再变」与「算不算组的一次有效结束」是两个判据：这里问的是前者。
+                // 只看成功与失败会把已经取消、已经迟到的成员当成还在跑，那条等待就永远等不到头。
                 waitingFor.add(name);
             }
         }
     }
 
-    /** 压住这条成员：只推下次查询时间，不动退避计数；读数里记一笔。 */
-    private boolean hold(WaitMember member, String reason) {
-        heldSinceByMember.putIfAbsent(member.getMemberIdentity(), OffsetDateTime.now());
+    /** 压住这条成员：只推下次查询时间，不动退避计数；真的推后了就在读数里记一笔。 */
+    private PolicyAction hold(WaitMember member, String reason) {
+        heldSinceByMember.putIfAbsent(memberKey(member),
+                new HeldSince(member.getRunId(), OffsetDateTime.now()));
         boolean pushed = waitGroupStore.holdMember(member.getGroupId(), member.getMemberIdentity(),
-                OffsetDateTime.now().plus(Duration.ofMillis(pollIntervalMs)));
-        holdPushes.incrementAndGet();
+                OffsetDateTime.now().plus(Duration.ofMillis(HOLD_POLL_DELAY_MS)));
+        if (pushed) {
+            // 只记真的推后的那几次：成员已经不是执行中时这条语句一行都不改，那不是一次压住。
+            holdPushes.incrementAndGet();
+        }
         log.debug("夹具策略压住这条成员，等放行：group={} member={} reason={} pushed={}",
                 member.getGroupId(), member.getMemberIdentity(), reason, pushed);
-        return true;
+        return PolicyAction.held();
+    }
+
+    /** 一条被压住的成员：属于哪条 Run、从哪一刻起被压。 */
+    private record HeldSince(String runId, OffsetDateTime since) {
     }
 
     /**
@@ -396,12 +490,23 @@ public class WaitMemberResultReceiver {
      * 重新计时。夹具的压住是一场验收里的短时行为，兜底是防止没人放行时整条链停在那里；真要卡
      * 「压了多久」的硬上限，起点就得写进库里，那是另一件事。</p>
      */
-    private boolean heldTooLong(WaitMember member, String memberKey, AcceptanceReleasePolicy policy) {
+    private boolean heldTooLong(WaitMember member, AcceptanceReleasePolicy policy) {
         if (policy.maxHoldSeconds() <= 0) {
             return false;
         }
-        OffsetDateTime since = heldSinceByMember.computeIfAbsent(memberKey, key -> OffsetDateTime.now());
-        return since.plusSeconds(policy.maxHoldSeconds()).isBefore(OffsetDateTime.now());
+        HeldSince held = heldSinceByMember.computeIfAbsent(memberKey(member),
+                key -> new HeldSince(member.getRunId(), OffsetDateTime.now()));
+        return held.since().plusSeconds(policy.maxHoldSeconds()).isBefore(OffsetDateTime.now());
+    }
+
+    /** Run 走到终态就把它的压住计时放掉；没有这条 Run 的记载就是空动作。 */
+    @EventListener
+    public void onRunFinalized(AgentRunFinalizedEvent event) {
+        if (event == null) {
+            return;
+        }
+        heldSinceByMember.entrySet()
+                .removeIf(entry -> entry.getValue().runId().equals(event.runId()));
     }
 
     /**
@@ -409,6 +514,14 @@ public class WaitMemberResultReceiver {
      *
      * <p>{@code terminal} 为空表示「作业本身不存在」这一种结论：这时没有结果体，成员按失败记，
      * 错误码由 {@code failureCode} 给。两种情形用的是同一条写入语句，归属核对也同一份。</p>
+     *
+     * <p>三种「按失败记」的来源有先后：{@code refusal}（夹具策略拒绝，例如点名了组里没有的成员）
+     * 优先，其次是夹具点名按失败收尾，最后才是沙箱自己给的失败。夹具点名的是「这次调用按失败算」，
+     * 而这条成员本来就已经失败时留真实原因、把夹具那句另记一处——把真因覆盖掉，排查时会误以为是
+     * 夹具把它弄失败的。</p>
+     *
+     * <p>用量记录按沙箱自己的终态写（见 {@link WaitMemberSettlement#settle}）：夹具点名失败只是
+     * 验收要看的结果，这一次外部调用真的发生过、真的占了名额，账要照实记。</p>
      */
     private void finish(WaitMember member,
                         WaitGroup group,
@@ -418,27 +531,43 @@ public class WaitMemberResultReceiver {
                         Terminal terminal,
                         String failureCode,
                         String reason,
-                        AcceptanceReleasePolicy policy) {
+                        AcceptanceReleasePolicy policy,
+                        PolicyOutcome outcome) {
+        ForcedFailure refusal = outcome == null ? null : outcome.refusal();
         String output = terminal == null ? "" : pythonSandboxTools.formatTerminalResult(
                 terminal.statusName(), terminal.result());
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
         boolean success = terminal != null && SUCCEEDED.equals(terminal.statusName())
                 && terminal.result().getExitCode() == 0
                 && !WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
+        boolean failedAlready = !success;
+        boolean designatedApplied = false;
         Map<String, Object> extra = new LinkedHashMap<>();
         if (terminal != null) {
             extra.put("taskId", terminal.taskId());
         }
         String designated = policy == null || member.getToolCallId() == null
                 ? null : policy.designatedFailure(member.getToolCallId()).orElse(null);
-        if (designated != null) {
+        if (refusal != null) {
+            success = false;
+            extra.put("errorCode", refusal.code());
+            extra.put("errorDetail", refusal.detail());
+        } else if (designated != null) {
             // 夹具点名这条成员按失败收尾：照常走失败路径（名额与用量照旧结算），
             // 已经把结果拿回来的话也把结果留在成员行里，失败原因单独写清楚。
             success = false;
-            designatedFailures.incrementAndGet();
-            extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
-            extra.put("errorDetail", designated);
-        } else if (!success) {
+            designatedApplied = true;
+            if (failedAlready) {
+                extra.put("errorCode", failureCode != null ? failureCode : errorCodeOf(terminal.statusName()));
+                if (reason != null) {
+                    extra.put("errorDetail", reason);
+                }
+                extra.put("designatedFailure", designated);
+            } else {
+                extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
+                extra.put("errorDetail", designated);
+            }
+        } else if (failedAlready) {
             extra.put("errorCode", failureCode != null ? failureCode : errorCodeOf(terminal.statusName()));
             if (reason != null) {
                 extra.put("errorDetail", reason);
@@ -473,7 +602,7 @@ public class WaitMemberResultReceiver {
                 run.getRunControlVersion()));
         // 这条成员有结论了，压住的计时不再需要。成员终态只落一次，这一条在上面那条语句返回 0 行时
         // 也照样清掉：那时它已经在别处落过终态，计时留着只会白占内存。
-        heldSinceByMember.remove(member.getMemberIdentity());
+        heldSinceByMember.remove(memberKey(member));
         if (!result.applied()) {
             // 已经被别人写过（重复上报、或者这条成员已经落过终态）：不重复放行下一段。
             duplicates.incrementAndGet();
@@ -482,6 +611,16 @@ public class WaitMemberResultReceiver {
             return;
         }
         completed.incrementAndGet();
+        // 策略定下的事到这里才真的发生过一次：决策处计数会把收尾失败后的重试也记成新的一次。
+        if (refusal != null) {
+            policyRefusals.incrementAndGet();
+        }
+        if (outcome != null && outcome.holdTimeoutRelease()) {
+            releasedOnHoldTimeout.incrementAndGet();
+        }
+        if (designatedApplied) {
+            designatedFailures.incrementAndGet();
+        }
         log.info("等待成员结果已接回：group={} member={} seq={} state={} 报告={}",
                 member.getGroupId(), member.getMemberIdentity(), member.getMemberSeq(),
                 result.memberState(), terminal == null ? reason : terminal.describe());
@@ -527,6 +666,9 @@ public class WaitMemberResultReceiver {
         isolated.incrementAndGet();
         log.warn("这条等待成员没法核对归属，先不接它的结果：group={} member={} reason={}",
                 member.getGroupId(), member.getMemberIdentity(), reason);
+        // 这一轮没走到放行判断，压住计时就不会自己清；Run 被取消、组没了的成员以后也不会再进扫描，
+        // 留着只会让「当前被压住几条」这个读数一直虚高，所以在隔离这一步也清一次。
+        heldSinceByMember.remove(memberKey(member));
         defer(member, now, reason);
     }
 

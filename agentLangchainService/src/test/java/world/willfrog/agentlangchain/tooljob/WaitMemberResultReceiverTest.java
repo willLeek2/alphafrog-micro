@@ -21,6 +21,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
@@ -489,12 +490,20 @@ class WaitMemberResultReceiverTest {
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDesignatedFailuresTotal", 1L);
     }
 
-    /** 策略点了这个等待组里没有的成员：夹具写错了，成员按失败收尾，不许压住干等。 */
+    /**
+     * 策略点了这个等待组里没有的成员：夹具写错了，成员按失败收尾，不许压住干等。
+     *
+     * <p>这条收尾还得走正常那条路：先把沙箱的真实终态取回来、按真实终态把名额与用量结算掉，再落失败。
+     * 已经派发的成员名额挂在沙箱任务上，绕开真实终态去收尾（当成「作业从来没建出来」）会让名额永远
+     * 还不回去，这条成员也就永远停在这里。</p>
+     */
     @Test
-    void aPolicyPointingAtAnUnknownPeerFailsTheMember() {
+    void aPolicyPointingAtAnUnknownPeerFailsTheMemberAfterRealSettlement() {
         givenDueMember();
         policyOf("{\"members\":{\"tc-1\":{\"releaseAfter\":[\"tc-missing\"]}}}");
         Mockito.lenient().when(waitGroupStore.listMembers(anyLong())).thenReturn(List.of());
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
         completion(true, WaitMemberState.FAILED, null);
 
         receiver.round();
@@ -502,8 +511,120 @@ class WaitMemberResultReceiverTest {
         assertThat(capturedRequest().resultRefJson())
                 .contains("acceptance_fixture_policy_peer_unknown")
                 .contains("tc-missing");
+        ArgumentCaptor<String> settledStatus = ArgumentCaptor.forClass(String.class);
+        verify(settlement).settle(any(), any(), settledStatus.capture(), any(), any());
+        assertThat(settledStatus.getValue())
+                .as("按沙箱自己的终态结算，名额与用量照实记")
+                .isEqualTo("SUCCEEDED");
+        verify(sandboxService).getTaskStatus(any(GetTaskStatusRequest.class));
         verify(waitGroupStore, never()).holdMember(anyLong(), anyString(), any());
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverPolicyRefusalsTotal", 1L);
+    }
+
+    /**
+     * 策略这一侧读不出来：这条成员按失败收尾，原因写清是夹具这一侧的问题，不推后重试。
+     *
+     * <p>照样先问沙箱、再结算：这条成员的外部作业可能真的在跑、真的占着名额，先结算再落失败，
+     * 账才收得回来。</p>
+     */
+    @Test
+    void anUnreadablePolicyFailsTheMemberInsteadOfRetryingForever() {
+        givenDueMember();
+        Mockito.lenient().when(acceptancePolicies.policyForRun(any()))
+                .thenThrow(AcceptanceFixtureExecutionException.refuse("acceptance_fixture_identity_changed",
+                        "这条 Run 的夹具身份中途换了"));
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().resultRefJson())
+                .contains("acceptance_fixture_policy_unreadable")
+                .contains("acceptance_fixture_identity_changed");
+        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), any());
+        verify(waitGroupStore, never()).rescheduleMember(anyLong(), anyString(), any(), anyInt());
+        assertThat(receiver.snapshot())
+                .containsEntry("waitMemberReceiverCompletedTotal", 1L)
+                .containsEntry("waitMemberReceiverDeferredTotal", 0L);
+    }
+
+    /** 读数按真的落库成功记：收尾没成、下一轮还要重来一次的那次，不算发生过一次。 */
+    @Test
+    void aRefusalIsCountedOnlyAfterItIsWritten() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"releaseAfter\":[\"tc-missing\"]}}}");
+        Mockito.lenient().when(waitGroupStore.listMembers(anyLong())).thenReturn(List.of());
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        when(settlement.settle(any(), any(), any(), any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(false, "reservation_busy"));
+
+        receiver.round();
+
+        verify(waitGroupStore, never()).completeMember(any());
+        assertThat(receiver.snapshot())
+                .as("这一轮没写进库里，不算发生过一次")
+                .containsEntry("waitMemberReceiverPolicyRefusalsTotal", 0L)
+                .containsEntry("waitMemberReceiverDeferredTotal", 1L);
+
+        when(settlement.settle(any(), any(), any(), any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(true, null));
+        completion(true, WaitMemberState.FAILED, null);
+        receiver.round();
+
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverPolicyRefusalsTotal", 1L);
+    }
+
+    /**
+     * 等兄弟成员这条规则也吃兜底时限：兄弟一直不落终态，压过时限就照常收尾。
+     *
+     * <p>没有这条兜底，夹具写出一条等不出头的等待关系（比如等一个已经取消、再也不会有人碰的成员）
+     * 会把这条成员永远压在那里。</p>
+     */
+    @Test
+    void aMemberWaitingForItsPeersIsReleasedWhenTheHoldTimesOut() throws Exception {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"releaseAfter\":[\"tc-2\"]}},\"maxHoldSeconds\":1}");
+        WaitMember peer = member();
+        peer.setMemberIdentity("peer-member");
+        peer.setToolCallId("tc-2");
+        peer.setState(WaitMemberState.RUNNING.name());
+        Mockito.lenient().when(waitGroupStore.listMembers(anyLong())).thenReturn(List.of(peer));
+        Mockito.lenient().when(waitGroupStore.holdMember(eq(GROUP_ID), eq(MEMBER_IDENTITY), any()))
+                .thenReturn(true);
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        assertThat(receiver.round()).isEqualTo(1);
+        verify(waitGroupStore, never()).completeMember(any());
+
+        Thread.sleep(1100L);
+        assertThat(receiver.round()).isEqualTo(1);
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverReleasedOnHoldTimeoutTotal", 1L);
+    }
+
+    /** 兄弟成员已经取消：它不会再变，等待到这里就结束，不把它当成还在跑。 */
+    @Test
+    void aCanceledPeerCountsAsFinished() {
+        givenDueMember();
+        policyOf("{\"members\":{\"tc-1\":{\"releaseAfter\":[\"tc-2\"]}}}");
+        WaitMember peer = member();
+        peer.setMemberIdentity("peer-member");
+        peer.setToolCallId("tc-2");
+        peer.setState(WaitMemberState.CANCELED.name());
+        Mockito.lenient().when(waitGroupStore.listMembers(anyLong())).thenReturn(List.of(peer));
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        verify(waitGroupStore, never()).holdMember(anyLong(), anyString(), any());
     }
 
     /** 压过兜底时限还没人放行：照常收尾，读数里单独记一笔，别把「没人放行」当成「被放行」。 */

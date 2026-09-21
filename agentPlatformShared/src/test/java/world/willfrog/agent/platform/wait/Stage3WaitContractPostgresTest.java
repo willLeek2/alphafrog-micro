@@ -30,6 +30,7 @@ import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.mapper.AcceptanceReleasePointMapper;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.service.AgentRunEventProjectionRepair;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
@@ -251,17 +252,21 @@ class Stage3WaitContractPostgresTest {
     }
 
     @Test
-    void aReleasePointIsOpenedOnlyByTheControlPlaneAndItsEvidenceIsPaired() throws Exception {
+    void aReleasePointIsOpenedOnlyByWritingTheTimeAndWhoOpenedItTogether() throws Exception {
         String insert = "INSERT INTO alphafrog_agent_run_release_point (run_id, release_key, lane_id, "
                 + "deployment_version) VALUES ";
         createRun("run-release", 0, 0L);
         // 行还没建出来时按「没放行」处理：夹具策略点名的放行点必须先由控制面建出来。
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
                 + "WHERE run_id = 'run-release'")).isZero();
+        assertThat(openReleasePoints("run-release", "point-a"))
+                .as("还没有这一行时读回来是「没放行」").isZero();
         execute(insert + "('run-release', 'point-a', 'lane-a', 'gen-1')");
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
                 + "WHERE run_id = 'run-release' AND release_key = 'point-a' AND opened_at IS NULL"))
                 .as("建出来但没标放行时仍是等待态").isEqualTo(1);
+        assertThat(openReleasePoints("run-release", "point-a"))
+                .as("建出来但没标放行：Agent 侧那条读语句也读成「没放行」").isZero();
         // 放行时刻与放行人成对：只写一半都要被拒，放行的证据说不清就不算放行。
         expectRejected("UPDATE alphafrog_agent_run_release_point SET opened_at = CURRENT_TIMESTAMP "
                         + "WHERE run_id = 'run-release' AND release_key = 'point-a'",
@@ -276,18 +281,32 @@ class Stage3WaitContractPostgresTest {
         // 放行点挂在一条不存在的 Run 上要被外键拒掉。
         expectRejected(insert + "('run-release-missing', 'point-a', 'lane-a', 'gen-1')",
                 "alphafrog_agent_run_release_point_run_id_fkey");
-        // 控制面把点标成已放行之后，读到的就是已放行；重复读一样，放行按许可而不是按取走一次。
+        // 控制面把点标成已放行之后，Agent 侧那条读语句读到的就是已放行；重复读一样（按许可读）。
         execute("UPDATE alphafrog_agent_run_release_point SET opened_at = CURRENT_TIMESTAMP, "
                 + "opened_by = 'control-plane' WHERE run_id = 'run-release' "
                 + "AND release_key = 'point-a'");
+        assertThat(openReleasePoints("run-release", "point-a"))
+                .as("标了放行时刻之后读成已放行").isEqualTo(1);
+        assertThat(openReleasePoints("run-release", "point-a"))
+                .as("按许可读：同一条读语句再读一次结果不变").isEqualTo(1);
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
                 + "WHERE run_id = 'run-release' AND release_key = 'point-a' "
                 + "AND opened_at IS NOT NULL AND opened_by = 'control-plane'"))
                 .as("放行之后这一行同时带着时刻与放行人").isEqualTo(1);
         // 另一个放行点不受影响：一条策略点几个点，放哪个点由控制面一个一个决定。
         execute(insert + "('run-release', 'point-b', 'lane-a', 'gen-1')");
+        assertThat(openReleasePoints("run-release", "point-b"))
+                .as("同一个 Run 的另一个点还没标，就是没放行").isZero();
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_release_point "
                 + "WHERE run_id = 'run-release' AND opened_at IS NULL")).isEqualTo(1);
+    }
+
+    /** Agent 侧那条读语句：走真的映射语句，测试里不另写一份 SQL。 */
+    private static int openReleasePoints(String runId, String releaseKey) {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return session.getMapper(AcceptanceReleasePointMapper.class)
+                    .countOpened(runId, releaseKey);
+        }
     }
 
     @Test
@@ -1970,7 +1989,8 @@ class Stage3WaitContractPostgresTest {
                 "mapper/AgentRunMapper.xml", "mapper/AgentRunEventMapper.xml",
                 "mapper/RunCoordinationMapper.xml",
                 "mapper/RunServiceLeaseMapper.xml",
-                "mapper/SchedulerStateMapper.xml")) {
+                "mapper/SchedulerStateMapper.xml",
+                "mapper/AcceptanceReleasePointMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
             }

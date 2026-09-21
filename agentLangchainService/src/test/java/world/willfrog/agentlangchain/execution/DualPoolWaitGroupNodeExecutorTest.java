@@ -32,6 +32,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -194,6 +195,32 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.memberRows(groupId).get(1).resultRefJson).doesNotContain("designated_failure");
         assertThat(store.events()).as("被点名的那条也算一条已结束的成员，组照样齐备")
                 .anyMatch(event -> event.startsWith("group_ready:"));
+    }
+
+    /**
+     * 策略要等的成员不在这一批里：夹具写错了，建组与派发之前就停住，一个外部作业都不建。
+     *
+     * <p>这种等待关系永远等不到头（除了兜底时限没人会来放行），所以它不该等到成员派发出去、名字
+     * 对不上时才被发现。</p>
+     */
+    @Test
+    void aPolicyWaitingForAMemberOutsideTheBatchStopsBeforeAnythingIsDispatched() {
+        model.enqueue(AiMessage.from(List.of(
+                toolCall("call-a", "getStockDaily", "{}"),
+                toolCall("call-b", "searchWeb", "{}"))));
+        world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy policy =
+                world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"members\":{\"call-a\":{\"releaseAfter\":[\"call-zzz\"]}}}", objectMapper)
+                        .orElseThrow();
+
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of(), policy)))
+                .as("夹具自己写错了，错误码要能让验收证据直接引用")
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("call-zzz");
+        assertThat(store.groupRows()).as("停在这一步：一个等待组、一条成员、一个外部作业都没建")
+                .isEmpty();
+        assertThat(store.events()).isEmpty();
+        assertThat(publisher.published).isEmpty();
     }
 
     /** 策略点名要压住：工具当场就结束了，压住没有可等的东西，成员照常成功，只留一行记录。 */

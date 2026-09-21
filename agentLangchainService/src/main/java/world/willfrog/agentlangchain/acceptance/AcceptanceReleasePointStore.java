@@ -1,7 +1,7 @@
 package world.willfrog.agentlangchain.acceptance;
 
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.mapper.AcceptanceReleasePointMapper;
 
 /**
  * 放行点：夹具策略把某几条成员的结果压在这里，等受限控制面把点标成已放行。
@@ -11,14 +11,17 @@ import org.springframework.stereotype.Component;
  *
  * <p>读法是「许可」：标成已放行之后每一轮读到的都是已放行，重复读不会有副作用，进程在两次读之间
  * 退出也不会把这次放行丢掉。没有这一行、或者行还没标，都按「没放行」处理。</p>
+ *
+ * <p>取值与判断都在 SQL 里（{@link AcceptanceReleasePointMapper} 的语句），这样它在真库上也能
+ * 被同一条语句验证：真库用例直接调这一层，而不是在测试里另写一份 SQL。</p>
  */
 @Component
 public class AcceptanceReleasePointStore {
 
-    private final JdbcTemplate jdbcTemplate;
+    private final AcceptanceReleasePointMapper mapper;
 
-    public AcceptanceReleasePointStore(JdbcTemplate jdbcTemplate) {
-        this.jdbcTemplate = jdbcTemplate;
+    public AcceptanceReleasePointStore(AcceptanceReleasePointMapper mapper) {
+        this.mapper = mapper;
     }
 
     /** 这个 Run 的这个放行点被标成已放行了吗。 */
@@ -26,13 +29,6 @@ public class AcceptanceReleasePointStore {
         if (runId == null || runId.isBlank() || releaseKey == null || releaseKey.isBlank()) {
             return false;
         }
-        Integer opened = jdbcTemplate.queryForObject("""
-                SELECT COUNT(*)
-                FROM alphafrog_agent_run_release_point
-                WHERE run_id = ?
-                  AND release_key = ?
-                  AND opened_at IS NOT NULL
-                """, Integer.class, runId, releaseKey);
-        return opened != null && opened > 0;
+        return mapper.countOpened(runId, releaseKey) > 0;
     }
 }

@@ -127,6 +127,7 @@ public final class AcceptanceReleasePolicy {
             // 一条成员都没点名的策略管不了任何事，当成「这条夹具不管放行」处理。
             return Optional.empty();
         }
+        rejectUnwaitableRules(fixtureId, rules);
         return Optional.of(new AcceptanceReleasePolicy(rules, maxHoldSeconds));
     }
 
@@ -205,6 +206,69 @@ public final class AcceptanceReleasePolicy {
             names.add(element.asText());
         }
         return names;
+    }
+
+    /**
+     * 点名的等待关系要等得出头：不许自己等自己，也不许绕成一圈。
+     *
+     * <p>这两类写法只从策略本身就能判出来，所以读策略这一步就拒绝，不等派发成员之后才发现：等不出头的
+     * 关系会让那几条成员一直压着，除了兜底时限或人来收拾，没有别的出路；夹具写错了就该当场说清是哪
+     * 几条成员绕住了，而不是让一次验收跑出个看不出原因的等待。</p>
+     *
+     * <p>「点名了不存在的成员」不在这里判：那要看这一批真的派发了哪些工具调用，是派发前那一步的事。</p>
+     */
+    private static void rejectUnwaitableRules(String fixtureId,
+                                             Map<String, MemberRule> rules) {
+        for (Map.Entry<String, MemberRule> entry : rules.entrySet()) {
+            String toolCallId = entry.getKey();
+            List<String> peers = entry.getValue().releaseAfter();
+            if (peers.contains(toolCallId)) {
+                throw invalid(fixtureId, "放行策略里成员 " + toolCallId + " 要等自己先落终态，这条永远等不到头");
+            }
+        }
+        // 只有「等别的成员先落终态」这种规则会连成等待关系；一条成员只写一种动作，所以等待关系就是
+        // 这些边。深度优先找出第一条绕回来的路径，报错里写清是哪一圈。
+        Map<String, Integer> marks = new LinkedHashMap<>();
+        for (String start : rules.keySet()) {
+            List<String> path = new ArrayList<>();
+            if (findCycle(start, rules, marks, path)) {
+                throw invalid(fixtureId, "放行策略里这几条成员互相等成了一整圈："
+                        + String.join(" → ", path));
+            }
+        }
+    }
+
+    /** 从这条成员往下走，看是否绕回自己；走到认过的成员就剪掉，path 里留着这一圈。 */
+    private static boolean findCycle(String toolCallId,
+                                     Map<String, MemberRule> rules,
+                                     Map<String, Integer> marks,
+                                     List<String> path) {
+        Integer mark = marks.get(toolCallId);
+        if (mark != null) {
+            // 2 表示这棵子树已经查完、没有圈；1 表示还在当前这条路径上，遇到它就是绕回来了。
+            if (mark == 1) {
+                // 只有「重见」这一个地方往路径上补名字：往上回退的那几层不再补，
+                // 否则同一圈会被每一层各补一次，报错里写出来的路径就不是真正那一圈。
+                path.add(toolCallId);
+                return true;
+            }
+            return false;
+        }
+        MemberRule rule = rules.get(toolCallId);
+        if (rule == null || rule.releaseAfter().isEmpty()) {
+            marks.put(toolCallId, 2);
+            return false;
+        }
+        marks.put(toolCallId, 1);
+        path.add(toolCallId);
+        for (String peer : rule.releaseAfter()) {
+            if (findCycle(peer, rules, marks, path)) {
+                return true;
+            }
+        }
+        path.remove(path.size() - 1);
+        marks.put(toolCallId, 2);
+        return false;
     }
 
     private static String requiredText(String fixtureId, JsonNode value, String where) {

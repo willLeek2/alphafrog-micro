@@ -32,6 +32,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
@@ -41,9 +42,11 @@ import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * 新调度器版本（DUAL_POOL_V2）的节点分段执行器：LINEAR 与 DAG 共用同一份模型与工具循环。
@@ -317,6 +320,7 @@ public class DualPoolWaitGroupNodeExecutor {
                     : toolDispatcher.stableOperationId(call.name(), rawToolCallId, input.identity()).orElse(null);
             drafts.add(new WaitMemberDraft(index, rawToolCallId, call.name(), operationId));
         }
+        validatePolicyPeers(input, drafts);
         int nextSegmentSequence = input.identity().segmentSequence() + 1;
         int nodeToolCalls = checkpoint.toolCallsUsed() + drafts.size();
         List<ChatMessage> history = new ArrayList<>(messages);
@@ -354,6 +358,46 @@ public class DualPoolWaitGroupNodeExecutor {
             }
         }
         return new Outcome.Suspended(groupId, checkpoint.modelTurn(), nextSegmentSequence, drafts.size());
+    }
+
+    /**
+     * 派发之前先核对夹具策略点名的成员都在这一批里。
+     *
+     * <p>一个等待组的成员就是这一次模型回合里那几个工具调用，组建出来之后就定死了；策略点名了一个不在
+     * 这一批里的成员，这条规则永远等不到头（被压住的成员除了兜底时限没人会来放行）。所以核对放在建组
+     * 与派发之前：一个外部作业都还没建出来，夹具写错了当场停住，原因就是夹具自己的稳定错误码。</p>
+     *
+     * <p>自己等自己、几条成员绕成一圈那两类在读策略时已经拒了——它们只从策略本身就能判出来。</p>
+     */
+    private void validatePolicyPeers(SegmentExecution input, List<WaitMemberDraft> drafts) {
+        AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
+        if (policy == null) {
+            return;
+        }
+        Set<String> batch = new LinkedHashSet<>();
+        for (WaitMemberDraft draft : drafts) {
+            if (draft.getToolCallId() != null && !draft.getToolCallId().isBlank()) {
+                batch.add(draft.getToolCallId());
+            }
+        }
+        for (WaitMemberDraft draft : drafts) {
+            String toolCallId = draft.getToolCallId();
+            if (toolCallId == null || toolCallId.isBlank() || !policy.covers(toolCallId)) {
+                continue;
+            }
+            List<String> missing = new ArrayList<>();
+            for (String peer : policy.releaseAfter(toolCallId)) {
+                if (!batch.contains(peer)) {
+                    missing.add(peer);
+                }
+            }
+            if (!missing.isEmpty()) {
+                throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_policy_invalid",
+                        "夹具策略里成员 " + toolCallId + " 要等 " + String.join("、", missing)
+                                + " 先落终态，这几个名字不在这一批工具调用里（这一批："
+                                + String.join("、", batch) + "）");
+            }
+        }
     }
 
     /**
@@ -453,10 +497,16 @@ public class DualPoolWaitGroupNodeExecutor {
         if (designated.isPresent()) {
             // 验收夹具点名这条成员按失败收尾：工具当场真的成功了也记成失败，这正是这个场景要造出来的
             // 「有一条成员失败、其余的照常」。工具的真实输出留在成员行里，失败原因单独写清楚。
-            success = false;
+            // 这条成员本来就是失败的（额度耗尽、控制信号中止、工具自己报错）时不覆盖真实原因：
+            // 覆盖掉会让排查的人以为是夹具把它弄失败的，夹具那句另记一处。
             extra = new LinkedHashMap<>(extra);
-            extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
-            extra.put("errorDetail", designated.get());
+            if (success) {
+                success = false;
+                extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
+                extra.put("errorDetail", designated.get());
+            } else {
+                extra.put("designatedFailure", designated.get());
+            }
         } else if (policy != null && member.getToolCallId() != null
                 && policy.covers(member.getToolCallId())) {
             // 压住结果与等兄弟成员先落终态这两种规则，针对的是「结果以后才回来」的成员。

@@ -120,6 +120,50 @@ class AcceptanceReleasePolicyTest {
                 .hasMessageContaining("最外层要是一个 JSON 对象");
     }
 
+    /** 等不出头的等待关系当场拒掉：自己等自己。 */
+    @Test
+    void aMemberWaitingForItselfIsRefused() {
+        assertThatThrownBy(() -> parse("{\"members\":{\"call-a\":{\"releaseAfter\":[\"call-a\"]}}}"))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("call-a")
+                .hasMessageContaining("等不到头");
+    }
+
+    /** 等不出头的等待关系当场拒掉：两条成员互相等；报错里要写清是哪一圈。 */
+    @Test
+    void aCycleOfWaitingMembersIsRefused() {
+        assertThatThrownBy(() -> parse("{\"members\":{"
+                + "\"call-a\":{\"releaseAfter\":[\"call-b\"]},"
+                + "\"call-b\":{\"releaseAfter\":[\"call-a\"]}}}"))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("call-a → call-b → call-a");
+    }
+
+    /** 三条成员绕一圈、外加一条不相干的规则：照样能找出那一圈。 */
+    @Test
+    void aLongerCycleIsRefusedAndUnrelatedRulesDoNotConfuseIt() {
+        assertThatThrownBy(() -> parse("{\"members\":{"
+                + "\"call-x\":{\"fail\":\"不相干的一条\"},"
+                + "\"call-a\":{\"releaseAfter\":[\"call-b\"]},"
+                + "\"call-b\":{\"releaseAfter\":[\"call-c\"]},"
+                + "\"call-c\":{\"releaseAfter\":[\"call-a\"]}}}"))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("call-a → call-b → call-c → call-a");
+    }
+
+    /** 等一条不写规则的成员是正常写法：它不参与等待，也就连不成圈。 */
+    @Test
+    void waitingForAMemberWithoutARuleIsAccepted() {
+        AcceptanceReleasePolicy policy = parse("{\"members\":{"
+                + "\"call-a\":{\"releaseAfter\":[\"call-b\",\"call-c\"]}}}").orElseThrow();
+
+        assertThat(policy.releaseAfter("call-a")).containsExactly("call-b", "call-c");
+        assertThat(policy.covers("call-b")).isFalse();
+    }
+
     private Optional<AcceptanceReleasePolicy> parse(String json) {
         return AcceptanceReleasePolicy.parse("fx-policy", json, objectMapper);
     }
