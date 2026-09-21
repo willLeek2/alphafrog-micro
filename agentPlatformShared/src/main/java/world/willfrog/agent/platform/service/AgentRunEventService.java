@@ -4,12 +4,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException;
+import world.willfrog.agent.platform.idempotency.RunRequestDigest;
+import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
@@ -164,6 +168,10 @@ public class AgentRunEventService {
      * {@link SchedulerVersion#fromWire(String)} 解析：认不出的取值直接抛
      * {@link world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException}，失败关闭，
      * 不落回 LEGACY。这个值只影响此后新建的 Run；存量 Run 与追问始终按库里已经冻结的取值路由。</p>
+     *
+     * <p>带幂等键时按用户范围内的键去重：同一个键配同一个请求摘要读回原来那条 Run，配不同摘要抛
+     * {@link RunIdempotencyConflictException}，两种情况都不会新建第二条 Run。读回发生在写任何东西之前，
+     * 所以重复提交不会多出事件、消息或提示词快照。</p>
      */
     public AgentRun createRun(String userId,
                               String message,
@@ -183,6 +191,19 @@ public class AgentRunEventService {
                               boolean generateArtifacts,
                               boolean isAdmin) {
         SchedulerVersion frozenSchedulerVersion = SchedulerVersion.fromWire(schedulerVersion);
+        String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
+        String requestDigest = normalizedIdempotencyKey == null ? null : RunRequestDigest.digest(
+                new RunRequestFingerprint(userId, message, contextJson, modelName, endpointName,
+                        provider, captureLlmRequests, stageConfigJson),
+                objectMapper);
+        if (normalizedIdempotencyKey != null) {
+            AgentRun existing = runMapper.findByUserIdempotencyKey(userId, normalizedIdempotencyKey);
+            if (existing != null) {
+                log.info("[AgentRunEventService] 幂等键命中，读回原来的 Run: userId={}, runId={}",
+                        userId, existing.getId());
+                return requireSameRequestDigest(existing, requestDigest, userId);
+            }
+        }
         log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}, schedulerVersion={}",
                 userId, stageConfigJson, isAdmin, frozenSchedulerVersion);
         // 生成无连字符 UUID 作为 runId
@@ -271,7 +292,24 @@ public class AgentRunEventService {
         run.setRestartAttempt(0);
         run.setToolJobAnchorJson("{}");
 
-        runMapper.insert(run);
+        run.setIdempotencyKey(normalizedIdempotencyKey);
+        run.setRequestDigest(requestDigest);
+        try {
+            runMapper.insert(run);
+        } catch (DuplicateKeyException duplicate) {
+            // 同一瞬间两个请求带着同一个键一起进来：唯一索引只放行一条，另一条在这里读回同一个 Run。
+            if (normalizedIdempotencyKey == null) {
+                throw duplicate;
+            }
+            AgentRun raced = runMapper.findByUserIdempotencyKey(userId, normalizedIdempotencyKey);
+            if (raced == null) {
+                // 唯一索引报的是别的冲突（例如主键重复），这种情况不能猜，原样抛出。
+                throw duplicate;
+            }
+            log.info("[AgentRunEventService] 幂等键并发命中，读回先写入的那条 Run: userId={}, runId={}",
+                    userId, raced.getId());
+            return requireSameRequestDigest(raced, requestDigest, userId);
+        }
         // 紧接着写入 RUN_RECEIVED 事件,保留 ext 全文作为事件 payload 便于审计
         append(runId, userId, "RUN_RECEIVED", ext);
 
@@ -286,6 +324,29 @@ public class AgentRunEventService {
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
         return runMapper.findByIdAndUserForDeployment(
                 runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
+    }
+
+    /** 空串与纯空白都按「没有带幂等键」处理：历史客户端会把空串传进来。 */
+    private static String normalizeIdempotencyKey(String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return null;
+        }
+        return idempotencyKey.strip();
+    }
+
+    /**
+     * 读回的 Run 必须与这次请求内容一致。
+     *
+     * <p>摘要不一致说明同一个键被拿去提交了另一份内容：既不读回（内容不一样），也不新建（同一键两条 Run
+     * 会让重复提交失去意义），直接按业务错误拒绝。</p>
+     */
+    private AgentRun requireSameRequestDigest(AgentRun existing, String requestDigest, String userId) {
+        if (existing.getRequestDigest() == null
+                || !existing.getRequestDigest().equals(requestDigest)) {
+            throw new RunIdempotencyConflictException(
+                    "同一个幂等键已经对应另一份创建请求：userId=" + userId + ", runId=" + existing.getId());
+        }
+        return existing;
     }
 
     private static String normalizeLaneTag(String laneTag) {

@@ -24,6 +24,14 @@ public interface AgentRunMapper {
 
     AgentRun findByIdAndUser(@Param("id") String id, @Param("userId") String userId);
 
+    /**
+     * 按用户与幂等键读回创建请求对应的 Run。
+     *
+     * <p>库里有「同一用户同键唯一」的部分唯一索引，所以最多只有一条；没有带键的 Run 时返回 null。</p>
+     */
+    AgentRun findByUserIdempotencyKey(@Param("userId") String userId,
+                                      @Param("idempotencyKey") String idempotencyKey);
+
     AgentRun findByIdAndUserForDeployment(
             @Param("id") String id,
             @Param("userId") String userId,
