@@ -13,9 +13,11 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
 import world.willfrog.agent.platform.service.StageConfigResolver;
 import world.willfrog.agent.platform.service.StageConfigValidator;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 为一次 agent run 解析 planning（规划）、execution（执行）、final-answer（最终答案）三个阶段各自使用的 ChatModel。
@@ -52,6 +54,7 @@ public class LangchainRunStageModelResolver {
     private final AgentAiServiceFactory aiServiceFactory;
     private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
+    private final AcceptanceFixtureModelRegistry acceptanceFixtureModels;
 
     /**
      * 解析一次 run 的三阶段 ChatModel。
@@ -74,6 +77,11 @@ public class LangchainRunStageModelResolver {
      * @return 包含三阶段 ChatModel 和 planning 阶段元信息的 StageModels
      */
     public StageModels resolve(AgentRun run) {
+        Optional<AcceptanceFixtureModelRegistry.ScriptedStage> scripted =
+                acceptanceFixtureModels.stageForRun(run);
+        if (scripted.isPresent()) {
+            return acceptanceFixtureStageModels(scripted.get());
+        }
         RunStageConfig stageConfig = stageConfigResolver.resolve(run.getExt());
         stageConfigValidator.validate(stageConfig);
 
@@ -127,6 +135,26 @@ public class LangchainRunStageModelResolver {
                 planningEndpointName,
                 planningModelName,
                 planningProviderOrder);
+    }
+
+    /**
+     * 带验收夹具的 Run 走这一条：三个阶段都用同一个脚本模型。
+     *
+     * <p>同一个实例是有意的：脚本按顺序消费，三个阶段的调用顺序在一条 Run 上是确定的
+     * （先规划、再逐节点执行、最后写答案），位置跟着 Run 走才对得起来。真实供应商的配置解析、
+     * 客户端构建、provider 顺序在这里一件都不做，所以这一次执行碰不到真实模型。</p>
+     *
+     * <p>规划端点的两个名字写成夹具的标记：事件、读数与调试界面里一眼看得出这次用的不是供应商。</p>
+     */
+    private StageModels acceptanceFixtureStageModels(AcceptanceFixtureModelRegistry.ScriptedStage stage) {
+        ChatModel scripted = stage.model();
+        return new StageModels(
+                scripted,
+                scripted,
+                scripted,
+                AcceptanceFixtureModelRegistry.ScriptedStage.ENDPOINT_NAME,
+                stage.modelName(),
+                List.of());
     }
 
     /**
