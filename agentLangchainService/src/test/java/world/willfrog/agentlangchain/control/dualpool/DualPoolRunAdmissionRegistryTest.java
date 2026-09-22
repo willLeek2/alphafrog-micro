@@ -43,6 +43,18 @@ class DualPoolRunAdmissionRegistryTest {
     /** 替身里那条活着的服务所有权：持有人 test-instance、代际 1，与 {@code leaseAcquired()} 对应。 */
     private static final ServiceOwnershipFence FENCE = new ServiceOwnershipFence("test-instance", 1L);
 
+    /** 这条路在读服务租约时长：登记之后读数里报的是它归一化之后在用的数。 */
+    @Test
+    void theEffectiveLeaseTtlIsRegisteredForTheReading() {
+        FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
+        new DualPoolRunAdmissionRegistry(mock(SchedulerPermitLedger.class),
+                mock(NodeWorkItemStore.class), mock(AgentRunMapper.class), mock(RunServiceLeaseStore.class),
+                mock(ProcessInstanceIdentity.class), 120L, inUse);
+
+        assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
+                .containsEntry("DualPoolRunAdmissionRegistry", 120L);
+    }
+
     /**
      * 只量名额语义的替身：服务所有权交给一条「取一次就成功」的租约。受理这条路本来就要先拿到
      * 这条 Run 的服务所有权，拿不到的进程不该受理它，所以替身也必须把这一关摆出来。
@@ -57,7 +69,8 @@ class DualPoolRunAdmissionRegistryTest {
                         OffsetDateTime.now(), OffsetDateTime.now(),
                         OffsetDateTime.now().plusMinutes(2))));
         when(leaseStore.find(anyString())).thenReturn(Optional.empty());
-        return new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L);
+        return new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L,
+                new FrozenEffectiveSettings());
     }
 
     @Test
@@ -396,7 +409,8 @@ class DualPoolRunAdmissionRegistryTest {
                     Optional.of(new RunServiceLease(invocation.getArgument(0, String.class), "test-instance",
                             1L, OffsetDateTime.now(), OffsetDateTime.now(),
                             OffsetDateTime.now().plusMinutes(2))));
-            registry = new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L);
+            registry = new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity,
+                    120L, new FrozenEffectiveSettings());
         }
 
         private void residue(SchedulerVersion version, List<NodeWorkItem> items) {

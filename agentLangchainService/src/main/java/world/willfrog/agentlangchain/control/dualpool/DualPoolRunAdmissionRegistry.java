@@ -105,13 +105,18 @@ public class DualPoolRunAdmissionRegistry {
                                         RunServiceLeaseStore leaseStore,
                                         ProcessInstanceIdentity instanceIdentity,
                                         @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}")
-                                        long serviceLeaseTtlSeconds) {
+                                        long serviceLeaseTtlSeconds,
+                                        FrozenEffectiveSettings frozenEffectiveSettings) {
         this.permitLedger = permitLedger;
         this.workItemStore = workItemStore;
         this.runMapper = runMapper;
         this.leaseStore = leaseStore;
         this.instanceIdentity = instanceIdentity;
         this.serviceLeaseTtl = Duration.ofSeconds(Math.max(1L, serviceLeaseTtlSeconds));
+        // 同一个参数有四个消费者，各自归一化出来的数可能不同（这里按 1 秒起，领取那一路按 5 秒起）：
+        // 各自登记在用的值，读数里按「谁在用 → 用多少」列出来，不替它们挑一个。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
+                "DualPoolRunAdmissionRegistry", this.serviceLeaseTtl.toSeconds());
     }
 
     /**

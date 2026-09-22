@@ -146,7 +146,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
             @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
-            @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceLeaseTtlSeconds) {
+            @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceLeaseTtlSeconds,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.runMapper = runMapper;
         this.freshRunPipeline = freshRunPipeline;
         this.workItemStore = workItemStore;
@@ -169,7 +170,20 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.processIdentity = processIdentity;
         this.legacyHandoff = legacyHandoff;
         this.serviceLeaseTtl = Duration.ofSeconds(Math.max(5L, serviceLeaseTtlSeconds));
+        // 登记归一化之后真正在用的值：领取租约、协调延期重试、提示队列满重试与服务租约时长这几项
+        // 读数里报的都是这里登记的数，不是属性请求值。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_CLAIM_LEASE_SECONDS,
+                COMPONENT, this.claimLease.toSeconds());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_COORDINATION_DEFER_RETRY_MS,
+                COMPONENT, this.coordinationDeferRetry.toMillis());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_HINT_QUEUE_FULL_RETRY_MS,
+                COMPONENT, this.hintQueueFullRetry.toMillis());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
+                COMPONENT, this.serviceLeaseTtl.toSeconds());
     }
+
+    /** 读数与登记里用的组件名。 */
+    private static final String COMPONENT = "DatabaseDualPoolWorkHandler";
 
     @Override
     @Transactional

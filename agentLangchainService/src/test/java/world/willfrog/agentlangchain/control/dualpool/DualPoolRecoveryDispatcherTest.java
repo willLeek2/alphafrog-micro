@@ -70,6 +70,24 @@ class DualPoolRecoveryDispatcherTest {
                 recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024), 1000L, new FrozenEffectiveSettings());
     }
 
+    /**
+     * 启动扫描真正跑的那一刻，把这一次用到的翻页数登记下来。
+     *
+     * <p>翻页数不是启动时冻结的字段（它每次按当前配置取），所以「在用的值」只有跑的那一刻才说得清：
+     * 读数是给验收看板与排查看的，报的必须是真跑过的那个数。</p>
+     */
+    @Test
+    void theStartupBackfillRegistersThePagesItActuallyUses() {
+        FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
+        DualPoolRecoveryDispatcher withReading = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
+                intake, recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024), 1000L, inUse);
+
+        withReading.recoverOnStartup();
+
+        assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_RECOVERY_STARTUP_PAGES))
+                .containsEntry("DualPoolRecoveryDispatcher", 4);
+    }
+
     @Test
     void aDueNotificationIsConsumedAndItsNextSegmentIsHandedToTheNodePool() {
         store.addNotification(11L, RUN_ID, OffsetDateTime.now().minusSeconds(30));

@@ -57,6 +57,8 @@ public class DualPoolRecoveryDispatcher {
     private final WaitGroupRecoveryIntake intake;
     /** 每轮读一次的参数：批次、配额、提醒容量与退避都允许在运行期改，改完下一轮生效。 */
     private final DualPoolSchedulerSettings settings;
+    /** 启动扫描用到的翻页数要登记到读数里，所以这里留着登记入口。 */
+    private final FrozenEffectiveSettings frozenEffectiveSettings;
     /** 最近一次构造退避用的初值与上限；配置变了就按新值重建，不用重启。 */
     private volatile RecoveryBackoff backoff;
     private volatile long backoffBaseMs;
@@ -93,6 +95,7 @@ public class DualPoolRecoveryDispatcher {
         this.dispatcher = dispatcher;
         this.intake = intake;
         this.settings = settings;
+        this.frozenEffectiveSettings = frozenEffectiveSettings;
         // 补扫的间隔与 @Scheduled 上那个属性名在启动时各解析一次，取到的是同一个数；报出来是为了
         // 让读数与定时任务对得上，不是另立一份配置。
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RECOVERY_SCAN_INTERVAL_MS,
@@ -165,7 +168,12 @@ public class DualPoolRecoveryDispatcher {
         DualPoolSchedulerSettings.RoundSettings round = settings.round();
         int total = 0;
         int batchSize = round.recoveryBatchSize().intValue();
-        for (int page = 0; page < round.recoveryStartupPages().intValue(); page++) {
+        int startupPages = round.recoveryStartupPages().intValue();
+        // 翻页数不是一个启动时冻结的字段，而是这一次启动扫描真正用到的数：在这里登记，读数里这一项
+        // 报的就是它（登记之前那一项会写明「没有组件登记」）。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RECOVERY_STARTUP_PAGES,
+                "DualPoolRecoveryDispatcher", startupPages);
+        for (int page = 0; page < startupPages; page++) {
             int handled = safeRound(batchSize);
             total += handled;
             if (handled < batchSize) {

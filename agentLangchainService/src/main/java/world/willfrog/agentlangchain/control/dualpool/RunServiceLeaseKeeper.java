@@ -65,13 +65,35 @@ public class RunServiceLeaseKeeper {
             ProcessInstanceIdentity instanceIdentity,
             @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceTtlSeconds,
             @Value("${agent.langchain.dual-pool.service-lease-owned-limit:512}") int ownedLimit,
-            @Value("${agent.langchain.dual-pool.service-lease-renew-interval-ms:40000}") long renewIntervalMs) {
+            @Value("${agent.langchain.dual-pool.service-lease-renew-interval-ms:40000}") long renewIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.leaseStore = leaseStore;
         this.admissionRegistry = admissionRegistry;
         this.instanceIdentity = instanceIdentity;
         this.serviceTtl = Duration.ofSeconds(Math.max(1L, serviceTtlSeconds));
         this.ownedLimit = Math.max(1, ownedLimit);
         this.renewIntervalMs = Math.max(1L, renewIntervalMs);
+        // 登记归一化之后真正在用的值：读数里这一项报的就是这几个数，不是请求值。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
+                COMPONENT, this.serviceTtl.toSeconds());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_OWNED_LIMIT,
+                COMPONENT, this.ownedLimit);
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_RENEW_INTERVAL_MS,
+                COMPONENT, this.renewIntervalMs);
+    }
+
+    /** 读数与登记里用的组件名：同一个参数有几个消费者时，靠它分清是谁在用的数。 */
+    private static final String COMPONENT = "RunServiceLeaseKeeper";
+
+    /**
+     * 续期周期的毫秒数：周期任务与读数用的是这一个数。
+     *
+     * <p>下面 {@link #renewPeriodically()} 上的 {@code @Scheduled} 用 SpEL 直接取这里的值，而不是各自
+     * 去读一遍属性：属性值不合法（0 或负数）时这里按 1 毫秒处理，定时那一处若自己读属性就会拿到 0 而
+     * 变成不停转的空转，读数上还看不出来。</p>
+     */
+    public long renewIntervalMillis() {
+        return renewIntervalMs;
     }
 
     /** 进程起来先续一轮：上一次退出到这一次起来之间，手上的租约可能已经过期了。 */
@@ -80,7 +102,7 @@ public class RunServiceLeaseKeeper {
         safeRenew();
     }
 
-    @Scheduled(fixedDelayString = "${agent.langchain.dual-pool.service-lease-renew-interval-ms:40000}")
+    @Scheduled(fixedDelayString = "#{@runServiceLeaseKeeper.renewIntervalMillis()}")
     public void renewPeriodically() {
         safeRenew();
     }

@@ -90,12 +90,15 @@ public class WaitGroupRecoveryIntake {
             RunServiceLeaseStore leaseStore,
             ProcessInstanceIdentity instanceIdentity,
             DualPoolRunAdmissionRegistry admissionRegistry,
-            @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long leaseTtlSeconds) {
+            @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long leaseTtlSeconds,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.waitGroupStore = waitGroupStore;
         this.leaseStore = leaseStore;
         this.instanceIdentity = instanceIdentity;
         this.admissionRegistry = admissionRegistry;
         this.leaseTtl = Duration.ofSeconds(Math.max(1L, leaseTtlSeconds));
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
+                "WaitGroupRecoveryIntake", this.leaseTtl.toSeconds());
     }
 
     /**

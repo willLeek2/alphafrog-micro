@@ -6,6 +6,11 @@ import org.mockito.Mockito;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.beans.factory.config.BeanExpressionContext;
+import org.springframework.context.expression.StandardBeanExpressionResolver;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -40,6 +45,7 @@ class RunServiceLeaseKeeperTest {
     private DualPoolRunAdmissionRegistry admissionRegistry;
     private ProcessInstanceIdentity identity;
     private RunServiceLeaseKeeper keeper;
+    private FrozenEffectiveSettings frozenEffectiveSettings;
 
     @BeforeEach
     void setUp() {
@@ -47,7 +53,9 @@ class RunServiceLeaseKeeperTest {
         admissionRegistry = Mockito.mock(DualPoolRunAdmissionRegistry.class);
         identity = Mockito.mock(ProcessInstanceIdentity.class);
         Mockito.lenient().when(identity.value()).thenReturn(OWNER);
-        keeper = new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, 120L, 512, 40_000L);
+        frozenEffectiveSettings = new FrozenEffectiveSettings();
+        keeper = new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, 120L, 512, 40_000L,
+                frozenEffectiveSettings);
     }
 
     /** 平常一轮：清点几条、批量续几条，两边对上就不再逐条看。 */
@@ -180,13 +188,60 @@ class RunServiceLeaseKeeperTest {
     @Test
     void theOwnedListingIsBounded() {
         RunServiceLeaseKeeper bounded = new RunServiceLeaseKeeper(
-                leaseStore, admissionRegistry, identity, 60L, 7, 20_000L);
+                leaseStore, admissionRegistry, identity, 60L, 7, 20_000L, frozenEffectiveSettings);
         when(leaseStore.listOwnedWithLiveRun(OWNER, 7)).thenReturn(List.of());
         bounded.renewOwnedOnce();
         verify(leaseStore).listOwnedWithLiveRun(OWNER, 7);
         assertThat(bounded.snapshot())
                 .containsEntry("serviceLeaseTtlSeconds", 60L)
                 .containsEntry("serviceLeaseRenewIntervalMs", 20_000L);
+    }
+
+    /** 读数里报的是归一化之后在用的三个数，不是属性请求值。 */
+    @Test
+    void theEffectiveLeaseValuesAreRegisteredForTheReading() {
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
+                .containsEntry("RunServiceLeaseKeeper", 120L);
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_OWNED_LIMIT))
+                .containsEntry("RunServiceLeaseKeeper", 512);
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_RENEW_INTERVAL_MS))
+                .containsEntry("RunServiceLeaseKeeper", 40_000L);
+
+        // 属性值不合法时按 1 处理：登记的也是归一化之后的 1，读数才不会报一个这里根本没采用的数。
+        FrozenEffectiveSettings illegal = new FrozenEffectiveSettings();
+        new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, 0L, 0, 0L, illegal);
+        assertThat(illegal.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
+                .containsEntry("RunServiceLeaseKeeper", 1L);
+        assertThat(illegal.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_OWNED_LIMIT))
+                .containsEntry("RunServiceLeaseKeeper", 1);
+        assertThat(illegal.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_RENEW_INTERVAL_MS))
+                .containsEntry("RunServiceLeaseKeeper", 1L);
+    }
+
+    /**
+     * 定时续期取的就是这里登记的周期：属性值不合法时按 1 毫秒排，而不是各自再读一遍属性。
+     *
+     * <p>排期用的是 SpEL 表达式，写错 Bean 名或表达式时容器起不来，所以这条用例真的把容器起一遍。</p>
+     */
+    @Test
+    void theScheduledRenewalUsesTheRegisteredInterval() throws Exception {
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.registerBean("runServiceLeaseKeeper", RunServiceLeaseKeeper.class, () -> keeper);
+            context.registerBean(SchedulingEnabler.class);
+            context.refresh();
+
+            Scheduled scheduled = RunServiceLeaseKeeper.class.getMethod("renewPeriodically")
+                    .getAnnotation(Scheduled.class);
+            Object resolved = new StandardBeanExpressionResolver().evaluate(
+                    scheduled.fixedDelayString(), new BeanExpressionContext(context.getBeanFactory(), null));
+
+            assertThat(resolved).as("定时续期的周期与读数里登记的是同一个数").isEqualTo(40_000L);
+        }
+    }
+
+    /** 只为了让上面那条用例的容器打开定时任务处理。 */
+    @EnableScheduling
+    static class SchedulingEnabler {
     }
 
     private static RunServiceLease lease(String runId, long fencingToken) {

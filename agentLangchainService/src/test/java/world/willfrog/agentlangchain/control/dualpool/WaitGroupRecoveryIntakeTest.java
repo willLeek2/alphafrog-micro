@@ -47,6 +47,8 @@ class WaitGroupRecoveryIntakeTest {
     private DualPoolRunAdmissionRegistry admissionRegistry;
     private WaitGroupRecoveryIntake intake;
 
+    private FrozenEffectiveSettings frozenEffectiveSettings;
+
     @BeforeEach
     void setUp() {
         waitGroupStore = Mockito.mock(WaitGroupStore.class);
@@ -54,10 +56,18 @@ class WaitGroupRecoveryIntakeTest {
         admissionRegistry = Mockito.mock(DualPoolRunAdmissionRegistry.class);
         ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
         Mockito.lenient().when(identity.value()).thenReturn(OWNER);
+        frozenEffectiveSettings = new FrozenEffectiveSettings();
         intake = new WaitGroupRecoveryIntake(waitGroupStore, leaseStore, identity,
-                admissionRegistry, 120L);
+                admissionRegistry, 120L, frozenEffectiveSettings);
         Mockito.lenient().when(admissionRegistry.reserveForRecovery(RUN_ID))
                 .thenReturn(new DualPoolRunAdmissionRegistry.Admission(true, 11L));
+    }
+
+    /** 这条路在读服务租约时长：登记之后读数里报的是它归一化之后在用的数。 */
+    @Test
+    void theEffectiveLeaseTtlIsRegisteredForTheReading() {
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
+                .containsEntry("WaitGroupRecoveryIntake", 120L);
     }
 
     /** 不是所有者：不消费、不动通知、不占名额。 */

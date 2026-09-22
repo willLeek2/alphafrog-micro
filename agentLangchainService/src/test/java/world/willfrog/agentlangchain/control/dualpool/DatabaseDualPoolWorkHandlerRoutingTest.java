@@ -55,6 +55,9 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     private SchedulerVersionPolicy versionPolicy;
     private RunServiceLeaseStore leaseStore;
     private LegacyRunHandoff legacyHandoff;
+    /** 读数用的登记表：这一份用例顺带量「领取租约、两次重试与服务租约时长」有没有登记在用的值。 */
+    private final FrozenEffectiveSettings frozenEffectiveSettings = new FrozenEffectiveSettings();
+
     private DatabaseDualPoolWorkHandler handler;
 
     @BeforeEach
@@ -95,7 +98,25 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 handoffProvider,
                 // 上限与水位按默认值；这一份用例量的是路由，不是参数解析。
                 TestSchedulerSettings.propertyOnly(),
-                300, 1000, 5000, 120);
+                300, 1000, 5000, 120, frozenEffectiveSettings);
+    }
+
+    /**
+     * 四个启动冻结的值各自登记归一化之后真正在用的数。
+     *
+     * <p>读数里这几项报的是这里登记的数，不是属性请求值；服务租约时长这一项要求至少 5 秒，所以请求
+     * 1 秒时登记的是 5 秒——报出 1 秒会让验收与排查以为真的只保 1 秒。</p>
+     */
+    @Test
+    void theEffectiveLeaseAndRetryValuesAreRegisteredForTheReading() {
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_NODE_WORKER_CLAIM_LEASE_SECONDS))
+                .containsEntry("DatabaseDualPoolWorkHandler", 300L);
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_COORDINATION_DEFER_RETRY_MS))
+                .containsEntry("DatabaseDualPoolWorkHandler", 1000L);
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_HINT_QUEUE_FULL_RETRY_MS))
+                .containsEntry("DatabaseDualPoolWorkHandler", 5000L);
+        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
+                .containsEntry("DatabaseDualPoolWorkHandler", 120L);
     }
 
     /** 本进程已经握着这条 Run 的租约：读一次就够，不必再写一遍。 */
