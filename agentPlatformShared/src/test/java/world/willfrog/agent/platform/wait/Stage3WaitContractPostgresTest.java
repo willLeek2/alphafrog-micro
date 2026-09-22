@@ -120,6 +120,8 @@ class Stage3WaitContractPostgresTest {
     private static final String ACCEPTANCE_FIXTURE_SCRIPT =
             "014_agent_run_acceptance_fixture.sql";
     private static final String RELEASE_POINT_SCRIPT = "015_agent_run_release_point.sql";
+    private static final String FIXTURE_CALL_SCRIPT = "016_agent_run_acceptance_fixture_call.sql";
+    private static final String FIXTURE_POLICY_SCRIPT = "017_agent_run_acceptance_fixture_policy.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -750,6 +752,154 @@ class Stage3WaitContractPostgresTest {
                 + "(scope_key, unfinished_count, add_paused, paused_since, high_watermark, low_watermark) "
                 + "VALUES ('PROBE-BAD-WATERMARK', 0, FALSE, NULL, 90, 96)",
                 "alphafrog_agent_scheduler_capacity_state_counter_check");
+    }
+
+    // ==================== 夹具的调用身份与放行规则 ====================
+
+    /**
+     * 同一次调用重启后重领，拿回同一个回复。
+     *
+     * <p>这里执行的是夹具认领用的那一条语句（服务端 {@code FixtureCallStore} 发的是同一条）：两个唯一键
+     * 分别保证「一次调用只领一个回复」与「一个回复只被一次调用领走」。所以进程重启之后，同一个调用身份
+     * 再报一次也只读回原来那一行——这正是「停掉 Agent 再恢复」这类验收能测出来的依据。</p>
+     */
+    @Test
+    void aClaimBelongsToItsCallIdentitySoARestartGetsTheSameTurn() throws Exception {
+        String runId = "run-fixture-restart";
+        String firstCall = "stage=node;memberSeq=0;nodeId=n1";
+        String secondCall = "stage=node;memberSeq=1;nodeId=n1";
+
+        assertThat(insertClaim(runId, firstCall, 0)).isEqualTo(1);
+        // 重启之后：同一个身份又来领，即使这次想领下一个回合，也只会读回原来那一行。
+        assertThat(insertClaim(runId, firstCall, 1)).isZero();
+        assertThat(claimedTurnOf(runId, firstCall)).isZero();
+        // 另一个身份去领已经被领走的回合：领不到，只能换下一个声明的回合。
+        assertThat(insertClaim(runId, secondCall, 0)).isZero();
+        assertThat(insertClaim(runId, secondCall, 1)).isEqualTo(1);
+        assertThat(claimedTurnOf(runId, secondCall)).isEqualTo(1);
+        assertThat(claimRowCount(runId)).isEqualTo(2);
+    }
+
+    /** 四个线程同时用同一个身份领同一个回合：只有一条写得进去，读回来还是那个回合。 */
+    @Test
+    void oneIdentityClaimingUnderConcurrencyWritesExactlyOneRow() throws Exception {
+        String runId = "run-fixture-race";
+        String call = "stage=node;memberSeq=0;nodeId=n1";
+
+        List<Integer> inserted = runConcurrently(CONCURRENT_THREADS,
+                ignored -> insertClaimQuietly(runId, call, 0));
+
+        assertThat(inserted.stream().filter(rows -> rows == 1).count())
+                .as("四条并发写入里只有一条真的落库")
+                .isEqualTo(1);
+        assertThat(inserted).as("没写进去的那三条如实返回零")
+                .filteredOn(rows -> rows == 0).hasSize(CONCURRENT_THREADS - 1);
+        assertThat(claimRowCount(runId)).isEqualTo(1);
+        assertThat(claimedTurnOf(runId, call)).isZero();
+    }
+
+    /** 夹具写错字段名时，规则一条成员都打不中：命中的记录留在库里，终态核对按它点名。 */
+    @Test
+    void aRuleHitIsRecordedOnceAndTheRunEndVerdictCarriesTheCounts() throws Exception {
+        String runId = "run-fixture-policy";
+        insertScenario(runId);
+        assertThat(insertPolicy(runId)).isEqualTo(1);
+        assertThat(insertPolicy(runId)).as("同一条 Run 的策略快照只留一份").isZero();
+
+        assertThat(insertRuleHit(runId, 0, 0)).isEqualTo(1);
+        assertThat(insertRuleHit(runId, 0, 0)).as("同一件事重复记只留一行").isZero();
+        assertThat(insertRuleHit(runId, 0, 1)).isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " WHERE run_id = '" + runId + "'")).isEqualTo(2);
+
+        // 终态核对把结论写回场景行：脚本与规则两路都在这一行上。
+        execute("UPDATE alphafrog_agent_run_acceptance_fixture_scenario"
+                + " SET verdict = 'script_incomplete', claimed_turn_count = 1, required_missing_count = 0,"
+                + " policy_rule_count = 2, policy_hit_rule_count = 1, policy_missing_count = 1,"
+                + " policy_detail = '第 1 条规则（fail，选择器 memberSeq=5;nodeId=n9）'"
+                + " WHERE run_id = '" + runId + "'");
+        assertThat(queryString("SELECT policy_detail FROM alphafrog_agent_run_acceptance_fixture_scenario"
+                + " WHERE run_id = '" + runId + "'")).contains("memberSeq=5;nodeId=n9");
+
+        // 认不出的结论写不进去：以后加结论取值时，旧代码写出来的行不会悄悄混进证据里。
+        expectRejected("UPDATE alphafrog_agent_run_acceptance_fixture_scenario"
+                + " SET verdict = 'unknown' WHERE run_id = '" + runId + "'",
+                "alphafrog_agent_run_acceptance_fixture_scenario_verdict_check");
+    }
+
+    /** 认领语句的写法：与服务端 {@code FixtureCallStore} 发出的那条完全一致。 */
+    private static String claimStatement(String runId, String callIdentity, int turnIndex) {
+        return "INSERT INTO alphafrog_agent_run_acceptance_fixture_call"
+                + " (run_id, fixture_id, scenario_id, call_identity, call_stage, turn_index,"
+                + " script_digest, declared_for, optional_turn)"
+                + " VALUES ('" + runId + "', 'fx-probe', 'scenario-probe', '" + callIdentity + "', 'NODE',"
+                + " " + turnIndex + ", '" + "d".repeat(64) + "', '声明的原文', FALSE)"
+                + " ON CONFLICT DO NOTHING";
+    }
+
+    private static int insertClaim(String runId, String callIdentity, int turnIndex) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement()) {
+            return statement.executeUpdate(claimStatement(runId, callIdentity, turnIndex));
+        }
+    }
+
+    /** 并发用例里用的那一份：`IntFunction` 不许抛受检异常，这里把失败包成运行时异常。 */
+    private static int insertClaimQuietly(String runId, String callIdentity, int turnIndex) {
+        try {
+            return insertClaim(runId, callIdentity, turnIndex);
+        } catch (Exception e) {
+            throw new IllegalStateException("并发认领时出错：" + e.getMessage(), e);
+        }
+    }
+
+    private static long claimRowCount(String runId) throws Exception {
+        return countRows("SELECT count(*) FROM alphafrog_agent_run_acceptance_fixture_call"
+                + " WHERE run_id = '" + runId + "'");
+    }
+
+    /** 这个调用身份当初领到的是哪一个回合。 */
+    private static long claimedTurnOf(String runId, String callIdentity) throws Exception {
+        return countRows("SELECT turn_index FROM alphafrog_agent_run_acceptance_fixture_call"
+                + " WHERE run_id = '" + runId + "' AND call_identity = '" + callIdentity + "'");
+    }
+
+    private static void insertScenario(String runId) throws Exception {
+        execute("INSERT INTO alphafrog_agent_run_acceptance_fixture_scenario"
+                + " (run_id, fixture_id, scenario_id, script_digest, script_size, declarations_json,"
+                + " required_turn_count, optional_turn_count)"
+                + " VALUES ('" + runId + "', 'fx-probe', 'scenario-probe', '" + "e".repeat(64) + "', 1,"
+                + " '[{\"turn\":0,\"stage\":\"answer\",\"optional\":false,\"scope\":{}}]'::jsonb, 1, 0)");
+    }
+
+    private static int insertPolicy(String runId) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement()) {
+            return statement.executeUpdate("INSERT INTO alphafrog_agent_run_acceptance_fixture_policy"
+                    + " (run_id, fixture_id, scenario_id, policy_digest, rules_json, rule_count)"
+                    + " VALUES ('" + runId + "', 'fx-probe', 'scenario-probe', '" + "f".repeat(64) + "',"
+                    + " '[{\"index\":0,\"action\":\"holdUntilPoint\",\"selector\":\"memberSeq=0;nodeId=n1\"}]'::jsonb,"
+                    + " 2) ON CONFLICT DO NOTHING");
+        }
+    }
+
+    private static int insertRuleHit(String runId, int ruleIndex, int memberSeq) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement()) {
+            return statement.executeUpdate("INSERT INTO alphafrog_agent_run_acceptance_fixture_rule_hit"
+                    + " (run_id, rule_index, selector_text, action, group_id, member_seq)"
+                    + " VALUES ('" + runId + "', " + ruleIndex + ", 'memberSeq=0;nodeId=n1',"
+                    + " 'holdUntilPoint', 9001, " + memberSeq + ") ON CONFLICT DO NOTHING");
+        }
+    }
+
+    private static String queryString(String sql) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement();
+             var rows = statement.executeQuery(sql)) {
+            rows.next();
+            return rows.getString(1);
+        }
     }
 
     // ==================== 并发用例 ====================
@@ -2018,7 +2168,8 @@ class Stage3WaitContractPostgresTest {
         for (int round = 1; round <= 2; round++) {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
-                    RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT)) {
+                    RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT,
+                    FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -2387,6 +2538,36 @@ class Stage3WaitContractPostgresTest {
                 + "AND indexname = 'idx_agent_run_release_point_opened' "
                 + "AND indexdef LIKE '%opened_at IS NOT NULL%'"))
                 .as("放行点表要有只含已放行行的索引").isEqualTo(1);
+        // 016/017 那几张夹具表：认领、场景结论、策略快照与命中记录，都只加结构不写数据。
+        for (String table : List.of("alphafrog_agent_run_acceptance_fixture_call",
+                "alphafrog_agent_run_acceptance_fixture_scenario",
+                "alphafrog_agent_run_acceptance_fixture_policy",
+                "alphafrog_agent_run_acceptance_fixture_rule_hit")) {
+            assertThat(countRows("SELECT count(*) FROM " + table))
+                    .as("刚升级完的表里不该有数据：" + table).isZero();
+        }
+        // 一组唯一约束撑起「谁拿了哪个回复」这件事：一次调用一行、一个回合一行、一条规则打中一条成员一行、
+        // 每条 Run 的场景与策略各一份。少任何一条，两个进程同时跑同一条 Run 时就会出现重复消费或重复计账。
+        assertThat(countRows("SELECT count(*) FROM pg_constraint WHERE connamespace = current_schema()::regnamespace"
+                + " AND conname IN ("
+                + "'alphafrog_agent_run_acceptance_fixture_call_identity_key', "
+                + "'alphafrog_agent_run_acceptance_fixture_call_turn_key', "
+                + "'alphafrog_agent_run_acceptance_fixture_scenario_run_key', "
+                + "'alphafrog_agent_run_acceptance_fixture_policy_run_key', "
+                + "'alphafrog_agent_run_acceptance_fixture_rule_hit_key')"))
+                .as("夹具的认领、场景、策略与命中记录都要有各自的唯一约束").isEqualTo(5);
+        for (String table : List.of("alphafrog_agent_run_acceptance_fixture_scenario",
+                "alphafrog_agent_run_acceptance_fixture_policy")) {
+            String column = "alphafrog_agent_run_acceptance_fixture_scenario".equals(table)
+                    ? "declarations_json" : "rules_json";
+            assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                    + "WHERE table_schema = current_schema() AND table_name = '" + table + "'"
+                    + " AND column_name = '" + column + "' AND data_type = 'jsonb'"))
+                    .as("快照列要是 JSONB：" + table + "." + column).isEqualTo(1);
+        }
+        assertThat(countRows("SELECT count(*) FROM pg_constraint WHERE connamespace = current_schema()::regnamespace"
+                + " AND conname = 'alphafrog_agent_run_acceptance_fixture_scenario_verdict_check'"))
+                .as("结论列要有取值约束：以后加结论取值时旧代码写出来的行不会悄悄混进证据").isEqualTo(1);
     }
 
     /** 再报一次同一段的挂起：用来验「旧计划的挂起整条不生效」。 */

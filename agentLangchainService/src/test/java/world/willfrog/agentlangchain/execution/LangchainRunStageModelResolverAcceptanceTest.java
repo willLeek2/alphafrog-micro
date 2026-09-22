@@ -91,7 +91,9 @@ class LangchainRunStageModelResolverAcceptanceTest {
     void aFixtureRunCarriesTheReleasePolicyToTheNodeExecutor() {
         when(acceptanceFixtureModels.stageForRun(any())).thenReturn(Optional.of(scriptedStage()));
         AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1",
-                "{\"members\":{\"call-1\":{\"fail\":\"沙箱那边回不来了\"}}}", objectMapper).orElseThrow();
+                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                        + "\"fail\":\"沙箱那边回不来了\"}]}",
+                objectMapper).orElseThrow();
         when(acceptancePolicies.policyForRun(any())).thenReturn(Optional.of(policy));
 
         LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());

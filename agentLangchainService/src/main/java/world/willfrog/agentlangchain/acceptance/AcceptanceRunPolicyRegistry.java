@@ -28,13 +28,16 @@ public class AcceptanceRunPolicyRegistry {
 
     private final AcceptanceFixtureResolver fixtureResolver;
     private final ObjectMapper objectMapper;
+    private final FixtureRuleHitStore ruleHitStore;
     private final Map<String, AcceptanceReleasePolicy> policyByRun = new ConcurrentHashMap<>();
     private final Map<String, String> fixtureIdByRun = new ConcurrentHashMap<>();
 
     public AcceptanceRunPolicyRegistry(AcceptanceFixtureResolver fixtureResolver,
-                                       ObjectMapper objectMapper) {
+                                       ObjectMapper objectMapper,
+                                       FixtureRuleHitStore ruleHitStore) {
         this.fixtureResolver = fixtureResolver;
         this.objectMapper = objectMapper;
+        this.ruleHitStore = ruleHitStore;
     }
 
     /**
@@ -71,10 +74,13 @@ public class AcceptanceRunPolicyRegistry {
                     "本进程记住的夹具 Run 已经到 " + MAX_TRACKED_RUNS + " 条：这个数只会在终态事件漏掉时涨起来，"
                             + "先查这些 Run 为什么没走到终态");
         }
+        // 第一次读到策略就把这份策略写下来：之后夹具行被改过、被停用或被删掉，核对结论仍然说得清
+        //「这次验收点名了哪几件事」。内容被原位改过时这里会当场拒绝。
+        ruleHitStore.snapshotPolicy(runId, fixtureId, row.get().scenarioId(), parsed.get());
         fixtureIdByRun.putIfAbsent(runId, fixtureId);
         AcceptanceReleasePolicy winner = policyByRun.putIfAbsent(runId, parsed.get());
-        log.info("验收夹具的放行策略生效: runId={} fixture={} scenario={} members={}",
-                runId, fixtureId, row.get().scenarioId(), parsed.get().size());
+        log.info("验收夹具的放行策略生效: runId={} fixture={} scenario={} 规则={} 条 策略摘要={}",
+                runId, fixtureId, row.get().scenarioId(), parsed.get().ruleCount(), parsed.get().digest());
         return Optional.of(winner == null ? parsed.get() : winner);
     }
 

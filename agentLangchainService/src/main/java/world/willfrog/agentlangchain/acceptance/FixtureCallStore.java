@@ -44,10 +44,14 @@ public class FixtureCallStore {
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final FixtureRuleHitStore ruleHitStore;
 
-    public FixtureCallStore(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
+    public FixtureCallStore(JdbcTemplate jdbcTemplate,
+                            ObjectMapper objectMapper,
+                            FixtureRuleHitStore ruleHitStore) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.ruleHitStore = ruleHitStore;
     }
 
     /**
@@ -145,10 +149,11 @@ public class FixtureCallStore {
     }
 
     /**
-     * Run 走到终态那一刻核对脚本：必答回合是不是都真的被领走过。
+     * Run 走到终态那一刻核对两件事：必答回合是不是都真的被领走过，点名的规则是不是都真的打中过成员。
      *
-     * <p>少了回合时，前面那几条回复照样能让 Run 走到终态，脚本尾部没用上的部分会被静默丢掉。
-     * 这个结论落在库里，验收执行器与排查都能按 Run 直接读，不必自己拼脚本与认领记录。</p>
+     * <p>少了回合时，前面那几条回复照样能让 Run 走到终态，脚本尾部没用上的部分会被静默丢掉；
+     * 规则点错了字段名或序号时一声不响，一条成员都打不中。两种情况下那次验收看起来都像跑完了。
+     * 这个结论落在库里，验收执行器与排查都能按 Run 直接读，不必自己拼脚本、策略与执行记录。</p>
      *
      * @return 核对结论；这条 Run 不是夹具 Run（没有场景快照）时返回空
      */
@@ -175,10 +180,15 @@ public class FixtureCallStore {
         for (Claim claim : claims) {
             claimedTurns.add(claim.turnIndex());
         }
+        Optional<FixtureRuleHitStore.PolicySnapshot> policy = ruleHitStore.policyOf(runId);
+        List<FixtureRuleHitStore.RuleFact> ruleFacts = policy.map(FixtureRuleHitStore.PolicySnapshot::rules)
+                .orElse(List.of());
+        Set<Integer> hitRules = ruleHitStore.hitRuleIndexes(runId);
         FixtureScenarioVerdict verdict;
         try {
-            // 快照里存的是「这次要求发生哪些调用」；核对是对着它算，不再去读夹具行（可能已经回收）。
-            verdict = FixtureScenarioVerdict.evaluate(declarationsOf(scenario), claimedTurns);
+            // 快照里存的是「这次要求发生哪些调用、点名哪些调用」；核对是对着它算，不再去读夹具行
+            //（可能已经回收）。
+            verdict = FixtureScenarioVerdict.evaluate(declarationsOf(scenario), ruleFacts, claimedTurns, hitRules);
         } catch (Exception broken) {
             log.error("夹具场景声明的快照读不出来，这条 Run 的必答回合没法核对: runId={} reason={}",
                     runId, broken.getMessage());
@@ -191,12 +201,25 @@ public class FixtureCallStore {
                     claimed_turn_count = ?,
                     required_missing_count = ?,
                     detail = ?,
+                    policy_rule_count = ?,
+                    policy_hit_rule_count = ?,
+                    policy_missing_count = ?,
+                    policy_detail = ?,
                     recorded_at = CURRENT_TIMESTAMP
                 WHERE run_id = ?
-                """, verdict.verdict(), claims.size(), verdict.missing().size(), detail, runId);
+                """, verdict.verdict(), claims.size(), verdict.missing().size(), detail,
+                policy.map(FixtureRuleHitStore.PolicySnapshot::rules).map(List::size).orElse(null),
+                hitRules.size(),
+                policy.isEmpty() ? null : verdict.missingRules().size(),
+                verdict.missingRules().isEmpty() ? null : String.join("；", verdict.missingRules()),
+                runId);
         if (!verdict.missing().isEmpty()) {
             log.error("验收夹具脚本有必答回合没有发生，这次验收不能算通过: runId={} fixture={} 没发生的回合={}",
                     runId, scenario.get("fixtureId"), verdict.missing());
+        }
+        if (!verdict.missingRules().isEmpty()) {
+            log.error("验收夹具的放行策略有规则一次都没打中成员，这次验收不能算通过: runId={} fixture={} 没打中的规则={}",
+                    runId, scenario.get("fixtureId"), verdict.missingRules());
         }
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("runId", runId);
@@ -209,6 +232,11 @@ public class FixtureCallStore {
         snapshot.put("requiredMissingCount", verdict.missing().size());
         snapshot.put("missingRequiredDeclarations", verdict.missing());
         snapshot.put("consumedDeclarations", verdict.consumed());
+        snapshot.put("policyDigest", policy.map(FixtureRuleHitStore.PolicySnapshot::digest).orElse(null));
+        snapshot.put("policyRuleCount", policy.map(FixtureRuleHitStore.PolicySnapshot::rules)
+                .map(List::size).orElse(null));
+        snapshot.put("policyHitRuleCount", hitRules.size());
+        snapshot.put("policyMissingRules", verdict.missingRules());
         return Optional.of(snapshot);
     }
 

@@ -23,6 +23,8 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.acceptance.FixtureCallStore;
 import world.willfrog.agentlangchain.acceptance.FrozenModelScript;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.FixtureRuleHitStore;
 import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
@@ -38,7 +40,12 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
@@ -59,6 +66,7 @@ class DualPoolWaitGroupNodeExecutorTest {
 
     private final AgentPromptService promptService = mock(AgentPromptService.class);
     private final LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+    private final FixtureRuleHitStore ruleHits = mock(FixtureRuleHitStore.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private InMemoryWaitGroupStore store;
@@ -76,7 +84,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher, publisher,
                 objectMapper, TestSchedulerSettings.propertyOnly(
                         "agent.langchain.dual-pool.wait-group.max-members", "16"),
-                1024 * 1024, 2000L, new FrozenEffectiveSettings());
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         when(promptService.reactSystemPrompt()).thenReturn("系统提示");
         when(promptService.dagReactStageInstruction(any())).thenReturn("阶段说明");
@@ -179,9 +187,10 @@ class DualPoolWaitGroupNodeExecutorTest {
         model.enqueue(AiMessage.from(List.of(
                 toolCall("call-a", "getStockDaily", "{}"),
                 toolCall("call-b", "searchWeb", "{}"))));
-        world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy policy =
-                world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy.parse("fx-1",
-                                "{\"members\":{\"call-a\":{\"fail\":\"这个场景要造一条失败成员\"}}}",
+        AcceptanceReleasePolicy policy =
+                AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                                        + "\"fail\":\"这个场景要造一条失败成员\"}]}",
                                 objectMapper)
                         .orElseThrow();
 
@@ -212,18 +221,94 @@ class DualPoolWaitGroupNodeExecutorTest {
         model.enqueue(AiMessage.from(List.of(
                 toolCall("call-a", "getStockDaily", "{}"),
                 toolCall("call-b", "searchWeb", "{}"))));
-        world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy policy =
-                world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy.parse("fx-1",
-                                "{\"members\":{\"call-a\":{\"releaseAfter\":[\"call-zzz\"]}}}", objectMapper)
+        AcceptanceReleasePolicy policy =
+                AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                                        + "\"releaseAfter\":[{\"memberSeq\":9}]}]}",
+                                objectMapper)
                         .orElseThrow();
 
         assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of(), policy)))
                 .as("夹具自己写错了，错误码要能让验收证据直接引用")
-                .hasMessageContaining("acceptance_fixture_policy_invalid")
-                .hasMessageContaining("call-zzz");
+                .hasMessageContaining("acceptance_fixture_policy_peer_unknown")
+                .hasMessageContaining("memberSeq=9");
         assertThat(store.groupRows()).as("停在这一步：一个等待组、一条成员、一个外部作业都没建")
                 .isEmpty();
         assertThat(store.events()).isEmpty();
+        assertThat(publisher.published).isEmpty();
+    }
+
+    /**
+     * 同一个编号在下一段再出现时，只写「第 0 段」的规则不该打中它。
+     *
+     * <p>工具调用编号是模型给的，模型完全可能每一段都从 {@code call_1} 开始编号。规则只写编号时
+     * 会连带命中下一段的成员，点名对象就不是夹具作者想说的那一条。</p>
+     */
+    @Test
+    void aRuleThatNamesOneSegmentDoesNotHitTheSameCallIdInTheNextSegment() {
+        AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
+                {"rules":[{"for":{"nodeId":"todo_1","segmentSequence":0,"memberSeq":0},
+                           "fail":"这个场景要造一条失败成员"}]}
+                """, objectMapper).orElseThrow();
+
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
+        long firstGroup = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                segment(segmentIdentity(0), startPayload(), List.of(), policy))).groupId();
+
+        // 下一段：模型又用了同一个编号 call-a。
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
+        long secondGroup = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                segment(segmentIdentity(1), startPayload(), List.of(), policy))).groupId();
+
+        assertThat(store.memberRows(firstGroup)).as("被点名的这一段落失败")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.FAILED.name());
+        assertThat(store.memberRows(secondGroup)).as("下一段的同编号成员不该被这条规则打中")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.SUCCEEDED.name());
+        verify(ruleHits).record(RUN_ID, policy.rules().get(0), firstGroup, 0);
+        verify(ruleHits, never()).record(eq(RUN_ID), any(), eq(secondGroup), anyInt());
+    }
+
+    /** 两个节点各自用 {@code call-a} 时，只写一个节点的规则不该打中另一个节点。 */
+    @Test
+    void aRuleThatNamesOneNodeDoesNotHitAnotherNodesSameCallId() {
+        AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
+                {"rules":[{"for":{"nodeId":"todo_1","memberSeq":0},"fail":"这个节点上这条按失败算"}]}
+                """, objectMapper).orElseThrow();
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
+
+        long otherNode = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                segment(new NodeWorkItemIdentity(RUN_ID, GENERATION, "todo_2", 0, 0), startPayload(),
+                        List.of(), policy))).groupId();
+
+        assertThat(store.memberRows(otherNode)).as("另一个节点上的同编号成员照常成功")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.SUCCEEDED.name());
+        verify(ruleHits, never()).record(any(), any(), anyLong(), anyInt());
+    }
+
+    /**
+     * 这一批里两条成员互相等（写法还不同）：拿到这一批成员就判得出这一圈，派发之前停住。
+     *
+     * <p>绕成圈的等待关系谁都等不到头，除了兜底时限没有别的出路；一个外部作业都还没建出来时停住，
+     * 不用还任何账。</p>
+     */
+    @Test
+    void aWaitCycleInsideOneBatchStopsBeforeAnythingIsDispatched() {
+        model.enqueue(AiMessage.from(List.of(
+                toolCall("call-a", "getStockDaily", "{}"),
+                toolCall("call-b", "searchWeb", "{}"))));
+        AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
+                {"rules":[
+                  {"for":{"nodeId":"todo_1","segmentSequence":0,"memberSeq":0},"releaseAfter":[{"memberSeq":1}]},
+                  {"for":{"nodeId":"todo_1","segmentSequence":0,"memberSeq":1},"releaseAfter":[{"memberSeq":0}]}]}
+                """, objectMapper).orElseThrow();
+
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of(), policy)))
+                .hasMessageContaining("acceptance_fixture_policy_ambiguous")
+                .hasMessageContaining("绕成了一整圈");
+        assertThat(store.groupRows()).as("停在这一步：一个等待组都没建").isEmpty();
         assertThat(publisher.published).isEmpty();
     }
 
@@ -231,9 +316,11 @@ class DualPoolWaitGroupNodeExecutorTest {
     @Test
     void aHoldRuleOnAnInPlaceMemberDoesNotChangeItsOutcome() {
         model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
-        world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy policy =
-                world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy.parse("fx-1",
-                                "{\"members\":{\"call-a\":{\"holdUntilPoint\":\"point-a\"}}}", objectMapper)
+        AcceptanceReleasePolicy policy =
+                AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                                        + "\"holdUntilPoint\":\"point-a\"}]}",
+                                objectMapper)
                         .orElseThrow();
 
         DualPoolWaitGroupNodeExecutor.Outcome outcome =
@@ -549,7 +636,7 @@ class DualPoolWaitGroupNodeExecutorTest {
 
     private DualPoolWaitGroupNodeExecutor.SegmentExecution firstSegment(
             List<ToolSpecification> specifications,
-            world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy releasePolicy) {
+            AcceptanceReleasePolicy releasePolicy) {
         return segment(segmentIdentity(0), startPayload(), specifications, releasePolicy);
     }
 
@@ -567,7 +654,7 @@ class DualPoolWaitGroupNodeExecutorTest {
             NodeWorkItemIdentity identity,
             JsonNode payload,
             List<ToolSpecification> specifications,
-            world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy releasePolicy,
+            AcceptanceReleasePolicy releasePolicy,
             ChatModel segmentModel) {
         return new DualPoolWaitGroupNodeExecutor.SegmentExecution(
                 identity,
@@ -591,7 +678,7 @@ class DualPoolWaitGroupNodeExecutorTest {
             NodeWorkItemIdentity identity,
             JsonNode payload,
             List<ToolSpecification> specifications,
-            world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy releasePolicy) {
+            AcceptanceReleasePolicy releasePolicy) {
         return new DualPoolWaitGroupNodeExecutor.SegmentExecution(
                 identity,
                 new NodeWorkItemVersions(0L, 0L, 1),

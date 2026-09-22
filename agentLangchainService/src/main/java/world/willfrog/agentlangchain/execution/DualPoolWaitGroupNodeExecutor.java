@@ -37,6 +37,7 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionExcept
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
+import world.willfrog.agentlangchain.acceptance.FixtureRuleHitStore;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
@@ -81,6 +82,8 @@ public class DualPoolWaitGroupNodeExecutor {
     private final NodeToolDispatcher toolDispatcher;
     private final ResumedSegmentPublisher resumedSegmentPublisher;
     private final ObjectMapper objectMapper;
+    /** 放行策略的规则命中记录：一条规则真的打中了哪一条成员，终态核对着它点名。 */
+    private final FixtureRuleHitStore ruleHitStore;
     /** 等待组成员上限按组读取：这个值允许在运行期改，改完只影响之后新建的等待组。 */
     private final DualPoolSchedulerSettings settings;
     private final int maxMemberResultChars;
@@ -97,7 +100,8 @@ public class DualPoolWaitGroupNodeExecutor {
                                          int maxMemberResultChars,
                                          @Value("${agent.langchain.dual-pool.wait-group.member-poll-delay-ms:2000}")
                                          long memberPollDelayMs,
-                                         FrozenEffectiveSettings frozenEffectiveSettings) {
+                                         FrozenEffectiveSettings frozenEffectiveSettings,
+                                         FixtureRuleHitStore ruleHitStore) {
         this.promptService = promptService;
         this.executionGuard = executionGuard;
         this.waitGroupStore = waitGroupStore;
@@ -105,6 +109,7 @@ public class DualPoolWaitGroupNodeExecutor {
         this.resumedSegmentPublisher = resumedSegmentPublisher;
         this.objectMapper = objectMapper;
         this.settings = settings;
+        this.ruleHitStore = ruleHitStore;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.memberPollDelayMs = Math.max(1L, memberPollDelayMs);
         // 登记归一化之后真正在用的值，读数才不会报出一个这里根本没有采用的数。
@@ -330,7 +335,10 @@ public class DualPoolWaitGroupNodeExecutor {
                     : toolDispatcher.stableOperationId(call.name(), rawToolCallId, input.identity()).orElse(null);
             drafts.add(new WaitMemberDraft(index, rawToolCallId, call.name(), operationId));
         }
-        validatePolicyPeers(input, drafts);
+        int modelTurn = checkpoint.modelTurn();
+        AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
+        List<AcceptanceReleasePolicy.MemberFacts> facts = memberFacts(input, modelTurn, drafts);
+        AcceptanceReleasePolicy.RuleMatches policyMatches = matchPolicyRules(policy, facts);
         int nextSegmentSequence = input.identity().segmentSequence() + 1;
         int nodeToolCalls = checkpoint.toolCallsUsed() + drafts.size();
         List<ChatMessage> history = new ArrayList<>(messages);
@@ -356,7 +364,8 @@ public class DualPoolWaitGroupNodeExecutor {
             return new Outcome.NotOwned("segment_not_matched:" + input.identity().describe());
         }
         long groupId = suspended.groupId();
-        Long notificationId = dispatchMembers(groupId, input, calls);
+        recordPolicyHits(input.identity().runId(), policy, policyMatches, groupId);
+        Long notificationId = dispatchMembers(groupId, input, modelTurn, policy, policyMatches, calls);
         if (notificationId != null) {
             boolean published = resumedSegmentPublisher.publish(notificationId,
                     input.versions().runControlVersion(),
@@ -371,42 +380,70 @@ public class DualPoolWaitGroupNodeExecutor {
     }
 
     /**
-     * 派发之前先核对夹具策略点名的成员都在这一批里。
+     * 这一批草稿在策略眼里的样子。
      *
-     * <p>一个等待组的成员就是这一次模型回合里那几个工具调用，组建出来之后就定死了；策略点名了一个不在
-     * 这一批里的成员，这条规则永远等不到头（被压住的成员除了兜底时限没人会来放行）。所以核对放在建组
-     * 与派发之前：一个外部作业都还没建出来，夹具写错了当场停住，原因就是夹具自己的稳定错误码。</p>
-     *
-     * <p>自己等自己、几条成员绕成一圈那两类在读策略时已经拒了——它们只从策略本身就能判出来。</p>
+     * <p>等待组一级的身份来自分段身份与这一段的模型回合，成员一级的身份来自草稿的组内序号与模型给的
+     * 工具调用编号。结果接收方按等待组与成员记录凑出来的字段与此完全一致，策略在两边才会给同一个答案。</p>
      */
-    private void validatePolicyPeers(SegmentExecution input, List<WaitMemberDraft> drafts) {
-        AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
+    private static List<AcceptanceReleasePolicy.MemberFacts> memberFacts(SegmentExecution input,
+                                                                        int modelTurn,
+                                                                        List<WaitMemberDraft> drafts) {
+        NodeWorkItemIdentity identity = input.identity();
+        List<AcceptanceReleasePolicy.MemberFacts> facts = new ArrayList<>();
+        for (WaitMemberDraft draft : drafts) {
+            facts.add(new AcceptanceReleasePolicy.MemberFacts(identity.nodeId(), identity.nodeAttempt(),
+                    identity.segmentSequence(), modelTurn, draft.getMemberSeq(), draft.getToolCallId()));
+        }
+        return List.copyOf(facts);
+    }
+
+    /** 一条已落库的成员在策略眼里的样子：派发与收尾两处都用它，免得两边凑的字段不一样。 */
+    private static AcceptanceReleasePolicy.MemberFacts memberFacts(SegmentExecution input,
+                                                                  int modelTurn,
+                                                                  WaitMember member) {
+        NodeWorkItemIdentity identity = input.identity();
+        return new AcceptanceReleasePolicy.MemberFacts(identity.nodeId(), identity.nodeAttempt(),
+                identity.segmentSequence(), modelTurn, member.getMemberSeq(), member.getToolCallId());
+    }
+
+    /**
+     * 派发之前把策略核一遍：这一批里每条规则打中了谁，点名的兄弟成员在不在这一批里。
+     *
+     * <p>一个等待组的成员就是这一次模型回合里那几个工具调用，组建出来之后就定死了；规则点名了一个
+     * 不在这一批里的成员，这条等待永远等不到头（被压住的成员除了兜底时限没人会来放行）。所以核对放在
+     * 建组与派发之前：一个外部作业都还没建出来，夹具写错了当场停住，原因就是夹具自己的稳定错误码。</p>
+     *
+     * <p>选择器同时打中两条成员、两条规则点名同一条成员，这两类由 {@code match} 当场拒绝：点名对象
+     * 不确定，压住/放行/判失败的是谁就说不清。等自己、组内绕成圈这两类要看这一批到底有哪几条成员，
+     * 所以在这里判：绕成圈的那几条成员会一直压着，除了兜底时限没有别的出路。</p>
+     */
+    private AcceptanceReleasePolicy.RuleMatches matchPolicyRules(
+            AcceptanceReleasePolicy policy,
+            List<AcceptanceReleasePolicy.MemberFacts> facts) {
         if (policy == null) {
+            return null;
+        }
+        AcceptanceReleasePolicy.RuleMatches matches = policy.match(facts);
+        policy.rejectCyclesInGroup(facts, matches);
+        return matches;
+    }
+
+    /**
+     * 这一批里命中的规则各记一笔。
+     *
+     * <p>规则只写「点名某一次调用」时，字段名或序号写错不会报错，只会一条成员都打不中，那次验收看
+     * 起来像跑完了。所以命中要落库，跑到终态时按它核对。派发前与结果接收方都会记，重复记只留一行。</p>
+     */
+    private void recordPolicyHits(String runId,
+                                  AcceptanceReleasePolicy policy,
+                                  AcceptanceReleasePolicy.RuleMatches matches,
+                                  long groupId) {
+        if (policy == null || matches == null) {
             return;
         }
-        Set<String> batch = new LinkedHashSet<>();
-        for (WaitMemberDraft draft : drafts) {
-            if (draft.getToolCallId() != null && !draft.getToolCallId().isBlank()) {
-                batch.add(draft.getToolCallId());
-            }
-        }
-        for (WaitMemberDraft draft : drafts) {
-            String toolCallId = draft.getToolCallId();
-            if (toolCallId == null || toolCallId.isBlank() || !policy.covers(toolCallId)) {
-                continue;
-            }
-            List<String> missing = new ArrayList<>();
-            for (String peer : policy.releaseAfter(toolCallId)) {
-                if (!batch.contains(peer)) {
-                    missing.add(peer);
-                }
-            }
-            if (!missing.isEmpty()) {
-                throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_policy_invalid",
-                        "夹具策略里成员 " + toolCallId + " 要等 " + String.join("、", missing)
-                                + " 先落终态，这几个名字不在这一批工具调用里（这一批："
-                                + String.join("、", batch) + "）");
-            }
+        for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
+            matches.targetOf(rule.index()).ifPresent(target ->
+                    ruleHitStore.record(runId, rule, groupId, target.memberSeq()));
         }
     }
 
@@ -416,7 +453,12 @@ public class DualPoolWaitGroupNodeExecutor {
      * <p>只动还没派发的成员：同一次模型回合被重复执行时，已经落终态或已经在执行中的成员原样保留，
      * 不会第二次调用工具。返回这一次刚好让整组齐备的那条恢复通知编号。</p>
      */
-    private Long dispatchMembers(long groupId, SegmentExecution input, List<ToolExecutionRequest> calls) {
+    private Long dispatchMembers(long groupId,
+                                 SegmentExecution input,
+                                 int modelTurn,
+                                 AcceptanceReleasePolicy policy,
+                                 AcceptanceReleasePolicy.RuleMatches policyMatches,
+                                 List<ToolExecutionRequest> calls) {
         List<WaitMember> members = waitGroupStore.listMembers(groupId);
         Long notificationId = null;
         try {
@@ -426,7 +468,8 @@ public class DualPoolWaitGroupNodeExecutor {
                 }
                 ToolExecutionRequest call = locateCall(member, calls);
                 if (call == null) {
-                    notificationId = keepNotification(notificationId, completeMember(input, member, false, "",
+                    notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
+                            policyMatches, member, false, "",
                             Map.of("errorCode", "wait_group_member_request_missing")));
                     continue;
                 }
@@ -436,11 +479,11 @@ public class DualPoolWaitGroupNodeExecutor {
                                 member.getMemberIdentity(), member.getToolCallId(), member.getToolName(),
                                 call.arguments()));
                 if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Completed completed) {
-                    notificationId = keepNotification(notificationId, completeMember(
-                            input, member, true, completed.output(), Map.of()));
+                    notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
+                            policyMatches, member, true, completed.output(), Map.of()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Failed failed) {
-                    notificationId = keepNotification(notificationId, completeMember(
-                            input, member, false, failed.reason(), Map.of()));
+                    notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
+                            policyMatches, member, false, failed.reason(), Map.of()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Pending pending) {
                     // 后台作业已经建出来了。成员从「待派发」进入「执行中」，并把派发证明与下次查询
                     // 时间写上：证明留给结果接收方收尾，查询时间让接收方能找到这个成员。
@@ -460,7 +503,8 @@ public class DualPoolWaitGroupNodeExecutor {
             // 额度耗尽：还没拿到结果的成员记成失败，让整组仍然能齐备；本段按挂起收场，
             // 下一段恢复后模型调用会再次撞上额度检查，由那一次给出节点失败结果。
             notificationId = keepNotification(notificationId,
-                    abortRemainingMembers(groupId, input, members, "run_budget_exceeded"));
+                    abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
+                            "run_budget_exceeded"));
             log.warn("派发期间额度耗尽，未完成的成员按失败记：groupId={} segment={}",
                     groupId, input.identity().describe());
         } catch (RuntimeException e) {
@@ -469,7 +513,8 @@ public class DualPoolWaitGroupNodeExecutor {
             }
             // 取消、暂停这一类控制信号要求当前 Worker 松开调用栈。先把没拿到结果的成员记成失败，
             // 让等待链停在「组已齐备」而不是永远等不到人；随后原样抛出，交给上层收尾。
-            abortRemainingMembers(groupId, input, members, "member_dispatch_aborted");
+            abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
+                    "member_dispatch_aborted");
             throw e;
         }
         return notificationId;
@@ -477,6 +522,9 @@ public class DualPoolWaitGroupNodeExecutor {
 
     private Long abortRemainingMembers(long groupId,
                                        SegmentExecution input,
+                                       int modelTurn,
+                                       AcceptanceReleasePolicy policy,
+                                       AcceptanceReleasePolicy.RuleMatches policyMatches,
                                        List<WaitMember> members,
                                        String errorCode) {
         Long notificationId = null;
@@ -484,8 +532,8 @@ public class DualPoolWaitGroupNodeExecutor {
             if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING) {
                 continue;
             }
-            notificationId = keepNotification(notificationId, completeMember(input, member, false, "",
-                    Map.of("errorCode", errorCode)));
+            notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
+                    policyMatches, member, false, "", Map.of("errorCode", errorCode)));
         }
         return notificationId;
     }
@@ -496,14 +544,18 @@ public class DualPoolWaitGroupNodeExecutor {
 
     /** 上报一个成员的终态；返回这一次刚好让整组齐备的那条恢复通知编号，没有就是空。 */
     private Long completeMember(SegmentExecution input,
+                                int modelTurn,
+                                AcceptanceReleasePolicy policy,
+                                AcceptanceReleasePolicy.RuleMatches policyMatches,
                                 WaitMember member,
                                 boolean success,
                                 String output,
                                 Map<String, Object> extra) {
-        AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
-        Optional<String> designated = policy == null || member.getToolCallId() == null
+        Optional<AcceptanceReleasePolicy.Rule> rule = policy == null || policyMatches == null
                 ? Optional.empty()
-                : policy.designatedFailure(member.getToolCallId());
+                : policy.ruleAt(policyMatches, memberFacts(input, modelTurn, member));
+        Optional<String> designated = rule.filter(AcceptanceReleasePolicy.Rule::fails)
+                .map(AcceptanceReleasePolicy.Rule::failureDetail);
         if (designated.isPresent()) {
             // 验收夹具点名这条成员按失败收尾：工具当场真的成功了也记成失败，这正是这个场景要造出来的
             // 「有一条成员失败、其余的照常」。工具的真实输出留在成员行里，失败原因单独写清楚。
@@ -517,13 +569,12 @@ public class DualPoolWaitGroupNodeExecutor {
             } else {
                 extra.put("designatedFailure", designated.get());
             }
-        } else if (policy != null && member.getToolCallId() != null
-                && policy.covers(member.getToolCallId())) {
+        } else if (rule.isPresent()) {
             // 压住结果与等兄弟成员先落终态这两种规则，针对的是「结果以后才回来」的成员。
             // 这条成员在本次调用里当场就把结果拿回来了，那两条规则在这里没有可等的东西，
             // 只留一行记录，不放行也不压住。
-            log.info("放行策略点名的这条成员当场就结束了，压住与等兄弟成员在这里不适用：group={} member={} toolCall={}",
-                    member.getGroupId(), member.getMemberIdentity(), member.getToolCallId());
+            log.info("放行策略点名的这条成员当场就结束了，压住与等兄弟成员在这里不适用：group={} member={} 规则={}",
+                    member.getGroupId(), member.getMemberIdentity(), rule.get().describe());
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);

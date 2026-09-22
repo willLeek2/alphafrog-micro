@@ -26,6 +26,7 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionExcept
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
+import world.willfrog.agentlangchain.acceptance.FixtureRuleHitStore;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
@@ -46,6 +47,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -114,6 +116,10 @@ public class WaitMemberResultReceiver {
     /** 验收夹具的结果放行策略与放行点：不带夹具编号的 Run 拿到空，成员照原来的方式立刻收尾。 */
     private final AcceptanceRunPolicyRegistry acceptancePolicies;
     private final AcceptanceReleasePointStore releasePoints;
+    /** 放行策略的规则命中记录：一条规则真的打中了哪一条成员，终态核对着它点名。 */
+    private final FixtureRuleHitStore ruleHitStore;
+    /** 这个进程已经往库里记过的命中（Run|规则|组|成员）：同一件事不必每一轮都去问一次库。 */
+    private final Set<String> recordedRuleHits = ConcurrentHashMap.newKeySet();
 
     /** 每压住一轮记一次（同一条成员被压住多轮就记多笔），不是「压住过几条成员」。 */
     private final AtomicLong holdPushes = new AtomicLong();
@@ -148,7 +154,8 @@ public class WaitMemberResultReceiver {
             @Value("${agent.langchain.wait-member.receiver.poll-interval-ms:1000}") long pollIntervalMs,
             FrozenEffectiveSettings frozenEffectiveSettings,
             AcceptanceRunPolicyRegistry acceptancePolicies,
-            AcceptanceReleasePointStore releasePoints) {
+            AcceptanceReleasePointStore releasePoints,
+            FixtureRuleHitStore ruleHitStore) {
         this.waitGroupStore = waitGroupStore;
         this.runMapper = runMapper;
         this.nodeWorkItemStore = nodeWorkItemStore;
@@ -160,6 +167,7 @@ public class WaitMemberResultReceiver {
         this.settings = settings;
         this.acceptancePolicies = acceptancePolicies;
         this.releasePoints = releasePoints;
+        this.ruleHitStore = ruleHitStore;
         this.maxMemberResultChars = Math.max(1, maxMemberResultChars);
         this.pollIntervalMs = Math.max(1L, pollIntervalMs);
         // 登记归一化之后真正在用的值；轮询间隔与 @Scheduled 上那个属性名在启动时各解析一次，
@@ -393,74 +401,119 @@ public class WaitMemberResultReceiver {
      * 两种放行条件：等同一个等待组里的另外几条成员先落终态，或者等某个放行点被控制面标成已放行；
      * 两种都受 {@code maxHoldSeconds} 兜底，压过时限还没人放行就照常接结果，读数里单独记一笔。</p>
      *
-     * <p>策略点了这个等待组里不存在的成员，说明夹具写错了：这条成员要按失败收尾并把原因写清楚，
-     * 压住不动只会让人以为结果还没回来。**它仍然要走「先问沙箱、再结算、再写终态」那条正常路**——
-     * 已经派发的成员名额挂在沙箱任务上，绕开真实终态去收尾会让名额永远还不回去，这条成员也就
-     * 永远停在这里。所以这里只把「要收成失败」这个决定交回调用方，真正的收尾还是那条正常路。</p>
+     * <p>策略点名一个在这个等待组里对不上的成员（选择器写错、组里没有这条成员、或者一个选择器同时
+     * 对上两条），说明夹具写错了：这条成员要按失败收尾并把原因写清楚，压住不动只会让人以为结果
+     * 还没回来。**它仍然要走「先问沙箱、再结算、再写终态」那条正常路**——已经派发的成员名额挂在沙箱
+     * 任务上，绕开真实终态去收尾会让名额永远还不回去，这条成员也就永远停在这里。所以这里只把
+     * 「要收成失败」这个决定交回调用方，真正的收尾还是那条正常路。</p>
+     *
+     * <p>点名对了就把这笔命中记下来：规则写错字段名时一声不响、一条成员都不打中，跑到终态核对时
+     * 要说得清是哪条规则。</p>
      */
     private PolicyAction policyAction(AcceptanceReleasePolicy policy, WaitMember member, WaitGroup group) {
-        String toolCallId = member.getToolCallId();
         String key = memberKey(member);
-        if (toolCallId == null || toolCallId.isBlank() || !policy.covers(toolCallId)) {
+        List<WaitMember> members = waitGroupStore.listMembers(group.getId());
+        List<AcceptanceReleasePolicy.MemberFacts> facts = groupFacts(group, members);
+        Optional<AcceptanceReleasePolicy.Rule> matched =
+                policy.ruleAt(policy.match(facts), memberFactsOf(group, member));
+        if (matched.isEmpty()) {
             heldSinceByMember.remove(key);
             return PolicyAction.proceed();
         }
-        List<String> waitingFor = new ArrayList<>();
-        List<String> unknownPeers = new ArrayList<>();
-        collectWaitingPeers(policy.releaseAfter(toolCallId), group, waitingFor, unknownPeers);
-        if (!unknownPeers.isEmpty()) {
-            log.warn("夹具策略点了这个等待组里没有的成员，这条成员按失败收尾：group={} member={} peers={}",
-                    group.getId(), key, String.join(",", unknownPeers));
+        AcceptanceReleasePolicy.Rule rule = matched.get();
+        recordRuleHit(group, member, rule);
+        List<AcceptanceReleasePolicy.MemberFacts> peers;
+        try {
+            peers = policy.peersOf(rule, memberFactsOf(group, member), facts);
+        } catch (AcceptanceFixtureExecutionException e) {
+            log.warn("夹具策略点名的成员在这个等待组里对不上，这条成员按失败收尾：group={} member={} 原因={}",
+                    group.getId(), key, e.getMessage());
             heldSinceByMember.remove(key);
-            return PolicyAction.refuse(POLICY_PEER_UNKNOWN,
-                    "策略里点名的成员不在这个等待组里：" + String.join(",", unknownPeers));
+            return PolicyAction.refuse(POLICY_PEER_UNKNOWN, e.getMessage());
         }
+        List<String> waitingFor = new ArrayList<>();
+        for (AcceptanceReleasePolicy.MemberFacts peer : peers) {
+            WaitMember peerMember = memberOf(group, members, peer);
+            if (peerMember != null && !peerMember.stateEnum().isTerminal()) {
+                // 「还会不会再变」与「算不算组的一次有效结束」是两个判据：这里问的是前者。
+                // 只看成功与失败会把已经取消、已经迟到的成员当成还在跑，那条等待就永远等不到头。
+                waitingFor.add(peer.describe());
+            }
+        }
+        String releaseKey = rule.holdReleaseKey() == null ? "<无>" : rule.holdReleaseKey();
         boolean waitingForPeers = !waitingFor.isEmpty();
         boolean waitingForPoint = false;
-        Optional<String> releaseKey = policy.releasePointKey(toolCallId);
-        if (!waitingForPeers && releaseKey.isPresent()) {
-            waitingForPoint = !releasePoints.isOpened(member.getRunId(), releaseKey.get());
+        if (!waitingForPeers && rule.holds()) {
+            waitingForPoint = !releasePoints.isOpened(member.getRunId(), rule.holdReleaseKey());
         }
         if (waitingForPeers || waitingForPoint) {
             if (heldTooLong(member, policy)) {
                 // 兜底：压过时限还没人放行就照常接结果，读数里单独记一笔，别把「没人放行」当成「被放行」。
                 heldSinceByMember.remove(key);
                 log.warn("夹具策略压住这条成员超过兜底时限，照常接结果：group={} member={} 等兄弟={} 等放行点={}",
-                        group.getId(), key, String.join(",", waitingFor),
-                        releaseKey.orElse("<无>"));
+                        group.getId(), key, String.join(",", waitingFor), releaseKey);
                 return new PolicyAction(false, PolicyOutcome.holdTimeout());
             }
             return hold(member, waitingForPeers
                     ? "waiting_for:" + String.join(",", waitingFor)
-                    : "waiting_release_point:" + releaseKey.orElse(""));
+                    : "waiting_release_point:" + releaseKey);
         }
         heldSinceByMember.remove(key);
         return PolicyAction.proceed();
     }
 
-    /** 按名字找出「还没落终态」的成员，以及这个组里根本没有的名字。 */
-    private void collectWaitingPeers(List<String> names,
-                                     WaitGroup group,
-                                     List<String> waitingFor,
-                                     List<String> unknownPeers) {
-        if (names.isEmpty()) {
+    /** 这条成员身上的规则（按选择器匹配，一个等待组里一条成员最多被一条规则点名）。 */
+    private Optional<AcceptanceReleasePolicy.Rule> ruleFor(AcceptanceReleasePolicy policy,
+                                                          WaitGroup group,
+                                                          WaitMember member) {
+        List<WaitMember> members = waitGroupStore.listMembers(group.getId());
+        return policy.ruleAt(policy.match(groupFacts(group, members)), memberFactsOf(group, member));
+    }
+
+    /** 这个等待组里的成员在策略眼里的样子：组一级的身份来自等待组，成员一级来自成员记录。 */
+    private static List<AcceptanceReleasePolicy.MemberFacts> groupFacts(WaitGroup group,
+                                                                       List<WaitMember> members) {
+        List<AcceptanceReleasePolicy.MemberFacts> facts = new ArrayList<>();
+        for (WaitMember member : members) {
+            facts.add(memberFactsOf(group, member));
+        }
+        return facts;
+    }
+
+    private static AcceptanceReleasePolicy.MemberFacts memberFactsOf(WaitGroup group, WaitMember member) {
+        return new AcceptanceReleasePolicy.MemberFacts(group.getNodeId(), group.getNodeAttempt(),
+                group.getSegmentSequence(), group.getModelTurn(), member.getMemberSeq(),
+                member.getToolCallId());
+    }
+
+    /** 这个等待组里与某条成员身份对上的那一行；对不上时为空。 */
+    private static WaitMember memberOf(WaitGroup group,
+                                       List<WaitMember> members,
+                                       AcceptanceReleasePolicy.MemberFacts facts) {
+        for (WaitMember member : members) {
+            if (memberFactsOf(group, member).equals(facts)) {
+                return member;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 记一笔「这条规则真的打中了这条成员」。
+     *
+     * <p>同一件事只往库里记一次：这条成员被压住时会一轮一轮地走到这里，每一轮都写一遍没有意义。
+     * 记失败时不留下「已经记过」的记号，下一轮再试。</p>
+     */
+    private void recordRuleHit(WaitGroup group, WaitMember member, AcceptanceReleasePolicy.Rule rule) {
+        String key = member.getRunId() + "|" + rule.index() + "|" + group.getId() + "|" + member.getMemberSeq();
+        if (!recordedRuleHits.add(key)) {
             return;
         }
-        Map<String, WaitMemberState> statesByToolCallId = new LinkedHashMap<>();
-        for (WaitMember peer : waitGroupStore.listMembers(group.getId())) {
-            if (peer.getToolCallId() != null && !peer.getToolCallId().isBlank()) {
-                statesByToolCallId.put(peer.getToolCallId(), peer.stateEnum());
-            }
-        }
-        for (String name : names) {
-            WaitMemberState state = statesByToolCallId.get(name);
-            if (state == null) {
-                unknownPeers.add(name);
-            } else if (!state.isTerminal()) {
-                // 「还会不会再变」与「算不算组的一次有效结束」是两个判据：这里问的是前者。
-                // 只看成功与失败会把已经取消、已经迟到的成员当成还在跑，那条等待就永远等不到头。
-                waitingFor.add(name);
-            }
+        try {
+            ruleHitStore.record(member.getRunId(), rule, group.getId(), member.getMemberSeq());
+        } catch (RuntimeException e) {
+            recordedRuleHits.remove(key);
+            throw e;
         }
     }
 
@@ -499,7 +552,7 @@ public class WaitMemberResultReceiver {
         return held.since().plusSeconds(policy.maxHoldSeconds()).isBefore(OffsetDateTime.now());
     }
 
-    /** Run 走到终态就把它的压住计时放掉；没有这条 Run 的记载就是空动作。 */
+    /** Run 走到终态就把它的压住计时与「已经记过的命中」放掉；没有这条 Run 的记载就是空动作。 */
     @EventListener
     public void onRunFinalized(AgentRunFinalizedEvent event) {
         if (event == null) {
@@ -507,6 +560,8 @@ public class WaitMemberResultReceiver {
         }
         heldSinceByMember.entrySet()
                 .removeIf(entry -> entry.getValue().runId().equals(event.runId()));
+        String prefix = event.runId() + "|";
+        recordedRuleHits.removeIf(key -> key.startsWith(prefix));
     }
 
     /**
@@ -546,8 +601,12 @@ public class WaitMemberResultReceiver {
         if (terminal != null) {
             extra.put("taskId", terminal.taskId());
         }
-        String designated = policy == null || member.getToolCallId() == null
-                ? null : policy.designatedFailure(member.getToolCallId()).orElse(null);
+        String designated = policy == null
+                ? null
+                : ruleFor(policy, group, member)
+                        .filter(AcceptanceReleasePolicy.Rule::fails)
+                        .map(AcceptanceReleasePolicy.Rule::failureDetail)
+                        .orElse(null);
         if (refusal != null) {
             success = false;
             extra.put("errorCode", refusal.code());

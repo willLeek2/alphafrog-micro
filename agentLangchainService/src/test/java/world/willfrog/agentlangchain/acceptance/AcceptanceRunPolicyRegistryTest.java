@@ -31,10 +31,13 @@ class AcceptanceRunPolicyRegistryTest {
 
     private static final String LANE = "beta-lane-0910";
     private static final String GENERATION = "gen-" + "a".repeat(64);
-    private static final String POLICY = "{\"members\":{\"call-1\":{\"holdUntilPoint\":\"point-a\"}}}";
+    private static final String POLICY =
+            "{\"rules\":[{\"for\":{\"nodeId\":\"n1\",\"memberSeq\":0},\"holdUntilPoint\":\"point-a\"}]}";
+    private static final String POLICY_HOLDING_POINT_A = "point-a";
 
     private final AcceptanceFixtureStore store = mock(AcceptanceFixtureStore.class);
     private final DeploymentIdentityProvider identityProvider = mock(DeploymentIdentityProvider.class);
+    private final FixtureRuleHitStore ruleHitStore = mock(FixtureRuleHitStore.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
@@ -58,7 +61,9 @@ class AcceptanceRunPolicyRegistryTest {
         AcceptanceReleasePolicy second = registry.policyForRun(fixtureRun("fx-1")).orElseThrow();
 
         assertThat(first).isSameAs(second);
-        assertThat(first.releasePointKey("call-1")).contains("point-a");
+        assertThat(first.rules()).singleElement()
+                .satisfies(rule -> assertThat(rule.holdReleaseKey()).isEqualTo(POLICY_HOLDING_POINT_A));
+        verify(ruleHitStore).snapshotPolicy("run-1", "fx-1", "scenario-a", first);
         // 每次取用仍然重新核对夹具还在、已启用、没过期；只有解析结果被记住。
         verify(store, times(2)).find(LANE, GENERATION, "fx-1");
     }
@@ -92,7 +97,8 @@ class AcceptanceRunPolicyRegistryTest {
     @Test
     void aPolicyThatCannotBeReadIsRefused() throws Exception {
         AcceptanceRunPolicyRegistry registry = registry();
-        row("fx-1", "{\"members\":{\"call-1\":{\"holdUntillPoint\":\"point-a\"}}}");
+        row("fx-1", "{\"rules\":[{\"for\":{\"nodeId\":\"n1\",\"memberSeq\":0},"
+                + "\"holdUntillPoint\":\"point-a\"}]}");
 
         assertThatThrownBy(() -> registry.policyForRun(fixtureRun("fx-1")))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
@@ -104,7 +110,7 @@ class AcceptanceRunPolicyRegistryTest {
     void theFixtureOfARunCannotChangeWhileItRuns() throws Exception {
         AcceptanceRunPolicyRegistry registry = registry();
         row("fx-1", POLICY);
-        row("fx-2", "{\"members\":{\"call-1\":{\"fail\":\"故意失败\"}}}");
+        row("fx-2", "{\"rules\":[{\"for\":{\"nodeId\":\"n1\",\"memberSeq\":0},\"fail\":\"故意失败\"}]}");
         assertThat(registry.policyForRun(fixtureRun("fx-1"))).isPresent();
 
         assertThatThrownBy(() -> registry.policyForRun(fixtureRun("fx-2")))
@@ -145,7 +151,8 @@ class AcceptanceRunPolicyRegistryTest {
     private AcceptanceRunPolicyRegistry registry() {
         when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
         return new AcceptanceRunPolicyRegistry(
-                new AcceptanceFixtureResolver(store, identityProvider, objectMapper), objectMapper);
+                new AcceptanceFixtureResolver(store, identityProvider, objectMapper), objectMapper,
+                ruleHitStore);
     }
 
     private void row(String fixtureId, String policyJson) {

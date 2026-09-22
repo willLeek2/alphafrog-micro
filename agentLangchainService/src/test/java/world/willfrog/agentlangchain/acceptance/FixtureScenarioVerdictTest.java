@@ -9,7 +9,8 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * 终态核对：脚本里声明为必答的回合没有被领走时，这一次验收不能算通过。
+ * 终态核对：脚本里声明为必答的回合没有被领走、或者放行策略点名的规则一条都没打中时，
+ * 这一次验收不能算通过。
  */
 class FixtureScenarioVerdictTest {
 
@@ -95,6 +96,63 @@ class FixtureScenarioVerdictTest {
 
         assertThat(fromDeclarations).isEqualTo(fromScript);
         assertThat(fromDeclarations.consumed()).isEqualTo(List.of(script.declarationAt(0).describe()));
+    }
+
+    /** 放行策略点了名、但一条成员都没打中：夹具写错了字段名时就是这样，同样算这次验收没跑全。 */
+    @Test
+    void aRuleThatNeverHitAnyMemberIsNamedInsteadOfBeingSilentlyIgnored() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules = List.of(
+                new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"),
+                new FixtureRuleHitStore.RuleFact(1, "fail", "memberSeq=1;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0), Set.of(0));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.missing()).as("必答回合都发生了").isEmpty();
+        assertThat(verdict.missingRules()).singleElement()
+                .satisfies(rule -> assertThat(rule)
+                        .contains("第 1 条规则")
+                        .contains("memberSeq=1;nodeId=n1"));
+        assertThat(verdict.describeMissing()).contains("一次都没打中任何成员");
+    }
+
+    /** 两路都对上才算通过：回合都发生了、点名的规则也都打中了成员。 */
+    @Test
+    void bothTheTurnsAndTheRulesMustHaveHappened() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "fail", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0), Set.of(0));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.COMPLETE);
+        assertThat(verdict.missing()).isEmpty();
+        assertThat(verdict.missingRules()).isEmpty();
+        assertThat(verdict.describeMissing()).as("没有缺的东西就不写说明").isNull();
+    }
+
+    /** 脚本与策略两路都没跑全时，说明里两样都要写清。 */
+    @Test
+    void theDetailNamesBothKindsOfGaps() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "fail", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(), Set.of());
+
+        assertThat(verdict.describeMissing())
+                .contains("实际没有发生")
+                .contains("一次都没打中任何成员");
     }
 
     private FrozenModelScript parse(String json) {
