@@ -621,7 +621,6 @@ public class BetaDeploymentService {
             if (containerName != null && !containerName.isBlank()) error.put("containerName", containerName);
             service.set("lastError", error);
             if (retainedFailedCandidate != null) service.set("retainedFailedCandidate", retainedFailedCandidate);
-            else if (candidateCleaned) service.putNull("retainedFailedCandidate");
             scheduleNext(state);
             validateAll(state);
             return null;
