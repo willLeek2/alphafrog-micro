@@ -54,6 +54,14 @@ public class FixtureRuleHitStore {
     public static final String APPLIED_FAILURE = "designated_failure";
     /** 点名了成员，但被点名的动作没有落到它身上（成员当场出结果、或者这条成员被中止收尾）。 */
     public static final String NOT_APPLIED = "not_applied";
+
+    /**
+     * 「这条 Run 一开始就没有放行策略」写进摘要列的冻结值。
+     *
+     * <p>它占的是摘要那一列，所以写成一个不会与 sha-256 撞上的固定串；读回来时按 {@link #describe}
+     * 说成「没有放行策略」，不让人以为是一次摘要对不上。</p>
+     */
+    public static final String ABSENT_POLICY_DIGEST = "absent-no-policy";
     /** 算「动作真的生效」的三种结果。 */
     public static final Set<String> APPLIED_OUTCOMES = Set.of(APPLIED_HOLD, APPLIED_PEER, APPLIED_FAILURE);
 
@@ -79,26 +87,57 @@ public class FixtureRuleHitStore {
         if (runId == null || runId.isBlank() || policy == null) {
             return;
         }
+        freezePolicy(runId, fixtureId, scenarioId, policy.digest(), rulesJson(policy),
+                policy.ruleCount(), "策略摘要 " + policy.digest());
+    }
+
+    /**
+     * 把「这条 Run 一开始就没有放行策略」也冻结成一个明确的值。
+     *
+     * <p>不冻结的话会漏掉一种改法：夹具一开始没写策略，跑到一半被改成带策略。这条 Run 在前半段
+     * 的成员结果是当场收尾的（没有策略可依），后半段却会按新加的策略压住或判失败，一次验收说不清
+     * 它到底按哪一版跑完。两个进程第一次同时读时一个读到空、一个读到策略，同样由这里的读回比对
+     * 定胜负：赢家是策略时这一次空读当场拒绝，赢家是空时读到策略的那一次会拒绝。</p>
+     */
+    public void snapshotPolicyAbsent(String runId, String fixtureId, String scenarioId) {
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        freezePolicy(runId, fixtureId, scenarioId, ABSENT_POLICY_DIGEST, "[]", 0, "没有放行策略");
+    }
+
+    private void freezePolicy(String runId,
+                              String fixtureId,
+                              String scenarioId,
+                              String digest,
+                              String rulesJson,
+                              int ruleCount,
+                              String describe) {
         int inserted = jdbcTemplate.update("""
                 INSERT INTO alphafrog_agent_run_acceptance_fixture_policy
                     (run_id, fixture_id, scenario_id, policy_digest, rules_json, rule_count)
                 VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?)
                 ON CONFLICT DO NOTHING
-                """, runId, fixtureId, scenarioId, policy.digest(), rulesJson(policy), policy.ruleCount());
+                """, runId, fixtureId, scenarioId, digest, rulesJson, ruleCount);
         String stored = policydigestOf(runId);
         if (stored == null) {
             throw refuse("acceptance_fixture_content_changed",
                     "这条 Run 的策略快照没写进去，也读不回来：这一次验收说不清用的是哪一版策略");
         }
-        if (!stored.equals(policy.digest())) {
+        if (!stored.equals(digest)) {
             throw refuse("acceptance_fixture_content_changed",
-                    "这条 Run 一开始用的是策略摘要 " + stored + "，现在读回来的是 " + policy.digest()
+                    "这条 Run 一开始冻结的是 " + describe(stored) + "，现在读回来的是 " + describe(digest)
                             + "：同一条 Run 跑的过程中夹具的放行策略被改过，这一次验收说不清用的是哪一版");
         }
         if (inserted == 0) {
-            log.info("这条 Run 的策略快照已经写过了，读回赢家核对摘要一致: runId={} 摘要={}",
-                    runId, stored);
+            log.info("这条 Run 的策略快照已经写过了，读回赢家核对一致: runId={} 冻结值={}",
+                    runId, describe(stored));
         }
+    }
+
+    /** 排查与报错里把冻结值说成人话：空策略那个值不是摘要，别让它看起来像摘要对不上。 */
+    private static String describe(String digest) {
+        return ABSENT_POLICY_DIGEST.equals(digest) ? "「没有放行策略」" : "策略摘要 " + digest;
     }
 
     private String policydigestOf(String runId) {

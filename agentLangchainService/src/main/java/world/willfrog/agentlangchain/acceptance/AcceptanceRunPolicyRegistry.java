@@ -9,6 +9,7 @@ import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -18,6 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * 拿到空，成员结果照原来的方式立刻收尾。夹具本身由 {@link AcceptanceFixtureResolver} 查回来并核对，
  * 所以夹具在跑的中途失效时，读策略这一步会跟着停下——不会出现「夹具不让用了，但压住的成员还被
  * 悄悄放过去」。</p>
+ *
+ * <p>「读到的是策略」与「读到的是空」都要冻结：第一次读到的那一版是什么，这条 Run 就按哪一版跑完。
+ * 只冻结有策略的那一种会漏掉一种改法——夹具一开始没写策略、跑到一半被改成带策略，于是前半段的
+ * 成员结果当场收尾、后半段按新策略压住或判失败，一次验收说不清它按哪一版跑完。</p>
  */
 @Component
 @Slf4j
@@ -31,6 +36,8 @@ public class AcceptanceRunPolicyRegistry {
     private final FixtureRuleHitStore ruleHitStore;
     private final Map<String, AcceptanceReleasePolicy> policyByRun = new ConcurrentHashMap<>();
     private final Map<String, String> fixtureIdByRun = new ConcurrentHashMap<>();
+    /** 一开始读到「没有放行策略」的 Run：这个状态也要冻结，之后夹具加了策略就停下。 */
+    private final Set<String> absentRuns = ConcurrentHashMap.newKeySet();
 
     public AcceptanceRunPolicyRegistry(AcceptanceFixtureResolver fixtureResolver,
                                        ObjectMapper objectMapper,
@@ -44,8 +51,9 @@ public class AcceptanceRunPolicyRegistry {
      * 这条 Run 的结果放行策略。
      *
      * @param run 正在执行的 Run
-     * @return 不带夹具编号、或者夹具没写放行策略时返回空
-     * @throws AcceptanceFixtureExecutionException 带了编号但夹具现在不能用、或者策略读不出来
+     * @return 不带夹具编号、或者这条 Run 一开始就没有放行策略时返回空
+     * @throws AcceptanceFixtureExecutionException 带了编号但夹具现在不能用、策略读不出来、或者内容
+     *                                             在跑的过程中被改过（包括「从没有策略改成有策略」）
      */
     public Optional<AcceptanceReleasePolicy> policyForRun(AgentRun run) {
         Optional<AcceptanceFixtureRow> row = fixtureResolver.resolve(run);
@@ -68,12 +76,28 @@ public class AcceptanceRunPolicyRegistry {
             requireUnchanged(cached, fixtureId, row.get().scenarioId(), row.get().dispatchPolicyJson());
             return Optional.of(cached);
         }
+        if (absentRuns.contains(runId)) {
+            // 「一开始就没有策略」也是一种冻结状态：后来加了策略就要停下，不能前半段当场收尾、
+            // 后半段按新策略压住成员。
+            requireStillAbsent(fixtureId, row.get().scenarioId(), row.get().dispatchPolicyJson());
+            return Optional.empty();
+        }
         Optional<AcceptanceReleasePolicy> parsed =
                 AcceptanceReleasePolicy.parse(fixtureId, row.get().dispatchPolicyJson(), objectMapper);
         if (parsed.isEmpty()) {
+            if (trackedRunCount() >= MAX_TRACKED_RUNS) {
+                throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_tracked_runs_full",
+                        "本进程记住的夹具 Run 已经到 " + MAX_TRACKED_RUNS + " 条：这个数只会在终态事件漏掉时涨起来，"
+                                + "先查这些 Run 为什么没走到终态");
+            }
+            ruleHitStore.snapshotPolicyAbsent(runId, fixtureId, row.get().scenarioId());
+            fixtureIdByRun.putIfAbsent(runId, fixtureId);
+            absentRuns.add(runId);
+            log.info("这条 Run 没有放行策略，按「没有策略」冻结: runId={} fixture={} scenario={}",
+                    runId, fixtureId, row.get().scenarioId());
             return Optional.empty();
         }
-        if (policyByRun.size() >= MAX_TRACKED_RUNS) {
+        if (trackedRunCount() >= MAX_TRACKED_RUNS) {
             throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_tracked_runs_full",
                     "本进程记住的夹具 Run 已经到 " + MAX_TRACKED_RUNS + " 条：这个数只会在终态事件漏掉时涨起来，"
                             + "先查这些 Run 为什么没走到终态");
@@ -110,6 +134,29 @@ public class AcceptanceRunPolicyRegistry {
         }
     }
 
+    /**
+     * 「一开始就没有策略」的那条 Run 之后又读到了策略：停下。
+     *
+     * <p>前半段的成员结果是当场收尾的（没有策略可依），后半段按新加的策略压住或判失败，
+     * 这一次验收就说不清它到底按哪一版跑完。</p>
+     */
+    private void requireStillAbsent(String fixtureId, String scenarioId, String policyJson) {
+        Optional<AcceptanceReleasePolicy> current =
+                AcceptanceReleasePolicy.parse(fixtureId, policyJson, objectMapper);
+        if (current.isPresent()) {
+            throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_content_changed",
+                    "这条 Run 一开始的放行策略是空的（夹具 " + fixtureId + "，场景 " + scenarioId
+                            + "），现在读到了 " + current.get().ruleCount() + " 条规则（摘要 "
+                            + current.get().digest()
+                            + "）：同一条 Run 跑的过程中夹具新加了放行策略，这一次验收说不清用的是哪一版");
+        }
+    }
+
+    /** 本进程记住的夹具 Run 条数：有策略的与「一开始就没有策略」的合起来算同一份上限。 */
+    private int trackedRunCount() {
+        return policyByRun.size() + absentRuns.size();
+    }
+
     /** 放掉一条 Run 的策略；没有这条 Run 就是空动作。 */
     public void evict(String runId) {
         if (runId == null || runId.isBlank()) {
@@ -117,6 +164,7 @@ public class AcceptanceRunPolicyRegistry {
         }
         fixtureIdByRun.remove(runId);
         policyByRun.remove(runId);
+        absentRuns.remove(runId);
     }
 
     /** Run 走到终态就把策略放掉，与模型脚本位置同一个时机。 */

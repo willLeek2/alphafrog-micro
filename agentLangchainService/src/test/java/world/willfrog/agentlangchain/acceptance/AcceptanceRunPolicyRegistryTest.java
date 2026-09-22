@@ -75,6 +75,65 @@ class AcceptanceRunPolicyRegistryTest {
 
         assertThat(registry.policyForRun(fixtureRun("fx-1"))).isEmpty();
         assertThat(registry.policyForRun(fixtureRun("fx-1"))).isEmpty();
+        // 「没有策略」也冻结一次：之后夹具加了策略，这条 Run 就不能中途接受它。
+        verify(ruleHitStore, times(1)).snapshotPolicyAbsent("run-1", "fx-1", "scenario-a");
+    }
+
+    /**
+     * 一开始没有策略、跑到一半夹具加了策略：停下。
+     *
+     * <p>前半段的成员结果是当场收尾的（没有策略可依），后半段按新加的策略压住或判失败，这一次验收
+     * 就说不清按哪一版跑完。</p>
+     */
+    @Test
+    void aPolicyAddedAfterAnEmptyStartIsRefused() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", null);
+        assertThat(registry.policyForRun(fixtureRun("fx-1"))).isEmpty();
+
+        row("fx-1", POLICY);
+
+        assertThatThrownBy(() -> registry.policyForRun(fixtureRun("fx-1")))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_fixture_content_changed"))
+                .hasMessageContaining("新加了放行策略")
+                .hasMessageContaining("说不清用的是哪一版");
+    }
+
+    /**
+     * 两个进程第一次同时读、一个读到空、一个读到策略：输了的那一边当场停下。
+     *
+     * <p>库里只留一个赢家。这一次空读回来时发现赢家是策略（存储层读回比对时报出来），
+     * 就把这个拒绝原样传出去——不许把「读不到策略」当成「没有策略」接着跑。</p>
+     */
+    @Test
+    void aConcurrentFirstReadThatLosesToARealPolicyIsRefused() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", null);
+        org.mockito.Mockito.doThrow(AcceptanceFixtureExecutionException.refuse(
+                        "acceptance_fixture_content_changed", "库里已经冻结了策略摘要 abc"))
+                .when(ruleHitStore).snapshotPolicyAbsent("run-1", "fx-1", "scenario-a");
+
+        assertThatThrownBy(() -> registry.policyForRun(fixtureRun("fx-1")))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_fixture_content_changed"))
+                .hasMessageContaining("已经冻结了策略摘要");
+    }
+
+    /** Run 走到终态之后「没有策略」这个冻结也放掉：下一次读到的才是新的事实。 */
+    @Test
+    void theAbsentFreezeIsDroppedWhenTheRunFinishes() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", null);
+        assertThat(registry.policyForRun(fixtureRun("fx-1"))).isEmpty();
+
+        registry.onRunFinalized(new AgentRunFinalizedEvent(
+                "run-1", 7L, AgentRunStatus.COMPLETED.name(), false));
+        row("fx-1", POLICY);
+
+        assertThat(registry.policyForRun(fixtureRun("fx-1"))).isPresent();
     }
 
     @Test

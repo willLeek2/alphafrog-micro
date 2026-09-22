@@ -144,6 +144,52 @@ class FixtureRuleHitStoreTest {
                 .hasMessageContaining("读不回来");
     }
 
+    /**
+     * 「这条 Run 一开始就没有策略」也冻结成一个明确的值：与真有策略时一样，写完读回比对。
+     *
+     * <p>不冻结的话漏掉一种改法：夹具一开始没写策略，跑到一半被改成带策略——前半段的成员结果当场
+     * 收尾，后半段却按新策略压住或判失败。</p>
+     */
+    @Test
+    void theAbsentPolicyIsFrozenAsItsOwnValue() {
+        when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any(), any())).thenReturn(1);
+        when(jdbcTemplate.query(anyString(), any(RowMapper.class), any()))
+                .thenReturn(List.of(FixtureRuleHitStore.ABSENT_POLICY_DIGEST));
+
+        store.snapshotPolicyAbsent(RUN, "fx-1", "scenario-a");
+    }
+
+    /** 这一次读到空、库里已经冻结了一份真策略（并发首次读取输了）：拒绝，不把「读不到」当「没有」。 */
+    @Test
+    void anAbsentPolicyThatLosesToAFrozenRealPolicyIsRefused() {
+        when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+        when(jdbcTemplate.query(anyString(), any(RowMapper.class), any()))
+                .thenReturn(List.of("c".repeat(64)));
+
+        assertThatThrownBy(() -> store.snapshotPolicyAbsent(RUN, "fx-1", "scenario-a"))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_fixture_content_changed"))
+                .hasMessageContaining("没有放行策略")
+                .hasMessageContaining("c".repeat(64));
+    }
+
+    /** 反过来：库里冻结的是「没有策略」，这一次读到的是真策略（并发首次读取输了）：同样拒绝。 */
+    @Test
+    void aRealPolicyThatLosesToAFrozenAbsentPolicyIsRefused() {
+        AcceptanceReleasePolicy policy = policy();
+        when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+        when(jdbcTemplate.query(anyString(), any(RowMapper.class), any()))
+                .thenReturn(List.of(FixtureRuleHitStore.ABSENT_POLICY_DIGEST));
+
+        assertThatThrownBy(() -> store.snapshotPolicy(RUN, "fx-1", "scenario-a", policy))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_fixture_content_changed"))
+                .hasMessageContaining("没有放行策略")
+                .hasMessageContaining(policy.digest());
+    }
+
     /** 动作结果已经写过一次时，第二次上报不算数：三种生效结果各写一次，不许被改掉。 */
     @Test
     void aSecondActionReportIsNotCounted() {
