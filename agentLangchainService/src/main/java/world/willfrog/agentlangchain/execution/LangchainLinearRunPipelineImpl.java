@@ -672,7 +672,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
         List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
         LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
-                runId, userId, userGoal, dialogueContext, stageModels, toolSpecifications, runConfig);
+                runId, userId, run.getPlanGeneration(), userGoal, dialogueContext, stageModels,
+                toolSpecifications, runConfig);
         /*
          * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
          * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器失败即关闭；
@@ -695,6 +696,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         LangchainTodoPlan planned = planner.plan(LangchainPlanningRequest.builder()
                 .runId(inputs.runId())
                 .userId(inputs.userId())
+                .planGeneration(run.getPlanGeneration())
                 .userGoal(inputs.userGoal())
                 .dialogueContext(inputs.dialogueContext())
                 .model(inputs.stageModels().planningModel())
@@ -840,7 +842,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
             // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
             LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
-                    runId, userId, userGoal, executionContext.dialogueContext(),
+                    runId, userId, run.getPlanGeneration(), userGoal, executionContext.dialogueContext(),
                     stageModels, toolSpecifications, runConfig);
 
             // token + leaseVersion 使重复 launcher 只能写出一条 WORKFLOW_RESUMED 事件。
@@ -952,6 +954,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      */
     private LangchainWorkflowRequest buildWorkflowRequest(String runId,
                                                                  String userId,
+                                                                 Integer planGeneration,
                                                                  String userGoal,
                                                                  String dialogueContext,
                                                                  LangchainRunStageModelResolver.StageModels stageModels,
@@ -960,6 +963,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         return LangchainWorkflowRequest.builder()
                 .runId(runId)
                 .userId(userId)
+                .planGeneration(planGeneration)
                 .userGoal(userGoal)
                 .dialogueContext(dialogueContext)
                 .model(stageModels.executionModel())

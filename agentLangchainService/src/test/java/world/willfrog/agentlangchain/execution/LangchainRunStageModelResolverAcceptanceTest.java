@@ -14,6 +14,7 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionExcept
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
+import world.willfrog.agentlangchain.acceptance.FixtureCallStore;
 import world.willfrog.agentlangchain.acceptance.FrozenModelScript;
 import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
 
@@ -122,9 +123,11 @@ class LangchainRunStageModelResolverAcceptanceTest {
 
     private AcceptanceFixtureModelRegistry.ScriptedStage scriptedStage() {
         FrozenModelScript script = FrozenModelScript.parse("fx-1",
-                "{\"turns\":[{\"text\":\"计划\"},{\"text\":\"答案\"}]}", objectMapper);
+                "{\"turns\":[{\"for\":{\"stage\":\"planning\",\"planPhase\":\"strategy\"},\"text\":\"计划\"},"
+                        + "{\"for\":{\"stage\":\"answer\"},\"text\":\"答案\"}]}", objectMapper);
         return new AcceptanceFixtureModelRegistry.ScriptedStage(
-                new ScriptedChatModel("fx-1", "scenario-a", script), "fx-1", "scenario-a");
+                new ScriptedChatModel("run-1", "fx-1", "scenario-a", script, mock(FixtureCallStore.class)),
+                "fx-1", "scenario-a");
     }
 
     private AgentRun run() {

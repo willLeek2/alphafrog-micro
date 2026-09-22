@@ -54,14 +54,19 @@ public class AcceptanceFixtureGate {
     public Optional<AcceptanceFixtureRow> admitRequestContext(String contextJson,
                                                               String deploymentId,
                                                               String deploymentGenerationId) {
-        if (!mentionsFixture(contextJson)) {
+        if (contextJson == null || contextJson.isBlank()) {
+            return Optional.empty();
+        }
+        // 先解析，再看有没有夹具编号：不做「正文里出现过这个词」的字面猜测。上下文损坏到字段名都不完整时，
+        // 字面猜法会把一次本该跑夹具的请求当成普通请求放过去，那一步之后就接上真实模型了。
+        JsonNode context = readContext(contextJson);
+        if (context.get(CONTEXT_FIELD) == null || context.get(CONTEXT_FIELD).isNull()) {
             return Optional.empty();
         }
         if (!environment.getProperty(ENABLED_PROPERTY, Boolean.class, false)) {
             throw reject("acceptance_fixture_disabled",
                     "执行控制面没有打开（" + ENABLED_PROPERTY + "），带夹具编号的请求一律不创建任务");
         }
-        JsonNode context = readContext(contextJson);
         String fixtureId = textOf(context, CONTEXT_FIELD);
         if (fixtureId == null) {
             throw reject("acceptance_fixture_invalid", "上下文里的 " + CONTEXT_FIELD + " 是空的");
@@ -162,29 +167,25 @@ public class AcceptanceFixtureGate {
     }
 
     /**
-     * 上下文里有没有提到夹具编号。
+     * 读请求上下文。
      *
-     * <p>先做一次廉价的字面判断，是为了让不带夹具的普通请求一次解析都不做；代价是
-     * 「上下文里出现了这个词、但整体不是合法 JSON」这种情况会走进解析并当场报错，
-     * 这正好是我们要的：宁可报错，不能当成普通请求放过去。</p>
+     * <p>读不出来就当场拒绝，不按普通请求放过去：只有「读得出来、里面确实没有夹具编号」才算普通请求。
+     * 内容损坏时，光看文本有没有出现字段名是猜的——截断、转义变化都可能让字段名不完整，一次本该跑
+     * 夹具的验收会因此连上真实模型。</p>
      */
-    private boolean mentionsFixture(String contextJson) {
-        return contextJson != null && contextJson.contains(CONTEXT_FIELD);
-    }
-
     private JsonNode readContext(String contextJson) {
+        JsonNode root;
         try {
-            JsonNode root = OBJECT_MAPPER.readTree(contextJson);
-            if (root == null || !root.isObject()) {
-                throw reject("acceptance_fixture_invalid", "请求上下文不是 JSON 对象");
-            }
-            return root;
-        } catch (LangchainRunRejectedException e) {
-            throw e;
+            root = OBJECT_MAPPER.readTree(contextJson);
         } catch (Exception e) {
             throw reject("acceptance_fixture_invalid",
-                    "请求上下文里有 " + CONTEXT_FIELD + "，但整体不是合法 JSON: " + e.getMessage());
+                    "请求上下文不是合法 JSON（" + e.getMessage() + "）：分不清它是不是一次夹具请求，"
+                            + "按夹具这一侧拒绝，不按普通请求跑");
         }
+        if (root == null || !root.isObject()) {
+            throw reject("acceptance_fixture_invalid", "请求上下文不是一个 JSON 对象");
+        }
+        return root;
     }
 
     private static String textOf(JsonNode node, String field) {

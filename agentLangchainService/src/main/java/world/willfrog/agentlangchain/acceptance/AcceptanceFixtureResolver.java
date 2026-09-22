@@ -51,17 +51,25 @@ public class AcceptanceFixtureResolver {
      * @throws AcceptanceFixtureExecutionException 带了编号但夹具不能用、或者本进程认不出这条 Run 的泳道代际
      */
     public Optional<AcceptanceFixtureRow> resolve(AgentRun run) {
-        if (run == null || isBlank(run.getId()) || !mentionsFixture(run.getExt())) {
+        if (run == null || isBlank(run.getId())) {
             return Optional.empty();
         }
+        // 先解析 ext 与请求上下文，再看有没有夹具编号：不看「文本里有没有出现过这个词」。
+        // 上下文损坏到字段名不完整时，字面判断会放过它，这条 Run 就会接上真实模型跑完，
+        // 而验收最不能有的结果就是「本该失败的场景看起来跑过了」。
         String contextJson = contextJsonOf(run);
-        if (contextJson == null || !contextJson.contains(AcceptanceFixtureGate.CONTEXT_FIELD)) {
-            // ext 里出现这个词，只是因为别处提到了它（例如用户消息正文里写了这个词）。
-            // 请求上下文里没有这个字段，这条 Run 就是普通 Run。
+        if (contextJson == null) {
+            return Optional.empty();
+        }
+        JsonNode context = readContext(contextJson);
+        if (context.get(AcceptanceFixtureGate.CONTEXT_FIELD) == null
+                || context.get(AcceptanceFixtureGate.CONTEXT_FIELD).isNull()) {
+            // 上下文读得出来、里面确实没有夹具编号：这条 Run 就是普通 Run
+            //（正文里提到过这个词不算，正文不在请求上下文里）。
             return Optional.empty();
         }
         DeploymentIdentity lane = laneOf(run);
-        String fixtureId = readFixtureId(contextJson);
+        String fixtureId = readFixtureId(context);
         return Optional.of(requireUsableRow(lane, fixtureId, run.getId()));
     }
 
@@ -113,9 +121,9 @@ public class AcceptanceFixtureResolver {
     /**
      * 取 Run 的 ext 里原样存着的请求上下文。
      *
-     * <p>只有「ext 读得出来、内容里根本没有 context_json 这个字段」才算普通 Run：ext 里还存着用户消息
-     * 正文，正文里提到夹具编号这个词，不代表这是一条夹具 Run（创建路径把上下文单独存成一个字符串，
-     * 见 {@code AgentRunEventService} 的 ext 组装）。</p>
+     * <p>创建路径把请求上下文单独存成一个字符串（见 {@code AgentRunEventService} 的 ext 组装），
+     * 所以只有「ext 读得出来、里面根本没有 context_json 这个字段」才算普通 Run：ext 里还存着用户
+     * 消息正文，正文里提到夹具编号这个词，不代表这是一条夹具 Run。</p>
      *
      * <p>读不回来的情况一律拒绝，不按普通 Run 往下跑：ext 读不回来、或者读出来不是对象、或者
      * context_json 不是一个字符串，都说明这条 Run 的「是不是夹具 Run」判不出来。判不出来时按普通 Run
@@ -128,15 +136,13 @@ public class AcceptanceFixtureResolver {
             root = objectMapper.readTree(run.getExt());
         } catch (Exception e) {
             throw refuse("acceptance_fixture_invalid",
-                    "这条 Run 的 ext 里出现了 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 这个词，"
-                            + "但 ext 整体读不回来（" + e.getMessage() + "）：分不清它是夹具 Run 还是"
-                            + "正文里提到这个词的普通 Run，按夹具这一侧拒绝，不按普通 Run 跑");
+                    "这条 Run 的 ext 读不回来（" + e.getMessage() + "）：分不清它是夹具 Run 还是普通 Run，"
+                            + "按夹具这一侧拒绝，不按普通 Run 跑");
         }
         if (root == null || !root.isObject()) {
             throw refuse("acceptance_fixture_invalid",
-                    "这条 Run 的 ext 里出现了 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 这个词，"
-                            + "但 ext 整体不是一个 JSON 对象：分不清它是夹具 Run 还是正文里提到这个词的"
-                            + "普通 Run，按夹具这一侧拒绝，不按普通 Run 跑");
+                    "这条 Run 的 ext 不是一个 JSON 对象：分不清它是夹具 Run 还是普通 Run，"
+                            + "按夹具这一侧拒绝，不按普通 Run 跑");
         }
         JsonNode context = root.get("context_json");
         if (context == null || context.isNull()) {
@@ -152,24 +158,36 @@ public class AcceptanceFixtureResolver {
         return context.asText().isBlank() ? null : context.asText();
     }
 
-    /** 上下文里写了夹具编号就要读出来；读不出来按不可用处理，不悄悄当普通 Run 跑。 */
-    private String readFixtureId(String contextJson) {
-        JsonNode contextRoot;
+    /**
+     * 读请求上下文。
+     *
+     * <p>读不出来就拒绝：只有「读得出来、里面确实没有夹具编号」才算普通 Run。内容损坏时靠文本里
+     * 有没有出现字段名是猜的——截断、转义变化都可能让字段名不完整，一次本该跑夹具的验收会因此
+     * 接上真实模型。</p>
+     */
+    private JsonNode readContext(String contextJson) {
+        JsonNode context;
         try {
-            contextRoot = objectMapper.readTree(contextJson);
+            context = objectMapper.readTree(contextJson);
         } catch (Exception e) {
             throw refuse("acceptance_fixture_invalid",
-                    "请求上下文里有 " + AcceptanceFixtureGate.CONTEXT_FIELD + "，但整体不是合法 JSON: "
-                            + e.getMessage());
+                    "这条 Run 的请求上下文不是合法 JSON（" + e.getMessage() + "）：分不清它是夹具 Run 还是"
+                            + "普通 Run，按夹具这一侧拒绝，不按普通 Run 跑");
         }
-        if (contextRoot == null || !contextRoot.isObject()) {
+        if (context == null || !context.isObject()) {
             throw refuse("acceptance_fixture_invalid",
-                    "请求上下文里有 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 这个词，但整体不是 JSON 对象");
+                    "这条 Run 的请求上下文不是一个 JSON 对象：分不清它是夹具 Run 还是普通 Run，"
+                            + "按夹具这一侧拒绝，不按普通 Run 跑");
         }
+        return context;
+    }
+
+    /** 上下文里写了夹具编号就要读出来；读不出来按不可用处理，不悄悄当普通 Run 跑。 */
+    private String readFixtureId(JsonNode contextRoot) {
         JsonNode value = contextRoot.get(AcceptanceFixtureGate.CONTEXT_FIELD);
         if (value == null || value.isNull() || !value.isValueNode()) {
             throw refuse("acceptance_fixture_invalid",
-                    "请求上下文里有 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 这个词，但值读不出来");
+                    "请求上下文里的 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 值读不出来");
         }
         String fixtureId = value.asText("").trim();
         if (fixtureId.isBlank()) {
@@ -177,16 +195,6 @@ public class AcceptanceFixtureResolver {
                     "请求上下文里的 " + AcceptanceFixtureGate.CONTEXT_FIELD + " 是空的");
         }
         return fixtureId;
-    }
-
-    /**
-     * ext 里有没有可能带夹具。
-     *
-     * <p>先做一次廉价判断，让普通 Run 一次解析都不做；判断过了还要再看请求上下文里到底有没有这个
-     * 字段，因为 ext 里还存着用户消息正文，正文提到这个词不代表这是夹具 Run。</p>
-     */
-    private boolean mentionsFixture(String ext) {
-        return ext != null && ext.contains(AcceptanceFixtureGate.CONTEXT_FIELD);
     }
 
     private static boolean isBlank(String value) {

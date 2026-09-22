@@ -175,6 +175,30 @@ class AcceptanceFixtureGateTest {
     }
 
     @Test
+    void anUnreadableContextWithoutTheTokenIsStillRejected() {
+        AcceptanceFixtureGate gate = gate(true);
+
+        // 字段名在损坏中被截断时，靠「文本里有没有这个词」判断会把它当成普通请求放过去——
+        // 那一步之后就接上真实模型了。所以读不出来一律拒绝，不看有没有出现字段名。
+        assertThatThrownBy(() -> gate.admitRequestContext("{\"execution_mode\": \"DA", LANE, GENERATION))
+                .isInstanceOf(LangchainRunRejectedException.class)
+                .satisfies(e -> assertThat(reason(e)).isEqualTo("acceptance_fixture_invalid"));
+        assertThatThrownBy(() -> gate.admitRequestContext("{\"acceptanceFixture", LANE, GENERATION))
+                .isInstanceOf(LangchainRunRejectedException.class)
+                .satisfies(e -> assertThat(reason(e)).isEqualTo("acceptance_fixture_invalid"));
+        verifyNoInteractions(store);
+    }
+
+    @Test
+    void aContextThatIsNotAJsonObjectIsRejected() {
+        AcceptanceFixtureGate gate = gate(true);
+
+        assertThatThrownBy(() -> gate.admitRequestContext("[1, 2]", LANE, GENERATION))
+                .isInstanceOf(LangchainRunRejectedException.class)
+                .satisfies(e -> assertThat(reason(e)).isEqualTo("acceptance_fixture_invalid"));
+    }
+
+    @Test
     void blankFixtureIdIsRejected() {
         AcceptanceFixtureGate gate = gate(true);
 

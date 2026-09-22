@@ -10,6 +10,7 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import lombok.extern.slf4j.Slf4j;
@@ -33,7 +34,9 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
@@ -189,7 +192,7 @@ public class DualPoolWaitGroupNodeExecutor {
         ensureRunnable(input.request());
         AiMessage reply;
         try {
-            reply = chatOnce(input, messages);
+            reply = chatOnce(input, messages, checkpoint.modelTurn());
         } catch (RunBudgetException budget) {
             // 额度耗尽发生在挂起之前：这一段还没有交出去，直接按失败结果提交，
             // 由 Run 协调侧按既有语义收尾（与旧执行路径把额度失败写成节点失败结果一致）。
@@ -219,13 +222,20 @@ public class DualPoolWaitGroupNodeExecutor {
         return messages;
     }
 
-    private AiMessage chatOnce(SegmentExecution input, List<ChatMessage> messages) {
+    private AiMessage chatOnce(SegmentExecution input, List<ChatMessage> messages, int modelTurn) {
         ChatRequest chatRequest = ChatRequest.builder()
                 .messages(messages)
                 .toolSpecifications(visibleToolSpecifications(input.request().getToolSpecifications()))
                 .build();
-        ChatResponse response = input.request().executionModelOrDefault()
-                .chat(LangchainTodoNodeExecutor.maybeInjectLastMileHint(chatRequest));
+        // 这次调用的身份：哪条 Run、哪个计划代际、哪个节点、第几次尝试、哪一段、段内第几次模型回合。
+        // 夹具按这个身份发脚本回合，所以并行跑的几个节点各拿各的回复，重启后重做同一段也拿回同一份。
+        // 不带夹具编号的 Run 走的是真实模型，这一步原样返回，不影响它。
+        NodeWorkItemIdentity identity = input.identity();
+        ChatModel model = AcceptanceFixtureModelRegistry.forCall(
+                input.request().executionModelOrDefault(),
+                () -> FixtureCallIdentity.nodeSegment(identity.runId(), identity.planGeneration(),
+                        identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(), modelTurn));
+        ChatResponse response = model.chat(LangchainTodoNodeExecutor.maybeInjectLastMileHint(chatRequest));
         AiMessage reply = response == null ? null : response.aiMessage();
         if (reply == null) {
             throw new IllegalStateException("模型没有返回回复，无法继续这个节点：" + input.identity().describe());

@@ -106,8 +106,23 @@ class AcceptanceFixtureResolverTest {
                 .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_invalid"));
         assertThatThrownBy(() -> resolver.resolve(ordinaryRun("{\"acceptanceFixtureId\":\"  \"}")))
                 .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_invalid"));
-        // 上下文里没有这个词，坏不坏都按普通 Run 处理：一次解析都不做，也不查库。
-        assertThat(resolver.resolve(ordinaryRun("[1,2,3]"))).isEmpty();
+        verifyNoInteractions(store);
+    }
+
+    /**
+     * 上下文坏掉、连字段名都不完整时也拒绝，不看文本里有没有出现过这个词。
+     *
+     * <p>字段名被截断（{@code {"acceptanceFixture}）正是「靠字面判断」会猜错的那一类：猜错的代价是
+     * 这条 Run 接上真实模型跑完，一次本该失败的验收看起来像跑过了。</p>
+     */
+    @Test
+    void anUnreadableContextIsRefusedEvenWhenTheFieldNameIsCutOff() throws Exception {
+        assertRefusedAsInvalid(ordinaryRun("{\"acceptanceFixture"));
+        assertRefusedAsInvalid(ordinaryRun("{\"execution_mode\": \"DA"));
+        assertRefusedAsInvalid(ordinaryRun("[1,2,3]"));
+
+        // 读得出来、里面确实没有夹具编号，才是普通 Run。
+        assertThat(resolver.resolve(ordinaryRun("{\"execution_mode\":\"DAG\"}"))).isEmpty();
         verifyNoInteractions(store);
     }
 

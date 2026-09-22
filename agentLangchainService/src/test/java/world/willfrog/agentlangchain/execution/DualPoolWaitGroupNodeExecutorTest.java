@@ -20,6 +20,10 @@ import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
+import world.willfrog.agentlangchain.acceptance.FixtureCallStore;
+import world.willfrog.agentlangchain.acceptance.FrozenModelScript;
+import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
 import java.time.OffsetDateTime;
@@ -467,6 +471,70 @@ class DualPoolWaitGroupNodeExecutorTest {
                 WaitMemberState.SUCCEEDED, resultJson, null, GENERATION, 0L, 0L)).notificationId();
     }
 
+    /**
+     * 夹具 Run 上，分段执行器要把「这是哪一次调用」报给夹具。
+     *
+     * <p>报的身份必须含这条 Run、计划代际、节点、第几次尝试、第几段、段内第几次模型回合：夹具按身份
+     * 发回复，身份报错或不报都会当场拒绝，不会换真实模型接着跑。</p>
+     */
+    @Test
+    void aFixtureSegmentReportsItsCallIdentityToTheFixture() {
+        FixtureCallStore calls = mock(FixtureCallStore.class);
+        when(calls.claim(any(), any(), any(), any(), any()))
+                .thenReturn(new FixtureCallStore.Claim(0, "身份", "声明", false, "摘要", OffsetDateTime.now()));
+        ScriptedChatModel scripted = scriptedModel("""
+                {"turns":[{"for":{"stage":"node","segmentSequence":0},"text":"这一段只说话"}]}
+                """, calls);
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(
+                segment(segmentIdentity(0), startPayload(), List.of(), null, scripted));
+
+        assertThat(outcome).isInstanceOf(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class);
+        assertThat(((DualPoolWaitGroupNodeExecutor.Outcome.Completed) outcome)
+                .resultPatch().get("output")).isEqualTo("这一段只说话");
+        org.mockito.ArgumentCaptor<FixtureCallIdentity> reported =
+                org.mockito.ArgumentCaptor.forClass(FixtureCallIdentity.class);
+        org.mockito.Mockito.verify(calls).claim(org.mockito.ArgumentMatchers.eq(RUN_ID),
+                org.mockito.ArgumentMatchers.eq("fx-1"), org.mockito.ArgumentMatchers.eq("scenario-a"),
+                any(), reported.capture());
+        assertThat(reported.getValue().describe()).isEqualTo(FixtureCallIdentity
+                .nodeSegment(RUN_ID, GENERATION, NODE_ID, 0, 0, 0).describe());
+    }
+
+    /**
+     * 两段的回复各归各段，与执行先后无关。
+     *
+     * <p>脚本给第 0 段与第 1 段各声明了一条回复；这里先跑第 1 段，它拿到的仍然是声明给第 1 段的那一份。
+     * 换成「按第几次调用发回复」的做法，这里就会拿错。</p>
+     */
+    @Test
+    void eachSegmentGetsTheReplyDeclaredForItWhateverOrderTheyRunIn() {
+        FixtureCallStore calls = mock(FixtureCallStore.class);
+        // 夹具按身份派发：这里把身份里的分段序号映射到给它声明的那一个回合。
+        when(calls.claim(any(), any(), any(), any(), any())).thenAnswer(invocation -> {
+            FixtureCallIdentity identity = invocation.getArgument(4);
+            int sequence = Integer.parseInt(identity.scope().get("segmentSequence"));
+            return new FixtureCallStore.Claim(sequence, "第 " + sequence + " 段", "声明", false, "摘要",
+                    OffsetDateTime.now());
+        });
+        ScriptedChatModel scripted = scriptedModel("""
+                {"turns":[
+                  {"for":{"stage":"node","segmentSequence":0},"text":"第 0 段的回复"},
+                  {"for":{"stage":"node","segmentSequence":1},"text":"第 1 段的回复"}]}
+                """, calls);
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(
+                segment(segmentIdentity(1), startPayload(), List.of(), null, scripted));
+
+        assertThat(((DualPoolWaitGroupNodeExecutor.Outcome.Completed) outcome)
+                .resultPatch().get("output")).isEqualTo("第 1 段的回复");
+    }
+
+    private ScriptedChatModel scriptedModel(String scriptJson, FixtureCallStore calls) {
+        return new ScriptedChatModel(RUN_ID, "fx-1", "scenario-a",
+                FrozenModelScript.parse("fx-1", scriptJson, objectMapper), calls);
+    }
+
     private static ToolExecutionRequest toolCall(String id, String name, String arguments) {
         return ToolExecutionRequest.builder().id(id).name(name).arguments(arguments).build();
     }
@@ -493,6 +561,30 @@ class DualPoolWaitGroupNodeExecutorTest {
                                                                   JsonNode payload,
                                                                   List<ToolSpecification> specifications) {
         return segment(identity, payload, specifications, null);
+    }
+
+    private DualPoolWaitGroupNodeExecutor.SegmentExecution segment(
+            NodeWorkItemIdentity identity,
+            JsonNode payload,
+            List<ToolSpecification> specifications,
+            world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy releasePolicy,
+            ChatModel segmentModel) {
+        return new DualPoolWaitGroupNodeExecutor.SegmentExecution(
+                identity,
+                new NodeWorkItemVersions(0L, 0L, 1),
+                CLAIMANT,
+                LangchainWorkflowRequest.builder()
+                        .runId(RUN_ID)
+                        .userId("user-1")
+                        .userGoal("把这件事做完")
+                        .executionModel(segmentModel)
+                        .acceptanceReleasePolicy(releasePolicy)
+                        .toolSpecifications(new ArrayList<>(specifications))
+                        .build(),
+                TodoItem.builder().id(NODE_ID).sequence(1).description("第一个待办").build(),
+                List.of(),
+                Map.of(),
+                payload);
     }
 
     private DualPoolWaitGroupNodeExecutor.SegmentExecution segment(

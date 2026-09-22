@@ -20,6 +20,12 @@ import java.util.List;
 public class LangchainWorkflowRequest {
     private String runId;
     private String userId;
+    /**
+     * 这条 Run 当前是第几代计划；验收夹具按调用身份发模型回合时要带它。
+     *
+     * <p>不认识这个值的调用点可以不写，读的一方按 0 处理（{@link #planGenerationOrDefault()}）。</p>
+     */
+    private Integer planGeneration;
     private String userGoal;
     private String dialogueContext;
     private ChatModel model;
@@ -53,5 +59,10 @@ public class LangchainWorkflowRequest {
 
     public ChatModel finalAnswerModelOrDefault() {
         return finalAnswerModel == null ? model : finalAnswerModel;
+    }
+
+    /** 计划代际；调用点没写时按 0：夹具 Run 一定是双池那套，代际从 0 起。 */
+    public int planGenerationOrDefault() {
+        return planGeneration == null ? 0 : Math.max(0, planGeneration);
     }
 }
