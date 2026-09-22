@@ -184,6 +184,14 @@ public class DualPoolSchedulerSettings {
         return newRunSchedulerVersion(resolver());
     }
 
+    /**
+     * Nacos 启用时，必须等生效内容写进本地缓存并加载成功，才能用热配置冻结新 Run 的调度器版本。
+     * 没有加载器时（单测只喂环境属性）视为已经可用来解析。
+     */
+    public boolean hotConfigIsAuthoritative() {
+        return hotConfig == null || hotConfig.hotConfigIsAuthoritative();
+    }
+
     /** 与上面同一个判断，只是复用调用方已经取好的那一份热配置快照（一次读数里只取一份）。 */
     private Setting newRunSchedulerVersion(Resolver resolver) {
         Setting configured = resolver.text(KEY_NEW_RUN_SCHEDULER_VERSION,

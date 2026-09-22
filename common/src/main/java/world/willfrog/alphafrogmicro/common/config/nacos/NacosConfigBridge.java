@@ -5,13 +5,14 @@ import com.alibaba.nacos.api.config.ConfigService;
 import com.alibaba.nacos.api.config.listener.Listener;
 import com.alibaba.nacos.api.exception.NacosException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.core.env.Environment;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -35,8 +36,9 @@ import java.util.concurrent.Executor;
 /**
  * Nacos 配置桥接器。
  *
- * <p>订阅 Nacos Config 的指定 dataId，收到推送后三段式写本地文件，
- * 让各微服务现有的 *LocalConfigLoader 通过文件轮询自动热加载。</p>
+ * <p>订阅 Nacos Config 的指定 dataId，把生效内容写进本地缓存文件。
+ * 本地文件不是另一份真相：写成功后发 {@link NacosLocalConfigWrittenEvent}，
+ * 加载器立刻重读，不再把启动挂载目录里的种子文件当成权威配置。</p>
  *
  * <p>dataId 解析按「泳道 → 主」候选链（见 {@link #candidateDataIds(Subscription)}）：
  * 容器设置了 AF_LANE_TRAFFIC_SCOPE_ID 时先查 "{scopeId}.{dataId}"（泳道覆盖），
@@ -46,7 +48,7 @@ import java.util.concurrent.Executor;
  */
 @Slf4j
 @Component
-public class NacosConfigBridge {
+public class NacosConfigBridge implements SmartLifecycle {
 
     @Value("${alphafrog.config.nacos.server-addr:127.0.0.1:8848}")
     private String serverAddr;
@@ -74,21 +76,66 @@ public class NacosConfigBridge {
 
     private final ObjectMapper objectMapper;
     private final Environment environment;
+    private final ApplicationEventPublisher eventPublisher;
     private ConfigService configService;
     private final List<Subscription> activeSubscriptions = new ArrayList<>();
     private final Map<String, String> lastWrittenContentBySubscription = new LinkedHashMap<>();
+    private volatile boolean running;
 
     @Autowired
-    public NacosConfigBridge(ObjectProvider<ObjectMapper> objectMapperProvider, Environment environment) {
-        this(objectMapperProvider.getIfAvailable(ObjectMapper::new), environment);
+    public NacosConfigBridge(ObjectProvider<ObjectMapper> objectMapperProvider, Environment environment,
+                             ObjectProvider<ApplicationEventPublisher> eventPublisherProvider) {
+        this(objectMapperProvider.getIfAvailable(ObjectMapper::new), environment,
+                eventPublisherProvider.getIfAvailable());
     }
 
     public NacosConfigBridge(ObjectMapper objectMapper, Environment environment) {
-        this.objectMapper = objectMapper;
-        this.environment = environment;
+        this(objectMapper, environment, null);
     }
 
-    @PostConstruct
+    NacosConfigBridge(ObjectMapper objectMapper, Environment environment,
+                      ApplicationEventPublisher eventPublisher) {
+        this.objectMapper = objectMapper;
+        this.environment = environment;
+        this.eventPublisher = eventPublisher;
+    }
+
+    /**
+     * 在容器开始接流量之前把 Nacos 生效内容写进本地缓存。
+     *
+     * <p>不用 {@code @PostConstruct}：那时监听本地文件的加载器未必已经注册，
+     * 写盘事件会丢。{@link SmartLifecycle} 默认比 Web / Dubbo 更早启动。</p>
+     */
+    @Override
+    public void start() {
+        if (running) {
+            return;
+        }
+        init();
+        running = true;
+    }
+
+    @Override
+    public void stop() {
+        destroy();
+        running = false;
+    }
+
+    @Override
+    public boolean isRunning() {
+        return running;
+    }
+
+    @Override
+    public boolean isAutoStartup() {
+        return true;
+    }
+
+    @Override
+    public int getPhase() {
+        return 0;
+    }
+
     public void init() {
         if (!enabled) {
             log.info("[NacosConfigBridge] 未启用，跳过初始化");
@@ -124,6 +171,7 @@ public class NacosConfigBridge {
             } catch (NacosException e) {
                 log.warn("[NacosConfigBridge] 关闭 Nacos 客户端异常", e);
             }
+            configService = null;
         }
     }
 
@@ -310,6 +358,11 @@ public class NacosConfigBridge {
                 lastWrittenContentBySubscription.put(key, configContent);
                 log.info("[NacosConfigBridge] 配置同步完成 dataId={} effectiveDataId={} source={}",
                         subscription.getDataId(), effectiveDataId, source);
+                if (eventPublisher != null) {
+                    eventPublisher.publishEvent(new NacosLocalConfigWrittenEvent(
+                            this, subscription.getTargetFile(), subscription.getDataId(),
+                            effectiveDataId, source));
+                }
             }
         }
     }

@@ -29,6 +29,7 @@ public final class TestSchedulerSettings {
         properties.getRuntime().setScheduler(scheduler);
         AgentLlmLocalConfigLoader loader = Mockito.mock(AgentLlmLocalConfigLoader.class);
         Mockito.when(loader.current()).thenReturn(Optional.of(properties));
+        Mockito.when(loader.hotConfigIsAuthoritative()).thenReturn(true);
         return new DualPoolSchedulerSettings(loader, environment(keyValues));
     }
 

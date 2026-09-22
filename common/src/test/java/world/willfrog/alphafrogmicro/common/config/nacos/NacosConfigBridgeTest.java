@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.mock.env.MockEnvironment;
 
 import java.nio.file.Files;
@@ -121,9 +122,11 @@ class NacosConfigBridgeTest {
 
     @Test
     void constructor_shouldFallbackToLocalObjectMapper_whenNoObjectMapperBean(@TempDir Path tempDir) throws Exception {
+        DefaultListableBeanFactory factory = new DefaultListableBeanFactory();
         NacosConfigBridge bridge = new NacosConfigBridge(
-                new DefaultListableBeanFactory().getBeanProvider(ObjectMapper.class),
-                environment);
+                factory.getBeanProvider(ObjectMapper.class),
+                environment,
+                factory.getBeanProvider(ApplicationEventPublisher.class));
         Path targetFile = tempDir.resolve("test-config.json");
         NacosConfigBridge.Subscription sub = new NacosConfigBridge.Subscription();
         sub.setDataId("test.json");
@@ -492,6 +495,32 @@ class NacosConfigBridgeTest {
         // 候选链上每一条都挂了 listener（泳道 + 主）
         verify(mockConfigService).addListener(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), any(Listener.class));
         verify(mockConfigService).addListener(eq("agent-llm.json"), eq("alphafrog-beta-config"), any(Listener.class));
+    }
+
+    @Test
+    void subscribe_shouldPublishEventAfterWritingLaneOverlay(@TempDir Path tempDir) throws Exception {
+        environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
+        Path targetFile = tempDir.resolve("agent-llm.local.json");
+        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment, publisher);
+        injectValueField(bridge, "group", "alphafrog-beta-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("lane-demo.agent-llm.json"), eq("alphafrog-beta-config"), anyLong()))
+                .thenReturn("{\"runtime\":{\"scheduler\":{\"newRunSchedulerVersion\":\"DUAL_POOL_V2\"}}}");
+        injectConfigService(bridge, mockConfigService);
+
+        invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
+
+        ArgumentCaptor<NacosLocalConfigWrittenEvent> captor =
+                ArgumentCaptor.forClass(NacosLocalConfigWrittenEvent.class);
+        verify(publisher).publishEvent(captor.capture());
+        NacosLocalConfigWrittenEvent event = captor.getValue();
+        assertEquals(targetFile.toString(), event.getTargetFile());
+        assertEquals("agent-llm.json", event.getDataId());
+        assertEquals("lane-demo.agent-llm.json", event.getEffectiveDataId());
+        assertEquals("initial-load", event.getWriteSource());
+        assertTrue(Files.readString(targetFile).contains("DUAL_POOL_V2"));
     }
 
     @Test

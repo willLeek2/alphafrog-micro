@@ -2,7 +2,11 @@ package world.willfrog.agentlangchain.control.dualpool;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
+import org.mockito.Mockito;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.service.AgentLlmHotConfigNotSyncedException;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -124,5 +128,27 @@ class SchedulerVersionPolicyTest {
         assertThatThrownBy(() -> policy(new MockEnvironment()).versionOf(run))
                 .as("已经落库的版本不认识时不能回落到任何一个已知版本")
                 .isInstanceOf(UnknownSchedulerVersionException.class);
+    }
+
+    @Test
+    void refusesToFreezeVersionBeforeNacosWritesTheCache() {
+        AgentLlmLocalConfigLoader loader = Mockito.mock(AgentLlmLocalConfigLoader.class);
+        Mockito.when(loader.hotConfigIsAuthoritative()).thenReturn(false);
+        SchedulerVersionPolicy policy = new SchedulerVersionPolicy(
+                new DualPoolSchedulerSettings(loader, new MockEnvironment().withProperty(VERSION_KEY, "LEGACY")));
+        assertThatThrownBy(policy::versionForNewRun)
+                .as("Nacos 还没把覆盖写进缓存时，不得用环境里的 LEGACY 冻结新 Run")
+                .isInstanceOf(AgentLlmHotConfigNotSyncedException.class);
+    }
+
+    @Test
+    void usesHotConfigVersionAfterNacosCacheIsAuthoritative() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setNewRunSchedulerVersion("DUAL_POOL_V2");
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(
+                scheduler, VERSION_KEY, "LEGACY");
+        assertThat(new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("Nacos 覆盖进缓存之后，热配置的 V2 压过环境属性 LEGACY")
+                .isEqualTo("DUAL_POOL_V2");
     }
 }

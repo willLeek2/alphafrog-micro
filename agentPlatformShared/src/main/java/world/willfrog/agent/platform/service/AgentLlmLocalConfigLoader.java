@@ -11,11 +11,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationListener;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 import world.willfrog.alphafrogmicro.common.utils.PlaceholderResolver;
 
 import java.io.IOException;
@@ -39,10 +41,11 @@ import java.util.function.Supplier;
  *
  * <h2>加载机制</h2>
  * <ol>
- *   <li>启动时通过 {@link #load()} 首次加载配置文件（{@code agent.llm.config-file} 指定的路径）</li>
- *   <li>每 10s（可配）通过 {@code @Scheduled} 轮询文件最后修改时间，
- *       有变化时重新解析 JSON → 替换内存中的 {@link AgentLlmProperties} 实例</li>
- *   <li>Nacos→文件→轮询→解析→原子替换，全程不需要重启服务</li>
+ *   <li>Nacos 未启用时，启动通过 {@link #load()} 读 {@code agent.llm.config-file}</li>
+ *   <li>Nacos 启用时，启动不读挂载目录里的种子文件。等
+ *       {@link NacosLocalConfigWrittenEvent} 把生效内容写进同一路径后再加载。
+ *       种子文件里的调度器版本不能压过 Nacos 覆盖。</li>
+ *   <li>之后每 10s（可配）轮询文件修改时间；Nacos 写盘也会立刻强制重读</li>
  * </ol>
  *
  * <h2>{@code file:} 前缀解析</h2>
@@ -58,7 +61,7 @@ import java.util.function.Supplier;
 @Component
 @RequiredArgsConstructor
 @Slf4j
-public class AgentLlmLocalConfigLoader {
+public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     private final ObjectMapper objectMapper;
 
@@ -73,6 +76,11 @@ public class AgentLlmLocalConfigLoader {
 
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")
     private String instanceId;
+
+    @Value("${alphafrog.config.nacos.enabled:false}")
+    private boolean nacosEnabled;
+
+    private volatile boolean syncedFromNacos;
 
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
@@ -98,12 +106,55 @@ public class AgentLlmLocalConfigLoader {
 
     @PostConstruct
     public void load() {
+        if (nacosEnabled) {
+            log.info("Nacos 已启用：跳过启动时加载本地种子文件，等 Nacos 把生效配置写入缓存后再加载");
+            return;
+        }
         reloadIfNeeded(true);
     }
 
     @Scheduled(fixedDelayString = "${agent.llm.config-refresh-interval-ms:10000}")
     public void refresh() {
+        if (nacosEnabled && !syncedFromNacos) {
+            return;
+        }
         reloadIfNeeded(false);
+    }
+
+    @Override
+    public void onApplicationEvent(NacosLocalConfigWrittenEvent event) {
+        applyNacosWrittenFile(event.getTargetFile());
+    }
+
+    /**
+     * Nacos 已经把生效内容写进 {@code targetFile}。路径对得上才重读，并标记这份缓存可用来冻结新 Run。
+     */
+    public void applyNacosWrittenFile(String targetFile) {
+        if (targetFile == null || targetFile.isBlank()) {
+            return;
+        }
+        String file = configFile == null ? "" : configFile.trim();
+        if (file.isEmpty()) {
+            return;
+        }
+        Path configured = Paths.get(file).toAbsolutePath().normalize();
+        Path written = Paths.get(targetFile).toAbsolutePath().normalize();
+        if (!configured.equals(written)) {
+            return;
+        }
+        reloadIfNeeded(true);
+        syncedFromNacos = localSnapshot.config() != null;
+        if (!syncedFromNacos) {
+            log.error("Nacos 已写入 {}，本地加载器没有形成可用快照；新 Run 不得用种子文件冻结调度器版本",
+                    written);
+        }
+    }
+
+    /**
+     * Nacos 关闭时，本地文件就是这份配置。Nacos 打开时，必须等它把生效内容写进缓存并加载成功。
+     */
+    public boolean hotConfigIsAuthoritative() {
+        return !nacosEnabled || syncedFromNacos;
     }
 
     private void reloadIfNeeded(boolean force) {

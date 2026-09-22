@@ -997,6 +997,56 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void nacosEnabled_shouldIgnoreSeedFileUntilNacosWritesTheCache() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+
+        loader.load();
+        assertTrue(loader.current().isEmpty(), "Nacos 启用时不得把种子文件 LEGACY 载入内存");
+        assertFalse(loader.hotConfigIsAuthoritative());
+
+        loader.refresh();
+        assertTrue(loader.current().isEmpty(), "Nacos 还没写缓存时，轮询也不得偷吃种子文件");
+
+        Files.writeString(configFile, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "DUAL_POOL_V2" } }
+                }
+                """, StandardCharsets.UTF_8);
+        loader.applyNacosWrittenFile(configFile.toString());
+
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+        assertTrue(loader.hotConfigIsAuthoritative());
+    }
+
+    @Test
+    void nacosWriteToADifferentFile_shouldNotMarkAgentLlmAuthoritative() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Path other = tempDir.resolve("code-refine.json");
+        Files.writeString(configFile, """
+                { "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } } }
+                """, StandardCharsets.UTF_8);
+        Files.writeString(other, "{\"ok\":true}", StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+        loader.applyNacosWrittenFile(other.toString());
+
+        assertTrue(loader.current().isEmpty());
+        assertFalse(loader.hotConfigIsAuthoritative());
+    }
+
+    @Test
     void load_shouldTolerateMalformedJson() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, "{ invalid json }", StandardCharsets.UTF_8);
