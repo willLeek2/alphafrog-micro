@@ -25,9 +25,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * 同时动一条 Run。所以续期的节奏必须明显快于有效期，缺省是 120 秒的租约、40 秒续一次，中间
  * 容得下两次失败。</p>
  *
- * <p>续期的结果还能当体检用：先清点「本该续上几条」，再批量续，续上的比清点的少，说明其中
- * 有租约已经被别人按过期接手了。这种时候本进程在那几条 Run 上已经没有发言权，必须**撤销本进程
- * 的准入生命周期**（按 Run 与代际号条件撤销，见 {@link DualPoolRunAdmissionRegistry#revokeOwnership}），
+ * <p>续期的结果还能当体检用：逐条按代际号条件续期，哪一条续不上就说明它已经被别人按过期接手了。
+ * 这种时候本进程在那几条 Run 上已经没有发言权，必须**撤销本进程的准入生命周期**
+ * （按 Run 与代际号条件撤销，见 {@link DualPoolRunAdmissionRegistry#revokeOwnership}），
  * 不只是记一条日志：撤销之后协调回合与节点领取不会再为它们发起，已经领取在执行的那一段则由
  * 领取代际收尾（接手方重新排队时加一，旧执行者提交结果会因代际不匹配失败）。</p>
  *
@@ -124,7 +124,16 @@ public class RunServiceLeaseKeeper {
         }
     }
 
-    /** 续一轮：清点 → 批量续 → 对不上就点名那些已经不归自己的。返回续上的条数。 */
+    /**
+     * 续一轮：清点 → 整批续一次（把有界那一页之外的租约也续上）→ 逐条按代际号续，续不上的当场撤销。
+     *
+     * <p>「续上的条数比清点的条数少」这种做法判不准：整批续期是按持有者写的，它续的是本进程**全部**
+     * 租约，而清点的只是有界的一页——本进程手上的 Run 比这一页多的时候，条数永远对得上，被接手的那一条
+     * 反而看不出来；反过来，一页里大部分租约被接手时，条数对不上也说不清是哪一条。所以判定改成逐条
+     * 条件续期：每一条都带上自己的代际号，续得上的才算还在自己手上，续不上的点得出名、也能当即撤销。</p>
+     *
+     * @return 这一页里真正续上的条数
+     */
     public int renewOwnedOnce() {
         String owner = instanceIdentity.value();
         rounds.incrementAndGet();
@@ -136,37 +145,36 @@ public class RunServiceLeaseKeeper {
             return 0;
         }
 
-        int renewed = leaseStore.renewOwned(owner, serviceTtl);
+        // 这一页之外的租约靠整批续期活着：清点是有界的，本进程手上可能还有更多条。
+        leaseStore.renewOwned(owner, serviceTtl);
+
+        List<RunServiceLease> lost = new ArrayList<>();
+        int renewed = 0;
+        for (RunServiceLease lease : owned) {
+            if (leaseStore.renew(lease.runId(), owner, lease.fencingToken(), serviceTtl)) {
+                renewed++;
+                continue;
+            }
+            lost.add(lease);
+        }
         renewedLastRound = renewed;
         renewedTotal.addAndGet(renewed);
-        if (renewed < owned.size()) {
-            // 差数说明有租约被接手了。逐条再试一遍只是为了点名，平常这条路不会走到。
-            List<String> lost = new ArrayList<>();
-            for (RunServiceLease lease : owned) {
-                if (!leaseStore.renew(lease.runId(), owner, lease.fencingToken(), serviceTtl)) {
-                    lost.add(lease.runId());
-                }
+        if (!lost.isEmpty()) {
+            lostTotal.addAndGet(lost.size());
+            // 光记日志不够：本进程必须立刻不再把自己当成这些 Run 的服务方，否则协调回合与节点
+            // 领取还会继续发起（虽然数据库那一层会因凭据不匹配挡下，但那是白跑）。
+            // 撤销按「Run + 代际号」条件做：这条 Run 若已经被本进程用新代际重新取得，
+            // 新生命周期不会被旧回调删掉。
+            for (RunServiceLease lease : lost) {
+                boolean revoked = admissionRegistry != null
+                        && admissionRegistry.revokeOwnership(lease.runId(), lease.fencingToken());
+                lostRevokedTotal.addAndGet(revoked ? 1 : 0);
+                log.warn("本进程已经不再持有这条 Run 的服务所有权，撤销本进程的准入: runId={} fence={} 撤销={}",
+                        lease.runId(), lease.describe(), revoked);
             }
-            if (!lost.isEmpty()) {
-                lostTotal.addAndGet(lost.size());
-                // 光记日志不够：本进程必须立刻不再把自己当成这些 Run 的服务方，否则协调回合与节点
-                // 领取还会继续发起（虽然数据库那一层会因凭据不匹配挡下，但那是白跑）。
-                // 撤销按「Run + 代际号」条件做：这条 Run 若已经被本进程用新代际重新取得，
-                // 新生命周期不会被旧回调删掉。
-                for (RunServiceLease lease : owned) {
-                    if (!lost.contains(lease.runId())) {
-                        continue;
-                    }
-                    boolean revoked = admissionRegistry != null
-                            && admissionRegistry.revokeOwnership(lease.runId(), lease.fencingToken());
-                    lostRevokedTotal.addAndGet(revoked ? 1 : 0);
-                    log.warn("本进程已经不再持有这条 Run 的服务所有权，撤销本进程的准入: runId={} fence={} 撤销={}",
-                            lease.runId(), lease.describe(), revoked);
-                }
-                log.warn("本进程丢掉了这些 Run 的服务所有权，别的进程接手了它们在跑；"
-                                + "已经领取在执行的那一段按领取代际收尾: count={} runIds={}",
-                        lost.size(), lost);
-            }
+            log.warn("本进程丢掉了这些 Run 的服务所有权，别的进程接手了它们在跑；"
+                            + "已经领取在执行的那一段按领取代际收尾: count={} runIds={}",
+                    lost.size(), lost.stream().map(RunServiceLease::runId).toList());
         }
         return renewed;
     }

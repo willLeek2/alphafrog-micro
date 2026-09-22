@@ -32,10 +32,10 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 服务所有权续期的行为：手上的租约趁没过期先续上，续上的比该续的少就说明被别人接手了。
+ * 服务所有权续期的行为：手上的租约趁没过期先续上，哪一条续不上就说明那一条被别人接手了。
  *
- * <p>这里量的是三件事：平常一轮只有一条批量续期语句（不按 Run 逐条刷）；差数出现时才逐条
- * 点名（代价只在异常那一轮）；这一轮出错不带走调度线程，下一轮照跑。</p>
+ * <p>这里量的是四件事：清点是有界的一页，整批续期负责把这一页之外的租约也续上；判定是逐条按
+ * 代际号条件续期，不看条数对比；续不上的当场撤销本进程的准入；这一轮出错不带走调度线程，下一轮照跑。</p>
  */
 class RunServiceLeaseKeeperTest {
 
@@ -58,17 +58,25 @@ class RunServiceLeaseKeeperTest {
                 frozenEffectiveSettings);
     }
 
-    /** 平常一轮：清点几条、批量续几条，两边对上就不再逐条看。 */
+    /**
+     * 平常一轮：整批续一次（把有界那一页之外的租约也续上），再逐条按各自的代际号续。
+     *
+     * <p>条数对不上不说明问题——整批续期续的是本进程全部租约，清点的只有一页；所以判定只能逐条做。</p>
+     */
     @Test
-    void aNormalRoundRenewsInOneStatement() {
+    void aNormalRoundRenewsEachOwnedLeaseByItsToken() {
         when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
                 .thenReturn(List.of(lease("run-a", 1L), lease("run-b", 2L)));
         when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(2);
+        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
+        when(leaseStore.renew(eq("run-b"), eq(OWNER), eq(2L), any(Duration.class))).thenReturn(true);
 
         assertThat(keeper.renewOwnedOnce()).isEqualTo(2);
 
         verify(leaseStore).renewOwned(eq(OWNER), any(Duration.class));
-        verify(leaseStore, never()).renew(anyString(), anyString(), Mockito.anyLong(), any(Duration.class));
+        verify(leaseStore).renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class));
+        verify(leaseStore).renew(eq("run-b"), eq(OWNER), eq(2L), any(Duration.class));
+        verify(admissionRegistry, never()).revokeOwnership(anyString(), anyLong());
         assertThat(keeper.snapshot())
                 .containsEntry("serviceLeaseOwnedLastRound", 2)
                 .containsEntry("serviceLeaseRenewedLastRound", 2)
@@ -80,15 +88,15 @@ class RunServiceLeaseKeeperTest {
     }
 
     /**
-     * 该续两条、只续上一条：有一条已经被别人按过期接手了。
+     * 该续两条、按代际号只续上一条：没续上的那一条已经被别人按过期接手了。
      *
-     * <p>逐条再试只是为了点名是哪一个——这一轮之后派发器不会再动它，它的代际号也已经作废。</p>
+     * <p>点名与撤销都发生在这一刻——这一轮之后派发器不会再动它，它的代际号也已经作废。</p>
      */
     @Test
-    void aShortfallMeansSomeLeasesWereTakenOver() {
+    void aLeaseThatDoesNotRenewByItsTokenWasTakenOver() {
         when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
                 .thenReturn(List.of(lease("run-mine", 1L), lease("run-taken", 3L)));
-        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(1);
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(2);
         when(leaseStore.renew(eq("run-mine"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
         when(leaseStore.renew(eq("run-taken"), eq(OWNER), eq(3L), any(Duration.class))).thenReturn(false);
         when(admissionRegistry.revokeOwnership("run-taken", 3L)).thenReturn(true);
@@ -145,6 +153,7 @@ class RunServiceLeaseKeeperTest {
                 .thenThrow(new IllegalStateException("库读不了"))
                 .thenReturn(List.of(lease("run-a", 1L)));
         when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(1);
+        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
 
         assertThat(keeper.safeRenew()).as("读库就失败了：这一轮没有续上任何一条").isZero();
         assertThat(keeper.snapshot())
@@ -168,6 +177,7 @@ class RunServiceLeaseKeeperTest {
             return List.of(lease("run-a", 1L));
         });
         when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(1);
+        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
 
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {

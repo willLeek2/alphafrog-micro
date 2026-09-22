@@ -1153,15 +1153,25 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
      *
      * <p>先读一次：已经是自己的、还没过期就直接算持有，免得每一轮扫描都为同一批 Run 写一遍。
      * 需要的时候才去领——没建立过、或者上一代已经过期，两种都靠领取语句按条件决定。</p>
+     *
+     * <p>读到或领到的这一代要写回准入组件：写入、撤销与协调都按状态里那份凭据比对，只更新数据库
+     * 不更新这里，本进程会一直带着旧代际去写，条件语句全部落空，看起来像「什么都没发生」。</p>
      */
     private boolean holdsServiceOwnership(String runId) {
         String owner = processIdentity.value();
         RunServiceLease current = leaseStore.find(runId).orElse(null);
         if (current != null && owner.equals(current.ownerInstanceId())
                 && !current.expiredAt(OffsetDateTime.now())) {
+            admissionRegistry.bindFence(runId, fenceOf(current));
             return true;
         }
-        return leaseStore.acquire(runId, owner, serviceLeaseTtl).isPresent();
+        Optional<RunServiceLease> acquired = leaseStore.acquire(runId, owner, serviceLeaseTtl);
+        acquired.ifPresent(lease -> admissionRegistry.bindFence(runId, fenceOf(lease)));
+        return acquired.isPresent();
+    }
+
+    private static ServiceOwnershipFence fenceOf(RunServiceLease lease) {
+        return new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken());
     }
 
     private static int planGeneration(RunCoordination due) {

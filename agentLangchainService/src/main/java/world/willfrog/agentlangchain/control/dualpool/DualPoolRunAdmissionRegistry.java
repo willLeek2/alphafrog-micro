@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 
 /**
  * 当前进程明确接纳的双池 Run 集合。
@@ -55,13 +56,49 @@ public class DualPoolRunAdmissionRegistry {
         }
     }
 
-    private record AdmissionState(long activeEpoch, Set<Long> reservations) {
-        private AdmissionState {
+    /**
+     * 一条 Run 在本进程里的全部状态：服务所有权凭据、准入生命周期令牌、还没落库的预留。
+     *
+     * <p>三样放在同一个对象里，是因为它们说的是同一件事——本进程此刻能不能推进这条 Run。分成两份映射
+     * 存的时候，凭据与准入各自能单独变化，就出现了「凭据还在、准入没了」和「准入还在、凭据被删了」
+     * 这类对不上的状态；合成一个对象之后，撤销、释放、换新一代都是同一个
+     * {@link ConcurrentHashMap#compute} 临界区里的一次条件更新，读到的是同一代的三样东西。</p>
+     *
+     * <p>{@code activeEpoch} 是已经落库一轮的令牌，{@code reservations} 是数据库条件更新还没回来的预留，
+     * 两者只要有一个在，这个状态就占着一个业务名额。{@code fence} 为空的窗口只有一个：受控演练先清掉
+     * 凭据、还没重新取得的那些时刻。</p>
+     */
+    private record RunState(ServiceOwnershipFence fence, long activeEpoch, Set<Long> reservations) {
+        private RunState {
             reservations = Set.copyOf(reservations);
         }
 
         private boolean active() {
             return activeEpoch >= 0L;
+        }
+
+        /** 这个状态占着业务名额没有：有落库的一轮，或者有还没回音的预留。 */
+        private boolean admitted() {
+            return activeEpoch >= 0L || !reservations.isEmpty();
+        }
+
+        private RunState withFence(ServiceOwnershipFence bound) {
+            return new RunState(bound, activeEpoch, reservations);
+        }
+
+        private RunState withEpoch(long epoch, Set<Long> left) {
+            return new RunState(fence, epoch, left);
+        }
+
+        /**
+         * 摘掉准入令牌与预留，只留所有权凭据；连凭据也没有时返回空——调用方都是把返回值直接交给
+         * {@link ConcurrentHashMap#computeIfPresent}，返回空就是把这个状态整个摘掉。
+         *
+         * <p>留着凭据是有意的：正常终态与受控演练之后，同一条 Run 的追问还要在本进程里接着走，
+         * 凭据在手就不必重新去数据库领一趟。</p>
+         */
+        private RunState withoutAdmission() {
+            return fence == null ? null : new RunState(fence, -1L, Set.of());
         }
     }
 
@@ -70,16 +107,14 @@ public class DualPoolRunAdmissionRegistry {
     private final Set<String> startupRecoveredRunIds = ConcurrentHashMap.newKeySet();
     /** 启动时已用分段行事实证明可恢复的完整 DAG Run。 */
     private final Set<String> startupRecoveredWaitGroupRunIds = ConcurrentHashMap.newKeySet();
-    /** activeEpoch 是已持久化一轮的令牌；reservations 是尚未完成数据库条件更新的预留。 */
-    private final Map<String, AdmissionState> admissionStates = new ConcurrentHashMap<>();
     /**
-     * 本进程此刻服务一条 Run 的凭据：准入生命周期一建就绑定，丢了租约就按这个令牌条件撤销。
+     * 本进程此刻服务哪些 Run、每个各是哪一代：凭据、准入令牌、预留都在一个 {@link RunState} 里。
      *
      * <p>只有凭据在手才能推进这条 Run——协调、领取、Run 级写入都先看这里。租约本身在数据库里，
-     * 这里记的是「本进程认为自己据有哪一代」，两者一旦不一致就以数据库为准（写入会因条件不匹配落空）。
-     * </p>
+     * 这里记的是「本进程认为自己据有哪一代」，两者一旦不一致就以数据库为准（写入会因条件不匹配落空），
+     * 所以从数据库读到新的凭据之后要把同一代写回这里（{@link #bindFence}）。</p>
      */
-    private final Map<String, ServiceOwnershipFence> ownershipByRun = new ConcurrentHashMap<>();
+    private final Map<String, RunState> runs = new ConcurrentHashMap<>();
     private final AtomicLong admissionEpochSequence = new AtomicLong();
     /** 启动扫描判定「说不清该怎么恢复」的 Run 与原因；只在启动扫描里写，受理层对这些 Run 一律拒绝。 */
     private final Map<String, String> isolatedRunReasons = new ConcurrentHashMap<>();
@@ -239,7 +274,7 @@ public class DualPoolRunAdmissionRegistry {
                 || !identities.contains(anchorIdentity(runId, anchor))) {
             return false;
         }
-        ServiceOwnershipFence before = ownershipByRun.get(runId);
+        ServiceOwnershipFence before = currentOwnershipFence(runId).orElse(null);
         Optional<RunServiceLease> acquired = acquireOwnership(runId);
         if (acquired.isEmpty()) {
             // 所有权在别的进程手上：这条 Run 已经有人在服务，本进程不接手，也不算证明不了。
@@ -362,7 +397,7 @@ public class DualPoolRunAdmissionRegistry {
      */
     private boolean requeueAbandonedClaims(AgentRun run, List<NodeWorkItem> items) {
         SchedulerVersion version = SchedulerVersion.fromWire(run.getSchedulerVersion());
-        ServiceOwnershipFence fence = ownershipByRun.get(run.getId());
+        ServiceOwnershipFence fence = currentOwnershipFence(run.getId()).orElse(null);
         if (fence == null) {
             // 没有凭据就不该走到这里：放回领取态是「我接手了」的动作，先有所有权再动手。
             log.error("没有服务所有权凭据，拒绝放回领取态的分段: runId={}", run.getId());
@@ -397,11 +432,11 @@ public class DualPoolRunAdmissionRegistry {
 
     /** 刚取得、还没接手的租约要让出去：握着不服务的租约会被续期循环一直续住，别人接不了手。 */
     private void releaseFreshlyTaken(String runId, RunServiceLease lease, boolean alreadyMine) {
-        if (alreadyMine || lease == null) {
+        if (lease == null) {
             return;
         }
-        boolean released = leaseStore.release(runId, instanceIdentity.value(), lease.fencingToken());
-        log.warn("这条 Run 没有接手就先把刚取得的服务所有权让出去: runId={} released={}", runId, released);
+        releaseOwnershipIfFreshlyTaken(runId,
+                new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken()), alreadyMine);
     }
 
     /**
@@ -601,7 +636,7 @@ public class DualPoolRunAdmissionRegistry {
         }
         // 先取得这条 Run 的服务所有权：一条 Run 同一时刻只由一个进程服务，这件事必须是数据库里的事实，
         // 不能只是本进程的一个集合。拿不到说明别的进程正在服务它，这次不受理。
-        ServiceOwnershipFence before = ownershipByRun.get(runId);
+        ServiceOwnershipFence before = currentOwnershipFence(runId).orElse(null);
         Optional<RunServiceLease> acquired = acquireOwnership(runId);
         if (acquired.isEmpty()) {
             log.error("这条 Run 的服务所有权在别人手上，本进程不受理: runId={} version={}", runId, versionName);
@@ -652,7 +687,7 @@ public class DualPoolRunAdmissionRegistry {
         if (isAdmitted(runId)) {
             return true;
         }
-        ServiceOwnershipFence before = ownershipByRun.get(runId);
+        ServiceOwnershipFence before = currentOwnershipFence(runId).orElse(null);
         Optional<RunServiceLease> acquired = acquireOwnership(runId);
         if (acquired.isEmpty()) {
             log.warn("这条 Run 的服务所有权在别人手上，工具作业这条路径不受理: runId={}", runId);
@@ -685,7 +720,13 @@ public class DualPoolRunAdmissionRegistry {
             log.warn("这条 Run 在启动时被隔离，恢复受理一律拒绝: runId={} reason={}", runId, isolation);
             return Admission.rejected();
         }
-        if (!holdsOwnership(runId) && acquireOwnership(runId).isEmpty()) {
+        // 没有凭据就按数据库取一次。这一句以前写成「已经有凭据就不再取，否则取一次」，受理不成时
+        // 这次新取的租约就留在手里了——握着租约却不受理，这条 Run 会被锁到租约过期为止，别的进程
+        // 也接不了手。现在把「这次刚取的租约」记下来，受理没成就在返回前让出去。
+        Optional<RunServiceLease> acquired = holdsOwnership(runId)
+                ? Optional.empty()
+                : acquireOwnership(runId);
+        if (!holdsOwnership(runId)) {
             // 所有权在别人手上：这次恢复消费不该发生，也不该占预留。
             log.warn("这条 Run 的服务所有权在别人手上，恢复受理拒绝: runId={}", runId);
             return Admission.rejected();
@@ -694,7 +735,17 @@ public class DualPoolRunAdmissionRegistry {
         if (isAdmitted(runId)) {
             return new Admission(true, -1L);
         }
-        return admitExistingRunWithLease(runId);
+        Admission admission = admitExistingRunWithLease(runId);
+        if (admission.admitted() || acquired.isEmpty()) {
+            return admission;
+        }
+        // 刚取得凭据、受理却没成（业务名额拿不到）：这条 Run 这一轮不接手，把刚取得的让出去，
+        // 本进程也不再当成认识它。
+        knownRunIds.remove(runId);
+        releaseOwnershipIfFreshlyTaken(runId,
+                new ServiceOwnershipFence(acquired.get().ownerInstanceId(), acquired.get().fencingToken()),
+                false);
+        return Admission.rejected();
     }
 
     /** 同一进程内的追问或显式恢复可以重新占用业务名额；重启前未知的 Run 一律拒绝。 */
@@ -718,18 +769,22 @@ public class DualPoolRunAdmissionRegistry {
         }
         long reservationEpoch = admissionEpochSequence.incrementAndGet();
         AtomicBoolean reserved = new AtomicBoolean();
-        admissionStates.compute(runId, (ignored, current) -> {
-            AdmissionState state = current;
-            if (state == null) {
+        runs.compute(runId, (ignored, current) -> {
+            RunState state = current;
+            // 占名额这件事看的是「这个状态此刻占着名额没有」，不是「有没有这个状态」：
+            // 只有凭据、还没有准入的状态是允许存在的（先取得所有权再受理），那种状态要先占名额。
+            if (state == null || !state.admitted()) {
                 if (!permitLedger.tryAcquire(SchedulerPermitLayer.BUSINESS_ADMISSION)) {
-                    return null;
+                    return state;
                 }
-                state = new AdmissionState(-1L, Set.of());
+                if (state == null) {
+                    state = new RunState(null, -1L, Set.of());
+                }
             }
             Set<Long> reservations = new LinkedHashSet<>(state.reservations());
             reservations.add(reservationEpoch);
             reserved.set(true);
-            return new AdmissionState(state.activeEpoch(), reservations);
+            return state.withEpoch(state.activeEpoch(), reservations);
         });
         return reserved.get()
                 ? new Admission(true, reservationEpoch)
@@ -742,14 +797,14 @@ public class DualPoolRunAdmissionRegistry {
             return false;
         }
         AtomicBoolean activated = new AtomicBoolean();
-        admissionStates.computeIfPresent(runId, (ignored, state) -> {
+        runs.computeIfPresent(runId, (ignored, state) -> {
             if (!state.reservations().contains(admission.epoch())) {
                 return state;
             }
             Set<Long> reservations = new LinkedHashSet<>(state.reservations());
             reservations.remove(admission.epoch());
             activated.set(true);
-            return new AdmissionState(admission.epoch(), reservations);
+            return state.withEpoch(admission.epoch(), reservations);
         });
         return activated.get();
     }
@@ -760,30 +815,30 @@ public class DualPoolRunAdmissionRegistry {
             return false;
         }
         AtomicBoolean rolledBack = new AtomicBoolean();
-        admissionStates.computeIfPresent(runId, (ignored, state) -> {
+        runs.computeIfPresent(runId, (ignored, state) -> {
             if (!state.reservations().contains(admission.epoch())) {
                 return state;
             }
             Set<Long> reservations = new LinkedHashSet<>(state.reservations());
             reservations.remove(admission.epoch());
             rolledBack.set(true);
-            if (!state.active() && reservations.isEmpty()) {
+            if (!state.admitted()) {
                 permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
-                return null;
+                return state.withoutAdmission();
             }
-            return new AdmissionState(state.activeEpoch(), reservations);
+            return state.withEpoch(state.activeEpoch(), reservations);
         });
         return rolledBack.get();
     }
 
     public boolean isAdmitted(String runId) {
-        AdmissionState state = runId == null ? null : admissionStates.get(runId);
+        RunState state = runId == null ? null : runs.get(runId);
         return state != null && state.active();
     }
 
     /** 返回当前准入生命周期令牌；没有准入时返回 -1。 */
     public long currentAdmissionEpoch(String runId) {
-        AdmissionState state = runId == null ? null : admissionStates.get(runId);
+        RunState state = runId == null ? null : runs.get(runId);
         return state == null ? -1L : state.activeEpoch();
     }
 
@@ -855,7 +910,11 @@ public class DualPoolRunAdmissionRegistry {
         snapshot.put("isolatedRunReasons", Map.copyOf(isolatedRunReasons));
         // 本进程此刻服务着哪些 Run：凭据里的代际号是「第几次服务」，换人之后旧的写不进去。
         Map<String, String> owned = new LinkedHashMap<>();
-        ownershipByRun.forEach((runId, fence) -> owned.put(runId, fence.describe()));
+        runs.forEach((runId, state) -> {
+            if (state.fence() != null) {
+                owned.put(runId, state.fence().describe());
+            }
+        });
         snapshot.put("ownedRunCount", owned.size());
         snapshot.put("ownedRuns", owned);
         snapshot.put("requeuedAbandonedClaimTotal", requeuedAbandonedClaims.get());
@@ -878,26 +937,48 @@ public class DualPoolRunAdmissionRegistry {
             return Optional.empty();
         }
         Optional<RunServiceLease> acquired = leaseStore.acquire(runId, instanceIdentity.value(), serviceLeaseTtl);
-        acquired.ifPresent(lease -> ownershipByRun.put(runId,
+        acquired.ifPresent(lease -> bindFence(runId,
                 new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken())));
         return acquired;
     }
 
+    /**
+     * 把这一次从数据库读到的凭据写回这条 Run 的状态对象。
+     *
+     * <p>拿到或读到租约之后都要走这里：状态里记的凭据与数据库里那一代不一致时，协调、领取与
+     * Run 级写入会带着旧代际去写，全被条件语句挡回来——看起来像「什么都没做」，实际是账不对。
+     * 数据库是这对账里说了算的一边，读到什么就记什么。</p>
+     *
+     * @return true 表示写回之后这条 Run 记的凭据就是传进来的那一代
+     */
+    public boolean bindFence(String runId, ServiceOwnershipFence fence) {
+        if (runId == null || runId.isBlank() || fence == null) {
+            return false;
+        }
+        RunState bound = runs.compute(runId, (ignored, current) -> current == null
+                ? new RunState(fence, -1L, Set.of())
+                : current.withFence(fence));
+        return fence.equals(bound.fence());
+    }
+
     /** 本进程此刻是不是这条 Run 的服务方。 */
     public boolean holdsOwnership(String runId) {
-        return runId != null && ownershipByRun.containsKey(runId);
+        return runId != null && runs.containsKey(runId);
     }
 
     /** 本进程此刻对这条 Run 的服务所有权凭据；协调、领取与 Run 级写入都从这里取。 */
     public Optional<ServiceOwnershipFence> currentOwnershipFence(String runId) {
-        return runId == null ? Optional.empty() : Optional.ofNullable(ownershipByRun.get(runId));
+        RunState state = runId == null ? null : runs.get(runId);
+        return state == null ? Optional.empty() : Optional.ofNullable(state.fence());
     }
 
     /**
      * 续期循环发现这条 Run 的所有权已经不在本进程时调用。
      *
-     * <p>按令牌条件撤销：只有当前绑定的代际号就是调用方说的那一代才撤。同一进程后来重新取得这条 Run
-     * 时会绑定新的号，旧续期回调带着旧号回来就不该把新的生命周期删掉。</p>
+     * <p>读、比、删在同一个 {@link ConcurrentHashMap#computeIfPresent} 临界区里做完：按令牌条件撤销，
+     * 只有当前绑定的代际号就是调用方说的那一代才撤。照着「先读一次、比一下、再删」写出来的三步
+     * 会在这三步之间被并发插进来——本进程刚好用新一代重新取得这条 Run 时，最后一次删除会把新的
+     * 生命周期删掉，而数据库里这条 Run 是我们在服务：本进程从此写不动它，直到租约过期。</p>
      *
      * @return true 表示确实撤销了这一次生命周期
      */
@@ -905,22 +986,39 @@ public class DualPoolRunAdmissionRegistry {
         if (runId == null || runId.isBlank()) {
             return false;
         }
-        ServiceOwnershipFence current = ownershipByRun.get(runId);
-        if (current == null || current.fencingToken() != fencingToken) {
+        RunState revoked = dropIf(runId, state -> state.fence() != null
+                && state.fence().fencingToken() == fencingToken);
+        if (revoked == null) {
             return false;
         }
-        long epoch = currentAdmissionEpoch(runId);
-        ownershipByRun.remove(runId);
         knownRunIds.remove(runId);
-        if (epoch >= 0L) {
-            releaseBusinessPermitIfCurrent(runId, epoch);
-        } else {
-            // 还停在预留上（数据库条件更新没成功）：按 runId 清掉预留与它占的名额。
-            releaseBusinessPermit(runId);
-        }
-        log.warn("这条 Run 的服务所有权已经不在本进程，撤销本进程的准入: runId={} fence={}",
-                runId, current.describe());
+        log.warn("这条 Run 的服务所有权已经不在本进程，撤销本进程的准入: runId={} fence={} 名额已归还={}",
+                runId, revoked.fence().describe(), revoked.admitted());
         return true;
+    }
+
+    /**
+     * 挑起出这条 Run 状态对象里符合条件的那一代，摘掉时把它占着的业务名额一并归还。
+     *
+     * <p>摘除与归还名额必须在同一个临界区里成对做完：先摘掉再归还之间，别的请求看到的是
+     * 「这一条已经不在了」，于是去抢名额——而名额其实还没还，白抢一次。</p>
+     *
+     * @return 被摘掉的那个状态；没摘到返回 null
+     */
+    private RunState dropIf(String runId, Predicate<RunState> matches) {
+        AtomicReference<RunState> dropped = new AtomicReference<>();
+        runs.computeIfPresent(runId, (ignored, state) -> {
+            if (!matches.test(state)) {
+                return state;
+            }
+            dropped.set(state);
+            return null;
+        });
+        RunState gone = dropped.get();
+        if (gone != null && gone.admitted()) {
+            permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
+        }
+        return gone;
     }
 
     /**
@@ -1013,14 +1111,22 @@ public class DualPoolRunAdmissionRegistry {
         return identities;
     }
 
-    /** 刚取得、还没用上的租约要让出去：握着不服务的租约会被续期循环一直续住，别人接不了手。 */
+    /**
+     * 刚取得、还没用上的租约要让出去：握着不服务的租约会被续期循环一直续住，别人接不了手。
+     *
+     * <p>这条 Run 本来就是我们服务的时候（{@code alreadyMine}）什么都不动：这一次失败只是「这一轮
+     * 不做这件事」，凭据与数据库里那条租约照旧；以前在这里按 runId 无条件删掉本进程的凭据，删完之后
+     * 本进程还占着准入名额却写不动这条 Run，成了最麻烦的那种错位。</p>
+     */
     private void releaseOwnershipIfFreshlyTaken(String runId, ServiceOwnershipFence fence, boolean alreadyMine) {
-        ownershipByRun.remove(runId);
-        if (alreadyMine || fence == null) {
+        if (fence == null || alreadyMine) {
             return;
         }
+        // 只摘掉「就是刚取得的那一代」：中途被换过的状态不归这次调用管。
+        boolean cleared = dropIf(runId, state -> fence.equals(state.fence())) != null;
         boolean released = leaseStore.release(runId, fence.ownerInstanceId(), fence.fencingToken());
-        log.warn("这条 Run 没有受理就先把刚取得的服务所有权让出去: runId={} released={}", runId, released);
+        log.warn("这条 Run 没有受理就先把刚取得的服务所有权让出去: runId={} 状态已清={} released={}",
+                runId, cleared, released);
     }
 
     /** 仅在创建后的调度入口失败时撤销；正常终态仍保留，以便同进程追问继续走原版本。 */
@@ -1032,11 +1138,18 @@ public class DualPoolRunAdmissionRegistry {
         knownRunIds.remove(runId);
     }
 
-    /** Run 到达数据库终态后交还业务名额，但保留同进程身份，允许后续追问重新准入。 */
+    /** Run 到达数据库终态后交还业务名额，但保留同进程身份与所有权凭据，允许后续追问重新准入。 */
     public void releaseBusinessPermit(String runId) {
-        if (runId != null && admissionStates.remove(runId) != null) {
-            permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
+        if (runId == null) {
+            return;
         }
+        runs.computeIfPresent(runId, (ignored, state) -> {
+            if (!state.admitted()) {
+                return state;
+            }
+            permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
+            return state.withoutAdmission();
+        });
     }
 
     /**
@@ -1054,7 +1167,7 @@ public class DualPoolRunAdmissionRegistry {
         }
         AtomicBoolean released = new AtomicBoolean();
         AtomicReference<RuntimeException> cleanupFailure = new AtomicReference<>();
-        admissionStates.computeIfPresent(runId, (ignored, state) -> {
+        runs.computeIfPresent(runId, (ignored, state) -> {
             if (state.activeEpoch() != expectedEpoch || !state.reservations().isEmpty()) {
                 return state;
             }
@@ -1069,7 +1182,7 @@ public class DualPoolRunAdmissionRegistry {
             // 不会先看到 key 已删除、却因旧许可尚未归还而被瞬时误拒。
             permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
             released.set(true);
-            return null;
+            return state.withoutAdmission();
         });
         RuntimeException failure = cleanupFailure.get();
         if (failure != null) {
@@ -1082,13 +1195,20 @@ public class DualPoolRunAdmissionRegistry {
         return releaseBusinessPermitIfCurrent(runId, expectedEpoch, null);
     }
 
+    /** 此刻占着业务名额的 Run 数：有落库的一轮，或者有还没回音的预留，都算。 */
     public int admittedCount() {
-        return admissionStates.size();
+        int count = 0;
+        for (RunState state : runs.values()) {
+            if (state.admitted()) {
+                count++;
+            }
+        }
+        return count;
     }
 
     public Set<String> snapshotRunIds() {
         Set<String> activeRunIds = new LinkedHashSet<>();
-        admissionStates.forEach((runId, state) -> {
+        runs.forEach((runId, state) -> {
             if (state.active()) {
                 activeRunIds.add(runId);
             }
@@ -1098,17 +1218,21 @@ public class DualPoolRunAdmissionRegistry {
 
     private boolean activateNewRun(String runId) {
         AtomicBoolean admitted = new AtomicBoolean();
-        admissionStates.compute(runId, (ignored, current) -> {
-            if (current != null) {
+        runs.compute(runId, (ignored, current) -> {
+            if (current != null && current.admitted()) {
+                // 已经有落库的一轮或一个预留：不动它，也不重复占名额。
                 admitted.set(true);
                 return current;
             }
             if (!permitLedger.tryAcquire(SchedulerPermitLayer.BUSINESS_ADMISSION)) {
-                return null;
+                // 名额拿不到：状态照旧留着（凭据是真的，只是这次受理没成）。
+                return current;
             }
             long nextEpoch = admissionEpochSequence.incrementAndGet();
             admitted.set(true);
-            return new AdmissionState(nextEpoch, Set.of());
+            return current == null
+                    ? new RunState(null, nextEpoch, Set.of())
+                    : current.withEpoch(nextEpoch, Set.of());
         });
         return admitted.get();
     }

@@ -122,6 +122,97 @@ class DualPoolRunAdmissionRegistryTest {
                 .isEqualTo(1);
     }
 
+    /**
+     * 恢复预留没占上名额时，这一次刚取得的租约要让出去，本进程也不再以为这条 Run 归自己。
+     *
+     * <p>以前这里只把「本进程不认识这条 Run」记下来，凭据与库里的租约都留在手里：这条 Run 被本进程
+     * 锁着（续期循环还会一直替它续），却没有一个入口能推进它，直到租约过期。</p>
+     */
+    @Test
+    void aRejectedRecoveryReservationGivesTheFreshlyTakenLeaseBack() {
+        Fixture fixture = new Fixture();
+        fixture.permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
+
+        assertThat(fixture.registry.reserveForRecovery("run-2").admitted()).isFalse();
+
+        assertThat(fixture.registry.holdsOwnership("run-2")).as("没受理就不该留下凭据").isFalse();
+        assertThat(fixture.registry.snapshotRunIds()).containsExactly("run-1");
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse())
+                .as("被拒的那一次不占名额").isEqualTo(1);
+        verify(fixture.leaseStore).release("run-2", "test-instance", 1L);
+    }
+
+    /**
+     * 这条 Run 的租约本来就是我们的：这一轮接手失败（分段放不回去）不能把凭据清掉。
+     *
+     * <p>数据库里那条租约还是我们的，凭据清掉之后本进程会一直带着空凭据去写——每一次写入都被条件
+     * 语句挡回来，看起来像「什么都没发生」。</p>
+     */
+    @Test
+    void aFailedTakeoverLeavesTheOwnershipWeAlreadyHaveInPlace() {
+        Fixture fixture = new Fixture();
+        NodeWorkItem claimed = item("run-2", 3, "todo-1", 0, 0);
+        claimed.setState(NodeWorkItemState.CLAIMED.name());
+        claimed.setClaimEpoch(2);
+        claimed.setContextVersion(7L);
+        claimed.setRunControlVersion(2L);
+        claimed.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(claimed));
+        fixture.run(waitGroupRun(AgentRunStatus.EXECUTING));
+        when(fixture.leaseStore.find("run-2")).thenReturn(Optional.of(new RunServiceLease("run-2",
+                "test-instance", 1L, OffsetDateTime.now().minusMinutes(1), OffsetDateTime.now(),
+                OffsetDateTime.now().plusMinutes(2))));
+        when(fixture.workItems.requeueAbandonedClaim(any(), any(), any(), any()))
+                .thenReturn(NodeWorkItemMutationResult.rejected(NodeWorkItemRejection.of(
+                        NodeWorkItemRejectionReason.CONDITION_MISMATCH,
+                        claimed.identity(), new NodeWorkItemVersions(7L, 2L, 2), null)));
+        when(fixture.workItems.findByIdentity(claimed.identity())).thenReturn(Optional.of(claimed));
+
+        fixture.registry.detectStartupResidue();
+
+        assertThat(fixture.isolationReasonOf("run-2")).isEqualTo("claim_requeue_left_claimed");
+        assertThat(fixture.registry.holdsOwnership("run-2"))
+                .as("租约本来就在我们手上：这一轮不动它，凭据也留着").isTrue();
+        verify(fixture.leaseStore, never()).release(eq("run-2"), anyString(), anyLong());
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+    }
+
+    /**
+     * 带着旧代际号回来的撤销不该动现在这一代：本进程重新取得这条 Run 之后，旧回调说的那一代已经作废。
+     *
+     * <p>读、比、删要是分成三步做，中间被并发插进来就会把新的生命周期删掉——那之后本进程占着名额，
+     * 却因为凭据被删而写不动这条 Run。</p>
+     */
+    @Test
+    void aRevocationCarryingAStaleTokenLeavesTheStateWeTookBackAlone() {
+        Fixture fixture = new Fixture();
+        assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
+        assertThat(fixture.registry.bindFence("run-1", new ServiceOwnershipFence("test-instance", 9L))).isTrue();
+
+        assertThat(fixture.registry.revokeOwnership("run-1", 1L)).isFalse();
+
+        assertThat(fixture.registry.currentOwnershipFence("run-1"))
+                .contains(new ServiceOwnershipFence("test-instance", 9L));
+        assertThat(fixture.registry.isAdmitted("run-1")).isTrue();
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isEqualTo(1);
+    }
+
+    /** 撤销说的就是现在这一代：凭据、准入与名额一起交还，本进程也不再认识这条 Run。 */
+    @Test
+    void aRevocationCarryingTheCurrentTokenDropsTheOwnershipAndThePermit() {
+        Fixture fixture = new Fixture();
+        assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
+        assertThat(fixture.registry.bindFence("run-1", new ServiceOwnershipFence("test-instance", 9L))).isTrue();
+
+        assertThat(fixture.registry.revokeOwnership("run-1", 9L)).isTrue();
+
+        assertThat(fixture.registry.holdsOwnership("run-1")).isFalse();
+        assertThat(fixture.registry.isAdmitted("run-1")).isFalse();
+        assertThat(fixture.registry.isKnownInCurrentProcess("run-1")).isFalse();
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+    }
+
     @Test
     void startupRecoveryRejectsRunWithUnrelatedUnfinishedWorkItem() {
         SchedulerPermitLedger permitLedger = new SchedulerPermitLedger();

@@ -17,6 +17,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 import world.willfrog.agentlangchain.control.LegacyRunHandoff;
 import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
@@ -177,6 +178,33 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         assertThat(handler.routingSnapshot())
                 .containsEntry("legacyHandedOffTotal", 0L)
                 .containsEntry("legacyDeferredTotal", 1L);
+    }
+
+    /**
+     * 读到或领到的这一代要写回准入组件：只更新数据库不更新那里，本进程会带着旧代际去写，
+     * 条件语句全部落空，看起来像「什么都没发生」。
+     */
+    @Test
+    void theOwnershipThisRoundActuallyHasIsWrittenBackToTheAdmissionRegistry() {
+        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-legacy", "LEGACY")));
+        when(runMapper.findById("run-legacy")).thenReturn(run("run-legacy", "LEGACY"));
+        ownedByThisProcess("run-legacy");
+        when(legacyHandoff.handOff("run-legacy")).thenReturn(true);
+
+        handler.scanRunnableRuns(10);
+        verify(admissionRegistry).bindFence("run-legacy", new ServiceOwnershipFence("test-instance", 1L));
+
+        // 库里没有、这次现领一条：领到的代际（这里是 5）要写回，不能还留着上一轮的旧号。
+        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-fresh", "LEGACY")));
+        when(runMapper.findById("run-fresh")).thenReturn(run("run-fresh", "LEGACY"));
+        when(leaseStore.find("run-fresh")).thenReturn(Optional.empty());
+        when(leaseStore.acquire(eq("run-fresh"), anyString(), any(Duration.class)))
+                .thenReturn(Optional.of(new RunServiceLease("run-fresh", "test-instance", 5L,
+                        OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
+        when(legacyHandoff.handOff("run-fresh")).thenReturn(true);
+
+        handler.scanRunnableRuns(10);
+        verify(admissionRegistry).bindFence("run-fresh", new ServiceOwnershipFence("test-instance", 5L));
     }
 
     @Test
