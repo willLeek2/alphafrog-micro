@@ -1916,6 +1916,60 @@ class Stage3WaitContractPostgresTest {
                 .toList();
     }
 
+    /** Run 行自己的计划代际：启动时与分段行逐条比对的就是它。 */
+    private static int planGenerationOf(String runId) throws Exception {
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement();
+             var rows = statement.executeQuery(
+                     "SELECT plan_generation FROM alphafrog_agent_run WHERE id = '" + runId + "'")) {
+            assertThat(rows.next()).as("这条 Run 读得回来：" + runId).isTrue();
+            return rows.getInt(1);
+        }
+    }
+
+    /**
+     * 一条 Run 自己的坏记录只让它自己被隔离，隔壁那条干净 Run 照常带着完整输入，能接着恢复。
+     *
+     * <p>「可归属」的意思是这条坏记录指向的 Run 读得回来，只是行上的计划代际与 Run 自己那一代对不上。
+     * 扫描语句按 **Run 的版本**取行（里面连了 Run 表），所以行自己写错的那一列不影响它被读出来：它照样
+     * 出现在扫描结果里，带着自己写的那一代，交给启动那一处与 Run 行逐条比对，结论就是只隔离这一条。</p>
+     *
+     * <p>至于「行指向一条读不回来的 Run」那种，真库里造不出来：外键挡着写不进去；即使写得进去，扫描要连
+     * Run 表，这样的行连读都读不到。那一类只能靠准入注册表的单测钉住，不按「真库插一行就能造」来写。</p>
+     */
+    @Test
+    void aBadRecordIsolatedToOneRunLeavesTheCleanRunItsRecoveryInputs() throws Exception {
+        String badRun = "run-bad-record";
+        String cleanRun = "run-clean-neighbour";
+        createRunFor(badRun, "user-bad-record", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        createRunFor(cleanRun, "user-clean-neighbour", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
+        createSegment(badRun, 0, "node-a", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        createSegment(cleanRun, 0, "node-b", 0, 0, 0, null, 1L, 0L, "RUNNABLE");
+        // 坏记录的样子：这一行自称属于下一代计划，而它的 Run 还停在第 0 代。
+        execute("UPDATE alphafrog_agent_run_work_item SET plan_generation = 1 "
+                + "WHERE run_id = '" + badRun + "' AND node_id = 'node-a'");
+
+        assertThat(isolationInputsOf(badRun))
+                .as("坏记录照样被扫描读出来，带着它自称的那一代，供与 Run 行逐条比对")
+                .containsExactly("node-a:DUAL_POOL_V2:plan=1:ctrl=0");
+        assertThat(isolationInputsOf(cleanRun))
+                .as("隔壁 Run 读到的只有它自己的干净行").containsExactly("node-b:DUAL_POOL_V2:plan=0:ctrl=0");
+        assertThat(planGenerationOf(badRun)).as("坏记录指向的 Run 读得回来，这一条才算可归属").isZero();
+        assertThat(planGenerationOf(cleanRun))
+                .as("干净 Run 的分段与它自己的 Run 同代，没有可隔离的理由").isZero();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + cleanRun + "' AND state = 'RUNNABLE'"))
+                .as("隔壁那条 Run 的分段一行没动，仍然在等着被恢复").isEqualTo(1);
+
+        expectRejected("INSERT INTO alphafrog_agent_run_work_item (run_id, plan_generation, node_id, "
+                        + "context_version, run_control_version) "
+                        + "VALUES ('run-that-does-not-exist', 0, 'node-x', 1, 0)",
+                "alphafrog_agent_run_work_item_run_id_fkey");
+        execute("DELETE FROM alphafrog_agent_run WHERE id = '" + badRun + "'");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + badRun + "'")).as("Run 删掉时分段行一起走，所以「Run 没了、行还在」也留不下来").isZero();
+    }
+
     /** 资格记录建到一半的事务回滚：库里不留半条记录；同一个入口再来一次并提交，留下恰好一条。 */
     @Test
     void aRolledBackEntitlementWriteLeavesNoRowBehind() throws Exception {
