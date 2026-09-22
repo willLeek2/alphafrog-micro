@@ -48,6 +48,7 @@ systemd 单元通过 `/etc/alphafrog-beta/controller.env` 注入开关、监听�
 | `AF_BETA_CONTROLLER_STATE_ROOT` | 保存状态、部署单、生成的 Compose 和服务日志。随附 systemd 单元只会准备默认目录 `/var/lib/alphafrog-beta`；改用其他路径时，必须预先创建精确目录并授予 `alphafrog-beta` 写权限。若仍要让 systemd 托管该目录，再按目标系统的 systemd 规则调整单元。 |
 | `AF_BETA_CONTROLLER_API_TOKEN_FILE` | Bearer 凭证文件路径。凭证内容不写进 systemd 单元。 |
 | `AF_BETA_HEALTHCHECK_SCRIPT` | 挂载进候选容器的固定 TCP 探针。 |
+| `AF_BETA_FAILED_CANDIDATE_RETAIN` | `CANDIDATE_NOT_READY` 后保留失败候选容器的时间，默认 120 秒，允许 `PT0S` 到 `PT10M`。到期或显式重试 / 删部署后再 `docker rm --force`。 |
 | `AF_BETA_NACOS_SERVER_ADDRESS` | 生产 Nacos 从 Beta 机器可访问的地址，不包含 `nacos://` 前缀。 |
 | `AF_CONFIG_NACOS_NAMESPACE` / `AF_CONFIG_NACOS_USERNAME` / `AF_CONFIG_NACOS_PASSWORD` | Nacos 命名空间和可选鉴权。 |
 | `AF_OTEL_TRACES_ENDPOINT` | Java 服务通过 Java Agent 发送轨迹时使用的生产 Jaeger OTLP HTTP 地址。控制器也会为非 Java 服务生成对应的 `OTEL_*` 环境变量；是否真正导出轨迹取决于服务自身实现。 |

@@ -13,6 +13,7 @@ public class BetaControllerProperties {
     private boolean enabled;
     private Path stateRoot = Path.of("/var/lib/alphafrog-beta");
     private Duration reconcileDelay = Duration.ofSeconds(2);
+    private Duration failedCandidateRetain = Duration.ofSeconds(120);
     private int applicationDrainSeconds = 60;
     private Path apiTokenFile = Path.of("/etc/alphafrog-beta/secrets/controller-api-token");
     private Path healthcheckScript = Path.of("/opt/alphafrog-beta/bin/tcp-healthcheck");
@@ -28,6 +29,15 @@ public class BetaControllerProperties {
     public void setStateRoot(Path stateRoot) { this.stateRoot = stateRoot; }
     public Duration getReconcileDelay() { return reconcileDelay; }
     public void setReconcileDelay(Duration reconcileDelay) { this.reconcileDelay = reconcileDelay; }
+    public Duration getFailedCandidateRetain() { return failedCandidateRetain; }
+    public void setFailedCandidateRetain(Duration failedCandidateRetain) {
+        if (failedCandidateRetain == null || failedCandidateRetain.isNegative()
+                || failedCandidateRetain.compareTo(Duration.ofMinutes(10)) > 0) {
+            throw new IllegalArgumentException(
+                    "failed-candidate-retain 只接受 PT0S 到 PT10M，收到的是：" + failedCandidateRetain);
+        }
+        this.failedCandidateRetain = failedCandidateRetain;
+    }
     public int getApplicationDrainSeconds() { return applicationDrainSeconds; }
     public void setApplicationDrainSeconds(int applicationDrainSeconds) {
         this.applicationDrainSeconds = applicationDrainSeconds;
