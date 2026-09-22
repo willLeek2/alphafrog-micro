@@ -138,6 +138,8 @@ public class AgentLangchainRunService {
             }
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         } catch (RuntimeException e) {
+            log.error("创建后启动失败: runId={} schedulerVersion={} createdNow={}",
+                    run == null ? null : run.getId(), schedulerVersion, createdNow, e);
             if (reservation != null) {
                 runConcurrencyScheduler.release(reservation);
             }
@@ -168,7 +170,7 @@ public class AgentLangchainRunService {
         try {
             agentEventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
                     "engine", "agentLangchainService",
-                    "reason", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()
+                    "reason", describeFailure(error)
             ));
             runMapper.updateStatus(
                     run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.FAILED);
@@ -176,5 +178,31 @@ public class AgentLangchainRunService {
             log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
                     run.getId(), markError.getMessage());
         }
+    }
+
+    /**
+     * 排队失败事件要能从库里直接读出下一层原因。Spring 包过的数据库访问异常经常把
+     * {@code getMessage()} 留空，真正的语句错误在 cause 上。
+     */
+    static String describeFailure(Throwable error) {
+        if (error == null) {
+            return "unknown";
+        }
+        StringBuilder text = new StringBuilder();
+        Throwable current = error;
+        int depth = 0;
+        while (current != null && depth < 8) {
+            String message = current.getMessage();
+            String piece = (message == null || message.isBlank())
+                    ? current.getClass().getSimpleName()
+                    : current.getClass().getSimpleName() + ": " + message;
+            if (text.length() > 0) {
+                text.append(" | ");
+            }
+            text.append(piece);
+            current = current.getCause();
+            depth++;
+        }
+        return text.toString();
     }
 }

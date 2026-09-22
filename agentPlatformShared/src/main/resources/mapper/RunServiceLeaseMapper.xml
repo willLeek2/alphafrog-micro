@@ -14,7 +14,12 @@
     -->
     <sql id="liveRunStatuses">'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'CANCELING'</sql>
 
-    <resultMap id="RunServiceLeaseResultMap" type="world.willfrog.agent.platform.lease.RunServiceLease">
+    <!--
+      关掉自动映射。这份结果已经用构造器按列逐个取值。生产会话开了下划线转驼峰之后，
+      自动映射会按驼峰名把同一批列再塞进构造器，Java record 参数个数对不上，领取语句
+      会在行已经写入之后把映射异常抛回调用方。
+    -->
+    <resultMap id="RunServiceLeaseResultMap" type="world.willfrog.agent.platform.lease.RunServiceLease" autoMapping="false">
         <constructor>
             <idArg column="run_id" javaType="java.lang.String"/>
             <arg column="owner_instance_id" javaType="java.lang.String"/>

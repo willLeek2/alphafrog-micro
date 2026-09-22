@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.facade;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.ObjectProvider;
@@ -22,6 +23,8 @@ import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
+
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -245,5 +248,49 @@ class AgentLangchainRunServiceTest {
         verify(eventService).createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq("stable"), eq(GENERATION), isNull(),
                 eq(SchedulerVersionPolicy.LEGACY), anyBoolean(), anyBoolean());
+    }
+
+    @Test
+    void describeFailureWalksBlankOuterMessageToCause() {
+        RuntimeException cause = new IllegalArgumentException("argument type mismatch");
+        org.mybatis.spring.MyBatisSystemException wrapped =
+                new org.mybatis.spring.MyBatisSystemException(cause);
+        String text = AgentLangchainRunService.describeFailure(wrapped);
+        assertTrue(text.contains("MyBatisSystemException"));
+        assertTrue(text.contains("argument type mismatch"));
+    }
+
+    @Test
+    void dualPoolAdmitFailureWritesCauseChainIntoEnqueueFailedEvent() {
+        when(schedulerVersionPolicy.versionForNewRun())
+                .thenReturn(SchedulerVersionPolicy.DUAL_POOL_V2);
+        when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
+        when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
+        AgentRun run = new AgentRun();
+        run.setId("run-v2");
+        run.setUserId("u1");
+        run.setSchedulerVersion(SchedulerVersionPolicy.DUAL_POOL_V2);
+        run.setStatus(AgentRunStatus.RECEIVED);
+        when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
+                eq(SchedulerVersionPolicy.DUAL_POOL_V2), anyBoolean(), anyBoolean())).thenReturn(
+                new AgentRunEventService.RunCreation(run, true));
+        org.mybatis.spring.MyBatisSystemException failure =
+                new org.mybatis.spring.MyBatisSystemException(
+                        new IllegalArgumentException("argument type mismatch"));
+        when(dualPoolRunAdmissionRegistry.admitNewRun(eq("run-v2"), anyString())).thenThrow(failure);
+
+        assertThrows(org.mybatis.spring.MyBatisSystemException.class, () ->
+                runService.createRun(CreateAgentRunRequest.newBuilder()
+                        .setUserId("u1")
+                        .setMessage("v2")
+                        .build()));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
+        verify(eventService).append(eq("run-v2"), eq("u1"), eq("RUN_ENQUEUE_FAILED"), captor.capture());
+        assertTrue(String.valueOf(captor.getValue().get("reason")).contains("argument type mismatch"));
+        verify(pipeline, never()).launchAsync(any(), any());
+        verify(dualPoolRunAdmissionRegistry).forgetFailedAdmission("run-v2");
     }
 }
