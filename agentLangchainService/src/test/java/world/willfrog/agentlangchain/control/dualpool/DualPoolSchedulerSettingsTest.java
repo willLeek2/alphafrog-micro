@@ -86,9 +86,9 @@ class DualPoolSchedulerSettingsTest {
         assertThat(setting.rejection()).contains("不合法");
     }
 
-    /** 热配置里低水位高于高水位：这一层跳过，用下一层那个站得住的值，并把原因写清楚。 */
+    /** 热配置那一对不成立（低水位高于高水位）：整对跳到下一层，高水位不留在热配置那一层。 */
     @Test
-    void aHotLowWatermarkAboveTheHighOneFallsThroughToTheNextLayer() {
+    void aHotPairThatDoesNotHoldIsSkippedAsAWhole() {
         AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
         scheduler.setGlobalUnfinishedHighWatermark(100);
         scheduler.setGlobalUnfinishedLowWatermark(150);
@@ -98,12 +98,34 @@ class DualPoolSchedulerSettingsTest {
         DualPoolSchedulerSettings.Setting low = settings.globalUnfinishedLowWatermark();
         DualPoolSchedulerSettings.Setting high = settings.globalUnfinishedHighWatermark();
 
-        assertThat(high.intValue()).as("高水位取热配置那一份").isEqualTo(100);
-        assertThat(low.intValue()).as("热配置的 150 高于 100：跳到环境属性那一层的 96")
-                .isEqualTo(96);
-        assertThat(low.source()).as("来源是真正给出这个数的那一层，不是被跳过的那一层")
+        assertThat(high.intValue()).as("热配置那一对不成立：高水位也一起用环境属性那一层")
+                .isEqualTo(128);
+        assertThat(high.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_PROPERTY);
+        assertThat(low.intValue()).isEqualTo(96);
+        assertThat(low.source()).as("来源是真正给出这两个数的那一层，不是被跳过的那一层")
                 .isEqualTo(DualPoolSchedulerSettings.SOURCE_PROPERTY);
-        assertThat(low.rejection()).contains("低水位").contains("150");
+        assertThat(low.rejection()).contains("热配置").contains("不成立");
+    }
+
+    /** 某一层只写了一个值：整对跳过这一层，不用「这一层一个、下一层另一个」拼出一对。 */
+    @Test
+    void aLevelThatWritesOnlyOneOfThePairIsSkippedAsAWhole() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setGlobalUnfinishedHighWatermark(40);
+        scheduler.setGlobalUnfinishedLowWatermark(150);
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler, LOW, "90");
+
+        DualPoolSchedulerSettings.Setting low = settings.globalUnfinishedLowWatermark();
+        DualPoolSchedulerSettings.Setting high = settings.globalUnfinishedHighWatermark();
+
+        assertThat(high.intValue()).as("三层里只有代码默认那一对写全了").isEqualTo(128);
+        assertThat(low.intValue()).isEqualTo(96);
+        assertThat(high.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
+        assertThat(low.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
+        assertThat(high.rejection()).as("为什么没用热配置写的高水位 40，读数里要说得出")
+                .contains("热配置").contains("不成立");
+        assertThat(low.rejection()).as("环境属性只写了低水位，也要说清是这一层没写全")
+                .contains("环境属性").contains("没写全");
     }
 
     /** 低水位与高水位相等是成立的组合：含义是「降到高水位才恢复」。 */
@@ -121,50 +143,103 @@ class DualPoolSchedulerSettingsTest {
         assertThat(low.rejection()).isNull();
     }
 
-    /** 三层都没有成立的组合：回落到高水位，来源如实标成保守回退，不冒充某一层。 */
+    /** 热配置里的退避上限小于初值：整对跳过，用下一层那一对，并把原因写清楚。 */
     @Test
-    void whenNoLayerHasAValidCombinationTheFallbackIsLabelledAsSuch() {
-        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
-        scheduler.setGlobalUnfinishedHighWatermark(40);
-        scheduler.setGlobalUnfinishedLowWatermark(150);
-        // 环境属性那一层的低水位也高于热配置的高水位 40；代码默认的 96 同样高于它。
-        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler, LOW, "90");
-
-        DualPoolSchedulerSettings.Setting low = settings.globalUnfinishedLowWatermark();
-
-        assertThat(low.intValue()).as("回落到高水位本身：含义是「降到高水位才恢复」").isEqualTo(40);
-        assertThat(low.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_FALLBACK);
-        assertThat(low.rejection()).contains("热配置").contains("环境属性").contains("代码默认");
-    }
-
-    /** 热配置里的退避上限小于初值：跳过它、用下一层里那个站得住的值，并把原因写清楚。 */
-    @Test
-    void aHotBackoffCeilingBelowItsFloorIsSkippedWithAReason() {
+    void aHotBackoffPairThatDoesNotHoldIsSkippedAsAWhole() {
         AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
         scheduler.setRecoveryBackoffBaseMs(2000L);
         scheduler.setRecoveryBackoffMaxMs(500L);
         DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler);
 
+        DualPoolSchedulerSettings.Setting base = settings.recoveryBackoffBaseMs();
         DualPoolSchedulerSettings.Setting ceiling = settings.recoveryBackoffMaxMs();
 
-        assertThat(ceiling.longValue()).as("下一层是代码默认的 5000，它比初值 2000 大，站得住").isEqualTo(5000L);
+        assertThat(base.longValue()).as("热配置那一对不成立，初值也用代码默认那一对").isEqualTo(500L);
+        assertThat(ceiling.longValue()).isEqualTo(5000L);
         assertThat(ceiling.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
-        assertThat(ceiling.rejection()).contains("不合法").contains("退避初值");
+        assertThat(ceiling.rejection()).contains("热配置").contains("不成立");
     }
 
-    /** 初值本身就比任何一层能给出的上限都大：上限取初值，来源标成保守回退。 */
+    /**
+     * 报告里给的那种拼法：热配置写 9000/8000（这一对不成立），环境属性写 1000/2000（成立）。
+     *
+     * <p>整对按层回退的结果是环境属性那一对，而不是「热配置的 9000 配上环境属性的 9000」这种谁都没
+     * 配过的组合。</p>
+     */
     @Test
-    void aBackoffCeilingBelowItsFloorIsReported() {
+    void aValidPairOnTheNextLevelWinsAsAWholeOverAnInvalidPairAbove() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setRecoveryBackoffBaseMs(9000L);
+        scheduler.setRecoveryBackoffMaxMs(8000L);
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler,
+                "agent.langchain.dual-pool.recovery.backoff-base-ms", "1000",
+                "agent.langchain.dual-pool.recovery.backoff-max-ms", "2000");
+
+        DualPoolSchedulerSettings.Setting base = settings.recoveryBackoffBaseMs();
+        DualPoolSchedulerSettings.Setting ceiling = settings.recoveryBackoffMaxMs();
+
+        assertThat(base.longValue()).isEqualTo(1000L);
+        assertThat(ceiling.longValue()).isEqualTo(2000L);
+        assertThat(base.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_PROPERTY);
+        assertThat(ceiling.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_PROPERTY);
+        assertThat(ceiling.rejection()).contains("热配置");
+    }
+
+    /** 热配置只写了初值、没写上限：整对跳过，不拿热配置的初值去配代码默认的上限。 */
+    @Test
+    void aHotLevelWithOnlyOneOfTheBackoffPairIsSkippedAsAWhole() {
         AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
         scheduler.setRecoveryBackoffBaseMs(9000L);
         DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler);
 
+        DualPoolSchedulerSettings.Setting base = settings.recoveryBackoffBaseMs();
         DualPoolSchedulerSettings.Setting ceiling = settings.recoveryBackoffMaxMs();
 
-        assertThat(ceiling.longValue()).as("上限不能小于初值").isEqualTo(9000L);
-        assertThat(ceiling.source()).as("初值不是代码默认那一层给的，来源不能写成 default")
-                .isEqualTo(DualPoolSchedulerSettings.SOURCE_FALLBACK);
-        assertThat(ceiling.rejection()).contains("退避初值");
+        assertThat(base.longValue()).as("初值也跟着整对跳过，用代码默认那一对").isEqualTo(500L);
+        assertThat(ceiling.longValue()).isEqualTo(5000L);
+        assertThat(base.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
+        assertThat(ceiling.rejection()).contains("热配置").contains("没写全");
+    }
+
+    /** 成员接收退避那一对走同一套：热配置不成立时整对跳到环境属性那一对。 */
+    @Test
+    void theMemberReceiverBackoffPairFallsThroughAsAWholeToo() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setMemberReceiverBackoffBaseMs(9000L);
+        scheduler.setMemberReceiverBackoffMaxMs(100L);
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(scheduler,
+                "agent.langchain.wait-member.receiver.backoff-base-ms", "1500",
+                "agent.langchain.wait-member.receiver.backoff-max-ms", "3000");
+
+        DualPoolSchedulerSettings.Setting base = settings.memberReceiverBackoffBaseMs();
+        DualPoolSchedulerSettings.Setting ceiling = settings.memberReceiverBackoffMaxMs();
+
+        assertThat(base.longValue()).isEqualTo(1500L);
+        assertThat(ceiling.longValue()).isEqualTo(3000L);
+        assertThat(ceiling.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_PROPERTY);
+        assertThat(ceiling.rejection()).contains("热配置").contains("不成立");
+    }
+
+    /**
+     * 代码默认那一对是自洽的：所以正常路径上一定有一层成立，读数不会落进「保守回退」那一支。
+     *
+     * <p>这条钉住的是下面那三段往保守值收尾的代码不会在正常路径上被走到——真走到了，说明有人把默认值
+     * 改岔了，那时读数里的原因会说明。</p>
+     */
+    @Test
+    void theCodeDefaultPairHoldsSoThereIsAlwaysALevelToUse() {
+        DualPoolSchedulerSettings.RoundSettings round = TestSchedulerSettings.propertyOnly().round();
+
+        assertThat(round.globalUnfinishedHighWatermark().source())
+                .isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
+        assertThat(round.globalUnfinishedLowWatermark().source())
+                .isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
+        assertThat(round.globalUnfinishedLowWatermark().intValue())
+                .isLessThanOrEqualTo(round.globalUnfinishedHighWatermark().intValue());
+        assertThat(round.recoveryBackoffMaxMs().longValue())
+                .isGreaterThanOrEqualTo(round.recoveryBackoffBaseMs().longValue());
+        assertThat(round.memberReceiverBackoffMaxMs().longValue())
+                .isGreaterThanOrEqualTo(round.memberReceiverBackoffBaseMs().longValue());
     }
 
     /**

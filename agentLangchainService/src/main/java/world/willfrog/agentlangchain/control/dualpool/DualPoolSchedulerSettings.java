@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.IntPredicate;
 import java.util.function.LongPredicate;
@@ -180,7 +181,11 @@ public class DualPoolSchedulerSettings {
      * 否则泳道没法用配置切回旧入口，读数里显示的版本也对不上新 Run 真正落库的那个。</p>
      */
     public Setting newRunSchedulerVersion() {
-        Resolver resolver = resolver();
+        return newRunSchedulerVersion(resolver());
+    }
+
+    /** 与上面同一个判断，只是复用调用方已经取好的那一份热配置快照（一次读数里只取一份）。 */
+    private Setting newRunSchedulerVersion(Resolver resolver) {
         Setting configured = resolver.text(KEY_NEW_RUN_SCHEDULER_VERSION,
                 AgentLlmProperties.Scheduler::getNewRunSchedulerVersion, SchedulerVersion.LEGACY.name());
         String raw = configured.textValue();
@@ -299,16 +304,32 @@ public class DualPoolSchedulerSettings {
      * 谁都没配过的组合。</p>
      */
     public RoundSettings round() {
-        Resolver resolver = resolver();
-        Setting high = resolver.integer(KEY_GLOBAL_HIGH_WATERMARK,
+        return round(resolver());
+    }
+
+    /** 与上面同一份解析，只是复用调用方已经取好的那一份热配置快照（一次读数里只取一份）。 */
+    private RoundSettings round(Resolver resolver) {
+        Pair watermarks = resolvePair(resolver, "水位",
                 AgentLlmProperties.Scheduler::getGlobalUnfinishedHighWatermark,
-                value -> value >= 0, 128, "不能是负数", true);
-        Setting base = resolver.longValue(KEY_RECOVERY_BACKOFF_BASE_MS,
+                AgentLlmProperties.Scheduler::getGlobalUnfinishedLowWatermark,
+                KEY_GLOBAL_HIGH_WATERMARK, KEY_GLOBAL_LOW_WATERMARK,
+                128L, 96L,
+                value -> value >= 0L, (high, low) -> low <= high,
+                "不能是负数", "低水位不能高于高水位");
+        Pair recoveryBackoff = resolvePair(resolver, "恢复退避",
                 AgentLlmProperties.Scheduler::getRecoveryBackoffBaseMs,
-                value -> value >= 1L, 500L, "必须是大于 0 的毫秒数", true);
-        Setting memberBase = resolver.longValue(KEY_MEMBER_RECEIVER_BACKOFF_BASE_MS,
+                AgentLlmProperties.Scheduler::getRecoveryBackoffMaxMs,
+                KEY_RECOVERY_BACKOFF_BASE_MS, KEY_RECOVERY_BACKOFF_MAX_MS,
+                500L, 5000L,
+                value -> value >= 1L, (base, ceiling) -> ceiling >= base,
+                "必须是大于 0 的毫秒数", "上限不能小于初值");
+        Pair memberReceiverBackoff = resolvePair(resolver, "成员接收退避",
                 AgentLlmProperties.Scheduler::getMemberReceiverBackoffBaseMs,
-                value -> value >= 1L, 1000L, "必须是大于 0 的毫秒数", true);
+                AgentLlmProperties.Scheduler::getMemberReceiverBackoffMaxMs,
+                KEY_MEMBER_RECEIVER_BACKOFF_BASE_MS, KEY_MEMBER_RECEIVER_BACKOFF_MAX_MS,
+                1000L, 15000L,
+                value -> value >= 1L, (base, ceiling) -> ceiling >= base,
+                "必须是大于 0 的毫秒数", "上限不能小于初值");
         return new RoundSettings(
                 resolver.integer(KEY_PER_TURN_NEW_NODE_LIMIT,
                         AgentLlmProperties.Scheduler::getPerTurnNewNodeLimit,
@@ -316,8 +337,8 @@ public class DualPoolSchedulerSettings {
                 resolver.integer(KEY_PER_RUN_UNFINISHED_LIMIT,
                         AgentLlmProperties.Scheduler::getPerRunUnfinishedLimit,
                         value -> value >= 1, 256, "必须是大于 0 的整数", true),
-                high,
-                lowWatermark(resolver, high),
+                watermarks.first(),
+                watermarks.second(),
                 resolver.integer(KEY_WAIT_GROUP_MAX_MEMBERS,
                         AgentLlmProperties.Scheduler::getWaitGroupMaxMembers,
                         value -> value >= 1, 16, "必须是大于 0 的整数", true),
@@ -334,88 +355,95 @@ public class DualPoolSchedulerSettings {
                 resolver.integer(KEY_RECOVERY_STARTUP_PAGES,
                         AgentLlmProperties.Scheduler::getRecoveryStartupPages,
                         value -> value >= 1, 8, "必须是大于 0 的整数", false),
-                base,
-                ceiling(resolver, KEY_RECOVERY_BACKOFF_MAX_MS,
-                        AgentLlmProperties.Scheduler::getRecoveryBackoffMaxMs, base, 5000L),
+                recoveryBackoff.first(),
+                recoveryBackoff.second(),
                 resolver.integer(KEY_MEMBER_RECEIVER_BATCH_SIZE,
                         AgentLlmProperties.Scheduler::getMemberReceiverBatchSize,
                         value -> value >= 1, 8, "必须是大于 0 的整数", true),
-                memberBase,
-                ceiling(resolver, KEY_MEMBER_RECEIVER_BACKOFF_MAX_MS,
-                        AgentLlmProperties.Scheduler::getMemberReceiverBackoffMaxMs, memberBase, 15000L),
+                memberReceiverBackoff.first(),
+                memberReceiverBackoff.second(),
                 resolver.integer(KEY_MEMBER_RECEIVER_MAX_BACKOFF_STEP,
                         AgentLlmProperties.Scheduler::getMemberReceiverMaxBackoffStep,
                         value -> value >= 1, 6, "必须是大于 0 的整数", true));
     }
 
-    /**
-     * 低水位逐层找：某一层的值不高于高水位，这一层才算成立。
-     *
-     * <p>组合不成立时**跳到下一层**，而不是把这一层的值钳到高水位、来源标签还留着这一层：那样读数
-     * 会报出一个这一层根本没有的值，操作人按它判断「改生效了」会判断错。三层都不成立时才回落到高
-     * 水位本身（含义是「降到高水位才恢复」），来源如实标成保守回退，并把每一层为什么不成立都写出来。</p>
-     */
-    private Setting lowWatermark(Resolver resolver, Setting high) {
-        List<String> rejections = new ArrayList<>();
-        int ceiling = high.intValue();
-        Integer hot = resolver.hotValue(AgentLlmProperties.Scheduler::getGlobalUnfinishedLowWatermark);
-        if (hot != null) {
-            if (hot >= 0 && hot <= ceiling) {
-                return new Setting(hot, SOURCE_HOT_CONFIG, true, join(rejections));
-            }
-            rejections.add("热配置的低水位不合法（" + lowRequirement(ceiling) + "）：" + hot);
-        }
-        String configured = property(KEY_GLOBAL_LOW_WATERMARK);
-        if (configured != null && !configured.isBlank()) {
-            Integer parsed = parseInteger(configured);
-            if (parsed != null && parsed >= 0 && parsed <= ceiling) {
-                return new Setting(parsed, SOURCE_PROPERTY, true, join(rejections));
-            }
-            rejections.add("环境属性的低水位不合法（" + lowRequirement(ceiling) + "）：" + configured);
-        }
-        int fallback = 96;
-        if (fallback <= ceiling) {
-            return new Setting(fallback, SOURCE_DEFAULT, true, join(rejections));
-        }
-        rejections.add("三层都没有成立的组合（代码默认的低水位 " + fallback + " 高于高水位 " + ceiling + "）");
-        return new Setting(ceiling, SOURCE_FALLBACK, true, join(rejections));
-    }
-
-    private static String lowRequirement(int ceiling) {
-        return "不能是负数、也不能高于高水位 " + ceiling;
-    }
+    /** 成对参数解析出来的一对取值：同一个层里两个值一起成立，才采用这一层。 */
+    private record Pair(Setting first, Setting second) { }
 
     /**
-     * 上限逐层找：某一层的值不小于初值，这一层才算成立；没有一层成立就用初值兜底。
+     * 成对参数按层解析：同一层里两个值都读得出、各自合法、组合也成立，才整对采用这一层；否则整对跳到
+     * 下一层，并把这一层为什么不成立写进原因里。
      *
-     * <p>回落到初值时来源标成保守回退，不标成那个被丢掉的值所在的层——初值不是那一层给出的。</p>
+     * <p>不把这一层的值钳成「能过校验」的样子留用，也不拿这一层的值去配下一层的值。前一种做法会报出
+     * 一个这一层根本没有的值；后一种会拼出一对谁都没配过的组合——热配置写 40/50、环境属性写 100/90
+     * 时，会得到 40/40，操作人以为自己改的值生效了，看到的却是两个来源各取一半的结果。</p>
+     *
+     * <p>层序是热配置 → 环境属性 → 代码默认。代码默认那一对是自洽的（有测试盯着），所以正常路径下
+     * 一定有一层成立；万一它也不成立，按「第二个值跟着第一个值走」收尾，来源标成保守回退（低水位取
+     * 高水位＝降到高水位才恢复；上限取初值＝退避不再往上涨），不把这个不自洽的组合发出去。</p>
      */
-    private Setting ceiling(Resolver resolver, String key,
-                            Function<AgentLlmProperties.Scheduler, Long> hotField,
-                            Setting floor, long fallback) {
+    private Pair resolvePair(Resolver resolver, String label,
+                             Function<AgentLlmProperties.Scheduler, ? extends Number> firstHot,
+                             Function<AgentLlmProperties.Scheduler, ? extends Number> secondHot,
+                             String firstKey, String secondKey,
+                             long firstDefault, long secondDefault,
+                             LongPredicate valueValid, BiPredicate<Long, Long> pairValid,
+                             String valueRequirement, String pairRequirement) {
         List<String> rejections = new ArrayList<>();
-        long floorValue = floor.longValue();
-        Long hot = resolver.hotValue(hotField);
+        Pair hot = levelOf(asLong(resolver.hotValue(firstHot)), asLong(resolver.hotValue(secondHot)),
+                SOURCE_HOT_CONFIG, "热配置里的" + label, valueValid, pairValid,
+                valueRequirement, pairRequirement, rejections);
         if (hot != null) {
-            if (hot >= 1L && hot >= floorValue) {
-                return new Setting(hot, SOURCE_HOT_CONFIG, true, join(rejections));
-            }
-            rejections.add("热配置的值不合法（必须不小于退避初值 " + floorValue + "）：" + hot);
+            return hot;
         }
-        String configured = property(key);
-        if (configured != null && !configured.isBlank()) {
-            Long parsed = parseLong(configured);
-            if (parsed != null && parsed >= 1L && parsed >= floorValue) {
-                return new Setting(parsed, SOURCE_PROPERTY, true, join(rejections));
-            }
-            rejections.add("环境属性的值不合法（必须不小于退避初值 " + floorValue + "）：" + configured);
+        Pair configured = levelOf(number(property(firstKey)), number(property(secondKey)),
+                SOURCE_PROPERTY, "环境属性里的" + label, valueValid, pairValid,
+                valueRequirement, pairRequirement, rejections);
+        if (configured != null) {
+            return configured;
         }
-        if (fallback >= floorValue) {
-            return new Setting(fallback, SOURCE_DEFAULT, true, join(rejections));
+        Pair defaults = levelOf(firstDefault, secondDefault,
+                SOURCE_DEFAULT, "代码默认的" + label, valueValid, pairValid,
+                valueRequirement, pairRequirement, rejections);
+        if (defaults != null) {
+            return defaults;
         }
-        rejections.add("三层都没有成立的上限（代码默认的 " + fallback
-                + " 小于退避初值 " + floorValue + "，初值来自 " + floor.source() + "）");
-        return new Setting(floorValue, SOURCE_FALLBACK, true, join(rejections));
+        rejections.add("三层都没有成立的" + label + "组合，按保守值收尾");
+        return new Pair(new Setting(firstDefault, SOURCE_FALLBACK, true, join(rejections)),
+                new Setting(firstDefault, SOURCE_FALLBACK, true, join(rejections)));
+    }
+
+    /**
+     * 一层里的两个值：都写了、各自合法、组合也成立时才给出这一对；任一条不成立就记一句原因、返回空，
+     * 由调用方整对跳到下一层。原因里写清是「没写全」还是「值不合法」还是「组合不成立」，读数时能分清。
+     */
+    private Pair levelOf(Long first, Long second, String source, String levelName,
+                         LongPredicate valueValid, BiPredicate<Long, Long> pairValid,
+                         String valueRequirement, String pairRequirement, List<String> rejections) {
+        String values = "第一个=" + first + "，第二个=" + second;
+        if (first == null || second == null) {
+            rejections.add(levelName + "这一对没写全（两个值都要写，" + valueRequirement + "）：" + values);
+            return null;
+        }
+        if (!valueValid.test(first) || !valueValid.test(second)) {
+            rejections.add(levelName + "的值不合法（" + valueRequirement + "）：" + values);
+            return null;
+        }
+        if (!pairValid.test(first, second)) {
+            rejections.add(levelName + "这一对不成立（" + pairRequirement + "）：" + values);
+            return null;
+        }
+        return new Pair(new Setting(first, source, true, join(rejections)),
+                new Setting(second, source, true, join(rejections)));
+    }
+
+    private static Long asLong(Number value) {
+        return value == null ? null : value.longValue();
+    }
+
+    /** 属性源里的一个数：没有、空串、读不成数都算「这一层没给值」。 */
+    private static Long number(String raw) {
+        return raw == null || raw.isBlank() ? null : parseLong(raw);
     }
 
     private static String join(List<String> rejections) {
@@ -431,9 +459,10 @@ public class DualPoolSchedulerSettings {
      * 核对，漏掉一个就会失败。</p>
      */
     public Map<String, Setting> snapshot() {
+        // 整份读数用同一个解析器：热配置正好在这几次读之间改过时，报出来的仍然是同一份快照里的值。
         Resolver resolver = resolver();
-        RoundSettings round = round();
-        Setting version = newRunSchedulerVersion();
+        RoundSettings round = round(resolver);
+        Setting version = newRunSchedulerVersion(resolver);
         Map<String, Setting> snapshot = new LinkedHashMap<>();
         snapshot.put(KEY_NEW_RUN_SCHEDULER_VERSION, version);
         snapshot.put(KEY_PER_TURN_NEW_NODE_LIMIT, round.perTurnNewNodeLimit());

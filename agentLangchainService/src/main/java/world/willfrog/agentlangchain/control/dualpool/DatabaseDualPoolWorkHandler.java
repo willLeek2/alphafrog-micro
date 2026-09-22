@@ -220,7 +220,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         RunCoordination coordination = prepareCoordinationRow(run);
         // 轮次在回合开始时取一次：这一回合被服务的是哪一轮，由它说话。
         long turnRound = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
-        CoordinationTurn turn = new CoordinationTurn(run, coordination, turnRound);
+        // 这一回合要用的一整套调度参数也在回合开始时解析一次：名额、水位、每回合上限都从这一份里读，
+        // 热配置正好在这几次读之间改过时，才不会拿着两个版本的值拼出谁都没配过的组合。
+        CoordinationTurn turn = new CoordinationTurn(run, coordination, turnRound, settings.round());
         try {
             coordinateLocked(run, turn);
         } finally {
@@ -499,15 +501,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
      * 规划节点、普通节点、最终回答节点一视同仁：共同计数、共用名额，才谈得上「谁也不能绕过」。</p>
      */
     private int newNodesAllowed(String runId, CoordinationTurn turn) {
-        int perRunRoom = Math.max(0, settings.perRunUnfinishedLimit().intValue()
+        int perRunRoom = Math.max(0, turn.round.perRunUnfinishedLimit().intValue()
                 - workItemStore.countUnfinishedByRun(runId));
         if (perRunRoom == 0) {
             turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
             return 0;
         }
         SchedulerPauseDecision pause = stateStore.decideAndRecord(
-                workItemStore.countUnfinished(), settings.globalUnfinishedHighWatermark().intValue(),
-                settings.globalUnfinishedLowWatermark().intValue());
+                workItemStore.countUnfinished(), turn.round.globalUnfinishedHighWatermark().intValue(),
+                turn.round.globalUnfinishedLowWatermark().intValue());
         if (pause.paused()) {
             // 暂停标记是持久事实：进程重启后也只按库里那一条继续判断，不拿当前数量重新起算。
             turn.defer(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
@@ -542,7 +544,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (perRunRoom == 0) {
             return;
         }
-        int perTurnNewNodeLimit = settings.perTurnNewNodeLimit().intValue();
+        int perTurnNewNodeLimit = turn.round.perTurnNewNodeLimit().intValue();
         int allowed = Math.min(Math.min(drafts.size(), perTurnNewNodeLimit), perRunRoom);
         Map<String, String> datasetRefs = datasetRefs(completed);
         int toolCallsUsed = completed.stream().mapToInt(todo -> resultToolCalls(
@@ -1210,7 +1212,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         if (workItemStore.countUnfinishedByRun(identity.runId())
-                >= settings.perRunUnfinishedLimit().intValue()) {
+                >= turn.round.perRunUnfinishedLimit().intValue()) {
             turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
             return;
         }
@@ -1553,14 +1555,23 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
          * 一个拖了很久的回合会拿到一个更大的轮次号，等于把旧回合说成新回合。</p>
          */
         private final long turnRound;
+        /**
+         * 这一回合用的整套调度参数，回合开始时解析一次。
+         *
+         * <p>名额、水位、每回合上限都从这一份里读：热配置在回合中途改过时，这一回合照样按开始那一刻的
+         * 那一份走，不会出现「高水位是新版本、低水位是旧版本」这种谁都没配过的组合。</p>
+         */
+        private final DualPoolSchedulerSettings.RoundSettings round;
         private RunCoordinationDeferReason deferReason;
         private boolean progressed;
 
-        private CoordinationTurn(AgentRun run, RunCoordination coordination, long turnRound) {
+        private CoordinationTurn(AgentRun run, RunCoordination coordination, long turnRound,
+                                 DualPoolSchedulerSettings.RoundSettings round) {
             this.runId = run.getId();
             this.planGeneration = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
             this.coordinationServedRound = value(coordination.getCoordinationServedRound());
             this.turnRound = turnRound;
+            this.round = round;
         }
 
         private void served() {
