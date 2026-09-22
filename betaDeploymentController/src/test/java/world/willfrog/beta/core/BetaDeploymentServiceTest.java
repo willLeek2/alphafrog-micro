@@ -585,6 +585,69 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void startingCandidateKeepsRetainedIdentityWhenOldContainerRemoveFails() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        retainUnhealthyCandidate(clock);
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        int created = containers.createdContainers;
+        containers.failRemoveName = failedName;
+
+        service.submitManifest(manifest(3, "release-3", '3', 'e', 'f', "main-beta"));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+
+        JsonNode retained = state().path("retainedFailedCandidate");
+        assertEquals(failedName, retained.path("containerName").asText());
+        assertEquals(failedId, retained.path("instanceId").asText());
+        assertTrue(containers.values.containsKey(failedName));
+        assertFalse(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("candidateInstance").isNull());
+        assertEquals(created, containers.createdContainers);
+
+        containers.failRemoveName = null;
+        service.retry("beta-main-001", "agent-service");
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+        assertTrue(state().path("candidateInstance").isObject());
+        assertEquals(created + 1, containers.createdContainers);
+    }
+
+    @Test
+    void startingCandidateKeepsRetainedIdentityWhenOldComposeRemoveFails() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        retainUnhealthyCandidate(clock);
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        int created = containers.createdContainers;
+        containers.failRemoveComposeInstanceId = failedId;
+
+        service.submitManifest(manifest(3, "release-3", '3', 'e', 'f', "main-beta"));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+
+        JsonNode retained = state().path("retainedFailedCandidate");
+        assertEquals(failedName, retained.path("containerName").asText());
+        assertEquals(failedId, retained.path("instanceId").asText());
+        assertFalse(containers.values.containsKey(failedName));
+        assertFalse(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("candidateInstance").isNull());
+        assertEquals(created, containers.createdContainers);
+
+        containers.failRemoveComposeInstanceId = null;
+        service.retry("beta-main-001", "agent-service");
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+        assertTrue(state().path("candidateInstance").isObject());
+        assertEquals(created + 1, containers.createdContainers);
+    }
+
+    @Test
     void deleteMovesInstanceToDrainingBeforeSendingTheCommonStopDeadline() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         reconcile(3);
@@ -673,6 +736,22 @@ class BetaDeploymentServiceTest {
 
     private void reconcile(int count) {
         for (int index = 0; index < count; index++) service.reconcileOne();
+    }
+
+    private void retainUnhealthyCandidate(MutableClock clock) {
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
+        service.reconcileOne();
+        service.reconcileOne();
     }
 
     private JsonNode state() {
@@ -832,6 +911,8 @@ class BetaDeploymentServiceTest {
         int observedPortOffset;
         boolean failAfterCreating;
         int createdContainers;
+        String failRemoveName;
+        String failRemoveComposeInstanceId;
 
         @Override public void validateManifestEnvironment(JsonNode manifest) {
             if (manifest.path("deploymentId").asText().equals(invalidManifestId)) {
@@ -863,7 +944,11 @@ class BetaDeploymentServiceTest {
             stopTimeoutSeconds = timeoutSeconds;
             if (!leaveRunningAfterStop) stopped.put(name, true);
         }
-        @Override public void remove(String machineId, String name) { values.remove(name); }
+        @Override public void remove(String machineId, String name) {
+            if (name.equals(failRemoveName))
+                throw new ControllerException("CONTAINER_REMOVE_FAILED", "forced remove failure");
+            values.remove(name);
+        }
         @Override public ToolJobTestRuntime inspectToolJobTestRuntime(String machineId, String name) {
             CandidatePlan plan = plans.get(name);
             ContainerObservation container = values.get(name);
@@ -879,7 +964,11 @@ class BetaDeploymentServiceTest {
         @Override public ContainerObservation restart(String machineId, String name, java.time.Duration timeout) {
             return inspect(machineId, name);
         }
-        @Override public void removeCompose(String instanceId) { removedComposeInstanceIds.add(instanceId); }
+        @Override public void removeCompose(String instanceId) {
+            if (instanceId.equals(failRemoveComposeInstanceId))
+                throw new ControllerException("COMPOSE_REMOVE_FAILED", "forced compose remove failure");
+            removedComposeInstanceIds.add(instanceId);
+        }
         @Override public String containerName(CandidatePlan plan, String serviceName) {
             return "af-" + plan.instanceId();
         }
