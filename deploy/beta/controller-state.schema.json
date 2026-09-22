@@ -598,6 +598,39 @@
             "FACTS_UNCERTAIN",
             "DELETE_RETRYABLE"
           ]
+        },
+        "containerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        }
+      }
+    },
+    "retainedFailedCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "machineId",
+        "instanceId",
+        "containerName",
+        "retainUntil"
+      ],
+      "properties": {
+        "machineId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "instanceId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "containerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "retainUntil": {
+          "$ref": "#/$defs/timestamp"
         }
       }
     },
@@ -615,7 +648,8 @@
         "drainingInstance",
         "operation",
         "failedManifestVersion",
-        "lastError"
+        "lastError",
+        "retainedFailedCandidate"
       ],
       "properties": {
         "serviceName": {
@@ -695,6 +729,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retainedFailedCandidate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/retainedFailedCandidate"
             },
             {
               "type": "null"

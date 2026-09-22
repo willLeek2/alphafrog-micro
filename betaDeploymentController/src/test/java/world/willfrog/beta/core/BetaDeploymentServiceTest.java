@@ -49,6 +49,7 @@ class BetaDeploymentServiceTest {
         machine.setBindIp("127.0.0.1");
         machine.setRoutableAddress("10.0.0.8");
         properties.setMachines(Map.of("beta-machine-1", machine));
+        properties.setFailedCandidateRetain(java.time.Duration.ZERO);
         return properties;
     }
 
@@ -471,6 +472,116 @@ class BetaDeploymentServiceTest {
         assertEquals("STABLE", state().path("phase").asText());
         assertEquals(oldId, state().path("activeInstance").path("instanceId").asText());
         assertFalse(state().path("lastError").isNull());
+        assertEquals("CANDIDATE_NOT_READY", state().path("lastError").path("code").asText());
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertEquals(1, containers.values.size());
+        assertTrue(containers.values.containsKey(state().path("activeInstance").path("containerName").asText()));
+    }
+
+    @Test
+    void retainedFailedCandidateStaysUntilRetainDeadlineThenIsRemoved() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+
+        ObjectNode first = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
+        withPortfolioService(first);
+        service.submitManifest(first);
+        reconcile(6);
+
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        ObjectNode second = manifest(2, "release-2", '2', 'c', 'd', "main-beta");
+        withPortfolioService(second);
+        service.submitManifest(second);
+        service.reconcileOne();
+        service.reconcileOne();
+
+        JsonNode agent = stateOf("agent-service");
+        JsonNode retained = agent.path("retainedFailedCandidate");
+        String failedName = retained.path("containerName").asText();
+        String failedId = retained.path("instanceId").asText();
+        assertEquals("CANDIDATE_NOT_READY", agent.path("lastError").path("code").asText());
+        assertEquals(failedName, agent.path("lastError").path("containerName").asText());
+        assertTrue(agent.path("lastError").path("message").asText().endsWith("container=" + failedName));
+        assertTrue(containers.values.containsKey(failedName));
+        assertFalse(containers.removedComposeInstanceIds.contains(failedId));
+        assertEquals("STARTING_CANDIDATE", stateOf("portfolio-service").path("operation").path("phase").asText());
+
+        clock.set(Instant.parse(retained.path("retainUntil").asText()).plusSeconds(1));
+        service.reconcileOne();
+
+        assertTrue(stateOf("agent-service").path("retainedFailedCandidate").isNull());
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+    }
+
+    @Test
+    void retryDuringRetainRemovesFailedCandidateThenStartsANewOne() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
+        service.reconcileOne();
+        service.reconcileOne();
+
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        assertTrue(containers.values.containsKey(failedName));
+
+        service.retry("beta-main-001", "agent-service");
+
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        assertFalse(failedId.equals(state().path("operation").path("candidateInstanceId").asText()));
+    }
+
+    @Test
+    void requestDeleteDuringRetainRemovesFailedCandidateAndClearsDeployment() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        String activeId = state().path("activeInstance").path("instanceId").asText();
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
+        service.reconcileOne();
+        service.reconcileOne();
+
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        assertTrue(containers.values.containsKey(failedName));
+
+        service.requestDelete("beta-main-001");
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+
+        reconcile(2);
+        assertEquals(0, store.snapshot().path("deployments").size());
+        assertTrue(containers.removedComposeInstanceIds.contains(activeId));
     }
 
     @Test
@@ -792,5 +903,21 @@ class BetaDeploymentServiceTest {
             lastPort = port;
             return visible;
         }
+    }
+
+    private static final class MutableClock extends Clock {
+        private Instant instant;
+
+        private MutableClock(Instant instant) {
+            this.instant = instant;
+        }
+
+        private void set(Instant next) {
+            this.instant = next;
+        }
+
+        @Override public java.time.ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(java.time.ZoneId zone) { return Clock.fixed(instant, zone); }
+        @Override public Instant instant() { return instant; }
     }
 }
