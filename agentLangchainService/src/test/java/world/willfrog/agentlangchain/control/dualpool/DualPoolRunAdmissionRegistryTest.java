@@ -326,6 +326,51 @@ class DualPoolRunAdmissionRegistryTest {
     }
 
     /**
+     * 隔离结论不落表、也不靠内存传递：同一份库事实换一个进程实例再算一遍，答案必须一样。
+     *
+     * <p>第一个实例把「行自己的版本与 Run 版本不一致」这条 Run 判成整条隔离之后，第二个实例
+     * （新的进程身份、新的内存状态，与第一个共用同一份库事实）独立启动时要从同样的事实得出同样的
+     * 结论：隔离原因、版本阻断、以及它能不能被受理，三项都要一致。这一条量的是「重启之后结论重算」，
+     * 上一次进程记住了什么不参与判断。</p>
+     */
+    @Test
+    void aSecondInstanceReachesTheSameIsolationConclusionFromTheSameFacts() {
+        Fixture fixture = new Fixture();
+        NodeWorkItem v2Row = item("run-2", 3, "todo-1", 0, 0);
+        v2Row.setState(NodeWorkItemState.RUNNABLE.name());
+        v2Row.setClaimEpoch(0);
+        v2Row.setContextVersion(7L);
+        v2Row.setRunControlVersion(2L);
+        v2Row.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        NodeWorkItem v1Row = item("run-2", 3, "todo-2", 0, 0);
+        v1Row.setState(NodeWorkItemState.CLAIMED.name());
+        v1Row.setClaimEpoch(1);
+        v1Row.setContextVersion(7L);
+        v1Row.setRunControlVersion(2L);
+        v1Row.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V1.name());
+        fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(v2Row, v1Row));
+        fixture.run(waitGroupRun(AgentRunStatus.EXECUTING));
+        // 第二个实例：新的进程身份与内存，共用同一份库事实（同一个 workItems / runs 替身）。
+        DualPoolRunAdmissionRegistry secondInstance =
+                registryThatCanOwnRuns(fixture.permitLedger, fixture.workItems, fixture.runs);
+
+        fixture.registry.detectStartupResidue();
+        secondInstance.detectStartupResidue();
+
+        assertThat(isolationReasonOf(secondInstance, "run-2"))
+                .as("第二个实例从同一份库事实算出同一个隔离原因")
+                .isEqualTo(fixture.isolationReasonOf("run-2"))
+                .isEqualTo("item_scheduler_version_mismatch");
+        assertThat(secondInstance.isAdmitted("run-2"))
+                .as("隔离的 Run 在第二个实例上同样不被受理").isFalse();
+        assertThat(secondInstance.reserveForRecovery("run-2").admitted()).isFalse();
+        assertThat(secondInstance.startupResidueBlockedFor(SchedulerVersion.DUAL_POOL_V2.name()))
+                .as("阻断的是这一条 Run，不是整个版本：第二个实例的结论也一样").isFalse();
+        verify(fixture.workItems, never()).requeueAbandonedClaim(any(), any(), any(), any());
+        verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
+    }
+
+    /**
      * 父 Run 已经进终态、收口又没能证明那些分段也已终结：隔离这一条，不许借恢复接回执行链。
      *
      * <p>终态 Run 没有执行权。收口失败时如果落进普通恢复流程，它会被当成「说得清的遗留」重新取得
@@ -521,10 +566,16 @@ class DualPoolRunAdmissionRegistryTest {
 
         @SuppressWarnings("unchecked")
         private String isolationReasonOf(String runId) {
-            Map<String, Object> versions = (Map<String, Object>) registry.startupSnapshot().get("versions");
-            Map<String, Object> one = (Map<String, Object>) versions.get(SchedulerVersion.DUAL_POOL_V2.name());
-            return ((Map<String, String>) one.get("isolatedReasons")).get(runId);
+            return DualPoolRunAdmissionRegistryTest.isolationReasonOf(registry, runId);
         }
+    }
+
+    /** 某个实例在这条 Run 上给出的隔离原因；没有隔离就是 null。 */
+    @SuppressWarnings("unchecked")
+    private static String isolationReasonOf(DualPoolRunAdmissionRegistry registry, String runId) {
+        Map<String, Object> versions = (Map<String, Object>) registry.startupSnapshot().get("versions");
+        Map<String, Object> one = (Map<String, Object>) versions.get(SchedulerVersion.DUAL_POOL_V2.name());
+        return ((Map<String, String>) one.get("isolatedReasons")).get(runId);
     }
 
     private static AgentRun waitGroupRun(AgentRunStatus status) {
