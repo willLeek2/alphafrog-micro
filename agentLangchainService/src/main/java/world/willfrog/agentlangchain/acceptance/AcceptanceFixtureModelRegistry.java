@@ -60,10 +60,26 @@ public class AcceptanceFixtureModelRegistry {
         FrozenModelScript script = FrozenModelScript.parse(
                 row.get().fixtureId(), row.get().modelScriptJson(), objectMapper);
         ScriptedChatModel model = new ScriptedChatModel(
-                run.getId(), row.get().fixtureId(), row.get().scenarioId(), script, callStore);
+                run.getId(), row.get().fixtureId(), row.get().scenarioId(), script, callStore,
+                () -> rereadScript(run, row.get().fixtureId(), row.get().scenarioId()));
         log.info("验收夹具接管这条 Run 的模型回复: runId={} fixture={} scenario={} turns={} 脚本摘要={}",
                 run.getId(), row.get().fixtureId(), row.get().scenarioId(), script.size(), script.digest());
         return Optional.of(new ScriptedStage(model, row.get().fixtureId(), row.get().scenarioId()));
+    }
+
+    /**
+     * 每一次模型调用之前重读一遍夹具内容。
+     *
+     * <p>重读顺带把「这条夹具现在还能不能用」再核一遍（还在、已启用、没过期、泳道代际对得上）：
+     * 夹具在跑的中途被停用或过期时，这一步就会停下。读回来的内容交给认领那一步与冻结的摘要比对，
+     * 被原位改过时会拒绝，不会按新内容作答。</p>
+     */
+    private ScriptedChatModel.FixtureScript rereadScript(AgentRun run, String fixtureId, String scenarioId) {
+        AcceptanceFixtureRow current = fixtureResolver.resolve(run).orElseThrow(() -> refuse(
+                "acceptance_fixture_identity_changed",
+                "这条 Run 的请求上下文里已经不带夹具编号了: runId=" + run.getId()));
+        return new ScriptedChatModel.FixtureScript(current.fixtureId(), current.scenarioId(),
+                FrozenModelScript.parse(current.fixtureId(), current.modelScriptJson(), objectMapper));
     }
 
     /**

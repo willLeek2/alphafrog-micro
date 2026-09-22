@@ -91,7 +91,7 @@ class LangchainRunStageModelResolverAcceptanceTest {
     void aFixtureRunCarriesTheReleasePolicyToTheNodeExecutor() {
         when(acceptanceFixtureModels.stageForRun(any())).thenReturn(Optional.of(scriptedStage()));
         AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1",
-                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                "{\"rules\":[{\"for\":{\"planGeneration\":3,\"nodeId\":\"todo_1\",\"nodeAttempt\":0,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},"
                         + "\"fail\":\"沙箱那边回不来了\"}]}",
                 objectMapper).orElseThrow();
         when(acceptancePolicies.policyForRun(any())).thenReturn(Optional.of(policy));
@@ -128,7 +128,9 @@ class LangchainRunStageModelResolverAcceptanceTest {
                 "{\"turns\":[{\"for\":{\"stage\":\"planning\",\"planPhase\":\"strategy\"},\"text\":\"计划\"},"
                         + "{\"for\":{\"stage\":\"answer\"},\"text\":\"答案\"}]}", objectMapper);
         return new AcceptanceFixtureModelRegistry.ScriptedStage(
-                new ScriptedChatModel("run-1", "fx-1", "scenario-a", script, mock(FixtureCallStore.class)),
+                new ScriptedChatModel("run-1", "fx-1", "scenario-a", script,
+                        mock(FixtureCallStore.class),
+                        () -> new ScriptedChatModel.FixtureScript("fx-1", "scenario-a", script)),
                 "fx-1", "scenario-a");
     }
 

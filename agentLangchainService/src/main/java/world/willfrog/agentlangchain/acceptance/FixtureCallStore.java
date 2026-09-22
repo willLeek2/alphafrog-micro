@@ -113,39 +113,61 @@ public class FixtureCallStore {
      * <p>第一次认领时写，写在夹具行还在的时候：之后夹具过期、被停用或被删掉，都不影响事后核对
      * 「这次验收要求哪些回复发生」。同一条 Run 只写一次；已经写过时要求摘要一致——内容被改过
      * 时这里也会拒绝，而不是让一次验收悄悄换一版场景。</p>
+     *
+     * <p>两个进程同时第一次认领、各自读到不同内容时，插入只有一个会成；没插进去的那个要把赢家
+     * 读回来比对摘要，对不上就当场拒绝。不读回的话，两边会各自按自己读到的那一版往下跑，
+     * 而库里只留下其中一份声明，事后谁也说不清这次执行对应哪一版。</p>
      */
     public void recordScenario(String runId, String fixtureId, String scenarioId, FrozenModelScript script) {
-        List<Map<String, Object>> existing = jdbcTemplate.query("""
-                SELECT script_digest
-                FROM alphafrog_agent_run_acceptance_fixture_scenario
-                WHERE run_id = ?
-                """, (rs, rowNum) -> Map.<String, Object>of("digest", rs.getString("script_digest")), runId);
-        if (!existing.isEmpty()) {
-            String recorded = String.valueOf(existing.get(0).get("digest"));
-            if (!script.digest().equals(recorded)) {
-                throw refuse("acceptance_fixture_content_changed",
-                        "这条 Run 一开始用的是脚本摘要 " + recorded + "，现在读回来的是 " + script.digest()
-                                + "：同一条 Run 跑的过程中夹具内容被改过，这一次验收说不清用的是哪一版");
-            }
-            return;
-        }
-        int required = 0;
-        int optional = 0;
-        for (int turnIndex = 0; turnIndex < script.size(); turnIndex++) {
-            if (script.declarationAt(turnIndex).optional()) {
-                optional++;
-            } else {
-                required++;
-            }
-        }
-        jdbcTemplate.update("""
+        int inserted = jdbcTemplate.update("""
                 INSERT INTO alphafrog_agent_run_acceptance_fixture_scenario
                     (run_id, fixture_id, scenario_id, script_digest, script_size, declarations_json,
                      required_turn_count, optional_turn_count)
                 VALUES (?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?)
                 ON CONFLICT DO NOTHING
                 """, runId, fixtureId, scenarioId, script.digest(), script.size(),
-                declarationsJson(script), required, optional);
+                declarationsJson(script), requiredTurns(script), optionalTurns(script));
+        String recorded = recordedScriptDigest(runId);
+        if (recorded == null) {
+            throw refuse("acceptance_fixture_content_changed",
+                    "这条 Run 的场景声明没写进去，也读不回来：这一次验收说不清用的是哪一版脚本");
+        }
+        if (!script.digest().equals(recorded)) {
+            throw refuse("acceptance_fixture_content_changed",
+                    "这条 Run 一开始用的是脚本摘要 " + recorded + "，现在读回来的是 " + script.digest()
+                            + "：同一条 Run 跑的过程中夹具内容被改过，这一次验收说不清用的是哪一版");
+        }
+        if (inserted == 0) {
+            log.info("这条 Run 的场景声明已经写过了，读回赢家核对摘要一致: runId={} 摘要={}", runId, recorded);
+        }
+    }
+
+    /** 这条 Run 的场景快照里冻结的脚本摘要；还没写过时为空。 */
+    public Optional<String> frozenScriptDigest(String runId) {
+        return Optional.ofNullable(recordedScriptDigest(runId));
+    }
+
+    private String recordedScriptDigest(String runId) {
+        List<String> recorded = jdbcTemplate.query("""
+                SELECT script_digest
+                FROM alphafrog_agent_run_acceptance_fixture_scenario
+                WHERE run_id = ?
+                """, (rs, rowNum) -> rs.getString("script_digest"), runId);
+        return recorded.isEmpty() ? null : recorded.get(0);
+    }
+
+    private static int requiredTurns(FrozenModelScript script) {
+        int required = 0;
+        for (int turnIndex = 0; turnIndex < script.size(); turnIndex++) {
+            if (!script.declarationAt(turnIndex).optional()) {
+                required++;
+            }
+        }
+        return required;
+    }
+
+    private static int optionalTurns(FrozenModelScript script) {
+        return script.size() - requiredTurns(script);
     }
 
     /**
@@ -183,17 +205,19 @@ public class FixtureCallStore {
         Optional<FixtureRuleHitStore.PolicySnapshot> policy = ruleHitStore.policyOf(runId);
         List<FixtureRuleHitStore.RuleFact> ruleFacts = policy.map(FixtureRuleHitStore.PolicySnapshot::rules)
                 .orElse(List.of());
-        Set<Integer> hitRules = ruleHitStore.hitRuleIndexes(runId);
+        List<FixtureRuleHitStore.RuleHit> ruleHits = ruleHitStore.hitsOf(runId);
         FixtureScenarioVerdict verdict;
         try {
             // 快照里存的是「这次要求发生哪些调用、点名哪些调用」；核对是对着它算，不再去读夹具行
             //（可能已经回收）。
-            verdict = FixtureScenarioVerdict.evaluate(declarationsOf(scenario), ruleFacts, claimedTurns, hitRules);
+            verdict = FixtureScenarioVerdict.evaluate(declarationsOf(scenario), ruleFacts, claimedTurns, ruleHits);
         } catch (Exception broken) {
             log.error("夹具场景声明的快照读不出来，这条 Run 的必答回合没法核对: runId={} reason={}",
                     runId, broken.getMessage());
             return Optional.empty();
         }
+        long appliedRules = ruleHits.stream().filter(FixtureRuleHitStore.RuleHit::applied).count();
+        String ruleDetail = joinRuleGaps(verdict);
         String detail = verdict.describeMissing();
         jdbcTemplate.update("""
                 UPDATE alphafrog_agent_run_acceptance_fixture_scenario
@@ -204,14 +228,16 @@ public class FixtureCallStore {
                     policy_rule_count = ?,
                     policy_hit_rule_count = ?,
                     policy_missing_count = ?,
+                    policy_unapplied_count = ?,
                     policy_detail = ?,
                     recorded_at = CURRENT_TIMESTAMP
                 WHERE run_id = ?
                 """, verdict.verdict(), claims.size(), verdict.missing().size(), detail,
                 policy.map(FixtureRuleHitStore.PolicySnapshot::rules).map(List::size).orElse(null),
-                hitRules.size(),
+                appliedRules,
                 policy.isEmpty() ? null : verdict.missingRules().size(),
-                verdict.missingRules().isEmpty() ? null : String.join("；", verdict.missingRules()),
+                policy.isEmpty() ? null : verdict.unappliedRules().size(),
+                ruleDetail,
                 runId);
         if (!verdict.missing().isEmpty()) {
             log.error("验收夹具脚本有必答回合没有发生，这次验收不能算通过: runId={} fixture={} 没发生的回合={}",
@@ -220,6 +246,11 @@ public class FixtureCallStore {
         if (!verdict.missingRules().isEmpty()) {
             log.error("验收夹具的放行策略有规则一次都没打中成员，这次验收不能算通过: runId={} fixture={} 没打中的规则={}",
                     runId, scenario.get("fixtureId"), verdict.missingRules());
+        }
+        if (!verdict.unappliedRules().isEmpty()) {
+            log.error("验收夹具的放行策略有规则打中了成员但动作没有生效，这次验收不能算通过: "
+                            + "runId={} fixture={} 动作没生效的规则={}",
+                    runId, scenario.get("fixtureId"), verdict.unappliedRules());
         }
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("runId", runId);
@@ -235,9 +266,23 @@ public class FixtureCallStore {
         snapshot.put("policyDigest", policy.map(FixtureRuleHitStore.PolicySnapshot::digest).orElse(null));
         snapshot.put("policyRuleCount", policy.map(FixtureRuleHitStore.PolicySnapshot::rules)
                 .map(List::size).orElse(null));
-        snapshot.put("policyHitRuleCount", hitRules.size());
+        snapshot.put("policyHitRuleCount", appliedRules);
         snapshot.put("policyMissingRules", verdict.missingRules());
+        snapshot.put("policyUnappliedRules", verdict.unappliedRules());
+        snapshot.put("ruleHits", ruleHits.stream().map(FixtureRuleHitStore.RuleHit::describe).toList());
         return Optional.of(snapshot);
+    }
+
+    /** 两路缺口写成一行：没打中的、动作没生效的分开写，排查的人一眼看得出是哪一类。 */
+    private static String joinRuleGaps(FixtureScenarioVerdict verdict) {
+        List<String> parts = new ArrayList<>();
+        if (!verdict.missingRules().isEmpty()) {
+            parts.add("一次都没打中任何成员：" + String.join("；", verdict.missingRules()));
+        }
+        if (!verdict.unappliedRules().isEmpty()) {
+            parts.add("打中了成员但动作没有生效：" + String.join("；", verdict.unappliedRules()));
+        }
+        return parts.isEmpty() ? null : String.join(" | ", parts);
     }
 
     private String declarationsJson(FrozenModelScript script) {

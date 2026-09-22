@@ -32,7 +32,7 @@ class AcceptanceRunPolicyRegistryTest {
     private static final String LANE = "beta-lane-0910";
     private static final String GENERATION = "gen-" + "a".repeat(64);
     private static final String POLICY =
-            "{\"rules\":[{\"for\":{\"nodeId\":\"n1\",\"memberSeq\":0},\"holdUntilPoint\":\"point-a\"}]}";
+            "{\"rules\":[{\"for\":{\"planGeneration\":7,\"nodeId\":\"n1\",\"nodeAttempt\":1,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},\"holdUntilPoint\":\"point-a\"}]}";
     private static final String POLICY_HOLDING_POINT_A = "point-a";
 
     private final AcceptanceFixtureStore store = mock(AcceptanceFixtureStore.class);
@@ -92,6 +92,46 @@ class AcceptanceRunPolicyRegistryTest {
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
                         .isEqualTo("acceptance_fixture_not_enabled"));
+    }
+
+    /**
+     * 夹具行在跑的中途被原位改过（策略换成另一版）：缓存命中那一次也要停住。
+     *
+     * <p>进程里继续按旧策略跑，库里记下来的却是另一版的内容，执行记录与证据对不上：一条要求压住
+     * 某条成员的规则，可能在新一版里已经被删掉，被压住的成员就会被放过去。</p>
+     */
+    @Test
+    void aPolicyChangedMidRunIsRefusedOnTheCacheHit() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", POLICY);
+        assertThat(registry.policyForRun(fixtureRun("fx-1"))).isPresent();
+
+        // 只改了策略原文，摘要跟着变：夹具编号、场景、启用状态都没动。
+        row("fx-1", "{\"rules\":[{\"for\":{\"planGeneration\":7,\"nodeId\":\"n1\","
+                + "\"nodeAttempt\":1,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},"
+                + "\"fail\":\"换成判失败了\"}]}");
+
+        assertThatThrownBy(() -> registry.policyForRun(fixtureRun("fx-1")))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_fixture_content_changed"))
+                .hasMessageContaining("说不清用的是哪一版");
+    }
+
+    /** 策略被整段删掉（夹具行还在）：缓存命中那一次同样停住，不接着按旧策略跑。 */
+    @Test
+    void aPolicyRemovedMidRunIsRefusedOnTheCacheHit() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", POLICY);
+        assertThat(registry.policyForRun(fixtureRun("fx-1"))).isPresent();
+
+        row("fx-1", null);
+
+        assertThatThrownBy(() -> registry.policyForRun(fixtureRun("fx-1")))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_fixture_content_changed"))
+                .hasMessageContaining("策略被删掉了");
     }
 
     @Test

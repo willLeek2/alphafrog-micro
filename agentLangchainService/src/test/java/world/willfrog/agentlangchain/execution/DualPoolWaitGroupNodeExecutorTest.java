@@ -189,7 +189,7 @@ class DualPoolWaitGroupNodeExecutorTest {
                 toolCall("call-b", "searchWeb", "{}"))));
         AcceptanceReleasePolicy policy =
                 AcceptanceReleasePolicy.parse("fx-1",
-                                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                                "{\"rules\":[{\"for\":{\"planGeneration\":3,\"nodeId\":\"todo_1\",\"nodeAttempt\":0,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},"
                                         + "\"fail\":\"这个场景要造一条失败成员\"}]}",
                                 objectMapper)
                         .orElseThrow();
@@ -223,7 +223,7 @@ class DualPoolWaitGroupNodeExecutorTest {
                 toolCall("call-b", "searchWeb", "{}"))));
         AcceptanceReleasePolicy policy =
                 AcceptanceReleasePolicy.parse("fx-1",
-                                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
+                                "{\"rules\":[{\"for\":{\"planGeneration\":3,\"nodeId\":\"todo_1\",\"nodeAttempt\":0,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},"
                                         + "\"releaseAfter\":[{\"memberSeq\":9}]}]}",
                                 objectMapper)
                         .orElseThrow();
@@ -247,7 +247,7 @@ class DualPoolWaitGroupNodeExecutorTest {
     @Test
     void aRuleThatNamesOneSegmentDoesNotHitTheSameCallIdInTheNextSegment() {
         AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
-                {"rules":[{"for":{"nodeId":"todo_1","segmentSequence":0,"memberSeq":0},
+                {"rules":[{"for":{"planGeneration":3,"nodeId":"todo_1","nodeAttempt":0,"segmentSequence":0,"modelTurn":0,"memberSeq":0},
                            "fail":"这个场景要造一条失败成员"}]}
                 """, objectMapper).orElseThrow();
 
@@ -266,15 +266,16 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.memberRows(secondGroup)).as("下一段的同编号成员不该被这条规则打中")
                 .extracting(row -> row.state)
                 .containsExactly(WaitMemberState.SUCCEEDED.name());
-        verify(ruleHits).record(RUN_ID, policy.rules().get(0), firstGroup, 0);
-        verify(ruleHits, never()).record(eq(RUN_ID), any(), eq(secondGroup), anyInt());
+        verify(ruleHits).recordMatch(eq(RUN_ID), eq(policy.rules().get(0)), eq(firstGroup),
+                eq(factsOf(0, 0, "call-a")));
+        verify(ruleHits, never()).recordMatch(any(), any(), eq(secondGroup), any());
     }
 
     /** 两个节点各自用 {@code call-a} 时，只写一个节点的规则不该打中另一个节点。 */
     @Test
     void aRuleThatNamesOneNodeDoesNotHitAnotherNodesSameCallId() {
         AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
-                {"rules":[{"for":{"nodeId":"todo_1","memberSeq":0},"fail":"这个节点上这条按失败算"}]}
+                {"rules":[{"for":{"planGeneration":3,"nodeId":"todo_1","nodeAttempt":0,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"这个节点上这条按失败算"}]}
                 """, objectMapper).orElseThrow();
         model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
 
@@ -285,7 +286,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.memberRows(otherNode)).as("另一个节点上的同编号成员照常成功")
                 .extracting(row -> row.state)
                 .containsExactly(WaitMemberState.SUCCEEDED.name());
-        verify(ruleHits, never()).record(any(), any(), anyLong(), anyInt());
+        verify(ruleHits, never()).recordMatch(any(), any(), anyLong(), any());
     }
 
     /**
@@ -301,8 +302,8 @@ class DualPoolWaitGroupNodeExecutorTest {
                 toolCall("call-b", "searchWeb", "{}"))));
         AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
                 {"rules":[
-                  {"for":{"nodeId":"todo_1","segmentSequence":0,"memberSeq":0},"releaseAfter":[{"memberSeq":1}]},
-                  {"for":{"nodeId":"todo_1","segmentSequence":0,"memberSeq":1},"releaseAfter":[{"memberSeq":0}]}]}
+                  {"for":{"planGeneration":3,"nodeId":"todo_1","nodeAttempt":0,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"memberSeq":1}]},
+                  {"for":{"planGeneration":3,"nodeId":"todo_1","nodeAttempt":0,"segmentSequence":0,"modelTurn":0,"memberSeq":1},"releaseAfter":[{"memberSeq":0}]}]}
                 """, objectMapper).orElseThrow();
 
         assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of(), policy)))
@@ -312,23 +313,92 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(publisher.published).isEmpty();
     }
 
-    /** 策略点名要压住：工具当场就结束了，压住没有可等的东西，成员照常成功，只留一行记录。 */
+    /**
+     * 策略点名要压住的成员是一个当场就出结果的工具：压住没有可等的东西，派发之前就停下。
+     *
+     * <p>照旧把它收成终态的话，命中的那一行已经在库里，终态核对会以为「压住过」——一次没有经历
+     * 目标控制流的验收会显示证据完整。所以这一类配置在派发之前拒绝：一个等待组都没建，一件外部
+     * 作业都还没建出来，原因里写清是哪条规则、哪一条成员、什么工具。</p>
+     */
     @Test
-    void aHoldRuleOnAnInPlaceMemberDoesNotChangeItsOutcome() {
+    void aHoldRuleOnAnInPlaceMemberStopsBeforeDispatch() {
         model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
         AcceptanceReleasePolicy policy =
                 AcceptanceReleasePolicy.parse("fx-1",
-                                "{\"rules\":[{\"for\":{\"nodeId\":\"todo_1\",\"memberSeq\":0},"
-                                        + "\"holdUntilPoint\":\"point-a\"}]}",
+                                "{\"rules\":[{\"for\":{\"planGeneration\":3,\"nodeId\":\"todo_1\","
+                                        + "\"nodeAttempt\":0,\"segmentSequence\":0,\"modelTurn\":0,"
+                                        + "\"memberSeq\":0},\"holdUntilPoint\":\"point-a\"}]}",
                                 objectMapper)
                         .orElseThrow();
 
         DualPoolWaitGroupNodeExecutor.Outcome outcome =
                 executor.executeSegment(firstSegment(List.of(), policy));
 
-        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
+        assertThat(outcome).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class,
+                completed -> {
+                    assertThat(completed.resultPatch()).containsEntry("success", false);
+                    assertThat(completed.resultPatch()).containsEntry("failureReason",
+                            "acceptance_fixture_rule_needs_waiting_member:0:getStockDaily");
+                });
+        assertThat(store.groupRows()).as("停在这一步：一个等待组都没建").isEmpty();
+        assertThat(dispatcher.dispatched).as("一个工具调用都没发出去").isEmpty();
+        verify(ruleHits, never()).recordMatch(any(), any(), anyLong(), any());
+    }
+
+    /**
+     * 点名要压住的成员是一个会转后台的工具：配置成立，照常建组、照常派发。
+     *
+     * <p>结果以后才回来，压住有可等的东西；「动作真的落到了它身上」由结果接收方在成员真的被压住
+     * 那一刻记（那里才是动作发生的地方）。</p>
+     */
+    @Test
+    void aHoldRuleOnABackgroundMemberStillDispatches() {
+        dispatcher.requiresOperationId = true;
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "executePython", "{}"))));
+        dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":call-a:1", "task-a", dispatchProof(RUN_ID + ":call-a:1", "task-a")));
+        AcceptanceReleasePolicy policy =
+                AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"rules\":[{\"for\":{\"planGeneration\":3,\"nodeId\":\"todo_1\","
+                                        + "\"nodeAttempt\":0,\"segmentSequence\":0,\"modelTurn\":0,"
+                                        + "\"memberSeq\":0},\"holdUntilPoint\":\"point-a\"}]}",
+                                objectMapper)
+                        .orElseThrow();
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                firstSegment(List.of(), policy))).groupId();
+
         assertThat(store.memberRows(groupId)).extracting(row -> row.state)
-                .containsExactly(WaitMemberState.SUCCEEDED.name());
+                .containsExactly(WaitMemberState.RUNNING.name());
+        verify(ruleHits).recordMatch(eq(RUN_ID), eq(policy.rules().get(0)), eq(groupId),
+                eq(factsOf(0, 0, "call-a")));
+        verify(ruleHits, never()).recordAction(any(), anyInt(), any(), any());
+    }
+
+    /**
+     * 策略点名按失败收尾的成员当场就出结果：这一条照失败落，动作真的落到它身上了。
+     *
+     * <p>与压住那两条不同，指定失败不需要成员进入等待：工具的真实成功结果会被改写成夹具点名的
+     * 失败，落库之后才算「动作生效」。</p>
+     */
+    @Test
+    void aFailureRuleOnAnInPlaceMemberAppliesWhenTheMemberIsWritten() {
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
+        AcceptanceReleasePolicy policy =
+                AcceptanceReleasePolicy.parse("fx-1",
+                                "{\"rules\":[{\"for\":{\"planGeneration\":3,\"nodeId\":\"todo_1\","
+                                        + "\"nodeAttempt\":0,\"segmentSequence\":0,\"modelTurn\":0,"
+                                        + "\"memberSeq\":0},\"fail\":\"这个场景要造一条失败成员\"}]}",
+                                objectMapper)
+                        .orElseThrow();
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                firstSegment(List.of(), policy))).groupId();
+
+        assertThat(store.memberRows(groupId)).extracting(row -> row.state)
+                .containsExactly(WaitMemberState.FAILED.name());
+        verify(ruleHits).recordAction(RUN_ID, 0, FixtureRuleHitStore.APPLIED_FAILURE,
+                "成员按夹具点名的原因收成失败");
     }
 
     // ==================== 结果按原始序号接回 ====================
@@ -618,8 +688,18 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     private ScriptedChatModel scriptedModel(String scriptJson, FixtureCallStore calls) {
-        return new ScriptedChatModel(RUN_ID, "fx-1", "scenario-a",
-                FrozenModelScript.parse("fx-1", scriptJson, objectMapper), calls);
+        FrozenModelScript script = FrozenModelScript.parse("fx-1", scriptJson, objectMapper);
+        // 这个替身里的夹具内容不会变：每次调用前重读拿到的就是同一份，摘要与建对象时一致。
+        return new ScriptedChatModel(RUN_ID, "fx-1", "scenario-a", script, calls,
+                () -> new ScriptedChatModel.FixtureScript("fx-1", "scenario-a", script));
+    }
+
+    /** 一次调用在策略眼里的身份：与执行器凑出来的字段一致（计划代际、节点、尝试、段、模型回合、序号）。 */
+    private static AcceptanceReleasePolicy.MemberFacts factsOf(int segmentSequence,
+                                                              int memberSeq,
+                                                              String toolCallId) {
+        return new AcceptanceReleasePolicy.MemberFacts(GENERATION, NODE_ID, 0, segmentSequence, 0,
+                memberSeq, toolCallId);
     }
 
     private static ToolExecutionRequest toolCall(String id, String name, String arguments) {

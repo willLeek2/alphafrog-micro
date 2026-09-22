@@ -8,6 +8,7 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Supplier;
 
 import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException.refuse;
 
@@ -33,22 +34,40 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  */
 public class ScriptedChatModel implements ChatModel {
 
+    /**
+     * 这一段模型调用开始时重读回来的夹具内容。
+     *
+     * <p>同一个阶段模型对象会承担这条 Run 上的多次模型调用（节点分段重做、挂起后接着跑、
+     * 进程重启后重领）。每次都按「现在库里那一版」重读一次：建对象那一刻读到的内容只是当时的
+     * 事实，拿它当以后每一次调用的事实，会在夹具行被原位改过之后继续按旧内容作答，而库里记的
+     * 摘要已经换成新的。</p>
+     *
+     * @param fixtureId 重读到的夹具编号
+     * @param scenarioId 重读到的场景编号
+     * @param script    重读并解析出来的脚本
+     */
+    public record FixtureScript(String fixtureId, String scenarioId, FrozenModelScript script) {
+    }
+
     private final String runId;
     private final String fixtureId;
     private final String scenarioId;
     private final FrozenModelScript script;
     private final FixtureCallStore callStore;
+    private final Supplier<FixtureScript> currentFixture;
 
     public ScriptedChatModel(String runId,
                              String fixtureId,
                              String scenarioId,
                              FrozenModelScript script,
-                             FixtureCallStore callStore) {
+                             FixtureCallStore callStore,
+                             Supplier<FixtureScript> currentFixture) {
         this.runId = runId;
         this.fixtureId = fixtureId;
         this.scenarioId = scenarioId;
         this.script = script;
         this.callStore = callStore;
+        this.currentFixture = currentFixture;
     }
 
     /** 模板自己不能被调用：调用方拿到模型后必须先用 {@link #boundTo(FixtureCallIdentity)} 绑上身份。 */
@@ -106,9 +125,24 @@ public class ScriptedChatModel implements ChatModel {
         return runId;
     }
 
+    /**
+     * 这一次调用用哪一个回合作答。
+     *
+     * <p>先用现在这一版夹具内容认领：夹具行被原位改过时，认领那一步拿冻结的摘要一比就拒掉，
+     * 不会照着新内容作答、也不会把旧内容当成现在的事实。拿回来的回合再从这一次读到的脚本里取。
+     * </p>
+     */
     private AiMessage answerFor(FixtureCallIdentity identity) {
-        FixtureCallStore.Claim claim = callStore.claim(runId, fixtureId, scenarioId, script, identity);
-        return messageOf(script.turns().get(claim.turnIndex()));
+        FixtureScript current = currentFixture.get();
+        if (!fixtureId.equals(current.fixtureId()) || !scenarioId.equals(current.scenarioId())) {
+            throw refuse("acceptance_fixture_identity_changed",
+                    "这条 Run 一开始用的是夹具 " + fixtureId + "/" + scenarioId + "，现在读到的是 "
+                            + current.fixtureId() + "/" + current.scenarioId()
+                            + "：同一条 Run 的夹具身份不许中途换");
+        }
+        FixtureCallStore.Claim claim = callStore.claim(runId, fixtureId, scenarioId,
+                current.script(), identity);
+        return messageOf(current.script().turns().get(claim.turnIndex()));
     }
 
     private static AiMessage messageOf(FrozenModelScript.Turn turn) {

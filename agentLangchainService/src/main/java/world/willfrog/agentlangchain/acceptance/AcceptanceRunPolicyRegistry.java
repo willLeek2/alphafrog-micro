@@ -62,6 +62,10 @@ public class AcceptanceRunPolicyRegistry {
         }
         AcceptanceReleasePolicy cached = policyByRun.get(runId);
         if (cached != null) {
+            // 缓存命中也要跟库里现在那一版比一次摘要：夹具行在运行途中被原位改过时，进程里继续按
+            // 旧策略跑，库里记下来的却是另一版的内容与执行记录对不上。策略原文很小，重读一次比
+            //「一次验收说不清用的是哪一版」划算。
+            requireUnchanged(cached, fixtureId, row.get().scenarioId(), row.get().dispatchPolicyJson());
             return Optional.of(cached);
         }
         Optional<AcceptanceReleasePolicy> parsed =
@@ -82,6 +86,28 @@ public class AcceptanceRunPolicyRegistry {
         log.info("验收夹具的放行策略生效: runId={} fixture={} scenario={} 规则={} 条 策略摘要={}",
                 runId, fixtureId, row.get().scenarioId(), parsed.get().ruleCount(), parsed.get().digest());
         return Optional.of(winner == null ? parsed.get() : winner);
+    }
+
+    /**
+     * 缓存里的策略与库里现在那一版比一次摘要。
+     *
+     * <p>对不上说明夹具行在运行途中被原位改过：这条 Run 已经按旧策略走过一段（压住过谁、放行过谁），
+     * 换一版接着跑会让执行记录与证据对不上。当场拒绝，不悄悄换一版。</p>
+     */
+    private void requireUnchanged(AcceptanceReleasePolicy cached,
+                                  String fixtureId,
+                                  String scenarioId,
+                                  String policyJson) {
+        Optional<AcceptanceReleasePolicy> current =
+                AcceptanceReleasePolicy.parse(fixtureId, policyJson, objectMapper);
+        String currentDigest = current.map(AcceptanceReleasePolicy::digest).orElse(null);
+        if (currentDigest == null || !currentDigest.equals(cached.digest())) {
+            throw AcceptanceFixtureExecutionException.refuse("acceptance_fixture_content_changed",
+                    "这条 Run 一开始用的是策略摘要 " + cached.digest() + "（夹具 " + fixtureId
+                            + "，场景 " + scenarioId + "），现在库里那一版是 "
+                            + (currentDigest == null ? "空（策略被删掉了）" : currentDigest)
+                            + "：同一条 Run 跑的过程中夹具的放行策略被改过，这一次验收说不清用的是哪一版");
+        }
     }
 
     /** 放掉一条 Run 的策略；没有这条 Run 就是空动作。 */

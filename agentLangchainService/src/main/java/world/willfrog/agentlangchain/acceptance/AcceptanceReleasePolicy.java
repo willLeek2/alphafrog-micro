@@ -24,11 +24,12 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  * 没点名的成员照常立刻收尾——策略只改「什么时候接回来」与「哪一条回来算失败」，成员终态、组齐备、
  * 恢复分段、名额与用量这些照旧。</p>
  *
- * <p>点名用的是选择器（{@code for}），不是光写一个工具调用编号。原因很直接：工具调用编号是模型给
- * 的，同一个编号在别的节点、别的分段、别的模型回合里可以再出现一次（模型完全可能每次都从 {@code call_1}
- * 开始编号）。只写编号的规则会连带命中那些成员，压住/放行/判失败的对象就不是夹具作者想说的那一条，
- * 一次验收的结果也说不清。所以选择器至少要同时写清「哪一个等待组」（节点、第几次尝试、第几段、第几次
- * 模型回合里挑一个以上）与「组里哪一条成员」（组内序号或工具调用编号里挑一个以上）。</p>
+ * <p>点名用的是选择器（{@code for}），而且要求写全：等待组那一级五项（计划代际、节点、第几次尝试、
+ * 第几段、第几次模型回合）加上组内序号，工具调用编号写了就一起比对。原因很直接：工具调用编号是模型
+ * 给的，同一个编号在别的节点、别的分段、别的模型回合里可以再出现一次（模型完全可能每次都从
+ * {@code call_1} 开始编号）；少写任何一个组级字段，规则都会连带命中同一个 Run 里后面的某个等待组
+ * （计划重建后有同名节点，同一个节点的后续分段里成员序号会重新从 0 开始）。写全之后，一条选择器在整条
+ * Run 里只指得出一条成员，压住、等待、按失败收尾的对象才与夹具作者点名的那一条是同一个。</p>
  *
  * <p>匹配的结果按「一条成员最多被一条规则点名」核对：一条规则同时命中同一批里的两条以上成员、
  * 或者两条规则点名了同一条成员，都当场拒绝。夹具写错了要当场说清哪一条规则对不上，不能让一次验收
@@ -50,11 +51,23 @@ public final class AcceptanceReleasePolicy {
      */
     public static final String DESIGNATED_FAILURE_CODE = "acceptance_fixture_designated_failure";
 
-    /** 选择器里「哪一个等待组」这一级的字段：至少要写一个。 */
+    /**
+     * 选择器里「哪一个等待组」这一级的字段：五个都要写。
+     *
+     * <p>写全这一级才唯一：等待组就是「哪一次模型回合的那一批工具调用」，这一段里的每个字段都能
+     * 在别的等待组里再出现一次（计划重建后有同名节点、同一个节点的下一段里分段号不同但节点号相同）。
+     * 少写一个，规则就可能连带命中同一 Run 里后面的某个等待组，压住、放行、判失败的对象就不是夹具
+     * 作者点名的那一条。计划代际也算在里面：计划重建之后节点号会重新从同一个名字开始。</p>
+     */
     public static final Set<String> GROUP_KEYS =
-            Set.of("nodeId", "nodeAttempt", "segmentSequence", "modelTurn");
+            Set.of("planGeneration", "nodeId", "nodeAttempt", "segmentSequence", "modelTurn");
 
-    /** 选择器里「组里哪一条成员」这一级的字段：至少要写一个。 */
+    /**
+     * 选择器里「组里哪一条成员」这一级的字段：{@code memberSeq} 要写，{@code toolCallId} 可以再写。
+     *
+     * <p>组内序号是夹具作者自己排出来的（这一批里第几个工具调用），与模型给不给编号无关；
+     * 工具调用编号是模型给的，写了就一起比对，模型给出的编号与脚本写的不一样时这条规则不命中。</p>
+     */
     public static final Set<String> MEMBER_KEYS = Set.of("memberSeq", "toolCallId");
 
     private static final Set<String> POLICY_FIELDS = Set.of("version", "rules", "maxHoldSeconds");
@@ -107,8 +120,13 @@ public final class AcceptanceReleasePolicy {
      *
      * <p>两边调用点各自凑得出这些值：派发前从分段身份与这一段的模型回合来，结果接收方从等待组与成员
      * 记录来。凑出来的字段完全一样，策略才能在两个地方给同一个答案。</p>
+     *
+     * <p>这些字段合起来在同一条 Run 里唯一：等待组由「计划代际 + 节点 + 第几次尝试 + 第几段 + 第几次
+     * 模型回合」定死，成员由组内序号（可再加工具调用编号）定死。策略的选择器要写全前五项与组内序号，
+     * 一条规则因此只会命中一条成员——这是「点名的动作真的落到点名的对象上」的前提。</p>
      */
-    public record MemberFacts(String nodeId,
+    public record MemberFacts(int planGeneration,
+                              String nodeId,
                               int nodeAttempt,
                               int segmentSequence,
                               int modelTurn,
@@ -117,6 +135,7 @@ public final class AcceptanceReleasePolicy {
 
         public Map<String, String> fields() {
             Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("planGeneration", String.valueOf(planGeneration));
             fields.put("nodeId", nodeId);
             fields.put("nodeAttempt", String.valueOf(nodeAttempt));
             fields.put("segmentSequence", String.valueOf(segmentSequence));
@@ -129,8 +148,8 @@ public final class AcceptanceReleasePolicy {
         }
 
         public String describe() {
-            return nodeId + " 第 " + nodeAttempt + " 次尝试 第 " + segmentSequence + " 段 第 "
-                    + modelTurn + " 次模型回合 第 " + memberSeq + " 条成员"
+            return "计划第 " + planGeneration + " 代 " + nodeId + " 第 " + nodeAttempt + " 次尝试 第 "
+                    + segmentSequence + " 段 第 " + modelTurn + " 次模型回合 第 " + memberSeq + " 条成员"
                     + (toolCallId == null || toolCallId.isBlank() ? "（模型没给编号）" : "（" + toolCallId + "）");
         }
     }
@@ -472,10 +491,14 @@ public final class AcceptanceReleasePolicy {
     /**
      * 读一条规则的选择器。
      *
-     * <p>两级各至少要写一个字段：只写「组」这一级（比如只写 nodeId）会命中这个组里的每一条成员，
-     * 规则到底是叫哪一条压住、等谁、按失败收尾都说不清；只写「成员」这一级（尤其是只写工具调用
-     * 编号）会命中别的节点、别的分段里同名的成员——模型完全可能每次都从 {@code call_1} 开始编号。
-     * 这两类写法只从策略本身就能判出来，所以读策略这一步就拒绝。</p>
+     * <p>等待组那一级的五个字段要写全，成员这一级要写组内序号（工具调用编号写了就一起比对）。
+     * 这样一条选择器在整条 Run 里只指得出一条成员：等待组由这五项定死，组内由序号定死。</p>
+     *
+     * <p>只写这一级的一部分也是不够的。少写 {@code planGeneration}，计划重建之后的同名节点会被打中；
+     * 少写 {@code segmentSequence} 或 {@code modelTurn}，同一个节点的后续分段、同一段里的后续模型回合
+     * 里同名的成员会被打中；少写组内序号，这个组里的每一条成员都会被这条规则打中（压住、等谁、
+     * 按失败收尾的对象就说不清）。工具调用编号是模型给的，模型完全可能每次都从 {@code call_1}
+     * 开始编号，所以它不能单独充当成员那一级。这几种写法只从策略本身就能判出来，读策略这一步就拒绝。</p>
      */
     private static Map<String, String> readSelector(String fixtureId, JsonNode node, String where) {
         if (node == null || node.isNull()) {
@@ -503,19 +526,37 @@ public final class AcceptanceReleasePolicy {
             }
             selector.put(field, text.trim());
         }
-        boolean groupLevel = selector.keySet().stream().anyMatch(GROUP_KEYS::contains);
-        boolean memberLevel = selector.keySet().stream().anyMatch(MEMBER_KEYS::contains);
-        if (!groupLevel) {
-            throw invalid(fixtureId, where + "的 for 只写了组内成员那一段（"
-                    + selectorText(selector) + "）：没写是哪个节点哪一段第几次模型回合，别的节点、"
-                    + "别的分段里同名的成员也会被这条规则打中");
+        List<String> missingGroup = new ArrayList<>(GROUP_KEYS);
+        missingGroup.removeAll(selector.keySet());
+        missingGroup.sort(Comparator.naturalOrder());
+        if (!missingGroup.isEmpty()) {
+            throw invalid(fixtureId, where + "的 for 里没写全等待组这一级的字段（"
+                    + selectorText(selector) + "），少了 " + String.join("、", missingGroup)
+                    + "：" + missingGroupHint(missingGroup));
         }
-        if (!memberLevel) {
-            throw invalid(fixtureId, where + "的 for 只写了等待组那一段（"
+        if (!selector.containsKey("memberSeq")) {
+            throw invalid(fixtureId, where + "的 for 里没写组内序号 memberSeq（"
                     + selectorText(selector) + "）：这个组里的每一条成员都会被这条规则打中，"
-                    + "说不清点名的是哪一条，补上 memberSeq 或 toolCallId");
+                    + "说不清点名的是哪一条。工具调用编号是模型给的，同一个编号在别的组里会再出现，"
+                    + "不能单独充当点名成员那一级");
         }
         return selector;
+    }
+
+    /** 少写某一个组级字段时会发生什么：报错里直接写成「会打中谁」，不用人去推。 */
+    private static String missingGroupHint(List<String> missingGroup) {
+        List<String> hints = new ArrayList<>();
+        for (String field : missingGroup) {
+            switch (field) {
+                case "planGeneration" -> hints.add("计划代际：计划重建之后同一个节点名会再来一次，会被这条规则打中");
+                case "nodeId" -> hints.add("节点：别的节点里同名的成员会被这条规则打中");
+                case "nodeAttempt" -> hints.add("第几次尝试：同一个节点重试那一次会被这条规则打中");
+                case "segmentSequence" -> hints.add("第几段：同一个节点后续分段里同名的成员会被这条规则打中");
+                case "modelTurn" -> hints.add("第几次模型回合：同一段里后续模型回合的成员会被这条规则打中");
+                default -> hints.add(field);
+            }
+        }
+        return String.join("；", hints);
     }
 
     private static List<Map<String, String>> readPeerSelectors(String fixtureId,

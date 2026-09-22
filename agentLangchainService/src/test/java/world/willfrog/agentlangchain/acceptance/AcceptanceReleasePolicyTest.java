@@ -34,10 +34,10 @@ class AcceptanceReleasePolicyTest {
     void theThreeActionsAreReadApart() {
         AcceptanceReleasePolicy policy = parse("""
                 {"version":2,"maxHoldSeconds":30,"rules":[
-                  {"for":{"nodeId":"n1","segmentSequence":0,"memberSeq":0},"holdUntilPoint":"point-a"},
-                  {"for":{"nodeId":"n1","segmentSequence":0,"memberSeq":1},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"point-a"},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},
                    "releaseAfter":[{"memberSeq":0},{"memberSeq":2}]},
-                  {"for":{"nodeId":"n1","segmentSequence":0,"memberSeq":2},"fail":"这个场景要造一条失败成员"}]}
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":2},"fail":"这个场景要造一条失败成员"}]}
                 """).orElseThrow();
 
         assertThat(policy.fixtureId()).isEqualTo("fx-policy");
@@ -50,7 +50,8 @@ class AcceptanceReleasePolicyTest {
         assertThat(policy.rules().get(2).failureDetail()).isEqualTo("这个场景要造一条失败成员");
         assertThat(policy.rules().get(0).selectorText())
                 .as("选择器的写法按字段名字母序，报错与命中记录里都是这一串")
-                .isEqualTo("memberSeq=0;nodeId=n1;segmentSequence=0");
+                .isEqualTo("memberSeq=0;modelTurn=0;nodeAttempt=1;nodeId=n1;planGeneration=7"
+                        + ";segmentSequence=0");
     }
 
     @Test
@@ -64,42 +65,65 @@ class AcceptanceReleasePolicyTest {
                 .hasMessageContaining("rules");
     }
 
-    /** 只写工具调用编号定位不到唯一一条成员：别的节点、别的分段里可以再出现同一个编号。 */
+    /** 工具调用编号是模型给的：同一个编号在别的组里会再出现，不能单独充当点名成员那一级。 */
     @Test
-    void aSelectorThatOnlyNamesTheToolCallIdIsRefused() {
+    void aSelectorThatNamesTheMemberOnlyByToolCallIdIsRefused() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"toolCallId":"call-1"},"holdUntilPoint":"point-a"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"toolCallId":"call-1"},"holdUntilPoint":"point-a"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("acceptance_fixture_policy_invalid")
-                .hasMessageContaining("toolCallId=call-1")
-                .hasMessageContaining("只写了组内成员那一段");
+                .hasMessageContaining("没写组内序号 memberSeq")
+                .hasMessageContaining("toolCallId=call-1");
+    }
+
+    /** 等待组那一级少写一个字段，规则就会连带命中后面某个等待组：读策略这一步就拒。 */
+    @Test
+    void aSelectorThatLeavesOutAGroupKeyIsRefused() {
+        assertThatThrownBy(() -> parse("""
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"memberSeq":0},
+                           "holdUntilPoint":"point-a"}]}
+                """))
+                .as("少写模型回合：同一段里后续模型回合的同名成员会被打中")
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("没写全等待组这一级的字段")
+                .hasMessageContaining("modelTurn")
+                .hasMessageContaining("第几次模型回合");
+        assertThatThrownBy(() -> parse("""
+                {"rules":[{"for":{"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},
+                           "holdUntilPoint":"point-a"}]}
+                """))
+                .as("少写计划代际：计划重建之后的同名节点会被打中")
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("没写全等待组这一级的字段")
+                .hasMessageContaining("planGeneration")
+                .hasMessageContaining("计划重建之后同一个节点名会再来一次");
     }
 
     /** 只写等待组那一级会命中这个组里的每一条成员：说不清点名的是哪一条。 */
     @Test
     void aSelectorThatOnlyNamesTheGroupIsRefused() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","segmentSequence":0},"fail":"故意失败"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0},"fail":"故意失败"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("acceptance_fixture_policy_invalid")
-                .hasMessageContaining("只写了等待组那一段")
-                .hasMessageContaining("memberSeq 或 toolCallId");
+                .hasMessageContaining("没写组内序号 memberSeq");
     }
 
     /** 字段名打错会一条成员都打不中，所以读策略这一步就把认不出的字段名点出来。 */
     @Test
     void misspelledSelectorFieldsAreRefused() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeID":"n1","memberSeq":0},"holdUntilPoint":"point-a"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeID":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"point-a"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("认不出的字段")
                 .hasMessageContaining("nodeID")
                 .hasMessageContaining("nodeId");
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","member":0},"holdUntilPoint":"point-a"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"member":0},"holdUntilPoint":"point-a"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("认不出的字段")
@@ -109,13 +133,13 @@ class AcceptanceReleasePolicyTest {
     @Test
     void aRuleMustNameExactlyOneAction() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},
                            "holdUntilPoint":"point-a","fail":"故意失败"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("恰好写一种动作");
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0}}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0}}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("恰好写一种动作");
@@ -124,17 +148,17 @@ class AcceptanceReleasePolicyTest {
     @Test
     void emptyActionValuesAreRefused() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"holdUntilPoint":"  "}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"  "}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("holdUntilPoint");
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[]}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("releaseAfter");
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":["call-2"]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":["call-2"]}]}
                 """))
                 .as("等谁也要写成选择器：光写编号同样定位不到")
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
@@ -144,7 +168,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void aSelectorWithoutAMemberPartIsRefusedInPeersToo() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"nodeId":"n1"}]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"nodeId":"n1"}]}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("releaseAfter 第 0 项")
@@ -154,7 +178,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void anUnknownVersionIsRefused() {
         assertThatThrownBy(() -> parse("""
-                {"version":1,"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"x"}]}
+                {"version":1,"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"x"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("version 只认 2");
@@ -180,10 +204,10 @@ class AcceptanceReleasePolicyTest {
     @Test
     void maxHoldSecondsIsOptionalAndMustBePositive() {
         assertThat(parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"故意失败"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"故意失败"}]}
                 """).orElseThrow().maxHoldSeconds()).as("没写兜底就是不设兜底").isZero();
         assertThatThrownBy(() -> parse("""
-                {"maxHoldSeconds":0,"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"故意失败"}]}
+                {"maxHoldSeconds":0,"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"故意失败"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("maxHoldSeconds");
@@ -192,13 +216,13 @@ class AcceptanceReleasePolicyTest {
     @Test
     void unknownPolicyFieldsAreRefused() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"x"}],"hold":1}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"x"}],"hold":1}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("认不出的字段")
                 .hasMessageContaining("hold");
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"holdUntillPoint":"p"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntillPoint":"p"}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("holdUntillPoint");
@@ -207,13 +231,13 @@ class AcceptanceReleasePolicyTest {
     @Test
     void theDigestFollowsThePolicyText() {
         AcceptanceReleasePolicy first = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"x"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"x"}]}
                 """).orElseThrow();
         AcceptanceReleasePolicy same = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"x"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"x"}]}
                 """).orElseThrow();
         AcceptanceReleasePolicy changed = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"y"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"y"}]}
                 """).orElseThrow();
 
         assertThat(first.digest()).isEqualTo(same.digest()).hasSize(64);
@@ -226,7 +250,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void aSelectorPinsTheSegmentSoTheSameCallIdInTheNextGroupIsNotHit() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","segmentSequence":0,"toolCallId":"call_1"},
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":1,"memberSeq":0,"toolCallId":"call_1"},
                            "holdUntilPoint":"point-a"}]}
                 """).orElseThrow();
         List<AcceptanceReleasePolicy.MemberFacts> firstGroup = List.of(
@@ -245,7 +269,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void aSelectorPinsTheNodeSoAnotherNodesSameCallIdIsNotHit() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"fail":"这个节点上这条按失败算"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"fail":"这个节点上这条按失败算"}]}
                 """).orElseThrow();
         List<AcceptanceReleasePolicy.MemberFacts> otherNode =
                 List.of(member("n2", 0, 0, 0, "call_1"));
@@ -254,26 +278,59 @@ class AcceptanceReleasePolicyTest {
         assertThat(policy.match(List.of(member("n1", 0, 0, 0, "call_1"))).targetOf(0)).isPresent();
     }
 
+    /** 同一段里的下一次模型回合是另一条成员：组内序号一样也不该被同一条规则打中。 */
+    @Test
+    void aSelectorPinsTheModelTurnSoTheSameMemberInTheNextTurnIsNotHit() {
+        AcceptanceReleasePolicy policy = parse("""
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},"holdUntilPoint":"point-a"}]}
+                """).orElseThrow();
+
+        assertThat(policy.match(List.of(member("n1", 0, 1, 1, "call_1"))).isEmpty())
+                .as("同段里第 1 次模型回合的同序号成员不该被这条规则打中")
+                .isTrue();
+        assertThat(policy.match(List.of(member("n1", 0, 0, 1, "call_1"))).targetOf(0)).isPresent();
+    }
+
+    /** 计划重建之后同名节点会再来一次：计划代际写的是第 7 代时，第 8 代那一次不该被同一条规则打中。 */
+    @Test
+    void aSelectorPinsThePlanGenerationSoARebuiltPlanIsNotHit() {
+        AcceptanceReleasePolicy policy = parse("""
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"point-a"}]}
+                """).orElseThrow();
+        AcceptanceReleasePolicy.MemberFacts rebuilt =
+                new AcceptanceReleasePolicy.MemberFacts(8, "n1", 1, 0, 0, 0, "call_1");
+
+        assertThat(policy.match(List.of(rebuilt)).isEmpty())
+                .as("计划重建后的同名同序号成员不该被这条规则打中")
+                .isTrue();
+        assertThat(policy.match(List.of(member("n1", 0, 0, 0, "call_1"))).targetOf(0)).isPresent();
+    }
+
     /** 数值型的身份字段写数字也能对上：夹具作者写 0 或 "0" 是同一个意思。 */
     @Test
     void numericSelectorValuesAreMatchedAsNumbers() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","modelTurn":"1","memberSeq":0},"holdUntilPoint":"point-a"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":"1","memberSeq":0},"holdUntilPoint":"point-a"}]}
                 """).orElseThrow();
 
         assertThat(policy.match(List.of(member("n1", 0, 1, 0, "call_1"))).targetOf(0)).isPresent();
         assertThat(policy.match(List.of(member("n1", 0, 2, 0, "call_1"))).isEmpty()).isTrue();
     }
 
-    /** 一条规则同时打中两条成员：点名对象不确定，当场拒绝。 */
+    /**
+     * 同一批里两条成员的成员身份完全相同（不该出现的坏批次）：一条规则会同时打中它们，当场拒绝。
+     *
+     * <p>选择器写全之后，正常的组里不会出现这种情形；这里是最后一道 —— 真撞上了也不能随便挑一条
+     * 压住、放行或者判失败。</p>
+     */
     @Test
     void oneRuleHittingTwoMembersIsRefused() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","toolCallId":"call_1"},"holdUntilPoint":"point-a"}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"point-a"}]}
                 """).orElseThrow();
         List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
                 member("n1", 0, 0, 0, "call_1"),
-                member("n1", 0, 0, 1, "call_1"));
+                member("n1", 0, 0, 0, "call_1"));
 
         assertThatThrownBy(() -> policy.match(group))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
@@ -286,8 +343,8 @@ class AcceptanceReleasePolicyTest {
     void twoRulesPointingAtOneMemberAreRefused() {
         AcceptanceReleasePolicy policy = parse("""
                 {"rules":[
-                  {"for":{"nodeId":"n1","memberSeq":0},"holdUntilPoint":"point-a"},
-                  {"for":{"nodeId":"n1","toolCallId":"call_1"},"fail":"按失败算"}]}
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"point-a"},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0,"toolCallId":"call_1"},"fail":"按失败算"}]}
                 """).orElseThrow();
         List<AcceptanceReleasePolicy.MemberFacts> group = List.of(member("n1", 0, 0, 0, "call_1"));
 
@@ -302,8 +359,8 @@ class AcceptanceReleasePolicyTest {
     void rulesAtFindsTheRuleThatNamesThisMember() {
         AcceptanceReleasePolicy policy = parse("""
                 {"rules":[
-                  {"for":{"nodeId":"n1","memberSeq":0},"holdUntilPoint":"point-a"},
-                  {"for":{"nodeId":"n1","memberSeq":1},"fail":"按失败算"}]}
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"holdUntilPoint":"point-a"},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},"fail":"按失败算"}]}
                 """).orElseThrow();
         List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
                 member("n1", 0, 0, 0, "call_1"), member("n1", 0, 0, 1, "call_2"));
@@ -319,7 +376,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void peersResolveInsideTheSameGroup() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"memberSeq":2}]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"memberSeq":2}]}]}
                 """).orElseThrow();
         Availability group = group();
 
@@ -331,7 +388,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void aPeerThatIsNotInTheGroupIsRefused() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"memberSeq":9}]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"memberSeq":9}]}]}
                 """).orElseThrow();
         Availability group = group();
 
@@ -345,7 +402,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void anAmbiguousPeerIsRefused() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"toolCallId":"call_1"}]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"toolCallId":"call_1"}]}]}
                 """).orElseThrow();
         List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
                 member("n1", 0, 0, 0, "call_1"),
@@ -362,7 +419,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void waitingForItselfIsRefusedOnceTheGroupIsKnown() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"memberSeq":0}]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"memberSeq":0}]}]}
                 """).orElseThrow();
         Availability group = group();
 
@@ -376,8 +433,8 @@ class AcceptanceReleasePolicyTest {
     @Test
     void aSelfWaitWrittenIdenticallyIsRefusedAtParseTime() {
         assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},
-                           "releaseAfter":[{"nodeId":"n1","memberSeq":0}]}]}
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},
+                           "releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0}]}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("acceptance_fixture_policy_invalid")
@@ -389,12 +446,12 @@ class AcceptanceReleasePolicyTest {
     void aCycleWrittenIdenticallyIsRefusedAtParseTime() {
         assertThatThrownBy(() -> parse("""
                 {"rules":[
-                  {"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"nodeId":"n1","memberSeq":1}]},
-                  {"for":{"nodeId":"n1","memberSeq":1},"releaseAfter":[{"nodeId":"n1","memberSeq":0}]}]}
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1}]},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0}]}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("acceptance_fixture_policy_invalid")
-                .hasMessageContaining("memberSeq=0;nodeId=n1 → memberSeq=1;nodeId=n1 → memberSeq=0;nodeId=n1");
+                .hasMessageContaining("互相等成了一整圈");
     }
 
     /** 三条规则绕一圈、外加一条不相干的规则：照样能找出那一圈。 */
@@ -402,10 +459,10 @@ class AcceptanceReleasePolicyTest {
     void aLongerCycleIsRefusedAndUnrelatedRulesDoNotConfuseIt() {
         assertThatThrownBy(() -> parse("""
                 {"rules":[
-                  {"for":{"nodeId":"n1","memberSeq":7},"fail":"不相干的一条"},
-                  {"for":{"nodeId":"n1","memberSeq":0},"releaseAfter":[{"nodeId":"n1","memberSeq":1}]},
-                  {"for":{"nodeId":"n1","memberSeq":1},"releaseAfter":[{"nodeId":"n1","memberSeq":2}]},
-                  {"for":{"nodeId":"n1","memberSeq":2},"releaseAfter":[{"nodeId":"n1","memberSeq":0}]}]}
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":7},"fail":"不相干的一条"},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1}]},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":2}]},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":2},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0}]}]}
                 """))
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .hasMessageContaining("acceptance_fixture_policy_invalid")
@@ -422,8 +479,8 @@ class AcceptanceReleasePolicyTest {
     void aCycleWrittenDifferentlyIsRefusedOnceTheGroupIsKnown() {
         AcceptanceReleasePolicy policy = parse("""
                 {"rules":[
-                  {"for":{"nodeId":"n1","segmentSequence":0,"memberSeq":0},"releaseAfter":[{"memberSeq":1}]},
-                  {"for":{"nodeId":"n1","segmentSequence":0,"memberSeq":1},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"memberSeq":1}]},
+                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},
                    "releaseAfter":[{"nodeId":"n1","segmentSequence":0,"memberSeq":0}]}]}
                 """).orElseThrow();
         Availability group = group();
@@ -440,7 +497,7 @@ class AcceptanceReleasePolicyTest {
     @Test
     void waitingForAMemberWithoutARuleIsAccepted() {
         AcceptanceReleasePolicy policy = parse("""
-                {"rules":[{"for":{"nodeId":"n1","memberSeq":0},
+                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},
                            "releaseAfter":[{"memberSeq":1},{"memberSeq":2}]}]}
                 """).orElseThrow();
         Availability group = group();
@@ -466,13 +523,14 @@ class AcceptanceReleasePolicyTest {
         }
     }
 
+    /** 一个组里的成员：这一批的等待组级身份固定是「计划第 7 代、第 1 次尝试、第 0 段、第 0 次模型回合」。 */
     private static AcceptanceReleasePolicy.MemberFacts member(String nodeId,
                                                              int segmentSequence,
                                                              int modelTurn,
                                                              int memberSeq,
                                                              String toolCallId) {
-        return new AcceptanceReleasePolicy.MemberFacts(nodeId, 0, segmentSequence, modelTurn, memberSeq,
-                toolCallId);
+        return new AcceptanceReleasePolicy.MemberFacts(7, nodeId, 1, segmentSequence, modelTurn,
+                memberSeq, toolCallId);
     }
 
     private Optional<AcceptanceReleasePolicy> parse(String json) {

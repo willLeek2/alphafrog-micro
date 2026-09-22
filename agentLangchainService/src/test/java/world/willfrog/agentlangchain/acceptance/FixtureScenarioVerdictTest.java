@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.acceptance;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Set;
 
@@ -109,7 +110,8 @@ class FixtureScenarioVerdictTest {
                 new FixtureRuleHitStore.RuleFact(1, "fail", "memberSeq=1;nodeId=n1"));
 
         FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
-                script.declarations(), rules, Set.of(0), Set.of(0));
+                script.declarations(), rules, Set.of(0),
+                List.of(hit(0, FixtureRuleHitStore.APPLIED_HOLD)));
 
         assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
         assertThat(verdict.missing()).as("必答回合都发生了").isEmpty();
@@ -127,10 +129,11 @@ class FixtureScenarioVerdictTest {
                 {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
                 """);
         List<FixtureRuleHitStore.RuleFact> rules =
-                List.of(new FixtureRuleHitStore.RuleFact(0, "fail", "memberSeq=0;nodeId=n1"));
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
 
         FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
-                script.declarations(), rules, Set.of(0), Set.of(0));
+                script.declarations(), rules, Set.of(0),
+                List.of(hit(0, FixtureRuleHitStore.APPLIED_HOLD)));
 
         assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.COMPLETE);
         assertThat(verdict.missing()).isEmpty();
@@ -148,11 +151,64 @@ class FixtureScenarioVerdictTest {
                 List.of(new FixtureRuleHitStore.RuleFact(0, "fail", "memberSeq=0;nodeId=n1"));
 
         FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
-                script.declarations(), rules, Set.of(), Set.of());
+                script.declarations(), rules, Set.of(), List.of());
 
         assertThat(verdict.describeMissing())
                 .contains("实际没有发生")
                 .contains("一次都没打中任何成员");
+    }
+
+    /**
+     * 点名的规则打中了成员、但动作没有落到它身上：与「一条都没打中」一样算这次验收没跑全。
+     *
+     * <p>一条要求压住成员的规则，遇到当场就出结果的成员时没有可等的东西：命中的那一行已经在库里，
+     * 压住的动作却没发生。只看「有没有命中」的话，一次没经历目标控制流的验收会显示证据完整。</p>
+     */
+    @Test
+    void aRuleWhoseActionNeverAppliedIsNamedToo() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0),
+                List.of(hit(0, FixtureRuleHitStore.NOT_APPLIED)));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.missing()).as("必答回合都发生了").isEmpty();
+        assertThat(verdict.missingRules()).as("规则打中了成员").isEmpty();
+        assertThat(verdict.unappliedRules()).singleElement()
+                .satisfies(rule -> assertThat(rule)
+                        .contains("第 0 条规则")
+                        .contains("not_applied"));
+        assertThat(verdict.describeMissing()).contains("动作没有落到它身上");
+    }
+
+    /** 动作还没落地的规则（结果以后才回来）同样算这次验收没跑全：不能因为「命中了」就放过。 */
+    @Test
+    void aRuleWhoseActionHasNotSettledIsStillAGap() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0), List.of(hit(0, null)));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.unappliedRules()).singleElement()
+                .satisfies(rule -> assertThat(rule).contains("还没落地"));
+    }
+
+    /** 一条规则的落库记录：默认已经打中并生效，指定结果时按给的写。 */
+    private static FixtureRuleHitStore.RuleHit hit(int ruleIndex, String outcome) {
+        OffsetDateTime now = OffsetDateTime.now();
+        return new FixtureRuleHitStore.RuleHit(ruleIndex, "holdUntilPoint", "memberSeq=0;nodeId=n1",
+                1L, new AcceptanceReleasePolicy.MemberFacts(3, "n1", 0, 0, 0, 0, "call-a"),
+                now, outcome == null ? null : now, outcome, null);
     }
 
     private FrozenModelScript parse(String json) {

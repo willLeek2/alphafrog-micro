@@ -798,7 +798,12 @@ class Stage3WaitContractPostgresTest {
         assertThat(claimedTurnOf(runId, call)).isZero();
     }
 
-    /** 夹具写错字段名时，规则一条成员都打不中：命中的记录留在库里，终态核对按它点名。 */
+    /**
+     * 夹具写错字段名时，规则一条成员都打不中：命中的记录留在库里，终态核对按它点名。
+     *
+     * <p>一条规则在整条 Run 里只绑一个目标：同一个目标重复记只留一行，换个目标会撞唯一键；
+     * 被点名的动作有没有真的落到这条成员身上，是第二个时刻单独写的。</p>
+     */
     @Test
     void aRuleHitIsRecordedOnceAndTheRunEndVerdictCarriesTheCounts() throws Exception {
         String runId = "run-fixture-policy";
@@ -807,19 +812,46 @@ class Stage3WaitContractPostgresTest {
         assertThat(insertPolicy(runId)).as("同一条 Run 的策略快照只留一份").isZero();
 
         assertThat(insertRuleHit(runId, 0, 0)).isEqualTo(1);
-        assertThat(insertRuleHit(runId, 0, 0)).as("同一件事重复记只留一行").isZero();
-        assertThat(insertRuleHit(runId, 0, 1)).isEqualTo(1);
+        assertThat(insertRuleHit(runId, 0, 0)).as("同一个目标重复记只留一行").isZero();
+        assertThat(insertRuleHit(runId, 0, 1))
+                .as("同一条规则换一个目标：撞唯一键，写不进去").isZero();
+        expectRejected(insertRuleHitSql(runId, 0, 1),
+                "alphafrog_agent_run_acceptance_fixture_rule_hit_key");
+        assertThat(insertRuleHit(runId, 1, 1)).as("另一条规则可以有它自己的目标").isEqualTo(1);
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_acceptance_fixture_rule_hit"
                 + " WHERE run_id = '" + runId + "'")).isEqualTo(2);
 
-        // 终态核对把结论写回场景行：脚本与规则两路都在这一行上。
+        // 第二个时刻：动作真的落到这条成员身上时才写结果与时刻，两者成对。
+        execute("UPDATE alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " SET action_settled_at = CURRENT_TIMESTAMP, action_outcome = 'hold_waiting',"
+                + " action_detail = '在放行点 point-a 上等'"
+                + " WHERE run_id = '" + runId + "' AND rule_index = 0");
+        assertThat(queryString("SELECT action_outcome FROM alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " WHERE run_id = '" + runId + "' AND rule_index = 0")).isEqualTo("hold_waiting");
+        expectRejected("UPDATE alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " SET action_outcome = 'unknown' WHERE run_id = '" + runId + "' AND rule_index = 1",
+                "alphafrog_agent_run_acceptance_fixture_rule_hit_outcome_check");
+        expectRejected("UPDATE alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " SET action_outcome = 'hold_waiting'"
+                + " WHERE run_id = '" + runId + "' AND rule_index = 1",
+                "alphafrog_agent_run_acceptance_fixture_rule_hit_settled_check");
+        expectRejected("UPDATE alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " SET action_settled_at = CURRENT_TIMESTAMP"
+                + " WHERE run_id = '" + runId + "' AND rule_index = 1",
+                "alphafrog_agent_run_acceptance_fixture_rule_hit_settled_check");
+
+        // 终态核对把结论写回场景行：脚本与规则两路都在这一行上，动作没生效的规则单独计数。
         execute("UPDATE alphafrog_agent_run_acceptance_fixture_scenario"
                 + " SET verdict = 'script_incomplete', claimed_turn_count = 1, required_missing_count = 0,"
                 + " policy_rule_count = 2, policy_hit_rule_count = 1, policy_missing_count = 1,"
+                + " policy_unapplied_count = 0,"
                 + " policy_detail = '第 1 条规则（fail，选择器 memberSeq=5;nodeId=n9）'"
                 + " WHERE run_id = '" + runId + "'");
         assertThat(queryString("SELECT policy_detail FROM alphafrog_agent_run_acceptance_fixture_scenario"
                 + " WHERE run_id = '" + runId + "'")).contains("memberSeq=5;nodeId=n9");
+        expectRejected("UPDATE alphafrog_agent_run_acceptance_fixture_scenario"
+                + " SET policy_unapplied_count = '两条' WHERE run_id = '" + runId + "'",
+                null);
 
         // 认不出的结论写不进去：以后加结论取值时，旧代码写出来的行不会悄悄混进证据里。
         expectRejected("UPDATE alphafrog_agent_run_acceptance_fixture_scenario"
@@ -886,11 +918,19 @@ class Stage3WaitContractPostgresTest {
     private static int insertRuleHit(String runId, int ruleIndex, int memberSeq) throws Exception {
         try (Connection connection = dataSource.getConnection();
              Statement statement = connection.createStatement()) {
-            return statement.executeUpdate("INSERT INTO alphafrog_agent_run_acceptance_fixture_rule_hit"
-                    + " (run_id, rule_index, selector_text, action, group_id, member_seq)"
-                    + " VALUES ('" + runId + "', " + ruleIndex + ", 'memberSeq=0;nodeId=n1',"
-                    + " 'holdUntilPoint', 9001, " + memberSeq + ") ON CONFLICT DO NOTHING");
+            return statement.executeUpdate(insertRuleHitSql(runId, ruleIndex, memberSeq)
+                    + " ON CONFLICT DO NOTHING");
         }
+    }
+
+    /** 命中行的写入语句：与服务端 {@code FixtureRuleHitStore.recordMatch} 发出的那条列一致。 */
+    private static String insertRuleHitSql(String runId, int ruleIndex, int memberSeq) {
+        return "INSERT INTO alphafrog_agent_run_acceptance_fixture_rule_hit"
+                + " (run_id, rule_index, selector_text, action, group_id,"
+                + " plan_generation, node_id, node_attempt, segment_sequence, model_turn,"
+                + " member_seq, tool_call_id)"
+                + " VALUES ('" + runId + "', " + ruleIndex + ", 'memberSeq=0;nodeId=n1',"
+                + " 'holdUntilPoint', 9001, 7, 'n1', 1, 0, 0, " + memberSeq + ", 'call-" + memberSeq + "')";
     }
 
     private static String queryString(String sql) throws Exception {
@@ -2568,6 +2608,17 @@ class Stage3WaitContractPostgresTest {
         assertThat(countRows("SELECT count(*) FROM pg_constraint WHERE connamespace = current_schema()::regnamespace"
                 + " AND conname = 'alphafrog_agent_run_acceptance_fixture_scenario_verdict_check'"))
                 .as("结论列要有取值约束：以后加结论取值时旧代码写出来的行不会悄悄混进证据").isEqualTo(1);
+        // 命中记录这一张表分两个时刻写：打中了哪条成员、动作有没有真的落到它身上。
+        assertThat(countRows("SELECT count(*) FROM pg_constraint WHERE connamespace = current_schema()::regnamespace"
+                + " AND conname IN ("
+                + "'alphafrog_agent_run_acceptance_fixture_rule_hit_outcome_check', "
+                + "'alphafrog_agent_run_acceptance_fixture_rule_hit_settled_check')"))
+                .as("动作结果要有取值约束，且结果与时刻必须成对").isEqualTo(2);
+        assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                + "WHERE table_schema = current_schema()"
+                + " AND table_name = 'alphafrog_agent_run_acceptance_fixture_scenario'"
+                + " AND column_name = 'policy_unapplied_count' AND data_type = 'integer'"))
+                .as("结论里要有「打中了、动作没生效」的规则条数").isEqualTo(1);
     }
 
     /** 再报一次同一段的挂起：用来验「旧计划的挂起整条不生效」。 */

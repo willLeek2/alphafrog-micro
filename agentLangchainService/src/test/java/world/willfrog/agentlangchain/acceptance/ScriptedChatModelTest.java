@@ -94,6 +94,48 @@ class ScriptedChatModelTest {
                 .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_no_declared_turn"));
     }
 
+    /**
+     * 两次调用之间夹具被换成了另一份：第二次调用当场停住，不拿新夹具回答旧 Run 的问题。
+     */
+    @Test
+    void aFixtureSwappedBetweenTwoCallsIsRefused() {
+        FrozenModelScript first = FrozenModelScript.parse("fx-1", twoTurns(), objectMapper);
+        FrozenModelScript second = FrozenModelScript.parse("fx-2", twoTurns(), objectMapper);
+        when(callStore.claim(eq("run-1"), eq("fx-1"), eq("scenario-a"), any(), eq(IDENTITY)))
+                .thenReturn(claim(0, "回合 1 声明 stage=node;nodeId=n1"));
+        ScriptedChatModel model = new ScriptedChatModel("run-1", "fx-1", "scenario-a", first, callStore,
+                () -> new ScriptedChatModel.FixtureScript("fx-2", "scenario-a", second));
+        ChatModel bound = model.boundTo(IDENTITY);
+
+        assertThatThrownBy(() -> chat(bound))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_identity_changed"))
+                .hasMessageContaining("fx-1")
+                .hasMessageContaining("fx-2");
+    }
+
+    /**
+     * 夹具内容被原位改过（编号没变、回复换了）：第二次调用拿去认领的是**新读到的那一份**。
+     *
+     * <p>认领表里存着这次验收第一次用到的内容摘要，拿新内容去认领时摘要对不上，那边会当场拒绝。
+     * 如果这里仍然拿建对象时那一份去认领，这一次验收就会照着已经不存在的内容作答，而库里记下来的
+     * 却是改过之后的那一版。</p>
+     */
+    @Test
+    void theSecondCallClaimsWithTheScriptReadForThatCall() {
+        FrozenModelScript first = FrozenModelScript.parse("fx-1", twoTurns(), objectMapper);
+        FrozenModelScript second = FrozenModelScript.parse("fx-1", twoTurns(), objectMapper);
+        when(callStore.claim(any(), any(), any(), any(), eq(IDENTITY)))
+                .thenReturn(claim(0, "回合 1 声明 stage=node;nodeId=n1"));
+        ScriptedChatModel model = new ScriptedChatModel("run-1", "fx-1", "scenario-a", first, callStore,
+                () -> new ScriptedChatModel.FixtureScript("fx-1", "scenario-a", second));
+        ChatModel bound = model.boundTo(IDENTITY);
+
+        chat(bound);
+
+        verify(callStore).claim(eq("run-1"), eq("fx-1"), eq("scenario-a"), eq(second), eq(IDENTITY));
+    }
+
     @Test
     void anEmptyIdentityIsRefused() {
         assertThatThrownBy(() -> model(twoTurns()).boundTo(null))
@@ -101,8 +143,10 @@ class ScriptedChatModelTest {
     }
 
     private ScriptedChatModel model(String scriptJson) {
-        return new ScriptedChatModel("run-1", "fx-1", "scenario-a",
-                FrozenModelScript.parse("fx-1", scriptJson, objectMapper), callStore);
+        FrozenModelScript script = FrozenModelScript.parse("fx-1", scriptJson, objectMapper);
+        // 这个替身里的夹具内容不会变：每次调用前重读拿到的就是同一份，摘要与建对象时一致。
+        return new ScriptedChatModel("run-1", "fx-1", "scenario-a", script, callStore,
+                () -> new ScriptedChatModel.FixtureScript("fx-1", "scenario-a", script));
     }
 
     private static FixtureCallStore.Claim claim(int turnIndex, String declaredFor) {

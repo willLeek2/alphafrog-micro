@@ -75,6 +75,13 @@ public class DualPoolWaitGroupNodeExecutor {
     private static final List<String> SUB_AGENT_TOOL_NAMES = List.of("spawnSubAgent", "waitForSubAgent");
     /** 模型没有给出工具调用身份时，工具结果消息用的占位名字；只在本组内配对使用。 */
     private static final String SYNTHETIC_CALL_ID_PREFIX = "waitcall-";
+    /**
+     * 夹具点名的动作没有落到成员身上（这条成员没有进入等待）：这一条按失败收场，原因就是这个码。
+     *
+     * <p>派发之前已经按工具名拦过一类（点名的成员不是会转后台的工具）；这个是最后一道，
+     * 覆盖「工具在本次调用里当场出结果、或者被额度与控制信号中止」这些没有进入等待的情况。</p>
+     */
+    private static final String RULE_ACTION_NOT_APPLIED_CODE = "acceptance_fixture_rule_action_not_applied";
 
     private final AgentPromptService promptService;
     private final LangchainRunExecutionGuard executionGuard;
@@ -339,6 +346,10 @@ public class DualPoolWaitGroupNodeExecutor {
         AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
         List<AcceptanceReleasePolicy.MemberFacts> facts = memberFacts(input, modelTurn, drafts);
         AcceptanceReleasePolicy.RuleMatches policyMatches = matchPolicyRules(policy, facts);
+        String unwaitable = unwaitableTargetReason(policy, policyMatches, drafts);
+        if (unwaitable != null) {
+            return new Outcome.Completed(failurePatch(input, checkpoint, unwaitable, null));
+        }
         int nextSegmentSequence = input.identity().segmentSequence() + 1;
         int nodeToolCalls = checkpoint.toolCallsUsed() + drafts.size();
         List<ChatMessage> history = new ArrayList<>(messages);
@@ -364,7 +375,7 @@ public class DualPoolWaitGroupNodeExecutor {
             return new Outcome.NotOwned("segment_not_matched:" + input.identity().describe());
         }
         long groupId = suspended.groupId();
-        recordPolicyHits(input.identity().runId(), policy, policyMatches, groupId);
+        recordPolicyMatches(input.identity().runId(), policy, policyMatches, groupId);
         Long notificationId = dispatchMembers(groupId, input, modelTurn, policy, policyMatches, calls);
         if (notificationId != null) {
             boolean published = resumedSegmentPublisher.publish(notificationId,
@@ -391,8 +402,9 @@ public class DualPoolWaitGroupNodeExecutor {
         NodeWorkItemIdentity identity = input.identity();
         List<AcceptanceReleasePolicy.MemberFacts> facts = new ArrayList<>();
         for (WaitMemberDraft draft : drafts) {
-            facts.add(new AcceptanceReleasePolicy.MemberFacts(identity.nodeId(), identity.nodeAttempt(),
-                    identity.segmentSequence(), modelTurn, draft.getMemberSeq(), draft.getToolCallId()));
+            facts.add(new AcceptanceReleasePolicy.MemberFacts(identity.planGeneration(), identity.nodeId(),
+                    identity.nodeAttempt(), identity.segmentSequence(), modelTurn,
+                    draft.getMemberSeq(), draft.getToolCallId()));
         }
         return List.copyOf(facts);
     }
@@ -402,8 +414,9 @@ public class DualPoolWaitGroupNodeExecutor {
                                                                   int modelTurn,
                                                                   WaitMember member) {
         NodeWorkItemIdentity identity = input.identity();
-        return new AcceptanceReleasePolicy.MemberFacts(identity.nodeId(), identity.nodeAttempt(),
-                identity.segmentSequence(), modelTurn, member.getMemberSeq(), member.getToolCallId());
+        return new AcceptanceReleasePolicy.MemberFacts(identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence(), modelTurn,
+                member.getMemberSeq(), member.getToolCallId());
     }
 
     /**
@@ -429,22 +442,69 @@ public class DualPoolWaitGroupNodeExecutor {
     }
 
     /**
-     * 这一批里命中的规则各记一笔。
+     * 这一批里命中的规则各记一笔「打中了谁」。
      *
      * <p>规则只写「点名某一次调用」时，字段名或序号写错不会报错，只会一条成员都打不中，那次验收看
-     * 起来像跑完了。所以命中要落库，跑到终态时按它核对。派发前与结果接收方都会记，重复记只留一行。</p>
+     * 起来像跑完了。所以命中要落库，跑到终态时按它核对。派发前与结果接收方都会记，重复记只留一行。
+     * 这里记的是「选择器打中了谁」；被点名的动作有没有真的落到这条成员身上，是动作真的发生时才记的
+     * （压住、等兄弟成员、按失败收尾各自在自己的那一刻写）。</p>
      */
-    private void recordPolicyHits(String runId,
-                                  AcceptanceReleasePolicy policy,
-                                  AcceptanceReleasePolicy.RuleMatches matches,
-                                  long groupId) {
+    private void recordPolicyMatches(String runId,
+                                     AcceptanceReleasePolicy policy,
+                                     AcceptanceReleasePolicy.RuleMatches matches,
+                                     long groupId) {
         if (policy == null || matches == null) {
             return;
         }
         for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
             matches.targetOf(rule.index()).ifPresent(target ->
-                    ruleHitStore.record(runId, rule, groupId, target.memberSeq()));
+                    ruleHitStore.recordMatch(runId, rule, groupId, target));
         }
+    }
+
+    /**
+     * 点名的动作在这一批里做不做得到：做不到就在派发之前停下。
+     *
+     * <p>「压住等放行点」与「等兄弟成员先落终态」这两种动作，前提是这条成员的结果以后才回来
+     * ——它会转后台、留在执行中。点名的成员如果是一个当场就出结果的工具，这两种动作没有可等的东西，
+     * 系统只能把它照原样收成终态；那时命中的那一行已经在库里，终态核对会以为「压住过」「等过」，
+     * 一次本来没跑出目标控制流的验收会显示证据完整。所以这一类配置在派发之前就拒绝：一个外部作业
+     * 都还没建出来，夹具写错了当场停住，原因里写清是哪条规则、哪一条成员、什么工具。</p>
+     *
+     * @return 空表示这一批做得到；有值时是拒绝的原因
+     */
+    private String unwaitableTargetReason(AcceptanceReleasePolicy policy,
+                                          AcceptanceReleasePolicy.RuleMatches matches,
+                                          List<WaitMemberDraft> drafts) {
+        if (policy == null || matches == null) {
+            return null;
+        }
+        for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
+            if (!rule.holds() && !rule.waitsForPeers()) {
+                continue;
+            }
+            AcceptanceReleasePolicy.MemberFacts target = matches.targetOf(rule.index()).orElse(null);
+            if (target == null) {
+                continue;
+            }
+            String toolName = toolNameOf(drafts, target.memberSeq());
+            if (toolName == null || toolDispatcher.requiresStableOperationId(toolName)) {
+                // 会转后台的工具就是那个需要稳定外部作业身份的工具（见 NodeToolDispatcher）：
+                // 它的结果以后才回来，压住与等兄弟成员有可等的东西。
+                continue;
+            }
+            return "acceptance_fixture_rule_needs_waiting_member:" + rule.index() + ":" + toolName;
+        }
+        return null;
+    }
+
+    private static String toolNameOf(List<WaitMemberDraft> drafts, int memberSeq) {
+        for (WaitMemberDraft draft : drafts) {
+            if (draft.getMemberSeq() == memberSeq) {
+                return draft.getToolName();
+            }
+        }
+        return null;
     }
 
     /**
@@ -556,6 +616,8 @@ public class DualPoolWaitGroupNodeExecutor {
                 : policy.ruleAt(policyMatches, memberFacts(input, modelTurn, member));
         Optional<String> designated = rule.filter(AcceptanceReleasePolicy.Rule::fails)
                 .map(AcceptanceReleasePolicy.Rule::failureDetail);
+        AcceptanceReleasePolicy.Rule namedBy = rule.orElse(null);
+        AcceptanceReleasePolicy.Rule actionNotApplied = null;
         if (designated.isPresent()) {
             // 验收夹具点名这条成员按失败收尾：工具当场真的成功了也记成失败，这正是这个场景要造出来的
             // 「有一条成员失败、其余的照常」。工具的真实输出留在成员行里，失败原因单独写清楚。
@@ -569,12 +631,23 @@ public class DualPoolWaitGroupNodeExecutor {
             } else {
                 extra.put("designatedFailure", designated.get());
             }
-        } else if (rule.isPresent()) {
-            // 压住结果与等兄弟成员先落终态这两种规则，针对的是「结果以后才回来」的成员。
-            // 这条成员在本次调用里当场就把结果拿回来了，那两条规则在这里没有可等的东西，
-            // 只留一行记录，不放行也不压住。
-            log.info("放行策略点名的这条成员当场就结束了，压住与等兄弟成员在这里不适用：group={} member={} 规则={}",
-                    member.getGroupId(), member.getMemberIdentity(), rule.get().describe());
+        } else if (namedBy != null) {
+            // 压住结果与等兄弟成员先落终态这两种规则，针对的是「结果以后才回来」的成员。这条成员在
+            // 本次调用里没有进入等待（当场出结果，或者被额度、控制信号按失败中止），那两条动作没有
+            // 可作用的对象。派发之前已经按工具名拦过一次，这里是最后一道：动作没有落到它身上，就不
+            // 能在终态核对里算成「压住过」或者「等过」，所以这一条按夹具自己的错误码收场，并把
+            // 「动作没有生效」写进证据。
+            actionNotApplied = namedBy;
+            extra = new LinkedHashMap<>(extra);
+            String detail = "放行策略 " + namedBy.describe() + " 点名的这条成员没有进入等待"
+                    + "（当场出结果，或者已经按失败中止），压住与等兄弟成员没有可等的东西";
+            if (success) {
+                success = false;
+                extra.put("errorCode", RULE_ACTION_NOT_APPLIED_CODE);
+                extra.put("errorDetail", detail);
+            } else {
+                extra.put("ruleActionNotApplied", detail);
+            }
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
@@ -590,8 +663,33 @@ public class DualPoolWaitGroupNodeExecutor {
         if (!result.applied()) {
             log.info("成员结果没有写进去（重复上报或已落终态）：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity());
+            return result.notificationId();
         }
+        recordMemberAction(input, member, designated.isPresent() ? namedBy : null, actionNotApplied);
         return result.notificationId();
+    }
+
+    /**
+     * 这条成员的终态落定之后，把「被点名的动作有没有落到它身上」写进证据。
+     *
+     * <p>两种：指定失败的动作（终态按夹具说的落成失败）算生效；压住与等兄弟成员这两种在这条路上
+     * 没有可作用的对象，算没有生效。压住与等兄弟成员真正生效的那一刻在结果接收方（成员真的被留在
+     * 执行中、等放行点或者等兄弟成员），那里写的是另外两种结果。</p>
+     */
+    private void recordMemberAction(SegmentExecution input,
+                                    WaitMember member,
+                                    AcceptanceReleasePolicy.Rule designatedRule,
+                                    AcceptanceReleasePolicy.Rule notAppliedRule) {
+        String runId = input.identity().runId();
+        if (designatedRule != null) {
+            ruleHitStore.recordAction(runId, designatedRule.index(),
+                    FixtureRuleHitStore.APPLIED_FAILURE, "成员按夹具点名的原因收成失败");
+        }
+        if (notAppliedRule != null) {
+            ruleHitStore.recordAction(runId, notAppliedRule.index(), FixtureRuleHitStore.NOT_APPLIED,
+                    "这条成员（" + member.getMemberIdentity() + "，组内第 " + member.getMemberSeq()
+                            + " 条）没有进入等待，压住与等兄弟成员没有可等的东西");
+        }
     }
 
     /** 在这一次模型回合的请求里找回某个成员对应的那条工具请求。 */

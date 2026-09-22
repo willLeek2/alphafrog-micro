@@ -454,9 +454,11 @@ public class WaitMemberResultReceiver {
                         group.getId(), key, String.join(",", waitingFor), releaseKey);
                 return new PolicyAction(false, PolicyOutcome.holdTimeout());
             }
-            return hold(member, waitingForPeers
+            String reason = waitingForPeers
                     ? "waiting_for:" + String.join(",", waitingFor)
-                    : "waiting_release_point:" + releaseKey);
+                    : "waiting_release_point:" + releaseKey;
+            return hold(member, rule, waitingForPeers
+                    ? FixtureRuleHitStore.APPLIED_PEER : FixtureRuleHitStore.APPLIED_HOLD, reason);
         }
         heldSinceByMember.remove(key);
         return PolicyAction.proceed();
@@ -481,9 +483,9 @@ public class WaitMemberResultReceiver {
     }
 
     private static AcceptanceReleasePolicy.MemberFacts memberFactsOf(WaitGroup group, WaitMember member) {
-        return new AcceptanceReleasePolicy.MemberFacts(group.getNodeId(), group.getNodeAttempt(),
-                group.getSegmentSequence(), group.getModelTurn(), member.getMemberSeq(),
-                member.getToolCallId());
+        return new AcceptanceReleasePolicy.MemberFacts(group.getPlanGeneration(), group.getNodeId(),
+                group.getNodeAttempt(), group.getSegmentSequence(), group.getModelTurn(),
+                member.getMemberSeq(), member.getToolCallId());
     }
 
     /** 这个等待组里与某条成员身份对上的那一行；对不上时为空。 */
@@ -510,15 +512,24 @@ public class WaitMemberResultReceiver {
             return;
         }
         try {
-            ruleHitStore.record(member.getRunId(), rule, group.getId(), member.getMemberSeq());
+            ruleHitStore.recordMatch(member.getRunId(), rule, group.getId(),
+                    memberFactsOf(group, member));
         } catch (RuntimeException e) {
             recordedRuleHits.remove(key);
             throw e;
         }
     }
 
-    /** 压住这条成员：只推下次查询时间，不动退避计数；真的推后了就在读数里记一笔。 */
-    private PolicyAction hold(WaitMember member, String reason) {
+    /**
+     * 压住这条成员：只推下次查询时间，不动退避计数；真的推后了就在读数里记一笔。
+     *
+     * <p>推后成功这一刻才算「点名的动作落到了这条成员身上」，所以证据也在这一刻写：成员已经不是
+     * 执行中时这条语句一行都不改，那次不算压住，动作结果也就不会记成生效。</p>
+     */
+    private PolicyAction hold(WaitMember member,
+                             AcceptanceReleasePolicy.Rule rule,
+                             String appliedKind,
+                             String reason) {
         heldSinceByMember.putIfAbsent(memberKey(member),
                 new HeldSince(member.getRunId(), OffsetDateTime.now()));
         boolean pushed = waitGroupStore.holdMember(member.getGroupId(), member.getMemberIdentity(),
@@ -526,6 +537,7 @@ public class WaitMemberResultReceiver {
         if (pushed) {
             // 只记真的推后的那几次：成员已经不是执行中时这条语句一行都不改，那不是一次压住。
             holdPushes.incrementAndGet();
+            ruleHitStore.recordAction(member.getRunId(), rule.index(), appliedKind, reason);
         }
         log.debug("夹具策略压住这条成员，等放行：group={} member={} reason={} pushed={}",
                 member.getGroupId(), member.getMemberIdentity(), reason, pushed);
@@ -601,12 +613,12 @@ public class WaitMemberResultReceiver {
         if (terminal != null) {
             extra.put("taskId", terminal.taskId());
         }
-        String designated = policy == null
+        AcceptanceReleasePolicy.Rule designatedRule = policy == null
                 ? null
                 : ruleFor(policy, group, member)
                         .filter(AcceptanceReleasePolicy.Rule::fails)
-                        .map(AcceptanceReleasePolicy.Rule::failureDetail)
                         .orElse(null);
+        String designated = designatedRule == null ? null : designatedRule.failureDetail();
         if (refusal != null) {
             success = false;
             extra.put("errorCode", refusal.code());
@@ -677,8 +689,11 @@ public class WaitMemberResultReceiver {
         if (outcome != null && outcome.holdTimeoutRelease()) {
             releasedOnHoldTimeout.incrementAndGet();
         }
-        if (designatedApplied) {
+        if (designatedApplied && designatedRule != null) {
             designatedFailures.incrementAndGet();
+            // 指定失败的终态真的写进去了：这一刻才算「这条规则的动作落到了点名的成员身上」。
+            ruleHitStore.recordAction(group.getRunId(), designatedRule.index(),
+                    FixtureRuleHitStore.APPLIED_FAILURE, "按失败收尾：" + designated);
         }
         log.info("等待成员结果已接回：group={} member={} seq={} state={} 报告={}",
                 member.getGroupId(), member.getMemberIdentity(), member.getMemberSeq(),

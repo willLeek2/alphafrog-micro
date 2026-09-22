@@ -473,7 +473,7 @@ class WaitMemberResultReceiverTest {
     @Test
     void aDesignatedMemberFailsEvenWhenTheSandboxSucceeded() {
         givenGroupMembers(givenDueMember());
-        policyOf("{\"rules\":[{\"for\":{\"nodeId\":\"node-1\",\"memberSeq\":0},"
+        policyOf("{\"rules\":[{\"for\":{\"planGeneration\":2,\"nodeId\":\"node-1\",\"nodeAttempt\":1,\"segmentSequence\":3,\"modelTurn\":0,\"memberSeq\":0},"
                 + "\"fail\":\"这个场景要造一条失败成员\"}]}");
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
@@ -719,23 +719,23 @@ class WaitMemberResultReceiverTest {
 
     /** 点名压住这条成员：选择器写清是哪个节点的哪一条成员，不靠工具调用编号。 */
     private static String holdRule() {
-        return "{\"rules\":[{\"for\":{\"nodeId\":\"node-1\",\"memberSeq\":0},"
+        return "{\"rules\":[{\"for\":{\"planGeneration\":2,\"nodeId\":\"node-1\",\"nodeAttempt\":1,\"segmentSequence\":3,\"modelTurn\":0,\"memberSeq\":0},"
                 + "\"holdUntilPoint\":\"point-a\"}]}";
     }
 
     private static String holdRuleWithHoldTimeout() {
-        return "{\"maxHoldSeconds\":1,\"rules\":[{\"for\":{\"nodeId\":\"node-1\",\"memberSeq\":0},"
+        return "{\"maxHoldSeconds\":1,\"rules\":[{\"for\":{\"planGeneration\":2,\"nodeId\":\"node-1\",\"nodeAttempt\":1,\"segmentSequence\":3,\"modelTurn\":0,\"memberSeq\":0},"
                 + "\"holdUntilPoint\":\"point-a\"}]}";
     }
 
     /** 点名等另一条成员先落终态：等谁也用选择器写，光写编号在别的组里会点错。 */
     private static String peerRule(String peerToolCallId) {
-        return "{\"rules\":[{\"for\":{\"nodeId\":\"node-1\",\"memberSeq\":0},"
+        return "{\"rules\":[{\"for\":{\"planGeneration\":2,\"nodeId\":\"node-1\",\"nodeAttempt\":1,\"segmentSequence\":3,\"modelTurn\":0,\"memberSeq\":0},"
                 + "\"releaseAfter\":[{\"toolCallId\":\"" + peerToolCallId + "\"}]}]}";
     }
 
     private static String peerRuleWithHoldTimeout() {
-        return "{\"maxHoldSeconds\":1,\"rules\":[{\"for\":{\"nodeId\":\"node-1\",\"memberSeq\":0},"
+        return "{\"maxHoldSeconds\":1,\"rules\":[{\"for\":{\"planGeneration\":2,\"nodeId\":\"node-1\",\"nodeAttempt\":1,\"segmentSequence\":3,\"modelTurn\":0,\"memberSeq\":0},"
                 + "\"releaseAfter\":[{\"memberSeq\":1}]}]}";
     }
 
