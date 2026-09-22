@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.config;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
@@ -38,21 +39,36 @@ class LangchainRunAsyncConfigTest {
     }
 
     @Test
-    void theNodePoolRegistersTheValuesItActuallyUses() {
+    void theNodePoolRegistersTheValuesItActuallyUses() throws Exception {
         FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
 
         ThreadPoolTaskExecutor executor = new LangchainRunAsyncConfig()
                 .agentLangchainNodeTaskExecutor(inUse, 0, 0, 60, "agent-node-");
+        String label = beanNameOf("agentLangchainNodeTaskExecutor",
+                FrozenEffectiveSettings.class, int.class, int.class, int.class, String.class);
 
         assertThat(executor.getCorePoolSize()).as("至少要有一个线程，否则节点池不干活").isEqualTo(1);
         assertThat(executor.getMaxPoolSize()).isEqualTo(1);
         assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_NODE_WORKER_CORE_POOL_SIZE))
-                .containsEntry("agentLangChainNodeTaskExecutor", 1);
+                .containsEntry(label, 1);
         assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_NODE_WORKER_MAX_POOL_SIZE))
-                .containsEntry("agentLangChainNodeTaskExecutor", 1);
+                .containsEntry(label, 1);
         assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_NODE_WORKER_KEEP_ALIVE_SECONDS))
-                .containsEntry("agentLangChainNodeTaskExecutor", 60);
+                .containsEntry(label, 60);
         assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_NODE_WORKER_THREAD_NAME_PREFIX))
-                .containsEntry("agentLangChainNodeTaskExecutor", "agent-node-");
+                .containsEntry(label, "agent-node-");
+    }
+
+    /**
+     * 登记健康读数用的名字必须与这个 Bean 真正的名字一模一样。
+     *
+     * <p>两处各写一遍字符串时，改了一处忘了另一处不会有任何用例失败——读数里会多出一个没人认识的
+     * 名字，而真正的线程池在读数里看不到。这里把两处绑在一起比。</p>
+     */
+    private static String beanNameOf(String method, Class<?>... parameterTypes) throws Exception {
+        Bean declared = LangchainRunAsyncConfig.class.getMethod(method, parameterTypes).getAnnotation(Bean.class);
+        assertThat(declared).as("这个方法上要有 @Bean").isNotNull();
+        assertThat(declared.name()).as("Bean 名要显式写出来，别靠方法名").hasSize(1);
+        return declared.name()[0];
     }
 }

@@ -430,6 +430,28 @@ class NodeWorkItemMapperBindingTest {
     }
 
     /**
+     * 连了 Run 主表的那条查询，列名要逐列带上本表的别名。
+     *
+     * <p>Run 主表上也有 plan_generation、run_control_version、scheduler_version、id、created_at
+     * 这些同名列，不带别名在 PostgreSQL 上会直接报「列名有歧义」：这条语句一条也跑不出来。
+     * 这种错在只跑单测的机器上一直是绿的（那些用例不连库），要到真库上才炸，所以按渲染出来的
+     * SQL 逐列核一遍。</p>
+     */
+    @Test
+    void columnsAreAliasedWhenTheQueryJoinsTheRunTable() {
+        String sql = normalized(configuration.getMappedStatement(
+                        NAMESPACE + ".listUnfinishedByRunSchedulerVersion")
+                .getSqlSource().getBoundSql(dummyParams("listUnfinishedByRunSchedulerVersion")).getSql());
+        assertThat(sql).as("这条语句连了 Run 主表，才需要这条保护").contains("JOIN alphafrog_agent_run");
+        for (String column : List.of("id", "run_id", "plan_generation", "node_id", "node_attempt",
+                "segment_sequence", "state", "context_version", "run_control_version", "claim_epoch",
+                "scheduler_version", "claimed_by", "lease_expires_at", "next_visible_at",
+                "runnable_since", "dispatch_defer_reason", "payload_json", "created_at", "updated_at")) {
+            assertThat(sql).as("列 " + column + " 要带本表别名 wi.").contains("wi." + column);
+        }
+    }
+
+    /**
      * 节点派发的那一次全局扫描：新旧双池版本的到期分段放在一份候选里，一次取回；
      * 顺序里排第一位的是这张图最近被派发的轮次，从没被派发过的排最前。
      */

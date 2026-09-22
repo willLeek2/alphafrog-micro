@@ -54,6 +54,33 @@
         updated_at
     </sql>
 
+    <!--
+      同一批列，逐列带上本表的别名，给需要连 Run 主表的那几条查询用。
+      Run 主表上也有 plan_generation、run_control_version、scheduler_version、id、created_at 这些同名列，
+      不带别名在 PostgreSQL 上会直接报「列名有歧义」，语句一条都跑不出来。
+    -->
+    <sql id="workItemColumnsAliased">
+        wi.id,
+        wi.run_id,
+        wi.plan_generation,
+        wi.node_id,
+        wi.node_attempt,
+        wi.segment_sequence,
+        wi.state,
+        wi.context_version,
+        wi.run_control_version,
+        wi.claim_epoch,
+        wi.scheduler_version,
+        wi.claimed_by,
+        wi.lease_expires_at,
+        wi.next_visible_at,
+        wi.runnable_since,
+        wi.dispatch_defer_reason,
+        wi.payload_json::text AS payload_json,
+        wi.created_at,
+        wi.updated_at
+    </sql>
+
     <sql id="identityFence">
         run_id = #{runId}
         AND plan_generation = #{planGeneration}
@@ -181,7 +208,7 @@
       变成永远为真的判断——被筛掉的那些行根本看不见。这里把它读全，再由调用方逐行比对版本。
     -->
     <select id="listUnfinishedByRunSchedulerVersion" resultMap="NodeWorkItemResultMap">
-        SELECT <include refid="workItemColumns"/>
+        SELECT <include refid="workItemColumnsAliased"/>
         FROM alphafrog_agent_run_work_item wi
         JOIN alphafrog_agent_run r ON r.id = wi.run_id
         WHERE r.scheduler_version = #{schedulerVersion}

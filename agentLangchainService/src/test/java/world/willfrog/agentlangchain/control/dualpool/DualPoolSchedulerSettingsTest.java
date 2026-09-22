@@ -199,7 +199,7 @@ class DualPoolSchedulerSettingsTest {
     void startupFrozenValuesReportWhatTheComponentsActuallyUse() {
         FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
         inUse.register("agent.langchain.dual-pool.node-worker.core-pool-size",
-                "agentLangChainNodeTaskExecutor", 2);
+                "agentLangchainNodeTaskExecutor", 2);
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("agent.langchain.dual-pool.node-worker.core-pool-size", "8");
         DualPoolSchedulerSettings settings = new DualPoolSchedulerSettings(null, environment, inUse);
@@ -209,7 +209,7 @@ class DualPoolSchedulerSettingsTest {
 
         assertThat(core.intValue()).as("请求了 8，线程池真正在用 2").isEqualTo(2);
         assertThat(core.requested()).as("请求值单独留一份").isEqualTo(8);
-        assertThat(core.inUseBy()).containsEntry("agentLangChainNodeTaskExecutor", 2);
+        assertThat(core.inUseBy()).containsEntry("agentLangchainNodeTaskExecutor", 2);
         assertThat(core.rejection()).as("两个数不一样要说出来").contains("请求值与实际生效值不同");
         assertThat(core.hotChangeable()).isFalse();
     }

@@ -72,8 +72,12 @@ public class LangchainRunAsyncConfig {
     /**
      * 双池版本的节点执行线程池。它只消费已经在数据库中成功领取的节点工作项，
      * 与 Run 协调线程完全分开，避免慢节点占住协调名额。
+     *
+     * <p>Bean 名保持与注入点（`DualPoolDispatcher` 的限定名）一致的那个拼法：显式指定 Bean 名之后
+     * 方法名不再作为别名保留，两个名字差一个字母，服务启动时就会找不到这个线程池。健康读数里
+     * 登记用的名字与本名一致，不再另起一个拼法。</p>
      */
-    @Bean(name = "agentLangChainNodeTaskExecutor")
+    @Bean(name = "agentLangchainNodeTaskExecutor")
     public ThreadPoolTaskExecutor agentLangchainNodeTaskExecutor(
             FrozenEffectiveSettings frozenEffectiveSettings,
             @Value("${agent.langchain.dual-pool.node-worker.core-pool-size:4}") int corePoolSize,
@@ -83,7 +87,7 @@ public class LangchainRunAsyncConfig {
             String threadNamePrefix) {
         ThreadPoolTaskExecutor executor =
                 directHandoffExecutor(corePoolSize, maxPoolSize, keepAliveSeconds, threadNamePrefix);
-        registerPoolValues(frozenEffectiveSettings, "agentLangChainNodeTaskExecutor", executor,
+        registerPoolValues(frozenEffectiveSettings, "agentLangchainNodeTaskExecutor", executor,
                 DualPoolSchedulerSettings.KEY_NODE_WORKER_CORE_POOL_SIZE,
                 DualPoolSchedulerSettings.KEY_NODE_WORKER_MAX_POOL_SIZE,
                 DualPoolSchedulerSettings.KEY_NODE_WORKER_KEEP_ALIVE_SECONDS,
