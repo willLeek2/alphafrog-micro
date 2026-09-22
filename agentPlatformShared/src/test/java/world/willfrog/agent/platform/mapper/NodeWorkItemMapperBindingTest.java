@@ -452,6 +452,33 @@ class NodeWorkItemMapperBindingTest {
     }
 
     /**
+     * 创建工作项这一条是 Run 级写入：两层条件都要在同一句里核。
+     *
+     * <p>只核服务所有权不够。协调回合是「先读一次 Run 事实、再建工作项」，读事实之后、建行之前父 Run
+     * 可能已经往前走了：计划重建（代际变了）、暂停或取消（控制版本抬高）、整条 Run 已经终结。
+     * 这几种情况下建出来的行都属于已经过期的协调回合，语句里必须带上父 Run 的精确版本与可执行状态，
+     * 让它影响 0 行——这件事只有真库才判得出来，所以这里按渲染出来的 SQL 逐项核对。</p>
+     */
+    @Test
+    void createCarriesBothTheOwnershipFenceAndTheParentRunVersions() {
+        String insert = normalized(configuration.getMappedStatement(NAMESPACE + ".insert")
+                .getSqlSource().getBoundSql(dummyParams("insert")).getSql());
+        assertThat(insert).as("所有权那一层：持有人、代际号、未过期")
+                .contains("alphafrog_agent_run_service_lease")
+                .contains("owner_instance_id = ?")
+                .contains("fencing_token = ?")
+                .contains("expires_at > CURRENT_TIMESTAMP");
+        assertThat(insert).as("父 Run 那一层：调度器版本、计划代际、控制版本逐项相等")
+                .contains("FROM alphafrog_agent_run owner_run")
+                .contains("owner_run.scheduler_version = COALESCE(?, 'DUAL_POOL_V1')")
+                .contains("owner_run.plan_generation = ?")
+                .contains("owner_run.run_control_version = ?");
+        assertThat(insert).as("父 Run 还得停在能接着跑的状态上：与 requeueAbandonedClaim 用的是同一份清单")
+                .contains("owner_run.status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING',")
+                .contains("'SUMMARIZING', 'WAITING_TOOL_JOB')");
+    }
+
+    /**
      * 节点派发的那一次全局扫描：新旧双池版本的到期分段放在一份候选里，一次取回；
      * 顺序里排第一位的是这张图最近被派发的轮次，从没被派发过的排最前。
      */

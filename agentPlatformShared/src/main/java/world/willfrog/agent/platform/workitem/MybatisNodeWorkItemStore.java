@@ -45,8 +45,9 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
             return NodeWorkItemMutationResult.success();
         }
         NodeWorkItemIdentity identity = NodeWorkItemIdentity.of(item);
-        // 影响 0 行有两种可能：同一个身份已经有一行（唯一约束挡下），或者这条 Run 的服务所有权
-        // 已经不在本进程手上（语句里的所有权条件挡下）。回读一次把两者分开，不然日志会指错方向。
+        // 影响 0 行有两种可能：同一个身份已经有一行（唯一约束挡下），或者这条 Run 级写入现在不被允许
+        // （语句里的两个 EXISTS 挡下：所有权不在本进程，或者父 Run 的计划代际/控制版本/状态已经从
+        // 这次协调回合读到的那一版往前走了）。回读一次把「同一身份」这种分开，不然日志会指错方向。
         if (mapper.findByIdentity(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence()) != null) {
             log.warn("同一个身份已经有工作项，创建被唯一约束拒绝：{}", identity.describe());
@@ -54,7 +55,7 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                     NodeWorkItemRejectionReason.DUPLICATE_IDENTITY, identity,
                     NodeWorkItemVersions.of(item), null));
         }
-        log.error("这条 Run 的服务所有权已经不在本进程，工作项创建被拒: fence={} identity={}",
+        log.error("这条 Run 级写入被拒，工作项没有建成（所有权或父 Run 版本/状态已变）: fence={} identity={}",
                 fence.describe(), identity.describe());
         return NodeWorkItemMutationResult.rejected(NodeWorkItemRejection.of(
                 NodeWorkItemRejectionReason.OWNERSHIP_LOST, identity, NodeWorkItemVersions.of(item),

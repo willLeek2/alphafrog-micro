@@ -2160,6 +2160,33 @@ class Stage3WaitContractPostgresTest {
                 + badRun + "'")).as("Run 删掉时分段行一起走，所以「Run 没了、行还在」也留不下来").isZero();
     }
 
+    /**
+     * 创建工作项这一条是 Run 级写入：所有权与父 Run 的精确版本要在同一句里核。
+     *
+     * <p>协调回合是「先读一次 Run 事实、再建工作项」。租约被别的实例接管、计划代际被重建、控制版本
+     * 被抬高、或者父 Run 已经终结之后，旧协调回合建出来的行都属于过期事实：这条语句必须一行都建不出来，
+     * 而不是先建出来再靠下游发现。</p>
+     */
+    @Test
+    void creatingAWorkItemNeedsTheOwnershipAndTheExactParentRunVersions() throws Exception {
+        String runId = "run-work-item-parent-fence";
+        createRun(runId, 2, 3L);
+        ServiceOwnershipFence fence = ownershipForInsert(runId);
+
+        assertThat(insertSegmentRows(runId, fence, 2, 3L, "node-ok"))
+                .as("版本对得上、状态还能接着跑：这一行建得出来").isEqualTo(1);
+        assertThat(insertSegmentRows(runId, fence, 1, 3L, "node-stale-plan"))
+                .as("计划代际对不上：这是上一个计划代际的协调回合，建不出来").isZero();
+        assertThat(insertSegmentRows(runId, fence, 2, 2L, "node-stale-control"))
+                .as("控制版本对不上：读到事实之后这条 Run 被暂停或取消过").isZero();
+
+        execute("UPDATE alphafrog_agent_run SET status = 'COMPLETED' WHERE id = '" + runId + "'");
+        assertThat(insertSegmentRows(runId, fence, 2, 3L, "node-terminal"))
+                .as("父 Run 已经终结：不该再往它里面建分段").isZero();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_work_item WHERE run_id = '"
+                + runId + "'")).as("只有版本对得上的那一行留了下来").isEqualTo(1);
+    }
+
     /** 资格记录建到一半的事务回滚：库里不留半条记录；同一个入口再来一次并提交，留下恰好一条。 */
     @Test
     void aRolledBackEntitlementWriteLeavesNoRowBehind() throws Exception {
@@ -2314,6 +2341,33 @@ class Stage3WaitContractPostgresTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             assertThat(session.getMapper(NodeWorkItemMapper.class)
                     .insert(item, fence.ownerInstanceId(), fence.fencingToken())).isEqualTo(1);
+        }
+    }
+
+    /**
+     * 按给定版本造一条分段，返回语句实际影响的行数。
+     *
+     * <p>0 行有两种成因：所有权条件挡下（凭据被换掉或租约过期），父 Run 版本条件挡下（计划代际、
+     * 控制版本或状态已经往前走了）。用例按「哪一项写错」分别造，读回来的行数就是答案。</p>
+     */
+    private static int insertSegmentRows(String runId, ServiceOwnershipFence fence, int planGeneration,
+                                         long runControlVersion, String nodeId) {
+        NodeWorkItem item = new NodeWorkItem();
+        item.setRunId(runId);
+        item.setPlanGeneration(planGeneration);
+        item.setNodeId(nodeId);
+        item.setNodeAttempt(0);
+        item.setSegmentSequence(0);
+        item.setState("RUNNABLE");
+        item.setContextVersion(0L);
+        item.setRunControlVersion(runControlVersion);
+        item.setClaimEpoch(0);
+        item.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        item.setNextVisibleAt(java.time.OffsetDateTime.now().minusSeconds(1));
+        item.setPayloadJson("{}");
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            return session.getMapper(NodeWorkItemMapper.class)
+                    .insert(item, fence.ownerInstanceId(), fence.fencingToken());
         }
     }
 

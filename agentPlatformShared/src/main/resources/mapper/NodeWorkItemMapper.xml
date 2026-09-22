@@ -107,9 +107,16 @@
       新建一条工作项。同一个身份已经有一行时返回 0（唯一约束上 DO NOTHING），不是异常：
       条件更新管不了「同一个身份出现两行」，这条唯一约束才是那道闸。
 
-      它同时是 Run 级写入：由这条 Run 的所有者授权。语句用 INSERT ... SELECT + WHERE EXISTS
-      把服务所有权条件写进同一句，持有人、代际号与未过期三者缺一不可——不带凭据、或者凭据
-      已经被别人换掉，这一行就建不出来（影响 0 行），调用方按「这条 Run 现在不归我推进」处理。
+      它同时是 Run 级写入：由这条 Run 的所有者授权，而且这一行必须与父 Run 此刻的事实对得上。
+      语句用 INSERT ... SELECT + 两个 EXISTS 把两层条件写进同一句：①服务所有权（持有人、代际号、
+      未过期三者缺一不可）；②父 Run 的调度器版本、计划代际、控制版本逐项等于这条工作项携带的值，
+      状态还得是「还能接着跑」的那几个。
+
+      两层条件缺一不可的原因写在时间差上：协调回合是「先读一次 Run 事实、再建工作项」。
+      读事实之后、建行之前，租约可能被另一个实例接管（旧实例不该再往这条 Run 里建东西），
+      父 Run 也可能往前走了——计划已经重建（代际变了）、控制版本被暂停/取消抬高、或者整条 Run
+      已经终结：这几种情况下这一行都属于「已经过期的协调回合建出来的行」，建不出来才对。
+      影响 0 行时调用方按「这条 Run 现在不归我推进」处理，等下一轮重新读事实。
     -->
     <insert id="insert" parameterType="world.willfrog.agent.platform.workitem.NodeWorkItem">
         INSERT INTO alphafrog_agent_run_work_item
@@ -131,6 +138,15 @@
               AND lease_row.fencing_token = #{fencingToken}
               AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
         )
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{item.runId}
+                AND owner_run.scheduler_version = COALESCE(#{item.schedulerVersion}, 'DUAL_POOL_V1')
+                AND owner_run.plan_generation = #{item.planGeneration}
+                AND owner_run.run_control_version = #{item.runControlVersion}
+                AND owner_run.status IN (<include refid="liveRunStatuses"/>)
+          )
         ON CONFLICT (run_id, plan_generation, node_id, node_attempt, segment_sequence) DO NOTHING
     </insert>
 
