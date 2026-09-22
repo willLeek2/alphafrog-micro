@@ -4,7 +4,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
@@ -88,9 +87,10 @@ public class RunServiceLeaseKeeper {
     /**
      * 续期周期的毫秒数：周期任务与读数用的是这一个数。
      *
-     * <p>下面 {@link #renewPeriodically()} 上的 {@code @Scheduled} 用 SpEL 直接取这里的值，而不是各自
-     * 去读一遍属性：属性值不合法（0 或负数）时这里按 1 毫秒处理，定时那一处若自己读属性就会拿到 0 而
-     * 变成不停转的空转，读数上还看不出来。</p>
+     * <p>{@link RunServiceLeaseRenewSchedule} 在这个 bean 建完之后，用这里已经归一化的值去注册固定延迟。
+     * 属性值不合法（0 或负数）时这里按 1 毫秒处理；若定时任务自己再读一遍属性，就会拿到 0 变成不停转的空转，
+     * 读数上还看不出来。不能在 {@code @Scheduled} 里用 SpEL 引用这个 bean 自己：创建过程中解析表达式会形成
+     * 自引用循环，容器起不来。</p>
      */
     public long renewIntervalMillis() {
         return renewIntervalMs;
@@ -102,7 +102,7 @@ public class RunServiceLeaseKeeper {
         safeRenew();
     }
 
-    @Scheduled(fixedDelayString = "#{@runServiceLeaseKeeper.renewIntervalMillis()}")
+    /** 由 {@link RunServiceLeaseRenewSchedule} 按 {@link #renewIntervalMillis()} 注册的周期入口。 */
     public void renewPeriodically() {
         safeRenew();
     }

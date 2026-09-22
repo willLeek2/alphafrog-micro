@@ -7,10 +7,8 @@ import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
-import org.springframework.beans.factory.config.BeanExpressionContext;
-import org.springframework.context.expression.StandardBeanExpressionResolver;
 import org.springframework.scheduling.annotation.EnableScheduling;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -231,21 +229,37 @@ class RunServiceLeaseKeeperTest {
     /**
      * 定时续期取的就是这里登记的周期：属性值不合法时按 1 毫秒排，而不是各自再读一遍属性。
      *
-     * <p>排期用的是 SpEL 表达式，写错 Bean 名或表达式时容器起不来，所以这条用例真的把容器起一遍。</p>
+     * <p>排期发生在这个 bean 建完之后。若再在 {@code @Scheduled} 里用 SpEL 引用自己，
+     * Spring Boot 3.2 会把创建过程判成自引用循环，容器起不来。</p>
      */
     @Test
-    void theScheduledRenewalUsesTheRegisteredInterval() throws Exception {
+    void theScheduledRenewalUsesTheRegisteredInterval() {
+        FrozenEffectiveSettings illegal = new FrozenEffectiveSettings();
+        RunServiceLeaseKeeper clamped = new RunServiceLeaseKeeper(
+                leaseStore, admissionRegistry, identity, 0L, 0, 0L, illegal);
+        ScheduledTaskRegistrar registrar = new ScheduledTaskRegistrar();
+        new RunServiceLeaseRenewSchedule(clamped).configureTasks(registrar);
+
+        assertThat(registrar.getFixedDelayTaskList()).hasSize(1);
+        assertThat(registrar.getFixedDelayTaskList().get(0).getIntervalDuration())
+                .as("定时续期的周期与读数里登记的是同一个数")
+                .isEqualTo(Duration.ofMillis(1));
+    }
+
+    /**
+     * 容器按构造函数创建这个 bean，同时打开定时任务处理：不能再出现创建过程中引用自己的循环。
+     */
+    @Test
+    void springCanCreateTheKeeperWithoutASelfReferenceCycle() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
-            context.registerBean("runServiceLeaseKeeper", RunServiceLeaseKeeper.class, () -> keeper);
-            context.registerBean(SchedulingEnabler.class);
+            context.registerBean(RunServiceLeaseStore.class, () -> leaseStore);
+            context.registerBean(DualPoolRunAdmissionRegistry.class, () -> admissionRegistry);
+            context.registerBean(ProcessInstanceIdentity.class, () -> identity);
+            context.registerBean(FrozenEffectiveSettings.class, FrozenEffectiveSettings::new);
+            context.register(RunServiceLeaseKeeper.class, RunServiceLeaseRenewSchedule.class, SchedulingEnabler.class);
             context.refresh();
 
-            Scheduled scheduled = RunServiceLeaseKeeper.class.getMethod("renewPeriodically")
-                    .getAnnotation(Scheduled.class);
-            Object resolved = new StandardBeanExpressionResolver().evaluate(
-                    scheduled.fixedDelayString(), new BeanExpressionContext(context.getBeanFactory(), null));
-
-            assertThat(resolved).as("定时续期的周期与读数里登记的是同一个数").isEqualTo(40_000L);
+            assertThat(context.getBean(RunServiceLeaseKeeper.class).renewIntervalMillis()).isEqualTo(40_000L);
         }
     }
 
