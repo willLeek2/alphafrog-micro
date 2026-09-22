@@ -20,6 +20,17 @@ public record RunServiceLease(
         OffsetDateTime renewedAt,
         OffsetDateTime expiresAt) {
 
+    /**
+     * 生产会话把 BIGINT 读成装箱的 {@code Long}。MyBatis 按实参类型找构造器，
+     * 找不到 {@code long} 那一档时，领取语句会在行已经写入之后把映射异常抛回调用方。
+     */
+    public RunServiceLease(String runId, String ownerInstanceId, Long fencingToken,
+                           OffsetDateTime acquiredAt, OffsetDateTime renewedAt,
+                           OffsetDateTime expiresAt) {
+        this(runId, ownerInstanceId, fencingToken == null ? 0L : fencingToken.longValue(),
+                acquiredAt, renewedAt, expiresAt);
+    }
+
     /** 这一刻是不是已经过期：过期只说明「可以有人来接」，不等于已经没人在跑了。 */
     public boolean expiredAt(OffsetDateTime now) {
         return expiresAt == null || !expiresAt.isAfter(now);
