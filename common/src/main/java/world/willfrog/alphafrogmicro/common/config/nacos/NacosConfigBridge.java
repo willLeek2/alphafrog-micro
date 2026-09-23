@@ -45,6 +45,9 @@ import java.util.concurrent.Executor;
  * 无内容再回落 "{dataId}"（主配置）；整链为空打 error 日志，本地加载器回落默认。
  * 候选链只做组内 data-id 回落：所有查询都固定用订阅自身的 group，
  * 绝不跨组回退（不回落到订阅组之外的任何组，也不在组内造别的组名）。</p>
+ *
+ * <p>本地缓存路径在有 {@code AF_LANE_TRAFFIC_SCOPE_ID} 时会再拆一层子目录
+ * （见 {@link NacosLocalCachePaths}），避免主环境和泳道挂同一宿主目录时互相覆盖。</p>
  */
 @Slf4j
 @Component
@@ -201,6 +204,7 @@ public class NacosConfigBridge implements SmartLifecycle {
     }
 
     private void subscribe(Subscription subscription) throws NacosException {
+        subscription.setTargetFile(NacosLocalCachePaths.isolate(subscription.getTargetFile(), laneScopeId()));
         String subscriptionGroup = isBlank(subscription.getGroup()) ? group : subscription.getGroup();
         List<String> candidates = candidateDataIds(subscription);
         // Nacos 客户端断连时 getConfig 会回退本地快照文件；候选链上每一条的快照都要清掉，

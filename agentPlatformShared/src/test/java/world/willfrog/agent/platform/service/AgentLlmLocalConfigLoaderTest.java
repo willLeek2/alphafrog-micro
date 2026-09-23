@@ -1029,6 +1029,38 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath() throws Exception {
+        Path shared = tempDir.resolve("agent-llm.local.json");
+        Path isolated = shared.getParent().resolve("stage3-dag-0922").resolve("agent-llm.local.json");
+        Files.createDirectories(isolated.getParent());
+        Files.writeString(shared, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } }
+                }
+                """, StandardCharsets.UTF_8);
+        Files.writeString(isolated, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "DUAL_POOL_V2" } }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", shared.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+        ReflectionTestUtils.setField(loader, "laneTrafficScopeId", "stage3-dag-0922");
+
+        loader.applyNacosWrittenFile(shared.toString());
+        assertTrue(loader.current().isEmpty(), "共用路径上的主环境缓存不得被泳道加载器当成覆盖");
+
+        loader.applyNacosWrittenFile(isolated.toString());
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+        loader.refresh();
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+    }
+
+    @Test
     void snakeCaseApplicationMapper_stillBindsCamelCaseSchedulerVersion() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """

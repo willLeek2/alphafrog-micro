@@ -18,6 +18,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalCachePaths;
 import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 import world.willfrog.alphafrogmicro.common.utils.PlaceholderResolver;
 
@@ -87,6 +88,9 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
     @Value("${alphafrog.config.nacos.enabled:false}")
     private boolean nacosEnabled;
 
+    @Value("${AF_LANE_TRAFFIC_SCOPE_ID:}")
+    private String laneTrafficScopeId;
+
     private volatile boolean syncedFromNacos;
 
     @Autowired(required = false)
@@ -140,7 +144,7 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
         if (targetFile == null || targetFile.isBlank()) {
             return;
         }
-        String file = configFile == null ? "" : configFile.trim();
+        String file = resolvedConfigFile();
         if (file.isEmpty()) {
             return;
         }
@@ -164,8 +168,12 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
         return !nacosEnabled || syncedFromNacos;
     }
 
+    private String resolvedConfigFile() {
+        return NacosLocalCachePaths.isolate(configFile == null ? "" : configFile.trim(), laneTrafficScopeId);
+    }
+
     private void reloadIfNeeded(boolean force) {
-        String file = configFile == null ? "" : configFile.trim();
+        String file = resolvedConfigFile();
         if (file.isEmpty()) {
             if (force) {
                 log.info("agent.llm.config-file is empty, skip local llm config loading");

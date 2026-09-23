@@ -487,7 +487,8 @@ class NacosConfigBridgeTest {
 
         invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
 
-        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(targetFile));
+        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(isolatedCache(targetFile)));
+        assertFalse(Files.exists(targetFile), "泳道不得写入与主环境共用的缓存路径");
         // 泳道候选第一个被查且命中即短路，主 data-id 未被查询
         InOrder inOrder = inOrder(mockConfigService);
         inOrder.verify(mockConfigService).getConfig("lane-demo.agent-llm.json", "alphafrog-beta-config", 5000L);
@@ -516,11 +517,11 @@ class NacosConfigBridgeTest {
                 ArgumentCaptor.forClass(NacosLocalConfigWrittenEvent.class);
         verify(publisher).publishEvent(captor.capture());
         NacosLocalConfigWrittenEvent event = captor.getValue();
-        assertEquals(targetFile.toString(), event.getTargetFile());
+        assertEquals(isolatedCache(targetFile).toString(), event.getTargetFile());
         assertEquals("agent-llm.json", event.getDataId());
         assertEquals("lane-demo.agent-llm.json", event.getEffectiveDataId());
         assertEquals("initial-load", event.getWriteSource());
-        assertTrue(Files.readString(targetFile).contains("DUAL_POOL_V2"));
+        assertTrue(Files.readString(isolatedCache(targetFile)).contains("DUAL_POOL_V2"));
     }
 
     @Test
@@ -554,7 +555,9 @@ class NacosConfigBridgeTest {
         // 场景 c（overlay）：整链全空 → 删本地文件，加载器回落权威默认
         environment.setProperty("AF_LANE_TRAFFIC_SCOPE_ID", "lane-demo");
         Path targetFile = tempDir.resolve("agent-prompt-overlay.local.json");
-        Files.writeString(targetFile, "{\"formatVersion\":1,\"prompts\":{}}");
+        Path isolated = isolatedCache(targetFile);
+        Files.createDirectories(isolated.getParent());
+        Files.writeString(isolated, "{\"formatVersion\":1,\"prompts\":{}}");
 
         NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
         injectValueField(bridge, "group", "alphafrog-beta-config");
@@ -568,7 +571,7 @@ class NacosConfigBridgeTest {
 
         invokeSubscribe(bridge, subscription("agent-prompt-overlay.json", "alphafrog-beta-config", targetFile));
 
-        assertFalse(Files.exists(targetFile));
+        assertFalse(Files.exists(isolated));
         verify(mockConfigService).getConfig("lane-demo.agent-prompt-overlay.json", "alphafrog-beta-config", 5000L);
         verify(mockConfigService).getConfig("agent-prompt-overlay.json", "alphafrog-beta-config", 5000L);
     }
@@ -590,7 +593,7 @@ class NacosConfigBridgeTest {
         injectConfigService(bridge, mockConfigService);
 
         invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
-        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(targetFile));
+        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(isolatedCache(targetFile)));
 
         // 泳道 listener 收到「泳道配置被删」的推送（此时 getConfig(lane) 已返回 null）
         ArgumentCaptor<Listener> laneListenerCaptor = ArgumentCaptor.forClass(Listener.class);
@@ -599,7 +602,7 @@ class NacosConfigBridgeTest {
         laneListenerCaptor.getValue().receiveConfigInfo(null);
 
         // 整链重解析：泳道空 → 主 Beta 内容写入，覆盖掉旧泳道 JSON
-        assertEquals("{\"from\":\"main-beta\"}", Files.readString(targetFile));
+        assertEquals("{\"from\":\"main-beta\"}", Files.readString(isolatedCache(targetFile)));
         InOrder inOrder = inOrder(mockConfigService);
         inOrder.verify(mockConfigService).getConfig("lane-demo.agent-llm.json", "alphafrog-beta-config", 5000L);
         inOrder.verify(mockConfigService).getConfig("agent-llm.json", "alphafrog-beta-config", 5000L);
@@ -622,11 +625,11 @@ class NacosConfigBridgeTest {
         injectConfigService(bridge, mockConfigService);
 
         invokeSubscribe(bridge, subscription("agent-llm.json", "alphafrog-beta-config", targetFile));
-        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(targetFile));
+        assertEquals("{\"from\":\"lane-demo\"}", Files.readString(isolatedCache(targetFile)));
 
         bridge.refreshSubscriptions();
 
-        assertEquals("{\"from\":\"main-beta\"}", Files.readString(targetFile));
+        assertEquals("{\"from\":\"main-beta\"}", Files.readString(isolatedCache(targetFile)));
     }
 
     @Test
@@ -695,6 +698,10 @@ class NacosConfigBridgeTest {
         } finally {
             System.setProperty("user.home", previousHome);
         }
+    }
+
+    private static Path isolatedCache(Path configured) {
+        return Path.of(NacosLocalCachePaths.isolate(configured.toString(), "lane-demo"));
     }
 
     // ==================== 反射辅助方法 ====================
