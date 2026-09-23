@@ -651,7 +651,7 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
-        MemberCompletionResult result = waitGroupStore.completeMember(new MemberCompletionRequest(
+        MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
                 member.getGroupId(),
                 member.getMemberIdentity(),
                 success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
@@ -659,7 +659,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 member.getExternalOperationId(),
                 input.identity().planGeneration(),
                 input.versions().contextVersion(),
-                input.versions().runControlVersion()));
+                input.versions().runControlVersion()), member);
         if (!result.applied()) {
             log.info("成员结果没有写进去（重复上报或已落终态）：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity());
@@ -667,6 +667,35 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         recordMemberAction(input, member, designated.isPresent() ? namedBy : null, actionNotApplied);
         return result.notificationId();
+    }
+
+    /**
+     * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
+     */
+    private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member) {
+        try {
+            return waitGroupStore.completeMember(request);
+        } catch (RuntimeException e) {
+            log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
+                    member.getGroupId(), member.getMemberIdentity(), e);
+            String compact = WaitMemberResultPayload.compactPersistFailure(
+                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+            MemberCompletionRequest fallback = new MemberCompletionRequest(
+                    request.groupId(),
+                    request.memberIdentity(),
+                    WaitMemberState.FAILED,
+                    compact,
+                    request.externalOperationId(),
+                    request.planGeneration(),
+                    request.contextVersion(),
+                    request.runControlVersion());
+            try {
+                return waitGroupStore.completeMember(fallback);
+            } catch (RuntimeException retry) {
+                e.addSuppressed(retry);
+                throw e;
+            }
+        }
     }
 
     /**

@@ -662,7 +662,7 @@ public class WaitMemberResultReceiver {
             return;
         }
 
-        MemberCompletionResult result = waitGroupStore.completeMember(new MemberCompletionRequest(
+        MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
                 member.getGroupId(),
                 member.getMemberIdentity(),
                 success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
@@ -670,7 +670,7 @@ public class WaitMemberResultReceiver {
                 member.getExternalOperationId(),
                 group.getPlanGeneration(),
                 segment.getContextVersion(),
-                run.getRunControlVersion()));
+                run.getRunControlVersion()), member);
         // 这条成员有结论了，压住的计时不再需要。成员终态只落一次，这一条在上面那条语句返回 0 行时
         // 也照样清掉：那时它已经在别处落过终态，计时留着只会白占内存。
         heldSinceByMember.remove(memberKey(member));
@@ -703,6 +703,35 @@ public class WaitMemberResultReceiver {
             // 它自己的周期补扫与启动扫描会按数据库把这条通知重新发现。
             recoveryDispatcher.wake(result.notificationId());
             wakeups.incrementAndGet();
+        }
+    }
+
+    /**
+     * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
+     */
+    private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member) {
+        try {
+            return waitGroupStore.completeMember(request);
+        } catch (RuntimeException e) {
+            log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
+                    member.getGroupId(), member.getMemberIdentity(), e);
+            String compact = WaitMemberResultPayload.compactPersistFailure(
+                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+            MemberCompletionRequest fallback = new MemberCompletionRequest(
+                    request.groupId(),
+                    request.memberIdentity(),
+                    WaitMemberState.FAILED,
+                    compact,
+                    request.externalOperationId(),
+                    request.planGeneration(),
+                    request.contextVersion(),
+                    request.runControlVersion());
+            try {
+                return waitGroupStore.completeMember(fallback);
+            } catch (RuntimeException retry) {
+                e.addSuppressed(retry);
+                throw e;
+            }
         }
     }
 

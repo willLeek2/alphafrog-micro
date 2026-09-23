@@ -150,9 +150,16 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
 
     /** 用例把它设成与分段执行输入一致，用来模拟「这一段已经不归调用方所有」。 */
     int expectedClaimEpoch = 1;
+    /** 成员结束的 JSON 含这段文字时抛错，用来模拟 jsonb 写入失败。 */
+    String rejectCompleteMemberJsonContaining;
 
     @Override
     public MemberCompletionResult completeMember(MemberCompletionRequest request) {
+        if (rejectCompleteMemberJsonContaining != null
+                && request.resultRefJson() != null
+                && request.resultRefJson().contains(rejectCompleteMemberJsonContaining)) {
+            throw new IllegalStateException("simulated jsonb reject");
+        }
         FakeMember member = memberRows(request.groupId()).stream()
                 .filter(row -> row.memberIdentity.equals(request.memberIdentity()))
                 .findFirst().orElseThrow(() -> new IllegalArgumentException("成员不存在：" + request.memberIdentity()));
