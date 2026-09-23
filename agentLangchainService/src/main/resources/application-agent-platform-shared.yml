@@ -19,10 +19,6 @@ agent:
     record-channel-max-bytes: ${AF_FINANCE_RECORD_CHANNEL_MAX_BYTES:262144}
     stdout-max-bytes: ${AF_FINANCE_STDOUT_MAX_BYTES:1048576}
     stderr-max-bytes: ${AF_FINANCE_STDERR_MAX_BYTES:262144}
-  acceptance-fixture:
-    # 默认关。带 acceptanceFixtureId 的请求在开关关闭时直接拒绝，不改走普通规划。
-    # 显式 AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED 优先；未设置时有 AF_LANE_TRAFFIC_SCOPE_ID 的进程打开。
-    enabled: ${AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED:false}
   tool-job:
     # durable 工具的同步快路径；超过该阈值后 Run 先落 checkpoint，再转 WAITING_TOOL_JOB。
     fast-path-ms: ${AF_AGENT_TOOL_JOB_FAST_PATH_MS:1500}

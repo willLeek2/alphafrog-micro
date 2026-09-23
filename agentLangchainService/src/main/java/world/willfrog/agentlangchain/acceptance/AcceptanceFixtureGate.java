@@ -28,9 +28,6 @@ public class AcceptanceFixtureGate {
     /** 请求上下文里的字段名；只带编号，带不了计划或模型内容。 */
     public static final String CONTEXT_FIELD = "acceptanceFixtureId";
 
-    /** 执行控制面总开关（yml 绑定名）；显式环境变量见 {@link #ENV_FLAG}。 */
-    public static final String ENABLED_PROPERTY = "agent.acceptance-fixture.enabled";
-
     /** 控制器写入的显式开关。未设置时，有泳道范围的进程打开，主 Beta 保持关闭。 */
     public static final String ENV_FLAG = "AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED";
 
