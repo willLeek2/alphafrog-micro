@@ -26,7 +26,7 @@ import static org.mockito.Mockito.when;
  * 按 Run 取回放行策略：不带夹具编号的 Run 拿到空，带编号的按夹具里的那份策略走。
  *
  * <p>这里量三件事：普通 Run 一步都不查；同一份策略读两次拿到同一个对象（策略是不可变值，解析一次
- * 就够了）；夹具在跑的中途失效时读策略当场报错，不许「夹具不让用了，被压住的成员却被悄悄放过去」。</p>
+ * 就够了）；夹具在跑的中途失效时读策略当场报错。控制 Run 第一次读过之后，行过期仍返回冻结的那一版。</p>
  */
 class AcceptanceRunPolicyRegistryTest {
 
@@ -152,6 +152,29 @@ class AcceptanceRunPolicyRegistryTest {
                 .isInstanceOf(AcceptanceFixtureExecutionException.class)
                 .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
                         .isEqualTo("acceptance_fixture_not_enabled"));
+    }
+
+    /**
+     * 控制 Run 第一次读过策略之后，行过期仍返回冻结的那一版。
+     *
+     * <p>创建门已经核过启用与过期。压住窗口可能比控制行 TTL 长：到期后继续核存活会把已经压住的
+     * 成员收成读失败。内容摘要仍要对上；夹具 Run 不走这条路。</p>
+     */
+    @Test
+    void aControlRunKeepsFrozenPolicyAfterTheRowExpires() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("ctrl-1", POLICY);
+        AcceptanceReleasePolicy first = registry.policyForRun(controlRun("ctrl-1")).orElseThrow();
+
+        when(store.find(LANE, GENERATION, "ctrl-1"))
+                .thenReturn(Optional.of(new AcceptanceFixtureRow("ctrl-1", "scenario-a", true,
+                        OffsetDateTime.now().minusMinutes(5), OffsetDateTime.now().minusSeconds(1),
+                        null, null, POLICY)));
+
+        AcceptanceReleasePolicy second = registry.policyForRun(controlRun("ctrl-1")).orElseThrow();
+
+        assertThat(second).isSameAs(first);
+        verify(store, times(2)).find(LANE, GENERATION, "ctrl-1");
     }
 
     /**

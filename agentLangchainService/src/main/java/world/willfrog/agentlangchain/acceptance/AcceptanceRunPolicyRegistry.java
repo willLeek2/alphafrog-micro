@@ -16,9 +16,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * 按 Run 取回「这条 Run 的结果放行策略」。
  *
  * <p>策略来自夹具或控制行的 {@code dispatch_policy_json}：不带这两种编号的 Run、或者这一行没写
- * 放行策略的 Run 拿到空，成员结果照原来的方式立刻收尾。夹具本身由 {@link AcceptanceFixtureResolver}
- * 查回来并核对，所以这一行在跑的中途失效时，读策略这一步会跟着停下——不会出现「夹具不让用了，
- * 但压住的成员还被悄悄放过去」。请求同时带了夹具编号和控制编号时，策略仍取夹具那一行。</p>
+ * 放行策略的 Run 拿到空，成员结果照原来的方式立刻收尾。夹具 Run 每一次取用仍由
+ * {@link AcceptanceFixtureResolver} 核启用与过期，中途停用或过期时读策略当场停下。控制 Run
+ * 第一次读过之后，启用与过期随内容一起冻结，后续只对策略摘要；TTL 到期时压住的成员仍按冻结的
+ * 那一版等到放行点或兜底。请求同时带了夹具编号和控制编号时，策略仍取夹具那一行。</p>
  *
  * <p>「读到的是策略」与「读到的是空」都要冻结：第一次读到的那一版是什么，这条 Run 就按哪一版跑完。
  * 只冻结有策略的那一种会漏掉一种改法——夹具一开始没写策略、跑到一半被改成带策略，于是前半段的
@@ -58,7 +59,10 @@ public class AcceptanceRunPolicyRegistry {
     public Optional<AcceptanceReleasePolicy> policyForRun(AgentRun run) {
         Optional<AcceptanceFixtureRow> row = fixtureResolver.resolve(run);
         if (row.isEmpty()) {
-            row = fixtureResolver.resolveControl(run);
+            boolean frozen = policyByRun.containsKey(run.getId()) || absentRuns.contains(run.getId());
+            row = frozen
+                    ? fixtureResolver.resolveControlIgnoringLiveness(run)
+                    : fixtureResolver.resolveControl(run);
         }
         if (row.isEmpty()) {
             return Optional.empty();
@@ -105,8 +109,8 @@ public class AcceptanceRunPolicyRegistry {
                     "本进程记住的夹具 Run 已经到 " + MAX_TRACKED_RUNS + " 条：这个数只会在终态事件漏掉时涨起来，"
                             + "先查这些 Run 为什么没走到终态");
         }
-        // 第一次读到策略就把这份策略写下来：之后夹具行被改过、被停用或被删掉，核对结论仍然说得清
-        //「这次验收点名了哪几件事」。内容被原位改过时这里会当场拒绝。
+        // 第一次读到策略就把这份策略写下来。夹具 Run 之后仍核启用与过期；控制 Run 之后只对内容
+        // 摘要。内容被原位改过时这里会当场拒绝。
         ruleHitStore.snapshotPolicy(runId, fixtureId, row.get().scenarioId(), parsed.get());
         fixtureIdByRun.putIfAbsent(runId, fixtureId);
         AcceptanceReleasePolicy winner = policyByRun.putIfAbsent(runId, parsed.get());

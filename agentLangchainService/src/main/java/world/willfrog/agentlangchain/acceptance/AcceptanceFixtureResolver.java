@@ -24,8 +24,9 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  * <p>模型回复与结果放行策略都走这一份实现：两边对「这条 Run 带的是哪条夹具、现在还能不能用」
  * 必须有同一个答案，各写一套迟早会分家。</p>
  *
- * <p>每一次取用都重新查一遍、重新核一遍：夹具在跑的中途被停用或过期时，这条 Run 的后续执行按
- * 失败处理并写明原因。</p>
+ * <p>夹具 Run 每一次取用都重新查一遍、重新核一遍：中途被停用或过期时，后续执行按失败处理并写明
+ * 原因。控制 Run 第一次读过放行策略之后，启用与过期随内容一起冻结，后续只把行读回来对策略摘要；
+ * 那条路径见 {@link AcceptanceRunPolicyRegistry}。</p>
  */
 @Component
 @Slf4j
@@ -81,6 +82,20 @@ public class AcceptanceFixtureResolver {
      * 不把两行的策略混在一起。控制编号是空的或读不出来时当场拒绝，不悄悄当普通 Run 跑。</p>
      */
     public Optional<AcceptanceFixtureRow> resolveControl(AgentRun run) {
+        return resolveControlRow(run, true);
+    }
+
+    /**
+     * 控制 Run 已经冻结过策略内容之后，再把这一行读回来对摘要。
+     *
+     * <p>行还在就能读。启用、过期不再挡：TTL 到期或中途停用时，压住的成员仍按冻结的那一版等到
+     * 放行点或兜底。内容摘要对不上仍由调用方拒绝。行被删掉仍是 {@code acceptance_control_not_found}。</p>
+     */
+    public Optional<AcceptanceFixtureRow> resolveControlIgnoringLiveness(AgentRun run) {
+        return resolveControlRow(run, false);
+    }
+
+    private Optional<AcceptanceFixtureRow> resolveControlRow(AgentRun run, boolean requireLive) {
         if (run == null || isBlank(run.getId())) {
             return Optional.empty();
         }
@@ -100,7 +115,10 @@ public class AcceptanceFixtureResolver {
         DeploymentIdentity lane = laneOf(run, "acceptance_control_lane_unknown",
                 "acceptance_control_lane_mismatch");
         String controlId = readControlId(context);
-        return Optional.of(requireUsableRow(lane, controlId, run.getId(), "acceptance_control"));
+        if (requireLive) {
+            return Optional.of(requireUsableRow(lane, controlId, run.getId(), "acceptance_control"));
+        }
+        return Optional.of(loadExistingRow(lane, controlId, run.getId(), "acceptance_control"));
     }
 
     /**
@@ -133,15 +151,22 @@ public class AcceptanceFixtureResolver {
         return stored;
     }
 
-    private AcceptanceFixtureRow requireUsableRow(DeploymentIdentity lane,
-                                                  String rowId,
-                                                  String runId,
-                                                  String codePrefix) {
-        AcceptanceFixtureRow row = store.find(lane.deploymentId(), lane.generationId(), rowId)
+    private AcceptanceFixtureRow loadExistingRow(DeploymentIdentity lane,
+                                                 String rowId,
+                                                 String runId,
+                                                 String codePrefix) {
+        return store.find(lane.deploymentId(), lane.generationId(), rowId)
                 .orElseThrow(() -> refuse(codePrefix + "_not_found",
                         "本泳道本代际没有这一行: id=" + rowId
                                 + " lane=" + lane.deploymentId() + " generation=" + lane.generationId()
                                 + " runId=" + runId));
+    }
+
+    private AcceptanceFixtureRow requireUsableRow(DeploymentIdentity lane,
+                                                  String rowId,
+                                                  String runId,
+                                                  String codePrefix) {
+        AcceptanceFixtureRow row = loadExistingRow(lane, rowId, runId, codePrefix);
         if (!row.enabled()) {
             throw refuse(codePrefix + "_not_enabled", "这一行还没启用: " + row.describe());
         }
