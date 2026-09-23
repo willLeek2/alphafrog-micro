@@ -203,6 +203,36 @@ class FixtureScenarioVerdictTest {
                 .satisfies(rule -> assertThat(rule).contains("还没落地"));
     }
 
+    /**
+     * 规则已经绑过一条成员、后来又打中别的成员：点名对象之外的那一次不能让验收显示通过。
+     *
+     * <p>第一条仍然算动作生效；越界单独列出来。只看「点名的那条有没有被压住」会漏掉汇总节点那条
+     * python 被同一条 unique 规则再次打中。</p>
+     */
+    @Test
+    void anOverHitRuleIsNamedEvenWhenTheBoundActionApplied() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+        OffsetDateTime now = OffsetDateTime.now();
+        FixtureRuleHitStore.RuleHit hit = new FixtureRuleHitStore.RuleHit(0, "holdUntilPoint",
+                "memberSeq=0;nodeId=n1", 1L,
+                new AcceptanceReleasePolicy.MemberFacts(3, "n1", 0, 0, 0, 0, "call-a"),
+                now, now, FixtureRuleHitStore.APPLIED_HOLD,
+                FixtureRuleHitStore.OVER_HIT_MARKER + "：已绑定 call-a，再次点名 call-b");
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0), List.of(hit));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.unappliedRules()).as("点名的那一条动作已经生效").isEmpty();
+        assertThat(verdict.overHitRules()).singleElement()
+                .satisfies(rule -> assertThat(rule).contains(FixtureRuleHitStore.OVER_HIT_MARKER));
+        assertThat(verdict.describeMissing()).contains("后来又打中别的成员");
+    }
+
     /** 一条规则的落库记录：默认已经打中并生效，指定结果时按给的写。 */
     private static FixtureRuleHitStore.RuleHit hit(int ruleIndex, String outcome) {
         OffsetDateTime now = OffsetDateTime.now();

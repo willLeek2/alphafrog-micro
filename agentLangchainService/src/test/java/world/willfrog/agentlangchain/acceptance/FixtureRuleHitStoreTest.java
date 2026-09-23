@@ -43,29 +43,26 @@ class FixtureRuleHitStoreTest {
                 any(), any(), any(), any(), any())).thenReturn(0);
         hitRowBacks(MEMBER_A, null);
 
-        store.recordMatch(RUN, rule(0), 7L, MEMBER_A);
-        store.recordMatch(RUN, rule(0), 7L, MEMBER_A);
+        assertThat(store.recordMatch(RUN, rule(0), 7L, MEMBER_A))
+                .isEqualTo(FixtureRuleHitStore.MatchBinding.BOUND);
+        assertThat(store.recordMatch(RUN, rule(0), 7L, MEMBER_A))
+                .isEqualTo(FixtureRuleHitStore.MatchBinding.BOUND);
     }
 
     /**
-     * 同一个规则序号落到另一个目标上：当场拒绝。
+     * 同一个规则序号落到另一个目标上：不改已有行，返回已经绑过别人。
      *
-     * <p>两批调用撞上同一个点名时，压住、等待或判失败的是谁就说不清了；选择器写全之后本不该发生，
-     * 所以这里不许悄悄多记一行、也不许把先记下来的那一条改掉。</p>
+     * <p>后来这条成员不该被改写成验收失败；调用方按返回值记越界命中，业务结果照常接。
+     * 命中行写不进去才拒绝。</p>
      */
     @Test
-    void aRuleLandingOnAnotherTargetIsRefused() {
+    void aRuleLandingOnAnotherTargetIsOverHitNotRefused() {
         when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any(), any(), any(),
                 any(), any(), any(), any(), any())).thenReturn(0);
         hitRowBacks(MEMBER_A, null);
 
-        assertThatThrownBy(() -> store.recordMatch(RUN, rule(0), 7L, MEMBER_B))
-                .isInstanceOf(AcceptanceFixtureExecutionException.class)
-                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
-                        .isEqualTo("acceptance_fixture_policy_target_conflict"))
-                .hasMessageContaining("只该绑定一个目标")
-                .hasMessageContaining(MEMBER_A.describe())
-                .hasMessageContaining(MEMBER_B.describe());
+        assertThat(store.recordMatch(RUN, rule(0), 7L, MEMBER_B))
+                .isEqualTo(FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER);
     }
 
     /** 命中那一行没写进去（也读不回来）时同样拒绝：这一次验收说不清动作落到了谁身上。 */
@@ -193,7 +190,8 @@ class FixtureRuleHitStoreTest {
     /** 动作结果已经写过一次时，第二次上报不算数：三种生效结果各写一次，不许被改掉。 */
     @Test
     void aSecondActionReportIsNotCounted() {
-        when(jdbcTemplate.update(anyString(), any(), any(), any(), any())).thenReturn(0);
+        when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(0);
         hitRowBacks(MEMBER_A, FixtureRuleHitStore.APPLIED_HOLD);
 
         assertThat(store.recordAction(RUN, 0, FixtureRuleHitStore.APPLIED_PEER, "又来一次"))
@@ -203,9 +201,19 @@ class FixtureRuleHitStoreTest {
     /** 结果写进去了：算一次。 */
     @Test
     void anActionReportThatLandsIsCounted() {
-        when(jdbcTemplate.update(anyString(), any(), any(), any(), any())).thenReturn(1);
+        when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(1);
 
         assertThat(store.recordAction(RUN, 0, FixtureRuleHitStore.APPLIED_HOLD, "压住")).isTrue();
+    }
+
+    /** 越界命中写在已经绑定的那一行上，第二次再记同一条规则不再追加。 */
+    @Test
+    void anOverHitIsWrittenOnceOnTheBoundRow() {
+        when(jdbcTemplate.update(anyString(), any(), any(), any(), any(), any())).thenReturn(1);
+
+        store.recordOverHit(RUN, rule(0), MEMBER_B, MEMBER_A);
+        store.recordOverHit(RUN, rule(0), MEMBER_B, MEMBER_A);
     }
 
     /** 传进来的是空 Run 或空身份时不写库：这条 Run 不是夹具 Run。 */

@@ -33,7 +33,6 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
@@ -375,7 +374,7 @@ public class DualPoolWaitGroupNodeExecutor {
             return new Outcome.NotOwned("segment_not_matched:" + input.identity().describe());
         }
         long groupId = suspended.groupId();
-        recordPolicyMatches(input.identity().runId(), policy, policyMatches, groupId);
+        policyMatches = recordPolicyMatches(input.identity().runId(), policy, policyMatches, groupId);
         Long notificationId = dispatchMembers(groupId, input, modelTurn, policy, policyMatches, calls);
         if (notificationId != null) {
             boolean published = resumedSegmentPublisher.publish(notificationId,
@@ -456,28 +455,44 @@ public class DualPoolWaitGroupNodeExecutor {
      * 起来像跑完了。所以命中要落库，跑到终态时按它核对。派发前与结果接收方都会记，重复记只留一行。
      * 这里记的是「选择器打中了谁」；被点名的动作有没有真的落到这条成员身上，是动作真的发生时才记的
      * （压住、等兄弟成员、按失败收尾各自在自己的那一刻写）。</p>
+     *
+     * <p>{@code uniqueExternalTask} 打中一个已经绑过别人的目标时，这一条从返回的命中里拿掉：
+     * 后面 {@link #completeMember} 不会再按这条规则改写它的业务结果。越界记在已经绑定的那一行上。
+     * {@code allExternalTasks} 的其余成员仍留在命中里，动作按内存生效。建组派发前能拦住的写错
+     * （点名组外成员、压住当场出结果的工具）仍然直接抛，那时还没有沙箱结果可销毁。</p>
      */
-    private void recordPolicyMatches(String runId,
-                                     AcceptanceReleasePolicy policy,
-                                     AcceptanceReleasePolicy.RuleMatches matches,
-                                     long groupId) {
+    private AcceptanceReleasePolicy.RuleMatches recordPolicyMatches(String runId,
+                                                                   AcceptanceReleasePolicy policy,
+                                                                   AcceptanceReleasePolicy.RuleMatches matches,
+                                                                   long groupId) {
         if (policy == null || matches == null) {
-            return;
+            return matches;
         }
+        Map<Integer, List<AcceptanceReleasePolicy.MemberFacts>> kept = new LinkedHashMap<>();
         for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
+            List<AcceptanceReleasePolicy.MemberFacts> keptTargets = new ArrayList<>();
             for (AcceptanceReleasePolicy.MemberFacts target : matches.targetsOf(rule.index())) {
-                try {
-                    ruleHitStore.recordMatch(runId, rule, groupId, target);
-                } catch (AcceptanceFixtureExecutionException e) {
-                    if ("acceptance_fixture_policy_target_conflict".equals(e.code())
-                            && AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
+                FixtureRuleHitStore.MatchBinding binding =
+                        ruleHitStore.recordMatch(runId, rule, groupId, target);
+                if (binding == FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER) {
+                    if (AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
                         // 命中表按规则序号只留第一行；其余成员的压住仍按内存里的命中生效。
+                        keptTargets.add(target);
                         continue;
                     }
-                    throw e;
+                    AcceptanceReleasePolicy.MemberFacts bound = ruleHitStore.hitOf(runId, rule.index())
+                            .map(FixtureRuleHitStore.RuleHit::target)
+                            .orElse(null);
+                    ruleHitStore.recordOverHit(runId, rule, target, bound);
+                    continue;
                 }
+                keptTargets.add(target);
+            }
+            if (!keptTargets.isEmpty()) {
+                kept.put(rule.index(), keptTargets);
             }
         }
+        return new AcceptanceReleasePolicy.RuleMatches(kept);
     }
 
     /**

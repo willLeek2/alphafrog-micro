@@ -252,6 +252,11 @@ public class FixtureCallStore {
                             + "runId={} fixture={} 动作没生效的规则={}",
                     runId, scenario.get("fixtureId"), verdict.unappliedRules());
         }
+        if (!verdict.overHitRules().isEmpty()) {
+            log.error("验收夹具的放行策略有规则越界打中了别的成员，这次验收不能算通过: "
+                            + "runId={} fixture={} 越界命中的规则={}",
+                    runId, scenario.get("fixtureId"), verdict.overHitRules());
+        }
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("runId", runId);
         snapshot.put("fixtureId", scenario.get("fixtureId"));
@@ -269,6 +274,7 @@ public class FixtureCallStore {
         snapshot.put("policyHitRuleCount", appliedRules);
         snapshot.put("policyMissingRules", verdict.missingRules());
         snapshot.put("policyUnappliedRules", verdict.unappliedRules());
+        snapshot.put("policyOverHitRules", verdict.overHitRules());
         snapshot.put("ruleHits", ruleHits.stream().map(FixtureRuleHitStore.RuleHit::describe).toList());
         return Optional.of(snapshot);
     }
@@ -281,6 +287,9 @@ public class FixtureCallStore {
         }
         if (!verdict.unappliedRules().isEmpty()) {
             parts.add("打中了成员但动作没有生效：" + String.join("；", verdict.unappliedRules()));
+        }
+        if (!verdict.overHitRules().isEmpty()) {
+            parts.add("规则越界命中：" + String.join("；", verdict.overHitRules()));
         }
         return parts.isEmpty() ? null : String.join(" | ", parts);
     }

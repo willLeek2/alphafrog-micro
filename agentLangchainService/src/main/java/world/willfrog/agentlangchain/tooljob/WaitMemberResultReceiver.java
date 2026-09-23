@@ -120,6 +120,11 @@ public class WaitMemberResultReceiver {
     private final FixtureRuleHitStore ruleHitStore;
     /** 这个进程已经往库里记过的命中（Run|规则|组|成员）：同一件事不必每一轮都去问一次库。 */
     private final Set<String> recordedRuleHits = ConcurrentHashMap.newKeySet();
+    /**
+     * {@code uniqueExternalTask} 越界命中的成员键：已经记过越界之后每一轮都要照常接结果，
+     * 不能因为「命中已经记过」就回头去压住。
+     */
+    private final Set<String> overHitRuleMembers = ConcurrentHashMap.newKeySet();
 
     /** 每压住一轮记一次（同一条成员被压住多轮就记多笔），不是「压住过几条成员」。 */
     private final AtomicLong holdPushes = new AtomicLong();
@@ -424,7 +429,10 @@ public class WaitMemberResultReceiver {
             return PolicyAction.proceed();
         }
         AcceptanceReleasePolicy.Rule rule = matched.get();
-        recordRuleHit(group, member, rule);
+        if (!recordRuleHit(group, member, rule)) {
+            heldSinceByMember.remove(key);
+            return PolicyAction.proceed();
+        }
         List<AcceptanceReleasePolicy.MemberFacts> peers;
         try {
             peers = policy.peersOf(rule, memberFactsOf(group, member), facts);
@@ -539,23 +547,33 @@ public class WaitMemberResultReceiver {
      * 记一笔「这条规则真的打中了这条成员」。
      *
      * <p>同一件事只往库里记一次：这条成员被压住时会一轮一轮地走到这里，每一轮都写一遍没有意义。
-     * 记失败时不留下「已经记过」的记号，下一轮再试。</p>
+     * 记失败时不留下「已经记过」的记号，下一轮再试。返回 false 表示这条规则已经绑了别人：
+     * {@code uniqueExternalTask} 越界命中，调用方应照常接结果，不要压住也不要改写成失败。
+     * {@code allExternalTasks} 的其余成员返回 true，动作仍按内存命中生效。</p>
      */
-    private void recordRuleHit(WaitGroup group, WaitMember member, AcceptanceReleasePolicy.Rule rule) {
+    private boolean recordRuleHit(WaitGroup group, WaitMember member, AcceptanceReleasePolicy.Rule rule) {
         String key = member.getRunId() + "|" + rule.index() + "|" + group.getId() + "|" + member.getMemberSeq();
+        if (overHitRuleMembers.contains(key)) {
+            return false;
+        }
         if (!recordedRuleHits.add(key)) {
-            return;
+            return true;
         }
         try {
-            ruleHitStore.recordMatch(member.getRunId(), rule, group.getId(),
-                    memberFactsOf(group, member));
-        } catch (AcceptanceFixtureExecutionException e) {
-            recordedRuleHits.remove(key);
-            if ("acceptance_fixture_policy_target_conflict".equals(e.code())
-                    && AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
-                return;
+            FixtureRuleHitStore.MatchBinding binding = ruleHitStore.recordMatch(member.getRunId(), rule,
+                    group.getId(), memberFactsOf(group, member));
+            if (binding == FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER) {
+                if (AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
+                    return true;
+                }
+                AcceptanceReleasePolicy.MemberFacts bound = ruleHitStore.hitOf(member.getRunId(), rule.index())
+                        .map(FixtureRuleHitStore.RuleHit::target)
+                        .orElse(null);
+                ruleHitStore.recordOverHit(member.getRunId(), rule, memberFactsOf(group, member), bound);
+                overHitRuleMembers.add(key);
+                return false;
             }
-            throw e;
+            return true;
         } catch (RuntimeException e) {
             recordedRuleHits.remove(key);
             throw e;
@@ -616,6 +634,7 @@ public class WaitMemberResultReceiver {
                 .removeIf(entry -> entry.getValue().runId().equals(event.runId()));
         String prefix = event.runId() + "|";
         recordedRuleHits.removeIf(key -> key.startsWith(prefix));
+        overHitRuleMembers.removeIf(key -> key.startsWith(prefix));
     }
 
     /**

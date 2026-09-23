@@ -396,6 +396,47 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     /**
+     * uniqueExternalTask 在下一组再打中另一条 python：成员照常派发，不按验收失败收尾。
+     *
+     * <p>命中表整条 Run 每条规则只留第一行。后来这条是场景 2 汇总节点那种真实业务调用，
+     * 仪器不该把它的结果改写成验收错误码。越界记在已经绑定的那一行上，等场景裁决响出来。</p>
+     */
+    @Test
+    void aLaterGroupUniqueHitStillDispatchesTheMember() {
+        dispatcher.requiresOperationId = true;
+        dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":call-a:1", "task-a", dispatchProof(RUN_ID + ":call-a:1", "task-a")));
+        AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
+                {"rules":[{"match":"uniqueExternalTask","toolName":"executePython","holdUntilPoint":"dag-wait-a"}]}
+                """, objectMapper).orElseThrow();
+        when(ruleHits.recordMatch(any(), any(), anyLong(), any()))
+                .thenReturn(FixtureRuleHitStore.MatchBinding.BOUND)
+                .thenReturn(FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER);
+        FixtureRuleHitStore.RuleHit firstHit = new FixtureRuleHitStore.RuleHit(0, "holdUntilPoint",
+                "uniqueExternalTask", 1L, factsOf(0, 0, "call-a"),
+                OffsetDateTime.now(), null, null, null);
+        when(ruleHits.hitOf(eq(RUN_ID), eq(0))).thenReturn(Optional.of(firstHit));
+
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "executePython", "{}"))));
+        long firstGroup = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                firstSegment(List.of(), policy))).groupId();
+
+        dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":call-b:1", "task-b", dispatchProof(RUN_ID + ":call-b:1", "task-b")));
+        model.enqueue(AiMessage.from(List.of(toolCall("call-b", "executePython", "{}"))));
+        long secondGroup = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                segment(segmentIdentity(1), startPayload(), List.of(), policy))).groupId();
+
+        assertThat(store.memberRows(firstGroup)).extracting(row -> row.state)
+                .containsExactly(WaitMemberState.RUNNING.name());
+        assertThat(store.memberRows(secondGroup)).as("后来这条 python 照常派发，不落失败")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.RUNNING.name());
+        verify(ruleHits).recordOverHit(eq(RUN_ID), eq(policy.rules().get(0)),
+                eq(factsOf(1, 0, "call-b")), eq(factsOf(0, 0, "call-a")));
+    }
+
+    /**
      * 策略点名按失败收尾的成员当场就出结果：这一条照失败落，动作真的落到它身上了。
      *
      * <p>与压住那两条不同，指定失败不需要成员进入等待：工具的真实成功结果会被改写成夹具点名的
