@@ -46,8 +46,9 @@ import java.util.concurrent.Executor;
  * 候选链只做组内 data-id 回落：所有查询都固定用订阅自身的 group，
  * 绝不跨组回退（不回落到订阅组之外的任何组，也不在组内造别的组名）。</p>
  *
- * <p>本地缓存路径在有 {@code AF_LANE_TRAFFIC_SCOPE_ID} 时会再拆一层子目录
- * （见 {@link NacosLocalCachePaths}），避免主环境和泳道挂同一宿主目录时互相覆盖。</p>
+ * <p>本地缓存路径在有 {@code AF_LANE_TRAFFIC_SCOPE_ID} 时会给文件名加上范围前缀
+ * （见 {@link NacosLocalCachePaths}），避免主环境和泳道挂同一宿主目录时互相覆盖。
+ * 配置文件仍在原目录，{@code file:} prompt 相对路径不变。</p>
  */
 @Slf4j
 @Component

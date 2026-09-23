@@ -1031,8 +1031,8 @@ class AgentLlmLocalConfigLoaderTest {
     @Test
     void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath() throws Exception {
         Path shared = tempDir.resolve("agent-llm.local.json");
-        Path isolated = shared.getParent().resolve("stage3-dag-0922").resolve("agent-llm.local.json");
-        Files.createDirectories(isolated.getParent());
+        Path isolated = shared.getParent().resolve("stage3-dag-0922.agent-llm.local.json");
+        assertEquals(shared.getParent(), isolated.getParent());
         Files.writeString(shared, """
                 {
                   "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } }

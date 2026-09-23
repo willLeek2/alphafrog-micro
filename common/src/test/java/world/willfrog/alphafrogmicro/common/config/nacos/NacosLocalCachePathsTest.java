@@ -20,24 +20,25 @@ class NacosLocalCachePathsTest {
     }
 
     @Test
-    void isolate_shouldPutFileUnderScopeDirectory() {
-        assertEquals("/app/config-dynamic/stage3-dag-0922/agent-llm.local.json",
-                NacosLocalCachePaths.isolate(
-                        "/app/config-dynamic/agent-llm.local.json", "stage3-dag-0922"));
+    void isolate_shouldPrefixFilenameAndKeepParentDirectory() {
+        String isolated = NacosLocalCachePaths.isolate(
+                "/app/config-dynamic/agent-llm.local.json", "stage3-dag-0922");
+        assertEquals("/app/config-dynamic/stage3-dag-0922.agent-llm.local.json", isolated);
+        assertEquals(Path.of("/app/config-dynamic"), Path.of(isolated).getParent());
     }
 
     @Test
-    void isolate_shouldNotNestScopeTwice() {
+    void isolate_shouldNotPrefixTwice() {
         String once = NacosLocalCachePaths.isolate(
                 "/app/config-dynamic/agent-llm.local.json", "lane-demo");
-        assertEquals("/app/config-dynamic/lane-demo/agent-llm.local.json", once);
+        assertEquals("/app/config-dynamic/lane-demo.agent-llm.local.json", once);
         assertEquals(once, NacosLocalCachePaths.isolate(once, "lane-demo"));
     }
 
     @Test
     void isolate_shouldKeepRelativeParent() {
         Path configured = Path.of("data", "agent-llm.local.json");
-        assertEquals(Path.of("data", "lane-demo", "agent-llm.local.json").toString(),
+        assertEquals(Path.of("data", "lane-demo.agent-llm.local.json").toString(),
                 NacosLocalCachePaths.isolate(configured.toString(), "lane-demo"));
     }
 }
