@@ -207,7 +207,7 @@ class SchedulerVersionPolicyTest {
         assertThat(settings.newRunSchedulerVersion().source())
                 .isEqualTo(DualPoolSchedulerSettings.SOURCE_HOT_CONFIG);
         assertThat(new SchedulerVersionPolicy(settings).versionForNewRun())
-                .as("JSON 树里的 camelCase 版本要进热配置快照，不能回落到 yml LEGACY")
+                .as("缓存文件按 camelCase 解析，应用 ObjectMapper 即使是 SNAKE_CASE 也不回落到 yml LEGACY")
                 .isEqualTo("DUAL_POOL_V2");
     }
 }

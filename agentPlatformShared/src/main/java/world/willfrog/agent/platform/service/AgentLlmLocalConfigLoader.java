@@ -3,6 +3,7 @@ package world.willfrog.agent.platform.service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -64,6 +65,12 @@ import java.util.function.Supplier;
 public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     private final ObjectMapper objectMapper;
+
+    /**
+     * Nacos 缓存文件是 camelCase。解析整份文件时用这份 mapper，不跟应用里可能被改成
+     * SNAKE_CASE 的 ObjectMapper 走同一套命名，避免单个字段再补一遍。
+     */
+    private volatile ObjectMapper llmFileMapper;
 
     @Value("${agent.llm.config-file:}")
     private String configFile;
@@ -194,10 +201,9 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
                         tree.fieldNames().forEachRemaining(topLevelSections::add);
                     }
                     Set<String> explicitPromptFields = explicitPromptFields(tree);
-                    AgentLlmProperties parsed = objectMapper.treeToValue(tree, AgentLlmProperties.class);
+                    AgentLlmProperties parsed = llmFileMapper().treeToValue(tree, AgentLlmProperties.class);
                     PlaceholderResolver.resolve(parsed);
                     AgentLlmProperties sanitized = sanitize(parsed);
-                    copySchedulerVersionFromTree(tree, sanitized);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(
                             sanitized, resolvePromptBaseDir(path), explicitPromptFields);
                     this.localSnapshot = new LocalConfigSnapshot(
@@ -733,35 +739,19 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
         return text != null && !text.trim().isEmpty();
     }
 
-    /**
-     * Nacos 缓存文件里的调度器版本以 JSON 树为准。ObjectMapper 若按 SNAKE_CASE 命名，
-     * camelCase 的 {@code newRunSchedulerVersion} 会绑不上，热配置快照就会变成空，
-     * 创建回落到环境属性里的 LEGACY。
-     */
-    private void copySchedulerVersionFromTree(JsonNode tree, AgentLlmProperties cfg) {
-        if (tree == null || cfg == null || cfg.getRuntime() == null) {
-            return;
+    private ObjectMapper llmFileMapper() {
+        ObjectMapper cached = llmFileMapper;
+        if (cached != null) {
+            return cached;
         }
-        JsonNode scheduler = tree.path("runtime").path("scheduler");
-        if (!scheduler.isObject()) {
-            return;
-        }
-        String version = firstText(scheduler,
-                "newRunSchedulerVersion", "new-run-scheduler-version", "new_run_scheduler_version");
-        if (version == null || version.isBlank()) {
-            return;
-        }
-        cfg.getRuntime().getScheduler().setNewRunSchedulerVersion(version.trim());
-    }
-
-    private static String firstText(JsonNode object, String... names) {
-        for (String name : names) {
-            JsonNode node = object.get(name);
-            if (node != null && node.isTextual() && !node.asText().isBlank()) {
-                return node.asText();
+        synchronized (reloadLock) {
+            if (llmFileMapper == null) {
+                ObjectMapper copy = objectMapper.copy();
+                copy.setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
+                llmFileMapper = copy;
             }
+            return llmFileMapper;
         }
-        return null;
     }
 
     private static String schedulerVersionOf(AgentLlmProperties cfg) {

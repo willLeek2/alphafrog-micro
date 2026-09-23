@@ -1029,7 +1029,7 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
-    void snakeCaseObjectMapper_shouldStillBindCamelCaseSchedulerVersionFromJsonTree() throws Exception {
+    void snakeCaseApplicationMapper_stillBindsCamelCaseSchedulerVersion() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
                 {
