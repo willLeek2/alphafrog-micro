@@ -15,10 +15,10 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 按 Run 取回「这条 Run 的结果放行策略」。
  *
- * <p>策略来自夹具的 {@code dispatch_policy_json}：不带夹具编号的 Run、或者夹具没写放行策略的 Run
- * 拿到空，成员结果照原来的方式立刻收尾。夹具本身由 {@link AcceptanceFixtureResolver} 查回来并核对，
- * 所以夹具在跑的中途失效时，读策略这一步会跟着停下——不会出现「夹具不让用了，但压住的成员还被
- * 悄悄放过去」。</p>
+ * <p>策略来自夹具或控制行的 {@code dispatch_policy_json}：不带这两种编号的 Run、或者这一行没写
+ * 放行策略的 Run 拿到空，成员结果照原来的方式立刻收尾。夹具本身由 {@link AcceptanceFixtureResolver}
+ * 查回来并核对，所以这一行在跑的中途失效时，读策略这一步会跟着停下——不会出现「夹具不让用了，
+ * 但压住的成员还被悄悄放过去」。请求同时带了夹具编号和控制编号时，策略仍取夹具那一行。</p>
  *
  * <p>「读到的是策略」与「读到的是空」都要冻结：第一次读到的那一版是什么，这条 Run 就按哪一版跑完。
  * 只冻结有策略的那一种会漏掉一种改法——夹具一开始没写策略、跑到一半被改成带策略，于是前半段的
@@ -57,6 +57,9 @@ public class AcceptanceRunPolicyRegistry {
      */
     public Optional<AcceptanceReleasePolicy> policyForRun(AgentRun run) {
         Optional<AcceptanceFixtureRow> row = fixtureResolver.resolve(run);
+        if (row.isEmpty()) {
+            row = fixtureResolver.resolveControl(run);
+        }
         if (row.isEmpty()) {
             return Optional.empty();
         }

@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
@@ -59,6 +60,8 @@ class AgentLangchainRunServiceTest {
     private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
     @Mock
     private AcceptanceFixtureGate acceptanceFixtureGate;
+    @Mock
+    private AcceptanceControlGate acceptanceControlGate;
 
     private AgentLangchainRunService runService;
 
@@ -68,7 +71,8 @@ class AgentLangchainRunServiceTest {
                 creditService, userDao,
                 world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
                         withIdentity(runMapper, "stable", GENERATION),
-                schedulerVersionPolicy, dualPoolRunAdmissionRegistry, acceptanceFixtureGate);
+                schedulerVersionPolicy, dualPoolRunAdmissionRegistry, acceptanceFixtureGate,
+                acceptanceControlGate);
         lenient().when(schedulerVersionPolicy.versionForNewRun())
                 .thenReturn(SchedulerVersionPolicy.LEGACY);
         // 版本家族判断按版本名如实回答：假的策略不能把双池版本说成不是双池，否则这里测的就不是创建路径了。

@@ -9,6 +9,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
@@ -41,6 +42,7 @@ public class AgentLangchainRunService {
     private final SchedulerVersionPolicy schedulerVersionPolicy;
     private final DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
     private final AcceptanceFixtureGate acceptanceFixtureGate;
+    private final AcceptanceControlGate acceptanceControlGate;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         String userId = request.getUserId();
@@ -66,6 +68,9 @@ public class AgentLangchainRunService {
         // 在这里连夹具表都不会查，行为与从前一致。夹具内容本身由执行层从 Run 的 ext 里
         // 读回来（请求上下文原样存在那里），这里只负责确认这次请求可以用它。
         acceptanceFixtureGate.admitRequestContext(
+                request.getContextJson(), deploymentIdentity.deploymentId(), deploymentIdentity.generationId());
+        // 控制编号走同一张夹具表，但不接管模型回复。夹具门已经处理过的请求，这里仍按自己的编号再查一次。
+        acceptanceControlGate.admitRequestContext(
                 request.getContextJson(), deploymentIdentity.deploymentId(), deploymentIdentity.generationId());
 
         LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();

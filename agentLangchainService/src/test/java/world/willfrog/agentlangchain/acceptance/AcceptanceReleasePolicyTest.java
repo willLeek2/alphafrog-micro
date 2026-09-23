@@ -507,6 +507,90 @@ class AcceptanceReleasePolicyTest {
         policy.rejectCyclesInGroup(group.members(), policy.match(group.members()));
     }
 
+    // ==================== 外部作业身份 ====================
+
+    /** 只写 operationId 就能点名那一条成员，同一组里另一条不会被打中。 */
+    @Test
+    void anOperationIdSelectorHitsOnlyThatMember() {
+        AcceptanceReleasePolicy policy = parse("""
+                {"rules":[{"for":{"operationId":"op-a"},"holdUntilPoint":"point-a"}]}
+                """).orElseThrow();
+        List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
+                memberWithOp("n1", 0, "call_1", "op-a", "executePython", "{\"code\":\"a\"}"),
+                memberWithOp("n1", 1, "call_2", "op-b", "executePython", "{\"code\":\"b\"}"));
+
+        AcceptanceReleasePolicy.RuleMatches matches = policy.match(group);
+        assertThat(matches.targetOf(0)).contains(group.get(0));
+        assertThat(policy.ruleAt(matches, group.get(1))).isEmpty();
+    }
+
+    /** uniqueExternalTask 加上 codeContains：只压住参数正文含那一段的那条 python。 */
+    @Test
+    void uniqueExternalTaskWithCodeContainsHitsTheMatchingPython() {
+        AcceptanceReleasePolicy policy = parse("""
+                {"rules":[{"match":"uniqueExternalTask","toolName":"executePython","codeContains":"100000",
+                           "holdUntilPoint":"point-a"}]}
+                """).orElseThrow();
+        List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
+                memberWithOp("n1", 0, "call_1", "op-a", "executePython",
+                        "{\"code\":\"for i in range(100000): pass\"}"),
+                memberWithOp("n1", 1, "call_2", "op-b", "executePython", "{\"code\":\"print(1)\"}"),
+                memberWithOp("n1", 2, "call_3", "op-c", "getStockDaily", "{}"));
+
+        AcceptanceReleasePolicy.RuleMatches matches = policy.match(group);
+        assertThat(matches.targetOf(0)).contains(group.get(0));
+        assertThat(policy.ruleAt(matches, group.get(1))).isEmpty();
+        assertThat(policy.ruleAt(matches, group.get(2))).isEmpty();
+    }
+
+    /** uniqueExternalTask 对上两条：当场拒绝，报上条数和候选 operationId。 */
+    @Test
+    void uniqueExternalTaskWithTwoCandidatesIsAmbiguous() {
+        AcceptanceReleasePolicy policy = parse("""
+                {"rules":[{"match":"uniqueExternalTask","toolName":"executePython","holdUntilPoint":"point-a"}]}
+                """).orElseThrow();
+        List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
+                memberWithOp("n1", 0, "call_1", "op-a", "executePython", "{\"code\":\"a\"}"),
+                memberWithOp("n1", 1, "call_2", "op-b", "executePython", "{\"code\":\"b\"}"));
+
+        assertThatThrownBy(() -> policy.match(group))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(((AcceptanceFixtureExecutionException) e).code())
+                        .isEqualTo("acceptance_control_bind_ambiguous"))
+                .hasMessageContaining("2 条成员")
+                .hasMessageContaining("op-a")
+                .hasMessageContaining("op-b");
+    }
+
+    /** allExternalTasks 打中这一组里每一条 executePython。 */
+    @Test
+    void allExternalTasksHitsEveryExecutePythonInTheGroup() {
+        AcceptanceReleasePolicy policy = parse("""
+                {"rules":[{"match":"allExternalTasks","toolName":"executePython","holdUntilPoint":"point-a"}]}
+                """).orElseThrow();
+        List<AcceptanceReleasePolicy.MemberFacts> group = List.of(
+                memberWithOp("n1", 0, "call_1", "op-a", "executePython", "{\"code\":\"a\"}"),
+                memberWithOp("n1", 1, "call_2", "op-b", "getStockDaily", "{}"),
+                memberWithOp("n1", 2, "call_3", "op-c", "executePython", "{\"code\":\"c\"}"));
+
+        AcceptanceReleasePolicy.RuleMatches matches = policy.match(group);
+        assertThat(matches.targetsOf(0)).containsExactly(group.get(0), group.get(2));
+        assertThat(policy.ruleAt(matches, group.get(0))).isPresent();
+        assertThat(policy.ruleAt(matches, group.get(1))).isEmpty();
+        assertThat(policy.ruleAt(matches, group.get(2))).isPresent();
+    }
+
+    /** for 和 match 写在同一条规则上：读策略就拒。 */
+    @Test
+    void aRuleCannotWriteBothForAndMatch() {
+        assertThatThrownBy(() -> parse("""
+                {"rules":[{"for":{"operationId":"op-a"},"match":"uniqueExternalTask","holdUntilPoint":"point-a"}]}
+                """))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("不能同时写 for 和 match");
+    }
+
     private Availability group() {
         List<AcceptanceReleasePolicy.MemberFacts> members = List.of(
                 member("n1", 0, 0, 0, "call_1"),
@@ -531,6 +615,16 @@ class AcceptanceReleasePolicyTest {
                                                              String toolCallId) {
         return new AcceptanceReleasePolicy.MemberFacts(7, nodeId, 1, segmentSequence, modelTurn,
                 memberSeq, toolCallId);
+    }
+
+    private static AcceptanceReleasePolicy.MemberFacts memberWithOp(String nodeId,
+                                                                   int memberSeq,
+                                                                   String toolCallId,
+                                                                   String operationId,
+                                                                   String toolName,
+                                                                   String argumentText) {
+        return new AcceptanceReleasePolicy.MemberFacts(7, nodeId, 1, 0, 0, memberSeq, toolCallId,
+                operationId, toolName, argumentText);
     }
 
     private Optional<AcceptanceReleasePolicy> parse(String json) {

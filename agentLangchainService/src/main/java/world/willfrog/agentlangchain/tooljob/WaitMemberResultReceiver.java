@@ -417,6 +417,9 @@ public class WaitMemberResultReceiver {
         Optional<AcceptanceReleasePolicy.Rule> matched =
                 policy.ruleAt(policy.match(facts), memberFactsOf(group, member));
         if (matched.isEmpty()) {
+            matched = recordedHitRule(policy, group, member);
+        }
+        if (matched.isEmpty()) {
             heldSinceByMember.remove(key);
             return PolicyAction.proceed();
         }
@@ -469,7 +472,38 @@ public class WaitMemberResultReceiver {
                                                           WaitGroup group,
                                                           WaitMember member) {
         List<WaitMember> members = waitGroupStore.listMembers(group.getId());
-        return policy.ruleAt(policy.match(groupFacts(group, members)), memberFactsOf(group, member));
+        Optional<AcceptanceReleasePolicy.Rule> matched =
+                policy.ruleAt(policy.match(groupFacts(group, members)), memberFactsOf(group, member));
+        if (matched.isPresent()) {
+            return matched;
+        }
+        return recordedHitRule(policy, group, member);
+    }
+
+    /**
+     * 派发时已经按 {@code uniqueExternalTask} 绑过的命中：结果接收方没有参数正文，按命中行找回。
+     */
+    private Optional<AcceptanceReleasePolicy.Rule> recordedHitRule(AcceptanceReleasePolicy policy,
+                                                                  WaitGroup group,
+                                                                  WaitMember member) {
+        List<FixtureRuleHitStore.RuleHit> hits = ruleHitStore.hitsOf(member.getRunId());
+        if (hits == null || hits.isEmpty()) {
+            return Optional.empty();
+        }
+        for (FixtureRuleHitStore.RuleHit hit : hits) {
+            if (hit.groupId() != group.getId()) {
+                continue;
+            }
+            if (hit.target() == null || hit.target().memberSeq() != member.getMemberSeq()) {
+                continue;
+            }
+            for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
+                if (rule.index() == hit.ruleIndex()) {
+                    return Optional.of(rule);
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     /** 这个等待组里的成员在策略眼里的样子：组一级的身份来自等待组，成员一级来自成员记录。 */
@@ -485,7 +519,8 @@ public class WaitMemberResultReceiver {
     private static AcceptanceReleasePolicy.MemberFacts memberFactsOf(WaitGroup group, WaitMember member) {
         return new AcceptanceReleasePolicy.MemberFacts(group.getPlanGeneration(), group.getNodeId(),
                 group.getNodeAttempt(), group.getSegmentSequence(), group.getModelTurn(),
-                member.getMemberSeq(), member.getToolCallId());
+                member.getMemberSeq(), member.getToolCallId(),
+                member.getExternalOperationId(), member.getToolName(), null);
     }
 
     /** 这个等待组里与某条成员身份对上的那一行；对不上时为空。 */
@@ -514,6 +549,13 @@ public class WaitMemberResultReceiver {
         try {
             ruleHitStore.recordMatch(member.getRunId(), rule, group.getId(),
                     memberFactsOf(group, member));
+        } catch (AcceptanceFixtureExecutionException e) {
+            recordedRuleHits.remove(key);
+            if ("acceptance_fixture_policy_target_conflict".equals(e.code())
+                    && AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
+                return;
+            }
+            throw e;
         } catch (RuntimeException e) {
             recordedRuleHits.remove(key);
             throw e;

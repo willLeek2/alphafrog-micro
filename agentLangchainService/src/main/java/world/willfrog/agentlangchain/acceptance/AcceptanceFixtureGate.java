@@ -105,6 +105,14 @@ public class AcceptanceFixtureGate {
      * 的进程视为隔离泳道并打开；主 Beta 没有这个变量，保持关闭。</p>
      */
     boolean fixtureControlEnabled() {
+        return controlSurfaceEnabled(environment);
+    }
+
+    /**
+     * 夹具门与控制门共用的开关：显式 {@code AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED} 优先，
+     * 未设置时有泳道范围的进程打开。
+     */
+    static boolean controlSurfaceEnabled(Environment environment) {
         Boolean explicit = environment.getProperty(ENV_FLAG, Boolean.class);
         if (explicit != null) {
             return explicit;

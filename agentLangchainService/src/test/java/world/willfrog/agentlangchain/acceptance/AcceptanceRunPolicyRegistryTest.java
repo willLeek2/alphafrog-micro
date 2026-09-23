@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -247,6 +248,39 @@ class AcceptanceRunPolicyRegistryTest {
                         .isEqualTo("acceptance_fixture_tracked_runs_full"));
     }
 
+    /** 只带控制编号、不带夹具编号：放行策略从这一行的 dispatchPolicyJson 读出来。 */
+    @Test
+    void aControlOnlyRunLoadsDispatchPolicy() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("ctrl-1", POLICY);
+
+        AcceptanceReleasePolicy policy = registry.policyForRun(controlRun("ctrl-1")).orElseThrow();
+
+        assertThat(policy.rules()).singleElement()
+                .satisfies(rule -> assertThat(rule.holdReleaseKey()).isEqualTo(POLICY_HOLDING_POINT_A));
+        verify(store).find(LANE, GENERATION, "ctrl-1");
+        verify(ruleHitStore).snapshotPolicy("run-1", "ctrl-1", "scenario-a", policy);
+    }
+
+    /** 夹具编号和控制编号都在时，策略取夹具那一行，不把两行混在一起。 */
+    @Test
+    void fixtureAndControlTogetherUseTheFixturePolicy() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", POLICY);
+        row("ctrl-1", "{\"rules\":[{\"for\":{\"planGeneration\":7,\"nodeId\":\"n1\","
+                + "\"nodeAttempt\":1,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},"
+                + "\"fail\":\"控制行的策略\"}]}");
+
+        AcceptanceReleasePolicy policy = registry.policyForRun(run("run-1",
+                "{\"execution_mode\":\"DAG\",\"acceptanceFixtureId\":\"fx-1\","
+                        + "\"acceptanceControlId\":\"ctrl-1\"}")).orElseThrow();
+
+        assertThat(policy.rules()).singleElement()
+                .satisfies(rule -> assertThat(rule.holdReleaseKey()).isEqualTo(POLICY_HOLDING_POINT_A));
+        verify(store).find(LANE, GENERATION, "fx-1");
+        verify(store, never()).find(LANE, GENERATION, "ctrl-1");
+    }
+
     private AcceptanceRunPolicyRegistry registry() {
         when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
         return new AcceptanceRunPolicyRegistry(
@@ -267,6 +301,10 @@ class AcceptanceRunPolicyRegistryTest {
 
     private AgentRun fixtureRun(String runId, String fixtureId) throws Exception {
         return run(runId, "{\"execution_mode\":\"DAG\",\"acceptanceFixtureId\":\"" + fixtureId + "\"}");
+    }
+
+    private AgentRun controlRun(String controlId) throws Exception {
+        return run("run-1", "{\"execution_mode\":\"DAG\",\"acceptanceControlId\":\"" + controlId + "\"}");
     }
 
     private AgentRun run(String runId, String contextJson) throws Exception {

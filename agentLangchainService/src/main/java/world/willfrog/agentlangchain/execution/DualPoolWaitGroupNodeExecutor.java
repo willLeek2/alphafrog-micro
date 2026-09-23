@@ -344,7 +344,7 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         int modelTurn = checkpoint.modelTurn();
         AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
-        List<AcceptanceReleasePolicy.MemberFacts> facts = memberFacts(input, modelTurn, drafts);
+        List<AcceptanceReleasePolicy.MemberFacts> facts = memberFacts(input, modelTurn, drafts, calls);
         AcceptanceReleasePolicy.RuleMatches policyMatches = matchPolicyRules(policy, facts);
         String unwaitable = unwaitableTargetReason(policy, policyMatches, drafts);
         if (unwaitable != null) {
@@ -393,18 +393,23 @@ public class DualPoolWaitGroupNodeExecutor {
     /**
      * 这一批草稿在策略眼里的样子。
      *
-     * <p>等待组一级的身份来自分段身份与这一段的模型回合，成员一级的身份来自草稿的组内序号与模型给的
-     * 工具调用编号。结果接收方按等待组与成员记录凑出来的字段与此完全一致，策略在两边才会给同一个答案。</p>
+     * <p>等待组一级的身份来自分段身份与这一段的模型回合，成员一级的身份来自草稿的组内序号、模型给的
+     * 工具调用编号，以及派发时的外部作业身份与工具名。参数正文给 {@code uniqueExternalTask} 的
+     * {@code codeContains} 用，结果接收方没有这份正文，按派发时已经记下的命中找回。</p>
      */
     private static List<AcceptanceReleasePolicy.MemberFacts> memberFacts(SegmentExecution input,
                                                                         int modelTurn,
-                                                                        List<WaitMemberDraft> drafts) {
+                                                                        List<WaitMemberDraft> drafts,
+                                                                        List<ToolExecutionRequest> calls) {
         NodeWorkItemIdentity identity = input.identity();
         List<AcceptanceReleasePolicy.MemberFacts> facts = new ArrayList<>();
-        for (WaitMemberDraft draft : drafts) {
+        for (int index = 0; index < drafts.size(); index++) {
+            WaitMemberDraft draft = drafts.get(index);
+            String argumentText = index < calls.size() ? calls.get(index).arguments() : null;
             facts.add(new AcceptanceReleasePolicy.MemberFacts(identity.planGeneration(), identity.nodeId(),
                     identity.nodeAttempt(), identity.segmentSequence(), modelTurn,
-                    draft.getMemberSeq(), draft.getToolCallId()));
+                    draft.getMemberSeq(), draft.getToolCallId(),
+                    draft.getExternalOperationId(), draft.getToolName(), argumentText));
         }
         return List.copyOf(facts);
     }
@@ -412,11 +417,13 @@ public class DualPoolWaitGroupNodeExecutor {
     /** 一条已落库的成员在策略眼里的样子：派发与收尾两处都用它，免得两边凑的字段不一样。 */
     private static AcceptanceReleasePolicy.MemberFacts memberFacts(SegmentExecution input,
                                                                   int modelTurn,
-                                                                  WaitMember member) {
+                                                                  WaitMember member,
+                                                                  String argumentText) {
         NodeWorkItemIdentity identity = input.identity();
         return new AcceptanceReleasePolicy.MemberFacts(identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), modelTurn,
-                member.getMemberSeq(), member.getToolCallId());
+                member.getMemberSeq(), member.getToolCallId(),
+                member.getExternalOperationId(), member.getToolName(), argumentText);
     }
 
     /**
@@ -426,9 +433,10 @@ public class DualPoolWaitGroupNodeExecutor {
      * 不在这一批里的成员，这条等待永远等不到头（被压住的成员除了兜底时限没人会来放行）。所以核对放在
      * 建组与派发之前：一个外部作业都还没建出来，夹具写错了当场停住，原因就是夹具自己的稳定错误码。</p>
      *
-     * <p>选择器同时打中两条成员、两条规则点名同一条成员，这两类由 {@code match} 当场拒绝：点名对象
-     * 不确定，压住/放行/判失败的是谁就说不清。等自己、组内绕成圈这两类要看这一批到底有哪几条成员，
-     * 所以在这里判：绕成圈的那几条成员会一直压着，除了兜底时限没有别的出路。</p>
+     * <p>选择器同时打中两条成员、两条规则点名同一条成员，这两类由策略匹配当场拒绝：点名对象
+     * 不确定，压住/放行/判失败的是谁就说不清。{@code allExternalTasks} 是例外，一条规则可以打中
+     * 这一批里多条外部作业。等自己、组内绕成圈这两类要看这一批到底有哪几条成员，所以在这里判：
+     * 绕成圈的那几条成员会一直压着，除了兜底时限没有别的出路。</p>
      */
     private AcceptanceReleasePolicy.RuleMatches matchPolicyRules(
             AcceptanceReleasePolicy policy,
@@ -457,8 +465,18 @@ public class DualPoolWaitGroupNodeExecutor {
             return;
         }
         for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
-            matches.targetOf(rule.index()).ifPresent(target ->
-                    ruleHitStore.recordMatch(runId, rule, groupId, target));
+            for (AcceptanceReleasePolicy.MemberFacts target : matches.targetsOf(rule.index())) {
+                try {
+                    ruleHitStore.recordMatch(runId, rule, groupId, target);
+                } catch (AcceptanceFixtureExecutionException e) {
+                    if ("acceptance_fixture_policy_target_conflict".equals(e.code())
+                            && AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
+                        // 命中表按规则序号只留第一行；其余成员的压住仍按内存里的命中生效。
+                        continue;
+                    }
+                    throw e;
+                }
+            }
         }
     }
 
@@ -483,17 +501,15 @@ public class DualPoolWaitGroupNodeExecutor {
             if (!rule.holds() && !rule.waitsForPeers()) {
                 continue;
             }
-            AcceptanceReleasePolicy.MemberFacts target = matches.targetOf(rule.index()).orElse(null);
-            if (target == null) {
-                continue;
+            for (AcceptanceReleasePolicy.MemberFacts target : matches.targetsOf(rule.index())) {
+                String toolName = toolNameOf(drafts, target.memberSeq());
+                if (toolName == null || toolDispatcher.requiresStableOperationId(toolName)) {
+                    // 会转后台的工具就是那个需要稳定外部作业身份的工具（见 NodeToolDispatcher）：
+                    // 它的结果以后才回来，压住与等兄弟成员有可等的东西。
+                    continue;
+                }
+                return "acceptance_fixture_rule_needs_waiting_member:" + rule.index() + ":" + toolName;
             }
-            String toolName = toolNameOf(drafts, target.memberSeq());
-            if (toolName == null || toolDispatcher.requiresStableOperationId(toolName)) {
-                // 会转后台的工具就是那个需要稳定外部作业身份的工具（见 NodeToolDispatcher）：
-                // 它的结果以后才回来，压住与等兄弟成员有可等的东西。
-                continue;
-            }
-            return "acceptance_fixture_rule_needs_waiting_member:" + rule.index() + ":" + toolName;
         }
         return null;
     }
@@ -530,7 +546,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 if (call == null) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
                             policyMatches, member, false, "",
-                            Map.of("errorCode", "wait_group_member_request_missing")));
+                            Map.of("errorCode", "wait_group_member_request_missing"), null));
                     continue;
                 }
                 NodeToolDispatcher.DispatchOutcome outcome = toolDispatcher.dispatch(
@@ -540,10 +556,10 @@ public class DualPoolWaitGroupNodeExecutor {
                                 call.arguments()));
                 if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Completed completed) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                            policyMatches, member, true, completed.output(), Map.of()));
+                            policyMatches, member, true, completed.output(), Map.of(), call.arguments()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Failed failed) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                            policyMatches, member, false, failed.reason(), Map.of()));
+                            policyMatches, member, false, failed.reason(), Map.of(), call.arguments()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Pending pending) {
                     // 后台作业已经建出来了。成员从「待派发」进入「执行中」，并把派发证明与下次查询
                     // 时间写上：证明留给结果接收方收尾，查询时间让接收方能找到这个成员。
@@ -593,7 +609,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 continue;
             }
             notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                    policyMatches, member, false, "", Map.of("errorCode", errorCode)));
+                    policyMatches, member, false, "", Map.of("errorCode", errorCode), null));
         }
         return notificationId;
     }
@@ -610,10 +626,11 @@ public class DualPoolWaitGroupNodeExecutor {
                                 WaitMember member,
                                 boolean success,
                                 String output,
-                                Map<String, Object> extra) {
+                                Map<String, Object> extra,
+                                String argumentText) {
         Optional<AcceptanceReleasePolicy.Rule> rule = policy == null || policyMatches == null
                 ? Optional.empty()
-                : policy.ruleAt(policyMatches, memberFacts(input, modelTurn, member));
+                : policy.ruleAt(policyMatches, memberFacts(input, modelTurn, member, argumentText));
         Optional<String> designated = rule.filter(AcceptanceReleasePolicy.Rule::fails)
                 .map(AcceptanceReleasePolicy.Rule::failureDetail);
         AcceptanceReleasePolicy.Rule namedBy = rule.orElse(null);
