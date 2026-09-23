@@ -84,8 +84,16 @@ public class LangchainRunStageModelResolver {
                 acceptanceFixtureModels.stageForRun(run);
         if (scripted.isPresent()) {
             return acceptanceFixtureStageModels(scripted.get(),
-                    acceptancePolicies.policyForRun(run).orElse(null));
+                    acceptancePolicies.policyForRun(run).orElse(null), run);
         }
+        return resolveOrdinaryModels(run);
+    }
+
+    /**
+     * 按原路径建规划、执行、写答案三个真实模型。夹具 Run 第一次碰到未声明调用时才走这里，
+     * 纯预录 Run 不会解析供应商、也不会建客户端。
+     */
+    private StageModels resolveOrdinaryModels(AgentRun run) {
         RunStageConfig stageConfig = stageConfigResolver.resolve(run.getExt());
         stageConfigValidator.validate(stageConfig);
 
@@ -143,20 +151,30 @@ public class LangchainRunStageModelResolver {
     }
 
     /**
-     * 带验收夹具的 Run 走这一条：三个阶段都用同一个脚本模型。
+     * 带验收夹具的 Run 走这一条：三个阶段共用同一个脚本模型。
      *
-     * <p>同一个实例是有意的：脚本按顺序消费，三个阶段的调用顺序在一条 Run 上是确定的
-     * （先规划、再逐节点执行、最后写答案），位置跟着 Run 走才对得起来。真实供应商的配置解析、
-     * 客户端构建、provider 顺序在这里一件都不做，所以这一次执行碰不到真实模型。</p>
+     * <p>脚本 {@code for} 点名的回合发预录。没点名的调用按阶段去取真实模型：规划走规划客户端，
+     * 节点和图判定走执行客户端，写答案走写答案客户端。真实客户端在第一次未声明调用时才建，
+     * 纯预录 Run 不解析供应商、不碰密钥。</p>
      *
-     * <p>规划端点的两个名字写成夹具的标记：事件、读数与调试界面里一眼看得出这次用的不是供应商。</p>
+     * <p>规划端点的两个名字仍写成夹具标记：事件里一眼看得出这条 Run 带了预录名单。
+     * 未声明调用真正打到哪一家供应商，记在那一次真实模型调用自己的事件里。</p>
      *
      * <p>结果放行策略跟着一起带上：节点执行器在工具当场完成、直接给成员写终态那一步要用它。
      * 夹具没写放行策略时是空，成员照原来的方式立刻收尾。</p>
      */
     private StageModels acceptanceFixtureStageModels(AcceptanceFixtureModelRegistry.ScriptedStage stage,
-                                                     AcceptanceReleasePolicy releasePolicy) {
-        ChatModel scripted = stage.model();
+                                                     AcceptanceReleasePolicy releasePolicy,
+                                                     AgentRun run) {
+        LazyOrdinaryModels lazy = new LazyOrdinaryModels(run);
+        ChatModel scripted = stage.model().withRealModel(identity -> {
+            StageModels ordinary = lazy.get();
+            return switch (identity.stage()) {
+                case PLANNING -> ordinary.planningModel();
+                case ANSWER -> ordinary.finalAnswerModel();
+                case NODE, JUDGE -> ordinary.executionModel();
+            };
+        });
         return new StageModels(
                 scripted,
                 scripted,
@@ -165,6 +183,35 @@ public class LangchainRunStageModelResolver {
                 stage.modelName(),
                 List.of(),
                 releasePolicy);
+    }
+
+    /** 夹具 Run 上的真实客户端：第一次未声明调用才解析，失败记住，避免并行两次各建一次。 */
+    private final class LazyOrdinaryModels {
+        private final AgentRun run;
+        private StageModels cached;
+        private RuntimeException failed;
+
+        private LazyOrdinaryModels(AgentRun run) {
+            this.run = run;
+        }
+
+        private StageModels get() {
+            synchronized (this) {
+                if (failed != null) {
+                    throw failed;
+                }
+                if (cached != null) {
+                    return cached;
+                }
+                try {
+                    cached = resolveOrdinaryModels(run);
+                    return cached;
+                } catch (RuntimeException error) {
+                    failed = error;
+                    throw error;
+                }
+            }
+        }
     }
 
     /**

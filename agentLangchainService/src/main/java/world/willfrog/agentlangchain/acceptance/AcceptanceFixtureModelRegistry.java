@@ -18,7 +18,8 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  * 按 Run 决定「这条 Run 的模型回复从哪儿来」。
  *
  * <p>执行层每次要建阶段模型时都来这里问一句：不带夹具编号的 Run 拿到空，照原来的方式解析真实
- * 模型；带编号的 Run 拿到一个按夹具脚本作答的模型。</p>
+ * 模型；带编号的 Run 拿到一个按夹具脚本作答的模型。脚本 {@code for} 没点名的调用，由阶段模型
+ * 解析那一步懒建的真实客户端回答。</p>
  *
  * <p>这个模型是「模板」：它自己不回答问题，使用它的地方要用 {@link #forCall(ChatModel,
  * FixtureCallIdentity)} 把这一次调用的身份绑上去。脚本按调用身份发回合（见

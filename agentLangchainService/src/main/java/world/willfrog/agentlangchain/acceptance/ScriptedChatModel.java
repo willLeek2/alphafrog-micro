@@ -8,6 +8,7 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException.refuse;
@@ -29,8 +30,9 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  * 内部也落在 {@code doChat}）。langchain4j 的这几个入口最终都会走到 {@code doChat}，
  * 写在这一层就全覆盖了；写在上层会漏掉直接调 {@code doChat} 的那条路。</p>
  *
- * <p>没有可领的回合时抛错，不回落到任何真实供应商：那一步一旦发生，一次本该失败的验收就会看起来
- * 像是跑过去了。</p>
+ * <p>脚本 {@code for} 点名的回合发预录。没点名的调用，若绑了该阶段真实模型，就把请求交给它；
+ * 真实模型按第一次未声明调用再去建，纯预录 Run 碰不到供应商配置。声明匹配但回合都被领走、
+ * 身份认不出、夹具中途换了，仍当场拒绝。</p>
  */
 public class ScriptedChatModel implements ChatModel {
 
@@ -55,6 +57,7 @@ public class ScriptedChatModel implements ChatModel {
     private final FrozenModelScript script;
     private final FixtureCallStore callStore;
     private final Supplier<FixtureScript> currentFixture;
+    private final Function<FixtureCallIdentity, ChatModel> realModelFor;
 
     public ScriptedChatModel(String runId,
                              String fixtureId,
@@ -62,12 +65,31 @@ public class ScriptedChatModel implements ChatModel {
                              FrozenModelScript script,
                              FixtureCallStore callStore,
                              Supplier<FixtureScript> currentFixture) {
+        this(runId, fixtureId, scenarioId, script, callStore, currentFixture, null);
+    }
+
+    public ScriptedChatModel(String runId,
+                             String fixtureId,
+                             String scenarioId,
+                             FrozenModelScript script,
+                             FixtureCallStore callStore,
+                             Supplier<FixtureScript> currentFixture,
+                             Function<FixtureCallIdentity, ChatModel> realModelFor) {
         this.runId = runId;
         this.fixtureId = fixtureId;
         this.scenarioId = scenarioId;
         this.script = script;
         this.callStore = callStore;
         this.currentFixture = currentFixture;
+        this.realModelFor = realModelFor;
+    }
+
+    /**
+     * 给这份模板补上「未声明调用走哪一个真实模型」。三个阶段可以共用同一个实例：按调用身份的阶段
+     * 去取规划、执行或写答案那一个客户端。供应商客户端在第一次未声明调用时才建。
+     */
+    public ScriptedChatModel withRealModel(Function<FixtureCallIdentity, ChatModel> realModelFor) {
+        return new ScriptedChatModel(runId, fixtureId, scenarioId, script, callStore, currentFixture, realModelFor);
     }
 
     /** 模板自己不能被调用：调用方拿到模型后必须先用 {@link #boundTo(FixtureCallIdentity)} 绑上身份。 */
@@ -168,7 +190,19 @@ public class ScriptedChatModel implements ChatModel {
 
         @Override
         public ChatResponse doChat(ChatRequest chatRequest) {
-            return ChatResponse.builder().aiMessage(template.answerFor(identity)).build();
+            try {
+                return ChatResponse.builder().aiMessage(template.answerFor(identity)).build();
+            } catch (AcceptanceFixtureExecutionException error) {
+                if (!"acceptance_fixture_no_declared_turn".equals(error.code())
+                        || template.realModelFor == null) {
+                    throw error;
+                }
+                ChatModel real = template.realModelFor.apply(identity);
+                if (real == null) {
+                    throw error;
+                }
+                return real.doChat(chatRequest);
+            }
         }
     }
 }
