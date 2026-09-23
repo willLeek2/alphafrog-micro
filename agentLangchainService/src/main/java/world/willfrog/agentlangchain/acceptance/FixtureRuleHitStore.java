@@ -34,9 +34,11 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  * 终态核对按后者算：动作没生效的规则与一条都没打中的规则一样，都要在结论里点名。</p>
  *
  * <p>一条规则在整条 Run 里只能绑定一个目标（表上 {@code (run_id, rule_index)} 唯一）。选择器写全之后
- * 本来就只指得出一条成员，所以这条约束是最后一道：真出现第二条时写入方当场失败关闭（错误码
- * {@code acceptance_fixture_policy_target_conflict}），不会悄悄多记一行，把「动作落到了点名的对象上」
- * 这句话撑成通过。</p>
+ * 本来就只指得出一条成员，所以这条约束是最后一道：真出现第二条时不改已经写下的那一行，
+ * 也不把后来这条成员收成失败。调用方按返回值区分「已经绑过别人」：{@code uniqueExternalTask}
+ * 记一笔规则越界命中，成员照常接业务结果；场景裁决看到越界就把这次验收标成不完整。命中行写不进去
+ * 也读不回来时仍当场拒绝（错误码 {@code acceptance_fixture_policy_target_conflict}），因为那时
+ * 「动作落到了谁身上」根本说不清。</p>
  *
  * <p>策略原文的摘要与全部规则也在第一次读到它的时候留一份快照：之后夹具行被改过、被停用或被删掉，
  * 核对结论仍然说得清「这次验收要求点名哪些调用」。快照的写入是「插入后读回赢家」，两个进程同时
@@ -54,6 +56,26 @@ public class FixtureRuleHitStore {
     public static final String APPLIED_FAILURE = "designated_failure";
     /** 点名了成员，但被点名的动作没有落到它身上（成员当场出结果、或者这条成员被中止收尾）。 */
     public static final String NOT_APPLIED = "not_applied";
+    /**
+     * 命中行 {@code action_detail} 里标记「这条规则后来又打中了别的成员」。
+     *
+     * <p>不另开列：迁移不许自造。越界发生在已经绑好的那一行上，场景裁决读这个标记，
+     * 不靠进程内存。</p>
+     */
+    public static final String OVER_HIT_MARKER = "规则越界命中";
+
+    /**
+     * 一次 {@link #recordMatch} 相对已经写下的那一行是什么关系。
+     *
+     * <p>{@link #ALREADY_BOUND_OTHER} 不是错误：第一条仍然有效，后来这条成员不该被改写成验收失败。
+     * 命中行写不回去才抛 {@code acceptance_fixture_policy_target_conflict}。</p>
+     */
+    public enum MatchBinding {
+        /** 这一次就是绑上去的目标（第一次写入，或重复记同一条成员）。 */
+        BOUND,
+        /** 这一条规则已经绑了另一个目标；本行没改。 */
+        ALREADY_BOUND_OTHER
+    }
 
     /**
      * 「这条 Run 一开始就没有放行策略」写进摘要列的冻结值。
@@ -153,15 +175,17 @@ public class FixtureRuleHitStore {
      * 记一笔「这条规则的选择器打中这条成员」，并把目标身份一起写下来。
      *
      * <p>重复记同一件事（派发前记过、结果接收方又记一次、同一条成员被压住时一轮一轮走到这里）
-     * 只留一行，不报错也不覆盖。同一个规则序号落到**另一个**目标上时当场拒绝：选择器写全之后
-     * 不该发生，真发生了说明这条 Run 上有两批调用撞上了同一个点名，动作落到谁身上已经说不清。</p>
+     * 只留一行，不报错也不覆盖。同一个规则序号落到另一个目标上时不改已有行、
+     * 也不抛错：返回 {@link MatchBinding#ALREADY_BOUND_OTHER}，由调用方决定是
+     * {@code allExternalTasks} 的其余成员（动作仍按内存命中生效）还是 {@code uniqueExternalTask}
+     * 跨组再命中（记越界、成员照常接结果）。</p>
      */
-    public void recordMatch(String runId,
-                            AcceptanceReleasePolicy.Rule rule,
-                            long groupId,
-                            AcceptanceReleasePolicy.MemberFacts target) {
+    public MatchBinding recordMatch(String runId,
+                                    AcceptanceReleasePolicy.Rule rule,
+                                    long groupId,
+                                    AcceptanceReleasePolicy.MemberFacts target) {
         if (runId == null || runId.isBlank() || rule == null || target == null) {
-            return;
+            return MatchBinding.BOUND;
         }
         jdbcTemplate.update("""
                 INSERT INTO alphafrog_agent_run_acceptance_fixture_rule_hit
@@ -180,12 +204,38 @@ public class FixtureRuleHitStore {
                             + "这一次验收说不清点名的动作落到了谁身上");
         }
         if (!stored.target().equals(target)) {
-            throw refuse("acceptance_fixture_policy_target_conflict",
-                    "这条 Run 上第 " + rule.index() + " 条规则已经点名过 " + stored.target().describe()
-                            + "，现在又要点名 " + target.describe()
-                            + "：一条规则在整条 Run 里只该绑定一个目标，两批调用撞上同一个点名时"
-                            + "压住、等待或判失败的是谁就说不清了");
+            return MatchBinding.ALREADY_BOUND_OTHER;
         }
+        return MatchBinding.BOUND;
+    }
+
+    /**
+     * 记一笔「这条规则已经绑过别人，现在又打中了另一条成员」。
+     *
+     * <p>写在已经绑定的那一行的 {@code action_detail} 里，带 {@link #OVER_HIT_MARKER}。
+     * 已经记过就越过，不追加第二条。后来的成员不写进命中表，避免把唯一约束撑成两个目标。</p>
+     */
+    public void recordOverHit(String runId,
+                              AcceptanceReleasePolicy.Rule rule,
+                              AcceptanceReleasePolicy.MemberFacts attempted,
+                              AcceptanceReleasePolicy.MemberFacts bound) {
+        if (runId == null || runId.isBlank() || rule == null || attempted == null) {
+            return;
+        }
+        String boundText = bound == null ? "已经写下的那一条" : bound.describe();
+        String note = OVER_HIT_MARKER + "：已绑定 " + boundText + "，再次点名 " + attempted.describe();
+        jdbcTemplate.update("""
+                UPDATE alphafrog_agent_run_acceptance_fixture_rule_hit
+                SET action_detail = CASE
+                    WHEN action_detail IS NULL OR btrim(action_detail) = '' THEN ?
+                    WHEN action_detail LIKE ? THEN action_detail
+                    ELSE action_detail || '；' || ?
+                END
+                WHERE run_id = ?
+                  AND rule_index = ?
+                """, note, "%" + OVER_HIT_MARKER + "%", note, runId, rule.index());
+        log.warn("放行策略第 {} 条规则越界命中：runId={} 已绑定={} 再次点名={}",
+                rule.index(), runId, boundText, attempted.describe());
     }
 
     /**
@@ -200,15 +250,21 @@ public class FixtureRuleHitStore {
         if (runId == null || runId.isBlank()) {
             return false;
         }
+        String actionDetail = detail == null ? "" : detail;
         int updated = jdbcTemplate.update("""
                 UPDATE alphafrog_agent_run_acceptance_fixture_rule_hit
                 SET action_settled_at = CURRENT_TIMESTAMP,
                     action_outcome = ?,
-                    action_detail = ?
+                    action_detail = CASE
+                        WHEN action_detail LIKE ? THEN ? || '；' || substr(action_detail,
+                                strpos(action_detail, ?))
+                        ELSE ?
+                    END
                 WHERE run_id = ?
                   AND rule_index = ?
                   AND action_outcome IS NULL
-                """, outcome, detail, runId, ruleIndex);
+                """, outcome, "%" + OVER_HIT_MARKER + "%", actionDetail, OVER_HIT_MARKER,
+                actionDetail, runId, ruleIndex);
         if (updated == 0) {
             RuleHit stored = hitOf(runId, ruleIndex).orElse(null);
             if (stored == null) {
@@ -371,9 +427,16 @@ public class FixtureRuleHitStore {
             return actionOutcome != null;
         }
 
+        /** 同一条规则后来又打中了别的成员：点名对象之外的那一次。 */
+        public boolean overHit() {
+            return actionDetail != null && actionDetail.contains(OVER_HIT_MARKER);
+        }
+
         public String describe() {
             return target.describe() + "（动作结果 "
-                    + (actionOutcome == null ? "还没落地" : actionOutcome) + "）";
+                    + (actionOutcome == null ? "还没落地" : actionOutcome)
+                    + (overHit() ? "；" + OVER_HIT_MARKER : "")
+                    + "）";
         }
     }
 

@@ -182,4 +182,30 @@ class PromptOverlayLoaderTest {
         assertFalse(loader.current().applied());
         assertEquals(authority.baseBundleDigest(), authority.bundleDigest());
     }
+
+    @Test
+    void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath() throws Exception {
+        Path shared = tempDir.resolve("agent-prompt-overlay.local.json");
+        Path isolated = shared.getParent().resolve("stage3-dag-0922.agent-prompt-overlay.local.json");
+        Files.writeString(shared, overlayJson("\n主环境覆盖", null), StandardCharsets.UTF_8);
+        Files.writeString(isolated, overlayJson("\n泳道覆盖", null), StandardCharsets.UTF_8);
+
+        PromptOverlayLoader loader = newLoader(shared.toString());
+        ReflectionTestUtils.setField(loader, "laneTrafficScopeId", "stage3-dag-0922");
+
+        loader.applyNacosWrittenFile(shared.toString());
+        assertFalse(loader.current().applied(), "共用路径上的主环境覆盖不得被泳道加载器当成覆盖");
+        assertFalse(authority.prompts().getAgentRunSystemPrompt().endsWith("主环境覆盖"));
+
+        loader.applyNacosWrittenFile(isolated.toString());
+        assertTrue(loader.current().applied());
+        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("泳道覆盖"));
+        loader.refresh();
+        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("泳道覆盖"));
+
+        Files.delete(isolated);
+        loader.load();
+        assertFalse(loader.current().applied());
+        assertFalse(authority.prompts().getAgentRunSystemPrompt().endsWith("泳道覆盖"));
+    }
 }

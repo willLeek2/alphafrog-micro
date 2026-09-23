@@ -717,7 +717,7 @@ public class AgentLlmProperties {
      * 改完要重启，运行时的读数会标明这一点。</p>
      */
     public static class Scheduler {
-        @JsonAlias({"new-run-scheduler-version", "new_run_scheduler_version"})
+        @JsonAlias({"newRunSchedulerVersion", "new-run-scheduler-version", "new_run_scheduler_version"})
         private String newRunSchedulerVersion;
         @JsonAlias({"per-turn-new-node-limit", "per_turn_new_node_limit"})
         private Integer perTurnNewNodeLimit;

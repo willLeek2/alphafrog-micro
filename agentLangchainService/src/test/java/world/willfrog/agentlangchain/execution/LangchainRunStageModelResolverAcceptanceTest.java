@@ -1,7 +1,11 @@
 package world.willfrog.agentlangchain.execution;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -14,6 +18,7 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionExcept
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
+import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.acceptance.FixtureCallStore;
 import world.willfrog.agentlangchain.acceptance.FrozenModelScript;
 import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
@@ -26,11 +31,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
+import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException.refuse;
 
 /**
- * 阶段模型解析这一步：带夹具的 Run 只用脚本模型，普通 Run 照原样解析真实模型。
+ * 阶段模型解析：带夹具的 Run 先拿到脚本模型，未声明调用才懒建真实客户端；普通 Run 照原样解析。
  */
 class LangchainRunStageModelResolverAcceptanceTest {
 
@@ -53,17 +60,53 @@ class LangchainRunStageModelResolverAcceptanceTest {
 
         LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());
 
-        // 三个阶段同一个实例：脚本的位置跟着这条 Run 走。
+        // 三个阶段同一个实例：脚本跟着这条 Run 走。真实供应商客户端要等未声明调用才建。
         assertThat(models.planningModel()).isSameAs(models.executionModel());
         assertThat(models.executionModel()).isSameAs(models.finalAnswerModel());
         assertThat(models.executionModel()).isInstanceOf(ScriptedChatModel.class);
         assertThat(models.planningEndpointName()).isEqualTo("acceptance-fixture");
         assertThat(models.planningModelName()).isEqualTo("acceptance-fixture:fx-1");
         assertThat(models.planningProviderOrder()).isEmpty();
-        // 真实供应商这一侧一件都没做：没读配置、没解析端点、没建客户端。
         verifyNoInteractions(aiServiceFactory);
         verifyNoInteractions(stageConfigResolver);
         verifyNoInteractions(eventService);
+    }
+
+    @Test
+    void aFixtureRunBuildsTheRealClientOnlyForAnUndeclaredTurn() {
+        FixtureCallStore store = mock(FixtureCallStore.class);
+        when(store.claim(any(), any(), any(), any(), any()))
+                .thenThrow(refuse("acceptance_fixture_no_declared_turn", "无声明"));
+        FrozenModelScript script = FrozenModelScript.parse("fx-1",
+                "{\"turns\":[{\"for\":{\"stage\":\"planning\",\"planPhase\":\"strategy\"},\"text\":\"计划\"}]}",
+                objectMapper);
+        ScriptedChatModel scripted = new ScriptedChatModel("run-1", "fx-1", "scenario-a", script, store,
+                () -> new ScriptedChatModel.FixtureScript("fx-1", "scenario-a", script));
+        when(acceptanceFixtureModels.stageForRun(any()))
+                .thenReturn(Optional.of(new AcceptanceFixtureModelRegistry.ScriptedStage(
+                        scripted, "fx-1", "scenario-a")));
+        when(stageConfigResolver.resolve(any())).thenReturn(new RunStageConfig());
+        when(aiServiceFactory.resolveLlm(nullable(String.class), nullable(String.class)))
+                .thenReturn(new AgentLlmResolver.ResolvedLlm(
+                        "openrouter", "https://example.test", "some-model", "k", null, List.of(), 4096));
+        ChatModel real = new ChatModel() {
+            @Override
+            public ChatResponse doChat(ChatRequest chatRequest) {
+                return ChatResponse.builder().aiMessage(AiMessage.from("真")).build();
+            }
+        };
+        when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any(), any())).thenReturn(real);
+
+        LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());
+        verifyNoInteractions(aiServiceFactory);
+
+        ChatResponse response = AcceptanceFixtureModelRegistry.forCall(
+                        models.executionModel(),
+                        () -> FixtureCallIdentity.nodeSegment("run-1", 0, "n1", 0, 0, 0))
+                .chat(ChatRequest.builder().messages(List.of(UserMessage.from("继续"))).build());
+
+        assertThat(response.aiMessage().text()).isEqualTo("真");
+        verify(aiServiceFactory).buildChatModelWithProviderOrder(any(), any(), any());
     }
 
     @Test

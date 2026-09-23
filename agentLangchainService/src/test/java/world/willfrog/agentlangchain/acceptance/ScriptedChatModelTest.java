@@ -94,6 +94,44 @@ class ScriptedChatModelTest {
                 .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_no_declared_turn"));
     }
 
+    @Test
+    void anUndeclaredTurnGoesToTheRealModelWhenADelegateIsPresent() {
+        when(callStore.claim(any(), any(), any(), any(), any()))
+                .thenThrow(refuse("acceptance_fixture_no_declared_turn", "脚本里没有任何回合声明回答这一次调用"));
+        ChatModel real = replies("真模型");
+
+        ChatResponse response = chat(model(twoTurns()).withRealModel(identity -> real).boundTo(IDENTITY));
+
+        assertThat(response.aiMessage().text()).isEqualTo("真模型");
+    }
+
+    @Test
+    void aMatchedTurnDoesNotTouchTheRealModel() {
+        when(callStore.claim(eq("run-1"), eq("fx-1"), eq("scenario-a"), any(), eq(IDENTITY)))
+                .thenReturn(claim(0, "回合 1 声明 stage=node;nodeId=n1"));
+        ChatModel real = new ChatModel() {
+            @Override
+            public ChatResponse doChat(ChatRequest chatRequest) {
+                throw new AssertionError("声明命中时不该建真实模型");
+            }
+        };
+
+        ChatResponse response = chat(model(twoTurns()).withRealModel(identity -> real).boundTo(IDENTITY));
+
+        assertThat(response.aiMessage().text()).isEqualTo("第一回合");
+    }
+
+    @Test
+    void usedUpStillRefusesEvenWithADelegate() {
+        when(callStore.claim(any(), any(), any(), any(), any()))
+                .thenThrow(refuse("acceptance_fixture_declared_turns_used_up", "回合都被领走了"));
+        ChatModel real = replies("真模型");
+
+        assertThatThrownBy(() -> chat(model(twoTurns()).withRealModel(identity -> real).boundTo(IDENTITY)))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_declared_turns_used_up"));
+    }
+
     /**
      * 两次调用之间夹具被换成了另一份：第二次调用当场停住，不拿新夹具回答旧 Run 的问题。
      */
@@ -158,6 +196,15 @@ class ScriptedChatModelTest {
         return model.chat(ChatRequest.builder()
                 .messages(List.<ChatMessage>of(UserMessage.from("继续")))
                 .build());
+    }
+
+    private static ChatModel replies(String text) {
+        return new ChatModel() {
+            @Override
+            public ChatResponse doChat(ChatRequest chatRequest) {
+                return ChatResponse.builder().aiMessage(AiMessage.from(text)).build();
+            }
+        };
     }
 
     private static String twoTurns() {

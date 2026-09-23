@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -25,7 +26,7 @@ import static org.mockito.Mockito.when;
  * 按 Run 取回放行策略：不带夹具编号的 Run 拿到空，带编号的按夹具里的那份策略走。
  *
  * <p>这里量三件事：普通 Run 一步都不查；同一份策略读两次拿到同一个对象（策略是不可变值，解析一次
- * 就够了）；夹具在跑的中途失效时读策略当场报错，不许「夹具不让用了，被压住的成员却被悄悄放过去」。</p>
+ * 就够了）；夹具在跑的中途失效时读策略当场报错。控制 Run 第一次读过之后，行过期仍返回冻结的那一版。</p>
  */
 class AcceptanceRunPolicyRegistryTest {
 
@@ -154,6 +155,29 @@ class AcceptanceRunPolicyRegistryTest {
     }
 
     /**
+     * 控制 Run 第一次读过策略之后，行过期仍返回冻结的那一版。
+     *
+     * <p>创建门已经核过启用与过期。压住窗口可能比控制行 TTL 长：到期后继续核存活会把已经压住的
+     * 成员收成读失败。内容摘要仍要对上；夹具 Run 不走这条路。</p>
+     */
+    @Test
+    void aControlRunKeepsFrozenPolicyAfterTheRowExpires() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("ctrl-1", POLICY);
+        AcceptanceReleasePolicy first = registry.policyForRun(controlRun("ctrl-1")).orElseThrow();
+
+        when(store.find(LANE, GENERATION, "ctrl-1"))
+                .thenReturn(Optional.of(new AcceptanceFixtureRow("ctrl-1", "scenario-a", true,
+                        OffsetDateTime.now().minusMinutes(5), OffsetDateTime.now().minusSeconds(1),
+                        null, null, POLICY)));
+
+        AcceptanceReleasePolicy second = registry.policyForRun(controlRun("ctrl-1")).orElseThrow();
+
+        assertThat(second).isSameAs(first);
+        verify(store, times(2)).find(LANE, GENERATION, "ctrl-1");
+    }
+
+    /**
      * 夹具行在跑的中途被原位改过（策略换成另一版）：缓存命中那一次也要停住。
      *
      * <p>进程里继续按旧策略跑，库里记下来的却是另一版的内容，执行记录与证据对不上：一条要求压住
@@ -247,6 +271,39 @@ class AcceptanceRunPolicyRegistryTest {
                         .isEqualTo("acceptance_fixture_tracked_runs_full"));
     }
 
+    /** 只带控制编号、不带夹具编号：放行策略从这一行的 dispatchPolicyJson 读出来。 */
+    @Test
+    void aControlOnlyRunLoadsDispatchPolicy() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("ctrl-1", POLICY);
+
+        AcceptanceReleasePolicy policy = registry.policyForRun(controlRun("ctrl-1")).orElseThrow();
+
+        assertThat(policy.rules()).singleElement()
+                .satisfies(rule -> assertThat(rule.holdReleaseKey()).isEqualTo(POLICY_HOLDING_POINT_A));
+        verify(store).find(LANE, GENERATION, "ctrl-1");
+        verify(ruleHitStore).snapshotPolicy("run-1", "ctrl-1", "scenario-a", policy);
+    }
+
+    /** 夹具编号和控制编号都在时，策略取夹具那一行，不把两行混在一起。 */
+    @Test
+    void fixtureAndControlTogetherUseTheFixturePolicy() throws Exception {
+        AcceptanceRunPolicyRegistry registry = registry();
+        row("fx-1", POLICY);
+        row("ctrl-1", "{\"rules\":[{\"for\":{\"planGeneration\":7,\"nodeId\":\"n1\","
+                + "\"nodeAttempt\":1,\"segmentSequence\":0,\"modelTurn\":0,\"memberSeq\":0},"
+                + "\"fail\":\"控制行的策略\"}]}");
+
+        AcceptanceReleasePolicy policy = registry.policyForRun(run("run-1",
+                "{\"execution_mode\":\"DAG\",\"acceptanceFixtureId\":\"fx-1\","
+                        + "\"acceptanceControlId\":\"ctrl-1\"}")).orElseThrow();
+
+        assertThat(policy.rules()).singleElement()
+                .satisfies(rule -> assertThat(rule.holdReleaseKey()).isEqualTo(POLICY_HOLDING_POINT_A));
+        verify(store).find(LANE, GENERATION, "fx-1");
+        verify(store, never()).find(LANE, GENERATION, "ctrl-1");
+    }
+
     private AcceptanceRunPolicyRegistry registry() {
         when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
         return new AcceptanceRunPolicyRegistry(
@@ -267,6 +324,10 @@ class AcceptanceRunPolicyRegistryTest {
 
     private AgentRun fixtureRun(String runId, String fixtureId) throws Exception {
         return run(runId, "{\"execution_mode\":\"DAG\",\"acceptanceFixtureId\":\"" + fixtureId + "\"}");
+    }
+
+    private AgentRun controlRun(String controlId) throws Exception {
+        return run("run-1", "{\"execution_mode\":\"DAG\",\"acceptanceControlId\":\"" + controlId + "\"}");
     }
 
     private AgentRun run(String runId, String contextJson) throws Exception {

@@ -651,6 +651,37 @@ class WaitMemberResultReceiverTest {
                 .containsEntry("waitMemberReceiverCompletedTotal", 1L);
     }
 
+    /**
+     * uniqueExternalTask 打中一个已经绑过别人的成员：照常接沙箱结果，不压住、不改写成验收失败。
+     *
+     * <p>这是场景 2 汇总节点再调一次 python 的路径。命中表只留第一行；后来这条是真实业务结果，
+     * 仪器只记越界，不销毁数据。</p>
+     */
+    @Test
+    void aUniqueOverHitProceedsWithTheSandboxResult() {
+        givenGroupMembers(givenDueMember());
+        policyOf("{\"rules\":[{\"match\":\"uniqueExternalTask\",\"toolName\":\"executePython\","
+                + "\"holdUntilPoint\":\"point-a\"}]}");
+        when(ruleHits.recordMatch(any(), any(), anyLong(), any()))
+                .thenReturn(FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER);
+        FixtureRuleHitStore.RuleHit bound = new FixtureRuleHitStore.RuleHit(0, "holdUntilPoint",
+                "uniqueExternalTask", 99L,
+                new AcceptanceReleasePolicy.MemberFacts(2, "other-node", 0, 0, 0, 0, "call-first"),
+                OffsetDateTime.now(), null, null, null);
+        when(ruleHits.hitOf(eq(RUN_ID), eq(0))).thenReturn(Optional.of(bound));
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        assertThat(capturedRequest().resultRefJson())
+                .doesNotContain("acceptance_fixture_policy_unreadable");
+        verify(waitGroupStore, never()).holdMember(anyLong(), anyString(), any());
+        verify(ruleHits).recordOverHit(eq(RUN_ID), any(), any(), any());
+    }
+
     // ===== 造数据 =====
 
     private WaitMember givenDueMember() {

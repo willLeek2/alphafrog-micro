@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.control.dualpool;
 
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.service.AgentLlmHotConfigNotSyncedException;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 
 /**
@@ -13,6 +14,9 @@ import world.willfrog.agent.platform.workitem.SchedulerVersion;
  * <p>「配置写的是什么、实际生效的是什么」由设置解析组件一起算出来（热配置 → 环境属性 → 代码默认，
  * 以及进程终止演练开关对默认值的覆盖），这里只负责认出这个版本名并把认不出的当场拒掉。演练开关
  * 只覆盖代码默认值：显式配置的版本（包括显式写的 LEGACY）是操作人的选择，不被别的开关改写。</p>
+ *
+ * <p>泳道进程（容器里有 {@code AF_LANE_TRAFFIC_SCOPE_ID}）再加一条：新 Run 的版本必须来自
+ * agent-llm 热配置。环境属性里的 LEGACY 默认值不能在覆盖尚未进入内存快照时冻进库。</p>
  */
 @Component
 public class SchedulerVersionPolicy {
@@ -28,9 +32,21 @@ public class SchedulerVersionPolicy {
     }
 
     public String versionForNewRun() {
+        // Nacos 打开时，本地种子文件和环境属性里的 LEGACY 都不能抢在覆盖生效之前冻结版本。
+        if (!settings.hotConfigIsAuthoritative()) {
+            throw new AgentLlmHotConfigNotSyncedException(
+                    "agent-llm Nacos 尚未写入本地缓存，拒绝用种子文件或环境默认值冻结新 Run 的调度器版本");
+        }
         // 版本从这里读一次：热配置（泳道覆盖只影响该泳道）→ 环境属性 → 代码默认，演练开关也在这里
         // 生效。已经创建的 Run 只认自己记录里的版本，热配置怎么改都不会影响它们。
-        String effectiveVersion = requireKnown(settings.newRunSchedulerVersion().textValue());
+        DualPoolSchedulerSettings.Setting version = settings.newRunSchedulerVersion();
+        if (settings.laneProcess()
+                && !DualPoolSchedulerSettings.SOURCE_HOT_CONFIG.equals(version.source())) {
+            throw new AgentLlmHotConfigNotSyncedException(
+                    "泳道进程的新 Run 调度器版本必须来自 agent-llm 热配置，当前来源是 "
+                            + version.source() + " 值 " + version.textValue());
+        }
+        String effectiveVersion = requireKnown(version.textValue());
         // 认不出的值在这里失败关闭（既不是旧路径，也不是任何一个双池版本），不悄悄回落到旧版本。
         // 三个已知版本都可以给新 Run 用：完整 DAG 那一版的执行链已经接通（分段执行、等待组、
         // 结果接收、恢复分发与启动恢复都在），但要不要用由配置决定——没配置时仍是旧路径。

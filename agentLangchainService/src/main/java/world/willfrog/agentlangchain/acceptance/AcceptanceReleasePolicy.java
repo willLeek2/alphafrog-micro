@@ -32,7 +32,8 @@ import static world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutio
  * Run 里只指得出一条成员，压住、等待、按失败收尾的对象才与夹具作者点名的那一条是同一个。</p>
  *
  * <p>匹配的结果按「一条成员最多被一条规则点名」核对：一条规则同时命中同一批里的两条以上成员、
- * 或者两条规则点名了同一条成员，都当场拒绝。夹具写错了要当场说清哪一条规则对不上，不能让一次验收
+ * 或者两条规则点名了同一条成员，都当场拒绝。{@code allExternalTasks} 是例外：这一条规则会打中
+ * 本组里每一个对得上的外部作业。夹具写错了要当场说清哪一条规则对不上，不能让一次验收
  * 跑出个说不清压住了谁的结果。</p>
  *
  * <p>放行点是一条由受限控制面写入的库记录（{@code alphafrog_agent_run_release_point}），
@@ -63,16 +64,25 @@ public final class AcceptanceReleasePolicy {
             Set.of("planGeneration", "nodeId", "nodeAttempt", "segmentSequence", "modelTurn");
 
     /**
-     * 选择器里「组里哪一条成员」这一级的字段：{@code memberSeq} 要写，{@code toolCallId} 可以再写。
+     * 选择器里「组里哪一条成员」这一级的字段：没写 {@code operationId} 时 {@code memberSeq} 要写，
+     * {@code toolCallId} 可以再写。写了非空 {@code operationId} 时，组内序号可以不写。
      *
      * <p>组内序号是夹具作者自己排出来的（这一批里第几个工具调用），与模型给不给编号无关；
-     * 工具调用编号是模型给的，写了就一起比对，模型给出的编号与脚本写的不一样时这条规则不命中。</p>
+     * 工具调用编号是模型给的，写了就一起比对，模型给出的编号与脚本写的不一样时这条规则不命中。
+     * 外部作业身份是派发时按工具调用编出来的稳定编号，同一条 Run 里唯一。</p>
      */
-    public static final Set<String> MEMBER_KEYS = Set.of("memberSeq", "toolCallId");
+    public static final Set<String> MEMBER_KEYS = Set.of("memberSeq", "toolCallId", "operationId");
 
+    /** {@code uniqueExternalTask}：本组里对得上的外部作业必须恰好一条。 */
+    public static final String MATCH_UNIQUE_EXTERNAL_TASK = "uniqueExternalTask";
+    /** {@code allExternalTasks}：本组里对得上的每一条外部作业都被这一条规则点名；过滤只用 toolName，不能写 codeContains。 */
+    public static final String MATCH_ALL_EXTERNAL_TASKS = "allExternalTasks";
+
+    private static final Set<String> MATCH_VALUES =
+            Set.of(MATCH_UNIQUE_EXTERNAL_TASK, MATCH_ALL_EXTERNAL_TASKS);
     private static final Set<String> POLICY_FIELDS = Set.of("version", "rules", "maxHoldSeconds");
     private static final Set<String> RULE_FIELDS =
-            Set.of("for", "holdUntilPoint", "releaseAfter", "fail");
+            Set.of("for", "holdUntilPoint", "releaseAfter", "fail", "match", "toolName", "codeContains");
     private static final Set<String> ACTIONS = Set.of("holdUntilPoint", "releaseAfter", "fail");
     private static final int CURRENT_VERSION = 2;
 
@@ -80,18 +90,24 @@ public final class AcceptanceReleasePolicy {
      * 一条规则：选择器 + 恰好一种动作。
      *
      * @param index          这条规则在策略里的序号（从 0 起）；命中记录与核对结论都用它点名
-     * @param selector       选择器：字段名到值的映射，只写了的那几个字段参与比对
+     * @param selector       选择器：字段名到值的映射，只写了的那几个字段参与比对；{@code match} 规则可为空
      * @param action         {@code holdUntilPoint} / {@code releaseAfter} / {@code fail}
      * @param holdReleaseKey 压住时等的那个放行点名字
      * @param releaseAfter   等哪几条成员先落终态（每条是一个选择器，在这个等待组里解析）
      * @param failureDetail  按失败收尾时写进成员结果的说明
+     * @param match          按外部作业身份点名：{@code uniqueExternalTask} / {@code allExternalTasks}；与 {@code for} 互斥
+     * @param toolName       {@code match} 时可选：只认这个工具名；不写就是本组里任意工具
+     * @param codeContains   只跟 {@code uniqueExternalTask} 一起用：参数正文要含这一段
      */
     public record Rule(int index,
                        Map<String, String> selector,
                        String action,
                        String holdReleaseKey,
                        List<Map<String, String>> releaseAfter,
-                       String failureDetail) {
+                       String failureDetail,
+                       String match,
+                       String toolName,
+                       String codeContains) {
 
         public boolean holds() {
             return "holdUntilPoint".equals(action);
@@ -111,6 +127,9 @@ public final class AcceptanceReleasePolicy {
         }
 
         public String describe() {
+            if (match != null && !match.isBlank()) {
+                return "第 " + index + " 条规则（" + action + "，match=" + match + "）";
+            }
             return "第 " + index + " 条规则（" + action + "，选择器 " + selectorText() + "）";
         }
     }
@@ -123,7 +142,11 @@ public final class AcceptanceReleasePolicy {
      *
      * <p>这些字段合起来在同一条 Run 里唯一：等待组由「计划代际 + 节点 + 第几次尝试 + 第几段 + 第几次
      * 模型回合」定死，成员由组内序号（可再加工具调用编号）定死。策略的选择器要写全前五项与组内序号，
-     * 一条规则因此只会命中一条成员——这是「点名的动作真的落到点名的对象上」的前提。</p>
+     * 一条规则因此只会命中一条成员——这是「点名的动作真的落到点名的对象上」的前提。选择器也可以只写
+     * {@code operationId}：那是稳定的外部作业身份，同一组里两条成员不会共用。</p>
+     *
+     * <p>{@code operationId}、{@code toolName}、{@code argumentText} 只参与策略匹配。成员是不是同一条
+     * 仍按等待组加组内序号（再加工具调用编号）认定：命中行落库时没有这三列，读回来要比对得上。</p>
      */
     public record MemberFacts(int planGeneration,
                               String nodeId,
@@ -131,7 +154,22 @@ public final class AcceptanceReleasePolicy {
                               int segmentSequence,
                               int modelTurn,
                               int memberSeq,
-                              String toolCallId) {
+                              String toolCallId,
+                              String operationId,
+                              String toolName,
+                              String argumentText) {
+
+        /** 旧写法：外部作业身份、工具名、参数正文都空着。 */
+        public MemberFacts(int planGeneration,
+                           String nodeId,
+                           int nodeAttempt,
+                           int segmentSequence,
+                           int modelTurn,
+                           int memberSeq,
+                           String toolCallId) {
+            this(planGeneration, nodeId, nodeAttempt, segmentSequence, modelTurn, memberSeq, toolCallId,
+                    null, null, null);
+        }
 
         public Map<String, String> fields() {
             Map<String, String> fields = new LinkedHashMap<>();
@@ -144,39 +182,86 @@ public final class AcceptanceReleasePolicy {
             if (toolCallId != null && !toolCallId.isBlank()) {
                 fields.put("toolCallId", toolCallId);
             }
+            if (operationId != null && !operationId.isBlank()) {
+                fields.put("operationId", operationId);
+            }
+            if (toolName != null && !toolName.isBlank()) {
+                fields.put("toolName", toolName);
+            }
             return fields;
         }
 
         public String describe() {
             return "计划第 " + planGeneration + " 代 " + nodeId + " 第 " + nodeAttempt + " 次尝试 第 "
                     + segmentSequence + " 段 第 " + modelTurn + " 次模型回合 第 " + memberSeq + " 条成员"
-                    + (toolCallId == null || toolCallId.isBlank() ? "（模型没给编号）" : "（" + toolCallId + "）");
+                    + (toolCallId == null || toolCallId.isBlank() ? "（模型没给编号）" : "（" + toolCallId + "）")
+                    + (operationId == null || operationId.isBlank() ? "" : " operationId=" + operationId);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof MemberFacts facts)) {
+                return false;
+            }
+            return planGeneration == facts.planGeneration
+                    && nodeAttempt == facts.nodeAttempt
+                    && segmentSequence == facts.segmentSequence
+                    && modelTurn == facts.modelTurn
+                    && memberSeq == facts.memberSeq
+                    && java.util.Objects.equals(nodeId, facts.nodeId)
+                    && java.util.Objects.equals(toolCallId, facts.toolCallId);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(planGeneration, nodeId, nodeAttempt, segmentSequence,
+                    modelTurn, memberSeq, toolCallId);
         }
     }
 
     /**
-     * 一个等待组里每条规则命中了哪一条成员。
+     * 一个等待组里每条规则命中了哪几条成员。
      *
      * <p>没命中的规则不在这里：那条规则可能点名的是别的等待组。所以这个结果只说明「这一批里各条规则
      * 打到了谁」，而「有没有哪条规则一次都没打中」要看整条 Run 的命中记录，是跑到终态时核对的事。</p>
+     *
+     * <p>{@code allExternalTasks} 允许一条规则打中同一批里的多条成员；{@code uniqueExternalTask}
+     * 与 {@code for} 选择器仍是一条规则一条成员。{@link #targetOf} 取第一条，给旧的核对写法用。</p>
      */
-    public record RuleMatches(Map<Integer, MemberFacts> targetByRuleIndex) {
+    public record RuleMatches(Map<Integer, List<MemberFacts>> targetsByRuleIndex) {
 
-        public RuleMatches(Map<Integer, MemberFacts> targetByRuleIndex) {
-            this.targetByRuleIndex = Map.copyOf(targetByRuleIndex);
+        public RuleMatches(Map<Integer, List<MemberFacts>> targetsByRuleIndex) {
+            Map<Integer, List<MemberFacts>> copy = new LinkedHashMap<>();
+            for (Map.Entry<Integer, List<MemberFacts>> entry : targetsByRuleIndex.entrySet()) {
+                copy.put(entry.getKey(), List.copyOf(entry.getValue()));
+            }
+            this.targetsByRuleIndex = Map.copyOf(copy);
         }
 
+        /** 这条规则打中的第一条成员；一条都没打中就是空。 */
         public Optional<MemberFacts> targetOf(int ruleIndex) {
-            return Optional.ofNullable(targetByRuleIndex.get(ruleIndex));
+            List<MemberFacts> targets = targetsByRuleIndex.get(ruleIndex);
+            if (targets == null || targets.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(targets.get(0));
+        }
+
+        /** 这条规则打中的全部成员；{@code allExternalTasks} 时可能多于一条。 */
+        public List<MemberFacts> targetsOf(int ruleIndex) {
+            return targetsByRuleIndex.getOrDefault(ruleIndex, List.of());
         }
 
         public boolean isEmpty() {
-            return targetByRuleIndex.isEmpty();
+            return targetsByRuleIndex.isEmpty();
         }
 
         /** 这一批里被打中的规则序号，按规则顺序。 */
         public Set<Integer> ruleIndexes() {
-            return new LinkedHashSet<>(targetByRuleIndex.keySet());
+            return new LinkedHashSet<>(targetsByRuleIndex.keySet());
         }
     }
 
@@ -288,21 +373,19 @@ public final class AcceptanceReleasePolicy {
      * 这一批成员里，每条规则打到了谁。
      *
      * @param group 同一个等待组里的全部成员（派发前是这一批草稿，结果接收方是组里已落库的成员）
-     * @throws AcceptanceFixtureExecutionException 一条规则同时命中两条以上成员，或者两条规则点名了
-     *                                             同一条成员：点名对象不确定，压住/放行/判失败的是谁
-     *                                             就说不清，当场拒绝
+     * @throws AcceptanceFixtureExecutionException 一条规则同时命中两条以上成员（{@code allExternalTasks}
+     *                                             除外），或者两条规则点名了同一条成员：点名对象不确定，
+     *                                             压住/放行/判失败的是谁就说不清，当场拒绝。
+     *                                             {@code uniqueExternalTask} 对上两条以上时用
+     *                                             {@code acceptance_control_bind_ambiguous}
      */
     public RuleMatches match(List<MemberFacts> group) {
-        Map<Integer, MemberFacts> targets = new LinkedHashMap<>();
+        Map<Integer, List<MemberFacts>> targets = new LinkedHashMap<>();
         Map<String, Rule> claimedBy = new LinkedHashMap<>();
         for (Rule rule : rules) {
-            List<MemberFacts> hits = new ArrayList<>();
-            for (MemberFacts member : group) {
-                if (matches(rule.selector(), member.fields())) {
-                    hits.add(member);
-                }
-            }
-            if (hits.size() > 1) {
+            List<MemberFacts> hits = hitsOf(rule, group);
+            boolean allowsMany = MATCH_ALL_EXTERNAL_TASKS.equals(rule.match());
+            if (!allowsMany && hits.size() > 1) {
                 throw refuse("acceptance_fixture_policy_ambiguous",
                         "夹具 " + fixtureId + " 的放行策略里，" + rule.describe() + " 同时命中同一批里的 "
                                 + hits.size() + " 条成员（"
@@ -312,24 +395,27 @@ public final class AcceptanceReleasePolicy {
             if (hits.isEmpty()) {
                 continue;
             }
-            MemberFacts hit = hits.get(0);
-            Rule other = claimedBy.putIfAbsent(hit.describe(), rule);
-            if (other != null) {
-                throw refuse("acceptance_fixture_policy_ambiguous",
-                        "夹具 " + fixtureId + " 的放行策略里，" + other.describe() + " 与 " + rule.describe()
-                                + " 点名了同一条成员（" + hit.describe() + "）：同一条成员只该被一条规则点名，"
-                                + "两条规则会互相盖掉对方");
+            for (MemberFacts hit : hits) {
+                Rule other = claimedBy.putIfAbsent(hit.describe(), rule);
+                if (other != null) {
+                    throw refuse("acceptance_fixture_policy_ambiguous",
+                            "夹具 " + fixtureId + " 的放行策略里，" + other.describe() + " 与 " + rule.describe()
+                                    + " 点名了同一条成员（" + hit.describe() + "）：同一条成员只该被一条规则点名，"
+                                    + "两条规则会互相盖掉对方");
+                }
             }
-            targets.put(rule.index(), hit);
+            targets.put(rule.index(), List.copyOf(hits));
         }
         return new RuleMatches(targets);
     }
 
-    /** 这一批里，点名了这条成员的规则（按前面的核对，最多一条）。 */
+    /** 这一批里，点名了这条成员的规则（按前面的核对，{@code allExternalTasks} 时一条规则可点名多条）。 */
     public Optional<Rule> ruleAt(RuleMatches matches, MemberFacts member) {
         for (Rule rule : rules) {
-            if (matches.targetOf(rule.index()).filter(member::equals).isPresent()) {
-                return Optional.of(rule);
+            for (MemberFacts target : matches.targetsOf(rule.index())) {
+                if (member.equals(target)) {
+                    return Optional.of(rule);
+                }
             }
         }
         return Optional.empty();
@@ -395,11 +481,12 @@ public final class AcceptanceReleasePolicy {
         // 先把这个组里每条规则「等谁」解析出来，顺便把等自己、等不存在的成员这两类拒掉。
         Map<MemberFacts, List<MemberFacts>> waitingOn = new LinkedHashMap<>();
         for (Rule rule : rules) {
-            MemberFacts target = matches.targetOf(rule.index()).orElse(null);
-            if (target == null || !rule.waitsForPeers()) {
+            if (!rule.waitsForPeers()) {
                 continue;
             }
-            waitingOn.put(target, peersOf(rule, target, group));
+            for (MemberFacts target : matches.targetsOf(rule.index())) {
+                waitingOn.put(target, peersOf(rule, target, group));
+            }
         }
         for (MemberFacts start : waitingOn.keySet()) {
             List<MemberFacts> path = new ArrayList<>();
@@ -445,6 +532,68 @@ public final class AcceptanceReleasePolicy {
         return true;
     }
 
+    /**
+     * 这一条规则在这个等待组里打中了谁。
+     *
+     * <p>{@code for} 选择器按字段比对；{@code match} 按外部作业身份筛候选。{@code uniqueExternalTask}
+     * 对上两条以上当场拒绝，一条都对不上就当作这条规则在这一批里没命中。</p>
+     */
+    private List<MemberFacts> hitsOf(Rule rule, List<MemberFacts> group) {
+        if (rule.match() != null) {
+            List<MemberFacts> candidates = candidatesOf(rule, group);
+            if (MATCH_UNIQUE_EXTERNAL_TASK.equals(rule.match()) && candidates.size() > 1) {
+                throw refuse("acceptance_control_bind_ambiguous",
+                        "夹具 " + fixtureId + " 的放行策略里，" + rule.describe()
+                                + " 的 uniqueExternalTask 对上了 " + candidates.size()
+                                + " 条成员（operationId="
+                                + candidates.stream().map(MemberFacts::operationId).toList()
+                                + "）：这一组里只能有一条对得上，把 toolName 或 codeContains 写得更具体一点");
+            }
+            return candidates;
+        }
+        List<MemberFacts> hits = new ArrayList<>();
+        for (MemberFacts member : group) {
+            if (matches(rule.selector(), member.fields())) {
+                hits.add(member);
+            }
+        }
+        return hits;
+    }
+
+    /**
+     * {@code match} 规则的候选：有外部作业身份，工具名对得上（写了的话），参数正文含指定片段（写了的话）。
+     */
+    private static List<MemberFacts> candidatesOf(Rule rule, List<MemberFacts> group) {
+        List<MemberFacts> candidates = new ArrayList<>();
+        for (MemberFacts member : group) {
+            if (member.operationId() == null || member.operationId().isBlank()) {
+                continue;
+            }
+            if (rule.toolName() != null && !rule.toolName().equals(member.toolName())) {
+                continue;
+            }
+            if (rule.codeContains() != null) {
+                String args = member.argumentText();
+                if (args == null || !args.contains(rule.codeContains())) {
+                    continue;
+                }
+            }
+            candidates.add(member);
+        }
+        return candidates;
+    }
+
+    private static String optionalText(JsonNode value) {
+        if (value == null || value.isNull() || !value.isValueNode()) {
+            return null;
+        }
+        String text = value.isIntegralNumber() ? String.valueOf(value.asInt()) : value.asText();
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        return text.trim();
+    }
+
     /** 选择器的规范写法：字段名按字母序拼成 {@code key=value;key=value}。 */
     public static String selectorText(Map<String, String> selector) {
         List<String> keys = new ArrayList<>(selector.keySet());
@@ -462,7 +611,33 @@ public final class AcceptanceReleasePolicy {
             throw invalid(fixtureId, where + "要是一个 JSON 对象");
         }
         rejectUnknownFields(fixtureId, node, RULE_FIELDS, where);
-        Map<String, String> selector = readSelector(fixtureId, node.get("for"), where);
+        String match = optionalText(node.get("match"));
+        String filterToolName = optionalText(node.get("toolName"));
+        String codeContains = optionalText(node.get("codeContains"));
+        boolean hasFor = node.get("for") != null && !node.get("for").isNull();
+        if (match != null && hasFor) {
+            throw invalid(fixtureId, where + "不能同时写 for 和 match：要么用选择器点名一条成员，"
+                    + "要么按外部作业身份匹配");
+        }
+        if (match == null && !hasFor) {
+            throw invalid(fixtureId, where + "没有写 for 选择器，也没有写 match：说清这条规则点名的是哪一次调用");
+        }
+        if (match != null && !MATCH_VALUES.contains(match)) {
+            throw invalid(fixtureId, where + "的 match 只认 " + MATCH_UNIQUE_EXTERNAL_TASK + " 或 "
+                    + MATCH_ALL_EXTERNAL_TASKS + "，读到的是 " + match);
+        }
+        if (MATCH_ALL_EXTERNAL_TASKS.equals(match) && codeContains != null) {
+            throw invalid(fixtureId, where + "写了 allExternalTasks 又写了 codeContains："
+                    + "参数正文只在派发时有，结果接收方找回命中行时一条规则只能留下第一条成员，"
+                    + "第 2 条起会当场接结果却不报错。codeContains 只跟 uniqueExternalTask 一起用");
+        }
+        if (match == null && (filterToolName != null || codeContains != null)) {
+            throw invalid(fixtureId, where + "写了 toolName 或 codeContains，却没有写 match："
+                    + "这两个字段只跟 uniqueExternalTask / allExternalTasks 一起用");
+        }
+        Map<String, String> selector = hasFor
+                ? readSelector(fixtureId, node.get("for"), where)
+                : Map.of();
         List<String> actions = new ArrayList<>();
         for (String field : ACTIONS) {
             JsonNode value = node.get(field);
@@ -479,11 +654,14 @@ public final class AcceptanceReleasePolicy {
         JsonNode value = node.get(action);
         return switch (action) {
             case "holdUntilPoint" -> new Rule(index, selector, action,
-                    requiredText(fixtureId, value, where + "的 holdUntilPoint"), List.of(), null);
+                    requiredText(fixtureId, value, where + "的 holdUntilPoint"), List.of(), null,
+                    match, filterToolName, codeContains);
             case "fail" -> new Rule(index, selector, action, null, List.of(),
-                    requiredText(fixtureId, value, where + "的 fail"));
+                    requiredText(fixtureId, value, where + "的 fail"),
+                    match, filterToolName, codeContains);
             case "releaseAfter" -> new Rule(index, selector, action, null,
-                    readPeerSelectors(fixtureId, value, where), null);
+                    readPeerSelectors(fixtureId, value, where), null,
+                    match, filterToolName, codeContains);
             default -> throw invalid(fixtureId, where + "写了认不出的动作 " + action);
         };
     }
@@ -491,8 +669,12 @@ public final class AcceptanceReleasePolicy {
     /**
      * 读一条规则的选择器。
      *
-     * <p>等待组那一级的五个字段要写全，成员这一级要写组内序号（工具调用编号写了就一起比对）。
-     * 这样一条选择器在整条 Run 里只指得出一条成员：等待组由这五项定死，组内由序号定死。</p>
+     * <p>写了非空 {@code operationId} 时，等待组那一级和组内序号都可以不写：外部作业身份在同一条
+     * Run 里唯一，单独就能点名一条成员。</p>
+     *
+     * <p>没写 {@code operationId} 时，等待组那一级的五个字段要写全，成员这一级要写组内序号（工具调用
+     * 编号写了就一起比对）。这样一条选择器在整条 Run 里只指得出一条成员：等待组由这五项定死，组内由
+     * 序号定死。</p>
      *
      * <p>只写这一级的一部分也是不够的。少写 {@code planGeneration}，计划重建之后的同名节点会被打中；
      * 少写 {@code segmentSequence} 或 {@code modelTurn}，同一个节点的后续分段、同一段里的后续模型回合
@@ -525,6 +707,10 @@ public final class AcceptanceReleasePolicy {
                 throw invalid(fixtureId, where + "的 for 里 " + field + " 是空的");
             }
             selector.put(field, text.trim());
+        }
+        if (selector.containsKey("operationId")) {
+            // 外部作业身份单独就能点名一条成员：等待组字段和组内序号都可以不写。
+            return selector;
         }
         List<String> missingGroup = new ArrayList<>(GROUP_KEYS);
         missingGroup.removeAll(selector.keySet());

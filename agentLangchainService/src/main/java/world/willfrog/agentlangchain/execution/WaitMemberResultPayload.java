@@ -23,6 +23,14 @@ public final class WaitMemberResultPayload {
 
     /** 结果过大时写进载荷的错误码，恢复后模型与验收都能看到。 */
     public static final String TOO_LARGE = "member_result_too_large";
+    /**
+     * 结果正文已经拿到，但写成 jsonb 失败时写进载荷的错误码。
+     *
+     * <p>PostgreSQL 的 jsonb 不能存 NUL。工具原文里一旦带上这个字符，整条成员结束语句会抛错，
+     * 等待组停在「成员还待派发、下一段还在等待」，Run 一直执行到客户端超时。改写成这条失败后，
+     * 组仍能齐备并放行下一段，模型看到的是一句明确说明。</p>
+     */
+    public static final String PERSIST_FAILED = "member_result_persist_failed";
 
     private WaitMemberResultPayload() {
     }
@@ -54,7 +62,7 @@ public final class WaitMemberResultPayload {
                                 String output,
                                 Map<String, Object> extra,
                                 int maxChars) {
-        String text = output == null ? "" : output;
+        String text = stripJsonbUnsafe(output == null ? "" : output);
         boolean tooLarge = tooLarge(text, maxChars);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("toolName", toolName);
@@ -81,6 +89,32 @@ public final class WaitMemberResultPayload {
         } catch (Exception e) {
             throw new IllegalStateException("成员结果载荷无法编码", e);
         }
+    }
+
+    /**
+     * 第一次写入失败后改用的短失败载荷：不含工具原文，避免同一条非法字符或超大 JSON 再次把语句打爆。
+     */
+    public static String compactPersistFailure(ObjectMapper objectMapper,
+                                               String toolName,
+                                               String toolCallId,
+                                               String errorDetail) {
+        String detail = errorDetail == null || errorDetail.isBlank()
+                ? "成员结果无法写入等待组" : errorDetail;
+        if (detail.length() > 240) {
+            detail = detail.substring(0, 240);
+        }
+        return encode(objectMapper, toolName, toolCallId, false, "",
+                Map.of("errorCode", PERSIST_FAILED, "errorDetail", detail), Integer.MAX_VALUE);
+    }
+
+    /**
+     * jsonb 拒绝 NUL。写入前去掉，摘要按去掉后的正文计算，恢复时模型看到的也是这份没有 NUL 的原文。
+     */
+    static String stripJsonbUnsafe(String text) {
+        if (text == null || text.indexOf('\0') < 0) {
+            return text == null ? "" : text;
+        }
+        return text.replace("\0", "");
     }
 
     /** 读结果正文；载荷不是对象或没有正文时返回空串。 */

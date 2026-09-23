@@ -120,6 +120,11 @@ public class WaitMemberResultReceiver {
     private final FixtureRuleHitStore ruleHitStore;
     /** 这个进程已经往库里记过的命中（Run|规则|组|成员）：同一件事不必每一轮都去问一次库。 */
     private final Set<String> recordedRuleHits = ConcurrentHashMap.newKeySet();
+    /**
+     * {@code uniqueExternalTask} 越界命中的成员键：已经记过越界之后每一轮都要照常接结果，
+     * 不能因为「命中已经记过」就回头去压住。
+     */
+    private final Set<String> overHitRuleMembers = ConcurrentHashMap.newKeySet();
 
     /** 每压住一轮记一次（同一条成员被压住多轮就记多笔），不是「压住过几条成员」。 */
     private final AtomicLong holdPushes = new AtomicLong();
@@ -417,11 +422,17 @@ public class WaitMemberResultReceiver {
         Optional<AcceptanceReleasePolicy.Rule> matched =
                 policy.ruleAt(policy.match(facts), memberFactsOf(group, member));
         if (matched.isEmpty()) {
+            matched = recordedHitRule(policy, group, member);
+        }
+        if (matched.isEmpty()) {
             heldSinceByMember.remove(key);
             return PolicyAction.proceed();
         }
         AcceptanceReleasePolicy.Rule rule = matched.get();
-        recordRuleHit(group, member, rule);
+        if (!recordRuleHit(group, member, rule)) {
+            heldSinceByMember.remove(key);
+            return PolicyAction.proceed();
+        }
         List<AcceptanceReleasePolicy.MemberFacts> peers;
         try {
             peers = policy.peersOf(rule, memberFactsOf(group, member), facts);
@@ -469,7 +480,38 @@ public class WaitMemberResultReceiver {
                                                           WaitGroup group,
                                                           WaitMember member) {
         List<WaitMember> members = waitGroupStore.listMembers(group.getId());
-        return policy.ruleAt(policy.match(groupFacts(group, members)), memberFactsOf(group, member));
+        Optional<AcceptanceReleasePolicy.Rule> matched =
+                policy.ruleAt(policy.match(groupFacts(group, members)), memberFactsOf(group, member));
+        if (matched.isPresent()) {
+            return matched;
+        }
+        return recordedHitRule(policy, group, member);
+    }
+
+    /**
+     * 派发时已经按 {@code uniqueExternalTask} 绑过的命中：结果接收方没有参数正文，按命中行找回。
+     */
+    private Optional<AcceptanceReleasePolicy.Rule> recordedHitRule(AcceptanceReleasePolicy policy,
+                                                                  WaitGroup group,
+                                                                  WaitMember member) {
+        List<FixtureRuleHitStore.RuleHit> hits = ruleHitStore.hitsOf(member.getRunId());
+        if (hits == null || hits.isEmpty()) {
+            return Optional.empty();
+        }
+        for (FixtureRuleHitStore.RuleHit hit : hits) {
+            if (hit.groupId() != group.getId()) {
+                continue;
+            }
+            if (hit.target() == null || hit.target().memberSeq() != member.getMemberSeq()) {
+                continue;
+            }
+            for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
+                if (rule.index() == hit.ruleIndex()) {
+                    return Optional.of(rule);
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     /** 这个等待组里的成员在策略眼里的样子：组一级的身份来自等待组，成员一级来自成员记录。 */
@@ -485,7 +527,8 @@ public class WaitMemberResultReceiver {
     private static AcceptanceReleasePolicy.MemberFacts memberFactsOf(WaitGroup group, WaitMember member) {
         return new AcceptanceReleasePolicy.MemberFacts(group.getPlanGeneration(), group.getNodeId(),
                 group.getNodeAttempt(), group.getSegmentSequence(), group.getModelTurn(),
-                member.getMemberSeq(), member.getToolCallId());
+                member.getMemberSeq(), member.getToolCallId(),
+                member.getExternalOperationId(), member.getToolName(), null);
     }
 
     /** 这个等待组里与某条成员身份对上的那一行；对不上时为空。 */
@@ -504,16 +547,33 @@ public class WaitMemberResultReceiver {
      * 记一笔「这条规则真的打中了这条成员」。
      *
      * <p>同一件事只往库里记一次：这条成员被压住时会一轮一轮地走到这里，每一轮都写一遍没有意义。
-     * 记失败时不留下「已经记过」的记号，下一轮再试。</p>
+     * 记失败时不留下「已经记过」的记号，下一轮再试。返回 false 表示这条规则已经绑了别人：
+     * {@code uniqueExternalTask} 越界命中，调用方应照常接结果，不要压住也不要改写成失败。
+     * {@code allExternalTasks} 的其余成员返回 true，动作仍按内存命中生效。</p>
      */
-    private void recordRuleHit(WaitGroup group, WaitMember member, AcceptanceReleasePolicy.Rule rule) {
+    private boolean recordRuleHit(WaitGroup group, WaitMember member, AcceptanceReleasePolicy.Rule rule) {
         String key = member.getRunId() + "|" + rule.index() + "|" + group.getId() + "|" + member.getMemberSeq();
+        if (overHitRuleMembers.contains(key)) {
+            return false;
+        }
         if (!recordedRuleHits.add(key)) {
-            return;
+            return true;
         }
         try {
-            ruleHitStore.recordMatch(member.getRunId(), rule, group.getId(),
-                    memberFactsOf(group, member));
+            FixtureRuleHitStore.MatchBinding binding = ruleHitStore.recordMatch(member.getRunId(), rule,
+                    group.getId(), memberFactsOf(group, member));
+            if (binding == FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER) {
+                if (AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
+                    return true;
+                }
+                AcceptanceReleasePolicy.MemberFacts bound = ruleHitStore.hitOf(member.getRunId(), rule.index())
+                        .map(FixtureRuleHitStore.RuleHit::target)
+                        .orElse(null);
+                ruleHitStore.recordOverHit(member.getRunId(), rule, memberFactsOf(group, member), bound);
+                overHitRuleMembers.add(key);
+                return false;
+            }
+            return true;
         } catch (RuntimeException e) {
             recordedRuleHits.remove(key);
             throw e;
@@ -574,6 +634,7 @@ public class WaitMemberResultReceiver {
                 .removeIf(entry -> entry.getValue().runId().equals(event.runId()));
         String prefix = event.runId() + "|";
         recordedRuleHits.removeIf(key -> key.startsWith(prefix));
+        overHitRuleMembers.removeIf(key -> key.startsWith(prefix));
     }
 
     /**
@@ -662,7 +723,7 @@ public class WaitMemberResultReceiver {
             return;
         }
 
-        MemberCompletionResult result = waitGroupStore.completeMember(new MemberCompletionRequest(
+        MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
                 member.getGroupId(),
                 member.getMemberIdentity(),
                 success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
@@ -670,7 +731,7 @@ public class WaitMemberResultReceiver {
                 member.getExternalOperationId(),
                 group.getPlanGeneration(),
                 segment.getContextVersion(),
-                run.getRunControlVersion()));
+                run.getRunControlVersion()), member);
         // 这条成员有结论了，压住的计时不再需要。成员终态只落一次，这一条在上面那条语句返回 0 行时
         // 也照样清掉：那时它已经在别处落过终态，计时留着只会白占内存。
         heldSinceByMember.remove(memberKey(member));
@@ -703,6 +764,35 @@ public class WaitMemberResultReceiver {
             // 它自己的周期补扫与启动扫描会按数据库把这条通知重新发现。
             recoveryDispatcher.wake(result.notificationId());
             wakeups.incrementAndGet();
+        }
+    }
+
+    /**
+     * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
+     */
+    private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member) {
+        try {
+            return waitGroupStore.completeMember(request);
+        } catch (RuntimeException e) {
+            log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
+                    member.getGroupId(), member.getMemberIdentity(), e);
+            String compact = WaitMemberResultPayload.compactPersistFailure(
+                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+            MemberCompletionRequest fallback = new MemberCompletionRequest(
+                    request.groupId(),
+                    request.memberIdentity(),
+                    WaitMemberState.FAILED,
+                    compact,
+                    request.externalOperationId(),
+                    request.planGeneration(),
+                    request.contextVersion(),
+                    request.runControlVersion());
+            try {
+                return waitGroupStore.completeMember(fallback);
+            } catch (RuntimeException retry) {
+                e.addSuppressed(retry);
+                throw e;
+            }
         }
     }
 

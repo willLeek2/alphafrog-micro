@@ -249,9 +249,48 @@ class AcceptanceFixtureGateTest {
     }
 
     private AcceptanceFixtureGate gate(boolean enabled) {
-        when(environment.getProperty(AcceptanceFixtureGate.ENABLED_PROPERTY, Boolean.class, false))
+        when(environment.getProperty(AcceptanceFixtureGate.ENV_FLAG, Boolean.class))
                 .thenReturn(enabled);
         return new AcceptanceFixtureGate(store, environment);
+    }
+
+    @Test
+    void laneScopeOpensTheGateWhenExplicitFlagIsUnset() {
+        when(environment.getProperty(AcceptanceFixtureGate.ENV_FLAG, Boolean.class)).thenReturn(null);
+        when(environment.getProperty(AcceptanceFixtureGate.LANE_SCOPE_PROPERTY)).thenReturn("stage3-dag-0922");
+        AcceptanceFixtureGate gate = new AcceptanceFixtureGate(store, environment);
+        AcceptanceFixtureRow fixture = row(true, future(), "{\"executionMode\":\"DAG\"}");
+        when(store.find(LANE, GENERATION, "fx-1")).thenReturn(Optional.of(fixture));
+        when(store.recordUse(LANE, GENERATION, "fx-1")).thenReturn(true);
+
+        Optional<AcceptanceFixtureRow> admitted =
+                gate.admitRequestContext(context("fx-1", "DAG"), LANE, GENERATION);
+
+        assertThat(admitted).contains(fixture);
+    }
+
+    @Test
+    void mainProcessStaysClosedWhenExplicitFlagIsUnset() {
+        when(environment.getProperty(AcceptanceFixtureGate.ENV_FLAG, Boolean.class)).thenReturn(null);
+        when(environment.getProperty(AcceptanceFixtureGate.LANE_SCOPE_PROPERTY)).thenReturn(null);
+        AcceptanceFixtureGate gate = new AcceptanceFixtureGate(store, environment);
+
+        assertThatThrownBy(() -> gate.admitRequestContext(context("fx-1", "DAG"), LANE, GENERATION))
+                .isInstanceOf(LangchainRunRejectedException.class)
+                .satisfies(e -> assertThat(reason(e)).isEqualTo("acceptance_fixture_disabled"));
+        verifyNoInteractions(store);
+    }
+
+    @Test
+    void explicitFalseKeepsTheGateClosedEvenOnALane() {
+        when(environment.getProperty(AcceptanceFixtureGate.ENV_FLAG, Boolean.class)).thenReturn(false);
+        when(environment.getProperty(AcceptanceFixtureGate.LANE_SCOPE_PROPERTY)).thenReturn("stage3-dag-0922");
+        AcceptanceFixtureGate gate = new AcceptanceFixtureGate(store, environment);
+
+        assertThatThrownBy(() -> gate.admitRequestContext(context("fx-1", "DAG"), LANE, GENERATION))
+                .isInstanceOf(LangchainRunRejectedException.class)
+                .satisfies(e -> assertThat(reason(e)).isEqualTo("acceptance_fixture_disabled"));
+        verifyNoInteractions(store);
     }
 
     private static String context(String fixtureId, String executionMode) {

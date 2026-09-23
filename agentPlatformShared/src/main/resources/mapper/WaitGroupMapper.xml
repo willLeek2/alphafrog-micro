@@ -530,26 +530,38 @@
               AND EXISTS (SELECT 1 FROM run_fence)
             RETURNING m.id, m.group_id, m.member_seq, m.state
         ),
+        -- 完成数和齐备状态必须在同一次 UPDATE 里写完。同一语句里对这一行再 UPDATE
+        -- 一次时，后一次按原行快照写 READY，完成数仍是 0，齐备约束会拒收整句，成员也回滚。
         group_bumped AS (
             UPDATE alphafrog_agent_run_wait_group g SET
                 completed_members = g.completed_members
                     + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END,
+                state = CASE
+                    WHEN g.completed_members
+                        + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END
+                        = g.expected_members
+                    THEN 'READY' ELSE g.state END,
+                recovery_generation = CASE
+                    WHEN g.completed_members
+                        + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END
+                        = g.expected_members
+                    THEN g.recovery_generation + 1 ELSE g.recovery_generation END,
+                ready_at = CASE
+                    WHEN g.completed_members
+                        + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END
+                        = g.expected_members
+                    THEN CURRENT_TIMESTAMP ELSE g.ready_at END,
                 updated_at = CURRENT_TIMESTAMP
             FROM member_done d
             WHERE g.id = d.group_id
               AND g.state = 'WAITING'
-            RETURNING g.id, g.completed_members, g.expected_members, g.recovery_generation
+            RETURNING g.id, g.run_id, g.completed_members, g.expected_members,
+                      g.recovery_generation, g.state
         ),
         group_ready AS (
-            UPDATE alphafrog_agent_run_wait_group g SET
-                state = 'READY',
-                recovery_generation = g.recovery_generation + 1,
-                ready_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
+            SELECT b.id, b.run_id, b.recovery_generation
             FROM group_bumped b
-            WHERE g.id = b.id
-              AND b.completed_members = b.expected_members
-            RETURNING g.id, g.run_id, g.recovery_generation
+            WHERE b.state = 'READY'
         ),
         notification_written AS (
             INSERT INTO alphafrog_agent_run_recovery_notification

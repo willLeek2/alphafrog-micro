@@ -28,17 +28,19 @@ import java.util.Set;
  * @param missing       没发生的必答声明（原文写法），按回合序号排
  * @param missingRules  一次都没打中任何成员的规则（写法），按规则序号排
  * @param unappliedRules 打中了成员、但被点名的动作没有落到它身上的规则（写法），按规则序号排
+ * @param overHitRules   已经绑过一条成员、后来又打中别的成员的规则（写法），按规则序号排
  * @param consumed      被领走的声明与领走它的调用身份，按回合序号排
  */
 public record FixtureScenarioVerdict(String verdict,
                                      List<String> missing,
                                      List<String> missingRules,
                                      List<String> unappliedRules,
+                                     List<String> overHitRules,
                                      List<String> consumed) {
 
-    /** 必答声明都发生过、点名的规则都打中过成员、点名的动作也都真的生效了：要求的调用路径跑全了。 */
+    /** 必答声明都发生过、点名的规则都打中过成员、点名的动作也都真的生效了、也没有越界命中：要求的调用路径跑全了。 */
     public static final String COMPLETE = "complete";
-    /** 有必答声明没发生、点名的规则一条都没打中、或者点名的动作没有生效：这一次验收不能算通过。 */
+    /** 有必答声明没发生、点名的规则一条都没打中、点名的动作没有生效、或者规则越界打中了别的成员：这一次验收不能算通过。 */
     public static final String SCRIPT_INCOMPLETE = "script_incomplete";
 
     public static FixtureScenarioVerdict evaluate(FrozenModelScript script, Set<Integer> claimedTurns) {
@@ -73,6 +75,7 @@ public record FixtureScenarioVerdict(String verdict,
         List<String> missing = new ArrayList<>();
         List<String> missingRules = new ArrayList<>();
         List<String> unappliedRules = new ArrayList<>();
+        List<String> overHitRules = new ArrayList<>();
         List<String> consumed = new ArrayList<>();
         for (FrozenModelScript.TurnDeclaration declaration : declarations) {
             if (claimed.contains(declaration.turnIndex())) {
@@ -94,12 +97,17 @@ public record FixtureScenarioVerdict(String verdict,
                         + (hit.actionDetail() == null || hit.actionDetail().isBlank()
                                 ? "" : "（" + hit.actionDetail() + "）"));
             }
+            if (hit.overHit()) {
+                overHitRules.add(fact.describe() + "：" + (hit.actionDetail() == null
+                        ? FixtureRuleHitStore.OVER_HIT_MARKER
+                        : hit.actionDetail()));
+            }
         }
         boolean everythingHappened = missing.isEmpty() && missingRules.isEmpty()
-                && unappliedRules.isEmpty();
+                && unappliedRules.isEmpty() && overHitRules.isEmpty();
         return new FixtureScenarioVerdict(everythingHappened ? COMPLETE : SCRIPT_INCOMPLETE,
                 List.copyOf(missing), List.copyOf(missingRules), List.copyOf(unappliedRules),
-                List.copyOf(consumed));
+                List.copyOf(overHitRules), List.copyOf(consumed));
     }
 
     /** 没发生的那几件事写成一行的写法：落库的 detail 与日志都用它。 */
@@ -114,6 +122,10 @@ public record FixtureScenarioVerdict(String verdict,
         if (!unappliedRules.isEmpty()) {
             parts.add("放行策略里点名打中了成员、但动作没有落到它身上的规则："
                     + String.join("；", unappliedRules));
+        }
+        if (!overHitRules.isEmpty()) {
+            parts.add("放行策略里已经绑过一条成员、后来又打中别的成员的规则："
+                    + String.join("；", overHitRules));
         }
         return parts.isEmpty() ? null : String.join(" | ", parts);
     }

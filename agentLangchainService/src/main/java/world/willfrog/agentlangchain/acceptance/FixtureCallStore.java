@@ -102,9 +102,42 @@ public class FixtureCallStore {
             }
         }
         throw refuse("acceptance_fixture_declared_turns_used_up",
-                "夹具 " + fixtureId + "（场景 " + scenarioId + "）里声明回答这一次调用的回合"
-                        + "都已经被别的调用领走了：调用身份 " + identity.describe() + "，可以领的回合是 "
-                        + candidates.stream().map(FrozenModelScript.TurnDeclaration::describe).toList());
+                explainDeclaredTurnsUsedUp(fixtureId, scenarioId, identity, candidates));
+    }
+
+    /**
+     * 回合耗尽时的说明。声明没写 {@code nodeId} 时，每个节点的同位回合会争同一份；
+     * 这种通配只在场景已经钉死节点数时成立。
+     */
+    static String explainDeclaredTurnsUsedUp(String fixtureId,
+                                             String scenarioId,
+                                             FixtureCallIdentity identity,
+                                             List<FrozenModelScript.TurnDeclaration> candidates) {
+        String detail = "夹具 " + fixtureId + "（场景 " + scenarioId + "）里声明回答这一次调用的回合"
+                + "都已经被别的调用领走了：调用身份 " + identity.describe() + "，可以领的回合是 "
+                + candidates.stream().map(FrozenModelScript.TurnDeclaration::describe).toList();
+        if (nodeWildcardHitMultipleNodes(identity, candidates)) {
+            return detail + "。声明没写 nodeId，每个节点的同位回合都会命中同一份；当前节点是 "
+                    + identity.scope().get("nodeId")
+                    + "，这种通配只在场景已经钉死节点数时成立，否则把 nodeId 写进 for";
+        }
+        return detail;
+    }
+
+    static boolean nodeWildcardHitMultipleNodes(FixtureCallIdentity identity,
+                                                List<FrozenModelScript.TurnDeclaration> candidates) {
+        if (identity == null || identity.stage() != FixtureCallIdentity.Stage.NODE) {
+            return false;
+        }
+        if (!identity.scope().containsKey("nodeId")) {
+            return false;
+        }
+        for (FrozenModelScript.TurnDeclaration candidate : candidates) {
+            if ("node".equalsIgnoreCase(candidate.stage()) && !candidate.scope().containsKey("nodeId")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -252,6 +285,11 @@ public class FixtureCallStore {
                             + "runId={} fixture={} 动作没生效的规则={}",
                     runId, scenario.get("fixtureId"), verdict.unappliedRules());
         }
+        if (!verdict.overHitRules().isEmpty()) {
+            log.error("验收夹具的放行策略有规则越界打中了别的成员，这次验收不能算通过: "
+                            + "runId={} fixture={} 越界命中的规则={}",
+                    runId, scenario.get("fixtureId"), verdict.overHitRules());
+        }
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("runId", runId);
         snapshot.put("fixtureId", scenario.get("fixtureId"));
@@ -269,6 +307,7 @@ public class FixtureCallStore {
         snapshot.put("policyHitRuleCount", appliedRules);
         snapshot.put("policyMissingRules", verdict.missingRules());
         snapshot.put("policyUnappliedRules", verdict.unappliedRules());
+        snapshot.put("policyOverHitRules", verdict.overHitRules());
         snapshot.put("ruleHits", ruleHits.stream().map(FixtureRuleHitStore.RuleHit::describe).toList());
         return Optional.of(snapshot);
     }
@@ -281,6 +320,9 @@ public class FixtureCallStore {
         }
         if (!verdict.unappliedRules().isEmpty()) {
             parts.add("打中了成员但动作没有生效：" + String.join("；", verdict.unappliedRules()));
+        }
+        if (!verdict.overHitRules().isEmpty()) {
+            parts.add("规则越界命中：" + String.join("；", verdict.overHitRules()));
         }
         return parts.isEmpty() ? null : String.join(" | ", parts);
     }

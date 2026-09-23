@@ -96,6 +96,12 @@ public class DualPoolSchedulerSettings {
     /** 演练开关：只在版本来自代码默认时把它推进双池，显式配置的版本不被它改写。 */
     public static final String KEY_HALT_DRILL = "agent.tool-job.fault-injection.allow-process-halt";
 
+    /**
+     * 泳道容器由部署控制器写入。有值时，这一进程必须用 Nacos 覆盖里的调度器版本冻结新 Run，
+     * 不能回落到环境属性里的 LEGACY。
+     */
+    public static final String LANE_TRAFFIC_SCOPE_ID = "AF_LANE_TRAFFIC_SCOPE_ID";
+
     private static final String DUAL_POOL = "agent.langchain.dual-pool.";
     private static final String MEMBER_RECEIVER = "agent.langchain.wait-member.receiver.";
 
@@ -182,6 +188,23 @@ public class DualPoolSchedulerSettings {
      */
     public Setting newRunSchedulerVersion() {
         return newRunSchedulerVersion(resolver());
+    }
+
+    /**
+     * Nacos 启用时，必须等生效内容写进本地缓存并加载成功，才能用热配置冻结新 Run 的调度器版本。
+     * 没有加载器时（单测只喂环境属性）视为已经可用来解析。
+     */
+    public boolean hotConfigIsAuthoritative() {
+        return hotConfig == null || hotConfig.hotConfigIsAuthoritative();
+    }
+
+    /**
+     * 当前进程是不是泳道实例：部署时会写入 {@link #LANE_TRAFFIC_SCOPE_ID}。
+     * 主 Beta 没有这个变量，新 Run 仍可用环境属性里的版本。
+     */
+    public boolean laneProcess() {
+        String scopeId = environment.getProperty(LANE_TRAFFIC_SCOPE_ID);
+        return scopeId != null && !scopeId.isBlank();
     }
 
     /** 与上面同一个判断，只是复用调用方已经取好的那一份热配置快照（一次读数里只取一份）。 */

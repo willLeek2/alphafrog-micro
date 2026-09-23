@@ -181,6 +181,26 @@ class DualPoolWaitGroupNodeExecutorTest {
                 .as("等待组被消费成已交接，下一段放成可恢复").isTrue();
     }
 
+    @Test
+    void aJsonbRejectOnTheFirstWriteStillFinishesTheMemberWithACompactFailure() {
+        dispatcher.outputs.put("searchIndex", "CANNOT_STORE_THIS_OUTPUT");
+        store.rejectCompleteMemberJsonContaining = "CANNOT_STORE_THIS_OUTPUT";
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "searchIndex", "{\"keyword\":\"沪深300\"}"))));
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
+        assertThat(store.memberRows(groupId)).as("第一次写入失败后仍落了终态")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.FAILED.name());
+        assertThat(store.memberRows(groupId).get(0).resultRefJson)
+                .contains(WaitMemberResultPayload.PERSIST_FAILED)
+                .doesNotContain("CANNOT_STORE_THIS_OUTPUT");
+        assertThat(store.events()).as("短失败载荷写进去之后组照样齐备")
+                .anyMatch(event -> event.startsWith("group_ready:"));
+        assertThat(publisher.published).as("组齐备之后立刻放行下一段").hasSize(1);
+    }
+
     /** 夹具点名按失败收尾：工具当场成功，写进成员行的也是失败，并写清是场景点名的。 */
     @Test
     void aDesignatedMemberFailsEvenThoughItsToolSucceededInPlace() {
@@ -373,6 +393,47 @@ class DualPoolWaitGroupNodeExecutorTest {
         verify(ruleHits).recordMatch(eq(RUN_ID), eq(policy.rules().get(0)), eq(groupId),
                 eq(factsOf(0, 0, "call-a")));
         verify(ruleHits, never()).recordAction(any(), anyInt(), any(), any());
+    }
+
+    /**
+     * uniqueExternalTask 在下一组再打中另一条 python：成员照常派发，不按验收失败收尾。
+     *
+     * <p>命中表整条 Run 每条规则只留第一行。后来这条是场景 2 汇总节点那种真实业务调用，
+     * 仪器不该把它的结果改写成验收错误码。越界记在已经绑定的那一行上，等场景裁决响出来。</p>
+     */
+    @Test
+    void aLaterGroupUniqueHitStillDispatchesTheMember() {
+        dispatcher.requiresOperationId = true;
+        dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":call-a:1", "task-a", dispatchProof(RUN_ID + ":call-a:1", "task-a")));
+        AcceptanceReleasePolicy policy = AcceptanceReleasePolicy.parse("fx-1", """
+                {"rules":[{"match":"uniqueExternalTask","toolName":"executePython","holdUntilPoint":"dag-wait-a"}]}
+                """, objectMapper).orElseThrow();
+        when(ruleHits.recordMatch(any(), any(), anyLong(), any()))
+                .thenReturn(FixtureRuleHitStore.MatchBinding.BOUND)
+                .thenReturn(FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER);
+        FixtureRuleHitStore.RuleHit firstHit = new FixtureRuleHitStore.RuleHit(0, "holdUntilPoint",
+                "uniqueExternalTask", 1L, factsOf(0, 0, "call-a"),
+                OffsetDateTime.now(), null, null, null);
+        when(ruleHits.hitOf(eq(RUN_ID), eq(0))).thenReturn(Optional.of(firstHit));
+
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "executePython", "{}"))));
+        long firstGroup = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                firstSegment(List.of(), policy))).groupId();
+
+        dispatcher.pending.put("executePython", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":call-b:1", "task-b", dispatchProof(RUN_ID + ":call-b:1", "task-b")));
+        model.enqueue(AiMessage.from(List.of(toolCall("call-b", "executePython", "{}"))));
+        long secondGroup = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) executor.executeSegment(
+                segment(segmentIdentity(1), startPayload(), List.of(), policy))).groupId();
+
+        assertThat(store.memberRows(firstGroup)).extracting(row -> row.state)
+                .containsExactly(WaitMemberState.RUNNING.name());
+        assertThat(store.memberRows(secondGroup)).as("后来这条 python 照常派发，不落失败")
+                .extracting(row -> row.state)
+                .containsExactly(WaitMemberState.RUNNING.name());
+        verify(ruleHits).recordOverHit(eq(RUN_ID), eq(policy.rules().get(0)),
+                eq(factsOf(1, 0, "call-b")), eq(factsOf(0, 0, "call-a")));
     }
 
     /**

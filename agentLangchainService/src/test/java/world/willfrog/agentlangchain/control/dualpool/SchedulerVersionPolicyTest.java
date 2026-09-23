@@ -1,9 +1,20 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
+import org.mockito.Mockito;
+import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.service.AgentLlmHotConfigNotSyncedException;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -124,5 +135,79 @@ class SchedulerVersionPolicyTest {
         assertThatThrownBy(() -> policy(new MockEnvironment()).versionOf(run))
                 .as("已经落库的版本不认识时不能回落到任何一个已知版本")
                 .isInstanceOf(UnknownSchedulerVersionException.class);
+    }
+
+    @Test
+    void refusesToFreezeVersionBeforeNacosWritesTheCache() {
+        AgentLlmLocalConfigLoader loader = Mockito.mock(AgentLlmLocalConfigLoader.class);
+        Mockito.when(loader.hotConfigIsAuthoritative()).thenReturn(false);
+        SchedulerVersionPolicy policy = new SchedulerVersionPolicy(
+                new DualPoolSchedulerSettings(loader, new MockEnvironment().withProperty(VERSION_KEY, "LEGACY")));
+        assertThatThrownBy(policy::versionForNewRun)
+                .as("Nacos 还没把覆盖写进缓存时，不得用环境里的 LEGACY 冻结新 Run")
+                .isInstanceOf(AgentLlmHotConfigNotSyncedException.class);
+    }
+
+    @Test
+    void usesHotConfigVersionAfterNacosCacheIsAuthoritative() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setNewRunSchedulerVersion("DUAL_POOL_V2");
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(
+                scheduler, VERSION_KEY, "LEGACY");
+        assertThat(new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("Nacos 覆盖进缓存之后，热配置的 V2 压过环境属性 LEGACY")
+                .isEqualTo("DUAL_POOL_V2");
+    }
+
+    @Test
+    void laneProcessRejectsPropertyFallbackEvenAfterCacheIsAuthoritative() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(
+                scheduler,
+                VERSION_KEY, "LEGACY",
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "stage3-dag-0922");
+        assertThatThrownBy(() -> new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("泳道覆盖若没带调度器版本，不得用环境属性 LEGACY 冻进库")
+                .isInstanceOf(AgentLlmHotConfigNotSyncedException.class)
+                .hasMessageContaining("热配置")
+                .hasMessageContaining("property");
+    }
+
+    @Test
+    void laneProcessKeepsHotConfigVersion() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setNewRunSchedulerVersion("DUAL_POOL_V2");
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(
+                scheduler,
+                VERSION_KEY, "LEGACY",
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "stage3-dag-0922");
+        assertThat(new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("泳道覆盖写了 V2 时，按热配置冻结")
+                .isEqualTo("DUAL_POOL_V2");
+    }
+
+    @Test
+    void laneProcessReadsCamelCaseSchedulerVersionWhenObjectMapperUsesSnakeCase() throws Exception {
+        Path configFile = Files.createTempFile("agent-llm", ".json");
+        Files.writeString(configFile, """
+                {"runtime":{"scheduler":{"newRunSchedulerVersion":"DUAL_POOL_V2"}}}
+                """, StandardCharsets.UTF_8);
+        ObjectMapper snake = new ObjectMapper()
+                .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(snake);
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+        loader.applyNacosWrittenFile(configFile.toString());
+
+        DualPoolSchedulerSettings settings = new DualPoolSchedulerSettings(
+                loader,
+                new MockEnvironment()
+                        .withProperty(VERSION_KEY, "LEGACY")
+                        .withProperty(DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "stage3-dag-0922"));
+        assertThat(settings.newRunSchedulerVersion().source())
+                .isEqualTo(DualPoolSchedulerSettings.SOURCE_HOT_CONFIG);
+        assertThat(new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("缓存文件按 camelCase 解析，应用 ObjectMapper 即使是 SNAKE_CASE 也不回落到 yml LEGACY")
+                .isEqualTo("DUAL_POOL_V2");
     }
 }

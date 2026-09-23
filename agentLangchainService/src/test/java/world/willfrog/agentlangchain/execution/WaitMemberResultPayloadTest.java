@@ -48,4 +48,25 @@ class WaitMemberResultPayloadTest {
         assertThat(WaitMemberResultPayload.succeeded(json, objectMapper)).isFalse();
         assertThat(WaitMemberResultPayload.modelText(json, objectMapper)).isEqualTo("参数缺少资产代码");
     }
+
+    @Test
+    void nulInTheOutputIsStrippedBeforeEncoding() {
+        String json = WaitMemberResultPayload.encode(objectMapper, "searchIndex", "call-nul", true,
+                "沪深300\0指数", Map.of(), 1024);
+
+        assertThat(WaitMemberResultPayload.succeeded(json, objectMapper)).isTrue();
+        assertThat(WaitMemberResultPayload.output(json, objectMapper)).isEqualTo("沪深300指数");
+        assertThat(json).doesNotContain("\\u0000");
+    }
+
+    @Test
+    void compactPersistFailureKeepsTheGroupMovableWithoutTheOriginalOutput() {
+        String json = WaitMemberResultPayload.compactPersistFailure(objectMapper, "searchIndex", "call-d",
+                "ERROR: unsupported Unicode escape sequence \\u0000");
+
+        assertThat(WaitMemberResultPayload.succeeded(json, objectMapper)).isFalse();
+        assertThat(json).contains(WaitMemberResultPayload.PERSIST_FAILED);
+        assertThat(WaitMemberResultPayload.output(json, objectMapper)).isEmpty();
+        assertThat(WaitMemberResultPayload.modelText(json, objectMapper)).contains(WaitMemberResultPayload.PERSIST_FAILED);
+    }
 }

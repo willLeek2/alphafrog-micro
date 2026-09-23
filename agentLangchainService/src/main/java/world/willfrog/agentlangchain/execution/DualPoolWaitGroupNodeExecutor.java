@@ -33,7 +33,6 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
@@ -344,7 +343,7 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         int modelTurn = checkpoint.modelTurn();
         AcceptanceReleasePolicy policy = input.request().getAcceptanceReleasePolicy();
-        List<AcceptanceReleasePolicy.MemberFacts> facts = memberFacts(input, modelTurn, drafts);
+        List<AcceptanceReleasePolicy.MemberFacts> facts = memberFacts(input, modelTurn, drafts, calls);
         AcceptanceReleasePolicy.RuleMatches policyMatches = matchPolicyRules(policy, facts);
         String unwaitable = unwaitableTargetReason(policy, policyMatches, drafts);
         if (unwaitable != null) {
@@ -375,7 +374,7 @@ public class DualPoolWaitGroupNodeExecutor {
             return new Outcome.NotOwned("segment_not_matched:" + input.identity().describe());
         }
         long groupId = suspended.groupId();
-        recordPolicyMatches(input.identity().runId(), policy, policyMatches, groupId);
+        policyMatches = recordPolicyMatches(input.identity().runId(), policy, policyMatches, groupId);
         Long notificationId = dispatchMembers(groupId, input, modelTurn, policy, policyMatches, calls);
         if (notificationId != null) {
             boolean published = resumedSegmentPublisher.publish(notificationId,
@@ -393,18 +392,23 @@ public class DualPoolWaitGroupNodeExecutor {
     /**
      * 这一批草稿在策略眼里的样子。
      *
-     * <p>等待组一级的身份来自分段身份与这一段的模型回合，成员一级的身份来自草稿的组内序号与模型给的
-     * 工具调用编号。结果接收方按等待组与成员记录凑出来的字段与此完全一致，策略在两边才会给同一个答案。</p>
+     * <p>等待组一级的身份来自分段身份与这一段的模型回合，成员一级的身份来自草稿的组内序号、模型给的
+     * 工具调用编号，以及派发时的外部作业身份与工具名。参数正文给 {@code uniqueExternalTask} 的
+     * {@code codeContains} 用，结果接收方没有这份正文，按派发时已经记下的命中找回。</p>
      */
     private static List<AcceptanceReleasePolicy.MemberFacts> memberFacts(SegmentExecution input,
                                                                         int modelTurn,
-                                                                        List<WaitMemberDraft> drafts) {
+                                                                        List<WaitMemberDraft> drafts,
+                                                                        List<ToolExecutionRequest> calls) {
         NodeWorkItemIdentity identity = input.identity();
         List<AcceptanceReleasePolicy.MemberFacts> facts = new ArrayList<>();
-        for (WaitMemberDraft draft : drafts) {
+        for (int index = 0; index < drafts.size(); index++) {
+            WaitMemberDraft draft = drafts.get(index);
+            String argumentText = index < calls.size() ? calls.get(index).arguments() : null;
             facts.add(new AcceptanceReleasePolicy.MemberFacts(identity.planGeneration(), identity.nodeId(),
                     identity.nodeAttempt(), identity.segmentSequence(), modelTurn,
-                    draft.getMemberSeq(), draft.getToolCallId()));
+                    draft.getMemberSeq(), draft.getToolCallId(),
+                    draft.getExternalOperationId(), draft.getToolName(), argumentText));
         }
         return List.copyOf(facts);
     }
@@ -412,11 +416,13 @@ public class DualPoolWaitGroupNodeExecutor {
     /** 一条已落库的成员在策略眼里的样子：派发与收尾两处都用它，免得两边凑的字段不一样。 */
     private static AcceptanceReleasePolicy.MemberFacts memberFacts(SegmentExecution input,
                                                                   int modelTurn,
-                                                                  WaitMember member) {
+                                                                  WaitMember member,
+                                                                  String argumentText) {
         NodeWorkItemIdentity identity = input.identity();
         return new AcceptanceReleasePolicy.MemberFacts(identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), modelTurn,
-                member.getMemberSeq(), member.getToolCallId());
+                member.getMemberSeq(), member.getToolCallId(),
+                member.getExternalOperationId(), member.getToolName(), argumentText);
     }
 
     /**
@@ -426,9 +432,10 @@ public class DualPoolWaitGroupNodeExecutor {
      * 不在这一批里的成员，这条等待永远等不到头（被压住的成员除了兜底时限没人会来放行）。所以核对放在
      * 建组与派发之前：一个外部作业都还没建出来，夹具写错了当场停住，原因就是夹具自己的稳定错误码。</p>
      *
-     * <p>选择器同时打中两条成员、两条规则点名同一条成员，这两类由 {@code match} 当场拒绝：点名对象
-     * 不确定，压住/放行/判失败的是谁就说不清。等自己、组内绕成圈这两类要看这一批到底有哪几条成员，
-     * 所以在这里判：绕成圈的那几条成员会一直压着，除了兜底时限没有别的出路。</p>
+     * <p>选择器同时打中两条成员、两条规则点名同一条成员，这两类由策略匹配当场拒绝：点名对象
+     * 不确定，压住/放行/判失败的是谁就说不清。{@code allExternalTasks} 是例外，一条规则可以打中
+     * 这一批里多条外部作业。等自己、组内绕成圈这两类要看这一批到底有哪几条成员，所以在这里判：
+     * 绕成圈的那几条成员会一直压着，除了兜底时限没有别的出路。</p>
      */
     private AcceptanceReleasePolicy.RuleMatches matchPolicyRules(
             AcceptanceReleasePolicy policy,
@@ -448,18 +455,44 @@ public class DualPoolWaitGroupNodeExecutor {
      * 起来像跑完了。所以命中要落库，跑到终态时按它核对。派发前与结果接收方都会记，重复记只留一行。
      * 这里记的是「选择器打中了谁」；被点名的动作有没有真的落到这条成员身上，是动作真的发生时才记的
      * （压住、等兄弟成员、按失败收尾各自在自己的那一刻写）。</p>
+     *
+     * <p>{@code uniqueExternalTask} 打中一个已经绑过别人的目标时，这一条从返回的命中里拿掉：
+     * 后面 {@link #completeMember} 不会再按这条规则改写它的业务结果。越界记在已经绑定的那一行上。
+     * {@code allExternalTasks} 的其余成员仍留在命中里，动作按内存生效。建组派发前能拦住的写错
+     * （点名组外成员、压住当场出结果的工具）仍然直接抛，那时还没有沙箱结果可销毁。</p>
      */
-    private void recordPolicyMatches(String runId,
-                                     AcceptanceReleasePolicy policy,
-                                     AcceptanceReleasePolicy.RuleMatches matches,
-                                     long groupId) {
+    private AcceptanceReleasePolicy.RuleMatches recordPolicyMatches(String runId,
+                                                                   AcceptanceReleasePolicy policy,
+                                                                   AcceptanceReleasePolicy.RuleMatches matches,
+                                                                   long groupId) {
         if (policy == null || matches == null) {
-            return;
+            return matches;
         }
+        Map<Integer, List<AcceptanceReleasePolicy.MemberFacts>> kept = new LinkedHashMap<>();
         for (AcceptanceReleasePolicy.Rule rule : policy.rules()) {
-            matches.targetOf(rule.index()).ifPresent(target ->
-                    ruleHitStore.recordMatch(runId, rule, groupId, target));
+            List<AcceptanceReleasePolicy.MemberFacts> keptTargets = new ArrayList<>();
+            for (AcceptanceReleasePolicy.MemberFacts target : matches.targetsOf(rule.index())) {
+                FixtureRuleHitStore.MatchBinding binding =
+                        ruleHitStore.recordMatch(runId, rule, groupId, target);
+                if (binding == FixtureRuleHitStore.MatchBinding.ALREADY_BOUND_OTHER) {
+                    if (AcceptanceReleasePolicy.MATCH_ALL_EXTERNAL_TASKS.equals(rule.match())) {
+                        // 命中表按规则序号只留第一行；其余成员的压住仍按内存里的命中生效。
+                        keptTargets.add(target);
+                        continue;
+                    }
+                    AcceptanceReleasePolicy.MemberFacts bound = ruleHitStore.hitOf(runId, rule.index())
+                            .map(FixtureRuleHitStore.RuleHit::target)
+                            .orElse(null);
+                    ruleHitStore.recordOverHit(runId, rule, target, bound);
+                    continue;
+                }
+                keptTargets.add(target);
+            }
+            if (!keptTargets.isEmpty()) {
+                kept.put(rule.index(), keptTargets);
+            }
         }
+        return new AcceptanceReleasePolicy.RuleMatches(kept);
     }
 
     /**
@@ -483,17 +516,15 @@ public class DualPoolWaitGroupNodeExecutor {
             if (!rule.holds() && !rule.waitsForPeers()) {
                 continue;
             }
-            AcceptanceReleasePolicy.MemberFacts target = matches.targetOf(rule.index()).orElse(null);
-            if (target == null) {
-                continue;
+            for (AcceptanceReleasePolicy.MemberFacts target : matches.targetsOf(rule.index())) {
+                String toolName = toolNameOf(drafts, target.memberSeq());
+                if (toolName == null || toolDispatcher.requiresStableOperationId(toolName)) {
+                    // 会转后台的工具就是那个需要稳定外部作业身份的工具（见 NodeToolDispatcher）：
+                    // 它的结果以后才回来，压住与等兄弟成员有可等的东西。
+                    continue;
+                }
+                return "acceptance_fixture_rule_needs_waiting_member:" + rule.index() + ":" + toolName;
             }
-            String toolName = toolNameOf(drafts, target.memberSeq());
-            if (toolName == null || toolDispatcher.requiresStableOperationId(toolName)) {
-                // 会转后台的工具就是那个需要稳定外部作业身份的工具（见 NodeToolDispatcher）：
-                // 它的结果以后才回来，压住与等兄弟成员有可等的东西。
-                continue;
-            }
-            return "acceptance_fixture_rule_needs_waiting_member:" + rule.index() + ":" + toolName;
         }
         return null;
     }
@@ -530,7 +561,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 if (call == null) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
                             policyMatches, member, false, "",
-                            Map.of("errorCode", "wait_group_member_request_missing")));
+                            Map.of("errorCode", "wait_group_member_request_missing"), null));
                     continue;
                 }
                 NodeToolDispatcher.DispatchOutcome outcome = toolDispatcher.dispatch(
@@ -540,10 +571,10 @@ public class DualPoolWaitGroupNodeExecutor {
                                 call.arguments()));
                 if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Completed completed) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                            policyMatches, member, true, completed.output(), Map.of()));
+                            policyMatches, member, true, completed.output(), Map.of(), call.arguments()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Failed failed) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                            policyMatches, member, false, failed.reason(), Map.of()));
+                            policyMatches, member, false, failed.reason(), Map.of(), call.arguments()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Pending pending) {
                     // 后台作业已经建出来了。成员从「待派发」进入「执行中」，并把派发证明与下次查询
                     // 时间写上：证明留给结果接收方收尾，查询时间让接收方能找到这个成员。
@@ -593,7 +624,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 continue;
             }
             notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                    policyMatches, member, false, "", Map.of("errorCode", errorCode)));
+                    policyMatches, member, false, "", Map.of("errorCode", errorCode), null));
         }
         return notificationId;
     }
@@ -610,10 +641,11 @@ public class DualPoolWaitGroupNodeExecutor {
                                 WaitMember member,
                                 boolean success,
                                 String output,
-                                Map<String, Object> extra) {
+                                Map<String, Object> extra,
+                                String argumentText) {
         Optional<AcceptanceReleasePolicy.Rule> rule = policy == null || policyMatches == null
                 ? Optional.empty()
-                : policy.ruleAt(policyMatches, memberFacts(input, modelTurn, member));
+                : policy.ruleAt(policyMatches, memberFacts(input, modelTurn, member, argumentText));
         Optional<String> designated = rule.filter(AcceptanceReleasePolicy.Rule::fails)
                 .map(AcceptanceReleasePolicy.Rule::failureDetail);
         AcceptanceReleasePolicy.Rule namedBy = rule.orElse(null);
@@ -651,7 +683,7 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
-        MemberCompletionResult result = waitGroupStore.completeMember(new MemberCompletionRequest(
+        MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
                 member.getGroupId(),
                 member.getMemberIdentity(),
                 success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
@@ -659,7 +691,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 member.getExternalOperationId(),
                 input.identity().planGeneration(),
                 input.versions().contextVersion(),
-                input.versions().runControlVersion()));
+                input.versions().runControlVersion()), member);
         if (!result.applied()) {
             log.info("成员结果没有写进去（重复上报或已落终态）：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity());
@@ -667,6 +699,35 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         recordMemberAction(input, member, designated.isPresent() ? namedBy : null, actionNotApplied);
         return result.notificationId();
+    }
+
+    /**
+     * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
+     */
+    private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member) {
+        try {
+            return waitGroupStore.completeMember(request);
+        } catch (RuntimeException e) {
+            log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
+                    member.getGroupId(), member.getMemberIdentity(), e);
+            String compact = WaitMemberResultPayload.compactPersistFailure(
+                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+            MemberCompletionRequest fallback = new MemberCompletionRequest(
+                    request.groupId(),
+                    request.memberIdentity(),
+                    WaitMemberState.FAILED,
+                    compact,
+                    request.externalOperationId(),
+                    request.planGeneration(),
+                    request.contextVersion(),
+                    request.runControlVersion());
+            try {
+                return waitGroupStore.completeMember(fallback);
+            } catch (RuntimeException retry) {
+                e.addSuppressed(retry);
+                throw e;
+            }
+        }
     }
 
     /**

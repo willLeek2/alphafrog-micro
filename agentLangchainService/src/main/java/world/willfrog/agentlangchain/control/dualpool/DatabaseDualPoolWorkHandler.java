@@ -543,6 +543,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
     }
 
+    /** 当前分段是不是已经被等待组挂起语句写成结果已提交。 */
+    private boolean waitGroupSegmentAlreadyCommitted(NodeWorkItemIdentity identity) {
+        NodeWorkItem row = workItemStore.findByIdentity(identity).orElse(null);
+        return row != null
+                && row.stateEnum() == NodeWorkItemState.RESULT_COMMITTED
+                && segmentSuspended(row);
+    }
+
     /**
      * 把这一轮定下来的就绪节点写成工作项，并同步记下这一轮为什么没能建完。
      *
@@ -813,6 +821,13 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 // 外部任务已经取得持久锚点并把 Run 切到等待态。此时不能把原工作项写成
                 // EXECUTION_FAILED，否则终态对账器将失去可推进的 WAITING/EXECUTING 所有者。
                 log.error("双池长工具已持久挂起，节点交接尚未完成，保留原状态等待恢复: identity={}",
+                        identity.describe(), e);
+                return;
+            }
+            if (waitGroupVersion && waitGroupSegmentAlreadyCommitted(identity)) {
+                // 等待组挂起已经把当前分段写成 RESULT_COMMITTED。再走执行失败会打出
+                // TERMINAL_ALREADY，组里的成员却可能还停在 PENDING，下一段永远等不到放行。
+                log.error("等待组已经把当前分段写成结果已提交，节点异常不再改写成执行失败: identity={}",
                         identity.describe(), e);
                 return;
             }

@@ -28,8 +28,11 @@ public class AcceptanceFixtureGate {
     /** 请求上下文里的字段名；只带编号，带不了计划或模型内容。 */
     public static final String CONTEXT_FIELD = "acceptanceFixtureId";
 
-    /** 执行控制面总开关；默认关，Beta 验收时由泳道配置打开。 */
-    public static final String ENABLED_PROPERTY = "agent.acceptance-fixture.enabled";
+    /** 控制器写入的显式开关。未设置时，有泳道范围的进程打开，主 Beta 保持关闭。 */
+    public static final String ENV_FLAG = "AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED";
+
+    /** 泳道容器由控制器注入；主 Beta 不写。未设显式开关时用它判断是不是隔离泳道。 */
+    public static final String LANE_SCOPE_PROPERTY = "AF_LANE_TRAFFIC_SCOPE_ID";
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
@@ -63,9 +66,10 @@ public class AcceptanceFixtureGate {
         if (context.get(CONTEXT_FIELD) == null || context.get(CONTEXT_FIELD).isNull()) {
             return Optional.empty();
         }
-        if (!environment.getProperty(ENABLED_PROPERTY, Boolean.class, false)) {
+        if (!fixtureControlEnabled()) {
             throw reject("acceptance_fixture_disabled",
-                    "执行控制面没有打开（" + ENABLED_PROPERTY + "），带夹具编号的请求一律不创建任务");
+                    "执行控制面没有打开（" + ENV_FLAG + " 或泳道范围 " + LANE_SCOPE_PROPERTY
+                            + "），带夹具编号的请求一律不创建任务");
         }
         String fixtureId = textOf(context, CONTEXT_FIELD);
         if (fixtureId == null) {
@@ -91,6 +95,30 @@ public class AcceptanceFixtureGate {
         log.info("验收夹具已受理一次请求: {} lane={} generation={}",
                 row.describe(), deploymentId, deploymentGenerationId);
         return Optional.of(row);
+    }
+
+    /**
+     * 夹具门是否打开。
+     *
+     * <p>显式 {@code AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED} 优先：主 Beta 由控制器写成 false，
+     * 隔离泳道写成 true。宿主控制器还没带上这个变量时，有 {@code AF_LANE_TRAFFIC_SCOPE_ID}
+     * 的进程视为隔离泳道并打开；主 Beta 没有这个变量，保持关闭。</p>
+     */
+    boolean fixtureControlEnabled() {
+        return controlSurfaceEnabled(environment);
+    }
+
+    /**
+     * 夹具门与控制门共用的开关：显式 {@code AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED} 优先，
+     * 未设置时有泳道范围的进程打开。
+     */
+    static boolean controlSurfaceEnabled(Environment environment) {
+        Boolean explicit = environment.getProperty(ENV_FLAG, Boolean.class);
+        if (explicit != null) {
+            return explicit;
+        }
+        String laneScope = environment.getProperty(LANE_SCOPE_PROPERTY);
+        return laneScope != null && !laneScope.isBlank();
     }
 
     /**

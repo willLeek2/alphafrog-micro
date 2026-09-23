@@ -997,6 +997,107 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void nacosEnabled_shouldIgnoreSeedFileUntilNacosWritesTheCache() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+
+        loader.load();
+        assertTrue(loader.current().isEmpty(), "Nacos 启用时不得把种子文件 LEGACY 载入内存");
+        assertFalse(loader.hotConfigIsAuthoritative());
+
+        loader.refresh();
+        assertTrue(loader.current().isEmpty(), "Nacos 还没写缓存时，轮询也不得偷吃种子文件");
+
+        Files.writeString(configFile, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "DUAL_POOL_V2" } }
+                }
+                """, StandardCharsets.UTF_8);
+        loader.applyNacosWrittenFile(configFile.toString());
+
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+        assertTrue(loader.hotConfigIsAuthoritative());
+    }
+
+    @Test
+    void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath() throws Exception {
+        Path shared = tempDir.resolve("agent-llm.local.json");
+        Path isolated = shared.getParent().resolve("stage3-dag-0922.agent-llm.local.json");
+        assertEquals(shared.getParent(), isolated.getParent());
+        Files.writeString(shared, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } }
+                }
+                """, StandardCharsets.UTF_8);
+        Files.writeString(isolated, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "DUAL_POOL_V2" } }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", shared.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+        ReflectionTestUtils.setField(loader, "laneTrafficScopeId", "stage3-dag-0922");
+
+        loader.applyNacosWrittenFile(shared.toString());
+        assertTrue(loader.current().isEmpty(), "共用路径上的主环境缓存不得被泳道加载器当成覆盖");
+
+        loader.applyNacosWrittenFile(isolated.toString());
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+        loader.refresh();
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+    }
+
+    @Test
+    void snakeCaseApplicationMapper_stillBindsCamelCaseSchedulerVersion() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "DUAL_POOL_V2" } }
+                }
+                """, StandardCharsets.UTF_8);
+
+        ObjectMapper snake = new ObjectMapper()
+                .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(snake);
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+    }
+
+    @Test
+    void nacosWriteToADifferentFile_shouldNotMarkAgentLlmAuthoritative() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Path other = tempDir.resolve("code-refine.json");
+        Files.writeString(configFile, """
+                { "runtime": { "scheduler": { "newRunSchedulerVersion": "LEGACY" } } }
+                """, StandardCharsets.UTF_8);
+        Files.writeString(other, "{\"ok\":true}", StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        ReflectionTestUtils.setField(loader, "nacosEnabled", true);
+        loader.applyNacosWrittenFile(other.toString());
+
+        assertTrue(loader.current().isEmpty());
+        assertFalse(loader.hotConfigIsAuthoritative());
+    }
+
+    @Test
     void load_shouldTolerateMalformedJson() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, "{ invalid json }", StandardCharsets.UTF_8);

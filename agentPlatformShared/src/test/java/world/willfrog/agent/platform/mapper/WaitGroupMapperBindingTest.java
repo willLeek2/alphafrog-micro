@@ -216,15 +216,20 @@ class WaitGroupMapperBindingTest {
     void completionOnlyWritesStillOpenMembersAndCountsOnce() {
         String sql = sql("completeMember");
         assertThat(sql).contains("m.state IN ('PENDING', 'RUNNING')")
-                .contains("AND g.state = 'WAITING'")
-                .contains("b.completed_members = b.expected_members");
+                .contains("AND g.state = 'WAITING'");
+        assertThat(sql.split("UPDATE alphafrog_agent_run_wait_group", -1).length - 1)
+                .as("完成数和齐备状态必须同一次写入，不能对这一行再 UPDATE 一次")
+                .isEqualTo(1);
         String counted = String.join(", ",
                 WaitMemberState.completedWireValues().stream().map(v -> "'" + v + "'").toList());
         assertThat(sql).as("只有成功与失败计入完成数，取消与迟到加零")
                 .contains("IN (" + counted + ") THEN 1 ELSE 0");
+        assertThat(sql).as("完成数加到期望值时，同一次 SET 把组写成齐备")
+                .contains("THEN 'READY' ELSE g.state END")
+                .contains("= g.expected_members");
         assertThat(sql).as("组齐备与写通知在同一条语句里")
                 .contains("'READY'")
-                .contains("recovery_generation = g.recovery_generation + 1")
+                .contains("g.recovery_generation + 1")
                 .contains("INSERT INTO alphafrog_agent_run_recovery_notification");
         assertThat(sql).as("通知只写一条靠唯一约束兜底")
                 .contains("ON CONFLICT (group_id, recovery_generation) DO NOTHING");
