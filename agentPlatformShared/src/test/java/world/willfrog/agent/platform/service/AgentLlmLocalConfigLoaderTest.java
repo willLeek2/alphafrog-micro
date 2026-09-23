@@ -1029,6 +1029,25 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void snakeCaseObjectMapper_shouldStillBindCamelCaseSchedulerVersionFromJsonTree() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "runtime": { "scheduler": { "newRunSchedulerVersion": "DUAL_POOL_V2" } }
+                }
+                """, StandardCharsets.UTF_8);
+
+        ObjectMapper snake = new ObjectMapper()
+                .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(snake);
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        assertEquals("DUAL_POOL_V2",
+                loader.current().orElseThrow().getRuntime().getScheduler().getNewRunSchedulerVersion());
+    }
+
+    @Test
     void nacosWriteToADifferentFile_shouldNotMarkAgentLlmAuthoritative() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Path other = tempDir.resolve("code-refine.json");

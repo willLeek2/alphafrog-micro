@@ -356,8 +356,9 @@ public class NacosConfigBridge implements SmartLifecycle {
             writeConfigToFile(subscription, configContent);
             if (fileContentEquals(subscription, configContent)) {
                 lastWrittenContentBySubscription.put(key, configContent);
-                log.info("[NacosConfigBridge] 配置同步完成 dataId={} effectiveDataId={} source={}",
-                        subscription.getDataId(), effectiveDataId, source);
+                log.info("[NacosConfigBridge] 配置同步完成 dataId={} effectiveDataId={} source={} hasNewRunSchedulerVersion={}",
+                        subscription.getDataId(), effectiveDataId, source,
+                        containsSchedulerVersion(configContent));
                 if (eventPublisher != null) {
                     eventPublisher.publishEvent(new NacosLocalConfigWrittenEvent(
                             this, subscription.getTargetFile(), subscription.getDataId(),
@@ -504,6 +505,15 @@ public class NacosConfigBridge implements SmartLifecycle {
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private static boolean containsSchedulerVersion(String configContent) {
+        if (configContent == null || configContent.isBlank()) {
+            return false;
+        }
+        return configContent.contains("newRunSchedulerVersion")
+                || configContent.contains("new-run-scheduler-version")
+                || configContent.contains("new_run_scheduler_version");
     }
 
     public static class Subscription {

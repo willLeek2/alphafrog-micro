@@ -197,6 +197,7 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
                     AgentLlmProperties parsed = objectMapper.treeToValue(tree, AgentLlmProperties.class);
                     PlaceholderResolver.resolve(parsed);
                     AgentLlmProperties sanitized = sanitize(parsed);
+                    copySchedulerVersionFromTree(tree, sanitized);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(
                             sanitized, resolvePromptBaseDir(path), explicitPromptFields);
                     this.localSnapshot = new LocalConfigSnapshot(
@@ -215,11 +216,12 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
                             }
                         }
                     }
-                    log.info("Loaded local llm config from {} (endpoints={}, topLevelModels={}, endpointModels={})",
+                    log.info("Loaded local llm config from {} (endpoints={}, topLevelModels={}, endpointModels={}, newRunSchedulerVersion={})",
                             path,
                             sanitized.getEndpoints().size(),
                             sanitized.getModels().size(),
-                            endpointModels);
+                            endpointModels,
+                            schedulerVersionOf(sanitized));
                 }
             } catch (PromptConfigurationException e) {
                 markPromptReloadFailure(e.reason());
@@ -729,6 +731,45 @@ public class AgentLlmLocalConfigLoader implements ApplicationListener<NacosLocal
 
     private boolean hasText(String text) {
         return text != null && !text.trim().isEmpty();
+    }
+
+    /**
+     * Nacos 缓存文件里的调度器版本以 JSON 树为准。ObjectMapper 若按 SNAKE_CASE 命名，
+     * camelCase 的 {@code newRunSchedulerVersion} 会绑不上，热配置快照就会变成空，
+     * 创建回落到环境属性里的 LEGACY。
+     */
+    private void copySchedulerVersionFromTree(JsonNode tree, AgentLlmProperties cfg) {
+        if (tree == null || cfg == null || cfg.getRuntime() == null) {
+            return;
+        }
+        JsonNode scheduler = tree.path("runtime").path("scheduler");
+        if (!scheduler.isObject()) {
+            return;
+        }
+        String version = firstText(scheduler,
+                "newRunSchedulerVersion", "new-run-scheduler-version", "new_run_scheduler_version");
+        if (version == null || version.isBlank()) {
+            return;
+        }
+        cfg.getRuntime().getScheduler().setNewRunSchedulerVersion(version.trim());
+    }
+
+    private static String firstText(JsonNode object, String... names) {
+        for (String name : names) {
+            JsonNode node = object.get(name);
+            if (node != null && node.isTextual() && !node.asText().isBlank()) {
+                return node.asText();
+            }
+        }
+        return null;
+    }
+
+    private static String schedulerVersionOf(AgentLlmProperties cfg) {
+        if (cfg == null || cfg.getRuntime() == null || cfg.getRuntime().getScheduler() == null) {
+            return "-";
+        }
+        String version = cfg.getRuntime().getScheduler().getNewRunSchedulerVersion();
+        return version == null || version.isBlank() ? "-" : version;
     }
 
     private AgentLlmProperties sanitize(AgentLlmProperties input) {
