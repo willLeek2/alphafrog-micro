@@ -113,6 +113,7 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
         assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
         assertEquals("false", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("false", environmentNode.path("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED").asText());
         assertEquals("false", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
         assertEquals("false", environmentNode.path(
                 "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
@@ -417,6 +418,7 @@ class DockerComposeContainerRuntimeTest {
         // "{scopeId}.{dataId}" 候选，漏注会让泳道容器读不到泳道覆盖配置
         assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
         assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED").asText());
         assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
         assertEquals("true", environmentNode.path(
                 "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
@@ -436,6 +438,7 @@ class DockerComposeContainerRuntimeTest {
                 Files.readString(temporary.resolve("state/compose/i-one.json")))
                 .path("services").path("app").path("environment");
         assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED").asText());
         assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
         assertEquals("false", environmentNode.path(
                 "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());

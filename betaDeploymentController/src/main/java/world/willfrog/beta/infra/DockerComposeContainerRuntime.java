@@ -383,9 +383,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         environment.put("AF_DEPLOYMENT_GENERATION_ID", plan.generationId());
         environment.put("AF_LANE_TAG", plan.trafficScopeId());
         if (agentService) {
-            // 持久恢复和一次性故障点只在隔离泳道打开。主 Beta 明确写 false，覆盖服务
+            // 持久恢复、验收夹具门和一次性故障点只在隔离泳道打开。主 Beta 明确写 false，覆盖服务
             // env-file 里的任何遗留值。进程终止还必须由部署清单单独授权。
             environment.put("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED",
+                    Boolean.toString(laneDeployment));
+            environment.put("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED",
                     Boolean.toString(laneDeployment));
             environment.put("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED",
                     Boolean.toString(laneDeployment));
