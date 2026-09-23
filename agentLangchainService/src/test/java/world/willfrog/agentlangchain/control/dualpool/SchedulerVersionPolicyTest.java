@@ -151,4 +151,31 @@ class SchedulerVersionPolicyTest {
                 .as("Nacos 覆盖进缓存之后，热配置的 V2 压过环境属性 LEGACY")
                 .isEqualTo("DUAL_POOL_V2");
     }
+
+    @Test
+    void laneProcessRejectsPropertyFallbackEvenAfterCacheIsAuthoritative() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(
+                scheduler,
+                VERSION_KEY, "LEGACY",
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "stage3-dag-0922");
+        assertThatThrownBy(() -> new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("泳道覆盖若没带调度器版本，不得用环境属性 LEGACY 冻进库")
+                .isInstanceOf(AgentLlmHotConfigNotSyncedException.class)
+                .hasMessageContaining("热配置")
+                .hasMessageContaining("property");
+    }
+
+    @Test
+    void laneProcessKeepsHotConfigVersion() {
+        AgentLlmProperties.Scheduler scheduler = new AgentLlmProperties.Scheduler();
+        scheduler.setNewRunSchedulerVersion("DUAL_POOL_V2");
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.hot(
+                scheduler,
+                VERSION_KEY, "LEGACY",
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "stage3-dag-0922");
+        assertThat(new SchedulerVersionPolicy(settings).versionForNewRun())
+                .as("泳道覆盖写了 V2 时，按热配置冻结")
+                .isEqualTo("DUAL_POOL_V2");
+    }
 }
