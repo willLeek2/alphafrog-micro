@@ -580,6 +580,20 @@ class AcceptanceReleasePolicyTest {
         assertThat(policy.ruleAt(matches, group.get(2))).isPresent();
     }
 
+    /** allExternalTasks 加上 codeContains：读策略就拒，避免收尾时只压住第一条。 */
+    @Test
+    void allExternalTasksWithCodeContainsIsRefusedAtParse() {
+        assertThatThrownBy(() -> parse("""
+                {"rules":[{"match":"allExternalTasks","toolName":"executePython","codeContains":"100000",
+                  "holdUntilPoint":"point-a"}]}
+                """))
+                .isInstanceOf(AcceptanceFixtureExecutionException.class)
+                .hasMessageContaining("acceptance_fixture_policy_invalid")
+                .hasMessageContaining("allExternalTasks")
+                .hasMessageContaining("codeContains")
+                .hasMessageContaining("uniqueExternalTask");
+    }
+
     /** for 和 match 写在同一条规则上：读策略就拒。 */
     @Test
     void aRuleCannotWriteBothForAndMatch() {

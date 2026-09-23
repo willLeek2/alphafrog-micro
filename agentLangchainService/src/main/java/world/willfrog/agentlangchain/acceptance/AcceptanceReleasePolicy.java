@@ -75,7 +75,7 @@ public final class AcceptanceReleasePolicy {
 
     /** {@code uniqueExternalTask}：本组里对得上的外部作业必须恰好一条。 */
     public static final String MATCH_UNIQUE_EXTERNAL_TASK = "uniqueExternalTask";
-    /** {@code allExternalTasks}：本组里对得上的每一条外部作业都被这一条规则点名。 */
+    /** {@code allExternalTasks}：本组里对得上的每一条外部作业都被这一条规则点名；过滤只用 toolName，不能写 codeContains。 */
     public static final String MATCH_ALL_EXTERNAL_TASKS = "allExternalTasks";
 
     private static final Set<String> MATCH_VALUES =
@@ -97,7 +97,7 @@ public final class AcceptanceReleasePolicy {
      * @param failureDetail  按失败收尾时写进成员结果的说明
      * @param match          按外部作业身份点名：{@code uniqueExternalTask} / {@code allExternalTasks}；与 {@code for} 互斥
      * @param toolName       {@code match} 时可选：只认这个工具名；不写就是本组里任意工具
-     * @param codeContains   {@code match} 时可选：参数正文要含这一段
+     * @param codeContains   只跟 {@code uniqueExternalTask} 一起用：参数正文要含这一段
      */
     public record Rule(int index,
                        Map<String, String> selector,
@@ -625,6 +625,11 @@ public final class AcceptanceReleasePolicy {
         if (match != null && !MATCH_VALUES.contains(match)) {
             throw invalid(fixtureId, where + "的 match 只认 " + MATCH_UNIQUE_EXTERNAL_TASK + " 或 "
                     + MATCH_ALL_EXTERNAL_TASKS + "，读到的是 " + match);
+        }
+        if (MATCH_ALL_EXTERNAL_TASKS.equals(match) && codeContains != null) {
+            throw invalid(fixtureId, where + "写了 allExternalTasks 又写了 codeContains："
+                    + "参数正文只在派发时有，结果接收方找回命中行时一条规则只能留下第一条成员，"
+                    + "第 2 条起会当场接结果却不报错。codeContains 只跟 uniqueExternalTask 一起用");
         }
         if (match == null && (filterToolName != null || codeContains != null)) {
             throw invalid(fixtureId, where + "写了 toolName 或 codeContains，却没有写 match："
