@@ -161,6 +161,6 @@ class DatabasePersistentSubAgentToolBridgeTest {
     private static ChildRunIntentView child(String id) {
         return new ChildRunIntentView(1L, "run-parent", "run-parent", id, "child-op", 41L,
                 "spawn-member", "spawn-call", 3, 1, 1L, "ACCEPTED", "RECEIVED",
-                "SUCCEEDED", null, null, null, null);
+                "RUNNING", OffsetDateTime.now(), null, null, null);
     }
 }

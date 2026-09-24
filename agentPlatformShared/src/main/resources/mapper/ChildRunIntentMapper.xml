@@ -225,11 +225,14 @@
     </update>
 
     <update id="markChildTerminal">
-        UPDATE alphafrog_agent_run_child_intent
+        UPDATE alphafrog_agent_run_child_intent i
            SET state = 'TERMINAL', child_terminal_at = CURRENT_TIMESTAMP,
                updated_at = CURRENT_TIMESTAMP
-         WHERE id = #{intentId} AND state IN ('ACCEPTED', 'CANCEL_REQUESTED')
-           AND child_terminal_at IS NULL
+          FROM alphafrog_agent_run child
+         WHERE i.id = #{intentId} AND child.id = i.child_run_id
+           AND child.status IN ('COMPLETED', 'PARTIAL')
+           AND i.state IN ('ACCEPTED', 'CANCEL_REQUESTED')
+           AND i.child_terminal_at IS NULL
     </update>
 
     <update id="markPhysicalStopped">
@@ -239,7 +242,7 @@
          WHERE i.id = #{intentId} AND child.id = i.child_run_id
            AND i.state IN ('ACCEPTED', 'TERMINAL')
            AND i.physical_stopped_at IS NULL
-           AND child.status IN ('COMPLETED', 'PARTIAL')
+           AND child.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
            AND COALESCE(child.tool_job_anchor_json, '{}'::jsonb) = '{}'::jsonb
            AND NOT EXISTS (
                SELECT 1 FROM alphafrog_agent_run_wait_member m

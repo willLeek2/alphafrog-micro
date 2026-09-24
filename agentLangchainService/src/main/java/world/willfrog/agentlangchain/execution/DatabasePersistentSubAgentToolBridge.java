@@ -155,7 +155,7 @@ public class DatabasePersistentSubAgentToolBridge implements PersistentSubAgentT
         for (String childRunId : arguments.childRunIds()) {
             Optional<ChildRunIntentView> child = childIntentStore.findByChildRunId(childRunId);
             if (child.isEmpty() || !request.parentRunId().equals(child.get().parentRunId())
-                    || !"ACCEPTED".equals(child.get().intentState())
+                    || child.get().acceptedAt() == null
                     || child.get().childRunStatus() == null) {
                 return ReservationOutcome.NOT_FOUND;
             }
