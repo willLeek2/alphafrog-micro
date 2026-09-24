@@ -309,6 +309,8 @@ class WaitGroupMapperBindingTest {
         // 取不走的原因也是枚举取值：诊断那段 SQL 把它们当字面量写，写错一个字母调用方就认不出来。
         world.willfrog.agent.platform.wait.RecoveryRejection.allWireValues().forEach(known::add);
         world.willfrog.agent.platform.workitem.NodeWorkItemState.allWireValues().forEach(known::add);
+        // cancelChain 同时插入外部停机任务；它的缺证明状态属于停机记录，不属于等待成员。
+        known.add("BLOCKED_PROOF");
         for (AgentRunStatus status : AgentRunStatus.values()) {
             known.add(status.name());
         }

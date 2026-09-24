@@ -17,6 +17,8 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.wait.WaitGroup;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
@@ -90,6 +92,9 @@ public class LangchainRunControlService {
 
     @Autowired(required = false)
     private NodeWorkItemStore nodeWorkItemStore;
+
+    @Autowired(required = false)
+    private WaitGroupStore waitGroupStore;
 
     /**
      * 删除 run 及其关联的状态数据（Redis）。
@@ -256,6 +261,27 @@ public class LangchainRunControlService {
      * 当前进程的自动扫描集合；如果这里只改 Run 主记录，遗留工作项会一直阻塞后续双池准入。
      */
     private void cancelDualPoolWorkItems(String runId) {
+        if (waitGroupStore == null) {
+            log.error("双池 Run 已取消，但等待组存储不可用，外部任务无法排队停机: runId={}", runId);
+        } else {
+            // 等待组取消会同时落 Sandbox 停机记录。先留下外部任务责任，再关闭节点工作项。
+            try {
+                long afterGroupId = 0;
+                while (true) {
+                    java.util.List<WaitGroup> groups = waitGroupStore.listOpenGroupsByRun(
+                            runId, afterGroupId, 100);
+                    if (groups.isEmpty()) {
+                        break;
+                    }
+                    for (WaitGroup group : groups) {
+                        waitGroupStore.cancelChain(group.getId());
+                        afterGroupId = group.getId();
+                    }
+                }
+            } catch (RuntimeException e) {
+                log.error("双池 Run 已取消，但等待组及外部任务停机记录收口失败: runId={}", runId, e);
+            }
+        }
         if (nodeWorkItemStore == null) {
             log.error("双池 Run 已取消，但工作项存储不可用，无法同步收口: runId={}", runId);
             return;

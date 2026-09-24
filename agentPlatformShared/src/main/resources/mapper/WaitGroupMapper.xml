@@ -1001,6 +1001,25 @@
 
       Run 必须还在执行中且控制版本没变：计划代际失效或取消之后，旧 Worker 不能再去改等待事实。
     -->
+    <!-- 请求发往 Sandbox 前先落完整身份。取消先赢时成员已非 PENDING，不能再创建外部任务。 -->
+    <update id="recordMemberPreparing">
+        UPDATE alphafrog_agent_run_wait_member m SET
+            dispatch_proof_json = COALESCE(m.dispatch_proof_json, CAST(#{dispatchProofJson} AS jsonb)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE m.group_id = #{groupId}
+          AND m.member_identity = #{memberIdentity}
+          AND m.state = 'PENDING'
+          AND m.external_operation_id = #{externalOperationId}
+          AND (m.dispatch_proof_json IS NULL
+               OR (m.dispatch_proof_json -&gt;&gt; 'operationId' = #{externalOperationId}
+                   AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
+                       = CAST(#{dispatchProofJson} AS jsonb) -&gt;&gt; 'requestFingerprint'))
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_wait_group g
+              JOIN alphafrog_agent_run r ON r.id = g.run_id
+              WHERE g.id = m.group_id AND g.state = 'WAITING' AND r.status = 'EXECUTING')
+    </update>
+
     <update id="markMemberDispatched">
         UPDATE alphafrog_agent_run_wait_member m SET
             state = 'RUNNING',

@@ -150,6 +150,11 @@ public interface WaitGroupMapper {
 
     // ===== 成员派发 =====
 
+    int recordMemberPreparing(@Param("groupId") long groupId,
+                              @Param("memberIdentity") String memberIdentity,
+                              @Param("externalOperationId") String externalOperationId,
+                              @Param("dispatchProofJson") String dispatchProofJson);
+
     /**
      * 派发成功：成员从待派发进入执行中，并把外部作业身份与派发证明写上。
      *

@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.finance.*;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
@@ -44,6 +45,7 @@ class PythonSandboxToolsDataIntenseTest {
     private PythonSandboxTools tools;
     private PythonSandboxService sandbox;
     private DataAnalysisCapacityService capacity;
+    private WaitGroupStore waitGroupStore;
     private PythonSandboxDispatchStore dispatchStore;
     private DataAnalysisTerminalRecorder recorder;
     private AgentRunDatasetRegistry registry;
@@ -54,17 +56,21 @@ class PythonSandboxToolsDataIntenseTest {
         tools = new PythonSandboxTools(objectMapper);
         sandbox = mock(PythonSandboxService.class);
         capacity = mock(DataAnalysisCapacityService.class);
+        waitGroupStore = mock(WaitGroupStore.class);
         dispatchStore = mock(PythonSandboxDispatchStore.class);
         recorder = mock(DataAnalysisTerminalRecorder.class);
         registry = mock(AgentRunDatasetRegistry.class);
         inject("pythonSandboxService", sandbox);
         inject("agentRunDatasetRegistry", registry);
         inject("dataAnalysisCapacityService", capacity);
+        inject("waitGroupStore", waitGroupStore);
         inject("dataAnalysisCapacityProperties", new DataAnalysisCapacityProperties());
         inject("pythonSandboxDispatchStore", dispatchStore);
         inject("dataAnalysisTerminalRecorder", recorder);
         inject("fastPathMs", 5L);
         when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), any()))
+                .thenReturn(true);
+        when(waitGroupStore.recordMemberPreparing(anyLong(), anyString(), anyString(), anyString()))
                 .thenReturn(true);
         when(dispatchStore.promoteDagBlockingWorkerLost(eq("run-test"), any(), any()))
                 .thenReturn(true);
@@ -1722,6 +1728,21 @@ class PythonSandboxToolsDataIntenseTest {
     /** 在成员上下文里调用工具：与派发器在真实链路里装上下文的方式一致。 */
     private String invokeAsWaitGroupMember(String code, String datasetIds) {
         return invokeAsWaitGroupMember(code, datasetIds, EXPECTED_MEMBER_OPERATION);
+    }
+
+    @Test
+    void canceledMemberCannotCreateSandboxTaskWithoutDurableRequestProof() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(waitGroupStore.recordMemberPreparing(anyLong(), anyString(), anyString(), anyString()))
+                .thenReturn(false);
+
+        String output = invokeAsWaitGroupMember("print(1)", "1");
+
+        assertThat(output).contains("WAIT_GROUP_PREPARING_NOT_RECORDED");
+        verify(sandbox, never()).createTask(any());
+        verify(capacity).releaseReservation(any());
     }
 
     private String invokeAsWaitGroupMember(String code, String datasetIds, String expectedOperationId) {

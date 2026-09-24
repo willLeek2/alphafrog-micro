@@ -212,6 +212,18 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public boolean recordMemberPreparing(long groupId, String memberIdentity,
+                                         String externalOperationId, String dispatchProofJson) {
+        if (groupId <= 0 || memberIdentity == null || memberIdentity.isBlank()
+                || externalOperationId == null || externalOperationId.isBlank()
+                || dispatchProofJson == null || dispatchProofJson.isBlank()) {
+            throw new IllegalArgumentException("成员准备凭证参数不完整");
+        }
+        return mapper.recordMemberPreparing(groupId, memberIdentity,
+                externalOperationId, dispatchProofJson) == 1;
+    }
+
+    @Override
     public boolean markMemberDispatched(long groupId,
                                         String memberIdentity,
                                         String externalOperationId,

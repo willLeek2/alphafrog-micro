@@ -60,8 +60,19 @@ public interface WaitGroupStore {
     /** 取消一条等待链：组、还没结束的成员、下一段与还没被取走的通知一起停。 */
     WaitChainCancelResult cancelChain(long groupId);
 
+    /**
+     * 在调用 Sandbox 创建任务之前，先保存可恢复的操作身份、请求指纹与容量凭证。
+     * 取消若先落库，此操作返回 false，调用方不能再发出外部请求。
+     */
+    default boolean recordMemberPreparing(long groupId, String memberIdentity,
+                                          String externalOperationId, String dispatchProofJson) {
+        throw new UnsupportedOperationException("member preparing proof is not implemented");
+    }
+
     /** 按组编号分页找一条 Run 尚未关闭的等待链，供取消与重启恢复逐组收口。 */
-    List<WaitGroup> listOpenGroupsByRun(String runId, long afterGroupId, int limit);
+    default List<WaitGroup> listOpenGroupsByRun(String runId, long afterGroupId, int limit) {
+        throw new UnsupportedOperationException("open wait-group scan is not implemented");
+    }
 
     /**
      * 派发成功：成员从「已保存待派发」进入「已派发执行中」，并写上外部作业身份、派发证明与下次查询时间。

@@ -227,7 +227,7 @@
                updated_at = CURRENT_TIMESTAMP
           FROM alphafrog_agent_run child
          WHERE i.id = #{intentId} AND child.id = i.child_run_id
-           AND child.status IN ('COMPLETED', 'PARTIAL')
+           AND child.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
            AND i.state IN ('ACCEPTED', 'CANCEL_REQUESTED')
            AND i.child_terminal_at IS NULL
     </update>

@@ -23,6 +23,7 @@ import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
@@ -96,6 +97,9 @@ public class PythonSandboxTools {
 
     @Autowired(required = false)
     private DataAnalysisCapacityService dataAnalysisCapacityService;
+
+    @Autowired(required = false)
+    private WaitGroupStore waitGroupStore;
 
     @Autowired(required = false)
     private DataAnalysisCapacityProperties dataAnalysisCapacityProperties;
@@ -685,6 +689,23 @@ public class PythonSandboxTools {
             return fail("executePython", code, admission.getMessage(), Map.of("retryable",
                     admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
         }
+        // 取消与外部 createTask 之间需要一份已经落库的请求指纹。若取消先赢，
+        // 成员已不再待派发，不能继续创建一个无人负责的 Sandbox 任务。
+        WaitMemberDispatchProof preparingProof = proofForWaitGroup(plan, reservation, null);
+        boolean preparingRecorded;
+        try {
+            preparingRecorded = waitGroupStore != null && waitGroupStore.recordMemberPreparing(
+                    member.groupId(), member.memberIdentity(), identity.operationId(),
+                    preparingProof.toJson(objectMapper));
+        } catch (RuntimeException persistenceFailure) {
+            log.warn("Sandbox 创建前未能保存成员身份：{}", member.describe(), persistenceFailure);
+            preparingRecorded = false;
+        }
+        if (!preparingRecorded) {
+            releasePreDispatch(reservation);
+            return fail("executePython", "WAIT_GROUP_PREPARING_NOT_RECORDED",
+                    "Sandbox request identity could not be saved before dispatch", Map.of());
+        }
         ExecuteRequest request = withCapacityRequest(baseRequest, reservation, plan.estimate(), plan.spec());
         long createStartMs = System.currentTimeMillis();
         CreateVerdict verdict;
@@ -821,7 +842,15 @@ public class PythonSandboxTools {
             CapacityPlan plan,
             DataAnalysisReservation reservation,
             String taskId) {
-        WaitMemberDispatchProof proof = new WaitMemberDispatchProof(
+        WaitMemberDispatchProof proof = proofForWaitGroup(plan, reservation, taskId);
+        return new WaitGroupMemberPendingException(proof,
+                "wait group member dispatched: " + member.describe());
+    }
+
+    private WaitMemberDispatchProof proofForWaitGroup(CapacityPlan plan,
+                                                     DataAnalysisReservation reservation,
+                                                     String taskId) {
+        return new WaitMemberDispatchProof(
                 WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
                 reservation.identity().operationId(),
                 taskId,
@@ -830,8 +859,6 @@ public class PythonSandboxTools {
                 toJsonOrThrow("预估值", plan.estimate()),
                 toJsonOrThrow("名额预留凭证", reservation),
                 Instant.now().toString());
-        return new WaitGroupMemberPendingException(proof,
-                "wait group member dispatched: " + member.describe());
     }
 
     /** 序列化不成功就抛错：写不出派发证明时宁可让这次调用失败，也不能交出一份不完整的证明。 */
