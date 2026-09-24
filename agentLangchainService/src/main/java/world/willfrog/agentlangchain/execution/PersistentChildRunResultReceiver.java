@@ -275,7 +275,8 @@ public class PersistentChildRunResultReceiver {
 
     private static String childStatus(AgentRunStatus status) {
         return switch (status) {
-            case COMPLETED, PARTIAL -> "SUCCEEDED";
+            case COMPLETED -> "SUCCEEDED";
+            case PARTIAL -> "PARTIAL";
             case CANCELED -> "CANCELED";
             case EXPIRED -> "TIMEOUT";
             default -> "FAILED";

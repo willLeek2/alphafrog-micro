@@ -941,7 +941,8 @@
             FROM group_stopped s
             WHERE m.group_id = s.id
               AND m.state IN ('PENDING', 'RUNNING')
-            RETURNING m.id, m.run_id, m.group_id, m.external_operation_id, m.dispatch_proof_json
+            RETURNING m.id, m.run_id, m.group_id, m.tool_name,
+                      m.external_operation_id, m.dispatch_proof_json
         ),
         stop_queued AS (
             INSERT INTO alphafrog_agent_run_wait_member_stop (
@@ -957,7 +958,8 @@
                                  ~ '^sha256:[0-9a-f]{64}$'
                         THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
               FROM members_canceled m
-             WHERE m.external_operation_id IS NOT NULL
+             WHERE m.tool_name = 'executePython'
+               AND m.external_operation_id IS NOT NULL
             ON CONFLICT (wait_member_id) DO NOTHING
             RETURNING 1
         ),

@@ -295,7 +295,8 @@ class WaitGroupMapperBindingTest {
                 .contains("m.state IN ('PENDING', 'RUNNING')")
                 .contains("wi.state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')")
                 .contains("n.state = 'WAITING'")
-                .contains("state = 'CANCELED'");
+                .contains("state = 'CANCELED'")
+                .contains("m.tool_name = 'executePython'");
     }
 
     // ===== 字面量与 Java 取值一致 =====
