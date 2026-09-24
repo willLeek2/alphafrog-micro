@@ -108,17 +108,18 @@ class WaitMemberSettlementTest {
         assertThat(recorded.getValue().operationId()).isEqualTo(operationId());
     }
 
-    /** 账本说这次操作挂着另一份名额（或者早就还过）：不重复还，用量照记。 */
+    /** 账本冲突时不能用一条用量记录冒充名额已经还清。 */
     @Test
-    void aLedgerConflictSkipsOnlyTheRelease() {
+    void aLedgerConflictKeepsTheMemberUnsettled() {
         when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.CONFLICT);
-        when(terminalRecorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME);
 
-        assertThat(settlement.settle(member, proof(reservation), "SUCCEEDED",
-                result("SUCCEEDED", 0, "done", null), "{\"stdout\":\"done\"}").ok()).isTrue();
+        WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation), "SUCCEEDED",
+                result("SUCCEEDED", 0, "done", null), "{\"stdout\":\"done\"}");
+        assertThat(outcome.ok()).isFalse();
+        assertThat(outcome.reason()).isEqualTo("capacity_reservation_conflict");
 
         verify(capacityService, never()).releaseReservation(any());
-        verify(terminalRecorder).upsert(any());
+        verify(terminalRecorder, never()).upsert(any());
     }
 
     /** 名额没还回去：不下结论，等下一轮重来。 */

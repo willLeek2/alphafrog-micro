@@ -161,10 +161,11 @@ public class WaitMemberSettlement {
             return Outcome.blocked("restore_error");
         }
         if (restored == DataAnalysisRestoreOutcome.CONFLICT) {
-            // 账本上这次操作挂着另一份名额（或者已经还过了）：这时候释放会把别人的账算错，
-            // 所以不释放。这一条要人看得见，但不能因此把等待链永远停住——用量照记。
-            log.error("成员的名额凭证与容量账本冲突，跳过释放：member={} operation={}",
+            // 用量落库不能代替容量账本的释放证明。冲突时保留等待责任，避免外部任务虽停了、
+            // 根树许可却先还回去，随后又让新任务占进来。
+            log.error("成员的名额凭证与容量账本冲突，保留收尾责任：member={} operation={}",
                     member.getMemberIdentity(), confirmed.operationId());
+            return Outcome.blocked("capacity_reservation_conflict");
         } else {
             DataAnalysisReleaseOutcome outcome = capacityService.releaseReservation(
                     new DataAnalysisReleaseRequest(confirmed,
