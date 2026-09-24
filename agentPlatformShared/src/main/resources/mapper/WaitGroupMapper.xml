@@ -168,6 +168,17 @@
         WHERE id = #{groupId}
     </select>
 
+    <select id="listOpenGroupsByRun" resultMap="WaitGroupResultMap">
+        SELECT id, run_id, plan_generation, node_id, node_attempt, segment_sequence,
+               model_turn, scheduler_version, next_segment_sequence, state,
+               expected_members, completed_members, recovery_generation,
+               ready_at, created_at, updated_at
+          FROM alphafrog_agent_run_wait_group
+         WHERE run_id = #{runId} AND id &gt; #{afterGroupId}
+           AND state IN ('WAITING', 'READY')
+         ORDER BY id LIMIT #{limit}
+    </select>
+
     <select id="listMembers" resultMap="WaitMemberResultMap">
         SELECT id,
                group_id,
@@ -930,6 +941,24 @@
             FROM group_stopped s
             WHERE m.group_id = s.id
               AND m.state IN ('PENDING', 'RUNNING')
+            RETURNING m.id, m.run_id, m.group_id, m.external_operation_id, m.dispatch_proof_json
+        ),
+        stop_queued AS (
+            INSERT INTO alphafrog_agent_run_wait_member_stop (
+                wait_member_id, run_id, group_id, operation_id, task_id,
+                request_fingerprint, cancel_request_id, state)
+            SELECT m.id, m.run_id, m.group_id, m.external_operation_id,
+                   NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', ''),
+                   NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', ''),
+                   'wait-member-' || m.id::text,
+                   CASE WHEN m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
+                             AND m.external_operation_id ~ '^[^:\s]+:[^:\s]+:[1-9][0-9]*$'
+                             AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
+                                 ~ '^sha256:[0-9a-f]{64}$'
+                        THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
+              FROM members_canceled m
+             WHERE m.external_operation_id IS NOT NULL
+            ON CONFLICT (wait_member_id) DO NOTHING
             RETURNING 1
         ),
         segment_canceled AS (
@@ -957,6 +986,7 @@
         SELECT
             (SELECT count(*) FROM group_stopped) AS groups_canceled,
             (SELECT count(*) FROM members_canceled) AS members_canceled,
+            (SELECT count(*) FROM stop_queued) AS stop_tasks_queued,
             (SELECT count(*) FROM segments_canceled) AS segments_canceled,
             (SELECT count(*) FROM notification_canceled) AS notifications_canceled
     </select>

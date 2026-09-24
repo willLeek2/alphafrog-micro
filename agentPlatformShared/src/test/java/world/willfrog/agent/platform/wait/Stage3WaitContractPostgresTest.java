@@ -55,6 +55,7 @@ import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
 import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
 import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
+import world.willfrog.agent.platform.mapper.WaitMemberStopMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
@@ -129,6 +130,8 @@ class Stage3WaitContractPostgresTest {
     private static final String FIXTURE_CALL_SCRIPT = "016_agent_run_acceptance_fixture_call.sql";
     private static final String FIXTURE_POLICY_SCRIPT = "017_agent_run_acceptance_fixture_policy.sql";
     private static final String CHILD_INTENT_SCRIPT = "018_agent_run_child_intent.sql";
+    private static final String TREE_BUDGET_SCRIPT = "019_agent_run_tree_budget.sql";
+    private static final String WAIT_MEMBER_STOP_SCRIPT = "020_agent_run_wait_member_stop.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -328,6 +331,100 @@ class Stage3WaitContractPostgresTest {
             assertThat(store.listUnsettledByRoot(runId, 0, 1000)).isEmpty();
             assertThat(store.listAcceptedSpawnMembersPending(0, 1000))
                     .extracting("childRunId").contains(delivery.childRunId());
+        }
+    }
+
+    @Test
+    void canceledExternalMemberCreatesDurableStopTaskAndRequiresTerminalEvidence() throws Exception {
+        String runId = "run-external-stop";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        WaitGroupStore groups = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        long groupId = suspendExternalGroup(runId);
+        assertThat(groups.listOpenGroupsByRun(runId, 0, 10))
+                .extracting(WaitGroup::getId).contains(groupId);
+        String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
+                + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
+        assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
+                OffsetDateTime.now(), 0L)).isTrue();
+        long memberId = groups.listMembers(groupId).get(0).getId();
+        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
+            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            TransactionTemplate transaction = new TransactionTemplate(
+                    context.getBean(PlatformTransactionManager.class));
+            assertThatThrownBy(() -> transaction.executeWithoutResult(ignored -> {
+                assertThat(groups.cancelChain(groupId).canceled()).isTrue();
+                assertThat(stops.findByWaitMemberId(memberId)).isPresent();
+                throw new IllegalStateException("roll back cancellation");
+            })).isInstanceOf(IllegalStateException.class);
+            assertThat(groups.listOpenGroupsByRun(runId, 0, 10))
+                    .extracting(WaitGroup::getId).contains(groupId);
+            assertThat(stops.findByWaitMemberId(memberId)).isEmpty();
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(groups.cancelChain(groupId).canceled()).isTrue();
+                assertThat(stops.findByWaitMemberId(memberId)).isPresent();
+            });
+            WaitMemberStopTask first = stops.findByWaitMemberId(memberId).orElseThrow();
+            assertThat(first.getState()).isEqualTo("PENDING");
+            assertThat(first.getCancelRequestId()).isEqualTo("wait-member-" + memberId);
+            assertThat(first.getRequestFingerprint()).isEqualTo("sha256:" + "a".repeat(64));
+            assertThat(groups.cancelChain(groupId).canceled()).isFalse();
+            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).hasSize(1);
+            assertThat(groups.listOpenGroupsByRun(runId, 0, 10)).isEmpty();
+
+            WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
+                    "worker-a", "token-a", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)).orElseThrow());
+            assertThat(claimed.getId()).isEqualTo(first.getId());
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(stops.confirmSandboxTerminal(first.getId(), "token-a", "task-1", "CANCELED"))
+                        .isFalse();
+                assertThat(stops.retry(first.getId(), "wrong-token", OffsetDateTime.now().plusMinutes(2),
+                        "terminal unavailable")).isFalse();
+                assertThat(stops.retry(first.getId(), "token-a", OffsetDateTime.now().plusMinutes(2),
+                        "terminal unavailable")).isTrue();
+            });
+            assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getState()).isEqualTo("PENDING");
+            WaitMemberStopTask reclaimed = transaction.execute(ignored -> stops.claimDue(
+                    "worker-b", "token-b", OffsetDateTime.now().plusMinutes(3),
+                    OffsetDateTime.now().plusMinutes(4)).orElseThrow());
+            assertThat(reclaimed.getCancelRequestId()).isEqualTo(first.getCancelRequestId());
+            execute("UPDATE alphafrog_agent_run SET snapshot_json = "
+                    + "'{\"data_analysis_observability\":{\"calls\":[{\"operationId\":\"run:call:1\","
+                    + "\"taskId\":\"task-1\",\"terminalStatus\":\"CANCELED\","
+                    + "\"terminalAt\":\"2026-01-01T00:00:00Z\","
+                    + "\"reservation\":{\"state\":\"TERMINAL_CONFIRMED\"}}]}}'::jsonb "
+                    + "WHERE id = '" + runId + "'");
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(stops.confirmSandboxTerminal(first.getId(), "token-b", "other-task", "CANCELED"))
+                        .isFalse();
+                assertThat(stops.confirmSandboxTerminal(first.getId(), "token-b", "task-1", "CANCELED"))
+                        .isTrue();
+            });
+            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).isEmpty();
+            assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getTerminalStatus())
+                    .isEqualTo("CANCELED");
+        }
+    }
+
+    @Test
+    void missingDispatchProofStillLeavesVisibleBlockedStopTask() throws Exception {
+        String runId = "run-external-stop-proof-missing";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        WaitGroupStore groups = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        long groupId = suspendExternalGroup(runId);
+        execute("UPDATE alphafrog_agent_run_wait_member SET external_operation_id = 'run:call:2' "
+                + "WHERE group_id = " + groupId);
+        long memberId = groups.listMembers(groupId).get(0).getId();
+        assertThat(groups.cancelChain(groupId).canceled()).isTrue();
+        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
+            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getState())
+                    .isEqualTo("BLOCKED_PROOF");
+            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).hasSize(1);
         }
     }
 
@@ -2389,7 +2486,8 @@ class Stage3WaitContractPostgresTest {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
                     RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT,
-                    FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT, CHILD_INTENT_SCRIPT)) {
+                    FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT, CHILD_INTENT_SCRIPT,
+                    TREE_BUDGET_SCRIPT, WAIT_MEMBER_STOP_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -2416,7 +2514,7 @@ class Stage3WaitContractPostgresTest {
                 "mapper/RunServiceLeaseMapper.xml",
                 "mapper/SchedulerStateMapper.xml",
                 "mapper/AcceptanceReleasePointMapper.xml",
-                "mapper/ChildRunIntentMapper.xml")) {
+                "mapper/ChildRunIntentMapper.xml", "mapper/WaitMemberStopMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
             }
@@ -2876,6 +2974,31 @@ class Stage3WaitContractPostgresTest {
         context.register(TransactionManagementEnablement.class);
         context.refresh();
         return context;
+    }
+
+    private static AnnotationConfigApplicationContext stopStoreContext() {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        context.registerBean("probeDataSource", DataSource.class, () -> dataSource);
+        context.registerBean(PlatformTransactionManager.class, () -> new DataSourceTransactionManager(dataSource));
+        context.registerBean(WaitMemberStopMapper.class,
+                () -> new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitMemberStopMapper.class));
+        context.registerBean(MybatisWaitMemberStopStore.class);
+        context.register(TransactionManagementEnablement.class);
+        context.refresh();
+        return context;
+    }
+
+    private static long suspendExternalGroup(String runId) {
+        WaitGroupStore store = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        WaitSuspensionResult result = store.suspendSegment(new WaitSuspensionRequest(
+                new NodeWorkItemIdentity(runId, 0, "node-1", 0, 0),
+                new NodeWorkItemVersions(2L, 0L, 3), "worker-1", 0,
+                SchedulerVersion.DUAL_POOL_V2,
+                List.of(new WaitMemberDraft(0, "call-a", "executePython", null)),
+                "{\"waitSuspension\":true}", "{\"checkpoint\":\"external\"}"));
+        assertThat(result.suspended()).isTrue();
+        return result.groupId();
     }
 
     private static long suspendChildGroup(String runId, List<String> toolCallIds) {

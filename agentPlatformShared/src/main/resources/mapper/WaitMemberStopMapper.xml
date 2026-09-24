@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.WaitMemberStopMapper">
+    <resultMap id="StopTask" type="world.willfrog.agent.platform.wait.WaitMemberStopTask">
+        <id property="id" column="id"/>
+        <result property="waitMemberId" column="wait_member_id"/>
+        <result property="runId" column="run_id"/>
+        <result property="groupId" column="group_id"/>
+        <result property="operationId" column="operation_id"/>
+        <result property="taskId" column="task_id"/>
+        <result property="requestFingerprint" column="request_fingerprint"/>
+        <result property="cancelRequestId" column="cancel_request_id"/>
+        <result property="state" column="state"/>
+        <result property="nextAttemptAt" column="next_attempt_at"/>
+        <result property="attemptCount" column="attempt_count"/>
+        <result property="claimedBy" column="claimed_by"/>
+        <result property="claimToken" column="claim_token"/>
+        <result property="leaseUntil" column="lease_until"/>
+        <result property="lastError" column="last_error"/>
+        <result property="terminalTaskId" column="terminal_task_id"/>
+        <result property="terminalStatus" column="terminal_status"/>
+        <result property="terminalConfirmedAt" column="terminal_confirmed_at"/>
+    </resultMap>
+
+    <sql id="columns">
+        id, wait_member_id, run_id, group_id, operation_id, task_id, request_fingerprint,
+        cancel_request_id, state, next_attempt_at, attempt_count, claimed_by, claim_token,
+        lease_until, last_error, terminal_task_id, terminal_status, terminal_confirmed_at
+    </sql>
+
+    <select id="claimDue" resultType="java.lang.Long" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run_wait_member_stop s
+           SET state = 'CLAIMED', claimed_by = #{owner}, claim_token = #{claimToken},
+               lease_until = #{leaseUntil}, attempt_count = attempt_count + 1,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE s.id = (
+             SELECT candidate.id FROM alphafrog_agent_run_wait_member_stop candidate
+              WHERE (candidate.state = 'PENDING' AND candidate.next_attempt_at &lt;= #{now})
+                 OR (candidate.state = 'CLAIMED' AND candidate.lease_until &lt;= #{now})
+              ORDER BY candidate.next_attempt_at, candidate.id
+              LIMIT 1 FOR UPDATE OF candidate SKIP LOCKED)
+        RETURNING s.id
+    </select>
+
+    <select id="findById" resultMap="StopTask">
+        SELECT <include refid="columns"/>
+          FROM alphafrog_agent_run_wait_member_stop WHERE id = #{stopId}
+    </select>
+
+    <select id="findByWaitMemberId" resultMap="StopTask">
+        SELECT <include refid="columns"/>
+          FROM alphafrog_agent_run_wait_member_stop WHERE wait_member_id = #{waitMemberId}
+    </select>
+
+    <update id="retry">
+        UPDATE alphafrog_agent_run_wait_member_stop
+           SET state = 'PENDING', claimed_by = NULL, claim_token = NULL, lease_until = NULL,
+               next_attempt_at = #{nextAttemptAt}, last_error = #{reason},
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{stopId} AND state = 'CLAIMED' AND claim_token = #{claimToken}
+           AND lease_until &gt; CURRENT_TIMESTAMP
+    </update>
+
+    <update id="confirmSandboxTerminal">
+        UPDATE alphafrog_agent_run_wait_member_stop s
+           SET state = 'CONFIRMED', task_id = COALESCE(s.task_id, #{taskId}),
+               terminal_task_id = #{taskId}, terminal_status = #{terminalStatus},
+               terminal_confirmed_at = CURRENT_TIMESTAMP,
+               claimed_by = NULL, claim_token = NULL, lease_until = NULL,
+               last_error = NULL, updated_at = CURRENT_TIMESTAMP
+          FROM alphafrog_agent_run child
+         WHERE s.id = #{stopId} AND child.id = s.run_id
+           AND s.state = 'CLAIMED' AND s.claim_token = #{claimToken}
+           AND s.lease_until &gt; CURRENT_TIMESTAMP
+           AND (s.task_id IS NULL OR s.task_id = #{taskId})
+           AND #{terminalStatus} IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+           AND EXISTS (
+               SELECT 1 FROM jsonb_array_elements(COALESCE(
+                    child.snapshot_json #&gt; '{data_analysis_observability,calls}',
+                    '[]'::jsonb)) AS terminal(call)
+                WHERE terminal.call -&gt;&gt; 'operationId' = s.operation_id
+                  AND terminal.call -&gt;&gt; 'taskId' = #{taskId}
+                  AND terminal.call -&gt;&gt; 'terminalStatus' = #{terminalStatus}
+                  AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                  AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL)
+    </update>
+
+    <select id="listUnconfirmedByRun" resultMap="StopTask">
+        SELECT <include refid="columns"/>
+          FROM alphafrog_agent_run_wait_member_stop
+         WHERE run_id = #{runId} AND id &gt; #{afterStopId} AND state &lt;&gt; 'CONFIRMED'
+         ORDER BY id LIMIT #{limit}
+    </select>
+</mapper>

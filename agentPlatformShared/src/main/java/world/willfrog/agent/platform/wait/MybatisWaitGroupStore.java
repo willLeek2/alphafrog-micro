@@ -204,6 +204,14 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitGroup> listOpenGroupsByRun(String runId, long afterGroupId, int limit) {
+        if (runId == null || runId.isBlank() || afterGroupId < 0 || limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("等待组分页参数无效");
+        }
+        return mapper.listOpenGroupsByRun(runId, afterGroupId, limit);
+    }
+
+    @Override
     public boolean markMemberDispatched(long groupId,
                                         String memberIdentity,
                                         String externalOperationId,

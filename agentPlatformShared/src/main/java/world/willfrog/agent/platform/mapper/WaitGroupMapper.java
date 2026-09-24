@@ -35,6 +35,10 @@ public interface WaitGroupMapper {
 
     WaitGroup findGroupById(@Param("groupId") long groupId);
 
+    List<WaitGroup> listOpenGroupsByRun(@Param("runId") String runId,
+                                        @Param("afterGroupId") long afterGroupId,
+                                        @Param("limit") int limit);
+
     List<WaitMember> listMembers(@Param("groupId") long groupId);
 
     WaitMember findMemberByOperation(@Param("runId") String runId,
