@@ -62,6 +62,14 @@
            AND lease_until &gt; CURRENT_TIMESTAMP
     </update>
 
+    <update id="blockProof">
+        UPDATE alphafrog_agent_run_wait_member_stop
+           SET state = 'BLOCKED_PROOF', claimed_by = NULL, claim_token = NULL,
+               lease_until = NULL, last_error = #{reason}, updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{stopId} AND state = 'CLAIMED' AND claim_token = #{claimToken}
+           AND lease_until &gt; CURRENT_TIMESTAMP
+    </update>
+
     <update id="confirmSandboxTerminal">
         UPDATE alphafrog_agent_run_wait_member_stop s
            SET state = 'CONFIRMED', task_id = COALESCE(s.task_id, #{taskId}),
@@ -91,5 +99,17 @@
           FROM alphafrog_agent_run_wait_member_stop
          WHERE run_id = #{runId} AND id &gt; #{afterStopId} AND state &lt;&gt; 'CONFIRMED'
          ORDER BY id LIMIT #{limit}
+    </select>
+
+    <select id="hasUnconfirmedByRootRunId" resultType="java.lang.Boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+             WHERE s.state &lt;&gt; 'CONFIRMED'
+               AND (s.run_id = #{rootRunId}
+                    OR EXISTS (
+                        SELECT 1 FROM alphafrog_agent_run_child_intent i
+                         WHERE i.child_run_id = s.run_id
+                           AND i.root_run_id = #{rootRunId}))
+        )
     </select>
 </mapper>

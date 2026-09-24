@@ -821,7 +821,10 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         }
         if (taskId == null || taskId.isBlank()) return false;
         return switch (outcome) {
-            case CANCEL_INTENT_RECORDED -> "QUEUED".equals(status) || "RUNNING".equals(status);
+            // The cancel request keeps its first outcome on replay while current task status advances.
+            case CANCEL_INTENT_RECORDED -> "QUEUED".equals(status) || "RUNNING".equals(status)
+                    || "SUCCEEDED".equals(status) || "FAILED".equals(status)
+                    || "CANCELED".equals(status);
             case CANCELED -> "CANCELED".equals(status);
             case ALREADY_TERMINAL -> "SUCCEEDED".equals(status) || "FAILED".equals(status)
                     || "CANCELED".equals(status);

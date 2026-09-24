@@ -373,6 +373,12 @@ class DualPoolRecoveryDispatcherTest {
     /** 恢复分发器专用替身：只实现它用到的那几条语义。 */
     private static final class FakeWaitGroupStore implements WaitGroupStore {
 
+        @Override
+        public List<world.willfrog.agent.platform.wait.WaitGroup> listOpenGroupsByRun(
+                String runId, long afterGroupId, int limit) {
+            return List.of();
+        }
+
         private final Map<Long, RecoveryNotification> notifications = new LinkedHashMap<>();
         private final List<Long> consumed = new ArrayList<>();
         private final List<Long> deferred = new ArrayList<>();

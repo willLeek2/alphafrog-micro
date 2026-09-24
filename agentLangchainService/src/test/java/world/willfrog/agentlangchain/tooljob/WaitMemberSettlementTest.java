@@ -184,6 +184,34 @@ class WaitMemberSettlementTest {
         verify(terminalRecorder, never()).upsert(any());
     }
 
+    /** 准备凭证先落库、取消先于建任务：Sandbox 的取消墓碑有真实终态结果，应按终态记录用量。 */
+    @Test
+    void aPreCreateCancellationTombstoneIsSettledWithTerminalUsage() {
+        DataAnalysisReservation preparing = new DataAnalysisReservation(operationId(),
+                reservation.identity(), DataAnalysisResourceClass.STANDARD, 2,
+                DataAnalysisReservationState.PREPARING, null, Instant.now());
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(terminalRecorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+
+        WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(preparing),
+                "CANCELED", result("CANCELED", 0, "", "canceled before create"), "canceled before create");
+
+        assertThat(outcome.ok()).isTrue();
+        ArgumentCaptor<DataAnalysisReleaseRequest> release =
+                ArgumentCaptor.forClass(DataAnalysisReleaseRequest.class);
+        verify(capacityService).releaseReservation(release.capture());
+        assertThat(release.getValue().reason())
+                .isEqualTo(DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
+        DataAnalysisTerminalEnvelope envelope =
+                ((DataAnalysisReleaseProof.Terminal) release.getValue().proof()).envelope();
+        assertThat(envelope.reservation().state())
+                .isEqualTo(DataAnalysisReservationState.TERMINAL_CONFIRMED);
+        assertThat(envelope.taskId()).isEqualTo(TASK_ID);
+        assertThat(envelope.success()).isFalse();
+        verify(terminalRecorder).upsert(any());
+    }
+
     /** 凭证与结论对不上（说不存在、凭证却绑着任务）：不猜，退回重来。 */
     @Test
     void aStateMismatchIsNotGuessed() {

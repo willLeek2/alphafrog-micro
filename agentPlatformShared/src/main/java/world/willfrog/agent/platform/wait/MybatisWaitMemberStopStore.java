@@ -46,6 +46,16 @@ public class MybatisWaitMemberStopStore implements WaitMemberStopStore {
 
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
+    public boolean blockProof(long stopId, String claimToken, String reason) {
+        positive(stopId);
+        required(claimToken, "领取令牌");
+        required(reason, "阻断原因");
+        if (reason.length() > 512) throw new IllegalArgumentException("阻断原因过长");
+        return mapper.blockProof(stopId, claimToken, reason) == 1;
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public boolean confirmSandboxTerminal(long stopId, String claimToken,
                                           String taskId, String terminalStatus) {
         positive(stopId);
@@ -71,6 +81,12 @@ public class MybatisWaitMemberStopStore implements WaitMemberStopStore {
             throw new IllegalArgumentException("停机任务分页参数无效");
         }
         return mapper.listUnconfirmedByRun(runId, afterStopId, limit);
+    }
+
+    @Override
+    public boolean hasUnconfirmedByRootRunId(String rootRunId) {
+        required(rootRunId, "根 Run 编号");
+        return mapper.hasUnconfirmedByRootRunId(rootRunId);
     }
 
     private static void positive(long id) {

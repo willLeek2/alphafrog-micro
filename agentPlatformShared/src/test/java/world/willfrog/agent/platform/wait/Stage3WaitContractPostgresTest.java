@@ -85,6 +85,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -443,6 +444,7 @@ class Stage3WaitContractPostgresTest {
             assertThat(first.getRequestFingerprint()).isEqualTo("sha256:" + "a".repeat(64));
             assertThat(groups.cancelChain(groupId).canceled()).isFalse();
             assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).hasSize(1);
+            assertThat(stops.hasUnconfirmedByRootRunId(runId)).isTrue();
             assertThat(groups.listOpenGroupsByRun(runId, 0, 10)).isEmpty();
 
             WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
@@ -475,6 +477,7 @@ class Stage3WaitContractPostgresTest {
                         .isTrue();
             });
             assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).isEmpty();
+            assertThat(stops.hasUnconfirmedByRootRunId(runId)).isFalse();
             assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getTerminalStatus())
                     .isEqualTo("CANCELED");
         }
@@ -497,6 +500,78 @@ class Stage3WaitContractPostgresTest {
             assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getState())
                     .isEqualTo("BLOCKED_PROOF");
             assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).hasSize(1);
+        }
+    }
+
+    @Test
+    void stopWorkerCanBlockAnIdentityMismatchWithoutReclaimingTheTask() throws Exception {
+        String runId = "run-external-stop-mismatch";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        WaitGroupStore groups = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        long groupId = suspendExternalGroup(runId);
+        String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
+                + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
+        assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
+                OffsetDateTime.now(), 0L)).isTrue();
+        assertThat(groups.cancelChain(groupId).canceled()).isTrue();
+        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
+            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            TransactionTemplate transaction = new TransactionTemplate(
+                    context.getBean(PlatformTransactionManager.class));
+            WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
+                    "worker-a", "token-a", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)).orElseThrow());
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(stops.blockProof(claimed.getId(), "wrong-token", "identity_mismatch"))
+                        .isFalse();
+                assertThat(stops.blockProof(claimed.getId(), "token-a", "identity_mismatch"))
+                        .isTrue();
+            });
+            assertThat(stops.findByWaitMemberId(claimed.getWaitMemberId()).orElseThrow().getState())
+                    .isEqualTo("BLOCKED_PROOF");
+            Optional<WaitMemberStopTask> reclaimed = transaction.execute(ignored -> stops.claimDue(
+                    "worker-b", "token-b", OffsetDateTime.now().plusMinutes(2),
+                    OffsetDateTime.now().plusMinutes(3)));
+            assertThat(reclaimed).isEmpty();
+        }
+    }
+
+    @Test
+    void unconfirmedChildSandboxStopKeepsTheRootTreeReserved() throws Exception {
+        String rootRunId = "run-child-external-stop-root";
+        createRun(rootRunId, 0, 0L);
+        createSegment(rootRunId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        String childRunId;
+        try (AnnotationConfigApplicationContext context = childStoreContext()) {
+            ChildRunIntentStore children = context.getBean(ChildRunIntentStore.class);
+            TransactionTemplate transaction = new TransactionTemplate(
+                    context.getBean(PlatformTransactionManager.class));
+            transaction.executeWithoutResult(ignored -> children.reserveIntent(
+                    childRequest(rootRunId, suspendChildGroup(rootRunId, List.of("call-a")), "call-a"), 2));
+            ChildRunOutboxDelivery delivery = transaction.execute(ignored -> children.claimDueOutbox(
+                    "dispatcher", "claim", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)).orElseThrow());
+            childRunId = delivery.childRunId();
+            transaction.executeWithoutResult(ignored -> {
+                createRun(childRunId, 0, 0L);
+                assertThat(children.markAccepted(delivery.outboxId(), delivery.claimToken())).isTrue();
+            });
+        }
+        createSegment(childRunId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        WaitGroupStore groups = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        long groupId = suspendExternalGroup(childRunId);
+        String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
+                + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
+        assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
+                OffsetDateTime.now(), 0L)).isTrue();
+        assertThat(groups.cancelChain(groupId).canceled()).isTrue();
+        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
+            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            assertThat(stops.hasUnconfirmedByRootRunId(rootRunId)).isTrue();
+            assertThat(stops.hasUnconfirmedByRootRunId("unrelated-root")).isFalse();
         }
     }
 

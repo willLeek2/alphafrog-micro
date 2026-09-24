@@ -45,6 +45,20 @@ class PythonSandboxGatewayCancelTaskTest {
     }
 
     @Test
+    void replayKeepsOriginalIntentOutcomeEvenAfterSandboxReachesTerminalStatus() {
+        Fixture fixture = new Fixture();
+        fixture.shortServer.expect(once(), requestTo("http://sandbox/tasks/cancel"))
+                .andRespond(withSuccess("""
+                        {"outcome":"CANCEL_INTENT_RECORDED","task_id":"task-1","status":"CANCELED"}
+                        """, MediaType.APPLICATION_JSON));
+        CancelTaskResponse result = fixture.gateway.cancelTask(byTask());
+        fixture.verify();
+        assertEquals(CancelOutcome.CANCEL_INTENT_RECORDED, result.getOutcome());
+        assertEquals("CANCELED", result.getStatus());
+        assertFalse(result.hasErrorDetail());
+    }
+
+    @Test
     void operationCancellationForwardsIdentityAndReturnsPhysicalTerminalOnlyWhenSandboxSaysSo() {
         Fixture fixture = new Fixture();
         String fingerprint = "sha256:" + "a".repeat(64);

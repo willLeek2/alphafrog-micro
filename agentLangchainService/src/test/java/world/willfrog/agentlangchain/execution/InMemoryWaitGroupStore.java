@@ -348,6 +348,18 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitGroup> listOpenGroupsByRun(String runId, long afterGroupId, int limit) {
+        return groups.values().stream()
+                .filter(group -> group.id > afterGroupId && runId.equals(group.identity.runId()))
+                .filter(group -> WaitGroupState.WAITING.name().equals(group.state)
+                        || WaitGroupState.READY.name().equals(group.state))
+                .sorted(java.util.Comparator.comparingLong(group -> group.id))
+                .limit(limit)
+                .map(this::toGroup)
+                .toList();
+    }
+
+    @Override
     public List<WaitMember> listMembers(long groupId) {
         return memberRows(groupId).stream().map(this::toMember).toList();
     }

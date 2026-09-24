@@ -13,6 +13,9 @@ public interface WaitMemberStopStore {
     /** 外调失败或任务尚未终态时，按同一固定取消身份稍后再试。 */
     boolean retry(long stopId, String claimToken, OffsetDateTime nextAttemptAt, String reason);
 
+    /** 身份或派发证明确定冲突时停止自动发送，保留任务供人工核查。 */
+    boolean blockProof(long stopId, String claimToken, String reason);
+
     /** 仅在 PostgreSQL 已有匹配的 Sandbox 终态凭证时确认停机。 */
     boolean confirmSandboxTerminal(long stopId, String claimToken,
                                    String taskId, String terminalStatus);
@@ -21,4 +24,7 @@ public interface WaitMemberStopStore {
 
     /** 按任务编号分页读取某 Run 尚未确认的停机任务，包括派发证明缺失的任务。 */
     List<WaitMemberStopTask> listUnconfirmedByRun(String runId, long afterStopId, int limit);
+
+    /** 根 Run 自身或任一子 Run 仍有未确认停机任务时，保留整棵树的业务许可。 */
+    boolean hasUnconfirmedByRootRunId(String rootRunId);
 }
