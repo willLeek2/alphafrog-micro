@@ -26,6 +26,11 @@ import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
 import world.willfrog.agent.platform.capacity.MybatisSchedulerStateStore;
+import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
+import world.willfrog.agent.platform.childrun.ChildRunOutboxDelivery;
+import world.willfrog.agent.platform.childrun.ChildRunReservation;
+import world.willfrog.agent.platform.childrun.ChildRunReserveRequest;
+import world.willfrog.agent.platform.childrun.MybatisChildRunIntentStore;
 import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -36,6 +41,7 @@ import world.willfrog.agent.platform.service.AgentRunEventProjectionRepair;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.mapper.ChildRunIntentMapper;
 import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
 import world.willfrog.agent.platform.lease.MybatisRunServiceLeaseStore;
 import world.willfrog.agent.platform.lease.RunServiceLease;
@@ -122,6 +128,7 @@ class Stage3WaitContractPostgresTest {
     private static final String RELEASE_POINT_SCRIPT = "015_agent_run_release_point.sql";
     private static final String FIXTURE_CALL_SCRIPT = "016_agent_run_acceptance_fixture_call.sql";
     private static final String FIXTURE_POLICY_SCRIPT = "017_agent_run_acceptance_fixture_policy.sql";
+    private static final String CHILD_INTENT_SCRIPT = "018_agent_run_child_intent.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -177,6 +184,112 @@ class Stage3WaitContractPostgresTest {
     }
 
     // ==================== 反例约束 ====================
+
+    @Test
+    void childIntentSharesParentSuspensionTransactionAndCancelStopsUnacceptedDelivery() throws Exception {
+        String runId = "run-child-intent-cancel";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        try (AnnotationConfigApplicationContext context = childStoreContext()) {
+            ChildRunIntentStore store = context.getBean(ChildRunIntentStore.class);
+            TransactionTemplate transaction = new TransactionTemplate(
+                    context.getBean(PlatformTransactionManager.class));
+            ChildRunReservation reservation = transaction.execute(ignored -> {
+                long groupId = suspendChildGroup(runId, List.of("call-a", "call-b"));
+                ChildRunReserveRequest first = childRequest(runId, groupId, "call-a");
+                ChildRunReservation created = store.reserveIntent(first, 1);
+                assertThat(created.outcome()).isEqualTo(ChildRunReservation.Outcome.CREATED);
+                ChildRunReservation replayed = store.reserveIntent(first, 1);
+                assertThat(replayed.outcome()).isEqualTo(ChildRunReservation.Outcome.REPLAYED);
+                assertThat(replayed.childRunId()).isEqualTo(created.childRunId());
+                assertThat(replayed.operationId()).isEqualTo(created.operationId());
+                assertThat(replayed.outboxId()).isEqualTo(created.outboxId());
+                assertThat(store.reserveIntent(childRequest(runId, groupId, "call-b"), 1).outcome())
+                        .isEqualTo(ChildRunReservation.Outcome.LIMIT_EXCEEDED);
+                return created;
+            });
+            assertThat(reservation).isNotNull();
+            assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
+                    + "WHERE root_run_id = '" + runId + "'")).isEqualTo(1);
+            assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_child_outbox "
+                    + "WHERE intent_id = " + reservation.intentId())).isEqualTo(1);
+            assertThat(store.hasUnsettledDescendants(runId)).isTrue();
+            assertThat(store.listReservedRootRunIds(null, 1000)).contains(runId);
+
+            ChildRunOutboxDelivery delivery = transaction.execute(ignored -> store.claimDueOutbox(
+                    "dispatcher-a", "claim-a", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)).orElseThrow());
+            assertThat(delivery.childRunId()).isEqualTo(reservation.childRunId());
+            execute("UPDATE alphafrog_agent_run SET run_control_version = 1, status = 'CANCELING' "
+                    + "WHERE id = '" + runId + "'");
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(store.markAccepted(delivery.outboxId(), delivery.claimToken())).isFalse();
+                assertThat(store.cancelUnacceptedIfParentChanged(delivery.intentId())).isTrue();
+            });
+            assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
+                    + "WHERE root_run_id = '" + runId + "'")).isZero();
+            assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_child_outbox "
+                    + "WHERE id = " + delivery.outboxId() + " AND state = 'CANCELED'")).isEqualTo(1);
+            assertThat(store.hasUnsettledDescendants(runId)).isFalse();
+            assertThat(store.listReservedRootRunIds(null, 1000)).doesNotContain(runId);
+        }
+    }
+
+    @Test
+    void acceptedChildKeepsRootCapacityUntilTerminalAndPhysicalStopAreBothRecorded() throws Exception {
+        String runId = "run-child-intent-terminal";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        try (AnnotationConfigApplicationContext context = childStoreContext()) {
+            ChildRunIntentStore store = context.getBean(ChildRunIntentStore.class);
+            TransactionTemplate transaction = new TransactionTemplate(
+                    context.getBean(PlatformTransactionManager.class));
+            ChildRunReservation reservation = transaction.execute(ignored -> store.reserveIntent(
+                    childRequest(runId, suspendChildGroup(runId, List.of("call-a")), "call-a"), 2));
+            assertThat(reservation).isNotNull();
+            ChildRunOutboxDelivery delivery = transaction.execute(ignored -> store.claimDueOutbox(
+                    "dispatcher-b", "claim-b", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)).orElseThrow());
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(store.markAccepted(delivery.outboxId(), delivery.claimToken())).isTrue();
+                AgentRun child = new AgentRun();
+                child.setId(delivery.childRunId());
+                child.setUserId("user-1");
+                child.setDeploymentId("stable");
+                child.setDeploymentGenerationId("gen-" + "a".repeat(64));
+                child.setStatus(AgentRunStatus.RECEIVED);
+                child.setCurrentStep(0);
+                child.setMaxSteps(20);
+                child.setPlanJson("{}");
+                child.setSnapshotJson("{}");
+                child.setTtlExpiresAt(OffsetDateTime.now().plusHours(1));
+                child.setExt("{}");
+                child.setToolJobAnchorJson("{}");
+                child.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+                child.setPlanGeneration(-1);
+                child.setRunControlVersion(0L);
+                assertThat(new SqlSessionTemplate(sqlSessionFactory).getMapper(AgentRunMapper.class)
+                        .insert(child)).isEqualTo(1);
+            });
+            assertThat(store.rootRunIdOf(delivery.childRunId())).contains(runId);
+            assertThat(store.findByChildRunId(delivery.childRunId()).orElseThrow()
+                    .parentMemberIdentity()).isEqualTo("call-a");
+            assertThat(store.listAcceptedChildrenNeedingLaunch(0, 1000))
+                    .extracting("childRunId").contains(delivery.childRunId());
+            assertThat(store.listUnsettledByParent(runId, 0, 1000))
+                    .extracting("childRunId").contains(delivery.childRunId());
+            transaction.executeWithoutResult(ignored ->
+                    assertThat(store.markChildTerminal(delivery.childRunId())).isTrue());
+            assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
+                    + "WHERE root_run_id = '" + runId + "'")).isEqualTo(1);
+            transaction.executeWithoutResult(ignored ->
+                    assertThat(store.markPhysicalStopped(delivery.childRunId())).isTrue());
+            assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
+                    + "WHERE root_run_id = '" + runId + "'")).isZero();
+            assertThat(store.hasUnsettledDescendants(runId)).isFalse();
+            assertThat(store.listUnsettledByParent(runId, 0, 1000)).isEmpty();
+        }
+    }
 
     @Test
     void runIdempotencyColumnsArePairedAndUniquePerUser() throws Exception {
@@ -2236,7 +2349,7 @@ class Stage3WaitContractPostgresTest {
             for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
                     RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT,
-                    FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT)) {
+                    FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT, CHILD_INTENT_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -2262,7 +2375,8 @@ class Stage3WaitContractPostgresTest {
                 "mapper/RunCoordinationMapper.xml",
                 "mapper/RunServiceLeaseMapper.xml",
                 "mapper/SchedulerStateMapper.xml",
-                "mapper/AcceptanceReleasePointMapper.xml")) {
+                "mapper/AcceptanceReleasePointMapper.xml",
+                "mapper/ChildRunIntentMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
             }
@@ -2710,6 +2824,39 @@ class Stage3WaitContractPostgresTest {
         context.register(TransactionManagementEnablement.class);
         context.refresh();
         return context.getBean(SchedulerStateStore.class);
+    }
+
+    private static AnnotationConfigApplicationContext childStoreContext() {
+        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+        context.registerBean("probeDataSource", DataSource.class, () -> dataSource);
+        context.registerBean(PlatformTransactionManager.class, () -> new DataSourceTransactionManager(dataSource));
+        context.registerBean(ChildRunIntentMapper.class,
+                () -> new SqlSessionTemplate(sqlSessionFactory).getMapper(ChildRunIntentMapper.class));
+        context.registerBean(MybatisChildRunIntentStore.class);
+        context.register(TransactionManagementEnablement.class);
+        context.refresh();
+        return context;
+    }
+
+    private static long suspendChildGroup(String runId, List<String> toolCallIds) {
+        List<WaitMemberDraft> members = new ArrayList<>();
+        for (int index = 0; index < toolCallIds.size(); index++) {
+            members.add(new WaitMemberDraft(index, toolCallIds.get(index), "spawnSubAgent", null));
+        }
+        WaitGroupStore store = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        WaitSuspensionResult result = store.suspendSegment(new WaitSuspensionRequest(
+                new NodeWorkItemIdentity(runId, 0, "node-1", 0, 0),
+                new NodeWorkItemVersions(2L, 0L, 3), "worker-1", 0,
+                SchedulerVersion.DUAL_POOL_V2, members,
+                "{\"waitSuspension\":true}", "{\"checkpoint\":\"child\"}"));
+        assertThat(result.suspended()).isTrue();
+        return result.groupId();
+    }
+
+    private static ChildRunReserveRequest childRequest(String runId, long groupId, String toolCallId) {
+        return new ChildRunReserveRequest(runId, runId, groupId, toolCallId, "node-1",
+                toolCallId, 0, 0, 0L, "分析目标", "上下文", "model-a", "endpoint-a", "sha256:test");
     }
 
     /** 只为了给上面那段上下文打开注解事务管理。 */

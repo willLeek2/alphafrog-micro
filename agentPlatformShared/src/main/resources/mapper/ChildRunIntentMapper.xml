@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.ChildRunIntentMapper">
+
+    <resultMap id="ParentSnapshot" type="world.willfrog.agent.platform.childrun.ChildRunParentSnapshot">
+        <id property="id" column="id"/>
+        <result property="status" column="status"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="runControlVersion" column="run_control_version"/>
+        <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="deploymentId" column="deployment_id"/>
+        <result property="deploymentGenerationId" column="deployment_generation_id"/>
+    </resultMap>
+
+    <resultMap id="IntentRow" type="world.willfrog.agent.platform.childrun.ChildRunIntentRow">
+        <id property="id" column="id"/>
+        <result property="outboxId" column="outbox_id"/>
+        <result property="rootRunId" column="root_run_id"/>
+        <result property="parentRunId" column="parent_run_id"/>
+        <result property="childRunId" column="child_run_id"/>
+        <result property="parentWaitGroupId" column="parent_wait_group_id"/>
+        <result property="parentMemberIdentity" column="parent_member_identity"/>
+        <result property="parentNodeId" column="parent_node_id"/>
+        <result property="toolCallId" column="tool_call_id"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="nodeAttempt" column="node_attempt"/>
+        <result property="operationId" column="operation_id"/>
+        <result property="goal" column="goal"/>
+        <result property="context" column="context_text"/>
+        <result property="childModelName" column="child_model_name"/>
+        <result property="childEndpointName" column="child_endpoint_name"/>
+        <result property="parentSchedulerVersion" column="parent_scheduler_version"/>
+        <result property="parentDeploymentId" column="parent_deployment_id"/>
+        <result property="parentDeploymentGenerationId" column="parent_deployment_generation_id"/>
+        <result property="parentConfigSnapshotDigest" column="parent_config_snapshot_digest"/>
+        <result property="parentControlVersion" column="parent_control_version"/>
+        <result property="state" column="state"/>
+        <result property="claimToken" column="claim_token"/>
+        <result property="outboxState" column="outbox_state"/>
+        <result property="childRunStatus" column="child_run_status"/>
+        <result property="acceptedAt" column="accepted_at"/>
+        <result property="childTerminalAt" column="child_terminal_at"/>
+        <result property="physicalStoppedAt" column="physical_stopped_at"/>
+        <result property="capacityReleasedAt" column="capacity_released_at"/>
+    </resultMap>
+
+    <sql id="intentColumns">
+        i.id, o.id AS outbox_id, i.root_run_id, i.parent_run_id, i.child_run_id,
+        i.parent_wait_group_id, i.parent_member_identity, i.parent_node_id, i.tool_call_id,
+        i.plan_generation, i.node_attempt, i.operation_id, i.goal, i.context_text,
+        i.child_model_name, i.child_endpoint_name,
+        i.parent_scheduler_version, i.parent_deployment_id, i.parent_deployment_generation_id,
+        i.parent_config_snapshot_digest, i.parent_control_version, i.state,
+        o.claim_token, o.state AS outbox_state,
+        i.accepted_at, i.child_terminal_at, i.physical_stopped_at, i.capacity_released_at
+    </sql>
+
+    <select id="lockParentRun" resultMap="ParentSnapshot">
+        SELECT id, status, plan_generation, run_control_version, scheduler_version,
+               deployment_id, deployment_generation_id
+          FROM alphafrog_agent_run WHERE id = #{runId} FOR UPDATE
+    </select>
+
+    <select id="findByCall" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+         WHERE i.parent_run_id = #{request.parentRunId}
+           AND i.plan_generation = #{request.planGeneration}
+           AND i.parent_node_id = #{request.parentNodeId}
+           AND i.node_attempt = #{request.nodeAttempt}
+           AND i.tool_call_id = #{request.toolCallId}
+    </select>
+
+    <select id="findByIntentId" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+         WHERE i.id = #{intentId}
+    </select>
+
+    <select id="findByOutboxId" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+         WHERE o.id = #{outboxId}
+    </select>
+
+    <select id="findByChildRunId" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>, child.status AS child_run_status
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+          LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
+         WHERE i.child_run_id = #{childRunId}
+    </select>
+
+    <select id="lockIntent" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+         WHERE i.id = #{intentId}
+         FOR UPDATE OF i, o
+    </select>
+
+    <select id="matchesParentWaitMember" resultType="java.lang.Integer">
+        SELECT count(*) FROM alphafrog_agent_run_wait_group g
+        JOIN alphafrog_agent_run_wait_member m ON m.group_id = g.id AND m.run_id = g.run_id
+        WHERE g.id = #{request.parentWaitGroupId}
+          AND g.run_id = #{request.parentRunId}
+          AND g.plan_generation = #{request.planGeneration}
+          AND g.node_id = #{request.parentNodeId}
+          AND g.node_attempt = #{request.nodeAttempt}
+          AND g.state = 'WAITING'
+          AND m.member_identity = #{request.parentMemberIdentity}
+          AND m.tool_call_id = #{request.toolCallId}
+          AND m.tool_name = 'spawnSubAgent'
+    </select>
+
+    <select id="parentWaitMemberStillOpen" resultType="java.lang.Integer">
+        SELECT count(*) FROM alphafrog_agent_run_child_intent i
+        JOIN alphafrog_agent_run_wait_group g
+          ON g.id = i.parent_wait_group_id AND g.run_id = i.parent_run_id
+        JOIN alphafrog_agent_run_wait_member m
+          ON m.group_id = g.id AND m.member_identity = i.parent_member_identity
+        WHERE i.id = #{intentId} AND g.state = 'WAITING'
+          AND m.state IN ('PENDING', 'RUNNING')
+    </select>
+
+    <insert id="ensureTreeCapacity">
+        INSERT INTO alphafrog_agent_run_tree_capacity(root_run_id)
+        VALUES (#{rootRunId}) ON CONFLICT (root_run_id) DO NOTHING
+    </insert>
+
+    <update id="reserveTreeCapacity">
+        UPDATE alphafrog_agent_run_tree_capacity
+           SET active_child_count = active_child_count + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE root_run_id = #{rootRunId} AND active_child_count &lt; #{limit}
+    </update>
+
+    <update id="releaseTreeCapacity">
+        UPDATE alphafrog_agent_run_tree_capacity
+           SET active_child_count = active_child_count - 1, updated_at = CURRENT_TIMESTAMP
+         WHERE root_run_id = #{rootRunId} AND active_child_count &gt; 0
+    </update>
+
+    <delete id="pruneEmptyTreeCapacity">
+        DELETE FROM alphafrog_agent_run_tree_capacity
+         WHERE root_run_id = #{rootRunId} AND active_child_count = 0
+    </delete>
+
+    <select id="insertIntent" resultType="java.lang.Long" affectData="true" flushCache="true">
+        INSERT INTO alphafrog_agent_run_child_intent (
+            root_run_id, parent_run_id, child_run_id, parent_wait_group_id, parent_member_identity,
+            parent_node_id, tool_call_id, plan_generation, node_attempt, operation_id, goal, context_text,
+            child_model_name, child_endpoint_name,
+            parent_scheduler_version, parent_deployment_id, parent_deployment_generation_id,
+            parent_config_snapshot_digest, parent_control_version)
+        VALUES (#{request.rootRunId}, #{request.parentRunId}, #{childRunId},
+                #{request.parentWaitGroupId}, #{request.parentMemberIdentity}, #{request.parentNodeId},
+                #{request.toolCallId}, #{request.planGeneration}, #{request.nodeAttempt}, #{operationId},
+                #{request.goal}, #{request.context}, #{request.childModelName},
+                #{request.childEndpointName}, #{parent.schedulerVersion},
+                #{parent.deploymentId}, #{parent.deploymentGenerationId},
+                #{request.parentConfigSnapshotDigest}, #{request.parentControlVersion})
+        RETURNING id
+    </select>
+
+    <select id="insertOutbox" resultType="java.lang.Long" affectData="true" flushCache="true">
+        INSERT INTO alphafrog_agent_run_child_outbox(intent_id)
+        VALUES (#{intentId}) RETURNING id
+    </select>
+
+    <select id="claimDueOutbox" resultType="java.lang.Long" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run_child_outbox o
+           SET state = 'CLAIMED', claim_token = #{claimToken}, claimed_by = #{owner},
+               lease_until = #{leaseUntil}, delivery_attempts = delivery_attempts + 1,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE o.id = (
+             SELECT q.id FROM alphafrog_agent_run_child_outbox q
+             JOIN alphafrog_agent_run_child_intent i ON i.id = q.intent_id
+             WHERE ((q.state = 'PENDING' AND q.next_delivery_at &lt;= #{now})
+                    OR (q.state = 'CLAIMED' AND q.lease_until &lt;= #{now}))
+               AND i.state = 'PENDING'
+             ORDER BY q.next_delivery_at, q.id
+             LIMIT 1 FOR UPDATE OF q SKIP LOCKED)
+        RETURNING o.id
+    </select>
+
+    <update id="markIntentAccepted">
+        UPDATE alphafrog_agent_run_child_intent
+           SET state = 'ACCEPTED', accepted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{intentId} AND state = 'PENDING'
+    </update>
+
+    <update id="acknowledgeOutbox">
+        UPDATE alphafrog_agent_run_child_outbox
+           SET state = 'ACKED', claim_token = NULL, claimed_by = NULL, lease_until = NULL,
+               acked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{outboxId} AND state = 'CLAIMED' AND claim_token = #{claimToken}
+    </update>
+
+    <update id="cancelUnaccepted">
+        UPDATE alphafrog_agent_run_child_intent
+           SET state = 'CANCELED_BEFORE_ACCEPT', cancel_requested_at = CURRENT_TIMESTAMP,
+               child_terminal_at = CURRENT_TIMESTAMP, physical_stopped_at = CURRENT_TIMESTAMP,
+               capacity_released_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{intentId} AND state = 'PENDING' AND capacity_released_at IS NULL
+    </update>
+
+    <update id="cancelOutbox">
+        UPDATE alphafrog_agent_run_child_outbox
+           SET state = 'CANCELED', claim_token = NULL, claimed_by = NULL, lease_until = NULL,
+               canceled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE intent_id = #{intentId} AND state IN ('PENDING', 'CLAIMED')
+    </update>
+
+    <update id="requestCancellation">
+        UPDATE alphafrog_agent_run_child_intent
+           SET state = 'CANCEL_REQUESTED', cancel_requested_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{intentId} AND state = 'ACCEPTED'
+    </update>
+
+    <update id="markChildTerminal">
+        UPDATE alphafrog_agent_run_child_intent
+           SET state = 'TERMINAL', child_terminal_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{intentId} AND state IN ('ACCEPTED', 'CANCEL_REQUESTED')
+           AND child_terminal_at IS NULL
+    </update>
+
+    <update id="markPhysicalStopped">
+        UPDATE alphafrog_agent_run_child_intent
+           SET physical_stopped_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{intentId} AND state IN ('ACCEPTED', 'CANCEL_REQUESTED', 'TERMINAL')
+           AND physical_stopped_at IS NULL
+    </update>
+
+    <update id="releaseIntentCapacity">
+        UPDATE alphafrog_agent_run_child_intent
+           SET capacity_released_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{intentId} AND capacity_released_at IS NULL
+           AND child_terminal_at IS NOT NULL AND physical_stopped_at IS NOT NULL
+    </update>
+
+    <select id="rootRunIdOf" resultType="java.lang.String">
+        SELECT CASE
+            WHEN EXISTS (SELECT 1 FROM alphafrog_agent_run_child_intent i
+                         WHERE i.child_run_id = r.id)
+            THEN (SELECT i.root_run_id FROM alphafrog_agent_run_child_intent i
+                  WHERE i.child_run_id = r.id AND i.accepted_at IS NOT NULL)
+            ELSE r.id END
+          FROM alphafrog_agent_run r WHERE r.id = #{runId}
+    </select>
+
+    <select id="hasUnsettledDescendants" resultType="java.lang.Boolean">
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM alphafrog_agent_run WHERE id = #{rootRunId})
+                    THEN EXISTS (SELECT 1 FROM alphafrog_agent_run_child_intent
+                                 WHERE root_run_id = #{rootRunId}
+                                   AND capacity_released_at IS NULL)
+                    ELSE NULL END
+    </select>
+
+    <select id="listReservedRootRunIds" resultType="java.lang.String">
+        SELECT root_run_id FROM alphafrog_agent_run_tree_capacity
+        WHERE active_child_count &gt; 0
+        <if test="afterRootRunId != null and afterRootRunId != ''">
+            AND root_run_id &gt; #{afterRootRunId}
+        </if>
+        ORDER BY root_run_id LIMIT #{limit}
+    </select>
+
+    <select id="listAcceptedChildrenNeedingLaunch" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>, child.status AS child_run_status
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+          LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
+         WHERE i.id &gt; #{afterIntentId}
+           AND i.state = 'ACCEPTED'
+           AND (child.id IS NULL OR child.status NOT IN
+                ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED'))
+         ORDER BY i.id LIMIT #{limit}
+    </select>
+
+    <select id="listUnsettledByParent" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>, child.status AS child_run_status
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+          LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
+         WHERE i.parent_run_id = #{parentRunId}
+           AND i.id &gt; #{afterIntentId}
+           AND i.capacity_released_at IS NULL
+         ORDER BY i.id LIMIT #{limit}
+    </select>
+</mapper>
