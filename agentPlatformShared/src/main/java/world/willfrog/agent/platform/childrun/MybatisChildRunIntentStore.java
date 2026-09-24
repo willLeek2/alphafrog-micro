@@ -53,6 +53,8 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
         }
         StringBuilder identity = new StringBuilder();
         appendIdentityField(identity, request.parentRunId());
+        appendIdentityField(identity, String.valueOf(request.parentWaitGroupId()));
+        appendIdentityField(identity, request.parentMemberIdentity());
         appendIdentityField(identity, String.valueOf(request.planGeneration()));
         appendIdentityField(identity, request.parentNodeId());
         appendIdentityField(identity, String.valueOf(request.nodeAttempt()));

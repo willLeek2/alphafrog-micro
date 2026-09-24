@@ -40,6 +40,17 @@
         <result property="deploymentGenerationId" column="deployment_generation_id"/>
     </resultMap>
 
+    <!-- Sandbox 用量凭证由独立 CAS 写入。整份业务快照重建时保留已落库凭证，
+         否则执行终态会抹掉任务停止证据，导致父子调用树的容量无法释放。 -->
+    <sql id="snapshotPreservingDataAnalysisObservability">
+        CASE WHEN jsonb_exists(COALESCE(snapshot_json, '{}'::jsonb), 'data_analysis_observability')
+             THEN CAST(#{snapshotJson} AS jsonb)
+                  || jsonb_build_object('data_analysis_observability',
+                                        snapshot_json -&gt; 'data_analysis_observability')
+             ELSE CAST(#{snapshotJson} AS jsonb)
+        END
+    </sql>
+
     <insert id="insert" parameterType="world.willfrog.agent.platform.entity.AgentRun">
         INSERT INTO alphafrog_agent_run
         (id, user_id, deployment_id, deployment_generation_id, lane_tag,
@@ -582,7 +593,7 @@
     <update id="updateSnapshot">
         UPDATE alphafrog_agent_run
         SET status = #{status},
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             last_error = #{lastError},
             updated_at = CURRENT_TIMESTAMP
             <if test="completed">
@@ -595,7 +606,7 @@
     <!-- 取消时只更新可观测快照，保持数据库状态留在等待终态收尾的位置。 -->
     <update id="updateSnapshotIfStatus">
         UPDATE alphafrog_agent_run
-        SET snapshot_json = CAST(#{snapshotJson} AS jsonb),
+        SET snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
@@ -605,7 +616,7 @@
     <update id="pauseSnapshotWithTtl">
         UPDATE alphafrog_agent_run
         SET status = 'WAITING',
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             run_control_version = CASE
                 WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
                 ELSE run_control_version
@@ -622,7 +633,7 @@
     <update id="updateTerminalSnapshot">
         UPDATE alphafrog_agent_run
         SET status = #{status},
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             last_error = #{lastError},
             updated_at = CURRENT_TIMESTAMP
             <if test="completed">
@@ -642,7 +653,7 @@
     <update id="cancelTerminalSnapshotWithTtl">
         UPDATE alphafrog_agent_run
         SET status = 'CANCELED',
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             run_control_version = CASE
                 WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
                 ELSE run_control_version
@@ -1768,7 +1779,7 @@
         UPDATE alphafrog_agent_run
         SET plan_json = COALESCE(CAST(#{planJson} AS jsonb), plan_json),
             status = #{status},
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             completed_at = CASE WHEN #{completed} THEN CURRENT_TIMESTAMP ELSE completed_at END,
             last_error = #{lastError},
             updated_at = CURRENT_TIMESTAMP

@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run_child_intent (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT agent_run_child_intent_call_key
-        UNIQUE (parent_run_id, plan_generation, parent_node_id, node_attempt, tool_call_id),
+        UNIQUE (parent_wait_group_id, parent_member_identity),
     CONSTRAINT agent_run_child_intent_group_fk
         FOREIGN KEY (parent_wait_group_id, parent_run_id)
         REFERENCES alphafrog_agent_run_wait_group(id, run_id)

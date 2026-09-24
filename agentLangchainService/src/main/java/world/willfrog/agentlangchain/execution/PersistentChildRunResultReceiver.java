@@ -186,6 +186,7 @@ public class PersistentChildRunResultReceiver {
                 state.put("status", childStatus(child.getStatus()));
                 state.put("result", answer(child));
                 state.put("error", child.getLastError() == null ? "" : child.getLastError());
+                state.put("toolCallsUsed", toolCalls(child));
                 results.add(state);
             } else {
                 allTerminal = false;
@@ -237,11 +238,11 @@ public class PersistentChildRunResultReceiver {
     }
 
     private String success(String tool, Map<String, Object> data) {
-        return write(Map.of("ok", true, "tool", tool, "data", data));
+        return write(Map.of("ok", true, "tool", tool, "data", data, "error", Map.of()));
     }
 
     private String error(String tool, String code) {
-        return write(Map.of("ok", false, "tool", tool,
+        return write(Map.of("ok", false, "tool", tool, "data", Map.of(),
                 "error", Map.of("code", code, "message", code)));
     }
 
@@ -259,6 +260,16 @@ public class PersistentChildRunResultReceiver {
             return snapshot.path("answer").asText("");
         } catch (Exception malformed) {
             return "";
+        }
+    }
+
+    private int toolCalls(AgentRun child) {
+        try {
+            JsonNode snapshot = json.readTree(child.getSnapshotJson());
+            return Math.max(0, snapshot.path("observability").path("summary")
+                    .path("toolCalls").asInt(0));
+        } catch (Exception malformed) {
+            return 0;
         }
     }
 

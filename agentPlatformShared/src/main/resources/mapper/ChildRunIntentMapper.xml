@@ -68,11 +68,8 @@
         SELECT <include refid="intentColumns"/>
           FROM alphafrog_agent_run_child_intent i
           JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
-         WHERE i.parent_run_id = #{request.parentRunId}
-           AND i.plan_generation = #{request.planGeneration}
-           AND i.parent_node_id = #{request.parentNodeId}
-           AND i.node_attempt = #{request.nodeAttempt}
-           AND i.tool_call_id = #{request.toolCallId}
+         WHERE i.parent_wait_group_id = #{request.parentWaitGroupId}
+           AND i.parent_member_identity = #{request.parentMemberIdentity}
     </select>
 
     <select id="findByIntentId" resultMap="IntentRow">
