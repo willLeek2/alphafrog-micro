@@ -263,6 +263,22 @@
                updated_at
         FROM alphafrog_agent_run_wait_member
         WHERE state = 'RUNNING'
+          AND tool_name = 'executePython'
+          AND next_poll_at IS NOT NULL
+          AND next_poll_at &lt;= #{now}
+        ORDER BY next_poll_at, id
+        LIMIT #{limit}
+    </select>
+
+    <select id="scanDueSubAgentMembers" resultMap="WaitMemberResultMap">
+        SELECT id, group_id, run_id, member_seq, member_identity, tool_call_id,
+               tool_name, external_operation_id, state,
+               result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
+               next_poll_at, poll_count, backoff_step, finished_at, created_at, updated_at
+        FROM alphafrog_agent_run_wait_member
+        WHERE state = 'RUNNING'
+          AND tool_name IN ('spawnSubAgent', 'waitForSubAgent')
           AND next_poll_at IS NOT NULL
           AND next_poll_at &lt;= #{now}
         ORDER BY next_poll_at, id

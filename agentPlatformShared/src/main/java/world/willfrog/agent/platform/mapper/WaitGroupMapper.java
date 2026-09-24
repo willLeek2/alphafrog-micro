@@ -162,7 +162,10 @@ public interface WaitGroupMapper {
 
     /** 到点该查询外部作业状态的成员：还在执行中、下次查询时间已到。 */
     List<WaitMember> scanDueMembers(@Param("now") OffsetDateTime now,
-                                    @Param("limit") int limit);
+                                   @Param("limit") int limit);
+
+    List<WaitMember> scanDueSubAgentMembers(@Param("now") OffsetDateTime now,
+                                            @Param("limit") int limit);
 
     /** 成员还在执行中时推后下次查询时间；已经落终态的成员不会被改。 */
     int rescheduleMember(@Param("groupId") long groupId,

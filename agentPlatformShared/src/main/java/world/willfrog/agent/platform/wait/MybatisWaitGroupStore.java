@@ -235,6 +235,14 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitMember> scanDueSubAgentMembers(OffsetDateTime now, int limit) {
+        if (now == null || limit <= 0) {
+            throw new IllegalArgumentException("sub-agent scan requires now and a positive limit");
+        }
+        return mapper.scanDueSubAgentMembers(now, limit);
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,

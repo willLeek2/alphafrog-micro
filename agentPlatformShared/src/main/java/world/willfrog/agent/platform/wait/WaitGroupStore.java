@@ -83,6 +83,11 @@ public interface WaitGroupStore {
      */
     List<WaitMember> scanDueMembers(OffsetDateTime now, int limit);
 
+    /** 到期的持久子代理创建/等待成员，由子代理协调器接回，不能交给 Python 作业接收器。 */
+    default List<WaitMember> scanDueSubAgentMembers(OffsetDateTime now, int limit) {
+        throw new UnsupportedOperationException("sub-agent member scan is not implemented");
+    }
+
     /** 成员还在执行中时推后它的下次查询时间并累加轮询次数；已经落终态的成员不会被改。 */
     boolean rescheduleMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt, int maxBackoffStep);
 
