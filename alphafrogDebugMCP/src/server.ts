@@ -3,11 +3,11 @@
  * 禁止向 stdout 写入日志（会破坏 JSON-RPC），仅使用 stderr。
  */
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildDockerLogsRemoteArgs } from "./dockerLogs.js";
+import { loadDebugMcpEnv } from "./envLoad.js";
 import {
   allSshHosts,
   dataRootForTarget,
@@ -17,6 +17,13 @@ import {
   repoPathForTarget,
   resolveTarget,
 } from "./hostCatalog.js";
+import {
+  openSshLocalForward,
+  pgClientConfig,
+  PG_QUERY_FAILED,
+  planPgConnect,
+  type SshTunnelHandle,
+} from "./pgQuery.js";
 import {
   buildLogBody,
   buildLogFileName,
@@ -41,24 +48,13 @@ import {
 } from "./redisQuery.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import dotenv from "dotenv";
 import pg from "pg";
 import { parse as parseShell, quote } from "shell-quote";
 import { z } from "zod";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ---------- 环境加载（与 Python 一致：默认仓库根 .env）----------
-function loadEnv(): void {
-  const custom = process.env.ALPHAFROG_DEBUG_DOTENV_PATH?.trim();
-  const repoRoot = path.resolve(__dirname, "..", "..");
-  const dotenvPath = custom && existsSync(custom) ? custom : path.join(repoRoot, ".env");
-  if (existsSync(dotenvPath)) {
-    dotenv.config({ path: dotenvPath, quiet: true });
-  }
-}
-
-loadEnv();
+loadDebugMcpEnv({ moduleDir: __dirname });
 
 const hostCatalog = loadHostCatalog();
 const knownSshHosts = allSshHosts(hostCatalog);
@@ -854,18 +850,32 @@ Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; val
     if (rejection) {
       return toolJson({ ok: false, error: rejection });
     }
-    const dsnKey = `ALPHAFROG_PG_${env.toUpperCase()}_DSN`;
-    const dsn = process.env[dsnKey];
-    if (!dsn) {
-      return toolJson({ ok: false, error: "该目标尚未配置数据库连接" });
+    const plan = planPgConnect(env, hostCatalog);
+    if ("error" in plan) {
+      return toolJson({ ok: false, error: plan.error });
     }
 
     const { sql: safeSql, effectiveLimit } = applyRowLimit(sql);
-
-    const client = new pg.Client({ connectionString: dsn });
+    let tunnel: SshTunnelHandle | undefined;
+    let pgClient: pg.Client | undefined;
     try {
-      await client.connect();
-      const res = await client.query(safeSql);
+      if (plan.mode === "ssh") {
+        tunnel = await openSshLocalForward({
+          sshHost: plan.sshHost,
+          remoteHost: plan.remoteHost,
+          remotePort: plan.remotePort,
+          sshConfig: process.env.ALPHAFROG_DEBUG_SSH_CONFIG?.trim(),
+          extraArgs: process.env.ALPHAFROG_DEBUG_SSH_ARGS?.trim()
+            ? parseShellArgs(process.env.ALPHAFROG_DEBUG_SSH_ARGS)
+            : undefined,
+          knownSshHosts,
+        });
+        pgClient = new pg.Client(pgClientConfig(plan, tunnel.localPort));
+      } else {
+        pgClient = new pg.Client(pgClientConfig(plan));
+      }
+      await pgClient.connect();
+      const res = await pgClient.query(safeSql);
       const columns = res.fields.map((f) => f.name);
       const rows = res.rows.map((row) => columns.map((c) => row[c]));
       return toolJson({
@@ -876,13 +886,19 @@ Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; val
         truncated: rows.length >= effectiveLimit,
       });
     } catch (e) {
-      console.error("[remote_pg_query]", e);
+      const hosts = plan.mode === "ssh" ? [plan.sshHost, plan.remoteHost, ...knownSshHosts] : knownSshHosts;
+      console.error("[remote_pg_query]", redactHosts(String(e), hosts));
       return toolJson({
         ok: false,
-        error: "数据库查询执行失败，详情请查看 MCP 服务端日志",
+        error: PG_QUERY_FAILED,
       });
     } finally {
-      await client.end().catch(() => {});
+      if (pgClient) {
+        await pgClient.end().catch(() => {});
+      }
+      if (tunnel) {
+        await tunnel.close().catch(() => {});
+      }
     }
   }
 );

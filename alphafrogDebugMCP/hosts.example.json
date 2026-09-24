@@ -1,5 +1,5 @@
 {
-  "_comment": "把本文件复制到 ~/.alphafrog/debug-mcp-hosts.json，权限设为 600。label 会返回给调用 MCP 的 agent，不要在 label 里写真实主机名或地址。",
+  "_comment": "把本文件复制到 ~/.alphafrog/debug-mcp-hosts.json，权限设为 600。label 会返回给调用 MCP 的 agent，不要在 label 里写真实主机名或地址。pg_via_ssh 为 true 时经该目标 ssh_host 转发后再连 DSN 里的地址（DSN 的 host 是 SSH 目标机视角）。工具返回不含 ssh_host 与 pg_via_ssh。",
   "targets": [
     {
       "id": "test",
@@ -10,6 +10,12 @@
       "id": "prod",
       "label": "生产环境",
       "ssh_host": "your-ssh-config-alias-prod"
+    },
+    {
+      "id": "beta_cn",
+      "label": "beta环境",
+      "ssh_host": "your-ssh-config-alias-beta",
+      "pg_via_ssh": true
     }
   ]
 }

@@ -2,7 +2,7 @@
 
 基于 **Node.js + TypeScript** 的 MCP 服务（stdio），用于通过 SSH 远程调试（`docker ps` / `docker logs` / `git log`）以及对 PostgreSQL 的只读查询。
 
-调用方（Agent）先用 `list_remote_targets` 拿到逻辑 id（如 `test`、`prod`，也可自行增加），再把该 id 传给其它工具的 `env`。真实 SSH Host 别名写在本机保密文件里，由 MCP 进程读取。工具返回只含逻辑 id，不含 SSH 主机名。数据库连接串等仍在 **MCP 进程环境** 中配置，勿写入可被误提交的仓库文件。
+调用方（Agent）先用 `list_remote_targets` 拿到逻辑 id（如 `test`、`prod`，也可自行增加），再把该 id 传给其它工具的 `env`。真实 SSH Host 别名写在本机保密文件里，由 MCP 进程读取。工具返回只含逻辑 id，不含 SSH 主机名、SSH config 路径或库连接串。数据库连接串写在 MCP 进程启动时自己读取的本机 dotenv 里，勿写入可被误提交的仓库文件。
 
 ## 环境要求
 
@@ -27,7 +27,12 @@ node dist/server.js
 
 进程启动后仅向 **stderr** 打一行状态日志；**不要**向 stdout 打印普通日志，否则会破坏 MCP 的 JSON-RPC。
 
-可选：在仓库根目录放置 `.env`，或通过环境变量 `ALPHAFROG_DEBUG_DOTENV_PATH` 指向自定义 dotenv 文件（与加载逻辑见源码）。
+dotenv 按下面顺序加载，**已有环境变量不被覆盖**（harness 的 `mcp.json` / `config.toml` 里写过的键优先）：
+
+1. `~/.alphafrog/debug-mcp.env`。若设置了 `ALPHAFROG_DEBUG_DOTENV_PATH`，改读该路径。
+2. 仓库根目录 `.env`。
+
+PostgreSQL DSN 写在第 1 份文件里，谁启动同一份 `dist/server.js` 都能读到。不要只写进某一个 IDE 的 MCP 配置。也可以用 `ALPHAFROG_DEBUG_DOTENV_PATH` 指向自定义 dotenv。
 
 ## 工具列表
 
@@ -38,7 +43,7 @@ node dist/server.js
 - `remote_git_log(env, repo_path?, limit?)` — 远程 `git log`
 - `remote_docker_logs(env, container, tail?, grep?, timestamps?, since?, until?, max_bytes?, timeout_seconds?, save_to_file?)` — 抓取容器日志
 - `remote_docker_follow(env, container, follow_seconds?, tail?, grep?, timestamps?, max_bytes?, save_to_file?)` — 限时 follow 日志
-- `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。
+- `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。需要该目标已配置 `ALPHAFROG_PG_<ID>_DSN`。工具返回不含连接方式。
 - `remote_redis_query(env, operation, pattern?, limit?, offset?, keys?, timeout_seconds?)` — 只读 Redis 查询（经 SSH 在远程 Redis 容器内执行 `redis-cli`）。`operation` 支持：
   - `scan_keys`：按 `pattern` 列出 key，支持 `limit`（默认 100，最大 500）与 `offset`（默认 0，最大 10000）
   - `get_values`：按 `keys` 数组（最多 50 个）批量读取键值；支持 string/hash/list/set/zset，集合类最多返回 100 项
@@ -119,8 +124,6 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
         "ALPHAFROG_DEBUG_DATA_ROOT_TEST": "/srv/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_DEBUG_DATA_ROOT_PROD": "/root/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_DEBUG_LOG_SAVE_DIR": "/tmp/alphafrog-debug-logs",
-        "ALPHAFROG_PG_TEST_DSN": "postgresql://...",
-        "ALPHAFROG_PG_PROD_DSN": "postgresql://...",
         "ALPHAFROG_REDIS_CONTAINER_TEST": "alphafrog-redis",
         "ALPHAFROG_REDIS_CONTAINER_PROD": "alphafrog-redis",
         "ALPHAFROG_REDIS_PASSWORD_TEST": "your-redis-password",
@@ -131,7 +134,7 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
 }
 ```
 
-仓库内占位示例：[cursor-mcp.example.json](cursor-mcp.example.json)。敏感连接串只放本机，勿提交 git。
+仓库内占位示例：[cursor-mcp.example.json](cursor-mcp.example.json)。PostgreSQL DSN 写在 `~/.alphafrog/debug-mcp.env`，敏感连接串只放本机，勿提交 git。
 
 ### 方式 B：`node` + 相对路径 + `cwd`
 
@@ -181,6 +184,12 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
       "ssh_host": "your-ssh-config-alias-prod",
       "repo_path": "~/alphafrog/alphafrog-micro",
       "data_root": "/root/alphafrog/alphafrog-micro/data"
+    },
+    {
+      "id": "beta_cn",
+      "label": "beta环境",
+      "ssh_host": "your-ssh-config-alias-beta",
+      "pg_via_ssh": true
     }
   ]
 }
@@ -191,13 +200,21 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
 - `id`：给 Agent 用的逻辑名，`[a-z][a-z0-9_]{0,31}`，对应其它工具的 `env`。
 - `label`：给 Agent 看的中文说明。label 里写主机名或 IP 会随 `list_remote_targets` 暴露出去。
 - `ssh_host`：`~/.ssh/config` 里的 Host 别名，只给 MCP 进程用来拼 `ssh`，工具返回不会带上它。
+- `pg_via_ssh`：可选。为 `true` 时，`remote_pg_query` 经该目标的 `ssh_host` 做本地转发，再连 DSN 里的 host/port。DSN 里的 host 是 **SSH 目标机视角** 的地址（例如目标机本机 Postgres 写 `127.0.0.1`）。工具返回不含该字段，也不区分直连还是转发。
 - `repo_path` / `data_root`：可选；未写时仍可读 `ALPHAFROG_DEBUG_REPO_PATH_<ID>`、`ALPHAFROG_DEBUG_DATA_ROOT_<ID>` 或默认仓库路径。
 
 建议权限：`chmod 600 ~/.alphafrog/debug-mcp-hosts.json`。
 
-`list_remote_targets` 对调用 MCP 的 Agent 返回 `id`、`label`、`capabilities`（`docker` / `git` / `pg` / `redis` / `agent_data`）。PostgreSQL DSN、Redis 密码仍按 id 读环境变量：`ALPHAFROG_PG_<ID>_DSN`、`ALPHAFROG_REDIS_CONTAINER_<ID>`、`ALPHAFROG_REDIS_PASSWORD_<ID>`。
+PostgreSQL DSN 写在 `~/.alphafrog/debug-mcp.env`（`chmod 600`），按目标 id 命名：`ALPHAFROG_PG_<ID>_DSN`。示例：
 
-MCP 工具的入参和返回不含 ssh host。本机若允许 Agent 直接读文件系统，Agent 仍可能按路径打开该 JSON。需要限制文件读取时，把该文件加入 Cursor 的忽略或拒绝读取列表。
+```
+ALPHAFROG_PG_PROD_DSN=postgresql://user:pass@203.0.113.10:5432/alphafrog
+ALPHAFROG_PG_BETA_CN_DSN=postgresql://user:pass@127.0.0.1:5432/alphafrog
+```
+
+`list_remote_targets` 对调用 MCP 的 Agent 返回 `id`、`label`、`capabilities`（`docker` / `git` / `pg` / `redis` / `agent_data`）。`pg` 只表示该目标配了 DSN。Redis 密码仍按 id 读环境变量：`ALPHAFROG_REDIS_CONTAINER_<ID>`、`ALPHAFROG_REDIS_PASSWORD_<ID>`。
+
+MCP 工具的入参和返回不含 ssh host、SSH config 路径、DSN、`pg_via_ssh`。本机若允许 Agent 直接读文件系统，Agent 仍可能按路径打开 `~/.alphafrog/`、`~/.ssh/config`。需要限制文件读取时，把这些路径加入 Cursor 的忽略或拒绝读取列表。
 
 ## 附录：服务端环境变量（仅供人类运维）
 
@@ -213,6 +230,7 @@ MCP 工具的入参和返回不含 ssh host。本机若允许 Agent 直接读文
 | 远程仓库路径 | `ALPHAFROG_DEBUG_REPO_PATH_<ID>`、`ALPHAFROG_DEBUG_DEFAULT_REPO_PATH` |
 | 远程 agent data 根目录（`remote_agent_data_query`；清单 `data_root` 或按 id 的环境变量，均为可选；未配置时调用该工具会报错） | `ALPHAFROG_DEBUG_DATA_ROOT_<ID>` |
 | Docker 日志落盘目录（`remote_docker_logs` / `remote_docker_follow` 的 `save_to_file=true`） | `ALPHAFROG_DEBUG_LOG_SAVE_DIR` |
+| 共享 dotenv（DSN 等；默认 `~/.alphafrog/debug-mcp.env`） | `ALPHAFROG_DEBUG_DOTENV_PATH` |
 | PostgreSQL DSN | `ALPHAFROG_PG_<ID>_DSN` |
 
 ## 历史说明
