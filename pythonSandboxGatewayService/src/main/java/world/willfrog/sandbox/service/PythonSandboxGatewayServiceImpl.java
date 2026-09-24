@@ -29,7 +29,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
 
     // 260809-26Q3-stage1-w3 D13: dual RestTemplate beans with explicit timeouts.
     // Long-path serves createTask + getTaskResult (downstream may run max task duration).
-    // Short-query serves getTaskStatus + getTaskByOperationId (+ future D11 cancelTask).
+    // Short-query serves getTaskStatus, getTaskByOperationId and cancelTask.
     // Every call site MUST bind the correct bean via @Qualifier proof.
     private final RestTemplate longHttpClient;
     private final RestTemplate shortHttpClient;
@@ -709,6 +709,144 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 .build();
     }
 
+    @Override
+    public CancelTaskResponse cancelTask(CancelTaskRequest request) {
+        String endpoint = sandboxUrl + "/tasks/cancel";
+        String defect = cancelRequestDefect(request);
+        if (defect != null) {
+            return cancelFailure(defect,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT, null);
+        }
+        HttpCancelTaskRequest body = new HttpCancelTaskRequest();
+        body.setCancel_request_id(request.getCancelRequestId().trim());
+        body.setReason(request.getReason());
+        if (request.hasByTaskId()) {
+            HttpTaskIdCancelTarget target = new HttpTaskIdCancelTarget();
+            target.setTask_id(request.getByTaskId().getTaskId().trim());
+            body.setBy_task_id(target);
+        } else {
+            HttpOperationCancelTarget target = new HttpOperationCancelTarget();
+            target.setOperation_id(request.getByOperation().getOperationId().trim());
+            target.setRequest_fingerprint(request.getByOperation().getRequestFingerprint().trim());
+            body.setBy_operation(target);
+        }
+
+        long startMs = System.currentTimeMillis();
+        try {
+            ResponseEntity<HttpCancelTaskResponse> response = shortHttpClient.postForEntity(
+                    endpoint, body, HttpCancelTaskResponse.class);
+            int httpStatus = response.getStatusCode().value();
+            HttpCancelTaskResponse result = response.getBody();
+            CancelOutcome outcome = result == null ? null : parseCancelOutcome(result.getOutcome());
+            if (httpStatus != 200 || result == null || result.getError() != null && !result.getError().isBlank()
+                    || !validCancelResult(outcome, result)) {
+                emitSandboxHttp("POST", endpoint, httpStatus, System.currentTimeMillis() - startMs,
+                        "ERROR", "CANCEL_TASK_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+                return cancelFailure("Invalid cancel response from sandbox",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED, httpStatus);
+            }
+            emitSandboxHttp("POST", endpoint, httpStatus, System.currentTimeMillis() - startMs,
+                    "OK", null);
+            CancelTaskResponse.Builder mapped = CancelTaskResponse.newBuilder()
+                    .setOutcome(outcome);
+            if (result.getTask_id() != null) mapped.setTaskId(result.getTask_id());
+            if (result.getStatus() != null) mapped.setStatus(result.getStatus());
+            return mapped.build();
+        } catch (HttpClientErrorException.BadRequest | HttpClientErrorException.UnprocessableEntity e) {
+            return cancelHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT);
+        } catch (HttpClientErrorException.Conflict e) {
+            return cancelHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_CONFLICT);
+        } catch (HttpClientErrorException.TooManyRequests e) {
+            return cancelHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE);
+        } catch (HttpClientErrorException e) {
+            return cancelHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 404
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED);
+        } catch (HttpServerErrorException e) {
+            return cancelHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 503
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE);
+        } catch (ResourceAccessException e) {
+            SandboxErrorDetail detail = buildTransportErrorDetail(e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "CANCEL_TASK_" + detail.getCategory());
+            return CancelTaskResponse.newBuilder().setOutcome(CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED)
+                    .setError(nonBlankOr(e, "cancelTask transport failure"))
+                    .setErrorDetail(detail).build();
+        } catch (Exception e) {
+            log.error("sandbox.cancelTask.failed: reason={}", e.getMessage(), e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "CANCEL_TASK_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+            return cancelFailure(nonBlankOr(e, "cancelTask failed"),
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED, null);
+        }
+    }
+
+    private static String cancelRequestDefect(CancelTaskRequest request) {
+        if (request == null || request.getCancelRequestId().isBlank()) return "cancelRequestId is required";
+        if (request.hasByTaskId()) {
+            return request.getByTaskId().getTaskId().isBlank() ? "taskId is required" : null;
+        }
+        if (request.hasByOperation()) {
+            String operationId = request.getByOperation().getOperationId().trim();
+            String fingerprint = request.getByOperation().getRequestFingerprint().trim();
+            if (!operationId.matches("[^:\\s]+:[^:\\s]+:[1-9][0-9]*"))
+                return "operationId must identify one attempt";
+            if (!fingerprint.matches("sha256:[0-9a-f]{64}"))
+                return "requestFingerprint must be lowercase sha256";
+            return null;
+        }
+        return "cancel target is required";
+    }
+
+    private static CancelOutcome parseCancelOutcome(String value) {
+        if (value == null) return null;
+        try {
+            CancelOutcome outcome = CancelOutcome.valueOf(value);
+            return outcome == CancelOutcome.UNRECOGNIZED ? null : outcome;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static boolean validCancelResult(CancelOutcome outcome, HttpCancelTaskResponse result) {
+        if (outcome == null || outcome == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED) return false;
+        String taskId = result.getTask_id();
+        String status = result.getStatus();
+        if (outcome == CancelOutcome.NOT_FOUND) {
+            return (taskId == null || taskId.isBlank()) && (status == null || status.isBlank());
+        }
+        if (taskId == null || taskId.isBlank()) return false;
+        return switch (outcome) {
+            case CANCEL_INTENT_RECORDED -> "QUEUED".equals(status) || "RUNNING".equals(status);
+            case CANCELED -> "CANCELED".equals(status);
+            case ALREADY_TERMINAL -> "SUCCEEDED".equals(status) || "FAILED".equals(status)
+                    || "CANCELED".equals(status);
+            default -> false;
+        };
+    }
+
+    private CancelTaskResponse cancelHttpFailure(RuntimeException e, String endpoint, long startMs,
+                                                 SandboxHttpErrorCategory category) {
+        int httpStatus = extractDownstreamHttpStatus(e);
+        emitSandboxHttp("POST", endpoint, httpStatus, System.currentTimeMillis() - startMs,
+                "ERROR", "CANCEL_TASK_" + category.name());
+        return cancelFailure(extractDownstreamErrorText(e, "cancelTask rejected by sandbox"),
+                category, httpStatus);
+    }
+
+    private static CancelTaskResponse cancelFailure(String error, SandboxHttpErrorCategory category,
+                                                    Integer httpStatus) {
+        SandboxErrorDetail.Builder detail = SandboxErrorDetail.newBuilder().setCategory(category);
+        if (httpStatus != null) detail.setDownstreamHttpStatus(httpStatus);
+        return CancelTaskResponse.newBuilder().setOutcome(CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED)
+                .setError(nonBlankOr(error, "cancelTask failed"))
+                .setErrorDetail(detail.build()).build();
+    }
+
     /**
      * 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId as a single path segment.
      * Mirrors the getTaskByOperationId URL construction pattern (lines ~432-436)
@@ -1364,6 +1502,33 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String task_id;
         private String status;
         private String request_fingerprint;
+        private String error;
+    }
+
+    @Data
+    static class HttpCancelTaskRequest {
+        private HttpTaskIdCancelTarget by_task_id;
+        private HttpOperationCancelTarget by_operation;
+        private String cancel_request_id;
+        private String reason;
+    }
+
+    @Data
+    static class HttpTaskIdCancelTarget {
+        private String task_id;
+    }
+
+    @Data
+    static class HttpOperationCancelTarget {
+        private String operation_id;
+        private String request_fingerprint;
+    }
+
+    @Data
+    static class HttpCancelTaskResponse {
+        private String outcome;
+        private String task_id;
+        private String status;
         private String error;
     }
 
