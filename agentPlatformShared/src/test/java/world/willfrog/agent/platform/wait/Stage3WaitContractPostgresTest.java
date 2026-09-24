@@ -236,6 +236,35 @@ class Stage3WaitContractPostgresTest {
     }
 
     @Test
+    void closedParentWaitMemberCancelsUnacceptedChildEvenWhenRunVersionIsUnchanged() throws Exception {
+        String runId = "run-child-member-closed";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        try (AnnotationConfigApplicationContext context = childStoreContext()) {
+            ChildRunIntentStore store = context.getBean(ChildRunIntentStore.class);
+            TransactionTemplate transaction = new TransactionTemplate(
+                    context.getBean(PlatformTransactionManager.class));
+            ChildRunReservation reservation = transaction.execute(ignored -> store.reserveIntent(
+                    childRequest(runId, suspendChildGroup(runId, List.of("call-a")), "call-a"), 1));
+            assertThat(reservation).isNotNull();
+            ChildRunOutboxDelivery delivery = transaction.execute(ignored -> store.claimDueOutbox(
+                    "dispatcher-c", "claim-c", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)).orElseThrow());
+            try (SqlSession session = sqlSessionFactory.openSession(true)) {
+                new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class))
+                        .cancelChain(delivery.parentWaitGroupId());
+            }
+            transaction.executeWithoutResult(ignored -> {
+                assertThat(store.markAccepted(delivery.outboxId(), delivery.claimToken())).isFalse();
+                assertThat(store.cancelUnacceptedIfParentChanged(delivery.intentId())).isTrue();
+            });
+            assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_child_outbox "
+                    + "WHERE id = " + delivery.outboxId() + " AND state = 'CANCELED'")).isEqualTo(1);
+            assertThat(store.hasUnsettledDescendants(runId)).isFalse();
+        }
+    }
+
+    @Test
     void acceptedChildKeepsRootCapacityUntilTerminalAndPhysicalStopAreBothRecorded() throws Exception {
         String runId = "run-child-intent-terminal";
         createRun(runId, 0, 0L);
@@ -278,16 +307,27 @@ class Stage3WaitContractPostgresTest {
                     .extracting("childRunId").contains(delivery.childRunId());
             assertThat(store.listUnsettledByParent(runId, 0, 1000))
                     .extracting("childRunId").contains(delivery.childRunId());
+            assertThat(store.listUnsettledByRoot(runId, 0, 1000))
+                    .extracting("childRunId").contains(delivery.childRunId());
+            assertThat(store.listAcceptedSpawnMembersPending(0, 1000))
+                    .extracting("childRunId").contains(delivery.childRunId());
             transaction.executeWithoutResult(ignored ->
                     assertThat(store.markChildTerminal(delivery.childRunId())).isTrue());
             assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
                     + "WHERE root_run_id = '" + runId + "'")).isEqualTo(1);
+            transaction.executeWithoutResult(ignored ->
+                    assertThat(store.markPhysicalStopped(delivery.childRunId())).isFalse());
+            execute("UPDATE alphafrog_agent_run SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP "
+                    + "WHERE id = '" + delivery.childRunId() + "'");
             transaction.executeWithoutResult(ignored ->
                     assertThat(store.markPhysicalStopped(delivery.childRunId())).isTrue());
             assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
                     + "WHERE root_run_id = '" + runId + "'")).isZero();
             assertThat(store.hasUnsettledDescendants(runId)).isFalse();
             assertThat(store.listUnsettledByParent(runId, 0, 1000)).isEmpty();
+            assertThat(store.listUnsettledByRoot(runId, 0, 1000)).isEmpty();
+            assertThat(store.listAcceptedSpawnMembersPending(0, 1000))
+                    .extracting("childRunId").contains(delivery.childRunId());
         }
     }
 
@@ -2856,7 +2896,7 @@ class Stage3WaitContractPostgresTest {
 
     private static ChildRunReserveRequest childRequest(String runId, long groupId, String toolCallId) {
         return new ChildRunReserveRequest(runId, runId, groupId, toolCallId, "node-1",
-                toolCallId, 0, 0, 0L, "分析目标", "上下文", "model-a", "endpoint-a", "sha256:test");
+                toolCallId, 0, 0, 0L, "分析目标", "上下文", "model-a", "endpoint-a", 6, "sha256:test");
     }
 
     /** 只为了给上面那段上下文打开注解事务管理。 */

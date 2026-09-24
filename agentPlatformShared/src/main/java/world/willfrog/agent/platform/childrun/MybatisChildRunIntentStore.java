@@ -93,7 +93,7 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
                 row.getParentWaitGroupId(), row.getParentMemberIdentity(), row.getToolCallId(),
                 row.getPlanGeneration(), row.getNodeAttempt(), row.getParentControlVersion(),
                 row.getGoal(), row.getContext(), row.getChildModelName(),
-                row.getChildEndpointName(), row.getParentSchedulerVersion(),
+                row.getChildEndpointName(), row.getChildMaxSteps(), row.getParentSchedulerVersion(),
                 row.getParentDeploymentId(), row.getParentDeploymentGenerationId(),
                 row.getParentConfigSnapshotDigest()));
     }
@@ -136,7 +136,8 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
         if (row == null || !"PENDING".equals(row.getState())
                 || (!parentStopped(parent)
                     && Objects.equals(parent.getRunControlVersion(), row.getParentControlVersion())
-                    && Objects.equals(parent.getPlanGeneration(), row.getPlanGeneration()))) {
+                    && Objects.equals(parent.getPlanGeneration(), row.getPlanGeneration())
+                    && mapper.parentWaitMemberStillOpen(row.getId()) == 1)) {
             return false;
         }
         if (mapper.cancelUnaccepted(intentId) != 1 || mapper.cancelOutbox(intentId) != 1
@@ -230,6 +231,23 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
 
     @Override
     @Transactional(readOnly = true)
+    public List<ChildRunIntentView> listUnsettledByRoot(String rootRunId, long afterIntentId, int limit) {
+        required(rootRunId, "根 Run 编号");
+        requirePage(afterIntentId, limit);
+        return mapper.listUnsettledByRoot(rootRunId, afterIntentId, limit).stream()
+                .map(MybatisChildRunIntentStore::toView).toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ChildRunIntentView> listAcceptedSpawnMembersPending(long afterIntentId, int limit) {
+        requirePage(afterIntentId, limit);
+        return mapper.listAcceptedSpawnMembersPending(afterIntentId, limit).stream()
+                .map(MybatisChildRunIntentStore::toView).toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
     public Optional<ChildRunIntentView> findByChildRunId(String childRunId) {
         required(childRunId, "子 Run 编号");
         return Optional.ofNullable(mapper.findByChildRunId(childRunId))
@@ -284,6 +302,7 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
                 && Objects.equals(row.getContext(), request.context())
                 && Objects.equals(row.getChildModelName(), request.childModelName())
                 && Objects.equals(row.getChildEndpointName(), request.childEndpointName())
+                && Objects.equals(row.getChildMaxSteps(), request.childMaxSteps())
                 && Objects.equals(row.getParentConfigSnapshotDigest(), request.parentConfigSnapshotDigest())
                 && Objects.equals(row.getParentControlVersion(), request.parentControlVersion());
     }
@@ -298,7 +317,7 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
                 row.getChildRunId(), row.getOperationId(), row.getParentWaitGroupId(),
                 row.getParentMemberIdentity(), row.getToolCallId(), row.getPlanGeneration(),
                 row.getNodeAttempt(), row.getParentControlVersion(), row.getState(),
-                row.getChildRunStatus(), row.getAcceptedAt(), row.getChildTerminalAt(),
+                row.getChildRunStatus(), row.getParentMemberState(), row.getAcceptedAt(), row.getChildTerminalAt(),
                 row.getPhysicalStoppedAt(), row.getCapacityReleasedAt());
     }
 
@@ -338,6 +357,9 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
         required(request.parentConfigSnapshotDigest(), "父配置快照摘要");
         if (request.context() == null) {
             throw new IllegalArgumentException("子执行上下文不能为 null");
+        }
+        if (request.childMaxSteps() < 1 || request.childMaxSteps() > 12) {
+            throw new IllegalArgumentException("子执行的冻结步骤上限必须在 1 到 12 之间");
         }
     }
 

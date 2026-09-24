@@ -75,4 +75,11 @@ public interface ChildRunIntentMapper {
     List<ChildRunIntentRow> listUnsettledByParent(@Param("parentRunId") String parentRunId,
                                                    @Param("afterIntentId") long afterIntentId,
                                                    @Param("limit") int limit);
+
+    List<ChildRunIntentRow> listUnsettledByRoot(@Param("rootRunId") String rootRunId,
+                                                 @Param("afterIntentId") long afterIntentId,
+                                                 @Param("limit") int limit);
+
+    List<ChildRunIntentRow> listAcceptedSpawnMembersPending(@Param("afterIntentId") long afterIntentId,
+                                                             @Param("limit") int limit);
 }

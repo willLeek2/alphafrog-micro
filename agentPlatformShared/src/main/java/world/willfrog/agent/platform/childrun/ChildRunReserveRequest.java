@@ -15,5 +15,6 @@ public record ChildRunReserveRequest(
         String context,
         String childModelName,
         String childEndpointName,
+        int childMaxSteps,
         String parentConfigSnapshotDigest) {
 }

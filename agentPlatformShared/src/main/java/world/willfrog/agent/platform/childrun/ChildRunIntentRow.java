@@ -22,6 +22,7 @@ public class ChildRunIntentRow {
     private String context;
     private String childModelName;
     private String childEndpointName;
+    private Integer childMaxSteps;
     private String parentSchedulerVersion;
     private String parentDeploymentId;
     private String parentDeploymentGenerationId;
@@ -31,6 +32,7 @@ public class ChildRunIntentRow {
     private String claimToken;
     private String outboxState;
     private String childRunStatus;
+    private String parentMemberState;
     private OffsetDateTime acceptedAt;
     private OffsetDateTime childTerminalAt;
     private OffsetDateTime physicalStoppedAt;

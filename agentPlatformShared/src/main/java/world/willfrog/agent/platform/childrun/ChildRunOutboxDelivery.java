@@ -7,6 +7,7 @@ public record ChildRunOutboxDelivery(
         long parentWaitGroupId, String parentMemberIdentity, String toolCallId,
         int planGeneration, int nodeAttempt, long parentControlVersion,
         String goal, String context, String childModelName, String childEndpointName,
+        int childMaxSteps,
         String parentSchedulerVersion,
         String parentDeploymentId, String parentDeploymentGenerationId,
         String parentConfigSnapshotDigest) {

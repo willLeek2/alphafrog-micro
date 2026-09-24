@@ -7,7 +7,7 @@ public record ChildRunIntentView(
         long intentId, String rootRunId, String parentRunId, String childRunId,
         String operationId, long parentWaitGroupId, String parentMemberIdentity,
         String toolCallId, int planGeneration, int nodeAttempt, long parentControlVersion,
-        String intentState, String childRunStatus, OffsetDateTime acceptedAt,
+        String intentState, String childRunStatus, String parentMemberState, OffsetDateTime acceptedAt,
         OffsetDateTime childTerminalAt, OffsetDateTime physicalStoppedAt,
         OffsetDateTime capacityReleasedAt) {
 }

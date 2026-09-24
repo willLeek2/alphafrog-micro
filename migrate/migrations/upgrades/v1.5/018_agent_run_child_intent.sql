@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run_child_intent (
     context_text TEXT NOT NULL DEFAULT '',
     child_model_name VARCHAR(256),
     child_endpoint_name VARCHAR(256),
+    child_max_steps INT NOT NULL CHECK (child_max_steps BETWEEN 1 AND 12),
     parent_scheduler_version VARCHAR(32) NOT NULL CHECK (parent_scheduler_version = 'DUAL_POOL_V2'),
     parent_deployment_id VARCHAR(64),
     parent_deployment_generation_id VARCHAR(68),
