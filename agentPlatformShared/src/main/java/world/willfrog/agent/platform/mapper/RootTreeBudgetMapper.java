@@ -5,9 +5,17 @@ import org.apache.ibatis.annotations.Param;
 import world.willfrog.agent.platform.treebudget.RootTreeBudgetOperationRow;
 import world.willfrog.agent.platform.treebudget.RootTreeBudgetSnapshotRow;
 
+import java.util.List;
+
 /** 根调用树额度的 PostgreSQL 原子操作。 */
 @Mapper
 public interface RootTreeBudgetMapper {
+    String lockRun(@Param("runId") String runId);
+
+    List<String> listUntrackedActivity(@Param("limit") int limit);
+
+    Boolean hasUnreleasedActiveNodesByRun(@Param("runId") String runId);
+
     int ensureRoot(@Param("rootRunId") String rootRunId);
 
     RootTreeBudgetSnapshotRow lockRoot(@Param("rootRunId") String rootRunId);

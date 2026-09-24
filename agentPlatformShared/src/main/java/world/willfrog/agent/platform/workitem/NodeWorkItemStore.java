@@ -161,6 +161,9 @@ public interface NodeWorkItemStore {
                                               String newOwner,
                                               Duration lease);
 
+    /** 节点线程实际退出后确认同代际终态；取消或过期本身不能证明执行线程已经停止。 */
+    void acknowledgeWorkerExit(NodeWorkItemIdentity identity, int claimEpoch);
+
     Optional<NodeWorkItem> findByIdentity(NodeWorkItemIdentity identity);
 
     /**

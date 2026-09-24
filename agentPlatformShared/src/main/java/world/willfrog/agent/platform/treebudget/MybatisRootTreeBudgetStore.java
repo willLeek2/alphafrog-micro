@@ -13,16 +13,33 @@ public class MybatisRootTreeBudgetStore implements RootTreeBudgetStore {
 
     @Override
     @Transactional
+    public void lockRoot(String rootRunId) {
+        requireId(rootRunId, "rootRunId", 64);
+        if (mapper.lockRoot(rootRunId) != null) return;
+        mapper.ensureRoot(rootRunId);
+        if (mapper.lockRoot(rootRunId) == null) {
+            throw new IllegalStateException("根 Run 不存在：" + rootRunId);
+        }
+    }
+
+    @Override
+    @Transactional
+    public void lockExistingRoot(String rootRunId) {
+        requireId(rootRunId, "rootRunId", 64);
+        if (mapper.lockRoot(rootRunId) == null) {
+            throw new IllegalStateException("子 Run 对应的根树额度行不存在：" + rootRunId);
+        }
+    }
+
+    @Override
+    @Transactional
     public State reserve(String rootRunId, String operationId, Kind kind, long limit) {
         requireId(rootRunId, "rootRunId", 64);
         requireId(operationId, "operationId", 512);
         if (kind == null || limit <= 0) {
             throw new IllegalArgumentException("根树额度类别和正数上限均不能为空");
         }
-        mapper.ensureRoot(rootRunId);
-        if (mapper.lockRoot(rootRunId) == null) {
-            throw new IllegalStateException("根 Run 不存在：" + rootRunId);
-        }
+        lockRoot(rootRunId);
         RootTreeBudgetOperationRow existing = mapper.operation(operationId);
         if (existing != null) {
             if (!rootRunId.equals(existing.getRootRunId()) || !kind.name().equals(existing.getKind())) {

@@ -68,6 +68,7 @@ public interface NodeWorkItemMapper {
                   @Param("schedulerVersion") String schedulerVersion,
                   @Param("contextVersion") long contextVersion,
                   @Param("runControlVersion") long runControlVersion,
+                  @Param("expectedClaimEpoch") int expectedClaimEpoch,
                   @Param("claimedBy") String claimedBy,
                   @Param("leaseExpiresAt") OffsetDateTime leaseExpiresAt);
 

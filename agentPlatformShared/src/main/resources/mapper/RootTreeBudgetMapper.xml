@@ -3,6 +3,76 @@
         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="world.willfrog.agent.platform.mapper.RootTreeBudgetMapper">
 
+    <select id="lockRun" resultType="java.lang.String">
+        SELECT id FROM alphafrog_agent_run WHERE id = #{runId} FOR UPDATE
+    </select>
+
+    <select id="listUntrackedActivity" resultType="java.lang.String">
+        SELECT detail FROM (
+            SELECT 'ACTIVE_NODE work_item=' || wi.id || ' run=' || wi.run_id
+                   || ' epoch=' || wi.claim_epoch AS detail
+              FROM alphafrog_agent_run_work_item wi
+              LEFT JOIN alphafrog_agent_run_tree_budget_operation o
+                ON o.operation_id = 'active-node:' || wi.id || ':' || wi.claim_epoch
+             WHERE wi.state IN ('CLAIMED', 'EXECUTING')
+               AND (o.operation_id IS NULL OR o.kind != 'ACTIVE_NODE'
+                    OR o.state != 'CONFIRMED'
+                    OR o.root_run_id != COALESCE(
+                        (SELECT ci.root_run_id FROM alphafrog_agent_run_child_intent ci
+                          WHERE ci.child_run_id = wi.run_id), wi.run_id))
+            UNION ALL
+            SELECT 'EXTERNAL_WAIT group=' || g.id || ' run=' || g.run_id AS detail
+              FROM alphafrog_agent_run_wait_group g
+              LEFT JOIN alphafrog_agent_run_tree_budget_operation o
+                ON o.operation_id = 'external-wait:' || length(g.run_id) || ':' || g.run_id
+                    || ':' || g.plan_generation || ':' || length(g.node_id) || ':' || g.node_id
+                    || ':' || g.node_attempt || ':' || g.segment_sequence || ':' || g.model_turn
+             WHERE g.state = 'WAITING'
+               AND (o.operation_id IS NULL OR o.kind != 'EXTERNAL_WAIT'
+                    OR o.state != 'CONFIRMED'
+                    OR o.root_run_id != COALESCE(
+                        (SELECT ci.root_run_id FROM alphafrog_agent_run_child_intent ci
+                          WHERE ci.child_run_id = g.run_id), g.run_id))
+            UNION ALL
+            SELECT 'ACTIVE_NODE orphan operation=' || o.operation_id AS detail
+              FROM alphafrog_agent_run_tree_budget_operation o
+             WHERE o.kind = 'ACTIVE_NODE' AND o.state != 'RELEASED'
+               AND NOT EXISTS (
+                    SELECT 1 FROM alphafrog_agent_run_work_item wi
+                     WHERE wi.state IN ('CLAIMED', 'EXECUTING')
+                       AND o.operation_id = 'active-node:' || wi.id || ':' || wi.claim_epoch)
+            UNION ALL
+            SELECT 'EXTERNAL_WAIT orphan operation=' || o.operation_id AS detail
+              FROM alphafrog_agent_run_tree_budget_operation o
+             WHERE o.kind = 'EXTERNAL_WAIT' AND o.state != 'RELEASED'
+               AND NOT EXISTS (
+                    SELECT 1 FROM alphafrog_agent_run_wait_group g
+                     WHERE g.state = 'WAITING'
+                       AND o.operation_id = 'external-wait:' || length(g.run_id) || ':' || g.run_id
+                           || ':' || g.plan_generation || ':' || length(g.node_id) || ':' || g.node_id
+                           || ':' || g.node_attempt || ':' || g.segment_sequence || ':' || g.model_turn)
+            UNION ALL
+            SELECT 'COUNTER root=' || b.root_run_id AS detail
+              FROM alphafrog_agent_run_tree_budget b
+             WHERE b.active_nodes != (SELECT count(*) FROM alphafrog_agent_run_tree_budget_operation o
+                   WHERE o.root_run_id = b.root_run_id AND o.kind = 'ACTIVE_NODE' AND o.state != 'RELEASED')
+                OR b.external_waits != (SELECT count(*) FROM alphafrog_agent_run_tree_budget_operation o
+                   WHERE o.root_run_id = b.root_run_id AND o.kind = 'EXTERNAL_WAIT' AND o.state != 'RELEASED')
+        ) anomalies LIMIT #{limit}
+    </select>
+
+    <select id="hasUnreleasedActiveNodesByRun" resultType="java.lang.Boolean">
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM alphafrog_agent_run WHERE id = #{runId})
+            THEN EXISTS (
+                SELECT 1 FROM alphafrog_agent_run_work_item wi
+                JOIN alphafrog_agent_run_tree_budget_operation o
+                  ON o.kind = 'ACTIVE_NODE'
+                 AND o.state != 'RELEASED'
+                 AND o.operation_id LIKE 'active-node:' || wi.id || ':%'
+                WHERE wi.run_id = #{runId}
+            ) ELSE NULL END
+    </select>
+
     <resultMap id="BudgetSnapshot" type="world.willfrog.agent.platform.treebudget.RootTreeBudgetSnapshotRow">
         <result property="llmCalls" column="llm_calls"/>
         <result property="toolCalls" column="tool_calls"/>

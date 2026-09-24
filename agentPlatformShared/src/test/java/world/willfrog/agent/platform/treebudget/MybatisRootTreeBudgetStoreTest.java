@@ -64,6 +64,8 @@ class MybatisRootTreeBudgetStoreTest {
             new XMLMapperBuilder(xml, config, resource, config.getSqlFragments()).parse();
         }
         assertThat(config.hasStatement(RootTreeBudgetMapper.class.getName() + ".tryIncrement")).isTrue();
+        assertThat(config.hasStatement(RootTreeBudgetMapper.class.getName()
+                + ".hasUnreleasedActiveNodesByRun")).isTrue();
     }
 
     private static RootTreeBudgetOperationRow row(String id, String root, String kind, String state) {

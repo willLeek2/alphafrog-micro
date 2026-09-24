@@ -105,7 +105,7 @@ class MybatisNodeWorkItemStoreTest {
     @Test
     void claimReturnsEmptyWhenUpdateTouchedNoRow() {
         when(mapper.claim(anyString(), anyLong(), anyString(), anyInt(), anyString(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyString(), any())).thenReturn(null);
+                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any())).thenReturn(null);
         Optional<NodeWorkItemClaim> claim = store.claim(IDENTITY,
                 new NodeWorkItemVersions(7L, 3L, 0), "worker-a", Duration.ofSeconds(30),
                 VERSION, FENCE);
@@ -115,7 +115,7 @@ class MybatisNodeWorkItemStoreTest {
     @Test
     void claimReturnsNewEpochWhenUpdateSucceeded() {
         when(mapper.claim(anyString(), anyLong(), anyString(), anyInt(), anyString(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyString(), any())).thenReturn(1);
+                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any())).thenReturn(1);
         Optional<NodeWorkItemClaim> claim = store.claim(IDENTITY,
                 new NodeWorkItemVersions(7L, 3L, 0), "worker-a", Duration.ofSeconds(30),
                 VERSION, FENCE);

@@ -1,9 +1,17 @@
 package world.willfrog.agent.platform.wait;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
+import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityBudget;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
+import world.willfrog.agent.platform.treebudget.RootTreeBudgetStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -17,16 +25,45 @@ import java.util.Optional;
  * 这段代码认为不可能的组合时直接抛错，让问题在写入那一刻暴露，不留给恢复路径。</p>
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class MybatisWaitGroupStore implements WaitGroupStore {
 
     private final WaitGroupMapper mapper;
+    private final NodeWorkItemMapper workItems;
+    private final RootTreeActivityBudget activityBudget;
+
+    @Autowired
+    public MybatisWaitGroupStore(WaitGroupMapper mapper, NodeWorkItemMapper workItems,
+                                 RootTreeActivityBudget activityBudget) {
+        this.mapper = mapper;
+        this.workItems = workItems;
+        this.activityBudget = activityBudget;
+    }
+
+    /** 旧合同测试的窄构造器；生产必须带根树额度。 */
+    public MybatisWaitGroupStore(WaitGroupMapper mapper) {
+        this.mapper = mapper;
+        this.workItems = null;
+        this.activityBudget = null;
+    }
 
     @Override
+    @Transactional
     public WaitSuspensionResult suspendSegment(WaitSuspensionRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("整组挂起请求不能为空");
+        }
+        RootTreeBudgetStore.State waitReservation = null;
+        NodeWorkItem executing = null;
+        if (activityBudget != null) {
+            String rootRunId = activityBudget.lockForRun(request.segment().runId());
+            executing = workItems.findByIdentity(request.segment().runId(),
+                    request.segment().planGeneration(), request.segment().nodeId(),
+                    request.segment().nodeAttempt(), request.segment().segmentSequence());
+            waitReservation = activityBudget.reserveWait(rootRunId, request);
+            if (waitReservation == RootTreeBudgetStore.State.REJECTED) {
+                throw new RootTreeActivityLimitException("EXTERNAL_WAIT", rootRunId);
+            }
         }
         WaitSuspensionRow row = mapper.suspendSegment(
                 request.segment().runId(),
@@ -59,10 +96,23 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                         + row.getWrittenMembers() + "、下一段 " + row.getWrittenNextSegments()
                         + "，分段 " + request.segment().describe());
             }
+            if (activityBudget != null) {
+                if (waitReservation != RootTreeBudgetStore.State.RESERVED
+                        || executing == null || executing.stateEnum() != NodeWorkItemState.EXECUTING) {
+                    throw new IllegalStateException("整组新建时额度或原执行分段身份不一致："
+                            + request.segment().describe());
+                }
+                activityBudget.confirmWait(request);
+                activityBudget.releaseNode(executing, request.versions().claimEpoch());
+            }
             return new WaitSuspensionResult(
                     WaitSuspensionOutcome.SUSPENDED, row.getCreatedGroupId(), row.getNextSegmentSequence());
         }
         if (closed == 0 && row.getExistingGroupId() != null) {
+            if (activityBudget != null && waitReservation == RootTreeBudgetStore.State.RESERVED) {
+                throw new IllegalStateException("已有等待组却缺少已确认的根树额度："
+                        + request.segment().describe());
+            }
             // 幂等重试：组是上一次就写好的，成员与下一段这一次都不会再插一次，所以不看那两个计数。
             log.info("同一次模型回合的等待组已经保存过，这次不重复写入：{} turn={}",
                     request.segment().describe(), request.modelTurn());
@@ -75,6 +125,9 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                     row.getNextSegmentSequence());
         }
         if (closed == 0) {
+            if (activityBudget != null && waitReservation == RootTreeBudgetStore.State.RESERVED) {
+                TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            }
             log.warn("整组挂起没有生效：当前分段已经不在调用方手里 {} {}", request.segment().describe(),
                     request.versions().describe());
             return new WaitSuspensionResult(WaitSuspensionOutcome.SEGMENT_NOT_MATCHED, null, null);
@@ -85,10 +138,12 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    @Transactional
     public MemberCompletionResult completeMember(MemberCompletionRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("成员结束请求不能为空");
         }
+        WaitGroup before = activityGroupBefore(request.groupId());
         WaitMemberCompletionRow row = mapper.completeMember(
                 request.groupId(),
                 request.memberIdentity(),
@@ -103,14 +158,25 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
             log.info("成员结束没有写进去（重复上报或成员已落终态）：group={} member={}",
                     request.groupId(), request.memberIdentity());
         }
-        return toCompletionResult(row, written > 0);
+        MemberCompletionResult result = toCompletionResult(row, written > 0);
+        if (activityBudget != null && written > 0 && before == null) {
+            throw new IllegalStateException("成员状态已修改但读不到所属等待组：" + request.groupId());
+        }
+        if (activityBudget != null && written > 0 && before != null
+                && before.stateEnum() == WaitGroupState.WAITING
+                && result.groupState() == WaitGroupState.READY) {
+            activityBudget.releaseWait(before.identity().segment(), before.getModelTurn());
+        }
+        return result;
     }
 
     @Override
+    @Transactional
     public MemberCompletionResult reportLateMember(LateMemberRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("迟到结果请求不能为空");
         }
+        WaitGroup before = activityGroupBefore(request.groupId());
         WaitMemberCompletionRow row = mapper.reportLateMember(
                 request.groupId(),
                 request.memberIdentity(),
@@ -125,7 +191,16 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
             log.info("迟到结果的身份或版本对不上，什么都没有改：group={} member={}",
                     request.groupId(), request.memberIdentity());
         }
-        return toCompletionResult(row, written > 0);
+        MemberCompletionResult result = toCompletionResult(row, written > 0);
+        if (activityBudget != null && written > 0 && before == null) {
+            throw new IllegalStateException("迟到成员已修改但读不到所属等待组：" + request.groupId());
+        }
+        if (activityBudget != null && before != null
+                && before.stateEnum() == WaitGroupState.WAITING
+                && result.groupState() == WaitGroupState.CANCELED) {
+            activityBudget.releaseWait(before.identity().segment(), before.getModelTurn());
+        }
+        return result;
     }
 
     @Override
@@ -188,19 +263,41 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    @Transactional
     public WaitChainCancelResult cancelChain(long groupId) {
         if (groupId <= 0) {
             throw new IllegalArgumentException("等待组编号必须为正数：" + groupId);
         }
+        WaitGroup before = activityGroupBefore(groupId);
         WaitChainCancelRow row = mapper.cancelChain(groupId);
         if (row == null) {
             throw new IllegalStateException("取消等待链语句没有返回结果行：group=" + groupId);
         }
-        return new WaitChainCancelResult(
+        WaitChainCancelResult result = new WaitChainCancelResult(
                 value(row.getGroupsCanceled()),
                 value(row.getMembersCanceled()),
                 value(row.getSegmentsCanceled()),
                 value(row.getNotificationsCanceled()));
+        if (activityBudget != null && result.canceled() && before == null) {
+            throw new IllegalStateException("等待链已取消但读不到释放前的等待组：" + groupId);
+        }
+        if (activityBudget != null && result.canceled() && before != null
+                && before.stateEnum() == WaitGroupState.WAITING) {
+            activityBudget.releaseWait(before.identity().segment(), before.getModelTurn());
+        }
+        return result;
+    }
+
+    private WaitGroup activityGroupBefore(long groupId) {
+        if (activityBudget == null) return null;
+        WaitGroup observed = mapper.findGroupById(groupId);
+        if (observed == null) return null;
+        activityBudget.lockForRun(observed.getRunId());
+        WaitGroup locked = mapper.findGroupById(groupId);
+        if (locked == null || !observed.getRunId().equals(locked.getRunId())) {
+            throw new IllegalStateException("等待组在锁定期间发生变化：" + groupId);
+        }
+        return locked;
     }
 
     @Override

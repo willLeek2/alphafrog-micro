@@ -24,6 +24,7 @@ import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeDispatchDeferReason;
 import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
@@ -735,8 +736,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             // 计划代际或 Run 状态已经变化：旧提示不得领取。协调回合会把旧行标为 STALE/CANCELED。
             return;
         }
-        Optional<NodeWorkItemClaim> claimed = workItemStore.claim(
-                identity, item.versions(), claimant, claimLease, version, fence);
+        Optional<NodeWorkItemClaim> claimed;
+        try {
+            claimed = workItemStore.claim(identity, item.versions(), claimant, claimLease, version, fence);
+        } catch (RootTreeActivityLimitException limit) {
+            // 根树节点额度暂满时保持工作项可领取，周期扫描会在别的节点结束后重试。
+            log.debug("根树节点额度暂满，本次不领取分段：{}", identity.describe());
+            return;
+        }
         if (claimed.isEmpty()) {
             return;
         }
@@ -749,10 +756,20 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             log.warn("记录节点派发轮转位置失败: runId={} reason={}",
                     identity.runId(), safeReason(e));
         }
-        NodeWorkItemMutationResult started = workItemStore.startExecution(
-                identity, claim.claimEpoch(), claimant);
+        NodeWorkItemMutationResult started;
+        try {
+            started = workItemStore.startExecution(identity, claim.claimEpoch(), claimant);
+        } catch (RuntimeException e) {
+            workItemStore.acknowledgeWorkerExit(identity, claim.claimEpoch());
+            throw e;
+        }
         if (!started.applied()) {
-            reportRejection(identity.runId(), started);
+            try {
+                reportRejection(identity.runId(), started);
+            } finally {
+                // 取消可能发生在领取与启动之间；此线程此刻已经停下，才能归还那次领取的额度。
+                workItemStore.acknowledgeWorkerExit(identity, claim.claimEpoch());
+            }
             return;
         }
         NodeWorkItemVersions submitted = new NodeWorkItemVersions(
@@ -838,7 +855,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             }
             dispatcher.offerRun(new RunCoordinationHint(identity.runId(), RunCoordinationHint.Reason.NODE_RESULT));
         } finally {
-            freshRunPipeline.clearDualPoolNodeContext(identity.runId());
+            try {
+                workItemStore.acknowledgeWorkerExit(identity, claim.claimEpoch());
+            } finally {
+                freshRunPipeline.clearDualPoolNodeContext(identity.runId());
+            }
         }
     }
 

@@ -1,9 +1,14 @@
 package world.willfrog.agent.platform.workitem;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityBudget;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
+import world.willfrog.agent.platform.treebudget.RootTreeBudgetStore;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -18,11 +23,23 @@ import java.util.Optional;
  * 路径上，不影响热路径。</p>
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
 
     private final NodeWorkItemMapper mapper;
+    private final RootTreeActivityBudget activityBudget;
+
+    @Autowired
+    public MybatisNodeWorkItemStore(NodeWorkItemMapper mapper, RootTreeActivityBudget activityBudget) {
+        this.mapper = mapper;
+        this.activityBudget = activityBudget;
+    }
+
+    /** 旧合同测试的窄构造器；生产只注入带根树额度的构造器。 */
+    public MybatisNodeWorkItemStore(NodeWorkItemMapper mapper) {
+        this.mapper = mapper;
+        this.activityBudget = null;
+    }
 
     @Override
     public NodeWorkItemMutationResult create(NodeWorkItem item, ServiceOwnershipFence fence) {
@@ -80,6 +97,7 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    @Transactional
     public Optional<NodeWorkItemClaim> claim(NodeWorkItemIdentity identity,
                                              NodeWorkItemVersions expected,
                                              String claimant,
@@ -90,13 +108,41 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         requireClaimant(claimant);
         requireFence(fence);
         OffsetDateTime leaseExpiresAt = leaseExpiry(lease);
+        NodeWorkItem before = null;
+        if (activityBudget != null) {
+            String rootRunId = activityBudget.lockForRun(identity.runId());
+            before = mapper.findByIdentity(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                    identity.nodeAttempt(), identity.segmentSequence());
+            if (before == null || before.getClaimEpoch() == null
+                    || before.getClaimEpoch() != expected.claimEpoch()) {
+                return Optional.empty();
+            }
+            RootTreeBudgetStore.State reserved = activityBudget.reserveNode(
+                    rootRunId, before, expected.claimEpoch() + 1);
+            if (reserved == RootTreeBudgetStore.State.REJECTED) {
+                throw new RootTreeActivityLimitException("ACTIVE_NODE", rootRunId);
+            }
+            if (reserved != RootTreeBudgetStore.State.RESERVED) {
+                throw new IllegalStateException("节点领取的额度操作身份已被使用：" + identity.describe());
+            }
+        }
         Integer newEpoch = mapper.claim(fence.ownerInstanceId(), fence.fencingToken(),
                 identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), schedulerVersion.name(),
-                expected.contextVersion(), expected.runControlVersion(), claimant, leaseExpiresAt);
+                expected.contextVersion(), expected.runControlVersion(), expected.claimEpoch(),
+                claimant, leaseExpiresAt);
         if (newEpoch == null) {
+            if (activityBudget != null) {
+                TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            }
             log.debug("没有领到工作项（状态或版本不匹配，或已被别人领走）：{}", identity.describe());
             return Optional.empty();
+        }
+        if (activityBudget != null) {
+            if (newEpoch != expected.claimEpoch() + 1) {
+                throw new IllegalStateException("工作项领取代际与预留身份不一致：" + identity.describe());
+            }
+            activityBudget.confirmNode(before, newEpoch);
         }
         return Optional.of(new NodeWorkItemClaim(identity, claimant, newEpoch, leaseExpiresAt));
     }
@@ -111,20 +157,24 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult commitSegmentResult(NodeWorkItemIdentity identity,
                                                           NodeWorkItemVersions versions,
                                                           String payloadPatchJson,
                                                           String externalSideEffectRef) {
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.commitSegmentResult(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), objectPayload(payloadPatchJson));
         if (rows == 1) {
+            releaseIfActive(before);
             return NodeWorkItemMutationResult.success();
         }
         return rejectWithEpochCheck(identity, versions, versions.claimEpoch(), externalSideEffectRef);
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult suspendForToolJob(NodeWorkItemIdentity identity,
                                                         NodeWorkItemVersions versions,
                                                         String claimant,
@@ -132,53 +182,64 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                                                         String toolCallId,
                                                         int attempt) {
         requireClaimant(claimant);
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.suspendForToolJob(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), claimant, operationId, toolCallId, attempt);
+        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult promoteToolJobResumable(NodeWorkItemIdentity identity,
                                                               NodeWorkItemVersions versions,
                                                               String operationId,
                                                               String anchorJson,
                                                               String resumePayloadJson) {
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.promoteToolJobResumable(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId,
                 objectPayload(anchorJson), objectPayload(resumePayloadJson));
+        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult commitResumedToolJobResult(NodeWorkItemIdentity identity,
                                                                  NodeWorkItemVersions versions,
                                                                  String operationId,
                                                                  String payloadPatchJson,
                                                                  String externalSideEffectRef) {
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.commitResumedToolJobResult(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId,
                 objectPayload(payloadPatchJson));
+        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), externalSideEffectRef);
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult requeueAbandonedClaim(NodeWorkItemIdentity identity,
                                                             NodeWorkItemVersions versions,
                                                             ServiceOwnershipFence fence,
                                                             SchedulerVersion schedulerVersion) {
         requireVersion(schedulerVersion);
         requireFence(fence);
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.requeueAbandonedClaim(identity.runId(), identity.planGeneration(),
                 identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(),
                 versions.contextVersion(), versions.runControlVersion(), versions.claimEpoch(),
                 fence.ownerInstanceId(), fence.fencingToken(), schedulerVersion.name());
         if (rows == 1) {
+            releaseIfActive(before);
             log.warn("恢复把一段被放弃的分段放回可领取: {} 原代际 {}", identity.describe(),
                     versions.claimEpoch());
             return NodeWorkItemMutationResult.success();
@@ -187,25 +248,31 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult requeueInterruptedToolJob(NodeWorkItemIdentity identity,
                                                                 NodeWorkItemVersions versions,
                                                                 String operationId) {
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.requeueInterruptedToolJob(
                 identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId);
+        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult reportExecutionFailure(NodeWorkItemIdentity identity,
                                                              int claimEpoch,
                                                              String claimant,
                                                              String reason) {
         requireClaimant(claimant);
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.reportExecutionFailure(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), claimEpoch, claimant, reason);
+        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, null, claimEpoch, null);
     }
@@ -223,22 +290,33 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult cancel(NodeWorkItemIdentity identity,
                                              long runControlVersion,
                                              int claimEpoch,
                                              String reason) {
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.cancel(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), runControlVersion, claimEpoch, reason);
+        // 业务取消可以先于实际节点线程退出，原领取代际的额度由线程退出确认归还。
+        if (rows == 1 && activityBudget != null && before == null) {
+            throw new IllegalStateException("工作项已取消但读不到取消前的持久行：" + identity.describe());
+        }
         return rows == 1 ? NodeWorkItemMutationResult.success() : rejectByCurrentRow(identity, null, null);
     }
 
     @Override
+    @Transactional
     public NodeWorkItemMutationResult markStale(NodeWorkItemIdentity identity,
                                                 long contextVersion,
                                                 long runControlVersion,
                                                 String reason) {
+        NodeWorkItem before = activityBefore(identity);
         int rows = mapper.markStale(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), contextVersion, runControlVersion, reason);
+        if (rows == 1 && activityBudget != null && before == null) {
+            throw new IllegalStateException("工作项已过期但读不到变更前的持久行：" + identity.describe());
+        }
         return rows == 1 ? NodeWorkItemMutationResult.success() : rejectByCurrentRow(identity, null, null);
     }
 
@@ -261,20 +339,81 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    @Transactional
     public Optional<NodeWorkItemClaim> handOverClaim(NodeWorkItemIdentity identity,
                                                      int expectedClaimEpoch,
                                                      String newOwner,
                                                      Duration lease) {
         requireClaimant(newOwner);
         OffsetDateTime leaseExpiresAt = leaseExpiry(lease);
+        String rootRunId = null;
+        NodeWorkItem before = null;
+        if (activityBudget != null) {
+            rootRunId = activityBudget.lockForRun(identity.runId());
+            before = mapper.findByIdentity(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                    identity.nodeAttempt(), identity.segmentSequence());
+            if (before == null || before.getClaimEpoch() == null
+                    || before.getClaimEpoch() != expectedClaimEpoch) {
+                return Optional.empty();
+            }
+            releaseIfActive(before);
+            RootTreeBudgetStore.State reserved = activityBudget.reserveNode(
+                    rootRunId, before, expectedClaimEpoch + 1);
+            if (reserved == RootTreeBudgetStore.State.REJECTED) {
+                throw new RootTreeActivityLimitException("ACTIVE_NODE", rootRunId);
+            }
+            if (reserved != RootTreeBudgetStore.State.RESERVED) {
+                throw new IllegalStateException("转交的节点额度身份已被使用：" + identity.describe());
+            }
+        }
         Integer newEpoch = mapper.handOverClaim(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), expectedClaimEpoch, newOwner, leaseExpiresAt);
         if (newEpoch == null) {
+            if (activityBudget != null) {
+                TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            }
             log.warn("显式转交没有生效（期望代际或状态不匹配）：{} 期望代际 {}", identity.describe(), expectedClaimEpoch);
             return Optional.empty();
         }
+        if (activityBudget != null) {
+            if (newEpoch != expectedClaimEpoch + 1) {
+                throw new IllegalStateException("转交代际与额度身份不一致：" + identity.describe());
+            }
+            activityBudget.confirmNode(before, newEpoch);
+        }
         log.info("显式转交生效：{} 交给 {}，代际 {}", identity.describe(), newOwner, newEpoch);
         return Optional.of(new NodeWorkItemClaim(identity, newOwner, newEpoch, leaseExpiresAt));
+    }
+
+    @Override
+    @Transactional
+    public void acknowledgeWorkerExit(NodeWorkItemIdentity identity, int claimEpoch) {
+        if (activityBudget == null) return;
+        if (claimEpoch <= 0) throw new IllegalArgumentException("退出确认缺少领取代际");
+        NodeWorkItem current = activityBefore(identity);
+        if (current == null || current.getClaimEpoch() == null
+                || current.getClaimEpoch() != claimEpoch) return;
+        if (current.terminal()) {
+            activityBudget.releaseNode(current, claimEpoch);
+        }
+    }
+
+    private NodeWorkItem activityBefore(NodeWorkItemIdentity identity) {
+        if (activityBudget == null) return null;
+        activityBudget.lockForRun(identity.runId());
+        return mapper.findByIdentity(identity.runId(), identity.planGeneration(), identity.nodeId(),
+                identity.nodeAttempt(), identity.segmentSequence());
+    }
+
+    private void releaseIfActive(NodeWorkItem before) {
+        if (activityBudget == null) return;
+        if (before == null) {
+            throw new IllegalStateException("工作项状态已变化但读不到释放前的持久行");
+        }
+        if (before.stateEnum() == NodeWorkItemState.CLAIMED
+                || before.stateEnum() == NodeWorkItemState.EXECUTING) {
+            activityBudget.releaseNode(before, before.getClaimEpoch());
+        }
     }
 
     @Override

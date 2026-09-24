@@ -302,6 +302,7 @@
           AND next_visible_at &lt;= CURRENT_TIMESTAMP
           AND context_version = #{contextVersion}
           AND run_control_version = #{runControlVersion}
+          AND claim_epoch = #{expectedClaimEpoch}
           AND EXISTS (
               SELECT 1
               FROM alphafrog_agent_run owner_run

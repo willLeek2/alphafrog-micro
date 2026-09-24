@@ -53,10 +53,15 @@ import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.mapper.MigrationStatements;
 import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
 import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
+import world.willfrog.agent.platform.mapper.RootTreeBudgetMapper;
 import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
 import world.willfrog.agent.platform.mapper.WaitMemberStopMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.treebudget.MybatisRootTreeBudgetStore;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityBudget;
+import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
+import world.willfrog.agent.platform.treebudget.RootTreeBudgetStore;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentMessageService;
@@ -65,6 +70,7 @@ import world.willfrog.agent.platform.service.AgentRunEventRedisStore;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.workitem.MybatisNodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
@@ -132,6 +138,7 @@ class Stage3WaitContractPostgresTest {
     private static final String CHILD_INTENT_SCRIPT = "018_agent_run_child_intent.sql";
     private static final String TREE_BUDGET_SCRIPT = "019_agent_run_tree_budget.sql";
     private static final String WAIT_MEMBER_STOP_SCRIPT = "020_agent_run_wait_member_stop.sql";
+    private static final String TREE_ACTIVITY_SCRIPT = "021_agent_run_tree_activity_gate.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -184,6 +191,71 @@ class Stage3WaitContractPostgresTest {
              Statement statement = connection.createStatement()) {
             statement.execute("DROP SCHEMA IF EXISTS " + SCHEMA + " CASCADE");
         }
+    }
+
+    @Test
+    void rootTreeNodeAndWaitLimitsFollowDurableStateInOneTransaction() {
+        String runId = "run-tree-activity";
+        createRun(runId, 0, 0L);
+        createSegment(runId, 0, "node-first", 0, 0, 0, null, 2L, 0L, "RUNNABLE");
+        createSegment(runId, 0, "node-second", 0, 0, 0, null, 2L, 0L, "RUNNABLE");
+        ServiceOwnershipFence fence = fenceFor(runId);
+        SqlSessionTemplate template = new SqlSessionTemplate(sqlSessionFactory);
+        RootTreeBudgetStore budget = new MybatisRootTreeBudgetStore(
+                template.getMapper(RootTreeBudgetMapper.class));
+        RootTreeActivityBudget activity = new RootTreeActivityBudget(
+                template.getMapper(RootTreeBudgetMapper.class),
+                new MybatisChildRunIntentStore(template.getMapper(ChildRunIntentMapper.class)),
+                budget, 1, 1);
+        NodeWorkItemStore nodes = new MybatisNodeWorkItemStore(
+                template.getMapper(NodeWorkItemMapper.class), activity);
+        WaitGroupStore waits = new MybatisWaitGroupStore(
+                template.getMapper(WaitGroupMapper.class), template.getMapper(NodeWorkItemMapper.class), activity);
+        TransactionTemplate transaction = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        NodeWorkItemIdentity first = new NodeWorkItemIdentity(runId, 0, "node-first", 0, 0);
+        NodeWorkItemIdentity second = new NodeWorkItemIdentity(runId, 0, "node-second", 0, 0);
+
+        NodeWorkItemClaim firstClaim = transaction.execute(ignored -> nodes.claim(first,
+                new NodeWorkItemVersions(2L, 0L, 0), "tree-worker", java.time.Duration.ofMinutes(1),
+                SchedulerVersion.DUAL_POOL_V2, fence).orElseThrow());
+        assertThat(firstClaim).isNotNull();
+        assertThat(budget.snapshot(runId).activeNodes()).isEqualTo(1);
+        assertThatThrownBy(() -> transaction.execute(ignored -> nodes.claim(second,
+                new NodeWorkItemVersions(2L, 0L, 0), "tree-worker", java.time.Duration.ofMinutes(1),
+                SchedulerVersion.DUAL_POOL_V2, fence)))
+                .isInstanceOf(RootTreeActivityLimitException.class);
+        assertThat(nodes.findByIdentity(second).orElseThrow().getState()).isEqualTo("RUNNABLE");
+
+        assertThat(nodes.startExecution(first, firstClaim.claimEpoch(), "tree-worker").applied()).isTrue();
+        WaitSuspensionResult suspended = transaction.execute(ignored -> waits.suspendSegment(
+                new WaitSuspensionRequest(first, new NodeWorkItemVersions(2L, 0L, firstClaim.claimEpoch()),
+                        "tree-worker", 0, SchedulerVersion.DUAL_POOL_V2,
+                        List.of(new WaitMemberDraft(0, "tree-call", "executePython", null)),
+                        "{\"waitSuspension\":true}", "{\"checkpoint\":\"tree\"}")));
+        assertThat(suspended).isNotNull();
+        assertThat(suspended.suspended()).isTrue();
+        assertThat(budget.snapshot(runId)).isEqualTo(new RootTreeBudgetStore.Snapshot(0, 0, 0, 1));
+
+        MemberCompletionResult completed = transaction.execute(ignored -> waits.completeMember(
+                new MemberCompletionRequest(suspended.groupId(), "tree-call", WaitMemberState.SUCCEEDED,
+                        "{\"result\":\"ok\"}", null, 0, 2L, 0L)));
+        assertThat(completed).isNotNull();
+        assertThat(completed.groupBecameReady()).isTrue();
+        assertThat(budget.snapshot(runId).externalWaits()).isZero();
+
+        NodeWorkItemClaim secondClaim = transaction.execute(ignored -> nodes.claim(second,
+                new NodeWorkItemVersions(2L, 0L, 0), "tree-worker", java.time.Duration.ofMinutes(1),
+                SchedulerVersion.DUAL_POOL_V2, fence).orElseThrow());
+        assertThat(secondClaim).isNotNull();
+        assertThat(budget.snapshot(runId).activeNodes()).isEqualTo(1);
+        boolean canceled = Boolean.TRUE.equals(transaction.execute(ignored ->
+                nodes.cancel(second, 0L, secondClaim.claimEpoch(), "tree-test").applied()));
+        assertThat(canceled).isTrue();
+        assertThat(budget.snapshot(runId).activeNodes()).isEqualTo(1);
+        assertThat(activity.hasUnreleasedActiveNodesByRun(runId)).isTrue();
+        transaction.executeWithoutResult(ignored -> nodes.acknowledgeWorkerExit(second, secondClaim.claimEpoch()));
+        assertThat(budget.snapshot(runId).activeNodes()).isZero();
+        assertThat(activity.hasUnreleasedActiveNodesByRun(runId)).isFalse();
     }
 
     // ==================== 反例约束 ====================
@@ -1256,11 +1328,11 @@ class Stage3WaitContractPostgresTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             NodeWorkItemMapper mapper = session.getMapper(NodeWorkItemMapper.class);
             assertThat(mapper.claim(fence.ownerInstanceId(), fence.fencingToken(),
-                    runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L,
+                    runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L, 0,
                     "worker-1", java.time.OffsetDateTime.now().plusMinutes(1)))
                     .as("第一次领取成功").isEqualTo(1);
             assertThat(mapper.claim(fence.ownerInstanceId(), fence.fencingToken(),
-                    runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L,
+                    runId, 0, "node-1", 0, 0, "DUAL_POOL_V2", 1L, 0L, 1,
                     "worker-2", java.time.OffsetDateTime.now().plusMinutes(1)))
                     .as("重复领取加不到行").isNull();
             assertThat(mapper.startExecution(runId, 0, "node-1", 0, 0, 1, "worker-1")).isEqualTo(1);
@@ -2487,7 +2559,7 @@ class Stage3WaitContractPostgresTest {
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
                     RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT,
                     FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT, CHILD_INTENT_SCRIPT,
-                    TREE_BUDGET_SCRIPT, WAIT_MEMBER_STOP_SCRIPT)) {
+                    TREE_BUDGET_SCRIPT, WAIT_MEMBER_STOP_SCRIPT, TREE_ACTIVITY_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -2514,7 +2586,8 @@ class Stage3WaitContractPostgresTest {
                 "mapper/RunServiceLeaseMapper.xml",
                 "mapper/SchedulerStateMapper.xml",
                 "mapper/AcceptanceReleasePointMapper.xml",
-                "mapper/ChildRunIntentMapper.xml", "mapper/WaitMemberStopMapper.xml")) {
+                "mapper/ChildRunIntentMapper.xml", "mapper/WaitMemberStopMapper.xml",
+                "mapper/RootTreeBudgetMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
             }
@@ -2685,7 +2758,7 @@ class Stage3WaitContractPostgresTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             return session.getMapper(NodeWorkItemMapper.class).claim(
                     fence.ownerInstanceId(), fence.fencingToken(), runId, 0, nodeId, 0, 0,
-                    schedulerVersion, 1L, 0L, "stage3-claimer",
+                    schedulerVersion, 1L, 0L, 0, "stage3-claimer",
                     java.time.OffsetDateTime.now().plusMinutes(1));
         }
     }
