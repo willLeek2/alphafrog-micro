@@ -12,15 +12,12 @@ import world.willfrog.agent.platform.capacity.SchedulerPermitLayer;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLedger;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
@@ -44,19 +41,13 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
     private final ObjectProvider<RunServiceLeaseKeeper> leaseKeeperProvider;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final SchedulerPermitLedger permitLedger;
-    private final ArrayBlockingQueue<RunCoordinationHint> runHints;
-    /** 节点提示按 Run 分桶：派发时在桶之间轮转，一张宽图不能靠提示多占满整批机会。 */
-    private final Map<String, ArrayDeque<NodeWorkItemIdentity>> nodeHintBuckets = new LinkedHashMap<>();
-    /** 轮转次序：队头的 Run 先取，取过之后排到队尾；空桶直接移出。 */
-    private final LinkedHashSet<String> nodeHintRotation = new LinkedHashSet<>();
-    private final Object nodeHintLock = new Object();
+    private final TreeFairHintQueue<RunCoordinationHint> runHints;
+    private final TreeFairHintQueue<NodeWorkItemIdentity> nodeHints;
     /** 已经在队列里的提示身份：同一个 Run 的协调提示、同一条工作项的节点提示都只留一份。 */
     private final Set<String> pendingRunHints = ConcurrentHashMap.newKeySet();
     private final Set<NodeWorkItemIdentity> pendingNodeHints = ConcurrentHashMap.newKeySet();
     /** 队列满时没能入队的节点提示：等下一个节拍把下次检查时间落到数据库上。 */
     private final Queue<NodeWorkItemIdentity> undeliveredNodeHints = new ConcurrentLinkedQueue<>();
-    private final int nodeHintCapacity;
-    private int nodeHintCount;
     private final int scanBatchSize;
     private final int runSubmitBudget;
     private final int nodeSubmitBudget;
@@ -94,8 +85,8 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
         this.leaseKeeperProvider = leaseKeeperProvider;
         this.admissionRegistry = admissionRegistry;
         this.permitLedger = permitLedger;
-        this.runHints = new ArrayBlockingQueue<>(Math.max(1, runHintCapacity));
-        this.nodeHintCapacity = Math.max(1, nodeHintCapacity);
+        this.runHints = new TreeFairHintQueue<>(runHintCapacity);
+        this.nodeHints = new TreeFairHintQueue<>(nodeHintCapacity);
         this.scanBatchSize = Math.max(1, scanBatchSize);
         this.runSubmitBudget = Math.max(1, runSubmitBudget);
         this.nodeSubmitBudget = Math.max(1, nodeSubmitBudget);
@@ -111,7 +102,7 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RUN_WORKER_HINT_CAPACITY,
                 component, this.runHints.remainingCapacity());
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_HINT_CAPACITY,
-                component, this.nodeHintCapacity);
+                component, this.nodeHints.remainingCapacity());
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SCAN_BATCH_SIZE,
                 component, this.scanBatchSize);
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RUN_WORKER_SUBMIT_BUDGET,
@@ -143,7 +134,15 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
             runHintDeduped.incrementAndGet();
             return false;
         }
-        if (!runHints.offer(hint)) {
+        String rootRunId;
+        try {
+            rootRunId = admissionRegistry.rootRunIdForAdmitted(hint.runId());
+        } catch (IllegalStateException missingRoot) {
+            pendingRunHints.remove(hint.runId());
+            log.error("协调提示缺少可验证的根树身份，等待数据库扫描: runId={}", hint.runId(), missingRoot);
+            return false;
+        }
+        if (!runHints.offer(rootRunId, hint.runId(), hint)) {
             pendingRunHints.remove(hint.runId());
             runHintDropped.incrementAndGet();
             return false;
@@ -165,16 +164,20 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
             nodeHintDeduped.incrementAndGet();
             return false;
         }
-        synchronized (nodeHintLock) {
-            if (nodeHintCount >= nodeHintCapacity) {
-                pendingNodeHints.remove(identity);
-                nodeHintDropped.incrementAndGet();
-                undeliveredNodeHints.offer(identity);
-                return false;
-            }
-            nodeHintBuckets.computeIfAbsent(identity.runId(), ignored -> new ArrayDeque<>()).addLast(identity);
-            nodeHintRotation.add(identity.runId());
-            nodeHintCount++;
+        String rootRunId;
+        try {
+            rootRunId = admissionRegistry.rootRunIdForAdmitted(identity.runId());
+        } catch (IllegalStateException missingRoot) {
+            pendingNodeHints.remove(identity);
+            log.error("节点提示缺少可验证的根树身份，等待数据库扫描: identity={}",
+                    identity.describe(), missingRoot);
+            return false;
+        }
+        if (!nodeHints.offer(rootRunId, identity.runId(), identity)) {
+            pendingNodeHints.remove(identity);
+            nodeHintDropped.incrementAndGet();
+            undeliveredNodeHints.offer(identity);
+            return false;
         }
         return true;
     }
@@ -251,11 +254,12 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
             if (!permitLedger.tryAcquire(SchedulerPermitLayer.NODE_EXECUTION_SEGMENT)) {
                 return;
             }
-            NodeWorkItemIdentity identity = pollNextNodeHint();
+            NodeWorkItemIdentity identity = nodeHints.poll();
             if (identity == null) {
                 permitLedger.release(SchedulerPermitLayer.NODE_EXECUTION_SEGMENT);
                 return;
             }
+            pendingNodeHints.remove(identity);
             nodeInFlight.incrementAndGet();
             try {
                 nodeExecutor.execute(() -> {
@@ -281,8 +285,8 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
     public Map<String, Object> snapshot() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("runHintQueueDepth", runHints.size());
-        snapshot.put("nodeHintQueueDepth", nodeHintDepth());
-        snapshot.put("nodeHintRunBuckets", nodeHintBucketCount());
+        snapshot.put("nodeHintQueueDepth", nodeHints.size());
+        snapshot.put("nodeHintRunBuckets", nodeHints.runBucketCount());
         snapshot.put("runInFlight", runInFlight.get());
         snapshot.put("nodeInFlight", nodeInFlight.get());
         snapshot.put("runHintDroppedTotal", runHintDropped.get());
@@ -292,7 +296,10 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
         snapshot.put("undeliveredHintDeferredTotal", undeliveredHintDeferred.get());
         snapshot.put("runSubmitRejectedTotal", runSubmitRejected.get());
         snapshot.put("nodeSubmitRejectedTotal", nodeSubmitRejected.get());
-        snapshot.put("admittedRuns", admissionRegistry.admittedCount());
+        snapshot.put("admittedRuns", admissionRegistry.snapshotRunIds().size());
+        snapshot.put("admittedRootTrees", admissionRegistry.admittedCount());
+        snapshot.put("rootCapacityRecoveryBlocked", admissionRegistry.rootCapacityRecoveryBlocked());
+        snapshot.put("rootCapacityRecoveryReason", admissionRegistry.rootCapacityRecoveryReason());
         snapshot.put("startupResidueBlocked", admissionRegistry.startupResidueBlocked());
         // 启动残留按版本各报一条：哪个版本被阻断、为什么、隔离了哪些 Run，另一版还能不能服务。
         snapshot.put("startup", admissionRegistry.startupSnapshot());
@@ -313,7 +320,7 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
 
     @Override
     public int hintQueueDepth() {
-        return runHints.size() + nodeHintDepth();
+        return runHints.size() + nodeHints.size();
     }
 
     @Override
@@ -328,50 +335,6 @@ public class DualPoolDispatcher implements HintQueueDepthSource {
 
     private List<NodeWorkItemIdentity> safeNodeHints(List<NodeWorkItemIdentity> hints) {
         return hints == null ? List.of() : new ArrayList<>(hints);
-    }
-
-    /**
-     * 按 Run 轮转取一条节点提示：每轮让不同的运行图各取一次，再回到队头。
-     *
-     * <p>不这么做时，一张先建出几十个节点的宽图会把队列前部占满，别的图在它跑完之前拿不到派发机会。
-     * 轮转只影响「谁先拿到内存提示」，能不能真的执行仍由数据库条件更新决定。</p>
-     */
-    private NodeWorkItemIdentity pollNextNodeHint() {
-        synchronized (nodeHintLock) {
-            int candidates = nodeHintRotation.size();
-            for (int i = 0; i < candidates; i++) {
-                String runId = nodeHintRotation.iterator().next();
-                nodeHintRotation.remove(runId);
-                ArrayDeque<NodeWorkItemIdentity> bucket = nodeHintBuckets.get(runId);
-                if (bucket == null || bucket.isEmpty()) {
-                    nodeHintBuckets.remove(runId);
-                    continue;
-                }
-                NodeWorkItemIdentity identity = bucket.pollFirst();
-                nodeHintCount--;
-                if (bucket.isEmpty()) {
-                    nodeHintBuckets.remove(runId);
-                } else {
-                    // 这个 Run 还有待派发的节点：排到队尾，让别的图先取。
-                    nodeHintRotation.add(runId);
-                }
-                pendingNodeHints.remove(identity);
-                return identity;
-            }
-            return null;
-        }
-    }
-
-    private int nodeHintDepth() {
-        synchronized (nodeHintLock) {
-            return nodeHintCount;
-        }
-    }
-
-    private int nodeHintBucketCount() {
-        synchronized (nodeHintLock) {
-            return nodeHintBuckets.size();
-        }
     }
 
     /** 队列满时丢掉的提示：把下次检查时间推到数据库上，交给周期补扫，而不是等下一次提示。 */

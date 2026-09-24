@@ -4,6 +4,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLayer;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLedger;
@@ -25,6 +26,7 @@ import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -64,11 +66,12 @@ public class DualPoolRunAdmissionRegistry {
      * 这类对不上的状态；合成一个对象之后，撤销、释放、换新一代都是同一个
      * {@link ConcurrentHashMap#compute} 临界区里的一次条件更新，读到的是同一代的三样东西。</p>
      *
-     * <p>{@code activeEpoch} 是已经落库一轮的令牌，{@code reservations} 是数据库条件更新还没回来的预留，
-     * 两者只要有一个在，这个状态就占着一个业务名额。{@code fence} 为空的窗口只有一个：受控演练先清掉
-     * 凭据、还没重新取得的那些时刻。</p>
+     * <p>{@code activeEpoch} 是已经落库一轮的令牌，{@code reservations} 是数据库条件更新还没回来的预留。
+     * 两者只要有一个在，这条 Run 就是根树准入成员；整棵树只占一份业务名额。
+     * {@code fence} 为空的窗口只有一个：受控演练先清掉凭据、还没重新取得的那些时刻。</p>
      */
-    private record RunState(ServiceOwnershipFence fence, long activeEpoch, Set<Long> reservations) {
+    private record RunState(ServiceOwnershipFence fence, long activeEpoch, Set<Long> reservations,
+                            String rootRunId) {
         private RunState {
             reservations = Set.copyOf(reservations);
         }
@@ -77,17 +80,21 @@ public class DualPoolRunAdmissionRegistry {
             return activeEpoch >= 0L;
         }
 
-        /** 这个状态占着业务名额没有：有落库的一轮，或者有还没回音的预留。 */
+        /** 这条 Run 是否仍是根树准入成员：有落库的一轮，或者有还没回音的预留。 */
         private boolean admitted() {
             return activeEpoch >= 0L || !reservations.isEmpty();
         }
 
         private RunState withFence(ServiceOwnershipFence bound) {
-            return new RunState(bound, activeEpoch, reservations);
+            return new RunState(bound, activeEpoch, reservations, rootRunId);
         }
 
         private RunState withEpoch(long epoch, Set<Long> left) {
-            return new RunState(fence, epoch, left);
+            return new RunState(fence, epoch, left, rootRunId);
+        }
+
+        private RunState withRoot(String root) {
+            return new RunState(fence, activeEpoch, reservations, root);
         }
 
         /**
@@ -98,7 +105,7 @@ public class DualPoolRunAdmissionRegistry {
          * 凭据在手就不必重新去数据库领一趟。</p>
          */
         private RunState withoutAdmission() {
-            return fence == null ? null : new RunState(fence, -1L, Set.of());
+            return fence == null ? null : new RunState(fence, -1L, Set.of(), rootRunId);
         }
     }
 
@@ -115,6 +122,12 @@ public class DualPoolRunAdmissionRegistry {
      * 所以从数据库读到新的凭据之后要把同一代写回这里（{@link #bindFence}）。</p>
      */
     private final Map<String, RunState> runs = new ConcurrentHashMap<>();
+    /** 同一根调用树只占一份业务许可；两张表只在 admissionLock 下读写。 */
+    private final Object admissionLock = new Object();
+    private final Set<String> permittedRoots = new LinkedHashSet<>();
+    private final Map<String, Set<String>> admittedRunsByRoot = new HashMap<>();
+    private volatile boolean rootCapacityRecoveryBlocked;
+    private volatile String rootCapacityRecoveryReason = "none";
     private final AtomicLong admissionEpochSequence = new AtomicLong();
     /** 启动扫描判定「说不清该怎么恢复」的 Run 与原因；只在启动扫描里写，受理层对这些 Run 一律拒绝。 */
     private final Map<String, String> isolatedRunReasons = new ConcurrentHashMap<>();
@@ -131,6 +144,7 @@ public class DualPoolRunAdmissionRegistry {
     private final AgentRunMapper runMapper;
     private final RunServiceLeaseStore leaseStore;
     private final ProcessInstanceIdentity instanceIdentity;
+    private final RootRunResolver rootRunResolver;
     private final Duration serviceLeaseTtl;
 
     @Autowired
@@ -141,17 +155,31 @@ public class DualPoolRunAdmissionRegistry {
                                         ProcessInstanceIdentity instanceIdentity,
                                         @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}")
                                         long serviceLeaseTtlSeconds,
-                                        FrozenEffectiveSettings frozenEffectiveSettings) {
+                                        FrozenEffectiveSettings frozenEffectiveSettings,
+                                        RootRunResolver rootRunResolver) {
         this.permitLedger = permitLedger;
         this.workItemStore = workItemStore;
         this.runMapper = runMapper;
         this.leaseStore = leaseStore;
         this.instanceIdentity = instanceIdentity;
+        this.rootRunResolver = rootRunResolver;
         this.serviceLeaseTtl = Duration.ofSeconds(Math.max(1L, serviceLeaseTtlSeconds));
         // 同一个参数有四个消费者，各自归一化出来的数可能不同（这里按 1 秒起，领取那一路按 5 秒起）：
         // 各自登记在用的值，读数里按「谁在用 → 用多少」列出来，不替它们挑一个。
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
                 "DualPoolRunAdmissionRegistry", this.serviceLeaseTtl.toSeconds());
+    }
+
+    /** 旧版单 Run 单元测试的兼容入口；Spring 只使用带持久解析器的构造器。 */
+    DualPoolRunAdmissionRegistry(SchedulerPermitLedger permitLedger,
+                                 NodeWorkItemStore workItemStore,
+                                 AgentRunMapper runMapper,
+                                 RunServiceLeaseStore leaseStore,
+                                 ProcessInstanceIdentity instanceIdentity,
+                                 long serviceLeaseTtlSeconds,
+                                 FrozenEffectiveSettings frozenEffectiveSettings) {
+        this(permitLedger, workItemStore, runMapper, leaseStore, instanceIdentity,
+                serviceLeaseTtlSeconds, frozenEffectiveSettings, RootRunResolver.identityForTests());
     }
 
     /**
@@ -161,6 +189,7 @@ public class DualPoolRunAdmissionRegistry {
      */
     @PostConstruct
     void detectStartupResidue() {
+        restorePersistedRootPermits();
         for (SchedulerVersion version : List.of(SchedulerVersion.DUAL_POOL_V1, SchedulerVersion.DUAL_POOL_V2)) {
             detectResidueFor(version);
         }
@@ -769,23 +798,27 @@ public class DualPoolRunAdmissionRegistry {
         }
         long reservationEpoch = admissionEpochSequence.incrementAndGet();
         AtomicBoolean reserved = new AtomicBoolean();
-        runs.compute(runId, (ignored, current) -> {
-            RunState state = current;
-            // 占名额这件事看的是「这个状态此刻占着名额没有」，不是「有没有这个状态」：
-            // 只有凭据、还没有准入的状态是允许存在的（先取得所有权再受理），那种状态要先占名额。
-            if (state == null || !state.admitted()) {
-                if (!permitLedger.tryAcquire(SchedulerPermitLayer.BUSINESS_ADMISSION)) {
-                    return state;
+        synchronized (admissionLock) {
+            runs.compute(runId, (ignored, current) -> {
+                RunState state = current;
+                // Run 自己仍有独立准入代际；业务名额只按根调用树领取一次。
+                if (state == null || !state.admitted()) {
+                    String root = acquireTreeAdmission(runId, state);
+                    if (root == null) {
+                        return state;
+                    }
+                    if (state == null) {
+                        state = new RunState(null, -1L, Set.of(), root);
+                    } else {
+                        state = state.withRoot(root);
+                    }
                 }
-                if (state == null) {
-                    state = new RunState(null, -1L, Set.of());
-                }
-            }
-            Set<Long> reservations = new LinkedHashSet<>(state.reservations());
-            reservations.add(reservationEpoch);
-            reserved.set(true);
-            return state.withEpoch(state.activeEpoch(), reservations);
-        });
+                Set<Long> reservations = new LinkedHashSet<>(state.reservations());
+                reservations.add(reservationEpoch);
+                reserved.set(true);
+                return state.withEpoch(state.activeEpoch(), reservations);
+            });
+        }
         return reserved.get()
                 ? new Admission(true, reservationEpoch)
                 : Admission.rejected();
@@ -815,19 +848,21 @@ public class DualPoolRunAdmissionRegistry {
             return false;
         }
         AtomicBoolean rolledBack = new AtomicBoolean();
-        runs.computeIfPresent(runId, (ignored, state) -> {
-            if (!state.reservations().contains(admission.epoch())) {
-                return state;
-            }
-            Set<Long> reservations = new LinkedHashSet<>(state.reservations());
-            reservations.remove(admission.epoch());
-            rolledBack.set(true);
-            if (!state.admitted()) {
-                permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
-                return state.withoutAdmission();
-            }
-            return state.withEpoch(state.activeEpoch(), reservations);
-        });
+        synchronized (admissionLock) {
+            runs.computeIfPresent(runId, (ignored, state) -> {
+                if (!state.reservations().contains(admission.epoch())) {
+                    return state;
+                }
+                Set<Long> reservations = new LinkedHashSet<>(state.reservations());
+                reservations.remove(admission.epoch());
+                rolledBack.set(true);
+                if (state.activeEpoch() < 0L && reservations.isEmpty()) {
+                    releaseTreeAdmission(runId, state.rootRunId());
+                    return state.withoutAdmission();
+                }
+                return state.withEpoch(state.activeEpoch(), reservations);
+            });
+        }
         return rolledBack.get();
     }
 
@@ -956,7 +991,7 @@ public class DualPoolRunAdmissionRegistry {
             return false;
         }
         RunState bound = runs.compute(runId, (ignored, current) -> current == null
-                ? new RunState(fence, -1L, Set.of())
+                ? new RunState(fence, -1L, Set.of(), null)
                 : current.withFence(fence));
         return fence.equals(bound.fence());
     }
@@ -1007,18 +1042,19 @@ public class DualPoolRunAdmissionRegistry {
      */
     private RunState dropIf(String runId, Predicate<RunState> matches) {
         AtomicReference<RunState> dropped = new AtomicReference<>();
-        runs.computeIfPresent(runId, (ignored, state) -> {
-            if (!matches.test(state)) {
-                return state;
-            }
-            dropped.set(state);
-            return null;
-        });
-        RunState gone = dropped.get();
-        if (gone != null && gone.admitted()) {
-            permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
+        synchronized (admissionLock) {
+            runs.computeIfPresent(runId, (ignored, state) -> {
+                if (!matches.test(state)) {
+                    return state;
+                }
+                dropped.set(state);
+                if (state.admitted()) {
+                    releaseTreeAdmission(runId, state.rootRunId());
+                }
+                return null;
+            });
         }
-        return gone;
+        return dropped.get();
     }
 
     /**
@@ -1143,13 +1179,15 @@ public class DualPoolRunAdmissionRegistry {
         if (runId == null) {
             return;
         }
-        runs.computeIfPresent(runId, (ignored, state) -> {
-            if (!state.admitted()) {
-                return state;
-            }
-            permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
-            return state.withoutAdmission();
-        });
+        synchronized (admissionLock) {
+            runs.computeIfPresent(runId, (ignored, state) -> {
+                if (!state.admitted()) {
+                    return state;
+                }
+                releaseTreeAdmission(runId, state.rootRunId());
+                return state.withoutAdmission();
+            });
+        }
     }
 
     /**
@@ -1167,23 +1205,23 @@ public class DualPoolRunAdmissionRegistry {
         }
         AtomicBoolean released = new AtomicBoolean();
         AtomicReference<RuntimeException> cleanupFailure = new AtomicReference<>();
-        runs.computeIfPresent(runId, (ignored, state) -> {
-            if (state.activeEpoch() != expectedEpoch || !state.reservations().isEmpty()) {
-                return state;
-            }
-            try {
-                if (cleanup != null) {
-                    cleanup.run();
+        synchronized (admissionLock) {
+            runs.computeIfPresent(runId, (ignored, state) -> {
+                if (state.activeEpoch() != expectedEpoch || !state.reservations().isEmpty()) {
+                    return state;
                 }
-            } catch (RuntimeException e) {
-                cleanupFailure.set(e);
-            }
-            // 仍在同一 runId 的 compute 临界区内归还许可。这样等待进入的新一轮准入
-            // 不会先看到 key 已删除、却因旧许可尚未归还而被瞬时误拒。
-            permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
-            released.set(true);
-            return state.withoutAdmission();
-        });
+                try {
+                    if (cleanup != null) {
+                        cleanup.run();
+                    }
+                } catch (RuntimeException e) {
+                    cleanupFailure.set(e);
+                }
+                releaseTreeAdmission(runId, state.rootRunId());
+                released.set(true);
+                return state.withoutAdmission();
+            });
+        }
         RuntimeException failure = cleanupFailure.get();
         if (failure != null) {
             throw failure;
@@ -1195,15 +1233,19 @@ public class DualPoolRunAdmissionRegistry {
         return releaseBusinessPermitIfCurrent(runId, expectedEpoch, null);
     }
 
-    /** 此刻占着业务名额的 Run 数：有落库的一轮，或者有还没回音的预留，都算。 */
+    /** 此刻占业务名额的根调用树数；保留等待后代收尾的根树也计算在内。 */
     public int admittedCount() {
-        int count = 0;
-        for (RunState state : runs.values()) {
-            if (state.admitted()) {
-                count++;
-            }
+        synchronized (admissionLock) {
+            return permittedRoots.size();
         }
-        return count;
+    }
+
+    public boolean rootCapacityRecoveryBlocked() {
+        return rootCapacityRecoveryBlocked;
+    }
+
+    public String rootCapacityRecoveryReason() {
+        return rootCapacityRecoveryReason;
     }
 
     public Set<String> snapshotRunIds() {
@@ -1218,22 +1260,154 @@ public class DualPoolRunAdmissionRegistry {
 
     private boolean activateNewRun(String runId) {
         AtomicBoolean admitted = new AtomicBoolean();
-        runs.compute(runId, (ignored, current) -> {
-            if (current != null && current.admitted()) {
-                // 已经有落库的一轮或一个预留：不动它，也不重复占名额。
+        synchronized (admissionLock) {
+            runs.compute(runId, (ignored, current) -> {
+                if (current != null && current.admitted()) {
+                    admitted.set(true);
+                    return current;
+                }
+                String root = acquireTreeAdmission(runId, current);
+                if (root == null) {
+                    return current;
+                }
+                long nextEpoch = admissionEpochSequence.incrementAndGet();
                 admitted.set(true);
-                return current;
-            }
-            if (!permitLedger.tryAcquire(SchedulerPermitLayer.BUSINESS_ADMISSION)) {
-                // 名额拿不到：状态照旧留着（凭据是真的，只是这次受理没成）。
-                return current;
-            }
-            long nextEpoch = admissionEpochSequence.incrementAndGet();
-            admitted.set(true);
-            return current == null
-                    ? new RunState(null, nextEpoch, Set.of())
-                    : current.withEpoch(nextEpoch, Set.of());
-        });
+                return current == null
+                        ? new RunState(null, nextEpoch, Set.of(), root)
+                        : current.withRoot(root).withEpoch(nextEpoch, Set.of());
+            });
+        }
         return admitted.get();
+    }
+
+    /** 已受理的 Run 的根身份供两个提示队列分桶；缺失身份不能放行提示。 */
+    public String rootRunIdForAdmitted(String runId) {
+        RunState state = runId == null ? null : runs.get(runId);
+        if (state == null || !state.active() || state.rootRunId() == null) {
+            throw new IllegalStateException("admitted_root_identity_missing:" + runId);
+        }
+        return state.rootRunId();
+    }
+
+    /** 创建意图或最后一个子任务收尾后可调用；无活跃成员且持久后代均收尾才还根树许可。 */
+    public void reconcileRootPermit(String rootRunId) {
+        synchronized (admissionLock) {
+            maybeReleaseTreePermit(rootRunId);
+        }
+    }
+
+    /** 持久创建意图稍后收尾或查询短暂失败时，自动复查空闲根树。 */
+    @Scheduled(fixedDelayString = "${agent.langchain.dual-pool.scan.interval-ms:1000}")
+    public void reconcileRetainedRootPermits() {
+        synchronized (admissionLock) {
+            for (String root : List.copyOf(permittedRoots)) {
+                if (!admittedRunsByRoot.containsKey(root)) {
+                    maybeReleaseTreePermit(root);
+                }
+            }
+        }
+        if (rootCapacityRecoveryBlocked) {
+            restorePersistedRootPermits();
+        }
+    }
+
+    /** 先恢复持久子工作预留，再让启动残留扫描为每条 Run 单独取得服务资格。 */
+    void restorePersistedRootPermits() {
+        synchronized (admissionLock) {
+            final int pageSize = 100;
+            String after = "";
+            try {
+                while (true) {
+                    List<String> roots = rootRunResolver.listReservedRootRunIds(after, pageSize);
+                    if (roots == null) {
+                        throw new IllegalStateException("reserved_root_page_missing");
+                    }
+                    if (roots.size() > pageSize) {
+                        throw new IllegalStateException("reserved_root_page_too_large");
+                    }
+                    if (roots.isEmpty()) {
+                        rootCapacityRecoveryBlocked = false;
+                        rootCapacityRecoveryReason = "none";
+                        return;
+                    }
+                    for (String root : roots) {
+                        if (root == null || root.isBlank() || root.compareTo(after) <= 0) {
+                            throw new IllegalStateException("reserved_root_page_out_of_order");
+                        }
+                        if (!permittedRoots.contains(root)) {
+                            if (!permitLedger.tryAcquire(SchedulerPermitLayer.BUSINESS_ADMISSION)) {
+                                throw new IllegalStateException("reserved_root_capacity_exceeded:" + root);
+                            }
+                            permittedRoots.add(root);
+                        }
+                        after = root;
+                    }
+                }
+            } catch (RuntimeException e) {
+                rootCapacityRecoveryBlocked = true;
+                rootCapacityRecoveryReason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                log.error("持久根树名额恢复失败，拒绝新的根树准入: reason={}", rootCapacityRecoveryReason, e);
+            }
+        }
+    }
+
+    private String acquireTreeAdmission(String runId, RunState current) {
+        String root = current == null ? null : current.rootRunId();
+        if (root == null) {
+            try {
+                root = rootRunResolver.rootRunId(runId);
+            } catch (RuntimeException e) {
+                log.error("根树身份查询失败，拒绝 Run 准入: runId={}", runId, e);
+                return null;
+            }
+        }
+        if (root == null || root.isBlank()) {
+            log.error("根树身份缺失，拒绝 Run 准入: runId={}", runId);
+            return null;
+        }
+        if (rootCapacityRecoveryBlocked && !permittedRoots.contains(root)) {
+            log.error("持久根树名额尚未完整恢复，拒绝新根树准入: runId={} rootRunId={} reason={}",
+                    runId, root, rootCapacityRecoveryReason);
+            return null;
+        }
+        if (!permittedRoots.contains(root)) {
+            if (!permitLedger.tryAcquire(SchedulerPermitLayer.BUSINESS_ADMISSION)) {
+                return null;
+            }
+            permittedRoots.add(root);
+        }
+        admittedRunsByRoot.computeIfAbsent(root, ignored -> new LinkedHashSet<>()).add(runId);
+        return root;
+    }
+
+    private void releaseTreeAdmission(String runId, String root) {
+        if (root == null) {
+            throw new IllegalStateException("admitted_root_identity_missing:" + runId);
+        }
+        Set<String> members = admittedRunsByRoot.get(root);
+        if (members == null || !members.remove(runId)) {
+            throw new IllegalStateException("root_admission_member_missing:" + runId);
+        }
+        if (members.isEmpty()) {
+            admittedRunsByRoot.remove(root);
+        }
+        maybeReleaseTreePermit(root);
+    }
+
+    private void maybeReleaseTreePermit(String root) {
+        if (!permittedRoots.contains(root) || admittedRunsByRoot.containsKey(root)) {
+            return;
+        }
+        try {
+            if (rootRunResolver.hasUnsettledDescendants(root)) {
+                return;
+            }
+        } catch (RuntimeException e) {
+            // 根树还有没有子工作不能证实时，保留业务许可，等待持久事实恢复后重查。
+            log.error("根树收尾状态查询失败，保留业务许可: rootRunId={}", root, e);
+            return;
+        }
+        permittedRoots.remove(root);
+        permitLedger.release(SchedulerPermitLayer.BUSINESS_ADMISSION);
     }
 }

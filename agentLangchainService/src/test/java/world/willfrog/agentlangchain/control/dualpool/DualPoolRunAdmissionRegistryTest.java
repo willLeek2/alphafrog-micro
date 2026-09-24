@@ -25,6 +25,10 @@ import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -61,6 +65,12 @@ class DualPoolRunAdmissionRegistryTest {
      */
     private static DualPoolRunAdmissionRegistry registryThatCanOwnRuns(
             SchedulerPermitLedger permitLedger, NodeWorkItemStore workItems, AgentRunMapper runs) {
+        return registryThatCanOwnRuns(permitLedger, workItems, runs, RootRunResolver.identityForTests());
+    }
+
+    private static DualPoolRunAdmissionRegistry registryThatCanOwnRuns(
+            SchedulerPermitLedger permitLedger, NodeWorkItemStore workItems, AgentRunMapper runs,
+            RootRunResolver resolver) {
         RunServiceLeaseStore leaseStore = mock(RunServiceLeaseStore.class);
         ProcessInstanceIdentity identity = mock(ProcessInstanceIdentity.class);
         when(identity.value()).thenReturn("test-instance");
@@ -70,7 +80,119 @@ class DualPoolRunAdmissionRegistryTest {
                         OffsetDateTime.now().plusMinutes(2))));
         when(leaseStore.find(anyString())).thenReturn(Optional.empty());
         return new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L,
-                new FrozenEffectiveSettings());
+                new FrozenEffectiveSettings(), resolver);
+    }
+
+    @Test
+    void childSharesRootPermitAndRetainsItUntilDurableDescendantsSettle() {
+        SchedulerPermitLedger ledger = new SchedulerPermitLedger();
+        ledger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        RootRunResolver resolver = mock(RootRunResolver.class);
+        when(resolver.rootRunId("root")).thenReturn("root");
+        when(resolver.rootRunId("child")).thenReturn("root");
+        when(resolver.rootRunId("other")).thenReturn("other");
+        when(resolver.hasUnsettledDescendants("root")).thenReturn(true, false);
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                ledger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class), resolver);
+
+        assertThat(registry.admitNewRun("root", SchedulerVersion.DUAL_POOL_V2.name())).isTrue();
+        assertThat(registry.admitNewRun("child", SchedulerVersion.DUAL_POOL_V2.name())).isTrue();
+        assertThat(registry.rootRunIdForAdmitted("child")).isEqualTo("root");
+        assertThat(registry.admittedCount()).isEqualTo(1);
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isEqualTo(1);
+        assertThat(registry.admitNewRun("other", SchedulerVersion.DUAL_POOL_V2.name())).isFalse();
+
+        assertThat(registry.releaseBusinessPermitIfCurrent("root", registry.currentAdmissionEpoch("root")))
+                .isTrue();
+        assertThat(registry.isAdmitted("child")).isTrue();
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isEqualTo(1);
+        assertThat(registry.releaseBusinessPermitIfCurrent("child", registry.currentAdmissionEpoch("child")))
+                .isTrue();
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isEqualTo(1);
+        registry.reconcileRootPermit("root");
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+        assertThat(registry.admitNewRun("other", SchedulerVersion.DUAL_POOL_V2.name())).isTrue();
+    }
+
+    @Test
+    void unresolvedRootIdentityNeverAdmitsRunAsNewTree() {
+        SchedulerPermitLedger ledger = new SchedulerPermitLedger();
+        ledger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        RootRunResolver resolver = mock(RootRunResolver.class);
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                ledger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class), resolver);
+
+        assertThat(registry.admitNewRun("unknown-child", SchedulerVersion.DUAL_POOL_V2.name())).isFalse();
+        assertThat(registry.isAdmitted("unknown-child")).isFalse();
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+    }
+
+    @Test
+    void concurrentChildrenShareOneRootPermit() throws Exception {
+        SchedulerPermitLedger ledger = new SchedulerPermitLedger();
+        ledger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        RootRunResolver resolver = mock(RootRunResolver.class);
+        when(resolver.rootRunId(anyString())).thenReturn("root");
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                ledger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class), resolver);
+        assertThat(registry.admitNewRun("root", SchedulerVersion.DUAL_POOL_V2.name())).isTrue();
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<Boolean> first = executor.submit(() -> {
+                start.await();
+                return registry.admitNewRun("child-1", SchedulerVersion.DUAL_POOL_V2.name());
+            });
+            Future<Boolean> second = executor.submit(() -> {
+                start.await();
+                return registry.admitNewRun("child-2", SchedulerVersion.DUAL_POOL_V2.name());
+            });
+            start.countDown();
+            assertThat(first.get()).isTrue();
+            assertThat(second.get()).isTrue();
+            assertThat(registry.snapshotRunIds()).contains("root", "child-1", "child-2");
+            assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isEqualTo(1);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void startupRestoresDurableTreeReservationBeforeChildAdmission() {
+        SchedulerPermitLedger ledger = new SchedulerPermitLedger();
+        ledger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        RootRunResolver resolver = mock(RootRunResolver.class);
+        when(resolver.listReservedRootRunIds("", 100)).thenReturn(List.of("root"));
+        when(resolver.listReservedRootRunIds("root", 100)).thenReturn(List.of());
+        when(resolver.rootRunId("child")).thenReturn("root");
+        when(resolver.rootRunId("other")).thenReturn("other");
+        when(resolver.hasUnsettledDescendants("root")).thenReturn(true);
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                ledger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class), resolver);
+
+        registry.restorePersistedRootPermits();
+        assertThat(registry.rootCapacityRecoveryBlocked()).isFalse();
+        assertThat(registry.admittedCount()).isEqualTo(1);
+        assertThat(registry.admitNewRun("child", SchedulerVersion.DUAL_POOL_V2.name())).isTrue();
+        assertThat(registry.admitNewRun("other", SchedulerVersion.DUAL_POOL_V2.name())).isFalse();
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isEqualTo(1);
+    }
+
+    @Test
+    void incompleteDurableReservationScanBlocksNewTrees() {
+        SchedulerPermitLedger ledger = new SchedulerPermitLedger();
+        ledger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        RootRunResolver resolver = mock(RootRunResolver.class);
+        when(resolver.listReservedRootRunIds("", 100)).thenThrow(new IllegalStateException("database_unavailable"));
+        when(resolver.rootRunId("new-root")).thenReturn("new-root");
+        DualPoolRunAdmissionRegistry registry = registryThatCanOwnRuns(
+                ledger, mock(NodeWorkItemStore.class), mock(AgentRunMapper.class), resolver);
+
+        registry.restorePersistedRootPermits();
+        assertThat(registry.rootCapacityRecoveryBlocked()).isTrue();
+        assertThat(registry.admitNewRun("new-root", SchedulerVersion.DUAL_POOL_V2.name())).isFalse();
+        assertThat(ledger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
     }
 
     @Test
