@@ -188,7 +188,10 @@ def validate_identities(root_id: str, children: list[dict[str, Any]],
         audit.need(text(intent.get("parentRunId")) == root_id
                    and text(intent.get("rootRunId")) == root_id,
                    f"intent_parent_root_relation:{child_id}")
-        audit.need(text(intent.get("status")).upper() == "ACCEPTED",
+        audit.need(bool(read_time(intent.get("acceptedAt")))
+                   and text(intent.get("outboxStatus")).upper() == "ACKED"
+                   and text(intent.get("status")).upper()
+                   in ("ACCEPTED", "CANCEL_REQUESTED", "TERMINAL"),
                    f"creation_accepted:{child_id}")
     for run_id in [root_id, *child_ids]:
         audit.need(any(text(event.get("runId")) == run_id for event in events),

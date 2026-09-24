@@ -29,7 +29,8 @@ def intent(run_id: str) -> dict:
     return {"intentId": f"intent-{run_id}", "operationId": f"op-{run_id}",
             "outboxId": f"ob-{run_id}", "toolCallId": f"spawn-{run_id}",
             "parentNodeId": "N4", "childRunId": run_id, "parentRunId": "parent",
-            "rootRunId": "parent", "status": "ACCEPTED"}
+            "rootRunId": "parent", "status": "TERMINAL",
+            "acceptedAt": "2026-09-24T10:01:00Z", "outboxStatus": "ACKED"}
 
 
 def wait(ids: list[str], results: list[dict], started: str, completed: str,
@@ -95,6 +96,13 @@ class Stage5AChildRunEvidenceTest(unittest.TestCase):
             "--scenario-id", "case", "--child-evidence-file", str(self.evidence_path),
             "--output", str(output)]), 0)
         self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["status"], "passed")
+
+        proof["creationIntents"][0]["status"] = "ACCEPTED"
+        self.assertEqual(self.audit("single_child", proof)["status"], "passed")
+        proof["creationIntents"][0]["acceptedAt"] = None
+        result = self.audit("single_child", proof)
+        self.assertEqual(result["status"], "evidence_incomplete")
+        self.assertIn("creation_accepted:child-1", result["missingEvidence"])
 
     def test_second_child_finishes_first_but_results_keep_request_order(self) -> None:
         proof = self.base | {
