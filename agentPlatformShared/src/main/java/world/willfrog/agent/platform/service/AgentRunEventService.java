@@ -404,6 +404,9 @@ public class AgentRunEventService {
         }
 
         ObjectNode ext = requireObjectJson(parent.getExt(), "parent ext").deepCopy();
+        if (ext.path("child_run").asBoolean(false)) {
+            throw new IllegalArgumentException("A child Run cannot create another child Run");
+        }
         ObjectNode childContext = sanitizeChildContext(ext.path("context_json"));
         if (context != null && !context.isBlank()) {
             childContext.put("sub_agent_context", context);
@@ -484,7 +487,16 @@ public class AgentRunEventService {
         ObjectNode context;
         if (raw.isTextual()) {
             String text = raw.asText();
-            context = text.isBlank() ? objectMapper.createObjectNode() : requireObjectJson(text, "parent context");
+            if (text.isBlank()) {
+                context = objectMapper.createObjectNode();
+            } else {
+                try {
+                    context = requireObjectJson(text, "parent context");
+                } catch (IllegalStateException invalidJson) {
+                    context = objectMapper.createObjectNode();
+                    context.put("parent_context_text", text);
+                }
+            }
         } else if (raw instanceof ObjectNode object) {
             context = object.deepCopy();
         } else if (raw.isMissingNode() || raw.isNull()) {
