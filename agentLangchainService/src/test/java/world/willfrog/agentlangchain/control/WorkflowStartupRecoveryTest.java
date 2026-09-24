@@ -101,7 +101,7 @@ class WorkflowStartupRecoveryTest {
     @Test
     void dualPoolRunIsNotClaimedAfterProcessRestart() {
         AgentRun candidate = run(AgentRunStatus.EXECUTING, 0, "{\"items\":[]}");
-        when(schedulerVersionPolicy.isDualPool(candidate)).thenReturn(true);
+        when(schedulerVersionPolicy.isDualPoolFamily(candidate)).thenReturn(true);
 
         recovery.recoverOne(candidate);
 

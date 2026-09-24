@@ -1,0 +1,390 @@
+package world.willfrog.agentlangchain.control.dualpool;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.wait.RecoveryNotification;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+
+import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * 恢复通知的分发：三个入口进同一段处理逻辑，每一轮只处理有限条。
+ *
+ * <p>三个入口各管一种情形。<b>提交后唤醒</b>：写结果的那个线程已经把通知消费掉了，只有它没消费成
+ * （准入还没恢复之类）时才需要一个「马上再试一次」的提醒，这条提醒只活在内存里、可以丢。
+ * <b>周期补扫</b>：内存提示丢了、进程活着但没人守着，靠它按数据库把到期通知重新发现。
+ * <b>启动扫描</b>：进程刚起来时集中翻几页，把重启前就已经齐备的等待链先放出去，之后交给周期补扫。</p>
+ *
+ * <p>每一轮的上限同时管住两件事：一轮最多处理多少条通知、一轮最多往节点池投多少条。上限还要按
+ * 固定名额切开：先给数据库补扫留一份，剩下的才用来处理内存提醒。提醒是无界的即时消息，光靠它自己
+ * 排队就能把整轮预算吃光，重启前遗留、提醒丢了、只在数据库里的通知会一直等不到机会；数据库才是
+ * 事实来源，每一轮都得进得去。</p>
+ *
+ * <p>没消费成的按 {@link RecoveryBackoff} 推后下次可见时间——取不走的通知留在候选队头，会把同一批
+ * 里本来能取走的那些挤掉，看上去就像恢复卡住了。取不走的原因为两种：还能有下次的推后重试，再也
+ * 不会被服务的由受理层落成关闭态并写明原因，不再回到扫描队头。</p>
+ *
+ * <p>一条通知能不能取走，由 {@link WaitGroupRecoveryIntake} 按「服务所有权 → 业务名额预留 → 消费」
+ * 的顺序判定；这里只负责取候选、按轮数上限驱动、推后重试与把放行出来的下一段投给节点池。</p>
+ */
+@Component
+@Slf4j
+public class DualPoolRecoveryDispatcher {
+
+    /** 分发器实例标识，写进通知的消费方字段，事后能看出是谁放行的。 */
+    private static final String DISPATCHER_ID = "dual-pool-recovery-periodic";
+
+    private final WaitGroupStore waitGroupStore;
+    private final AgentRunMapper runMapper;
+    private final DualPoolDispatcher dispatcher;
+    private final WaitGroupRecoveryIntake intake;
+    /** 每轮读一次的参数：批次、配额、提醒容量与退避都允许在运行期改，改完下一轮生效。 */
+    private final DualPoolSchedulerSettings settings;
+    /** 启动扫描用到的翻页数要登记到读数里，所以这里留着登记入口。 */
+    private final FrozenEffectiveSettings frozenEffectiveSettings;
+    /** 最近一次构造退避用的初值与上限；配置变了就按新值重建，不用重启。 */
+    private volatile RecoveryBackoff backoff;
+    private volatile long backoffBaseMs;
+    private volatile long backoffMaxMs;
+    /** 最近一轮实际用的扫描配额（配的值超过本轮总上限时会被压低），以及这一轮是什么时候跑的。 */
+    private volatile int scanQuotaLastRound;
+    private volatile OffsetDateTime lastRoundAt;
+
+    /** 提交后唤醒的提醒：只带通知编号，取之前回库读权威状态。 */
+    private final ConcurrentLinkedQueue<Long> wakeups = new ConcurrentLinkedQueue<>();
+    private final LinkedHashSet<Long> pendingWakeups = new LinkedHashSet<>();
+    private final Object wakeupLock = new Object();
+
+    private final AtomicLong rounds = new AtomicLong();
+    private final AtomicLong scanned = new AtomicLong();
+    private final AtomicLong consumed = new AtomicLong();
+    private final AtomicLong deferred = new AtomicLong();
+    private final AtomicLong wakeupsHandled = new AtomicLong();
+    private final AtomicLong hintFailed = new AtomicLong();
+    private final AtomicLong droppedWakeups = new AtomicLong();
+    private final AtomicLong closed = new AtomicLong();
+    private final AtomicLong lostRaces = new AtomicLong();
+
+    public DualPoolRecoveryDispatcher(
+            WaitGroupStore waitGroupStore,
+            AgentRunMapper runMapper,
+            DualPoolDispatcher dispatcher,
+            WaitGroupRecoveryIntake intake,
+            DualPoolSchedulerSettings settings,
+            @Value("${agent.langchain.dual-pool.recovery.scan-interval-ms:1000}") long scanIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
+        this.waitGroupStore = waitGroupStore;
+        this.runMapper = runMapper;
+        this.dispatcher = dispatcher;
+        this.intake = intake;
+        this.settings = settings;
+        this.frozenEffectiveSettings = frozenEffectiveSettings;
+        // 补扫的间隔与 @Scheduled 上那个属性名在启动时各解析一次，取到的是同一个数；报出来是为了
+        // 让读数与定时任务对得上，不是另立一份配置。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RECOVERY_SCAN_INTERVAL_MS,
+                "DualPoolRecoveryDispatcher", Math.max(1L, scanIntervalMs));
+    }
+
+    /** 退避参数按当前配置取；配置改了就用新值重建一个，读数与推后用的是同一个。 */
+    private RecoveryBackoff backoff() {
+        // 初值与上限从同一份解析结果里取，不会一个新版一个旧版拼成一个谁都没配过的组合。
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        long base = round.recoveryBackoffBaseMs().longValue();
+        long max = round.recoveryBackoffMaxMs().longValue();
+        RecoveryBackoff current = backoff;
+        if (current == null || base != backoffBaseMs || max != backoffMaxMs) {
+            current = new RecoveryBackoff(Duration.ofMillis(base), Duration.ofMillis(max));
+            backoff = current;
+            backoffBaseMs = base;
+            backoffMaxMs = max;
+        }
+        return current;
+    }
+
+    /**
+     * 提交后唤醒：只记一条内存提示，马上返回。
+     *
+     * <p>在线路径已经自己消费过通知了，走到这里说明它没消费成。这里不直接消费：把「再试一次」
+     * 排进下一轮，既不让写结果的那个线程多做一次库操作，也不会因为它失败而影响结果落库。</p>
+     */
+    public boolean wake(long notificationId) {
+        if (notificationId <= 0) {
+            return false;
+        }
+        synchronized (wakeupLock) {
+            if (pendingWakeups.contains(notificationId)) {
+                return false;
+            }
+            if (pendingWakeups.size() >= settings.recoveryWakeupCapacity().intValue()) {
+                // 提醒满了就丢提醒：它只是「快一点」的优化，数据库补扫才是保证。
+                // 丢掉一条不会丢事实——那条通知还在库里等着到期被扫到。
+                droppedWakeups.incrementAndGet();
+                return false;
+            }
+            pendingWakeups.add(notificationId);
+        }
+        wakeups.offer(notificationId);
+        return true;
+    }
+
+    /** 周期补扫：按数据库把到期通知重新发现。 */
+    @Scheduled(fixedDelayString = "${agent.langchain.dual-pool.recovery.scan-interval-ms:1000}")
+    public void rediscover() {
+        if (!dispatcher.isReady()) {
+            return;
+        }
+        safeRound(settings.recoveryBatchSize().intValue());
+    }
+
+    /**
+     * 启动扫描：进程刚起来时集中翻几页，把重启前已经齐备的等待链先放出去。
+     *
+     * <p>翻几页就收手，不做「一次扫空」：剩下的由周期补扫接着发现，启动阶段不该被一张大表拖住。
+     * 每一页处理多少条与周期补扫同一个上限。</p>
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void recoverOnStartup() {
+        if (!dispatcher.isReady()) {
+            return;
+        }
+        // 每页多少条与翻几页从同一份解析结果里取：两个参数不该一个新版一个旧版。
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        int total = 0;
+        int batchSize = round.recoveryBatchSize().intValue();
+        int startupPages = round.recoveryStartupPages().intValue();
+        // 翻页数不是一个启动时冻结的字段，而是这一次启动扫描真正用到的数：在这里登记，读数里这一项
+        // 报的就是它（登记之前那一项会写明「没有组件登记」）。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_RECOVERY_STARTUP_PAGES,
+                "DualPoolRecoveryDispatcher", startupPages);
+        for (int page = 0; page < startupPages; page++) {
+            int handled = safeRound(batchSize);
+            total += handled;
+            if (handled < batchSize) {
+                break;
+            }
+        }
+        if (total > 0) {
+            log.info("启动恢复扫描完成：本轮重新发现并处理了 {} 条恢复通知，其余交给周期补扫", total);
+        }
+    }
+
+    /** 一轮处理；返回这一轮实际处理的条数，供启动分页判断还有没有下一页。 */
+    public int safeRound(int limit) {
+        try {
+            return round(limit);
+        } catch (RuntimeException e) {
+            // 分发器自己出错不能把调度线程带走：下一轮接着来，问题留在日志里。
+            log.error("恢复分发一轮失败: reason={}", e.getMessage(), e);
+            return 0;
+        }
+    }
+
+    private int round(int limit) {
+        rounds.incrementAndGet();
+        lastRoundAt = OffsetDateTime.now();
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        int budget = Math.max(1, limit);
+        // 扫描配额同时受两个东西约束：配的那个值、以及这一轮的总上限。配额比总上限还大的话，
+        // 「一轮最多处理这么多条」这条合同就被配额破了；启动分页也会因为每页实际超过上限而失真。
+        int scanQuota = Math.max(1, Math.min(round.recoveryScanQuota().intValue(), budget));
+        // 读数里记下这一轮实际用的配额：配的值比总上限大时两者不一样，只看配置值会以为配额生效了。
+        scanQuotaLastRound = scanQuota;
+        // 数据库先走，而且至少拿到固定名额：提醒再多也占不住它那一份。提醒少的时候不去浪费预算——
+        // 提醒就那么多条，剩下的整份都给补扫，一轮的吞吐不因为保底而变小。
+        int hintShare = Math.min(pendingWakeupDepth(), Math.max(0, budget - scanQuota));
+        int scanBudget = Math.max(scanQuota, budget - hintShare);
+        int handled = scanDue(scanBudget);
+        int rest = budget - handled;
+        if (rest > 0) {
+            handled += drainWakeups(rest);
+        }
+        return handled;
+    }
+
+    /** 内存里还压着几条提醒：在锁里读，读到的是一个完整的深度。 */
+    private int pendingWakeupDepth() {
+        synchronized (wakeupLock) {
+            return pendingWakeups.size();
+        }
+    }
+
+    /** 按数据库补扫一批到期通知，最多处理这么多条。 */
+    private int scanDue(int limit) {
+        if (limit <= 0) {
+            return 0;
+        }
+        List<RecoveryNotification> due = waitGroupStore.scanDueRecoveryNotifications(limit);
+        scanned.addAndGet(due.size());
+        int handled = 0;
+        for (RecoveryNotification notification : due) {
+            attempt(notification);
+            handled++;
+        }
+        return handled;
+    }
+
+    private int drainWakeups(int budget) {
+        int handled = 0;
+        while (handled < budget) {
+            Long notificationId = wakeups.poll();
+            if (notificationId == null) {
+                return handled;
+            }
+            synchronized (wakeupLock) {
+                pendingWakeups.remove(notificationId);
+            }
+            wakeupsHandled.incrementAndGet();
+            Optional<RecoveryNotification> notification = waitGroupStore.findNotification(notificationId);
+            if (notification.isEmpty()) {
+                continue;
+            }
+            attempt(notification.get());
+            handled++;
+        }
+        return handled;
+    }
+
+    /**
+     * 试一条通知：交给受理层按「服务所有权 → 业务名额预留 → 消费」走一遍，按结局分流。
+     *
+     * <p>这里不再自己读 Run 判断能不能取：原因由消费语句给出，看到的就是库里的样子。Run 读不回来或
+     * 版本不认识时受理层会把它收口——那样的通知永远不会再有下一步，留在扫描队头只会挡住后面的。</p>
+     */
+    private void attempt(RecoveryNotification notification) {
+        if (!notification.consumable()) {
+            return;
+        }
+        AgentRun run = readRun(notification.getRunId());
+        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification, run, DISPATCHER_ID);
+        switch (result.outcome()) {
+            case CONSUMED -> {
+                consumed.incrementAndGet();
+                deliver(result.nextSegment());
+            }
+            case CLOSED -> closed.incrementAndGet();
+            case LOST_RACE -> lostRaces.incrementAndGet();
+            case DEFERRED -> defer(notification, run, result);
+        }
+    }
+
+    /**
+     * 把放行出来的下一段投给节点池。
+     *
+     * <p>投不进去不算失败：下一段已经是可恢复态、业务名额也已经受理，节点扫描会重新发现它。
+     * 这里只记数，不重试投递。</p>
+     */
+    private void deliver(NodeWorkItemIdentity nextSegment) {
+        if (nextSegment == null) {
+            // 消费成功却拿不到完整身份：受理层已经把这种情形当成没消费成处理过，走到这里说明
+            // 语句与这段代码的假设对不上，必须报出来。
+            log.error("恢复通知被消费但没有返回下一段身份，等待链会停住，需要人工检查");
+            hintFailed.incrementAndGet();
+            return;
+        }
+        if (!dispatcher.offerNode(nextSegment)) {
+            hintFailed.incrementAndGet();
+        }
+    }
+
+    /**
+     * 这一轮取不走：推后下次可见时间。
+     *
+     * <p>原因分两类记。一类是「本来就不该现在取」——Run 不在执行中、正在取消、通知代际落后、
+     * 下一段还没到等待态、这条 Run 的服务所有权在别人手上，这类会随着别的路径推进自己变好；
+     * 另一类是「再也不会被服务」，那种已经在受理层落成关闭态，不会走到这里。</p>
+     */
+    private void defer(RecoveryNotification notification, AgentRun run,
+                       WaitGroupRecoveryIntake.IntakeResult result) {
+        OffsetDateTime nextVisibleAt = backoff().nextVisibleAt(OffsetDateTime.now(),
+                notification.getId(), notification.getCreatedAt());
+        boolean pushedLater = waitGroupStore.deferRecoveryNotification(notification.getId(), nextVisibleAt);
+        deferred.incrementAndGet();
+        String reason = describe(result);
+        if (pushedLater) {
+            log.debug("恢复通知这一轮取不走，推后到 {}：notification={} runId={} status={} reason={}",
+                    nextVisibleAt, notification.getId(), notification.getRunId(),
+                    run == null ? null : run.getStatus(), reason);
+        } else {
+            // 推后没生效：这条通知多半刚被别人取走或关掉，下一次扫描不会再看到它。
+            lostRaces.incrementAndGet();
+            log.debug("恢复通知推后没有生效（已经不在等待态或时间没变晚）：notification={} reason={}",
+                    notification.getId(), reason);
+        }
+    }
+
+    /** 取不走的原因：优先用语句给的拒绝原因，其次用它给的补充说明。 */
+    private static String describe(WaitGroupRecoveryIntake.IntakeResult result) {
+        if (result.rejection() != null) {
+            return result.detail() == null
+                    ? result.rejection().name()
+                    : result.rejection().name() + ":" + result.detail();
+        }
+        return result.detail() == null ? "unknown" : result.detail();
+    }
+
+    private AgentRun readRun(String runId) {
+        return runId == null || runId.isBlank() ? null : runMapper.findById(runId);
+    }
+
+    private static boolean terminal(AgentRunStatus status) {
+        return status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED
+                || status == AgentRunStatus.CANCELED || status == AgentRunStatus.EXPIRED
+                || status == AgentRunStatus.PARTIAL;
+    }
+
+    private static long value(Long value) {
+        return value == null ? 0L : value;
+    }
+
+    /** 分发器的当前读数：轮数、处理条数、投递失败与隔离数，以及内存里还压着几条唤醒提醒。 */
+    public Map<String, Object> snapshot() {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("recoveryRounds", rounds.get());
+        snapshot.put("recoveryScannedTotal", scanned.get());
+        snapshot.put("recoveryConsumedTotal", consumed.get());
+        snapshot.put("recoveryDeferredTotal", deferred.get());
+        snapshot.put("recoveryWakeupsHandledTotal", wakeupsHandled.get());
+        snapshot.put("recoveryHintFailedTotal", hintFailed.get());
+        snapshot.put("recoveryClosedTotal", closed.get());
+        snapshot.put("recoveryLostRaceTotal", lostRaces.get());
+        snapshot.put("recoveryDroppedWakeupsTotal", droppedWakeups.get());
+        DualPoolSchedulerSettings.RoundSettings round = settings.round();
+        snapshot.put("recoveryBatchSize", round.recoveryBatchSize().value());
+        snapshot.put("recoveryScanQuota", round.recoveryScanQuota().value());
+        // 配的值与本轮真正用的值分开报：配额比这一轮总上限大时会被压低，只报配置值看不出这件事。
+        snapshot.put("recoveryScanQuotaLastRound", scanQuotaLastRound);
+        snapshot.put("recoveryLastRoundAt", lastRoundAt == null ? null : lastRoundAt.toString());
+        snapshot.put("recoveryWakeupCapacity", round.recoveryWakeupCapacity().value());
+        // 提醒深度与刷新窗口在同一把锁里读：并发提醒与出队时不能读到一个看不见的组合。
+        synchronized (wakeupLock) {
+            snapshot.put("recoveryPendingWakeups", pendingWakeups.size());
+        }
+        snapshot.put("recoveryBackoff", backoff().describe());
+        snapshot.putAll(intake.snapshot());
+        return snapshot;
+    }
+
+    /** 只读观测：当前正压着的唤醒提醒编号，供诊断与验收用。 */
+    public List<Long> pendingWakeupIds() {
+        synchronized (wakeupLock) {
+            return new ArrayList<>(pendingWakeups);
+        }
+    }
+}

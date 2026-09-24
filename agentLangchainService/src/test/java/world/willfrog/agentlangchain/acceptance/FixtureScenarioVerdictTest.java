@@ -1,0 +1,247 @@
+package world.willfrog.agentlangchain.acceptance;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Set;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * 终态核对：脚本里声明为必答的回合没有被领走、或者放行策略点名的规则一条都没打中时，
+ * 这一次验收不能算通过。
+ */
+class FixtureScenarioVerdictTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Test
+    void everyRequiredTurnBeingClaimedIsTheOnlyPass() {
+        FrozenModelScript script = parse("""
+                {"turns":[
+                  {"for":{"stage":"planning","planPhase":"strategy"},"text":"策略"},
+                  {"for":{"stage":"node","nodeId":"n1"},"text":"节点"},
+                  {"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(script, Set.of(0, 1, 2));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.COMPLETE);
+        assertThat(verdict.missing()).isEmpty();
+        assertThat(verdict.describeMissing()).isNull();
+        assertThat(verdict.consumed()).hasSize(3);
+        assertThat(verdict.consumed().get(1)).contains("nodeId=n1");
+    }
+
+    @Test
+    void aRequiredTurnThatNeverHappenedIsNamedInsteadOfBeingSilentlyDropped() {
+        FrozenModelScript script = parse("""
+                {"turns":[
+                  {"for":{"stage":"node","nodeId":"n1"},"text":"节点一"},
+                  {"for":{"stage":"node","nodeId":"n2"},"text":"节点二"},
+                  {"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+
+        // 少了节点二那一次：前面的回复照样让 Run 走到终态，这一次验收不能被算成通过。
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(script, Set.of(0, 2));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.missing()).hasSize(1);
+        assertThat(verdict.missing().get(0)).contains("回合 2").contains("nodeId=n2");
+        assertThat(verdict.describeMissing()).contains("实际没有发生");
+        assertThat(verdict.consumed()).hasSize(2);
+    }
+
+    @Test
+    void anOptionalTurnThatNeverHappenedIsNotMissing() {
+        FrozenModelScript script = parse("""
+                {"turns":[
+                  {"for":{"stage":"node","nodeId":"n1"},"text":"必答"},
+                  {"for":{"stage":"node","nodeId":"n1","modelTurn":1},"optional":true,"text":"可以不发生"}]}
+                """);
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(script, Set.of(0));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.COMPLETE);
+        assertThat(verdict.missing()).isEmpty();
+        assertThat(verdict.consumed()).hasSize(1);
+    }
+
+    @Test
+    void nothingClaimedMeansEveryRequiredTurnIsMissing() {
+        FrozenModelScript script = parse("""
+                {"turns":[
+                  {"for":{"stage":"node","nodeId":"n1"},"text":"甲"},
+                  {"for":{"stage":"node","nodeId":"n1"},"optional":true,"text":"乙"}]}
+                """);
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(script, Set.of());
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.missing()).hasSize(1);
+        assertThat(verdict.missing().get(0)).contains("回合 1");
+    }
+
+    @Test
+    void theSnapshotDeclarationsAreWhatTheVerdictIsComputedFrom() {
+        // 终态核对读的是当初落库的声明快照（夹具行可能已经回收），所以这里直接用声明清单算。
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+
+        FixtureScenarioVerdict fromDeclarations =
+                FixtureScenarioVerdict.evaluate(script.declarations(), Set.of(0));
+        FixtureScenarioVerdict fromScript = FixtureScenarioVerdict.evaluate(script, Set.of(0));
+
+        assertThat(fromDeclarations).isEqualTo(fromScript);
+        assertThat(fromDeclarations.consumed()).isEqualTo(List.of(script.declarationAt(0).describe()));
+    }
+
+    /** 放行策略点了名、但一条成员都没打中：夹具写错了字段名时就是这样，同样算这次验收没跑全。 */
+    @Test
+    void aRuleThatNeverHitAnyMemberIsNamedInsteadOfBeingSilentlyIgnored() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules = List.of(
+                new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"),
+                new FixtureRuleHitStore.RuleFact(1, "fail", "memberSeq=1;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0),
+                List.of(hit(0, FixtureRuleHitStore.APPLIED_HOLD)));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.missing()).as("必答回合都发生了").isEmpty();
+        assertThat(verdict.missingRules()).singleElement()
+                .satisfies(rule -> assertThat(rule)
+                        .contains("第 1 条规则")
+                        .contains("memberSeq=1;nodeId=n1"));
+        assertThat(verdict.describeMissing()).contains("一次都没打中任何成员");
+    }
+
+    /** 两路都对上才算通过：回合都发生了、点名的规则也都打中了成员。 */
+    @Test
+    void bothTheTurnsAndTheRulesMustHaveHappened() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0),
+                List.of(hit(0, FixtureRuleHitStore.APPLIED_HOLD)));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.COMPLETE);
+        assertThat(verdict.missing()).isEmpty();
+        assertThat(verdict.missingRules()).isEmpty();
+        assertThat(verdict.describeMissing()).as("没有缺的东西就不写说明").isNull();
+    }
+
+    /** 脚本与策略两路都没跑全时，说明里两样都要写清。 */
+    @Test
+    void theDetailNamesBothKindsOfGaps() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "fail", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(), List.of());
+
+        assertThat(verdict.describeMissing())
+                .contains("实际没有发生")
+                .contains("一次都没打中任何成员");
+    }
+
+    /**
+     * 点名的规则打中了成员、但动作没有落到它身上：与「一条都没打中」一样算这次验收没跑全。
+     *
+     * <p>一条要求压住成员的规则，遇到当场就出结果的成员时没有可等的东西：命中的那一行已经在库里，
+     * 压住的动作却没发生。只看「有没有命中」的话，一次没经历目标控制流的验收会显示证据完整。</p>
+     */
+    @Test
+    void aRuleWhoseActionNeverAppliedIsNamedToo() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0),
+                List.of(hit(0, FixtureRuleHitStore.NOT_APPLIED)));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.missing()).as("必答回合都发生了").isEmpty();
+        assertThat(verdict.missingRules()).as("规则打中了成员").isEmpty();
+        assertThat(verdict.unappliedRules()).singleElement()
+                .satisfies(rule -> assertThat(rule)
+                        .contains("第 0 条规则")
+                        .contains("not_applied"));
+        assertThat(verdict.describeMissing()).contains("动作没有落到它身上");
+    }
+
+    /** 动作还没落地的规则（结果以后才回来）同样算这次验收没跑全：不能因为「命中了」就放过。 */
+    @Test
+    void aRuleWhoseActionHasNotSettledIsStillAGap() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0), List.of(hit(0, null)));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.unappliedRules()).singleElement()
+                .satisfies(rule -> assertThat(rule).contains("还没落地"));
+    }
+
+    /**
+     * 规则已经绑过一条成员、后来又打中别的成员：点名对象之外的那一次不能让验收显示通过。
+     *
+     * <p>第一条仍然算动作生效；越界单独列出来。只看「点名的那条有没有被压住」会漏掉汇总节点那条
+     * python 被同一条 unique 规则再次打中。</p>
+     */
+    @Test
+    void anOverHitRuleIsNamedEvenWhenTheBoundActionApplied() {
+        FrozenModelScript script = parse("""
+                {"turns":[{"for":{"stage":"answer"},"text":"答案"}]}
+                """);
+        List<FixtureRuleHitStore.RuleFact> rules =
+                List.of(new FixtureRuleHitStore.RuleFact(0, "holdUntilPoint", "memberSeq=0;nodeId=n1"));
+        OffsetDateTime now = OffsetDateTime.now();
+        FixtureRuleHitStore.RuleHit hit = new FixtureRuleHitStore.RuleHit(0, "holdUntilPoint",
+                "memberSeq=0;nodeId=n1", 1L,
+                new AcceptanceReleasePolicy.MemberFacts(3, "n1", 0, 0, 0, 0, "call-a"),
+                now, now, FixtureRuleHitStore.APPLIED_HOLD,
+                FixtureRuleHitStore.OVER_HIT_MARKER + "：已绑定 call-a，再次点名 call-b");
+
+        FixtureScenarioVerdict verdict = FixtureScenarioVerdict.evaluate(
+                script.declarations(), rules, Set.of(0), List.of(hit));
+
+        assertThat(verdict.verdict()).isEqualTo(FixtureScenarioVerdict.SCRIPT_INCOMPLETE);
+        assertThat(verdict.unappliedRules()).as("点名的那一条动作已经生效").isEmpty();
+        assertThat(verdict.overHitRules()).singleElement()
+                .satisfies(rule -> assertThat(rule).contains(FixtureRuleHitStore.OVER_HIT_MARKER));
+        assertThat(verdict.describeMissing()).contains("后来又打中别的成员");
+    }
+
+    /** 一条规则的落库记录：默认已经打中并生效，指定结果时按给的写。 */
+    private static FixtureRuleHitStore.RuleHit hit(int ruleIndex, String outcome) {
+        OffsetDateTime now = OffsetDateTime.now();
+        return new FixtureRuleHitStore.RuleHit(ruleIndex, "holdUntilPoint", "memberSeq=0;nodeId=n1",
+                1L, new AcceptanceReleasePolicy.MemberFacts(3, "n1", 0, 0, 0, 0, "call-a"),
+                now, outcome == null ? null : now, outcome, null);
+    }
+
+    private FrozenModelScript parse(String json) {
+        return FrozenModelScript.parse("fx-1", json, objectMapper);
+    }
+}

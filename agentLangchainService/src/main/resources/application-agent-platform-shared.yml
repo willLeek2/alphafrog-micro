@@ -79,11 +79,44 @@ agent:
         max-capacity-units: ${AF_AGENT_RUN_SCHEDULER_MAX_CAPACITY_UNITS:4}
         advanced-diagnostics-enabled: ${AF_AGENT_RUN_SCHEDULER_ADVANCED_DIAGNOSTICS_ENABLED:false}
     dual-pool:
-      # 只在创建 Run 时读取并冻结；LEGACY / DUAL_POOL_V1 之外的值失败关闭。
+      # 这一组参数可以在运行期改：热配置（Nacos 的 agent-llm，泳道覆盖只影响该泳道）优先，
+      # 其次是这里的值，最后是代码默认。生效值与来源可以从 /agent-langchain/scheduler 的
+      # dualPool.settings 读回；泳道里配错的值会被跳过并记下原因，不会静默换成别的数。
+      #
+      # 版本只在创建 Run 时读一次并写进数据库；已经创建的 Run 永远按它自己的版本跑。
+      # 认不出的值失败关闭（新 Run 会被拒绝），不会悄悄回落到旧版本。
       new-run-scheduler-version: ${AF_AGENT_NEW_RUN_SCHEDULER_VERSION:LEGACY}
+      # 下面几个只能在启动时生效（改了要重启），读数里会标明。
       business-admission-limit: ${AF_AGENT_DUAL_POOL_BUSINESS_ADMISSION_LIMIT:100}
-      # 每个 Run 同时存在的未完成工作项上限；创建工作项前按数据库实时计数。
+      # 每个 Run 同时存在的未完成工作项上限；创建工作项前按数据库实时计数。改完只影响之后新建的工作项。
       per-run-unfinished-limit: ${AF_AGENT_DUAL_POOL_PER_RUN_UNFINISHED_LIMIT:256}
+      # 一个协调回合最多新增几个节点；改完只影响之后新建的节点。
+      per-turn-new-node-limit: ${AF_AGENT_DUAL_POOL_PER_TURN_NEW_NODE_LIMIT:8}
+      # 全局未完成工作项的高低水位：到高水位暂停新增，降到低水位才恢复。低水位不会高于高水位。
+      global-unfinished-high-watermark: ${AF_AGENT_DUAL_POOL_GLOBAL_UNFINISHED_HIGH_WATERMARK:128}
+      global-unfinished-low-watermark: ${AF_AGENT_DUAL_POOL_GLOBAL_UNFINISHED_LOW_WATERMARK:96}
+      coordination-defer-retry-ms: ${AF_AGENT_DUAL_POOL_COORDINATION_DEFER_RETRY_MS:1000}
+      hint-queue-full-retry-ms: ${AF_AGENT_DUAL_POOL_HINT_QUEUE_FULL_RETRY_MS:5000}
+      wait-group:
+        # 一个等待组最多几个成员；改完只影响之后新建的等待组。
+        max-members: ${AF_AGENT_DUAL_POOL_WAIT_GROUP_MAX_MEMBERS:16}
+        max-member-result-chars: ${AF_AGENT_DUAL_POOL_WAIT_GROUP_MAX_MEMBER_RESULT_CHARS:1048576}
+        member-poll-delay-ms: ${AF_AGENT_DUAL_POOL_WAIT_GROUP_MEMBER_POLL_DELAY_MS:2000}
+      recovery:
+        # 恢复分发一轮最多处理几条通知、每轮至少给数据库补扫留多少名额、内存提醒最多压几条、
+        # 启动时最多翻几页、退避的初值与上限。按回合读取，改完下一轮生效。
+        batch-size: ${AF_AGENT_DUAL_POOL_RECOVERY_BATCH_SIZE:8}
+        scan-quota: ${AF_AGENT_DUAL_POOL_RECOVERY_SCAN_QUOTA:4}
+        wakeup-capacity: ${AF_AGENT_DUAL_POOL_RECOVERY_WAKEUP_CAPACITY:1024}
+        startup-pages: ${AF_AGENT_DUAL_POOL_RECOVERY_STARTUP_PAGES:8}
+        backoff-base-ms: ${AF_AGENT_DUAL_POOL_RECOVERY_BACKOFF_BASE_MS:500}
+        backoff-max-ms: ${AF_AGENT_DUAL_POOL_RECOVERY_BACKOFF_MAX_MS:5000}
+        # 周期补扫的间隔由定时任务在启动时读取，改了要重启。
+        scan-interval-ms: ${AF_AGENT_DUAL_POOL_RECOVERY_SCAN_INTERVAL_MS:1000}
+      # Run 服务租约：只能在启动时生效。
+      service-lease-ttl-seconds: ${AF_AGENT_DUAL_POOL_SERVICE_LEASE_TTL_SECONDS:120}
+      service-lease-renew-interval-ms: ${AF_AGENT_DUAL_POOL_SERVICE_LEASE_RENEW_INTERVAL_MS:40000}
+      service-lease-owned-limit: ${AF_AGENT_DUAL_POOL_SERVICE_LEASE_OWNED_LIMIT:512}
       # 两个物理池都使用直接移交，不在 ThreadPoolTaskExecutor 内形成第二层队列。
       # hint 队列只是延迟优化；数据库扫描负责在提示丢失后重新发现工作。
       hint-drain-interval-ms: ${AF_AGENT_DUAL_POOL_HINT_DRAIN_INTERVAL_MS:50}
@@ -107,6 +140,15 @@ agent:
       scan:
         interval-ms: ${AF_AGENT_DUAL_POOL_SCAN_INTERVAL_MS:1000}
         batch-size: ${AF_AGENT_DUAL_POOL_SCAN_BATCH_SIZE:100}
+    wait-member:
+      receiver:
+        # 等待成员的结果接收：一轮取几条、退避初值与上限、最多翻几步（这三个按回合读取，改完下一轮生效），
+        # 以及轮询间隔（只能在启动时生效）。生效值与来源同样在 dualPool.settings 里读回。
+        batch-size: ${AF_AGENT_WAIT_MEMBER_RECEIVER_BATCH_SIZE:8}
+        backoff-base-ms: ${AF_AGENT_WAIT_MEMBER_RECEIVER_BACKOFF_BASE_MS:1000}
+        backoff-max-ms: ${AF_AGENT_WAIT_MEMBER_RECEIVER_BACKOFF_MAX_MS:15000}
+        max-backoff-step: ${AF_AGENT_WAIT_MEMBER_RECEIVER_MAX_BACKOFF_STEP:6}
+        poll-interval-ms: ${AF_AGENT_WAIT_MEMBER_RECEIVER_POLL_INTERVAL_MS:1000}
   tool-cache:
     version: ${AF_AGENT_TOOL_CACHE_VERSION:v1}
     search-ttl-seconds: ${AF_AGENT_TOOL_CACHE_SEARCH_TTL_SECONDS:3600}

@@ -26,6 +26,19 @@ public class AgentRun {
      * 库里是原始字符串，读出来必须显式经过 {@code SchedulerVersion.fromWire}，未知取值失败关闭。
      */
     private String schedulerVersion;
+    /**
+     * 创建请求携带的幂等键；只在用户范围内唯一，不携带时为 null。
+     *
+     * <p>同一个用户拿同一个键重复提交时读回原来那条 Run，不会再建第二条。历史 Run 只把键写在
+     * {@code ext.idempotency_key} 里，这一列不做事后回填。</p>
+     */
+    private String idempotencyKey;
+    /**
+     * 创建请求内容的摘要；与幂等键成对出现。
+     *
+     * <p>同一个键配同一个摘要读回原 Run，配不同摘要直接拒绝，两种情况都不会新建第二条 Run。</p>
+     */
+    private String requestDigest;
     /** 当前已经分配到的计划代际；尚未创建双池计划时为 -1。 */
     private Integer planGeneration;
     /** 暂停、恢复、取消等控制动作的持久版本；节点提交必须与当前值一致。 */

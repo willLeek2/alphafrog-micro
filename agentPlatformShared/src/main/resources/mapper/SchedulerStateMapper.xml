@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.SchedulerStateMapper">
+
+    <!--
+      调度器全局状态：全局新增暂停状态与跨图轮转轮次。两张表都是「作用域做主键、一行一条事实」。
+
+      容量判定必须在一个事务里「先锁行、再判定、再写」：只读一次、在 Java 里算完再无条件覆盖，
+      两个线程会各自拿旧标记去判定，后写的那个可以把前一个刚做出的暂停或恢复撤销掉。
+      锁行之后读到的才是权威值，「这次有没有改变标记」也才算得准。
+    -->
+
+    <resultMap id="SchedulerCapacityStateResultMap"
+               type="world.willfrog.agent.platform.capacity.SchedulerCapacityState">
+        <id property="scopeKey" column="scope_key"/>
+        <result property="unfinishedCount" column="unfinished_count"/>
+        <result property="addPaused" column="add_paused"/>
+        <result property="pausedSince" column="paused_since"/>
+        <result property="highWatermark" column="high_watermark"/>
+        <result property="lowWatermark" column="low_watermark"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <!--
+      取值之前先锁住这一行，供「读—判定—写」三步在同一事务里完成。
+      在 READ COMMITTED 下，被并发更新过的行会在拿到锁之后返回最新已提交版本。
+    -->
+    <select id="lockCapacityState" resultMap="SchedulerCapacityStateResultMap">
+        SELECT scope_key,
+               unfinished_count,
+               add_paused,
+               paused_since,
+               high_watermark,
+               low_watermark,
+               updated_at
+        FROM alphafrog_agent_scheduler_capacity_state
+        WHERE scope_key = #{scopeKey}
+        FOR UPDATE
+    </select>
+
+    <select id="loadCapacityState" resultMap="SchedulerCapacityStateResultMap">
+        SELECT scope_key,
+               unfinished_count,
+               add_paused,
+               paused_since,
+               high_watermark,
+               low_watermark,
+               updated_at
+        FROM alphafrog_agent_scheduler_capacity_state
+        WHERE scope_key = #{scopeKey}
+    </select>
+
+    <!--
+      写入一次判定结果：数量、暂停标记、暂停起始时间一起落库。暂停起始时间只在「从没暂停变成暂停」
+      那一刻写入，一直暂停期间保持不变；恢复时清空。
+
+      只允许在锁行之后调用：这里的写入不带「旧标记」条件，条件由持有行锁的那段事务保证。
+    -->
+    <select id="applyCapacityDecision" resultMap="SchedulerCapacityStateResultMap"
+            affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_scheduler_capacity_state SET
+            unfinished_count = #{unfinishedCount},
+            add_paused = #{paused}::boolean,
+            paused_since = CASE
+                WHEN #{paused}::boolean THEN COALESCE(paused_since, CURRENT_TIMESTAMP)
+                ELSE NULL
+            END,
+            high_watermark = #{highWatermark},
+            low_watermark = #{lowWatermark},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE scope_key = #{scopeKey}
+        RETURNING scope_key,
+                  unfinished_count,
+                  add_paused,
+                  paused_since,
+                  high_watermark,
+                  low_watermark,
+                  updated_at
+    </select>
+
+    <select id="advanceRound" resultType="java.lang.Long" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_scheduler_round SET
+            round_number = round_number + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE scope_key = #{scopeKey}
+        RETURNING round_number
+    </select>
+
+    <!--
+      读当前轮次号：没有这一行就返回空，由调用方失败关闭。
+      它与 advanceRound 必须同一种语义：缺种子行说明迁移没跑完，把 0 当成「第一轮」只会把
+      不完整的库伪装成正常状态。
+    -->
+    <select id="currentRound" resultType="java.lang.Long">
+        SELECT round_number
+        FROM alphafrog_agent_scheduler_round
+        WHERE scope_key = #{scopeKey}
+    </select>
+
+</mapper>

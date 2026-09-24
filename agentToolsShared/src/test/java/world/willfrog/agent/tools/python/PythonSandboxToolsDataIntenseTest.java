@@ -9,6 +9,8 @@ import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.finance.*;
+import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
@@ -28,6 +30,14 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class PythonSandboxToolsDataIntenseTest {
+
+    /**
+     * 成员行上的外部作业身份。
+     *
+     * <p>它的形态就是「runId + 持久调用身份 + 轮次」，与工具层按成员上下文拼出来的值一致；
+     * 不一致时工具层什么都不做（有一条用例专门证明这件事）。</p>
+     */
+    private static final String EXPECTED_MEMBER_OPERATION = "run-test:call-1--wi-0000:1";
 
     @TempDir Path tempDir;
 
@@ -1627,6 +1637,112 @@ class PythonSandboxToolsDataIntenseTest {
                 batch, List.of(record), "rows=5", List.of(), true);
     }
 
+    // ==================== 等待成员：用预计算身份建任务，不写 Run 级进度记录 ====================
+
+    @Test
+    void aWaitGroupMemberCreatesOneTaskUnderThePersistedIdentityAndSkipsTheRunAnchor() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-wg")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getOperationId()).isEqualTo(EXPECTED_MEMBER_OPERATION);
+        assertThat(pending.getTaskId()).isEqualTo("task-wg");
+        ArgumentCaptor<ExecuteRequest> request = ArgumentCaptor.forClass(ExecuteRequest.class);
+        verify(sandbox).createTask(request.capture());
+        assertThat(request.getValue().getOperationId())
+                .as("沙箱任务用的是整组落库时写进成员行的身份")
+                .isEqualTo(EXPECTED_MEMBER_OPERATION);
+        assertThat(request.getValue().getRequestFingerprint()).startsWith("sha256:");
+        assertThat(request.getValue().getEstimatedRows()).isEqualTo(2L);
+        assertThat(pending.getProof().operationId()).isEqualTo(EXPECTED_MEMBER_OPERATION);
+        assertThat(pending.getProof().taskConfirmed()).isTrue();
+        assertThat(pending.getProof().reservationJson()).contains("TASK_ATTACHED");
+        assertThat(pending.getProof().estimateJson()).contains("\"estimatedRows\":2");
+        // 新路径没有 Run 级长工具进度记录：成员行才是这些事实的落点。
+        verify(dispatchStore, never()).persistPreparing(any(), any());
+        verify(dispatchStore, never()).persistAttached(any(), any());
+        verify(dispatchStore, never()).transferToPending(any(), any());
+        verify(dispatchStore, never()).isInvocationBlocked(any());
+    }
+
+    @Test
+    void aWaitGroupMemberWhoseIdentityDoesNotMatchThePersistedOneCreatesNothing() throws Exception {
+        fixtureDataset();
+
+        // 成员行上写着另一个身份：拼出来的值与它对不上，这次调用什么都不做。
+        String output = invokeAsWaitGroupMember("print(1)", "1", "run-test:someone-else:1");
+
+        assertThat(output).contains("\"ok\":false").contains("WAIT_GROUP_OPERATION_IDENTITY_MISMATCH");
+        verify(sandbox, never()).createTask(any());
+        verify(capacity, never()).reserve(any(), any());
+        verify(dispatchStore, never()).persistPreparing(any(), any());
+    }
+
+    @Test
+    void aWaitGroupMemberWhoseCreateOutcomeIsUnknownKeepsTheReservationAndTheAbsentTaskId() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("网关超时"));
+        // 回查也失败：既拿到不确认，也拿不到「没建出来」的证明。
+        when(sandbox.getTaskByOperationId(any())).thenThrow(new IllegalStateException("网关还是不通"));
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).as("任务编号还没证实就不写一个出来").isNull();
+        assertThat(pending.getProof().taskConfirmed()).isFalse();
+        assertThat(pending.getProof().reservationJson())
+                .as("名额还留着，不能猜着释放").contains("PREPARING");
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void anAuthoritativeAbsentCreateReleasesTheReservationAndReturnsFailureText() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("网关拒绝"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+
+        String output = invokeAsWaitGroupMember("print(1)", "1");
+
+        assertThat(output).contains("\"ok\":false").contains("CREATE_TASK_FAILED");
+        verify(capacity).releaseReservation(any());
+        verify(dispatchStore, never()).persistPreparing(any(), any());
+    }
+
+    /** 在成员上下文里调用工具：与派发器在真实链路里装上下文的方式一致。 */
+    private String invokeAsWaitGroupMember(String code, String datasetIds) {
+        return invokeAsWaitGroupMember(code, datasetIds, EXPECTED_MEMBER_OPERATION);
+    }
+
+    private String invokeAsWaitGroupMember(String code, String datasetIds, String expectedOperationId) {
+        WaitGroupMemberExecutionContext.Snapshot member = new WaitGroupMemberExecutionContext.Snapshot(
+                "run-test", 77L, "member-1", 0, "call-1--wi-0000", expectedOperationId, "segment");
+        try (WaitGroupMemberExecutionContext.Scope ignored =
+                     WaitGroupMemberExecutionContext.install(member)) {
+            return tools.executePython(code, datasetIds, null, null, 30);
+        }
+    }
+
+    private DataAnalysisReservation preparingReservation(String operationId) {
+        // 预计算身份的形态就是 runId:持久调用身份:轮次，这里按同样形态造一条。
+        String[] parts = operationId.split(":");
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
+                parts[0], parts[1], Integer.parseInt(parts[2]));
+        return new DataAnalysisReservation(identity.reservationId(), identity,
+                DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.PREPARING, null, Instant.now());
+    }
+
     private void fixtureDataset() throws Exception {
         Path csv = tempDir.resolve("prices.csv");
         Files.writeString(csv, "ts_code,close\n600000.SH,10\n600001.SH,11\n");
@@ -1643,10 +1759,7 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     private DataAnalysisReservation preparingReservation() {
-        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity("run-test", "call-1", 1);
-        return new DataAnalysisReservation(identity.reservationId(), identity,
-                DataAnalysisResourceClass.STANDARD, 1,
-                DataAnalysisReservationState.PREPARING, null, Instant.now());
+        return preparingReservation("run-test:call-1:1");
     }
 
     private SandboxResourceUsage completeUsage() {

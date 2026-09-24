@@ -608,6 +608,7 @@ public class AgentLlmProperties {
         private RunBudget runBudget = new RunBudget();
         private FinalAnswerStage finalAnswer = new FinalAnswerStage();
         private Request request = new Request();
+        private Scheduler scheduler = new Scheduler();
 
         public Resume getResume() {
             return resume;
@@ -695,6 +696,186 @@ public class AgentLlmProperties {
 
         public void setRequest(Request request) {
             this.request = request == null ? new Request() : request;
+        }
+
+        public Scheduler getScheduler() {
+            return scheduler;
+        }
+
+        public void setScheduler(Scheduler scheduler) {
+            this.scheduler = scheduler == null ? new Scheduler() : scheduler;
+        }
+    }
+
+    /**
+     * 双池调度里那些「不重启也能改」的参数。
+     *
+     * <p>这一组走热配置（Nacos 的 {@code agent-llm}，泳道覆盖只影响该泳道），字段全部可空：
+     * 没写的按「环境属性 → 代码默认」回落。读它们的组件每用一次取一次，所以改完下一轮就生效。</p>
+     *
+     * <p>池大小、许可上限、线程名前缀这类只能在启动时生效的参数不在这里——它们由环境属性决定，
+     * 改完要重启，运行时的读数会标明这一点。</p>
+     */
+    public static class Scheduler {
+        @JsonAlias({"newRunSchedulerVersion", "new-run-scheduler-version", "new_run_scheduler_version"})
+        private String newRunSchedulerVersion;
+        @JsonAlias({"per-turn-new-node-limit", "per_turn_new_node_limit"})
+        private Integer perTurnNewNodeLimit;
+        @JsonAlias({"per-run-unfinished-limit", "per_run_unfinished_limit"})
+        private Integer perRunUnfinishedLimit;
+        @JsonAlias({"global-unfinished-high-watermark", "global_unfinished_high_watermark"})
+        private Integer globalUnfinishedHighWatermark;
+        @JsonAlias({"global-unfinished-low-watermark", "global_unfinished_low_watermark"})
+        private Integer globalUnfinishedLowWatermark;
+        @JsonAlias({"wait-group-max-members", "wait_group_max_members"})
+        private Integer waitGroupMaxMembers;
+        @JsonAlias({"recovery-batch-size", "recovery_batch_size"})
+        private Integer recoveryBatchSize;
+        @JsonAlias({"recovery-scan-quota", "recovery_scan_quota"})
+        private Integer recoveryScanQuota;
+        @JsonAlias({"recovery-wakeup-capacity", "recovery_wakeup_capacity"})
+        private Integer recoveryWakeupCapacity;
+        @JsonAlias({"recovery-startup-pages", "recovery_startup_pages"})
+        private Integer recoveryStartupPages;
+        @JsonAlias({"recovery-backoff-base-ms", "recovery_backoff_base_ms"})
+        private Long recoveryBackoffBaseMs;
+        @JsonAlias({"recovery-backoff-max-ms", "recovery_backoff_max_ms"})
+        private Long recoveryBackoffMaxMs;
+        @JsonAlias({"member-receiver-batch-size", "member_receiver_batch_size"})
+        private Integer memberReceiverBatchSize;
+        @JsonAlias({"member-receiver-backoff-base-ms", "member_receiver_backoff_base_ms"})
+        private Long memberReceiverBackoffBaseMs;
+        @JsonAlias({"member-receiver-backoff-max-ms", "member_receiver_backoff_max_ms"})
+        private Long memberReceiverBackoffMaxMs;
+        @JsonAlias({"member-receiver-max-backoff-step", "member_receiver_max_backoff_step"})
+        private Integer memberReceiverMaxBackoffStep;
+
+        public String getNewRunSchedulerVersion() {
+            return newRunSchedulerVersion;
+        }
+
+        public void setNewRunSchedulerVersion(String newRunSchedulerVersion) {
+            this.newRunSchedulerVersion = newRunSchedulerVersion;
+        }
+
+        public Integer getPerTurnNewNodeLimit() {
+            return perTurnNewNodeLimit;
+        }
+
+        public void setPerTurnNewNodeLimit(Integer perTurnNewNodeLimit) {
+            this.perTurnNewNodeLimit = perTurnNewNodeLimit;
+        }
+
+        public Integer getPerRunUnfinishedLimit() {
+            return perRunUnfinishedLimit;
+        }
+
+        public void setPerRunUnfinishedLimit(Integer perRunUnfinishedLimit) {
+            this.perRunUnfinishedLimit = perRunUnfinishedLimit;
+        }
+
+        public Integer getGlobalUnfinishedHighWatermark() {
+            return globalUnfinishedHighWatermark;
+        }
+
+        public void setGlobalUnfinishedHighWatermark(Integer globalUnfinishedHighWatermark) {
+            this.globalUnfinishedHighWatermark = globalUnfinishedHighWatermark;
+        }
+
+        public Integer getGlobalUnfinishedLowWatermark() {
+            return globalUnfinishedLowWatermark;
+        }
+
+        public void setGlobalUnfinishedLowWatermark(Integer globalUnfinishedLowWatermark) {
+            this.globalUnfinishedLowWatermark = globalUnfinishedLowWatermark;
+        }
+
+        public Integer getWaitGroupMaxMembers() {
+            return waitGroupMaxMembers;
+        }
+
+        public void setWaitGroupMaxMembers(Integer waitGroupMaxMembers) {
+            this.waitGroupMaxMembers = waitGroupMaxMembers;
+        }
+
+        public Integer getRecoveryBatchSize() {
+            return recoveryBatchSize;
+        }
+
+        public void setRecoveryBatchSize(Integer recoveryBatchSize) {
+            this.recoveryBatchSize = recoveryBatchSize;
+        }
+
+        public Integer getRecoveryScanQuota() {
+            return recoveryScanQuota;
+        }
+
+        public void setRecoveryScanQuota(Integer recoveryScanQuota) {
+            this.recoveryScanQuota = recoveryScanQuota;
+        }
+
+        public Integer getRecoveryWakeupCapacity() {
+            return recoveryWakeupCapacity;
+        }
+
+        public void setRecoveryWakeupCapacity(Integer recoveryWakeupCapacity) {
+            this.recoveryWakeupCapacity = recoveryWakeupCapacity;
+        }
+
+        public Integer getRecoveryStartupPages() {
+            return recoveryStartupPages;
+        }
+
+        public void setRecoveryStartupPages(Integer recoveryStartupPages) {
+            this.recoveryStartupPages = recoveryStartupPages;
+        }
+
+        public Long getRecoveryBackoffBaseMs() {
+            return recoveryBackoffBaseMs;
+        }
+
+        public void setRecoveryBackoffBaseMs(Long recoveryBackoffBaseMs) {
+            this.recoveryBackoffBaseMs = recoveryBackoffBaseMs;
+        }
+
+        public Long getRecoveryBackoffMaxMs() {
+            return recoveryBackoffMaxMs;
+        }
+
+        public void setRecoveryBackoffMaxMs(Long recoveryBackoffMaxMs) {
+            this.recoveryBackoffMaxMs = recoveryBackoffMaxMs;
+        }
+
+        public Integer getMemberReceiverBatchSize() {
+            return memberReceiverBatchSize;
+        }
+
+        public void setMemberReceiverBatchSize(Integer memberReceiverBatchSize) {
+            this.memberReceiverBatchSize = memberReceiverBatchSize;
+        }
+
+        public Long getMemberReceiverBackoffBaseMs() {
+            return memberReceiverBackoffBaseMs;
+        }
+
+        public void setMemberReceiverBackoffBaseMs(Long memberReceiverBackoffBaseMs) {
+            this.memberReceiverBackoffBaseMs = memberReceiverBackoffBaseMs;
+        }
+
+        public Long getMemberReceiverBackoffMaxMs() {
+            return memberReceiverBackoffMaxMs;
+        }
+
+        public void setMemberReceiverBackoffMaxMs(Long memberReceiverBackoffMaxMs) {
+            this.memberReceiverBackoffMaxMs = memberReceiverBackoffMaxMs;
+        }
+
+        public Integer getMemberReceiverMaxBackoffStep() {
+            return memberReceiverMaxBackoffStep;
+        }
+
+        public void setMemberReceiverMaxBackoffStep(Integer memberReceiverMaxBackoffStep) {
+            this.memberReceiverMaxBackoffStep = memberReceiverMaxBackoffStep;
         }
     }
 

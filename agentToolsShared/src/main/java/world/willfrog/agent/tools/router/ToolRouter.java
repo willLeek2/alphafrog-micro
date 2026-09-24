@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
@@ -703,6 +704,12 @@ public class ToolRouter {
             // - 不清理 anchor，清理权属于带 token/version 的恢复消费者；
             // - 不释放 Sandbox reservation，它会在 finalizer 确认终态后准确释放。
             // 任一“方便的统一异常处理”都会破坏上述 durable handoff 顺序。
+            throw pending;
+        } catch (WaitGroupMemberPendingException pending) {
+            // 新调度器版本的等待成员：沙箱任务已经建好，只是这次调用不再等它。
+            // 事实由派发器写进成员行（成员行在派发之前就已经落库），终态结果由接收方按派发证明写入。
+            // 与上面的 pending 一样，这里也不能把信号改写成工具失败 JSON，否则当前分段会继续跑模型，
+            // 而库里已经有了一条「这个成员在执行中」的记录。
             throw pending;
         } catch (Exception e) {
             // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息

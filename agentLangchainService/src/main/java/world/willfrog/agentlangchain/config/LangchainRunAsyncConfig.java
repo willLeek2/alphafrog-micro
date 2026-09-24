@@ -11,6 +11,8 @@ import world.willfrog.agent.platform.capacity.SchedulerCapacityMetrics;
 import world.willfrog.agent.platform.capacity.SchedulerPermitLedger;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -51,34 +53,72 @@ public class LangchainRunAsyncConfig {
      */
     @Bean(name = "agentLangchainRunCoordinationTaskExecutor")
     public ThreadPoolTaskExecutor agentLangchainRunCoordinationTaskExecutor(
+            FrozenEffectiveSettings frozenEffectiveSettings,
             @Value("${agent.langchain.dual-pool.run-worker.core-pool-size:2}") int corePoolSize,
             @Value("${agent.langchain.dual-pool.run-worker.max-pool-size:2}") int maxPoolSize,
             @Value("${agent.langchain.dual-pool.run-worker.keep-alive-seconds:60}") int keepAliveSeconds,
             @Value("${agent.langchain.dual-pool.run-worker.thread-name-prefix:agent-run-coordination-}")
             String threadNamePrefix) {
-        return directHandoffExecutor(corePoolSize, maxPoolSize, keepAliveSeconds, threadNamePrefix);
+        ThreadPoolTaskExecutor executor =
+                directHandoffExecutor(corePoolSize, maxPoolSize, keepAliveSeconds, threadNamePrefix);
+        registerPoolValues(frozenEffectiveSettings, "agentLangchainRunCoordinationTaskExecutor", executor,
+                DualPoolSchedulerSettings.KEY_RUN_WORKER_CORE_POOL_SIZE,
+                DualPoolSchedulerSettings.KEY_RUN_WORKER_MAX_POOL_SIZE,
+                DualPoolSchedulerSettings.KEY_RUN_WORKER_KEEP_ALIVE_SECONDS,
+                DualPoolSchedulerSettings.KEY_RUN_WORKER_THREAD_NAME_PREFIX);
+        return executor;
     }
 
     /**
      * 双池版本的节点执行线程池。它只消费已经在数据库中成功领取的节点工作项，
      * 与 Run 协调线程完全分开，避免慢节点占住协调名额。
+     *
+     * <p>Bean 名保持与注入点（`DualPoolDispatcher` 的限定名）一致的那个拼法：显式指定 Bean 名之后
+     * 方法名不再作为别名保留，两个名字差一个字母，服务启动时就会找不到这个线程池。健康读数里
+     * 登记用的名字与本名一致，不再另起一个拼法。</p>
      */
     @Bean(name = "agentLangchainNodeTaskExecutor")
     public ThreadPoolTaskExecutor agentLangchainNodeTaskExecutor(
+            FrozenEffectiveSettings frozenEffectiveSettings,
             @Value("${agent.langchain.dual-pool.node-worker.core-pool-size:4}") int corePoolSize,
             @Value("${agent.langchain.dual-pool.node-worker.max-pool-size:4}") int maxPoolSize,
             @Value("${agent.langchain.dual-pool.node-worker.keep-alive-seconds:60}") int keepAliveSeconds,
             @Value("${agent.langchain.dual-pool.node-worker.thread-name-prefix:agent-node-}")
             String threadNamePrefix) {
-        return directHandoffExecutor(corePoolSize, maxPoolSize, keepAliveSeconds, threadNamePrefix);
+        ThreadPoolTaskExecutor executor =
+                directHandoffExecutor(corePoolSize, maxPoolSize, keepAliveSeconds, threadNamePrefix);
+        registerPoolValues(frozenEffectiveSettings, "agentLangchainNodeTaskExecutor", executor,
+                DualPoolSchedulerSettings.KEY_NODE_WORKER_CORE_POOL_SIZE,
+                DualPoolSchedulerSettings.KEY_NODE_WORKER_MAX_POOL_SIZE,
+                DualPoolSchedulerSettings.KEY_NODE_WORKER_KEEP_ALIVE_SECONDS,
+                DualPoolSchedulerSettings.KEY_NODE_WORKER_THREAD_NAME_PREFIX);
+        return executor;
+    }
+
+    /**
+     * 把线程池构造完之后真正在用的值登记到读数里。
+     *
+     * <p>取的是线程池自己的字段，不是刚才传进来的那几个数：这里做过归一化（核心数不超过上限、名字
+     * 为空时给默认），登记传进来的原值会让读数与线程池对不上。</p>
+     */
+    private static void registerPoolValues(FrozenEffectiveSettings registry, String component,
+                                           ThreadPoolTaskExecutor executor,
+                                           String coreKey, String maxKey, String keepAliveKey,
+                                           String prefixKey) {
+        registry.register(coreKey, component, executor.getCorePoolSize());
+        registry.register(maxKey, component, executor.getMaxPoolSize());
+        registry.register(keepAliveKey, component, executor.getKeepAliveSeconds());
+        registry.register(prefixKey, component, executor.getThreadNamePrefix());
     }
 
     @Bean
     public SchedulerBackpressureProbe schedulerBackpressureProbe(
             NodeWorkItemStore store,
             DualPoolDispatcher dispatcher,
-            @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit) {
-        return new SchedulerBackpressureProbe(store, dispatcher, perRunUnfinishedLimit);
+            DualPoolSchedulerSettings settings) {
+        // 上限按需取：这个值允许在运行期改，读数与协调回合看到的必须是同一个数。
+        return new SchedulerBackpressureProbe(store, dispatcher,
+                () -> settings.perRunUnfinishedLimit().intValue());
     }
 
     @Bean

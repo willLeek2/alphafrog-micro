@@ -11,6 +11,7 @@ import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.LocalCacheScope;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.workitem.NodeDispatchDeferReason;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
@@ -53,7 +54,8 @@ class NodeWorkItemMapperBindingTest {
     private static final List<String> TRANSITION_STATEMENTS = List.of(
             "claim", "handOverClaim", "startExecution", "commitSegmentResult",
             "suspendForToolJob", "promoteToolJobResumable", "commitResumedToolJobResult",
-            "requeueInterruptedToolJob", "reportExecutionFailure", "renewLease", "cancel", "markStale");
+            "requeueInterruptedToolJob", "requeueAbandonedClaim", "reportExecutionFailure",
+            "renewLease", "cancel", "markStale");
 
     private Configuration configuration;
     private String xml;
@@ -136,6 +138,16 @@ class NodeWorkItemMapperBindingTest {
                 "在 " + upgradesDirs + " 下找不到 *_agent_run_work_item.sql：建表迁移必须跟着代码一起在仓库里");
     }
 
+    /**
+     * 读出「最后一份定义了某个约束的迁移脚本」。
+     *
+     * <p>约束会被后续迁移重写（宽化取值、补列），只比对第一份脚本会漏掉漂移；具体排序与查找规则
+     * 在 {@link MigrationScripts} 里，迁移相关测试共用一份。</p>
+     */
+    private static String readLastMigrationContaining(String marker) {
+        return MigrationScripts.lastContaining(marker);
+    }
+
     @Test
     void interfaceAndXmlStatementsMatch() {
         List<String> missing = new ArrayList<>();
@@ -168,7 +180,7 @@ class NodeWorkItemMapperBindingTest {
 
     @Test
     void migrationStateCheckCoversExactlyAllWireValues() {
-        String migration = readMigration();
+        String migration = readLastMigrationContaining("alphafrog_agent_run_work_item_state_check");
         String check = slice(migration, "alphafrog_agent_run_work_item_state_check",
                 "scheduler_version_check");
         assertThat(quotedValues(check))
@@ -177,17 +189,40 @@ class NodeWorkItemMapperBindingTest {
     }
 
     @Test
+    void migrationRunnableSinceColumnIsAddedAndBackfilled() {
+        String migration = readLastMigrationContaining("runnable_since");
+        assertThat(migration).as("加列要幂等").contains("ADD COLUMN IF NOT EXISTS runnable_since");
+        assertThat(migration).as("存量行要回填，退避中的行取当前时间，别回填出将来的起点")
+                .contains("SET runnable_since = LEAST(next_visible_at, CURRENT_TIMESTAMP)");
+        assertThat(migration).as("存量值是近似值，注释里要说清楚，免得拿它当精确排队起点")
+                .contains("近似值");
+        assertThat(migration).as("加完要收紧成非空").contains("ALTER COLUMN runnable_since SET NOT NULL");
+    }
+
+    @Test
+    void migrationDispatchDeferReasonColumnMatchesEnum() {
+        String migration = readLastMigrationContaining("dispatch_defer_reason");
+        assertThat(migration).as("加列要幂等")
+                .contains("ADD COLUMN IF NOT EXISTS dispatch_defer_reason");
+        assertThat(MigrationScripts.constraintValues(migration,
+                "alphafrog_agent_run_work_item_dispatch_defer_reason_check"))
+                .as("节点派发延期原因应与 NodeDispatchDeferReason 逐项一致")
+                .containsExactlyElementsOf(NodeDispatchDeferReason.allWireValues());
+    }
+
+    @Test
     void migrationSchedulerVersionCheckMatchesEnum() {
-        String migration = readMigration();
         List<String> expected = List.of(SchedulerVersion.values()).stream().map(Enum::name).toList();
-        String workItemCheck = slice(migration, "alphafrog_agent_run_work_item_scheduler_version_check",
-                "alphafrog_agent_run_work_item_counter_check");
-        assertThat(quotedValues(workItemCheck))
-                .as("工作项表的调度器版本约束应与枚举取值一致")
+        String workItemScript =
+                readLastMigrationContaining("alphafrog_agent_run_work_item_scheduler_version_check");
+        assertThat(MigrationScripts.constraintValues(workItemScript,
+                "alphafrog_agent_run_work_item_scheduler_version_check"))
+                .as("工作项表的调度器版本约束应与枚举取值一致（含后续迁移的宽化）")
                 .containsExactlyElementsOf(expected);
-        String runCheck = slice(migration, "alphafrog_agent_run_scheduler_version_check", "CREATE TABLE");
-        assertThat(quotedValues(runCheck))
-                .as("Run 表的调度器版本约束应与枚举取值一致")
+        String runScript = readLastMigrationContaining("alphafrog_agent_run_scheduler_version_check");
+        assertThat(MigrationScripts.constraintValues(runScript,
+                "alphafrog_agent_run_scheduler_version_check"))
+                .as("Run 表的调度器版本约束应与枚举取值一致（含后续迁移的宽化）")
                 .containsExactlyElementsOf(expected);
     }
 
@@ -211,8 +246,36 @@ class NodeWorkItemMapperBindingTest {
         assertThat(mappedColumns).as("结果映射应覆盖这些列").contains(
                 "run_id", "plan_generation", "node_id", "node_attempt", "segment_sequence",
                 "state", "context_version", "run_control_version", "claim_epoch", "scheduler_version",
-                "claimed_by", "lease_expires_at", "next_visible_at", "payload_json");
+                "claimed_by", "lease_expires_at", "next_visible_at", "runnable_since",
+                "dispatch_defer_reason", "payload_json");
         assertThat(xml).as("id 列也要映射").contains("<id property=\"id\" column=\"id\"/>");
+    }
+
+    // ===== 派发成功与失败的留痕 =====
+
+    @Test
+    void dispatchDeferAndSuccessWriteTheSameColumnInOppositeDirections() {
+        String defer = sql("deferDispatch");
+        assertThat(defer).as("派发失败写下原因并推后可见时间")
+                .contains("dispatch_defer_reason = ?")
+                .contains("next_visible_at = ?");
+        assertThat(defer).as("只有可派发的两种状态会被这条路碰到")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
+        assertThat(defer).as("这条不做状态迁移，别把状态一起改了").doesNotContain("state = '");
+        String dispatched = sql("markDispatched");
+        assertThat(dispatched).as("派发成功清掉上一次的原因")
+                .contains("dispatch_defer_reason = NULL");
+        assertThat(dispatched).as("两个方向的条件要对称，否则成功清不掉失败写下的值")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
+        assertThat(dispatched).as("清原因不改可见时间").doesNotContain("next_visible_at =");
+    }
+
+    @Test
+    void claimingAnItemClearsTheStaleDispatchFailure() {
+        for (String id : List.of("claim", "handOverClaim")) {
+            assertThat(sql(id)).as(id + " 成功之后这条工作项已经有人接手，上一次派发失败的原因不再成立")
+                    .contains("dispatch_defer_reason = NULL");
+        }
     }
 
     // ===== 领取与转交的 SQL 形状 =====
@@ -232,8 +295,10 @@ class NodeWorkItemMapperBindingTest {
         }
         String claimSql = normalized(configuration.getMappedStatement(NAMESPACE + ".claim")
                 .getSqlSource().getBoundSql(dummyParams("claim")).getSql());
-        assertThat(claimSql).as("领取只从首次可运行或长工具可恢复状态领")
-                .contains("state IN ('RUNNABLE', 'RESUMABLE')");
+        String claimable = String.join(", ",
+                NodeWorkItemState.claimableWireValues().stream().map(v -> "'" + v + "'").toList());
+        assertThat(claimSql).as("领取只从首次可运行与结果齐备可恢复两个状态领")
+                .contains("state IN (" + claimable + ")");
         assertThat(claimSql).as("领取要等到下次可领取时间").contains("next_visible_at <= CURRENT_TIMESTAMP");
         assertThat(claimSql).as("领取要按调度器版本过滤").contains("scheduler_version = ?");
         String handOverSql = normalized(configuration.getMappedStatement(NAMESPACE + ".handOverClaim")
@@ -259,9 +324,39 @@ class NodeWorkItemMapperBindingTest {
         assertThat(problems).as("每条状态迁移都要带齐五个身份字段").isEmpty();
     }
 
+    /**
+     * 启动恢复把死在领取态的分段放回可领取：只动领取态的行，放回时代际加一、清掉领取者与租约。
+     *
+     * <p>代际加一是这道语句的全部价值：旧执行者万一还活着，提交结果时会因为代际对不上被拒。</p>
+     */
+    @Test
+    void abandonedClaimRequeueOnlyTouchesClaimedStatesAndMovesEpochForward() {
+        String requeue = sql("requeueAbandonedClaim");
+        assertThat(requeue)
+                .as("只有已领取或执行中的行会被放回")
+                .contains("state IN ('CLAIMED', 'EXECUTING')")
+                .as("放回成可运行")
+                .contains("state = 'RUNNABLE'")
+                .as("代际加一，旧领取者的提交会被拒")
+                .contains("claim_epoch = claim_epoch + 1")
+                .as("领取者与领取租约都要清掉")
+                .contains("claimed_by = NULL")
+                .contains("lease_expires_at = NULL")
+                .as("放回之后立刻可领取")
+                .contains("next_visible_at = CURRENT_TIMESTAMP")
+                .as("期望代际、上下文版本、控制版本三样都要对上")
+                .contains("claim_epoch = ?")
+                .contains("context_version = ?")
+                .contains("run_control_version = ?");
+        Set<String> used = boundParamNames(configuration.getMappedStatement(NAMESPACE + ".requeueAbandonedClaim"),
+                dummyParams("requeueAbandonedClaim"));
+        assertThat(used).as("放回带期望代际做条件").contains("claimEpoch");
+    }
+
     @Test
     void submitAndFailureAndRenewCarryClaimEpoch() {
-        for (String id : List.of("commitSegmentResult", "reportExecutionFailure", "renewLease")) {
+        for (String id : List.of("commitSegmentResult", "reportExecutionFailure", "renewLease",
+                "requeueAbandonedClaim")) {
             Set<String> used = boundParamNames(configuration.getMappedStatement(NAMESPACE + "." + id),
                     dummyParams(id));
             assertThat(used).as(id + " 必须带领取代际做条件").contains("claimEpoch");
@@ -332,6 +427,75 @@ class NodeWorkItemMapperBindingTest {
             assertThat(sql).as(id + " 未完成的范围就是「不在终态里」")
                     .contains("state NOT IN (" + terminal + ")");
         }
+    }
+
+    /**
+     * 连了 Run 主表的那条查询，列名要逐列带上本表的别名。
+     *
+     * <p>Run 主表上也有 plan_generation、run_control_version、scheduler_version、id、created_at
+     * 这些同名列，不带别名在 PostgreSQL 上会直接报「列名有歧义」：这条语句一条也跑不出来。
+     * 这种错在只跑单测的机器上一直是绿的（那些用例不连库），要到真库上才炸，所以按渲染出来的
+     * SQL 逐列核一遍。</p>
+     */
+    @Test
+    void columnsAreAliasedWhenTheQueryJoinsTheRunTable() {
+        String sql = normalized(configuration.getMappedStatement(
+                        NAMESPACE + ".listUnfinishedByRunSchedulerVersion")
+                .getSqlSource().getBoundSql(dummyParams("listUnfinishedByRunSchedulerVersion")).getSql());
+        assertThat(sql).as("这条语句连了 Run 主表，才需要这条保护").contains("JOIN alphafrog_agent_run");
+        for (String column : List.of("id", "run_id", "plan_generation", "node_id", "node_attempt",
+                "segment_sequence", "state", "context_version", "run_control_version", "claim_epoch",
+                "scheduler_version", "claimed_by", "lease_expires_at", "next_visible_at",
+                "runnable_since", "dispatch_defer_reason", "payload_json", "created_at", "updated_at")) {
+            assertThat(sql).as("列 " + column + " 要带本表别名 wi.").contains("wi." + column);
+        }
+    }
+
+    /**
+     * 创建工作项这一条是 Run 级写入：两层条件都要在同一句里核。
+     *
+     * <p>只核服务所有权不够。协调回合是「先读一次 Run 事实、再建工作项」，读事实之后、建行之前父 Run
+     * 可能已经往前走了：计划重建（代际变了）、暂停或取消（控制版本抬高）、整条 Run 已经终结。
+     * 这几种情况下建出来的行都属于已经过期的协调回合，语句里必须带上父 Run 的精确版本与可执行状态，
+     * 让它影响 0 行——这件事只有真库才判得出来，所以这里按渲染出来的 SQL 逐项核对。</p>
+     */
+    @Test
+    void createCarriesBothTheOwnershipFenceAndTheParentRunVersions() {
+        String insert = normalized(configuration.getMappedStatement(NAMESPACE + ".insert")
+                .getSqlSource().getBoundSql(dummyParams("insert")).getSql());
+        assertThat(insert).as("所有权那一层：持有人、代际号、未过期")
+                .contains("alphafrog_agent_run_service_lease")
+                .contains("owner_instance_id = ?")
+                .contains("fencing_token = ?")
+                .contains("expires_at > CURRENT_TIMESTAMP");
+        assertThat(insert).as("父 Run 那一层：调度器版本、计划代际、控制版本逐项相等")
+                .contains("FROM alphafrog_agent_run owner_run")
+                .contains("owner_run.scheduler_version = COALESCE(?, 'DUAL_POOL_V1')")
+                .contains("owner_run.plan_generation = ?")
+                .contains("owner_run.run_control_version = ?");
+        assertThat(insert).as("父 Run 还得停在能接着跑的状态上：与 requeueAbandonedClaim 用的是同一份清单")
+                .contains("owner_run.status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING',")
+                .contains("'SUMMARIZING', 'WAITING_TOOL_JOB')");
+    }
+
+    /**
+     * 节点派发的那一次全局扫描：新旧双池版本的到期分段放在一份候选里，一次取回；
+     * 顺序里排第一位的是这张图最近被派发的轮次，从没被派发过的排最前。
+     */
+    @Test
+    void globalDispatchScanIsOneCandidateSetOrderedByDispatchRotation() {
+        String sql = normalized(configuration.getMappedStatement(NAMESPACE + ".scanClaimableAcrossDualPool")
+                .getSqlSource().getBoundSql(dummyParams("scanClaimableAcrossDualPool")).getSql());
+        assertThat(sql).as("双池家族的版本列在同一份候选里，不是每种版本各扫一次")
+                .contains("scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2')")
+                .doesNotContain("scheduler_version = ?");
+        assertThat(sql).as("只取到期可领取的分段")
+                .contains("state IN ('RUNNABLE', 'RESUMABLE')")
+                .contains("next_visible_at <= CURRENT_TIMESTAMP");
+        assertThat(sql).as("轮转位置排第一位：没被派发过的按 0 算，排最前")
+                .contains("ORDER BY COALESCE((SELECT c.dispatch_served_round");
+        assertThat(sql).as("还没有协调资格记录的图按 0 处理，不因此被跳过")
+                .contains("), 0)");
     }
 
     // ===== 参数绑定 =====

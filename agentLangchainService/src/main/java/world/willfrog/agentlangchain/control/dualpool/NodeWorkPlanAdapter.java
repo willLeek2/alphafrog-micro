@@ -30,7 +30,8 @@ public class NodeWorkPlanAdapter {
                                               Set<String> completedNodeIds,
                                               Set<String> existingNodeIds,
                                               long contextVersion,
-                                              long runControlVersion) {
+                                              long runControlVersion,
+                                              String schedulerVersion) {
         List<TodoItem> ordered = items(plan).stream()
                 .sorted(Comparator.comparingInt(TodoItem::getSequence))
                 .toList();
@@ -50,7 +51,7 @@ public class NodeWorkPlanAdapter {
             }
             List<String> dependency = previous == null ? List.of() : List.of(previous);
             return List.of(draft(runId, planGeneration, item, "LINEAR", dependency,
-                    contextVersion, runControlVersion));
+                    contextVersion, runControlVersion, schedulerVersion));
         }
         return List.of();
     }
@@ -61,7 +62,8 @@ public class NodeWorkPlanAdapter {
                                            Set<String> completedNodeIds,
                                            Set<String> existingNodeIds,
                                            long contextVersion,
-                                           long runControlVersion) {
+                                           long runControlVersion,
+                                           String schedulerVersion) {
         List<TodoItem> items = items(plan);
         validateItems(items);
         LangchainDagExecutionGraph graph = LangchainDagExecutionGraph.from(items);
@@ -81,7 +83,8 @@ public class NodeWorkPlanAdapter {
                 continue;
             }
             runnable.add(draft(runId, planGeneration, item, "DAG",
-                    dependencies.stream().sorted().toList(), contextVersion, runControlVersion));
+                    dependencies.stream().sorted().toList(), contextVersion, runControlVersion,
+                    schedulerVersion));
         }
         return List.copyOf(runnable);
     }
@@ -92,14 +95,15 @@ public class NodeWorkPlanAdapter {
                                 String workflow,
                                 List<String> dependencies,
                                 long contextVersion,
-                                long runControlVersion) {
+                                long runControlVersion,
+                                String schedulerVersion) {
         return new NodeWorkDraft(
                 new NodeWorkItemIdentity(runId, planGeneration, item.getId(), INITIAL_ATTEMPT, INITIAL_SEGMENT),
                 workflow,
                 dependencies,
                 contextVersion,
                 runControlVersion,
-                SchedulerVersionPolicy.DUAL_POOL_V1,
+                schedulerVersion,
                 item);
     }
 

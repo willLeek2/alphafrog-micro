@@ -22,6 +22,8 @@
         <result property="completedAt" column="completed_at"/>
         <result property="ext" column="ext"/>
         <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="idempotencyKey" column="idempotency_key"/>
+        <result property="requestDigest" column="request_digest"/>
         <result property="planGeneration" column="plan_generation"/>
         <result property="runControlVersion" column="run_control_version"/>
         <result property="executionCheckpointJson" column="execution_checkpoint_json"/>
@@ -42,7 +44,8 @@
         INSERT INTO alphafrog_agent_run
         (id, user_id, deployment_id, deployment_generation_id, lane_tag,
          status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext,
-         execution_checkpoint_json, restart_attempt, tool_job_anchor_json, scheduler_version, plan_generation,
+         execution_checkpoint_json, restart_attempt, tool_job_anchor_json, scheduler_version,
+         idempotency_key, request_digest, plan_generation,
          run_control_version)
         VALUES
         (#{id}, #{userId}, #{deploymentId}, #{deploymentGenerationId}, #{laneTag},
@@ -50,7 +53,8 @@
          CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb),
          COALESCE(CAST(#{executionCheckpointJson} AS jsonb), '{}'::jsonb), COALESCE(#{restartAttempt}, 0),
          COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb),
-         COALESCE(#{schedulerVersion}, 'LEGACY'), COALESCE(#{planGeneration}, -1),
+         COALESCE(#{schedulerVersion}, 'LEGACY'),
+         #{idempotencyKey}, #{requestDigest}, COALESCE(#{planGeneration}, -1),
          COALESCE(#{runControlVersion}, 0))
     </insert>
 
@@ -138,6 +142,42 @@
         FROM alphafrog_agent_run
         WHERE id = #{id}
           AND user_id = #{userId}
+        LIMIT 1
+    </select>
+
+    <!--
+      按用户与幂等键读回创建请求对应的 Run。只读这一条，不做部署代际过滤：同一次创建请求在滚动部署
+      前后重复提交时应当读回原来那条 Run，换了代际不该变成第二条。
+    -->
+    <select id="findByUserIdempotencyKey" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               deployment_id,
+               deployment_generation_id,
+               lane_tag,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               scheduler_version,
+               idempotency_key,
+               request_digest,
+               plan_generation,
+               run_control_version,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
+               tool_job_anchor_json::text AS tool_job_anchor_json
+        FROM alphafrog_agent_run
+        WHERE user_id = #{userId}
+          AND idempotency_key = #{idempotencyKey}
+          AND idempotency_key IS NOT NULL
         LIMIT 1
     </select>
 
@@ -365,6 +405,11 @@
           AND status = #{expectedStatus}
     </update>
 
+    <!--
+      开一轮新计划是 Run 级推进：条件里除了 Run 自己的状态与代际，还要核「现在还是我在服务这条 Run」。
+      服务所有权条件（持有人 + 代际号 + 未过期）必须在这条语句里核，不能在调用方那里先查一遍——
+      查与写之间租约可能到期并被别的进程接管，那个时间窗里旧所有者不该还能推进计划代际。
+    -->
     <select id="advancePlanGeneration" resultType="java.lang.Integer" affectData="true" flushCache="true">
         UPDATE alphafrog_agent_run
         SET plan_generation = GREATEST(plan_generation, #{observedWorkItemGeneration}) + 1,
@@ -373,6 +418,14 @@
           AND user_id = #{userId}
           AND status = #{expectedStatus}
           AND plan_generation = #{expectedGeneration}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{id}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
         RETURNING plan_generation
     </select>
 

@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
@@ -159,6 +160,11 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                     //（后台任务的进度对账与终态处理组件）负责写入。
                     // 原样重抛可保留 runId/toolCallId/attempt，供上层生成可恢复的挂起结果。
                     throw pending;
+                } catch (WaitGroupMemberPendingException pending) {
+                    // 新调度器版本的等待成员：沙箱任务已经建好，只是这次调用不再等它。
+                    // 与上面同样是控制信号，不能变成工具失败文本，也不能写 TOOL_CALL_FINISHED；
+                    // 事实由派发器写进成员行，终态结果由结果接收方按派发证明写入。
+                    throw pending;
                 } catch (Exception e) {
                     output = e.getMessage();
                     success = false;
@@ -245,16 +251,14 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * 其他工具没有跨进程持久作业，继续保留模型原始 id。</p>
      */
     private String durableToolCallId(String toolName, String rawToolCallId) {
-        if (!"executePython".equals(toolName)) {
+        if (!DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName)) {
             return rawToolCallId;
         }
         DualPoolToolJobExecutionContext.Snapshot snapshot = DualPoolToolJobExecutionContext.current();
         if (snapshot == null || snapshot.identity() == null) {
             return rawToolCallId;
         }
-        String workItemScope = snapshot.identity().describe();
-        UUID workItemDigest = UUID.nameUUIDFromBytes(workItemScope.getBytes(StandardCharsets.UTF_8));
-        return rawToolCallId + "--wi-" + workItemDigest;
+        return DurableToolCallIds.forTool(toolName, rawToolCallId, snapshot.identity());
     }
 
     /**

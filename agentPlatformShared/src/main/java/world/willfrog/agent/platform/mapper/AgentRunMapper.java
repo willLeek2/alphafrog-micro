@@ -24,6 +24,14 @@ public interface AgentRunMapper {
 
     AgentRun findByIdAndUser(@Param("id") String id, @Param("userId") String userId);
 
+    /**
+     * 按用户与幂等键读回创建请求对应的 Run。
+     *
+     * <p>库里有「同一用户同键唯一」的部分唯一索引，所以最多只有一条；没有带键的 Run 时返回 null。</p>
+     */
+    AgentRun findByUserIdempotencyKey(@Param("userId") String userId,
+                                      @Param("idempotencyKey") String idempotencyKey);
+
     AgentRun findByIdAndUserForDeployment(
             @Param("id") String id,
             @Param("userId") String userId,
@@ -61,13 +69,18 @@ public interface AgentRunMapper {
 
     /**
      * 为新一轮计划原子分配代际。Run 行是权威，工作项最大代际只作为防回退下限。
-     * 返回 null 表示 Run 状态或调用方读取的旧代际已经变化。
+     * 返回 null 表示 Run 状态、调用方读取的旧代际或者这条 Run 的服务所有权已经变化。
+     *
+     * <p>服务所有权在同一条语句里核对：开一轮新计划是 Run 级推进，只有现在还在服务这条 Run 的
+     * 那个进程能做。先查租约再写，中间隔着租约到期与别人接管的时间窗。</p>
      */
     Integer advancePlanGeneration(@Param("id") String id,
                                   @Param("userId") String userId,
                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
                                   @Param("expectedGeneration") int expectedGeneration,
-                                  @Param("observedWorkItemGeneration") int observedWorkItemGeneration);
+                                  @Param("observedWorkItemGeneration") int observedWorkItemGeneration,
+                                  @Param("ownerInstanceId") String ownerInstanceId,
+                                  @Param("fencingToken") long fencingToken);
 
     /** 恢复路径唯一的 checkpoint 写入口：条件只用业务字段，不再按部署身份分叉。 */
     int updateExecutionCheckpoint(@Param("id") String id,

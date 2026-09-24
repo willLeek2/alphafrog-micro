@@ -22,9 +22,7 @@ class NodeWorkItemContractValuesTest {
     }
 
     @Test
-    void waitingAndResumableAreReservedNotTerminal() {
-        assertThat(NodeWorkItemState.WAITING.isReserved()).isTrue();
-        assertThat(NodeWorkItemState.RESUMABLE.isReserved()).isTrue();
+    void waitingAndResumableAreLiveNonTerminalStates() {
         assertThat(NodeWorkItemState.WAITING.isTerminal()).isFalse();
         assertThat(NodeWorkItemState.RESUMABLE.isTerminal()).isFalse();
         assertThat(NodeWorkItemState.terminalWireValues())
@@ -32,7 +30,20 @@ class NodeWorkItemContractValuesTest {
     }
 
     @Test
-    void allWireValuesCoverSevenActivePlusTwoReserved() {
+    void onlyRunnableAndResumableCanBeClaimed() {
+        assertThat(NodeWorkItemState.claimableWireValues())
+                .as("能被领取的只有首次可运行与结果齐备后可恢复两个状态")
+                .containsExactly("RUNNABLE", "RESUMABLE");
+        assertThat(NodeWorkItemState.allWireValues())
+                .as("可领取状态必须都在取值集合里")
+                .containsAll(NodeWorkItemState.claimableWireValues());
+        assertThat(NodeWorkItemState.terminalWireValues())
+                .as("终态不能被领取")
+                .doesNotContainAnyElementsOf(NodeWorkItemState.claimableWireValues());
+    }
+
+    @Test
+    void allWireValuesCoverAllNineStates() {
         List<String> values = NodeWorkItemState.allWireValues();
         assertThat(values).hasSize(9);
         assertThat(values).containsAll(List.of("RUNNABLE", "CLAIMED", "EXECUTING", "RESULT_COMMITTED",
@@ -53,9 +64,10 @@ class NodeWorkItemContractValuesTest {
     void unknownSchedulerVersionFailsClosedInsteadOfFallingBackToLegacy() {
         assertThat(SchedulerVersion.fromWire("LEGACY")).isEqualTo(SchedulerVersion.LEGACY);
         assertThat(SchedulerVersion.fromWire("DUAL_POOL_V1")).isEqualTo(SchedulerVersion.DUAL_POOL_V1);
-        assertThatThrownBy(() -> SchedulerVersion.fromWire("DUAL_POOL_V2"))
+        assertThat(SchedulerVersion.fromWire("DUAL_POOL_V2")).isEqualTo(SchedulerVersion.DUAL_POOL_V2);
+        assertThatThrownBy(() -> SchedulerVersion.fromWire("DUAL_POOL_V3"))
                 .isInstanceOf(UnknownSchedulerVersionException.class)
-                .hasMessageContaining("DUAL_POOL_V2");
+                .hasMessageContaining("DUAL_POOL_V3");
         assertThatThrownBy(() -> SchedulerVersion.fromWire("legacy"))
                 .as("大小写不一致也算不认识的取值，不许猜")
                 .isInstanceOf(UnknownSchedulerVersionException.class);
@@ -68,6 +80,26 @@ class NodeWorkItemContractValuesTest {
         assertThat(SchedulerVersion.DEFAULT_FOR_EXISTING_ROWS).isEqualTo(SchedulerVersion.LEGACY);
         assertThat(SchedulerVersion.LEGACY.isDualPool()).isFalse();
         assertThat(SchedulerVersion.DUAL_POOL_V1.isDualPool()).isTrue();
+        assertThat(SchedulerVersion.DUAL_POOL_V2.isDualPool())
+                .as("V2 不是「单工具锚点」那个版本，不能拿它当 V1 用")
+                .isFalse();
+    }
+
+    @Test
+    void dualPoolFamilyAndWaitGroupCapabilityAreSeparateQuestions() {
+        assertThat(SchedulerVersion.LEGACY.isDualPoolFamily()).isFalse();
+        assertThat(SchedulerVersion.DUAL_POOL_V1.isDualPoolFamily()).isTrue();
+        assertThat(SchedulerVersion.DUAL_POOL_V2.isDualPoolFamily()).isTrue();
+
+        assertThat(SchedulerVersion.LEGACY.usesWaitGroups()).isFalse();
+        assertThat(SchedulerVersion.DUAL_POOL_V1.usesWaitGroups())
+                .as("V1 用 Run 级单工具锚点，撑不起一个分段里的多个工具")
+                .isFalse();
+        assertThat(SchedulerVersion.DUAL_POOL_V2.usesWaitGroups()).isTrue();
+
+        assertThat(SchedulerVersion.DUAL_POOL_V1.usesRunLevelToolJobAnchor()).isTrue();
+        assertThat(SchedulerVersion.DUAL_POOL_V2.usesRunLevelToolJobAnchor()).isFalse();
+        assertThat(SchedulerVersion.LEGACY.usesRunLevelToolJobAnchor()).isFalse();
     }
 
     @Test

@@ -1,0 +1,1012 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.WaitGroupMapper">
+
+    <!--
+      等待组、等待成员与持久恢复通知。三条写入路径都是「先锁 Run、再动子行」的单条语句，
+      条件不匹配时影响的只是零行：调用方据返回的计数判断这一次到底写进去没有。
+
+      三句必须成立的话都在这里落地：
+      - 成员只结束一次：成员行的状态条件更新 + 组完成计数只在成员状态第一次落终态时加一。
+      - 最后一个成员只产生一次恢复资格：组从等待变齐备的条件更新 + 通知表的 (group_id, recovery_generation) 唯一约束。
+      - 旧领取提交为零：恢复消费是通知的条件更新，同一代际只有一次能把下一段放成可恢复。
+    -->
+
+    <resultMap id="WaitGroupResultMap" type="world.willfrog.agent.platform.wait.WaitGroup">
+        <id property="id" column="id"/>
+        <result property="runId" column="run_id"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="nodeId" column="node_id"/>
+        <result property="nodeAttempt" column="node_attempt"/>
+        <result property="segmentSequence" column="segment_sequence"/>
+        <result property="modelTurn" column="model_turn"/>
+        <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="nextSegmentSequence" column="next_segment_sequence"/>
+        <result property="state" column="state"/>
+        <result property="expectedMembers" column="expected_members"/>
+        <result property="completedMembers" column="completed_members"/>
+        <result property="recoveryGeneration" column="recovery_generation"/>
+        <result property="readyAt" column="ready_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <resultMap id="WaitMemberResultMap" type="world.willfrog.agent.platform.wait.WaitMember">
+        <id property="id" column="id"/>
+        <result property="groupId" column="group_id"/>
+        <result property="runId" column="run_id"/>
+        <result property="memberSeq" column="member_seq"/>
+        <result property="memberIdentity" column="member_identity"/>
+        <result property="toolCallId" column="tool_call_id"/>
+        <result property="toolName" column="tool_name"/>
+        <result property="externalOperationId" column="external_operation_id"/>
+        <result property="state" column="state"/>
+        <result property="resultRefJson" column="result_ref_json"/>
+        <result property="dispatchProofJson" column="dispatch_proof_json"/>
+        <result property="nextPollAt" column="next_poll_at"/>
+        <result property="pollCount" column="poll_count"/>
+        <result property="backoffStep" column="backoff_step"/>
+        <result property="finishedAt" column="finished_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <resultMap id="RecoveryNotificationResultMap"
+               type="world.willfrog.agent.platform.wait.RecoveryNotification">
+        <id property="id" column="id"/>
+        <result property="groupId" column="group_id"/>
+        <result property="runId" column="run_id"/>
+        <result property="recoveryGeneration" column="recovery_generation"/>
+        <result property="state" column="state"/>
+        <result property="nextVisibleAt" column="next_visible_at"/>
+        <result property="consumedAt" column="consumed_at"/>
+        <result property="consumedBy" column="consumed_by"/>
+        <result property="closeReason" column="close_reason"/>
+        <result property="closedAt" column="closed_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <!-- 整组挂起语句的返回：这次到底有没有真的把分段交出去、组是新建的还是已经有的。 -->
+    <resultMap id="WaitSuspensionResultMap"
+               type="world.willfrog.agent.platform.wait.WaitSuspensionRow">
+        <result property="closedSegments" column="closed_segments"/>
+        <result property="createdGroupId" column="created_group_id"/>
+        <result property="existingGroupId" column="existing_group_id"/>
+        <result property="writtenMembers" column="written_members"/>
+        <result property="writtenNextSegments" column="written_next_segments"/>
+        <result property="nextSegmentSequence" column="next_segment_sequence"/>
+        <result property="rejection" column="rejection"/>
+        <result property="rejectionDetail" column="rejection_detail"/>
+    </resultMap>
+
+    <!-- 成员结束语句的返回：这一次结束有没有算进组，组现在处在哪一步。 -->
+    <resultMap id="WaitMemberCompletionResultMap"
+               type="world.willfrog.agent.platform.wait.WaitMemberCompletionRow">
+        <result property="memberId" column="member_id"/>
+        <result property="memberSeq" column="member_seq"/>
+        <result property="memberState" column="member_state"/>
+        <result property="groupId" column="group_id"/>
+        <result property="groupState" column="group_state"/>
+        <result property="completedMembers" column="completed_members"/>
+        <result property="expectedMembers" column="expected_members"/>
+        <result property="recoveryGeneration" column="recovery_generation"/>
+        <result property="notificationId" column="notification_id"/>
+        <result property="writtenMembers" column="written_members"/>
+        <result property="writtenSiblings" column="written_siblings"/>
+    </resultMap>
+
+    <!-- 恢复消费语句的返回：通知取走了没有、下一段放行了没有。 -->
+    <resultMap id="RecoveryConsumptionResultMap"
+               type="world.willfrog.agent.platform.wait.RecoveryConsumptionRow">
+        <result property="consumed" column="consumed"/>
+        <result property="promoted" column="promoted"/>
+        <result property="groupId" column="group_id"/>
+        <result property="nextRunId" column="next_run_id"/>
+        <result property="nextPlanGeneration" column="next_plan_generation"/>
+        <result property="nextNodeId" column="next_node_id"/>
+        <result property="nextNodeAttempt" column="next_node_attempt"/>
+        <result property="nextSegmentSequence" column="next_segment_sequence"/>
+    </resultMap>
+
+    <!-- 取消语句的返回：每个动作各自取消了几行。 -->
+    <resultMap id="WaitChainCancelResultMap"
+               type="world.willfrog.agent.platform.wait.WaitChainCancelRow">
+        <result property="groupsCanceled" column="groups_canceled"/>
+        <result property="membersCanceled" column="members_canceled"/>
+        <result property="segmentsCanceled" column="segments_canceled"/>
+        <result property="notificationsCanceled" column="notifications_canceled"/>
+    </resultMap>
+
+    <!-- ==================== 读 ==================== -->
+
+    <select id="findGroup" resultMap="WaitGroupResultMap">
+        SELECT id,
+               run_id,
+               plan_generation,
+               node_id,
+               node_attempt,
+               segment_sequence,
+               model_turn,
+               scheduler_version,
+               next_segment_sequence,
+               state,
+               expected_members,
+               completed_members,
+               recovery_generation,
+               ready_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_wait_group
+        WHERE run_id = #{runId}
+          AND plan_generation = #{planGeneration}
+          AND node_id = #{nodeId}
+          AND node_attempt = #{nodeAttempt}
+          AND segment_sequence = #{segmentSequence}
+          AND model_turn = #{modelTurn}
+    </select>
+
+    <select id="findGroupById" resultMap="WaitGroupResultMap">
+        SELECT id,
+               run_id,
+               plan_generation,
+               node_id,
+               node_attempt,
+               segment_sequence,
+               model_turn,
+               scheduler_version,
+               next_segment_sequence,
+               state,
+               expected_members,
+               completed_members,
+               recovery_generation,
+               ready_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_wait_group
+        WHERE id = #{groupId}
+    </select>
+
+    <select id="listMembers" resultMap="WaitMemberResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               member_seq,
+               member_identity,
+               tool_call_id,
+               tool_name,
+               external_operation_id,
+               state,
+               result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
+               next_poll_at,
+               poll_count,
+               backoff_step,
+               finished_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_wait_member
+        WHERE group_id = #{groupId}
+        ORDER BY member_seq
+    </select>
+
+    <select id="findMemberByOperation" resultMap="WaitMemberResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               member_seq,
+               member_identity,
+               tool_call_id,
+               tool_name,
+               external_operation_id,
+               state,
+               result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
+               next_poll_at,
+               poll_count,
+               backoff_step,
+               finished_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_wait_member
+        WHERE run_id = #{runId}
+          AND external_operation_id = #{externalOperationId}
+    </select>
+
+    <select id="findMemberByIdentity" resultMap="WaitMemberResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               member_seq,
+               member_identity,
+               tool_call_id,
+               tool_name,
+               external_operation_id,
+               state,
+               result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
+               next_poll_at,
+               poll_count,
+               backoff_step,
+               finished_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_wait_member
+        WHERE group_id = #{groupId}
+          AND member_identity = #{memberIdentity}
+    </select>
+
+    <!--
+      到点该查询外部作业状态的成员：还在执行中、下次查询时间已经到，等得最久的排最前。
+
+      一轮只取一批候选：每个成员要打一次外部查询，一轮能查多少由调用方给的上限说了算。
+      按 next_poll_at 的偏索引取（那张索引只收执行中的成员），不扫整张成员表。
+    -->
+    <select id="scanDueMembers" resultMap="WaitMemberResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               member_seq,
+               member_identity,
+               tool_call_id,
+               tool_name,
+               external_operation_id,
+               state,
+               result_ref_json::text AS result_ref_json,
+               dispatch_proof_json::text AS dispatch_proof_json,
+               next_poll_at,
+               poll_count,
+               backoff_step,
+               finished_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_wait_member
+        WHERE state = 'RUNNING'
+          AND next_poll_at IS NOT NULL
+          AND next_poll_at &lt;= #{now}
+        ORDER BY next_poll_at, id
+        LIMIT #{limit}
+    </select>
+
+    <select id="listNotifications" resultMap="RecoveryNotificationResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               recovery_generation,
+               state,
+               next_visible_at,
+               consumed_at,
+               consumed_by,
+               close_reason,
+               closed_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_recovery_notification
+        WHERE group_id = #{groupId}
+        ORDER BY recovery_generation
+    </select>
+
+    <select id="findNotificationById" resultMap="RecoveryNotificationResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               recovery_generation,
+               state,
+               next_visible_at,
+               consumed_at,
+               consumed_by,
+               close_reason,
+               closed_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_recovery_notification
+        WHERE id = #{notificationId}
+    </select>
+
+    <!--
+      到期的恢复通知：还没被取走、已经到了下次可见时间，等得最久的排最前。
+
+      这里不预判「能不能取走」：能不能取走由消费那条语句里的条件说了算（Run 还在执行、计划代际
+      与控制版本、通知代际等于组当前代际、下一段还在等待态）。扫描先取一批候选，逐条去试，
+      试不成的由调用方按退避推后下次可见时间——把一个取不走的通知在每一轮里反复捞出来，
+      只会让同一批里别的通知轮不到。
+    -->
+    <select id="scanDueRecoveryNotifications" resultMap="RecoveryNotificationResultMap">
+        SELECT id,
+               group_id,
+               run_id,
+               recovery_generation,
+               state,
+               next_visible_at,
+               consumed_at,
+               consumed_by,
+               close_reason,
+               closed_at,
+               created_at,
+               updated_at
+        FROM alphafrog_agent_run_recovery_notification
+        WHERE state = 'WAITING'
+          AND next_visible_at &lt;= CURRENT_TIMESTAMP
+        ORDER BY next_visible_at, id
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      把一条通知推后：只对还在等待态、且新时间确实更晚的才写。
+
+      只许往后推：迟到的延期写入不能把已经提前的时间拉回来，否则同一批候选会被反复捞。
+      已经取走或取消的通知不受影响——它的状态已经变了，这条写入影响 0 行。
+    -->
+    <update id="deferRecoveryNotification">
+        UPDATE alphafrog_agent_run_recovery_notification SET
+            next_visible_at = #{nextVisibleAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{notificationId}
+          AND state = 'WAITING'
+          AND next_visible_at &lt; #{nextVisibleAt}
+    </update>
+
+    <!--
+      把一条通知收口成关闭态：只对还在等待态的通知生效，并且必须写明原因。
+
+      收口是条件更新，不是覆盖：已经取走的、已经关闭的、随组取消的通知都影响 0 行。关闭不删行，
+      原因留在这一行上，事后能查这条资格为什么没有被服务。
+    -->
+    <update id="closeRecoveryNotification">
+        UPDATE alphafrog_agent_run_recovery_notification SET
+            state = 'CLOSED',
+            close_reason = #{reason},
+            closed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{notificationId}
+          AND state = 'WAITING'
+    </update>
+
+    <!-- ==================== 整组挂起 ==================== -->
+
+    <!--
+      整组挂起：结束当前执行分段、保存等待组与全部成员、把下一段建成等待态，一条语句一件事。
+
+      顺序不能换：先锁 Run（还没移交的节点只能由持有它的执行者交出），再条件结束当前分段，
+      之后每一步都从上一个 CTE 的 RETURNING 取行，所以分段没交出去时后面一行都不会写。
+
+      重试是同一条语句：分段已经结束、组已经存在时只有 existing_group_id 有值，成员与下一段
+      都不会被重复创建。这条读回也走同一道 Run 栅栏（代际、控制版本、冻结调度器版本）：栅栏过不去
+      时它一个字段都不返回，调用方看到的是「这个分段不归你」。
+    -->
+    <select id="suspendSegment" resultMap="WaitSuspensionResultMap" affectData="true" flushCache="true">
+        WITH member_input AS (
+            SELECT *
+            FROM (VALUES
+            <foreach collection="members" item="m" separator=",">
+                (#{m.memberSeq}::int, #{m.memberIdentity}::varchar, #{m.toolCallId}::varchar,
+                 #{m.toolName}::varchar, #{m.externalOperationId}::varchar)
+            </foreach>
+            ) AS m(member_seq, member_identity, tool_call_id, tool_name, external_operation_id)
+        ),
+        run_fence AS (
+            SELECT r.id AS run_id, r.plan_generation, r.run_control_version
+            FROM alphafrog_agent_run r
+            WHERE r.id = #{runId}
+              AND r.status = 'EXECUTING'
+              -- 计划代际与控制版本都在这里比对：计划推进之后控制版本可能还没变，只比控制版本
+              -- 会让旧计划的执行者把已经作废的分段交出去、建出没人认领的等待组。
+              AND r.plan_generation = #{planGeneration}
+              -- 冻结的调度器版本也要对上：这份等待事实只属于等待组那一套执行层。
+              AND r.scheduler_version = #{schedulerVersion}
+              AND r.run_control_version = #{runControlVersion}
+            FOR UPDATE
+        ),
+        segment_closed AS (
+            UPDATE alphafrog_agent_run_work_item wi SET
+                state = 'RESULT_COMMITTED',
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                payload_json = wi.payload_json || CAST(#{suspensionPayloadJson} AS jsonb),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE wi.run_id = #{runId}
+              AND wi.plan_generation = #{planGeneration}
+              AND wi.node_id = #{nodeId}
+              AND wi.node_attempt = #{nodeAttempt}
+              AND wi.segment_sequence = #{segmentSequence}
+              AND wi.state = 'EXECUTING'
+              AND wi.claim_epoch = #{claimEpoch}
+              AND wi.claimed_by = #{claimedBy}
+              AND wi.context_version = #{contextVersion}
+              AND wi.run_control_version = #{runControlVersion}
+              AND EXISTS (SELECT 1 FROM run_fence)
+            RETURNING wi.run_id, wi.plan_generation, wi.node_id, wi.node_attempt, wi.segment_sequence
+        ),
+        group_created AS (
+            INSERT INTO alphafrog_agent_run_wait_group
+                (run_id, plan_generation, node_id, node_attempt, segment_sequence, model_turn,
+                 scheduler_version, next_segment_sequence, state, expected_members, completed_members)
+            SELECT s.run_id, s.plan_generation, s.node_id, s.node_attempt, s.segment_sequence,
+                   #{modelTurn}::int, #{schedulerVersion}::varchar, s.segment_sequence + 1,
+                   'WAITING', (SELECT count(*) FROM member_input)::int, 0
+            FROM segment_closed s
+            RETURNING id, run_id, plan_generation, node_id, node_attempt, segment_sequence,
+                      next_segment_sequence
+        ),
+        members_written AS (
+            INSERT INTO alphafrog_agent_run_wait_member
+                (group_id, run_id, member_seq, member_identity, tool_call_id, tool_name,
+                 external_operation_id, state)
+            SELECT g.id, g.run_id, m.member_seq, m.member_identity, m.tool_call_id, m.tool_name,
+                   m.external_operation_id, 'PENDING'
+            FROM group_created g
+            CROSS JOIN member_input m
+            RETURNING 1
+        ),
+        next_segment_created AS (
+            INSERT INTO alphafrog_agent_run_work_item
+                (run_id, plan_generation, node_id, node_attempt, segment_sequence, state,
+                 context_version, run_control_version, claim_epoch, scheduler_version,
+                 next_visible_at, runnable_since, payload_json)
+            SELECT g.run_id, g.plan_generation, g.node_id, g.node_attempt, g.next_segment_sequence,
+                   'WAITING', #{contextVersion}::bigint, #{runControlVersion}::bigint, 0,
+                   #{schedulerVersion}::varchar, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                   CAST(#{nextSegmentPayloadJson} AS jsonb)
+            FROM group_created g
+            RETURNING 1
+        )
+        SELECT
+            (SELECT count(*) FROM segment_closed) AS closed_segments,
+            (SELECT id FROM group_created) AS created_group_id,
+            -- 读回已有的组也要过同一道 Run 栅栏：计划已经推进之后，旧工人重试同一个身份
+            -- 读到的是一份作废的组，把它当成「已经挂起过」就会让执行者以为分段交出去了。
+            (SELECT g.id FROM alphafrog_agent_run_wait_group g
+              JOIN run_fence f ON f.run_id = g.run_id
+              WHERE g.run_id = #{runId}
+                AND g.plan_generation = #{planGeneration}
+                AND g.node_id = #{nodeId}
+                AND g.node_attempt = #{nodeAttempt}
+                AND g.segment_sequence = #{segmentSequence}
+                AND g.model_turn = #{modelTurn}) AS existing_group_id,
+            (SELECT count(*) FROM members_written) AS written_members,
+            (SELECT count(*) FROM next_segment_created) AS written_next_segments,
+            -- 首次挂起时这一行是刚插进去的，同一条语句的主查询看不到它（数据修改 CTE 与主查询
+            -- 用同一份快照），只能从 group_created 的 RETURNING 里取；幂等重试路径没有新插入，
+            -- 才回基础表里读已经存在的组。
+            COALESCE(
+                (SELECT next_segment_sequence FROM group_created),
+                (SELECT g.next_segment_sequence FROM alphafrog_agent_run_wait_group g
+                  JOIN run_fence f ON f.run_id = g.run_id
+                  WHERE g.run_id = #{runId}
+                    AND g.plan_generation = #{planGeneration}
+                    AND g.node_id = #{nodeId}
+                    AND g.node_attempt = #{nodeAttempt}
+                    AND g.segment_sequence = #{segmentSequence}
+                    AND g.model_turn = #{modelTurn})
+            ) AS next_segment_sequence
+    </select>
+
+    <!-- ==================== 成员结束 ==================== -->
+
+    <!--
+      成员结束一次：成员行只在还是待派发或执行中时才落终态，所以同一个成员被报两次时第二次
+      影响零行。组完成计数只在这一行真的落终态时才加，且只有成功与失败才计入；取消与迟到
+      加零。计数加满的同一刻把组改成齐备并写出一条恢复通知，通知靠 (组, 恢复代际) 唯一约束
+      保证只有一条。
+    -->
+    <select id="completeMember" resultMap="WaitMemberCompletionResultMap"
+            affectData="true" flushCache="true">
+        WITH run_fence AS (
+            SELECT r.id AS run_id, r.run_control_version
+            FROM alphafrog_agent_run r
+            JOIN alphafrog_agent_run_wait_group g ON g.id = #{groupId} AND g.run_id = r.id
+            -- 归属这一段的那条工作项也要对上：只核对组号时，计划推进或换段之后
+            -- 旧成员仍能把旧组推进成齐备，接着放出已经作废的下一段。
+            JOIN alphafrog_agent_run_work_item wi
+                 ON wi.run_id = g.run_id
+                AND wi.plan_generation = g.plan_generation
+                AND wi.node_id = g.node_id
+                AND wi.node_attempt = g.node_attempt
+                AND wi.segment_sequence = g.segment_sequence
+            WHERE r.status = 'EXECUTING'
+              AND r.plan_generation = g.plan_generation
+              AND r.plan_generation = #{planGeneration}
+              AND r.run_control_version = #{runControlVersion}
+              -- 上下文版本是挂起那一刻这一段的上下文：对不上说明这一段已经不属于这条链了。
+              AND wi.context_version = #{contextVersion}
+              AND wi.run_control_version = #{runControlVersion}
+            FOR UPDATE OF r
+        ),
+        member_done AS (
+            UPDATE alphafrog_agent_run_wait_member m SET
+                state = #{memberState}::varchar,
+                result_ref_json = CAST(#{resultRefJson} AS jsonb),
+                external_operation_id = COALESCE(m.external_operation_id, #{externalOperationId}::varchar),
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE m.group_id = #{groupId}
+              AND m.member_identity = #{memberIdentity}
+              -- 外部作业身份必须逐字对上，包括「两边都是空」这一种：
+              -- 允许空值覆盖会把「不是这次作业的结果」也算成它的结果。
+              AND ((m.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
+                   OR m.external_operation_id = #{externalOperationId}::varchar)
+              AND m.state IN ('PENDING', 'RUNNING')
+              AND EXISTS (SELECT 1 FROM run_fence)
+            RETURNING m.id, m.group_id, m.member_seq, m.state
+        ),
+        -- 完成数和齐备状态必须在同一次 UPDATE 里写完。同一语句里对这一行再 UPDATE
+        -- 一次时，后一次按原行快照写 READY，完成数仍是 0，齐备约束会拒收整句，成员也回滚。
+        group_bumped AS (
+            UPDATE alphafrog_agent_run_wait_group g SET
+                completed_members = g.completed_members
+                    + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END,
+                state = CASE
+                    WHEN g.completed_members
+                        + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END
+                        = g.expected_members
+                    THEN 'READY' ELSE g.state END,
+                recovery_generation = CASE
+                    WHEN g.completed_members
+                        + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END
+                        = g.expected_members
+                    THEN g.recovery_generation + 1 ELSE g.recovery_generation END,
+                ready_at = CASE
+                    WHEN g.completed_members
+                        + CASE WHEN #{memberState}::varchar IN ('SUCCEEDED', 'FAILED') THEN 1 ELSE 0 END
+                        = g.expected_members
+                    THEN CURRENT_TIMESTAMP ELSE g.ready_at END,
+                updated_at = CURRENT_TIMESTAMP
+            FROM member_done d
+            WHERE g.id = d.group_id
+              AND g.state = 'WAITING'
+            RETURNING g.id, g.run_id, g.completed_members, g.expected_members,
+                      g.recovery_generation, g.state
+        ),
+        group_ready AS (
+            SELECT b.id, b.run_id, b.recovery_generation
+            FROM group_bumped b
+            WHERE b.state = 'READY'
+        ),
+        notification_written AS (
+            INSERT INTO alphafrog_agent_run_recovery_notification
+                (group_id, run_id, recovery_generation, state, next_visible_at)
+            SELECT r.id, r.run_id, r.recovery_generation, 'WAITING', CURRENT_TIMESTAMP
+            FROM group_ready r
+            ON CONFLICT (group_id, recovery_generation) DO NOTHING
+            RETURNING id
+        )
+        SELECT
+            COALESCE(
+                (SELECT id FROM member_done),
+                (SELECT id FROM alphafrog_agent_run_wait_member
+                  WHERE group_id = #{groupId} AND member_identity = #{memberIdentity})
+            ) AS member_id,
+            (SELECT member_seq FROM member_done) AS member_seq,
+            COALESCE(
+                (SELECT state FROM member_done),
+                (SELECT state FROM alphafrog_agent_run_wait_member
+                  WHERE group_id = #{groupId} AND member_identity = #{memberIdentity})
+            ) AS member_state,
+            (SELECT id FROM alphafrog_agent_run_wait_group WHERE id = #{groupId}) AS group_id,
+            COALESCE(
+                (SELECT 'READY' FROM group_ready),
+                (SELECT state FROM alphafrog_agent_run_wait_group WHERE id = #{groupId})
+            ) AS group_state,
+            COALESCE(
+                (SELECT completed_members FROM group_bumped),
+                (SELECT completed_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId})
+            ) AS completed_members,
+            COALESCE(
+                (SELECT expected_members FROM group_bumped),
+                (SELECT expected_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId})
+            ) AS expected_members,
+            (SELECT recovery_generation FROM group_ready) AS recovery_generation,
+            -- 通知编号要返回真实主键：常量 1 只在空库第一条上碰巧是对的，
+            -- 第二条会把错误编号交给恢复消费，真正的通知永远留在等待态。
+            (SELECT id FROM notification_written) AS notification_id,
+            (SELECT count(*) FROM member_done) AS written_members
+    </select>
+
+    <!--
+      迟到结果留档。
+
+      三种情况一次说清：
+
+      1. 成员还在等（待派发/执行中）：改成迟到，并停掉这条链。链停不下来时兄弟成员会一直等在
+         等待态，最后谁也不推进。
+      2. 成员已经被取消（取消先落地、结果随后才回来）：只补审计字段，状态迁到迟到。
+         `result_ref_json`、外部作业身份、结束时间都只在还是空的时候写一次——
+         重复上报不能把第一次留下的审计结果覆盖掉。
+      3. 报上来的身份与这一行对不上（组号或成员身份传错）：什么都不做。错的身份不该有权停掉
+         另一条链。
+
+      停链只在 Run 还在这一代执行、控制版本没变时发生；版本已经变了的旧链由它自己的终结路径
+      处理，这里只留审计。
+    -->
+    <select id="reportLateMember" resultMap="WaitMemberCompletionResultMap"
+            affectData="true" flushCache="true">
+        WITH run_fence AS (
+            -- 先锁 Run 行，再动任何子行：这条语句自带一段「取消之后再补审计」的成员更新，
+            -- 那段审计不挑 Run 的版本（版本已经变了才更需要留痕），但锁的顺序必须和其他写入一致，
+            -- 否则同一张图上的并发写入会互相锁出死结。
+            SELECT r.id AS run_id, r.status, r.plan_generation AS run_plan_generation,
+                   r.run_control_version AS run_control_version
+            FROM alphafrog_agent_run r
+            JOIN alphafrog_agent_run_wait_group g ON g.id = #{groupId} AND g.run_id = r.id
+            FOR UPDATE OF r
+        ),
+        member_late AS (
+            UPDATE alphafrog_agent_run_wait_member m SET
+                state = 'LATE',
+                result_ref_json = COALESCE(m.result_ref_json, CAST(#{resultRefJson} AS jsonb)),
+                external_operation_id = COALESCE(m.external_operation_id, #{externalOperationId}::varchar),
+                finished_at = COALESCE(m.finished_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE m.group_id = #{groupId}
+              AND m.member_identity = #{memberIdentity}
+              -- 外部作业身份逐字对上才算这个成员的结果；两边都是空也只在同一成员上成立。
+              AND ((m.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
+                   OR m.external_operation_id = #{externalOperationId}::varchar)
+              -- 已经落过终态的不再改：迟到结果只补审计，重复上报不许覆盖先到的那一份。
+              AND m.state IN ('PENDING', 'RUNNING', 'CANCELED')
+              AND EXISTS (SELECT 1 FROM run_fence)
+            RETURNING m.id, m.group_id, m.member_seq, m.state
+        ),
+        group_stopped AS (
+            UPDATE alphafrog_agent_run_wait_group g SET
+                state = 'CANCELED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM member_late d, run_fence f
+            WHERE g.id = d.group_id
+              AND g.id = #{groupId}
+              AND f.run_id = g.run_id
+              AND g.state IN ('WAITING', 'READY')
+              -- 停链要 Run 还在这一代执行：计划代际与控制版本都得对上。版本来不及对上的旧链
+              -- 由它自己的终结路径处理，这一条只留审计，不推进组、不碰分段。
+              AND f.status = 'EXECUTING'
+              AND f.run_plan_generation = g.plan_generation
+              AND f.run_control_version = #{runControlVersion}
+            RETURNING g.id, g.run_id, g.plan_generation, g.node_id, g.node_attempt,
+                      g.next_segment_sequence
+        ),
+        siblings_canceled AS (
+            UPDATE alphafrog_agent_run_wait_member m SET
+                state = 'CANCELED',
+                finished_at = COALESCE(m.finished_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE m.group_id = s.id
+              AND m.state IN ('PENDING', 'RUNNING')
+            RETURNING 1
+        ),
+        segment_canceled AS (
+            UPDATE alphafrog_agent_run_work_item wi SET
+                state = 'CANCELED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE wi.run_id = s.run_id
+              AND wi.plan_generation = s.plan_generation
+              AND wi.node_id = s.node_id
+              AND wi.node_attempt = s.node_attempt
+              AND wi.segment_sequence = s.next_segment_sequence
+              AND wi.state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')
+            RETURNING 1
+        ),
+        notification_canceled AS (
+            UPDATE alphafrog_agent_run_recovery_notification n SET
+                state = 'CANCELED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE n.group_id = s.id
+              AND n.state = 'WAITING'
+            RETURNING 1
+        )
+        SELECT
+            (SELECT id FROM member_late) AS member_id,
+            (SELECT member_seq FROM member_late) AS member_seq,
+            (SELECT state FROM member_late) AS member_state,
+            (SELECT id FROM group_stopped) AS group_id,
+            COALESCE(
+                (SELECT 'CANCELED' FROM group_stopped),
+                (SELECT state FROM alphafrog_agent_run_wait_group WHERE id = #{groupId})
+            ) AS group_state,
+            (SELECT completed_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId}) AS completed_members,
+            (SELECT expected_members FROM alphafrog_agent_run_wait_group WHERE id = #{groupId}) AS expected_members,
+            NULL::int AS recovery_generation,
+            NULL::bigint AS notification_id,
+            (SELECT count(*) FROM member_late) AS written_members,
+            (SELECT count(*) FROM siblings_canceled) AS written_siblings
+    </select>
+
+    <!-- ==================== 恢复消费 ==================== -->
+
+    <!--
+      恢复消费：把下一段放成可恢复、组改成已恢复、通知改成已消费，三件事一次做完。
+
+      三步用 RETURNING 串起来（下一段 → 组 → 通知），后面的每一步都必须拿到前一步写出的行才可能命中，
+      所以只有两种结局：三件都成，或者一件都不写。不允许出现「通知已经算消费掉、下一段却没放行」——
+      恢复资格只有一条，丢了就永远不再出现，等待链会一直停在那里。
+
+      能进这段的条件一次给全：
+      - 这条 Run 的服务所有权确实在这位调用者手上：租约行的持有者与代际都对得上、并且还没过期。
+        租约行与 Run 行在同一句里一起锁住，核对与写入之间不会被人接手；非所有者或旧代际一行都改不动。
+      - Run 还在执行、计划代际没推进、控制版本没变。
+      - 通知没被取走、已经到了时间、恢复代际等于组当前代际（旧代际的通知作废）、组已经齐备。
+      - 下一段确实还在等待态，而且它自己保存的控制版本与 Run 当前控制版本一致：段是旧控制代际的
+        产物时不能放行，否则「暂停过又继续」的 Run 会把作废的那一段当成新的一段放出去。
+
+      取不成时把原因一起带回去：调用方按原因决定推后还是收口关闭，不用拿自己手上的旧快照猜。
+      原因与判断出自同一份库状态，只读不写，不参与结果。
+    -->
+    <select id="consumeRecovery" resultMap="RecoveryConsumptionResultMap"
+            affectData="true" flushCache="true">
+        WITH run_fence AS (
+            SELECT r.id AS run_id, g.id AS group_id, g.recovery_generation
+            FROM alphafrog_agent_run r
+            JOIN alphafrog_agent_run_recovery_notification n
+                 ON n.id = #{notificationId} AND n.run_id = r.id
+            JOIN alphafrog_agent_run_wait_group g ON g.id = n.group_id
+            JOIN alphafrog_agent_run_service_lease l
+                 ON l.run_id = r.id
+                AND l.owner_instance_id = #{ownerInstanceId}
+                AND l.fencing_token = #{fencingToken}
+                AND l.expires_at > CURRENT_TIMESTAMP
+            WHERE n.state = 'WAITING'
+              AND n.next_visible_at &lt;= CURRENT_TIMESTAMP
+              AND n.recovery_generation = g.recovery_generation
+              AND g.state = 'READY'
+              AND r.status = 'EXECUTING'
+              AND r.plan_generation = g.plan_generation
+              AND r.run_control_version = #{runControlVersion}
+              AND EXISTS (
+                  SELECT 1 FROM alphafrog_agent_run_work_item wi
+                  WHERE wi.run_id = g.run_id
+                    AND wi.plan_generation = g.plan_generation
+                    AND wi.node_id = g.node_id
+                    AND wi.node_attempt = g.node_attempt
+                    AND wi.segment_sequence = g.next_segment_sequence
+                    AND wi.state = 'WAITING'
+                    AND wi.run_control_version = r.run_control_version)
+            FOR UPDATE OF r, n, l
+        ),
+        segment_promoted AS (
+            UPDATE alphafrog_agent_run_work_item wi SET
+                state = 'RESUMABLE',
+                runnable_since = CURRENT_TIMESTAMP,
+                next_visible_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            FROM run_fence f
+            WHERE wi.run_id = f.run_id
+              AND wi.state = 'WAITING'
+              -- 放行那一步自己也再核对一遍控制代际：这一段必须属于 Run 当前的控制版本。
+              AND EXISTS (
+                  SELECT 1 FROM alphafrog_agent_run r
+                  WHERE r.id = f.run_id
+                    AND r.status = 'EXECUTING'
+                    AND r.run_control_version = wi.run_control_version)
+              AND EXISTS (
+                  SELECT 1 FROM alphafrog_agent_run_wait_group g
+                  WHERE g.id = f.group_id
+                    AND wi.plan_generation = g.plan_generation
+                    AND wi.node_id = g.node_id
+                    AND wi.node_attempt = g.node_attempt
+                    AND wi.segment_sequence = g.next_segment_sequence)
+            RETURNING wi.run_id, wi.plan_generation, wi.node_id, wi.node_attempt,
+                      wi.segment_sequence, f.group_id AS group_id
+        ),
+        group_resumed AS (
+            UPDATE alphafrog_agent_run_wait_group g SET
+                state = 'RESUMED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM segment_promoted p
+            WHERE g.id = p.group_id
+              AND g.state = 'READY'
+            RETURNING g.id AS group_id
+        ),
+        notification_consumed AS (
+            UPDATE alphafrog_agent_run_recovery_notification n SET
+                state = 'CONSUMED',
+                consumed_at = CURRENT_TIMESTAMP,
+                consumed_by = #{dispatcherId},
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_resumed r
+            WHERE n.id = #{notificationId}
+              AND n.group_id = r.group_id
+              AND n.state = 'WAITING'
+            -- 组号要与通知主键一起返回：主查询要按它回报这次消费放行的是哪条链，
+            -- 只返回主键的话主查询点不到 group_id 这一列。
+            RETURNING n.id, n.group_id
+        ),
+        -- 这一条通知现在为什么取不走：与上面的判断用同一份库状态，从最前面的条件开始逐条问，
+        -- 第一个不成立的就是原因。全部成立时原因为空——那说明这次消费本该成功。
+        diagnosis AS (
+            SELECT
+                CASE
+                    WHEN n.state &lt;&gt; 'WAITING' THEN 'NOTIFICATION_NOT_WAITING'
+                    WHEN n.next_visible_at &gt; CURRENT_TIMESTAMP THEN 'NOTIFICATION_NOT_DUE'
+                    WHEN r.id IS NULL THEN 'RUN_MISSING'
+                    WHEN g.id IS NULL THEN 'GROUP_MISSING'
+                    WHEN n.recovery_generation &lt;&gt; g.recovery_generation THEN 'GENERATION_STALE'
+                    WHEN g.state = 'CANCELED' THEN 'GROUP_CANCELED'
+                    WHEN g.state = 'RESUMED' THEN 'GROUP_ALREADY_RESUMED'
+                    WHEN g.state &lt;&gt; 'READY' THEN 'GROUP_NOT_READY'
+                    WHEN r.status IN ('COMPLETED', 'FAILED', 'CANCELED', 'EXPIRED', 'PARTIAL')
+                        THEN 'RUN_TERMINAL'
+                    WHEN r.status = 'CANCELING' THEN 'RUN_CANCELING'
+                    WHEN r.status &lt;&gt; 'EXECUTING' THEN 'RUN_NOT_EXECUTING'
+                    WHEN r.plan_generation &lt;&gt; g.plan_generation THEN 'PLAN_GENERATION_STALE'
+                    WHEN r.run_control_version &lt;&gt; #{runControlVersion}
+                        THEN 'RUN_CONTROL_VERSION_CHANGED'
+                    WHEN wi.id IS NULL THEN 'NEXT_SEGMENT_MISSING'
+                    WHEN wi.run_control_version &lt;&gt; r.run_control_version
+                        THEN 'SEGMENT_CONTROL_VERSION_STALE'
+                    WHEN wi.state IN ('RESUMABLE', 'RUNNABLE', 'CLAIMED', 'EXECUTING')
+                        THEN 'NEXT_SEGMENT_ACTIVE'
+                    WHEN wi.state &lt;&gt; 'WAITING' THEN 'NEXT_SEGMENT_TERMINAL'
+                    WHEN l.run_id IS NULL
+                         OR l.owner_instance_id &lt;&gt; #{ownerInstanceId}
+                         OR l.fencing_token &lt;&gt; #{fencingToken}
+                         OR l.expires_at &lt;= CURRENT_TIMESTAMP
+                        THEN 'LEASE_NOT_OWNED'
+                    ELSE 'UNKNOWN'
+                END AS rejection,
+                CASE
+                    WHEN n.state &lt;&gt; 'WAITING' THEN n.state
+                    WHEN r.id IS NULL OR g.id IS NULL THEN NULL
+                    WHEN g.state = 'CANCELED' OR g.state = 'RESUMED' THEN g.state
+                    WHEN r.status &lt;&gt; 'EXECUTING' THEN r.status
+                    WHEN wi.id IS NULL THEN NULL
+                    WHEN wi.state &lt;&gt; 'WAITING' THEN wi.state
+                    ELSE NULL
+                END AS rejection_detail
+            FROM alphafrog_agent_run_recovery_notification n
+            LEFT JOIN alphafrog_agent_run_wait_group g ON g.id = n.group_id
+            LEFT JOIN alphafrog_agent_run r ON r.id = n.run_id
+            LEFT JOIN alphafrog_agent_run_service_lease l ON l.run_id = n.run_id
+            LEFT JOIN alphafrog_agent_run_work_item wi
+                   ON wi.run_id = g.run_id
+                  AND wi.plan_generation = g.plan_generation
+                  AND wi.node_id = g.node_id
+                  AND wi.node_attempt = g.node_attempt
+                  AND wi.segment_sequence = g.next_segment_sequence
+            WHERE n.id = #{notificationId}
+        )
+        SELECT
+            (SELECT count(*) FROM notification_consumed) AS consumed,
+            (SELECT count(*) FROM segment_promoted) AS promoted,
+            (SELECT group_id FROM notification_consumed) AS group_id,
+            -- 放行出来的那一段的完整身份随结果一起返回：周期补扫这一路手上只有通知，
+            -- 拿不到身份就没法把下一段投给节点池，而为了拿身份再读一次库会和别的写入赛跑。
+            (SELECT run_id FROM segment_promoted) AS next_run_id,
+            (SELECT plan_generation FROM segment_promoted) AS next_plan_generation,
+            (SELECT node_id FROM segment_promoted) AS next_node_id,
+            (SELECT node_attempt FROM segment_promoted) AS next_node_attempt,
+            (SELECT segment_sequence FROM segment_promoted) AS next_segment_sequence,
+            -- 取不成的那些：原因与补充状态一起带回去。
+            (SELECT rejection FROM diagnosis) AS rejection,
+            (SELECT rejection_detail FROM diagnosis) AS rejection_detail
+    </select>
+
+    <!-- ==================== 整链取消 ==================== -->
+
+    <!--
+      取消一条等待链：组、还没结束的成员、下一段和还没被取走的通知一起停。
+      已经结束的成员保持原样，好让「谁先拿到结果」这件事留痕。
+    -->
+    <select id="cancelChain" resultMap="WaitChainCancelResultMap" affectData="true" flushCache="true">
+        WITH run_fence AS (
+            SELECT r.id AS run_id
+            FROM alphafrog_agent_run r
+            JOIN alphafrog_agent_run_wait_group g ON g.id = #{groupId} AND g.run_id = r.id
+            FOR UPDATE OF r
+        ),
+        group_stopped AS (
+            UPDATE alphafrog_agent_run_wait_group g SET
+                state = 'CANCELED',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE g.id = #{groupId}
+              AND g.state IN ('WAITING', 'READY')
+              AND EXISTS (SELECT 1 FROM run_fence)
+            RETURNING g.id, g.run_id, g.plan_generation, g.node_id, g.node_attempt,
+                      g.next_segment_sequence
+        ),
+        members_canceled AS (
+            UPDATE alphafrog_agent_run_wait_member m SET
+                state = 'CANCELED',
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE m.group_id = s.id
+              AND m.state IN ('PENDING', 'RUNNING')
+            RETURNING 1
+        ),
+        segment_canceled AS (
+            UPDATE alphafrog_agent_run_work_item wi SET
+                state = 'CANCELED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE wi.run_id = s.run_id
+              AND wi.plan_generation = s.plan_generation
+              AND wi.node_id = s.node_id
+              AND wi.node_attempt = s.node_attempt
+              AND wi.segment_sequence = s.next_segment_sequence
+              AND wi.state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')
+            RETURNING 1
+        ),
+        notification_canceled AS (
+            UPDATE alphafrog_agent_run_recovery_notification n SET
+                state = 'CANCELED',
+                updated_at = CURRENT_TIMESTAMP
+            FROM group_stopped s
+            WHERE n.group_id = s.id
+              AND n.state = 'WAITING'
+            RETURNING 1
+        )
+        SELECT
+            (SELECT count(*) FROM group_stopped) AS groups_canceled,
+            (SELECT count(*) FROM members_canceled) AS members_canceled,
+            (SELECT count(*) FROM segments_canceled) AS segments_canceled,
+            (SELECT count(*) FROM notification_canceled) AS notifications_canceled
+    </select>
+
+    <!-- ==================== 成员派发 ==================== -->
+
+    <!--
+      派发成功：成员从「已保存待派发」进入「已派发执行中」，同时把外部作业身份与派发证明写上。
+
+      只对还没派发的成员生效，所以同一个成员被重复派发时第二次影响零行：调用方据返回值就能知道
+      「这一次是不是我把它送出去的」。已经落终态的成员不会被这条语句改动。
+
+      Run 必须还在执行中且控制版本没变：计划代际失效或取消之后，旧 Worker 不能再去改等待事实。
+    -->
+    <update id="markMemberDispatched">
+        UPDATE alphafrog_agent_run_wait_member m SET
+            state = 'RUNNING',
+            external_operation_id = COALESCE(#{externalOperationId}::varchar, m.external_operation_id),
+            dispatch_proof_json = COALESCE(CAST(#{dispatchProofJson} AS jsonb), m.dispatch_proof_json),
+            next_poll_at = COALESCE(#{nextPollAt}, m.next_poll_at),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE m.group_id = #{groupId}
+          AND m.member_identity = #{memberIdentity}
+          AND m.state = 'PENDING'
+          -- 已经在库里的外部作业身份不能被另一个值换掉：整组落库时写下的身份是结果接收方
+          -- 找回这个成员的唯一凭据，派发阶段只能沿用同一个值。
+          AND (m.external_operation_id IS NULL
+               OR #{externalOperationId}::varchar IS NULL
+               OR m.external_operation_id = #{externalOperationId}::varchar)
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run r
+              WHERE r.id = m.run_id
+                AND r.status = 'EXECUTING'
+                AND r.run_control_version = #{runControlVersion})
+    </update>
+
+    <!-- ==================== 成员轮询 ==================== -->
+
+    <!--
+      成员还在执行中时推后它的下次查询时间并累加轮询次数。已经落终态的成员不会被改，
+      所以「某个操作被查了第几次」永远只增一次。
+    -->
+    <update id="rescheduleMember">
+        UPDATE alphafrog_agent_run_wait_member SET
+            next_poll_at = #{nextPollAt},
+            poll_count = poll_count + 1,
+            backoff_step = LEAST(backoff_step + 1, #{maxBackoffStep}::int),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE group_id = #{groupId}
+          AND member_identity = #{memberIdentity}
+          AND state = 'RUNNING'
+    </update>
+
+    <!--
+      验收夹具按放行策略压住这条成员：只推下次查询时间，不动轮询次数与退避步数。
+      被压住不是「问不到结论」，退避步数涨上去会让放行之后还要多等一个退避周期才接回来。
+      只对还在执行中的成员生效：已经落终态的成员不会被改。
+    -->
+    <update id="holdMember">
+        UPDATE alphafrog_agent_run_wait_member SET
+            next_poll_at = #{nextPollAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE group_id = #{groupId}
+          AND member_identity = #{memberIdentity}
+          AND state = 'RUNNING'
+    </update>
+
+</mapper>

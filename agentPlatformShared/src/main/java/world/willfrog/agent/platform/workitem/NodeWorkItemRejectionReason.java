@@ -21,7 +21,16 @@ public enum NodeWorkItemRejectionReason {
     DUPLICATE_IDENTITY("同一个身份已经有一行"),
 
     /** 这一行不存在。 */
-    NOT_FOUND("这一行不存在");
+    NOT_FOUND("这一行不存在"),
+
+    /**
+     * 这条 Run 级写入现在不被允许：语句里的条件挡下了它。
+     *
+     * <p>可能是服务所有权已经不在本进程手上，也可能是父 Run 的调度器版本、计划代际、控制版本或状态
+     * 已经从这次协调回合读到的那一版往前走了。两种情况下调用方都按「这条 Run 现在不归我推进」处理，
+     * 等下一轮重新读事实。</p>
+     */
+    OWNERSHIP_LOST("这条 Run 的服务所有权已经不在本进程，或者父 Run 的版本与状态已经往前走了");
 
     private final String detail;
 

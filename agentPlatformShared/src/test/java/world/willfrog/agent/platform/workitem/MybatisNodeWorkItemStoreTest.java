@@ -30,6 +30,9 @@ import static org.mockito.Mockito.when;
 class MybatisNodeWorkItemStoreTest {
 
     private static final NodeWorkItemIdentity IDENTITY = new NodeWorkItemIdentity("run-1", 0, "node-1", 0, 0);
+    /** Run 级写入要带的服务所有权凭据：这里只证明它被原样交给语句。 */
+    private static final ServiceOwnershipFence FENCE = new ServiceOwnershipFence("instance-a", 7L);
+    private static final SchedulerVersion VERSION = SchedulerVersion.DUAL_POOL_V1;
 
     @Mock
     private NodeWorkItemMapper mapper;
@@ -58,39 +61,64 @@ class MybatisNodeWorkItemStoreTest {
 
     @Test
     void createReportsDuplicateIdentityInsteadOfThrowing() {
-        lenient().when(mapper.insert(any())).thenReturn(0);
+        lenient().when(mapper.insert(any(), anyString(), anyLong())).thenReturn(0);
+        // 影响 0 行时回读一次：同一身份已经有行 ⇒ 唯一约束挡下，不是所有权问题。
+        lenient().when(mapper.findByIdentity(anyString(), anyInt(), anyString(), anyInt(), anyInt()))
+                .thenReturn(row("RUNNABLE", 0));
         NodeWorkItem candidate = row("RUNNABLE", 0);
-        NodeWorkItemMutationResult result = store.create(candidate);
+        NodeWorkItemMutationResult result = store.create(candidate, FENCE);
         assertThat(result.applied()).isFalse();
         assertThat(result.rejection().reason()).isEqualTo(NodeWorkItemRejectionReason.DUPLICATE_IDENTITY);
+    }
+
+    @Test
+    void createReportsLostOwnershipWhenNothingWasWrittenAndNoRowExists() {
+        lenient().when(mapper.insert(any(), anyString(), anyLong())).thenReturn(0);
+        lenient().when(mapper.findByIdentity(anyString(), anyInt(), anyString(), anyInt(), anyInt()))
+                .thenReturn(null);
+        NodeWorkItem candidate = row("RUNNABLE", 0);
+
+        NodeWorkItemMutationResult result = store.create(candidate, FENCE);
+
+        assertThat(result.applied()).isFalse();
+        // 没有同一身份的行、也没写进去：语句里的服务所有权条件把它挡下了。
+        assertThat(result.rejection().reason()).isEqualTo(NodeWorkItemRejectionReason.OWNERSHIP_LOST);
+    }
+
+    @Test
+    void createRefusesAnEmptyOwnershipFence() {
+        NodeWorkItem candidate = row("RUNNABLE", 0);
+        assertThatThrownBy(() -> store.create(candidate, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("服务所有权凭据");
     }
 
     @Test
     void createRefusesMissingSchedulerVersion() {
         NodeWorkItem candidate = row("RUNNABLE", 0);
         candidate.setSchedulerVersion(null);
-        assertThatThrownBy(() -> store.create(candidate))
+        assertThatThrownBy(() -> store.create(candidate, FENCE))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("调度器版本");
     }
 
     @Test
     void claimReturnsEmptyWhenUpdateTouchedNoRow() {
-        when(mapper.claim(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyString(),
-                anyLong(), anyLong(), anyString(), any())).thenReturn(null);
+        when(mapper.claim(anyString(), anyLong(), anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyString(), anyLong(), anyLong(), anyString(), any())).thenReturn(null);
         Optional<NodeWorkItemClaim> claim = store.claim(IDENTITY,
                 new NodeWorkItemVersions(7L, 3L, 0), "worker-a", Duration.ofSeconds(30),
-                SchedulerVersion.DUAL_POOL_V1);
+                VERSION, FENCE);
         assertThat(claim).isEmpty();
     }
 
     @Test
     void claimReturnsNewEpochWhenUpdateSucceeded() {
-        when(mapper.claim(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyString(),
-                anyLong(), anyLong(), anyString(), any())).thenReturn(1);
+        when(mapper.claim(anyString(), anyLong(), anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyString(), anyLong(), anyLong(), anyString(), any())).thenReturn(1);
         Optional<NodeWorkItemClaim> claim = store.claim(IDENTITY,
                 new NodeWorkItemVersions(7L, 3L, 0), "worker-a", Duration.ofSeconds(30),
-                SchedulerVersion.DUAL_POOL_V1);
+                VERSION, FENCE);
         assertThat(claim).isPresent();
         assertThat(claim.get().claimEpoch()).isEqualTo(1);
         assertThat(claim.get().claimedBy()).isEqualTo("worker-a");
@@ -172,7 +200,7 @@ class MybatisNodeWorkItemStoreTest {
                 .hasMessageContaining("JSON 对象");
         NodeWorkItem candidate = row("RUNNABLE", 0);
         candidate.setPayloadJson("42");
-        assertThatThrownBy(() -> store.create(candidate))
+        assertThatThrownBy(() -> store.create(candidate, FENCE))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -198,6 +226,27 @@ class MybatisNodeWorkItemStoreTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.scanClaimable(null, 10))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void abandonedClaimRequeueReportsSuccessOnlyWhenOneRowMoved() {
+        when(mapper.requeueAbandonedClaim(anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyLong(), anyLong(), anyInt(), anyString(), anyLong(), anyString())).thenReturn(1);
+        assertThat(store.requeueAbandonedClaim(IDENTITY, new NodeWorkItemVersions(7L, 3L, 2),
+                FENCE, VERSION).applied()).isTrue();
+    }
+
+    @Test
+    void abandonedClaimRequeueOnMovedEpochIsReportedAsStaleSubmission() {
+        when(mapper.requeueAbandonedClaim(anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyLong(), anyLong(), anyInt(), anyString(), anyLong(), anyString())).thenReturn(0);
+        when(mapper.findByIdentity(anyString(), anyInt(), anyString(), anyInt(), anyInt()))
+                .thenReturn(row("CLAIMED", 3));
+
+        NodeWorkItemMutationResult result = store.requeueAbandonedClaim(IDENTITY,
+                new NodeWorkItemVersions(7L, 3L, 2), FENCE, VERSION);
+
+        assertThat(result.rejection().reason()).isEqualTo(NodeWorkItemRejectionReason.STALE_SUBMISSION);
     }
 
     @Test

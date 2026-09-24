@@ -9,10 +9,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationListener;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalCachePaths;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -45,12 +48,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * Nacos 自身的版本号只是传输元数据。文档缺失、为空或任一加载校验不过时，
  * 保持当前生效版本不变；文件被删除视为覆盖撤下，回落 classpath 默认版本。</p>
  *
+ * <p>解析走 {@code JsonNode} 字面量键，不绑定 POJO 字段名。应用 ObjectMapper
+ * 即使被改成 SNAKE_CASE，也不影响 {@code formatVersion} 这类键。</p>
+ *
  * @see PromptAuthority 权威默认版本与覆盖叠加
  */
 @Component
 @RequiredArgsConstructor
 @Slf4j
-public class PromptOverlayLoader {
+public class PromptOverlayLoader implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     static final String DATA_ID = "agent-prompt-overlay.json";
     private static final int SUPPORTED_FORMAT_VERSION = 1;
@@ -65,6 +71,9 @@ public class PromptOverlayLoader {
 
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")
     private String instanceId;
+
+    @Value("${AF_LANE_TRAFFIC_SCOPE_ID:}")
+    private String laneTrafficScopeId;
 
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
@@ -105,6 +114,30 @@ public class PromptOverlayLoader {
         reloadIfNeeded(false);
     }
 
+    @Override
+    public void onApplicationEvent(NacosLocalConfigWrittenEvent event) {
+        applyNacosWrittenFile(event.getTargetFile());
+    }
+
+    /**
+     * Nacos 已经把覆盖文档写进 {@code targetFile}。路径对得上才重读，避免泳道吃到主环境那份未加前缀的缓存。
+     */
+    public void applyNacosWrittenFile(String targetFile) {
+        if (targetFile == null || targetFile.isBlank()) {
+            return;
+        }
+        String file = resolvedOverlayFile();
+        if (file.isEmpty()) {
+            return;
+        }
+        Path configured = Paths.get(file).toAbsolutePath().normalize();
+        Path written = Paths.get(targetFile).toAbsolutePath().normalize();
+        if (!configured.equals(written)) {
+            return;
+        }
+        reloadIfNeeded(true);
+    }
+
     public OverlayState current() {
         return state;
     }
@@ -113,8 +146,12 @@ public class PromptOverlayLoader {
         return overlayReloadFailureCount.get();
     }
 
+    private String resolvedOverlayFile() {
+        return NacosLocalCachePaths.isolate(overlayFile == null ? "" : overlayFile.trim(), laneTrafficScopeId);
+    }
+
     private void reloadIfNeeded(boolean force) {
-        String file = overlayFile == null ? "" : overlayFile.trim();
+        String file = resolvedOverlayFile();
         if (file.isEmpty()) {
             return;
         }

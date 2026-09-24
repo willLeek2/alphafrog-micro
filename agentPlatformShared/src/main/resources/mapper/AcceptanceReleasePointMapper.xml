@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  验收夹具的放行点是读的：被策略压住的成员结果，等这里对应的点被标成已放行才收尾。
+  写入方是宿主机上的受限控制面，Agent 进程只有下面这一条读语句。
+-->
+<mapper namespace="world.willfrog.agent.platform.mapper.AcceptanceReleasePointMapper">
+
+    <!--
+      按「Run + 放行点」精确命中；只有标了放行时刻的行才算已放行。
+      行还没建出来、或者建出来没标，都返回 0：两种都是「还没放行」。
+    -->
+    <select id="countOpened" resultType="int">
+        SELECT COUNT(*)
+        FROM alphafrog_agent_run_release_point
+        WHERE run_id = #{runId}
+          AND release_key = #{releaseKey}
+          AND opened_at IS NOT NULL
+    </select>
+
+</mapper>

@@ -19,6 +19,8 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
+import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
 import world.willfrog.agentlangchain.tools.LangchainRepeatedToolCallContext;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
@@ -892,8 +894,12 @@ public class LangchainTodoNodeExecutor {
      * @return 配置完成的 final answer AiServices 代理实例
      */
     private LangchainFinalAnswerAiService buildFinalAnswerAiService(LangchainWorkflowRequest request) {
+        // 写答案这一次的调用身份：哪条 Run、哪一代计划。夹具按身份发脚本回合，同一条 Run 重做这一次
+        // （进程重启后接着写）也拿回同一份回复；不带夹具编号的 Run 这一步原样返回真实模型。
         return AiServices.builder(LangchainFinalAnswerAiService.class)
-                .chatModel(request.finalAnswerModelOrDefault())
+                .chatModel(AcceptanceFixtureModelRegistry.forCall(
+                        request.finalAnswerModelOrDefault(),
+                        () -> FixtureCallIdentity.answer(request.getRunId(), request.planGenerationOrDefault())))
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);

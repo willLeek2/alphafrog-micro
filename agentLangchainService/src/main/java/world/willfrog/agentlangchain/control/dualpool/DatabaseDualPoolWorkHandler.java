@@ -9,31 +9,47 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
+import world.willfrog.agent.platform.capacity.SchedulerRoundScope;
+import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.coordination.RunCoordination;
+import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
+import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeDispatchDeferReason;
 import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import org.springframework.beans.factory.ObjectProvider;
+import world.willfrog.agentlangchain.control.LegacyRunHandoff;
+import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.ExecutionModeResolver;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
 import world.willfrog.agentlangchain.execution.LangchainCompletedTodo;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
+import world.willfrog.agentlangchain.execution.WaitGroupSuspensionMarker;
 import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
 import java.time.Duration;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -44,6 +60,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 双 Worker 池的数据库实现。
@@ -78,9 +95,32 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final SchedulerVersionPolicy schedulerVersionPolicy;
     private final DualPoolToolJobCoordinator toolJobCoordinator;
+    private final DualPoolWaitGroupNodeExecutor waitGroupNodeExecutor;
+    private final RunCoordinationStore coordinationStore;
+    private final SchedulerStateStore stateStore;
     private final Duration claimLease;
-    private final int perRunUnfinishedLimit;
+    private final Duration coordinationDeferRetry;
+    private final Duration hintQueueFullRetry;
+    /** 每个回合读一次的参数：上限与水位允许在运行期改，改完只影响之后新建的节点。 */
+    private final DualPoolSchedulerSettings settings;
     private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
+    private final RunServiceLeaseStore leaseStore;
+    private final ProcessInstanceIdentity processIdentity;
+    private final ObjectProvider<LegacyRunHandoff> legacyHandoff;
+    private final Duration serviceLeaseTtl;
+
+    /** 交出去的旧版本 Run 累计条数（反复扫描同一行的重复命中也算，是「次数」不是「当前候选数」）。 */
+    private final AtomicLong legacyHandedOff = new AtomicLong();
+    /** 旧版本 Run 这一轮没接手、按所有权原因推后的累计次数。 */
+    private final AtomicLong legacyDeferred = new AtomicLong();
+    /** 服务所有权在别的进程手上、这一轮不接手的累计次数（双池那一路）。 */
+    private final AtomicLong leaseNotAcquired = new AtomicLong();
+    /** 版本读不出来、或不属于任何已知执行层的候选累计次数：只记账，不动这些 Run 的任何状态。 */
+    private final AtomicLong routingIsolated = new AtomicLong();
+    /** 最近一轮的当前条数：与上面的累计值分开，读数里两个都要看得见。 */
+    private volatile long legacyCandidatesLastRound;
+    private volatile long leaseNotAcquiredLastRound;
+    private volatile long routingIsolatedLastRound;
     /** 固定条带锁不会按 runId 增长，也不会在旧协调回合仍等待时被删除并创建第二把锁。 */
     private final Object[] runLockStripes = createRunLockStripes();
 
@@ -96,8 +136,18 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             DualPoolRunAdmissionRegistry admissionRegistry,
             SchedulerVersionPolicy schedulerVersionPolicy,
             DualPoolToolJobCoordinator toolJobCoordinator,
+            DualPoolWaitGroupNodeExecutor waitGroupNodeExecutor,
+            RunCoordinationStore coordinationStore,
+            SchedulerStateStore stateStore,
+            RunServiceLeaseStore leaseStore,
+            ProcessInstanceIdentity processIdentity,
+            ObjectProvider<LegacyRunHandoff> legacyHandoff,
+            DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
-            @Value("${agent.langchain.dual-pool.per-run-unfinished-limit:256}") int perRunUnfinishedLimit) {
+            @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
+            @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
+            @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceLeaseTtlSeconds,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
         this.runMapper = runMapper;
         this.freshRunPipeline = freshRunPipeline;
         this.workItemStore = workItemStore;
@@ -109,9 +159,31 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.admissionRegistry = admissionRegistry;
         this.schedulerVersionPolicy = schedulerVersionPolicy;
         this.toolJobCoordinator = toolJobCoordinator;
+        this.waitGroupNodeExecutor = waitGroupNodeExecutor;
+        this.coordinationStore = coordinationStore;
+        this.stateStore = stateStore;
         this.claimLease = Duration.ofSeconds(Math.max(1L, claimLeaseSeconds));
-        this.perRunUnfinishedLimit = Math.max(1, perRunUnfinishedLimit);
+        this.coordinationDeferRetry = Duration.ofMillis(Math.max(1L, coordinationDeferRetryMs));
+        this.hintQueueFullRetry = Duration.ofMillis(Math.max(1L, hintQueueFullRetryMs));
+        this.settings = settings;
+        this.leaseStore = leaseStore;
+        this.processIdentity = processIdentity;
+        this.legacyHandoff = legacyHandoff;
+        this.serviceLeaseTtl = Duration.ofSeconds(Math.max(5L, serviceLeaseTtlSeconds));
+        // 登记归一化之后真正在用的值：领取租约、协调延期重试、提示队列满重试与服务租约时长这几项
+        // 读数里报的都是这里登记的数，不是属性请求值。
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_CLAIM_LEASE_SECONDS,
+                COMPONENT, this.claimLease.toSeconds());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_COORDINATION_DEFER_RETRY_MS,
+                COMPONENT, this.coordinationDeferRetry.toMillis());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_HINT_QUEUE_FULL_RETRY_MS,
+                COMPONENT, this.hintQueueFullRetry.toMillis());
+        frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
+                COMPONENT, this.serviceLeaseTtl.toSeconds());
     }
+
+    /** 读数与登记里用的组件名。 */
+    private static final String COMPONENT = "DatabaseDualPoolWorkHandler";
 
     @Override
     @Transactional
@@ -123,46 +195,137 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (admissionEpoch < 0L) {
             return;
         }
+        if (!admissionRegistry.holdsOwnership(hint.runId())) {
+            // 服务所有权不在本进程：这条 Run 现在归别的进程服务，本进程不推进它。
+            // 这一步只是少做无用功，真正的闸门在每条写入的语句里（凭据不匹配就影响 0 行）。
+            log.warn("这条 Run 的服务所有权不在本进程，不协调它: runId={}", hint.runId());
+            return;
+        }
         Object lock = runLockFor(hint.runId());
         synchronized (lock) {
             // 提示可能在等待条带锁期间跨过终态与追问/恢复边界；旧 epoch 不能协调新一轮。
-            if (admissionRegistry.currentAdmissionEpoch(hint.runId()) != admissionEpoch) {
+            if (admissionRegistry.currentAdmissionEpoch(hint.runId()) != admissionEpoch
+                    || !admissionRegistry.holdsOwnership(hint.runId())) {
                 return;
             }
-            coordinateLocked(hint.runId());
+            coordinationTurn(hint.runId());
         }
     }
 
-    private void coordinateLocked(String runId) {
+    /**
+     * 一轮 Run 协调：先把这个 Run 的协调资格与轮转位置对齐，再按 Run 状态推进，最后把
+     * 「这一轮推进了没有、没推进是卡在哪一条上」落库。
+     *
+     * <p>记账放在这里而不是散在各个分支里：延期原因是给验收看的事实，不能靠日志推断，也不能
+     * 因为走的是哪条分支而漏写。成功推进与延期记录都按同一把条带锁串行，条带锁之外读到的都是旧值。</p>
+     */
+    private void coordinationTurn(String runId) {
         AgentRun run = runMapper.findById(runId);
         if (run == null) {
             releaseRun(runId);
             return;
         }
-        if (!schedulerVersionPolicy.isDualPool(run)) {
-            log.error("已接纳 Run 的调度器版本不是 DUAL_POOL_V1，停止协调: runId={} version={}",
+        if (!schedulerVersionPolicy.isDualPoolFamily(run)) {
+            log.error("已接纳 Run 的调度器版本不属于双池执行层，停止协调: runId={} version={}",
                     runId, run.getSchedulerVersion());
             releaseRun(runId);
             return;
         }
+        RunCoordination coordination = prepareCoordinationRow(run);
+        // 轮次在回合开始时取一次：这一回合被服务的是哪一轮，由它说话。
+        long turnRound = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
+        // 这一回合要用的一整套调度参数也在回合开始时解析一次：名额、水位、每回合上限都从这一份里读，
+        // 热配置正好在这几次读之间改过时，才不会拿着两个版本的值拼出谁都没配过的组合。
+        CoordinationTurn turn = new CoordinationTurn(run, coordination, turnRound, settings.round());
+        try {
+            coordinateLocked(run, turn);
+        } finally {
+            recordTurn(turn);
+        }
+    }
+
+    /**
+     * 确保这个 Run 有协调资格记录，并让记录上的计划代际跟着 Run 走；返回这一轮读到的资格记录。
+     *
+     * <p>记录上的版本与计划代际都由存储层从 Run 主表派生，这里不传值：滚动部署期间同一条 Run 的
+     * 冻结版本只有一个出处，传进去就会出现主记录与子记录各说一套。计划代际只同步前移的那一代，
+     * 拿旧观察去写会让存储层拒掉（影响 0 行）。</p>
+     */
+    private RunCoordination prepareCoordinationRow(AgentRun run) {
+        int generation = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
+        RunCoordination existing = coordinationStore.find(run.getId()).orElse(null);
+        if (existing == null) {
+            coordinationStore.ensure(run.getId());
+            RunCoordination created = coordinationStore.find(run.getId()).orElse(null);
+            if (created == null) {
+                throw new IllegalStateException("协调资格记录刚建好就读不回来，Run 可能不在库里：runId=" + run.getId());
+            }
+            return created;
+        }
+        if (value(existing.getPlanGeneration()) != generation) {
+            ServiceOwnershipFence fence = ownershipFence(run.getId());
+            if (fence == null) {
+                log.warn("没有服务所有权凭据，不把资格记录的计划代际同步到 Run 当前值: runId={} 期望代际={}",
+                        run.getId(), generation);
+            } else if (coordinationStore.syncPlanGeneration(run.getId(), generation, fence)) {
+                existing.setPlanGeneration(generation);
+            }
+        }
+        return existing;
+    }
+
+    /**
+     * 把这一轮的记账写进数据库。
+     *
+     * <p>没推进又有明确原因时记延期（原因 + 下次可见时间）；其余情况都记「被服务过」——包括那些
+     * 只是在等已经在跑的节点、既没新建也没被挡住的回合。这么记是为了让轮转公平：等节点的图这一轮
+     * 确实占到了协调机会，下一轮可以先让别人来。</p>
+     */
+    private void recordTurn(CoordinationTurn turn) {
+        ServiceOwnershipFence fence = ownershipFence(turn.runId);
+        if (fence == null) {
+            // 记账也要带凭据：这一轮是不是本进程服务的、服务到哪一轮，不能由已经没有所有权的
+            // 回合来写。写不进去就少记一轮，别的进程下一轮会补上，不影响执行事实。
+            log.warn("没有服务所有权凭据，这一轮的记账不写: runId={} turnRound={}", turn.runId, turn.turnRound);
+            return;
+        }
+        if (!turn.progressed && turn.deferReason != null) {
+            OffsetDateTime nextVisibleAt = OffsetDateTime.now().plus(coordinationDeferRetry);
+            if (coordinationStore.deferFor(turn.runId, turn.deferReason, nextVisibleAt,
+                    turn.planGeneration, turn.coordinationServedRound, fence)) {
+                log.info("Run 协调延期: runId={} reason={} nextVisibleAt={}",
+                        turn.runId, turn.deferReason, nextVisibleAt);
+            }
+            return;
+        }
+        if (!coordinationStore.markCoordinationServed(turn.runId, turn.turnRound, turn.planGeneration,
+                fence)) {
+            // 计划代际已经变了、或者资格记录已经被别的回合推进过：这次成功写不生效。
+            log.info("Run 协调的成功推进没有写进去（计划代际或轮次已经变化）: runId={} turnRound={}",
+                    turn.runId, turn.turnRound);
+        }
+    }
+
+    private void coordinateLocked(AgentRun run, CoordinationTurn turn) {
         AgentRunStatus status = run.getStatus();
         if (status == AgentRunStatus.RECEIVED) {
-            ensurePlanningWorkItem(run);
+            ensurePlanningWorkItem(run, turn);
             return;
         }
         if (status == AgentRunStatus.EXECUTING) {
             try {
-                advanceExecutingRun(run);
+                advanceExecutingRun(run, turn);
             } catch (RuntimeException e) {
                 // 冻结 Plan 损坏、结构不合法或模式判定失败时，不能只让 dispatcher 记日志后
                 // 把 Run 永久留在 EXECUTING。把协调异常转成同一套持久失败收尾。
                 String reason = "dual_pool_coordination_failed:" + safeReason(e);
-                log.error("双池协调失败，转入持久失败收尾: runId={} reason={}", runId, reason, e);
+                log.error("双池协调失败，转入持久失败收尾: runId={} reason={}", run.getId(), reason, e);
                 persistInfrastructureFailure(run, null, List.of(), reason,
                         Map.of("stage", "advance_executing_run"));
             }
             return;
         }
+        String runId = run.getId();
         if (status == AgentRunStatus.WAITING_TOOL_JOB && toolJobCoordinator.hasActiveWait(runId)) {
             return;
         }
@@ -174,7 +337,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
     }
 
-    private void ensurePlanningWorkItem(AgentRun run) {
+    private void ensurePlanningWorkItem(AgentRun run, CoordinationTurn turn) {
         List<NodeWorkItem> unfinished = workItemStore.listUnfinishedByRun(run.getId());
         Optional<NodeWorkItem> existingPlanning = unfinished.stream()
                 .filter(item -> PLANNING_NODE_ID.equals(item.getNodeId()))
@@ -182,12 +345,19 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                         && item.getPlanGeneration().equals(run.getPlanGeneration()))
                 .findFirst();
         if (existingPlanning.isPresent()) {
-            dispatcher.offerNode(existingPlanning.get().identity());
+            if (offerIfRunnable(existingPlanning.get())) {
+                turn.served();
+            }
             return;
         }
         for (NodeWorkItem old : unfinished) {
             workItemStore.markStale(old.identity(), value(old.getContextVersion()),
                     value(old.getRunControlVersion()), "new_plan_generation");
+        }
+        ServiceOwnershipFence fence = ownershipFence(run.getId());
+        if (fence == null) {
+            log.warn("没有服务所有权凭据，不开新计划: runId={}", run.getId());
+            return;
         }
         int expectedGeneration = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
         int observedWorkItemGeneration = workItemStore.maxPlanGenerationByRun(run.getId());
@@ -199,33 +369,40 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         } else {
             Integer advanced = runMapper.advancePlanGeneration(
                     run.getId(), run.getUserId(), AgentRunStatus.RECEIVED,
-                    expectedGeneration, observedWorkItemGeneration);
+                    expectedGeneration, observedWorkItemGeneration,
+                    fence.ownerInstanceId(), fence.fencingToken());
             if (advanced == null) {
                 return;
             }
             generation = advanced;
         }
+        if (newNodesAllowed(run.getId(), turn) == 0) {
+            return;
+        }
         NodeWorkItemIdentity identity = identity(run.getId(), generation, PLANNING_NODE_ID);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("kind", KIND_PLANNING);
         payload.put("workflow", "PENDING_PLAN");
-        createAndHint(identity, 0L, value(run.getRunControlVersion()), payload);
+        createAndHint(identity, 0L, value(run.getRunControlVersion()), payload,
+                run.getSchedulerVersion(), turn);
     }
 
-    private void advanceExecutingRun(AgentRun run) {
+    private void advanceExecutingRun(AgentRun run, CoordinationTurn turn) {
         int generation = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
         if (generation < 0) {
             persistInfrastructureFailure(run, null, List.of(), "dual_pool_plan_generation_missing", null);
             return;
         }
-        NodeWorkItem planning = workItemStore.findByIdentity(
-                identity(run.getId(), generation, PLANNING_NODE_ID)).orElse(null);
+        Map<String, NodeWorkItem> latestSegments = latestSegmentsByNode(run.getId(), generation);
+        NodeWorkItem planning = latestSegments.get(PLANNING_NODE_ID);
         if (planning == null) {
             persistInfrastructureFailure(run, null, List.of(), "dual_pool_planning_work_item_missing", null);
             return;
         }
         if (!planning.terminal()) {
-            dispatcher.offerNode(planning.identity());
+            if (offerIfRunnable(planning)) {
+                turn.served();
+            }
             return;
         }
         if (planning.stateEnum() != NodeWorkItemState.RESULT_COMMITTED
@@ -250,8 +427,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         boolean unfinishedExists = false;
 
         for (TodoItem item : items) {
-            NodeWorkItem row = workItemStore.findByIdentity(identity(run.getId(), generation, item.getId()))
-                    .orElse(null);
+            NodeWorkItem row = latestSegments.get(item.getId());
             if (row == null) {
                 continue;
             }
@@ -259,12 +435,19 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             existingIds.add(item.getId());
             if (!row.terminal()) {
                 unfinishedExists = true;
-                dispatcher.offerNode(row.identity());
+                if (offerIfRunnable(row)) {
+                    turn.served();
+                }
                 continue;
             }
             if (row.stateEnum() == NodeWorkItemState.RESULT_COMMITTED && segmentSuccess(row)) {
                 completedIds.add(item.getId());
                 completed.add(completedTodo(item, row));
+                continue;
+            }
+            if (segmentSuspended(row)) {
+                // 这一段把整组工具交出去了，节点并没有失败：下一段已经建好，等结果齐备放行。
+                unfinishedExists = true;
                 continue;
             }
             failureReason = segmentFailure(row, "dual_pool_todo_failed:" + item.getId());
@@ -277,38 +460,118 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         if (completedIds.size() == items.size()) {
-            advanceFinalAnswer(run, plan, generation, completed);
+            advanceFinalAnswer(run, plan, generation, completed, latestSegments, turn);
             return;
         }
 
         boolean useDag = ExecutionModeResolver.inspectFrozen(plan).useDag();
+        String schedulerVersion = run.getSchedulerVersion();
         List<NodeWorkDraft> drafts = useDag
                 ? planAdapter.runnableDag(run.getId(), generation, plan, completedIds, existingIds,
-                        completedIds.size(), value(run.getRunControlVersion()))
+                        completedIds.size(), value(run.getRunControlVersion()), schedulerVersion)
                 : planAdapter.runnableLinear(run.getId(), generation, plan, completedIds, existingIds,
-                        completedIds.size(), value(run.getRunControlVersion()));
+                        completedIds.size(), value(run.getRunControlVersion()), schedulerVersion);
         if (drafts.isEmpty() && !unfinishedExists) {
             persistInfrastructureFailure(run, plan, completed,
                     "dual_pool_no_runnable_node", null);
             return;
         }
         if (!drafts.isEmpty()) {
-            createTodoWorkItems(drafts, completed);
+            createTodoWorkItems(drafts, completed, turn);
+            return;
+        }
+        // 没有新节点可建、也没有失败：这一次协调只是在等已经在跑的节点，记一次被服务过。
+        turn.served();
+    }
+
+    /**
+     * 一个计划代际下每个逻辑节点的最新分段，按节点编号索引。
+     *
+     * <p>一次等待会把当前分段写成已提交并建出下一段，所以这里必须看最新分段：拿第一段去判断，
+     * 会把「悬在等待里的节点」当成有结果的节点。</p>
+     */
+    private Map<String, NodeWorkItem> latestSegmentsByNode(String runId, int planGeneration) {
+        Map<String, NodeWorkItem> byNode = new LinkedHashMap<>();
+        for (NodeWorkItem item : workItemStore.listLatestSegments(runId, planGeneration)) {
+            byNode.put(item.getNodeId(), item);
+        }
+        return byNode;
+    }
+
+    /** 只把确实能领取的分段投进提醒队列：等待中的下一段不该占掉别人的派发机会。 */
+    private boolean offerIfRunnable(NodeWorkItem item) {
+        if (item.stateEnum() != NodeWorkItemState.RUNNABLE
+                && item.stateEnum() != NodeWorkItemState.RESUMABLE) {
+            return false;
+        }
+        dispatcher.offerNode(item.identity());
+        return true;
+    }
+
+    /**
+     * 新增节点前的两道闸：这个 Run 还能背多少未完成节点、全局是否已经暂停新增。
+     *
+     * <p>返回还能新增的数量，0 表示这一轮不允许新增（原因已经记在这一轮的记账上）。两道闸对
+     * 规划节点、普通节点、最终回答节点一视同仁：共同计数、共用名额，才谈得上「谁也不能绕过」。</p>
+     */
+    private int newNodesAllowed(String runId, CoordinationTurn turn) {
+        int perRunRoom = Math.max(0, turn.round.perRunUnfinishedLimit().intValue()
+                - workItemStore.countUnfinishedByRun(runId));
+        if (perRunRoom == 0) {
+            turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
+            return 0;
+        }
+        SchedulerPauseDecision pause = stateStore.decideAndRecord(
+                workItemStore.countUnfinished(), turn.round.globalUnfinishedHighWatermark().intValue(),
+                turn.round.globalUnfinishedLowWatermark().intValue());
+        if (pause.paused()) {
+            // 暂停标记是持久事实：进程重启后也只按库里那一条继续判断，不拿当前数量重新起算。
+            turn.defer(RunCoordinationDeferReason.GLOBAL_UNFINISHED_PAUSED);
+            log.info("全局新增已暂停，暂不新增节点: runId={} {}", runId, pause.describe());
+            return 0;
+        }
+        return perRunRoom;
+    }
+
+    /** 这一行是不是「整组工具交出去」的挂起分段：它已提交但不是完成。 */
+    private boolean segmentSuspended(NodeWorkItem row) {
+        try {
+            return WaitGroupSuspensionMarker.present(objectMapper.readTree(row.getPayloadJson()));
+        } catch (Exception e) {
+            // 载荷读不出来时不能当成挂起：宁可走原有的失败收尾，也不要把坏数据当等待继续挂着。
+            return false;
         }
     }
 
-    private void createTodoWorkItems(List<NodeWorkDraft> drafts, List<LangchainCompletedTodo> completed) {
-        int available = Math.max(0,
-                perRunUnfinishedLimit - workItemStore.countUnfinishedByRun(drafts.get(0).identity().runId()));
-        if (available == 0) {
-            log.warn("Run 的未完成工作项达到上限，等待后续协调回合: runId={} limit={}",
-                    drafts.get(0).identity().runId(), perRunUnfinishedLimit);
+    /** 当前分段是不是已经被等待组挂起语句写成结果已提交。 */
+    private boolean waitGroupSegmentAlreadyCommitted(NodeWorkItemIdentity identity) {
+        NodeWorkItem row = workItemStore.findByIdentity(identity).orElse(null);
+        return row != null
+                && row.stateEnum() == NodeWorkItemState.RESULT_COMMITTED
+                && segmentSuspended(row);
+    }
+
+    /**
+     * 把这一轮定下来的就绪节点写成工作项，并同步记下这一轮为什么没能建完。
+     *
+     * <p>三道限制一起算，取最小的那个：这一回合的节点数上限、这个 Run 还能背多少未完成节点、
+     * 以及全局高水位。前两道是给单张图和单个回合设的上限，第三道是全局的：到高水位就整批停新增，
+     * 直到回落到低水位才恢复，中途不允许因为「已经低于高水位」提前开闸。</p>
+     */
+    private void createTodoWorkItems(List<NodeWorkDraft> drafts,
+                                     List<LangchainCompletedTodo> completed,
+                                     CoordinationTurn turn) {
+        String runId = drafts.get(0).identity().runId();
+        int perRunRoom = newNodesAllowed(runId, turn);
+        if (perRunRoom == 0) {
             return;
         }
+        int perTurnNewNodeLimit = turn.round.perTurnNewNodeLimit().intValue();
+        int allowed = Math.min(Math.min(drafts.size(), perTurnNewNodeLimit), perRunRoom);
         Map<String, String> datasetRefs = datasetRefs(completed);
         int toolCallsUsed = completed.stream().mapToInt(todo -> resultToolCalls(
-                drafts.get(0).identity().runId(), drafts.get(0).identity().planGeneration(), todo.getTodoId())).sum();
-        for (NodeWorkDraft draft : drafts.stream().limit(available).toList()) {
+                runId, drafts.get(0).identity().planGeneration(), todo.getTodoId())).sum();
+        for (NodeWorkDraft draft : drafts.stream().limit(allowed).toList()) {
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("kind", KIND_TODO);
             payload.put("workflow", draft.workflow());
@@ -317,18 +580,27 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             payload.put("completedContext", completed);
             payload.put("datasetRefs", datasetRefs);
             payload.put("toolCallsUsed", toolCallsUsed);
-            createAndHint(draft.identity(), draft.contextVersion(), draft.runControlVersion(), payload);
+            createAndHint(draft.identity(), draft.contextVersion(), draft.runControlVersion(), payload,
+                    draft.schedulerVersion(), turn);
+        }
+        if (allowed < drafts.size()) {
+            // 这一轮确实推进了，只是没全建完：剩下的就绪节点留给后续回合，由节点完成后的协调提示或
+            // 周期补扫接着建。这里不记延期原因，因为延期原因是「这一轮没推进」的事实。
+            log.info("这一回合没有建完所有就绪节点，剩下的留给后续回合: runId={} 已建={} 就绪={} 每回合上限={} Run 剩余={}",
+                    runId, allowed, drafts.size(), perTurnNewNodeLimit, perRunRoom);
         }
     }
 
     private void advanceFinalAnswer(AgentRun run,
                                     LangchainTodoPlan plan,
                                     int generation,
-                                    List<LangchainCompletedTodo> completed) {
+                                    List<LangchainCompletedTodo> completed,
+                                    Map<String, NodeWorkItem> latestSegments,
+                                    CoordinationTurn turn) {
         NodeWorkItemIdentity identity = identity(run.getId(), generation, FINAL_ANSWER_NODE_ID);
-        NodeWorkItem finalItem = workItemStore.findByIdentity(identity).orElse(null);
+        NodeWorkItem finalItem = latestSegments.get(FINAL_ANSWER_NODE_ID);
         if (finalItem == null) {
-            if (workItemStore.countUnfinishedByRun(run.getId()) >= perRunUnfinishedLimit) {
+            if (newNodesAllowed(run.getId(), turn) == 0) {
                 return;
             }
             Map<String, Object> payload = new LinkedHashMap<>();
@@ -339,11 +611,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             payload.put("datasetRefs", datasetRefs(completed));
             payload.put("toolCallsUsed", completed.stream().mapToInt(todo ->
                     resultToolCalls(run.getId(), generation, todo.getTodoId())).sum());
-            createAndHint(identity, completed.size(), value(run.getRunControlVersion()), payload);
+            createAndHint(identity, completed.size(), value(run.getRunControlVersion()), payload,
+                    run.getSchedulerVersion(), turn);
             return;
         }
         if (!finalItem.terminal()) {
-            dispatcher.offerNode(identity);
+            if (offerIfRunnable(finalItem)) {
+                turn.served();
+            }
             return;
         }
         if (finalItem.stateEnum() != NodeWorkItemState.RESULT_COMMITTED || !segmentSuccess(finalItem)) {
@@ -396,30 +671,23 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         try {
             int generation = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
             int totalToolCalls = totalCommittedToolCalls(run.getId(), generation, plan);
-            if (plan == null) {
-                boolean durable = freshRunPipeline.persistDualPoolFailureWithoutPlan(
-                        run, reason, failureMetadata, totalToolCalls);
-                if (durable || terminalNow(run.getId())) {
-                    if (cancelUnfinished(run.getId(), "run_failed")) {
-                        releaseRun(run.getId());
-                    }
-                }
-                return;
-            }
-            LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
-                    freshRunPipeline.rebuildDualPoolNodeContext(run.getId());
-            if (context == null) {
-                return;
-            }
-            boolean durable = freshRunPipeline.persistDualPoolWorkflowResult(context,
-                    LangchainWorkflowResult.builder()
-                            .success(false)
-                            .failureReason(reason)
-                            .failureMetadata(failureMetadata)
-                            .plan(plan)
-                            .completedTodos(completed)
-                            .toolCallsUsed(totalToolCalls)
-                            .build());
+            // 写失败这条路不解析阶段模型：模型解析会因为「这条 Run 自己的配置有问题」而拒绝（夹具中途
+            // 失效、脚本位置重建不了、请求上下文读不出来都是这一类），拿它挡着写失败，Run 就停在执行中。
+            LangchainLinearRunPipelineImpl.DualPoolNodeContext context = plan == null
+                    ? null : freshRunPipeline.rebuildDualPoolNodeContextForFailure(run.getId());
+            boolean durable = context == null
+                    // 计划读不回来：按「没有计划」那条路把失败写出去，总比不写强。
+                    ? freshRunPipeline.persistDualPoolFailureWithoutPlan(
+                            run, reason, failureMetadata, totalToolCalls)
+                    : freshRunPipeline.persistDualPoolWorkflowResult(context,
+                            LangchainWorkflowResult.builder()
+                                    .success(false)
+                                    .failureReason(reason)
+                                    .failureMetadata(failureMetadata)
+                                    .plan(plan)
+                                    .completedTodos(completed)
+                                    .toolCallsUsed(totalToolCalls)
+                                    .build());
             if (durable || terminalNow(run.getId())) {
                 if (cancelUnfinished(run.getId(), "run_failed")) {
                     releaseRun(run.getId());
@@ -437,15 +705,27 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (identity == null || !admissionRegistry.isAdmitted(identity.runId())) {
             return;
         }
+        ServiceOwnershipFence fence = ownershipFence(identity.runId());
+        if (fence == null) {
+            // 服务所有权不在本进程：这一段的领取与执行都不该由本进程发起。
+            log.warn("这条 Run 的服务所有权不在本进程，不领取它的分段: runId={} identity={}",
+                    identity.runId(), identity.describe());
+            return;
+        }
         NodeWorkItem item = workItemStore.findByIdentity(identity).orElse(null);
         if (item == null || (item.stateEnum() != NodeWorkItemState.RUNNABLE
                 && item.stateEnum() != NodeWorkItemState.RESUMABLE)
-                || item.schedulerVersionEnum() != SchedulerVersion.DUAL_POOL_V1) {
+                || !item.schedulerVersionEnum().isDualPoolFamily()) {
             return;
         }
+        SchedulerVersion version = item.schedulerVersionEnum();
+        boolean waitGroupVersion = version.usesWaitGroups();
+        // 这一回合归属的轮次在回合开始时取一次：领取成功时记的是「这一回合被服务」，
+        // 写到一半再去读全局轮次会把拖久了的回合说成更晚才被服务。
+        long dispatchTurnRound = stateStore.currentRound(SchedulerRoundScope.NODE_DISPATCH);
         AgentRun run = runMapper.findById(identity.runId());
         boolean planning = PLANNING_NODE_ID.equals(identity.nodeId());
-        if (run == null || !schedulerVersionPolicy.isDualPool(run)
+        if (run == null || !schedulerVersionPolicy.isDualPoolFamily(run)
                 || run.getPlanGeneration() == null
                 || run.getPlanGeneration() != identity.planGeneration()
                 || run.getRunControlVersion() == null
@@ -456,11 +736,19 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         Optional<NodeWorkItemClaim> claimed = workItemStore.claim(
-                identity, item.versions(), claimant, claimLease, SchedulerVersion.DUAL_POOL_V1);
+                identity, item.versions(), claimant, claimLease, version, fence);
         if (claimed.isEmpty()) {
             return;
         }
         NodeWorkItemClaim claim = claimed.get();
+        // 领取成功才算这张图真的拿到了节点执行机会：写失败只记日志，不影响这次执行。
+        try {
+            coordinationStore.markDispatchServed(identity.runId(), dispatchTurnRound,
+                    run.getPlanGeneration(), fence);
+        } catch (RuntimeException e) {
+            log.warn("记录节点派发轮转位置失败: runId={} reason={}",
+                    identity.runId(), safeReason(e));
+        }
         NodeWorkItemMutationResult started = workItemStore.startExecution(
                 identity, claim.claimEpoch(), claimant);
         if (!started.applied()) {
@@ -477,7 +765,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             try (DualPoolToolJobExecutionContext.Scope ignored =
                          DualPoolToolJobExecutionContext.install(
                                  identity, submitted, claimant, item.getPayloadJson())) {
-                if (KIND_TODO.equals(kind)) {
+                if (KIND_TODO.equals(kind) && waitGroupVersion) {
+                    Optional<Map<String, Object>> waitGroupPatch =
+                            executeWaitGroupSegment(identity, submitted, claim, payload);
+                    if (waitGroupPatch.isEmpty()) {
+                        // 这一段把整组工具交出去了（或已经不在自己手里）：挂起语句已经把它写成
+                        // 分段结果已提交，没有第二份结果要提交，节点执行名额在这里交还。
+                        return;
+                    }
+                    resultPatch = waitGroupPatch.get();
+                } else if (KIND_TODO.equals(kind)) {
                     todoExecution = executeTodo(identity.runId(), payload);
                     if (todoExecution.result().isSuspended()) {
                         NodeWorkItemMutationResult suspended = toolJobCoordinator.suspend(
@@ -527,6 +824,13 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                         identity.describe(), e);
                 return;
             }
+            if (waitGroupVersion && waitGroupSegmentAlreadyCommitted(identity)) {
+                // 等待组挂起已经把当前分段写成 RESULT_COMMITTED。再走执行失败会打出
+                // TERMINAL_ALREADY，组里的成员却可能还停在 PENDING，下一段永远等不到放行。
+                log.error("等待组已经把当前分段写成结果已提交，节点异常不再改写成执行失败: identity={}",
+                        identity.describe(), e);
+                return;
+            }
             NodeWorkItemMutationResult failed = workItemStore.reportExecutionFailure(
                     identity, claim.claimEpoch(), claimant, safeReason(e));
             if (!failed.applied()) {
@@ -556,6 +860,77 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                     ? current.getLastError() : "dual_pool_planning_not_completed");
         }
         return result;
+    }
+
+    /**
+     * 新调度器版本的节点分段：交给共用节点执行器跑一次模型回合。
+     *
+     * <p>返回空表示这一段把整组工具交了出去——挂起语句已经把它写成「分段结果已提交」，
+     * 没有第二份结果要提交，调用方只要交还节点执行名额。</p>
+     */
+    private Optional<Map<String, Object>> executeWaitGroupSegment(NodeWorkItemIdentity identity,
+                                                                  NodeWorkItemVersions versions,
+                                                                  NodeWorkItemClaim claim,
+                                                                  JsonNode payload) throws Exception {
+        LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
+                freshRunPipeline.rebuildDualPoolNodeContext(identity.runId());
+        if (context == null) {
+            throw new IllegalStateException("dual_pool_run_not_executing");
+        }
+        TodoItem todo = objectMapper.treeToValue(payload.path("todo"), TodoItem.class);
+        List<LangchainCompletedTodo> completed = completedContext(payload.path("completedContext"));
+        Map<String, String> datasetRefs = objectMapper.convertValue(
+                payload.path("datasetRefs"), new TypeReference<Map<String, String>>() { });
+        AgentContext.setPhase("dual_pool_node_execution");
+        AgentContext.setStage("todo_execution");
+        AgentContext.setWorkflow(payload.path("workflow").asText("linear").toLowerCase());
+        // 取工具目录时网页搜索开关按「调用参数 → 线程上下文 → 默认值」取值，而派发这一层不经过调用参数，
+        // 所以这里要把规划阶段写进请求的开关落到上下文，否则派发时算出来的目录会比模型看到的那份少。
+        AgentContext.setWebSearchEnabled(
+                Boolean.TRUE.equals(context.workflowRequest().getWebSearchEnabled()));
+        long startedAt = System.currentTimeMillis();
+        freshRunPipeline.emitDualPoolTodoNodeEvent(
+                identity.runId(), context.run().getUserId(), "TODO_NODE_STARTED", todo,
+                null, 0L, null, false, null);
+        DualPoolWaitGroupNodeExecutor.Outcome outcome;
+        // 这一段执行的工具调用事件要带上节点归属，与旧节点路径一致；跑完就清掉，不留在线程上。
+        AgentContext.setTodoContext(todo.getId(), todo.getSequence());
+        try {
+            outcome = waitGroupNodeExecutor.executeSegment(
+                    new DualPoolWaitGroupNodeExecutor.SegmentExecution(
+                            identity, versions, claimant, context.workflowRequest(), todo, completed,
+                            datasetRefs, payload));
+        } finally {
+            AgentContext.clearTodoContext();
+        }
+        if (outcome instanceof DualPoolWaitGroupNodeExecutor.Outcome.Completed completedOutcome) {
+            Map<String, Object> patch = completedOutcome.resultPatch();
+            boolean success = Boolean.TRUE.equals(patch.get("success"));
+            freshRunPipeline.emitDualPoolTodoNodeEvent(
+                    identity.runId(), context.run().getUserId(),
+                    success ? "TODO_NODE_COMPLETED" : "TODO_NODE_FAILED", todo,
+                    success ? null : String.valueOf(patch.get("failureReason")),
+                    System.currentTimeMillis() - startedAt, failureMetadata(patch), false, null);
+            return Optional.of(patch);
+        }
+        if (outcome instanceof DualPoolWaitGroupNodeExecutor.Outcome.Suspended suspended) {
+            log.info("节点分段把整组工具交了出去：segment={} group={} turn={} members={}",
+                    identity.describe(), suspended.groupId(), suspended.modelTurn(), suspended.memberCount());
+            return Optional.empty();
+        }
+        DualPoolWaitGroupNodeExecutor.Outcome.NotOwned notOwned =
+                (DualPoolWaitGroupNodeExecutor.Outcome.NotOwned) outcome;
+        log.warn("节点分段已经不在本 Worker 手里，没有提交任何结果：segment={} detail={}",
+                identity.describe(), notOwned.detail());
+        return Optional.empty();
+    }
+
+    private Map<String, Object> failureMetadata(Map<String, Object> patch) {
+        Object metadata = patch.get("failureMetadata");
+        if (metadata instanceof Map<?, ?> map && !map.isEmpty()) {
+            return objectMapper.convertValue(map, new TypeReference<Map<String, Object>>() { });
+        }
+        return null;
     }
 
     private TodoExecution executeTodo(String runId, JsonNode payload) throws Exception {
@@ -633,19 +1008,105 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         return result;
     }
 
+    /**
+     * 一轮 Run 协调的补扫：按轮转位置取这一轮该被协调的 Run。
+     *
+     * <p>取法有两路，缺一不可。一路读库里的协调资格（按最近被服务的轮次升序、跳过还没到下次可见时间的），
+     * 这样进程重启后或者内存提示丢光时，图仍然会被重新发现；另一路是本进程记住的 Run，用于刚受理、
+     * 还没写进轮转表的那些。两路都只出还活着的双池 Run，按第一次出现的顺序去重。</p>
+     *
+     * <p>每一轮开始先推进全局轮次号，再把上一轮没被服务到的记录的「连续错过轮数」刷新一遍：
+     * 这两个数是公平性的观测事实，只在每轮边界上更新。</p>
+     */
     @Override
     public List<RunCoordinationHint> scanRunnableRuns(int limit) {
         if (limit <= 0) {
             return List.of();
         }
+        refreshRoundCounters();
+        long round = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
+        LinkedHashMap<String, AgentRun> candidates = new LinkedHashMap<>();
+        long legacyThisRound = 0L;
+        long leaseMissThisRound = 0L;
+        long isolatedThisRound = 0L;
+        // 一次全局扫描：三个调度器版本排在同一份候选顺序里，选出来之后按每一行冻结的版本路由。
+        // 候选是共享的，谁能被接手不共享：能不能动这条 Run，由它自己的服务所有权说了算。
+        for (RunCoordination due : coordinationStore.scanDue(limit)) {
+            AgentRun run = runMapper.findById(due.getRunId());
+            if (run == null) {
+                // 资格行指向一条读不回来的 Run：不动它的状态，也不接手。
+                isolatedThisRound++;
+                routingIsolated.incrementAndGet();
+                if (routingIsolated.get() == 1L || routingIsolated.get() % 1000L == 0L) {
+                    log.error("协调候选指向一条读不回来的 Run，保持失败关闭: runId={} 累计{}条",
+                            due.getRunId(), routingIsolated.get());
+                }
+                continue;
+            }
+            SchedulerVersion version;
+            try {
+                version = SchedulerVersion.fromWire(run.getSchedulerVersion());
+            } catch (RuntimeException unknownVersion) {
+                // 冻结版本读不出来：这条 Run 归哪套执行层都不知道，谁都不许动它的状态。
+                isolatedThisRound++;
+                long isolated = routingIsolated.incrementAndGet();
+                if (isolated == 1L || isolated % 1000L == 0L) {
+                    log.error("协调候选里的调度器版本读不出来，保持失败关闭: runId={} version={} 累计{}条",
+                            due.getRunId(), run.getSchedulerVersion(), isolated);
+                }
+                continue;
+            }
+            if (!Objects.equals(due.getSchedulerVersion(), run.getSchedulerVersion())) {
+                // 资格行上的版本只是一份镜像，算数的是 Run 主表上冻结的那一个：两边不一致说明
+                // 有人绕开写入路径改过，这里按主表走并留一条记录，不按镜像路由。
+                log.warn("资格行上的调度器版本与 Run 主表不一致，按主表路由: runId={} coordination={} run={}",
+                        due.getRunId(), due.getSchedulerVersion(), run.getSchedulerVersion());
+            }
+            if (version == SchedulerVersion.LEGACY) {
+                legacyThisRound++;
+                handOffLegacyRun(run, due, round);
+                continue;
+            }
+            if (!version.isDualPoolFamily()) {
+                isolatedThisRound++;
+                long isolated = routingIsolated.incrementAndGet();
+                if (isolated == 1L || isolated % 1000L == 0L) {
+                    log.error("协调候选里的版本不属于任何已知执行层，保持失败关闭: runId={} version={} 累计{}条",
+                            due.getRunId(), run.getSchedulerVersion(), isolated);
+                }
+                continue;
+            }
+            if (!holdsServiceOwnership(run.getId())) {
+                // 别的进程正活着持有这条 Run：这一轮不碰它，也不改它的轮次位置。
+                leaseMissThisRound++;
+                leaseNotAcquired.incrementAndGet();
+                continue;
+            }
+            candidates.put(run.getId(), run);
+        }
+        legacyCandidatesLastRound = legacyThisRound;
+        leaseNotAcquiredLastRound = leaseMissThisRound;
+        routingIsolatedLastRound = isolatedThisRound;
+
+        for (String locallyAdmitted : admissionRegistry.snapshotRunIds()) {
+            candidates.computeIfAbsent(locallyAdmitted, runMapper::findById);
+        }
+
         List<RunCoordinationHint> hints = new ArrayList<>();
-        for (String runId : admissionRegistry.snapshotRunIds()) {
+        for (Map.Entry<String, AgentRun> entry : candidates.entrySet()) {
             if (hints.size() >= limit) {
                 break;
             }
-            AgentRun run = runMapper.findById(runId);
-            if (run == null || !schedulerVersionPolicy.isDualPool(run)) {
+            String runId = entry.getKey();
+            AgentRun run = entry.getValue();
+            if (run == null || !schedulerVersionPolicy.isDualPoolFamily(run)) {
                 releaseRun(runId);
+                continue;
+            }
+            if (!admissionRegistry.isAdmitted(runId)
+                    && !admissionRegistry.takeoverLegacyRun(runId)) {
+                // 库里有资格记录但这个进程还没有受理它：接管要按与启动恢复同一套证明重新判定
+                // （证明不了就隔离），不在这里凭一次扫描就无条件受理。
                 continue;
             }
             hints.add(new RunCoordinationHint(runId, RunCoordinationHint.Reason.SCAN_REDISCOVERED));
@@ -653,22 +1114,145 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         return List.copyOf(hints);
     }
 
+    /**
+     * 旧版本 Run 的处理：拿到服务所有权之后才交给旧入口，拿不到就按所有权原因推后。
+     *
+     * <p>三道都要过。第一道是所有权：候选是三个版本共用的，但「能不能动这条 Run」由它自己的
+     * 所有权决定——没有可跨进程核对、会过期、能原子转交的持久事实，凭一条候选就接手，会在滚动
+     * 部署新旧并存的窗口里对着旧进程正在跑的图再启动一次。第二道是旧入口在不在（它随配置开关）。
+     * 第三道是旧入口自己的领取条件（领取语句会核对状态与重试次数）。</p>
+     *
+     * <p>没接手的要推后：不推后它会一直停在候选页首，页数一满，排在它后面的双池 Run 永远看不见。</p>
+     */
+    private void handOffLegacyRun(AgentRun run, RunCoordination due, long round) {
+        String runId = run.getId();
+        if (!holdsServiceOwnership(runId)) {
+            deferLegacyRun(due, "所有权不在本进程");
+            return;
+        }
+        LegacyRunHandoff handoff = legacyHandoff.getIfAvailable();
+        if (handoff == null) {
+            deferLegacyRun(due, "旧入口没有启用");
+            return;
+        }
+        if (!handoff.handOff(runId)) {
+            deferLegacyRun(due, "旧入口没有接手");
+            return;
+        }
+        legacyHandedOff.incrementAndGet();
+        // 交出去了：记下这一轮服务过它，它从此排在别的候选后面。
+        boolean marked = coordinationStore.markHandoffServed(runId, round, planGeneration(due));
+        if (!marked) {
+            log.info("旧版本 Run 已经交给旧入口，但轮次位置没有写进去（可能刚换了计划代际）: runId={}", runId);
+        }
+    }
+
+    /** 按所有权原因推后一条旧版本候选，让它从页首让开。 */
+    private void deferLegacyRun(RunCoordination due, String why) {
+        legacyDeferred.incrementAndGet();
+        boolean deferred = coordinationStore.deferHandoff(due.getRunId(),
+                RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
+                OffsetDateTime.now().plus(coordinationDeferRetry),
+                planGeneration(due), servedRound(due));
+        if (!deferred) {
+            log.debug("旧版本 Run 的推后没有生效（轮次或代际已经变了）: runId={}", due.getRunId());
+        }
+        if (legacyDeferred.get() == 1L || legacyDeferred.get() % 1000L == 0L) {
+            log.info("旧版本 Run 这一轮不接手（{}），按所有权原因推后: runId={} 累计{}次",
+                    why, due.getRunId(), legacyDeferred.get());
+        }
+    }
+
+    /**
+     * 本进程现在是不是这条 Run 的服务所有者。
+     *
+     * <p>先读一次：已经是自己的、还没过期就直接算持有，免得每一轮扫描都为同一批 Run 写一遍。
+     * 需要的时候才去领——没建立过、或者上一代已经过期，两种都靠领取语句按条件决定。</p>
+     *
+     * <p>读到或领到的这一代要写回准入组件：写入、撤销与协调都按状态里那份凭据比对，只更新数据库
+     * 不更新这里，本进程会一直带着旧代际去写，条件语句全部落空，看起来像「什么都没发生」。</p>
+     */
+    private boolean holdsServiceOwnership(String runId) {
+        String owner = processIdentity.value();
+        RunServiceLease current = leaseStore.find(runId).orElse(null);
+        if (current != null && owner.equals(current.ownerInstanceId())
+                && !current.expiredAt(OffsetDateTime.now())) {
+            admissionRegistry.bindFence(runId, fenceOf(current));
+            return true;
+        }
+        Optional<RunServiceLease> acquired = leaseStore.acquire(runId, owner, serviceLeaseTtl);
+        acquired.ifPresent(lease -> admissionRegistry.bindFence(runId, fenceOf(lease)));
+        return acquired.isPresent();
+    }
+
+    private static ServiceOwnershipFence fenceOf(RunServiceLease lease) {
+        return new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken());
+    }
+
+    private static int planGeneration(RunCoordination due) {
+        return due.getPlanGeneration() == null ? -1 : due.getPlanGeneration();
+    }
+
+    private static long servedRound(RunCoordination due) {
+        return due.getCoordinationServedRound() == null ? 0L : due.getCoordinationServedRound();
+    }
+
+    /** 每轮边界：把上一轮结束时该记的轮数刷新掉，再进到这一轮。刷新针对同一份全局候选集合。 */
+    private void refreshRoundCounters() {
+        long round = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
+        coordinationStore.refreshCoordinationMissedRounds(round);
+        stateStore.advanceRound(SchedulerRoundScope.RUN_COORDINATION);
+    }
+
+    /**
+     * 节点派发那一组轮次的轮边界：刷新上一轮的「连续未获派发轮数」，再进到这一轮。
+     *
+     * <p>它与 Run 协调各用一组计数器：两类轮转互不覆盖，「上一轮谁先拿到节点机会」才算得出来。</p>
+     */
+    private void refreshDispatchRound() {
+        long round = stateStore.currentRound(SchedulerRoundScope.NODE_DISPATCH);
+        coordinationStore.refreshDispatchMissedRounds(round);
+        stateStore.advanceRound(SchedulerRoundScope.NODE_DISPATCH);
+    }
+
     @Override
     public List<NodeWorkItemIdentity> scanRunnableNodes(int limit) {
         if (limit <= 0) {
             return List.of();
         }
-        return workItemStore.scanClaimable(SchedulerVersion.DUAL_POOL_V1, limit).stream()
+        refreshDispatchRound();
+        // 新旧版本共用同一个节点池：一次全局扫描取回所有双池版本的到期分段，顺序按这张图最近
+        // 被派发的轮次排。按版本各扫一次会让每种版本各占一份名额，轮转就散了。
+        return workItemStore.scanClaimableAcrossDualPool(limit).stream()
                 .map(NodeWorkItem::identity)
                 .filter(identity -> admissionRegistry.isAdmitted(identity.runId()))
                 .toList();
     }
 
+    /**
+     * 写一条节点工作项并给出第一次派发提示。
+     *
+     * <p>调度器版本跟着它所属的 Run 走：同一个 Run 建出来的行必须是同一个版本，否则新版本的 Run
+     * 会被旧版本的扫描或恢复路径处理。写库成功才算推进，写失败当场抛错——同一身份重复创建说明
+     * 上游把同一张图推导了两次，掩盖它只会让后面更难查。</p>
+     */
     private void createAndHint(NodeWorkItemIdentity identity,
                                long contextVersion,
                                long runControlVersion,
-                               Map<String, Object> payload) {
-        if (workItemStore.countUnfinishedByRun(identity.runId()) >= perRunUnfinishedLimit) {
+                               Map<String, Object> payload,
+                               String schedulerVersion,
+                               CoordinationTurn turn) {
+        ServiceOwnershipFence fence = ownershipFence(identity.runId());
+        if (fence == null) {
+            // 没有服务所有权就没有「往这条 Run 里建分段」这件事：这一轮不推进，等所有权回来。
+            log.warn("没有服务所有权凭据，不新建工作项: runId={} identity={}",
+                    identity.runId(), identity.describe());
+            turn.defer(RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE);
+            return;
+        }
+        if (workItemStore.countUnfinishedByRun(identity.runId())
+                >= turn.round.perRunUnfinishedLimit().intValue()) {
+            turn.defer(RunCoordinationDeferReason.PER_RUN_UNFINISHED_LIMIT);
             return;
         }
         NodeWorkItem item = new NodeWorkItem();
@@ -681,18 +1265,39 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         item.setContextVersion(contextVersion);
         item.setRunControlVersion(runControlVersion);
         item.setClaimEpoch(0);
-        item.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V1.name());
+        item.setSchedulerVersion(schedulerVersion);
         try {
             item.setPayloadJson(objectMapper.writeValueAsString(payload));
         } catch (Exception e) {
             throw new IllegalStateException("dual_pool_work_payload_encode_failed", e);
         }
-        NodeWorkItemMutationResult created = workItemStore.create(item);
+        NodeWorkItemMutationResult created = workItemStore.create(item, fence);
         if (!created.applied()) {
             reportRejection(identity.runId(), created);
             throw new IllegalStateException("dual_pool_work_identity_conflict:" + identity.describe());
         }
         dispatcher.offerNode(identity);
+        turn.served();
+    }
+
+    /**
+     * 内存提示队列满时把这条工作项的下次可见时间推后。
+     *
+     * <p>「没送出去」正常会在提示队列满的那一瞬间发生，也可能因为这条工作项已经被领走、已经进终态而在
+     * 这里落空——后一种不是错，直接按已不需要提醒处理。原因字段会在真正领取时被清掉（领取语句自己清），
+     * 所以这里不需要再写一次「派发成功」留痕。</p>
+     */
+    @Override
+    public void deferHintDelivery(NodeWorkItemIdentity identity) {
+        if (identity == null) {
+            return;
+        }
+        OffsetDateTime nextVisibleAt = OffsetDateTime.now().plus(hintQueueFullRetry);
+        NodeWorkItemMutationResult deferred = workItemStore.deferDispatch(
+                identity, NodeDispatchDeferReason.HINT_QUEUE_FULL, nextVisibleAt);
+        if (!deferred.applied()) {
+            log.debug("提示未送出但这条工作项已不需要提醒: identity={}", identity.describe());
+        }
     }
 
     private boolean cancelUnfinished(String runId, String reason) {
@@ -952,10 +1557,71 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         return stripes;
     }
 
+    /**
+     * 这条 Run 此刻归本进程服务时的凭据；没有就说明所有权已经不在本进程。
+     *
+     * <p>协调入口、节点领取与所有 Run 级写入都先取它：入口这一层是为了少做无用功，
+     * 真正管住并发的是每条语句里对持有人、代际号与有效期的核对。</p>
+     */
+    private ServiceOwnershipFence ownershipFence(String runId) {
+        return admissionRegistry.currentOwnershipFence(runId).orElse(null);
+    }
+
     private static boolean isTerminal(AgentRunStatus status) {
         return status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
                 || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED
                 || status == AgentRunStatus.EXPIRED;
+    }
+
+    /**
+     * 一轮 Run 协调的记账：这一轮到底推进了这个 Run 没有，没推进是卡在哪一条上。
+     *
+     * <p>延期原因只记第一道挡住的限制：后面的检查是在「前面已经通过」的前提下做的，把最后一个
+     * 原因写上去会让「这张图被什么挡住」换个人看就换一个答案。已经推进过的一轮不记延期——
+     * 那个字段的含义是「这一轮没能推进」，推进并同时受限是两件事，受限的账记在日志里。</p>
+     */
+    private static final class CoordinationTurn {
+
+        private final String runId;
+        /** 这一回合开始时读到的计划代际：延期与成功写都要带它做条件，旧的观察不许覆盖新事实。 */
+        private final int planGeneration;
+        /** 这一轮开始时读到的协调轮次：同样作为延期的条件，图已经被服务过时这次延期不写。 */
+        private final long coordinationServedRound;
+        /**
+         * 这一回合归属的轮次，在回合开始时取一次。
+         *
+         * <p>成功写记的是「这一回合被服务」，所以记的是这个值。写到一半再去读全局轮次的话，
+         * 一个拖了很久的回合会拿到一个更大的轮次号，等于把旧回合说成新回合。</p>
+         */
+        private final long turnRound;
+        /**
+         * 这一回合用的整套调度参数，回合开始时解析一次。
+         *
+         * <p>名额、水位、每回合上限都从这一份里读：热配置在回合中途改过时，这一回合照样按开始那一刻的
+         * 那一份走，不会出现「高水位是新版本、低水位是旧版本」这种谁都没配过的组合。</p>
+         */
+        private final DualPoolSchedulerSettings.RoundSettings round;
+        private RunCoordinationDeferReason deferReason;
+        private boolean progressed;
+
+        private CoordinationTurn(AgentRun run, RunCoordination coordination, long turnRound,
+                                 DualPoolSchedulerSettings.RoundSettings round) {
+            this.runId = run.getId();
+            this.planGeneration = run.getPlanGeneration() == null ? -1 : run.getPlanGeneration();
+            this.coordinationServedRound = value(coordination.getCoordinationServedRound());
+            this.turnRound = turnRound;
+            this.round = round;
+        }
+
+        private void served() {
+            progressed = true;
+        }
+
+        private void defer(RunCoordinationDeferReason reason) {
+            if (!progressed && deferReason == null) {
+                deferReason = reason;
+            }
+        }
     }
 
     private static NodeWorkItemIdentity identity(String runId, int generation, String nodeId) {
@@ -978,5 +1644,24 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
 
     private static String firstNonBlank(String first, String second) {
         return first != null && !first.isBlank() ? first : (second == null ? "" : second);
+    }
+
+    /**
+     * 路由的读数：交出去的旧版本、没接手而推后的、因为所有权在别人手上而跳过的、版本读不出来隔离的。
+     *
+     * <p>累计值是「反复扫描同一行的命中次数」，不是当前候选数——两个含义分开报，免得把
+     * 「同一行被扫了很多轮」看成「候选里堆了很多条」。当前条数单独一组。</p>
+     */
+    @Override
+    public Map<String, Object> routingSnapshot() {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("legacyHandedOffTotal", legacyHandedOff.get());
+        snapshot.put("legacyDeferredTotal", legacyDeferred.get());
+        snapshot.put("leaseNotAcquiredTotal", leaseNotAcquired.get());
+        snapshot.put("routingIsolatedTotal", routingIsolated.get());
+        snapshot.put("legacyCandidatesLastRound", legacyCandidatesLastRound);
+        snapshot.put("leaseNotAcquiredLastRound", leaseNotAcquiredLastRound);
+        snapshot.put("routingIsolatedLastRound", routingIsolatedLastRound);
+        return snapshot;
     }
 }

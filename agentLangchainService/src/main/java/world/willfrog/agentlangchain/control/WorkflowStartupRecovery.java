@@ -64,9 +64,16 @@ public class WorkflowStartupRecovery {
                 candidates.size(), boundedLimit);
     }
 
-    void recoverOne(AgentRun candidate) {
+    /**
+     * 试着把一条旧版本 Run 接回来跑。
+     *
+     * <p>返回 true 表示这一次确实领取成功并交付给了执行入口；false 表示没有接手（Run 读不出、
+     * 已经结束、条件不成立、或者领取被别人抢先）。启动扫描不看返回值；按服务所有权接手的那条路
+     * 靠它判断要不要把这条 Run 记成「已经服务过」。</p>
+     */
+    boolean recoverOne(AgentRun candidate) {
         if (candidate == null || candidate.getStatus() == null) {
-            return;
+            return false;
         }
         String runId = candidate.getId();
         String userId = candidate.getUserId();
@@ -81,50 +88,54 @@ public class WorkflowStartupRecovery {
                             "reason", "canceling_during_service_restart"));
                     finalizationService.publishFinalizedEvent(
                             runId, userId, AgentRunStatus.CANCELED.name());
+                    return true;
                 }
-                return;
+                return false;
             }
-            // 双池第一阶段不具备跨进程恢复协议。这里必须在 claim 与状态修改之前跳过，
-            // 保留数据库记录供读取、观察和显式取消；不能错误接回 LEGACY 调度器。
-            boolean dualPool;
+            // 双池家族的 Run 由双池那套协议接管（服务所有权 + 分段行事实），不是「不具备恢复协议」。
+            // 这里必须在 claim 与状态修改之前跳过，把记录留给双池的启动受理：接回 LEGACY 调度器
+            // 会让一段图在旧串行链上再跑一遍。
+            boolean dualPoolFamily;
             try {
-                dualPool = schedulerVersionPolicy.isDualPool(candidate);
+                dualPoolFamily = schedulerVersionPolicy.isDualPoolFamily(candidate);
             } catch (IllegalStateException unknownVersion) {
                 // 未知版本不能被启动扫描改写成 LEGACY，也不能推进状态；保留原记录供人工检查。
                 log.error("Run 的调度器版本未知，启动恢复保持失败关闭: runId={} schedulerVersion={}",
                         runId, candidate.getSchedulerVersion());
-                return;
+                return false;
             }
-            if (dualPool) {
-                log.warn("双池 Run 在服务启动后保持失败关闭，不自动领取: runId={} status={}",
-                        runId, status);
-                return;
+            if (dualPoolFamily) {
+                log.warn("双池家族的 Run 由双池启动受理决定接不接手，这里不动它: runId={} status={} "
+                                + "schedulerVersion={}",
+                        runId, status, candidate.getSchedulerVersion());
+                return false;
             }
             int attempt = candidate.getRestartAttempt() == null ? 0 : candidate.getRestartAttempt();
             int maxAttempts = Math.max(0, maxRestartAttempts);
             if (attempt >= maxAttempts) {
                 fail(candidate, "workflow_restart_attempts_exhausted");
-                return;
+                return false;
             }
             if (candidate.getTtlExpiresAt() != null
                     && OffsetDateTime.now().isAfter(candidate.getTtlExpiresAt())) {
                 fail(candidate, "workflow_restart_ttl_expired");
-                return;
+                return false;
             }
             boolean frozenPlan = hasFrozenPlan(candidate);
             boolean replan = (status == AgentRunStatus.RECEIVED || status == AgentRunStatus.PLANNING)
                     && !frozenPlan;
             if (!replan && !frozenPlan) {
                 fail(candidate, "workflow_restart_plan_missing");
-                return;
+                return false;
             }
             if (ownershipGateway.claimStartupRestart(
                     runId, status, attempt, maxAttempts) != 1) {
-                return;
+                // 领取条件不成立：别人先领走了，或者这条 Run 已经被别的路径推进过。
+                return false;
             }
             AgentRun claimed = runMapper.findById(runId);
             if (claimed == null) {
-                return;
+                return false;
             }
             boolean accepted;
             if (replan) {
@@ -135,18 +146,20 @@ public class WorkflowStartupRecovery {
             }
             if (!accepted) {
                 failClaimed(claimed, "workflow_restart_scheduler_rejected");
-                return;
+                return false;
             }
             eventService.append(runId, userId, "WORKFLOW_RESTART_QUEUED", Map.of(
                     "restart_attempt", claimed.getRestartAttempt() == null ? attempt + 1 : claimed.getRestartAttempt(),
                     "planner_skipped", !replan,
                     "previous_status", status.name()));
+            return true;
         } catch (Exception e) {
             log.error("Workflow startup recovery failed for run={}", runId, e);
             AgentRun latest = runMapper.findById(runId);
             if (latest != null) {
                 failClaimed(latest, "workflow_restart_launch_failed:" + safeMessage(e));
             }
+            return false;
         }
     }
 

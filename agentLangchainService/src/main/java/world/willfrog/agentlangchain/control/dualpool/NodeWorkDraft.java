@@ -1,7 +1,8 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
-import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.workflow.TodoItem;
 
 import java.util.List;
 
@@ -26,7 +27,9 @@ public record NodeWorkDraft(NodeWorkItemIdentity identity,
         if (contextVersion < 0 || runControlVersion < 0) {
             throw new IllegalArgumentException("node_work_draft_negative_version");
         }
-        if (!SchedulerVersionPolicy.DUAL_POOL_V1.equals(schedulerVersion)) {
+        // 草案跟着它所属的 Run 走：DUAL_POOL_V1 与 DUAL_POOL_V2 都在双池执行层里，
+        // 建出来的工作项必须和 Run 记的是同一个版本，不能被这里改成另一个。
+        if (schedulerVersion == null || !SchedulerVersion.fromWire(schedulerVersion).isDualPoolFamily()) {
             throw new IllegalArgumentException("node_work_draft_scheduler_version_required");
         }
     }

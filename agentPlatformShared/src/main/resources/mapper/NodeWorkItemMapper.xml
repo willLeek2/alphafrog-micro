@@ -25,6 +25,8 @@
         <result property="claimedBy" column="claimed_by"/>
         <result property="leaseExpiresAt" column="lease_expires_at"/>
         <result property="nextVisibleAt" column="next_visible_at"/>
+        <result property="runnableSince" column="runnable_since"/>
+        <result property="dispatchDeferReason" column="dispatch_defer_reason"/>
         <result property="payloadJson" column="payload_json"/>
         <result property="createdAt" column="created_at"/>
         <result property="updatedAt" column="updated_at"/>
@@ -45,9 +47,38 @@
         claimed_by,
         lease_expires_at,
         next_visible_at,
+        runnable_since,
+        dispatch_defer_reason,
         payload_json::text AS payload_json,
         created_at,
         updated_at
+    </sql>
+
+    <!--
+      同一批列，逐列带上本表的别名，给需要连 Run 主表的那几条查询用。
+      Run 主表上也有 plan_generation、run_control_version、scheduler_version、id、created_at 这些同名列，
+      不带别名在 PostgreSQL 上会直接报「列名有歧义」，语句一条都跑不出来。
+    -->
+    <sql id="workItemColumnsAliased">
+        wi.id,
+        wi.run_id,
+        wi.plan_generation,
+        wi.node_id,
+        wi.node_attempt,
+        wi.segment_sequence,
+        wi.state,
+        wi.context_version,
+        wi.run_control_version,
+        wi.claim_epoch,
+        wi.scheduler_version,
+        wi.claimed_by,
+        wi.lease_expires_at,
+        wi.next_visible_at,
+        wi.runnable_since,
+        wi.dispatch_defer_reason,
+        wi.payload_json::text AS payload_json,
+        wi.created_at,
+        wi.updated_at
     </sql>
 
     <sql id="identityFence">
@@ -61,20 +92,61 @@
     <!-- 终态：分段结果已提交、执行失败、被取消、已过期。写成一行，免得拼接出多余空白影响部分索引匹配。 -->
     <sql id="terminalStates">'RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE'</sql>
 
+    <!--
+      还没结束、也不是「取消中」的 Run 状态：父 Run 的条件写用它来判断「这条 Run 现在还能接着跑」。
+      与 RunCoordinationMapper 里那份清单必须逐项一致（同一个含义在两处各写一份是 MyBatis 的
+      命名空间限制），NodeWorkItemMapperBindingTest 会比对两处字面量。
+    -->
+    <sql id="liveRunStatuses">
+        'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'WAITING_TOOL_JOB'
+    </sql>
+
     <!-- ==================== 创建 ==================== -->
 
-    <!-- 同一个身份已经有一行时返回 0：身份唯一靠这条唯一约束，不靠条件更新。 -->
+    <!--
+      新建一条工作项。同一个身份已经有一行时返回 0（唯一约束上 DO NOTHING），不是异常：
+      条件更新管不了「同一个身份出现两行」，这条唯一约束才是那道闸。
+
+      它同时是 Run 级写入：由这条 Run 的所有者授权，而且这一行必须与父 Run 此刻的事实对得上。
+      语句用 INSERT ... SELECT + 两个 EXISTS 把两层条件写进同一句：①服务所有权（持有人、代际号、
+      未过期三者缺一不可）；②父 Run 的调度器版本、计划代际、控制版本逐项等于这条工作项携带的值，
+      状态还得是「还能接着跑」的那几个。
+
+      两层条件缺一不可的原因写在时间差上：协调回合是「先读一次 Run 事实、再建工作项」。
+      读事实之后、建行之前，租约可能被另一个实例接管（旧实例不该再往这条 Run 里建东西），
+      父 Run 也可能往前走了——计划已经重建（代际变了）、控制版本被暂停/取消抬高、或者整条 Run
+      已经终结：这几种情况下这一行都属于「已经过期的协调回合建出来的行」，建不出来才对。
+      影响 0 行时调用方按「这条 Run 现在不归我推进」处理，等下一轮重新读事实。
+    -->
     <insert id="insert" parameterType="world.willfrog.agent.platform.workitem.NodeWorkItem">
         INSERT INTO alphafrog_agent_run_work_item
         (run_id, plan_generation, node_id, node_attempt, segment_sequence,
          state, context_version, run_control_version, claim_epoch, scheduler_version,
-         claimed_by, lease_expires_at, next_visible_at, payload_json)
-        VALUES
-        (#{runId}, #{planGeneration}, #{nodeId}, #{nodeAttempt}, #{segmentSequence},
-         COALESCE(#{state}, 'RUNNABLE'), #{contextVersion}, #{runControlVersion},
-         COALESCE(#{claimEpoch}, 0), COALESCE(#{schedulerVersion}, 'DUAL_POOL_V1'),
-         #{claimedBy}, #{leaseExpiresAt}, COALESCE(#{nextVisibleAt}, CURRENT_TIMESTAMP),
-         COALESCE(CAST(#{payloadJson} AS jsonb), '{}'::jsonb))
+         claimed_by, lease_expires_at, next_visible_at, runnable_since, payload_json)
+        SELECT
+         #{item.runId}, #{item.planGeneration}, #{item.nodeId}, #{item.nodeAttempt}, #{item.segmentSequence},
+         COALESCE(#{item.state}, 'RUNNABLE'), #{item.contextVersion}, #{item.runControlVersion},
+         COALESCE(#{item.claimEpoch}, 0), COALESCE(#{item.schedulerVersion}, 'DUAL_POOL_V1'),
+         #{item.claimedBy}, #{item.leaseExpiresAt}, COALESCE(#{item.nextVisibleAt}, CURRENT_TIMESTAMP),
+         COALESCE(#{item.runnableSince}, CURRENT_TIMESTAMP),
+         COALESCE(CAST(#{item.payloadJson} AS jsonb), '{}'::jsonb)
+        WHERE EXISTS (
+            SELECT 1
+            FROM alphafrog_agent_run_service_lease lease_row
+            WHERE lease_row.run_id = #{item.runId}
+              AND lease_row.owner_instance_id = #{ownerInstanceId}
+              AND lease_row.fencing_token = #{fencingToken}
+              AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+        )
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{item.runId}
+                AND owner_run.scheduler_version = COALESCE(#{item.schedulerVersion}, 'DUAL_POOL_V1')
+                AND owner_run.plan_generation = #{item.planGeneration}
+                AND owner_run.run_control_version = #{item.runControlVersion}
+                AND owner_run.status IN (<include refid="liveRunStatuses"/>)
+          )
         ON CONFLICT (run_id, plan_generation, node_id, node_attempt, segment_sequence) DO NOTHING
     </insert>
 
@@ -96,12 +168,45 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+      节点派发的一次全局扫描：双池家族的到期可领取分段放在同一份候选里，再按这张图最近一次
+      被派发的轮次升序排（从没被派发过的算 0，排最前），然后才是到期时间与行号。
+      版本条件的写法与按版本取那一条不同：这里是一份候选、一个 LIMIT，写法上把两个双池版本
+      列成清单，而不是每种版本各扫一次；旧路径（LEGACY）的分段不属于节点池。
+      轮转位置在协调资格表上，这张图还没有资格记录时按 0 处理——没被派发过就该排在前面。
+    -->
+    <select id="scanClaimableAcrossDualPool" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2')
+          AND state IN ('RUNNABLE', 'RESUMABLE')
+          AND next_visible_at &lt;= CURRENT_TIMESTAMP
+        ORDER BY COALESCE((SELECT c.dispatch_served_round
+                           FROM alphafrog_agent_run_coordination c
+                           WHERE c.run_id = alphafrog_agent_run_work_item.run_id), 0),
+                 next_visible_at, id
+        LIMIT #{limit}
+    </select>
+
     <select id="listUnfinishedByRun" resultMap="NodeWorkItemResultMap">
         SELECT <include refid="workItemColumns"/>
         FROM alphafrog_agent_run_work_item
         WHERE run_id = #{runId}
           AND state NOT IN (<include refid="terminalStates"/>)
         ORDER BY plan_generation, node_attempt, segment_sequence, id
+    </select>
+
+    <!--
+      每个逻辑节点的最新分段：一个节点一次等待会把自己的分段写成已提交并建出下一段，
+      所以「这个节点做完了没有」只能看最新那一行。取最大尝试次数、再取最大分段序号，
+      最后用 id 兜底，保证同一身份下排序稳定。
+    -->
+    <select id="listLatestSegments" resultMap="NodeWorkItemResultMap">
+        SELECT DISTINCT ON (node_id) <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE run_id = #{runId}
+          AND plan_generation = #{planGeneration}
+        ORDER BY node_id, node_attempt DESC, segment_sequence DESC, id DESC
     </select>
 
     <select id="listUnfinishedBySchedulerVersion" resultMap="NodeWorkItemResultMap">
@@ -111,6 +216,29 @@
           AND state NOT IN (<include refid="terminalStates"/>)
         ORDER BY id
         LIMIT #{limit}
+    </select>
+
+    <!--
+      按「Run 的调度器版本」取未完成分段：版本条件加在 Run 主表上，行自己的版本不参与筛选。
+      启动残留与遗留接管都要用这一条，原因是行级筛选会让「这条 Run 的全部未完成分段都属于这一版」
+      变成永远为真的判断——被筛掉的那些行根本看不见。这里把它读全，再由调用方逐行比对版本。
+    -->
+    <select id="listUnfinishedByRunSchedulerVersion" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumnsAliased"/>
+        FROM alphafrog_agent_run_work_item wi
+        JOIN alphafrog_agent_run r ON r.id = wi.run_id
+        WHERE r.scheduler_version = #{schedulerVersion}
+          AND wi.state NOT IN (<include refid="terminalStates"/>)
+        ORDER BY wi.run_id, wi.id
+        LIMIT #{limit}
+    </select>
+
+    <select id="countUnfinishedByRunSchedulerVersion" resultType="int">
+        SELECT COUNT(*)
+        FROM alphafrog_agent_run_work_item wi
+        JOIN alphafrog_agent_run r ON r.id = wi.run_id
+        WHERE r.scheduler_version = #{schedulerVersion}
+          AND wi.state NOT IN (<include refid="terminalStates"/>)
     </select>
 
     <select id="countUnfinished" resultType="int">
@@ -152,8 +280,13 @@
     <!-- ==================== 状态迁移 ==================== -->
 
     <!--
-      条件领取：可运行 + 三类期望版本（计划代际在身份里、上下文版本、控制版本）匹配。
-      领取代际在这里原子加一；返回 null 表示这次没领到，本次放弃。
+      条件领取：可运行 + 三类期望版本（计划代际在身份里、上下文版本、控制版本）匹配，
+      且「现在还是我在服务这条 Run」。领取代际在这里原子加一；返回 null 表示这次没领到，本次放弃。
+
+      服务所有权条件（持有人 + 代际号 + 未过期）和父 Run 的版本都必须在这一句里核：调用方入口
+      查过一遍不等于写的时候还有效，租约可能已经到期并被别的进程接管——那样旧所有者会从失去
+      所有权之后再领走一个新分段。父 Run 的调度器版本与这一行精确相等也在这里卡：只比「都是双池
+      家族」会让旧版本的分段在新的 Run 下被执行。
     -->
     <select id="claim" resultType="java.lang.Integer" affectData="true" flushCache="true">
         UPDATE alphafrog_agent_run_work_item SET
@@ -161,6 +294,7 @@
             claim_epoch = claim_epoch + 1,
             claimed_by = #{claimedBy},
             lease_expires_at = #{leaseExpiresAt},
+            dispatch_defer_reason = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE <include refid="identityFence"/>
           AND scheduler_version = #{schedulerVersion}
@@ -174,7 +308,16 @@
               WHERE owner_run.id = #{runId}
                 AND owner_run.plan_generation = #{planGeneration}
                 AND owner_run.run_control_version = #{runControlVersion}
+                AND owner_run.scheduler_version = #{schedulerVersion}
                 AND owner_run.status IN ('RECEIVED', 'EXECUTING')
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{runId}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
           )
         RETURNING claim_epoch
     </select>
@@ -189,12 +332,56 @@
             claim_epoch = claim_epoch + 1,
             claimed_by = #{newOwner},
             lease_expires_at = #{leaseExpiresAt},
+            dispatch_defer_reason = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE <include refid="identityFence"/>
           AND state IN ('CLAIMED', 'EXECUTING')
           AND claim_epoch = #{expectedClaimEpoch}
         RETURNING claim_epoch
     </select>
+
+    <!--
+      启动恢复与遗留接管：把一段死在「已领取/执行中」的分段放回可领取状态（RUNNABLE），让节点池重新领取从头执行。
+      代际加一是为了废掉旧领取者：它若还活着，提交结果时会因为代际对不上被拒。
+      与「显式转交」的区别是这条不指定新主人，也不需要旧执行者先停下。
+
+      两条 EXISTS 是这条语句的凭据，缺一不可，而且必须在同一条语句里核——「先查租约再写」中间隔着
+      租约到期与别人接管的时间窗，那段时间里另一个进程可能已经接手并在跑这一段：
+      ① 服务租约：现在还是我持有、令牌没被别人换掉、且没有过期；
+      ② 父 Run：调度器版本与行一致、计划代际与控制版本还是我读到的值、状态仍是可以接着跑的那些。
+      条件不匹配就影响 0 行，调用方按「这条 Run 现在不能接手」处理。
+    -->
+    <update id="requeueAbandonedClaim">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'RUNNABLE',
+            claim_epoch = claim_epoch + 1,
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            next_visible_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('CLAIMED', 'EXECUTING')
+          AND claim_epoch = #{claimEpoch}
+          AND context_version = #{contextVersion}
+          AND run_control_version = #{runControlVersion}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{runId}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run owner_run
+              WHERE owner_run.id = #{runId}
+                AND owner_run.scheduler_version = #{schedulerVersion}
+                AND owner_run.plan_generation = #{planGeneration}
+                AND owner_run.run_control_version = #{runControlVersion}
+                AND owner_run.status IN (<include refid="liveRunStatuses"/>)
+          )
+    </update>
 
     <update id="startExecution">
         UPDATE alphafrog_agent_run_work_item SET
@@ -450,6 +637,32 @@
           AND state NOT IN (<include refid="terminalStates"/>)
           AND context_version = #{contextVersion}
           AND run_control_version = #{runControlVersion}
+    </update>
+
+    <!--
+      派发失败留痕：这次没能把这条工作项送出去，写下原因并把下次可见时间推后。
+      只对可派发的两种状态生效（可运行、可恢复）：已经有人领走的行不再由派发路径触碰。
+      这条只解释「为什么它一直坐在这里」，能不能被取到由 next_visible_at 决定。
+    -->
+    <update id="deferDispatch">
+        UPDATE alphafrog_agent_run_work_item SET
+            dispatch_defer_reason = #{reason},
+            next_visible_at = #{nextVisibleAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('RUNNABLE', 'RESUMABLE')
+    </update>
+
+    <!--
+      派发成功留痕：这次把它送出去了，清掉上一次的失败原因。
+      与 deferDispatch 是同一个字段的两个方向，条件与它对称。
+    -->
+    <update id="markDispatched">
+        UPDATE alphafrog_agent_run_work_item SET
+            dispatch_defer_reason = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE <include refid="identityFence"/>
+          AND state IN ('RUNNABLE', 'RESUMABLE')
     </update>
 
 </mapper>

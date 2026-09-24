@@ -321,6 +321,9 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                     .maxToolRoundTrips(maxToolRoundTrips)
                     .webSearchEnabled(environment.parentRequest().getWebSearchEnabled())
                     .codeInterpreterEnabled(environment.parentRequest().getCodeInterpreterEnabled())
+                    // 验收夹具的放行策略跟着父请求走：子代理的请求是从父请求原样派生的，
+                    // 少带一个字段就会让子代理那条路上的成员收尾方式与父请求对不上。
+                    .acceptanceReleasePolicy(environment.parentRequest().getAcceptanceReleasePolicy())
                     .build();
             TodoItem item = TodoItem.builder()
                     .id("sub_agent_" + handle.subAgentId)
