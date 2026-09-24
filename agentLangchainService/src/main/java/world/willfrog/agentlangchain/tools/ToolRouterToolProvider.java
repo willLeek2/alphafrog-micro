@@ -8,6 +8,7 @@ import dev.langchain4j.service.tool.ToolProvider;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
@@ -20,6 +21,7 @@ import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.execution.PersistentSubAgentToolBridge;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -82,6 +84,25 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final AgentRunEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
+    private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
+
+    /** 保留旧调度器现有的独立构造调用点；生产构造由配置类传入持久子代理桥接。 */
+    public ToolRouterToolProvider(ToolRouter toolRouter,
+                                  MarketDataTools marketDataTools,
+                                  RagTools ragTools,
+                                  SearchTools searchTools,
+                                  PythonSandboxTools pythonSandboxTools,
+                                  ListMyDataTool listMyDataTool,
+                                  LoadToolGuideTool loadToolGuideTool,
+                                  RereadToolHandler rereadToolHandler,
+                                  ObjectMapper objectMapper,
+                                  AgentRunEventService agentEventService,
+                                  LangchainToolConcurrencyThrottle toolThrottle,
+                                  PythonSandboxDispatchStore pythonSandboxDispatchStore) {
+        this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools,
+                listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
+                toolThrottle, pythonSandboxDispatchStore, null);
+    }
 
     /**
      * 为当前 LC4j 调用构建「工具名 → ToolExecutor」映射。
@@ -118,7 +139,10 @@ public class ToolRouterToolProvider implements ToolProvider {
                 webSearchEnabled,
                 codeInterpreterEnabled
         );
-        if (PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
+        PersistentSubAgentToolBridge bridge = subAgentBridge == null ? null : subAgentBridge.getIfAvailable();
+        String runId = AgentContext.getRunId();
+        if (PHASE_SUB_AGENT.equals(AgentContext.getPhase())
+                || (bridge != null && runId != null && !runId.isBlank() && bridge.isChildRun(runId))) {
             // 子代理阶段禁止再生成子代理：模型可见目录和 Router 运行时检查同时关掉这两个工具。
             specifications = specifications.stream()
                     .filter(spec -> !"spawnSubAgent".equals(spec.name())

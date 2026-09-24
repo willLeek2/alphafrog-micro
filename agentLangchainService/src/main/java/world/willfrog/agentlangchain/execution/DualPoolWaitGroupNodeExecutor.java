@@ -15,7 +15,11 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.service.AgentPromptService;
@@ -70,7 +74,7 @@ import java.util.Set;
 public class DualPoolWaitGroupNodeExecutor {
 
     private static final String KIND_TODO = "TODO";
-    /** 子代理工具在模型可见目录里的名字：新调度器版本不暴露它们。 */
+    /** 子代理工具在模型可见目录里的名字。 */
     private static final List<String> SUB_AGENT_TOOL_NAMES = List.of("spawnSubAgent", "waitForSubAgent");
     /** 模型没有给出工具调用身份时，工具结果消息用的占位名字；只在本组内配对使用。 */
     private static final String SYNTHETIC_CALL_ID_PREFIX = "waitcall-";
@@ -86,6 +90,8 @@ public class DualPoolWaitGroupNodeExecutor {
     private final LangchainRunExecutionGuard executionGuard;
     private final WaitGroupStore waitGroupStore;
     private final NodeToolDispatcher toolDispatcher;
+    private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
+    private final PlatformTransactionManager transactionManager;
     private final ResumedSegmentPublisher resumedSegmentPublisher;
     private final ObjectMapper objectMapper;
     /** 放行策略的规则命中记录：一条规则真的打中了哪一条成员，终态核对着它点名。 */
@@ -95,10 +101,13 @@ public class DualPoolWaitGroupNodeExecutor {
     private final int maxMemberResultChars;
     private final long memberPollDelayMs;
 
+    @Autowired
     public DualPoolWaitGroupNodeExecutor(AgentPromptService promptService,
                                          LangchainRunExecutionGuard executionGuard,
                                          WaitGroupStore waitGroupStore,
                                          NodeToolDispatcher toolDispatcher,
+                                         ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
+                                         PlatformTransactionManager transactionManager,
                                          ResumedSegmentPublisher resumedSegmentPublisher,
                                          ObjectMapper objectMapper,
                                          DualPoolSchedulerSettings settings,
@@ -112,6 +121,8 @@ public class DualPoolWaitGroupNodeExecutor {
         this.executionGuard = executionGuard;
         this.waitGroupStore = waitGroupStore;
         this.toolDispatcher = toolDispatcher;
+        this.subAgentBridge = subAgentBridge;
+        this.transactionManager = transactionManager;
         this.resumedSegmentPublisher = resumedSegmentPublisher;
         this.objectMapper = objectMapper;
         this.settings = settings;
@@ -124,6 +135,23 @@ public class DualPoolWaitGroupNodeExecutor {
                 component, this.maxMemberResultChars);
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_WAIT_GROUP_MEMBER_POLL_DELAY_MS,
                 component, this.memberPollDelayMs);
+    }
+
+    /** 旧调用点的构造方式只用于不含持久子代理的节点测试。 */
+    DualPoolWaitGroupNodeExecutor(AgentPromptService promptService,
+                                  LangchainRunExecutionGuard executionGuard,
+                                  WaitGroupStore waitGroupStore,
+                                  NodeToolDispatcher toolDispatcher,
+                                  ResumedSegmentPublisher resumedSegmentPublisher,
+                                  ObjectMapper objectMapper,
+                                  DualPoolSchedulerSettings settings,
+                                  int maxMemberResultChars,
+                                  long memberPollDelayMs,
+                                  FrozenEffectiveSettings frozenEffectiveSettings,
+                                  FixtureRuleHitStore ruleHitStore) {
+        this(promptService, executionGuard, waitGroupStore, toolDispatcher, null, null,
+                resumedSegmentPublisher, objectMapper, settings, maxMemberResultChars, memberPollDelayMs,
+                frozenEffectiveSettings, ruleHitStore);
     }
 
     /**
@@ -222,21 +250,24 @@ public class DualPoolWaitGroupNodeExecutor {
     private List<ChatMessage> initialMessages(SegmentExecution input) {
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(SystemMessage.from(promptService.reactSystemPrompt()));
+        List<ToolSpecification> visible = visibleToolSpecifications(input.identity().runId(),
+                input.request().getToolSpecifications());
         messages.add(UserMessage.from(LangchainTodoUserMessageBuilder.buildTodoUserMessage(
                 promptService,
                 input.request().getUserGoal(),
                 input.completedTodos(),
                 input.datasetRefs(),
                 input.todo().getDescription(),
-                input.request().getToolSpecifications(),
-                ToolCapabilityPromptRenderer.render(promptService, input.request().getToolSpecifications()))));
+                visible,
+                ToolCapabilityPromptRenderer.render(promptService, visible))));
         return messages;
     }
 
     private AiMessage chatOnce(SegmentExecution input, List<ChatMessage> messages, int modelTurn) {
         ChatRequest chatRequest = ChatRequest.builder()
                 .messages(messages)
-                .toolSpecifications(visibleToolSpecifications(input.request().getToolSpecifications()))
+                .toolSpecifications(visibleToolSpecifications(input.identity().runId(),
+                        input.request().getToolSpecifications()))
                 .build();
         // 这次调用的身份：哪条 Run、哪个计划代际、哪个节点、第几次尝试、哪一段、段内第几次模型回合。
         // 夹具按这个身份发脚本回合，所以并行跑的几个节点各拿各的回复，重启后重做同一段也拿回同一份。
@@ -257,12 +288,17 @@ public class DualPoolWaitGroupNodeExecutor {
     /**
      * 交给模型的工具目录。
      *
-     * <p>新调度器版本不向模型暴露子代理工具：父子 Run 怎样共用容量与轮转顺序留给后续阶段，
-     * 这一阶段先按计划把入口收起来。运行时的拒绝在派发那一层另做一次，模型绕不过去。</p>
+     * <p>父 Run 只有在持久子代理桥接确认开关和身份均允许时才看见入口；子 Run 不得再生子 Run。
+     * 派发层独立复核，防止伪造的模型请求绕过目录。</p>
      */
-    private List<ToolSpecification> visibleToolSpecifications(List<ToolSpecification> specifications) {
+    private List<ToolSpecification> visibleToolSpecifications(String runId,
+                                                              List<ToolSpecification> specifications) {
         if (specifications == null || specifications.isEmpty()) {
             return List.of();
+        }
+        PersistentSubAgentToolBridge bridge = subAgentBridge == null ? null : subAgentBridge.getIfAvailable();
+        if (bridge != null && bridge.availableForRun(runId)) {
+            return List.copyOf(specifications);
         }
         return specifications.stream()
                 .filter(specification -> !SUB_AGENT_TOOL_NAMES.contains(specification.name()))
@@ -361,7 +397,7 @@ public class DualPoolWaitGroupNodeExecutor {
                         .toJson(objectMapper)));
         String nextSegmentPayloadJson = json(nextSegmentPayload(input, nextCheckpoint));
 
-        WaitSuspensionResult suspended = waitGroupStore.suspendSegment(new WaitSuspensionRequest(
+        WaitSuspensionRequest suspension = new WaitSuspensionRequest(
                 input.identity(),
                 input.versions(),
                 input.claimant(),
@@ -369,13 +405,15 @@ public class DualPoolWaitGroupNodeExecutor {
                 SchedulerVersion.DUAL_POOL_V2,
                 drafts,
                 suspensionPayloadJson,
-                nextSegmentPayloadJson));
-        if (!suspended.suspended()) {
+                nextSegmentPayloadJson);
+        SuspensionReservation reservation = suspendAndReserveSubAgents(input, calls, suspension);
+        if (!reservation.suspended().suspended()) {
             return new Outcome.NotOwned("segment_not_matched:" + input.identity().describe());
         }
-        long groupId = suspended.groupId();
+        long groupId = reservation.suspended().groupId();
         policyMatches = recordPolicyMatches(input.identity().runId(), policy, policyMatches, groupId);
-        Long notificationId = dispatchMembers(groupId, input, modelTurn, policy, policyMatches, calls);
+        Long notificationId = keepNotification(reservation.notificationId(),
+                dispatchMembers(groupId, input, modelTurn, policy, policyMatches, calls));
         if (notificationId != null) {
             boolean published = resumedSegmentPublisher.publish(notificationId,
                     input.versions().runControlVersion(),
@@ -387,6 +425,75 @@ public class DualPoolWaitGroupNodeExecutor {
             }
         }
         return new Outcome.Suspended(groupId, checkpoint.modelTurn(), nextSegmentSequence, drafts.size());
+    }
+
+    private record SuspensionReservation(WaitSuspensionResult suspended, Long notificationId) {
+    }
+
+    /** 创建意图、等待请求与父节点挂起在同一事务中落库，进程退出后不会只留下其中一半。 */
+    private SuspensionReservation suspendAndReserveSubAgents(SegmentExecution input,
+                                                              List<ToolExecutionRequest> calls,
+                                                              WaitSuspensionRequest suspension) {
+        boolean hasSubAgentCall = calls.stream().anyMatch(call -> SUB_AGENT_TOOL_NAMES.contains(call.name()));
+        PersistentSubAgentToolBridge bridge = subAgentBridge == null ? null : subAgentBridge.getIfAvailable();
+        if (!hasSubAgentCall || bridge == null || !bridge.availableForRun(input.identity().runId())) {
+            return new SuspensionReservation(waitGroupStore.suspendSegment(suspension), null);
+        }
+        if (transactionManager == null) {
+            throw new IllegalStateException("子代理创建需要数据库事务，不能只挂起父等待组");
+        }
+        SuspensionReservation result = new TransactionTemplate(transactionManager).execute(status -> {
+            WaitSuspensionResult suspended = waitGroupStore.suspendSegment(suspension);
+            if (!suspended.suspended()) {
+                return new SuspensionReservation(suspended, null);
+            }
+            Long notificationId = null;
+            for (WaitMember member : waitGroupStore.listMembers(suspended.groupId())) {
+                if (member.terminal() || !SUB_AGENT_TOOL_NAMES.contains(member.getToolName())) {
+                    continue;
+                }
+                ToolExecutionRequest call = locateCall(member, calls);
+                if (call == null) {
+                    throw new IllegalStateException("已挂起的子代理成员找不到原始工具请求："
+                            + member.getMemberIdentity());
+                }
+                if (member.getExternalOperationId() == null || member.getExternalOperationId().isBlank()) {
+                    throw new IllegalStateException("子代理成员缺少持久操作身份：" + member.getMemberIdentity());
+                }
+                PersistentSubAgentToolBridge.ReservationRequest request =
+                        new PersistentSubAgentToolBridge.ReservationRequest(
+                                input.identity().runId(), input.identity(), input.versions(),
+                                suspended.groupId(), member.getMemberSeq(), member.getMemberIdentity(),
+                                member.getToolCallId(), member.getExternalOperationId(), call.arguments());
+                PersistentSubAgentToolBridge.ReservationOutcome outcome =
+                        "spawnSubAgent".equals(member.getToolName())
+                                ? bridge.reserveSpawn(request) : bridge.reserveWait(request);
+                if (outcome == null) {
+                    throw new IllegalStateException("子代理预留没有返回结果：" + member.getMemberIdentity());
+                }
+                if (outcome != PersistentSubAgentToolBridge.ReservationOutcome.RESERVED) {
+                    String errorCode = switch (outcome) {
+                        case LIMIT_EXCEEDED -> "sub_agent_limit_exceeded";
+                        case INVALID_REQUEST -> "sub_agent_invalid_request";
+                        case NOT_FOUND -> "sub_agent_not_found";
+                        case RESERVED -> throw new IllegalStateException("已预留不能写失败结果");
+                    };
+                    String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
+                            member.getToolCallId(), false, "", Map.of("errorCode", errorCode),
+                            maxMemberResultChars);
+                    MemberCompletionResult completed = waitGroupStore.completeMember(new MemberCompletionRequest(
+                            suspended.groupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
+                            resultJson, member.getExternalOperationId(), input.identity().planGeneration(),
+                            input.versions().contextVersion(), input.versions().runControlVersion()));
+                    notificationId = keepNotification(notificationId, completed.notificationId());
+                }
+            }
+            return new SuspensionReservation(suspended, notificationId);
+        });
+        if (result == null) {
+            throw new IllegalStateException("子代理挂起事务没有返回结果");
+        }
+        return result;
     }
 
     /**

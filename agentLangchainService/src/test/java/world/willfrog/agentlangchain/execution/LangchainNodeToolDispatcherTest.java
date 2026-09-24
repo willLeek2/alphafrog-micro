@@ -23,6 +23,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * 派发一次工具调用的规则自检。
@@ -175,6 +177,41 @@ class LangchainNodeToolDispatcherTest {
 
         assertThat(outcome).isInstanceOfSatisfying(NodeToolDispatcher.DispatchOutcome.Failed.class,
                 failed -> assertThat(failed.reason()).isEqualTo("sub_agent_tool_not_available:spawnSubAgent"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void enabledSubAgentToolUsesPersistentBridgeInsteadOfLegacyCatalog() {
+        PersistentSubAgentToolBridge bridge = mock(PersistentSubAgentToolBridge.class);
+        ObjectProvider<PersistentSubAgentToolBridge> bridgeProvider = mock(ObjectProvider.class);
+        when(bridgeProvider.getIfAvailable()).thenReturn(bridge);
+        when(bridge.availableForRun(RUN_ID)).thenReturn(true);
+        NodeToolDispatcher.DispatchRequest request = new NodeToolDispatcher.DispatchRequest(
+                RUN_ID, SEGMENT, 77L, 0, MEMBER_IDENTITY, "call-a", "spawnSubAgent", "{\"goal\":\"查资料\"}");
+        when(bridge.dispatch(request)).thenReturn(new NodeToolDispatcher.DispatchOutcome.Completed("child-1"));
+        executors.put("spawnSubAgent", (toolRequest, memoryId) -> {
+            throw new AssertionError("V2 不得执行旧进程内子代理工具");
+        });
+
+        NodeToolDispatcher.DispatchOutcome outcome =
+                new LangchainNodeToolDispatcher(toolProvider(), objectMapper, bridgeProvider).dispatch(request);
+
+        assertThat(outcome).isInstanceOfSatisfying(NodeToolDispatcher.DispatchOutcome.Completed.class,
+                completed -> assertThat(completed.output()).isEqualTo("child-1"));
+    }
+
+    @Test
+    void subAgentOperationIdentityIsStableAndScopedToEachSegmentAndTool() {
+        String spawnId = dispatcher.stableOperationId("spawnSubAgent", "call-a", SEGMENT).orElseThrow();
+        assertThat(dispatcher.requiresStableOperationId("spawnSubAgent")).isTrue();
+        assertThat(dispatcher.requiresStableOperationId("waitForSubAgent")).isTrue();
+        assertThat(dispatcher.stableOperationId("spawnSubAgent", "call-a", SEGMENT)).contains(spawnId);
+        assertThat(dispatcher.stableOperationId("waitForSubAgent", "call-a", SEGMENT).orElseThrow())
+                .isNotEqualTo(spawnId);
+        assertThat(dispatcher.stableOperationId("spawnSubAgent", "call-a",
+                new NodeWorkItemIdentity(RUN_ID, 3, "todo_2", 1, 0)).orElseThrow())
+                .isNotEqualTo(spawnId);
+        assertThat(dispatcher.stableOperationId("spawnSubAgent", null, SEGMENT)).isEmpty();
     }
 
     @Test

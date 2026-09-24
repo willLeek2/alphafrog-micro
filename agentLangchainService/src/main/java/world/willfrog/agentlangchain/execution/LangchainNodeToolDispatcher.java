@@ -11,6 +11,7 @@ import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
@@ -25,6 +26,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 
 /**
  * 用生产环境的工具目录派发一次工具调用。
@@ -37,8 +40,8 @@ import java.util.Optional;
  * 等待成员的一次后台作业；作业交出去之后工具层抛出挂起信号，这里把它翻成
  * {@link DispatchOutcome.Pending}，由调用方把派发证明写进成员行。</p>
  *
- * <p>子代理工具在新调度器版本里不派发：模型看不到它们（执行器那一层已经从目录里滤掉），
- * 万一有别的路径把请求送进来，这里也直接拒绝，不让它落到工具路由器上。</p>
+ * <p>子代理工具只交给持久父子 Run 桥接处理；无桥接、开关关闭或当前 Run 是子 Run 时直接拒绝，
+ * 不让它落到旧进程内工具路由器上。</p>
  */
 @Component
 @Slf4j
@@ -50,16 +53,29 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
 
     private final ObjectProvider<ToolProvider> toolProvider;
     private final ObjectMapper objectMapper;
+    private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
 
-    public LangchainNodeToolDispatcher(ObjectProvider<ToolProvider> toolProvider, ObjectMapper objectMapper) {
+    @Autowired
+    public LangchainNodeToolDispatcher(ObjectProvider<ToolProvider> toolProvider,
+                                       ObjectMapper objectMapper,
+                                       ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge) {
         this.toolProvider = toolProvider;
         this.objectMapper = objectMapper;
+        this.subAgentBridge = subAgentBridge;
+    }
+
+    LangchainNodeToolDispatcher(ObjectProvider<ToolProvider> toolProvider, ObjectMapper objectMapper) {
+        this(toolProvider, objectMapper, null);
     }
 
     @Override
     public DispatchOutcome dispatch(DispatchRequest request) {
         if (SUB_AGENT_TOOL_NAMES.contains(request.toolName())) {
-            return new DispatchOutcome.Failed("sub_agent_tool_not_available:" + request.toolName());
+            PersistentSubAgentToolBridge bridge = subAgentBridge == null ? null : subAgentBridge.getIfAvailable();
+            if (bridge == null || !bridge.availableForRun(request.runId())) {
+                return new DispatchOutcome.Failed("sub_agent_tool_not_available:" + request.toolName());
+            }
+            return bridge.dispatch(request);
         }
         ToolExecutor executor = executorFor(request.toolName());
         if (executor == null) {
@@ -136,6 +152,13 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
 
     @Override
     public Optional<String> stableOperationId(String toolName, String rawToolCallId, NodeWorkItemIdentity segment) {
+        if (SUB_AGENT_TOOL_NAMES.contains(toolName)) {
+            if (rawToolCallId == null || rawToolCallId.isBlank() || segment == null) {
+                return Optional.empty();
+            }
+            String scope = segment.describe() + "|" + toolName + "|" + rawToolCallId;
+            return Optional.of("sub-agent-tool:" + UUID.nameUUIDFromBytes(scope.getBytes(StandardCharsets.UTF_8)));
+        }
         if (!DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName)
                 || rawToolCallId == null || rawToolCallId.isBlank()) {
             return Optional.empty();
@@ -147,7 +170,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
 
     @Override
     public boolean requiresStableOperationId(String toolName) {
-        return DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName);
+        return DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName) || SUB_AGENT_TOOL_NAMES.contains(toolName);
     }
 
     private ToolExecutor executorFor(String toolName) {

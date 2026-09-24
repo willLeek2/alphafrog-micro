@@ -13,6 +13,9 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.WaitGroupIdentity;
@@ -651,6 +654,35 @@ class DualPoolWaitGroupNodeExecutorTest {
                 .containsExactly("getStockDaily");
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void childCreationIsReservedBeforeItsToolMemberIsDispatched() {
+        PersistentSubAgentToolBridge bridge = mock(PersistentSubAgentToolBridge.class);
+        ObjectProvider<PersistentSubAgentToolBridge> bridgeProvider = mock(ObjectProvider.class);
+        PlatformTransactionManager transactions = mock(PlatformTransactionManager.class);
+        when(bridgeProvider.getIfAvailable()).thenReturn(bridge);
+        when(bridge.availableForRun(RUN_ID)).thenReturn(true);
+        when(bridge.reserveSpawn(any())).thenReturn(PersistentSubAgentToolBridge.ReservationOutcome.RESERVED);
+        when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
+        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher,
+                bridgeProvider, transactions, publisher, objectMapper, TestSchedulerSettings.propertyOnly(
+                "agent.langchain.dual-pool.wait-group.max-members", "16"),
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+        dispatcher.subAgentOperationId = true;
+        dispatcher.beforeDispatch = () -> verify(bridge).reserveSpawn(any());
+        model.enqueue(AiMessage.from(List.of(toolCall("call-child", "spawnSubAgent",
+                "{\"goal\":\"查资料\"}"))));
+
+        executor.executeSegment(firstSegment(List.of(ToolSpecification.builder()
+                .name("spawnSubAgent").description("创建子代理").build())));
+
+        assertThat(model.lastSpecifications()).extracting(ToolSpecification::name)
+                .containsExactly("spawnSubAgent");
+        assertThat(store.memberRows(store.groupRows().get(0).id).get(0).externalOperationId)
+                .isEqualTo("sub-agent-tool:test-call-child");
+        verify(transactions).commit(any());
+    }
+
     // ==================== 测试脚手架 ====================
 
     /**
@@ -890,6 +922,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         final Map<String, DispatchOutcome> pending = new LinkedHashMap<>();
         final List<DispatchRequest> dispatched = new ArrayList<>();
         boolean requiresOperationId;
+        boolean subAgentOperationId;
         Runnable beforeDispatch = () -> { };
 
         @Override
@@ -908,14 +941,18 @@ class DualPoolWaitGroupNodeExecutorTest {
         public Optional<String> stableOperationId(String toolName, String rawToolCallId,
                                                   NodeWorkItemIdentity segment) {
             if (!requiresOperationId || !"executePython".equals(toolName)) {
-                return Optional.empty();
+                return subAgentOperationId && ("spawnSubAgent".equals(toolName)
+                        || "waitForSubAgent".equals(toolName))
+                        ? Optional.of("sub-agent-tool:test-" + rawToolCallId) : Optional.empty();
             }
             return Optional.of(segment.runId() + ":" + rawToolCallId + ":1");
         }
 
         @Override
         public boolean requiresStableOperationId(String toolName) {
-            return requiresOperationId && "executePython".equals(toolName);
+            return (requiresOperationId && "executePython".equals(toolName))
+                    || (subAgentOperationId && ("spawnSubAgent".equals(toolName)
+                    || "waitForSubAgent".equals(toolName)));
         }
     }
 

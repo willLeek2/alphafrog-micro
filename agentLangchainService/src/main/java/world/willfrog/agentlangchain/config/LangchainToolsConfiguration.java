@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.service.tool.ToolProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import world.willfrog.agent.platform.service.AgentRunEventService;
@@ -15,6 +16,7 @@ import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
+import world.willfrog.agentlangchain.execution.PersistentSubAgentToolBridge;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 
 /**
@@ -38,7 +40,8 @@ public class LangchainToolsConfiguration {
                                        ObjectMapper objectMapper,
                                        AgentRunEventService eventService,
                                        LangchainToolConcurrencyThrottle toolThrottle,
-                                       PythonSandboxDispatchStore pythonSandboxDispatchStore) {
+                                       PythonSandboxDispatchStore pythonSandboxDispatchStore,
+                                       ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge) {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
@@ -51,7 +54,8 @@ public class LangchainToolsConfiguration {
                 objectMapper,
                 eventService,
                 toolThrottle,
-                pythonSandboxDispatchStore
+                pythonSandboxDispatchStore,
+                subAgentBridge
         );
     }
 }

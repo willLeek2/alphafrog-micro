@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -32,6 +33,7 @@ import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.execution.PersistentSubAgentToolBridge;
 
 import java.util.Map;
 import java.util.Set;
@@ -55,11 +57,19 @@ class ToolRouterToolProviderTest {
     private AgentRunEventService eventService;
 
     private ToolRouterToolProvider provider;
+    private ObjectMapper objectMapper;
+    private MarketDataTools marketDataTools;
+    private RagTools ragTools;
+    private SearchTools searchTools;
+    private PythonSandboxTools pythonSandboxTools;
+    private ListMyDataTool listMyDataTool;
+    private LoadToolGuideTool loadToolGuideTool;
+    private RereadToolHandler rereadToolHandler;
 
     @BeforeEach
     void setUp() {
-        ObjectMapper objectMapper = new ObjectMapper();
-        MarketDataTools marketDataTools = new MarketDataTools(
+        objectMapper = new ObjectMapper();
+        marketDataTools = new MarketDataTools(
                 mock(DatasetWriter.class),
                 mock(DatasetRegistry.class),
                 mock(ManifestWriter.class),
@@ -67,12 +77,12 @@ class ToolRouterToolProviderTest {
                 new AgentLlmProperties(),
                 objectMapper
         );
-        RagTools ragTools = new RagTools(objectMapper);
-        SearchTools searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
-        PythonSandboxTools pythonSandboxTools = new PythonSandboxTools(objectMapper);
-        ListMyDataTool listMyDataTool = new ListMyDataTool(objectMapper);
-        LoadToolGuideTool loadToolGuideTool = new LoadToolGuideTool(objectMapper);
-        RereadToolHandler rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
+        ragTools = new RagTools(objectMapper);
+        searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
+        pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        listMyDataTool = new ListMyDataTool(objectMapper);
+        loadToolGuideTool = new LoadToolGuideTool(objectMapper);
+        rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
 
         provider = new ToolRouterToolProvider(
                 toolRouter,
@@ -138,6 +148,27 @@ class ToolRouterToolProviderTest {
 
         assertFalse(toolNames.contains("spawnSubAgent"));
         assertFalse(toolNames.contains("waitForSubAgent"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void persistentChildRunCannotSeeSubAgentControlsEvenOutsideLegacyChildPhase() {
+        PersistentSubAgentToolBridge bridge = mock(PersistentSubAgentToolBridge.class);
+        ObjectProvider<PersistentSubAgentToolBridge> bridgeProvider = mock(ObjectProvider.class);
+        when(bridgeProvider.getIfAvailable()).thenReturn(bridge);
+        AgentContext.setRunId("child-run-1");
+        when(bridge.isChildRun("child-run-1")).thenReturn(true);
+        ToolRouterToolProvider childProvider = new ToolRouterToolProvider(
+                toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools,
+                listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, eventService,
+                new LangchainToolConcurrencyThrottle(false, 20, 60),
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class), bridgeProvider);
+
+        Set<String> names = childProvider.provideTools(request(Map.of())).tools().keySet().stream()
+                .map(ToolSpecification::name).collect(Collectors.toSet());
+
+        assertFalse(names.contains("spawnSubAgent"));
+        assertFalse(names.contains("waitForSubAgent"));
     }
 
     @Test
