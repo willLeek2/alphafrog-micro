@@ -1,6 +1,8 @@
 package world.willfrog.agent.platform.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -9,6 +11,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -369,6 +373,132 @@ public class AgentRunEventService {
      * 新建的那条才允许准入与启动：读回的 Run 已经在别处跑着，再启动一次会让同一次请求执行两遍。</p>
      */
     public record RunCreation(AgentRun run, boolean created) {
+    }
+
+    /**
+     * Create one child Run from a durable spawn intent. The caller owns the transaction that
+     * also marks the intent accepted; neither side may commit without the other.
+     */
+    public AgentRun createChildRun(AgentRun parent,
+                                   String childRunId,
+                                   String rootRunId,
+                                   String goal,
+                                   String context,
+                                   String modelName,
+                                   String endpointName,
+                                   int maxSteps) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("Child Run creation requires the outbox acceptance transaction");
+        }
+        if (parent == null || parent.getId() == null || childRunId == null || childRunId.isBlank()
+                || rootRunId == null || rootRunId.isBlank() || goal == null || goal.isBlank()) {
+            throw new IllegalArgumentException("Child Run creation requires parent, child, root and goal");
+        }
+        if (!SchedulerVersion.DUAL_POOL_V2.name().equals(parent.getSchedulerVersion())) {
+            throw new IllegalArgumentException("Only dual-pool V2 Run can create a child Run");
+        }
+        if (childRunId.equals(parent.getId()) || childRunId.equals(rootRunId)
+                || maxSteps <= 0 || maxSteps > 12) {
+            throw new IllegalArgumentException("Invalid child Run identity or step limit");
+        }
+
+        ObjectNode ext = requireObjectJson(parent.getExt(), "parent ext").deepCopy();
+        ObjectNode childContext = sanitizeChildContext(ext.path("context_json"));
+        if (context != null && !context.isBlank()) {
+            childContext.put("sub_agent_context", context);
+        }
+        String childGoal = context == null || context.isBlank()
+                ? goal : goal + "\n\nContext:\n" + context;
+        ext.put("user_goal", childGoal);
+        ext.put("context_json", childContext.toString());
+        ext.put("idempotency_key", "");
+        ext.put("execution_mode", PlanExecutionMode.AUTO.name());
+        ext.put("child_run", true);
+        ext.put("parent_run_id", parent.getId());
+        ext.put("root_run_id", rootRunId);
+        ext.put("sub_agent_depth", 1);
+        ext.remove("acceptanceFixtureId");
+        ext.remove("acceptanceControlId");
+        ext.remove("acceptance_fixture_id");
+        ext.remove("acceptance_control_id");
+        ext.remove("debug_observability");
+        if (modelName != null && !modelName.isBlank()) {
+            ext.put("model_name", modelName);
+        }
+        if (endpointName != null && !endpointName.isBlank()) {
+            ext.put("endpoint_name", endpointName);
+        }
+
+        AgentRun child = new AgentRun();
+        child.setId(childRunId);
+        child.setUserId(parent.getUserId());
+        child.setDeploymentId(parent.getDeploymentId());
+        child.setDeploymentGenerationId(parent.getDeploymentGenerationId());
+        child.setLaneTag(parent.getLaneTag());
+        child.setSchedulerVersion(parent.getSchedulerVersion());
+        child.setPlanGeneration(-1);
+        child.setRunControlVersion(0L);
+        child.setStatus(AgentRunStatus.RECEIVED);
+        child.setCurrentStep(0);
+        child.setMaxSteps(maxSteps);
+        child.setPlanJson("{}");
+        child.setSnapshotJson("{}");
+        child.setLastError(null);
+        child.setTtlExpiresAt(nextTtlExpiresAt());
+        child.setExt(ext.toString());
+        child.setExecutionCheckpointJson("{}");
+        child.setRestartAttempt(0);
+        child.setToolJobAnchorJson("{}");
+        child.setIdempotencyKey(null);
+        child.setRequestDigest(null);
+
+        runMapper.insert(child);
+        if (!coordinationStore.ensure(childRunId)) {
+            throw new IllegalStateException("Child Run did not receive a coordination row: " + childRunId);
+        }
+        AgentRunEvent received = persistEvent(childRunId, "RUN_RECEIVED", ext);
+        messageService.createInitialMessage(childRunId, childGoal);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                projectAppended(received);
+            }
+        });
+        return child;
+    }
+
+    private ObjectNode requireObjectJson(String value, String label) {
+        try {
+            JsonNode node = objectMapper.readTree(value);
+            if (node instanceof ObjectNode object) {
+                return object;
+            }
+        } catch (Exception ignored) {
+            // The frozen parent contract is invalid; refuse to create a child with guessed settings.
+        }
+        throw new IllegalStateException(label + " must be a JSON object");
+    }
+
+    private ObjectNode sanitizeChildContext(JsonNode raw) {
+        ObjectNode context;
+        if (raw.isTextual()) {
+            String text = raw.asText();
+            context = text.isBlank() ? objectMapper.createObjectNode() : requireObjectJson(text, "parent context");
+        } else if (raw instanceof ObjectNode object) {
+            context = object.deepCopy();
+        } else if (raw.isMissingNode() || raw.isNull()) {
+            context = objectMapper.createObjectNode();
+        } else {
+            throw new IllegalStateException("parent context must be a JSON object");
+        }
+        context.remove("acceptanceFixtureId");
+        context.remove("acceptanceControlId");
+        context.remove("acceptance_fixture_id");
+        context.remove("acceptance_control_id");
+        context.remove("executionMode");
+        context.remove("execution_mode");
+        return context;
     }
 
     /**
