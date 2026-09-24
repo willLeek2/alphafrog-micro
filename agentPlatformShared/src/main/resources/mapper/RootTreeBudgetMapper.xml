@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.RootTreeBudgetMapper">
+
+    <resultMap id="BudgetSnapshot" type="world.willfrog.agent.platform.treebudget.RootTreeBudgetSnapshotRow">
+        <result property="llmCalls" column="llm_calls"/>
+        <result property="toolCalls" column="tool_calls"/>
+        <result property="activeNodes" column="active_nodes"/>
+        <result property="externalWaits" column="external_waits"/>
+    </resultMap>
+
+    <resultMap id="BudgetOperation" type="world.willfrog.agent.platform.treebudget.RootTreeBudgetOperationRow">
+        <id property="operationId" column="operation_id"/>
+        <result property="rootRunId" column="root_run_id"/>
+        <result property="kind" column="kind"/>
+        <result property="state" column="state"/>
+    </resultMap>
+
+    <insert id="ensureRoot">
+        INSERT INTO alphafrog_agent_run_tree_budget(root_run_id)
+        VALUES (#{rootRunId}) ON CONFLICT (root_run_id) DO NOTHING
+    </insert>
+
+    <select id="lockRoot" resultMap="BudgetSnapshot">
+        SELECT llm_calls, tool_calls, active_nodes, external_waits
+          FROM alphafrog_agent_run_tree_budget WHERE root_run_id = #{rootRunId} FOR UPDATE
+    </select>
+
+    <select id="snapshot" resultMap="BudgetSnapshot">
+        SELECT llm_calls, tool_calls, active_nodes, external_waits
+          FROM alphafrog_agent_run_tree_budget WHERE root_run_id = #{rootRunId}
+    </select>
+
+    <select id="operation" resultMap="BudgetOperation">
+        SELECT operation_id, root_run_id, kind, state
+          FROM alphafrog_agent_run_tree_budget_operation WHERE operation_id = #{operationId}
+    </select>
+
+    <update id="tryIncrement">
+        UPDATE alphafrog_agent_run_tree_budget
+           SET llm_calls = llm_calls + CASE WHEN #{kind} = 'LLM_CALL' THEN 1 ELSE 0 END,
+               tool_calls = tool_calls + CASE WHEN #{kind} = 'TOOL_CALL' THEN 1 ELSE 0 END,
+               active_nodes = active_nodes + CASE WHEN #{kind} = 'ACTIVE_NODE' THEN 1 ELSE 0 END,
+               external_waits = external_waits + CASE WHEN #{kind} = 'EXTERNAL_WAIT' THEN 1 ELSE 0 END,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE root_run_id = #{rootRunId}
+           AND CASE #{kind}
+                 WHEN 'LLM_CALL' THEN llm_calls
+                 WHEN 'TOOL_CALL' THEN tool_calls
+                 WHEN 'ACTIVE_NODE' THEN active_nodes
+                 WHEN 'EXTERNAL_WAIT' THEN external_waits
+               END &lt; #{limit}
+    </update>
+
+    <update id="decrement">
+        UPDATE alphafrog_agent_run_tree_budget
+           SET llm_calls = llm_calls - CASE WHEN #{kind} = 'LLM_CALL' THEN 1 ELSE 0 END,
+               tool_calls = tool_calls - CASE WHEN #{kind} = 'TOOL_CALL' THEN 1 ELSE 0 END,
+               active_nodes = active_nodes - CASE WHEN #{kind} = 'ACTIVE_NODE' THEN 1 ELSE 0 END,
+               external_waits = external_waits - CASE WHEN #{kind} = 'EXTERNAL_WAIT' THEN 1 ELSE 0 END,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE root_run_id = #{rootRunId}
+    </update>
+
+    <insert id="insertOperation">
+        INSERT INTO alphafrog_agent_run_tree_budget_operation(operation_id, root_run_id, kind, state)
+        VALUES (#{operationId}, #{rootRunId}, #{kind}, 'RESERVED')
+    </insert>
+
+    <update id="updateState">
+        UPDATE alphafrog_agent_run_tree_budget_operation
+           SET state = #{next}, updated_at = CURRENT_TIMESTAMP
+         WHERE operation_id = #{operationId} AND state = #{expected}
+    </update>
+</mapper>
