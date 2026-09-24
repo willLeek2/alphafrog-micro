@@ -7,6 +7,7 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
@@ -17,6 +18,8 @@ import world.willfrog.agent.workflow.StructuredPlanningSupport;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
+import world.willfrog.agentlangchain.execution.RootTreeCallBudget;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 
 import java.util.stream.Collectors;
 
@@ -75,6 +78,8 @@ public class LangchainAiPlanner {
     private final AgentPromptService promptService;
     private final LangchainPlanningStructuredOutputSettings structuredOutputSettings;
     private final ObjectMapper objectMapper;
+    @Autowired
+    private RootTreeCallBudget rootTreeCallBudget;
 
     /**
      * 执行一次完整的 agent 规划，返回 Todo 计划。
@@ -197,6 +202,7 @@ public class LangchainAiPlanner {
                         StructuredPlanningSupport.strategyStageJsonSchema(maxDetailLength),
                         request
                 );
+                beforePlanningModelCall(request, attempt, "strategy");
                 ChatResponse strategyResponse = planningModel(request, attempt, "strategy").chat(ctx.getMessages());
                 String strategyRaw = strategyResponse.aiMessage() == null ? "" : nvl(strategyResponse.aiMessage().text());
                 JsonNode strategyRoot = StructuredPlanningSupport.parseStructuredJson(objectMapper, strategyRaw);
@@ -236,6 +242,7 @@ public class LangchainAiPlanner {
                         structuredOutputSettings.todoPlanningJsonSchema(),
                         request
                 );
+                beforePlanningModelCall(request, attempt, "todos");
                 ChatResponse todosResponse = planningModel(request, attempt, "todos").chat(ctx.getMessages());
                 String todosRaw = todosResponse.aiMessage() == null ? "" : nvl(todosResponse.aiMessage().text());
                 LangchainTodoPlan plan = parseValidateTodoPlan(
@@ -335,6 +342,7 @@ public class LangchainAiPlanner {
                                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                                 .build();
                 try {
+                    beforePlanningModelCall(request, attempt, "single");
                     LangchainTodoPlan plan = parseValidateTodoPlan(service.plan(userMessage), mode, maxTodos);
                     log.info("[LangchainAiPlanner] runId={} legacy_single_stage_planning ok attempt={} todos={}",
                             nvl(request.getRunId()), attempt, plan.getItems().size());
@@ -357,6 +365,14 @@ public class LangchainAiPlanner {
      * <p>身份里带计划代际、尝试序号与阶段（{@code strategy} / {@code todos} / {@code single}）：
      * 重试是新一代调用，拿脚本里为它声明的那一份回复；同一轮重做（进程重启）身份不变，拿回同一份。</p>
      */
+    private void beforePlanningModelCall(LangchainPlanningRequest request, int attempt, String phase) {
+        if (rootTreeCallBudget != null) {
+            rootTreeCallBudget.beforeModelCall(new NodeWorkItemIdentity(
+                    request.getRunId(), request.getPlanGeneration() == null ? 0 : request.getPlanGeneration(),
+                    "__dual_pool_planning__", 0, 0), phase + ':' + attempt);
+        }
+    }
+
     private static ChatModel planningModel(LangchainPlanningRequest request, int attempt, String phase) {
         return AcceptanceFixtureModelRegistry.forCall(request.getModel(),
                 () -> FixtureCallIdentity.planning(request.getRunId(),

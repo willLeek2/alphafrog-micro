@@ -9,6 +9,7 @@ import dev.langchain4j.service.tool.ToolProviderResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
@@ -25,6 +26,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verify;
 
 /**
  * 派发一次工具调用的规则自检。
@@ -50,6 +53,23 @@ class LangchainNodeToolDispatcherTest {
     @BeforeEach
     void setUp() {
         dispatcher = new LangchainNodeToolDispatcher(toolProvider(), objectMapper);
+    }
+
+    @Test
+    void unknownAndParallelLimitLookupDoNotSpendTreeToolBudget() {
+        RootTreeCallBudget treeBudget = mock(RootTreeCallBudget.class);
+        ReflectionTestUtils.setField(dispatcher, "rootTreeCallBudget", treeBudget);
+        dispatcher.dispatch(new NodeToolDispatcher.DispatchRequest(
+                RUN_ID, SEGMENT, 77L, 0, "unknown-member", "unknown-call", "notATool", "{}"));
+        executors.put("checkParallelLimits", (request, memoryId) -> "{}");
+        dispatcher.dispatch(new NodeToolDispatcher.DispatchRequest(
+                RUN_ID, SEGMENT, 77L, 1, "limit-member", "limit-call", "checkParallelLimits", "{}"));
+        verifyNoInteractions(treeBudget);
+
+        executors.put("normalTool", (request, memoryId) -> "done");
+        dispatcher.dispatch(new NodeToolDispatcher.DispatchRequest(
+                RUN_ID, SEGMENT, 77L, 2, "normal-member", "normal-call", "normalTool", "{}"));
+        verify(treeBudget).beforeToolCall(RUN_ID, 77L, "normal-member");
     }
 
     // ==================== 会转后台的工具 ====================

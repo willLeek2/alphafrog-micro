@@ -87,6 +87,8 @@ public class DualPoolWaitGroupNodeExecutor {
     private static final String RULE_ACTION_NOT_APPLIED_CODE = "acceptance_fixture_rule_action_not_applied";
 
     private final AgentPromptService promptService;
+    @Autowired
+    private RootTreeCallBudget rootTreeCallBudget;
     private final LangchainRunExecutionGuard executionGuard;
     private final WaitGroupStore waitGroupStore;
     private final NodeToolDispatcher toolDispatcher;
@@ -273,6 +275,9 @@ public class DualPoolWaitGroupNodeExecutor {
         // 夹具按这个身份发脚本回合，所以并行跑的几个节点各拿各的回复，重启后重做同一段也拿回同一份。
         // 不带夹具编号的 Run 走的是真实模型，这一步原样返回，不影响它。
         NodeWorkItemIdentity identity = input.identity();
+        if (rootTreeCallBudget != null) {
+            rootTreeCallBudget.beforeModelCall(identity, Integer.toString(modelTurn));
+        }
         ChatModel model = AcceptanceFixtureModelRegistry.forCall(
                 input.request().executionModelOrDefault(),
                 () -> FixtureCallIdentity.nodeSegment(identity.runId(), identity.planGeneration(),
@@ -459,6 +464,25 @@ public class DualPoolWaitGroupNodeExecutor {
                 }
                 if (member.getExternalOperationId() == null || member.getExternalOperationId().isBlank()) {
                     throw new IllegalStateException("子代理成员缺少持久操作身份：" + member.getMemberIdentity());
+                }
+                try {
+                    if (rootTreeCallBudget != null) {
+                        // 创建意图会在提交后由 outbox 真正建子 Run；额度必须先于意图在同一事务确认。
+                        rootTreeCallBudget.beforeToolCall(input.identity().runId(),
+                                suspended.groupId(), member.getMemberIdentity());
+                    }
+                } catch (RunBudgetException budget) {
+                    String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
+                            member.getToolCallId(), false, "",
+                            Map.of("errorCode", "run_budget_exceeded",
+                                    "errorDetail", "当前运行预算已用尽，无法继续调用工具。请根据已有结果回答；信息不足时说明无法完成。"),
+                            maxMemberResultChars);
+                    MemberCompletionResult completed = waitGroupStore.completeMember(new MemberCompletionRequest(
+                            suspended.groupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
+                            resultJson, member.getExternalOperationId(), input.identity().planGeneration(),
+                            input.versions().contextVersion(), input.versions().runControlVersion()));
+                    notificationId = keepNotification(notificationId, completed.notificationId());
+                    continue;
                 }
                 PersistentSubAgentToolBridge.ReservationRequest request =
                         new PersistentSubAgentToolBridge.ReservationRequest(
@@ -730,8 +754,12 @@ public class DualPoolWaitGroupNodeExecutor {
             if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING) {
                 continue;
             }
+            Map<String, Object> failure = "run_budget_exceeded".equals(errorCode)
+                    ? Map.of("errorCode", errorCode,
+                            "errorDetail", "当前运行预算已用尽，无法继续调用工具。请根据已有结果回答；信息不足时说明无法完成。")
+                    : Map.of("errorCode", errorCode);
             notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                    policyMatches, member, false, "", Map.of("errorCode", errorCode), null));
+                    policyMatches, member, false, "", failure, null));
         }
         return notificationId;
     }

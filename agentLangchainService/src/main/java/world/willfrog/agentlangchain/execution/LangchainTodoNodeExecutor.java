@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingExceptio
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -169,6 +170,8 @@ public class LangchainTodoNodeExecutor {
      * 不调用 check() / exceeded() 主路径（避免 #60 的 AgentRunBudgetService.exceeded() 改 RunBudgetException 时连带受影响）。
      */
     private final AgentRunBudgetService budgetService;
+    @Autowired
+    private RootTreeCallBudget rootTreeCallBudget;
 
     /**
      * Run 状态存储。side-effect-free 读取 observability summary (llmCalls / toolCalls / totalTokens / startedAtMillis)，
@@ -798,8 +801,14 @@ public class LangchainTodoNodeExecutor {
                                    List<LangchainCompletedTodo> completedTodos) {
         // 生成最终答案前也要检查 run 是否已被取消——避免用户在最后一步点了 cancel 但请求仍发出
         ensureRunnable(request);
+        LangchainFinalAnswerAiService answerService = buildFinalAnswerAiService(request);
+        if (rootTreeCallBudget != null) {
+            rootTreeCallBudget.beforeModelCall(new NodeWorkItemIdentity(
+                    request.getRunId(), request.planGenerationOrDefault(),
+                    "__dual_pool_final_answer__", 0, 0), "0");
+        }
         // buildFinalAnswerAiService 不注入 toolProvider → 纯文本生成，不会触发工具调用
-        String modelText = buildFinalAnswerAiService(request)
+        String modelText = answerService
                 .answer(LangchainTodoUserMessageBuilder.buildFinalUserMessage(
                         promptService,
                         request.getUserGoal(),

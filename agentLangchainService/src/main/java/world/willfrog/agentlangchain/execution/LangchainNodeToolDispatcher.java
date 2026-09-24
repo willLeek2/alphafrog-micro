@@ -54,6 +54,8 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
     private final ObjectProvider<ToolProvider> toolProvider;
     private final ObjectMapper objectMapper;
     private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
+    @Autowired
+    private RootTreeCallBudget rootTreeCallBudget;
 
     @Autowired
     public LangchainNodeToolDispatcher(ObjectProvider<ToolProvider> toolProvider,
@@ -75,6 +77,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             if (bridge == null || !bridge.availableForRun(request.runId())) {
                 return new DispatchOutcome.Failed("sub_agent_tool_not_available:" + request.toolName());
             }
+            countToolCall(request);
             return bridge.dispatch(request);
         }
         ToolExecutor executor = executorFor(request.toolName());
@@ -94,6 +97,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             // 会转后台的工具必须有预先算好的外部作业身份，否则工具层建出来的作业没人认得回来。
             return new DispatchOutcome.Failed("wait_group_member_without_operation_id:" + request.toolName());
         }
+        countToolCall(request);
         try (WaitGroupMemberExecutionContext.Scope ignored = waitGroup
                 .map(WaitGroupMemberExecutionContext::install).orElse(null)) {
             String output = executor.execute(executionRequest, null);
@@ -111,6 +115,12 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             String message = e.getMessage();
             return new DispatchOutcome.Failed(message == null || message.isBlank()
                     ? e.getClass().getSimpleName() : message);
+        }
+    }
+
+    private void countToolCall(DispatchRequest request) {
+        if (rootTreeCallBudget != null && !"checkParallelLimits".equals(request.toolName())) {
+            rootTreeCallBudget.beforeToolCall(request.runId(), request.groupId(), request.memberIdentity());
         }
     }
 

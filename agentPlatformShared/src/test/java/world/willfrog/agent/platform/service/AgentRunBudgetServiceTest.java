@@ -13,6 +13,8 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.entity.AgentRun;
 
 import java.util.Map;
 import java.util.Optional;
@@ -27,6 +29,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.mock;
 
 @ExtendWith(MockitoExtension.class)
 class AgentRunBudgetServiceTest {
@@ -120,6 +123,28 @@ class AgentRunBudgetServiceTest {
         assertEquals(1.0, rbe.getRatio(), 0.001);
         assertFalse(rbe.isPartial());
         assertEquals("RUN_BUDGET_EXCEEDED:tool_calls:2/2", ex.getMessage());
+    }
+
+    @Test
+    void v2UsesPersistentTreeCallCountsButStillChecksTokenBudget() {
+        AgentRunMapper runs = mock(AgentRunMapper.class);
+        AgentRun run = mock(AgentRun.class);
+        when(run.getSchedulerVersion()).thenReturn("DUAL_POOL_V2");
+        when(runs.findById("run-1")).thenReturn(run);
+        ReflectionTestUtils.setField(service, "runMapper", runs);
+        when(localConfigLoader.current()).thenReturn(Optional.empty());
+        lenient().when(stateStore.loadObservability("run-1")).thenReturn(Optional.of("""
+                {"summary":{"startedAtMillis":%d,"llmCalls":50,"toolCalls":30,"totalTokens":0}}
+                """.formatted(System.currentTimeMillis())));
+
+        service.checkBeforeLlmCall();
+        service.checkBeforeToolCall();
+
+        when(stateStore.loadObservability("run-1")).thenReturn(Optional.of("""
+                {"summary":{"startedAtMillis":%d,"llmCalls":50,"toolCalls":30,"totalTokens":300000}}
+                """.formatted(System.currentTimeMillis())));
+        assertEquals("tokens", assertThrows(RunBudgetException.class, service::checkBeforeLlmCall)
+                .getDimension());
     }
 
     @Test

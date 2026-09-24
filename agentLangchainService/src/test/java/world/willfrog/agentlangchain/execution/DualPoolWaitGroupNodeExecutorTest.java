@@ -16,6 +16,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
+import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.WaitGroupIdentity;
@@ -49,6 +51,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
@@ -681,6 +684,50 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.memberRows(store.groupRows().get(0).id).get(0).externalOperationId)
                 .isEqualTo("sub-agent-tool:test-call-child");
         verify(transactions).commit(any());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void toolBudgetFailureNeverCreatesAChildIntent() {
+        PersistentSubAgentToolBridge bridge = mock(PersistentSubAgentToolBridge.class);
+        ObjectProvider<PersistentSubAgentToolBridge> bridgeProvider = mock(ObjectProvider.class);
+        PlatformTransactionManager transactions = mock(PlatformTransactionManager.class);
+        RootTreeCallBudget budget = mock(RootTreeCallBudget.class);
+        when(bridgeProvider.getIfAvailable()).thenReturn(bridge);
+        when(bridge.availableForRun(RUN_ID)).thenReturn(true);
+        when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
+        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher,
+                bridgeProvider, transactions, publisher, objectMapper, TestSchedulerSettings.propertyOnly(
+                "agent.langchain.dual-pool.wait-group.max-members", "16"),
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+        ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
+        doThrow(new RunBudgetException("tool_calls", 1, 1, false))
+                .when(budget).beforeToolCall(eq(RUN_ID), anyLong(), any());
+        dispatcher.subAgentOperationId = true;
+        model.enqueue(AiMessage.from(List.of(toolCall("call-child", "spawnSubAgent",
+                "{\"goal\":\"查资料\"}"))));
+
+        executor.executeSegment(firstSegment(List.of(ToolSpecification.builder()
+                .name("spawnSubAgent").description("创建子代理").build())));
+
+        org.mockito.Mockito.verify(bridge, never()).reserveSpawn(any());
+        long groupId = store.groupRows().get(0).id;
+        assertThat(store.memberRows(groupId).get(0).state)
+                .isEqualTo(WaitMemberState.FAILED.name());
+        assertThat(publisher.published).hasSize(1);
+        JsonNode nextPayload = nextPayload(0, 0);
+        model.enqueue(AiMessage.from("子代理额度已满，我直接说明现有信息"));
+        DualPoolWaitGroupNodeExecutor.Outcome resumed = executor.executeSegment(
+                segment(segmentIdentity(1), nextPayload));
+        assertThat(resumed).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class,
+                completed -> assertThat(completed.resultPatch())
+                        .containsEntry("output", "子代理额度已满，我直接说明现有信息"));
+        assertThat(model.lastRequest().stream()
+                .filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast)
+                .map(ToolExecutionResultMessage::text))
+                .anySatisfy(text -> assertThat(text)
+                        .contains("run_budget_exceeded", "请根据已有结果回答"));
     }
 
     // ==================== 测试脚手架 ====================
