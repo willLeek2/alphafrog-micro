@@ -9,10 +9,14 @@ import org.springframework.transaction.support.TransactionTemplate;
 import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
 import world.willfrog.agent.platform.childrun.ChildRunIntentView;
 import world.willfrog.agent.platform.childrun.ChildRunOutboxDelivery;
+import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.platform.wait.WaitGroup;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.RunCoordinationHint;
 
@@ -28,6 +32,7 @@ public class PersistentChildRunCoordinator {
     private final ChildRunIntentStore intentStore;
     private final AgentRunEventService runEventService;
     private final AgentRunMapper runMapper;
+    private final WaitGroupStore waitGroups;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final DualPoolRunPipeline runPipeline;
     private final TransactionTemplate transactions;
@@ -38,6 +43,7 @@ public class PersistentChildRunCoordinator {
     public PersistentChildRunCoordinator(ChildRunIntentStore intentStore,
                                          AgentRunEventService runEventService,
                                          AgentRunMapper runMapper,
+                                         WaitGroupStore waitGroups,
                                          DualPoolRunAdmissionRegistry admissionRegistry,
                                          DualPoolRunPipeline runPipeline,
                                          PlatformTransactionManager transactionManager,
@@ -45,6 +51,7 @@ public class PersistentChildRunCoordinator {
         this.intentStore = intentStore;
         this.runEventService = runEventService;
         this.runMapper = runMapper;
+        this.waitGroups = waitGroups;
         this.admissionRegistry = admissionRegistry;
         this.runPipeline = runPipeline;
         this.transactions = new TransactionTemplate(transactionManager);
@@ -92,9 +99,16 @@ public class PersistentChildRunCoordinator {
                 || !delivery.parentDeploymentGenerationId().equals(parent.getDeploymentGenerationId())) {
             throw new IllegalStateException("子 Run 创建时父级冻结身份不一致");
         }
+        WaitGroup group = waitGroups.findGroup(delivery.parentWaitGroupId())
+                .orElseThrow(() -> new IllegalStateException("子 Run 创建时父等待组不存在"));
+        WaitMember member = waitGroups.findMemberByIdentity(delivery.parentWaitGroupId(),
+                        delivery.parentMemberIdentity())
+                .orElseThrow(() -> new IllegalStateException("子 Run 创建时父工具成员不存在"));
+        ChildRunAcceptanceControls.MemberIdentity bindingIdentity =
+                ChildRunAcceptanceControls.requireMemberIdentity(delivery, group, member);
         return runEventService.createChildRun(parent, delivery.childRunId(), delivery.rootRunId(),
                 delivery.goal(), delivery.context(), delivery.childModelName(),
-                delivery.childEndpointName(), delivery.childMaxSteps());
+                delivery.childEndpointName(), delivery.childMaxSteps(), bindingIdentity);
     }
 
     private void launch(AgentRun child) {

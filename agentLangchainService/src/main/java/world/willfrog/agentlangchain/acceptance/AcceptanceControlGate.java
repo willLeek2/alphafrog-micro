@@ -5,11 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agentlangchain.control.LangchainRunRejectedException;
 
 import java.time.OffsetDateTime;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -19,8 +23,9 @@ import java.util.Optional;
  * 要么直接报错；不存在「这一行不可用就照普通请求跑一遍」这条路。这一行只提供放行策略，
  * 不接管整条 Run 的模型回复。</p>
  *
- * <p>不带这个字段的请求完全不受影响：连夹具表都不会查。夹具门已经处理过 {@code acceptanceFixtureId}
- * 的请求，这里仍会按自己的编号再查一次。</p>
+ * <p>父请求也可以用 {@code childAcceptanceControls} 点名特定的父工具成员，为对应子 Run 指定各自的
+ * 控制行。没有编号和成员绑定的请求不查夹具表。夹具门已经处理过 {@code acceptanceFixtureId} 的请求，
+ * 这里仍会按自己的编号再查一次。</p>
  */
 @Component
 @Slf4j
@@ -51,7 +56,7 @@ public class AcceptanceControlGate {
      * @param contextJson          请求上下文原文（未解析）
      * @param deploymentId         本进程所在泳道
      * @param deploymentGenerationId 本进程的部署代际
-     * @return 上下文没带控制编号时为空；带了则返回这一行当前的样子
+     * @return 父 Run 没带自己的控制编号时为空；子 Run 的绑定也会校验和登记，但不返回给父 Run
      * @throws LangchainRunRejectedException 带了编号但这一行不可用：调用方必须就此停下，
      *                                       不创建 Run，也不改走普通规划
      */
@@ -62,7 +67,14 @@ public class AcceptanceControlGate {
             return Optional.empty();
         }
         JsonNode context = readContext(contextJson);
-        if (context.get(CONTEXT_FIELD) == null || context.get(CONTEXT_FIELD).isNull()) {
+        List<ChildRunAcceptanceControls.Binding> childBindings;
+        try {
+            childBindings = ChildRunAcceptanceControls.parse(context);
+        } catch (IllegalArgumentException invalid) {
+            throw reject("acceptance_control_invalid", invalid.getMessage());
+        }
+        boolean controlsParent = context.hasNonNull(CONTEXT_FIELD);
+        if (!controlsParent && childBindings.isEmpty()) {
             return Optional.empty();
         }
         if (!fixtureControlEnabled()) {
@@ -70,10 +82,37 @@ public class AcceptanceControlGate {
                     "执行控制面没有打开（" + ENV_FLAG + " 或泳道范围 " + LANE_SCOPE_PROPERTY
                             + "），带控制编号的请求一律不创建任务");
         }
-        String controlId = textOf(context, CONTEXT_FIELD);
-        if (controlId == null) {
+        String parentControlId = controlsParent ? textOf(context, CONTEXT_FIELD) : null;
+        if (controlsParent && parentControlId == null) {
             throw reject("acceptance_control_invalid", "上下文里的 " + CONTEXT_FIELD + " 是空的");
         }
+        if (parentControlId != null && childBindings.stream()
+                .anyMatch(binding -> parentControlId.equals(binding.controlId()))) {
+            throw reject("acceptance_control_invalid", "父 Run 与子 Run 不能共用同一控制编号；请分别发布控制行");
+        }
+        Map<String, AcceptanceFixtureRow> rows = new LinkedHashMap<>();
+        if (parentControlId != null) {
+            rows.put(parentControlId, usableRow(parentControlId, deploymentId, deploymentGenerationId));
+            checkScenarioMatches(rows.get(parentControlId), context);
+        }
+        for (ChildRunAcceptanceControls.Binding binding : childBindings) {
+            rows.computeIfAbsent(binding.controlId(), id -> usableRow(id,
+                    deploymentId, deploymentGenerationId));
+        }
+        for (Map.Entry<String, AcceptanceFixtureRow> entry : rows.entrySet()) {
+            if (!store.recordUse(deploymentId, deploymentGenerationId, entry.getKey())) {
+                throw reject("acceptance_control_expired",
+                        "控制行在读取与登记之间失效（被停用或过期）: " + entry.getValue().describe());
+            }
+            log.info("验收控制行已受理一次请求: {} lane={} generation={}",
+                    entry.getValue().describe(), deploymentId, deploymentGenerationId);
+        }
+        return Optional.ofNullable(parentControlId == null ? null : rows.get(parentControlId));
+    }
+
+    private AcceptanceFixtureRow usableRow(String controlId,
+                                           String deploymentId,
+                                           String deploymentGenerationId) {
         AcceptanceFixtureRow row = store.find(deploymentId, deploymentGenerationId, controlId)
                 .orElseThrow(() -> reject("acceptance_control_not_found",
                         "本泳道本代际没有这条控制行: control=" + controlId
@@ -84,14 +123,7 @@ public class AcceptanceControlGate {
         if (row.expiredAt(OffsetDateTime.now())) {
             throw reject("acceptance_control_expired", "控制行授权已过期: " + row.describe());
         }
-        checkScenarioMatches(row, context);
-        if (!store.recordUse(deploymentId, deploymentGenerationId, controlId)) {
-            throw reject("acceptance_control_expired",
-                    "控制行在读取与登记之间失效（被停用或过期）: " + row.describe());
-        }
-        log.info("验收控制行已受理一次请求: {} lane={} generation={}",
-                row.describe(), deploymentId, deploymentGenerationId);
-        return Optional.of(row);
+        return row;
     }
 
     boolean fixtureControlEnabled() {

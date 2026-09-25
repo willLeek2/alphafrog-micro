@@ -92,7 +92,8 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
         }
         return Optional.of(new ChildRunOutboxDelivery(outboxId, row.getId(), claimToken,
                 row.getChildRunId(), row.getOperationId(), row.getRootRunId(), row.getParentRunId(),
-                row.getParentWaitGroupId(), row.getParentMemberIdentity(), row.getToolCallId(),
+                row.getParentWaitGroupId(), row.getParentMemberIdentity(), row.getParentNodeId(),
+                row.getToolCallId(),
                 row.getPlanGeneration(), row.getNodeAttempt(), row.getParentControlVersion(),
                 row.getGoal(), row.getContext(), row.getChildModelName(),
                 row.getChildEndpointName(), row.getChildMaxSteps(), row.getParentSchedulerVersion(),

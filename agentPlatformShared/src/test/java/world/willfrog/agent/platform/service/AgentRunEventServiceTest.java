@@ -8,10 +8,12 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.data.redis.core.ZSetOperations;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
@@ -121,6 +123,81 @@ class AgentRunEventServiceTest {
                         org.mockito.ArgumentMatchers.anyInt()))
                 .thenAnswer(invocation -> persisted.get(
                         invocation.getArgument(0) + ":" + invocation.getArgument(1)));
+    }
+
+    @Test
+    void childControlsFollowExactParentSpawnMembers() throws Exception {
+        AgentRun parent = parentWithContext("""
+                {"acceptanceFixtureId":"parent-fixture","acceptanceControlId":"parent-control",
+                 "childAcceptanceControls":[
+                   {"for":{"planGeneration":1,"nodeId":"branch-a","nodeAttempt":0,
+                           "segmentSequence":2,"modelTurn":3,"memberSeq":0,"toolCallId":"call-a"},
+                    "acceptanceControlId":"control-a"},
+                   {"for":{"planGeneration":1,"nodeId":"branch-a","nodeAttempt":0,
+                           "segmentSequence":2,"modelTurn":3,"memberSeq":1,"toolCallId":"call-b"},
+                    "acceptanceControlId":"control-b"}]}
+                """);
+
+        AgentRun first = createChild(parent, "child-a", member(1, "branch-a", 0, 2, 3, 0, "call-a"));
+        AgentRun second = createChild(parent, "child-b", member(1, "branch-a", 0, 2, 3, 1, "call-b"));
+        AgentRun anotherTurn = createChild(parent, "child-later",
+                member(1, "branch-a", 0, 2, 4, 0, "call-a"));
+
+        assertEquals("control-a", childContext(first).path("acceptanceControlId").asText());
+        assertEquals("control-b", childContext(second).path("acceptanceControlId").asText());
+        assertFalse(childContext(anotherTurn).has("acceptanceControlId"));
+        for (AgentRun child : List.of(first, second, anotherTurn)) {
+            var context = childContext(child);
+            assertFalse(context.has("acceptanceFixtureId"));
+            assertFalse(context.has("childAcceptanceControls"));
+            assertEquals("AUTO", objectMapper.readTree(child.getExt()).path("execution_mode").asText());
+        }
+    }
+
+    @Test
+    void childWithoutExplicitBindingDoesNotInheritParentControl() throws Exception {
+        AgentRun parent = parentWithContext("{\"acceptanceControlId\":\"parent-control\"}");
+        AgentRun child = createChild(parent, "ordinary-child",
+                member(0, "node-a", 0, 0, 0, 0, "call-a"));
+
+        assertFalse(childContext(child).has("acceptanceControlId"));
+    }
+
+    private AgentRun parentWithContext(String contextJson) {
+        AgentRun parent = new AgentRun();
+        parent.setId("parent-run");
+        parent.setUserId("user-1");
+        parent.setDeploymentId(DEPLOYMENT_ID);
+        parent.setDeploymentGenerationId(DEPLOYMENT_GENERATION_ID);
+        parent.setSchedulerVersion("DUAL_POOL_V2");
+        parent.setExt("{\"context_json\":" + objectMapper.valueToTree(contextJson) + "}");
+        return parent;
+    }
+
+    private AgentRun createChild(AgentRun parent, String childId,
+                                 ChildRunAcceptanceControls.MemberIdentity identity) {
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:" + childId)).thenReturn(1L);
+        TransactionSynchronizationManager.setActualTransactionActive(true);
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            return service.createChildRun(parent, childId, parent.getId(), "calculate", "",
+                    null, null, 6, identity);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+            TransactionSynchronizationManager.setActualTransactionActive(false);
+        }
+    }
+
+    private com.fasterxml.jackson.databind.JsonNode childContext(AgentRun run) throws Exception {
+        return objectMapper.readTree(objectMapper.readTree(run.getExt()).path("context_json").asText());
+    }
+
+    private static ChildRunAcceptanceControls.MemberIdentity member(int plan, String node, int attempt,
+                                                                     int segment, int turn, int sequence,
+                                                                     String call) {
+        return new ChildRunAcceptanceControls.MemberIdentity(plan, node, attempt, segment, turn,
+                sequence, call);
     }
 
 

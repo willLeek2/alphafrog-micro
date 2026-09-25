@@ -1,5 +1,7 @@
 package world.willfrog.agent.platform.service;
 
+import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -386,13 +388,15 @@ public class AgentRunEventService {
                                    String context,
                                    String modelName,
                                    String endpointName,
-                                   int maxSteps) {
+                                   int maxSteps,
+                                   ChildRunAcceptanceControls.MemberIdentity bindingIdentity) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()
                 || !TransactionSynchronizationManager.isSynchronizationActive()) {
             throw new IllegalStateException("Child Run creation requires the outbox acceptance transaction");
         }
         if (parent == null || parent.getId() == null || childRunId == null || childRunId.isBlank()
-                || rootRunId == null || rootRunId.isBlank() || goal == null || goal.isBlank()) {
+                || rootRunId == null || rootRunId.isBlank() || goal == null || goal.isBlank()
+                || bindingIdentity == null) {
             throw new IllegalArgumentException("Child Run creation requires parent, child, root and goal");
         }
         if (!SchedulerVersion.DUAL_POOL_V2.name().equals(parent.getSchedulerVersion())) {
@@ -407,7 +411,7 @@ public class AgentRunEventService {
         if (ext.path("child_run").asBoolean(false)) {
             throw new IllegalArgumentException("A child Run cannot create another child Run");
         }
-        ObjectNode childContext = sanitizeChildContext(ext.path("context_json"));
+        ObjectNode childContext = sanitizeChildContext(ext.path("context_json"), bindingIdentity);
         if (context != null && !context.isBlank()) {
             childContext.put("sub_agent_context", context);
         }
@@ -423,6 +427,7 @@ public class AgentRunEventService {
         ext.put("sub_agent_depth", 1);
         ext.remove("acceptanceFixtureId");
         ext.remove("acceptanceControlId");
+        ext.remove(ChildRunAcceptanceControls.CONTEXT_FIELD);
         ext.remove("acceptance_fixture_id");
         ext.remove("acceptance_control_id");
         ext.remove("debug_observability");
@@ -483,7 +488,8 @@ public class AgentRunEventService {
         throw new IllegalStateException(label + " must be a JSON object");
     }
 
-    private ObjectNode sanitizeChildContext(JsonNode raw) {
+    private ObjectNode sanitizeChildContext(JsonNode raw,
+                                            ChildRunAcceptanceControls.MemberIdentity bindingIdentity) {
         ObjectNode context;
         if (raw.isTextual()) {
             String text = raw.asText();
@@ -504,12 +510,17 @@ public class AgentRunEventService {
         } else {
             throw new IllegalStateException("parent context must be a JSON object");
         }
+        String childControlId = ChildRunAcceptanceControls.controlFor(context, bindingIdentity).orElse(null);
         context.remove("acceptanceFixtureId");
         context.remove("acceptanceControlId");
+        context.remove(ChildRunAcceptanceControls.CONTEXT_FIELD);
         context.remove("acceptance_fixture_id");
         context.remove("acceptance_control_id");
         context.remove("executionMode");
         context.remove("execution_mode");
+        if (childControlId != null) {
+            context.put("acceptanceControlId", childControlId);
+        }
         return context;
     }
 
