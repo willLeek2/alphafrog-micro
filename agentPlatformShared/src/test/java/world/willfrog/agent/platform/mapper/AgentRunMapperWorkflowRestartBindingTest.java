@@ -34,6 +34,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
             "updateExecutionCheckpoint",
             "updateTerminalSnapshot",
             "updateSnapshotIfStatus",
+            "persistCancelDisposition",
             "pauseSnapshotWithTtl",
             "cancelTerminalSnapshotWithTtl",
             "updateResumedTerminal",
@@ -272,25 +273,39 @@ class AgentRunMapperWorkflowRestartBindingTest {
     void cancelAndPauseControlWritesStayAtomicWithBusinessFieldConditions() {
         String snapshot = normalizedSql(statement("updateSnapshotIfStatus")
                 .getBoundSql(dummyParameters(methodParams.get("updateSnapshotIfStatus"))));
+        String anchoredCancel = normalizedSql(statement("persistCancelDisposition")
+                .getBoundSql(dummyParameters(methodParams.get("persistCancelDisposition"))));
         String pause = normalizedSql(statement("pauseSnapshotWithTtl")
                 .getBoundSql(dummyParameters(methodParams.get("pauseSnapshotWithTtl"))));
         String cancel = normalizedSql(statement("cancelTerminalSnapshotWithTtl")
                 .getBoundSql(dummyParameters(methodParams.get("cancelTerminalSnapshotWithTtl"))));
 
         assertThat(snapshot)
-                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("snapshot_json = CASE")
+                .contains("CAST(? AS jsonb)")
                 .contains("status = ?")
+                .doesNotContain("SET status = 'CANCELED'")
                 .doesNotContain("deployment_id", "deployment_generation_id");
+        assertThat(anchoredCancel)
+                .contains("'runDisposition', 'CANCELED'")
+                .contains("WHEN scheduler_version = 'DUAL_POOL_V2'")
+                .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'")
+                .contains("THEN run_control_version + 1")
+                .contains("tool_job_anchor_json ->> 'operationId' = ?")
+                .contains("status = ?");
         assertThat(pause)
                 .contains("status = 'WAITING'")
-                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("snapshot_json = CASE")
+                .contains("CAST(? AS jsonb)")
                 .contains("ttl_expires_at = ?")
                 .contains("status = ?")
                 .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
                 .doesNotContain("deployment_id", "deployment_generation_id");
         assertThat(cancel)
                 .contains("status = 'CANCELED'")
-                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("snapshot_json = CASE")
+                .contains("CAST(? AS jsonb)")
+                .contains("WHEN scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2') THEN run_control_version + 1")
                 .contains("ttl_expires_at = ?")
                 .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
                 .doesNotContain("deployment_id", "deployment_generation_id");

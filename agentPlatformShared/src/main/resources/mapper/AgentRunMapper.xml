@@ -692,7 +692,7 @@
         SET status = 'CANCELED',
             snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             run_control_version = CASE
-                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                WHEN scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2') THEN run_control_version + 1
                 ELSE run_control_version
             END,
             ttl_expires_at = #{ttlExpiresAt},
@@ -852,7 +852,9 @@
 
     <!--
         取消意图专用窄写。只在与读取时相同的 Run 状态和精确
-        operationId 下，用 jsonb 合并仅写 autoResume=false 与 runDisposition=CANCELED，
+        operationId 下，用 jsonb 合并 autoResume=false 与 runDisposition=CANCELED。
+        V2 首次写入取消处置时同时递增控制版本，让子树当时就失去创建和执行资格；
+        同一锚点重复取消不再递增。等待状态仍留给长工具收尾。
         绝不把内存中的整份旧锚点写回——第二个长工具已替换锚点（operationId 变化）时
         返回 0，由调用方重读当前任务后重试或按既有语义失败关闭。
     -->
@@ -862,6 +864,12 @@
                 'autoResume', false,
                 'runDisposition', 'CANCELED'
             ),
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V2'
+                 AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+                THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
