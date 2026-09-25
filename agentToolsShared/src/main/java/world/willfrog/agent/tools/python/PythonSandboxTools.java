@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -1024,11 +1025,6 @@ public class PythonSandboxTools {
                                 .build();
                     } else if (lookup != null && !lookup.getFound()
                             && lookup.getError().isBlank()) {
-                        /*
-                         * 只有权威响应“未找到且无查询错误”才能证明 create 未发生。Gateway transport/
-                         * 5xx/解析异常会返回 found=false + error；该状态不具备否定证明，必须保留
-                         * PREPARING，避免真实 Sandbox task 已创建却被 Java 释放容量并清 anchor。
-                         */
                         if (!waitPolicy.durableSuspend()) {
                             if (!abortDagBlockingPreparing(runId, anchor, reservation)) {
                                 return dagBlockingLeaseLost(
@@ -1040,10 +1036,11 @@ public class PythonSandboxTools {
                                     Map.of("operation_id", identity.operationId(),
                                             "message", nvl(createFailure.getMessage())));
                         }
-                        if (releasePreDispatch(reservation)) {
-                            pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
-                        }
-                        throw createFailure;
+                        // 查到暂时不存在也不能释放名额：迟到的 create RPC 仍可能到达。
+                        // 先用同一 operation/fingerprint 写取消墓碑，取得稳定 taskId，
+                        // 再像普通 Sandbox 任务一样接收终态并释放容量。
+                        createResp = tombstoneCreateUncertain(
+                                identity.operationId(), spec.requestFingerprint(), "");
                     } else {
                         // 查询也无法证明结果时保留 PREPARING，交给 startup recovery 决定，不能猜测释放。
                         throw new IllegalStateException(
@@ -1056,21 +1053,21 @@ public class PythonSandboxTools {
                     throw createFailure;
                 }
             }
-            // create 响应必须包含无错误的 taskId，否则在确认释放成功后清 active anchor。
+            // 无效响应也不能直接释放 PREPARING；按外部作业身份写墓碑并接回终态。
             if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
                     || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
                 if (!waitPolicy.durableSuspend()) {
                     if (!abortDagBlockingPreparing(runId, anchor, reservation)) {
                         return dagBlockingLeaseLost(
-                                null, toolStartMs,
-                                "durable PREPARING abort was rejected after invalid create response");
+                            null, toolStartMs,
+                            "durable PREPARING abort was rejected after invalid create response");
                     }
-                } else if (releasePreDispatch(reservation)) {
-                    pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
+                    return fail("executePython", "CREATE_TASK_FAILED",
+                            "Failed to create python sandbox task",
+                            Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
                 }
-                return fail("executePython", "CREATE_TASK_FAILED",
-                        "Failed to create python sandbox task",
-                        Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
+                createResp = tombstoneCreateUncertain(identity.operationId(),
+                        spec.requestFingerprint(), createResp == null ? "" : nvl(createResp.getTaskId()));
             }
             String taskId = createResp.getTaskId();
             /*
@@ -1643,6 +1640,38 @@ public class PythonSandboxTools {
 
     private boolean releasePreDispatch(DataAnalysisReservation reservation) {
         return releasePreDispatch(reservation, DataAnalysisReleaseReason.CREATE_NOT_STARTED);
+    }
+
+    private ExecuteResponse tombstoneCreateUncertain(
+            String operationId, String fingerprint, String responseTaskId) {
+        String cancelId = "tool-job-create-" + UUID.nameUUIDFromBytes(
+                operationId.getBytes(StandardCharsets.UTF_8));
+        CancelTaskResponse canceled = pythonSandboxService.cancelTask(CancelTaskRequest.newBuilder()
+                .setByOperation(OperationCancelTarget.newBuilder()
+                        .setOperationId(operationId)
+                        .setRequestFingerprint(fingerprint))
+                .setCancelRequestId(cancelId)
+                .setReason("CREATE_RESULT_UNCERTAIN")
+                .build());
+        if (canceled == null || canceled.hasErrorDetail() || !canceled.getError().isBlank()
+                || canceled.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
+                || canceled.getOutcome() == CancelOutcome.NOT_FOUND
+                || canceled.getTaskId().isBlank()) {
+            throw new IllegalStateException("Sandbox creation outcome remains uncertain");
+        }
+        GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
+        if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()
+                || !lookup.getFound() || !canceled.getTaskId().equals(lookup.getTaskId())
+                || !fingerprint.equals(lookup.getRequestFingerprint())
+                || responseTaskId != null && !responseTaskId.isBlank()
+                    && !responseTaskId.equals(lookup.getTaskId())) {
+            throw new IllegalStateException("Sandbox cancel tombstone identity could not be verified");
+        }
+        return ExecuteResponse.newBuilder()
+                .setTaskId(lookup.getTaskId())
+                .setRequestFingerprint(fingerprint)
+                .build();
     }
 
     private boolean releasePreDispatch(

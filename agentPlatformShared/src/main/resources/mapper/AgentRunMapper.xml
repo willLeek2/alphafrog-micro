@@ -1175,6 +1175,7 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
     </update>
 
     <!--

@@ -279,6 +279,8 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .getBoundSql(dummyParameters(methodParams.get("pauseSnapshotWithTtl"))));
         String cancel = normalizedSql(statement("cancelTerminalSnapshotWithTtl")
                 .getBoundSql(dummyParameters(methodParams.get("cancelTerminalSnapshotWithTtl"))));
+        String clearActive = normalizedSql(statement("clearActiveToolJobAnchor")
+                .getBoundSql(dummyParameters(methodParams.get("clearActiveToolJobAnchor"))));
 
         assertThat(snapshot)
                 .contains("snapshot_json = CASE")
@@ -293,6 +295,9 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("THEN run_control_version + 1")
                 .contains("tool_job_anchor_json ->> 'operationId' = ?")
                 .contains("status = ?");
+        assertThat(clearActive)
+                .contains("tool_job_anchor_json ->> 'operationId' = ?")
+                .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'");
         assertThat(pause)
                 .contains("status = 'WAITING'")
                 .contains("snapshot_json = CASE")

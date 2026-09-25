@@ -207,6 +207,26 @@ public class ToolJobStartupRecovery {
                     if (resolution.outcome()
                             == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
                         reservation = resolution.reservation();
+                    } else if ("CANCELED".equals(anchor.getRunDisposition())
+                            && resolution.outcome()
+                            != ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
+                        /*
+                         * The pre-create cancel tombstone may be temporarily unreachable, or
+                         * another instance may have attached it already. PREPARING remains a
+                         * real capacity reservation. Keep admission available for other runs
+                         * and wake the online reconciler to reread the database; never replay
+                         * createTask for this canceled operation.
+                         */
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(
+                                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (Exception redisFailure) {
+                            log.warn("Failed to schedule canceled PREPARING recovery for run={}",
+                                    run.getId(), redisFailure);
+                        }
+                        continue;
                     } else if (ToolJobRunDisposition.isDagCleanupOnly(
                             anchor.getRunDisposition())
                             && resolution.outcome()

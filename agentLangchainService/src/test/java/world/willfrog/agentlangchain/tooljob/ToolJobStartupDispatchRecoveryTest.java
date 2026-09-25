@@ -103,6 +103,61 @@ class ToolJobStartupDispatchRecoveryTest {
         verify(fixture.capacity, never()).recover(anyList(), anyInt(), anyInt());
     }
 
+    @Test
+    void canceledPreparingUsesTombstoneAtStartupInsteadOfReplayingCreate() throws Exception {
+        Fixture fixture = fixture();
+        ToolJobAnchor anchor = preparingAnchor();
+        anchor.setRunDisposition("CANCELED");
+        anchor.setAutoResume(false);
+        when(fixture.anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(fixture.sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCELED)
+                .setTaskId("tombstone-1").setStatus("CANCELED").build());
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("tombstone-1")
+                        .setRequestFingerprint("sha256:" + "a".repeat(64)).build());
+
+        fixture.recovery.onReady();
+
+        verify(fixture.sandbox, never()).createTask(any());
+        verify(fixture.sandbox).cancelTask(argThat(request -> request.hasByOperation()
+                && "run-1:call-1:1".equals(request.getByOperation().getOperationId())));
+        ArgumentCaptor<List<DataAnalysisReservation>> reservations = ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(reservations.capture(), anyInt(), anyInt());
+        assertThat(reservations.getValue()).singleElement().satisfies(reservation -> {
+            assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.TASK_ATTACHED);
+            assertThat(reservation.taskId()).isEqualTo("tombstone-1");
+        });
+        verify(fixture.anchorService).updateActiveAndStatus(
+                eq("run-1"), argThat(updated -> "CANCELED".equals(updated.getRunDisposition())),
+                eq(AgentRunStatus.WAITING_TOOL_JOB), eq(AgentRunStatus.EXECUTING),
+                eq("run-1:call-1:1"));
+    }
+
+    @Test
+    void unavailableCanceledTombstoneKeepsCapacityAndSchedulesOnlineRetry() throws Exception {
+        Fixture fixture = fixture();
+        ToolJobAnchor anchor = preparingAnchor();
+        anchor.setRunDisposition("CANCELED");
+        anchor.setAutoResume(false);
+        when(fixture.anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(fixture.sandbox.cancelTask(any()))
+                .thenThrow(new IllegalStateException("sandbox unavailable"));
+
+        fixture.recovery.onReady();
+
+        verify(fixture.sandbox, never()).createTask(any());
+        ArgumentCaptor<List<DataAnalysisReservation>> reservations = ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(reservations.capture(), anyInt(), anyInt());
+        assertThat(reservations.getValue()).singleElement().satisfies(reservation ->
+                assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING));
+        verify(fixture.redisCache).upsertDue(eq("run-1"),
+                argThat(due -> due.getNextPollAt() != null));
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), any(), any(), any());
+    }
+
     private Fixture fixture() throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);

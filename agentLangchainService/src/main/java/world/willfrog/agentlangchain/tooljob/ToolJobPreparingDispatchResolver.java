@@ -11,9 +11,16 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.OperationCancelTarget;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
+
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 
 /**
  * 恢复 PREPARING dispatch 的共享解析器。
@@ -72,6 +79,10 @@ final class ToolJobPreparingDispatchResolver {
             return Resolution.invalidEvidence();
         }
 
+        if ("CANCELED".equals(anchor.getRunDisposition())) {
+            return resolveCanceledPreparing(runId, anchor, preparing, sandboxService, anchorService);
+        }
+
         GetTaskByOperationIdResponse lookup;
         try {
             lookup = sandboxService.getTaskByOperationId(
@@ -127,6 +138,15 @@ final class ToolJobPreparingDispatchResolver {
             fingerprint = created.getRequestFingerprint();
         }
 
+        return attachResolvedTask(runId, anchor, preparing, taskId, anchorService);
+    }
+
+    private static Resolution attachResolvedTask(
+            String runId,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation preparing,
+            String taskId,
+            ToolJobAnchorService anchorService) {
         DataAnalysisReservation attached = new DataAnalysisReservation(
                 preparing.reservationId(),
                 preparing.identity(),
@@ -182,6 +202,47 @@ final class ToolJobPreparingDispatchResolver {
              * 不能再把本地 PREPARING 快照写回覆盖可能已提交的 ATTACHED。
              */
             return Resolution.durableWriteUncertain();
+        }
+    }
+
+    private static Resolution resolveCanceledPreparing(
+            String runId,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation preparing,
+            PythonSandboxService sandboxService,
+            ToolJobAnchorService anchorService) {
+        String operationId = anchor.getOperationId();
+        String fingerprint = anchor.getRequestFingerprint();
+        String cancelId = "tool-job-create-" + UUID.nameUUIDFromBytes(
+                operationId.getBytes(StandardCharsets.UTF_8));
+        try {
+            // The same cancel identity is used by the original worker and both recovery paths.
+            // It prevents a delayed create RPC from becoming an unowned Sandbox task.
+            CancelTaskResponse canceled = sandboxService.cancelTask(CancelTaskRequest.newBuilder()
+                    .setByOperation(OperationCancelTarget.newBuilder()
+                            .setOperationId(operationId)
+                            .setRequestFingerprint(fingerprint))
+                    .setCancelRequestId(cancelId)
+                    .setReason("RUN_CANCELED")
+                    .build());
+            if (canceled == null || canceled.hasErrorDetail() || !canceled.getError().isBlank()
+                    || canceled.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
+                    || canceled.getOutcome() == CancelOutcome.NOT_FOUND
+                    || canceled.getTaskId().isBlank()) {
+                return Resolution.remoteUnavailable();
+            }
+            GetTaskByOperationIdResponse lookup = sandboxService.getTaskByOperationId(
+                    GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
+            if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()
+                    || !lookup.getFound() || !canceled.getTaskId().equals(lookup.getTaskId())
+                    || !fingerprint.equals(lookup.getRequestFingerprint())) {
+                return Resolution.remoteUnavailable();
+            }
+            return attachResolvedTask(runId, anchor, preparing, lookup.getTaskId(), anchorService);
+        } catch (Exception remoteFailure) {
+            log.warn("Canceled PREPARING operation still awaits Sandbox tombstone: run={} operation={}",
+                    runId, operationId, remoteFailure);
+            return Resolution.remoteUnavailable();
         }
     }
 

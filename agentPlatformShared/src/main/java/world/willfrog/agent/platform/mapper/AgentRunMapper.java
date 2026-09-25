@@ -439,7 +439,7 @@ public interface AgentRunMapper {
             @Param("id") String id,
             @Param("expectedOperationId") String expectedOperationId);
 
-    /** 只清理仍属于指定 operation 的活跃 anchor，防止旧清理动作删除新一轮工具上下文。 */
+    /** 只清理仍属于指定 operation 且尚未记录取消的活跃 anchor，防止旧线程抹掉取消收尾凭据。 */
     int clearActiveToolJobAnchor(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
                                  @Param("expectedOperationId") String expectedOperationId);

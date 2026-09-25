@@ -152,6 +152,35 @@ class AgentRunMapperPostgresIntegrationTest {
     }
 
     @Test
+    void oldWorkerCannotClearAnAnchorAfterCancelDispositionWasPersisted() throws Exception {
+        String operationId = "clear-after-cancel:call-1:1";
+        insertRun("clear-after-cancel", AgentRunStatus.EXECUTING,
+                synchronousAnchor(operationId, "PREPARING", "PREPARING", false));
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.clearActiveToolJobAnchor(
+                    "clear-after-cancel", AgentRunStatus.EXECUTING, operationId))
+                    .isEqualTo(1);
+        }
+
+        insertRun("clear-after-cancel-2", AgentRunStatus.EXECUTING,
+                synchronousAnchor("clear-after-cancel-2:call-1:1", "PREPARING", "PREPARING", false));
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            String canceledOperationId = "clear-after-cancel-2:call-1:1";
+            assertThat(mapper.persistCancelDisposition(
+                    "clear-after-cancel-2", AgentRunStatus.EXECUTING,
+                    canceledOperationId)).isEqualTo(1);
+            assertThat(mapper.clearActiveToolJobAnchor(
+                    "clear-after-cancel-2", AgentRunStatus.EXECUTING, canceledOperationId))
+                    .isZero();
+            assertThat(mapper.findById("clear-after-cancel-2").getToolJobAnchorJson())
+                    .contains("CANCELED", canceledOperationId);
+        }
+    }
+
+    @Test
     void synchronousClearRequiresTerminalReleasedUsageProofAndOwnership() throws Exception {
         insertRun("sync-clear-valid", AgentRunStatus.EXECUTING,
                 synchronousAnchor("sync-clear-valid:call-1:1", "TERMINAL", "RELEASED", true));

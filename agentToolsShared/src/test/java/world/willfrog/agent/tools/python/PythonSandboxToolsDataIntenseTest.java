@@ -24,6 +24,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -1442,6 +1443,51 @@ class PythonSandboxToolsDataIntenseTest {
         verify(dispatchStore, never()).clearActive(any(), any());
         verify(dispatchStore, never()).persistAttached(any(), any());
         verify(dispatchStore, never()).transferToPending(any(), any());
+    }
+
+    @Test
+    void delayedCreateAfterAbsentLookupIsCanceledByOperationAndKeptUntilTerminal() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        AtomicReference<ToolJobAnchor> attached = new AtomicReference<>();
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            attached.set(snapshot(invocation.getArgument(1)));
+            return true;
+        });
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        AtomicReference<ExecuteRequest> created = new AtomicReference<>();
+        AtomicInteger lookups = new AtomicInteger();
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            created.set(invocation.getArgument(0));
+            throw new IllegalStateException("create response lost");
+        });
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation ->
+                lookups.incrementAndGet() == 1
+                        ? GetTaskByOperationIdResponse.newBuilder().setFound(false).build()
+                        : GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("late-task")
+                        .setRequestFingerprint(created.get().getRequestFingerprint()).build());
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCEL_INTENT_RECORDED)
+                .setTaskId("late-task").setStatus("RUNNING").build());
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(sandbox).cancelTask(argThat(request -> request.hasByOperation()
+                && created.get().getOperationId().equals(request.getByOperation().getOperationId())
+                && created.get().getRequestFingerprint().equals(
+                request.getByOperation().getRequestFingerprint())
+                && request.getCancelRequestId().startsWith("tool-job-create-")));
+        assertThat(attached.get().getTaskId()).isEqualTo("late-task");
+        assertThat(attached.get().getReservationJson()).contains("TASK_ATTACHED");
+        verify(dispatchStore).transferToPending(eq("run-test"), any());
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).clearActive(any(), any());
     }
 
     @Test
