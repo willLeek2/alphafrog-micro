@@ -15,6 +15,12 @@ import java.util.Set;
 /** Shared protobuf-JSON parser used by both synchronous and background terminal paths. */
 public final class SandboxResourceUsageParser {
 
+    private static final Set<String> KNOWN_MISSING_FIELDS = Set.of(
+            "cpuMillis", "memoryPeakBytes", "memoryByteMillis", "logicalBytesScanned",
+            "artifactBytesWritten", "temporaryBytesWritten", "queueWaitMillis",
+            "prepareMillis", "executionWallMillis", "cleanupMillis", "datasetOpenCount",
+            "samplingIntervalMillis", "exitReason");
+
     private SandboxResourceUsageParser() {
     }
 
@@ -34,25 +40,44 @@ public final class SandboxResourceUsageParser {
             JsonFormat.parser().merge(usageJson, builder);
             SandboxResourceUsage usage = builder.build();
 
-            String actualResourceClass = usage.getResourceClass().trim();
-            if (!actualResourceClass.isEmpty()) {
-                DataAnalysisResourceClass parsedResourceClass;
-                try {
-                    parsedResourceClass = DataAnalysisResourceClass.valueOf(actualResourceClass);
-                } catch (IllegalArgumentException e) {
-                    throw new IllegalArgumentException(
-                            "resourceUsage resourceClass is unsupported: " + actualResourceClass, e);
-                }
-                if (parsedResourceClass != resourceClass) {
-                    throw new IllegalArgumentException(
-                            "resourceUsage resourceClass does not match reservation resourceClass");
-                }
+            Set<String> declaredMissing = new LinkedHashSet<>(usage.getMissingFieldsList());
+            if (!KNOWN_MISSING_FIELDS.containsAll(declaredMissing)) {
+                throw new IllegalArgumentException("resourceUsage missingFields contains an unknown field");
             }
 
-            Set<String> declaredMissing = new LinkedHashSet<>(usage.getMissingFieldsList());
-            if (!DataAnalysisResourceUsage.P0_REQUIRED_MEASURED_FIELDS.containsAll(declaredMissing)) {
-                throw new IllegalArgumentException(
-                        "resourceUsage missingFields contains an unknown or non-P0 field");
+            String actualResourceClass = usage.getResourceClass().trim();
+            if (!actualResourceClass.isEmpty()) {
+                if ("UNKNOWN".equals(actualResourceClass)) {
+                    /*
+                     * A by-operation cancel can reach Sandbox before createTask. The terminal
+                     * result then has no request and no remote resource class. The reservation
+                     * still has the frozen class; use it only when the terminal usage declares
+                     * cancellation and every measurement missing. This shape does not prove
+                     * whether a genuine task existed, so release still requires terminal proof.
+                     */
+                    Set<String> expectedMissing = new LinkedHashSet<>(
+                            KNOWN_MISSING_FIELDS);
+                    expectedMissing.remove("exitReason");
+                    if (!"CANCELED".equals(usage.getExitReason())
+                            || usage.getAttributionComplete()
+                            || !declaredMissing.equals(expectedMissing)
+                            || hasAnyMeasurement(usage)) {
+                        throw new IllegalArgumentException(
+                                "resourceUsage UNKNOWN class lacks unmeasured cancellation evidence");
+                    }
+                } else {
+                    DataAnalysisResourceClass parsedResourceClass;
+                    try {
+                        parsedResourceClass = DataAnalysisResourceClass.valueOf(actualResourceClass);
+                    } catch (IllegalArgumentException e) {
+                        throw new IllegalArgumentException(
+                                "resourceUsage resourceClass is unsupported: " + actualResourceClass, e);
+                    }
+                    if (parsedResourceClass != resourceClass) {
+                        throw new IllegalArgumentException(
+                                "resourceUsage resourceClass does not match reservation resourceClass");
+                    }
+                }
             }
 
             Long cpu = nullableLong(usage.hasCpuMillis(), usage.getCpuMillis(), "cpuMillis", declaredMissing);
@@ -114,6 +139,23 @@ public final class SandboxResourceUsageParser {
         } catch (Exception e) {
             throw new IllegalArgumentException("invalid resourceUsage protobuf JSON", e);
         }
+    }
+
+    private static boolean hasAnyMeasurement(SandboxResourceUsage usage) {
+        return usage.hasCpuMillis()
+                || usage.hasMemoryPeakBytes()
+                || usage.hasMemoryByteMillis()
+                || usage.hasLogicalBytesScanned()
+                || usage.hasArtifactBytesWritten()
+                || usage.hasTemporaryBytesWritten()
+                || usage.hasQueueWaitMillis()
+                || usage.hasPrepareMillis()
+                || usage.hasExecutionWallMillis()
+                || usage.hasCleanupMillis()
+                || usage.hasDatasetOpenCount()
+                || usage.hasSamplingIntervalMillis()
+                || usage.getOomKilled()
+                || usage.getTimedOut();
     }
 
     private static Long nullableLong(boolean present, long value, String field, Set<String> missing) {

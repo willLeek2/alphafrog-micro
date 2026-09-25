@@ -6,6 +6,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
@@ -26,6 +27,8 @@ import static org.mockito.Mockito.when;
 
 class ToolJobPreparingDispatchResolverTest {
 
+    private static final String FINGERPRINT = "sha256:" + "a".repeat(64);
+
     private final PythonSandboxService sandbox = mock(PythonSandboxService.class);
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
     private final DataAnalysisOperationIdentity identity =
@@ -42,7 +45,7 @@ class ToolJobPreparingDispatchResolverTest {
                 .setStatus("CANCELED").build());
         when(sandbox.getTaskByOperationId(any())).thenReturn(
                 GetTaskByOperationIdResponse.newBuilder().setFound(true)
-                        .setTaskId("tombstone-1").setRequestFingerprint("sha256:request")
+                        .setTaskId("tombstone-1").setRequestFingerprint(FINGERPRINT)
                         .build());
         when(anchorService.updateActive(eq("run-1"), eq(anchor),
                 eq(AgentRunStatus.EXECUTING), eq(identity.operationId()))).thenReturn(true);
@@ -61,7 +64,7 @@ class ToolJobPreparingDispatchResolverTest {
         verify(sandbox).cancelTask(org.mockito.ArgumentMatchers.argThat(request ->
                 request.hasByOperation()
                         && identity.operationId().equals(request.getByOperation().getOperationId())
-                        && "sha256:request".equals(request.getByOperation().getRequestFingerprint())
+                        && FINGERPRINT.equals(request.getByOperation().getRequestFingerprint())
                         && ("tool-job-create-" + UUID.nameUUIDFromBytes(
                         identity.operationId().getBytes(StandardCharsets.UTF_8)))
                         .equals(request.getCancelRequestId())));
@@ -92,7 +95,7 @@ class ToolJobPreparingDispatchResolverTest {
                 .setStatus("CANCELED").build());
         when(sandbox.getTaskByOperationId(any())).thenReturn(
                 GetTaskByOperationIdResponse.newBuilder().setFound(true)
-                        .setTaskId("other-task").setRequestFingerprint("sha256:request")
+                        .setTaskId("other-task").setRequestFingerprint(FINGERPRINT)
                         .build());
 
         ToolJobPreparingDispatchResolver.Resolution result =
@@ -100,15 +103,45 @@ class ToolJobPreparingDispatchResolverTest {
                         "run-1", anchor, preparing, sandbox, anchorService);
 
         assertThat(result.outcome())
-                .isEqualTo(ToolJobPreparingDispatchResolver.Outcome.REMOTE_UNAVAILABLE);
+                .isEqualTo(ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE);
         verify(anchorService, never()).updateActive(any(), any(), any(), any());
         verify(sandbox, never()).createTask(any());
+    }
+
+    @Test
+    void lostDagWorkerCancelsByOperationAndAttachesForCleanupOnly() {
+        ToolJobAnchor anchor = canceledPreparing();
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        anchor.setBlockingOwnerId("old-owner");
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCEL_INTENT_RECORDED)
+                .setTaskId("late-dag-task").setStatus("RUNNING").build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("late-dag-task").setRequestFingerprint(FINGERPRINT)
+                        .build());
+        when(anchorService.updateDagCleanupPreparing(eq("run-1"), eq(anchor),
+                eq(identity.operationId()), eq("old-owner"), eq(FINGERPRINT)))
+                .thenReturn(true);
+
+        ToolJobPreparingDispatchResolver.Resolution result =
+                ToolJobPreparingDispatchResolver.resolve(
+                        "run-1", anchor, preparing, sandbox, anchorService);
+
+        assertThat(result.outcome())
+                .isEqualTo(ToolJobPreparingDispatchResolver.Outcome.RESOLVED);
+        assertThat(result.reservation().taskId()).isEqualTo("late-dag-task");
+        verify(sandbox).cancelTask(org.mockito.ArgumentMatchers.argThat(request ->
+                request.hasByOperation()
+                        && "DAG_WORKER_LOST".equals(request.getReason())));
+        verify(sandbox, never()).createTask(any());
+        verify(anchorService, never()).updateActive(any(), any(), any(), any());
     }
 
     private ToolJobAnchor canceledPreparing() {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId(identity.operationId());
-        anchor.setRequestFingerprint("sha256:request");
+        anchor.setRequestFingerprint(FINGERPRINT);
         anchor.setAnchorState("PREPARING");
         anchor.setRunDisposition("CANCELED");
         anchor.setAutoResume(false);

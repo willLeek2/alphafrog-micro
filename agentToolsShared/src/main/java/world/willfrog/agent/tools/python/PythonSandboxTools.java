@@ -1026,15 +1026,11 @@ public class PythonSandboxTools {
                     } else if (lookup != null && !lookup.getFound()
                             && lookup.getError().isBlank()) {
                         if (!waitPolicy.durableSuspend()) {
-                            if (!abortDagBlockingPreparing(runId, anchor, reservation)) {
+                            if (!renewDagBlockingLease(runId, anchor, true)) {
                                 return dagBlockingLeaseLost(
                                         null, toolStartMs,
-                                        "durable PREPARING abort was rejected after authoritative create result");
+                                        "DAG worker lost its lease before canceling an uncertain create");
                             }
-                            return fail("executePython", "CREATE_TASK_FAILED",
-                                    "Sandbox create failed and the operation was authoritatively absent",
-                                    Map.of("operation_id", identity.operationId(),
-                                            "message", nvl(createFailure.getMessage())));
                         }
                         // 查到暂时不存在也不能释放名额：迟到的 create RPC 仍可能到达。
                         // 先用同一 operation/fingerprint 写取消墓碑，取得稳定 taskId，
@@ -1057,14 +1053,11 @@ public class PythonSandboxTools {
             if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
                     || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
                 if (!waitPolicy.durableSuspend()) {
-                    if (!abortDagBlockingPreparing(runId, anchor, reservation)) {
+                    if (!renewDagBlockingLease(runId, anchor, true)) {
                         return dagBlockingLeaseLost(
-                            null, toolStartMs,
-                            "durable PREPARING abort was rejected after invalid create response");
+                                null, toolStartMs,
+                                "DAG worker lost its lease before canceling an uncertain create");
                     }
-                    return fail("executePython", "CREATE_TASK_FAILED",
-                            "Failed to create python sandbox task",
-                            Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
                 }
                 createResp = tombstoneCreateUncertain(identity.operationId(),
                         spec.requestFingerprint(), createResp == null ? "" : nvl(createResp.getTaskId()));
@@ -1396,54 +1389,6 @@ public class PythonSandboxTools {
             anchor.setBlockingLeaseUntil(expectedLeaseUntil);
         }
         return renewed;
-    }
-
-    private boolean abortDagBlockingPreparing(
-            String runId,
-            ToolJobAnchor anchor,
-            DataAnalysisReservation preparingReservation) throws Exception {
-        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
-        if (!renewDagBlockingLease(runId, anchor, true)) {
-            return false;
-        }
-        expectedLeaseUntil = anchor.getBlockingLeaseUntil();
-        DataAnalysisReservation released = transitionReservation(
-                preparingReservation,
-                DataAnalysisReservationState.RELEASED,
-                null);
-        // 先生成 durable proof，再改变本地 anchor；序列化失败时 outer fallback 仍看见 PREPARING。
-        String releasedReservationJson = objectMapper.writeValueAsString(released);
-        String previousReservationJson = anchor.getReservationJson();
-        anchor.setAnchorState("ABORTING");
-        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_PREPARING_ABORT);
-        anchor.setReservationJson(releasedReservationJson);
-
-        boolean began;
-        try {
-            began = pythonSandboxDispatchStore.beginDagBlockingPreparingAbort(
-                    runId, anchor, expectedLeaseUntil);
-        } catch (Exception beginFailure) {
-            /*
-             * DB outcome 不确定：若 begin 未提交，outer fallback 需要用原 PREPARING 快照
-             * 做 WORKER_LOST CAS；若已提交，DB 的 ABORTING disposition 会拒绝该 CAS，
-             * durable abort intent 仍安全保留。
-             */
-            anchor.setAnchorState("PREPARING");
-            anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME);
-            anchor.setReservationJson(previousReservationJson);
-            throw beginFailure;
-        }
-        if (!began) {
-            // takeover/过期/operation 漂移时绝不能触碰容量账本。
-            return false;
-        }
-
-        if (!releasePreDispatch(preparingReservation, DataAnalysisReleaseReason.PREPARING_ABORTED)) {
-            // durable ABORTING/RELEASED intent 留给恢复者重入；不能猜测清 anchor。
-            return false;
-        }
-        return pythonSandboxDispatchStore.completeDagBlockingPreparingAbort(
-                runId, anchor, expectedLeaseUntil);
     }
 
     private String promoteDagBlockingFailure(

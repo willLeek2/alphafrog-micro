@@ -26,7 +26,8 @@ import java.util.UUID;
  * 恢复 PREPARING dispatch 的共享解析器。
  *
  * <p>调用方必须区分远端暂不可决与数据库里的证据损坏。前者可以按同一 operationId
- * 在线重试；后者不能继续查询或重放，以免把错误任务附着到 Run。</p>
+ * 在线重试；后者不能继续查询或重放，以免把错误任务附着到 Run。已取消的 Run 和失去
+ * 执行线程的 DAG 节点只能先按 operationId 留下持久取消墓碑，再接收真实终态；不能重放创建。</p>
  */
 final class ToolJobPreparingDispatchResolver {
 
@@ -79,8 +80,9 @@ final class ToolJobPreparingDispatchResolver {
             return Resolution.invalidEvidence();
         }
 
-        if ("CANCELED".equals(anchor.getRunDisposition())) {
-            return resolveCanceledPreparing(runId, anchor, preparing, sandboxService, anchorService);
+        if ("CANCELED".equals(anchor.getRunDisposition())
+                || ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+            return resolveStoppedPreparing(runId, anchor, preparing, sandboxService, anchorService);
         }
 
         GetTaskByOperationIdResponse lookup;
@@ -205,7 +207,7 @@ final class ToolJobPreparingDispatchResolver {
         }
     }
 
-    private static Resolution resolveCanceledPreparing(
+    private static Resolution resolveStoppedPreparing(
             String runId,
             ToolJobAnchor anchor,
             DataAnalysisReservation preparing,
@@ -223,7 +225,8 @@ final class ToolJobPreparingDispatchResolver {
                             .setOperationId(operationId)
                             .setRequestFingerprint(fingerprint))
                     .setCancelRequestId(cancelId)
-                    .setReason("RUN_CANCELED")
+                    .setReason("CANCELED".equals(anchor.getRunDisposition())
+                            ? "RUN_CANCELED" : "DAG_WORKER_LOST")
                     .build());
             if (canceled == null || canceled.hasErrorDetail() || !canceled.getError().isBlank()
                     || canceled.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
@@ -234,13 +237,16 @@ final class ToolJobPreparingDispatchResolver {
             GetTaskByOperationIdResponse lookup = sandboxService.getTaskByOperationId(
                     GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
             if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()
-                    || !lookup.getFound() || !canceled.getTaskId().equals(lookup.getTaskId())
-                    || !fingerprint.equals(lookup.getRequestFingerprint())) {
+                    || !lookup.getFound()) {
                 return Resolution.remoteUnavailable();
+            }
+            if (!canceled.getTaskId().equals(lookup.getTaskId())
+                    || !fingerprint.equals(lookup.getRequestFingerprint())) {
+                return Resolution.invalidEvidence();
             }
             return attachResolvedTask(runId, anchor, preparing, lookup.getTaskId(), anchorService);
         } catch (Exception remoteFailure) {
-            log.warn("Canceled PREPARING operation still awaits Sandbox tombstone: run={} operation={}",
+            log.warn("Stopped PREPARING operation still awaits Sandbox tombstone: run={} operation={}",
                     runId, operationId, remoteFailure);
             return Resolution.remoteUnavailable();
         }

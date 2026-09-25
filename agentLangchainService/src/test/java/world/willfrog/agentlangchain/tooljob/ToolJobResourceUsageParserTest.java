@@ -11,6 +11,8 @@ import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.alphafrogmicro.sandbox.idl.SandboxResourceUsage;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
@@ -87,7 +89,7 @@ class ToolJobResourceUsageParserTest {
         assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
                 objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("unknown or non-P0");
+                .hasMessageContaining("unknown field");
     }
 
     @Test
@@ -108,6 +110,67 @@ class ToolJobResourceUsageParserTest {
                 objectMapper, DataAnalysisResourceClass.HEAVY, json(usage));
 
         assertThat(parsed.resourceClass()).isEqualTo(DataAnalysisResourceClass.HEAVY);
+    }
+
+    @Test
+    void preCreateCancelWithUnknownRemoteClassRetainsHonestMissingMeasurements() throws Exception {
+        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
+                objectMapper, DataAnalysisResourceClass.HEAVY, json(preCreateCanceledUsage()));
+
+        assertThat(parsed.resourceClass()).isEqualTo(DataAnalysisResourceClass.HEAVY);
+        assertThat(parsed.exitReason()).isEqualTo("CANCELED");
+        assertThat(parsed.attributionComplete()).isFalse();
+        assertThat(parsed.cpuMillis()).isNull();
+        assertThat(parsed.missingFields())
+                .contains("cpuMillis", "memoryPeakBytes", "datasetOpenCount")
+                .doesNotContain("exitReason", "memoryByteMillis");
+    }
+
+    @Test
+    void unknownRemoteClassWithMeasuredUsageCannotMasqueradeAsPreCreateCancel() throws Exception {
+        SandboxResourceUsage usage = preCreateCanceledUsage().toBuilder()
+                .setCpuMillis(1).build();
+
+        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
+                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("lacks unmeasured cancellation evidence");
+    }
+
+    @Test
+    void unknownRemoteClassWithoutCancellationEvidenceStillFailsClosed() throws Exception {
+        SandboxResourceUsage usage = preCreateCanceledUsage().toBuilder()
+                .setExitReason("UNKNOWN").build();
+
+        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
+                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("lacks unmeasured cancellation evidence");
+    }
+
+    @Test
+    void unknownRemoteClassWithExecutionFlagsCannotMasqueradeAsPreCreateCancel() throws Exception {
+        SandboxResourceUsage usage = preCreateCanceledUsage().toBuilder()
+                .setTimedOut(true).build();
+
+        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
+                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("lacks unmeasured cancellation evidence");
+    }
+
+    private SandboxResourceUsage preCreateCanceledUsage() {
+        return SandboxResourceUsage.newBuilder()
+                .setResourceClass("UNKNOWN")
+                .setExitReason("CANCELED")
+                .setAttributionComplete(false)
+                .addAllMissingFields(List.of(
+                        "cpuMillis", "memoryPeakBytes", "memoryByteMillis",
+                        "logicalBytesScanned", "artifactBytesWritten",
+                        "temporaryBytesWritten", "queueWaitMillis", "prepareMillis",
+                        "executionWallMillis", "cleanupMillis", "datasetOpenCount",
+                        "samplingIntervalMillis"))
+                .build();
     }
 
     private SandboxResourceUsage.Builder completeUsage() {

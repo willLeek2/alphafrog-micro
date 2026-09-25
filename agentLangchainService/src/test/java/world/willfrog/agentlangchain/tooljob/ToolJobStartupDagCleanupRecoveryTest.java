@@ -206,6 +206,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         .setTaskId("task-recovered")
                         .setRequestFingerprint("sha256:" + "a".repeat(64))
                         .build());
+        cancelByOperationReturns(fixture.sandbox, "task-recovered");
 
         fixture.recovery.onReady();
 
@@ -213,6 +214,10 @@ class ToolJobStartupDagCleanupRecoveryTest {
         takeoverOrder.verify(fixture.anchorService).promoteExpiredDagBlockingWorkerLost(
                 eq("run-dag"), any(ToolJobAnchor.class),
                 eq("run-dag:call-1:1"), eq("owner-old"));
+        takeoverOrder.verify(fixture.sandbox).cancelTask(
+                org.mockito.ArgumentMatchers.argThat(request -> request.hasByOperation()
+                        && "run-dag:call-1:1".equals(
+                        request.getByOperation().getOperationId())));
         takeoverOrder.verify(fixture.sandbox).getTaskByOperationId(
                 org.mockito.ArgumentMatchers.argThat(
                         request -> "run-dag:call-1:1".equals(request.getOperationId())));
@@ -254,6 +259,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         .setTaskId("task-recovered")
                         .setRequestFingerprint("sha256:" + "a".repeat(64))
                         .build());
+        cancelByOperationReturns(fixture.sandbox, "task-recovered");
 
         fixture.recovery.onReady();
 
@@ -276,19 +282,21 @@ class ToolJobStartupDagCleanupRecoveryTest {
     }
 
     @Test
-    void startupLookupFailureKeepsPreparingCapacityAndOnlineReconcilerAttachesLater()
+    void startupCancelFailureKeepsPreparingCapacityAndOnlineReconcilerAttachesLater()
             throws Exception {
         Fixture fixture = fixture(
                 "RUNNING",
                 dagPreparingAnchor(
                         ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
                         Instant.now().minusSeconds(5)));
+        when(fixture.sandbox.cancelTask(any()))
+                .thenThrow(new IllegalStateException("gateway timeout"))
+                .thenReturn(CancelTaskResponse.newBuilder()
+                        .setOutcome(CancelOutcome.CANCELED)
+                        .setTaskId("task-recovered-online")
+                        .setStatus("CANCELED").build());
         when(fixture.sandbox.getTaskByOperationId(any()))
                 .thenReturn(GetTaskByOperationIdResponse.newBuilder()
-                                .setFound(false)
-                                .setError("gateway timeout")
-                                .build(),
-                        GetTaskByOperationIdResponse.newBuilder()
                                 .setFound(true)
                                 .setTaskId("task-recovered-online")
                                 .setRequestFingerprint("sha256:" + "a".repeat(64))
@@ -303,7 +311,8 @@ class ToolJobStartupDagCleanupRecoveryTest {
             assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING);
             assertThat(reservation.taskId()).isNull();
         });
-        verify(fixture.sandbox).getTaskByOperationId(any());
+        verify(fixture.sandbox, never()).getTaskByOperationId(any());
+        verify(fixture.sandbox).cancelTask(any());
         verify(fixture.sandbox, never()).createTask(any());
         verify(fixture.anchorService).updateDagCleanupPreparing(
                 eq("run-dag"),
@@ -318,9 +327,10 @@ class ToolJobStartupDagCleanupRecoveryTest {
 
         fixture.reconciler.reconcileFromDue();
 
-        verify(fixture.sandbox, times(2)).getTaskByOperationId(
+        verify(fixture.sandbox).getTaskByOperationId(
                 org.mockito.ArgumentMatchers.argThat(
                         request -> "run-dag:call-1:1".equals(request.getOperationId())));
+        verify(fixture.sandbox, times(2)).cancelTask(any());
         verify(fixture.anchorService, org.mockito.Mockito.atLeastOnce())
                 .updateDagCleanupPreparing(
                 eq("run-dag"),
@@ -349,6 +359,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         .setTaskId("task-wrong")
                         .setRequestFingerprint("sha256:" + "b".repeat(64))
                         .build());
+        cancelByOperationReturns(fixture.sandbox, "task-wrong");
 
         fixture.recovery.onReady();
 
@@ -365,30 +376,27 @@ class ToolJobStartupDagCleanupRecoveryTest {
     }
 
     @Test
-    void expiredDagPreparingWithContradictoryReplayFingerprintRemainsQuarantined()
+    void expiredDagPreparingWithContradictoryTombstoneFingerprintRemainsQuarantined()
             throws Exception {
         Fixture fixture = fixture(
                 "RUNNING",
                 dagPreparingAnchor(
                         ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
                         Instant.now().minusSeconds(5)));
+        cancelByOperationReturns(fixture.sandbox, "task-replayed");
         when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
-                GetTaskByOperationIdResponse.newBuilder()
-                        .setFound(false)
-                        .build());
-        when(fixture.sandbox.createTask(any())).thenReturn(
-                ExecuteResponse.newBuilder()
+                GetTaskByOperationIdResponse.newBuilder().setFound(true)
                         .setTaskId("task-replayed")
-                        .setRequestFingerprint("sha256:" + "b".repeat(64))
-                        .build());
+                        .setRequestFingerprint("sha256:" + "b".repeat(64)).build());
 
         fixture.recovery.onReady();
 
-        verify(fixture.sandbox).createTask(
-                org.mockito.ArgumentMatchers.argThat(
-                        request -> "run-dag:call-1:1".equals(request.getOperationId())
-                                && ("sha256:" + "a".repeat(64)).equals(
-                                request.getRequestFingerprint())));
+        verify(fixture.sandbox).cancelTask(
+                org.mockito.ArgumentMatchers.argThat(request -> request.hasByOperation()
+                        && "run-dag:call-1:1".equals(request.getByOperation().getOperationId())
+                        && ("sha256:" + "a".repeat(64)).equals(
+                        request.getByOperation().getRequestFingerprint())));
+        verify(fixture.sandbox, never()).createTask(any());
         verify(fixture.capacity, never()).recover(anyList(), anyInt(), anyInt());
         verify(fixture.anchorService, never()).updateDagCleanup(
                 eq("run-dag"),
@@ -426,6 +434,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         .setTaskId("task-stale")
                         .setRequestFingerprint("sha256:" + "a".repeat(64))
                         .build());
+        cancelByOperationReturns(fixture.sandbox, "task-stale");
 
         fixture.recovery.onReady();
 
@@ -465,6 +474,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         .setTaskId("task-write-uncertain")
                         .setRequestFingerprint("sha256:" + "a".repeat(64))
                         .build());
+        cancelByOperationReturns(fixture.sandbox, "task-write-uncertain");
         doThrow(new IllegalStateException("commit outcome unknown"))
                 .when(fixture.anchorService)
                 .updateDagCleanupPreparing(
@@ -622,6 +632,12 @@ class ToolJobStartupDagCleanupRecoveryTest {
         anchor.setNextPollAt(Instant.now().minusSeconds(1));
         anchor.setTimeoutAt(Instant.now().plusSeconds(60));
         return anchor;
+    }
+
+    private static void cancelByOperationReturns(PythonSandboxService sandbox, String taskId) {
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCELED)
+                .setTaskId(taskId).setStatus("CANCELED").build());
     }
 
     private static void inject(Object target, String fieldName, Object value) throws Exception {
