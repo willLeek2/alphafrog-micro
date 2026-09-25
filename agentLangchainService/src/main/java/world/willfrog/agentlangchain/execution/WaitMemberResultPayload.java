@@ -98,13 +98,25 @@ public final class WaitMemberResultPayload {
                                                String toolName,
                                                String toolCallId,
                                                String errorDetail) {
+        return compactPersistFailure(objectMapper, toolName, toolCallId, errorDetail, null);
+    }
+
+    /** 后台作业的短失败载荷仍保留任务编号，供取消与容量收尾核对外部身份。 */
+    public static String compactPersistFailure(ObjectMapper objectMapper,
+                                               String toolName,
+                                               String toolCallId,
+                                               String errorDetail,
+                                               String taskId) {
         String detail = errorDetail == null || errorDetail.isBlank()
                 ? "成员结果无法写入等待组" : errorDetail;
         if (detail.length() > 240) {
             detail = detail.substring(0, 240);
         }
-        return encode(objectMapper, toolName, toolCallId, false, "",
-                Map.of("errorCode", PERSIST_FAILED, "errorDetail", detail), Integer.MAX_VALUE);
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("errorCode", PERSIST_FAILED);
+        extra.put("errorDetail", detail);
+        if (taskId != null && !taskId.isBlank()) extra.put("taskId", taskId);
+        return encode(objectMapper, toolName, toolCallId, false, "", extra, Integer.MAX_VALUE);
     }
 
     /**

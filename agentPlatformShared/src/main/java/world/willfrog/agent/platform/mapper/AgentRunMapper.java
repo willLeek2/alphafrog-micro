@@ -24,6 +24,21 @@ public interface AgentRunMapper {
 
     AgentRun findByIdAndUser(@Param("id") String id, @Param("userId") String userId);
 
+    /** 删除调用树时锁住根 Run，防止状态在检查与删除之间变化。 */
+    AgentRun findByIdAndUserForUpdate(@Param("id") String id, @Param("userId") String userId);
+
+    /** 子 Run 是内部执行记录，不接受用户直接暂停、恢复或删除。 */
+    boolean isChildRun(@Param("id") String id);
+
+    /** 锁住本根树已建立的子 Run；未受理的意图没有对应主记录。 */
+    List<AgentRun> listChildRunsByRootForUpdate(@Param("rootRunId") String rootRunId);
+
+    /** 所有子 Run 删除后，移除父子关系；待投递记录由外键级联删除。 */
+    int deleteChildIntentsByRoot(@Param("rootRunId") String rootRunId);
+
+    /** 零占用行不再阻止用户删除已结清的根 Run。 */
+    int deleteEmptyTreeCapacityByRoot(@Param("rootRunId") String rootRunId);
+
     /**
      * 按用户与幂等键读回创建请求对应的 Run。
      *

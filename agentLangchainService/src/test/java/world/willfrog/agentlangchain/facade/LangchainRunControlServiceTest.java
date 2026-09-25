@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 
@@ -78,6 +79,22 @@ class LangchainRunControlServiceTest {
         assertEquals("原测试部署已停用", cancelError.getMessage());
         assertEquals("原测试部署已停用", pauseError.getMessage());
         verify(readService, never()).requireWritableRun(anyString(), anyString());
+    }
+
+    @Test
+    void publicControlsDoNotPauseResumeOrDeleteInternalChild() {
+        when(readService.requireWritableRun("r1", "u1"))
+                .thenReturn(run(AgentRunStatus.CANCELED));
+        when(runMapper.isChildRun("r1")).thenReturn(true);
+
+        assertThrows(IllegalStateException.class, () ->
+                service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+        assertThrows(IllegalStateException.class, () -> service.resumeRun(resumeRequest()));
+        assertThrows(IllegalStateException.class, () ->
+                service.deleteRun(DeleteAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+        verify(runMapper, never()).deleteByIdAndUser(anyString(), anyString());
     }
 
     @Test

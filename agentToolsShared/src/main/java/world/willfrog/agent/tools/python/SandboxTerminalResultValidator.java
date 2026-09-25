@@ -53,9 +53,14 @@ public final class SandboxTerminalResultValidator {
                     requestedTaskId);
             return null;
         }
+        boolean canceledWithStructuredReason = "CANCELED".equals(status)
+                && response.hasResourceUsage()
+                && "CANCELED".equals(response.getResourceUsage().getExitReason())
+                && response.hasRetryable() && !response.getRetryable();
         if (("FAILED".equals(status) || "CANCELED".equals(status))
                 && response.getError().isBlank()
-                && response.getStderr().isBlank()) {
+                && response.getStderr().isBlank()
+                && !canceledWithStructuredReason) {
             log.warn("validateTerminalResult: {} with no error/stderr for taskId={}",
                     status, requestedTaskId);
             return null;

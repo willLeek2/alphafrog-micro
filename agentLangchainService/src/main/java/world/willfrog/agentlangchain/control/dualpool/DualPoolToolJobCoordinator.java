@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobFaultInjector;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkerProcessProof;
 import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
@@ -29,7 +30,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 /**
  * LINEAR 双池节点与既有长工具状态机之间的持久交接层。
@@ -43,12 +43,6 @@ import java.util.UUID;
 public class DualPoolToolJobCoordinator {
 
     public static final String RESUME_STATE = "DUAL_POOL_READY";
-    private static final String PROCESS_NODE_CLAIMANT = "dual-pool-node-" + UUID.randomUUID();
-
-    static String processNodeClaimant() {
-        return PROCESS_NODE_CLAIMANT;
-    }
-
     private final NodeWorkItemStore workItemStore;
     private final ToolJobAnchorService anchorService;
     private final ToolJobCheckpointWriter checkpointWriter;
@@ -198,7 +192,7 @@ public class DualPoolToolJobCoordinator {
         // worker 同时执行恢复分段；旧 worker 最终虽会被提交栅栏拒绝，但模型调用已经重复。
         // 只有领取者属于上一进程时才执行重排；当前进程的领取说明恢复已经在进行。
         if (preserveCurrentProcessClaim
-                && PROCESS_NODE_CLAIMANT.equals(current.getClaimedBy())) {
+                && NodeWorkerProcessProof.isCurrentProcess(current.getClaimedBy())) {
             return true;
         }
         NodeWorkItemMutationResult requeued = workItemStore.requeueInterruptedToolJob(

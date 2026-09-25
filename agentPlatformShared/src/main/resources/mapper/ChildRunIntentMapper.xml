@@ -244,21 +244,62 @@
            AND NOT EXISTS (
                SELECT 1 FROM alphafrog_agent_run_wait_member m
                 WHERE m.run_id = child.id
-                  AND (m.state NOT IN ('SUCCEEDED', 'FAILED')
-                    OR (m.external_operation_id IS NOT NULL AND NOT EXISTS (
+                  AND NOT (
+                    (m.state IN ('SUCCEEDED', 'FAILED')
+                     AND (m.tool_name &lt;&gt; 'executePython'
+                          OR (m.external_operation_id IS NULL AND m.dispatch_proof_json IS NULL)
+                          OR EXISTS (
                         SELECT 1
                           FROM jsonb_array_elements(COALESCE(
                                child.snapshot_json #&gt; '{data_analysis_observability,calls}',
                                '[]'::jsonb)) AS terminal(call)
-                         WHERE NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', '') IS NOT NULL
-                           AND m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
-                           AND m.result_ref_json -&gt;&gt; 'taskId' = m.dispatch_proof_json -&gt;&gt; 'taskId'
+                         WHERE m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
+                           AND NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', '') IS NOT NULL
+                           AND NULLIF(m.result_ref_json -&gt;&gt; 'taskId', '') IS NOT NULL
+                           AND (NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', '') IS NULL
+                                OR m.result_ref_json -&gt;&gt; 'taskId'
+                                   = m.dispatch_proof_json -&gt;&gt; 'taskId')
                            AND terminal.call -&gt;&gt; 'operationId' = m.external_operation_id
-                           AND terminal.call -&gt;&gt; 'taskId' = m.dispatch_proof_json -&gt;&gt; 'taskId'
+                           AND terminal.call -&gt;&gt; 'taskId' = m.result_ref_json -&gt;&gt; 'taskId'
                            AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
                            AND NULLIF(terminal.call -&gt;&gt; 'terminalStatus', '') IS NOT NULL
                            AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL)))
+                    OR (m.state = 'FAILED' AND m.tool_name = 'executePython'
+                        AND m.dispatch_proof_json IS NULL)
+                    OR (m.state IN ('CANCELED', 'LATE') AND m.tool_name &lt;&gt; 'executePython')
+                    OR (m.state IN ('CANCELED', 'LATE') AND m.tool_name = 'executePython'
+                        AND m.dispatch_proof_json IS NULL)
+                    OR (m.state IN ('CANCELED', 'LATE') AND m.tool_name = 'executePython'
+                        AND m.external_operation_id IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                             WHERE s.wait_member_id = m.id AND s.run_id = child.id
+                               AND s.group_id = m.group_id
+                               AND s.operation_id = m.external_operation_id
+                               AND s.request_fingerprint = m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
+                               AND s.state = 'CONFIRMED'
+                               AND s.task_id = s.terminal_task_id
+                               AND s.terminal_confirmed_at IS NOT NULL
+                               AND EXISTS (
+                                   SELECT 1 FROM jsonb_array_elements(COALESCE(
+                                        child.snapshot_json #&gt; '{data_analysis_observability,calls}',
+                                        '[]'::jsonb)) AS terminal(call)
+                                    WHERE terminal.call -&gt;&gt; 'operationId' = s.operation_id
+                                      AND terminal.call -&gt;&gt; 'taskId' = s.terminal_task_id
+                                      AND terminal.call -&gt;&gt; 'terminalStatus' = s.terminal_status
+                                      AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                                      AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL)))
+                  )
                )
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                WHERE s.run_id = child.id AND s.state &lt;&gt; 'CONFIRMED')
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_tree_budget_operation o
+               JOIN alphafrog_agent_run_work_item active_item
+                 ON o.operation_id LIKE 'active-node:' || active_item.id || ':%'
+                WHERE active_item.run_id = child.id
+                  AND o.kind = 'ACTIVE_NODE' AND o.state &lt;&gt; 'RELEASED')
            AND NOT EXISTS (
                SELECT 1 FROM alphafrog_agent_run_work_item wi
                 WHERE wi.run_id = child.id
@@ -278,8 +319,7 @@
 
     <select id="rootRunIdOf" resultType="java.lang.String">
         SELECT CASE
-            WHEN EXISTS (SELECT 1 FROM alphafrog_agent_run_child_intent i
-                         WHERE i.child_run_id = r.id)
+            WHEN r.ext -&gt;&gt; 'child_run' = 'true'
             THEN (SELECT i.root_run_id FROM alphafrog_agent_run_child_intent i
                   WHERE i.child_run_id = r.id AND i.accepted_at IS NOT NULL)
             ELSE r.id END
@@ -291,16 +331,39 @@
                     THEN EXISTS (SELECT 1 FROM alphafrog_agent_run_child_intent
                                  WHERE root_run_id = #{rootRunId}
                                    AND capacity_released_at IS NULL)
+                      OR EXISTS (SELECT 1 FROM alphafrog_agent_run_tree_capacity c
+                                  WHERE c.root_run_id = #{rootRunId}
+                                    AND c.active_child_count &gt; 0)
+                      OR EXISTS (SELECT 1 FROM alphafrog_agent_run_tree_budget b
+                                  WHERE b.root_run_id = #{rootRunId}
+                                    AND (b.active_nodes &gt; 0 OR b.external_waits &gt; 0))
+                      OR EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                                  LEFT JOIN alphafrog_agent_run_child_intent i
+                                    ON i.child_run_id = s.run_id
+                                 WHERE s.state &lt;&gt; 'CONFIRMED'
+                                   AND (s.run_id = #{rootRunId}
+                                        OR i.root_run_id = #{rootRunId}))
                     ELSE NULL END
     </select>
 
     <select id="listReservedRootRunIds" resultType="java.lang.String">
-        SELECT root_run_id FROM alphafrog_agent_run_tree_capacity
-        WHERE active_child_count &gt; 0
+        SELECT active.root_run_id FROM (
+            SELECT root_run_id FROM alphafrog_agent_run_tree_capacity
+             WHERE active_child_count &gt; 0
+            UNION
+            SELECT root_run_id FROM alphafrog_agent_run_tree_budget
+             WHERE active_nodes &gt; 0 OR external_waits &gt; 0
+            UNION
+            SELECT COALESCE(i.root_run_id, s.run_id) AS root_run_id
+              FROM alphafrog_agent_run_wait_member_stop s
+              LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = s.run_id
+             WHERE s.state &lt;&gt; 'CONFIRMED'
+        ) active
+        WHERE 1 = 1
         <if test="afterRootRunId != null and afterRootRunId != ''">
-            AND root_run_id &gt; #{afterRootRunId}
+            AND active.root_run_id &gt; #{afterRootRunId}
         </if>
-        ORDER BY root_run_id LIMIT #{limit}
+        ORDER BY active.root_run_id LIMIT #{limit}
     </select>
 
     <select id="listAcceptedChildrenNeedingLaunch" resultMap="IntentRow">

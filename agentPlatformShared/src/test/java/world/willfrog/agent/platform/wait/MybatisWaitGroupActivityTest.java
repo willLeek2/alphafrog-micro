@@ -26,7 +26,7 @@ class MybatisWaitGroupActivityTest {
     private final NodeWorkItemIdentity segment = new NodeWorkItemIdentity("run-a", 1, "node-a", 0, 0);
 
     @Test
-    void suspensionReservesWaitBeforeBusinessWriteThenReleasesExecutingNode() {
+    void suspensionReservesWaitButKeepsNodeUntilSynchronousDispatchReturns() {
         WaitSuspensionRequest request = request();
         NodeWorkItem executing = new NodeWorkItem();
         executing.setState("EXECUTING");
@@ -51,7 +51,7 @@ class MybatisWaitGroupActivityTest {
         order.verify(mapper).suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
                 anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString());
         order.verify(activity).confirmWait(request);
-        order.verify(activity).releaseNode(executing, 1);
+        verify(activity, never()).releaseNode(any(), anyInt());
     }
 
     @Test

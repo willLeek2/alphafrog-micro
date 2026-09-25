@@ -248,8 +248,13 @@ class WaitGroupMapperBindingTest {
         assertThat(sql).contains("state = 'LATE'")
                 .contains("g.state IN ('WAITING', 'READY')")
                 .contains("state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')")
-                .doesNotContain("INSERT")
+                .doesNotContain("INSERT INTO alphafrog_agent_run_recovery_notification")
                 .doesNotContain("completed_members = completed_members + 1");
+        assertThat(sql).as("被停链的 Python 兄弟成员必须在同一事务留下停机责任")
+                .contains("INSERT INTO alphafrog_agent_run_wait_member_stop")
+                .contains("FROM siblings_canceled m")
+                .contains("m.dispatch_proof_json IS NOT NULL")
+                .contains("m.id <> (SELECT id FROM member_late)");
         // 已经被取消的成员也要能补审计：否则取消之后真到的结果连引用都留不下来。
         assertThat(sql).as("迟到结果允许从「已取消」补一次审计")
                 .contains("m.state IN ('PENDING', 'RUNNING', 'CANCELED')");
@@ -310,6 +315,12 @@ class WaitGroupMapperBindingTest {
         // 取不走的原因也是枚举取值：诊断那段 SQL 把它们当字面量写，写错一个字母调用方就认不出来。
         world.willfrog.agent.platform.wait.RecoveryRejection.allWireValues().forEach(known::add);
         world.willfrog.agent.platform.workitem.NodeWorkItemState.allWireValues().forEach(known::add);
+        for (var kind : world.willfrog.agent.platform.treebudget.RootTreeBudgetStore.Kind.values()) {
+            known.add(kind.name());
+        }
+        for (var state : world.willfrog.agent.platform.treebudget.RootTreeBudgetStore.State.values()) {
+            known.add(state.name());
+        }
         // cancelChain 同时插入外部停机任务；它的缺证明状态属于停机记录，不属于等待成员。
         known.add("BLOCKED_PROOF");
         for (AgentRunStatus status : AgentRunStatus.values()) {

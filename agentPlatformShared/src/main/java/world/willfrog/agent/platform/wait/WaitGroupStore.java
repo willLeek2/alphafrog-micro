@@ -60,6 +60,11 @@ public interface WaitGroupStore {
     /** 取消一条等待链：组、还没结束的成员、下一段与还没被取走的通知一起停。 */
     WaitChainCancelResult cancelChain(long groupId);
 
+    /** 已取消的组中，给漏掉的 Python 外部作业幂等补建持久停机任务。 */
+    default int ensureCanceledMemberStopTasks(long groupId) {
+        throw new UnsupportedOperationException("canceled member stop repair is not implemented");
+    }
+
     /**
      * 在调用 Sandbox 创建任务之前，先保存可恢复的操作身份、请求指纹与容量凭证。
      * 取消若先落库，此操作返回 false，调用方不能再发出外部请求。
@@ -72,6 +77,38 @@ public interface WaitGroupStore {
     /** 按组编号分页找一条 Run 尚未关闭的等待链，供取消与重启恢复逐组收口。 */
     default List<WaitGroup> listOpenGroupsByRun(String runId, long afterGroupId, int limit) {
         throw new UnsupportedOperationException("open wait-group scan is not implemented");
+    }
+
+    /**
+     * 找出父 Run 已经终止或留下持久取消意图、但等待链仍开放的组。
+     * 按组编号分页，供进程重启和取消收尾失败后继续排入外部停机任务。
+     */
+    default List<WaitGroup> scanOpenGroupsWithStoppedRun(long afterGroupId, int limit) {
+        throw new UnsupportedOperationException("stopped run wait-group scan is not implemented");
+    }
+
+    /** 按组编号分页找出已取消、但有已派发 Python 成员缺少停机任务的组。 */
+    default List<WaitGroup> scanCanceledGroupsMissingStopTasks(long afterGroupId, int limit) {
+        throw new UnsupportedOperationException("canceled member stop scan is not implemented");
+    }
+
+    /** 旧派发线程退出后，找到仍保留创建前请求证明的 Python 成员。 */
+    default List<WaitMember> scanPendingPythonMembersWithProof(String deploymentId,
+                                                                String deploymentGenerationId,
+                                                                long afterMemberId, int limit) {
+        throw new UnsupportedOperationException("pending Python recovery scan is not implemented");
+    }
+
+    /** 同时核对旧工作项领取身份和已归还的 ACTIVE_NODE 额度，才可发送稳定取消请求。 */
+    default boolean safeToRecoverPendingPython(long memberId, long workItemId, int claimEpoch,
+                                               String claimedBy, String operationId, String fingerprint) {
+        throw new UnsupportedOperationException("pending Python recovery guard is not implemented");
+    }
+
+    /** Sandbox 已持久接纳同一操作的取消墓碑后，才开放结果接收。 */
+    default boolean recoverPendingPythonMember(long memberId, long workItemId, int claimEpoch,
+                                               String claimedBy, String operationId, String fingerprint) {
+        throw new UnsupportedOperationException("pending Python recovery CAS is not implemented");
     }
 
     /**
@@ -96,6 +133,13 @@ public interface WaitGroupStore {
      * 取一批候选、有界。</p>
      */
     List<WaitMember> scanDueMembers(OffsetDateTime now, int limit);
+
+    /** 启动恢复容量账本时分页核对尚未收尾的 Python 成员。 */
+    default List<WaitMember> scanUnresolvedPythonMembersForCapacity(String deploymentId,
+                                                                      String deploymentGenerationId,
+                                                                      long afterMemberId, int limit) {
+        throw new UnsupportedOperationException("Python capacity member scan is not implemented");
+    }
 
     /** 到期的持久子代理创建/等待成员，由子代理协调器接回，不能交给 Python 作业接收器。 */
     default List<WaitMember> scanDueSubAgentMembers(OffsetDateTime now, int limit) {

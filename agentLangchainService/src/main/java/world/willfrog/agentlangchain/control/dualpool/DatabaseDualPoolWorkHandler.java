@@ -26,6 +26,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkerProcessProof;
 import world.willfrog.agent.platform.workitem.NodeDispatchDeferReason;
 import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
@@ -104,7 +105,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final Duration hintQueueFullRetry;
     /** 每个回合读一次的参数：上限与水位允许在运行期改，改完只影响之后新建的节点。 */
     private final DualPoolSchedulerSettings settings;
-    private final String claimant = DualPoolToolJobCoordinator.processNodeClaimant();
+    private volatile String claimant;
     private final RunServiceLeaseStore leaseStore;
     private final ProcessInstanceIdentity processIdentity;
     private final ObjectProvider<LegacyRunHandoff> legacyHandoff;
@@ -737,6 +738,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         Optional<NodeWorkItemClaim> claimed;
+        String claimant;
+        try {
+            claimant = nodeClaimant();
+        } catch (IllegalArgumentException | IllegalStateException missingProof) {
+            // 不影响旧路径及服务启动；缺少宿主进程证明的实例不能领取双池节点。
+            log.error("节点进程身份证明不可用，拒绝领取双池分段：identity={} reason={}",
+                    identity.describe(), missingProof.getMessage());
+            return;
+        }
         try {
             claimed = workItemStore.claim(identity, item.versions(), claimant, claimLease, version, fence);
         } catch (RootTreeActivityLimitException limit) {
@@ -860,6 +870,17 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             } finally {
                 freshRunPipeline.clearDualPoolNodeContext(identity.runId());
             }
+        }
+    }
+
+    private String nodeClaimant() {
+        String ready = claimant;
+        if (ready != null) return ready;
+        synchronized (this) {
+            if (claimant == null) {
+                claimant = NodeWorkerProcessProof.claimant(processIdentity.value());
+            }
+            return claimant;
         }
     }
 

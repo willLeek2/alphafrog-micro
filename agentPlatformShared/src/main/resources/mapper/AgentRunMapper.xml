@@ -156,6 +156,41 @@
         LIMIT 1
     </select>
 
+    <select id="findByIdAndUserForUpdate" resultMap="AgentRunResultMap">
+        SELECT id, user_id, status, scheduler_version, ext::text AS ext
+          FROM alphafrog_agent_run
+         WHERE id = #{id} AND user_id = #{userId}
+         FOR UPDATE
+    </select>
+
+    <select id="isChildRun" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM alphafrog_agent_run run_row
+             WHERE run_row.id = #{id}
+               AND (run_row.ext -&gt;&gt; 'child_run' = 'true'
+                    OR EXISTS (SELECT 1 FROM alphafrog_agent_run_child_intent child
+                                WHERE child.child_run_id = run_row.id
+                                  AND child.accepted_at IS NOT NULL)))
+    </select>
+
+    <select id="listChildRunsByRootForUpdate" resultMap="AgentRunResultMap">
+        SELECT child.id, child.user_id, child.status
+          FROM alphafrog_agent_run_child_intent intent
+          JOIN alphafrog_agent_run child ON child.id = intent.child_run_id
+         WHERE intent.root_run_id = #{rootRunId}
+         ORDER BY child.id
+         FOR UPDATE OF child
+    </select>
+
+    <delete id="deleteChildIntentsByRoot">
+        DELETE FROM alphafrog_agent_run_child_intent WHERE root_run_id = #{rootRunId}
+    </delete>
+
+    <delete id="deleteEmptyTreeCapacityByRoot">
+        DELETE FROM alphafrog_agent_run_tree_capacity
+         WHERE root_run_id = #{rootRunId} AND active_child_count = 0
+    </delete>
+
     <!--
       按用户与幂等键读回创建请求对应的 Run。只读这一条，不做部署代际过滤：同一次创建请求在滚动部署
       前后重复提交时应当读回原来那条 Run，换了代际不该变成第二条。
@@ -272,8 +307,9 @@
                            END,
                        0
                ) AS tool_calls
-        FROM alphafrog_agent_run
+        FROM alphafrog_agent_run run_row
         WHERE user_id = #{userId}
+          AND COALESCE(run_row.ext -&gt;&gt; 'child_run', 'false') &lt;&gt; 'true'
         <if test="status != null">
             AND status = #{status}
         </if>
@@ -287,8 +323,9 @@
 
     <select id="countByUser" resultType="int">
         SELECT COUNT(1)
-        FROM alphafrog_agent_run
+        FROM alphafrog_agent_run run_row
         WHERE user_id = #{userId}
+          AND COALESCE(run_row.ext -&gt;&gt; 'child_run', 'false') &lt;&gt; 'true'
         <if test="status != null">
             AND status = #{status}
         </if>

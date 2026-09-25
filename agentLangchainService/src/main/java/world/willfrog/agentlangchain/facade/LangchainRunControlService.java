@@ -96,20 +96,22 @@ public class LangchainRunControlService {
     @Autowired(required = false)
     private WaitGroupStore waitGroupStore;
 
+    @Autowired
+    private AgentRunFamilyDeletionService familyDeletionService;
+
     /**
      * 删除 run 及其关联的状态数据（Redis）。
      * 仅允许在非运行状态下删除；正在执行的 run 需要先 cancel 或 pause。
      */
     public AgentEmpty deleteRun(DeleteAgentRunRequest request) {
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
-        if (isRunning(run.getStatus())) {
-            throw new IllegalStateException("run is running, cancel/pause first");
+        rejectDirectChildControl(run);
+        if (familyDeletionService == null) {
+            throw new IllegalStateException("调用树删除服务不可用");
         }
-        int deleted = runMapper.deleteByIdAndUser(run.getId(), run.getUserId());
-        if (deleted <= 0) {
-            throw new IllegalArgumentException("run not found");
+        for (String deletedRunId : familyDeletionService.deleteRoot(run.getId(), run.getUserId())) {
+            stateStore.clear(deletedRunId);
         }
-        stateStore.clear(run.getId());
         return AgentEmpty.newBuilder().build();
     }
 
@@ -333,6 +335,7 @@ public class LangchainRunControlService {
             PauseAgentRunRequest request) {
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
+        rejectDirectChildControl(run);
         if (schedulerVersionPolicy != null) {
             schedulerVersionPolicy.versionOf(run);
         }
@@ -372,6 +375,7 @@ public class LangchainRunControlService {
         // 归属判定在 gateway 的受理入口完成，之后才允许读取服务执行既有的过期收敛副作用。
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
+        rejectDirectChildControl(run);
         if (run.getStatus() == AgentRunStatus.EXPIRED) {
             throw new IllegalStateException("run expired");
         }
@@ -534,11 +538,10 @@ public class LangchainRunControlService {
                 || status == AgentRunStatus.EXPIRED;
     }
 
-    /** RECEIVED / PLANNING / EXECUTING / SUMMARIZING 均为运行中可中断状态 */
-    private boolean isRunning(AgentRunStatus status) {
-        return status == AgentRunStatus.RECEIVED
-                || status == AgentRunStatus.PLANNING
-                || status == AgentRunStatus.EXECUTING
-                || status == AgentRunStatus.SUMMARIZING;
+    private void rejectDirectChildControl(AgentRun run) {
+        if (run != null && runMapper.isChildRun(run.getId())) {
+            throw new IllegalStateException("子代理是内部执行记录，请通过父 Run 管理");
+        }
     }
+
 }

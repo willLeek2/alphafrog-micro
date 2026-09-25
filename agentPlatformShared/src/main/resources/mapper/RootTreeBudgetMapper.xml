@@ -39,7 +39,7 @@
              WHERE o.kind = 'ACTIVE_NODE' AND o.state != 'RELEASED'
                AND NOT EXISTS (
                     SELECT 1 FROM alphafrog_agent_run_work_item wi
-                     WHERE wi.state IN ('CLAIMED', 'EXECUTING')
+                     WHERE wi.claimed_by IS NOT NULL
                        AND o.operation_id = 'active-node:' || wi.id || ':' || wi.claim_epoch)
             UNION ALL
             SELECT 'EXTERNAL_WAIT orphan operation=' || o.operation_id AS detail

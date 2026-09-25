@@ -1710,19 +1710,116 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
-    void anAuthoritativeAbsentCreateReleasesTheReservationAndReturnsFailureText() throws Exception {
+    void anAuthoritativeAbsentCreateLeavesSettlementToTheReceiver() throws Exception {
         fixtureDataset();
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
         when(sandbox.createTask(any())).thenThrow(new IllegalStateException("网关拒绝"));
         when(sandbox.getTaskByOperationId(any())).thenReturn(
                 GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
 
-        String output = invokeAsWaitGroupMember("print(1)", "1");
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
 
-        assertThat(output).contains("\"ok\":false").contains("CREATE_TASK_FAILED");
-        verify(capacity).releaseReservation(any());
+        assertThat(pending.getTaskId()).isNull();
+        assertThat(pending.getProof().reservationJson()).contains("PREPARING");
+        verify(capacity, never()).releaseReservation(any());
         verify(dispatchStore, never()).persistPreparing(any(), any());
+    }
+
+    @Test
+    void anErrorResponseCannotBeTreatedAsNoTaskWhenLookupIsUncertain() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setError("gateway timeout after dispatch").build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(false)
+                .setErrorDetail(SandboxErrorDetail.newBuilder().build())
+                .build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        verify(capacity, never()).releaseReservation(any());
+        verify(sandbox).getTaskByOperationId(argThat(request ->
+                EXPECTED_MEMBER_OPERATION.equals(request.getOperationId())));
+    }
+
+    @Test
+    void anErrorResponseCanBeConfirmedByTheStableOperationIdentity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setError("response was lost").build());
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation -> {
+            ArgumentCaptor<ExecuteRequest> created = ArgumentCaptor.forClass(ExecuteRequest.class);
+            verify(sandbox).createTask(created.capture());
+            return GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                    .setTaskId("task-created")
+                    .setRequestFingerprint(created.getValue().getRequestFingerprint()).build();
+        });
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isEqualTo("task-created");
+        assertThat(pending.getProof().taskConfirmed()).isTrue();
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void anErrorResponseWithNoTaskLookupStillWaitsForDurableSettlement() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setError("gateway rejected request").build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void anEmptyCreateResponseWithUnavailableLookupCannotReleaseCapacity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenReturn(null);
+        when(sandbox.getTaskByOperationId(any())).thenReturn(null);
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        assertThat(pending.getProof().reservationJson()).contains("PREPARING");
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void aTypedCreateErrorCannotConfirmEvenIfItCarriesMatchingTaskIdentity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("contradictory-task")
+                    .setRequestFingerprint(request.getRequestFingerprint())
+                    .setErrorDetail(SandboxErrorDetail.newBuilder().build()).build();
+        });
+        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(true).setTaskId("contradictory-task")
+                .setErrorDetail(SandboxErrorDetail.newBuilder().build()).build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        verify(sandbox).getTaskByOperationId(any());
+        verify(capacity, never()).releaseReservation(any());
     }
 
     /** 在成员上下文里调用工具：与派发器在真实链路里装上下文的方式一致。 */
@@ -1743,6 +1840,21 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(output).contains("WAIT_GROUP_PREPARING_NOT_RECORDED");
         verify(sandbox, never()).createTask(any());
         verify(capacity).releaseReservation(any());
+    }
+
+    @Test
+    void persistenceFailureBeforeCreateReleasesTheLocalReservation() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(waitGroupStore.recordMemberPreparing(anyLong(), anyString(), anyString(), anyString()))
+                .thenThrow(new IllegalStateException("database unavailable"));
+
+        String output = invokeAsWaitGroupMember("print(1)", "1");
+
+        assertThat(output).contains("WAIT_GROUP_PREPARING_NOT_RECORDED");
+        verify(capacity).releaseReservation(any());
+        verify(sandbox, never()).createTask(any());
     }
 
     private String invokeAsWaitGroupMember(String code, String datasetIds, String expectedOperationId) {

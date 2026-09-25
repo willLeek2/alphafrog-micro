@@ -49,6 +49,9 @@ import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
  */
 class DatabaseDualPoolWorkHandlerRoutingTest {
 
+    private static final String TEST_INSTANCE = "agent@localhost@"
+            + ProcessHandle.current().pid() + "@test-instance";
+
     private RunCoordinationStore coordinationStore;
     private SchedulerStateStore stateStore;
     private AgentRunMapper runMapper;
@@ -75,7 +78,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         ObjectProvider<LegacyRunHandoff> handoffProvider = Mockito.mock(ObjectProvider.class);
         Mockito.lenient().when(admissionRegistry.snapshotRunIds()).thenReturn(Set.of());
         Mockito.lenient().when(stateStore.currentRound(any())).thenReturn(1L);
-        Mockito.lenient().when(identity.value()).thenReturn("test-instance");
+        Mockito.lenient().when(identity.value()).thenReturn(TEST_INSTANCE);
         Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
         Mockito.lenient().when(versionPolicy.isDualPoolFamily(any(world.willfrog.agent.platform.entity.AgentRun.class)))
                 .thenReturn(true);
@@ -122,7 +125,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
 
     /** 本进程已经握着这条 Run 的租约：读一次就够，不必再写一遍。 */
     private void ownedByThisProcess(String runId) {
-        RunServiceLease lease = new RunServiceLease(runId, "test-instance", 1L,
+        RunServiceLease lease = new RunServiceLease(runId, TEST_INSTANCE, 1L,
                 OffsetDateTime.now().minusMinutes(1), OffsetDateTime.now(),
                 OffsetDateTime.now().plusMinutes(2));
         Mockito.lenient().when(leaseStore.find(runId)).thenReturn(Optional.of(lease));
@@ -192,19 +195,19 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         when(legacyHandoff.handOff("run-legacy")).thenReturn(true);
 
         handler.scanRunnableRuns(10);
-        verify(admissionRegistry).bindFence("run-legacy", new ServiceOwnershipFence("test-instance", 1L));
+        verify(admissionRegistry).bindFence("run-legacy", new ServiceOwnershipFence(TEST_INSTANCE, 1L));
 
         // 库里没有、这次现领一条：领到的代际（这里是 5）要写回，不能还留着上一轮的旧号。
         when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-fresh", "LEGACY")));
         when(runMapper.findById("run-fresh")).thenReturn(run("run-fresh", "LEGACY"));
         when(leaseStore.find("run-fresh")).thenReturn(Optional.empty());
         when(leaseStore.acquire(eq("run-fresh"), anyString(), any(Duration.class)))
-                .thenReturn(Optional.of(new RunServiceLease("run-fresh", "test-instance", 5L,
+                .thenReturn(Optional.of(new RunServiceLease("run-fresh", TEST_INSTANCE, 5L,
                         OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
         when(legacyHandoff.handOff("run-fresh")).thenReturn(true);
 
         handler.scanRunnableRuns(10);
-        verify(admissionRegistry).bindFence("run-fresh", new ServiceOwnershipFence("test-instance", 5L));
+        verify(admissionRegistry).bindFence("run-fresh", new ServiceOwnershipFence(TEST_INSTANCE, 5L));
     }
 
     @Test
@@ -293,7 +296,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-dead-peer", "DUAL_POOL_V2")));
         when(runMapper.findById("run-dead-peer")).thenReturn(run("run-dead-peer", "DUAL_POOL_V2"));
         when(leaseStore.acquire(eq("run-dead-peer"), anyString(), any(Duration.class)))
-                .thenReturn(Optional.of(new RunServiceLease("run-dead-peer", "test-instance", 2L,
+                .thenReturn(Optional.of(new RunServiceLease("run-dead-peer", TEST_INSTANCE, 2L,
                         OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
         when(admissionRegistry.takeoverLegacyRun("run-dead-peer")).thenReturn(true);
 

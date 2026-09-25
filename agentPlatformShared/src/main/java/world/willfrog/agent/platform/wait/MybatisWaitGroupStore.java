@@ -103,7 +103,8 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
                             + request.segment().describe());
                 }
                 activityBudget.confirmWait(request);
-                activityBudget.releaseNode(executing, request.versions().claimEpoch());
+                // 这里仅把模型分段交给等待组；同一 Java 调用栈接着同步派发工具。
+                // ACTIVE_NODE 必须等节点 worker 的 finally 确认调用栈退出后才能归还。
             }
             return new WaitSuspensionResult(
                     WaitSuspensionOutcome.SUSPENDED, row.getCreatedGroupId(), row.getNextSegmentSequence());
@@ -288,6 +289,19 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
         return result;
     }
 
+    @Override
+    @Transactional
+    public int ensureCanceledMemberStopTasks(long groupId) {
+        if (groupId <= 0) {
+            throw new IllegalArgumentException("等待组编号必须为正数：" + groupId);
+        }
+        Integer inserted = mapper.ensureCanceledMemberStopTasks(groupId);
+        if (inserted == null || inserted < 0) {
+            throw new IllegalStateException("已取消等待组停机补建没有返回有效数量：group=" + groupId);
+        }
+        return inserted;
+    }
+
     private WaitGroup activityGroupBefore(long groupId) {
         if (activityBudget == null) return null;
         WaitGroup observed = mapper.findGroupById(groupId);
@@ -306,6 +320,22 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
             throw new IllegalArgumentException("等待组分页参数无效");
         }
         return mapper.listOpenGroupsByRun(runId, afterGroupId, limit);
+    }
+
+    @Override
+    public List<WaitGroup> scanOpenGroupsWithStoppedRun(long afterGroupId, int limit) {
+        if (afterGroupId < 0 || limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("已停止 Run 的等待组分页参数无效");
+        }
+        return mapper.scanOpenGroupsWithStoppedRun(afterGroupId, limit);
+    }
+
+    @Override
+    public List<WaitGroup> scanCanceledGroupsMissingStopTasks(long afterGroupId, int limit) {
+        if (afterGroupId < 0 || limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("已取消组停机补扫分页参数无效");
+        }
+        return mapper.scanCanceledGroupsMissingStopTasks(afterGroupId, limit);
     }
 
     @Override
@@ -349,6 +379,46 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
             throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
         }
         return mapper.scanDueMembers(now, limit);
+    }
+
+    @Override
+    public List<WaitMember> scanUnresolvedPythonMembersForCapacity(String deploymentId,
+                                                                     String deploymentGenerationId,
+                                                                     long afterMemberId, int limit) {
+        if (deploymentId == null || deploymentId.isBlank()
+                || deploymentGenerationId == null || deploymentGenerationId.isBlank()
+                || afterMemberId < 0 || limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("Python 容量恢复成员分页参数无效");
+        }
+        return mapper.scanUnresolvedPythonMembersForCapacity(
+                deploymentId, deploymentGenerationId, afterMemberId, limit);
+    }
+
+    @Override
+    public List<WaitMember> scanPendingPythonMembersWithProof(String deploymentId,
+                                                                String deploymentGenerationId,
+                                                                long afterMemberId, int limit) {
+        if (deploymentId == null || deploymentId.isBlank()
+                || deploymentGenerationId == null || deploymentGenerationId.isBlank()
+                || afterMemberId < 0 || limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("待派发 Python 成员分页参数无效");
+        }
+        return mapper.scanPendingPythonMembersWithProof(
+                deploymentId, deploymentGenerationId, afterMemberId, limit);
+    }
+
+    @Override
+    public boolean safeToRecoverPendingPython(long memberId, long workItemId, int claimEpoch,
+                                              String claimedBy, String operationId, String fingerprint) {
+        return mapper.countSafePendingPythonRecovery(memberId, workItemId, claimEpoch,
+                claimedBy, operationId, fingerprint) == 1;
+    }
+
+    @Override
+    public boolean recoverPendingPythonMember(long memberId, long workItemId, int claimEpoch,
+                                              String claimedBy, String operationId, String fingerprint) {
+        return mapper.recoverPendingPythonMember(memberId, workItemId, claimEpoch,
+                claimedBy, operationId, fingerprint) == 1;
     }
 
     @Override

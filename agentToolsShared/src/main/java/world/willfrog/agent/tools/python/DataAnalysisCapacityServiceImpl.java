@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -18,6 +19,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReleaseOutcome;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReleaseProof;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReleaseRequest;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
@@ -299,9 +301,26 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
             if (current == null) {
                 return DataAnalysisReleaseOutcome.NOT_FOUND;
             }
+            // Idempotence is scoped to the same reservation and the same physical task.
+            // A PREPARING proof must never treat a task-bound release as its own "already released".
+            if (!current.identity().equals(reservation.identity())
+                    || current.resourceClass() != reservation.resourceClass()
+                    || current.capacityUnits() != reservation.capacityUnits()
+                    || !current.acquiredAt().equals(reservation.acquiredAt())
+                    || !Objects.equals(current.taskId(), reservation.taskId())) {
+                return DataAnalysisReleaseOutcome.CONFLICT;
+            }
             if (current.state() == DataAnalysisReservationState.RELEASED) {
                 // Idempotent: the ledger already shows RELEASED for this reservationId.
                 return DataAnalysisReleaseOutcome.ALREADY_RELEASED;
+            }
+            if (request.proof() instanceof DataAnalysisReleaseProof.PreDispatchAbort
+                    && current.state() != DataAnalysisReservationState.PREPARING) {
+                return DataAnalysisReleaseOutcome.CONFLICT;
+            }
+            if (request.proof() instanceof DataAnalysisReleaseProof.Terminal
+                    && current.state() != DataAnalysisReservationState.TERMINAL_CONFIRMED) {
+                return DataAnalysisReleaseOutcome.CONFLICT;
             }
             // The proof-bearing contract already enforces the allowed state machine for the
             // proof type. We mirror that here so the ledger does not silently release a
@@ -365,25 +384,29 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
                         conflicts.add(reservationId);
                     }
                 }
-                if (!isActiveState(canonical.state())) {
-                    continue; // PREPARING without active resolution or already RELEASED entries are dropped.
+                if (canonical.state() == DataAnalysisReservationState.RELEASED) {
+                    continue;
                 }
                 accepted.add(canonical);
             }
 
             int restored = 0;
+            int active = 0;
             int heavyActive = 0;
             int unitsUsed = 0;
             for (DataAnalysisReservation reservation : accepted) {
                 ledger.put(reservation.reservationId(), reservation);
                 restored++;
                 unitsUsed += reservation.capacityUnits();
-                if (reservation.resourceClass() == DataAnalysisResourceClass.HEAVY) {
-                    heavyActive++;
+                if (isActiveState(reservation.state())) {
+                    active++;
+                    if (reservation.resourceClass() == DataAnalysisResourceClass.HEAVY) {
+                        heavyActive++;
+                    }
                 }
             }
             usedUnits.set(unitsUsed);
-            activeCount.set(restored);
+            activeCount.set(active);
             heavyActiveCount.set(heavyActive);
 
             boolean overConfigured = unitsUsed > configuredMaxUnits;
@@ -396,12 +419,12 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
             }
             admissionState.set(next);
             List<String> sortedConflicts = conflicts.stream().sorted().toList();
-            log.info("data-analysis capacity recovered restored={} usedUnits={}/{} heavyActive={}/{} conflicts={} state={}",
-                    restored, unitsUsed, configuredMaxUnits, heavyActive, configuredMaxHeavyActive,
+            log.info("data-analysis capacity recovered restored={} active={} usedUnits={}/{} heavyActive={}/{} conflicts={} state={}",
+                    restored, active, unitsUsed, configuredMaxUnits, heavyActive, configuredMaxHeavyActive,
                     sortedConflicts, next);
             return new DataAnalysisCapacityRecoveryReport(
                     restored,
-                    restored,
+                    active,
                     heavyActive,
                     unitsUsed,
                     configuredMaxUnits,

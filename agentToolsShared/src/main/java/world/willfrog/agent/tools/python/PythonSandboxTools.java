@@ -691,18 +691,25 @@ public class PythonSandboxTools {
         }
         // 取消与外部 createTask 之间需要一份已经落库的请求指纹。若取消先赢，
         // 成员已不再待派发，不能继续创建一个无人负责的 Sandbox 任务。
-        WaitMemberDispatchProof preparingProof = proofForWaitGroup(plan, reservation, null);
-        boolean preparingRecorded;
+        boolean preparingRecorded = false;
         try {
+            WaitMemberDispatchProof preparingProof = proofForWaitGroup(plan, reservation, null);
             preparingRecorded = waitGroupStore != null && waitGroupStore.recordMemberPreparing(
                     member.groupId(), member.memberIdentity(), identity.operationId(),
                     preparingProof.toJson(objectMapper));
         } catch (RuntimeException persistenceFailure) {
             log.warn("Sandbox 创建前未能保存成员身份：{}", member.describe(), persistenceFailure);
-            preparingRecorded = false;
         }
         if (!preparingRecorded) {
-            releasePreDispatch(reservation);
+            // 预留只存在于本进程的容量账本中；尚未持久化创建证明，也没有发起外部请求。
+            // 包括构造证明时的异常在内，都必须把这份本地预留归还。进程在此处退出时账本随进程消失。
+            if (!releasePreDispatch(reservation)) {
+                log.error("成员创建证明未落库，且本地预留归还失败：{} reservation={}",
+                        member.describe(), reservation.reservationId());
+                return fail("executePython", "WAIT_GROUP_PREPARING_RELEASE_FAILED",
+                        "Sandbox request identity could not be saved and local capacity could not be released",
+                        Map.of());
+            }
             return fail("executePython", "WAIT_GROUP_PREPARING_NOT_RECORDED",
                     "Sandbox request identity could not be saved before dispatch", Map.of());
         }
@@ -716,16 +723,11 @@ public class PythonSandboxTools {
             verdict = verdictOf(createFailure, plan.spec());
         }
         if (verdict instanceof CreateVerdict.Absent absent) {
-            // 权威答复说这次调用没有建出任务：名额还回去，这个成员按失败记，
-            // 模型在下一段读到失败文本后自己决定下一步。
-            if (!releasePreDispatch(reservation)) {
-                log.error("成员建任务被权威否定，但名额没有还回去：{} reservation={}",
-                        member.describe(), reservation.reservationId());
-            }
-            emitSandboxToolTotal(toolStartMs, "ERROR", "CREATE_TASK_FAILED");
-            return fail("executePython", "CREATE_TASK_FAILED",
-                    "Sandbox create failed and the operation was authoritatively absent",
-                    Map.of("operation_id", identity.operationId(), "message", nvl(absent.detail())));
+            // 即使当前回查不存在，原 create RPC 仍可能迟到；接收侧会先写稳定取消墓碑，
+            // 再按 Sandbox 的真实取消终态结算容量与用量。
+            log.info("成员创建当前未找到，交给结果接收侧写取消墓碑并收尾：{} 原因={}",
+                    member.describe(), absent.detail());
+            throw pendingForWaitGroup(member, plan, reservation, null);
         }
         if (verdict instanceof CreateVerdict.Unknown unknown) {
             // 还没有结论：名额留着，成员照样按执行中记，由结果接收侧按外部作业身份回查。
@@ -773,36 +775,19 @@ public class PythonSandboxTools {
     /**
      * 读建任务响应：确认、没建出来，还是还没有结论。
      *
-     * <p>响应里的 canonical 指纹是任务编号的身份凭据。指纹为空或漂移时先用外部作业身份做一次
-     * 权威回读，只有任务编号相同、指纹精确且非空才认。</p>
+     * <p>响应里的 canonical 指纹是任务编号的身份凭据。错误、空响应或身份不全时按稳定的
+     * operationId 回读；有响应任务号时还必须与回读一致，指纹也必须精确且非空。</p>
      */
     private CreateVerdict verdictOf(ExecuteResponse createResp, CanonicalSandboxCreateSpec spec) {
-        if (createResp == null
-                || (createResp.getError() != null && !createResp.getError().isEmpty())
-                || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
-            return new CreateVerdict.Absent(createResp == null ? "empty response" : nvl(createResp.getError()));
-        }
-        String taskId = createResp.getTaskId();
-        if (!createResp.getRequestFingerprint().isBlank()
+        String taskId = createResp == null ? "" : createResp.getTaskId();
+        if (createResp != null && createResp.getError().isBlank()
+                && !createResp.hasErrorDetail() && !taskId.isBlank()
+                && !createResp.getRequestFingerprint().isBlank()
                 && spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
             return new CreateVerdict.Confirmed(taskId);
         }
-        GetTaskByOperationIdResponse lookup;
-        try {
-            lookup = pythonSandboxService.getTaskByOperationId(GetTaskByOperationIdRequest.newBuilder()
-                    .setOperationId(spec.operationId()).build());
-        } catch (Exception lookupFailure) {
-            log.error("沙箱建任务的身份回读失败：operationId={} taskId={}",
-                    spec.operationId(), taskId, lookupFailure);
-            return new CreateVerdict.Unknown("create identity lookup failed");
-        }
-        boolean confirmed = lookup != null && lookup.getFound()
-                && taskId.equals(lookup.getTaskId())
-                && !lookup.getRequestFingerprint().isBlank()
-                && spec.requestFingerprint().equals(lookup.getRequestFingerprint());
-        return confirmed
-                ? new CreateVerdict.Confirmed(taskId)
-                : new CreateVerdict.Unknown("create identity unverified");
+        return lookupCreateVerdict(spec, taskId,
+                createResp == null ? "empty create response" : nvl(createResp.getError()));
     }
 
     /**
@@ -812,21 +797,31 @@ public class PythonSandboxTools {
      * 报错」才能当成没建出来；查询也失败时保留名额，留给结果接收侧继续回查。</p>
      */
     private CreateVerdict verdictOf(Exception createFailure, CanonicalSandboxCreateSpec spec) {
+        return lookupCreateVerdict(spec, "", nvl(createFailure.getMessage()));
+    }
+
+    private CreateVerdict lookupCreateVerdict(CanonicalSandboxCreateSpec spec,
+                                               String responseTaskId,
+                                               String detail) {
         GetTaskByOperationIdResponse lookup;
         try {
             lookup = pythonSandboxService.getTaskByOperationId(GetTaskByOperationIdRequest.newBuilder()
                     .setOperationId(spec.operationId()).build());
         } catch (Exception lookupFailure) {
-            createFailure.addSuppressed(lookupFailure);
-            return new CreateVerdict.Unknown("create failed and the operation lookup also failed");
+            log.warn("沙箱建任务结果回读失败：operationId={}", spec.operationId(), lookupFailure);
+            return new CreateVerdict.Unknown("operation lookup failed: " + detail);
         }
-        if (lookup != null && lookup.getFound() && !lookup.getTaskId().isBlank()
+        if (lookup != null && lookup.getError().isBlank() && !lookup.hasErrorDetail()
+                && lookup.getFound() && !lookup.getTaskId().isBlank()
                 && !lookup.getRequestFingerprint().isBlank()
-                && spec.requestFingerprint().equals(lookup.getRequestFingerprint())) {
+                && spec.requestFingerprint().equals(lookup.getRequestFingerprint())
+                && (responseTaskId.isBlank() || responseTaskId.equals(lookup.getTaskId()))) {
             return new CreateVerdict.Confirmed(lookup.getTaskId());
         }
-        if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()) {
-            return new CreateVerdict.Absent(nvl(createFailure.getMessage()));
+        if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()
+                && !lookup.hasErrorDetail() && lookup.getTaskId().isBlank()
+                && lookup.getRequestFingerprint().isBlank() && responseTaskId.isBlank()) {
+            return new CreateVerdict.Absent(detail);
         }
         return new CreateVerdict.Unknown("create outcome is ambiguous");
     }

@@ -38,6 +38,10 @@ public interface NodeWorkItemMapper {
                                 @Param("nodeAttempt") int nodeAttempt,
                                 @Param("segmentSequence") int segmentSequence);
 
+    /** 业务状态已交出节点、但退出回执可能随进程崩溃丢失的领取代际。 */
+    List<NodeWorkItem> scanUnreleasedExitedCandidates(@Param("afterId") long afterId,
+                                                      @Param("limit") int limit);
+
     /**
      * 扫描可领取的工作项：状态可运行、已到下次可领取时间，按调度器版本过滤。
      * 内存提示队列只是唤醒提示，在线扫描用它把工作项重新发现。

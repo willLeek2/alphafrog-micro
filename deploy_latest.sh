@@ -552,6 +552,16 @@ else
   exit 1
 fi
 
+# Linux 稳定部署的 Agent 节点需要在容器重建后读取宿主 PID 与机器身份。
+# macOS 本地 Docker 不挂载 /etc/machine-id；本地应用仍可启动，双池领取会因缺证明拒绝。
+if [[ "$(uname -s)" == "Linux" ]] && is_in_list "agent-langchain-service" "${SELECTED[@]}"; then
+  if [[ ! -f /etc/machine-id ]]; then
+    echo "[deploy] ERROR: Linux Agent 部署缺少宿主 /etc/machine-id。" >&2
+    exit 1
+  fi
+  DOCKER_COMPOSE="$DOCKER_COMPOSE -f docker-compose.yml -f docker-compose.node-worker-linux.yml"
+fi
+
 # Dubbo 注册地址 fail-closed：compose 里每个 Dubbo 提供者都引用
 # ${AF_DUBBO_REGISTRY_HOST_IP:?...}，缺值时任何 compose 命令都会失败。这里在
 # 调用 compose 之前先校验（进程环境优先，否则回退读仓库根 .env，与 sandbox

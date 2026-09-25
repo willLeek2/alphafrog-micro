@@ -23,6 +23,9 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 
 /**
  * 等待成员的收尾：把一条已经拿到结论的后台作业，从「名额还占着」走到「名额还回去、用量记下来」。
@@ -35,9 +38,6 @@ import java.time.Instant;
  * 名额凭证、实际用量、结果摘要）→ 用这份信封当凭证把名额还回去 → 把用量记录幂等写进去。按这个
  * 顺序做，进程在任意一步之间退出，下一轮拿同一份证明重做一遍就行：还名额是幂等的（已经还过的返回
  * 「早就还了」），用量记录也是幂等的（同样的内容返回「早就在了」）。</p>
- *
- * <p>拿不出结论的那一种（权威地说这个后台作业不存在）走另一条路：名额停在「准备中」，按「建任务
- * 被否定」还回去，没有用量可记。</p>
  *
  * <p>还名额与写用量都不成功时不吞掉：返回没成的原因，由调用方把这条成员按退避推后、下一轮重来。
  * 成员行上的终态因此只在账目落定之后才写出去——先写成员终态再收尾的话，进程在两步之间退出就再也
@@ -79,15 +79,17 @@ public class WaitMemberSettlement {
      *
      * @param member   成员行（取工具名、调用身份等身份字段）
      * @param proof    派发证明（取名额凭证与预估）
-     * @param statusName 沙箱给的终态名；为 {@code null} 表示「权威地说这个后台作业不存在」
-     * @param result   沙箱的终态结果体；上面那种情形为 {@code null}
+     * @param statusName 沙箱给的终态名
+     * @param result   沙箱的终态结果体
      * @param preview  交给模型的那份结果正文（写进信封时按上限截断）
+     * @param finishedAt Sandbox 为该任务保存的终态时刻；重试时必须保持相同
      */
     public Outcome settle(WaitMember member,
                           WaitMemberDispatchProof proof,
                           String statusName,
                           TaskResultResponse result,
-                          String preview) {
+                          String preview,
+                          String finishedAt) {
         DataAnalysisReservation stored;
         DataAnalysisEstimate estimate;
         try {
@@ -96,36 +98,16 @@ public class WaitMemberSettlement {
         } catch (Exception e) {
             return Outcome.blocked("reservation_unreadable");
         }
-        if (statusName == null) {
-            return releaseNotCreated(stored, member);
+        if (!stored.operationId().equals(proof.operationId())
+                || !stored.identity().runId().equals(member.getRunId())
+                || !stored.identity().toolCallId().equals(member.getToolCallId())
+                || !proof.operationId().equals(member.getExternalOperationId())) {
+            return Outcome.blocked("reservation_identity_mismatch");
         }
-        if (result == null) {
+        if (statusName == null || result == null) {
             return Outcome.blocked("terminal_result_missing");
         }
-        return releaseWithUsage(member, stored, estimate, statusName, result, preview);
-    }
-
-    /** 权威地说「这个后台作业不存在」：名额停在准备中，按建任务被否定还回去。 */
-    private Outcome releaseNotCreated(DataAnalysisReservation stored, WaitMember member) {
-        if (stored.state() != DataAnalysisReservationState.PREPARING) {
-            // 证明里的名额已经绑在某个任务上，说明这次不是「没建出来」——两种事实对不上，不能猜。
-            log.warn("成员按「任务不存在」收尾，但名额凭证不是准备中，先不释放：member={} state={}",
-                    member.getMemberIdentity(), stored.state());
-            return Outcome.blocked("reservation_state_mismatch:" + stored.state());
-        }
-        DataAnalysisReleaseOutcome outcome = capacityService.releaseReservation(
-                new DataAnalysisReleaseRequest(stored,
-                        new DataAnalysisReleaseProof.PreDispatchAbort(stored.identity()),
-                        DataAnalysisReleaseReason.CREATE_NOT_STARTED));
-        if (outcome == DataAnalysisReleaseOutcome.RELEASED
-                || outcome == DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
-            log.info("成员的后台作业不存在，名额已还回去：member={} operation={}",
-                    member.getMemberIdentity(), stored.operationId());
-            return Outcome.success();
-        }
-        log.warn("成员的后台作业不存在，但名额没有还回去：member={} operation={} outcome={}",
-                member.getMemberIdentity(), stored.operationId(), outcome);
-        return Outcome.blocked("release_not_created:" + outcome);
+        return releaseWithUsage(member, stored, estimate, statusName, result, preview, finishedAt);
     }
 
     /** 有结论的作业：名额还回去、用量记下来。两步都幂等。 */
@@ -134,7 +116,8 @@ public class WaitMemberSettlement {
                                      DataAnalysisEstimate estimate,
                                      String statusName,
                                      TaskResultResponse result,
-                                     String preview) {
+                                     String preview,
+                                     String finishedAt) {
         String taskId = result.getTaskId();
         if (taskId == null || taskId.isBlank()) {
             return Outcome.blocked("terminal_without_task_id");
@@ -148,9 +131,27 @@ public class WaitMemberSettlement {
         // 信封要求名额处在「终态已确认」——还完名额之后再拿「已释放」去组织会被它自己拒掉，
         // 所以两份用途共用同一个对象，顺序上先当凭证、后当记录。
         DataAnalysisTerminalEnvelope envelope = envelope(member, confirmed, estimate,
-                statusName, result, preview);
+                statusName, result, preview, finishedAt);
         if (envelope == null) {
             return Outcome.blocked("envelope_unbuildable");
+        }
+        DataAnalysisReleaseRequest releaseRequest = new DataAnalysisReleaseRequest(confirmed,
+                new DataAnalysisReleaseProof.Terminal(envelope),
+                DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
+        if (stored.state() == DataAnalysisReservationState.PREPARING) {
+            // 创建前请求证明只含 PREPARING。Sandbox 后来确认了任务（包括取消墓碑）时，
+            // 容量账本仍须按真实状态机先绑 taskId，再确认终态。
+            DataAnalysisRestoreOutcome attachedOutcome;
+            try {
+                attachedOutcome = capacityService.restoreReservation(attached);
+            } catch (RuntimeException e) {
+                log.warn("成员任务附着凭证无法恢复：member={} operation={} reason={}",
+                        member.getMemberIdentity(), confirmed.operationId(), e.getMessage());
+                return Outcome.blocked("restore_attached_error");
+            }
+            if (attachedOutcome == DataAnalysisRestoreOutcome.CONFLICT) {
+                return releasedEarlierOrBlocked(member, confirmed, envelope, releaseRequest);
+            }
         }
         DataAnalysisRestoreOutcome restored;
         try {
@@ -161,16 +162,9 @@ public class WaitMemberSettlement {
             return Outcome.blocked("restore_error");
         }
         if (restored == DataAnalysisRestoreOutcome.CONFLICT) {
-            // 用量落库不能代替容量账本的释放证明。冲突时保留等待责任，避免外部任务虽停了、
-            // 根树许可却先还回去，随后又让新任务占进来。
-            log.error("成员的名额凭证与容量账本冲突，保留收尾责任：member={} operation={}",
-                    member.getMemberIdentity(), confirmed.operationId());
-            return Outcome.blocked("capacity_reservation_conflict");
+            return releasedEarlierOrBlocked(member, confirmed, envelope, releaseRequest);
         } else {
-            DataAnalysisReleaseOutcome outcome = capacityService.releaseReservation(
-                    new DataAnalysisReleaseRequest(confirmed,
-                            new DataAnalysisReleaseProof.Terminal(envelope),
-                            DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED));
+            DataAnalysisReleaseOutcome outcome = capacityService.releaseReservation(releaseRequest);
             if (outcome != DataAnalysisReleaseOutcome.RELEASED
                     && outcome != DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
                 log.warn("成员的名额没有还回去，这一轮不下结论：member={} operation={} outcome={}",
@@ -179,6 +173,20 @@ public class WaitMemberSettlement {
             }
         }
         return recordUsage(member, confirmed, envelope);
+    }
+
+    /** 用量落库失败后的重试可能看见已释放账本；只凭同一终态释放证明认作完成。 */
+    private Outcome releasedEarlierOrBlocked(WaitMember member,
+                                             DataAnalysisReservation confirmed,
+                                             DataAnalysisTerminalEnvelope envelope,
+                                             DataAnalysisReleaseRequest request) {
+        DataAnalysisReleaseOutcome released = capacityService.releaseReservation(request);
+        if (released == DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
+            return recordUsage(member, confirmed, envelope);
+        }
+        log.error("成员名额凭证与容量账本冲突且无同任务的已释放凭证：member={} operation={} outcome={}",
+                member.getMemberIdentity(), confirmed.operationId(), released);
+        return Outcome.blocked("capacity_reservation_conflict");
     }
 
     /** 用量记录：按操作身份幂等写入，同样的内容重复写返回「早就在了」。 */
@@ -211,8 +219,10 @@ public class WaitMemberSettlement {
                                                   DataAnalysisEstimate estimate,
                                                   String statusName,
                                                   TaskResultResponse result,
-                                                  String preview) {
+                                                  String preview,
+                                                  String finishedAt) {
         try {
+            Instant terminalAt = parseSandboxFinishedAt(finishedAt);
             DataAnalysisResourceUsage usage = usageOf(reservation, result);
             boolean success = "SUCCEEDED".equals(statusName) && result.getExitCode() == 0;
             String rawRef = blankToNull(result.getDatasetDir());
@@ -240,11 +250,23 @@ public class WaitMemberSettlement {
                     estimate,
                     reservation,
                     usage,
-                    Instant.now(),
+                    terminalAt,
                     true);
         } catch (Exception e) {
             log.warn("成员的终态信封组织不出来：member={} reason={}", member.getMemberIdentity(), e.getMessage());
             return null;
+        }
+    }
+
+    private static Instant parseSandboxFinishedAt(String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("Sandbox 终态缺少完成时刻");
+        }
+        try {
+            return OffsetDateTime.parse(value).toInstant();
+        } catch (RuntimeException withOffset) {
+            // Python Sandbox 使用 UTC datetime.utcnow()，旧 HTTP 生产者可能不给时区后缀。
+            return LocalDateTime.parse(value).toInstant(ZoneOffset.UTC);
         }
     }
 

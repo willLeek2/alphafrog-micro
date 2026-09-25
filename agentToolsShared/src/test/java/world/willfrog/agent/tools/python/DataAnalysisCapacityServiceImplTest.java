@@ -389,6 +389,38 @@ class DataAnalysisCapacityServiceImplTest {
         }
 
         @Test
+        void aPreparingProofCannotClaimAnAlreadyReleasedTaskBoundReservation() {
+            openAfterEmptyRecover();
+            DataAnalysisReservation preparing = service.reserve(
+                    identity("run-1", "call-1", 1), standardEstimate());
+            DataAnalysisReservation attached = new DataAnalysisReservation(
+                    preparing.reservationId(), preparing.identity(), preparing.resourceClass(),
+                    preparing.capacityUnits(), DataAnalysisReservationState.TASK_ATTACHED,
+                    "task-1", preparing.acquiredAt());
+            assertEquals(DataAnalysisRestoreOutcome.ADDED, service.restoreReservation(attached));
+            DataAnalysisReservation confirmed = new DataAnalysisReservation(
+                    preparing.reservationId(), preparing.identity(), preparing.resourceClass(),
+                    preparing.capacityUnits(), DataAnalysisReservationState.TERMINAL_CONFIRMED,
+                    "task-1", preparing.acquiredAt());
+            assertEquals(DataAnalysisRestoreOutcome.ADDED, service.restoreReservation(confirmed));
+            DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
+                    "run-1", "call-1", 1, preparing.operationId(), "task-1",
+                    "CANCELED", false, "canceled", null, "CANCELED", "sandbox CANCELED", false,
+                    standardEstimate(), confirmed,
+                    world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceUsage.missing(
+                            DataAnalysisResourceClass.STANDARD), FIXED_INSTANT, true);
+            assertEquals(DataAnalysisReleaseOutcome.RELEASED, service.releaseReservation(
+                    new DataAnalysisReleaseRequest(confirmed,
+                            new DataAnalysisReleaseProof.Terminal(envelope),
+                            DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED)));
+
+            assertEquals(DataAnalysisReleaseOutcome.CONFLICT, service.releaseReservation(
+                    new DataAnalysisReleaseRequest(preparing,
+                            new DataAnalysisReleaseProof.PreDispatchAbort(preparing.identity()),
+                            DataAnalysisReleaseReason.CREATE_NOT_STARTED)));
+        }
+
+        @Test
         void releaseMissingReservationReturnsNotFound() {
             openAfterEmptyRecover();
             DataAnalysisReservation ghost = new DataAnalysisReservation(
@@ -543,7 +575,7 @@ class DataAnalysisCapacityServiceImplTest {
         }
 
         @Test
-        void recoverDropsReleasedAndPreparingWithoutTaskId() {
+        void recoverKeepsPreparingUnitsWithoutCountingAnActiveTask() {
             DataAnalysisReservation released = new DataAnalysisReservation(
                     identity("run-1", "call-1", 1).reservationId(),
                     identity("run-1", "call-1", 1),
@@ -557,8 +589,26 @@ class DataAnalysisCapacityServiceImplTest {
             DataAnalysisCapacityRecoveryReport report = service.recover(
                     List.of(released, preparing),
                     properties.getMaxUnits(), properties.getMaxHeavyActive());
-            assertEquals(0, report.restoredReservations());
+            assertEquals(1, report.restoredReservations());
+            assertEquals(0, report.activeCount());
+            assertEquals(0, report.heavyActiveCount());
+            assertEquals(1, report.usedUnits());
+            assertEquals(preparing, service.ledgerSnapshot().get(preparing.reservationId()));
             assertEquals(DataAnalysisAdmissionState.OPEN, report.admissionState());
+        }
+
+        @Test
+        void identicalPreparingSnapshotsRestoreOnlyOnce() {
+            DataAnalysisOperationIdentity id = identity("run-1", "call-1", 1);
+            DataAnalysisReservation preparing = new DataAnalysisReservation(
+                    id.reservationId(), id, DataAnalysisResourceClass.STANDARD, 1,
+                    DataAnalysisReservationState.PREPARING, null, FIXED_INSTANT);
+            DataAnalysisCapacityRecoveryReport report = service.recover(
+                    List.of(preparing, preparing), properties.getMaxUnits(), properties.getMaxHeavyActive());
+            assertEquals(1, report.restoredReservations());
+            assertEquals(0, report.activeCount());
+            assertEquals(1, report.usedUnits());
+            assertTrue(report.conflicts().isEmpty());
         }
     }
 

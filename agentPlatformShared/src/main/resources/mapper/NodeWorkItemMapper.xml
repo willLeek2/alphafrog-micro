@@ -89,6 +89,20 @@
         AND segment_sequence = #{segmentSequence}
     </sql>
 
+    <select id="scanUnreleasedExitedCandidates" resultMap="NodeWorkItemResultMap">
+        SELECT <include refid="workItemColumnsAliased"/>
+          FROM alphafrog_agent_run_work_item wi
+          JOIN alphafrog_agent_run_tree_budget_operation o
+            ON o.operation_id = 'active-node:' || wi.id || ':' || wi.claim_epoch
+           AND o.kind = 'ACTIVE_NODE' AND o.state = 'CONFIRMED'
+         WHERE wi.state IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE',
+                            'WAITING', 'RESUMABLE')
+           AND wi.claimed_by IS NOT NULL
+           AND wi.id &gt; #{afterId}
+         ORDER BY wi.id
+         LIMIT #{limit}
+    </select>
+
     <!-- 终态：分段结果已提交、执行失败、被取消、已过期。写成一行，免得拼接出多余空白影响部分索引匹配。 -->
     <sql id="terminalStates">'RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE'</sql>
 
@@ -289,7 +303,7 @@
       家族」会让旧版本的分段在新的 Run 下被执行。
     -->
     <select id="claim" resultType="java.lang.Integer" affectData="true" flushCache="true">
-        UPDATE alphafrog_agent_run_work_item SET
+        UPDATE alphafrog_agent_run_work_item wi SET
             state = 'CLAIMED',
             claim_epoch = claim_epoch + 1,
             claimed_by = #{claimedBy},
@@ -303,6 +317,11 @@
           AND context_version = #{contextVersion}
           AND run_control_version = #{runControlVersion}
           AND claim_epoch = #{expectedClaimEpoch}
+          AND NOT EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_tree_budget_operation old_node
+               WHERE old_node.kind = 'ACTIVE_NODE' AND old_node.state != 'RELEASED'
+                 AND old_node.operation_id LIKE 'active-node:' || wi.id || ':%'
+                 AND old_node.operation_id != 'active-node:' || wi.id || ':' || (#{expectedClaimEpoch} + 1))
           AND EXISTS (
               SELECT 1
               FROM alphafrog_agent_run owner_run
@@ -425,7 +444,6 @@
     <update id="suspendForToolJob">
         UPDATE alphafrog_agent_run_work_item wi SET
             state = 'WAITING',
-            claimed_by = NULL,
             lease_expires_at = NULL,
             payload_json = wi.payload_json || jsonb_build_object(
                 'toolJobWait', jsonb_build_object(
@@ -512,7 +530,6 @@
         )
         UPDATE alphafrog_agent_run_work_item wi SET
             state = 'RESUMABLE',
-            claimed_by = NULL,
             lease_expires_at = NULL,
             next_visible_at = CURRENT_TIMESTAMP,
             payload_json = wi.payload_json || jsonb_build_object(
@@ -573,7 +590,6 @@
     <update id="requeueInterruptedToolJob">
         UPDATE alphafrog_agent_run_work_item wi SET
             state = 'RESUMABLE',
-            claimed_by = NULL,
             lease_expires_at = NULL,
             next_visible_at = CURRENT_TIMESTAMP,
             updated_at = CURRENT_TIMESTAMP

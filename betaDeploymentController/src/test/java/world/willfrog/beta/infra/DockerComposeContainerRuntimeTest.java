@@ -173,7 +173,10 @@ class DockerComposeContainerRuntimeTest {
                 .path("stop_grace_period").asText());
         assertEquals("unless-stopped", mapper.readTree(content).path("services").path("app")
                 .path("restart").asText());
+        assertEquals("host", mapper.readTree(content).path("services").path("app")
+                .path("pid").asText());
         JsonNode volumes = mapper.readTree(content).path("services").path("app").path("volumes");
+        assertTrue(containsVolume(volumes, "/etc/machine-id:/run/alphafrog/host-machine-id:ro"));
         assertTrue(containsVolume(volumes, properties.getObservability().getJavaAgentJar()
                 + ":/otel/javaagent.jar:ro"));
         assertTrue(containsVolume(volumes, temporary.resolve("state/data/logs/agent-service") + ":/app/logs"));

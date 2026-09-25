@@ -1,0 +1,11 @@
+services:
+  agent-langchain-service:
+    # 仅 Linux 稳定部署启用：节点领取需要在容器重建后核验旧 JVM 是否物理退出。
+    pid: host
+    volumes:
+      - type: bind
+        source: /etc/machine-id
+        target: /run/alphafrog/host-machine-id
+        read_only: true
+        bind:
+          create_host_path: false

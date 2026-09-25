@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,6 +12,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitMember;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
+import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
@@ -46,6 +51,8 @@ public class ToolJobStartupRecovery {
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
     private final RunOwnershipGateway ownershipGateway;
+    private final WaitGroupStore waitGroupStore;
+    private final ObjectMapper proofMapper = new ObjectMapper().findAndRegisterModules();
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
 
@@ -58,6 +65,7 @@ public class ToolJobStartupRecovery {
     @DubboReference
     private PythonSandboxService sandboxService;
 
+    @Autowired
     public ToolJobStartupRecovery(ToolJobAnchorService anchorService,
                                   ToolJobRedisCache redisCache,
                                   DataAnalysisCapacityService capacityService,
@@ -65,7 +73,8 @@ public class ToolJobStartupRecovery {
                                   ToolJobFinalizer finalizer,
                                   ToolJobResumeService resumeService,
                                   ToolJobConfig config,
-                                  RunOwnershipGateway ownershipGateway) {
+                                  RunOwnershipGateway ownershipGateway,
+                                  WaitGroupStore waitGroupStore) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
@@ -74,6 +83,20 @@ public class ToolJobStartupRecovery {
         this.resumeService = resumeService;
         this.config = config;
         this.ownershipGateway = ownershipGateway;
+        this.waitGroupStore = waitGroupStore;
+    }
+
+    /** Existing narrow unit tests construct the legacy anchor-only recovery path directly. */
+    public ToolJobStartupRecovery(ToolJobAnchorService anchorService,
+                                  ToolJobRedisCache redisCache,
+                                  DataAnalysisCapacityService capacityService,
+                                  DataAnalysisCapacityProperties capacityProperties,
+                                  ToolJobFinalizer finalizer,
+                                  ToolJobResumeService resumeService,
+                                  ToolJobConfig config,
+                                  RunOwnershipGateway ownershipGateway) {
+        this(anchorService, redisCache, capacityService, capacityProperties, finalizer,
+                resumeService, config, ownershipGateway, null);
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -82,7 +105,10 @@ public class ToolJobStartupRecovery {
         log.info("T3 startup recovery beginning");
         try {
             // 第一阶段恢复容量真相，决定 admission 能否从 RECOVERING 转 OPEN。
-            recoverCapacityLedger();
+            if (!recoverCapacityLedger()) {
+                log.error("T3 startup recovery stopped before anchor replay: capacity admission remains closed");
+                return;
+            }
             // 第二阶段恢复轮询索引、finalizer 进度和恢复 launcher。
             recoverToolJobAnchors();
             log.info("T3 startup recovery complete");
@@ -91,7 +117,7 @@ public class ToolJobStartupRecovery {
         }
     }
 
-    private void recoverCapacityLedger() {
+    private boolean recoverCapacityLedger() {
         // 只扫描仍有 active anchor 的 Run，终态已清理 anchor 不再占用容量。
         List<AgentRun> activeRuns = activeRunsForRecovery(200);
         // durableReservations 会一次性提交给容量服务重建。
@@ -105,9 +131,7 @@ public class ToolJobStartupRecovery {
             if (anchor == null || anchor.getReservationJson() == null) continue;
             try {
                 // 注册 Java Time 模块以还原 acquiredAt 等时间字段。
-                com.fasterxml.jackson.databind.ObjectMapper mapper =
-                        new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
-                DataAnalysisReservation reservation = mapper.readValue(
+                DataAnalysisReservation reservation = proofMapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())) {
@@ -229,13 +253,15 @@ public class ToolJobStartupRecovery {
             }
         }
 
+        appendUnresolvedWaitMemberReservations(durableReservations, quarantinedRuns);
+
         // 任一 reservation 无法证明时就拒绝开放准入，避免漏算容量后超额准入。
         if (!quarantinedRuns.isEmpty()) {
-            log.error("CAPACITY QUARANTINE: {} run(s) have unparseable reservationJson — "
-                    + "BLOCKING admission recovery to prevent over-admission. Runs: {}",
+            log.error("CAPACITY QUARANTINE: {} anchor/member proof or scan error(s) — "
+                    + "BLOCKING admission recovery to prevent over-admission. Identities: {}",
                     quarantinedRuns.size(), quarantinedRuns);
             // 保持 admission=RECOVERING，由运维处理隔离 Run；不能部分恢复后开放。
-            return;
+            return false;
         }
 
         // 无隔离项时才按当前配置恢复账本并允许 RECOVERING→OPEN。
@@ -247,6 +273,101 @@ public class ToolJobStartupRecovery {
                 report.restoredReservations(), report.activeCount(),
                 report.heavyActiveCount(), report.usedUnits(),
                 report.configuredMaxUnits(), report.admissionState(), report.conflicts());
+        return true;
+    }
+
+    private void appendUnresolvedWaitMemberReservations(List<DataAnalysisReservation> reservations,
+                                                        List<String> quarantined) {
+        if (waitGroupStore == null) {
+            // Production constructor requires this store. Only older anchor-only unit tests use the narrow constructor.
+            return;
+        }
+        long afterId = 0;
+        final int pageSize = 200;
+        var identity = ownershipGateway.requireIdentity();
+        while (true) {
+            List<WaitMember> page;
+            try {
+                page = waitGroupStore.scanUnresolvedPythonMembersForCapacity(
+                        identity.deploymentId(), identity.generationId(), afterId, pageSize);
+            } catch (RuntimeException scanFailure) {
+                log.error("Cannot scan unresolved Python wait members; capacity admission remains closed", scanFailure);
+                quarantined.add("wait-member-scan-after:" + afterId);
+                return;
+            }
+            if (page == null) {
+                quarantined.add("wait-member-scan-null-after:" + afterId);
+                return;
+            }
+            if (page.size() > pageSize) {
+                quarantined.add("wait-member-scan-oversized-after:" + afterId);
+                return;
+            }
+            for (WaitMember member : page) {
+                if (member == null || member.getId() == null || member.getId() <= afterId) {
+                    quarantined.add("wait-member-page-order-after:" + afterId);
+                    return;
+                }
+                afterId = member.getId();
+                try {
+                    // The wait-member table is shared by main Beta and every lane. Only this
+                    // deployment generation may rebuild its own in-process capacity ledger.
+                    if (ownershipGateway.findOwnedRun(member.getRunId()) == null) {
+                        continue;
+                    }
+                    appendWaitMemberReservation(member, reservations);
+                } catch (RuntimeException invalid) {
+                    log.error("Unresolved Python member has no reliable capacity proof: member={} run={} reason={}",
+                            member.getId(), member.getRunId(), invalid.getMessage());
+                    quarantined.add("wait-member:" + member.getId());
+                }
+            }
+            if (page.size() < pageSize) {
+                return;
+            }
+        }
+    }
+
+    private void appendWaitMemberReservation(WaitMember member,
+                                             List<DataAnalysisReservation> reservations) {
+        if (!"executePython".equals(member.getToolName())) {
+            throw new IllegalStateException("scan returned a non-Python member");
+        }
+        WaitMemberState state = member.stateEnum();
+        if (state != WaitMemberState.PENDING && state != WaitMemberState.RUNNING
+                && state != WaitMemberState.CANCELED && state != WaitMemberState.LATE) {
+            throw new IllegalStateException("scan returned a settled member");
+        }
+        String proofJson = member.getDispatchProofJson();
+        if (proofJson == null || proofJson.isBlank()) {
+            if (state == WaitMemberState.PENDING) {
+                // No pre-create proof was persisted, hence there is no durable reservation to rebuild.
+                return;
+            }
+            throw new IllegalStateException("unresolved member is missing dispatch proof");
+        }
+        WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(proofMapper, proofJson)
+                .orElseThrow(() -> new IllegalStateException("dispatch proof is unreadable"));
+        DataAnalysisReservation reservation;
+        try {
+            reservation = proofMapper.readValue(proof.reservationJson(), DataAnalysisReservation.class);
+        } catch (Exception invalid) {
+            throw new IllegalStateException("reservation proof is unreadable", invalid);
+        }
+        if (member.getRunId() == null || member.getToolCallId() == null
+                || member.getExternalOperationId() == null
+                || !member.getRunId().equals(reservation.identity().runId())
+                || !member.getToolCallId().equals(reservation.identity().toolCallId())
+                || !member.getExternalOperationId().equals(proof.operationId())
+                || !proof.operationId().equals(reservation.operationId())) {
+            throw new IllegalStateException("member, proof and reservation identities differ");
+        }
+        if (reservation.state() == DataAnalysisReservationState.RELEASED
+                || proof.taskId() == null && reservation.state() != DataAnalysisReservationState.PREPARING
+                || proof.taskId() != null && !proof.taskId().equals(reservation.taskId())) {
+            throw new IllegalStateException("reservation state or task identity differs from dispatch proof");
+        }
+        reservations.add(reservation);
     }
 
     private void recoverToolJobAnchors() {

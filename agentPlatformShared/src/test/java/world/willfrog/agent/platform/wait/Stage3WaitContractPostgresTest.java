@@ -235,7 +235,9 @@ class Stage3WaitContractPostgresTest {
                         "{\"waitSuspension\":true}", "{\"checkpoint\":\"tree\"}")));
         assertThat(suspended).isNotNull();
         assertThat(suspended.suspended()).isTrue();
-        assertThat(budget.snapshot(runId)).isEqualTo(new RootTreeBudgetStore.Snapshot(0, 0, 0, 1));
+        assertThat(budget.snapshot(runId)).isEqualTo(new RootTreeBudgetStore.Snapshot(0, 0, 1, 1));
+        transaction.executeWithoutResult(ignored -> nodes.acknowledgeWorkerExit(first, firstClaim.claimEpoch()));
+        assertThat(budget.snapshot(runId).activeNodes()).isZero();
 
         MemberCompletionResult completed = transaction.execute(ignored -> waits.completeMember(
                 new MemberCompletionRequest(suspended.groupId(), "tree-call", WaitMemberState.SUCCEEDED,
@@ -484,7 +486,7 @@ class Stage3WaitContractPostgresTest {
     }
 
     @Test
-    void missingDispatchProofStillLeavesVisibleBlockedStopTask() throws Exception {
+    void canceledMemberWithoutPreDispatchProofNeedsNoSandboxStopTask() throws Exception {
         String runId = "run-external-stop-proof-missing";
         createRun(runId, 0, 0L);
         createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
@@ -497,9 +499,41 @@ class Stage3WaitContractPostgresTest {
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
             WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
-            assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getState())
-                    .isEqualTo("BLOCKED_PROOF");
-            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).hasSize(1);
+            assertThat(stops.findByWaitMemberId(memberId)).isEmpty();
+            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).isEmpty();
+            assertThat(groups.scanCanceledGroupsMissingStopTasks(0, 100))
+                    .extracting(WaitGroup::getId).doesNotContain(groupId);
+        }
+    }
+
+    @Test
+    void lateMemberStopsDispatchedSiblingAndCanceledGroupRepairIsIdempotent() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-late-sibling-stop", 2, 0L);
+        WaitGroupStore groups = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        String proof = "{\"operationId\":\"run:callb:1\",\"taskId\":\"task-b\","
+                + "\"requestFingerprint\":\"sha256:" + "b".repeat(64) + "\"}";
+        assertThat(groups.markMemberDispatched(fixture.groupId(), "call-b", "run:callb:1", proof,
+                OffsetDateTime.now(), fixture.runControlVersion())).isTrue();
+        long siblingId = memberByIdentity(fixture.groupId(), "call-b").getId();
+
+        MemberCompletionResult late = groups.reportLateMember(new LateMemberRequest(
+                fixture.groupId(), "call-a", "{\"note\":\"late\"}", null,
+                fixture.runControlVersion()));
+        assertThat(late.memberState()).isEqualTo(WaitMemberState.LATE);
+        assertThat(memberByIdentity(fixture.groupId(), "call-b").getState()).isEqualTo("CANCELED");
+        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
+            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            assertThat(stops.findByWaitMemberId(siblingId).orElseThrow().getState()).isEqualTo("PENDING");
+            // 模拟旧进程在组已取消后未留下停机任务：补扫仍能从成员派发证明找回责任。
+            execute("DELETE FROM alphafrog_agent_run_wait_member_stop WHERE wait_member_id = " + siblingId);
+            assertThat(groups.scanCanceledGroupsMissingStopTasks(0, 100))
+                    .extracting(WaitGroup::getId).contains(fixture.groupId());
+            assertThat(groups.ensureCanceledMemberStopTasks(fixture.groupId())).isEqualTo(1);
+            assertThat(groups.ensureCanceledMemberStopTasks(fixture.groupId())).isZero();
+            assertThat(stops.findByWaitMemberId(siblingId).orElseThrow().getState()).isEqualTo("PENDING");
+            assertThat(groups.scanCanceledGroupsMissingStopTasks(0, 100))
+                    .extracting(WaitGroup::getId).doesNotContain(fixture.groupId());
         }
     }
 

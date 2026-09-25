@@ -34,9 +34,13 @@ import world.willfrog.agentlangchain.control.dualpool.RecoveryBackoff;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
+import world.willfrog.alphafrogmicro.sandbox.idl.OperationCancelTarget;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 
@@ -77,8 +81,6 @@ public class WaitMemberResultReceiver {
     private static final String SUCCEEDED = "SUCCEEDED";
     private static final String CANCELED = "CANCELED";
     private static final String RESULT_LOST = "RESULT_LOST";
-    /** 按外部作业身份回查、权威地说「这个后台作业不存在」时给成员写的错误码。 */
-    private static final String TASK_NOT_FOUND = "wait_member_task_not_found";
     /** 夹具策略点了同一个等待组里不存在的成员时写的错误码。 */
     private static final String POLICY_PEER_UNKNOWN = "acceptance_fixture_policy_peer_unknown";
     /**
@@ -314,19 +316,23 @@ public class WaitMemberResultReceiver {
 
         String taskId = proof.taskId();
         if (taskId == null) {
-            TaskLookup lookup = lookupByOperation(proof.operationId());
+            TaskLookup lookup = lookupByOperation(proof);
             if (lookup.taskId() == null) {
                 if (lookup.notFound()) {
-                    // 权威地说「没建出来」：这次后台作业不存在，成员按失败落终态，
-                    // 否则等待链会一直等一个永远不会有的结果。
-                    finish(member, group, segment, run, proof, null, TASK_NOT_FOUND, "task_not_found",
-                            policy, outcome);
+                    // createTask 的网络请求可能尚未抵达 Sandbox。先写持久取消墓碑，
+                    // 再确认相同操作身份，才能排除迟到创建；仅凭此刻 found=false 不释放容量。
+                    taskId = tombstoneAbsentOperation(member, proof);
+                    if (taskId == null) {
+                        defer(member, now, "cancel_tombstone_unavailable");
+                        return;
+                    }
+                } else {
+                    defer(member, now, "task_lookup_unavailable");
                     return;
                 }
-                defer(member, now, "task_lookup_unavailable");
-                return;
+            } else {
+                taskId = lookup.taskId();
             }
-            taskId = lookup.taskId();
         }
 
         TaskStatusResponse status = queryStatus(taskId);
@@ -344,7 +350,8 @@ public class WaitMemberResultReceiver {
             defer(member, now, "result_unavailable");
             return;
         }
-        finish(member, group, segment, run, proof, new Terminal(taskId, statusName, result), null, null,
+        finish(member, group, segment, run, proof,
+                new Terminal(taskId, statusName, result, status.getFinishedAt()),
                 policy, outcome);
     }
 
@@ -640,9 +647,6 @@ public class WaitMemberResultReceiver {
     /**
      * 写成员终态并把放行交给恢复分发器。
      *
-     * <p>{@code terminal} 为空表示「作业本身不存在」这一种结论：这时没有结果体，成员按失败记，
-     * 错误码由 {@code failureCode} 给。两种情形用的是同一条写入语句，归属核对也同一份。</p>
-     *
      * <p>三种「按失败记」的来源有先后：{@code refusal}（夹具策略拒绝，例如点名了组里没有的成员）
      * 优先，其次是夹具点名按失败收尾，最后才是沙箱自己给的失败。夹具点名的是「这次调用按失败算」，
      * 而这条成员本来就已经失败时留真实原因、把夹具那句另记一处——把真因覆盖掉，排查时会误以为是
@@ -657,23 +661,19 @@ public class WaitMemberResultReceiver {
                         AgentRun run,
                         WaitMemberDispatchProof proof,
                         Terminal terminal,
-                        String failureCode,
-                        String reason,
                         AcceptanceReleasePolicy policy,
                         PolicyOutcome outcome) {
         ForcedFailure refusal = outcome == null ? null : outcome.refusal();
-        String output = terminal == null ? "" : pythonSandboxTools.formatTerminalResult(
+        String output = pythonSandboxTools.formatTerminalResult(
                 terminal.statusName(), terminal.result());
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
-        boolean success = terminal != null && SUCCEEDED.equals(terminal.statusName())
+        boolean success = SUCCEEDED.equals(terminal.statusName())
                 && terminal.result().getExitCode() == 0
                 && !WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
         boolean failedAlready = !success;
         boolean designatedApplied = false;
         Map<String, Object> extra = new LinkedHashMap<>();
-        if (terminal != null) {
-            extra.put("taskId", terminal.taskId());
-        }
+        extra.put("taskId", terminal.taskId());
         AcceptanceReleasePolicy.Rule designatedRule = policy == null
                 ? null
                 : ruleFor(policy, group, member)
@@ -690,20 +690,14 @@ public class WaitMemberResultReceiver {
             success = false;
             designatedApplied = true;
             if (failedAlready) {
-                extra.put("errorCode", failureCode != null ? failureCode : errorCodeOf(terminal.statusName()));
-                if (reason != null) {
-                    extra.put("errorDetail", reason);
-                }
+                extra.put("errorCode", errorCodeOf(terminal.statusName()));
                 extra.put("designatedFailure", designated);
             } else {
                 extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
                 extra.put("errorDetail", designated);
             }
         } else if (failedAlready) {
-            extra.put("errorCode", failureCode != null ? failureCode : errorCodeOf(terminal.statusName()));
-            if (reason != null) {
-                extra.put("errorDetail", reason);
-            }
+            extra.put("errorCode", errorCodeOf(terminal.statusName()));
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
@@ -712,9 +706,8 @@ public class WaitMemberResultReceiver {
         // 保持执行中，下一轮拿同一份证明重来（两步都是幂等的），绝不出现「成员已经落终态、
         // 名额还挂在账上」这种没人会再回来处理的状态。
         WaitMemberSettlement.Outcome settled = settlement.settle(member, proof,
-                terminal == null ? null : terminal.statusName(),
-                terminal == null ? null : terminal.result(),
-                output);
+                terminal.statusName(), terminal.result(),
+                output, terminal.finishedAt());
         if (!settled.ok()) {
             settlementFailures.incrementAndGet();
             log.warn("成员的结果已经拿到，但名额与用量还没收干净，先把这条成员推后：member={} reason={}",
@@ -731,7 +724,7 @@ public class WaitMemberResultReceiver {
                 member.getExternalOperationId(),
                 group.getPlanGeneration(),
                 segment.getContextVersion(),
-                run.getRunControlVersion()), member);
+                run.getRunControlVersion()), member, terminal.taskId());
         // 这条成员有结论了，压住的计时不再需要。成员终态只落一次，这一条在上面那条语句返回 0 行时
         // 也照样清掉：那时它已经在别处落过终态，计时留着只会白占内存。
         heldSinceByMember.remove(memberKey(member));
@@ -758,7 +751,7 @@ public class WaitMemberResultReceiver {
         }
         log.info("等待成员结果已接回：group={} member={} seq={} state={} 报告={}",
                 member.getGroupId(), member.getMemberIdentity(), member.getMemberSeq(),
-                result.memberState(), terminal == null ? reason : terminal.describe());
+                result.memberState(), terminal.describe());
         if (result.groupBecameReady()) {
             // 组齐备了：叫一次恢复分发器，让它尽快把下一段放出去。提醒丢了也不要紧，
             // 它自己的周期补扫与启动扫描会按数据库把这条通知重新发现。
@@ -770,14 +763,15 @@ public class WaitMemberResultReceiver {
     /**
      * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
      */
-    private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member) {
+    private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member,
+                                                           String taskId) {
         try {
             return waitGroupStore.completeMember(request);
         } catch (RuntimeException e) {
             log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity(), e);
             String compact = WaitMemberResultPayload.compactPersistFailure(
-                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage(), taskId);
             MemberCompletionRequest fallback = new MemberCompletionRequest(
                     request.groupId(),
                     request.memberIdentity(),
@@ -837,19 +831,53 @@ public class WaitMemberResultReceiver {
     }
 
     /** 按外部作业身份回查沙箱任务号：三种结论分开，只有权威的「没建出来」才当失败。 */
-    private TaskLookup lookupByOperation(String operationId) {
+    private TaskLookup lookupByOperation(WaitMemberDispatchProof proof) {
+        String operationId = proof.operationId();
         try {
             GetTaskByOperationIdResponse lookup = sandboxService.getTaskByOperationId(
                     GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
-            String taskId = lookup.getTaskId();
-            if (taskId != null && !taskId.isBlank()) {
-                return new TaskLookup(taskId, false);
+            if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()) {
+                return new TaskLookup(null, false);
             }
-            return new TaskLookup(null, true);
+            if (lookup.getFound()) {
+                if (lookup.getTaskId().isBlank()
+                        || !proof.requestFingerprint().equals(lookup.getRequestFingerprint())) {
+                    log.error("按外部作业身份回查的 Sandbox 身份不一致：operationId={}", operationId);
+                    return new TaskLookup(null, false);
+                }
+                return new TaskLookup(lookup.getTaskId(), false);
+            }
+            // Sandbox 合同只把 found=false、无 errorDetail、无错误文本认作权威不存在。
+            // found=false 却带任务身份是矛盾响应，不能据此归还容量。
+            return new TaskLookup(null, lookup.getTaskId().isBlank()
+                    && lookup.getRequestFingerprint().isBlank());
         } catch (Exception e) {
             log.warn("按外部作业身份回查沙箱任务暂时不可用：operationId={} reason={}",
                     operationId, e.getMessage());
             return new TaskLookup(null, false);
+        }
+    }
+
+    private String tombstoneAbsentOperation(WaitMember member, WaitMemberDispatchProof proof) {
+        if (member.getId() == null) return null;
+        try {
+            CancelTaskResponse cancel = sandboxService.cancelTask(CancelTaskRequest.newBuilder()
+                    .setByOperation(OperationCancelTarget.newBuilder()
+                            .setOperationId(proof.operationId())
+                            .setRequestFingerprint(proof.requestFingerprint()))
+                    .setCancelRequestId("wait-member-" + member.getId())
+                    .setReason("CREATE_RESULT_UNCERTAIN")
+                    .build());
+            if (cancel == null || cancel.hasErrorDetail() || !cancel.getError().isBlank()
+                    || cancel.getOutcome() == CancelOutcome.NOT_FOUND
+                    || cancel.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
+                    || cancel.getTaskId().isBlank()) return null;
+            TaskLookup verified = lookupByOperation(proof);
+            return cancel.getTaskId().equals(verified.taskId()) ? verified.taskId() : null;
+        } catch (RuntimeException e) {
+            log.warn("创建结果不确定时写 Sandbox 取消墓碑失败：member={} reason={}",
+                    member.getId(), e.getMessage());
+            return null;
         }
     }
 
@@ -881,7 +909,8 @@ public class WaitMemberResultReceiver {
     }
 
     /** 一次已经确认终态的外部作业：任务号、终态名和结果体。 */
-    private record Terminal(String taskId, String statusName, TaskResultResponse result) {
+    private record Terminal(String taskId, String statusName, TaskResultResponse result,
+                            String finishedAt) {
         private String describe() {
             return "task=" + taskId + " status=" + statusName;
         }

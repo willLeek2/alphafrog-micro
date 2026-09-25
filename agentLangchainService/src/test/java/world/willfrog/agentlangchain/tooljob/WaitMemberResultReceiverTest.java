@@ -31,6 +31,8 @@ import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
@@ -48,6 +50,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
@@ -102,7 +105,7 @@ class WaitMemberResultReceiverTest {
                         "agent.langchain.wait-member.receiver.backoff-max-ms", "15000",
                         "agent.langchain.wait-member.receiver.max-backoff-step", "6"),
                 4096, 1000L, new FrozenEffectiveSettings(), acceptancePolicies, releasePoints, ruleHits);
-        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
+        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
 
         Mockito.lenient().when(waitGroupStore.rescheduleMember(anyLong(), anyString(), any(), anyInt()))
@@ -220,7 +223,8 @@ class WaitMemberResultReceiverTest {
     void anUnconfirmedTaskIsResolvedByItsOperationId() {
         givenDueMemberWithProof(proof(null));
         when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
-                .thenReturn(GetTaskByOperationIdResponse.newBuilder().setTaskId("task-9").build());
+                .thenReturn(GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("task-9").setRequestFingerprint("sha256:fingerprint").build());
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
         completion(true, WaitMemberState.SUCCEEDED, null);
@@ -231,12 +235,20 @@ class WaitMemberResultReceiverTest {
         assertThat(capturedRequest().resultRefJson()).contains("task-9");
     }
 
-    /** 权威地说这个后台作业不存在：成员按失败落终态，不让等待链一直等一个不会有结果的任务。 */
+    /** 当前不存在仍可能有迟到 create；固定取消身份先建墓碑，再按终态结算。 */
     @Test
-    void anAuthoritativelyMissingTaskBecomesAFailureNotAWait() {
+    void aMissingOperationIsTombstonedBeforeCapacitySettlement() {
         givenDueMemberWithProof(proof(null));
         when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
-                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance(),
+                        GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                                .setTaskId("tombstone-1")
+                                .setRequestFingerprint("sha256:fingerprint").build());
+        when(sandboxService.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCELED).setTaskId("tombstone-1")
+                .setStatus("CANCELED").build());
+        status("CANCELED");
+        result("CANCELED", -1, "canceled before create");
         completion(true, WaitMemberState.FAILED, null);
 
         receiver.round();
@@ -244,9 +256,97 @@ class WaitMemberResultReceiverTest {
         MemberCompletionRequest request = capturedRequest();
         assertThat(request.memberState()).isEqualTo(WaitMemberState.FAILED);
         assertThat(request.resultRefJson())
-                .contains("wait_member_task_not_found")
-                .contains("task_not_found");
+                .contains("tombstone-1")
+                .doesNotContain("sandboxNoTaskProof");
+        verify(sandboxService).cancelTask(org.mockito.ArgumentMatchers.argThat(cancel ->
+                cancel.getCancelRequestId().equals("wait-member-41")
+                        && cancel.hasByOperation()
+                        && cancel.getByOperation().getOperationId().equals("op-1")
+                        && cancel.getByOperation().getRequestFingerprint().equals("sha256:fingerprint")));
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 0L);
+    }
+
+    /** 墓碑外调不确定时不能把瞬间不存在误当最终结论。 */
+    @Test
+    void missingOperationWithUncertainCancelKeepsMemberPending() {
+        givenDueMemberWithProof(proof(null));
+        when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+        when(sandboxService.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED).build());
+
+        receiver.round();
+
+        verify(waitGroupStore, never()).completeMember(any());
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 1L);
+    }
+
+    @Test
+    void tombstoneWithDifferentOperationBindingCannotSettleMember() {
+        givenDueMemberWithProof(proof(null));
+        when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance(),
+                        GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                                .setTaskId("tombstone-1")
+                                .setRequestFingerprint("sha256:another-request").build());
+        when(sandboxService.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCELED).setTaskId("tombstone-1")
+                .setStatus("CANCELED").build());
+
+        receiver.round();
+
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(waitGroupStore, never()).completeMember(any());
+    }
+
+    /** 结果正文无法保存时，短失败载荷仍须留下已结算的 Sandbox 任务号。 */
+    @Test
+    void compactPersistenceFallbackKeepsSandboxTaskIdentity() {
+        givenDueMember();
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        when(waitGroupStore.completeMember(any()))
+                .thenThrow(new IllegalStateException("unserializable result"))
+                .thenReturn(new MemberCompletionResult(true, WaitMemberState.FAILED,
+                        WaitGroupState.READY, 1, 1, null));
+
+        receiver.round();
+
+        ArgumentCaptor<MemberCompletionRequest> requests =
+                ArgumentCaptor.forClass(MemberCompletionRequest.class);
+        verify(waitGroupStore, times(2)).completeMember(requests.capture());
+        assertThat(requests.getAllValues().get(1).resultRefJson())
+                .contains("\"taskId\":\"task-1\"")
+                .contains(WaitMemberResultPayload.PERSIST_FAILED);
+    }
+
+    /** 远端失败不能被空任务号伪装成“权威未创建”，否则会提前归还容量。 */
+    @Test
+    void aLookupErrorDoesNotSettleOrPersistNoTaskProof() {
+        givenDueMemberWithProof(proof(null));
+        when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
+                .thenReturn(GetTaskByOperationIdResponse.newBuilder().setError("gateway unavailable").build());
+
+        receiver.round();
+
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(waitGroupStore, never()).completeMember(any());
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 1L);
+    }
+
+    /** 查到了别的请求身份也不能接到当前成员；任务号一样不足以证明归属。 */
+    @Test
+    void aLookupWithDifferentFingerprintDoesNotSettle() {
+        givenDueMemberWithProof(proof(null));
+        when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
+                .thenReturn(GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("task-9").setRequestFingerprint("sha256:wrong").build());
+
+        receiver.round();
+
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(waitGroupStore, never()).completeMember(any());
     }
 
     /** 回查暂时问不到：只推后，不写终态——远端说不清不能当结论。 */
@@ -367,7 +467,7 @@ class WaitMemberResultReceiverTest {
         givenDueMember();
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
-        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any()))
+        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(false, "release:NOT_FOUND"));
 
         receiver.round();
@@ -392,7 +492,7 @@ class WaitMemberResultReceiverTest {
 
         ArgumentCaptor<String> statusName = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<String> preview = ArgumentCaptor.forClass(String.class);
-        verify(settlement).settle(any(), any(), statusName.capture(), any(), preview.capture());
+        verify(settlement).settle(any(), any(), statusName.capture(), any(), preview.capture(), any());
         assertThat(statusName.getValue()).isEqualTo("SUCCEEDED");
         assertThat(preview.getValue())
                 .as("交给收尾的正文与写进成员结果的是同一份")
@@ -489,7 +589,7 @@ class WaitMemberResultReceiverTest {
                 .contains("这个场景要造一条失败成员")
                 .contains("done");
         // 名额与用量照常收尾：被点名按失败收尾不等于这次调用没发生过。
-        verify(settlement).settle(any(), any(), any(), any(), any());
+        verify(settlement).settle(any(), any(), any(), any(), any(), any());
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDesignatedFailuresTotal", 1L);
     }
 
@@ -514,7 +614,7 @@ class WaitMemberResultReceiverTest {
                 .contains("acceptance_fixture_policy_peer_unknown")
                 .contains("tc-missing");
         ArgumentCaptor<String> settledStatus = ArgumentCaptor.forClass(String.class);
-        verify(settlement).settle(any(), any(), settledStatus.capture(), any(), any());
+        verify(settlement).settle(any(), any(), settledStatus.capture(), any(), any(), any());
         assertThat(settledStatus.getValue())
                 .as("按沙箱自己的终态结算，名额与用量照实记")
                 .isEqualTo("SUCCEEDED");
@@ -544,7 +644,7 @@ class WaitMemberResultReceiverTest {
         assertThat(capturedRequest().resultRefJson())
                 .contains("acceptance_fixture_policy_unreadable")
                 .contains("acceptance_fixture_identity_changed");
-        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), any());
+        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), any(), any());
         verify(waitGroupStore, never()).rescheduleMember(anyLong(), anyString(), any(), anyInt());
         assertThat(receiver.snapshot())
                 .containsEntry("waitMemberReceiverCompletedTotal", 1L)
@@ -558,7 +658,7 @@ class WaitMemberResultReceiverTest {
         policyOf(peerRule("tc-missing"));
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
-        when(settlement.settle(any(), any(), any(), any(), any()))
+        when(settlement.settle(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(false, "reservation_busy"));
 
         receiver.round();
@@ -569,7 +669,7 @@ class WaitMemberResultReceiverTest {
                 .containsEntry("waitMemberReceiverPolicyRefusalsTotal", 0L)
                 .containsEntry("waitMemberReceiverDeferredTotal", 1L);
 
-        when(settlement.settle(any(), any(), any(), any(), any()))
+        when(settlement.settle(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
         completion(true, WaitMemberState.FAILED, null);
         receiver.round();
@@ -727,6 +827,7 @@ class WaitMemberResultReceiverTest {
                 .thenAnswer(invocation -> TaskStatusResponse.newBuilder()
                         .setTaskId(invocation.getArgument(0, GetTaskStatusRequest.class).getTaskId())
                         .setStatus(statusName)
+                        .setFinishedAt("2026-09-25T02:03:04.123456")
                         .build());
     }
 

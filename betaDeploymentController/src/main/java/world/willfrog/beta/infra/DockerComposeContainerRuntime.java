@@ -366,6 +366,9 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         boolean agentService = "agent-service".equals(service.path("serviceName").asText());
         boolean laneDeployment = !"main-beta".equals(plan.trafficScopeId());
         if (agentService) {
+            // 节点额度只能在旧 JVM 物理退出后回收。宿主 PID 空间与 machine-id 让
+            // Docker 重建后仍可核验旧 PID；其他服务无需共享宿主进程空间。
+            app.put("pid", "host");
             // 长工具进程级故障演练会让 Agent 主进程立即退出。由 Docker 用原容器、原镜像和
             // 原环境重新拉起，避免把「恢复同一部署」误做成一次新的蓝绿发布。
             app.put("restart", "unless-stopped");
@@ -474,6 +477,9 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         port.put("mode", "host");
         ArrayNode volumes = app.putArray("volumes");
         volumes.add(properties.getHealthcheckScript().toString() + ':' + properties.getHealthcheckScript() + ":ro");
+        if (agentService) {
+            volumes.add("/etc/machine-id:/run/alphafrog/host-machine-id:ro");
+        }
         if (template != null) {
             if (template.isJavaAgentEnabled()) {
                 String javaAgentContainerPath = "/otel/javaagent.jar";

@@ -179,6 +179,47 @@
          ORDER BY id LIMIT #{limit}
     </select>
 
+    <!-- 取消请求可能在 Run 终态落库之后、等待链收口之前中断。逐组补扫保留真实的停机责任。 -->
+    <select id="scanOpenGroupsWithStoppedRun" resultMap="WaitGroupResultMap">
+        SELECT g.id, g.run_id, g.plan_generation, g.node_id, g.node_attempt,
+               g.segment_sequence, g.model_turn, g.scheduler_version,
+               g.next_segment_sequence, g.state, g.expected_members,
+               g.completed_members, g.recovery_generation, g.ready_at,
+               g.created_at, g.updated_at
+          FROM alphafrog_agent_run_wait_group g
+          JOIN alphafrog_agent_run r ON r.id = g.run_id
+         WHERE g.id &gt; #{afterGroupId}
+           AND g.state IN ('WAITING', 'READY')
+           AND (
+               r.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED', 'CANCELING')
+               OR (r.status = 'WAITING_TOOL_JOB'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED')
+           )
+         ORDER BY g.id LIMIT #{limit}
+    </select>
+
+    <!-- reportLateMember 已把组与兄弟成员取消时，若进程在旧代码路径退出，按持久事实补建停机任务。 -->
+    <select id="scanCanceledGroupsMissingStopTasks" resultMap="WaitGroupResultMap">
+        SELECT g.id, g.run_id, g.plan_generation, g.node_id, g.node_attempt,
+               g.segment_sequence, g.model_turn, g.scheduler_version,
+               g.next_segment_sequence, g.state, g.expected_members,
+               g.completed_members, g.recovery_generation, g.ready_at,
+               g.created_at, g.updated_at
+          FROM alphafrog_agent_run_wait_group g
+         WHERE g.id &gt; #{afterGroupId}
+           AND g.state = 'CANCELED'
+           AND EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member m
+                WHERE m.group_id = g.id AND m.state = 'CANCELED'
+                  AND m.tool_name = 'executePython'
+                  AND m.external_operation_id IS NOT NULL
+                  AND m.dispatch_proof_json IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                       WHERE s.wait_member_id = m.id))
+         ORDER BY g.id LIMIT #{limit}
+    </select>
+
     <select id="listMembers" resultMap="WaitMemberResultMap">
         SELECT id,
                group_id,
@@ -280,6 +321,92 @@
         ORDER BY next_poll_at, id
         LIMIT #{limit}
     </select>
+
+    <!-- 启动时恢复容量账本：未决成员，以及已取消/迟到但停机尚未确认的 Python 成员。 -->
+    <select id="scanUnresolvedPythonMembersForCapacity" resultMap="WaitMemberResultMap">
+        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity, m.tool_call_id,
+               m.tool_name, m.external_operation_id, m.state,
+               m.result_ref_json::text AS result_ref_json,
+               m.dispatch_proof_json::text AS dispatch_proof_json,
+               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at, m.created_at, m.updated_at
+          FROM alphafrog_agent_run_wait_member m
+          JOIN alphafrog_agent_run r ON r.id = m.run_id
+         WHERE m.id &gt; #{afterMemberId}
+           AND r.deployment_id = #{deploymentId}
+           AND r.deployment_generation_id = #{deploymentGenerationId}
+           AND m.tool_name = 'executePython'
+           AND (m.state IN ('PENDING', 'RUNNING')
+                OR (m.state IN ('CANCELED', 'LATE') AND (
+                    m.dispatch_proof_json IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                         WHERE s.wait_member_id = m.id AND s.state &lt;&gt; 'CONFIRMED'))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM alphafrog_agent_run_wait_member_stop confirmed
+                         WHERE confirmed.wait_member_id = m.id AND confirmed.state = 'CONFIRMED')))
+         ORDER BY m.id LIMIT #{limit}
+    </select>
+
+    <!-- 创建前请求身份已落库、但旧派发线程退出前未记录 createTask 结论的成员。 -->
+    <select id="scanPendingPythonMembersWithProof" resultMap="WaitMemberResultMap">
+        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity, m.tool_call_id,
+               m.tool_name, m.external_operation_id, m.state,
+               m.result_ref_json::text AS result_ref_json,
+               m.dispatch_proof_json::text AS dispatch_proof_json,
+               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at, m.created_at, m.updated_at
+          FROM alphafrog_agent_run_wait_member m
+          JOIN alphafrog_agent_run_wait_group g ON g.id = m.group_id AND g.state = 'WAITING'
+          JOIN alphafrog_agent_run r ON r.id = g.run_id AND r.status = 'EXECUTING'
+         WHERE m.id &gt; #{afterMemberId}
+           AND r.deployment_id = #{deploymentId}
+           AND r.deployment_generation_id = #{deploymentGenerationId}
+           AND m.tool_name = 'executePython' AND m.state = 'PENDING'
+           AND m.external_operation_id IS NOT NULL
+           AND m.dispatch_proof_json IS NOT NULL
+           AND m.dispatch_proof_json -&gt;&gt; 'taskId' IS NULL
+         ORDER BY m.id LIMIT #{limit}
+    </select>
+
+    <sql id="safePendingPythonRecovery">
+        m.id = #{memberId}
+        AND m.tool_name = 'executePython' AND m.state = 'PENDING'
+        AND m.external_operation_id = #{operationId}
+        AND m.dispatch_proof_json -&gt;&gt; 'operationId' = #{operationId}
+        AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+        AND m.dispatch_proof_json -&gt;&gt; 'taskId' IS NULL
+        AND g.id = m.group_id AND g.state = 'WAITING'
+        AND r.id = g.run_id AND r.status = 'EXECUTING'
+        AND wi.id = #{workItemId}
+        AND wi.run_id = g.run_id AND wi.plan_generation = g.plan_generation
+        AND wi.node_id = g.node_id AND wi.node_attempt = g.node_attempt
+        AND wi.segment_sequence = g.segment_sequence
+        AND wi.claim_epoch = #{claimEpoch} AND wi.claimed_by = #{claimedBy}
+        AND wi.state IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE', 'WAITING', 'RESUMABLE')
+        AND node_budget.operation_id = 'active-node:' || wi.id || ':' || wi.claim_epoch
+        AND node_budget.kind = 'ACTIVE_NODE' AND node_budget.state = 'RELEASED'
+    </sql>
+
+    <select id="countSafePendingPythonRecovery" resultType="int">
+        SELECT count(*)
+          FROM alphafrog_agent_run_wait_member m,
+               alphafrog_agent_run_wait_group g,
+               alphafrog_agent_run r,
+               alphafrog_agent_run_work_item wi,
+               alphafrog_agent_run_tree_budget_operation node_budget
+         WHERE <include refid="safePendingPythonRecovery"/>
+    </select>
+
+    <!-- Sandbox 已接纳同一 cancelRequestId 的墓碑后才开放轮询；再次核对原 worker 的额度已归还。 -->
+    <update id="recoverPendingPythonMember">
+        UPDATE alphafrog_agent_run_wait_member m
+           SET state = 'RUNNING', next_poll_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+          FROM alphafrog_agent_run_wait_group g,
+               alphafrog_agent_run r,
+               alphafrog_agent_run_work_item wi,
+               alphafrog_agent_run_tree_budget_operation node_budget
+         WHERE <include refid="safePendingPythonRecovery"/>
+    </update>
 
     <select id="scanDueSubAgentMembers" resultMap="WaitMemberResultMap">
         SELECT id, group_id, run_id, member_seq, member_identity, tool_call_id,
@@ -428,7 +555,6 @@
         segment_closed AS (
             UPDATE alphafrog_agent_run_work_item wi SET
                 state = 'RESULT_COMMITTED',
-                claimed_by = NULL,
                 lease_expires_at = NULL,
                 payload_json = wi.payload_json || CAST(#{suspensionPayloadJson} AS jsonb),
                 updated_at = CURRENT_TIMESTAMP
@@ -700,6 +826,28 @@
             FROM group_stopped s
             WHERE m.group_id = s.id
               AND m.state IN ('PENDING', 'RUNNING')
+              AND m.id &lt;&gt; (SELECT id FROM member_late)
+            RETURNING m.id, m.run_id, m.group_id, m.tool_name,
+                      m.external_operation_id, m.dispatch_proof_json
+        ),
+        stop_queued AS (
+            INSERT INTO alphafrog_agent_run_wait_member_stop (
+                wait_member_id, run_id, group_id, operation_id, task_id,
+                request_fingerprint, cancel_request_id, state)
+            SELECT m.id, m.run_id, m.group_id, m.external_operation_id,
+                   NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', ''),
+                   NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', ''),
+                   'wait-member-' || m.id::text,
+                   CASE WHEN m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
+                             AND m.external_operation_id ~ '^[^:\s]+:[^:\s]+:[1-9][0-9]*$'
+                             AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
+                                 ~ '^sha256:[0-9a-f]{64}$'
+                        THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
+              FROM siblings_canceled m
+             WHERE m.tool_name = 'executePython'
+               AND m.external_operation_id IS NOT NULL
+               AND m.dispatch_proof_json IS NOT NULL
+            ON CONFLICT (wait_member_id) DO NOTHING
             RETURNING 1
         ),
         segment_canceled AS (
@@ -738,7 +886,8 @@
             NULL::int AS recovery_generation,
             NULL::bigint AS notification_id,
             (SELECT count(*) FROM member_late) AS written_members,
-            (SELECT count(*) FROM siblings_canceled) AS written_siblings
+            (SELECT count(*) FROM siblings_canceled) AS written_siblings,
+            (SELECT count(*) FROM stop_queued) AS stop_tasks_queued
     </select>
 
     <!-- ==================== 恢复消费 ==================== -->
@@ -957,9 +1106,11 @@
                              AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
                                  ~ '^sha256:[0-9a-f]{64}$'
                         THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
-              FROM members_canceled m
+             FROM members_canceled m
              WHERE m.tool_name = 'executePython'
                AND m.external_operation_id IS NOT NULL
+               -- 创建 Sandbox 作业之前必须先写派发证明；这里没有证明表示请求尚未发出。
+               AND m.dispatch_proof_json IS NOT NULL
             ON CONFLICT (wait_member_id) DO NOTHING
             RETURNING 1
         ),
@@ -989,11 +1140,46 @@
             (SELECT count(*) FROM group_stopped) AS groups_canceled,
             (SELECT count(*) FROM members_canceled) AS members_canceled,
             (SELECT count(*) FROM stop_queued) AS stop_tasks_queued,
-            (SELECT count(*) FROM segments_canceled) AS segments_canceled,
+            (SELECT count(*) FROM segment_canceled) AS segments_canceled,
             (SELECT count(*) FROM notification_canceled) AS notifications_canceled
     </select>
 
     <!-- ==================== 成员派发 ==================== -->
+
+    <!-- 取消组内已有派发证明但尚无停机任务的 Python 成员；唯一约束使重复补扫无副作用。 -->
+    <select id="ensureCanceledMemberStopTasks" resultType="java.lang.Integer"
+            affectData="true" flushCache="true">
+        WITH run_fence AS (
+            SELECT r.id AS run_id, g.id AS group_id
+              FROM alphafrog_agent_run r
+              JOIN alphafrog_agent_run_wait_group g ON g.id = #{groupId} AND g.run_id = r.id
+             WHERE g.state = 'CANCELED'
+             FOR UPDATE OF r
+        ),
+        stop_queued AS (
+            INSERT INTO alphafrog_agent_run_wait_member_stop (
+                wait_member_id, run_id, group_id, operation_id, task_id,
+                request_fingerprint, cancel_request_id, state)
+            SELECT m.id, m.run_id, m.group_id, m.external_operation_id,
+                   NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', ''),
+                   NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', ''),
+                   'wait-member-' || m.id::text,
+                   CASE WHEN m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
+                             AND m.external_operation_id ~ '^[^:\s]+:[^:\s]+:[1-9][0-9]*$'
+                             AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
+                                 ~ '^sha256:[0-9a-f]{64}$'
+                        THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
+              FROM run_fence f
+              JOIN alphafrog_agent_run_wait_member m ON m.group_id = f.group_id
+             WHERE m.state = 'CANCELED'
+               AND m.tool_name = 'executePython'
+               AND m.external_operation_id IS NOT NULL
+               AND m.dispatch_proof_json IS NOT NULL
+            ON CONFLICT (wait_member_id) DO NOTHING
+            RETURNING 1
+        )
+        SELECT count(*) FROM stop_queued
+    </select>
 
     <!--
       派发成功：成员从「已保存待派发」进入「已派发执行中」，同时把外部作业身份与派发证明写上。

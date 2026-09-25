@@ -21,6 +21,12 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalRecorder;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisUpsertOutcome;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
+import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
+import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.platform.service.DataAnalysisObservabilityService;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 import java.time.Instant;
@@ -29,6 +35,9 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -38,7 +47,7 @@ import static org.mockito.Mockito.when;
  *
  * <p>这里量四件事：正常终态走「终态已确认 → 还名额 → 写用量」，还名额时带的是那份终态信封；
  * 账本说已经还过（或者挂着别的名额）时不重复还、但用量照记；任何一步没成都不下结论（返回原因、
- * 由调用方推后重来）；「后台作业不存在」那一条走建任务被否定那条路、没有用量可记。</p>
+ * 由调用方推后重来）；创建前取消墓碑也有 Sandbox 终态，按同一路径记录用量。</p>
  */
 class WaitMemberSettlementTest {
 
@@ -46,6 +55,7 @@ class WaitMemberSettlementTest {
     private static final String TOOL_CALL_ID = "call-1";
     private static final int ATTEMPT = 1;
     private static final String TASK_ID = "task-9";
+    private static final String FINISHED_AT = "2026-09-25T02:03:04.123456";
 
     /** 与生产同一套模块：凭证里带时刻，读它要认 Java 时间类型。 */
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
@@ -82,7 +92,7 @@ class WaitMemberSettlementTest {
         when(terminalRecorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation),
-                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "{\"stdout\":\"done\"}");
+                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "{\"stdout\":\"done\"}", FINISHED_AT);
 
         assertThat(outcome.ok()).isTrue();
 
@@ -99,6 +109,7 @@ class WaitMemberSettlementTest {
                 .isEqualTo(DataAnalysisReservationState.TERMINAL_CONFIRMED);
         assertThat(envelope.taskId()).isEqualTo(TASK_ID);
         assertThat(envelope.operationId()).isEqualTo(operationId());
+        assertThat(envelope.terminalAt()).isEqualTo(Instant.parse("2026-09-25T02:03:04.123456Z"));
         assertThat(envelope.success()).isTrue();
         assertThat(envelope.background()).as("这是后台作业的结果接回").isTrue();
 
@@ -112,13 +123,14 @@ class WaitMemberSettlementTest {
     @Test
     void aLedgerConflictKeepsTheMemberUnsettled() {
         when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.CONFLICT);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.CONFLICT);
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation), "SUCCEEDED",
-                result("SUCCEEDED", 0, "done", null), "{\"stdout\":\"done\"}");
+                result("SUCCEEDED", 0, "done", null), "{\"stdout\":\"done\"}", FINISHED_AT);
         assertThat(outcome.ok()).isFalse();
         assertThat(outcome.reason()).isEqualTo("capacity_reservation_conflict");
 
-        verify(capacityService, never()).releaseReservation(any());
+        verify(capacityService).releaseReservation(any());
         verify(terminalRecorder, never()).upsert(any());
     }
 
@@ -129,7 +141,7 @@ class WaitMemberSettlementTest {
         when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.NOT_FOUND);
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation),
-                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "out");
+                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "out", FINISHED_AT);
 
         assertThat(outcome.ok()).isFalse();
         assertThat(outcome.reason()).startsWith("release:");
@@ -143,7 +155,7 @@ class WaitMemberSettlementTest {
                 .thenThrow(new IllegalStateException("容量账本正在恢复"));
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation),
-                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "out");
+                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "out", FINISHED_AT);
 
         assertThat(outcome.ok()).isFalse();
         assertThat(outcome.reason()).isEqualTo("restore_error");
@@ -158,30 +170,10 @@ class WaitMemberSettlementTest {
         when(terminalRecorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.CONFLICT);
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation),
-                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "out");
+                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "out", FINISHED_AT);
 
         assertThat(outcome.ok()).isFalse();
         assertThat(outcome.reason()).startsWith("usage:");
-    }
-
-    /** 权威地说这个后台作业不存在：按建任务被否定还名额，没有用量可记。 */
-    @Test
-    void aTaskThatWasNeverCreatedIsReleasedWithoutUsage() {
-        DataAnalysisReservation preparing = new DataAnalysisReservation(operationId(),
-                reservation.identity(), DataAnalysisResourceClass.STANDARD, 2,
-                DataAnalysisReservationState.PREPARING, null, Instant.now());
-        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-
-        WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(preparing), null, null, "");
-
-        assertThat(outcome.ok()).isTrue();
-        ArgumentCaptor<DataAnalysisReleaseRequest> release =
-                ArgumentCaptor.forClass(DataAnalysisReleaseRequest.class);
-        verify(capacityService).releaseReservation(release.capture());
-        assertThat(release.getValue().reason())
-                .isEqualTo(DataAnalysisReleaseReason.CREATE_NOT_STARTED);
-        assertThat(release.getValue().proof()).isInstanceOf(DataAnalysisReleaseProof.PreDispatchAbort.class);
-        verify(terminalRecorder, never()).upsert(any());
     }
 
     /** 准备凭证先落库、取消先于建任务：Sandbox 的取消墓碑有真实终态结果，应按终态记录用量。 */
@@ -195,7 +187,8 @@ class WaitMemberSettlementTest {
         when(terminalRecorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(preparing),
-                "CANCELED", result("CANCELED", 0, "", "canceled before create"), "canceled before create");
+                "CANCELED", result("CANCELED", 0, "", "canceled before create"),
+                "canceled before create", FINISHED_AT);
 
         assertThat(outcome.ok()).isTrue();
         ArgumentCaptor<DataAnalysisReleaseRequest> release =
@@ -212,13 +205,86 @@ class WaitMemberSettlementTest {
         verify(terminalRecorder).upsert(any());
     }
 
-    /** 凭证与结论对不上（说不存在、凭证却绑着任务）：不猜，退回重来。 */
+    /** 真实容量账本须走 PREPARING→TASK_ATTACHED→终态；写用量失败后重试仍能结清。 */
     @Test
-    void aStateMismatchIsNotGuessed() {
-        WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation), null, null, "");
+    void preparingTombstoneSettlesAndRetryAfterReleaseDoesNotReopenCapacity() {
+        DataAnalysisReservation preparing = new DataAnalysisReservation(operationId(),
+                reservation.identity(), DataAnalysisResourceClass.STANDARD, 2,
+                DataAnalysisReservationState.PREPARING, null, Instant.now());
+        DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
+        DataAnalysisCapacityServiceImpl realCapacity = new DataAnalysisCapacityServiceImpl(properties);
+        realCapacity.recover(List.of(preparing), properties.getMaxUnits(),
+                properties.getMaxHeavyActive());
+        WaitMemberSettlement realSettlement = new WaitMemberSettlement(
+                realCapacity, terminalRecorder, objectMapper);
+        when(terminalRecorder.upsert(any()))
+                .thenReturn(DataAnalysisUpsertOutcome.CONFLICT, DataAnalysisUpsertOutcome.INSERTED);
+
+        WaitMemberDispatchProof preproof = proof(preparing);
+        TaskResultResponse tombstone = result("CANCELED", -1, "", "canceled before create");
+        WaitMemberSettlement.Outcome first = realSettlement.settle(member, preproof,
+                "CANCELED", tombstone, "canceled before create", FINISHED_AT);
+        assertThat(first.ok()).isFalse();
+        assertThat(first.reason()).startsWith("usage:");
+
+        WaitMemberSettlement.Outcome retry = realSettlement.settle(member, preproof,
+                "CANCELED", tombstone, "canceled before create", FINISHED_AT);
+        assertThat(retry.ok()).isTrue();
+        verify(terminalRecorder, org.mockito.Mockito.times(2)).upsert(any());
+    }
+
+    /** 用量已进 Run 快照、成员还没落终态时，重试必须读到同一完成时间并命中真实幂等记录。 */
+    @Test
+    void retryAfterUsageInsertUsesStableSandboxFinishedAt() {
+        DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
+        DataAnalysisCapacityServiceImpl realCapacity = new DataAnalysisCapacityServiceImpl(properties);
+        realCapacity.recover(List.of(reservation), properties.getMaxUnits(),
+                properties.getMaxHeavyActive());
+        AgentRunMapper runMapper = Mockito.mock(AgentRunMapper.class);
+        AgentRunStateStore cache = Mockito.mock(AgentRunStateStore.class);
+        AgentRun run = new AgentRun();
+        run.setId(RUN_ID);
+        run.setSnapshotJson("{}");
+        when(runMapper.findById(RUN_ID)).thenReturn(run);
+        when(runMapper.casUpdateDataAnalysisObservability(eq(RUN_ID), isNull(), anyString()))
+                .thenAnswer(invocation -> {
+                    String snapshot = invocation.getArgument(2);
+                    run.setSnapshotJson("{\"data_analysis_observability\":" + snapshot + "}");
+                    return 1;
+                });
+        DataAnalysisObservabilityService realRecorder =
+                new DataAnalysisObservabilityService(runMapper, cache, objectMapper);
+        WaitMemberSettlement realSettlement = new WaitMemberSettlement(
+                realCapacity, realRecorder, objectMapper);
+        WaitMemberDispatchProof storedProof = proof(reservation);
+        TaskResultResponse terminal = result("SUCCEEDED", 0, "done", null);
+
+        // 模拟第一次用量已写成功，随后成员终态写库失败：再次调用相同结算流程。
+        assertThat(realSettlement.settle(member, storedProof, "SUCCEEDED", terminal,
+                "done", FINISHED_AT).ok()).isTrue();
+        assertThat(realSettlement.settle(member, storedProof, "SUCCEEDED", terminal,
+                "done", FINISHED_AT).ok()).isTrue();
+        verify(runMapper, org.mockito.Mockito.times(1))
+                .casUpdateDataAnalysisObservability(eq(RUN_ID), isNull(), anyString());
+    }
+
+    /** 没有 Sandbox 终态结果时不凭空释放容量。 */
+    @Test
+    void missingTerminalResultCannotSettle() {
+        WaitMemberSettlement.Outcome outcome = settlement.settle(
+                member, proof(reservation), null, null, "", FINISHED_AT);
 
         assertThat(outcome.ok()).isFalse();
-        assertThat(outcome.reason()).contains("reservation_state_mismatch");
+        assertThat(outcome.reason()).isEqualTo("terminal_result_missing");
+        verify(capacityService, never()).releaseReservation(any());
+    }
+
+    @Test
+    void missingSandboxFinishedAtDoesNotReleaseCapacity() {
+        WaitMemberSettlement.Outcome outcome = settlement.settle(member, proof(reservation),
+                "SUCCEEDED", result("SUCCEEDED", 0, "done", null), "done", "");
+        assertThat(outcome.ok()).isFalse();
+        assertThat(outcome.reason()).isEqualTo("envelope_unbuildable");
         verify(capacityService, never()).releaseReservation(any());
     }
 
@@ -231,7 +297,7 @@ class WaitMemberSettlementTest {
         String huge = "x".repeat(DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES + 5000);
 
         assertThat(settlement.settle(member, proof(reservation), "SUCCEEDED",
-                result("SUCCEEDED", 0, "done", null), huge).ok()).isTrue();
+                result("SUCCEEDED", 0, "done", null), huge, FINISHED_AT).ok()).isTrue();
 
         ArgumentCaptor<DataAnalysisTerminalEnvelope> recorded =
                 ArgumentCaptor.forClass(DataAnalysisTerminalEnvelope.class);
@@ -250,7 +316,7 @@ class WaitMemberSettlementTest {
                 OffsetDateTime.now().toString());
 
         WaitMemberSettlement.Outcome outcome = settlement.settle(member, broken, "SUCCEEDED",
-                result("SUCCEEDED", 0, "done", null), "out");
+                result("SUCCEEDED", 0, "done", null), "out", FINISHED_AT);
 
         assertThat(outcome.ok()).isFalse();
         assertThat(outcome.reason()).isEqualTo("reservation_unreadable");

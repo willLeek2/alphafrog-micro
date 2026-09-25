@@ -39,6 +39,31 @@ public interface WaitGroupMapper {
                                         @Param("afterGroupId") long afterGroupId,
                                         @Param("limit") int limit);
 
+    List<WaitGroup> scanOpenGroupsWithStoppedRun(@Param("afterGroupId") long afterGroupId,
+                                                  @Param("limit") int limit);
+
+    List<WaitGroup> scanCanceledGroupsMissingStopTasks(@Param("afterGroupId") long afterGroupId,
+                                                       @Param("limit") int limit);
+
+    List<WaitMember> scanPendingPythonMembersWithProof(@Param("deploymentId") String deploymentId,
+                                                        @Param("deploymentGenerationId") String deploymentGenerationId,
+                                                        @Param("afterMemberId") long afterMemberId,
+                                                        @Param("limit") int limit);
+
+    int countSafePendingPythonRecovery(@Param("memberId") long memberId,
+                                       @Param("workItemId") long workItemId,
+                                       @Param("claimEpoch") int claimEpoch,
+                                       @Param("claimedBy") String claimedBy,
+                                       @Param("operationId") String operationId,
+                                       @Param("requestFingerprint") String requestFingerprint);
+
+    int recoverPendingPythonMember(@Param("memberId") long memberId,
+                                   @Param("workItemId") long workItemId,
+                                   @Param("claimEpoch") int claimEpoch,
+                                   @Param("claimedBy") String claimedBy,
+                                   @Param("operationId") String operationId,
+                                   @Param("requestFingerprint") String requestFingerprint);
+
     List<WaitMember> listMembers(@Param("groupId") long groupId);
 
     WaitMember findMemberByOperation(@Param("runId") String runId,
@@ -148,6 +173,8 @@ public interface WaitGroupMapper {
     /** 组、还没结束的成员、下一段与还没被取走的通知一起停。 */
     WaitChainCancelRow cancelChain(@Param("groupId") long groupId);
 
+    Integer ensureCanceledMemberStopTasks(@Param("groupId") long groupId);
+
     // ===== 成员派发 =====
 
     int recordMemberPreparing(@Param("groupId") long groupId,
@@ -172,6 +199,11 @@ public interface WaitGroupMapper {
     /** 到点该查询外部作业状态的成员：还在执行中、下次查询时间已到。 */
     List<WaitMember> scanDueMembers(@Param("now") OffsetDateTime now,
                                    @Param("limit") int limit);
+
+    List<WaitMember> scanUnresolvedPythonMembersForCapacity(@Param("deploymentId") String deploymentId,
+                                                             @Param("deploymentGenerationId") String deploymentGenerationId,
+                                                             @Param("afterMemberId") long afterMemberId,
+                                                             @Param("limit") int limit);
 
     List<WaitMember> scanDueSubAgentMembers(@Param("now") OffsetDateTime now,
                                             @Param("limit") int limit);

@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * {@link NodeWorkItemStore} 的 MyBatis 实现。
@@ -28,17 +29,23 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
 
     private final NodeWorkItemMapper mapper;
     private final RootTreeActivityBudget activityBudget;
+    private final Predicate<String> processExited;
 
     @Autowired
     public MybatisNodeWorkItemStore(NodeWorkItemMapper mapper, RootTreeActivityBudget activityBudget) {
+        this(mapper, activityBudget, NodeWorkerProcessProof::definitelyExited);
+    }
+
+    MybatisNodeWorkItemStore(NodeWorkItemMapper mapper, RootTreeActivityBudget activityBudget,
+                             Predicate<String> processExited) {
         this.mapper = mapper;
         this.activityBudget = activityBudget;
+        this.processExited = processExited;
     }
 
     /** 旧合同测试的窄构造器；生产只注入带根树额度的构造器。 */
     public MybatisNodeWorkItemStore(NodeWorkItemMapper mapper) {
-        this.mapper = mapper;
-        this.activityBudget = null;
+        this(mapper, null, NodeWorkerProcessProof::definitelyExited);
     }
 
     @Override
@@ -167,7 +174,6 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), objectPayload(payloadPatchJson));
         if (rows == 1) {
-            releaseIfActive(before);
             return NodeWorkItemMutationResult.success();
         }
         return rejectWithEpochCheck(identity, versions, versions.claimEpoch(), externalSideEffectRef);
@@ -186,7 +192,6 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         int rows = mapper.suspendForToolJob(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), claimant, operationId, toolCallId, attempt);
-        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
@@ -203,7 +208,6 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId,
                 objectPayload(anchorJson), objectPayload(resumePayloadJson));
-        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
@@ -220,7 +224,6 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId,
                 objectPayload(payloadPatchJson));
-        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), externalSideEffectRef);
     }
@@ -234,6 +237,10 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         requireVersion(schedulerVersion);
         requireFence(fence);
         NodeWorkItem before = activityBefore(identity);
+        if (activityBudget != null && before != null
+                && !processExited.test(before.getClaimedBy())) {
+            throw new IllegalStateException("原节点进程尚未确认退出，不能重新领取或归还额度：" + identity.describe());
+        }
         int rows = mapper.requeueAbandonedClaim(identity.runId(), identity.planGeneration(),
                 identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(),
                 versions.contextVersion(), versions.runControlVersion(), versions.claimEpoch(),
@@ -257,7 +264,6 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                 identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId);
-        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
@@ -272,7 +278,6 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         NodeWorkItem before = activityBefore(identity);
         int rows = mapper.reportExecutionFailure(identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), claimEpoch, claimant, reason);
-        if (rows == 1) releaseIfActive(before);
         return rows == 1 ? NodeWorkItemMutationResult.success()
                 : rejectWithEpochCheck(identity, null, claimEpoch, null);
     }
@@ -356,6 +361,10 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                     || before.getClaimEpoch() != expectedClaimEpoch) {
                 return Optional.empty();
             }
+            if (!processExited.test(before.getClaimedBy())) {
+                throw new IllegalStateException("原节点线程尚未确认退出，不能转交领取代际："
+                        + identity.describe());
+            }
             releaseIfActive(before);
             RootTreeBudgetStore.State reserved = activityBudget.reserveNode(
                     rootRunId, before, expectedClaimEpoch + 1);
@@ -393,9 +402,23 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         NodeWorkItem current = activityBefore(identity);
         if (current == null || current.getClaimEpoch() == null
                 || current.getClaimEpoch() != claimEpoch) return;
-        if (current.terminal()) {
+        if (current.terminal() || current.stateEnum() == NodeWorkItemState.WAITING
+                || current.stateEnum() == NodeWorkItemState.RESUMABLE) {
             activityBudget.releaseNode(current, claimEpoch);
         }
+    }
+
+    /** 崩溃可能发生在业务交出节点之后、finally 回执之前；仅本机 OS 能证明旧进程已退出时补回执。 */
+    @Transactional
+    public boolean reconcileExitedWorker(NodeWorkItemIdentity identity, int claimEpoch) {
+        if (activityBudget == null) return false;
+        NodeWorkItem current = activityBefore(identity);
+        if (current == null || current.getClaimEpoch() == null || current.getClaimEpoch() != claimEpoch
+                || !(current.terminal() || current.stateEnum() == NodeWorkItemState.WAITING
+                        || current.stateEnum() == NodeWorkItemState.RESUMABLE)
+                || !processExited.test(current.getClaimedBy())) return false;
+        activityBudget.releaseNode(current, claimEpoch);
+        return true;
     }
 
     private NodeWorkItem activityBefore(NodeWorkItemIdentity identity) {

@@ -105,7 +105,8 @@ public class CanceledWaitMemberStopWorker {
         WaitMember member = groups.findMemberByOperation(stop.getRunId(), stop.getOperationId()).orElse(null);
         if (member == null || !stop.getWaitMemberId().equals(member.getId())
                 || !stop.getGroupId().equals(member.getGroupId())
-                || member.stateEnum() != WaitMemberState.CANCELED
+                || (member.stateEnum() != WaitMemberState.CANCELED
+                    && member.stateEnum() != WaitMemberState.LATE)
                 || !"executePython".equals(member.getToolName())) {
             block(stop, "wait_member_identity_mismatch");
             return;
@@ -169,7 +170,8 @@ public class CanceledWaitMemberStopWorker {
         String taskId = cancel.getTaskId();
         TaskStatusResponse status = sandbox.getTaskStatus(
                 GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
-        if (status == null || status.hasErrorDetail() || !status.getError().isBlank()) {
+        // 终态 FAILED 的 error 是任务失败原因，不是状态查询失败；传输失败由 errorDetail 表达。
+        if (status == null || status.hasErrorDetail()) {
             retry(stop, "sandbox_status_unavailable");
             return;
         }
@@ -202,7 +204,7 @@ public class CanceledWaitMemberStopWorker {
         String preview = !result.getStdout().isBlank() ? result.getStdout()
                 : !result.getStderr().isBlank() ? result.getStderr() : result.getError();
         WaitMemberSettlement.Outcome settled = settlement.settle(member, proof,
-                terminalStatus, result, preview);
+                terminalStatus, result, preview, status.getFinishedAt());
         if (!settled.ok()) {
             retry(stop, "sandbox_settlement_incomplete");
             return;
