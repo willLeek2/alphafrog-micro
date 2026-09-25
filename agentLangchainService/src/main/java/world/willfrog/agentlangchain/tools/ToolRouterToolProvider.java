@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -85,6 +86,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
     private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
+    private final AgentPromptService promptService;
 
     /** 保留旧调度器现有的独立构造调用点；生产构造由配置类传入持久子代理桥接。 */
     public ToolRouterToolProvider(ToolRouter toolRouter,
@@ -101,7 +103,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore) {
         this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools,
                 listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
-                toolThrottle, pythonSandboxDispatchStore, null);
+                toolThrottle, pythonSandboxDispatchStore, null, null);
     }
 
     /**
@@ -139,11 +141,14 @@ public class ToolRouterToolProvider implements ToolProvider {
                 webSearchEnabled,
                 codeInterpreterEnabled
         );
-        PersistentSubAgentToolBridge bridge = subAgentBridge == null ? null : subAgentBridge.getIfAvailable();
+        boolean subAgentEnabled = promptService != null && promptService.subAgentEnabled();
+        PersistentSubAgentToolBridge bridge = !subAgentEnabled || subAgentBridge == null
+                ? null : subAgentBridge.getIfAvailable();
         String runId = AgentContext.getRunId();
-        if (PHASE_SUB_AGENT.equals(AgentContext.getPhase())
+        if (!subAgentEnabled
+                || PHASE_SUB_AGENT.equals(AgentContext.getPhase())
                 || (bridge != null && runId != null && !runId.isBlank() && bridge.isChildRun(runId))) {
-            // 子代理阶段禁止再生成子代理：模型可见目录和 Router 运行时检查同时关掉这两个工具。
+            // 开关关闭或子代理阶段时，模型不应看到执行时会拒绝的子代理工具。
             specifications = specifications.stream()
                     .filter(spec -> !"spawnSubAgent".equals(spec.name())
                             && !"waitForSubAgent".equals(spec.name()))

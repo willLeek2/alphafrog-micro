@@ -7,6 +7,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
@@ -41,7 +42,8 @@ public class LangchainToolsConfiguration {
                                        AgentRunEventService eventService,
                                        LangchainToolConcurrencyThrottle toolThrottle,
                                        PythonSandboxDispatchStore pythonSandboxDispatchStore,
-                                       ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge) {
+                                       ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
+                                       AgentPromptService promptService) {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
@@ -55,7 +57,8 @@ public class LangchainToolsConfiguration {
                 eventService,
                 toolThrottle,
                 pythonSandboxDispatchStore,
-                subAgentBridge
+                subAgentBridge,
+                promptService
         );
     }
 }

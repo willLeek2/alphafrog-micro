@@ -20,6 +20,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
@@ -43,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -55,6 +57,9 @@ class ToolRouterToolProviderTest {
 
     @Mock
     private AgentRunEventService eventService;
+
+    @Mock
+    private AgentPromptService promptService;
 
     private ToolRouterToolProvider provider;
     private ObjectMapper objectMapper;
@@ -96,8 +101,11 @@ class ToolRouterToolProviderTest {
                 objectMapper,
                 eventService,
                 new LangchainToolConcurrencyThrottle(false, 20, 60),
-                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class)
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class),
+                null,
+                promptService
         );
+        lenient().when(promptService.subAgentEnabled()).thenReturn(true);
     }
 
     @AfterEach
@@ -138,6 +146,21 @@ class ToolRouterToolProviderTest {
     }
 
     @Test
+    void provideTools_shouldFollowSubAgentFeatureToggleForEachModelCall() {
+        when(promptService.subAgentEnabled()).thenReturn(false, true);
+
+        Set<String> disabledNames = provider.provideTools(request(Map.of())).tools().keySet().stream()
+                .map(ToolSpecification::name).collect(Collectors.toSet());
+        assertFalse(disabledNames.contains("spawnSubAgent"));
+        assertFalse(disabledNames.contains("waitForSubAgent"));
+
+        Set<String> enabledNames = provider.provideTools(request(Map.of())).tools().keySet().stream()
+                .map(ToolSpecification::name).collect(Collectors.toSet());
+        assertTrue(enabledNames.contains("spawnSubAgent"));
+        assertTrue(enabledNames.contains("waitForSubAgent"));
+    }
+
+    @Test
     void provideTools_shouldHideSubAgentControlsInsideChildPhase() {
         AgentContext.setPhase(world.willfrog.agent.platform.service.AgentRunObservabilityService.PHASE_SUB_AGENT);
 
@@ -162,7 +185,8 @@ class ToolRouterToolProviderTest {
                 toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools,
                 listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, eventService,
                 new LangchainToolConcurrencyThrottle(false, 20, 60),
-                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class), bridgeProvider);
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class),
+                bridgeProvider, promptService);
 
         Set<String> names = childProvider.provideTools(request(Map.of())).tools().keySet().stream()
                 .map(ToolSpecification::name).collect(Collectors.toSet());

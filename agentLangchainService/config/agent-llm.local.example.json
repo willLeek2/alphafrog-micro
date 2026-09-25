@@ -275,7 +275,7 @@
       }
     },
     "subAgent": {
-      "enabled": true,
+      "enabled": false,
       "complexityThreshold": "MEDIUM",
       "maxSteps": 6,
       "maxCount": 3,
