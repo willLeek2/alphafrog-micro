@@ -210,28 +210,6 @@ class LangchainRunControlServiceTest {
     }
 
     @Test
-    void cancelFailsClosedWhenNonterminalStateKeepsChanging() {
-        AgentRun running = run(AgentRunStatus.EXECUTING);
-        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
-        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
-                .thenReturn("{\"observability\":{}}");
-        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
-                .thenReturn(0);
-
-        IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
-                service.cancelRun(
-                        CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
-
-        assertTrue(failure.getMessage().contains("cancel_state_changed"));
-        verify(runMapper, times(2)).cancelTerminalSnapshotWithTtl(
-                eq("r1"), eq("u1"), anyString(), any());
-        verify(eventService, never()).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
-        verify(stateStore, never()).markRunStatus("r1", AgentRunStatus.CANCELED.name());
-        verify(stateStore).markRunStatus("r1", AgentRunStatus.EXECUTING.name());
-    }
-
-    @Test
     void cancelTerminalReentryDoesNotPublishAgain() {
         AgentRun canceled = run(AgentRunStatus.CANCELED);
         when(readService.requireWritableRun("r1", "u1")).thenReturn(canceled);

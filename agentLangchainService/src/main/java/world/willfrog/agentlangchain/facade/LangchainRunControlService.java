@@ -223,10 +223,14 @@ public class LangchainRunControlService {
                 if (!isTerminal(current.getStatus()) && retryAfterConcurrentChange) {
                     // 状态或锚点在读取后改变；最多重新选择一次取消路径，防止新锚点
                     // 被当成普通 Run 直接终结，也避免持续竞争时无界重试。
+                    log.warn("Cancel state changed during terminal write; rechecking current "
+                                    + "anchor: runId={} status={}", runId, current.getStatus());
                     return cancelRunWhileActive(request, false);
                 }
                 AgentRun restored = restoreRedisAfterLostCancelWrite(runId, userId);
                 if (!isTerminal(restored.getStatus())) {
+                    log.warn("Cancel state changed again; caller must retry: runId={} status={}",
+                            runId, restored.getStatus());
                     throw new IllegalStateException(
                             "cancel_state_changed: unable to persist cancel after concurrent change");
                 }

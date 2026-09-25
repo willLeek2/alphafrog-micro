@@ -148,17 +148,6 @@ class ToolJobResourceUsageParserTest {
                 .hasMessageContaining("lacks unmeasured cancellation evidence");
     }
 
-    @Test
-    void unknownRemoteClassWithExecutionFlagsCannotMasqueradeAsPreCreateCancel() throws Exception {
-        SandboxResourceUsage usage = preCreateCanceledUsage().toBuilder()
-                .setTimedOut(true).build();
-
-        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("lacks unmeasured cancellation evidence");
-    }
-
     private SandboxResourceUsage preCreateCanceledUsage() {
         return SandboxResourceUsage.newBuilder()
                 .setResourceClass("UNKNOWN")

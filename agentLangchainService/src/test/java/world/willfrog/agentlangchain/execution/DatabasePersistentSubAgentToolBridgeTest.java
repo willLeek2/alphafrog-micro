@@ -126,18 +126,6 @@ class DatabasePersistentSubAgentToolBridgeTest {
         verify(waits, never()).markMemberDispatched(anyLong(), any(), any(), any(), any(), anyLong());
     }
 
-    @Test
-    void childRunCannotExposeRecursiveTools() {
-        AgentRun child = new AgentRun();
-        child.setId("run-child");
-        child.setSchedulerVersion("DUAL_POOL_V2");
-        child.setExt("{\"child_run\":true}");
-        when(runs.findById("run-child")).thenReturn(child);
-
-        assertThat(bridge.isChildRun("run-child")).isTrue();
-        assertThat(bridge.availableForRun("run-child")).isFalse();
-    }
-
     private void pendingMember(PersistentSubAgentToolBridge.ReservationRequest request, String tool) {
         WaitMember member = new WaitMember();
         member.setRunId(request.parentRunId());

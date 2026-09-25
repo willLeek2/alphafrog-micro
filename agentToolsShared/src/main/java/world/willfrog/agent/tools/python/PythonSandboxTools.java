@@ -1035,6 +1035,9 @@ public class PythonSandboxTools {
                         // 查到暂时不存在也不能释放名额：迟到的 create RPC 仍可能到达。
                         // 先用同一 operation/fingerprint 写取消墓碑，取得稳定 taskId，
                         // 再像普通 Sandbox 任务一样接收终态并释放容量。
+                        log.warn("DAG Sandbox create response lost and lookup absent; preserving capacity "
+                                        + "until cancellation tombstone: runId={} operationId={}",
+                                runId, identity.operationId());
                         createResp = tombstoneCreateUncertain(
                                 identity.operationId(), spec.requestFingerprint(), "");
                     } else {
@@ -1059,6 +1062,9 @@ public class PythonSandboxTools {
                                 "DAG worker lost its lease before canceling an uncertain create");
                     }
                 }
+                log.warn("DAG Sandbox create response unverified; preserving capacity "
+                                + "until cancellation tombstone: runId={} operationId={}",
+                        runId, identity.operationId());
                 createResp = tombstoneCreateUncertain(identity.operationId(),
                         spec.requestFingerprint(), createResp == null ? "" : nvl(createResp.getTaskId()));
             }
@@ -1613,6 +1619,8 @@ public class PythonSandboxTools {
                     && !responseTaskId.equals(lookup.getTaskId())) {
             throw new IllegalStateException("Sandbox cancel tombstone identity could not be verified");
         }
+        log.info("Sandbox create cancellation tombstone verified: operationId={} taskId={} outcome={}",
+                operationId, lookup.getTaskId(), canceled.getOutcome());
         return ExecuteResponse.newBuilder()
                 .setTaskId(lookup.getTaskId())
                 .setRequestFingerprint(fingerprint)

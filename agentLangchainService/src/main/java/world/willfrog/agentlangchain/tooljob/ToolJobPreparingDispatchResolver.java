@@ -242,8 +242,14 @@ final class ToolJobPreparingDispatchResolver {
             }
             if (!canceled.getTaskId().equals(lookup.getTaskId())
                     || !fingerprint.equals(lookup.getRequestFingerprint())) {
+                log.error("Stopped PREPARING tombstone identity mismatch: run={} operation={} "
+                                + "cancelTaskId={} lookupTaskId={}",
+                        runId, operationId, canceled.getTaskId(), lookup.getTaskId());
                 return Resolution.invalidEvidence();
             }
+            log.info("Stopped PREPARING tombstone verified: run={} operation={} taskId={} "
+                            + "disposition={}",
+                    runId, operationId, lookup.getTaskId(), anchor.getRunDisposition());
             return attachResolvedTask(runId, anchor, preparing, lookup.getTaskId(), anchorService);
         } catch (Exception remoteFailure) {
             log.warn("Stopped PREPARING operation still awaits Sandbox tombstone: run={} operation={}",

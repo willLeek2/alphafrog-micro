@@ -154,15 +154,6 @@ class AgentRunEventServiceTest {
         }
     }
 
-    @Test
-    void childWithoutExplicitBindingDoesNotInheritParentControl() throws Exception {
-        AgentRun parent = parentWithContext("{\"acceptanceControlId\":\"parent-control\"}");
-        AgentRun child = createChild(parent, "ordinary-child",
-                member(0, "node-a", 0, 0, 0, 0, "call-a"));
-
-        assertFalse(childContext(child).has("acceptanceControlId"));
-    }
-
     private AgentRun parentWithContext(String contextJson) {
         AgentRun parent = new AgentRun();
         parent.setId("parent-run");

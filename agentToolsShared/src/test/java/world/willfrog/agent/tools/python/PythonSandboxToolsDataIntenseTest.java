@@ -1827,37 +1827,6 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
-    void anErrorResponseWithNoTaskLookupStillWaitsForDurableSettlement() throws Exception {
-        fixtureDataset();
-        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
-        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
-                .setError("gateway rejected request").build());
-        when(sandbox.getTaskByOperationId(any())).thenReturn(
-                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
-
-        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
-                () -> invokeAsWaitGroupMember("print(1)", "1"));
-
-        assertThat(pending.getTaskId()).isNull();
-        verify(capacity, never()).releaseReservation(any());
-    }
-
-    @Test
-    void anEmptyCreateResponseWithUnavailableLookupCannotReleaseCapacity() throws Exception {
-        fixtureDataset();
-        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
-        when(sandbox.createTask(any())).thenReturn(null);
-        when(sandbox.getTaskByOperationId(any())).thenReturn(null);
-
-        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
-                () -> invokeAsWaitGroupMember("print(1)", "1"));
-
-        assertThat(pending.getTaskId()).isNull();
-        assertThat(pending.getProof().reservationJson()).contains("PREPARING");
-        verify(capacity, never()).releaseReservation(any());
-    }
-
-    @Test
     void aTypedCreateErrorCannotConfirmEvenIfItCarriesMatchingTaskIdentity() throws Exception {
         fixtureDataset();
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));

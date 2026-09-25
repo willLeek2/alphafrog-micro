@@ -105,7 +105,16 @@ public class PersistentChildRunLifecycleReconciler {
                 || !Objects.equals(parent.getPlanGeneration(), intent.planGeneration());
         if (intent.acceptedAt() == null) {
             if (parentStopped) {
-                transactions.execute(ignored -> intents.cancelUnacceptedIfParentChanged(intent.intentId()));
+                boolean canceled = Boolean.TRUE.equals(transactions.execute(
+                        ignored -> intents.cancelUnacceptedIfParentChanged(intent.intentId())));
+                if (canceled) {
+                    log.info("Parent stopped; unaccepted child intent canceled: rootRunId={} "
+                                    + "parentRunId={} childRunId={} intentId={} parentVersion={} "
+                                    + "reservedVersion={}",
+                            intent.rootRunId(), intent.parentRunId(), intent.childRunId(),
+                            intent.intentId(), parent.getRunControlVersion(),
+                            intent.parentControlVersion());
+                }
             }
             return;
         }
@@ -122,7 +131,15 @@ public class PersistentChildRunLifecycleReconciler {
             return;
         }
         if (parentStopped) {
-            transactions.execute(ignored -> intents.requestCancellation(child.getId()));
+            boolean requested = Boolean.TRUE.equals(transactions.execute(
+                    ignored -> intents.requestCancellation(child.getId())));
+            if (requested) {
+                log.info("Parent stopped; accepted child cancellation requested: rootRunId={} "
+                                + "parentRunId={} childRunId={} intentId={} parentVersion={} "
+                                + "reservedVersion={}",
+                        intent.rootRunId(), intent.parentRunId(), child.getId(), intent.intentId(),
+                        parent.getRunControlVersion(), intent.parentControlVersion());
+            }
             controls.cancelRun(CancelAgentRunRequest.newBuilder()
                     .setId(child.getId()).setUserId(child.getUserId()).build());
         }
