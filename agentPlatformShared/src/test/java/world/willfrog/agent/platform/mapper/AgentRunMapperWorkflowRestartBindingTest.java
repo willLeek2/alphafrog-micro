@@ -371,6 +371,22 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
+    void canceledToolJobCannotBeChangedBackToCheckpointFailureOrStaleDisposition() {
+        for (String id : List.of("markToolJobCheckpointFailed", "markToolJobCheckpointFailurePending")) {
+            String sql = normalizedSql(statement(id).getBoundSql(Map.of()));
+            assertThat(sql).as(id)
+                    .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'");
+        }
+        for (String id : List.of("updateToolJobAnchor", "updateToolJobAnchorAndStatus",
+                "updateActiveToolJobAnchor", "updateToolJobAnchorAndStatusByOperation")) {
+            String sql = normalizedSql(statement(id).getBoundSql(Map.of()));
+            assertThat(sql).as(id)
+                    .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'")
+                    .contains("CAST(? AS jsonb) ->> 'runDisposition' = 'CANCELED'");
+        }
+    }
+
+    @Test
     void legacyToolJobTestOverloadDoesNotAddAnUnknownDeploymentParameter() {
         String sql = normalizedSql(statement("updateToolJobAnchor").getBoundSql(Map.of()));
         assertThat(sql)

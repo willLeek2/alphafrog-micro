@@ -818,6 +818,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -834,6 +836,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -983,6 +987,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -1106,6 +1112,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -1342,6 +1350,7 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
           AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
     </update>
 
     <!--
@@ -1361,6 +1370,7 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
           AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
           AND (last_error IS NULL OR last_error = #{marker})
     </update>
 

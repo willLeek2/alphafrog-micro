@@ -150,6 +150,28 @@ class ToolJobCheckpointFailureRecoveryServiceTest {
     }
 
     @Test
+    void cancellationSupersedesCheckpointFailureForTheSameToolJob() throws Exception {
+        ToolJobAnchorService anchors = mock(ToolJobAnchorService.class);
+        AgentRunMapper mapper = mock(AgentRunMapper.class);
+        ToolJobCheckpointRequest request = request();
+        ToolJobAnchor canceled = equivalentAnchor(request);
+        canceled.setCheckpointVersion(1);
+        canceled.setRunDisposition("CANCELED");
+        when(anchors.loadAnchor("run-1")).thenReturn(canceled);
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB);
+        run.setToolJobAnchorJson(canceled.toJson());
+        when(mapper.findById("run-1")).thenReturn(run);
+        ToolJobCheckpointFailureRecoveryService service =
+                new ToolJobCheckpointFailureRecoveryService(anchors, mapper, objectMapper);
+
+        assertThat(service.handleFailure(request))
+                .isEqualTo(ToolJobCheckpointFailureRecoveryService.Outcome.SUPERSEDED);
+        verify(anchors, times(1)).markCheckpointFailed(request, "durable_checkpoint_write_failed");
+    }
+
+    @Test
     void sameOwnerMarkerCasMissGetsBoundedFailureDispositionRetry() throws Exception {
         ToolJobAnchorService anchors = mock(ToolJobAnchorService.class);
         AgentRunMapper mapper = mock(AgentRunMapper.class);
