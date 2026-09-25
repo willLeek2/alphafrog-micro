@@ -700,6 +700,7 @@
         WHERE id = #{id}
           AND user_id = #{userId}
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND (tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb)
     </update>
 
     <update id="resetForResume">

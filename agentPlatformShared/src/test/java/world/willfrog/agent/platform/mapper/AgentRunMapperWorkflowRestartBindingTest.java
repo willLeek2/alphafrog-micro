@@ -308,6 +308,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("WHEN scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2') THEN run_control_version + 1")
                 .contains("ttl_expires_at = ?")
                 .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
+                .contains("tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb")
                 .doesNotContain("deployment_id", "deployment_generation_id");
     }
 

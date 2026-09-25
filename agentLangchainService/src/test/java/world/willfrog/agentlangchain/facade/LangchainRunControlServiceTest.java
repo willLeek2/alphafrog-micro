@@ -26,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -147,9 +148,10 @@ class LangchainRunControlServiceTest {
     @Test
     void cancelPersistenceMismatchDoesNotPublish() {
         AgentRun running = run(AgentRunStatus.EXECUTING);
-        AgentRun refreshed = run(AgentRunStatus.EXECUTING);
+        AgentRun refreshed = run(AgentRunStatus.COMPLETED);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(running, refreshed, refreshed);
         when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
-        when(readService.requireReadableRun("r1", "u1")).thenReturn(refreshed);
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
@@ -161,11 +163,71 @@ class LangchainRunControlServiceTest {
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
-        assertEquals("EXECUTING", response.getStatus());
+        assertEquals("COMPLETED", response.getStatus());
         verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), eq("CANCELED"), anyMap());
         verify(stateStore, never()).markRunStatus("r1", AgentRunStatus.CANCELED.name());
         verify(stateStore).markRunStatus("r1", AgentRunStatus.CANCELING.name());
+        verify(stateStore).markRunStatus("r1", AgentRunStatus.COMPLETED.name());
+    }
+
+    @Test
+    void cancelRechecksNewToolJobOwnerBeforeEndingRun() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        AgentRun waiting = run(AgentRunStatus.WAITING_TOOL_JOB);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running, waiting);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(waiting);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(running, waiting);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        ToolJobAnchor claimed = new ToolJobAnchor();
+        claimed.setOperationId("r1:tc-1:1");
+        AtomicReference<ToolJobAnchor> durableAnchor = new AtomicReference<>();
+        when(anchorService.loadAnchor("r1")).thenAnswer(ignored -> durableAnchor.get());
+        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
+                .thenAnswer(ignored -> {
+                    // The worker claimed PREPARING after the first anchor read. PostgreSQL's
+                    // empty-anchor condition rejects the ordinary terminal cancellation.
+                    durableAnchor.set(claimed);
+                    return 0;
+                });
+        when(anchorService.persistCancelDisposition(
+                "r1", "r1:tc-1:1", AgentRunStatus.WAITING_TOOL_JOB)).thenReturn(true);
+
+        var response = service.cancelRun(
+                CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verify(runMapper, times(1)).cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any());
+        verify(anchorService).persistCancelDisposition(
+                "r1", "r1:tc-1:1", AgentRunStatus.WAITING_TOOL_JOB);
+        verify(runMapper).updateSnapshotIfStatus(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB), anyString());
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void cancelFailsClosedWhenNonterminalStateKeepsChanging() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
+                .thenReturn(0);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
+                service.cancelRun(
+                        CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        assertTrue(failure.getMessage().contains("cancel_state_changed"));
+        verify(runMapper, times(2)).cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any());
+        verify(eventService, never()).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
+        verify(stateStore, never()).markRunStatus("r1", AgentRunStatus.CANCELED.name());
         verify(stateStore).markRunStatus("r1", AgentRunStatus.EXECUTING.name());
     }
 

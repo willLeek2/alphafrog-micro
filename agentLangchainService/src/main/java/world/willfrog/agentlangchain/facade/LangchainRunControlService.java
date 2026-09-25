@@ -125,6 +125,11 @@ public class LangchainRunControlService {
 
     private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRunWhileActive(
             CancelAgentRunRequest request) {
+        return cancelRunWhileActive(request, true);
+    }
+
+    private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRunWhileActive(
+            CancelAgentRunRequest request, boolean retryAfterConcurrentChange) {
         // 认领/受理入口的归属判定在 gateway：只允许控制本部署代际的 Run。
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
@@ -208,17 +213,24 @@ public class LangchainRunControlService {
                         restoreRedisAfterLostCancelWrite(runId, userId));
             }
         } else {
-            // 快照+状态+TTL 一条原子写入，带终态栅栏：数据库已是终态（执行刚提交的
-            // COMPLETED 等）时返回 0，先落库的终态赢。迟到取消拿不到行时不发
-            // CANCELED 事件、不写 Redis 终态、不结算，直接按现状返回——不广播
-            // 数据库里不存在的终态。
+            // 快照+状态+TTL 一条原子写入，并要求锚点仍为空。执行线程若在读取锚点后
+            // 已抢到长工具所有权，本次条件更新返回 0；重读后改走有锚点取消，保留
+            // Sandbox 任务与容量的收尾责任。已写入的业务终态仍由先提交者决定。
             canceledPersisted = runMapper.cancelTerminalSnapshotWithTtl(
                     runId, userId, snapshot, agentEventService.nextInterruptedExpiresAt()) == 1;
             if (!canceledPersisted) {
-                log.warn("CANCELED refused by terminal fence (run already terminal or invisible): "
-                        + "runId={} — returning current state without terminal broadcast", runId);
-                AgentRun current = restoreRedisAfterLostCancelWrite(runId, userId);
-                return AgentLangchainRunMessageMapper.toRunMessage(current);
+                AgentRun current = ownershipGateway.requireOwnedRunForUser(runId, userId);
+                if (!isTerminal(current.getStatus()) && retryAfterConcurrentChange) {
+                    // 状态或锚点在读取后改变；最多重新选择一次取消路径，防止新锚点
+                    // 被当成普通 Run 直接终结，也避免持续竞争时无界重试。
+                    return cancelRunWhileActive(request, false);
+                }
+                AgentRun restored = restoreRedisAfterLostCancelWrite(runId, userId);
+                if (!isTerminal(restored.getStatus())) {
+                    throw new IllegalStateException(
+                            "cancel_state_changed: unable to persist cancel after concurrent change");
+                }
+                return AgentLangchainRunMessageMapper.toRunMessage(restored);
             }
         }
         if (canceledPersisted && schedulerMetrics != null) {

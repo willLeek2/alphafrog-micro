@@ -130,6 +130,28 @@ class AgentRunMapperPostgresIntegrationTest {
     }
 
     @Test
+    void terminalCancelOnlyWinsWhileToolJobAnchorIsStillEmpty() throws Exception {
+        insertRun("cancel-empty-anchor", AgentRunStatus.EXECUTING, "{}");
+        insertRun("cancel-claimed-anchor", AgentRunStatus.EXECUTING,
+                synchronousAnchor("cancel-claimed-anchor:call-1:1", "PREPARING", "PREPARING", false));
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            OffsetDateTime expiresAt = OffsetDateTime.now().plusMinutes(10);
+            assertThat(mapper.cancelTerminalSnapshotWithTtl(
+                    "cancel-empty-anchor", "user-1", "{}", expiresAt)).isEqualTo(1);
+            assertThat(mapper.cancelTerminalSnapshotWithTtl(
+                    "cancel-claimed-anchor", "user-1", "{}", expiresAt)).isZero();
+            assertThat(mapper.findById("cancel-empty-anchor").getStatus())
+                    .isEqualTo(AgentRunStatus.CANCELED);
+            AgentRun claimed = mapper.findById("cancel-claimed-anchor");
+            assertThat(claimed.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+            assertThat(claimed.getToolJobAnchorJson())
+                    .contains("cancel-claimed-anchor:call-1:1");
+        }
+    }
+
+    @Test
     void synchronousClearRequiresTerminalReleasedUsageProofAndOwnership() throws Exception {
         insertRun("sync-clear-valid", AgentRunStatus.EXECUTING,
                 synchronousAnchor("sync-clear-valid:call-1:1", "TERMINAL", "RELEASED", true));
