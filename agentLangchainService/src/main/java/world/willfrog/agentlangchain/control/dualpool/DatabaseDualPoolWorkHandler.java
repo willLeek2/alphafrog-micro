@@ -48,6 +48,7 @@ import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.execution.WaitGroupSuspensionMarker;
 import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
 import java.time.Duration;
@@ -737,6 +738,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             // 计划代际或 Run 状态已经变化：旧提示不得领取。协调回合会把旧行标为 STALE/CANCELED。
             return;
         }
+        // 提示由定时线程搬运，领取后的模型与工具调用必须重新使用 Run 持久化的泳道标签。
+        LaneScopeGateway.wrap(run, () -> executeOwnedNode(
+                identity, item, run, version, waitGroupVersion, dispatchTurnRound, fence)).run();
+    }
+
+    private void executeOwnedNode(NodeWorkItemIdentity identity, NodeWorkItem item, AgentRun run,
+                                  SchedulerVersion version, boolean waitGroupVersion,
+                                  long dispatchTurnRound, ServiceOwnershipFence fence) {
         Optional<NodeWorkItemClaim> claimed;
         String claimant;
         try {

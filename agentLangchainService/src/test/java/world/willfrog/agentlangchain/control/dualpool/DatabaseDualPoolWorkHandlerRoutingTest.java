@@ -16,18 +16,23 @@ import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
 import world.willfrog.agentlangchain.control.LegacyRunHandoff;
 import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -55,6 +60,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     private RunCoordinationStore coordinationStore;
     private SchedulerStateStore stateStore;
     private AgentRunMapper runMapper;
+    private NodeWorkItemStore workItemStore;
     private DualPoolRunAdmissionRegistry admissionRegistry;
     private SchedulerVersionPolicy versionPolicy;
     private RunServiceLeaseStore leaseStore;
@@ -70,6 +76,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         coordinationStore = Mockito.mock(RunCoordinationStore.class);
         stateStore = Mockito.mock(SchedulerStateStore.class);
         runMapper = Mockito.mock(AgentRunMapper.class);
+        workItemStore = Mockito.mock(NodeWorkItemStore.class);
         admissionRegistry = Mockito.mock(DualPoolRunAdmissionRegistry.class);
         versionPolicy = Mockito.mock(SchedulerVersionPolicy.class);
         leaseStore = Mockito.mock(RunServiceLeaseStore.class);
@@ -85,7 +92,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         handler = new DatabaseDualPoolWorkHandler(
                 runMapper,
                 Mockito.mock(FreshRunPipeline.class),
-                Mockito.mock(NodeWorkItemStore.class),
+                workItemStore,
                 Mockito.mock(NodeWorkPlanAdapter.class),
                 Mockito.mock(LangchainTodoNodeExecutor.class),
                 Mockito.mock(AgentRunEventService.class),
@@ -250,6 +257,45 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 .extracting(RunCoordinationHint::runId)
                 .containsExactly("run-v2");
         assertThat(handler.routingSnapshot()).containsEntry("leaseNotAcquiredLastRound", 0L);
+    }
+
+    @Test
+    void nodeClaimUsesPersistedRunLaneAndRestoresTheCallingThread() {
+        String runId = "run-in-lane";
+        AgentRun run = run(runId, "DUAL_POOL_V2");
+        run.setLaneTag("candidate-lane");
+        NodeWorkItemIdentity workIdentity = new NodeWorkItemIdentity(runId, 0, "todo-1", 0, 0);
+        NodeWorkItem item = new NodeWorkItem();
+        item.setRunId(runId);
+        item.setPlanGeneration(0);
+        item.setNodeId("todo-1");
+        item.setNodeAttempt(0);
+        item.setSegmentSequence(0);
+        item.setState(NodeWorkItemState.RUNNABLE.name());
+        item.setSchedulerVersion("DUAL_POOL_V2");
+        item.setContextVersion(0L);
+        item.setRunControlVersion(0L);
+        item.setClaimEpoch(0);
+        ServiceOwnershipFence fence = new ServiceOwnershipFence(TEST_INSTANCE, 1L);
+        when(admissionRegistry.isAdmitted(runId)).thenReturn(true);
+        when(admissionRegistry.currentOwnershipFence(runId)).thenReturn(Optional.of(fence));
+        when(runMapper.findById(runId)).thenReturn(run);
+        when(workItemStore.findByIdentity(workIdentity)).thenReturn(Optional.of(item));
+        AtomicReference<String> laneAtClaim = new AtomicReference<>();
+        when(workItemStore.claim(eq(workIdentity), any(), anyString(), any(), any(), eq(fence)))
+                .thenAnswer(invocation -> {
+                    laneAtClaim.set(LaneScopeGateway.currentLaneTag());
+                    return Optional.empty();
+                });
+        AgentRun caller = run("caller", "DUAL_POOL_V2");
+        caller.setLaneTag("caller-lane");
+
+        LaneScopeGateway.wrap(caller, () -> {
+            handler.executeNode(workIdentity);
+            assertThat(LaneScopeGateway.currentLaneTag()).isEqualTo("caller-lane");
+        }).run();
+
+        assertThat(laneAtClaim).hasValue("candidate-lane");
     }
 
     /**
