@@ -6,7 +6,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
 
-/** 进程崩溃丢失 finally 回执时，按持久领取身份和本机进程事实补归还节点额度。 */
+/** 进程崩溃丢失 finally 回执时，按持久领取身份和同容器重启事实补归还节点额度。 */
 @Component
 @RequiredArgsConstructor
 @Slf4j

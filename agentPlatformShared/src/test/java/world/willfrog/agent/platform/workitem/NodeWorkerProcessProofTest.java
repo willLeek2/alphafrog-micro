@@ -15,6 +15,31 @@ class NodeWorkerProcessProofTest {
     private static final Instant STARTED = Instant.parse("2026-09-25T08:00:00Z");
     private static final String OLD = "dual-pool-node:v3@" + MACHINE + "@" + BOOT
             + "@1@" + STARTED.toEpochMilli() + "@" + NAMESPACE;
+    private static final String OLD_CONTAINER = "dual-pool-node:v4@instance-7@abcdef012345@" + BOOT;
+
+    @Test
+    void ordinaryClaimWorksWithoutHostPidOrMachineId() {
+        String claimant = NodeWorkerProcessProof.claimant("agent@local@1@boot");
+
+        assertThat(claimant).startsWith("dual-pool-node:v4@");
+        assertThat(NodeWorkerProcessProof.isCurrentProcess(claimant)).isTrue();
+    }
+
+    @Test
+    void containerRestartProvesExitOnlyForTheSameImmutableContainer() {
+        assertThat(NodeWorkerProcessProof.exitedByContainerObservation(
+                OLD_CONTAINER, "instance-7", "abcdef012345", NEXT_BOOT)).isTrue();
+        assertThat(NodeWorkerProcessProof.exitedByContainerObservation(
+                OLD_CONTAINER, "instance-7", "abcdef012345", BOOT)).isFalse();
+        assertThat(NodeWorkerProcessProof.exitedByContainerObservation(
+                OLD_CONTAINER, "instance-8", "abcdef012345", NEXT_BOOT)).isFalse();
+        assertThat(NodeWorkerProcessProof.exitedByContainerObservation(
+                OLD_CONTAINER, "instance-7", "fedcba987654", NEXT_BOOT)).isFalse();
+        assertThat(NodeWorkerProcessProof.exitedByContainerObservation(
+                OLD_CONTAINER, null, "abcdef012345", NEXT_BOOT)).isFalse();
+        assertThat(NodeWorkerProcessProof.exitedByContainerObservation(
+                OLD_CONTAINER, "instance-7", null, NEXT_BOOT)).isFalse();
+    }
 
     @Test
     void liveAndUnverifiableOwnersNeverReleaseCapacity() {

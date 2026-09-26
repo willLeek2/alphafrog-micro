@@ -411,6 +411,32 @@ class DualPoolRunAdmissionRegistryTest {
                 .containsEntry("isolatedRunCount", 0);
     }
 
+    @Test
+    void unconfirmedOldWorkerWaitsForTheNextScanInsteadOfIsolatingTheRun() {
+        Fixture fixture = new Fixture();
+        NodeWorkItem claimed = item("run-2", 3, "todo-1", 0, 0);
+        claimed.setState(NodeWorkItemState.CLAIMED.name());
+        claimed.setClaimEpoch(2);
+        claimed.setContextVersion(7L);
+        claimed.setRunControlVersion(2L);
+        claimed.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(claimed));
+        fixture.run(waitGroupRun(AgentRunStatus.EXECUTING));
+        when(fixture.workItems.listUnfinishedByRun("run-2")).thenReturn(List.of(claimed));
+        when(fixture.workItems.requeueAbandonedClaim(any(), any(), any(), any()))
+                .thenThrow(new world.willfrog.agent.platform.workitem.NodeWorkerExitUnconfirmedException("still running"))
+                .thenReturn(NodeWorkItemMutationResult.success());
+
+        fixture.registry.detectStartupResidue();
+
+        assertThat(fixture.registry.isAdmitted("run-2")).isFalse();
+        assertThat(fixture.isolationReasonOf("run-2")).isNull();
+        verify(fixture.leaseStore).release(eq("run-2"), anyString(), anyLong());
+
+        assertThat(fixture.registry.takeoverLegacyRun("run-2")).isTrue();
+        assertThat(fixture.registry.isAdmitted("run-2")).isTrue();
+    }
+
     /**
      * 一条 V2 的 Run 下面混着一行 V1 的未完成分段：整条 Run 隔离，那一行也不会被别的版本领走。
      *

@@ -195,6 +195,12 @@ public class DualPoolToolJobCoordinator {
                 && NodeWorkerProcessProof.isCurrentProcess(current.getClaimedBy())) {
             return true;
         }
+        if (!NodeWorkerProcessProof.isCurrentProcess(current.getClaimedBy())
+                && !NodeWorkerProcessProof.definitelyExited(current.getClaimedBy())) {
+            log.info("旧节点执行者尚未确认退出，保留长工具恢复分段等待下轮恢复: identity={}",
+                    identity.describe());
+            return false;
+        }
         NodeWorkItemMutationResult requeued = workItemStore.requeueInterruptedToolJob(
                 identity,
                 new NodeWorkItemVersions(

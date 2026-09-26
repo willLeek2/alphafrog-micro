@@ -239,7 +239,7 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         NodeWorkItem before = activityBefore(identity);
         if (activityBudget != null && before != null
                 && !processExited.test(before.getClaimedBy())) {
-            throw new IllegalStateException("原节点进程尚未确认退出，不能重新领取或归还额度：" + identity.describe());
+            throw new NodeWorkerExitUnconfirmedException("原节点进程尚未确认退出，不能重新领取或归还额度：" + identity.describe());
         }
         int rows = mapper.requeueAbandonedClaim(identity.runId(), identity.planGeneration(),
                 identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(),
@@ -260,12 +260,26 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                                                                 NodeWorkItemVersions versions,
                                                                 String operationId) {
         NodeWorkItem before = activityBefore(identity);
+        boolean previousProcessExited = activityBudget != null && before != null
+                && processExited.test(before.getClaimedBy());
+        if (activityBudget != null && before != null && !previousProcessExited
+                && !NodeWorkerProcessProof.isCurrentProcess(before.getClaimedBy())) {
+            throw new NodeWorkerExitUnconfirmedException("原节点进程尚未确认退出，不能重新开放长工具分段："
+                    + identity.describe());
+        }
         int rows = mapper.requeueInterruptedToolJob(
                 identity.runId(), identity.planGeneration(), identity.nodeId(),
                 identity.nodeAttempt(), identity.segmentSequence(), versions.contextVersion(),
                 versions.runControlVersion(), versions.claimEpoch(), operationId);
-        return rows == 1 ? NodeWorkItemMutationResult.success()
-                : rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
+        if (rows == 1) {
+            // 旧 JVM 已退出时，重排与旧代际归还必须在同一事务；否则新领取会抬高行上的
+            // claim_epoch，周期对账再也找不到旧代际。当前 JVM 的额度由 worker 的 finally 归还。
+            if (previousProcessExited) {
+                activityBudget.releaseNode(before, versions.claimEpoch());
+            }
+            return NodeWorkItemMutationResult.success();
+        }
+        return rejectWithEpochCheck(identity, versions, versions.claimEpoch(), operationId);
     }
 
     @Override
@@ -362,7 +376,7 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                 return Optional.empty();
             }
             if (!processExited.test(before.getClaimedBy())) {
-                throw new IllegalStateException("原节点线程尚未确认退出，不能转交领取代际："
+                throw new NodeWorkerExitUnconfirmedException("原节点线程尚未确认退出，不能转交领取代际："
                         + identity.describe());
             }
             releaseIfActive(before);
@@ -400,15 +414,13 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         if (activityBudget == null) return;
         if (claimEpoch <= 0) throw new IllegalArgumentException("退出确认缺少领取代际");
         NodeWorkItem current = activityBefore(identity);
-        if (current == null || current.getClaimEpoch() == null
-                || current.getClaimEpoch() != claimEpoch) return;
-        if (current.terminal() || current.stateEnum() == NodeWorkItemState.WAITING
-                || current.stateEnum() == NodeWorkItemState.RESUMABLE) {
-            activityBudget.releaseNode(current, claimEpoch);
-        }
+        if (current == null) return;
+        // finally 证明的是传入的旧领取代际已经退出，与工作项此刻是否被下一代领取无关。
+        // 额度操作用 (工作项 ID, 领取代际) 定位，幂等释放，不会释放下一代的额度。
+        activityBudget.releaseNode(current, claimEpoch);
     }
 
-    /** 崩溃可能发生在业务交出节点之后、finally 回执之前；仅本机 OS 能证明旧进程已退出时补回执。 */
+    /** 崩溃可能发生在业务交出节点之后、finally 回执之前；证实旧进程退出后补回执。 */
     @Transactional
     public boolean reconcileExitedWorker(NodeWorkItemIdentity identity, int claimEpoch) {
         if (activityBudget == null) return false;

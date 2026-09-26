@@ -547,6 +547,7 @@ services:
       <<: [*otel-env, *agent-llm-proxy-env]
       TZ: Asia/Shanghai
       OTEL_SERVICE_NAME: agentLangchainService
+      AF_AGENT_INSTANCE_ID: alphafrog-agent-langchain-service
       DUBBO_IP_TO_REGISTRY: ${AF_DUBBO_REGISTRY_HOST_IP:?set AF_DUBBO_REGISTRY_HOST_IP in .env (host private IP)}
       DUBBO_PORT_TO_REGISTRY: "50059"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.id=${AF_DEPLOYMENT_ID:-stable},lane.tag=${AF_LANE_TAG:-stable},service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_AGENT_LANGCHAIN_SERVICE:-unknown}"

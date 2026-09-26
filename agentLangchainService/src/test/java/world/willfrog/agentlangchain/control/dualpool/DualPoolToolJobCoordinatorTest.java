@@ -114,10 +114,11 @@ class DualPoolToolJobCoordinatorTest {
     }
 
     @Test
-    void restartRequeuesClaimedResumeOnlyWithNextEpoch() {
+    void interruptedCurrentWorkerRequeuesClaimedResumeWithNextEpoch() {
         ToolJobAnchor anchor = anchor(3);
         anchor.setResumeState(DualPoolToolJobCoordinator.RESUME_STATE);
         NodeWorkItem claimed = item("CLAIMED", 4);
+        claimed.setClaimedBy(world.willfrog.agent.platform.workitem.NodeWorkerProcessProof.claimant("test-process"));
         when(store.findByIdentity(claimed.identity())).thenReturn(Optional.of(claimed));
         when(store.requeueInterruptedToolJob(any(), any(), any()))
                 .thenReturn(NodeWorkItemMutationResult.success());
@@ -134,6 +135,7 @@ class DualPoolToolJobCoordinatorTest {
         ToolJobAnchor anchor = anchor(3);
         anchor.setResumeState(DualPoolToolJobCoordinator.RESUME_STATE);
         NodeWorkItem firstClaim = item("EXECUTING", 4);
+        firstClaim.setClaimedBy(world.willfrog.agent.platform.workitem.NodeWorkerProcessProof.claimant("test-process"));
         when(store.findByIdentity(firstClaim.identity())).thenReturn(Optional.of(firstClaim));
         when(store.requeueInterruptedToolJob(any(), any(), any()))
                 .thenReturn(NodeWorkItemMutationResult.success());
@@ -151,6 +153,20 @@ class DualPoolToolJobCoordinatorTest {
         verify(store).commitResumedToolJobResult(
                 firstClaim.identity(), new NodeWorkItemVersions(7, 9, 5),
                 "run-1:call-1:1", "{\"segmentResult\":{\"success\":true}}", null);
+    }
+
+    @Test
+    void unknownOldWorkerStaysClaimedUntilItsExitCanBeConfirmed() {
+        ToolJobAnchor anchor = anchor(3);
+        anchor.setResumeState(DualPoolToolJobCoordinator.RESUME_STATE);
+        NodeWorkItem claimed = item("CLAIMED", 4);
+        claimed.setClaimedBy("unknown-old-worker");
+        when(store.findByIdentity(claimed.identity())).thenReturn(Optional.of(claimed));
+
+        assertThat(coordinator.recoverResumableAtStartup("run-1", anchor)).isFalse();
+
+        verify(store, never()).requeueInterruptedToolJob(any(), any(), any());
+        verify(dispatcher, never()).offerNode(any());
     }
 
     @Test

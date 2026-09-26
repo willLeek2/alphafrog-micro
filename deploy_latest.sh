@@ -552,8 +552,8 @@ else
   exit 1
 fi
 
-# Linux 稳定部署的 Agent 节点需要在容器重建后读取宿主 PID 与机器身份。
-# macOS 本地 Docker 不挂载 /etc/machine-id；本地应用仍可启动，双池领取会因缺证明拒绝。
+# 兼容旧版 v3 领取记录：它们仍需宿主 PID 与机器身份才能确认旧线程退出。
+# 新版 v4 领取和同容器重启不依赖这些挂载；清空旧记录前暂保留旧证明入口。
 if [[ "$(uname -s)" == "Linux" ]] && is_in_list "agent-langchain-service" "${SELECTED[@]}"; then
   if [[ ! -f /etc/machine-id ]]; then
     echo "[deploy] ERROR: Linux Agent 部署缺少宿主 /etc/machine-id。" >&2

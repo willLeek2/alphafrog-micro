@@ -1,6 +1,7 @@
 services:
   agent-langchain-service:
-    # 仅 Linux 稳定部署启用：节点领取需要在容器重建后核验旧 JVM 是否物理退出。
+    # 仅 Linux 稳定部署启用：兼容升级前的 v3 领取记录，确认旧 JVM 已退出。
+    # 新版 v4 正常领取及同容器重启不读取这些宿主证明。
     pid: host
     volumes:
       - type: bind

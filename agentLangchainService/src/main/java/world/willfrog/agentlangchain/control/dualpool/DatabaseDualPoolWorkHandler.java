@@ -741,10 +741,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         String claimant;
         try {
             claimant = nodeClaimant();
-        } catch (IllegalArgumentException | IllegalStateException missingProof) {
-            // 不影响旧路径及服务启动；缺少宿主进程证明的实例不能领取双池节点。
-            log.error("节点进程身份证明不可用，拒绝领取双池分段：identity={} reason={}",
-                    identity.describe(), missingProof.getMessage());
+        } catch (IllegalArgumentException | IllegalStateException invalidIdentity) {
+            log.error("节点领取身份不可用，拒绝领取双池分段：identity={} reason={}",
+                    identity.describe(), invalidIdentity.getMessage());
             return;
         }
         try {
@@ -879,6 +878,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         synchronized (this) {
             if (claimant == null) {
                 claimant = NodeWorkerProcessProof.claimant(processIdentity.value());
+                if (!NodeWorkerProcessProof.canConfirmSameContainerRestart()) {
+                    log.warn("当前 Agent 缺少可核验的 Docker 容器身份；节点仍可执行，进程重启后旧节点额度需停机确认才能回收");
+                }
             }
             return claimant;
         }

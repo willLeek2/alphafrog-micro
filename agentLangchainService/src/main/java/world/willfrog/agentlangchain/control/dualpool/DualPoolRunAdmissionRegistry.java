@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkerExitUnconfirmedException;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
@@ -398,9 +399,15 @@ public class DualPoolRunAdmissionRegistry {
             log.warn("这条 Run 的服务所有权在别人手上，本进程不接手: runId={}", runId);
             return null;
         }
-        if (!requeueAbandonedClaims(run, items)) {
+        try {
+            if (!requeueAbandonedClaims(run, items)) {
+                releaseFreshlyTaken(runId, acquired.get(), alreadyMine);
+                return "claim_requeue_left_claimed";
+            }
+        } catch (NodeWorkerExitUnconfirmedException waitingForExit) {
             releaseFreshlyTaken(runId, acquired.get(), alreadyMine);
-            return "claim_requeue_left_claimed";
+            log.info("旧节点执行者尚未确认退出，保留工作项和额度等待下轮恢复：runId={}", runId);
+            return null;
         }
         knownRunIds.add(runId);
         if (!admitExistingRun(runId)) {
@@ -418,9 +425,9 @@ public class DualPoolRunAdmissionRegistry {
     /**
      * 把死在领取态的分段放回可领取状态，并核对没有哪一条还留在领取态。
      *
-     * <p>服务所有权就是「旧执行者已经不在了」的凭据；放回时代际加一，旧执行者万一还活着，
-     * 提交结果时会因为代际对不上被拒。凭据本身也进语句：租约在两次操作之间到期并被别人接管时，
-     * 这一写会因所有权条件不匹配影响 0 行，而不是替新主人改行。</p>
+     * <p>服务所有权只证明本进程此刻有权修改这条 Run，不证明旧节点线程已经退出；
+     * 工作项存储会先核对旧执行者的退出事实，才放回并归还旧额度。放回时代际加一，
+     * 旧提交因代际不符被拒。服务所有权也进入更新条件，避免租约换主后误改新主人的行。</p>
      *
      * @return true 表示这条 Run 已经没有留在领取态的分段
      */

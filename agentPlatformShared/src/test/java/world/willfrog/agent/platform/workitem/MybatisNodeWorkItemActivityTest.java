@@ -109,6 +109,35 @@ class MybatisNodeWorkItemActivityTest {
         verify(activity).releaseNode(terminal, 3);
     }
 
+    @Test
+    void crashedWorkerRequeueReleasesOldEpochBeforeAnotherClaimCanAdvanceTheRow() {
+        NodeWorkItem old = item("EXECUTING", 3);
+        old.setClaimedBy("exited-worker");
+        when(mapper.findByIdentity("run-a", 1, "node-a", 0, 0)).thenReturn(old);
+        when(mapper.requeueInterruptedToolJob(anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyLong(), anyLong(), anyInt(), anyString())).thenReturn(1);
+        MybatisNodeWorkItemStore observingStore = new MybatisNodeWorkItemStore(mapper, activity,
+                claimant -> "exited-worker".equals(claimant));
+
+        assertThat(observingStore.requeueInterruptedToolJob(identity,
+                new NodeWorkItemVersions(2, 0, 3), "operation-a").applied()).isTrue();
+        var order = inOrder(mapper, activity);
+        order.verify(mapper).requeueInterruptedToolJob(anyString(), anyInt(), anyString(), anyInt(), anyInt(),
+                anyLong(), anyLong(), anyInt(), anyString());
+        order.verify(activity).releaseNode(old, 3);
+    }
+
+    @Test
+    void finishedWorkerReleasesItsOwnEpochEvenAfterAnotherWorkerClaimedTheSameRow() {
+        NodeWorkItem next = item("EXECUTING", 4);
+        when(mapper.findByIdentity("run-a", 1, "node-a", 0, 0)).thenReturn(next);
+
+        store.acknowledgeWorkerExit(identity, 3);
+
+        verify(activity).releaseNode(next, 3);
+        verify(activity, never()).releaseNode(next, 4);
+    }
+
     private NodeWorkItem item(String state, int epoch) {
         NodeWorkItem item = new NodeWorkItem();
         item.setId(17L);
