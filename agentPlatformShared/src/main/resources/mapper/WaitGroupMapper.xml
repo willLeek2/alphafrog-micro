@@ -322,6 +322,25 @@
         LIMIT #{limit}
     </select>
 
+    <select id="scanDueMembersForDeployment" resultMap="WaitMemberResultMap">
+        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity,
+               m.tool_call_id, m.tool_name, m.external_operation_id, m.state,
+               m.result_ref_json::text AS result_ref_json,
+               m.dispatch_proof_json::text AS dispatch_proof_json,
+               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at,
+               m.created_at, m.updated_at
+          FROM alphafrog_agent_run_wait_member m
+          JOIN alphafrog_agent_run r ON r.id = m.run_id
+         WHERE r.deployment_id = #{deploymentId}
+           AND r.deployment_generation_id = #{deploymentGenerationId}
+           AND m.state = 'RUNNING'
+           AND m.tool_name = 'executePython'
+           AND m.next_poll_at IS NOT NULL
+           AND m.next_poll_at &lt;= #{now}
+         ORDER BY m.next_poll_at, m.id
+         LIMIT #{limit}
+    </select>
+
     <!-- 启动时恢复容量账本：未决成员，以及已取消/迟到但停机尚未确认的 Python 成员。 -->
     <select id="scanUnresolvedPythonMembersForCapacity" resultMap="WaitMemberResultMap">
         SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity, m.tool_call_id,

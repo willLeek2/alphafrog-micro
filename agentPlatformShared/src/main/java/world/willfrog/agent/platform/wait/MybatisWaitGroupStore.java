@@ -382,6 +382,19 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitMember> scanDueMembers(String deploymentId, String deploymentGenerationId,
+                                           OffsetDateTime now, int limit) {
+        if (deploymentId == null || deploymentId.isBlank()
+                || deploymentGenerationId == null || deploymentGenerationId.isBlank()) {
+            throw new IllegalArgumentException("部署身份不能为空");
+        }
+        if (now == null || limit < 1 || limit > 1000) {
+            throw new IllegalArgumentException("成员扫描参数无效");
+        }
+        return mapper.scanDueMembersForDeployment(deploymentId, deploymentGenerationId, now, limit);
+    }
+
+    @Override
     public List<WaitMember> scanUnresolvedPythonMembersForCapacity(String deploymentId,
                                                                      String deploymentGenerationId,
                                                                      long afterMemberId, int limit) {

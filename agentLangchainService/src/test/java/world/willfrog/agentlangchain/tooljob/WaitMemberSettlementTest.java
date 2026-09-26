@@ -21,12 +21,14 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalRecorder;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisUpsertOutcome;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.DataAnalysisObservabilityService;
+import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 import java.time.Instant;
@@ -117,6 +119,63 @@ class WaitMemberSettlementTest {
                 ArgumentCaptor.forClass(DataAnalysisTerminalEnvelope.class);
         verify(terminalRecorder).upsert(recorded.capture());
         assertThat(recorded.getValue().operationId()).isEqualTo(operationId());
+    }
+
+    /** 模型可在后续分段复用同一个调用编号；两次真实任务分别按持久操作身份结清。 */
+    @Test
+    void firstAndLaterPythonMembersWithTheSameRawCallIdSettleTheirOwnReservations() {
+        String rawCallId = "executePython_1";
+        NodeWorkItemIdentity firstSegment = new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 0);
+        NodeWorkItemIdentity laterSegment = new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 1);
+        String firstDurableId = DurableToolCallIds.forTool("executePython", rawCallId, firstSegment);
+        String laterDurableId = DurableToolCallIds.forTool("executePython", rawCallId, laterSegment);
+        assertThat(firstDurableId).isNotEqualTo(rawCallId).isNotEqualTo(laterDurableId);
+
+        DataAnalysisReservation first = reservationFor(firstDurableId, "task-first");
+        DataAnalysisReservation later = reservationFor(laterDurableId, "task-later");
+        WaitMember firstMember = memberFor(rawCallId, first.operationId(), 41L, 7L);
+        WaitMember laterMember = memberFor(rawCallId, later.operationId(), 42L, 8L);
+        DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
+        DataAnalysisCapacityServiceImpl realCapacity = new DataAnalysisCapacityServiceImpl(properties);
+        realCapacity.recover(List.of(first, later), properties.getMaxUnits(),
+                properties.getMaxHeavyActive());
+        WaitMemberSettlement realSettlement = new WaitMemberSettlement(
+                realCapacity, terminalRecorder, objectMapper);
+        when(terminalRecorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+
+        assertThat(realSettlement.settle(firstMember, proof(first), "SUCCEEDED",
+                result("task-first", "SUCCEEDED", 0, "first", null), "first", FINISHED_AT).ok()).isTrue();
+        assertThat(realSettlement.settle(laterMember, proof(later), "SUCCEEDED",
+                result("task-later", "SUCCEEDED", 0, "later", null), "later", FINISHED_AT).ok()).isTrue();
+
+        ArgumentCaptor<DataAnalysisTerminalEnvelope> recorded =
+                ArgumentCaptor.forClass(DataAnalysisTerminalEnvelope.class);
+        verify(terminalRecorder, org.mockito.Mockito.times(2)).upsert(recorded.capture());
+        assertThat(recorded.getAllValues()).extracting(DataAnalysisTerminalEnvelope::operationId)
+                .containsExactly(first.operationId(), later.operationId());
+        assertThat(recorded.getAllValues()).extracting(DataAnalysisTerminalEnvelope::taskId)
+                .containsExactly("task-first", "task-later");
+    }
+
+    /** 凭证换成别的持久操作身份时仍须拒绝，不能为了兼容模型原文而放松归属。 */
+    @Test
+    void reservationFromAnotherSegmentCannotSettleTheMember() {
+        String rawCallId = "executePython_1";
+        String firstDurableId = DurableToolCallIds.forTool("executePython", rawCallId,
+                new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 0));
+        String laterDurableId = DurableToolCallIds.forTool("executePython", rawCallId,
+                new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 1));
+        WaitMember firstMember = memberFor(rawCallId,
+                new DataAnalysisOperationIdentity(RUN_ID, firstDurableId, ATTEMPT).operationId(), 41L, 7L);
+        DataAnalysisReservation later = reservationFor(laterDurableId, "task-later");
+
+        WaitMemberSettlement.Outcome outcome = settlement.settle(firstMember, proof(later), "SUCCEEDED",
+                result("task-later", "SUCCEEDED", 0, "later", null), "later", FINISHED_AT);
+
+        assertThat(outcome.ok()).isFalse();
+        assertThat(outcome.reason()).isEqualTo("reservation_identity_mismatch");
+        verify(capacityService, never()).releaseReservation(any());
+        verify(terminalRecorder, never()).upsert(any());
     }
 
     /** 账本冲突时不能用一条用量记录冒充名额已经还清。 */
@@ -330,11 +389,30 @@ class WaitMemberSettlementTest {
 
     private WaitMemberDispatchProof proof(DataAnalysisReservation stored) {
         return new WaitMemberDispatchProof(WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
-                operationId(), stored.taskId(), "sha256:fingerprint",
+                stored.operationId(), stored.taskId(), "sha256:fingerprint",
                 "{\"code\":\"print(1)\"}",
                 toJson(new DataAnalysisEstimate(1L, 1024L, 1, 1.0d, 0, List.of(),
                         DataAnalysisResourceClass.STANDARD, 2)),
                 toJson(stored), OffsetDateTime.now().toString());
+    }
+
+    private DataAnalysisReservation reservationFor(String durableCallId, String taskId) {
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(RUN_ID, durableCallId, ATTEMPT);
+        return new DataAnalysisReservation(identity.reservationId(), identity,
+                DataAnalysisResourceClass.STANDARD, 2, DataAnalysisReservationState.TASK_ATTACHED,
+                taskId, Instant.now());
+    }
+
+    private WaitMember memberFor(String rawCallId, String externalOperationId, long id, long groupId) {
+        WaitMember candidate = new WaitMember();
+        candidate.setId(id);
+        candidate.setGroupId(groupId);
+        candidate.setRunId(RUN_ID);
+        candidate.setMemberIdentity("node-1:" + groupId + ":" + rawCallId);
+        candidate.setToolName("executePython");
+        candidate.setToolCallId(rawCallId);
+        candidate.setExternalOperationId(externalOperationId);
+        return candidate;
     }
 
     private String toJson(Object value) {
@@ -346,8 +424,13 @@ class WaitMemberSettlementTest {
     }
 
     private static TaskResultResponse result(String status, int exitCode, String stdout, String error) {
+        return result(TASK_ID, status, exitCode, stdout, error);
+    }
+
+    private static TaskResultResponse result(String taskId, String status, int exitCode, String stdout,
+                                             String error) {
         TaskResultResponse.Builder builder = TaskResultResponse.newBuilder()
-                .setTaskId(TASK_ID)
+                .setTaskId(taskId)
                 .setStatus(status)
                 .setExitCode(exitCode)
                 .setStdout(stdout);

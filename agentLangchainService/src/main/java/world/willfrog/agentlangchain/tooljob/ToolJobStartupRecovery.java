@@ -19,6 +19,8 @@ import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
@@ -202,8 +204,10 @@ public class ToolJobStartupRecovery {
                             continue;
                         }
                     }
+                    DataAnalysisReservation preparing = reservation;
                     ToolJobPreparingDispatchResolver.Resolution resolution =
-                            resolvePreparingDispatch(run, anchor, reservation);
+                            LaneScopeGateway.call(run,
+                                    () -> resolvePreparingDispatch(run, anchor, preparing));
                     if (resolution.outcome()
                             == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
                         reservation = resolution.reservation();
@@ -374,10 +378,18 @@ public class ToolJobStartupRecovery {
         } catch (Exception invalid) {
             throw new IllegalStateException("reservation proof is unreadable", invalid);
         }
-        if (member.getRunId() == null || member.getToolCallId() == null
-                || member.getExternalOperationId() == null
-                || !member.getRunId().equals(reservation.identity().runId())
-                || !member.getToolCallId().equals(reservation.identity().toolCallId())
+        if (member.getRunId() == null || member.getGroupId() == null
+                || member.getToolCallId() == null || member.getExternalOperationId() == null) {
+            throw new IllegalStateException("member identity is incomplete");
+        }
+        var group = waitGroupStore.findGroup(member.getGroupId()).orElse(null);
+        if (group == null || !member.getRunId().equals(group.getRunId())) {
+            throw new IllegalStateException("member has no matching persisted segment");
+        }
+        String durableCallId = DurableToolCallIds.forTool(
+                member.getToolName(), member.getToolCallId(), group.identity().segment());
+        if (!member.getRunId().equals(reservation.identity().runId())
+                || !durableCallId.equals(reservation.identity().toolCallId())
                 || !member.getExternalOperationId().equals(proof.operationId())
                 || !proof.operationId().equals(reservation.operationId())) {
             throw new IllegalStateException("member, proof and reservation identities differ");
@@ -486,6 +498,10 @@ public class ToolJobStartupRecovery {
     }
 
     private void resolveActiveAnchor(AgentRun run, ToolJobAnchor anchor) {
+        LaneScopeGateway.wrap(run, () -> resolveActiveAnchorScoped(run, anchor)).run();
+    }
+
+    private void resolveActiveAnchorScoped(AgentRun run, ToolJobAnchor anchor) {
         // taskId 缺失无法查询 Sandbox，保留 anchor 并等待人工/后续 PREPARING 修复。
         String taskId = anchor.getTaskId();
         if (taskId == null || taskId.isBlank()) {

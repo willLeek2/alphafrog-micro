@@ -98,9 +98,11 @@ public class WaitMemberSettlement {
         } catch (Exception e) {
             return Outcome.blocked("reservation_unreadable");
         }
+        // 成员的 toolCallId 是模型原文；容量凭证中的 toolCallId 带有工作项分段后缀。
+        // 外部操作身份由 Run、持久工具调用身份和尝试次数生成，并已随成员和证明分别落库。
+        // 核对这三份持久身份，不能把模型原文直接与容量凭证里的持久身份比较。
         if (!stored.operationId().equals(proof.operationId())
                 || !stored.identity().runId().equals(member.getRunId())
-                || !stored.identity().toolCallId().equals(member.getToolCallId())
                 || !proof.operationId().equals(member.getExternalOperationId())) {
             return Outcome.blocked("reservation_identity_mismatch");
         }

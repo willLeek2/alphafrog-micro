@@ -7,7 +7,8 @@ import java.util.Optional;
 /** 已取消外部等待成员的持久停机任务；写操作加入调用方事务。 */
 public interface WaitMemberStopStore {
     /** 领取一条到期任务；租约过期的领取也会重新开放。 */
-    Optional<WaitMemberStopTask> claimDue(String owner, String claimToken,
+    Optional<WaitMemberStopTask> claimDue(String deploymentId, String deploymentGenerationId,
+                                          String owner, String claimToken,
                                           OffsetDateTime now, OffsetDateTime leaseUntil);
 
     /** 外调失败或任务尚未终态时，按同一固定取消身份稍后再试。 */

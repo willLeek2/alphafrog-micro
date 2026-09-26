@@ -17,6 +17,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
@@ -150,6 +151,19 @@ public class ToolJobReconciler {
     }
 
     private void processItem(String runId) {
+        if (ownershipGateway == null) {
+            // Narrow constructor is retained for existing in-memory tests; production always injects ownership.
+            processItemScoped(runId);
+            return;
+        }
+        AgentRun run = ownershipGateway.findOwnedRun(runId);
+        if (run == null) {
+            return;
+        }
+        LaneScopeGateway.wrap(run, () -> processItemScoped(runId)).run();
+    }
+
+    private void processItemScoped(String runId) {
         try {
             // checkpoint 写失败 marker 优先处理；未解决前不能继续轮询并恢复一个缺上下文的 Run。
             if (checkpointFailureRecoveryService != null

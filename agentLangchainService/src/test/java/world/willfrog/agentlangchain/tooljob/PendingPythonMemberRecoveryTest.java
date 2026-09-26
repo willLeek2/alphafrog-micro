@@ -14,7 +14,10 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
@@ -32,7 +35,8 @@ import static org.mockito.Mockito.*;
 class PendingPythonMemberRecoveryTest {
     private static final String FINGERPRINT = "sha256:" + "a".repeat(64);
     private static final DataAnalysisOperationIdentity OPERATION =
-            new DataAnalysisOperationIdentity("run-1", "call-1", 1);
+            new DataAnalysisOperationIdentity("run-1", DurableToolCallIds.forTool(
+                    "executePython", "call-1", new NodeWorkItemIdentity("run-1", 1, "node-1", 1, 1)), 1);
     private static final String OPERATION_ID = OPERATION.operationId();
     private final WaitGroupStore groups = mock(WaitGroupStore.class);
     private final NodeWorkItemStore workItems = mock(NodeWorkItemStore.class);
@@ -80,6 +84,10 @@ class PendingPythonMemberRecoveryTest {
         item.setClaimedBy("old-process");
         when(ownership.requireIdentity()).thenReturn(
                 new DeploymentIdentity("beta-test", "gen-" + "1".repeat(64)));
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setLaneTag("lane-test");
+        when(ownership.findOwnedRun("run-1")).thenReturn(run);
         when(groups.scanPendingPythonMembersWithProof("beta-test", "gen-" + "1".repeat(64), 0, 100))
                 .thenReturn(List.of(member));
         when(groups.findGroup(7L)).thenReturn(Optional.of(group));

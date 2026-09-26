@@ -416,6 +416,12 @@ class DualPoolRecoveryDispatcherTest {
         }
 
         @Override
+        public List<WaitMember> scanDueMembers(String deploymentId, String deploymentGenerationId,
+                                                OffsetDateTime now, int limit) {
+            return scanDueMembers(now, limit);
+        }
+
+        @Override
         public Optional<RecoveryNotification> findNotification(long notificationId) {
             return Optional.ofNullable(notifications.get(notificationId));
         }

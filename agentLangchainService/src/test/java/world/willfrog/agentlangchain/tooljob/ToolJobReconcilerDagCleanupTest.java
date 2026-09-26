@@ -447,6 +447,12 @@ class ToolJobReconcilerDagCleanupTest {
         world.willfrog.agentlangchain.gateway.RunOwnershipGateway ownershipGateway =
                 mock(world.willfrog.agentlangchain.gateway.RunOwnershipGateway.class);
         when(ownershipGateway.owns(anyString())).thenReturn(true);
+        when(ownershipGateway.findOwnedRun(anyString())).thenAnswer(invocation -> {
+            world.willfrog.agent.platform.entity.AgentRun run =
+                    new world.willfrog.agent.platform.entity.AgentRun();
+            run.setId(invocation.getArgument(0));
+            return run;
+        });
         when(ownershipGateway.listActiveAnchors(100)).thenReturn(List.of());
         when(ownershipGateway.listResumeReadyAnchors(50)).thenReturn(List.of());
         when(ownershipGateway.listStuckAtCasStatusAnchors(20)).thenReturn(List.of());

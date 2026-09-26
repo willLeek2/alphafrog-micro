@@ -17,14 +17,17 @@ public class MybatisWaitMemberStopStore implements WaitMemberStopStore {
 
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
-    public Optional<WaitMemberStopTask> claimDue(String owner, String claimToken,
+    public Optional<WaitMemberStopTask> claimDue(String deploymentId, String deploymentGenerationId,
+                                                  String owner, String claimToken,
                                                   OffsetDateTime now, OffsetDateTime leaseUntil) {
+        required(deploymentId, "部署编号");
+        required(deploymentGenerationId, "部署代际");
         required(owner, "领取者");
         required(claimToken, "领取令牌");
         if (now == null || leaseUntil == null || !leaseUntil.isAfter(now)) {
             throw new IllegalArgumentException("停机任务租期必须晚于领取时刻");
         }
-        Long id = mapper.claimDue(owner, claimToken, now, leaseUntil);
+        Long id = mapper.claimDue(deploymentId, deploymentGenerationId, owner, claimToken, now, leaseUntil);
         if (id == null) return Optional.empty();
         WaitMemberStopTask task = mapper.findById(id);
         if (task == null) throw new IllegalStateException("已领取的停机任务不存在");

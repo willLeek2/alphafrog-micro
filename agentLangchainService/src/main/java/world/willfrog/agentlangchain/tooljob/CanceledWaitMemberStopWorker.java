@@ -13,6 +13,9 @@ import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.platform.wait.WaitMemberStopStore;
 import world.willfrog.agent.platform.wait.WaitMemberStopTask;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
@@ -35,6 +38,7 @@ import java.util.UUID;
 @Slf4j
 public class CanceledWaitMemberStopWorker {
     private final WaitMemberStopStore stops;
+    private final RunOwnershipGateway ownership;
     private final WaitGroupStore groups;
     private final PythonSandboxService sandbox;
     private final WaitMemberSettlement settlement;
@@ -48,6 +52,7 @@ public class CanceledWaitMemberStopWorker {
     public CanceledWaitMemberStopWorker(WaitMemberStopStore stops, WaitGroupStore groups,
                                         PythonSandboxService sandbox, WaitMemberSettlement settlement,
                                         ObjectMapper objectMapper, PlatformTransactionManager transactionManager,
+                                        RunOwnershipGateway ownership,
                                         @Value("${agent.langchain.wait-member.stop.batch-size:16}") int batchSize,
                                         @Value("${agent.langchain.wait-member.stop.lease-seconds:120}") long leaseSeconds,
                                         @Value("${agent.langchain.wait-member.stop.retry-seconds:5}") long retrySeconds) {
@@ -55,6 +60,7 @@ public class CanceledWaitMemberStopWorker {
             throw new IllegalArgumentException("停机 worker 参数无效");
         }
         this.stops = stops;
+        this.ownership = ownership;
         this.groups = groups;
         this.sandbox = sandbox;
         this.settlement = settlement;
@@ -75,16 +81,23 @@ public class CanceledWaitMemberStopWorker {
     }
 
     public int runBatch() {
+        var identity = ownership.requireIdentity();
         int processed = 0;
         for (int index = 0; index < batchSize; index++) {
             OffsetDateTime now = OffsetDateTime.now();
             String token = UUID.randomUUID().toString();
             Optional<WaitMemberStopTask> next = transaction.execute(ignored ->
-                    stops.claimDue(owner, token, now, now.plusSeconds(leaseSeconds)));
+                    stops.claimDue(identity.deploymentId(), identity.generationId(),
+                            owner, token, now, now.plusSeconds(leaseSeconds)));
             if (next == null || next.isEmpty()) break;
             WaitMemberStopTask stop = next.get();
             try {
-                process(stop);
+                AgentRun run = ownership.findOwnedRun(stop.getRunId());
+                if (run == null) {
+                    retry(stop, "run_ownership_unavailable");
+                } else {
+                    LaneScopeGateway.wrap(run, () -> process(stop)).run();
+                }
             } catch (RuntimeException e) {
                 log.warn("外部等待成员停机暂未收尾：stop={} reason={}", stop.getId(), e.getMessage());
                 retry(stop, "unexpected_failure");

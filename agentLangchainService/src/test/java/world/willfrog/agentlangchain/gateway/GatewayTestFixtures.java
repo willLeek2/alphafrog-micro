@@ -51,6 +51,13 @@ public final class GatewayTestFixtures {
             public boolean owns(String runId) {
                 return true;
             }
+
+            @Override
+            public AgentRun findOwnedRun(String runId) {
+                AgentRun run = new AgentRun();
+                run.setId(runId);
+                return run;
+            }
         };
     }
 }

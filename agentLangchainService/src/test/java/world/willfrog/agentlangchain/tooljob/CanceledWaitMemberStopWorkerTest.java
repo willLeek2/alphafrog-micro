@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
@@ -10,12 +11,16 @@ import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.wait.WaitMemberStopStore;
 import world.willfrog.agent.platform.wait.WaitMemberStopTask;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
+import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
 import java.util.Optional;
 
@@ -36,9 +41,15 @@ class CanceledWaitMemberStopWorkerTest {
     private WaitGroupStore groups;
     private PythonSandboxService sandbox;
     private WaitMemberSettlement settlement;
+    private RunOwnershipGateway ownership;
     private CanceledWaitMemberStopWorker worker;
     private WaitMemberStopTask stop;
     private WaitMember member;
+
+    @AfterEach
+    void clearLane() {
+        LaneContext.clear();
+    }
 
     @BeforeEach
     void setUp() throws Exception {
@@ -46,10 +57,17 @@ class CanceledWaitMemberStopWorkerTest {
         groups = mock(WaitGroupStore.class);
         sandbox = mock(PythonSandboxService.class);
         settlement = mock(WaitMemberSettlement.class);
+        ownership = mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(
+                new DeploymentIdentity("stable", "gen-" + "a".repeat(64)));
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setLaneTag("lane-test");
+        when(ownership.findOwnedRun("run-1")).thenReturn(run);
         PlatformTransactionManager transaction = mock(PlatformTransactionManager.class);
         when(transaction.getTransaction(any())).thenAnswer(ignored -> new SimpleTransactionStatus());
         worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox,
-                settlement, objectMapper, transaction, 2, 120, 5);
+                settlement, objectMapper, transaction, ownership, 2, 120, 5);
         stop = new WaitMemberStopTask();
         stop.setId(9L);
         stop.setWaitMemberId(41L);
@@ -60,7 +78,7 @@ class CanceledWaitMemberStopWorkerTest {
         stop.setRequestFingerprint(FINGERPRINT);
         stop.setCancelRequestId("wait-member-41");
         stop.setClaimToken("claim-1");
-        when(stops.claimDue(any(), any(), any(), any()))
+        when(stops.claimDue(any(), any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of(stop), Optional.empty());
 
         member = new WaitMember();
@@ -77,6 +95,51 @@ class CanceledWaitMemberStopWorkerTest {
                 "{}", "{}", "{}", "2026-01-01T00:00:00Z")));
         when(groups.findMemberByOperation("run-1", "run-1:call-1:1"))
                 .thenReturn(Optional.of(member));
+    }
+
+    @Test
+    void sandboxLookupUsesPersistedLaneAndRestoresWorkerThread() {
+        LaneContext.setTrafficScopeId("previous-thread-lane");
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(ignored -> {
+            assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-test");
+            assertThat(LaneContext.officialDubboTag()).isEqualTo("lane-test");
+            return GetTaskByOperationIdResponse.newBuilder().setFound(false).build();
+        });
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder().build());
+
+        worker.runBatch();
+
+        assertThat(LaneContext.trafficScopeId()).isEqualTo("previous-thread-lane");
+        verify(stops, org.mockito.Mockito.times(2)).claimDue(
+                eq("stable"), eq("gen-" + "a".repeat(64)), any(), any(), any(), any());
+    }
+
+    @Test
+    void mainBetaStopUsesUntaggedSandboxRoute() {
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setLaneTag(LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID);
+        when(ownership.findOwnedRun("run-1")).thenReturn(run);
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(ignored -> {
+            assertThat(LaneContext.officialDubboTag()).isNull();
+            return GetTaskByOperationIdResponse.newBuilder().setFound(false).build();
+        });
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder().build());
+
+        worker.runBatch();
+
+        verify(sandbox).getTaskByOperationId(any());
+        assertThat(LaneContext.trafficScopeId()).isNull();
+    }
+
+    @Test
+    void lostRunOwnershipDoesNotCallSandbox() {
+        when(ownership.findOwnedRun("run-1")).thenReturn(null);
+
+        worker.runBatch();
+
+        org.mockito.Mockito.verifyNoInteractions(sandbox);
+        verify(stops).retry(eq(9L), eq("claim-1"), any(), eq("run_ownership_unavailable"));
     }
 
     @Test

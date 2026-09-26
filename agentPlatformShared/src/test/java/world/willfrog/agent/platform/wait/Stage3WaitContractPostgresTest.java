@@ -450,7 +450,7 @@ class Stage3WaitContractPostgresTest {
             assertThat(groups.listOpenGroupsByRun(runId, 0, 10)).isEmpty();
 
             WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
-                    "worker-a", "token-a", OffsetDateTime.now(),
+                    "stable", "gen-" + "a".repeat(64), "worker-a", "token-a", OffsetDateTime.now(),
                     OffsetDateTime.now().plusMinutes(1)).orElseThrow());
             assertThat(claimed.getId()).isEqualTo(first.getId());
             transaction.executeWithoutResult(ignored -> {
@@ -463,7 +463,7 @@ class Stage3WaitContractPostgresTest {
             });
             assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getState()).isEqualTo("PENDING");
             WaitMemberStopTask reclaimed = transaction.execute(ignored -> stops.claimDue(
-                    "worker-b", "token-b", OffsetDateTime.now().plusMinutes(3),
+                    "stable", "gen-" + "a".repeat(64), "worker-b", "token-b", OffsetDateTime.now().plusMinutes(3),
                     OffsetDateTime.now().plusMinutes(4)).orElseThrow());
             assertThat(reclaimed.getCancelRequestId()).isEqualTo(first.getCancelRequestId());
             execute("UPDATE alphafrog_agent_run SET snapshot_json = "
@@ -555,7 +555,7 @@ class Stage3WaitContractPostgresTest {
             TransactionTemplate transaction = new TransactionTemplate(
                     context.getBean(PlatformTransactionManager.class));
             WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
-                    "worker-a", "token-a", OffsetDateTime.now(),
+                    "stable", "gen-" + "a".repeat(64), "worker-a", "token-a", OffsetDateTime.now(),
                     OffsetDateTime.now().plusMinutes(1)).orElseThrow());
             transaction.executeWithoutResult(ignored -> {
                 assertThat(stops.blockProof(claimed.getId(), "wrong-token", "identity_mismatch"))
@@ -566,7 +566,7 @@ class Stage3WaitContractPostgresTest {
             assertThat(stops.findByWaitMemberId(claimed.getWaitMemberId()).orElseThrow().getState())
                     .isEqualTo("BLOCKED_PROOF");
             Optional<WaitMemberStopTask> reclaimed = transaction.execute(ignored -> stops.claimDue(
-                    "worker-b", "token-b", OffsetDateTime.now().plusMinutes(2),
+                    "stable", "gen-" + "a".repeat(64), "worker-b", "token-b", OffsetDateTime.now().plusMinutes(2),
                     OffsetDateTime.now().plusMinutes(3)));
             assertThat(reclaimed).isEmpty();
         }

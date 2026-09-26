@@ -16,6 +16,8 @@ import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkerProcessProof;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
@@ -78,7 +80,10 @@ public class PendingPythonMemberRecovery {
         for (WaitMember member : candidates) {
             scanCursor = member.getId();
             try {
-                recover(member);
+                var run = ownership.findOwnedRun(member.getRunId());
+                if (run != null) {
+                    LaneScopeGateway.wrap(run, () -> recover(member)).run();
+                }
             } catch (RuntimeException e) {
                 log.warn("待派发 Python 成员暂不能恢复：member={} reason={}", member.getId(), e.getMessage());
             }
@@ -89,10 +94,15 @@ public class PendingPythonMemberRecovery {
         WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(
                 objectMapper, member.getDispatchProofJson()).orElse(null);
         if (proof == null || proof.taskConfirmed() || member.getId() == null
+                || member.getGroupId() == null || member.getToolCallId() == null
                 || !proof.operationId().equals(member.getExternalOperationId())) {
             log.error("待派发 Python 成员的持久请求身份不完整：member={}", member.getId());
             return;
         }
+        WaitGroup group = groups.findGroup(member.getGroupId()).orElse(null);
+        if (group == null || !group.getRunId().equals(member.getRunId())) return;
+        String durableCallId = DurableToolCallIds.forTool(
+                member.getToolName(), member.getToolCallId(), group.identity().segment());
         try {
             DataAnalysisReservation reservation = objectMapper.readValue(
                     proof.reservationJson(), DataAnalysisReservation.class);
@@ -101,7 +111,7 @@ public class PendingPythonMemberRecovery {
                     || reservation.taskId() != null
                     || !reservation.operationId().equals(proof.operationId())
                     || !reservation.identity().runId().equals(member.getRunId())
-                    || !reservation.identity().toolCallId().equals(member.getToolCallId())) {
+                    || !reservation.identity().toolCallId().equals(durableCallId)) {
                 log.error("待派发 Python 成员容量凭证身份不一致：member={}", member.getId());
                 return;
             }
@@ -109,8 +119,6 @@ public class PendingPythonMemberRecovery {
             log.error("待派发 Python 成员容量凭证不可读取：member={}", member.getId());
             return;
         }
-        WaitGroup group = groups.findGroup(member.getGroupId()).orElse(null);
-        if (group == null || !group.getRunId().equals(member.getRunId())) return;
         NodeWorkItem item = workItems.findByIdentity(group.identity().segment()).orElse(null);
         if (item == null || item.getId() == null || item.getClaimEpoch() == null
                 || item.getClaimedBy() == null

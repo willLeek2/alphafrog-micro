@@ -200,6 +200,11 @@ public interface WaitGroupMapper {
     List<WaitMember> scanDueMembers(@Param("now") OffsetDateTime now,
                                    @Param("limit") int limit);
 
+    List<WaitMember> scanDueMembersForDeployment(@Param("deploymentId") String deploymentId,
+                                                  @Param("deploymentGenerationId") String deploymentGenerationId,
+                                                  @Param("now") OffsetDateTime now,
+                                                  @Param("limit") int limit);
+
     List<WaitMember> scanUnresolvedPythonMembersForCapacity(@Param("deploymentId") String deploymentId,
                                                              @Param("deploymentGenerationId") String deploymentGenerationId,
                                                              @Param("afterMemberId") long afterMemberId,

@@ -305,6 +305,12 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitMember> scanDueMembers(String deploymentId, String deploymentGenerationId,
+                                            OffsetDateTime now, int limit) {
+        return scanDueMembers(now, limit);
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,

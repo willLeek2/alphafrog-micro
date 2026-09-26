@@ -8,7 +8,6 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
-import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.MemberCompletionResult;
@@ -32,6 +31,9 @@ import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.RecoveryBackoff;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
@@ -100,7 +102,7 @@ public class WaitMemberResultReceiver {
     private static final long HOLD_POLL_DELAY_MS = 5000L;
 
     private final WaitGroupStore waitGroupStore;
-    private final AgentRunMapper runMapper;
+    private final RunOwnershipGateway ownership;
     private final NodeWorkItemStore nodeWorkItemStore;
     private final PythonSandboxService sandboxService;
     private final PythonSandboxTools pythonSandboxTools;
@@ -148,7 +150,7 @@ public class WaitMemberResultReceiver {
 
     public WaitMemberResultReceiver(
             WaitGroupStore waitGroupStore,
-            AgentRunMapper runMapper,
+            RunOwnershipGateway ownership,
             NodeWorkItemStore nodeWorkItemStore,
             PythonSandboxService sandboxService,
             PythonSandboxTools pythonSandboxTools,
@@ -164,7 +166,7 @@ public class WaitMemberResultReceiver {
             AcceptanceReleasePointStore releasePoints,
             FixtureRuleHitStore ruleHitStore) {
         this.waitGroupStore = waitGroupStore;
-        this.runMapper = runMapper;
+        this.ownership = ownership;
         this.nodeWorkItemStore = nodeWorkItemStore;
         this.sandboxService = sandboxService;
         this.pythonSandboxTools = pythonSandboxTools;
@@ -223,13 +225,19 @@ public class WaitMemberResultReceiver {
     public int round() {
         rounds.incrementAndGet();
         OffsetDateTime now = OffsetDateTime.now();
-        List<WaitMember> due = waitGroupStore.scanDueMembers(now,
+        DeploymentIdentity deployment = ownership.requireIdentity();
+        List<WaitMember> due = waitGroupStore.scanDueMembers(deployment.deploymentId(),
+                deployment.generationId(), now,
                 settings.memberReceiverBatchSize().intValue());
         scanned.addAndGet(due.size());
         int handled = 0;
         for (WaitMember member : due) {
             try {
-                collect(member, now);
+                AgentRun run = ownership.findOwnedRun(member.getRunId());
+                if (run == null) {
+                    continue;
+                }
+                LaneScopeGateway.wrap(run, () -> collect(member, now, run)).run();
                 handled++;
             } catch (RuntimeException e) {
                 // 一个成员上的意外不带走这一批：推后它、记一笔，别的成员照旧。
@@ -243,7 +251,7 @@ public class WaitMemberResultReceiver {
     }
 
     /** 一个成员：核对归属、问一次外部作业、按结论写终态或推后。 */
-    private void collect(WaitMember member, OffsetDateTime now) {
+    private void collect(WaitMember member, OffsetDateTime now, AgentRun run) {
         if (member.stateEnum() != WaitMemberState.RUNNING) {
             return;
         }
@@ -256,11 +264,6 @@ public class WaitMemberResultReceiver {
         }
         WaitMemberDispatchProof proof = proofOpt.get();
 
-        AgentRun run = runMapper.findById(member.getRunId());
-        if (run == null) {
-            isolate(member, now, "run_missing");
-            return;
-        }
         if (run.getStatus() != AgentRunStatus.EXECUTING) {
             // Run 不在执行中：取消、暂停、终态都由它们自己的路径收尾，这里不动它。
             isolate(member, now, "run_not_executing:" + run.getStatus());

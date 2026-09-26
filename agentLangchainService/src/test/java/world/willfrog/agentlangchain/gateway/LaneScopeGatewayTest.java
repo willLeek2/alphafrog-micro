@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.gateway;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -17,6 +18,21 @@ import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
 class LaneScopeGatewayTest {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    @org.junit.jupiter.api.Test
+    void synchronousCallRestoresPreviousLaneEvenWhenSupplierFails() {
+        AgentRun run = new AgentRun();
+        run.setLaneTag("lane-persisted");
+        LaneContext.setTrafficScopeId("previous-lane");
+
+        assertThat(LaneScopeGateway.call(run, LaneContext::trafficScopeId))
+                .isEqualTo("lane-persisted");
+        assertThatThrownBy(() -> LaneScopeGateway.call(run, () -> {
+            assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-persisted");
+            throw new IllegalStateException("failure");
+        })).isInstanceOf(IllegalStateException.class);
+        assertThat(LaneContext.trafficScopeId()).isEqualTo("previous-lane");
+    }
 
     @AfterEach
     void tearDown() throws InterruptedException {

@@ -134,6 +134,10 @@ public interface WaitGroupStore {
      */
     List<WaitMember> scanDueMembers(OffsetDateTime now, int limit);
 
+    /** 只返回本部署代际到期的 Python 成员，避免共享队列中的其他部署占满分页。 */
+    List<WaitMember> scanDueMembers(String deploymentId, String deploymentGenerationId,
+                                    OffsetDateTime now, int limit);
+
     /** 启动恢复容量账本时分页核对尚未收尾的 Python 成员。 */
     default List<WaitMember> scanUnresolvedPythonMembersForCapacity(String deploymentId,
                                                                       String deploymentGenerationId,

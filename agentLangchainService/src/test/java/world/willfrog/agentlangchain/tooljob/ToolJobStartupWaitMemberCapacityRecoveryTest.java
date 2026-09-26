@@ -12,14 +12,18 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitGroup;
+import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -41,8 +45,8 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
 
     @Test
     void restoresBothPreparingAndAttachedMembersFromDurableProofs() throws Exception {
-        DataAnalysisOperationIdentity preparingId = new DataAnalysisOperationIdentity("run-a", "call-a", 1);
-        DataAnalysisOperationIdentity attachedId = new DataAnalysisOperationIdentity("run-b", "call-b", 1);
+        DataAnalysisOperationIdentity preparingId = operation("run-a", "call-a");
+        DataAnalysisOperationIdentity attachedId = operation("run-b", "call-b");
         DataAnalysisReservation preparing = reservation(preparingId, DataAnalysisReservationState.PREPARING, null);
         DataAnalysisReservation attached = reservation(attachedId, DataAnalysisReservationState.TASK_ATTACHED, "task-b");
         WaitMember first = member(1, preparing, "PENDING");
@@ -61,12 +65,14 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
 
     @Test
     void canceledAndLateMembersWithUnconfirmedStopsStillOccupyCapacity() throws Exception {
-        DataAnalysisOperationIdentity id = new DataAnalysisOperationIdentity("run-c", "call-c", 1);
+        DataAnalysisOperationIdentity id = operation("run-c", "call-c");
         DataAnalysisReservation attached = reservation(id, DataAnalysisReservationState.TASK_ATTACHED, "task-c");
-        DataAnalysisOperationIdentity lateId = new DataAnalysisOperationIdentity("run-l", "call-l", 1);
+        DataAnalysisOperationIdentity lateId = operation("run-l", "call-l");
         DataAnalysisReservation late = reservation(lateId, DataAnalysisReservationState.TASK_ATTACHED, "task-l");
+        WaitMember canceledMember = member(3, attached, "CANCELED");
+        WaitMember lateMember = member(4, late, "LATE");
         when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200))
-                .thenReturn(List.of(member(3, attached, "CANCELED"), member(4, late, "LATE")));
+                .thenReturn(List.of(canceledMember, lateMember));
         when(capacity.recover(anyList(), anyInt(), anyInt())).thenReturn(emptyReport());
 
         recovery().onReady();
@@ -114,8 +120,20 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
     private WaitMember member(long rowId, DataAnalysisReservation reservation, String state) throws Exception {
         WaitMember member = new WaitMember();
         member.setId(rowId);
+        member.setGroupId(rowId);
         member.setRunId(reservation.identity().runId());
-        member.setToolCallId(reservation.identity().toolCallId());
+        String durableCallId = reservation.identity().toolCallId();
+        member.setToolCallId(durableCallId.substring(0,
+                durableCallId.indexOf(DurableToolCallIds.WORK_ITEM_SUFFIX)));
+        WaitGroup group = new WaitGroup();
+        group.setId(rowId);
+        group.setRunId(member.getRunId());
+        group.setPlanGeneration(1);
+        group.setNodeId("node");
+        group.setNodeAttempt(1);
+        group.setSegmentSequence(1);
+        group.setModelTurn(1);
+        when(groups.findGroup(rowId)).thenReturn(Optional.of(group));
         member.setExternalOperationId(reservation.operationId());
         member.setToolName("executePython");
         member.setState(state);
@@ -125,6 +143,11 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
                 mapper.writeValueAsString(reservation), Instant.parse("2026-09-25T00:00:00Z").toString())
                 .toJson(mapper));
         return member;
+    }
+
+    private static DataAnalysisOperationIdentity operation(String runId, String rawCallId) {
+        return new DataAnalysisOperationIdentity(runId, DurableToolCallIds.forTool(
+                "executePython", rawCallId, new NodeWorkItemIdentity(runId, 1, "node", 1, 1)), 1);
     }
 
     private static DataAnalysisReservation reservation(DataAnalysisOperationIdentity id,

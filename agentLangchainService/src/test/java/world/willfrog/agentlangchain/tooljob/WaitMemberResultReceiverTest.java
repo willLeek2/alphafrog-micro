@@ -6,7 +6,6 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.MemberCompletionResult;
@@ -29,6 +28,9 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
@@ -42,6 +44,7 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -74,7 +77,7 @@ class WaitMemberResultReceiverTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private WaitGroupStore waitGroupStore;
-    private AgentRunMapper runMapper;
+    private RunOwnershipGateway ownership;
     private NodeWorkItemStore nodeWorkItemStore;
     private PythonSandboxService sandboxService;
     private PythonSandboxTools pythonSandboxTools;
@@ -88,7 +91,9 @@ class WaitMemberResultReceiverTest {
     @BeforeEach
     void setUp() {
         waitGroupStore = Mockito.mock(WaitGroupStore.class);
-        runMapper = Mockito.mock(AgentRunMapper.class);
+        ownership = Mockito.mock(RunOwnershipGateway.class);
+        Mockito.lenient().when(ownership.requireIdentity()).thenReturn(
+                new DeploymentIdentity("stage5a-test", "gen-" + "a".repeat(64)));
         nodeWorkItemStore = Mockito.mock(NodeWorkItemStore.class);
         sandboxService = Mockito.mock(PythonSandboxService.class);
         pythonSandboxTools = Mockito.mock(PythonSandboxTools.class);
@@ -97,7 +102,7 @@ class WaitMemberResultReceiverTest {
         acceptancePolicies = Mockito.mock(AcceptanceRunPolicyRegistry.class);
         releasePoints = Mockito.mock(AcceptanceReleasePointStore.class);
         ruleHits = Mockito.mock(FixtureRuleHitStore.class);
-        receiver = new WaitMemberResultReceiver(waitGroupStore, runMapper, nodeWorkItemStore,
+        receiver = new WaitMemberResultReceiver(waitGroupStore, ownership, nodeWorkItemStore,
                 sandboxService, pythonSandboxTools, settlement, recoveryDispatcher, objectMapper,
                 TestSchedulerSettings.propertyOnly(
                         "agent.langchain.wait-member.receiver.batch-size", "8",
@@ -119,18 +124,21 @@ class WaitMemberResultReceiverTest {
     void aChangedReceiverBatchSizeTakesEffectOnTheNextRound() {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("agent.langchain.wait-member.receiver.batch-size", "8");
-        Mockito.lenient().when(waitGroupStore.scanDueMembers(any(), anyInt())).thenReturn(List.of());
-        WaitMemberResultReceiver live = new WaitMemberResultReceiver(waitGroupStore, runMapper,
+        Mockito.lenient().when(waitGroupStore.scanDueMembers(anyString(), anyString(), any(), anyInt()))
+                .thenReturn(List.of());
+        WaitMemberResultReceiver live = new WaitMemberResultReceiver(waitGroupStore, ownership,
                 nodeWorkItemStore, sandboxService, pythonSandboxTools, settlement, recoveryDispatcher,
                 objectMapper, new DualPoolSchedulerSettings(null, environment), 4096, 1000L,
                 new FrozenEffectiveSettings(), acceptancePolicies, releasePoints, ruleHits);
 
         live.round();
-        verify(waitGroupStore).scanDueMembers(any(), eq(8));
+        verify(waitGroupStore).scanDueMembers(eq("stage5a-test"), eq("gen-" + "a".repeat(64)),
+                any(), eq(8));
 
         environment.setProperty("agent.langchain.wait-member.receiver.batch-size", "3");
         live.round();
-        verify(waitGroupStore).scanDueMembers(any(), eq(3));
+        verify(waitGroupStore).scanDueMembers(eq("stage5a-test"), eq("gen-" + "a".repeat(64)),
+                any(), eq(3));
     }
 
     /** 还在跑的作业：推后下次查询时间，不写任何终态。 */
@@ -150,6 +158,39 @@ class WaitMemberResultReceiverTest {
         assertThat(receiver.snapshot())
                 .containsEntry("waitMemberReceiverDeferredTotal", 1L)
                 .containsEntry("waitMemberReceiverCompletedTotal", 0L);
+    }
+
+    @Test
+    void backgroundSandboxLookupUsesTheRunLaneAndRestoresThePreviousScope() {
+        givenDueMember();
+        AgentRun run = run(AgentRunStatus.EXECUTING);
+        run.setLaneTag("stage5a-test");
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(run);
+        AtomicReference<String> routedLane = new AtomicReference<>();
+        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenAnswer(invocation -> {
+            routedLane.set(LaneContext.trafficScopeId());
+            return TaskStatusResponse.newBuilder()
+                    .setTaskId(invocation.getArgument(0, GetTaskStatusRequest.class).getTaskId())
+                    .setStatus("RUNNING")
+                    .build();
+        });
+        LaneContext.setTrafficScopeId("previous-lane");
+        try {
+            receiver.round();
+            assertThat(routedLane.get()).isEqualTo("stage5a-test");
+            assertThat(LaneContext.trafficScopeId()).isEqualTo("previous-lane");
+        } finally {
+            LaneContext.clear();
+        }
+    }
+
+    @Test
+    void aMemberOutsideThisDeploymentIsNotSentToSandbox() {
+        givenDueMember();
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(null);
+
+        assertThat(receiver.round()).isZero();
+        verify(sandboxService, never()).getTaskStatus(any(GetTaskStatusRequest.class));
     }
 
     /** 确认成功的作业：按同一份载荷写成员终态，并只在这条让整组齐备时叫一次分发器。 */
@@ -384,7 +425,7 @@ class WaitMemberResultReceiverTest {
     void aMemberWhoseRunIsNotExecutingIsIsolated() {
         givenDueMember();
         AgentRun run = run(AgentRunStatus.CANCELED);
-        when(runMapper.findById(RUN_ID)).thenReturn(run);
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(run);
 
         receiver.round();
 
@@ -398,7 +439,7 @@ class WaitMemberResultReceiverTest {
     void aMemberWithoutItsSegmentIsIsolated() {
         givenDueMember();
         AgentRun run = run(AgentRunStatus.EXECUTING);
-        when(runMapper.findById(RUN_ID)).thenReturn(run);
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(run);
         when(waitGroupStore.findGroup(GROUP_ID)).thenReturn(Optional.of(group()));
         when(nodeWorkItemStore.findByIdentity(any())).thenReturn(Optional.empty());
 
@@ -427,7 +468,7 @@ class WaitMemberResultReceiverTest {
     /** 这一轮扫不动（库读不出来）：不带走调度线程，下一轮照跑。 */
     @Test
     void aFailingRoundIsSwallowedAndTheNextRoundStillRuns() {
-        when(waitGroupStore.scanDueMembers(any(), anyInt()))
+        when(waitGroupStore.scanDueMembers(anyString(), anyString(), any(), anyInt()))
                 .thenThrow(new IllegalStateException("库读不了"))
                 .thenReturn(List.of());
 
@@ -811,12 +852,13 @@ class WaitMemberResultReceiverTest {
     }
 
     private void givenDue(WaitMember... members) {
-        Mockito.lenient().when(waitGroupStore.scanDueMembers(any(), anyInt()))
+        Mockito.lenient().when(waitGroupStore.scanDueMembers(anyString(), anyString(), any(), anyInt()))
                 .thenReturn(List.of(members));
     }
 
     private void givenRunAndGroup() {
-        Mockito.lenient().when(runMapper.findById(RUN_ID)).thenReturn(run(AgentRunStatus.EXECUTING));
+        Mockito.lenient().when(ownership.findOwnedRun(RUN_ID))
+                .thenReturn(run(AgentRunStatus.EXECUTING));
         Mockito.lenient().when(waitGroupStore.findGroup(GROUP_ID)).thenReturn(Optional.of(group()));
         Mockito.lenient().when(nodeWorkItemStore.findByIdentity(any())).thenReturn(Optional.of(segment()));
     }

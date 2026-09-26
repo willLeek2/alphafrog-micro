@@ -36,8 +36,11 @@
                updated_at = CURRENT_TIMESTAMP
          WHERE s.id = (
              SELECT candidate.id FROM alphafrog_agent_run_wait_member_stop candidate
-              WHERE (candidate.state = 'PENDING' AND candidate.next_attempt_at &lt;= #{now})
-                 OR (candidate.state = 'CLAIMED' AND candidate.lease_until &lt;= #{now})
+              JOIN alphafrog_agent_run r ON r.id = candidate.run_id
+              WHERE r.deployment_id = #{deploymentId}
+                AND r.deployment_generation_id = #{deploymentGenerationId}
+                AND ((candidate.state = 'PENDING' AND candidate.next_attempt_at &lt;= #{now})
+                 OR (candidate.state = 'CLAIMED' AND candidate.lease_until &lt;= #{now}))
               ORDER BY candidate.next_attempt_at, candidate.id
               LIMIT 1 FOR UPDATE OF candidate SKIP LOCKED)
         RETURNING s.id

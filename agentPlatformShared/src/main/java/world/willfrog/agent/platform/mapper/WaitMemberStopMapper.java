@@ -9,7 +9,9 @@ import java.util.List;
 
 @Mapper
 public interface WaitMemberStopMapper {
-    Long claimDue(@Param("owner") String owner, @Param("claimToken") String claimToken,
+    Long claimDue(@Param("deploymentId") String deploymentId,
+                  @Param("deploymentGenerationId") String deploymentGenerationId,
+                  @Param("owner") String owner, @Param("claimToken") String claimToken,
                   @Param("now") OffsetDateTime now, @Param("leaseUntil") OffsetDateTime leaseUntil);
 
     WaitMemberStopTask findById(@Param("stopId") long stopId);

@@ -11,6 +11,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
@@ -44,6 +46,7 @@ public class ToolJobContinuationTracker {
     private final AgentRunMapper runMapper;
     private final ToolJobConfig config;
     private final LangchainSchedulerMetrics metrics;
+    private final RunOwnershipGateway ownership;
     @DubboReference
     private PythonSandboxService sandboxService;
 
@@ -54,11 +57,22 @@ public class ToolJobContinuationTracker {
                                       AgentRunMapper runMapper,
                                       ToolJobConfig config,
                                       LangchainSchedulerMetrics metrics) {
+        this(anchorService, finalizer, runMapper, config, metrics, null);
+    }
+
+    @Autowired
+    public ToolJobContinuationTracker(ToolJobAnchorService anchorService,
+                                      ToolJobFinalizer finalizer,
+                                      AgentRunMapper runMapper,
+                                      ToolJobConfig config,
+                                      LangchainSchedulerMetrics metrics,
+                                      RunOwnershipGateway ownership) {
         this.anchorService = anchorService;
         this.finalizer = finalizer;
         this.runMapper = runMapper;
         this.config = config;
         this.metrics = metrics;
+        this.ownership = ownership;
     }
 
     /**
@@ -97,7 +111,14 @@ public class ToolJobContinuationTracker {
     public void pollPending() {
         for (ContinuationEntry entry : entries.values()) {
             try {
-                processEntry(entry);
+                if (ownership == null) {
+                    processEntry(entry);
+                } else {
+                    AgentRun run = ownership.findOwnedRun(entry.runId());
+                    if (run != null) {
+                        LaneScopeGateway.wrap(run, () -> processEntry(entry)).run();
+                    }
+                }
             } catch (Exception e) {
                 // 单项异常不阻塞其他 Run 的轮询；失败预算耗尽会按 RESULT_LOST 走完终态处理。
                 log.error("Continuation poll failed for run={}: {}", entry.runId(), e.getMessage(), e);
