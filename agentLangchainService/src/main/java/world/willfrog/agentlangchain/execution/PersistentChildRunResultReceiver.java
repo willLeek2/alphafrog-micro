@@ -17,6 +17,8 @@ import world.willfrog.agent.platform.wait.MemberCompletionResult;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberState;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -34,6 +36,7 @@ public class PersistentChildRunResultReceiver {
     private final WaitGroupStore waitGroups;
     private final ChildRunIntentStore intents;
     private final AgentRunMapper runs;
+    private final RunOwnershipGateway ownership;
     private final ObjectMapper json;
     private final int batchSize;
     private final int maxResultChars;
@@ -42,12 +45,14 @@ public class PersistentChildRunResultReceiver {
     public PersistentChildRunResultReceiver(WaitGroupStore waitGroups,
                                             ChildRunIntentStore intents,
                                             AgentRunMapper runs,
+                                            RunOwnershipGateway ownership,
                                             ObjectMapper json,
                                             @Value("${agent.langchain.child-run.result-batch-size:64}") int batchSize,
                                             @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}") int maxResultChars) {
         this.waitGroups = waitGroups;
         this.intents = intents;
         this.runs = runs;
+        this.ownership = ownership;
         this.json = json;
         this.batchSize = Math.max(1, Math.min(batchSize, 256));
         this.maxResultChars = Math.max(1024, maxResultChars);
@@ -57,22 +62,31 @@ public class PersistentChildRunResultReceiver {
     public void collectDueResults() {
         List<WaitMember> due;
         try {
-            due = waitGroups.scanDueSubAgentMembers(OffsetDateTime.now(), batchSize);
+            DeploymentIdentity deployment = ownership.requireIdentity();
+            due = waitGroups.scanDueSubAgentMembers(deployment.deploymentId(),
+                    deployment.generationId(), OffsetDateTime.now(), batchSize);
         } catch (RuntimeException failure) {
             log.error("子代理等待成员补扫失败，保留持久成员待重试", failure);
             return;
         }
         for (WaitMember member : due) {
+            boolean owned = false;
             try {
+                owned = ownership.findOwnedRun(member.getRunId()) != null;
+                if (!owned) {
+                    continue;
+                }
                 collect(member);
             } catch (RuntimeException failure) {
                 log.error("子代理等待成员仍待接回: groupId={} member={}",
                         member.getGroupId(), member.getMemberIdentity(), failure);
-                try {
-                    waitGroups.rescheduleMember(member.getGroupId(), member.getMemberIdentity(),
-                            OffsetDateTime.now().plusSeconds(2), 8);
-                } catch (RuntimeException retryFailure) {
-                    log.error("子代理等待成员退避写入失败", retryFailure);
+                if (owned) {
+                    try {
+                        waitGroups.rescheduleMember(member.getGroupId(), member.getMemberIdentity(),
+                                OffsetDateTime.now().plusSeconds(2), 8);
+                    } catch (RuntimeException retryFailure) {
+                        log.error("子代理等待成员退避写入失败", retryFailure);
+                    }
                 }
             }
         }
@@ -83,7 +97,9 @@ public class PersistentChildRunResultReceiver {
     public synchronized void repairAcceptedSpawnResults() {
         List<ChildRunIntentView> page;
         try {
-            page = intents.listAcceptedSpawnMembersPending(spawnScanCursor, batchSize);
+            DeploymentIdentity deployment = ownership.requireIdentity();
+            page = intents.listAcceptedSpawnMembersPending(deployment.deploymentId(),
+                    deployment.generationId(), spawnScanCursor, batchSize);
         } catch (RuntimeException failure) {
             log.error("已受理子 Run 的父工具结果补扫失败", failure);
             return;
@@ -95,10 +111,14 @@ public class PersistentChildRunResultReceiver {
         for (ChildRunIntentView view : page) {
             spawnScanCursor = view.intentId();
             try {
+                if (ownership.findOwnedRun(view.parentRunId()) == null) {
+                    continue;
+                }
                 WaitMember member = waitGroups.findMemberByIdentity(
                         view.parentWaitGroupId(), view.parentMemberIdentity())
                         .orElseThrow(() -> new IllegalStateException("accepted spawn member missing"));
-                if (member.stateEnum() != WaitMemberState.RUNNING) {
+                if (!view.parentRunId().equals(member.getRunId())
+                        || member.stateEnum() != WaitMemberState.RUNNING) {
                     throw new IllegalStateException("accepted spawn member is not dispatched");
                 }
                 collect(member);

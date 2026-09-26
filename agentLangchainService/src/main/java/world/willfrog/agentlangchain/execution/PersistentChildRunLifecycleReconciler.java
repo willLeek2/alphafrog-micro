@@ -8,11 +8,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
 import world.willfrog.agent.platform.childrun.ChildRunIntentView;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.facade.LangchainRunControlService;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.util.List;
 import java.util.Objects;
@@ -24,18 +25,18 @@ public class PersistentChildRunLifecycleReconciler {
     private static final int PAGE_SIZE = 100;
 
     private final ChildRunIntentStore intents;
-    private final AgentRunMapper runs;
+    private final RunOwnershipGateway ownership;
     private final LangchainRunControlService controls;
     private final DualPoolRunAdmissionRegistry admissions;
     private final TransactionTemplate transactions;
 
     public PersistentChildRunLifecycleReconciler(ChildRunIntentStore intents,
-                                                 AgentRunMapper runs,
+                                                 RunOwnershipGateway ownership,
                                                  LangchainRunControlService controls,
                                                  DualPoolRunAdmissionRegistry admissions,
                                                  PlatformTransactionManager transactionManager) {
         this.intents = intents;
-        this.runs = runs;
+        this.ownership = ownership;
         this.controls = controls;
         this.admissions = admissions;
         this.transactions = new TransactionTemplate(transactionManager);
@@ -47,7 +48,9 @@ public class PersistentChildRunLifecycleReconciler {
         for (int rootPage = 0; rootPage < 10; rootPage++) {
             List<String> roots;
             try {
-                roots = intents.listReservedRootRunIds(afterRoot, PAGE_SIZE);
+                DeploymentIdentity identity = ownership.requireIdentity();
+                roots = intents.listReservedRootRunIdsForDeployment(afterRoot, PAGE_SIZE,
+                        identity.deploymentId(), identity.generationId());
             } catch (RuntimeException failure) {
                 log.error("子 Run 根树收尾扫描失败，保留持久容量待重试", failure);
                 return;
@@ -66,6 +69,9 @@ public class PersistentChildRunLifecycleReconciler {
     }
 
     private void reconcileRoot(String root) {
+        if (ownership.findOwnedRun(root) == null) {
+            return;
+        }
         long afterIntent = 0L;
         for (int page = 0; page < 10; page++) {
             List<ChildRunIntentView> children;
@@ -95,9 +101,9 @@ public class PersistentChildRunLifecycleReconciler {
     }
 
     private void reconcileChild(ChildRunIntentView intent) {
-        AgentRun parent = runs.findById(intent.parentRunId());
+        AgentRun parent = ownership.findOwnedRun(intent.parentRunId());
         if (parent == null) {
-            throw new IllegalStateException("parent Run missing for child intent");
+            throw new IllegalStateException("parent Run missing or belongs to another deployment");
         }
         boolean parentStopped = terminal(parent.getStatus())
                 || parent.getStatus() == AgentRunStatus.CANCELING
@@ -118,9 +124,9 @@ public class PersistentChildRunLifecycleReconciler {
             }
             return;
         }
-        AgentRun child = runs.findById(intent.childRunId());
+        AgentRun child = ownership.findOwnedRun(intent.childRunId());
         if (child == null) {
-            throw new IllegalStateException("accepted child intent has no Run record");
+            throw new IllegalStateException("accepted child Run missing or belongs to another deployment");
         }
         if (terminal(child.getStatus())) {
             transactions.execute(ignored -> {

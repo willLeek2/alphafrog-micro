@@ -7,11 +7,12 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.RecoveryNotification;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -52,7 +53,7 @@ public class DualPoolRecoveryDispatcher {
     private static final String DISPATCHER_ID = "dual-pool-recovery-periodic";
 
     private final WaitGroupStore waitGroupStore;
-    private final AgentRunMapper runMapper;
+    private final RunOwnershipGateway ownership;
     private final DualPoolDispatcher dispatcher;
     private final WaitGroupRecoveryIntake intake;
     /** 每轮读一次的参数：批次、配额、提醒容量与退避都允许在运行期改，改完下一轮生效。 */
@@ -84,14 +85,14 @@ public class DualPoolRecoveryDispatcher {
 
     public DualPoolRecoveryDispatcher(
             WaitGroupStore waitGroupStore,
-            AgentRunMapper runMapper,
+            RunOwnershipGateway ownership,
             DualPoolDispatcher dispatcher,
             WaitGroupRecoveryIntake intake,
             DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.recovery.scan-interval-ms:1000}") long scanIntervalMs,
             FrozenEffectiveSettings frozenEffectiveSettings) {
         this.waitGroupStore = waitGroupStore;
-        this.runMapper = runMapper;
+        this.ownership = ownership;
         this.dispatcher = dispatcher;
         this.intake = intake;
         this.settings = settings;
@@ -230,7 +231,9 @@ public class DualPoolRecoveryDispatcher {
         if (limit <= 0) {
             return 0;
         }
-        List<RecoveryNotification> due = waitGroupStore.scanDueRecoveryNotifications(limit);
+        DeploymentIdentity deployment = ownership.requireIdentity();
+        List<RecoveryNotification> due = waitGroupStore.scanDueRecoveryNotifications(
+                deployment.deploymentId(), deployment.generationId(), limit);
         scanned.addAndGet(due.size());
         int handled = 0;
         for (RecoveryNotification notification : due) {
@@ -264,14 +267,17 @@ public class DualPoolRecoveryDispatcher {
     /**
      * 试一条通知：交给受理层按「服务所有权 → 业务名额预留 → 消费」走一遍，按结局分流。
      *
-     * <p>这里不再自己读 Run 判断能不能取：原因由消费语句给出，看到的就是库里的样子。Run 读不回来或
-     * 版本不认识时受理层会把它收口——那样的通知永远不会再有下一步，留在扫描队头只会挡住后面的。</p>
+     * <p>先核对 Run 属于当前部署代际，避免另一个共享数据库的部署消费、推后或关闭这条通知。
+     * 属于本代际后的业务条件仍由受理层和消费语句核对。</p>
      */
     private void attempt(RecoveryNotification notification) {
         if (!notification.consumable()) {
             return;
         }
-        AgentRun run = readRun(notification.getRunId());
+        AgentRun run = ownership.findOwnedRun(notification.getRunId());
+        if (run == null) {
+            return;
+        }
         WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification, run, DISPATCHER_ID);
         switch (result.outcome()) {
             case CONSUMED -> {
@@ -337,10 +343,6 @@ public class DualPoolRecoveryDispatcher {
                     : result.rejection().name() + ":" + result.detail();
         }
         return result.detail() == null ? "unknown" : result.detail();
-    }
-
-    private AgentRun readRun(String runId) {
-        return runId == null || runId.isBlank() ? null : runMapper.findById(runId);
     }
 
     private static boolean terminal(AgentRunStatus status) {

@@ -186,6 +186,27 @@
         RETURNING o.id
     </select>
 
+    <select id="claimDueOutboxForDeployment" resultType="java.lang.Long" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run_child_outbox o
+           SET state = 'CLAIMED', claim_token = #{claimToken}, claimed_by = #{owner},
+               lease_until = #{leaseUntil}, delivery_attempts = delivery_attempts + 1,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE o.id = (
+             SELECT q.id FROM alphafrog_agent_run_child_outbox q
+             JOIN alphafrog_agent_run_child_intent i ON i.id = q.intent_id
+             JOIN alphafrog_agent_run parent ON parent.id = i.parent_run_id
+             WHERE ((q.state = 'PENDING' AND q.next_delivery_at &lt;= #{now})
+                    OR (q.state = 'CLAIMED' AND q.lease_until &lt;= #{now}))
+               AND i.state = 'PENDING'
+               AND i.parent_deployment_id = #{deploymentId}
+               AND i.parent_deployment_generation_id = #{generationId}
+               AND parent.deployment_id = #{deploymentId}
+               AND parent.deployment_generation_id = #{generationId}
+             ORDER BY q.next_delivery_at, q.id
+             LIMIT 1 FOR UPDATE OF q SKIP LOCKED)
+        RETURNING o.id
+    </select>
+
     <update id="markIntentAccepted">
         UPDATE alphafrog_agent_run_child_intent
            SET state = 'ACCEPTED', accepted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -366,6 +387,28 @@
         ORDER BY active.root_run_id LIMIT #{limit}
     </select>
 
+    <select id="listReservedRootRunIdsForDeployment" resultType="java.lang.String">
+        SELECT active.root_run_id FROM (
+            SELECT root_run_id FROM alphafrog_agent_run_tree_capacity
+             WHERE active_child_count &gt; 0
+            UNION
+            SELECT root_run_id FROM alphafrog_agent_run_tree_budget
+             WHERE active_nodes &gt; 0 OR external_waits &gt; 0
+            UNION
+            SELECT COALESCE(i.root_run_id, s.run_id) AS root_run_id
+              FROM alphafrog_agent_run_wait_member_stop s
+              LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = s.run_id
+             WHERE s.state &lt;&gt; 'CONFIRMED'
+        ) active
+        JOIN alphafrog_agent_run root ON root.id = active.root_run_id
+        WHERE root.deployment_id = #{deploymentId}
+          AND root.deployment_generation_id = #{generationId}
+        <if test="afterRootRunId != null and afterRootRunId != ''">
+            AND active.root_run_id &gt; #{afterRootRunId}
+        </if>
+        ORDER BY active.root_run_id LIMIT #{limit}
+    </select>
+
     <select id="listAcceptedChildrenNeedingLaunch" resultMap="IntentRow">
         SELECT <include refid="intentColumns"/>, child.status AS child_run_status
           FROM alphafrog_agent_run_child_intent i
@@ -375,6 +418,24 @@
            AND i.state = 'ACCEPTED'
            AND (child.id IS NULL OR child.status NOT IN
                 ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED'))
+         ORDER BY i.id LIMIT #{limit}
+    </select>
+
+    <select id="listAcceptedChildrenNeedingLaunchForDeployment" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>, child.status AS child_run_status
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+          JOIN alphafrog_agent_run parent ON parent.id = i.parent_run_id
+          LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
+         WHERE i.id &gt; #{afterIntentId}
+           AND i.state = 'ACCEPTED'
+           AND i.parent_deployment_id = #{deploymentId}
+           AND i.parent_deployment_generation_id = #{generationId}
+           AND parent.deployment_id = #{deploymentId}
+           AND parent.deployment_generation_id = #{generationId}
+           AND (child.id IS NULL OR (child.deployment_id = #{deploymentId}
+               AND child.deployment_generation_id = #{generationId}
+               AND child.status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')))
          ORDER BY i.id LIMIT #{limit}
     </select>
 
@@ -410,6 +471,24 @@
            AND member.member_identity = i.parent_member_identity
           LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
          WHERE i.id &gt; #{afterIntentId}
+           AND i.accepted_at IS NOT NULL
+           AND member.state IN ('PENDING', 'RUNNING')
+         ORDER BY i.id LIMIT #{limit}
+    </select>
+
+    <select id="listAcceptedSpawnMembersPendingForDeployment" resultMap="IntentRow">
+        SELECT <include refid="intentColumns"/>, child.status AS child_run_status,
+               member.state AS parent_member_state
+          FROM alphafrog_agent_run_child_intent i
+          JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
+          JOIN alphafrog_agent_run parent ON parent.id = i.parent_run_id
+          JOIN alphafrog_agent_run_wait_member member
+            ON member.group_id = i.parent_wait_group_id
+           AND member.member_identity = i.parent_member_identity
+          LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
+         WHERE parent.deployment_id = #{deploymentId}
+           AND parent.deployment_generation_id = #{deploymentGenerationId}
+           AND i.id &gt; #{afterIntentId}
            AND i.accepted_at IS NOT NULL
            AND member.state IN ('PENDING', 'RUNNING')
          ORDER BY i.id LIMIT #{limit}

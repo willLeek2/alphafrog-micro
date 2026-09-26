@@ -85,6 +85,11 @@ public interface WaitGroupMapper {
      */
     List<RecoveryNotification> scanDueRecoveryNotifications(@Param("limit") int limit);
 
+    List<RecoveryNotification> scanDueRecoveryNotificationsForDeployment(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("limit") int limit);
+
     /**
      * 把一条通知推后：只对还在等待态、且新时间确实更晚的才写。
      * 已经取走或取消的通知影响 0 行，迟到的延期写入也不会把时间拉回来。
@@ -212,6 +217,11 @@ public interface WaitGroupMapper {
 
     List<WaitMember> scanDueSubAgentMembers(@Param("now") OffsetDateTime now,
                                             @Param("limit") int limit);
+
+    List<WaitMember> scanDueSubAgentMembersForDeployment(@Param("deploymentId") String deploymentId,
+                                                          @Param("deploymentGenerationId") String deploymentGenerationId,
+                                                          @Param("now") OffsetDateTime now,
+                                                          @Param("limit") int limit);
 
     /** 成员还在执行中时推后下次查询时间；已经落终态的成员不会被改。 */
     int rescheduleMember(@Param("groupId") long groupId,

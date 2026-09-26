@@ -150,6 +150,12 @@ public interface WaitGroupStore {
         throw new UnsupportedOperationException("sub-agent member scan is not implemented");
     }
 
+    /** 只返回本部署代际到期的子代理成员，避免共享队列中的其他部署占满分页。 */
+    default List<WaitMember> scanDueSubAgentMembers(String deploymentId, String deploymentGenerationId,
+                                                     OffsetDateTime now, int limit) {
+        throw new UnsupportedOperationException("deployment-scoped sub-agent member scan is not implemented");
+    }
+
     /** 成员还在执行中时推后它的下次查询时间并累加轮询次数；已经落终态的成员不会被改。 */
     boolean rescheduleMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt, int maxBackoffStep);
 
@@ -188,6 +194,12 @@ public interface WaitGroupStore {
      * <p>周期补扫与启动扫描用它把通知重新发现：内存提示可以丢，库里这条通知还在就得有人来取。</p>
      */
     List<RecoveryNotification> scanDueRecoveryNotifications(int limit);
+
+    /** 只扫描本部署代际的到期通知，防止共享数据库中其他部署的通知占满批次。 */
+    default List<RecoveryNotification> scanDueRecoveryNotifications(String deploymentId,
+                                                                    String deploymentGenerationId, int limit) {
+        throw new UnsupportedOperationException("deployment-scoped recovery scan is not implemented");
+    }
 
     /**
      * 把一条通知推后到某个时刻：取不走时按退避推迟，避免同一批候选被反复捞。

@@ -46,6 +46,10 @@ public interface ChildRunIntentMapper {
     Long claimDueOutbox(@Param("owner") String owner, @Param("claimToken") String claimToken,
                         @Param("now") OffsetDateTime now, @Param("leaseUntil") OffsetDateTime leaseUntil);
 
+    Long claimDueOutboxForDeployment(@Param("owner") String owner, @Param("claimToken") String claimToken,
+                        @Param("now") OffsetDateTime now, @Param("leaseUntil") OffsetDateTime leaseUntil,
+                        @Param("deploymentId") String deploymentId, @Param("generationId") String generationId);
+
     int markIntentAccepted(@Param("intentId") long intentId);
 
     int acknowledgeOutbox(@Param("outboxId") long outboxId, @Param("claimToken") String claimToken);
@@ -69,8 +73,16 @@ public interface ChildRunIntentMapper {
     List<String> listReservedRootRunIds(@Param("afterRootRunId") String afterRootRunId,
                                         @Param("limit") int limit);
 
+    List<String> listReservedRootRunIdsForDeployment(@Param("afterRootRunId") String afterRootRunId,
+                                        @Param("limit") int limit, @Param("deploymentId") String deploymentId,
+                                        @Param("generationId") String generationId);
+
     List<ChildRunIntentRow> listAcceptedChildrenNeedingLaunch(@Param("afterIntentId") long afterIntentId,
                                                               @Param("limit") int limit);
+
+    List<ChildRunIntentRow> listAcceptedChildrenNeedingLaunchForDeployment(
+            @Param("afterIntentId") long afterIntentId, @Param("limit") int limit,
+            @Param("deploymentId") String deploymentId, @Param("generationId") String generationId);
 
     List<ChildRunIntentRow> listUnsettledByParent(@Param("parentRunId") String parentRunId,
                                                    @Param("afterIntentId") long afterIntentId,
@@ -82,4 +94,10 @@ public interface ChildRunIntentMapper {
 
     List<ChildRunIntentRow> listAcceptedSpawnMembersPending(@Param("afterIntentId") long afterIntentId,
                                                              @Param("limit") int limit);
+
+    List<ChildRunIntentRow> listAcceptedSpawnMembersPendingForDeployment(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("afterIntentId") long afterIntentId,
+            @Param("limit") int limit);
 }

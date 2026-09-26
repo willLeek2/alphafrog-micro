@@ -77,12 +77,29 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
     @Transactional(propagation = Propagation.MANDATORY)
     public Optional<ChildRunOutboxDelivery> claimDueOutbox(String owner, String claimToken,
                                                            OffsetDateTime now, OffsetDateTime leaseUntil) {
+        return claimDueOutboxInternal(owner, claimToken, now, leaseUntil, null, null);
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Optional<ChildRunOutboxDelivery> claimDueOutboxForDeployment(String owner, String claimToken,
+            OffsetDateTime now, OffsetDateTime leaseUntil, String deploymentId, String generationId) {
+        required(deploymentId, "部署编号");
+        required(generationId, "部署代际编号");
+        return claimDueOutboxInternal(owner, claimToken, now, leaseUntil, deploymentId, generationId);
+    }
+
+    private Optional<ChildRunOutboxDelivery> claimDueOutboxInternal(String owner, String claimToken,
+            OffsetDateTime now, OffsetDateTime leaseUntil, String deploymentId, String generationId) {
         required(owner, "领取者");
         required(claimToken, "领取令牌");
         if (now == null || leaseUntil == null || !leaseUntil.isAfter(now)) {
             throw new IllegalArgumentException("投递租期必须晚于领取时刻");
         }
-        Long outboxId = mapper.claimDueOutbox(owner, claimToken, now, leaseUntil);
+        Long outboxId = deploymentId == null
+                ? mapper.claimDueOutbox(owner, claimToken, now, leaseUntil)
+                : mapper.claimDueOutboxForDeployment(owner, claimToken, now, leaseUntil,
+                        deploymentId, generationId);
         if (outboxId == null) {
             return Optional.empty();
         }
@@ -217,10 +234,32 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
 
     @Override
     @Transactional(readOnly = true)
+    public List<String> listReservedRootRunIdsForDeployment(String afterRootRunId, int limit,
+            String deploymentId, String generationId) {
+        requirePageSize(limit);
+        required(deploymentId, "部署编号");
+        required(generationId, "部署代际编号");
+        return List.copyOf(mapper.listReservedRootRunIdsForDeployment(afterRootRunId, limit,
+                deploymentId, generationId));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
     public List<ChildRunIntentView> listAcceptedChildrenNeedingLaunch(long afterIntentId, int limit) {
         requirePage(afterIntentId, limit);
         return mapper.listAcceptedChildrenNeedingLaunch(afterIntentId, limit).stream()
                 .map(MybatisChildRunIntentStore::toView).toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ChildRunIntentView> listAcceptedChildrenNeedingLaunchForDeployment(long afterIntentId,
+            int limit, String deploymentId, String generationId) {
+        requirePage(afterIntentId, limit);
+        required(deploymentId, "部署编号");
+        required(generationId, "部署代际编号");
+        return mapper.listAcceptedChildrenNeedingLaunchForDeployment(afterIntentId, limit,
+                deploymentId, generationId).stream().map(MybatisChildRunIntentStore::toView).toList();
     }
 
     @Override
@@ -246,6 +285,19 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
     public List<ChildRunIntentView> listAcceptedSpawnMembersPending(long afterIntentId, int limit) {
         requirePage(afterIntentId, limit);
         return mapper.listAcceptedSpawnMembersPending(afterIntentId, limit).stream()
+                .map(MybatisChildRunIntentStore::toView).toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ChildRunIntentView> listAcceptedSpawnMembersPending(String deploymentId,
+                                                                      String deploymentGenerationId,
+                                                                      long afterIntentId, int limit) {
+        required(deploymentId, "部署编号");
+        required(deploymentGenerationId, "部署代际");
+        requirePage(afterIntentId, limit);
+        return mapper.listAcceptedSpawnMembersPendingForDeployment(
+                deploymentId, deploymentGenerationId, afterIntentId, limit).stream()
                 .map(MybatisChildRunIntentStore::toView).toList();
     }
 

@@ -14,6 +14,9 @@ public interface ChildRunIntentStore {
     Optional<ChildRunOutboxDelivery> claimDueOutbox(String owner, String claimToken,
                                                     OffsetDateTime now, OffsetDateTime leaseUntil);
 
+    Optional<ChildRunOutboxDelivery> claimDueOutboxForDeployment(String owner, String claimToken,
+            OffsetDateTime now, OffsetDateTime leaseUntil, String deploymentId, String generationId);
+
     /** 校验父控制版本与取消状态并确认受理；失败时调用方不得创建子 Run。 */
     boolean markAccepted(long outboxId, String claimToken);
 
@@ -42,8 +45,14 @@ public interface ChildRunIntentStore {
     /** 按根 Run 编号分页扫描仍占树级容量的根，供启动恢复重建业务准入。 */
     List<String> listReservedRootRunIds(String afterRootRunId, int limit);
 
+    List<String> listReservedRootRunIdsForDeployment(String afterRootRunId, int limit,
+            String deploymentId, String generationId);
+
     /** 启动后按意图编号扫描已受理但子 Run 尚未终态的记录；调用方需核工作项后补投。 */
     List<ChildRunIntentView> listAcceptedChildrenNeedingLaunch(long afterIntentId, int limit);
+
+    List<ChildRunIntentView> listAcceptedChildrenNeedingLaunchForDeployment(long afterIntentId, int limit,
+            String deploymentId, String generationId);
 
     /** 按父 Run 扫描仍占根树容量的子执行，供取消传播与收尾。 */
     List<ChildRunIntentView> listUnsettledByParent(String parentRunId, long afterIntentId, int limit);
@@ -53,6 +62,13 @@ public interface ChildRunIntentStore {
 
     /** 子执行已受理但原 spawn 工具成员还未收到结果时，按意图编号补扫。 */
     List<ChildRunIntentView> listAcceptedSpawnMembersPending(long afterIntentId, int limit);
+
+    /** 仅补扫本部署代际的父 Run，避免共享库里其他部署的意图占满分页。 */
+    default List<ChildRunIntentView> listAcceptedSpawnMembersPending(String deploymentId,
+                                                                       String deploymentGenerationId,
+                                                                       long afterIntentId, int limit) {
+        throw new UnsupportedOperationException("deployment-scoped spawn member scan is not implemented");
+    }
 
     /** 子 Run 终态回接时按稳定 childRunId 读取父等待成员身份。 */
     Optional<ChildRunIntentView> findByChildRunId(String childRunId);

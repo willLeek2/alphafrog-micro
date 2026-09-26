@@ -443,6 +443,17 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public List<WaitMember> scanDueSubAgentMembers(String deploymentId, String deploymentGenerationId,
+                                                    OffsetDateTime now, int limit) {
+        if (deploymentId == null || deploymentId.isBlank()
+                || deploymentGenerationId == null || deploymentGenerationId.isBlank()
+                || now == null || limit <= 0) {
+            throw new IllegalArgumentException("sub-agent scan requires deployment identity, now and a positive limit");
+        }
+        return mapper.scanDueSubAgentMembersForDeployment(deploymentId, deploymentGenerationId, now, limit);
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,
@@ -535,6 +546,19 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
             throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
         }
         return mapper.scanDueRecoveryNotifications(limit);
+    }
+
+    @Override
+    public List<RecoveryNotification> scanDueRecoveryNotifications(String deploymentId,
+                                                                     String deploymentGenerationId, int limit) {
+        if (deploymentId == null || deploymentId.isBlank()
+                || deploymentGenerationId == null || deploymentGenerationId.isBlank()) {
+            throw new IllegalArgumentException("扫描恢复通知必须给出部署及代际");
+        }
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.scanDueRecoveryNotificationsForDeployment(deploymentId, deploymentGenerationId, limit);
     }
 
     @Override

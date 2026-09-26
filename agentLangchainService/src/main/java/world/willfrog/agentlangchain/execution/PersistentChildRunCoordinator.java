@@ -11,7 +11,6 @@ import world.willfrog.agent.platform.childrun.ChildRunIntentView;
 import world.willfrog.agent.platform.childrun.ChildRunOutboxDelivery;
 import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.platform.wait.WaitGroup;
@@ -19,6 +18,8 @@ import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.RunCoordinationHint;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
 import java.util.Optional;
@@ -31,7 +32,7 @@ import java.util.List;
 public class PersistentChildRunCoordinator {
     private final ChildRunIntentStore intentStore;
     private final AgentRunEventService runEventService;
-    private final AgentRunMapper runMapper;
+    private final RunOwnershipGateway ownership;
     private final WaitGroupStore waitGroups;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final DualPoolRunPipeline runPipeline;
@@ -42,7 +43,7 @@ public class PersistentChildRunCoordinator {
 
     public PersistentChildRunCoordinator(ChildRunIntentStore intentStore,
                                          AgentRunEventService runEventService,
-                                         AgentRunMapper runMapper,
+                                         RunOwnershipGateway ownership,
                                          WaitGroupStore waitGroups,
                                          DualPoolRunAdmissionRegistry admissionRegistry,
                                          DualPoolRunPipeline runPipeline,
@@ -50,7 +51,7 @@ public class PersistentChildRunCoordinator {
                                          @Value("${agent.langchain.child-run.outbox-batch-size:32}") int batchSize) {
         this.intentStore = intentStore;
         this.runEventService = runEventService;
-        this.runMapper = runMapper;
+        this.ownership = ownership;
         this.waitGroups = waitGroups;
         this.admissionRegistry = admissionRegistry;
         this.runPipeline = runPipeline;
@@ -65,8 +66,10 @@ public class PersistentChildRunCoordinator {
             try {
                 OffsetDateTime now = OffsetDateTime.now();
                 String token = UUID.randomUUID().toString();
-                claimed = transactions.execute(ignored -> intentStore.claimDueOutbox(
-                        owner, token, now, now.plusSeconds(30)));
+                DeploymentIdentity identity = ownership.requireIdentity();
+                claimed = transactions.execute(ignored -> intentStore.claimDueOutboxForDeployment(
+                        owner, token, now, now.plusSeconds(30),
+                        identity.deploymentId(), identity.generationId()));
             } catch (RuntimeException failure) {
                 log.error("子 Run 创建请求领取失败，保留数据库投递记录等待重试", failure);
                 return;
@@ -89,12 +92,15 @@ public class PersistentChildRunCoordinator {
     }
 
     private AgentRun acceptAndCreate(ChildRunOutboxDelivery delivery) {
+        AgentRun parent = ownership.findOwnedRun(delivery.parentRunId());
+        if (parent == null) {
+            throw new IllegalStateException("子 Run 创建时父 Run 不属于当前部署代际");
+        }
         if (!intentStore.markAccepted(delivery.outboxId(), delivery.claimToken())) {
             intentStore.cancelUnacceptedIfParentChanged(delivery.intentId());
             return null;
         }
-        AgentRun parent = runMapper.findById(delivery.parentRunId());
-        if (parent == null || !delivery.parentSchedulerVersion().equals(parent.getSchedulerVersion())
+        if (!delivery.parentSchedulerVersion().equals(parent.getSchedulerVersion())
                 || !delivery.parentDeploymentId().equals(parent.getDeploymentId())
                 || !delivery.parentDeploymentGenerationId().equals(parent.getDeploymentGenerationId())) {
             throw new IllegalStateException("子 Run 创建时父级冻结身份不一致");
@@ -112,6 +118,10 @@ public class PersistentChildRunCoordinator {
     }
 
     private void launch(AgentRun child) {
+        if (ownership.findOwnedRun(child.getId()) == null) {
+            log.warn("子 Run 不属于当前部署代际，停止投递: runId={}", child.getId());
+            return;
+        }
         if (!admissionRegistry.isAdmitted(child.getId())
                 && !admissionRegistry.admitNewRun(child.getId(), SchedulerVersion.DUAL_POOL_V2.name())) {
             log.warn("子 Run 已持久受理，当前进程尚未取得执行资格，等待扫描补投: runId={}", child.getId());
@@ -131,7 +141,9 @@ public class PersistentChildRunCoordinator {
     public synchronized void restoreAcceptedChildren() {
         List<ChildRunIntentView> page;
         try {
-            page = intentStore.listAcceptedChildrenNeedingLaunch(launchScanCursor, batchSize);
+            DeploymentIdentity identity = ownership.requireIdentity();
+            page = intentStore.listAcceptedChildrenNeedingLaunchForDeployment(
+                    launchScanCursor, batchSize, identity.deploymentId(), identity.generationId());
         } catch (RuntimeException failure) {
             log.error("已受理子 Run 补扫失败，保留持久记录重试", failure);
             return;
@@ -147,9 +159,10 @@ public class PersistentChildRunCoordinator {
                         intent.intentId(), intent.childRunId());
                 continue;
             }
-            AgentRun child = runMapper.findById(intent.childRunId());
-            if (child == null) {
-                log.error("子 Run 主记录状态与读回不一致，停止补投: intentId={}", intent.intentId());
+            AgentRun parent = ownership.findOwnedRun(intent.parentRunId());
+            AgentRun child = ownership.findOwnedRun(intent.childRunId());
+            if (parent == null || child == null) {
+                log.warn("父或子 Run 不属于当前部署代际，停止补投: intentId={}", intent.intentId());
                 continue;
             }
             if (!admissionRegistry.isAdmitted(child.getId())

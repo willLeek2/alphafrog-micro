@@ -7,7 +7,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.RecoveryConsumptionResult;
 import world.willfrog.agent.platform.wait.RecoveryNotification;
@@ -16,6 +15,8 @@ import world.willfrog.agent.platform.wait.RecoveryRejection;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -47,12 +48,14 @@ import org.springframework.mock.env.MockEnvironment;
 class DualPoolRecoveryDispatcherTest {
 
     private static final String RUN_ID = "run-recovery";
+    private static final String DEPLOYMENT_ID = "stage5a-test";
+    private static final String GENERATION_ID = "gen-" + "a".repeat(64);
     private static final int BATCH = 2;
     private static final NodeWorkItemIdentity NEXT_SEGMENT =
             new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 3);
 
     @Mock
-    private AgentRunMapper runMapper;
+    private RunOwnershipGateway ownership;
     @Mock
     private DualPoolDispatcher dispatcher;
     @Mock
@@ -65,8 +68,9 @@ class DualPoolRecoveryDispatcherTest {
     void setUp() {
         store = new FakeWaitGroupStore();
         lenient().when(dispatcher.isReady()).thenReturn(true);
+        lenient().when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION_ID));
         // 默认每轮给数据库补扫留 1 个名额，其余预算给内存提醒。
-        recovery = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher, intake,
+        recovery = new DualPoolRecoveryDispatcher(store, ownership, dispatcher, intake,
                 recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024), 1000L, new FrozenEffectiveSettings());
     }
 
@@ -79,7 +83,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void theStartupBackfillRegistersThePagesItActuallyUses() {
         FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
-        DualPoolRecoveryDispatcher withReading = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
+        DualPoolRecoveryDispatcher withReading = new DualPoolRecoveryDispatcher(store, ownership, dispatcher,
                 intake, recoverySettings(BATCH, 500L, 5_000L, 4, 1, 1024), 1000L, inUse);
 
         withReading.recoverOnStartup();
@@ -91,7 +95,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aDueNotificationIsConsumedAndItsNextSegmentIsHandedToTheNodePool() {
         store.addNotification(11L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(WaitGroupRecoveryIntake.IntakeResult.consumed(NEXT_SEGMENT));
         when(dispatcher.offerNode(any())).thenReturn(true);
@@ -105,11 +109,31 @@ class DualPoolRecoveryDispatcherTest {
                 .containsEntry("recoveryScannedTotal", 1L);
     }
 
+    @Test
+    void foreignNotificationCannotUseScanBudgetOrWakeupToReachIntake() {
+        store.addNotification(10L, "foreign-run", OffsetDateTime.now().minusSeconds(60),
+                "other-deployment", GENERATION_ID);
+        store.addNotification(11L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun("foreign-run")).thenReturn(null);
+        when(intake.take(any(), any(), anyString()))
+                .thenReturn(WaitGroupRecoveryIntake.IntakeResult.consumed(NEXT_SEGMENT));
+        recovery.wake(10L);
+
+        recovery.safeRound(BATCH);
+
+        ArgumentCaptor<RecoveryNotification> asked = ArgumentCaptor.forClass(RecoveryNotification.class);
+        verify(intake).take(asked.capture(), any(), anyString());
+        assertThat(asked.getValue().getId()).isEqualTo(11L);
+        assertThat(store.lastScanLimit).isEqualTo(1);
+        assertThat(store.notifications.get(10L).getState()).isEqualTo(RecoveryNotificationState.WAITING.name());
+    }
+
     /** 投递用的是受理层返回的那一段：数据库放行了哪一段就投哪一段。 */
     @Test
     void theSegmentThatWasActuallyReleasedIsTheOneHandedToTheNodePool() {
         store.addNotification(11L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         NodeWorkItemIdentity authoritative =
                 new NodeWorkItemIdentity(RUN_ID, 7, "node-authoritative", 2, 9);
         when(intake.take(any(), any(), anyString()))
@@ -125,7 +149,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aNotificationThatCannotBeConsumedIsPushedLaterInsteadOfBeingRetriedEveryRound() {
         store.addNotification(12L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
                         WaitGroupRecoveryIntake.Outcome.DEFERRED, null,
@@ -145,7 +169,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aNotificationThatWillNeverBeServedIsClosedAndNotDeferred() {
         store.addNotification(13L, "run-terminal", OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById("run-terminal")).thenReturn(runningRun());
+        when(ownership.findOwnedRun("run-terminal")).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
                         WaitGroupRecoveryIntake.Outcome.CLOSED, null, null, "run_terminal:COMPLETED"));
@@ -163,7 +187,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aNotificationSomeoneElseTookIsCountedAsALostRaceNotAsABackoff() {
         store.addNotification(15L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
                         WaitGroupRecoveryIntake.Outcome.LOST_RACE, null,
@@ -178,7 +202,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aWakeupIsHandledBeforeTheDatabaseScanAndOnlyOnce() {
         store.addNotification(14L, RUN_ID, OffsetDateTime.now().plusSeconds(600));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(WaitGroupRecoveryIntake.IntakeResult.consumed(NEXT_SEGMENT));
 
@@ -197,7 +221,7 @@ class DualPoolRecoveryDispatcherTest {
         for (long id = 21L; id <= 25L; id++) {
             store.addNotification(id, RUN_ID, OffsetDateTime.now().minusSeconds(30));
         }
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(WaitGroupRecoveryIntake.IntakeResult.consumed(NEXT_SEGMENT));
         when(dispatcher.offerNode(any())).thenReturn(true);
@@ -220,7 +244,7 @@ class DualPoolRecoveryDispatcherTest {
             store.addNotification(id, RUN_ID, OffsetDateTime.now().minusSeconds(30));
         }
         store.addNotification(34L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(WaitGroupRecoveryIntake.IntakeResult.consumed(NEXT_SEGMENT));
         when(dispatcher.offerNode(any())).thenReturn(true);
@@ -254,7 +278,7 @@ class DualPoolRecoveryDispatcherTest {
             store.addNotification(id, RUN_ID, OffsetDateTime.now().plusSeconds(600));
             recovery.wake(id);
         }
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString())).thenAnswer(invocation -> {
             RecoveryNotification notification = invocation.getArgument(0);
             if (notification.getId() <= 40L) {
@@ -287,7 +311,7 @@ class DualPoolRecoveryDispatcherTest {
     void aChangedBatchSizeTakesEffectOnTheNextRound() {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("agent.langchain.dual-pool.recovery.batch-size", "1");
-        DualPoolRecoveryDispatcher live = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher, intake,
+        DualPoolRecoveryDispatcher live = new DualPoolRecoveryDispatcher(store, ownership, dispatcher, intake,
                 new DualPoolSchedulerSettings(null, environment), 1000L, new FrozenEffectiveSettings());
 
         live.rediscover();
@@ -301,7 +325,7 @@ class DualPoolRecoveryDispatcherTest {
     /** 提醒队列有上限：满了就丢提醒，数据库事实不受影响。 */
     @Test
     void aFullReminderQueueDropsRemindersInsteadOfGrowing() {
-        DualPoolRecoveryDispatcher bounded = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
+        DualPoolRecoveryDispatcher bounded = new DualPoolRecoveryDispatcher(store, ownership, dispatcher,
                 intake, recoverySettings(BATCH, 500L, 5_000L, 4, 1, 3), 1000L,
                 new FrozenEffectiveSettings());
         assertThat(bounded.wake(1L)).isTrue();
@@ -321,7 +345,7 @@ class DualPoolRecoveryDispatcherTest {
     @Test
     void aConsumedNotificationWithoutASegmentIdentityIsReportedAsAFailure() {
         store.addNotification(16L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
                         WaitGroupRecoveryIntake.Outcome.CONSUMED, null, null, null));
@@ -347,12 +371,12 @@ class DualPoolRecoveryDispatcherTest {
     /** 扫描配额比这一轮的总上限还大时，一轮处理的条数与向数据库索要的条数都不许越过上限。 */
     @Test
     void aScanQuotaLargerThanTheRoundBudgetStaysInsideTheBudget() {
-        DualPoolRecoveryDispatcher wideQuota = new DualPoolRecoveryDispatcher(store, runMapper, dispatcher,
+        DualPoolRecoveryDispatcher wideQuota = new DualPoolRecoveryDispatcher(store, ownership, dispatcher,
                 intake, recoverySettings(1, 500L, 5_000L, 4, 4, 1024), 1000L,
                 new FrozenEffectiveSettings());
         store.addNotification(41L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
         store.addNotification(42L, RUN_ID, OffsetDateTime.now().minusSeconds(30));
-        when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(runningRun());
         when(intake.take(any(), any(), anyString()))
                 .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
                         WaitGroupRecoveryIntake.Outcome.DEFERRED, null, null, "admission_unavailable"));
@@ -380,6 +404,7 @@ class DualPoolRecoveryDispatcherTest {
         }
 
         private final Map<Long, RecoveryNotification> notifications = new LinkedHashMap<>();
+        private final Map<Long, DeploymentIdentity> notificationOwners = new LinkedHashMap<>();
         private final List<Long> consumed = new ArrayList<>();
         private final List<Long> deferred = new ArrayList<>();
         private final List<Long> closed = new ArrayList<>();
@@ -398,6 +423,11 @@ class DualPoolRecoveryDispatcherTest {
         }
 
         void addNotification(long id, String runId, OffsetDateTime nextVisibleAt) {
+            addNotification(id, runId, nextVisibleAt, DEPLOYMENT_ID, GENERATION_ID);
+        }
+
+        void addNotification(long id, String runId, OffsetDateTime nextVisibleAt,
+                             String deploymentId, String generationId) {
             RecoveryNotification notification = new RecoveryNotification();
             notification.setId(id);
             notification.setGroupId(77L);
@@ -407,6 +437,7 @@ class DualPoolRecoveryDispatcherTest {
             notification.setNextVisibleAt(nextVisibleAt);
             notification.setCreatedAt(OffsetDateTime.now().minusSeconds(30));
             notifications.put(id, notification);
+            notificationOwners.put(id, new DeploymentIdentity(deploymentId, generationId));
         }
 
         @Override
@@ -435,6 +466,27 @@ class DualPoolRecoveryDispatcherTest {
             // 与真语句同一个口径：只取还在等待态、且已经到了下次可见时间的那批。
             OffsetDateTime now = OffsetDateTime.now();
             return notifications.values().stream()
+                    .filter(RecoveryNotification::consumable)
+                    .filter(notification -> notification.getNextVisibleAt() == null
+                            || !notification.getNextVisibleAt().isAfter(now))
+                    .sorted(java.util.Comparator
+                            .comparing((RecoveryNotification notification) -> notification.getNextVisibleAt())
+                            .thenComparingLong(RecoveryNotification::getId))
+                    .limit(limit)
+                    .toList();
+        }
+
+        @Override
+        public List<RecoveryNotification> scanDueRecoveryNotifications(String deploymentId,
+                                                                         String deploymentGenerationId, int limit) {
+            lastScanLimit = limit;
+            OffsetDateTime now = OffsetDateTime.now();
+            return notifications.values().stream()
+                    .filter(notification -> {
+                        DeploymentIdentity owner = notificationOwners.get(notification.getId());
+                        return owner != null && deploymentId.equals(owner.deploymentId())
+                                && deploymentGenerationId.equals(owner.generationId());
+                    })
                     .filter(RecoveryNotification::consumable)
                     .filter(notification -> notification.getNextVisibleAt() == null
                             || !notification.getNextVisibleAt().isAfter(now))
