@@ -382,6 +382,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         labels.put("alphafrog.deployment-generation-id", plan.generationId());
         labels.put("alphafrog.host-port", Integer.toString(plan.hostPort()));
         ObjectNode environment = app.putObject("environment");
+        // 部署单覆盖服务环境文件；下面按实例计算的变量再覆盖部署单同名键。
+        JsonNode overrides = service.path("environmentOverrides");
+        if (overrides.isObject()) {
+            overrides.fields().forEachRemaining(entry -> environment.put(entry.getKey(), entry.getValue().asText()));
+        }
         environment.put("AF_DEPLOYMENT_ID", plan.deploymentId());
         environment.put("AF_DEPLOYMENT_GENERATION_ID", plan.generationId());
         environment.put("AF_LANE_TAG", plan.trafficScopeId());

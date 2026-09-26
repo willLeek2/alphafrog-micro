@@ -124,6 +124,34 @@ class BetaContractValidatorTest {
         assertEquals("MANIFEST_INVALID", failure.code());
     }
 
+    @Test
+    void acceptsStringEnvironmentOverridesAndIncludesThemInServiceDigest() {
+        ObjectMapper mapper = new ObjectMapper();
+        BetaContractValidator validator = new BetaContractValidator(mapper, new BetaControllerProperties());
+        ObjectNode manifest = manifest(mapper, "com.alphafrog.StockService",
+                "providers:com.alphafrog.StockService::");
+        ObjectNode service = (ObjectNode) manifest.path("services").path(0);
+        String originalDigest = service.path("serviceSpecSha256").asText();
+        service.putObject("environmentOverrides").put("AF_SANDBOX_IMAGE", "sha256:" + "b".repeat(64));
+        String updatedDigest = JsonSupport.serviceSha256(mapper, service);
+        org.junit.jupiter.api.Assertions.assertNotEquals(originalDigest, updatedDigest);
+        service.put("serviceSpecSha256", updatedDigest);
+
+        assertDoesNotThrow(() -> validator.validateManifest(manifest));
+        assertEquals(updatedDigest, JsonSupport.serviceSha256(mapper, service));
+
+        ((ObjectNode) service.path("environmentOverrides")).put("BAD-NAME", "value");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+
+        ((ObjectNode) service.path("environmentOverrides")).remove("BAD-NAME");
+        ((ObjectNode) service.path("environmentOverrides")).put("VALID_NAME", 42);
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+    }
+
     private static ObjectNode manifest(ObjectMapper mapper, String serviceKey, String nacosServiceName) {
         ObjectNode root = mapper.createObjectNode();
         root.put("schemaVersion", 1);
