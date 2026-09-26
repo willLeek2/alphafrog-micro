@@ -209,14 +209,18 @@ class AgentRunMapperWorkflowRestartBindingTest {
 
         assertThat(shutdown)
                 .contains("deployment_id = ?", "deployment_generation_id = ?", "status = 'FAILED'")
-                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
+                .contains("scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'");
         assertThat(orphan)
                 .contains("WITH candidates AS", "LIMIT ?", "FOR UPDATE SKIP LOCKED")
                 .contains("deployment_id <> 'stable'", "deployment_id = ?",
-                        "deployment_generation_id = ?", "status = 'FAILED'");
+                        "deployment_generation_id = ?", "status = 'FAILED'")
+                .contains("scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'",
+                        "run.scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'");
         assertThat(candidates)
                 .contains("SELECT DISTINCT deployment_id")
                 .contains("deployment_id <> 'stable'")
+                .contains("scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'")
                 .contains("NOT (deployment_id = ? AND deployment_generation_id = ?)")
                 .doesNotContain("LIMIT ?", "(deployment_id, deployment_generation_id) > (?, ?)");
     }

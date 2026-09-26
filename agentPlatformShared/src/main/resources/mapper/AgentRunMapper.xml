@@ -570,6 +570,7 @@
                         deployment_generation_id
         FROM alphafrog_agent_run
         WHERE status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
           AND deployment_id &lt;&gt; 'stable'
           AND NOT (deployment_id = #{excludedDeploymentId}
                    AND deployment_generation_id = #{excludedDeploymentGenerationId})
@@ -585,6 +586,7 @@
         WHERE deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
     </update>
 
     <select id="countNonTerminalRunsForDeploymentGeneration" resultType="int">
@@ -602,6 +604,7 @@
             WHERE deployment_id = #{deploymentId}
               AND deployment_generation_id = #{deploymentGenerationId}
               AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+              AND scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
             ORDER BY id
             LIMIT #{limit}
             FOR UPDATE SKIP LOCKED
@@ -617,6 +620,7 @@
           AND run.deployment_id = #{deploymentId}
           AND run.deployment_generation_id = #{deploymentGenerationId}
           AND run.status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND run.scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
     </update>
 
     <update id="updateExt">

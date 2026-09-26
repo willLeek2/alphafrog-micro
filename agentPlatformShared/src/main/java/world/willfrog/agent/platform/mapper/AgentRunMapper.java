@@ -134,13 +134,14 @@ public interface AgentRunMapper {
                             @Param("expectedStatus") AgentRunStatus expectedStatus,
                             @Param("lastError") String lastError);
 
-    /** 查询仍有未结束 Run 的部署代际，供实例消亡后的有界补漏清扫使用。 */
+    /** 查询仍有未结束旧版 Run 的部署代际；可恢复的 V2 Run 不因实例暂时缺席而失败。 */
     List<DeploymentGenerationRecord> listNonTerminalDeploymentGenerations(
             @Param("excludedDeploymentId") String excludedDeploymentId,
             @Param("excludedDeploymentGenerationId") String excludedDeploymentGenerationId);
 
     /**
-     * 当前实例在自然处理窗口结束时，只为本实例所属代际补写失败终态。
+     * 当前实例在自然处理窗口结束时，只为本实例所属代际的旧版 Run 补写失败终态。
+     * 可恢复的 V2 Run 保留数据库检查点，允许同容器 Java 进程强制退出后续跑。
      * 这条语句不由部署控制器调用，也不用于切流时提前终止业务。
      */
     int failNonTerminalRunsForDeploymentGeneration(
@@ -153,7 +154,8 @@ public interface AgentRunMapper {
             @Param("deploymentGenerationId") String deploymentGenerationId);
 
     /**
-     * 已确认没有存活实例的代际补漏写。调用方必须先记录注册缺席，在确认期限后仍未
+     * 已确认没有存活实例的代际旧版 Run 补漏写；V2 Run 不因注册缺席而失败。
+     * 调用方必须先记录注册缺席，在确认期限后仍未
      * 发现存活实例，并在执行本语句前再次核对；SQL 仍以原部署身份和非终态作为窄条件。
      */
     int failOrphanedNonTerminalRunsForDeploymentGeneration(

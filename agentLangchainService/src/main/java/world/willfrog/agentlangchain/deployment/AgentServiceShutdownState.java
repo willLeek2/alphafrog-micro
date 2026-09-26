@@ -17,7 +17,7 @@ import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** 停收新任务后等待本代 Run 自然完成，自然处理窗口结束时把剩余记录诚实地收为失败。 */
+/** 停收新任务并等待自然完成；窗口结束后仅把不可续跑的旧版 Run 写成失败。 */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE)
 @Slf4j
@@ -88,11 +88,12 @@ public class AgentServiceShutdownState implements ApplicationListener<ContextClo
             // 自然窗口到达以后不再让执行线程继续占用最后的持久化与退出余量。
             // ThreadPoolTaskExecutor 已配置为无额外等待，shutdown 会立即中断剩余任务。
             runExecutor.shutdown();
+            // V2 Run 保留数据库检查点，不能因 SIGTERM 的短暂关闭窗口写成 FAILED。
             runMapper.failNonTerminalRunsForDeploymentGeneration(
                     identity.deploymentId(), identity.generationId(),
                     "deployment_generation_shutdown_deadline_exceeded");
         } catch (RuntimeException databaseFailure) {
-            log.error("关闭期间无法把本代遗留 Run 写成明确失败，后续由代际清扫器补写: deploymentId={} generationId={}",
+            log.error("关闭期间无法收尾本代旧版 Run，后续由代际清扫器补写: deploymentId={} generationId={}",
                     identity.deploymentId(), identity.generationId(), databaseFailure);
         } finally {
             if (interrupted) {
