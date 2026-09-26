@@ -139,7 +139,7 @@ frontend 更新是操作阶段上的唯一例外：跳过候选阶段，提交�
 - 使用镜像引用（本地 tag 或摘要）并核对本机 Image ID；
 - 注入部署标识、部署代际、泳道范围、发布标识和镜像摘要；
 - 注入 `OTEL_SERVICE_NAME` 与包含部署、泳道、版本、提交和本地 Image ID 的五字段 `OTEL_RESOURCE_ATTRIBUTES`；
-- 从控制器配置注入 OTLP HTTP 轨迹地址、协议和导出开关；生成 Compose 的 `environment` 对同名服务环境文件值具有更高优先级；
+- 从控制器配置注入 OTLP HTTP 轨迹地址、协议和导出开关；生成 Compose 的 `environment` 对同名服务环境文件值具有更高优先级。服务环境变量先取环境文件的值，再由部署单中可选的 `environmentOverrides` 覆盖同名键，最后由控制器写入本次实例计算的部署身份、提供者端口和网关上游地址等键。省略 `environmentOverrides` 或设为空对象时，未由控制器计算的键继续使用环境文件中的值；
 - 为 Java 服务只读挂载一份宿主机上已经校验的 OpenTelemetry Java Agent，并把启动参数追加到服务专用 JVM 参数之后；非 Java 服务不挂载 Java Agent；
 - 为每个服务创建并挂载独立的 `<状态根目录>/data/logs/<serviceName>:/app/logs`，服务模板不得覆盖该目录或 Java Agent 的固定容器路径；
 - 所有 Beta frontend 实例都启用入口打标；泳道名只注入给非主 Beta 的泳道 frontend，主 Beta frontend 不注入泳道名，作为共用入口改读请求头指定的泳道名；

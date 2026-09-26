@@ -101,6 +101,30 @@ class BetaDeploymentServiceTest {
     }
 
     @Test
+    void changingOnlyEnvironmentOverridesCreatesAnInstanceWithTheNewValue() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        String oldInstance = state().path("activeInstance").path("instanceId").asText();
+        String oldDigest = state().path("activeInstance").path("serviceSpecSha256").asText();
+
+        ObjectNode updated = manifest(2, "release-1", '1', 'a', 'b', "main-beta");
+        ObjectNode spec = (ObjectNode) updated.path("services").path(0);
+        spec.putObject("environmentOverrides").put("EXAMPLE_OPTION", "updated");
+        spec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, spec));
+        service.submitManifest(updated);
+        reconcile(4);
+
+        JsonNode active = state().path("activeInstance");
+        assertEquals("STABLE", state().path("phase").asText());
+        assertFalse(oldInstance.equals(active.path("instanceId").asText()));
+        assertFalse(oldDigest.equals(active.path("serviceSpecSha256").asText()));
+        assertEquals("updated", containers.createdSpecs.get(active.path("containerName").asText())
+                .path("environmentOverrides").path("EXAMPLE_OPTION").asText());
+        assertEquals(28081, active.path("hostPort").asInt());
+        assertTrue(containers.stopped.containsKey("af-" + oldInstance));
+    }
+
+    @Test
     void startFailureRemovesTheDeterministicCandidateBeforeRetry() {
         service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
         String candidateId = state().path("operation").path("candidateInstanceId").asText();
@@ -900,6 +924,7 @@ class BetaDeploymentServiceTest {
         ContainerObservation.Health health = ContainerObservation.Health.HEALTHY;
         final Map<String, ContainerObservation> values = new LinkedHashMap<>();
         final Map<String, CandidatePlan> plans = new LinkedHashMap<>();
+        final Map<String, JsonNode> createdSpecs = new LinkedHashMap<>();
         final Map<String, String> commits = new LinkedHashMap<>();
         final Map<String, Boolean> processHaltAllowed = new LinkedHashMap<>();
         final Map<String, Boolean> stopped = new LinkedHashMap<>();
@@ -927,6 +952,7 @@ class BetaDeploymentServiceTest {
                     name, "10.0.0.8", plan.hostPort(), true, health);
             values.put(name, value);
             plans.put(name, plan);
+            createdSpecs.put(name, spec.deepCopy());
             commits.put(name, manifest.path("gitCommit").asText());
             processHaltAllowed.put(name, spec.path("runtime").path("allowToolJobProcessHalt").asBoolean(false));
             if (failAfterCreating) throw new ControllerException("CONTAINER_START_FAILED", "post-create check failed");

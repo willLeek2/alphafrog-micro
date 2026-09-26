@@ -157,6 +157,15 @@
         "registration": {
           "$ref": "#/$defs/registrationTemplate"
         },
+        "environmentOverrides": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "runtimeConfigSha256": {
           "anyOf": [
             {

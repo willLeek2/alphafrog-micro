@@ -121,6 +121,7 @@ class DockerComposeContainerRuntimeTest {
         assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
         // agent 这类服务没有 HTTP 上游，compose 里不出现沙箱地址变量。
         assertFalse(environmentNode.has("AF_SANDBOX_SERVICE_URL"));
+        assertFalse(environmentNode.has("AF_SANDBOX_IMAGE"));
         assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));
@@ -181,6 +182,22 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
         assertFalse(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void manifestOverridesEnvFileButControllerComputedPortWins() throws Exception {
+        ((ObjectNode) service).putObject("environmentOverrides")
+                .put("AF_SANDBOX_IMAGE", "sha256:" + "c".repeat(64))
+                .put("DUBBO_PORT_TO_REGISTRY", "9999");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode environment = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app").path("environment");
+        assertEquals("sha256:" + "c".repeat(64), environment.path("AF_SANDBOX_IMAGE").asText());
+        assertEquals("28080", environment.path("DUBBO_PORT_TO_REGISTRY").asText());
     }
 
     @Test
