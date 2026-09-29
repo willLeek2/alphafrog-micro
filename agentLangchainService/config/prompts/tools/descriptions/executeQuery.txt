@@ -8,7 +8,7 @@
 数据怎么引用：
   - 先用 listMyData 拿到当前 Run 可见的数据集整数编号
   - 每个数据集在 SQL 里是一张视图，表名是 t<编号>：编号 1 的数据集叫 t1，编号 2 叫 t2，以此类推
-  - 表结构（列名与类型）在 listMyData 的结果里查看；SQL 里只能引用你传入 dataset_ids 的表
+  - 表结构（列名与类型）在 listMyData 的结果里查看；SQL 里只能引用你传入 dataset_ids 的表（数据以视图形式挂载好，无需也不应自行调用 read_csv/read_parquet 等文件读取函数）
 
 参数说明：
   sql           - 一条 DuckDB SQL 查询语句，必填。只接受单条语句；多语句以及 ATTACH/COPY/INSTALL/LOAD 语句在准入阶段直接拒绝
@@ -17,7 +17,7 @@
 
 返回结果：
   - 成功：columns（列名）、rows（数据行）、row_count、truncated（是否因行数上限被截断）
-  - 执行前准入会拒绝明显过重的查询（笛卡尔积、超过返回上限的全局排序、估计行数超档），被拒时改写 SQL 或换 BACKGROUND 档再试
+  - 执行前准入会拒绝明显过重的查询：多语句与 ATTACH/COPY/INSTALL/LOAD、笛卡尔积、无 LIMIT 的全局排序、无过滤且无 LIMIT 且估计返回超过档位行数上限的整表直出（预览数据集请带 LIMIT）、估计处理行数超档；被拒时按提示加 LIMIT、加过滤条件、改用聚合，或换 BACKGROUND 档再试
   - 语句超时返回 STATEMENT_TIMEOUT 错误码，不返回部分行；缩短时间范围、加过滤条件或改用 BACKGROUND 档后重试
   - 日期/时间列返回 ISO 字符串，小数为浮点，二进制列为 base64
 

@@ -65,6 +65,52 @@ class SqlQueryToolsTest {
         }
     }
 
+    // ---------- 扫描量准入（元数据行数/字节数求和对照容量硬上限） ----------
+
+    @Test
+    void capacityClassifyIsClassRelativeAndCoversBytes() {
+        // 上限跟资源档位走：超 STANDARD 但未越硬上限的挂载归 HEAVY 而不是被拒，
+        // 拒绝只发生在单任务硬上限（60 万行 / 512MiB）之外。字节维度独立生效。
+        var props = new world.willfrog.agent.tools.python.DataAnalysisCapacityProperties();
+        var decision = props.classify(300_000L, 1024L, List.of());
+        assertEquals(world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass.HEAVY,
+                decision.resourceClass(), "300k 行超标准档但不越硬上限：归 HEAVY 不是拒绝");
+        assertEquals(world.willfrog.agent.tools.python.DataAnalysisCapacityProperties
+                        .DataAnalysisResourceClassDecision.Outcome.REJECTED,
+                props.classify(700_000L, 1024L, List.of()).outcome(), "行数越硬上限拒");
+        assertEquals(world.willfrog.agent.tools.python.DataAnalysisCapacityProperties
+                        .DataAnalysisResourceClassDecision.Outcome.REJECTED,
+                props.classify(100L, 600L * 1024 * 1024, List.of()).outcome(), "字节越硬上限拒");
+    }
+
+    @Test
+    void planCapacityRefusesOverCapMountByMetadata() throws Exception {
+        // 扫描量准入走元数据求和（不是引擎估计）：边车 meta.json 的行数/字节数是判定输入。
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("sq-cap");
+        java.nio.file.Path overRows = dir.resolve("over.csv");
+        java.nio.file.Files.writeString(overRows, "id\n1\n");
+        java.nio.file.Files.writeString(dir.resolve("over.meta.json"), "{\"rowCount\":700000}");
+        org.springframework.test.util.ReflectionTestUtils.setField(
+                tools, "dataAnalysisCapacityProperties",
+                new world.willfrog.agent.tools.python.DataAnalysisCapacityProperties());
+        var datasets = List.of(world.willfrog.agent.workflow.AgentRunDatasetEntry.forDataset(
+                1, "ds-1", overRows.toString(), "000001.SZ", "over.csv"));
+
+        RuntimeException refusal = assertThrows(RuntimeException.class,
+                () -> org.springframework.test.util.ReflectionTestUtils.invokeMethod(
+                        tools, "planCapacity", "INTERACTIVE", datasets));
+        assertEquals("DataIntenseRefusal", refusal.getClass().getSimpleName());
+        var codeAccessor = refusal.getClass().getDeclaredMethod("code");
+        codeAccessor.setAccessible(true);
+        assertEquals("DATA_ANALYSIS_TASK_TOO_LARGE", codeAccessor.invoke(refusal));
+        var detailsAccessor = refusal.getClass().getDeclaredMethod("details");
+        detailsAccessor.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> details = (Map<String, Object>) detailsAccessor.invoke(refusal);
+        assertEquals(700_000L, details.get("estimated_rows"));
+        assertEquals(false, details.get("retryable"));
+    }
+
     // ---------- 运行器渲染 ----------
 
     @Test

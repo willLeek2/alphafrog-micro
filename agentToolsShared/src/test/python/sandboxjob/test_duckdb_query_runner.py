@@ -9,7 +9,9 @@
 二进制类型的序列化、超大结果的体积守卫、端到端信封。
 """
 import base64
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -73,9 +75,16 @@ spec_base = {
 (WORK / "tmp").mkdir()
 
 # ---------- 单元级 ----------
-plan_sample = "│        ~20,000 rows       │\n│    ~1,234,567 rows    │"
-check("estimated-rows parse", runner._max_estimated_rows(plan_sample) == 1234567)
-check("estimated-rows empty", runner._max_estimated_rows("no markers") == 0)
+# 估计行数来自 EXPLAIN (FORMAT JSON) 的 extra_info（字符串值；有界/聚合算子不给）
+plan_tree_sample = [{"name": "PROJECTION", "extra_info": {"Estimated Cardinality": "20000"},
+                     "children": [{"name": "READ_PARQUET",
+                                   "extra_info": {"Estimated Cardinality": "1,234,567"}}]}]
+_max_est = max((e for e in (runner._node_estimated_rows(n)
+                            for r in plan_tree_sample for n in runner._walk(r))
+                if e is not None), default=0)
+check("estimated-rows parse (json tree)", _max_est == 1234567)
+check("estimated-rows missing tolerated",
+      runner._node_estimated_rows({"name": "TOP_N", "extra_info": {"Top": "5"}}) is None)
 
 con = runner.configure_engine(spec_base)
 locked = False
@@ -156,46 +165,127 @@ check("preflight passes semicolon inside string literal", not ok)
 
 # ---------- EXPLAIN 准入 ----------
 def gate_expect_reject(con, sql, spec, expect_code):
+    """断言两件事：拒了，且是用声称的那条规则拒的（抓真实信封核对错误码——
+    只断言「拒了」会让坏死规则隐身：规则不触发、拒绝来自别的规则，测试照样绿）。"""
+    buf = io.StringIO()
     try:
-        runner.gate(con, sql, spec["tier"], spec)
+        with contextlib.redirect_stdout(buf):
+            runner.gate(con, sql, spec["tier"], spec)
         return False, "no exit"
     except SystemExit:
-        return True, expect_code  # 信封内容在端到端用例里核对
+        lines = [l for l in buf.getvalue().splitlines() if l.startswith(runner.RESULT_MARKER)]
+        if not lines:
+            return False, "no envelope"
+        env = json.loads(lines[-1][len(runner.RESULT_MARKER):])
+        actual = env.get("error", {}).get("code")
+        return actual == expect_code, f"expect={expect_code} actual={actual}"
 
 
 ok, detail = gate_expect_reject(con2, "SELECT * FROM t1, t2", spec_two, "PLAN_CROSS_PRODUCT")
 check("gate rejects cross product", ok, detail)
 ok, detail = gate_expect_reject(con2, "SELECT * FROM t2 ORDER BY id", spec_two, "PLAN_GLOBAL_SORT")
-check("gate rejects unbounded global sort on big table (300k>100 row_cap)", ok, detail)
+check("gate rejects unbounded global sort (ORDER_BY 无 TOP_N 祖先)", ok, detail)
 ok, _report = runner.gate(con2, "SELECT * FROM t1 ORDER BY id LIMIT 5", "INTERACTIVE", spec_two)
-check("gate passes ORDER BY + LIMIT (TOP_N 有界重排估计极小)", ok)
-# 派生表形态（避免标量子查询被 DuckDB 1.5 展开成 CROSS_PRODUCT 干扰本检查）：
-# 外层 TOP_N 有界 + 内层无界排序。基数小（过滤后约 50 行 ≤ row_cap 100）放行——
-# TOP_N 的存在不再整体豁免排序检查，按每个 ORDER_BY 算子框自身的估计行数判定。
+check("gate passes ORDER BY + LIMIT (TOP_N 有界重排)", ok)
+# 派生表形态：外层 TOP_N 有界 + 内层小排序。内层 ORDER_BY 的祖先链上有 TOP_N
+# （内外两层排序共用同一个 TOP_N 祖先判定），小表估计行数在档内，放行。
 ok, _report = runner.gate(
     con2,
     "SELECT * FROM (SELECT * FROM t1 WHERE id < 50 ORDER BY id) sub ORDER BY id LIMIT 5",
     "INTERACTIVE", spec_two)
 check("gate passes bounded-outer + small inner sort", ok)
-# 同一形态但内层无界排序压在大表上（约 30 万行 > row_cap 100）：拒。
+# 同一形态压在大表上：排序规则因 TOP_N 祖先放行，拒绝来自估计行数规则（300k>200k）。
 ok, detail = gate_expect_reject(
     con2,
     "SELECT * FROM (SELECT * FROM t2 ORDER BY id) sub ORDER BY id LIMIT 5",
-    spec_two, "PLAN_GLOBAL_SORT")
-check("gate rejects bounded-outer hiding big inner sort (TOP_N 不再整体豁免)", ok, detail)
-ok, detail = gate_expect_reject(con2, "SELECT * FROM t2", spec_two, "PLAN_ESTIMATED_ROWS_OVER_CAP")
-check("gate rejects EC over interactive cap (300k>200k)", ok, detail)
+    spec_two, "PLAN_ESTIMATED_ROWS_OVER_CAP")
+check("gate rejects big inner sort via estimated-rows cap", ok, detail)
+# 顶层输出规模规则：无过滤无 LIMIT 的整表直出，顶层算子估计行数超过返回上限即拒
+# （比估计行数规则先触发，给出可操作的 PLAN_FULL_SCAN）。
+ok, detail = gate_expect_reject(con2, "SELECT * FROM t2", spec_two, "PLAN_FULL_SCAN")
+check("gate rejects unbounded dump via top-output rule (300k>100)", ok, detail)
+# 顶层白名单：聚合顶层直接放行（count(*) 在 Parquet 上甚至是元数据扫描）。
+ok, _report = runner.gate(con2, "SELECT count(*) FROM t2", "INTERACTIVE", spec_two)
+check("gate passes count(*) (aggregate top whitelisted)", ok)
+# 顶层有界但扫描超估计行数档：BACKGROUND 档上限放宽到 600k 后放行。
 spec_two_bg = {**spec_two, "tier": "BACKGROUND", "limits": LIMITS_BG}
-ok_bg, report_bg = runner.gate(con2, "SELECT * FROM t2", "BACKGROUND", spec_two_bg)
-check("gate passes same scan at background cap (300k<600k)", ok_bg,
+ok_bg, report_bg = runner.gate(con2, "SELECT * FROM t2 LIMIT 5", "BACKGROUND", spec_two_bg)
+check("gate passes bounded scan at background cap (300k<600k)", ok_bg,
       f"ec={report_bg['estimated_rows_max']}")
+# 同一条在 INTERACTIVE 档（200k）拒：估计行数规则对照档位上限。
+ok, detail = gate_expect_reject(con2, "SELECT * FROM t2 LIMIT 5", spec_two,
+                                "PLAN_ESTIMATED_ROWS_OVER_CAP")
+check("gate rejects bounded scan over interactive est-cap (300k>200k)", ok, detail)
 
 # 兼容回落：旧锚点重放的规格没有 estimated_row_cap，按当时固定值判定（INTERACTIVE 20 万）。
+# 用有界顶层的查询才能走到估计行数规则（无界直出会先被顶层规模规则拦下）。
 legacy_limits = {k: v for k, v in LIMITS.items() if k != "estimated_row_cap"}
 ok, detail = gate_expect_reject(
-    con2, "SELECT * FROM t2", {**spec_two, "limits": legacy_limits},
+    con2, "SELECT * FROM t2 LIMIT 5", {**spec_two, "limits": legacy_limits},
     "PLAN_ESTIMATED_ROWS_OVER_CAP")
 check("gate falls back to legacy cap when estimated_row_cap absent (300k>200k)", ok, detail)
+
+# ---------- 固定用例集（错拒率统计：每次改动必跑，验收以此为准） ----------
+# 标签按最终口径：结构规则专用码优先（笛卡尔积、无界排序），规模规则在后
+# （顶层输出规模 PLAN_FULL_SCAN -> 各算子估计行数对照档位上限）。
+# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于基线 0/12，
+# 漏放（应拒被放）必须为 0。基线数字见 C4 验收说明。
+mid_csv = MOUNT / "mid.csv"
+duckdb.execute(
+    f"COPY (SELECT range AS id, range * 2 AS val FROM range(5000)) TO '{mid_csv}' (HEADER)")
+CASE_SPEC = {**spec_base, "datasets": [
+    {"alias": "t1", "path": str(MOUNT / "small.csv"), "format": "csv"},
+    {"alias": "t2", "path": str(MOUNT / "big.parquet"), "format": "parquet"},
+    {"alias": "t3", "path": str(MOUNT / "mid.csv"), "format": "csv"},
+]}
+# (名称, sql, INTERACTIVE/BACKGROUND, 应判, 应拒时的错误码, 在测哪条规则)
+CASE_SET = [
+    ("csv_filtered_small", "SELECT * FROM t1 WHERE id < 10", "I", "放", None, "顶层 FILTER 估计 ≤ row_cap"),
+    ("csv_limit_preview", "SELECT * FROM t1 LIMIT 100", "I", "放", None, "顶层 STREAMING_LIMIT 白名单"),
+    ("parquet_count", "SELECT count(*) FROM t2", "I", "放", None, "聚合顶层白名单（Parquet 元数据扫描）"),
+    ("csv_count", "SELECT count(*) FROM t1", "I", "放", None, "聚合顶层白名单（CSV 真实全扫但顶层收敛）"),
+    ("big_limit5_bg", "SELECT * FROM t2 LIMIT 5", "B", "放", None, "顶层有界 + 估计 300k ≤ 后台档 600k"),
+    ("topn_bounded", "SELECT * FROM t1 ORDER BY id LIMIT 5", "I", "放", None, "ORDER_BY 有 TOP_N 祖先"),
+    ("window_bounded", "SELECT id, row_number() OVER (ORDER BY id) rn FROM t1 LIMIT 50", "I", "放", None, "顶层 STREAMING_LIMIT 白名单"),
+    ("distinct_small", "SELECT DISTINCT val % 5 FROM t1", "I", "放", None, "顶层 HASH_GROUP_BY 白名单"),
+    ("group_by_small", "SELECT id % 7 g, count(*) FROM t1 GROUP BY id % 7", "I", "放", None, "顶层 HASH_GROUP_BY 白名单"),
+    ("literal_no_false_positive", "SELECT ';' AS s, 'ATTACH' AS k FROM t1 LIMIT 1", "I", "放", None, "文本禁令不误伤字面量"),
+    ("recursive_cte", "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r WHERE x < 500) SELECT count(*) FROM r", "I", "放", None, "聚合顶层；慢归超时管不归准入管"),
+    ("derived_small_inner_sort", "SELECT * FROM (SELECT * FROM t1 WHERE id < 50 ORDER BY id) sub ORDER BY id LIMIT 5", "I", "放", None, "TOP_N 祖先 + 小内层"),
+    ("big_unfiltered_dump", "SELECT * FROM t2", "I", "拒", "PLAN_FULL_SCAN", "顶层 READ_PARQUET 估计 300k > 100"),
+    ("parquet_filtered_big", "SELECT * FROM t2 WHERE id < 100", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 60k > 100（估计偏高的错拒，验收量化）"),
+    ("csv_unbounded_dump", "SELECT * FROM t1", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 ~103 > 100"),
+    ("window_unbounded", "SELECT id, row_number() OVER (ORDER BY id) rn FROM t1", "I", "拒", "PLAN_FULL_SCAN", "顶层 PROJECTION 估计 ~104 > 100"),
+    ("mid_unbounded_dump", "SELECT * FROM t3", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 ~5k > 100（估计行数规则不拒，顶层规则独立价值）"),
+    ("unbounded_sort", "SELECT * FROM t2 ORDER BY id", "I", "拒", "PLAN_GLOBAL_SORT", "ORDER_BY 无 TOP_N 祖先（结构先于规模）"),
+    ("hidden_big_inner_sort", "SELECT * FROM (SELECT * FROM t2 ORDER BY id) sub ORDER BY id LIMIT 5", "I", "拒", "PLAN_ESTIMATED_ROWS_OVER_CAP", "TOP_N 祖先放行排序规则；扫描 300k 超 200k"),
+    ("big_limit5", "SELECT * FROM t2 LIMIT 5", "I", "拒", "PLAN_ESTIMATED_ROWS_OVER_CAP", "顶层有界放行；扫描框估计 300k > 200k"),
+    ("cross_product", "SELECT * FROM t1, t1 b", "I", "拒", "PLAN_CROSS_PRODUCT", "结构规则"),
+    ("multi_statement", "SELECT 1; SELECT 2", "I", "拒", "PLAN_MULTI_STATEMENT", "文本禁令"),
+    ("attach", "ATTACH ':memory:' AS x", "I", "拒", "PLAN_FORBIDDEN_STATEMENT", "文本禁令（引擎闸漏内存 ATTACH）"),
+    ("copy", "COPY t1 TO 'x.csv'", "I", "拒", "PLAN_FORBIDDEN_STATEMENT", "文本禁令"),
+]
+case_con = runner.configure_engine(CASE_SPEC)
+runner.mount_datasets(case_con, CASE_SPEC)
+case_false_reject = case_false_allow = 0
+for name, sql, tier, expect, expect_code, rule in CASE_SET:
+    case_spec = {**CASE_SPEC, "tier": "BACKGROUND" if tier == "B" else "INTERACTIVE",
+                 "limits": LIMITS_BG if tier == "B" else LIMITS}
+    if expect == "放":
+        try:
+            case_ok, _ = runner.gate(case_con, sql, case_spec["tier"], case_spec)
+        except SystemExit:
+            case_ok = False
+        check(f"case {name} ({rule})", case_ok, "应放被拒")
+        case_false_reject += 0 if case_ok else 1
+    else:
+        case_ok, detail = gate_expect_reject(case_con, sql, case_spec, expect_code)
+        check(f"case {name} ({rule})", case_ok, detail)
+        case_false_allow += 0 if case_ok else 1
+check("case-set false-reject rate at baseline (0/12)", case_false_reject == 0,
+      f"false_reject={case_false_reject}")
+check("case-set false-allow is zero", case_false_allow == 0, f"false_allow={case_false_allow}")
+case_con.close()
 
 # ---------- 语句超时与执行错误 ----------
 con3 = duckdb.connect(database=":memory:")

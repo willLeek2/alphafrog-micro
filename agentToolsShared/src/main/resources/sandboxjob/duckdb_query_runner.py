@@ -181,60 +181,101 @@ def preflight(sql, report):
                     f"查询包含被禁止的语句 {keyword}，准入拒绝", report)
 
 
-def _plan_text(plan_rows):
-    return "\n".join(str(row[1]) for row in plan_rows)
+def _explain_tree(con, sql):
+    """EXPLAIN (FORMAT JSON) 只出计划不执行主查询；返回物理计划树列表（通常一棵树）。
+    树节点带 name 与 extra_info，祖先关系精确，不靠 ASCII 框序启发式。"""
+    rows = con.execute(f"EXPLAIN (FORMAT JSON) {sql}").fetchall()
+    payload = rows[0][1] if len(rows[0]) > 1 else rows[0][0]
+    return json.loads(payload)
 
 
-def _max_estimated_rows(plan_text):
-    """EXPLAIN 文本里每个算子框底部标注估计行数（如 `~20,000 rows`），取最大值对照档位上限。"""
-    estimated = [int(m.replace(",", "")) for m in re.findall(r"~([\d,]+)\s*rows", plan_text)]
-    return max(estimated) if estimated else 0
+def _walk(node):
+    yield node
+    for child in node.get("children", []):
+        yield from _walk(child)
 
 
-def _operator_boxes(plan_text):
-    """把计划 ASCII 按算子框切开（每个框以 ┌ 顶边开头），逐框返回文本。"""
-    return re.split(r"┌[─]+┐", plan_text)
+def _walk_with_ancestors(node, ancestors=()):
+    yield node, ancestors
+    for child in node.get("children", []):
+        yield from _walk_with_ancestors(child, ancestors + (node,))
 
 
-def _box_estimated_rows(box_text):
-    m = re.search(r"~([\d,]+)\s*rows", box_text)
-    return int(m.group(1).replace(",", "")) if m else 0
+def _node_estimated_rows(node):
+    """extra_info 里的 Estimated Cardinality 是字符串；有界/聚合类算子不给该值。"""
+    raw = node.get("extra_info", {}).get("Estimated Cardinality")
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).replace(",", ""))
+    except ValueError:
+        return None
+
+
+# 顶层输出有界或聚合收敛的算子：LIMIT 类显式有界；聚合/GROUP BY 把结果收敛到小组
+# 规模，超返回上限由截断机制承载。其余顶层算子按估计行数判定。
+_BOUNDED_TOP_NAMES = frozenset({"LIMIT", "STREAMING_LIMIT", "TOP_N"})
+
+
+def _is_bounded_or_aggregate_top(name):
+    return name in _BOUNDED_TOP_NAMES or "AGGREGATE" in name or "GROUP_BY" in name
 
 
 def gate(con, sql, tier, spec):
-    """EXPLAIN 只出计划不执行主查询；任一检查不过即拒收。返回 (放行?, 报告)。"""
+    """EXPLAIN 只出计划不执行主查询；任一检查不过即拒收。返回 (放行?, 报告)。
+
+    检查顺序：文本禁令 -> 结构规则（笛卡尔积、无界全局排序）-> 规模规则（顶层输出
+    规模、各算子估计行数对照档位上限）。结构规则先跑是为了让模型拿到可操作的专用
+    错误码——笛卡尔积该加连接条件，加 LIMIT 是错的补救方向。"""
     limits = spec["limits"]
     report = {"estimated_rows_max": 0, "checks": []}
     preflight(sql, report)
 
     try:
-        plan_rows = con.execute(f"EXPLAIN {sql}").fetchall()
+        plan_tree = _explain_tree(con, sql)
     except Exception as exc:
         return False, {"stage": "explain", "error": str(exc)}
-    plan_text = _plan_text(plan_rows)
-    report["estimated_rows_max"] = _max_estimated_rows(plan_text)
+    nodes = [n for root in plan_tree for n in _walk(root)]
+    report["estimated_rows_max"] = max(
+        (e for e in (_node_estimated_rows(n) for n in nodes) if e is not None),
+        default=0)
 
     # 结构规则一：笛卡尔积有独立算子名。
-    if "CROSS_PRODUCT" in plan_text:
+    if any(n.get("name") == "CROSS_PRODUCT" for n in nodes):
         report["checks"].append("cross_product")
         plan_reject("PLAN_CROSS_PRODUCT", "查询包含笛卡尔积连接，准入拒绝", report)
 
-    # 结构规则二：无界全局排序。计划里 ORDER_BY 算子框自身的估计行数超过
-    # 返回行数上限，说明这个排序不是 TOP_N 之后的有界重排（那种框估计极小），
-    # 按无界全局排序拒。任何位置出现 TOP_N 不再整体豁免本检查。
-    row_cap = int(limits["row_cap"])
-    for box in _operator_boxes(plan_text):
-        if re.search(r"│\s*ORDER_BY\s*│", box):
-            box_est = _box_estimated_rows(box)
-            if box_est > row_cap:
-                report["checks"].append("global_sort_over_row_cap")
+    # 结构规则二：无界全局排序。duckdb 不给排序算子印估计行数，有界重排与无界
+    # 全排只能按祖先链区分：ORDER_BY 的祖先里没有 TOP_N 就是对全集排序。
+    for root in plan_tree:
+        for node, ancestors in _walk_with_ancestors(root):
+            if node.get("name") == "ORDER_BY" and not any(
+                    a.get("name") == "TOP_N" for a in ancestors):
+                report["checks"].append("global_sort_without_top_n")
                 plan_reject("PLAN_GLOBAL_SORT",
-                            f"全局排序估计处理 {box_est} 行，超过返回行数上限 {row_cap}，准入拒绝",
+                            "查询包含无 LIMIT 的全局排序，准入拒绝；请加 LIMIT 做 Top-N",
                             report)
 
-    # 估计行数对照档位上限。新渲染的规格永远带 estimated_row_cap（值由 Java 侧容量
-    # 配置下发）；旧锚点重放的规格里没有该字段，回落当时的固定上限，保证老作业
-    # 恢复后行为不变。两个回落值只服务兼容性，不再随版本调整。
+    # 规模规则一：顶层输出规模。要回答的问题只有一个——这条查询最终会返回超过
+    # 返回行数上限的行吗？顶层是 LIMIT 类或聚合类算子直接放行；其余看顶层估计行数，
+    # 超过上限即拒；估计缺失且不在白名单同样拒（宁可错拒也不放过）。
+    row_cap = int(limits["row_cap"])
+    for root in plan_tree:
+        name = root.get("name", "")
+        if _is_bounded_or_aggregate_top(name):
+            continue
+        estimated = _node_estimated_rows(root)
+        if estimated is None or estimated > row_cap:
+            report["checks"].append("top_output_over_row_cap")
+            plan_reject("PLAN_FULL_SCAN",
+                        f"查询顶层输出估计 {estimated if estimated is not None else '未知'} 行，"
+                        f"超过返回行数上限 {row_cap}，准入拒绝；请加 LIMIT、加过滤条件或改用聚合",
+                        report)
+
+    # 规模规则二：各算子估计行数对照档位上限。估计行数上限与返回行数上限是两个
+    # 不同口径：这里管估计处理规模。新渲染的规格永远带 estimated_row_cap（值由
+    # Java 侧容量配置下发）；旧锚点重放的规格里没有该字段，回落当时的固定上限，
+    # 保证老作业恢复后行为不变。两个回落值只服务兼容性，不再随版本调整。
     cap_raw = limits.get("estimated_row_cap")
     cap = int(cap_raw) if cap_raw is not None else (200_000 if tier == "INTERACTIVE" else 600_000)
     if report["estimated_rows_max"] > cap:
