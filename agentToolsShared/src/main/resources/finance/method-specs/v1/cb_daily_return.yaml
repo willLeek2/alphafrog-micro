@@ -5,7 +5,7 @@ displayName: 可转债日收益与区间收益
 definition: 日收益 = 当日涨跌幅/100；区间收益 = 区间内日收益连乘减一（prod(1+ret) - 1）。双输出：最后一个有值日的日收益，以及区间连乘收益（window 不传对整个传入序列连乘、传入时对最后 window 个有值日连乘）。转债价格序列不加复权因子；缺值日跳过并计入警告。
 resolverHints:
   aliases: [转债日收益, 可转债收益, 转债区间收益]
-  commonPhrases: [这只转债今天涨了多少, 转债这段时间收益多少]
+  commonPhrases: [这只转债涨了多少, 转债这段时间收益多少]
   clarificationDimensions:
     - id: cbAndRange
       question: 哪只转债、哪个日期区间

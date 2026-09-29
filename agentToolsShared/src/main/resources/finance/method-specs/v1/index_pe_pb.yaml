@@ -5,7 +5,7 @@ displayName: 指数滚动市盈率与市净率
 definition: 读指数每日指标（index_dailybasic）的市盈率（TTM）与市净率，接口值直接采用，无值的键不输出。
 resolverHints:
   aliases: [指数市盈率, 指数市净率, 指数估值, 大盘估值]
-  commonPhrases: [大盘现在估值多高, 指数贵不贵]
+  commonPhrases: [大盘现在估值多高, 指数贵不贵, 沪深300市盈率多少, 中证500市净率多少, 沪深300的市盈率和市净率是多少]
   clarificationDimensions:
     - id: indexAndDate
       question: 哪个指数、哪个交易日

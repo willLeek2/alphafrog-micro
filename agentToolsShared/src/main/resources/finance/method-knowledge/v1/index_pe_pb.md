@@ -1,7 +1,7 @@
 ---
 methodId: finance.valuation.index_pe_pb
 version: 1.0.0
-specDigest: sha256:3c4ccc58553fee9c610384ade48ccc2f327295e694e4e32ea8b2d75fe7b1c55c
+specDigest: sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6
 ---
 
 # 指数滚动市盈率与市净率

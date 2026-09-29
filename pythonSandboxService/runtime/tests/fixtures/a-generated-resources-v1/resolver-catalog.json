@@ -65,10 +65,10 @@
     "id" : "cbAndRange",
     "question" : "哪只转债、哪个日期区间"
   } ],
-  "commonPhrases" : [ "这只转债今天涨了多少", "转债这段时间收益多少" ],
+  "commonPhrases" : [ "这只转债涨了多少", "转债这段时间收益多少" ],
   "displayName" : "可转债日收益与区间收益",
   "methodId" : "finance.return.cb_daily_return",
-  "specDigest" : "sha256:29a5af03a1f21954c4165e3984e0b7bc551ce10aac3cc620b2c98ec6ce0aa458",
+  "specDigest" : "sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7",
   "version" : "1.0.0"
 }, {
   "aliases" : [ "ETF区间收益", "ETF复权收益", "ETF收益率" ],
@@ -76,10 +76,10 @@
     "id" : "etfAndRange",
     "question" : "哪只ETF、哪个日期区间"
   } ],
-  "commonPhrases" : [ "这只ETF这段时间赚了多少" ],
+  "commonPhrases" : [ "这只ETF这段时间赚了多少", "这只ETF今年以来复权涨了多少" ],
   "displayName" : "ETF复权区间收益",
   "methodId" : "finance.return.etf_adj_return",
-  "specDigest" : "sha256:981e0dacafd30771729250ca06e7f1f7167bdec41a20f58ca2f8b404e76b535a",
+  "specDigest" : "sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab",
   "version" : "1.0.0"
 }, {
   "aliases" : [ "基金区间收益", "累计净值收益", "公募基金收益" ],
@@ -190,10 +190,10 @@
     "id" : "indexAndDate",
     "question" : "哪个指数、哪个交易日"
   } ],
-  "commonPhrases" : [ "大盘现在估值多高", "指数贵不贵" ],
+  "commonPhrases" : [ "大盘现在估值多高", "指数贵不贵", "沪深300市盈率多少", "中证500市净率多少", "沪深300的市盈率和市净率是多少" ],
   "displayName" : "指数滚动市盈率与市净率",
   "methodId" : "finance.valuation.index_pe_pb",
-  "specDigest" : "sha256:3c4ccc58553fee9c610384ade48ccc2f327295e694e4e32ea8b2d75fe7b1c55c",
+  "specDigest" : "sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6",
   "version" : "1.0.0"
 }, {
   "aliases" : [ "市净率", "市净率PB", "PB" ],

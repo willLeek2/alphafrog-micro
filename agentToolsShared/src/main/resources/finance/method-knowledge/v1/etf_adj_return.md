@@ -1,7 +1,7 @@
 ---
 methodId: finance.return.etf_adj_return
 version: 1.0.0
-specDigest: sha256:981e0dacafd30771729250ca06e7f1f7167bdec41a20f58ca2f8b404e76b535a
+specDigest: sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab
 ---
 
 # ETF复权区间收益

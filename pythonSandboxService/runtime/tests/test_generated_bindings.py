@@ -54,7 +54,7 @@ _FIXTURE_DIR = os.path.join(_TESTS_DIR, "fixtures", "a-generated-resources-v1")
 # Byte pin: method_specs.json generated from the fixture must stay exactly the
 # historical bytes (the swap changes neither the format nor the pin).
 _FROZEN_METHOD_SPECS_SHA256 = (
-    "2cf9befb56792cf00523898f0fc0f1b9d1bd87349d752041d58a0920eae7a129"
+    "9c9c5d1a83c126fd2e7fa9b5b53a93b12077f0701681ab6980079944a40e29b6"
 )
 
 # Spec §6 frozen identities, pinned VERBATIM (version 1.0.0).
@@ -86,12 +86,12 @@ _FROZEN_TRIPLES = {
     ),
     "finance.return.cb_daily_return": (
         "1.0.0",
-        "sha256:29a5af03a1f21954c4165e3984e0b7bc551ce10aac3cc620b2c98ec6ce0aa458",
+        "sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7",
         "cb_daily_return",
     ),
     "finance.return.etf_adj_return": (
         "1.0.0",
-        "sha256:981e0dacafd30771729250ca06e7f1f7167bdec41a20f58ca2f8b404e76b535a",
+        "sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab",
         "etf_adj_return",
     ),
     "finance.return.fund_accum_nav_return": (
@@ -136,7 +136,7 @@ _FROZEN_TRIPLES = {
     ),
     "finance.valuation.index_pe_pb": (
         "1.0.0",
-        "sha256:3c4ccc58553fee9c610384ade48ccc2f327295e694e4e32ea8b2d75fe7b1c55c",
+        "sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6",
         "index_pe_pb",
     ),
     "finance.valuation.price_to_book": (

@@ -5,7 +5,7 @@ displayName: ETF复权区间收益
 definition: ETF 复权收盘（收盘 × 复权因子）的区间收益率：ret = 复权收盘[t]/复权收盘[t-N] - 1。window 不传时按传入序列首尾计算（数据集复用命中时调用侧先按请求窗口过滤再传入）；传入时取最后 N+1 个有效日两端。因子可选传入方法内相乘，缺因子日与无行情日分开跳过。
 resolverHints:
   aliases: [ETF区间收益, ETF复权收益, ETF收益率]
-  commonPhrases: [这只ETF这段时间赚了多少]
+  commonPhrases: [这只ETF这段时间赚了多少, 这只ETF今年以来复权涨了多少]
   clarificationDimensions:
     - id: etfAndRange
       question: 哪只ETF、哪个日期区间

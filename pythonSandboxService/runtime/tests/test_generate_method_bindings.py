@@ -83,10 +83,10 @@ _FROZEN_SPEC_DIGESTS = {
         "sha256:d73018ebeacf1bc1f465fce51b5005fb46f20009ae9440ae3b6c5252e9e30b09"
     ),
     "finance.return.cb_daily_return": (
-        "sha256:29a5af03a1f21954c4165e3984e0b7bc551ce10aac3cc620b2c98ec6ce0aa458"
+        "sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7"
     ),
     "finance.return.etf_adj_return": (
-        "sha256:981e0dacafd30771729250ca06e7f1f7167bdec41a20f58ca2f8b404e76b535a"
+        "sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab"
     ),
     "finance.return.fund_accum_nav_return": (
         "sha256:53b7613839e145715964ae3777e400f9748a367b862400a3809794b52f41bed9"
@@ -113,7 +113,7 @@ _FROZEN_SPEC_DIGESTS = {
         "sha256:a849e7ed36b10948dcfdbfffc671196fbc7b6cbfd60b8a76e72a030ef7a50564"
     ),
     "finance.valuation.index_pe_pb": (
-        "sha256:3c4ccc58553fee9c610384ade48ccc2f327295e694e4e32ea8b2d75fe7b1c55c"
+        "sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6"
     ),
     "finance.valuation.price_to_book": (
         "sha256:924468f3ba30e8343d988d1e9b7cca6072b5df0be1bffafd3fbd46bfc0ccbf20"
@@ -127,7 +127,7 @@ _FROZEN_SPEC_DIGESTS = {
 # generator over the committed fixture dir must produce a method_specs.json
 # with EXACTLY this sha256. Any drift is a regression.
 _FROZEN_METHOD_SPECS_SHA256 = (
-    "2cf9befb56792cf00523898f0fc0f1b9d1bd87349d752041d58a0920eae7a129"
+    "9c9c5d1a83c126fd2e7fa9b5b53a93b12077f0701681ab6980079944a40e29b6"
 )
 
 # Env gate for the live e2e run against A's final generated directory.

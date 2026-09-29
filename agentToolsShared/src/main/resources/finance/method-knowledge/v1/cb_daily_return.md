@@ -1,7 +1,7 @@
 ---
 methodId: finance.return.cb_daily_return
 version: 1.0.0
-specDigest: sha256:29a5af03a1f21954c4165e3984e0b7bc551ce10aac3cc620b2c98ec6ce0aa458
+specDigest: sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7
 ---
 
 # 可转债日收益与区间收益

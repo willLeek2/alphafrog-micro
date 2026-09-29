@@ -26,12 +26,12 @@
 }, {
   "methodId" : "finance.return.cb_daily_return",
   "resourcePath" : "finance/method-specs/v1/cb_daily_return.json",
-  "specDigest" : "sha256:29a5af03a1f21954c4165e3984e0b7bc551ce10aac3cc620b2c98ec6ce0aa458",
+  "specDigest" : "sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7",
   "version" : "1.0.0"
 }, {
   "methodId" : "finance.return.etf_adj_return",
   "resourcePath" : "finance/method-specs/v1/etf_adj_return.json",
-  "specDigest" : "sha256:981e0dacafd30771729250ca06e7f1f7167bdec41a20f58ca2f8b404e76b535a",
+  "specDigest" : "sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab",
   "version" : "1.0.0"
 }, {
   "methodId" : "finance.return.fund_accum_nav_return",
@@ -76,7 +76,7 @@
 }, {
   "methodId" : "finance.valuation.index_pe_pb",
   "resourcePath" : "finance/method-specs/v1/index_pe_pb.json",
-  "specDigest" : "sha256:3c4ccc58553fee9c610384ade48ccc2f327295e694e4e32ea8b2d75fe7b1c55c",
+  "specDigest" : "sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6",
   "version" : "1.0.0"
 }, {
   "methodId" : "finance.valuation.price_to_book",
