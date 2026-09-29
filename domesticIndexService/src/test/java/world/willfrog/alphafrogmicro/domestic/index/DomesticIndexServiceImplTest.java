@@ -200,6 +200,11 @@ public class DomesticIndexServiceImplTest {
         }
 
         @Override
+        public List<String> getAllIndexInfoTsCodesWithDaily(int offset, int limit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
         public List<IndexInfo> getAllIndexInfo(int offset, int limit) {
             throw new UnsupportedOperationException();
         }
@@ -235,6 +240,13 @@ public class DomesticIndexServiceImplTest {
         @Override
         public boolean hasAnyIndexDaily(String tsCode) {
             return !rows.isEmpty();
+        }
+
+        @Override
+        public List<Map<String, Object>> getEligibleRandomIndices(Long startDate, Long endDate,
+                                                                   int requiredDailyCount, Double minAverageAmount,
+                                                                   int candidateLimit) {
+            throw new UnsupportedOperationException();
         }
     }
 }
