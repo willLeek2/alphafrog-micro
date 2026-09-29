@@ -448,16 +448,6 @@ def _adj_warnings(null_close_days: int, missing_factor_days: int) -> tuple:
     return tuple(parts)
 
 
-def _optional_positive_number(name: str, value: Any) -> float | None:
-    """None -> None（无值）；否则必须是有限正数。"""
-    if value is None:
-        return None
-    v = _validate_number(name, value)
-    if v <= 0:
-        raise ValueError(f"{name} must be > 0, got {v}")
-    return v
-
-
 def _optional_number(name: str, value: Any) -> float | None:
     """None -> None（无值）；否则必须是有限数。"""
     if value is None:
@@ -498,9 +488,9 @@ def rolling_pe(pe_ttm_series: Sequence[float | None], *, window: int | None = No
 
 
 def price_to_book(pb: float | None) -> FinanceMetricResult | None:
-    """市净率（阶段二·估值）：直接采用接口 pb；无值为 None（不输出记录）。"""
-    value = _optional_positive_number("pb", pb)
-    if value is None:
+    """市净率（阶段二·估值）：直接采用接口 pb；无值或非正（无效比率）均为 None（不输出记录）。"""
+    value = _optional_number("pb", pb)
+    if value is None or value <= 0:
         return None
     return _metric_result(
         "price_to_book",
@@ -518,8 +508,9 @@ def index_pe_pb(pe_ttm: float | None, pb: float | None) -> Dict[str, FinanceMetr
         v = _validate_number("peTtm", pe_ttm)
         outputs["peTtm"] = {"value": v, "unit": _UNIT_RATIO}
     if pb is not None:
-        v = _optional_positive_number("pb", pb)
-        if v is not None:
+        # 非正 pb 只省略 pb 键（无效比率不当数据缺陷抛错），peTtm 照常输出。
+        v = _validate_number("pb", pb)
+        if v > 0:
             outputs["pb"] = {"value": v, "unit": _UNIT_RATIO}
     if not outputs:
         return {}
@@ -663,7 +654,12 @@ def forward_pe_peg(rows: Sequence[Mapping[str, Any]]) -> Dict[str, FinanceMetric
         if math.isfinite(g) and g > 0 and current_pe is not None and current_pe > 0:
             peg_values.append(current_pe / (g * 100.0))
 
-    parameters: Dict[str, Any] = {"rowCount": len(items), "orgCount": len(groups)}
+    # rows 与 yaml 必填参数对齐（投影必检项）；rowCount/orgCount 为附加审计信息。
+    parameters: Dict[str, Any] = {
+        "rows": [dict(row) for row in items],
+        "rowCount": len(items),
+        "orgCount": len(groups),
+    }
     outputs: Dict[str, Dict[str, Any]] = {}
     warnings: tuple = ()
     if not pe_values:
@@ -688,14 +684,13 @@ def price_momentum(
 
     N 取 {63,126,252}（3/6/12 个月按交易日历）；adjFactors 可选——传入时
     adj_close = close * adj_factor（缺因子日与无行情日分开计数并跳过），不传时
-    closes 须已是复权口径（指数收盘即用）。有效日不足 N+1 时报错。
+    closes 须已是复权口径（指数收盘即用）。有效日不足 N+1 时不产出记录
+    （返回 None，调用方换较短窗口）。
     """
     n = _validate_window("window", window, 1, allowed=(63, 126, 252))
     series, null_close_days, missing_factor_days = _adj_close_series(closes, adj_factors)
     if len(series) < n + 1:
-        raise ValueError(
-            f"有效交易日 {len(series)} 不足窗口 {n}+1，动量无定义"
-        )
+        return None
     value = series[-1] / series[-1 - n] - 1.0
     parameters: Dict[str, Any] = {"closes": list(series), "window": n}
     if adj_factors is not None:
@@ -720,14 +715,15 @@ def moving_average(
     EMA_N 以首个 N 日 SMA 为起点迭代 α = 2/(N+1)（输出最新值）。一次一个窗口。
 
     指数/ETF 传入对应收盘口径（ETF 需乘复权因子——传 adjFactors 或预先乘好）。
-    有效日不足 N 时报错。
+    有效日不足 N 时不产出记录（返回空字典，调用方换较短窗口）。
     """
     n = _validate_window("window", window, 2)
     series, null_close_days, missing_factor_days = _adj_close_series(closes, adj_factors)
     if len(series) < n:
-        raise ValueError(f"有效交易日 {len(series)} 不足窗口 {n}，均线无定义")
-    sma = sum(series[:n]) / n
-    ema = sma
+        return {}
+    # SMA 与 EMA 的窗口口径不同：SMA 取最近 N 日；EMA 以最早 N 日均值为种子迭代到末端。
+    sma = sum(series[-n:]) / n
+    ema = sum(series[:n]) / n
     alpha = 2.0 / (n + 1)
     for price in series[n:]:
         ema = alpha * price + (1.0 - alpha) * ema
@@ -754,17 +750,17 @@ def etf_adj_return(
 
     ETF 应传 adjFactors（etf_close * etf_adj_factor）。window 为 N 个交易日：
     不传时按传入序列首尾计算（调用侧先按请求窗口过滤再传入）；传入时取最后
-    N+1 个有效日。有效日不足时报错。
+    N+1 个有效日。有效日不足时不产出记录（返回 None，调用方换较短窗口）。
     """
     n = None if window is None else _validate_window("window", window, 1)
     series, null_close_days, missing_factor_days = _adj_close_series(closes, adj_factors)
     if n is None:
         if len(series) < 2:
-            raise ValueError(f"有效交易日 {len(series)} 不足 2，区间收益无定义")
+            return None
         value = series[-1] / series[0] - 1.0
     else:
         if len(series) < n + 1:
-            raise ValueError(f"有效交易日 {len(series)} 不足窗口 {n}+1，区间收益无定义")
+            return None
         value = series[-1] / series[-1 - n] - 1.0
     parameters: Dict[str, Any] = {"closes": list(series)}
     if n is not None:
@@ -786,17 +782,18 @@ def fund_accum_nav_return(accum_navs: Sequence[float | None], *, window: int | N
 
     用累计净值（不是单位净值）；未披露日（null）按无值跳过并计警告。window 为 N
     个净值日：不传时按传入序列首尾计算（数据集复用命中时先按请求窗口过滤
-    nav_date、按日期排序，再传入）；传入时取最后 N+1 个有效日。
+    nav_date、按日期排序，再传入）；传入时取最后 N+1 个有效日。有效净值日不足时
+    不产出记录（返回 None，调用方换较短窗口）。
     """
     n = None if window is None else _validate_window("window", window, 1)
     series, missing = _compact_series("accumNavs", accum_navs)
     if n is None:
         if len(series) < 2:
-            raise ValueError(f"有效净值日 {len(series)} 不足 2，区间收益无定义")
+            return None
         value = series[-1] / series[0] - 1.0
     else:
         if len(series) < n + 1:
-            raise ValueError(f"有效净值日 {len(series)} 不足窗口 {n}+1，区间收益无定义")
+            return None
         value = series[-1] / series[-1 - n] - 1.0
     parameters: Dict[str, Any] = {"accumNavs": list(series)}
     if n is not None:
@@ -818,27 +815,28 @@ def cb_daily_return(pct_chgs: Sequence[float | None], *, window: int | None = No
     双输出：dailyReturn = 最后一个有值日的日收益；intervalReturn 在 window
     不传时对整个传入序列连乘、传入时对最后 window 个有值日连乘。
     pct_chg 缺值日按无行情跳过并计警告。转债价格序列不加复权因子。
+    传入序列没有任何有值日时返回空字典；有效日不足请求窗口时只输出
+    dailyReturn、intervalReturn 不产出（调用方换较短窗口）。
     """
     n = None if window is None else _validate_window("window", window, 1)
     series, missing = _compact_series("pctChgs", pct_chgs)
     if not series:
-        raise ValueError("pctChgs 内没有任何有值日，日收益无定义")
-    span = series if n is None else series[-n:]
-    if not span:
-        raise ValueError(f"有效交易日 {len(series)} 不足窗口 {n}，区间收益无定义")
-    prod = 1.0
-    for v in span:
-        prod *= 1.0 + v / 100.0
+        return {}
+    warnings = list(_warnings_for(missing))
     parameters: Dict[str, Any] = {"pctChgs": list(series)}
     if n is not None:
         parameters["window"] = n
-    outputs = {
-        "dailyReturn": {"value": series[-1] / 100.0, "unit": _UNIT_RATIO},
-        "intervalReturn": {"value": prod - 1.0, "unit": _UNIT_RATIO},
-    }
-    return _metric_result_multi(
-        "cb_daily_return", outputs, parameters, _warnings_for(missing)
-    )
+    outputs = {"dailyReturn": {"value": series[-1] / 100.0, "unit": _UNIT_RATIO}}
+    if n is None or len(series) >= n:
+        prod = 1.0
+        for v in (series if n is None else series[-n:]):
+            prod *= 1.0 + v / 100.0
+        outputs["intervalReturn"] = {"value": prod - 1.0, "unit": _UNIT_RATIO}
+    else:
+        warnings.append(
+            f"有效交易日 {len(series)} 不足窗口 {n}，区间收益未输出（调用方换较短窗口）"
+        )
+    return _metric_result_multi("cb_daily_return", outputs, parameters, tuple(warnings))
 
 
 # --- 风险 ---

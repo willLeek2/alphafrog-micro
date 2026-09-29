@@ -18,7 +18,7 @@ conventions:
   org_pair_median:
     canonicalPath: 机构内相邻预测期配对 + 跨机构中位数
     returnType: ratio
-    narrativeTemplate: 对 {rowCount} 行预测记录按机构分组、组内按预测期排序后配对（同一机构相邻预测期、当期市盈率与每股收益同行），跨机构的有限预测市盈率与 PEG 各取中位数；禁止取列表第一行
+    narrativeTemplate: 对 report_rc 预测记录按机构分组、组内按预测期排序后配对（同一机构相邻预测期、当期市盈率与每股收益同行），跨机构的有限预测市盈率与 PEG 各取中位数；禁止取列表第一行
 outputs:
   - {name: forwardPe, unit: ratio, description: 跨机构中位数预测市盈率, displayFormat: number}
   - {name: peg, unit: ratio, description: 跨机构中位数 PEG, displayFormat: number}

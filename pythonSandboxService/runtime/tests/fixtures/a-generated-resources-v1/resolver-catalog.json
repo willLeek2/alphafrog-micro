@@ -18,7 +18,7 @@
   "commonPhrases" : [ "按券商预测算贵不贵", "估值和预测增速匹配吗" ],
   "displayName" : "预测市盈率与PEG",
   "methodId" : "finance.forecast.forward_pe_peg",
-  "specDigest" : "sha256:25a5b6d72b7eefc6954227ff05e69ffe293e014ffdcebfbf5bdbc73c169db822",
+  "specDigest" : "sha256:f91c13bbb90f741f347b73788123fe51f718f3d2dbd8a097dbe5fb1997968226",
   "version" : "1.0.0"
 }, {
   "aliases" : [ "复合增长率", "CAGR", "年复合增长率" ],

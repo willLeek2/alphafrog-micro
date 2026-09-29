@@ -36,9 +36,9 @@ class ValuationAndForecastContractTests(unittest.TestCase):
         self.assertIsNone(metrics.free_float_turnover(None))
         self.assertEqual(metrics.ah_premium(31.4).value, 31.4)
         self.assertIsNone(metrics.ah_premium(None))
-        # 负值不合法：市净率非正直接拒绝
-        with self.assertRaises(ValueError):
-            metrics.price_to_book(-1.0)
+        # 非正 pb 是无效比率：省略记录而不是抛错（与无值同路径）
+        self.assertIsNone(metrics.price_to_book(-1.0))
+        self.assertIsNone(metrics.price_to_book(0.0))
 
     def test_index_pe_pb_partial_outputs(self):
         both = metrics.index_pe_pb(14.2, 1.6)
@@ -46,7 +46,26 @@ class ValuationAndForecastContractTests(unittest.TestCase):
         only_pe = metrics.index_pe_pb(14.2, None)
         self.assertEqual(set(only_pe), {"peTtm"})
         self.assertEqual(only_pe["peTtm"].parameters["output"], "peTtm")
+        # 非正 pb 只省略 pb 键，已算好的 peTtm 照常输出
+        non_positive_pb = metrics.index_pe_pb(14.2, -0.5)
+        self.assertEqual(set(non_positive_pb), {"peTtm"})
+        self.assertEqual(non_positive_pb["peTtm"].value, 14.2)
         self.assertEqual(metrics.index_pe_pb(None, None), {})
+
+    def test_index_pe_pb_real_csi300_sample(self):
+        # 真实样本：沪深300 2026-08-28 的 pe_ttm=13.8377、pb=1.4554。
+        # 来源：生产库 2026-09-29 取数。取数 SQL（可原样重跑）：
+        #   SELECT pe_ttm, pb FROM alphafrog_index_daily_basic
+        #    WHERE ts_code = '000300.SH'
+        #      AND pe_ttm IS NOT NULL AND pb IS NOT NULL
+        #    ORDER BY trade_date DESC LIMIT 2;
+        # 取数日期 2026-09-29；全表 64623 行无非正值，非正分支由上方合成用例覆盖。
+        # 生产数据会随抓取线续灌变化（回灌截止 2026-08-28），故固定窗口与取数日。
+        out = metrics.index_pe_pb(13.8377, 1.4554)
+        self.assertEqual(set(out), {"peTtm", "pb"})
+        self.assertAlmostEqual(out["peTtm"].value, 13.8377, places=10)
+        self.assertAlmostEqual(out["pb"].value, 1.4554, places=10)
+        self.assertEqual(out["pb"].parameters["output"], "pb")
 
     def test_dupont_consistency_check(self):
         out = metrics.dupont_roe(12.0, 15.0, 0.8, 1.0)
@@ -73,6 +92,8 @@ class ValuationAndForecastContractTests(unittest.TestCase):
         self.assertEqual(out["forwardPe"].value, 20.0)  # median(20, 15, 22)
         self.assertAlmostEqual(out["peg"].value, 1.15)  # median(0.8, 1.5)
         self.assertEqual(out["forwardPe"].parameters["output"], "forwardPe")
+        # rows 与 yaml 必填参数对齐（投影必检），rowCount/orgCount 为附加审计键
+        self.assertEqual(len(out["forwardPe"].parameters["rows"]), 5)
         self.assertEqual(out["forwardPe"].parameters["rowCount"], 5)
         self.assertEqual(out["forwardPe"].parameters["orgCount"], 3)
 

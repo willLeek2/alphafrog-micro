@@ -54,7 +54,7 @@ _FIXTURE_DIR = os.path.join(_TESTS_DIR, "fixtures", "a-generated-resources-v1")
 # Byte pin: method_specs.json generated from the fixture must stay exactly the
 # historical bytes (the swap changes neither the format nor the pin).
 _FROZEN_METHOD_SPECS_SHA256 = (
-    "ae12e88c465dbebb4c736b874145e5a940919abf00c4efd770f1483878c96392"
+    "2cf9befb56792cf00523898f0fc0f1b9d1bd87349d752041d58a0920eae7a129"
 )
 
 # Spec §6 frozen identities, pinned VERBATIM (version 1.0.0).
@@ -66,7 +66,7 @@ _FROZEN_TRIPLES = {
     ),
     "finance.forecast.forward_pe_peg": (
         "1.0.0",
-        "sha256:25a5b6d72b7eefc6954227ff05e69ffe293e014ffdcebfbf5bdbc73c169db822",
+        "sha256:f91c13bbb90f741f347b73788123fe51f718f3d2dbd8a097dbe5fb1997968226",
         "forward_pe_peg",
     ),
     "finance.growth.cagr": (

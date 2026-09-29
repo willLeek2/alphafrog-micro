@@ -3,10 +3,12 @@
 
 真实样本取自生产库 2026-09-29 快照：
 * 上证指数 000001.SH 2026-05-18 ~ 2026-08-28 共 70 个交易日收盘（alphafrog_index_daily）；
-* 华夏成长混合 000001.OF 2026-08-17 ~ 2026-08-28 共 10 个净值日累计净值（alphafrog_fund_nav）。
+* 华夏成长混合 000001.OF 2026-08-17 ~ 2026-08-28 共 10 个净值日累计净值（alphafrog_fund_nav）；
+* 沪深 300 ETF 510300.SH 2025-06-09 ~ 2025-06-30 共 16 个交易日的收盘与复权因子
+  （alphafrog_domestic_etf_daily / alphafrog_domestic_etf_adj_factor，跨一次分红除权）。
 期望值在测试内以独立算式直接表达（不调用被测函数）。
-ETF 与可转债当前无真实数据（ETF 复权因子链路、转债表均待抓取任务灌数），
-这两项与复权缺值/无行情分开计数用合成数据覆盖契约语义。
+可转债当前无真实数据（转债表待抓取任务灌数），其契约语义与复权缺值/无行情的
+分开计数用合成数据覆盖。
 """
 import math
 import unittest
@@ -30,6 +32,25 @@ SH_CLOSES = [
 # 000001.OF 累计净值，日期升序（2026-08-17 → 2026-08-28），来源：生产 alphafrog_fund_nav
 OF_ACCUM_NAVS = [3.976, 3.982, 3.892, 3.896, 3.902, 3.87, 3.86, 3.879, 3.913, 3.891]
 
+# 510300.SH 收盘与复权因子，日期升序（2025-06-09 → 2025-06-30，共 16 个交易日），
+# 跨过一次分红除权（因子 1.208 → 1.235）。
+# 来源：生产库 2026-09-29 取数。取数 SQL（可原样重跑）：
+#   SELECT d.close, a.adj_factor FROM alphafrog_domestic_etf_daily d
+#     JOIN alphafrog_domestic_etf_adj_factor a
+#       ON a.ts_code = d.ts_code AND a.trade_date = d.trade_date
+#    WHERE d.ts_code = '510300.SH'
+#      AND d.trade_date BETWEEN 1749340800000 AND 1751241600000
+#    ORDER BY d.trade_date;
+# 取这段窗口而不是 2025 全年（243 个交易日全配对）的理由：同段内既有除权前也有除权后，
+# 期望值可用一条独立算式表达；全量数据留待按需扩展。取数日期 2026-09-29——
+# 复权因子表自 2026-06-03 起存在缺口（510300.SH 缺到 2026-08-27、31 个交易日），
+# 缺因子日的行为由合成测试覆盖，不受生产数据后续补跑影响。
+ETF_510300_CLOSES = [
+    3.995, 3.972, 4.004, 4.006, 3.98, 3.99, 3.989, 3.904,
+    3.873, 3.878, 3.891, 3.936, 4.001, 3.986, 3.963, 3.982,
+]
+ETF_510300_FACTORS = [1.208] * 7 + [1.235] * 9
+
 
 class SeriesRealSampleTests(unittest.TestCase):
     def setUp(self):
@@ -46,20 +67,23 @@ class SeriesRealSampleTests(unittest.TestCase):
     def test_price_momentum_window_enum_enforced(self):
         with self.assertRaises(ValueError):
             metrics.price_momentum(SH_CLOSES, window=100)
-        with self.assertRaises(ValueError):
-            metrics.price_momentum([1.0, 2.0], window=63)
+        # 有效日不足窗口：不产出记录（返回 None），调用方换较短窗口
+        self.assertIsNone(metrics.price_momentum([1.0, 2.0], window=63))
 
     def test_moving_average_real_sh_index_50d(self):
         out = metrics.moving_average(SH_CLOSES, window=50)
-        expected_sma = sum(SH_CLOSES[:50]) / 50.0
+        # SMA 取最近 50 日；EMA 以最早 50 日均值为种子迭代到末端（两窗口口径不同）
+        expected_sma = sum(SH_CLOSES[-50:]) / 50.0
+        expected_ema = sum(SH_CLOSES[:50]) / 50.0
         alpha = 2.0 / (50 + 1)
-        expected_ema = expected_sma
         for price in SH_CLOSES[50:]:
             expected_ema = alpha * price + (1.0 - alpha) * expected_ema
         self.assertAlmostEqual(out["sma"].value, expected_sma, places=8)
         self.assertAlmostEqual(out["ema"].value, expected_ema, places=8)
         self.assertEqual(out["sma"].unit, "price")
         self.assertEqual(out["ema"].parameters["output"], "ema")
+        # 有效日不足窗口：空字典，不产出记录
+        self.assertEqual(metrics.moving_average(SH_CLOSES[:10], window=50), {})
 
     def test_drawdown_real_sh_index(self):
         out = metrics.drawdown_sortino_calmar(SH_CLOSES)
@@ -102,6 +126,51 @@ class SeriesRealSampleTests(unittest.TestCase):
         self.assertAlmostEqual(whole.value, 13.0 / 10.0 - 1.0, places=12)
         win = metrics.etf_adj_return(closes, window=2, adj_factors=factors)
         self.assertAlmostEqual(win.value, 13.0 / 11.0 - 1.0, places=12)
+        # 有效日不足：不产出记录（None）
+        self.assertIsNone(metrics.etf_adj_return([1.0], adj_factors=[1.0]))
+        self.assertIsNone(
+            metrics.etf_adj_return(closes, window=9, adj_factors=factors)
+        )
+
+    def test_etf_adj_return_real_510300_with_dividend(self):
+        # 真实样本跨一次分红除权：复权后序列的区间收益必须高于未复权的收盘比值，
+        # 否则说明复权因子没被用上（除权缺口正是这个口径要挡的错误）。
+        result = metrics.etf_adj_return(
+            ETF_510300_CLOSES, adj_factors=ETF_510300_FACTORS
+        )
+        expected = (
+            ETF_510300_CLOSES[-1] * ETF_510300_FACTORS[-1]
+            / (ETF_510300_CLOSES[0] * ETF_510300_FACTORS[0])
+            - 1.0
+        )
+        self.assertAlmostEqual(result.value, expected, places=12)
+        unadjusted = ETF_510300_CLOSES[-1] / ETF_510300_CLOSES[0] - 1.0
+        self.assertLess(unadjusted, 0.0, "样本窗口未复权口径应为负（除权跳降）")
+        self.assertGreater(result.value, unadjusted, "复权后区间收益应高于未复权比值")
+        self.assertFalse(result.warnings, "样本窗口因子全配对，不应有缺因子告警")
+        # 指定窗口取最后 N+1 个有效日两端
+        win = metrics.etf_adj_return(
+            ETF_510300_CLOSES, window=5, adj_factors=ETF_510300_FACTORS
+        )
+        self.assertAlmostEqual(
+            win.value,
+            (ETF_510300_CLOSES[-1] * ETF_510300_FACTORS[-1])
+            / (ETF_510300_CLOSES[-6] * ETF_510300_FACTORS[-6])
+            - 1.0,
+            places=12,
+        )
+
+    def test_fund_and_cb_insufficient_inputs(self):
+        # 基金净值有效日不足：None（换较短窗口），不足 2 日无区间收益定义
+        self.assertIsNone(metrics.fund_accum_nav_return([1.0]))
+        self.assertIsNone(metrics.fund_accum_nav_return(OF_ACCUM_NAVS, window=99))
+        # 转债：空序列空字典；窗口大于有效日时只出 dailyReturn 并告警
+        self.assertEqual(metrics.cb_daily_return([]), {})
+        short = metrics.cb_daily_return([1.0, 2.0], window=5)
+        self.assertEqual(set(short), {"dailyReturn"})
+        self.assertTrue(
+            any("不足窗口" in w for w in short["dailyReturn"].warnings)
+        )
 
     def test_cb_daily_return_synthetic(self):
         pct = [1.0, 2.0, -0.5, 3.0, None, 2.0]

@@ -71,7 +71,7 @@ _FROZEN_SPEC_DIGESTS = {
         "sha256:177a8c04110c31fc5c7a8e6f05f21cadfe9f56f4015cbbec2e245d15370611e3"
     ),
     "finance.forecast.forward_pe_peg": (
-        "sha256:25a5b6d72b7eefc6954227ff05e69ffe293e014ffdcebfbf5bdbc73c169db822"
+        "sha256:f91c13bbb90f741f347b73788123fe51f718f3d2dbd8a097dbe5fb1997968226"
     ),
     "finance.growth.cagr": (
         "sha256:cff05d88e83b787478edfd0252c414ded02b8236b9b1032126f5cd51c4d7b25e"
@@ -127,7 +127,7 @@ _FROZEN_SPEC_DIGESTS = {
 # generator over the committed fixture dir must produce a method_specs.json
 # with EXACTLY this sha256. Any drift is a regression.
 _FROZEN_METHOD_SPECS_SHA256 = (
-    "ae12e88c465dbebb4c736b874145e5a940919abf00c4efd770f1483878c96392"
+    "2cf9befb56792cf00523898f0fc0f1b9d1bd87349d752041d58a0920eae7a129"
 )
 
 # Env gate for the live e2e run against A's final generated directory.
