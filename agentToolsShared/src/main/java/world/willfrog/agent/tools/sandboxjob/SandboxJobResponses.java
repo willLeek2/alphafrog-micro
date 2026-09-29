@@ -68,6 +68,32 @@ public final class SandboxJobResponses {
         return value == null || value.isBlank() ? null : value.trim();
     }
 
+    /**
+     * 16KB UTF-8 安全截断（含后缀），与 ToolJobFinalizer 的终态预览同一算法：
+     * 超限时按字节截到上限减后缀长度，回退到 UTF-8 字符边界，再拼「…(truncated)」。
+     * 恢复注入给模型看的载荷预览统一走这里，避免多处拷贝漂移。
+     */
+    public static String boundedPreview(String s) {
+        if (s == null) {
+            return null;
+        }
+        String suffix = "\u2026(truncated)";
+        byte[] raw = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int max = world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES;
+        if (raw.length <= max) {
+            return s;
+        }
+        byte[] suffixBytes = suffix.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int cut = max - suffixBytes.length;
+        if (cut <= 0) {
+            return suffix;
+        }
+        while (cut > 0 && (raw[cut] & 0xC0) == 0x80) {
+            cut--;
+        }
+        return new String(raw, 0, cut, java.nio.charset.StandardCharsets.UTF_8) + suffix;
+    }
+
     private static String escapeJson(String text) {
         return nvl(text)
                 .replace("\\", "\\\\")

@@ -13,6 +13,7 @@ import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobWaitPolicy;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
 import world.willfrog.agent.tools.sandboxjob.SandboxToolJobLifecycle;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -33,6 +34,7 @@ import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
+import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import com.google.protobuf.util.JsonFormat;
@@ -741,14 +743,14 @@ public class PythonSandboxTools {
             int timeoutSeconds,
             long toolStartMs) throws Exception {
         // 等待策略必须来自 executor 已冻结的 effective workflow；未知值不能猜成 LINEAR。
-        Optional<PythonWaitPolicy> resolvedWaitPolicy =
-                PythonWaitPolicy.fromWorkflow(AgentContext.getWorkflow());
+        Optional<SandboxJobWaitPolicy> resolvedWaitPolicy =
+                SandboxJobWaitPolicy.fromWorkflow(AgentContext.getWorkflow());
         if (resolvedWaitPolicy.isEmpty()) {
             return fail("executePython", "WORKFLOW_MODE_UNAVAILABLE",
                     "executePython requires an effective workflow of linear or dag",
                     Map.of("workflow", nvl(AgentContext.getWorkflow())));
         }
-        PythonWaitPolicy waitPolicy = resolvedWaitPolicy.get();
+        SandboxJobWaitPolicy waitPolicy = resolvedWaitPolicy.get();
 
         // toolCallId 来自当前 Todo 的 AgentContext，是跨 worker 恢复的稳定逻辑调用身份。
         String toolCallId = AgentContext.getToolCallId();
@@ -941,31 +943,8 @@ public class PythonSandboxTools {
             List<AgentRunDatasetEntry> resolved,
             List<Map<String, Object>> illegal,
             boolean allowEmptyTokens) {
-        for (String token : tokens) {
-            if (!allowEmptyTokens && (token == null || token.isBlank())) {
-                continue;
-            }
-            int number;
-            try {
-                number = Integer.parseInt(token);
-            } catch (NumberFormatException nfe) {
-                // 非整数 token 无法对应 run 级编号，记入 illegal 并继续处理后续 token。
-                illegal.add(Map.of("input", token, "reason", "not_an_integer"));
-                continue;
-            }
-            Optional<AgentRunDatasetEntry> hit = "manifest".equals(kind)
-                    ? registry.findManifestByNumber(runId, number)
-                    : registry.findDatasetByNumber(runId, number);
-            if (hit.isPresent()) {
-                resolved.add(hit.get());
-            } else {
-                // 整数合法但当前 run 的对应编号空间里不存在该编号。
-                illegal.add(Map.of(
-                        "input", token,
-                        "reason", "no_" + kind + "_with_this_run_level_number"
-                ));
-            }
-        }
+        // 解析归集语义与 executeQuery 共用 RunLevelIdResolver，这里只留委托。
+        RunLevelIdResolver.resolveRunLevelNumbers(tokens, registry, runId, kind, resolved, illegal, allowEmptyTokens);
     }
 
     /** 查询沙箱任务当前状态；每次 Dubbo 调用前都会尝试安装调试 attachment。 */
@@ -1100,30 +1079,8 @@ public class PythonSandboxTools {
      * 会去重并保持首次出现顺序，避免重复挂载同一 dataset。
      */
     private String[] parseDatasetIds(String datasetIds) {
-        if (datasetIds == null) {
-            return new String[0];
-        }
-        String trimmed = datasetIds.trim();
-        if (trimmed.isEmpty()) {
-            return new String[0];
-        }
-        // 去掉 JSON 数组外层的方括号，后续仍按逗号拆分。
-        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-            trimmed = trimmed.substring(1, trimmed.length() - 1);
-        }
-        return java.util.Arrays.stream(trimmed.split(","))
-                .map(String::trim)
-                .map(item -> {
-                    String id = item;
-                    // 去掉 JSON 字符串元素两侧的双引号。
-                    if (id.startsWith("\"") && id.endsWith("\"") && id.length() >= 2) {
-                        id = id.substring(1, id.length() - 1).trim();
-                    }
-                    return id;
-                })
-                .filter(s -> !s.isEmpty())
-                .distinct()
-                .toArray(String[]::new);
+        // 拆分语义与 executeQuery 共用 RunLevelIdResolver.parseIds，这里只留委托。
+        return RunLevelIdResolver.parseIds(datasetIds);
     }
 
     /**

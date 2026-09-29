@@ -15,6 +15,7 @@ import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
@@ -41,6 +42,7 @@ class LangchainToolCatalogServiceConsistencyTest {
     private RagTools ragTools;
     private SearchTools searchTools;
     private PythonSandboxTools pythonSandboxTools;
+    private SqlQueryTools sqlQueryTools;
     private ListMyDataTool listMyDataTool;
     private LoadToolGuideTool loadToolGuideTool;
     private RereadToolHandler rereadToolHandler;
@@ -58,6 +60,7 @@ class LangchainToolCatalogServiceConsistencyTest {
         ragTools = new RagTools(objectMapper);
         searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        sqlQueryTools = new SqlQueryTools(objectMapper);
         listMyDataTool = new ListMyDataTool(objectMapper);
         loadToolGuideTool = new LoadToolGuideTool(objectMapper);
         rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
@@ -67,6 +70,7 @@ class LangchainToolCatalogServiceConsistencyTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 listMyDataTool,
                 loadToolGuideTool,
                 rereadToolHandler,
@@ -85,6 +89,7 @@ class LangchainToolCatalogServiceConsistencyTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 listMyDataTool,
                 loadToolGuideTool,
                 rereadToolHandler,

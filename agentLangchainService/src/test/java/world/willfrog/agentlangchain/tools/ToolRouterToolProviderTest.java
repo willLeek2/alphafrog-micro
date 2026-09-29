@@ -29,6 +29,7 @@ import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
@@ -67,6 +68,7 @@ class ToolRouterToolProviderTest {
     private RagTools ragTools;
     private SearchTools searchTools;
     private PythonSandboxTools pythonSandboxTools;
+    private SqlQueryTools sqlQueryTools;
     private ListMyDataTool listMyDataTool;
     private LoadToolGuideTool loadToolGuideTool;
     private RereadToolHandler rereadToolHandler;
@@ -85,6 +87,7 @@ class ToolRouterToolProviderTest {
         ragTools = new RagTools(objectMapper);
         searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        sqlQueryTools = new SqlQueryTools(objectMapper);
         listMyDataTool = new ListMyDataTool(objectMapper);
         loadToolGuideTool = new LoadToolGuideTool(objectMapper);
         rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
@@ -95,6 +98,7 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 listMyDataTool,
                 loadToolGuideTool,
                 rereadToolHandler,
@@ -182,7 +186,7 @@ class ToolRouterToolProviderTest {
         AgentContext.setRunId("child-run-1");
         when(bridge.isChildRun("child-run-1")).thenReturn(true);
         ToolRouterToolProvider childProvider = new ToolRouterToolProvider(
-                toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools,
+                toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
                 listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, eventService,
                 new LangchainToolConcurrencyThrottle(false, 20, 60),
                 mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class),

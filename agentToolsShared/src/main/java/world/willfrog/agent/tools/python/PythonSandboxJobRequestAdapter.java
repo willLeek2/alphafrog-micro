@@ -5,12 +5,11 @@ import world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
-import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobRequestAdapter;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 
-import java.nio.charset.StandardCharsets;
 
 /**
  * executePython 的请求适配器：ExecuteRequest 的规范化规格重建、指纹与恢复重放。
@@ -88,20 +87,7 @@ public final class PythonSandboxJobRequestAdapter implements SandboxJobRequestAd
         if (createRequestJson == null || createRequestJson.isBlank()) {
             return null;
         }
-        return boundedPreview(parseStoredCreateRequest(createRequestJson).getCode());
-    }
-
-    /** 与 ToolJobFinalizer.boundedPreview 同一算法：16KB UTF-8 安全截断（含后缀）。 */
-    private static String boundedPreview(String s) {
-        if (s == null) return null;
-        String suffix = "…(truncated)";
-        byte[] raw = s.getBytes(StandardCharsets.UTF_8);
-        int max = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES;
-        if (raw.length <= max) return s;
-        byte[] suffixBytes = suffix.getBytes(StandardCharsets.UTF_8);
-        int cut = max - suffixBytes.length;
-        if (cut <= 0) return suffix;
-        while (cut > 0 && (raw[cut] & 0xC0) == 0x80) cut--;
-        return new String(raw, 0, cut, StandardCharsets.UTF_8) + suffix;
+        // 预览截断算法全仓库只有 SandboxJobResponses.boundedPreview 一份。
+        return SandboxJobResponses.boundedPreview(parseStoredCreateRequest(createRequestJson).getCode());
     }
 }

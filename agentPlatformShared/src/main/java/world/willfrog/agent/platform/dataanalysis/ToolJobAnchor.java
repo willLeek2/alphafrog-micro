@@ -222,6 +222,9 @@ public class ToolJobAnchor {
 
     public static final String EXECUTE_PYTHON_TOOL = "executePython";
 
+    /** SQL 取数工具的稳定工具名：沙箱内固定 DuckDB 运行器执行模型给出的 SQL。 */
+    public static final String EXECUTE_QUERY_TOOL = "executeQuery";
+
     /**
      * 读历史 JSON 时：若新键没有 executePython，把旧三字段迁进 {@code repairAttempts}。
      * 迁完清掉内存里的旧字段，后续 {@link #toJson()} 不再写出旧键。

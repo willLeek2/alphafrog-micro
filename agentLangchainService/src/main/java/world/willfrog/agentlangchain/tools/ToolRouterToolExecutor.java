@@ -247,12 +247,13 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * 因此两个不同工作项都可能得到 {@code executePython_2}；直接拿它生成 operationId 会让
      * Sandbox 把第二个真实任务当成第一个任务的幂等重放。
      *
-     * <p>executePython 的持久身份追加节点工作项的稳定五字段摘要。同一工作项中断、重启或
+     * <p>沙箱后台长工具的持久身份追加节点工作项的稳定五字段摘要。同一工作项中断、重启或
      * 重新领取时摘要不变，不同计划代际、节点、节点尝试或执行分段则使用不同的摘要输入。
      * 其他工具没有跨进程持久作业，继续保留模型原始 id。</p>
      */
     private String durableToolCallId(String toolName, String rawToolCallId) {
-        if (!DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName)) {
+        // 是否「会转后台」以描述符注册表为准（executePython、executeQuery），不再按名单硬编码。
+        if (DurableSandboxTool.fromToolName(toolName).isEmpty()) {
             return rawToolCallId;
         }
         DualPoolToolJobExecutionContext.Snapshot snapshot = DualPoolToolJobExecutionContext.current();

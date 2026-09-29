@@ -13,6 +13,7 @@ import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
@@ -37,6 +38,7 @@ final class ToolCatalogBuilder {
                                                        RagTools ragTools,
                                                        SearchTools searchTools,
                                                        PythonSandboxTools pythonSandboxTools,
+                                                       SqlQueryTools sqlQueryTools,
                                                        ListMyDataTool listMyDataTool,
                                                        LoadToolGuideTool loadToolGuideTool,
                                                        RereadToolHandler rereadToolHandler,
@@ -47,6 +49,7 @@ final class ToolCatalogBuilder {
         addSpecsIfPresent(specifications, ragTools);
         addSpecsIfPresent(specifications, searchTools);
         addSpecsIfPresent(specifications, pythonSandboxTools);
+        addSpecsIfPresent(specifications, sqlQueryTools);
         addSpecsIfPresent(specifications, listMyDataTool);
         addSpecsIfPresent(specifications, loadToolGuideTool);
         addSpecsIfPresent(specifications, rereadToolHandler);

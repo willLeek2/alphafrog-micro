@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
@@ -78,7 +79,7 @@ class LangchainNodeToolDispatcherTest {
     void anAsyncMemberIsDispatchedWithThePersistedOperationIdentity() {
         String expectedOperationId = expectedOperationId();
         AtomicReference<WaitGroupMemberExecutionContext.Snapshot> seen = new AtomicReference<>();
-        executors.put(DurableToolCallIds.ASYNC_PYTHON_TOOL, (request, memoryId) -> {
+        executors.put(ToolJobAnchor.EXECUTE_PYTHON_TOOL, (request, memoryId) -> {
             seen.set(WaitGroupMemberExecutionContext.current());
             throw new WaitGroupMemberPendingException(
                     proof(expectedOperationId, "task-9"), "沙箱任务已交出");
@@ -113,14 +114,14 @@ class LangchainNodeToolDispatcherTest {
     @Test
     void anAsyncToolWithoutAModelCallIdFailsClosedBeforeAnyContext() {
         AtomicReference<WaitGroupMemberExecutionContext.Snapshot> seen = new AtomicReference<>();
-        executors.put(DurableToolCallIds.ASYNC_PYTHON_TOOL, (request, memoryId) -> {
+        executors.put(ToolJobAnchor.EXECUTE_PYTHON_TOOL, (request, memoryId) -> {
             seen.set(WaitGroupMemberExecutionContext.current());
             return "不该走到这里";
         });
 
         NodeToolDispatcher.DispatchOutcome outcome = dispatcher.dispatch(
                 new NodeToolDispatcher.DispatchRequest(RUN_ID, SEGMENT, 77L, 1, MEMBER_IDENTITY,
-                        null, DurableToolCallIds.ASYNC_PYTHON_TOOL, "{}"));
+                        null, ToolJobAnchor.EXECUTE_PYTHON_TOOL, "{}"));
 
         assertThat(outcome).isInstanceOfSatisfying(NodeToolDispatcher.DispatchOutcome.Failed.class,
                 failed -> assertThat(failed.reason())
@@ -130,7 +131,7 @@ class LangchainNodeToolDispatcherTest {
 
     @Test
     void aProofForAnotherOperationIsRejected() {
-        executors.put(DurableToolCallIds.ASYNC_PYTHON_TOOL, (request, memoryId) -> {
+        executors.put(ToolJobAnchor.EXECUTE_PYTHON_TOOL, (request, memoryId) -> {
             throw new WaitGroupMemberPendingException(
                     proof("run-stage3:someone-else:1", "task-9"), "沙箱任务已交出");
         });
@@ -248,11 +249,11 @@ class LangchainNodeToolDispatcherTest {
 
     private NodeToolDispatcher.DispatchRequest asyncRequest() {
         return new NodeToolDispatcher.DispatchRequest(RUN_ID, SEGMENT, 77L, 1, MEMBER_IDENTITY,
-                RAW_CALL_ID, DurableToolCallIds.ASYNC_PYTHON_TOOL, "{\"code\":\"print(1)\"}");
+                RAW_CALL_ID, ToolJobAnchor.EXECUTE_PYTHON_TOOL, "{\"code\":\"print(1)\"}");
     }
 
     private String durableCallId() {
-        return DurableToolCallIds.forTool(DurableToolCallIds.ASYNC_PYTHON_TOOL, RAW_CALL_ID, SEGMENT);
+        return DurableToolCallIds.forTool(ToolJobAnchor.EXECUTE_PYTHON_TOOL, RAW_CALL_ID, SEGMENT);
     }
 
     private String expectedOperationId() {

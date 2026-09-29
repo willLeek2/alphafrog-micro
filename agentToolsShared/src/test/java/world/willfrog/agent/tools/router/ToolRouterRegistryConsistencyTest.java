@@ -18,6 +18,7 @@ import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
@@ -83,6 +84,7 @@ class ToolRouterRegistryConsistencyTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),
@@ -164,6 +166,8 @@ class ToolRouterRegistryConsistencyTest {
 
         PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
         when(pythonSandboxTools.executePython(anyString(), anyString(), anyString(), anyString(), any())).thenReturn(okJson("executePython"));
+        SqlQueryTools sqlQueryTools = mock(SqlQueryTools.class);
+        when(sqlQueryTools.executeQuery(any(), any(), any())).thenReturn(okJson("executeQuery"));
 
         FinanceMethodTools financeMethodTools = mock(FinanceMethodTools.class);
         when(financeMethodTools.resolveFinanceMethods(anyString(), anyString())).thenReturn(okJson("resolveFinanceMethods"));
@@ -194,6 +198,7 @@ class ToolRouterRegistryConsistencyTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 financeMethodTools,
                 loadToolGuideTool,
                 listMyDataTool,

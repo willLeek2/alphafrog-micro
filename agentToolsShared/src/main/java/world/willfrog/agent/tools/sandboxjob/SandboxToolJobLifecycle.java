@@ -828,7 +828,7 @@ public final class SandboxToolJobLifecycle {
         // 随后把信号转换成正常的挂起结果。
         throw new ExternalToolJobPendingException(
                 runId, anchor.getToolCallId(), anchor.getAttempt(),
-                "Python Sandbox task continues in background: " + taskId);
+                anchor.getToolName() + " task continues in background: " + taskId);
     }
 
     // ==================== 名额与状态的共用小步 ====================

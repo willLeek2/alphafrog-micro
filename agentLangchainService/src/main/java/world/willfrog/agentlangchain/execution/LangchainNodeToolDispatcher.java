@@ -15,6 +15,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
@@ -142,9 +143,14 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
         return new DispatchOutcome.Pending(proof.operationId(), proof.taskId(), proof.toJson(objectMapper));
     }
 
-    /** 会转后台、需要在派发前装上成员上下文的工具。 */
+    /**
+     * 会转后台、需要在派发前装上成员上下文的工具。
+     *
+     * <p>等待组成员派发目前只有 executePython 接入；executeQuery 第一期只在顺序执行开放，
+     * 不接等待组，所以这里仍按 executePython 单列，不用描述符注册表。</p>
+     */
     private boolean isAsyncTool(String toolName) {
-        return DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName);
+        return ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName);
     }
 
     /** 这次派发对应的成员上下文；不是转后台的工具或算不出身份时返回空。 */
@@ -169,7 +175,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             String scope = segment.describe() + "|" + toolName + "|" + rawToolCallId;
             return Optional.of("sub-agent-tool:" + UUID.nameUUIDFromBytes(scope.getBytes(StandardCharsets.UTF_8)));
         }
-        if (!DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName)
+        if (!ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName)
                 || rawToolCallId == null || rawToolCallId.isBlank()) {
             return Optional.empty();
         }
@@ -180,7 +186,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
 
     @Override
     public boolean requiresStableOperationId(String toolName) {
-        return DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName) || SUB_AGENT_TOOL_NAMES.contains(toolName);
+        return ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName) || SUB_AGENT_TOOL_NAMES.contains(toolName);
     }
 
     private ToolExecutor executorFor(String toolName) {
