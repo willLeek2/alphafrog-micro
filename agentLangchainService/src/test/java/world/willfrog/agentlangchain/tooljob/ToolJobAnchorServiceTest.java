@@ -16,6 +16,7 @@ import java.time.Instant;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -443,7 +444,8 @@ class ToolJobAnchorServiceTest {
         assertThat(anchorService.claimPreparing("run-1", python, AgentRunStatus.EXECUTING)).isTrue();
 
         verify(agentRunMapper, never()).lockExecuteQuerySession(anyString());
-        verify(agentRunMapper, never()).countInFlightExecuteQueryByUser(anyString(), anyString(), anyString());
+        verify(agentRunMapper, never()).countInFlightExecuteQueryByUser(
+                anyString(), anyString(), anyString(), anyInt());
         verify(agentRunMapper, never()).findById("run-1");
         verify(agentRunMapper).claimPreparingToolJobAnchor(eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING));
     }
@@ -458,7 +460,7 @@ class ToolJobAnchorServiceTest {
         run.setUserId("user-9");
         when(agentRunMapper.findById("run-1")).thenReturn(run);
         when(agentRunMapper.countInFlightExecuteQueryByUser(
-                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL)).thenReturn(0);
+                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL, 600)).thenReturn(0);
         when(agentRunMapper.claimPreparingToolJobAnchor(eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING)))
                 .thenReturn(1);
 
@@ -468,7 +470,7 @@ class ToolJobAnchorServiceTest {
         order.verify(agentRunMapper).findById("run-1");
         order.verify(agentRunMapper).lockExecuteQuerySession("user-9");
         order.verify(agentRunMapper).countInFlightExecuteQueryByUser(
-                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL);
+                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL, 600);
         order.verify(agentRunMapper).claimPreparingToolJobAnchor(
                 eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING));
     }
@@ -481,7 +483,7 @@ class ToolJobAnchorServiceTest {
         run.setUserId("user-9");
         when(agentRunMapper.findById("run-2")).thenReturn(run);
         when(agentRunMapper.countInFlightExecuteQueryByUser(
-                "user-9", "run-2", ToolJobAnchor.EXECUTE_QUERY_TOOL)).thenReturn(1);
+                "user-9", "run-2", ToolJobAnchor.EXECUTE_QUERY_TOOL, 600)).thenReturn(1);
 
         assertThatThrownBy(() -> anchorService.claimPreparing("run-2", query, AgentRunStatus.EXECUTING))
                 .isInstanceOf(SessionQueryAdmissionException.class)
@@ -491,6 +493,25 @@ class ToolJobAnchorServiceTest {
                     assertThat(ex.retryable()).isTrue();
                 });
         verify(agentRunMapper, never()).claimPreparingToolJobAnchor(anyString(), anyString(), any());
+    }
+
+    @Test
+    void executeQueryClaimPassesConfiguredStaleSeconds() {
+        ToolJobAnchor query = new ToolJobAnchor();
+        query.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        AgentRun run = new AgentRun();
+        run.setUserId("user-9");
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+        when(agentRunMapper.countInFlightExecuteQueryByUser(
+                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL, 900)).thenReturn(0);
+        when(agentRunMapper.claimPreparingToolJobAnchor(eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING)))
+                .thenReturn(1);
+
+        new ToolJobAnchorService(agentRunMapper, 900)
+                .claimPreparing("run-1", query, AgentRunStatus.EXECUTING);
+
+        verify(agentRunMapper).countInFlightExecuteQueryByUser(
+                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL, 900);
     }
 
     @Test

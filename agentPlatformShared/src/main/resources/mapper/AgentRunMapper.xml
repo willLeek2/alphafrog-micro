@@ -871,8 +871,9 @@
     <!--
         同一用户其它 Run 上仍占用的 executeQuery 锚点。排除当前 Run，避免恢复路径把自己算进去。
         executePython 锚点的 toolName 不是 executeQuery，计数为 0。
-        只计非终态 Run。启动/孤儿回收器会把崩溃 Run 标成 FAILED 但不清锚点；
-        终态集合与 failOrphanedNonTerminalRunsForDeploymentGeneration 相同。
+        只计非终态 Run。当前代崩溃后 Run 停在 EXECUTING，代际清扫器不碰当前代，
+        所以还要排除 updated_at 早于陈旧阈值的残留锚点。终态集合与
+        failOrphanedNonTerminalRunsForDeploymentGeneration 相同。
     -->
     <select id="countInFlightExecuteQueryByUser" resultType="int">
         SELECT COUNT(*)
@@ -883,6 +884,8 @@
            AND tool_job_anchor_json IS NOT NULL
            AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
            AND tool_job_anchor_json #&gt;&gt; '{toolName}' = #{toolName}
+           AND updated_at IS NOT NULL
+           AND updated_at &gt;= CURRENT_TIMESTAMP - (#{staleSeconds} * INTERVAL '1 second')
     </select>
 
     <!--

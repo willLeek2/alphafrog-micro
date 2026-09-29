@@ -447,14 +447,8 @@ public class SqlQueryTools {
                             "tail_seconds", WALL_CLOCK_TAIL_SECONDS,
                             "retryable", false));
         }
+        // remainingSeconds > WALL_CLOCK_TAIL_SECONDS，差至少为 1；档位语句上限恒 > 0。
         int effectiveStatement = (int) Math.min(statementCapSeconds, remainingSeconds - WALL_CLOCK_TAIL_SECONDS);
-        if (effectiveStatement <= 0) {
-            throw new DataIntenseRefusal("RUN_WALL_CLOCK_INSUFFICIENT",
-                    "remaining run wall clock is not enough to start executeQuery",
-                    Map.of("remaining_ms", remainingWallClockMs,
-                            "tail_seconds", WALL_CLOCK_TAIL_SECONDS,
-                            "retryable", false));
-        }
         int effectiveProcess = (int) Math.min(processCapSeconds,
                 Math.min((long) effectiveStatement + TASK_OVERHEAD_SECONDS, remainingSeconds));
         return new QueryTimeouts(effectiveStatement, effectiveProcess);

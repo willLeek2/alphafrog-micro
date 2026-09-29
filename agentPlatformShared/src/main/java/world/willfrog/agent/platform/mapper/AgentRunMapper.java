@@ -356,12 +356,14 @@ public interface AgentRunMapper {
      * 统计同一用户其它非终态 Run 上仍占用的 executeQuery 锚点。
      * 锚点非空且 {@code toolName} 等于指定工具名即视为在途：同步完成会清成空对象，
      * LINEAR 挂起期间锚点一直持有到恢复消费。
-     * 终态（COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED）的残留锚点不计，
-     * 因为启动/孤儿回收器会把崩溃 Run 标成 FAILED 但不清锚点。
+     * 终态残留锚点不计。当前代进程崩溃后 Run 会停在 EXECUTING，代际清扫器不碰当前代，
+     * 所以还要排除 {@code updated_at} 早于陈旧阈值的行；阈值由
+     * {@code alphafrog.data-analysis.session-stale-seconds} 提供，缺省 600 秒。
      */
     int countInFlightExecuteQueryByUser(@Param("userId") String userId,
                                         @Param("excludeRunId") String excludeRunId,
-                                        @Param("toolName") String toolName);
+                                        @Param("toolName") String toolName,
+                                        @Param("staleSeconds") int staleSeconds);
 
     /**
      * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。

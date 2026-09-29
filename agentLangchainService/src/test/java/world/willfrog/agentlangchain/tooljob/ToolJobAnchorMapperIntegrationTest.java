@@ -196,6 +196,17 @@ class ToolJobAnchorMapperIntegrationTest {
         }
     }
 
+    private static void ageUpdatedAt(String id, String interval) throws Exception {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE alphafrog_agent_run SET updated_at = CURRENT_TIMESTAMP - CAST(? AS interval) WHERE id = ?")) {
+            ps.setString(1, interval);
+            ps.setString(2, id);
+            ps.executeUpdate();
+        }
+    }
+
     // ========== updateToolJobCheckpoint: atomic merge CAS ==========
 
     @Test
@@ -624,10 +635,14 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-failed-orphan", "FAILED",
                 "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
         updateUserId("run-failed-orphan", "user-session");
+        insertRun("run-stale-crash", "EXECUTING",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        updateUserId("run-stale-crash", "user-session");
+        ageUpdatedAt("run-stale-crash", "20 minutes");
 
         AgentRunMapper mapper = newMapper();
         assertThat(mapper.countInFlightExecuteQueryByUser(
-                "user-session", "run-self", ToolJobAnchor.EXECUTE_QUERY_TOOL)).isEqualTo(1);
+                "user-session", "run-self", ToolJobAnchor.EXECUTE_QUERY_TOOL, 600)).isEqualTo(1);
         assertThat(mapper.lockExecuteQuerySession("user-session")).isEqualTo(1);
     }
 
