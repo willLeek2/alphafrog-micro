@@ -767,7 +767,7 @@ public final class SandboxToolJobLifecycle {
         DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
                 runId, identity.toolCallId(), identity.attempt(), identity.operationId(),
                 attached.taskId(), status, businessSuccess, preview, rawRef,
-                errorCode, businessSuccess ? null : "sandbox " + status,
+                errorCode, businessSuccess ? null : terminalFailureMessage(status, errorCode),
                 result.retryable(), req.estimate(), confirmed, usage, terminalAt, false);
 
         DataAnalysisReleaseOutcome released = deps.capacityService().releaseReservation(
@@ -796,6 +796,16 @@ public final class SandboxToolJobLifecycle {
             return null;
         }
         return output;
+    }
+
+    /**
+     * 终态信封的错误文案：沙箱自身失败写沙箱状态；沙箱成功但业务失败时不能只写
+     * 沙箱状态（"sandbox SUCCEEDED" 会把计划拒绝读成成功），真实原因以错误码为准。
+     */
+    private static String terminalFailureMessage(String status, String errorCode) {
+        return "SUCCEEDED".equals(status)
+                ? "business failure: " + (errorCode == null ? "unknown" : errorCode)
+                : "sandbox " + status;
     }
 
     // ==================== 挂起段：名额过户与 WAITING_TOOL_JOB 移交 ====================
