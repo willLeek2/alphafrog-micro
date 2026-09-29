@@ -1,0 +1,29 @@
+schemaVersion: "1"
+methodId: finance.valuation.free_float_turnover
+version: 1.0.0
+displayName: 自由流通换手率
+definition: 采用每日指标接口的自由流通换手率（turnover_rate_f）。接口已是百分比数值；无值时不输出记录。
+resolverHints:
+  aliases: [自由流通换手率, 换手率, 自由流通换手]
+  commonPhrases: [筹码换手活跃吗, 成交活跃度用自由流通盘衡量是多少]
+  clarificationDimensions:
+    - id: tsCodeAndDate
+      question: 哪只股票、哪个交易日
+parameters:
+  turnoverRateF:
+    type: number
+    required: true
+    meaning: 自由流通换手率的百分比数值，无值传 null
+conventions:
+  direct_use:
+    canonicalPath: 接口值直接采用（百分比口径）
+    returnType: percent
+    narrativeTemplate: 采用每日指标接口在目标交易日的自由流通换手率 {turnoverRateF}%（接口已是百分比数值）
+outputs:
+  - {name: freeFloatTurnover, unit: percent, description: 自由流通换手率, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: free_float_turnover
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.valuation.free_float_turnover@1.0.0

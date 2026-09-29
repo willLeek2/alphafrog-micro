@@ -1,0 +1,34 @@
+schemaVersion: "1"
+methodId: finance.return.fund_accum_nav_return
+version: 1.0.0
+displayName: 公募累计净值区间收益
+definition: 用累计净值（不是单位净值）计算区间收益：ret = 累计净值[t]/累计净值[t-N] - 1。window 不传时按传入序列首尾计算（数据集复用命中时调用侧先按请求窗口过滤 nav_date、按日期排序后再传入）；传入时取最后 N+1 个有效净值日两端。未披露日（null）跳过并计入警告。
+resolverHints:
+  aliases: [基金区间收益, 累计净值收益, 公募基金收益]
+  commonPhrases: [这只基金这段时间赚了多少]
+  clarificationDimensions:
+    - id: fundAndRange
+      question: 哪只基金、哪个日期区间
+parameters:
+  accumNavs:
+    type: array
+    required: true
+    meaning: 按日期升序排列的累计净值序列，未披露日传 null
+  window:
+    type: integer
+    required: false
+    minimum: 1
+    meaning: 区间窗口的净值日个数；不传按传入序列首尾计算
+conventions:
+  accum_nav_interval_return:
+    canonicalPath: 累计净值两端相除减一
+    returnType: simple return
+    narrativeTemplate: 用累计净值（不是单位净值）在区间两端相除减一；指定窗口时取最后 window+1 个有效净值日两端，未披露净值日跳过
+outputs:
+  - {name: intervalReturn, unit: ratio, description: 累计净值口径区间收益率, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: fund_accum_nav_return
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.return.fund_accum_nav_return@1.0.0

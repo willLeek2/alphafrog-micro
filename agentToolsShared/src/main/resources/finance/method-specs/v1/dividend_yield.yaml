@@ -1,0 +1,29 @@
+schemaVersion: "1"
+methodId: finance.valuation.dividend_yield
+version: 1.0.0
+displayName: 股息率
+definition: 采用每日指标接口的近十二个月股息率（dv_ttm）。接口已是百分比数值，不再乘 100；无值时不输出记录。
+resolverHints:
+  aliases: [股息率, 股息率TTM, dividend yield]
+  commonPhrases: [分红回报有多少]
+  clarificationDimensions:
+    - id: tsCodeAndDate
+      question: 哪只股票、哪个交易日
+parameters:
+  dvTtm:
+    type: number
+    required: true
+    meaning: 近十二个月股息率的百分比数值，无值传 null
+conventions:
+  direct_use:
+    canonicalPath: 接口值直接采用（百分比口径）
+    returnType: percent
+    narrativeTemplate: 采用每日指标接口在目标交易日的近十二个月股息率 {dvTtm}%（接口已是百分比数值，不再乘 100）
+outputs:
+  - {name: dividendYield, unit: percent, description: 近十二个月股息率, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: dividend_yield
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.valuation.dividend_yield@1.0.0

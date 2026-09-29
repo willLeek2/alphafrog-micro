@@ -1,0 +1,41 @@
+schemaVersion: "1"
+methodId: finance.trend.moving_average
+version: 1.0.0
+displayName: 移动平均线
+definition: 简单移动平均（SMA）为最近 N 个有效日的收盘均值；指数移动平均（EMA）以首个 N 日 SMA 为起点、α=2/(N+1) 迭代到最新值。一次一个窗口，双输出（SMA 与 EMA）。股票/ETF 需复权口径（复权因子可选传入方法内相乘），指数收盘即用；缺因子日与无行情日分开跳过。
+resolverHints:
+  aliases: [均线, 移动平均, 移动平均线, MA, EMA]
+  commonPhrases: [股价在均线上方还是下方, 五十日均线是多少]
+  clarificationDimensions:
+    - id: tsCodeAndWindow
+      question: 哪只标的、窗口取多少个交易日
+    - id: adjusted
+      question: 序列是否需要方法内乘复权因子
+parameters:
+  closes:
+    type: array
+    required: true
+    meaning: 按日期升序排列的收盘序列，无行情日传 null
+  window:
+    type: integer
+    required: true
+    minimum: 2
+    meaning: 均线窗口的有效日个数（常用 50、200 个交易日）
+  adjFactors:
+    type: array
+    required: false
+    meaning: 与 closes 等长的复权因子序列，缺值传 null；不传表示序列已是复权口径
+conventions:
+  sma_ema_single_window:
+    canonicalPath: 窗口均值 + SMA 种子 EMA 迭代
+    returnType: price
+    narrativeTemplate: "{window} 个有效日窗口：简单均线取窗口均值，指数均线以首个窗口均值为起点按 α=2/(N+1) 迭代到最新值"
+outputs:
+  - {name: sma, unit: price, description: 窗口简单移动平均, displayFormat: number}
+  - {name: ema, unit: price, description: 窗口指数移动平均, displayFormat: number}
+libraryBinding:
+  package: alphafrog_finance
+  function: moving_average
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.trend.moving_average@1.0.0

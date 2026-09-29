@@ -1,0 +1,38 @@
+schemaVersion: "1"
+methodId: finance.return.etf_adj_return
+version: 1.0.0
+displayName: ETF复权区间收益
+definition: ETF 复权收盘（收盘 × 复权因子）的区间收益率：ret = 复权收盘[t]/复权收盘[t-N] - 1。window 不传时按传入序列首尾计算（数据集复用命中时调用侧先按请求窗口过滤再传入）；传入时取最后 N+1 个有效日两端。因子可选传入方法内相乘，缺因子日与无行情日分开跳过。
+resolverHints:
+  aliases: [ETF区间收益, ETF复权收益, ETF收益率]
+  commonPhrases: [这只ETF这段时间赚了多少]
+  clarificationDimensions:
+    - id: etfAndRange
+      question: 哪只ETF、哪个日期区间
+parameters:
+  closes:
+    type: array
+    required: true
+    meaning: 按日期升序排列的 ETF 收盘序列，无行情日传 null
+  window:
+    type: integer
+    required: false
+    minimum: 1
+    meaning: 区间窗口的交易日个数；不传按传入序列首尾计算
+  adjFactors:
+    type: array
+    required: false
+    meaning: 与 closes 等长的复权因子序列，缺值传 null；不传表示序列已是复权口径
+conventions:
+  adjusted_interval_return:
+    canonicalPath: 复权口径两端相除减一
+    returnType: simple return
+    narrativeTemplate: ETF 复权收盘（收盘乘复权因子）在区间两端的收益率；指定窗口时取最后 window+1 个有效日两端，缺因子日与无行情日分开跳过
+outputs:
+  - {name: intervalReturn, unit: ratio, description: 复权口径区间收益率, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: etf_adj_return
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.return.etf_adj_return@1.0.0

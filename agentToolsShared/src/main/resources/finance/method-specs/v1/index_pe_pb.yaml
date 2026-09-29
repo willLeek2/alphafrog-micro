@@ -1,0 +1,34 @@
+schemaVersion: "1"
+methodId: finance.valuation.index_pe_pb
+version: 1.0.0
+displayName: 指数滚动市盈率与市净率
+definition: 读指数每日指标（index_dailybasic）的市盈率（TTM）与市净率，接口值直接采用，无值的键不输出。
+resolverHints:
+  aliases: [指数市盈率, 指数市净率, 指数估值, 大盘估值]
+  commonPhrases: [大盘现在估值多高, 指数贵不贵]
+  clarificationDimensions:
+    - id: indexAndDate
+      question: 哪个指数、哪个交易日
+parameters:
+  peTtm:
+    type: number
+    required: false
+    meaning: 指数市盈率（TTM），无值传 null
+  pb:
+    type: number
+    required: false
+    meaning: 指数市净率，无值传 null
+conventions:
+  direct_use:
+    canonicalPath: 接口值直接采用
+    returnType: valuation ratio
+    narrativeTemplate: 采用指数每日指标接口在目标交易日的市盈率与市净率，无值的键不输出
+outputs:
+  - {name: peTtm, unit: ratio, description: 指数滚动市盈率（TTM）, displayFormat: number}
+  - {name: pb, unit: ratio, description: 指数市净率, displayFormat: number}
+libraryBinding:
+  package: alphafrog_finance
+  function: index_pe_pb
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.valuation.index_pe_pb@1.0.0

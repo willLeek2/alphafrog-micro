@@ -1,0 +1,45 @@
+schemaVersion: "1"
+methodId: finance.quality.dupont_roe
+version: 1.0.0
+displayName: 扣非净资产收益率与杜邦分解
+definition: 采用财务指标接口最新报告期的扣非净资产收益率（roe_dt）与杜邦三组件：净利率、总资产周转率、权益乘数。三者乘积作为核对值（杜邦恒等式），四值齐全时附一致性检查：相对偏差不超过 5% 或绝对偏差不超过 0.5 个百分点视为一致。各值无值时对应输出缺省。
+resolverHints:
+  aliases: [扣非ROE, 杜邦分解, 净资产收益率, ROE]
+  commonPhrases: [赚钱效率拆开看, 净利率、周转、杠杆各贡献多少]
+  clarificationDimensions:
+    - id: tsCodeAndPeriod
+      question: 哪只股票、哪个报告期（默认最新）
+parameters:
+  roeDt:
+    type: number
+    required: false
+    meaning: 扣非净资产收益率百分比数值，无值传 null
+  netprofitMargin:
+    type: number
+    required: false
+    meaning: 销售净利率百分比数值，无值传 null
+  assetsTurn:
+    type: number
+    required: false
+    meaning: 总资产周转率，无值传 null
+  assetsToEqt:
+    type: number
+    required: false
+    meaning: 权益乘数，无值传 null
+conventions:
+  dupont_check:
+    canonicalPath: 接口值直接采用 + 机械恒等式核对
+    returnType: percent 与 ratio 混合
+    narrativeTemplate: 采用财务指标接口最新报告期数值；杜邦核对值 = 净利率 × 总资产周转率 × 权益乘数，与扣非净资产收益率相对偏差不超过 5% 或绝对偏差不超过 0.5 个百分点时判定一致（机械核对，不做业务判断）
+outputs:
+  - {name: roeDt, unit: percent, description: 扣非净资产收益率, displayFormat: percent}
+  - {name: netprofitMargin, unit: percent, description: 销售净利率, displayFormat: percent}
+  - {name: assetsTurn, unit: ratio, description: 总资产周转率, displayFormat: number}
+  - {name: assetsToEqt, unit: ratio, description: 权益乘数, displayFormat: number}
+  - {name: dupontApprox, unit: percent, description: 杜邦三组件乘积核对值, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: dupont_roe
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.quality.dupont_roe@1.0.0
