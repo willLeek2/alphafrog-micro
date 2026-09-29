@@ -844,6 +844,21 @@ public class FetchTopicConsumer {
                     }
                     break;
 
+                // 财务指标（fina_indicator_vip，按报告期）：⑥ 扣非ROE 与杜邦三组件的数据来源
+                case "fina_indicator":
+                    if (taskSubType == 1) {
+                        DomesticFinaIndicatorFetchByPeriodRequest request =
+                                DomesticFinaIndicatorFetchByPeriodRequest.newBuilder()
+                                        .setPeriod(str(p, "period"))
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchFinaIndicatorByPeriod(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
                 case "rag_ann_fetch": {
                     int offsetParam = num(p, "offset");
                     int limitParam = num(p, "limit");

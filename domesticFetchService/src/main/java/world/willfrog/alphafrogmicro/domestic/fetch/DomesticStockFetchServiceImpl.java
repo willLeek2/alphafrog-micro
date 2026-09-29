@@ -785,4 +785,44 @@ public class DomesticStockFetchServiceImpl extends DomesticStockFetchServiceImpl
         return DomesticStkAhFetchByTradeDateResponse.newBuilder().setStatus("success")
                 .setFetchedItemsCount(result).build();
     }
+
+    // 4.15 财务指标爬取（fina_indicator_vip，按报告期）
+    // limit 默认 8000：一个报告期全市场约 5600 行（生产库 alphafrog_stock_info 实测 5601 只），
+    // 一页装得下；仍由 flow 配置的 offset_range 排页，个股数增长后不会静默截断。
+    @Override
+    public DomesticFinaIndicatorFetchByPeriodResponse fetchFinaIndicatorByPeriod(
+            DomesticFinaIndicatorFetchByPeriodRequest request) {
+
+        String period = request.getPeriod();
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "fina_indicator_vip");
+        queryParams.put("period", period);
+        queryParams.put("limit", limit > 0 ? limit : 8000);
+        queryParams.put("offset", offset);
+        params.put("params", queryParams);
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticFinaIndicatorFetchByPeriodResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+        JSONArray fields = response.getJSONObject("data").getJSONArray("fields");
+
+        int result = domesticStockStoreUtils.storeFinaIndicatorByRawTuShareOutput(data, fields);
+
+        if (result < 0) {
+            return DomesticFinaIndicatorFetchByPeriodResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+        return DomesticFinaIndicatorFetchByPeriodResponse.newBuilder().setStatus("success")
+                .setFetchedItemsCount(result).build();
+    }
 }

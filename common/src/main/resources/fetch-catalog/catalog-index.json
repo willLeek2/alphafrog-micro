@@ -35,6 +35,7 @@
     { "name": "adj_factor", "file": "fetch-catalog/adj_factor.json" },
     { "name": "cb_daily", "file": "fetch-catalog/cb_daily.json" },
     { "name": "stk_ah_comparison", "file": "fetch-catalog/stk_ah_comparison.json" },
+    { "name": "fina_indicator", "file": "fetch-catalog/fina_indicator.json" },
     { "name": "trade_calendar", "file": "fetch-catalog/trade_calendar.json" }
   ]
 }

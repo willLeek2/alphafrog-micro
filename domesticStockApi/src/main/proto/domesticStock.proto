@@ -419,6 +419,18 @@ message DomesticStkAhFetchByTradeDateResponse {
   int32 fetchedItemsCount = 2;
 }
 
+// 4.15 财务指标爬取（fina_indicator_vip，按报告期；字段按四类收进 JSONB 列）
+message DomesticFinaIndicatorFetchByPeriodRequest {
+  string period = 1;  // 报告期 yyyyMMdd，如 20241231
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticFinaIndicatorFetchByPeriodResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
 
 // P7-06：财务报表查询消息
 // 公共请求体（income / balancesheet / cashflow / express 共用）
@@ -587,4 +599,7 @@ service DomesticStockFetchService {
   rpc fetchAdjFactorByTradeDate(DomesticAdjFactorFetchByTradeDateRequest) returns (DomesticAdjFactorFetchByTradeDateResponse);
   rpc fetchCbDailyByTradeDate(DomesticCbDailyFetchByTradeDateRequest) returns (DomesticCbDailyFetchByTradeDateResponse);
   rpc fetchStkAhByTradeDate(DomesticStkAhFetchByTradeDateRequest) returns (DomesticStkAhFetchByTradeDateResponse);
+
+  // 财务指标（fina_indicator_vip，按报告期）：⑥ 扣非ROE 与杜邦三组件的数据来源
+  rpc fetchFinaIndicatorByPeriod(DomesticFinaIndicatorFetchByPeriodRequest) returns (DomesticFinaIndicatorFetchByPeriodResponse);
 }

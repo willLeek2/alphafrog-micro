@@ -967,6 +967,79 @@ public class DomesticStockStoreUtils {
         return list.size();
     }
 
+    // 4.15 财务指标（fina_indicator_vip，按报告期）
+    // 接口约 170 个字段没有对应列，按 022 迁移的分桶口径收进四类 JSONB，其余进 extended。
+    // 指标值原样按字符串存（与利润表 extended 同口径），读侧 getFinancialReport 也按字符串返回。
+    public int storeFinaIndicatorByRawTuShareOutput(JSONArray data, JSONArray fields) {
+        List<StockFinaIndicator> list = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < data.size(); i++) {
+                JSONArray item = data.getJSONArray(i);
+                StockFinaIndicator pojo = new StockFinaIndicator();
+
+                JSONObject profitability = new JSONObject();
+                JSONObject perShare = new JSONObject();
+                JSONObject capitalCash = new JSONObject();
+                JSONObject growth = new JSONObject();
+                JSONObject ext = new JSONObject();
+
+                for (int j = 0; j < fields.size(); j++) {
+                    String field = fields.getString(j);
+                    String value = item.getString(j);
+
+                    if (value == null || value.isEmpty()) continue;
+
+                    switch (field) {
+                        case "ts_code" -> pojo.setTsCode(value);
+                        case "ann_date" -> pojo.setAnnDate(DateConvertUtils.convertDateStrToLong(value, "yyyyMMdd"));
+                        case "end_date" -> pojo.setEndDate(DateConvertUtils.convertDateStrToLong(value, "yyyyMMdd"));
+                        default -> {
+                            // classify 对三个有独立列的字段返回 null（上面已按列处理），
+                            // Java 17 的 switch 不接受 null 分支，所以用 if 链。
+                            FinaIndicatorFieldBuckets.Bucket bucket =
+                                    FinaIndicatorFieldBuckets.classify(field);
+                            if (bucket == FinaIndicatorFieldBuckets.Bucket.PROFITABILITY) {
+                                profitability.put(field, value);
+                            } else if (bucket == FinaIndicatorFieldBuckets.Bucket.PER_SHARE) {
+                                perShare.put(field, value);
+                            } else if (bucket == FinaIndicatorFieldBuckets.Bucket.CAPITAL_CASH) {
+                                capitalCash.put(field, value);
+                            } else if (bucket == FinaIndicatorFieldBuckets.Bucket.GROWTH) {
+                                growth.put(field, value);
+                            } else if (bucket == FinaIndicatorFieldBuckets.Bucket.EXTENDED) {
+                                ext.put(field, value);
+                            }
+                        }
+                    }
+                }
+                if (pojo.getTsCode() == null || pojo.getEndDate() == null) continue;
+                if (!profitability.isEmpty()) pojo.setProfitability(profitability.toJSONString());
+                if (!perShare.isEmpty()) pojo.setPerShare(perShare.toJSONString());
+                if (!capitalCash.isEmpty()) pojo.setCapitalCash(capitalCash.toJSONString());
+                if (!growth.isEmpty()) pojo.setGrowth(growth.toJSONString());
+                if (!ext.isEmpty()) pojo.setExtended(ext.toJSONString());
+                list.add(pojo);
+            }
+        } catch (Exception e) {
+            log.error("Error converting fina_indicator data", e);
+            return -1;
+        }
+
+        try (SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            StockFinaIndicatorDao dao = sqlSession.getMapper(StockFinaIndicatorDao.class);
+            for (StockFinaIndicator pojo : list) {
+                dao.insertStockFinaIndicator(pojo);
+            }
+            sqlSession.commit();
+        } catch (Exception e) {
+            log.error("Error storing fina_indicator data", e);
+            return -2;
+        }
+
+        return list.size();
+    }
+
     // Helper methods
     private Double parseDouble(String value) {
         if (value == null || value.isEmpty()) return null;
