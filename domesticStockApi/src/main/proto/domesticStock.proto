@@ -314,6 +314,54 @@ message DomesticStockShareFloatFetchByDateRangeResponse {
   int32 fetchedItemsCount = 2;
 }
 
+// 4.11 每日指标爬取（写入日线表估值 JSON 与股本换手 JSON 列）
+message DomesticDailyBasicFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticDailyBasicFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.12 复权因子爬取（写入日线表复权因子列）
+message DomesticAdjFactorFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticAdjFactorFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.13 可转债日线爬取（行情用列，溢价进 premium JSON）
+message DomesticCbDailyFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticCbDailyFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.14 AH 比价爬取（全部普通列）
+message DomesticStkAhFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticStkAhFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
 
 // P7-06：财务报表查询消息
 // 公共请求体（income / balancesheet / cashflow / express 共用）
@@ -427,4 +475,10 @@ service DomesticStockFetchService {
   rpc fetchStockMoneyflowByTradeDate(DomesticStockMoneyflowFetchByTradeDateRequest) returns (DomesticStockMoneyflowFetchByTradeDateResponse);
   rpc fetchStockTop10HoldersByTsCode(DomesticStockTop10HoldersFetchByTsCodeRequest) returns (DomesticStockTop10HoldersFetchByTsCodeResponse);
   rpc fetchStockShareFloatByDateRange(DomesticStockShareFloatFetchByDateRangeRequest) returns (DomesticStockShareFloatFetchByDateRangeResponse);
+
+  // 预设金融指标库新增：每日指标 / 复权因子 / 转债日线 / AH 比价
+  rpc fetchDailyBasicByTradeDate(DomesticDailyBasicFetchByTradeDateRequest) returns (DomesticDailyBasicFetchByTradeDateResponse);
+  rpc fetchAdjFactorByTradeDate(DomesticAdjFactorFetchByTradeDateRequest) returns (DomesticAdjFactorFetchByTradeDateResponse);
+  rpc fetchCbDailyByTradeDate(DomesticCbDailyFetchByTradeDateRequest) returns (DomesticCbDailyFetchByTradeDateResponse);
+  rpc fetchStkAhByTradeDate(DomesticStkAhFetchByTradeDateRequest) returns (DomesticStkAhFetchByTradeDateResponse);
 }

@@ -784,6 +784,66 @@ public class FetchTopicConsumer {
                     }
                     break;
 
+                case "daily_basic":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticDailyBasicFetchByTradeDateRequest request =
+                                DomesticDailyBasicFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchDailyBasicByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "adj_factor":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticAdjFactorFetchByTradeDateRequest request =
+                                DomesticAdjFactorFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchAdjFactorByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "cb_daily":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticCbDailyFetchByTradeDateRequest request =
+                                DomesticCbDailyFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchCbDailyByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "stk_ah_comparison":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticStkAhFetchByTradeDateRequest request =
+                                DomesticStkAhFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchStkAhByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
                 case "rag_ann_fetch": {
                     int offsetParam = num(p, "offset");
                     int limitParam = num(p, "limit");

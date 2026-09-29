@@ -180,6 +180,8 @@ public class DomesticStockStoreUtils {
             StockQuoteDao stockQuoteDao = sqlSession.getMapper(StockQuoteDao.class);
             for (StockDaily stockDaily : stockDailyList) {
                 stockQuoteDao.insertStockDaily(stockDaily);
+                // 骨架行补齐：行已由每日指标/复权因子任务先写入时，这里把行情列写完整
+                stockQuoteDao.updateStockDailyQuoteColumns(stockDaily);
             }
             sqlSession.commit();
         } catch (Exception e) {
@@ -738,6 +740,227 @@ public class DomesticStockStoreUtils {
             sqlSession.commit();
         } catch (Exception e) {
             log.error("Error storing StockShareFloat data", e);
+            return -2;
+        }
+
+        return list.size();
+    }
+
+    // ==================== 指标库扩充新增：每日指标 / 复权因子 / 转债日线 / AH 比价存储方法 ====================
+
+    // 每日指标：估值键集与股本换手键集按阶段一定案，接口返回的 close 不入库
+    private static final Set<String> DAILY_BASIC_VALUATION_FIELDS = Set.of(
+            "pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ratio", "dv_ttm"
+    );
+    private static final Set<String> DAILY_BASIC_SHARE_TURNOVER_FIELDS = Set.of(
+            "turnover_rate", "turnover_rate_f", "volume_ratio", "total_share", "float_share",
+            "free_share", "total_mv", "circ_mv", "limit_status"
+    );
+
+    public int storeDailyBasicByRawTuShareOutput(JSONArray data, JSONArray fields) {
+        List<StockDaily> list = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < data.size(); i++) {
+                JSONArray item = data.getJSONArray(i);
+                StockDaily pojo = new StockDaily();
+                JSONObject valuation = new JSONObject();
+                JSONObject shareTurnover = new JSONObject();
+
+                for (int j = 0; j < fields.size(); j++) {
+                    String field = fields.getString(j);
+                    String value = item.getString(j);
+
+                    if (value == null || value.isEmpty()) continue;
+
+                    switch (field) {
+                        case "ts_code" -> pojo.setTsCode(value);
+                        case "trade_date" -> pojo.setTradeDate(DateConvertUtils.convertDateStrToLong(value, "yyyyMMdd"));
+                        default -> {
+                            if (DAILY_BASIC_VALUATION_FIELDS.contains(field)) {
+                                valuation.put(field, value);
+                            } else if (DAILY_BASIC_SHARE_TURNOVER_FIELDS.contains(field)) {
+                                shareTurnover.put(field, value);
+                            }
+                        }
+                    }
+                }
+                if (pojo.getTsCode() == null || pojo.getTradeDate() == null) continue;
+                if (!valuation.isEmpty()) {
+                    pojo.setValuation(valuation.toJSONString());
+                }
+                if (!shareTurnover.isEmpty()) {
+                    pojo.setShareTurnover(shareTurnover.toJSONString());
+                }
+                list.add(pojo);
+            }
+        } catch (Exception e) {
+            log.error("Error converting daily_basic data", e);
+            return -1;
+        }
+
+        try (SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            StockQuoteDao dao = sqlSession.getMapper(StockQuoteDao.class);
+            for (StockDaily pojo : list) {
+                dao.insertDailyBasicOnConflictUpdate(pojo);
+            }
+            sqlSession.commit();
+        } catch (Exception e) {
+            log.error("Error storing daily_basic data", e);
+            return -2;
+        }
+
+        return list.size();
+    }
+
+    public int storeAdjFactorByRawTuShareOutput(JSONArray data, JSONArray fields) {
+        List<StockDaily> list = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < data.size(); i++) {
+                JSONArray item = data.getJSONArray(i);
+                StockDaily pojo = new StockDaily();
+
+                for (int j = 0; j < fields.size(); j++) {
+                    String field = fields.getString(j);
+                    String value = item.getString(j);
+
+                    if (value == null || value.isEmpty()) continue;
+
+                    switch (field) {
+                        case "ts_code" -> pojo.setTsCode(value);
+                        case "trade_date" -> pojo.setTradeDate(DateConvertUtils.convertDateStrToLong(value, "yyyyMMdd"));
+                        case "adj_factor" -> pojo.setAdjFactor(parseDouble(value));
+                    }
+                }
+                if (pojo.getTsCode() == null || pojo.getTradeDate() == null) continue;
+                list.add(pojo);
+            }
+        } catch (Exception e) {
+            log.error("Error converting adj_factor data", e);
+            return -1;
+        }
+
+        try (SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            StockQuoteDao dao = sqlSession.getMapper(StockQuoteDao.class);
+            for (StockDaily pojo : list) {
+                dao.insertAdjFactorOnConflictUpdate(pojo);
+            }
+            sqlSession.commit();
+        } catch (Exception e) {
+            log.error("Error storing adj_factor data", e);
+            return -2;
+        }
+
+        return list.size();
+    }
+
+    // 转债日线：行情与涨跌幅用普通列，溢价四个字段进 premium JSON
+    private static final Set<String> CB_DAILY_PREMIUM_FIELDS = Set.of(
+            "bond_value", "bond_over_rate", "cb_value", "cb_over_rate"
+    );
+
+    public int storeCbDailyByRawTuShareOutput(JSONArray data, JSONArray fields) {
+        List<CbDaily> list = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < data.size(); i++) {
+                JSONArray item = data.getJSONArray(i);
+                CbDaily pojo = new CbDaily();
+                JSONObject premium = new JSONObject();
+
+                for (int j = 0; j < fields.size(); j++) {
+                    String field = fields.getString(j);
+                    String value = item.getString(j);
+
+                    if (value == null || value.isEmpty()) continue;
+
+                    switch (field) {
+                        case "ts_code" -> pojo.setTsCode(value);
+                        case "trade_date" -> pojo.setTradeDate(DateConvertUtils.convertDateStrToLong(value, "yyyyMMdd"));
+                        case "pre_close" -> pojo.setPreClose(parseDouble(value));
+                        case "open" -> pojo.setOpen(parseDouble(value));
+                        case "high" -> pojo.setHigh(parseDouble(value));
+                        case "low" -> pojo.setLow(parseDouble(value));
+                        case "close" -> pojo.setClose(parseDouble(value));
+                        case "change" -> pojo.setChange(parseDouble(value));
+                        case "pct_chg" -> pojo.setPctChg(parseDouble(value));
+                        case "vol" -> pojo.setVol(parseDouble(value));
+                        case "amount" -> pojo.setAmount(parseDouble(value));
+                        default -> {
+                            if (CB_DAILY_PREMIUM_FIELDS.contains(field)) {
+                                premium.put(field, value);
+                            }
+                        }
+                    }
+                }
+                if (pojo.getTsCode() == null || pojo.getTradeDate() == null) continue;
+                if (!premium.isEmpty()) {
+                    pojo.setPremium(premium.toJSONString());
+                }
+                list.add(pojo);
+            }
+        } catch (Exception e) {
+            log.error("Error converting cb_daily data", e);
+            return -1;
+        }
+
+        try (SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            CbDailyDao dao = sqlSession.getMapper(CbDailyDao.class);
+            for (CbDaily pojo : list) {
+                dao.insertCbDaily(pojo);
+            }
+            sqlSession.commit();
+        } catch (Exception e) {
+            log.error("Error storing cb_daily data", e);
+            return -2;
+        }
+
+        return list.size();
+    }
+
+    public int storeStkAhByRawTuShareOutput(JSONArray data, JSONArray fields) {
+        List<StkAh> list = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < data.size(); i++) {
+                JSONArray item = data.getJSONArray(i);
+                StkAh pojo = new StkAh();
+
+                for (int j = 0; j < fields.size(); j++) {
+                    String field = fields.getString(j);
+                    String value = item.getString(j);
+
+                    if (value == null || value.isEmpty()) continue;
+
+                    switch (field) {
+                        case "ts_code" -> pojo.setTsCode(value);
+                        case "hk_code" -> pojo.setHkCode(value);
+                        case "trade_date" -> pojo.setTradeDate(DateConvertUtils.convertDateStrToLong(value, "yyyyMMdd"));
+                        case "close" -> pojo.setClose(parseDouble(value));
+                        case "hk_close" -> pojo.setHkClose(parseDouble(value));
+                        case "pct_chg" -> pojo.setPctChg(parseDouble(value));
+                        case "hk_pct_chg" -> pojo.setHkPctChg(parseDouble(value));
+                        case "ah_comparison" -> pojo.setAhComparison(parseDouble(value));
+                        case "ah_premium" -> pojo.setAhPremium(parseDouble(value));
+                    }
+                }
+                if (pojo.getTsCode() == null || pojo.getTradeDate() == null) continue;
+                list.add(pojo);
+            }
+        } catch (Exception e) {
+            log.error("Error converting stk_ah_comparison data", e);
+            return -1;
+        }
+
+        try (SqlSession sqlSession = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            StkAhDao dao = sqlSession.getMapper(StkAhDao.class);
+            for (StkAh pojo : list) {
+                dao.insertStkAh(pojo);
+            }
+            sqlSession.commit();
+        } catch (Exception e) {
+            log.error("Error storing stk_ah_comparison data", e);
             return -2;
         }
 
