@@ -143,6 +143,28 @@ class LangchainNodeToolDispatcherTest {
                         .isEqualTo("wait_group_member_operation_identity_mismatch"));
     }
 
+    @Test
+    void aDurableToolWithoutWaitGroupSupportIsRejectedBeforeExecution() {
+        // executeQuery 本期不接等待组：成员派发在装上下文、执行工具之前直接拒，
+        // 与工作流类型无关（顺序执行挂起没人认领、并行执行占住 worker 到超时）。
+        AtomicReference<Boolean> executed = new AtomicReference<>(false);
+        executors.put(ToolJobAnchor.EXECUTE_QUERY_TOOL, (request, memoryId) -> {
+            executed.set(true);
+            return "{\"ok\":true}";
+        });
+
+        NodeToolDispatcher.DispatchOutcome outcome = dispatcher.dispatch(
+                new NodeToolDispatcher.DispatchRequest(RUN_ID, SEGMENT, 77L, 2, MEMBER_IDENTITY,
+                        "call-q", ToolJobAnchor.EXECUTE_QUERY_TOOL, "{}"));
+
+        assertThat(outcome).isInstanceOfSatisfying(NodeToolDispatcher.DispatchOutcome.Failed.class,
+                failed -> assertThat(failed.reason())
+                        .isEqualTo("wait_group_member_unsupported_tool:executeQuery"));
+        assertThat(executed.get()).as("派发前即拒，工具体不得执行").isFalse();
+        assertThat(WaitGroupMemberExecutionContext.current())
+                .as("拒绝不得留下成员上下文").isNull();
+    }
+
     // ==================== 同步工具与失败 ====================
 
     @Test

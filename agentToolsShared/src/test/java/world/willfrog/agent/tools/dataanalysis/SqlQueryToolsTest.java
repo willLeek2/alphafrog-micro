@@ -52,6 +52,19 @@ class SqlQueryToolsTest {
         }
     }
 
+    @Test
+    void entryRejectsWaitGroupMemberContext() throws Exception {
+        // 第一道防线在派发器；这里守住第二道：成员上下文直装时工具自身也要拒。
+        var snapshot = new world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext.Snapshot(
+                "run-1", 1L, "member-1", 0, "dtc-1", "op-1", "seg");
+        try (var ignored = world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext.install(snapshot)) {
+            JsonNode out = objectMapper.readTree(tools.executeQuery("SELECT 1", "1", "INTERACTIVE"));
+            assertFalse(out.path("ok").asBoolean());
+            assertEquals("WAIT_GROUP_NOT_SUPPORTED", out.path("error").path("code").asText());
+            assertFalse(out.path("error").path("details").path("retryable").asBoolean());
+        }
+    }
+
     // ---------- 运行器渲染 ----------
 
     @Test

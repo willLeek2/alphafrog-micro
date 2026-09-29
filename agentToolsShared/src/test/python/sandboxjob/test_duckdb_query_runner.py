@@ -190,6 +190,13 @@ ok_bg, report_bg = runner.gate(con2, "SELECT * FROM t2", "BACKGROUND", spec_two_
 check("gate passes same scan at background cap (300k<600k)", ok_bg,
       f"ec={report_bg['estimated_rows_max']}")
 
+# 兼容回落：旧锚点重放的规格没有 estimated_row_cap，按当时固定值判定（INTERACTIVE 20 万）。
+legacy_limits = {k: v for k, v in LIMITS.items() if k != "estimated_row_cap"}
+ok, detail = gate_expect_reject(
+    con2, "SELECT * FROM t2", {**spec_two, "limits": legacy_limits},
+    "PLAN_ESTIMATED_ROWS_OVER_CAP")
+check("gate falls back to legacy cap when estimated_row_cap absent (300k>200k)", ok, detail)
+
 # ---------- 语句超时与执行错误 ----------
 con3 = duckdb.connect(database=":memory:")
 status, _, _ = runner.execute_with_timeout(

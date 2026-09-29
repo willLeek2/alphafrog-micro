@@ -15,6 +15,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
@@ -94,6 +95,17 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
                         ? "{}" : request.argumentsJson())
                 .build();
         Optional<WaitGroupMemberExecutionContext.Snapshot> waitGroup = waitGroupContext(request);
+        if (!isAsyncTool(request.toolName())
+                && DurableSandboxTool.fromToolName(request.toolName()).isPresent()) {
+            /*
+             * 经过本派发器的调用都是等待组成员派发。会挂起的沙箱作业工具里，本期只有
+             * executePython 支持成员上下文；其余（executeQuery）在成员里挂起后没人认领
+             * （顺序执行留下孤儿作业、并行执行占住 worker 到任务超时），所以派发前直接拒，
+             * 与工作流类型无关。普通工具不会挂起，作为成员同步跑完，不受本检查影响。
+             * 工具内部的同名检查是第二道防线，生产上主要靠这里拦。
+             */
+            return new DispatchOutcome.Failed("wait_group_member_unsupported_tool:" + request.toolName());
+        }
         if (isAsyncTool(request.toolName()) && waitGroup.isEmpty()) {
             // 会转后台的工具必须有预先算好的外部作业身份，否则工具层建出来的作业没人认得回来。
             return new DispatchOutcome.Failed("wait_group_member_without_operation_id:" + request.toolName());

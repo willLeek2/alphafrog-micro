@@ -4,8 +4,10 @@
 只读挂载授权数据集为视图 -> EXPLAIN 准入检查 -> 执行（语句超时可中断）。
 输出：stdout 最后一行打印 `__EXECUTE_QUERY_RESULT__` 前缀的 JSON 信封，Java 侧只认这一行。
 
-档位数值（语句超时、返回行数上限、估计行数上限）全部由 Java 侧经规格下发，
-本文件不持有一份副本——容量阈值在 Java 侧是可配置项，双份硬编码必然漂移。
+档位数值（语句超时、返回行数上限、估计行数上限）全部由 Java 侧经规格下发——
+容量阈值在 Java 侧是可配置项，双份硬编码必然漂移。唯一例外是估计行数上限的
+兼容回落：旧锚点重放的规格里没有该字段时按当时的固定值判定（见 gate），
+新渲染的规格永远带它。
 """
 import base64
 import datetime
@@ -230,8 +232,11 @@ def gate(con, sql, tier, spec):
                             f"全局排序估计处理 {box_est} 行，超过返回行数上限 {row_cap}，准入拒绝",
                             report)
 
-    # 估计行数对照档位上限（上限由 Java 容量配置经规格下发，两边同源）。
-    cap = int(limits["estimated_row_cap"])
+    # 估计行数对照档位上限。新渲染的规格永远带 estimated_row_cap（值由 Java 侧容量
+    # 配置下发）；旧锚点重放的规格里没有该字段，回落当时的固定上限，保证老作业
+    # 恢复后行为不变。两个回落值只服务兼容性，不再随版本调整。
+    cap_raw = limits.get("estimated_row_cap")
+    cap = int(cap_raw) if cap_raw is not None else (200_000 if tier == "INTERACTIVE" else 600_000)
     if report["estimated_rows_max"] > cap:
         report["checks"].append("estimated_rows_over_cap")
         plan_reject("PLAN_ESTIMATED_ROWS_OVER_CAP",

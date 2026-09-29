@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
+import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
@@ -160,6 +161,18 @@ public class SqlQueryTools {
     private String executeQueryInternal(String sql, String datasetIds, String productTier) {
         long toolStartMs = System.currentTimeMillis();
         try {
+            /*
+             * 第一期不接等待组成员派发。第一道防线在派发器：成员派发在装成员上下文之前
+             * 就被拒了，生产路径到不了这里；这里是第二道，留给成员上下文直装的调用方
+             * 与单元测试。拒绝与工作流类型无关（顺序执行挂起后没人认领、并行执行占住
+             * worker 到任务超时，两个洞一起堵）。
+             */
+            if (WaitGroupMemberExecutionContext.current() != null) {
+                return fail("WAIT_GROUP_NOT_SUPPORTED",
+                        "executeQuery is not available as a wait-group member in this release; "
+                                + "call it as a standalone tool call",
+                        Map.of("retryable", false));
+            }
             // --- 档位解析： blank 默认 INTERACTIVE；未知档位直接拒，带上合法名单。 ---
             String tier = productTier == null || productTier.isBlank()
                     ? "INTERACTIVE"
@@ -210,19 +223,6 @@ public class SqlQueryTools {
                                 ? "" : AgentContext.getWorkflow()));
             }
             SandboxJobWaitPolicy waitPolicy = resolvedWaitPolicy.get();
-
-            /*
-             * DAG 上的后台档第一期不开放挂起：超过 1.5 秒运行时直接拒绝（断言在代码里，
-             * 不在提示词里）。BACKGROUND 档存在的意义就是 30 秒以上的查询，提前拒绝与
-             * 「跑过 1.5 秒再拒」等价，且不必为一个注定被拒的调用占用沙箱容量。
-             * DAG + INTERACTIVE 保留阻塞轮询（语句 30 秒封顶）。
-             */
-            if (!waitPolicy.durableSuspend() && "BACKGROUND".equals(tier)) {
-                return fail("DAG_BACKGROUND_NOT_SUPPORTED",
-                        "BACKGROUND tier is not available on parallel (dag) workflow in this release; "
-                                + "use INTERACTIVE or run in sequential execution",
-                        Map.of("retryable", false));
-            }
 
             // toolCallId 来自当前 Todo 的 AgentContext，是跨 worker 恢复的稳定逻辑调用身份。
             String toolCallId = AgentContext.getToolCallId();

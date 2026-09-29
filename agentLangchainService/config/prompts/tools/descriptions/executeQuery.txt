@@ -13,7 +13,7 @@
 参数说明：
   sql           - 一条 DuckDB SQL 查询语句，必填。只接受单条语句；多语句以及 ATTACH/COPY/INSTALL/LOAD 语句在准入阶段直接拒绝
   dataset_ids   - 要挂载的数据集编号，逗号分隔（如 "1,2"）或 JSON 数组（如 "[1,2]"），必填
-  product_tier  - 产品档位："INTERACTIVE"（默认，语句上限 30 秒，最多返回 100 行）| "BACKGROUND"（语句上限 120 秒，最多返回 1000 行，占用更多容量；并行执行的 Run 上不可用）
+  product_tier  - 产品档位："INTERACTIVE"（默认，语句上限 30 秒，最多返回 100 行）| "BACKGROUND"（语句上限 120 秒，最多返回 1000 行，占用更多容量）
 
 返回结果：
   - 成功：columns（列名）、rows（数据行）、row_count、truncated（是否因行数上限被截断）
@@ -25,3 +25,4 @@
   - 沙箱只读挂载你选中的数据集；查询不能读写其他文件、不能访问网络（由引擎配置强制，锁定后 SET/PRAGMA 改不回来）
   - 结果行数超过档位上限会被截断并标记 truncated=true；需要更多行时换 BACKGROUND 档或收窄查询
   - 结果集超过单次返回体积上限会返回 QUERY_RESULT_TOO_LARGE，收窄查询（加过滤、减少列）后重试
+  - executeQuery 要单独发起调用；把它和其他工具放进同一批并行调用会被派发器直接拒绝（本期不支持等待组成员派发）
