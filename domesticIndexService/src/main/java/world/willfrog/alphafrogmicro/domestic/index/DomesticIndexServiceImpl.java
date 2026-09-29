@@ -13,10 +13,12 @@ import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.component.MeiliSearchIndexManager;
 import world.willfrog.alphafrogmicro.common.component.MeiliSearchDataSyncService;
 import world.willfrog.alphafrogmicro.common.dao.domestic.calendar.TradeCalendarDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexDailyBasicDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexQuoteDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexDaily;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexDailyBasic;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexInfo;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
@@ -46,6 +48,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
 
     private final IndexInfoDao indexInfoDao;
     private final IndexQuoteDao indexQuoteDao;
+    // 指标库扩充：指数每日指标（估值），按 includeColumns 拼入日线响应
+    private final IndexDailyBasicDao indexDailyBasicDao;
     private final IndexWeightDao indexWeightDao;
     private final IndexDataCompletenessService indexDataCompletenessService;
     private final TradeCalendarDao tradeCalendarDao;
@@ -64,12 +68,14 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                                     IndexWeightDao indexWeightDao,
                                     IndexDataCompletenessService indexDataCompletenessService,
                                     TradeCalendarDao tradeCalendarDao,
+                                    IndexDailyBasicDao indexDailyBasicDao,
                                     Environment environment) {
         this.indexInfoDao = indexInfoDao;
         this.indexQuoteDao = indexQuoteDao;
         this.indexWeightDao = indexWeightDao;
         this.indexDataCompletenessService = indexDataCompletenessService;
         this.tradeCalendarDao = tradeCalendarDao;
+        this.indexDailyBasicDao = indexDailyBasicDao;
         this.environment = environment;
     }
 
@@ -388,6 +394,26 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
             return DomesticIndexDailyByTsCodeAndDateRangeResponse.newBuilder().build();
         }
 
+        // 指标库扩充：请求带 pe_ttm/pb 时，从指数每日指标表按 ts_code+trade_date 拼（两表简单拼接；
+        // 未请求不查第二张表）。请求了但当日无值，计入 missingFields。
+        List<String> includeColumns = request.getIncludeColumnsList();
+        boolean wantPeTtm = includeColumns.contains("pe_ttm");
+        boolean wantPb = includeColumns.contains("pb");
+        Map<Long, IndexDailyBasic> basicByTradeDate = new HashMap<>();
+        if (wantPeTtm || wantPb) {
+            try {
+                for (IndexDailyBasic basic : indexDailyBasicDao.getByTsCodeAndDateRange(
+                        request.getTsCode(), request.getStartDate(), request.getEndDate())) {
+                    if (basic.getTradeDate() != null) {
+                        basicByTradeDate.put(basic.getTradeDate(), basic);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Index daily basic fetch failed for tsCode: {}, continuing without valuation columns: {}",
+                        request.getTsCode(), e.getMessage());
+            }
+        }
+
         DomesticIndexDailyByTsCodeAndDateRangeResponse.Builder responseBuilder =
                 DomesticIndexDailyByTsCodeAndDateRangeResponse.newBuilder();
 
@@ -405,6 +431,22 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
             setDoubleIfPresent(itemBuilder::setPctChg, indexDaily.getPctChg(), "pct_chg", missingFields);
             setDoubleIfPresent(itemBuilder::setVol, indexDaily.getVol(), "vol", missingFields);
             setDoubleIfPresent(itemBuilder::setAmount, indexDaily.getAmount(), "amount", missingFields);
+            if (wantPeTtm) {
+                IndexDailyBasic basic = indexDaily.getTradeDate() == null ? null : basicByTradeDate.get(indexDaily.getTradeDate());
+                if (basic != null && basic.getPeTtm() != null) {
+                    itemBuilder.setPeTtm(basic.getPeTtm());
+                } else {
+                    missingFields.add("pe_ttm");
+                }
+            }
+            if (wantPb) {
+                IndexDailyBasic basic = indexDaily.getTradeDate() == null ? null : basicByTradeDate.get(indexDaily.getTradeDate());
+                if (basic != null && basic.getPb() != null) {
+                    itemBuilder.setPb(basic.getPb());
+                } else {
+                    missingFields.add("pb");
+                }
+            }
             itemBuilder.addAllMissingFields(missingFields);
 
             responseBuilder.addItems(itemBuilder.build());

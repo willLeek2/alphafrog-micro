@@ -141,7 +141,7 @@ class ToolRouterRegistryConsistencyTest {
         when(marketDataTools.searchStock(anyString())).thenReturn(okJson("searchStock"));
         when(marketDataTools.searchFund(anyString())).thenReturn(okJson("searchFund"));
         when(marketDataTools.getIndexInfo(anyString())).thenReturn(okJson("getIndexInfo"));
-        when(marketDataTools.getIndexDaily(anyString(), anyString(), anyString())).thenReturn(okJson("getIndexDaily"));
+        when(marketDataTools.getIndexDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getIndexDaily"));
         when(marketDataTools.searchIndex(anyString(), any(), any())).thenReturn(okJson("searchIndex"));
         when(marketDataTools.searchIndexAdvanced(any())).thenReturn(okJson("searchIndex"));
         when(marketDataTools.searchAssetInfo(anyString(), anyString(), anyString(), any(), any())).thenReturn(okJson("searchAssetInfo"));

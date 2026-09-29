@@ -83,6 +83,8 @@ public class MarketDataTools {
     );
     // 指标库扩充：getStockDaily 可选列（默认不返回，includeColumns 显式传入才带）
     private static final List<String> STOCK_DAILY_OPTIONAL_COLUMNS = List.of("adj_factor", "valuation", "share_turnover");
+    // 指标库扩充：getIndexDaily 可选列（值来自指数每日指标表，服务层按交易日拼入）
+    private static final List<String> INDEX_DAILY_OPTIONAL_COLUMNS = List.of("pe_ttm", "pb");
 
     /**
      * Dubbo 引用的股票服务，提供股票基础信息、日线、财务数据查询。
@@ -275,7 +277,7 @@ public class MarketDataTools {
         if (limitError != null) {
             return limitError;
         }
-        List<String> optionalColumns = parseStockDailyOptionalColumns(includeColumns);
+        List<String> optionalColumns = parseOptionalColumns(includeColumns, STOCK_DAILY_OPTIONAL_COLUMNS);
         if (optionalColumns == null) {
             return fail("getStockDaily", "INVALID_ARGUMENT",
                     "includeColumns 只接受 adj_factor / valuation / share_turnover，多个用逗号分隔；留空则只返回基础行情列。",
@@ -288,20 +290,21 @@ public class MarketDataTools {
         return getStockDailySingle(singleTsCode, startDateStr, endDateStr, optionalColumns);
     }
 
-    // 解析可选列参数：空/空白 → 空列表（默认行为）；非法列名 → null（调用方返回错误）
-    private List<String> parseStockDailyOptionalColumns(String includeColumns) {
+    // 解析可选列参数：空/空白 → 空列表（默认行为）；非法列名 → null（调用方按白名单返回错误）。
+    // 输出按 allowed 的固定顺序去重，保证数据集表头稳定。
+    private List<String> parseOptionalColumns(String includeColumns, List<String> allowed) {
         String normalized = nvl(includeColumns).trim();
         if (normalized.isEmpty()) {
             return List.of();
         }
-        List<String> requested = java.util.Arrays.stream(normalized.split("[,|]"))
+        List<String> requested = Arrays.stream(normalized.split("[,|]"))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .toList();
-        if (requested.stream().anyMatch(c -> !STOCK_DAILY_OPTIONAL_COLUMNS.contains(c))) {
+        if (requested.stream().anyMatch(c -> !allowed.contains(c))) {
             return null;
         }
-        return STOCK_DAILY_OPTIONAL_COLUMNS.stream().filter(requested::contains).toList();
+        return allowed.stream().filter(requested::contains).toList();
     }
 
     private String getStockDailySingle(String tsCode, String startDateStr, String endDateStr, List<String> optionalColumns) {
@@ -460,21 +463,27 @@ public class MarketDataTools {
      * 与 {@link #getStockDaily} 类似，大结果写入 dataset 并返回 {@code dataset_id}。</p>
      */
     @Tool
-    public String getIndexDaily(String tsCode, String startDateStr, String endDateStr) {
+    public String getIndexDaily(String tsCode, String startDateStr, String endDateStr, String includeColumns) {
         int maxItems = resolveMaxParallelDailyQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
         String limitError = batchLimitFailureIfExceeded("getIndexDaily", "tsCode", tsCodes, maxItems);
         if (limitError != null) {
             return limitError;
         }
+        List<String> optionalColumns = parseOptionalColumns(includeColumns, INDEX_DAILY_OPTIONAL_COLUMNS);
+        if (optionalColumns == null) {
+            return fail("getIndexDaily", "INVALID_ARGUMENT",
+                    "includeColumns 只接受 pe_ttm / pb，多个用逗号分隔；留空则只返回基础行情列。",
+                    Map.of("includeColumns", nvl(includeColumns), "allowed", INDEX_DAILY_OPTIONAL_COLUMNS));
+        }
         if (tsCodes.size() > 1) {
-            return batchGetDaily("getIndexDaily", tsCodes, startDateStr, endDateStr, false, List.of());
+            return batchGetDaily("getIndexDaily", tsCodes, startDateStr, endDateStr, false, optionalColumns);
         }
         String singleTsCode = tsCodes.isEmpty() ? tsCode : tsCodes.get(0);
-        return getIndexDailySingle(singleTsCode, startDateStr, endDateStr);
+        return getIndexDailySingle(singleTsCode, startDateStr, endDateStr, optionalColumns);
     }
 
-    private String getIndexDailySingle(String tsCode, String startDateStr, String endDateStr) {
+    private String getIndexDailySingle(String tsCode, String startDateStr, String endDateStr, List<String> optionalColumns) {
         String normalizedTsCode = nvl(tsCode).trim();
         String normalizedStart = compactDate(startDateStr);
         String normalizedEnd = compactDate(endDateStr);
@@ -488,15 +497,16 @@ public class MarketDataTools {
             ));
         }
 
-        List<String> headers = Arrays.asList("ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount");
+        List<String> headers = new ArrayList<>(DAILY_DATASET_HEADERS);
+        headers.addAll(optionalColumns);
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable("index_daily", normalizedTsCode, normalizedStart, normalizedEnd, headers)
                         .map(meta -> ok("getIndexDaily", datasetDataFromMeta(
                                 normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
-                        .orElseGet(() -> fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers));
+                        .orElseGet(() -> fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers, optionalColumns));
             }
-            return fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers);
+            return fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers, optionalColumns);
         } catch (Exception e) {
             return fail("getIndexDaily", "TOOL_ERROR", "Error fetching index daily data", Map.of("message", nvl(e.getMessage())));
         }
@@ -674,7 +684,7 @@ public class MarketDataTools {
             return getStockDaily(tsCode, startDate, endDate, null);
         }
         if ("index".equals(type)) {
-            return getIndexDaily(tsCode, startDate, endDate);
+            return getIndexDaily(tsCode, startDate, endDate, null);
         }
         return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Unsupported assetType: " + type,
                 Map.of("assetType", type));
@@ -797,8 +807,8 @@ public class MarketDataTools {
     /**
      * A 股资产特色数据查询（可转债日线 / AH 比价）。
      *
-     * <p>指标库扩充新增的小众资产数据入口：转债与 AH 不属于四大资产类别，按
-     * frog 拍板整合到这一个特色工具（「不新增对外工具入口」的唯一例外）。
+     * <p>指标库扩充新增的小众资产数据入口：转债与 AH 不属于四大资产类别，
+     * 单独用这一个特色工具承载（仅此一个工具收这两类资产）。
      * 整段序列走 dataset 机制，方法计算转债收益/溢价、AH 溢价时复用。</p>
      */
     @Tool
@@ -1203,7 +1213,7 @@ public class MarketDataTools {
                 .map(code -> supplyAsyncWithAgentContext(() -> {
                     String response = stock
                             ? getStockDailySingle(code, startDateStr, endDateStr, optionalColumns)
-                            : getIndexDailySingle(code, startDateStr, endDateStr);
+                            : getIndexDailySingle(code, startDateStr, endDateStr, optionalColumns);
                     Map<String, Object> payload = readJsonMap(response);
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("ts_code", code);
@@ -1221,9 +1231,7 @@ public class MarketDataTools {
         String dataType = stock ? "stock_daily" : "index_daily";
 
         List<String> columns = new ArrayList<>(DAILY_DATASET_HEADERS);
-        if (stock) {
-            columns.addAll(optionalColumns);
-        }
+        columns.addAll(optionalColumns);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("mode", "batch");
         data.put("ts_codes", tsCodes);
@@ -1841,7 +1849,7 @@ public class MarketDataTools {
      * <p>逻辑与 {@link #fetchStockDaily} 对称，只是底层 Dubbo 服务换为
      * domesticIndexService，dataset kind 为 {@code "index_daily"}。</p>
      */
-    private String fetchIndexDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers) {
+    private String fetchIndexDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers, List<String> optionalColumns) {
         try {
             long startDate = convertToMsTimestamp(startDateStr);
             long endDate = convertToMsTimestamp(endDateStr);
@@ -1849,6 +1857,7 @@ public class MarketDataTools {
                     .setTsCode(tsCode)
                     .setStartDate(startDate)
                     .setEndDate(endDate)
+                    .addAllIncludeColumns(optionalColumns)
                     .build();
             DomesticIndexDailyByTsCodeAndDateRangeResponse response = domesticIndexService.getDomesticIndexDailyByTsCodeAndDateRange(request);
             if (response.getItemsCount() <= 0) {
@@ -1865,19 +1874,23 @@ public class MarketDataTools {
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
                 String prefix = (runId != null ? runId : "shared") + "-index";
-                String datasetId = datasetWriter.writeDataset("index_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
-                        item.getTsCode(),
-                        indexDailyValue(item, "trade_date", item.getTradeDate()),
-                        indexDailyValue(item, "open", item.hasOpen() ? item.getOpen() : null),
-                        indexDailyValue(item, "high", item.hasHigh() ? item.getHigh() : null),
-                        indexDailyValue(item, "low", item.hasLow() ? item.getLow() : null),
-                        indexDailyValue(item, "close", item.getClose()),
-                        indexDailyValue(item, "pre_close", item.getPreClose()),
-                        indexDailyValue(item, "change", item.getChange()),
-                        indexDailyValue(item, "pct_chg", item.getPctChg()),
-                        indexDailyValue(item, "vol", item.hasVol() ? item.getVol() : null),
-                        indexDailyValue(item, "amount", item.hasAmount() ? item.getAmount() : null)
-                ));
+                String datasetId = datasetWriter.writeDataset("index_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> {
+                    List<Object> row = new ArrayList<>(Arrays.asList(
+                            item.getTsCode(),
+                            indexDailyValue(item, "trade_date", item.getTradeDate()),
+                            indexDailyValue(item, "open", item.hasOpen() ? item.getOpen() : null),
+                            indexDailyValue(item, "high", item.hasHigh() ? item.getHigh() : null),
+                            indexDailyValue(item, "low", item.hasLow() ? item.getLow() : null),
+                            indexDailyValue(item, "close", item.getClose()),
+                            indexDailyValue(item, "pre_close", item.getPreClose()),
+                            indexDailyValue(item, "change", item.getChange()),
+                            indexDailyValue(item, "pct_chg", item.getPctChg()),
+                            indexDailyValue(item, "vol", item.hasVol() ? item.getVol() : null),
+                            indexDailyValue(item, "amount", item.hasAmount() ? item.getAmount() : null)
+                    ));
+                    appendIndexDailyOptionalColumns(row, item, optionalColumns);
+                    return row;
+                });
                 if (datasetRegistry.isEnabled()) {
                     datasetRegistry.registerDataset("index_daily", tsCode, startDateStr, endDateStr, headers, datasetId, response.getItemsCount());
                 }
@@ -1901,6 +1914,13 @@ public class MarketDataTools {
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("trade_date", item.getTradeDate());
                 row.put("close", indexDailyValue(item, "close", item.getClose()));
+                for (String column : optionalColumns) {
+                    switch (column) {
+                        case "pe_ttm" -> row.put("pe_ttm", item.hasPeTtm() ? item.getPeTtm() : null);
+                        case "pb" -> row.put("pb", item.hasPb() ? item.getPb() : null);
+                        default -> log.warn("Unknown index includeColumn in preview: {}", column);
+                    }
+                }
                 previewRows.add(row);
             });
             Map<String, Object> data = datasetData(
@@ -1924,6 +1944,23 @@ public class MarketDataTools {
 
     private Object indexDailyValue(DomesticIndexDailyItem item, String field, Object value) {
         return item.getMissingFieldsList().contains(field) ? null : value;
+    }
+
+    /**
+     * 按请求的可选列顺序把指数估值列追加到 dataset 行尾。
+     *
+     * <p>pe_ttm/pb 来自指数每日指标表（服务层按交易日拼入）：proto optional + has() 判缺，
+     * 无值写 null 不写 0；请求了但缺值时服务端会把列名计入 missingFields，
+     * 由 {@link #attachIndexDailyMissingSummary} 汇总成 data_quality_note。</p>
+     */
+    private void appendIndexDailyOptionalColumns(List<Object> row, DomesticIndexDailyItem item, List<String> optionalColumns) {
+        for (String column : optionalColumns) {
+            switch (column) {
+                case "pe_ttm" -> row.add(item.hasPeTtm() ? item.getPeTtm() : null);
+                case "pb" -> row.add(item.hasPb() ? item.getPb() : null);
+                default -> log.warn("Unknown index includeColumn in dataset write: {}", column);
+            }
+        }
     }
 
     private void attachIndexDailyMissingSummary(Map<String, Object> data, List<DomesticIndexDailyItem> items) {
