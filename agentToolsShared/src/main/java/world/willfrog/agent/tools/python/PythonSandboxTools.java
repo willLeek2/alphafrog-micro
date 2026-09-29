@@ -946,6 +946,7 @@ public class PythonSandboxTools {
         // PREPARING 表示容量已占用，但 Sandbox taskId 尚未确认附着。
         anchor.setAnchorState("PREPARING");
         anchor.setToolCallId(toolCallId);
+        anchor.setToolName(ToolJobAnchor.EXECUTE_PYTHON_TOOL);
         anchor.setAttempt(DATA_ANALYSIS_ATTEMPT);
         // 保存当前 Todo 位置，后续 pipeline 完整 checkpoint 会补充已完成前缀。
         anchor.setTodoId(AgentContext.getTodoId());

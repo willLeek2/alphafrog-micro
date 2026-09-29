@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
@@ -112,10 +113,10 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             // emit STARTED
             emitToolCallStarted(toolCallId, request.name(), params);
 
-            if ("executePython".equals(request.name())
+            if (DurableSandboxTool.fromToolName(request.name()).isPresent()
                     && pythonSandboxDispatchStore != null
                     && pythonSandboxDispatchStore.isInvocationBlocked(AgentContext.getRunId())) {
-                String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: executePython requires a "
+                String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: " + request.name() + " requires a "
                         + "persisted node identity before creating a Sandbox task";
                 emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
                 return output;
@@ -183,7 +184,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             }
             emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs,
                     throttleRejected, throttleLayer);
-            acknowledgeSynchronousPythonCompletion(toolCallId, request.name());
+            acknowledgeSynchronousDurableCompletion(toolCallId, request.name());
 
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
@@ -404,7 +405,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
-        if ("executePython".equals(toolName)) {
+        // 沙箱后台长工具的终态由 finalizer 按同一 dedupeKey 幂等写入，这里用 appendOnce 防重复。
+        if (DurableSandboxTool.fromToolName(toolName).isPresent()) {
             String dedupeKey = runId + ":" + toolCallId + ":logical_terminal";
             agentEventService.appendOnce(runId, userId, "TOOL_CALL_FINISHED", dedupeKey, payload);
         } else {
@@ -412,8 +414,9 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         }
     }
 
-    private void acknowledgeSynchronousPythonCompletion(String toolCallId, String toolName) {
-        if (!"executePython".equals(toolName) || pythonSandboxDispatchStore == null) {
+    /** 同步完成的沙箱后台长工具要清掉派发凭证，防止恢复链把已完成调用当成待恢复任务。 */
+    private void acknowledgeSynchronousDurableCompletion(String toolCallId, String toolName) {
+        if (DurableSandboxTool.fromToolName(toolName).isEmpty() || pythonSandboxDispatchStore == null) {
             return;
         }
         String runId = AgentContext.getRunId();

@@ -37,6 +37,8 @@ public class ToolJobEventHookImpl implements ToolJobEventHook {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("run_id", runId);
         payload.put("tool_call_id", anchor.getToolCallId());
+        // 计价按事件里的工具名分价，缺失时下游只能按默认值 1 降级。
+        put(payload, "tool_name", anchor.getToolName());
         payload.put("attempt", anchor.getAttempt());
         put(payload, "operation_id", anchor.getOperationId());
         put(payload, "task_id", anchor.getTaskId());
