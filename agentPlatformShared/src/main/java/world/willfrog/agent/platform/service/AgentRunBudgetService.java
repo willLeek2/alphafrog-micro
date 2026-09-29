@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.entity.AgentRun;
 
@@ -121,6 +122,35 @@ public class AgentRunBudgetService {
     /** 返回生效的单次逻辑 LLM 调用最大 HTTP 重试次数（至少为 1）。 */
     public int maxHttpAttemptsPerLogicalCall() {
         return Math.max(1, effectiveConfig().maxHttpAttemptsPerLogicalCall());
+    }
+
+    /**
+     * 当前 Run 剩余墙钟毫秒数。起点锁 {@code alphafrog_agent_run.started_at}，
+     * 上限取 {@link #effectiveConfig()} 的 maxWallClockMs。
+     *
+     * <p>没有 runId 或墙钟上限未设（&lt;=0）时返回 {@link Long#MAX_VALUE}，表示不夹超时。
+     * started_at 缺失、Run 不存在或 mapper 未接线时抛 {@link RunStartedAtMissingException}，
+     * 不回落到 observability JSON 里的 startedAtMillis。</p>
+     */
+    public long remainingWallClockMs() {
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            return Long.MAX_VALUE;
+        }
+        if (runMapper == null) {
+            throw new RunStartedAtMissingException(runId);
+        }
+        AgentRun run = runMapper.findById(runId);
+        if (run == null || run.getStartedAt() == null) {
+            throw new RunStartedAtMissingException(runId);
+        }
+        long maxWallClockMs = effectiveConfig().maxWallClockMs();
+        if (maxWallClockMs <= 0L) {
+            return Long.MAX_VALUE;
+        }
+        long startedAtMillis = run.getStartedAt().toInstant().toEpochMilli();
+        long elapsed = Math.max(0L, System.currentTimeMillis() - startedAtMillis);
+        return Math.max(0L, maxWallClockMs - elapsed);
     }
 
     /**

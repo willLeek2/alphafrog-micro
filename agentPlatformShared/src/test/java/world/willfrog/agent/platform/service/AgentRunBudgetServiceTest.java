@@ -13,9 +13,11 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.entity.AgentRun;
 
+import java.time.OffsetDateTime;
 import java.util.Map;
 import java.util.Optional;
 
@@ -297,10 +299,50 @@ class AgentRunBudgetServiceTest {
         assertTrue(AgentContext.getLastMileHint() == null);
     }
 
+    @Test
+    void remainingWallClockMs_readsStartedAtFromAgentRunNotObservability() {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        ReflectionTestUtils.setField(service, "runMapper", runMapper);
+        AgentRun run = new AgentRun();
+        run.setStartedAt(OffsetDateTime.now().minusSeconds(10));
+        when(runMapper.findById("run-1")).thenReturn(run);
+        when(localConfigLoader.current()).thenReturn(Optional.empty());
+        stubObservabilityWithStartedAtMillis(1L);
+
+        long remaining = service.remainingWallClockMs();
+
+        assertTrue(remaining > 500_000L, "10 秒 elapsed 相对 600 秒上限，剩余应远大于 500 秒");
+        assertTrue(remaining <= 600_000L);
+        verify(stateStore, never()).loadObservability(any());
+    }
+
+    @Test
+    void remainingWallClockMs_rejectsMissingStartedAt() {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        ReflectionTestUtils.setField(service, "runMapper", runMapper);
+        when(runMapper.findById("run-1")).thenReturn(new AgentRun());
+
+        RunStartedAtMissingException thrown = assertThrows(
+                RunStartedAtMissingException.class, service::remainingWallClockMs);
+        assertEquals("run-1", thrown.runId());
+    }
+
+    @Test
+    void remainingWallClockMs_rejectsMissingMapper() {
+        assertThrows(RunStartedAtMissingException.class, service::remainingWallClockMs);
+    }
+
     private void stubObservability(long toolCalls, long llmCalls, long totalTokens) {
         String json = """
                 {"summary":{"startedAtMillis":%d,"toolCalls":%d,"llmCalls":%d,"totalTokens":%d}}
                 """.formatted(System.currentTimeMillis(), toolCalls, llmCalls, totalTokens);
+        lenient().when(stateStore.loadObservability("run-1")).thenReturn(Optional.of(json));
+    }
+
+    private void stubObservabilityWithStartedAtMillis(long startedAtMillis) {
+        String json = """
+                {"summary":{"startedAtMillis":%d,"toolCalls":0,"llmCalls":0,"totalTokens":0}}
+                """.formatted(startedAtMillis);
         lenient().when(stateStore.loadObservability("run-1")).thenReturn(Optional.of(json));
     }
 }

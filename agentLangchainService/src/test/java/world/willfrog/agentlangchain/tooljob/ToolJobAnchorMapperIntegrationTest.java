@@ -78,7 +78,7 @@ class ToolJobAnchorMapperIntegrationTest {
                     id VARCHAR(64) PRIMARY KEY,
                     user_id VARCHAR(64),
                     deployment_id VARCHAR(64),
-                    deployment_generation_id VARCHAR(64),
+                    deployment_generation_id VARCHAR(68),
                     lane_tag VARCHAR(128),
                     status VARCHAR(32) NOT NULL,
                     current_step INT DEFAULT 0,
@@ -604,6 +604,28 @@ class ToolJobAnchorMapperIntegrationTest {
                 AgentRunStatus.EXECUTING, "run-dispatch-cas:call-1:1")).isEqualTo(1);
         assertThat(mapper.findById("run-dispatch-cas").getStatus())
                 .isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
+    }
+
+    @Test
+    void executeQuerySessionCountSeesOtherUsersQueryAndIgnoresPython() throws Exception {
+        insertRun("run-self", "EXECUTING", "{}");
+        insertRun("run-other-query", "EXECUTING",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        insertRun("run-other-python", "EXECUTING",
+                "{\"toolName\":\"executePython\",\"anchorState\":\"PREPARING\"}");
+        insertRun("run-other-empty", "EXECUTING", "{}");
+        updateUserId("run-self", "user-session");
+        updateUserId("run-other-query", "user-session");
+        updateUserId("run-other-python", "user-session");
+        updateUserId("run-other-empty", "user-session");
+        insertRun("run-other-user", "EXECUTING",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        updateUserId("run-other-user", "someone-else");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.countInFlightExecuteQueryByUser(
+                "user-session", "run-self", ToolJobAnchor.EXECUTE_QUERY_TOOL)).isEqualTo(1);
+        assertThat(mapper.lockExecuteQuerySession("user-session")).isEqualTo(1);
     }
 
     @Test

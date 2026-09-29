@@ -11,6 +11,8 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
+import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
+import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
@@ -81,8 +83,13 @@ public class SqlQueryTools {
     static final Map<String, ProductTier> PRODUCT_TIERS = Map.of(
             "INTERACTIVE", new ProductTier(30, 100),
             "BACKGROUND", new ProductTier(120, 1000));
-    /** 沙箱任务超时 = 语句超时 + 固定开销（5 秒中断宽限 + 引擎启动/挂载/EXPLAIN 约 10 秒）。 */
+    /**
+     * 语句超时到进程超时的固定缓冲，也是档位进程上限相对语句上限的差值。
+     * INTERACTIVE 30+15=45，BACKGROUND 120+15=135；有效进程超时公式里的加数用同一个常量。
+     */
     static final int TASK_OVERHEAD_SECONDS = 15;
+    /** Run 快结束时留给终态写回与恢复的收尾余量，与进程缓冲不是同一个数。 */
+    static final int WALL_CLOCK_TAIL_SECONDS = 5;
 
     private static final int POLL_INTERVAL_MS = 1000;
     /** lease 剩余一半时续租，避免每次 fast-path poll 都写 PostgreSQL。 */
@@ -122,6 +129,9 @@ public class SqlQueryTools {
 
     @Autowired(required = false)
     private DataAnalysisCapacityProperties dataAnalysisCapacityProperties;
+
+    @Autowired(required = false)
+    private AgentRunBudgetService agentRunBudgetService;
 
     @Autowired(required = false)
     private PythonSandboxDispatchStore pythonSandboxDispatchStore;
@@ -249,8 +259,24 @@ public class SqlQueryTools {
             AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(resolvedDatasets, List.of());
             String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
             String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(subSnapshot);
-            int statementTimeoutSeconds = tierLimits.statementTimeoutSeconds();
-            int taskTimeoutSeconds = statementTimeoutSeconds + TASK_OVERHEAD_SECONDS;
+            long remainingWallClockMs;
+            try {
+                if (agentRunBudgetService == null) {
+                    throw new RunStartedAtMissingException(runId);
+                }
+                remainingWallClockMs = agentRunBudgetService.remainingWallClockMs();
+            } catch (RunStartedAtMissingException missingStartedAt) {
+                return fail("RUN_STARTED_AT_MISSING", missingStartedAt.getMessage(),
+                        Map.of("run_id", runId, "retryable", false));
+            }
+            QueryTimeouts timeouts;
+            try {
+                timeouts = clampQueryTimeouts(tierLimits.statementTimeoutSeconds(), remainingWallClockMs);
+            } catch (DataIntenseRefusal wallClockRefusal) {
+                return fail(wallClockRefusal.code(), wallClockRefusal.getMessage(), wallClockRefusal.details());
+            }
+            int statementTimeoutSeconds = timeouts.statementTimeoutSeconds();
+            int taskTimeoutSeconds = timeouts.taskTimeoutSeconds();
             CapacityPlan plan;
             try {
                 plan = planCapacity(tier, resolvedDatasets);
@@ -266,7 +292,9 @@ public class SqlQueryTools {
                 long estimatedRowCap = "BACKGROUND".equals(tier)
                         ? dataAnalysisCapacityProperties.getMaxRowsPerTask()
                         : dataAnalysisCapacityProperties.getStandardRowsMax();
-                runnerCode = renderRunner(sql, tier, tierLimits, resolvedDatasets,
+                runnerCode = renderRunner(sql, tier,
+                        new ProductTier(statementTimeoutSeconds, tierLimits.rowCap()),
+                        resolvedDatasets,
                         decision.memoryLimitBytes(), estimatedRowCap);
             } catch (IllegalStateException renderFailure) {
                 return fail("RUNNER_RENDER_FAILED", renderFailure.getMessage(), Map.of("retryable", false));
@@ -303,7 +331,9 @@ public class SqlQueryTools {
             String createRequestJson = JsonFormat.printer()
                     .omittingInsignificantWhitespace().print(request);
             // executeQuery 没有工具自有的锚点字段（无修复计数、无 finance 通道），extras 传 null。
-            SandboxToolJobLifecycle.PrepareDispatchResult dispatch = SandboxToolJobLifecycle.prepareDispatch(
+            SandboxToolJobLifecycle.PrepareDispatchResult dispatch;
+            try {
+                dispatch = SandboxToolJobLifecycle.prepareDispatch(
                     pythonSandboxDispatchStore,
                     new SandboxToolJobLifecycle.PrepareDispatchRequest(
                             runId,
@@ -325,6 +355,11 @@ public class SqlQueryTools {
                             spec.timeoutMillis(),
                             POLL_INTERVAL_MS),
                     null);
+            } catch (SessionQueryAdmissionException sessionBusy) {
+                SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
+                return fail(sessionBusy.code(), sessionBusy.getMessage(),
+                        Map.of("retryable", sessionBusy.retryable()));
+            }
             if (!dispatch.persisted()) {
                 // 未取得 anchor owner 时释放尚未转交的容量；同一 Run 内立刻重试必然再次失败。
                 SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
@@ -391,6 +426,45 @@ public class SqlQueryTools {
                     Map.of("message", e.getMessage() == null ? "" : e.getMessage()));
         }
     }
+
+    /**
+     * 按 Run 剩余墙钟夹语句超时与进程超时。档位进程上限与公式里「有效语句超时 + N 秒」
+     * 共用 {@link #TASK_OVERHEAD_SECONDS}。
+     */
+    static QueryTimeouts clampQueryTimeouts(int statementCapSeconds, long remainingWallClockMs) {
+        int processCapSeconds = statementCapSeconds + TASK_OVERHEAD_SECONDS;
+        if (remainingWallClockMs == Long.MAX_VALUE) {
+            return new QueryTimeouts(statementCapSeconds, processCapSeconds);
+        }
+        long remainingSeconds = remainingWallClockMs / 1000L;
+        if (remainingSeconds <= WALL_CLOCK_TAIL_SECONDS) {
+            throw new DataIntenseRefusal("RUN_WALL_CLOCK_INSUFFICIENT",
+                    "remaining run wall clock is not enough to start executeQuery",
+                    Map.of("remaining_ms", remainingWallClockMs,
+                            "tail_seconds", WALL_CLOCK_TAIL_SECONDS,
+                            "retryable", false));
+        }
+        int effectiveStatement = (int) Math.min(statementCapSeconds, remainingSeconds - WALL_CLOCK_TAIL_SECONDS);
+        if (effectiveStatement <= 0) {
+            throw new DataIntenseRefusal("RUN_WALL_CLOCK_INSUFFICIENT",
+                    "remaining run wall clock is not enough to start executeQuery",
+                    Map.of("remaining_ms", remainingWallClockMs,
+                            "tail_seconds", WALL_CLOCK_TAIL_SECONDS,
+                            "retryable", false));
+        }
+        int effectiveProcess = (int) Math.min(processCapSeconds,
+                Math.min((long) effectiveStatement + TASK_OVERHEAD_SECONDS, remainingSeconds));
+        if (effectiveProcess < effectiveStatement) {
+            throw new DataIntenseRefusal("RUN_WALL_CLOCK_INSUFFICIENT",
+                    "remaining run wall clock cannot keep process timeout above statement timeout",
+                    Map.of("remaining_ms", remainingWallClockMs,
+                            "effective_statement_seconds", effectiveStatement,
+                            "retryable", false));
+        }
+        return new QueryTimeouts(effectiveStatement, effectiveProcess);
+    }
+
+    record QueryTimeouts(int statementTimeoutSeconds, int taskTimeoutSeconds) {}
 
     /**
      * 冻结这次调用的容量事实：数据集预估值与资源档位。

@@ -860,6 +860,29 @@
     </update>
 
     <!--
+        事务级咨询锁：同一 user_id 的 executeQuery 抢占串行化。
+        hashtextextended 返回 64 位，避免 hashtext 的 32 位碰撞。
+        用 SELECT 1 包一层，是因为 pg_advisory_xact_lock 返回 void，MyBatis 不能把它当成 int 读。
+    -->
+    <select id="lockExecuteQuerySession" resultType="int">
+        SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(#{userId}, 0))) AS acquired
+    </select>
+
+    <!--
+        同一用户其它 Run 上仍占用的 executeQuery 锚点。排除当前 Run，避免恢复路径把自己算进去。
+        executePython 锚点的 toolName 不是 executeQuery，计数为 0。
+    -->
+    <select id="countInFlightExecuteQueryByUser" resultType="int">
+        SELECT COUNT(*)
+          FROM alphafrog_agent_run
+         WHERE user_id = #{userId}
+           AND id &lt;&gt; #{excludeRunId}
+           AND tool_job_anchor_json IS NOT NULL
+           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+           AND tool_job_anchor_json #&gt;&gt; '{toolName}' = #{toolName}
+    </select>
+
+    <!--
         取消意图专用窄写。只在与读取时相同的 Run 状态和精确
         operationId 下，用 jsonb 合并 autoResume=false 与 runDisposition=CANCELED。
         V2 首次写入取消处置时同时递增控制版本，让子树当时就失去创建和执行资格；

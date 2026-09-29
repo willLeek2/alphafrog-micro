@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -13,10 +14,12 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -427,5 +430,85 @@ class ToolJobAnchorServiceTest {
 
         assertThat(anchorService.closeResidualCanceledAnchor("run-1", "run-1:tc-9:2"))
                 .isFalse();
+    }
+
+    @Test
+    void executePythonClaimDoesNotTakeSessionLock() {
+        ToolJobAnchor python = new ToolJobAnchor();
+        python.setToolName(ToolJobAnchor.EXECUTE_PYTHON_TOOL);
+        python.setAnchorState("PREPARING");
+        when(agentRunMapper.claimPreparingToolJobAnchor(eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING)))
+                .thenReturn(1);
+
+        assertThat(anchorService.claimPreparing("run-1", python, AgentRunStatus.EXECUTING)).isTrue();
+
+        verify(agentRunMapper, never()).lockExecuteQuerySession(anyString());
+        verify(agentRunMapper, never()).countInFlightExecuteQueryByUser(anyString(), anyString(), anyString());
+        verify(agentRunMapper, never()).findById("run-1");
+        verify(agentRunMapper).claimPreparingToolJobAnchor(eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING));
+    }
+
+    @Test
+    void executeQueryClaimLocksThenCountsThenUpdates() {
+        ToolJobAnchor query = new ToolJobAnchor();
+        query.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        query.setAnchorState("PREPARING");
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setUserId("user-9");
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+        when(agentRunMapper.countInFlightExecuteQueryByUser(
+                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL)).thenReturn(0);
+        when(agentRunMapper.claimPreparingToolJobAnchor(eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING)))
+                .thenReturn(1);
+
+        assertThat(anchorService.claimPreparing("run-1", query, AgentRunStatus.EXECUTING)).isTrue();
+
+        var order = inOrder(agentRunMapper);
+        order.verify(agentRunMapper).findById("run-1");
+        order.verify(agentRunMapper).lockExecuteQuerySession("user-9");
+        order.verify(agentRunMapper).countInFlightExecuteQueryByUser(
+                "user-9", "run-1", ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        order.verify(agentRunMapper).claimPreparingToolJobAnchor(
+                eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING));
+    }
+
+    @Test
+    void executeQueryClaimRejectsWhenAnotherSessionQueryIsInFlight() {
+        ToolJobAnchor query = new ToolJobAnchor();
+        query.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        AgentRun run = new AgentRun();
+        run.setUserId("user-9");
+        when(agentRunMapper.findById("run-2")).thenReturn(run);
+        when(agentRunMapper.countInFlightExecuteQueryByUser(
+                "user-9", "run-2", ToolJobAnchor.EXECUTE_QUERY_TOOL)).thenReturn(1);
+
+        assertThatThrownBy(() -> anchorService.claimPreparing("run-2", query, AgentRunStatus.EXECUTING))
+                .isInstanceOf(SessionQueryAdmissionException.class)
+                .satisfies(thrown -> {
+                    SessionQueryAdmissionException ex = (SessionQueryAdmissionException) thrown;
+                    assertThat(ex.code()).isEqualTo("SESSION_QUERY_IN_PROGRESS");
+                    assertThat(ex.retryable()).isTrue();
+                });
+        verify(agentRunMapper, never()).claimPreparingToolJobAnchor(anyString(), anyString(), any());
+    }
+
+    @Test
+    void executeQueryClaimRejectsMissingUserId() {
+        ToolJobAnchor query = new ToolJobAnchor();
+        query.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        AgentRun run = new AgentRun();
+        run.setUserId("  ");
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+
+        assertThatThrownBy(() -> anchorService.claimPreparing("run-1", query, AgentRunStatus.EXECUTING))
+                .isInstanceOf(SessionQueryAdmissionException.class)
+                .satisfies(thrown -> {
+                    SessionQueryAdmissionException ex = (SessionQueryAdmissionException) thrown;
+                    assertThat(ex.code()).isEqualTo("SESSION_USER_ID_MISSING");
+                    assertThat(ex.retryable()).isFalse();
+                });
+        verify(agentRunMapper, never()).lockExecuteQuerySession(anyString());
+        verify(agentRunMapper, never()).claimPreparingToolJobAnchor(anyString(), anyString(), any());
     }
 }

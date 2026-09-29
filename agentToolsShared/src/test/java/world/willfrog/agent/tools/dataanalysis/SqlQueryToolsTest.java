@@ -113,6 +113,61 @@ class SqlQueryToolsTest {
         assertEquals(false, details.get("retryable"));
     }
 
+    @Test
+    void clampQueryTimeoutsUsesSameOverheadForCapAndFormula() {
+        assertEquals(15, SqlQueryTools.TASK_OVERHEAD_SECONDS);
+        assertEquals(45, 30 + SqlQueryTools.TASK_OVERHEAD_SECONDS);
+        assertEquals(135, 120 + SqlQueryTools.TASK_OVERHEAD_SECONDS);
+        SqlQueryTools.QueryTimeouts unbounded =
+                SqlQueryTools.clampQueryTimeouts(30, Long.MAX_VALUE);
+        assertEquals(30, unbounded.statementTimeoutSeconds());
+        assertEquals(45, unbounded.taskTimeoutSeconds());
+        SqlQueryTools.QueryTimeouts clamped =
+                SqlQueryTools.clampQueryTimeouts(30, 20_000L);
+        assertEquals(15, clamped.statementTimeoutSeconds());
+        assertEquals(20, clamped.taskTimeoutSeconds());
+    }
+
+    @Test
+    void clampQueryTimeoutsRefusesWhenRemainingAtOrBelowTail() {
+        RuntimeException refusal = assertThrows(RuntimeException.class,
+                () -> SqlQueryTools.clampQueryTimeouts(30, 5_000L));
+        assertEquals("DataIntenseRefusal", refusal.getClass().getSimpleName());
+        try {
+            var codeAccessor = refusal.getClass().getDeclaredMethod("code");
+            codeAccessor.setAccessible(true);
+            assertEquals("RUN_WALL_CLOCK_INSUFFICIENT", codeAccessor.invoke(refusal));
+            var detailsAccessor = refusal.getClass().getDeclaredMethod("details");
+            detailsAccessor.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> details = (Map<String, Object>) detailsAccessor.invoke(refusal);
+            assertEquals(false, details.get("retryable"));
+        } catch (ReflectiveOperationException reflectionFailure) {
+            fail(reflectionFailure);
+        }
+    }
+
+    @Test
+    void planCapacityBackgroundIsHeavyThreeUnits() throws Exception {
+        Path dir = Files.createTempDirectory("sq-bg");
+        Path csv = dir.resolve("small.csv");
+        Files.writeString(csv, "id\n1\n");
+        Files.writeString(dir.resolve("small.meta.json"), "{\"rowCount\":10,\"bytes\":128}");
+        ReflectionTestUtils.setField(tools, "dataAnalysisCapacityProperties",
+                new DataAnalysisCapacityProperties());
+        var datasets = List.of(AgentRunDatasetEntry.forDataset(
+                1, "ds-1", csv.toString(), "000001.SZ", "small.csv"));
+
+        Object plan = ReflectionTestUtils.invokeMethod(tools, "planCapacity", "BACKGROUND", datasets);
+        assertNotNull(plan);
+        var estimateAccessor = plan.getClass().getDeclaredMethod("estimate");
+        estimateAccessor.setAccessible(true);
+        var estimate = (world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate)
+                estimateAccessor.invoke(plan);
+        assertEquals(DataAnalysisResourceClass.HEAVY, estimate.resourceClass());
+        assertEquals(3, estimate.capacityUnits());
+    }
+
     // ---------- 运行器渲染 ----------
 
     @Test

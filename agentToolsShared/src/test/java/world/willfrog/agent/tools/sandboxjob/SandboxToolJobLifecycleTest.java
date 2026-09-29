@@ -33,9 +33,17 @@ class SandboxToolJobLifecycleTest {
         @Override public boolean completeDagBlockingPreparingAbort(String runId, ToolJobAnchor anchor, java.time.Instant expectedLeaseUntil) { return false; }
     }
 
-    private SandboxToolJobLifecycle.PrepareDispatchRequest request() {
+    private SandboxToolJobLifecycle.PrepareDispatchRequest requestPython() {
+        return request(ToolJobAnchor.EXECUTE_PYTHON_TOOL);
+    }
+
+    private SandboxToolJobLifecycle.PrepareDispatchRequest requestQuery() {
+        return request(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+    }
+
+    private SandboxToolJobLifecycle.PrepareDispatchRequest request(String toolName) {
         return new SandboxToolJobLifecycle.PrepareDispatchRequest(
-                "run-1", "executePython", "tool-call-1", 1, 2,
+                "run-1", toolName, "tool-call-1", 1, 2,
                 "run-1:tool-call-1:1", "fp-1",
                 "{}", "{\"code\":\"print(1)\"}",
                 "LINEAR_SUSPEND", true, true,
@@ -44,17 +52,17 @@ class SandboxToolJobLifecycleTest {
     }
 
     @Test
-    void freshPathAssemblesAnchorAndPersists() {
+    void freshPathAssemblesExecutePythonAnchorWithoutRenamingTool() {
         FakeDispatchStore store = new FakeDispatchStore();
         AtomicBoolean extrasApplied = new AtomicBoolean(false);
         SandboxToolJobLifecycle.PrepareDispatchResult result =
-                SandboxToolJobLifecycle.prepareDispatch(store, request(), a -> extrasApplied.set(true));
+                SandboxToolJobLifecycle.prepareDispatch(store, requestPython(), a -> extrasApplied.set(true));
 
         assertTrue(result.persisted());
         assertTrue(store.freshCalled);
         ToolJobAnchor anchor = result.anchor();
         assertEquals("PREPARING", anchor.getAnchorState());
-        assertEquals("executePython", anchor.getToolName());
+        assertEquals(ToolJobAnchor.EXECUTE_PYTHON_TOOL, anchor.getToolName());
         assertEquals("run-1:tool-call-1:1", anchor.getOperationId());
         assertEquals("fp-1", anchor.getRequestFingerprint());
         assertEquals(2, anchor.getSchemaVersion());
@@ -64,12 +72,33 @@ class SandboxToolJobLifecycleTest {
     }
 
     @Test
-    void casFailureReturnsNotPersisted() {
+    void freshPathAssemblesExecuteQueryAnchorWithQueryToolName() {
+        FakeDispatchStore store = new FakeDispatchStore();
+        SandboxToolJobLifecycle.PrepareDispatchResult result =
+                SandboxToolJobLifecycle.prepareDispatch(store, requestQuery(), null);
+
+        assertTrue(result.persisted());
+        assertEquals(ToolJobAnchor.EXECUTE_QUERY_TOOL, result.anchor().getToolName());
+    }
+
+    @Test
+    void casFailureReturnsNotPersistedForExecutePython() {
         FakeDispatchStore store = new FakeDispatchStore();
         store.persistResult = false;
         SandboxToolJobLifecycle.PrepareDispatchResult result =
-                SandboxToolJobLifecycle.prepareDispatch(store, request(), null);
+                SandboxToolJobLifecycle.prepareDispatch(store, requestPython(), null);
         assertFalse(result.persisted());
+        assertEquals(ToolJobAnchor.EXECUTE_PYTHON_TOOL, result.anchor().getToolName());
+    }
+
+    @Test
+    void casFailureReturnsNotPersistedForExecuteQuery() {
+        FakeDispatchStore store = new FakeDispatchStore();
+        store.persistResult = false;
+        SandboxToolJobLifecycle.PrepareDispatchResult result =
+                SandboxToolJobLifecycle.prepareDispatch(store, requestQuery(), null);
+        assertFalse(result.persisted());
+        assertEquals(ToolJobAnchor.EXECUTE_QUERY_TOOL, result.anchor().getToolName());
     }
 
     @Test
