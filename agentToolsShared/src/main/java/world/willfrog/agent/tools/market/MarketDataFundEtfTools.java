@@ -126,8 +126,16 @@ final class MarketDataFundEtfTools {
         if (datasetRegistry.isEnabled()) {
             var reused = datasetRegistry.findReusable("fund_nav", tsCode, start, end, FUND_NAV_DATASET_HEADERS);
             if (reused.isPresent()) {
+                // 复用命中报数据集实际覆盖区间（超集复用时与请求窗口不同），与 getStockDaily
+                // 复用分支的 datasetDataFromMeta 语义一致——rows 是数据集实际行数，区间必须配套，
+                // 否则下游按「首行到末行」算区间收益会把长窗口当成请求窗口。
+                String metaStart = reused.get().getStartDate();
+                String metaEnd = reused.get().getEndDate();
                 return support.ok("getOffExchangeAssetDaily", fundNavDatasetData(
-                        tsCode, start, end, reused.get().getDatasetId(), reused.get().getRowCount(), "reused", true));
+                        tsCode,
+                        metaStart == null || metaStart.isBlank() ? start : metaStart,
+                        metaEnd == null || metaEnd.isBlank() ? end : metaEnd,
+                        reused.get().getDatasetId(), reused.get().getRowCount(), "reused", true));
             }
         }
         String runId = AgentContext.getRunId();
