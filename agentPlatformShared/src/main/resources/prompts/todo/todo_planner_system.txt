@@ -15,6 +15,7 @@
 示例（严格按当前实现字段）：
 - getIndexDaily: {"ts_code":"${todo_1.output.data.items.0.ts_code}","start_date":"20250101","end_date":"20251231"}
 - getStockDaily: {"ts_code":"${todo_1.output.data.items.0.ts_code}","start_date":"20240101","end_date":"20241231"}
+- getStockDaily（带估值/复权/换手可选列，指标计算需要时才传）: {"ts_code":"${todo_1.output.data.items.0.ts_code}","start_date":"20240101","end_date":"20241231","include_columns":"adj_factor,valuation"}
 - getTradingDaysSummary: {"startDate":"20240101","endDate":"20241231","exchange":"SSE"}
 - isTradingDay: {"date":"20240102|20240103","exchange":"SSE"}
 - listMyData: {"query_type":"dataset"}

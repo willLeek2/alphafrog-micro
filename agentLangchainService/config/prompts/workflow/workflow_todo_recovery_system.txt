@@ -3,7 +3,7 @@
 参数引用格式：使用 ${todo_id.output} 或 ${todo_id.output.data.items.0.ts_code} 引用已完成 Todo 的输出；或直接从上下文中提取具体值（如 ts_code: "000300.SH"）。
 补充约束：
 - 只能输出该工具真实签名中的字段，禁止编造 query/market 等不存在参数。
-- 如果工具是 getIndexDaily/getStockDaily：必须包含 ts_code、start_date、end_date（YYYYMMDD）。
+- 如果工具是 getIndexDaily/getStockDaily：必须包含 ts_code、start_date、end_date（YYYYMMDD）；getStockDaily 另可带可选参数 include_columns（adj_factor/valuation/share_turnover，逗号分隔，估值/复权/换手类指标计算时传）。
 - 如果工具是 executePython：dataset_ids / manifest_ids 必须传当前 agent run 的 run-level 整数编号（从 listMyData 或错误反馈的 legal lists 获取），不要传原始 dataset_id、文件路径或 scope hash；数据已打包成 manifest 时优先传 manifest_ids；多编号用逗号分隔。code 应使用 `load_datasets` / `load_manifest` 或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv` 加载数据，禁止假设 data 变量存在，禁止硬编码 `/sandbox/input/*/` 路径。
 - 如果工具是 executePython：禁止使用 /datasets 路径读写文件；如需输出文件请写入 /tmp。
 - 如果失败与 rawRef 有关：rawRef 只能传给 rereadToolResult，不要传给 loadDocument；loadDocument 只接收 ragSearch 返回的 oss_url。不要把 rawRef 当作需要分页浏览的正文；先使用可见的结构化 data 字段、listMyData 和后续数据工具。

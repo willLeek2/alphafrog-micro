@@ -118,6 +118,10 @@ message DomesticStockDailyItem {
   double pctChg = 10;
   double vol = 11;
   double amount = 12;
+  // 指标库扩充新增：请求带对应列名时才返回（optional 区分「无值」与「值为 0」）
+  optional double adjFactor = 13;
+  string valuation = 14;
+  string shareTurnover = 15;
 }
 
 
@@ -131,6 +135,8 @@ message DomesticStockDailyByTsCodeAndDateRangeRequest {
   string tsCode = 1;
   int64 startDate = 2;
   int64 endDate = 3;
+  // 可选列：adj_factor / valuation / share_turnover；为空时只返回基础行情列
+  repeated string includeColumns = 4;
 }
 
 message DomesticStockDailyByTsCodeAndDateRangeResponse {
@@ -443,6 +449,48 @@ message DomesticStockExpressQueryResponse {
   repeated StockExpressItem items = 1;
 }
 
+// --- 财务指标（指标库扩充：四类 JSONB + extended 以原始 JSON 字符串返回，报告期窗口查询） ---
+message StockFinaIndicatorItem {
+  string ts_code      = 1;
+  string end_date     = 2;   // 报告期 YYYYMMDD
+  string ann_date     = 3;   // 公告日期 YYYYMMDD，可空
+  string profitability = 4;  // JSON：盈利与回报（roe*/roa*/roic*、利润率、扣非）
+  string per_share    = 5;   // JSON：每股（*ps、eps、bps）
+  string capital_cash = 6;   // JSON：营运偿债现金流与资本结构
+  string growth       = 7;   // JSON：增长（yoy、qoq、研发）
+  string extended     = 8;   // JSON：未进四类的字段
+}
+message DomesticStockFinaIndicatorQueryResponse {
+  repeated StockFinaIndicatorItem items = 1;
+}
+
+// --- 券商盈利预测（report_rc，报告日期窗口查询单只股票；数值字段 optional 区分「未给出」与 0） ---
+message StockReportRcItem {
+  string ts_code       = 1;
+  string name          = 2;
+  string report_date   = 3;   // 报告日期 YYYYMMDD
+  string org_name      = 4;
+  string author_name   = 5;
+  string quarter       = 6;   // 预测期，如 2024Q4
+  string report_title  = 7;
+  string classify      = 8;
+  optional double op_rt = 9;
+  optional double op_pr = 10;
+  optional double tp    = 11;  // 目标价
+  optional double np    = 12;  // 预测净利润
+  optional double eps   = 13;  // 预测每股收益
+  optional double pe    = 14;  // 预测市盈率
+  optional double rd    = 15;
+  optional double roe   = 16;
+  optional double ev_ebitda = 17;
+  string rating        = 18;
+  optional double max_price = 19;
+  optional double min_price = 20;
+}
+message DomesticStockReportRcQueryResponse {
+  repeated StockReportRcItem items = 1;
+}
+
 service DomesticStockService {
   rpc getStockInfoByTsCode(DomesticStockInfoByTsCodeRequest) returns (DomesticStockInfoByTsCodeResponse);
   rpc searchStock(DomesticStockSearchRequest) returns (DomesticStockSearchResponse);
@@ -456,6 +504,10 @@ service DomesticStockService {
   rpc queryStockBalancesheet(DomesticStockFinancialQueryRequest) returns (DomesticStockBalancesheetQueryResponse);
   rpc queryStockCashflow(DomesticStockFinancialQueryRequest) returns (DomesticStockCashflowQueryResponse);
   rpc queryStockExpress(DomesticStockFinancialQueryRequest) returns (DomesticStockExpressQueryResponse);
+
+  // 指标库扩充新增：财务指标 / 券商盈利预测查询
+  rpc queryStockFinaIndicator(DomesticStockFinancialQueryRequest) returns (DomesticStockFinaIndicatorQueryResponse);
+  rpc queryStockReportRc(DomesticStockFinancialQueryRequest) returns (DomesticStockReportRcQueryResponse);
 }
 
 

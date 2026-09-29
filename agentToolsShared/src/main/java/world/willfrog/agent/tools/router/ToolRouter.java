@@ -524,7 +524,8 @@ public class ToolRouter {
                 case "getStockDaily" -> marketDataTools.getStockDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
                 );
                 case "getStockSwIndustryInfo" -> marketDataTools.getStockSwIndustryInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))

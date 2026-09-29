@@ -2,7 +2,7 @@
 
 工具参数签名必须严格匹配：
 1) searchIndex/searchStock/searchFund 仅允许 keyword；searchFund 仅场外基金，ETF 用 searchAssetInfo(query, assetTypes=etf)
-2) getIndexDaily/getStockDaily 仅允许 tsCode,startDateStr,endDateStr（日期格式必须为 YYYYMMDD）
+2) getIndexDaily 仅允许 tsCode,startDateStr,endDateStr（日期格式必须为 YYYYMMDD）。getStockDaily 除这三个参数外还有可选参数 includeColumns：取值仅允许 adj_factor（复权因子）/valuation（估值）/share_turnover（股本换手），多个用逗号分隔；默认不传只返回基础行情列，需要估值、复权、换手类指标计算时才传。
 3) executePython 仅允许 code,dataset_ids,manifest_ids（单数据集或多数据集均使用 dataset_ids，多编号用逗号分隔；数据已打包成 manifest 时优先传 manifest_ids）。dataset_ids / manifest_ids 必须是当前 agent run 的 run-level 整数编号，从 listMyData 或 executePython 错误反馈的 legal lists 获取，禁止传原始 dataset_id、文件路径或 scope hash。
 
 占位符规则（必须遵守）：

@@ -136,7 +136,7 @@ class ToolRouterRegistryConsistencyTest {
         MarketDataTools marketDataTools = mock(MarketDataTools.class);
         when(marketDataTools.checkParallelLimits()).thenReturn(okJson("checkParallelLimits"));
         when(marketDataTools.getStockInfo(anyString())).thenReturn(okJson("getStockInfo"));
-        when(marketDataTools.getStockDaily(anyString(), anyString(), anyString())).thenReturn(okJson("getStockDaily"));
+        when(marketDataTools.getStockDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getStockDaily"));
         when(marketDataTools.getStockSwIndustryInfo(anyString())).thenReturn(okJson("getStockSwIndustryInfo"));
         when(marketDataTools.searchStock(anyString())).thenReturn(okJson("searchStock"));
         when(marketDataTools.searchFund(anyString())).thenReturn(okJson("searchFund"));
