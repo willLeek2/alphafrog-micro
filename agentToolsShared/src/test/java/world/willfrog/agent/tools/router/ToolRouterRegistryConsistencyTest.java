@@ -151,6 +151,7 @@ class ToolRouterRegistryConsistencyTest {
         when(marketDataTools.getExchangeAssetDaily(anyString(), anyString(), anyString(), anyString(), anyString(), any(), any())).thenReturn(okJson("getExchangeAssetDaily"));
         when(marketDataTools.getExchangeAssetDailyAdvanced(any(), anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getExchangeAssetDaily"));
         when(marketDataTools.getOffExchangeAssetDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getOffExchangeAssetDaily"));
+        when(marketDataTools.getSpecialAssetDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getSpecialAssetDaily"));
         when(marketDataTools.getEtfAdj(anyString(), anyString(), anyString())).thenReturn(okJson("getEtfAdj"));
         when(marketDataTools.getListedAssetShareSize(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getListedAssetShareSize"));
         when(marketDataTools.getFinancialReport(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getFinancialReport"));
@@ -219,6 +220,7 @@ class ToolRouterRegistryConsistencyTest {
             case "getStockDaily", "getIndexDaily", "getOffExchangeAssetDaily",
                  "getEtfAdj", "getListedAssetShareSize" -> Map.of("tsCode", "000001.SZ", "startDateStr", "20240101", "endDateStr", "20240105");
             case "getExchangeAssetDaily" -> Map.of("tsCode", "000001.SZ", "assetType", "stock", "startDateStr", "20240101", "endDateStr", "20240105", "priceMode", "raw_ohlc");
+            case "getSpecialAssetDaily" -> Map.of("tsCode", "113050.SH", "assetType", "cb", "startDateStr", "20240101", "endDateStr", "20240105");
             case "getStockInfo", "getIndexInfo", "getStockSwIndustryInfo" -> Map.of("tsCode", "000001.SZ");
             case "searchStock", "searchFund", "searchIndex" -> Map.of("keyword", "q");
             case "searchAssetInfo" -> Map.of("query", "q", "assetTypes", "stock", "marketScope", "domestic");

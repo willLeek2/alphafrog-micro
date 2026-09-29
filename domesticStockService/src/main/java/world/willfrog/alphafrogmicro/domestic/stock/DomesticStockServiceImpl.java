@@ -12,6 +12,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.component.MeiliSearchIndexManager;
 import world.willfrog.alphafrogmicro.common.component.MeiliSearchDataSyncService;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.CbDailyDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StkAhDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockQuoteDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockIncomeDao;
@@ -20,6 +22,8 @@ import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockCashflowDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockExpressDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockFinaIndicatorDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockReportRcDao;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.CbDaily;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StkAh;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockDaily;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockInfo;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockIncome;
@@ -59,6 +63,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
     private final StockExpressDao stockExpressDao;
     private final StockFinaIndicatorDao stockFinaIndicatorDao;
     private final StockReportRcDao stockReportRcDao;
+    private final CbDailyDao cbDailyDao;
+    private final StkAhDao stkAhDao;
     private final Environment environment;
     private volatile Client meiliClient;
     private volatile String meiliClientHost;
@@ -76,6 +82,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                                     StockExpressDao stockExpressDao,
                                     StockFinaIndicatorDao stockFinaIndicatorDao,
                                     StockReportRcDao stockReportRcDao,
+                                    CbDailyDao cbDailyDao,
+                                    StkAhDao stkAhDao,
                                     Environment environment) {
         this.stockInfoDao = stockInfoDao;
         this.stockQuoteDao = stockQuoteDao;
@@ -85,6 +93,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         this.stockExpressDao = stockExpressDao;
         this.stockFinaIndicatorDao = stockFinaIndicatorDao;
         this.stockReportRcDao = stockReportRcDao;
+        this.cbDailyDao = cbDailyDao;
+        this.stkAhDao = stkAhDao;
         this.environment = environment;
     }
 
@@ -753,6 +763,85 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         return DomesticStockReportRcQueryResponse.newBuilder()
                 .addAllItems(items)
                 .build();
+    }
+
+    // 指标库扩充新增：可转债日线查询（溢价四字段以 premium 原始 JSON 字符串返回）
+    @Override
+    public DomesticCbDailyByTsCodeAndDateRangeResponse getCbDailyByTsCodeAndDateRange(DomesticCbDailyByTsCodeAndDateRangeRequest request) {
+        String tsCode = request.getTsCode();
+        List<CbDaily> rows = cbDailyDao.getByTsCodeAndDateRange(tsCode, request.getStartDate(), request.getEndDate());
+
+        DomesticCbDailyByTsCodeAndDateRangeResponse.Builder responseBuilder = DomesticCbDailyByTsCodeAndDateRangeResponse.newBuilder();
+        for (CbDaily row : rows) {
+            CbDailyItem.Builder itemBuilder = CbDailyItem.newBuilder()
+                    .setTsCode(nvl(row.getTsCode()))
+                    .setTradeDate(row.getTradeDate() == null ? 0L : row.getTradeDate())
+                    .setPremium(nvl(row.getPremium()));
+            if (row.getPreClose() != null) {
+                itemBuilder.setPreClose(row.getPreClose());
+            }
+            if (row.getOpen() != null) {
+                itemBuilder.setOpen(row.getOpen());
+            }
+            if (row.getHigh() != null) {
+                itemBuilder.setHigh(row.getHigh());
+            }
+            if (row.getLow() != null) {
+                itemBuilder.setLow(row.getLow());
+            }
+            if (row.getClose() != null) {
+                itemBuilder.setClose(row.getClose());
+            }
+            if (row.getChange() != null) {
+                itemBuilder.setChange(row.getChange());
+            }
+            if (row.getPctChg() != null) {
+                itemBuilder.setPctChg(row.getPctChg());
+            }
+            if (row.getVol() != null) {
+                itemBuilder.setVol(row.getVol());
+            }
+            if (row.getAmount() != null) {
+                itemBuilder.setAmount(row.getAmount());
+            }
+            responseBuilder.addItems(itemBuilder.build());
+        }
+        return responseBuilder.build();
+    }
+
+    // 指标库扩充新增：AH 比价查询（A/H 收盘、涨跌幅、比价与溢价）
+    @Override
+    public DomesticStkAhByTsCodeAndDateRangeResponse getStkAhByTsCodeAndDateRange(DomesticStkAhByTsCodeAndDateRangeRequest request) {
+        String tsCode = request.getTsCode();
+        List<StkAh> rows = stkAhDao.getByTsCodeAndDateRange(tsCode, request.getStartDate(), request.getEndDate());
+
+        DomesticStkAhByTsCodeAndDateRangeResponse.Builder responseBuilder = DomesticStkAhByTsCodeAndDateRangeResponse.newBuilder();
+        for (StkAh row : rows) {
+            StkAhItem.Builder itemBuilder = StkAhItem.newBuilder()
+                    .setTsCode(nvl(row.getTsCode()))
+                    .setHkCode(nvl(row.getHkCode()))
+                    .setTradeDate(row.getTradeDate() == null ? 0L : row.getTradeDate());
+            if (row.getClose() != null) {
+                itemBuilder.setClose(row.getClose());
+            }
+            if (row.getHkClose() != null) {
+                itemBuilder.setHkClose(row.getHkClose());
+            }
+            if (row.getPctChg() != null) {
+                itemBuilder.setPctChg(row.getPctChg());
+            }
+            if (row.getHkPctChg() != null) {
+                itemBuilder.setHkPctChg(row.getHkPctChg());
+            }
+            if (row.getAhComparison() != null) {
+                itemBuilder.setAhComparison(row.getAhComparison());
+            }
+            if (row.getAhPremium() != null) {
+                itemBuilder.setAhPremium(row.getAhPremium());
+            }
+            responseBuilder.addItems(itemBuilder.build());
+        }
+        return responseBuilder.build();
     }
 
     private double orZero(Double v) { return v == null ? 0.0 : v; }

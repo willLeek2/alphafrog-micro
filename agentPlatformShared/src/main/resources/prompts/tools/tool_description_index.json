@@ -8,6 +8,7 @@
   "getIndexInfo",
   "getListedAssetShareSize",
   "getOffExchangeAssetDaily",
+  "getSpecialAssetDaily",
   "getStockDaily",
   "getStockInfo",
   "getStockSwIndustryInfo",

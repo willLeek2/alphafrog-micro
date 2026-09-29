@@ -794,6 +794,19 @@ public class MarketDataTools {
                 .getOffExchangeAssetDaily(tsCode, startDate, endDate, includeDataset);
     }
 
+    /**
+     * A 股资产特色数据查询（可转债日线 / AH 比价）。
+     *
+     * <p>指标库扩充新增的小众资产数据入口：转债与 AH 不属于四大资产类别，按
+     * frog 拍板整合到这一个特色工具（「不新增对外工具入口」的唯一例外）。
+     * 整段序列走 dataset 机制，方法计算转债收益/溢价、AH 溢价时复用。</p>
+     */
+    @Tool
+    public String getSpecialAssetDaily(String tsCode, String assetType, String startDate, String endDate) {
+        return new MarketDataSpecialAssetTools(domesticStockService, datasetWriter, datasetRegistry, this)
+                .getSpecialAssetDaily(tsCode, assetType, startDate, endDate);
+    }
+
     @Tool
     public String getEtfAdj(String tsCode, String startDate, String endDate) {
         return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)

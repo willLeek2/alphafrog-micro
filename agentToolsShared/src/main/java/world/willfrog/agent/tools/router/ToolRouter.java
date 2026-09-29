@@ -593,6 +593,12 @@ public class ToolRouter {
                         dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
                         str(params.get("includeDataset"), params.get("include_dataset"), params.get("arg3"))
                 );
+                case "getSpecialAssetDaily" -> marketDataTools.getSpecialAssetDaily(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3"))
+                );
                 case "getEtfAdj" -> {
                     if (!isAdjFactorEnabled()) {
                         // ETF 复权因子是可灰度关闭的功能。禁用时返回标准 JSON，
