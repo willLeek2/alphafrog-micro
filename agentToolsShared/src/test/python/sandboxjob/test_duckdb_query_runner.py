@@ -204,6 +204,12 @@ check("gate rejects big inner sort via estimated-rows cap", ok, detail)
 # （比估计行数规则先触发，给出可操作的 PLAN_FULL_SCAN）。
 ok, detail = gate_expect_reject(con2, "SELECT * FROM t2", spec_two, "PLAN_FULL_SCAN")
 check("gate rejects unbounded dump via top-output rule (300k>100)", ok, detail)
+# 顶层规则对过滤查询不拦（「无过滤全表扫描」的关键在「整表」）：大表过滤后放行——
+# Parquet 的过滤下推进扫描框（内嵌 Filters 键），CSV 的过滤是独立 FILTER 算子，两个信号都算数。
+ok, _report = runner.gate(con2, "SELECT * FROM t2 WHERE id < 100", "INTERACTIVE", spec_two)
+check("gate passes filtered big scan (parquet in-scan Filters)", ok)
+ok, _report = runner.gate(con2, "SELECT * FROM t1 WHERE id < 10", "INTERACTIVE", spec_two)
+check("gate passes filtered small scan (csv FILTER operator)", ok)
 # 顶层白名单：聚合顶层直接放行（count(*) 在 Parquet 上甚至是元数据扫描）。
 ok, _report = runner.gate(con2, "SELECT count(*) FROM t2", "INTERACTIVE", spec_two)
 check("gate passes count(*) (aggregate top whitelisted)", ok)
@@ -228,7 +234,7 @@ check("gate falls back to legacy cap when estimated_row_cap absent (300k>200k)",
 # ---------- 固定用例集（错拒率统计：每次改动必跑，验收以此为准） ----------
 # 标签按最终口径：结构规则专用码优先（笛卡尔积、无界排序），规模规则在后
 # （顶层输出规模 PLAN_FULL_SCAN -> 各算子估计行数对照档位上限）。
-# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于基线 0/12，
+# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于基线 0/13，
 # 漏放（应拒被放）必须为 0。基线数字见 C4 验收说明。
 mid_csv = MOUNT / "mid.csv"
 duckdb.execute(
@@ -253,7 +259,7 @@ CASE_SET = [
     ("recursive_cte", "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r WHERE x < 500) SELECT count(*) FROM r", "I", "放", None, "聚合顶层；慢归超时管不归准入管"),
     ("derived_small_inner_sort", "SELECT * FROM (SELECT * FROM t1 WHERE id < 50 ORDER BY id) sub ORDER BY id LIMIT 5", "I", "放", None, "TOP_N 祖先 + 小内层"),
     ("big_unfiltered_dump", "SELECT * FROM t2", "I", "拒", "PLAN_FULL_SCAN", "顶层 READ_PARQUET 估计 300k > 100"),
-    ("parquet_filtered_big", "SELECT * FROM t2 WHERE id < 100", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 60k > 100（估计偏高的错拒，验收量化）"),
+    ("parquet_filtered_big", "SELECT * FROM t2 WHERE id < 100", "I", "放", None, "计划级过滤信号（扫描框内嵌 Filters 键）；过滤查询顶层规则不拦"),
     ("csv_unbounded_dump", "SELECT * FROM t1", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 ~103 > 100"),
     ("window_unbounded", "SELECT id, row_number() OVER (ORDER BY id) rn FROM t1", "I", "拒", "PLAN_FULL_SCAN", "顶层 PROJECTION 估计 ~104 > 100"),
     ("mid_unbounded_dump", "SELECT * FROM t3", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 ~5k > 100（估计行数规则不拒，顶层规则独立价值）"),
@@ -282,7 +288,7 @@ for name, sql, tier, expect, expect_code, rule in CASE_SET:
         case_ok, detail = gate_expect_reject(case_con, sql, case_spec, expect_code)
         check(f"case {name} ({rule})", case_ok, detail)
         case_false_allow += 0 if case_ok else 1
-check("case-set false-reject rate at baseline (0/12)", case_false_reject == 0,
+check("case-set false-reject rate at baseline (0/13)", case_false_reject == 0,
       f"false_reject={case_false_reject}")
 check("case-set false-allow is zero", case_false_allow == 0, f"false_allow={case_false_allow}")
 case_con.close()

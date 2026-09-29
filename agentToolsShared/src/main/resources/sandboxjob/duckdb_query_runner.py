@@ -256,16 +256,20 @@ def gate(con, sql, tier, spec):
                             "查询包含无 LIMIT 的全局排序，准入拒绝；请加 LIMIT 做 Top-N",
                             report)
 
-    # 规模规则一：顶层输出规模。要回答的问题只有一个——这条查询最终会返回超过
-    # 返回行数上限的行吗？顶层是 LIMIT 类或聚合类算子直接放行；其余看顶层估计行数，
-    # 超过上限即拒；估计缺失且不在白名单同样拒（宁可错拒也不放过）。
+    # 规模规则一：顶层输出规模 + 无过滤，两个条件同时成立才拒。「无过滤全表扫描」
+    # 的关键在「整表」：过滤查询被截断仍语义正确（模型拿到的是过滤后的前 N 行），
+    # 整表直出被截断会误导模型（拿到的是表开头的任意前缀）。
+    # 「无过滤」是计划级判定，两个信号都要查（两种格式的过滤形态不同）：
+    # 独立 FILTER 算子节点（CSV），或扫描节点 extra_info 内嵌 Filters 键（Parquet 下推）。
     row_cap = int(limits["row_cap"])
+    plan_filtered = any(n.get("name") == "FILTER" for n in nodes) or any(
+        "Filters" in n.get("extra_info", {}) for n in nodes)
     for root in plan_tree:
         name = root.get("name", "")
         if _is_bounded_or_aggregate_top(name):
             continue
         estimated = _node_estimated_rows(root)
-        if estimated is None or estimated > row_cap:
+        if (estimated is None or estimated > row_cap) and not plan_filtered:
             report["checks"].append("top_output_over_row_cap")
             plan_reject("PLAN_FULL_SCAN",
                         f"查询顶层输出估计 {estimated if estimated is not None else '未知'} 行，"
