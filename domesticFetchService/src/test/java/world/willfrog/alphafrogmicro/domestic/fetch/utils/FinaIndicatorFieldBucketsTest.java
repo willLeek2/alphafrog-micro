@@ -52,5 +52,15 @@ class FinaIndicatorFieldBucketsTest {
         // some_future_field 是接口以后新增的字段——两者都不该被猜进某个语义桶
         assertEquals(FinaIndicatorFieldBuckets.Bucket.EXTENDED, FinaIndicatorFieldBuckets.classify("update_flag"));
         assertEquals(FinaIndicatorFieldBuckets.Bucket.EXTENDED, FinaIndicatorFieldBuckets.classify("some_future_field"));
+
+        // 七个非经营性损益构成字段：既不是营运/偿债/现金流，也不是资本结构，
+        // 按 022 迁移第 52 行的口径留 extended。钉在这里是因为它们紧挨着 ocf_* 家族，
+        // 容易被后来的人「顺手」塞进 capital_cash——而 capital_cash 已经有 ocf_to_or、
+        // salescash_to_or 这些真·现金流字段，塞进去以后按桶名取数的人会拿错语义。
+        for (String field : new String[]{"op_income", "opincome", "valuechange_income", "investincome",
+                "interst_income", "opincome_of_ebt", "investincome_of_ebt"}) {
+            assertEquals(FinaIndicatorFieldBuckets.Bucket.EXTENDED, FinaIndicatorFieldBuckets.classify(field),
+                    field + "（非经营性损益构成）应在 extended，不进 capital_cash");
+        }
     }
 }

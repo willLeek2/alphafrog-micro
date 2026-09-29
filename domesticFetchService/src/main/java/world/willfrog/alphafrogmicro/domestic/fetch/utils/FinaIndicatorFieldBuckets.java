@@ -20,10 +20,13 @@ import java.util.Set;
  * 新键自动落 extended。</p>
  *
  * <p>归属有歧义的字段本类不做判断，也不写死猜测：能明确归类的进集合，不能的留 extended。
- * 唯一被钉死的是 ⑥ 扣非ROE 与杜邦三组件要用的四个字段（{@code roe_dt}、
- * {@code netprofit_margin} 进 profitability；{@code assets_turn}、{@code assets_to_eqt} 进
- * capital_cash），它们由 {@code FinaIndicatorFieldBucketsTest} 逐个钉住——写侧分错桶，
- * ⑥ 就会读到空值，而且要到部署后才发现。</p>
+ * 两组字段由 {@code FinaIndicatorFieldBucketsTest} 逐个钉住：① ⑥ 扣非ROE 与杜邦三组件要用的
+ * 四个字段（{@code roe_dt}、{@code netprofit_margin} 进 profitability；{@code assets_turn}、
+ * {@code assets_to_eqt} 进 capital_cash）——写侧分错桶，⑥ 就会读到空值，而且要到部署后才发现；
+ * ② 七个非经营性损益构成字段（{@code op_income}、{@code opincome}、{@code valuechange_income}、
+ * {@code investincome}、{@code interst_income}、{@code opincome_of_ebt}、{@code investincome_of_ebt}）
+ * 留在 extended——它们既不是营运、偿债与现金流，也不是资本结构，硬塞进 capital_cash 会让
+ * 以后按桶名取数的人拿错语义。</p>
  */
 public final class FinaIndicatorFieldBuckets {
 
@@ -80,9 +83,7 @@ public final class FinaIndicatorFieldBuckets {
             "tangibleasset_to_debt", "tangasset_to_intdebt", "tangibleasset_to_netdebt",
             "invest_capital", "retained_earnings",
             // 现金流
-            "op_income", "opincome", "valuechange_income", "investincome", "interst_income", "daa",
-            "fcff", "fcfe", "capitalized_to_da",
-            "opincome_of_ebt", "investincome_of_ebt",
+            "daa", "fcff", "fcfe", "capitalized_to_da",
             "salescash_to_or", "ocf_to_or", "ocf_to_sales", "ocf_to_opincome", "ocf_to_profit",
             "ocf_to_shortdebt", "ocf_to_debt", "ocf_to_interestdebt", "ocf_to_netdebt",
             "cash_to_liqdebt", "cash_to_liqdebt_withinterest", "op_to_liqdebt", "op_to_debt"
