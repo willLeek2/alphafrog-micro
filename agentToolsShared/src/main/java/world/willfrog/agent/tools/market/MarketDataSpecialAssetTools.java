@@ -21,11 +21,12 @@ import java.util.Map;
  * A 股资产特色数据工具族的唯一生产实现（指标库扩充新工具）。
  *
  * <p>收可转债日线与 AH 比价两类小众资产数据：转债/AH 不属于股票/ETF/指数/场外基金
- * 四大资产类别，硬塞进既有日线工具会扭曲工具本意，经 frog 拍板单独开这一个特色数据
- * 工具整合（也是「不新增对外工具入口」限制的唯一例外）。</p>
+ * 四大资产类别，塞进既有日线工具会扭曲工具本意，因此单独用这一个特色数据工具承载
+ * （仅此一个工具收这两类资产）。</p>
  *
  * <p>与日线工具族同机制：数据集启用时整段序列写入 dataset（方法计算转债日收益/
- * 溢价率、AH 溢价需要整段序列），未启用时返回 20 行预览；数值缺值写 null 不写 0。</p>
+ * 溢价率、AH 溢价需要整段序列），未启用时返回 20 行预览；数值缺值写 null 不写 0。
+ * 返回与落盘行序不保证，需要顺序的使用方自行按 trade_date 排序。</p>
  */
 final class MarketDataSpecialAssetTools {
 
@@ -82,12 +83,12 @@ final class MarketDataSpecialAssetTools {
         }
     }
 
-    /** cb / convertible_bond → cb；ah / stk_ah → ah；其余（含空）→ null 表示非法。 */
+    /** cb / convertible_bond / cb_daily → cb；ah / stk_ah / stk_ah_comparison → ah；其余（含空）→ null 表示非法。 */
     private String normalizeAssetType(String assetType) {
         String raw = support.nvl(assetType).trim().toLowerCase();
         return switch (raw) {
-            case "cb", "convertible_bond" -> "cb";
-            case "ah", "stk_ah" -> "ah";
+            case "cb", "convertible_bond", "cb_daily" -> "cb";
+            case "ah", "stk_ah", "stk_ah_comparison" -> "ah";
             default -> null;
         };
     }

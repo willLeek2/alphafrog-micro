@@ -1,2 +1,2 @@
 查询场外基金净值序列。参数要求：tsCode 为基金代码；startDate/endDate 为 YYYYMMDD。不用于 ETF 场内日线回测。
-返回字段：nav_date（净值日期）、unit_nav（单位净值）、accum_nav（累计净值，未披露时为 null）、adj_nav（复权净值）。默认返回前 20 行预览；需要整段净值序列做区间收益等指标计算时，传 includeDataset=true，整段序列将写入数据集并返回 dataset_id（供后续分析复用），不传或 false 保持轻量预览。
+返回字段：nav_date（净值日期）、unit_nav（单位净值）、accum_nav（累计净值，未披露时为 null）、adj_nav（复权净值）。默认返回前 20 行预览；需要整段净值序列做区间收益等指标计算时，传 includeDataset=true，整段序列将写入数据集并返回 dataset_id（供后续分析复用），不传或 false 保持轻量预览。返回与数据集行序不保证，需要顺序时自行按 nav_date 排序。

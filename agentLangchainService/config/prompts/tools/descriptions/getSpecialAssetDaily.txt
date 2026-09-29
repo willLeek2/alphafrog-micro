@@ -8,7 +8,7 @@
 【返回字段】
   assetType=cb：ts_code、trade_date、pre_close、open、high、low、close、change、pct_chg、vol、amount、premium（溢价 JSON 字符串：bond_value 纯债价值、bond_over_rate 纯债溢价率、cb_value 转股价值、cb_over_rate 转股溢价率，接口给出的百分比）
   assetType=ah：ts_code、hk_code（H 股代码）、trade_date、close（A 股收盘）、hk_close（H 股收盘）、pct_chg、hk_pct_chg、ah_comparison（比价）、ah_premium（A/H 溢价 %）
-  数值缺失时为 null 不是 0；仅同时登录 A/H 两地的股票有 AH 比价数据。
+  数值缺失时为 null 不是 0；仅同时登录 A/H 两地的股票有 AH 比价数据。返回与数据集行序不保证，需要顺序时自行按 trade_date 排序。
 
 【数据机制】数据集启用时返回整段序列的 dataset_id（供指标计算复用），未启用时返回前 20 行预览（trade_date、close、premium 或 hk_close、ah_premium）。
 
