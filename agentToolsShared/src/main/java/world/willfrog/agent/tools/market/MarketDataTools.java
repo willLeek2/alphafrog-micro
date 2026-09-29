@@ -789,20 +789,20 @@ public class MarketDataTools {
     }
 
     @Tool
-    public String getOffExchangeAssetDaily(String tsCode, String startDate, String endDate) {
-        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, this)
-                .getOffExchangeAssetDaily(tsCode, startDate, endDate);
+    public String getOffExchangeAssetDaily(String tsCode, String startDate, String endDate, String includeDataset) {
+        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
+                .getOffExchangeAssetDaily(tsCode, startDate, endDate, includeDataset);
     }
 
     @Tool
     public String getEtfAdj(String tsCode, String startDate, String endDate) {
-        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, this)
+        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
                 .getEtfAdj(tsCode, startDate, endDate);
     }
 
     @Tool
     public String getListedAssetShareSize(String tsCode, String startDate, String endDate, String exchange) {
-        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, this)
+        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
                 .getListedAssetShareSize(tsCode, startDate, endDate, exchange);
     }
 

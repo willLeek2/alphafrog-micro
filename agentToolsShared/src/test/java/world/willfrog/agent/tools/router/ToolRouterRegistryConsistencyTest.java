@@ -150,7 +150,7 @@ class ToolRouterRegistryConsistencyTest {
         when(marketDataTools.isTradingDay(anyString(), anyString())).thenReturn(okJson("isTradingDay"));
         when(marketDataTools.getExchangeAssetDaily(anyString(), anyString(), anyString(), anyString(), anyString(), any(), any())).thenReturn(okJson("getExchangeAssetDaily"));
         when(marketDataTools.getExchangeAssetDailyAdvanced(any(), anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getExchangeAssetDaily"));
-        when(marketDataTools.getOffExchangeAssetDaily(anyString(), anyString(), anyString())).thenReturn(okJson("getOffExchangeAssetDaily"));
+        when(marketDataTools.getOffExchangeAssetDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getOffExchangeAssetDaily"));
         when(marketDataTools.getEtfAdj(anyString(), anyString(), anyString())).thenReturn(okJson("getEtfAdj"));
         when(marketDataTools.getListedAssetShareSize(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getListedAssetShareSize"));
         when(marketDataTools.getFinancialReport(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getFinancialReport"));
