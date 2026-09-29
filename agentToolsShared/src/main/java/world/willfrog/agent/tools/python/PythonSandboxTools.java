@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.tools.sandboxjob.SandboxToolJobLifecycle;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.ToolJobTransferException;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
@@ -924,69 +925,47 @@ public class PythonSandboxTools {
         // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
         ExecuteRequest request = withCapacityRequest(baseRequest, reservation, estimate, spec);
 
-        // 在调用 createTask 之前先构造完整 PREPARING anchor，覆盖 RPC 成败不确定窗口。
-        ToolJobAnchor anchor = new ToolJobAnchor();
-        // 版本 2 起，预估与名额预留必须同源、请求指纹必须一致；对不上就拒绝。旧数据只有版本 1 才能兼容处理。
-        anchor.setSchemaVersion(DATA_INTENSE_ANCHOR_SCHEMA_VERSION);
-        // 幂等操作身份与请求指纹用于启动恢复查询/重放。
-        anchor.setOperationId(identity.operationId());
-        anchor.setRequestFingerprint(spec.requestFingerprint());
-        anchor.setPythonRequestFingerprint(pythonRequestFingerprint);
-        // 新请求已经写了自己的数据库进度记录，上一轮终态后等待启动的修复阶段到此结束。
-        anchor.setPythonRepairPending(false);
-        anchor.setPythonRepairExhausted(false);
-        if (plan.repairContext() != null) {
-            anchor.setPythonRepairAttempt(plan.repairContext().repairAttempt());
-            anchor.setPythonFailedRequestFingerprints(plan.repairContext().failedRequestFingerprints());
-        }
-        anchor.setCanonicalCreateSpecJson(objectMapper.writeValueAsString(spec));
+        // 锚点组装与 PREPARING 抢占（四段持久第一段）已下沉到通用生命周期框架；
+        // 这里只补 executePython 自有字段（修复计数、finance 通道冻结快照）。
+        String canonicalSpecJson = objectMapper.writeValueAsString(spec);
         // createRequestJson 允许进程在 RPC 前后崩溃后重放同一 canonical 请求。
-        anchor.setCreateRequestJson(JsonFormat.printer()
-                .omittingInsignificantWhitespace().print(request));
-        // PREPARING 表示容量已占用，但 Sandbox taskId 尚未确认附着。
-        anchor.setAnchorState("PREPARING");
-        anchor.setToolCallId(toolCallId);
-        anchor.setToolName(ToolJobAnchor.EXECUTE_PYTHON_TOOL);
-        anchor.setAttempt(DATA_ANALYSIS_ATTEMPT);
-        // 保存当前 Todo 位置，后续 pipeline 完整 checkpoint 会补充已完成前缀。
-        anchor.setTodoId(AgentContext.getTodoId());
-        anchor.setSequence(AgentContext.getTodoSequence() == null ? 0 : AgentContext.getTodoSequence());
-        anchor.setRunDisposition(waitPolicy.runDisposition());
-        anchor.setAutoResume(waitPolicy.autoResume());
-        // reservation/estimate/dataset snapshot 都先写 anchor，确保旧 worker 退出前真相完整。
-        anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
-        anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
-        if (financeRecordChannelConfigLoader != null) {
-            anchor.setFinanceRecordLimitsJson(financeRecordChannelConfigLoader.frozenSnapshotJson());
-        }
-        anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
-        anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
-        // timeoutAt 和 nextPollAt 都写进了数据库，重启后不重新计时。
-        anchor.setTimeoutAt(Instant.now().plusMillis(spec.timeoutMillis()));
-        anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
-        if (!waitPolicy.durableSuspend()) {
-            // ownerId 在 JVM 生命周期内稳定；租约从第一次数据库抢占前开始计时。
-            anchor.setBlockingOwnerId(DagBlockingWorkerLease.processOwnerId());
-            anchor.setBlockingLeaseUntil(DagBlockingWorkerLease.renewedUntil(Instant.now()));
-        }
-
-        // 必须先 CAS 占有 anchor，再调用有副作用的 createTask。恢复 worker 的第二次长工具
-        // 不能走“空 anchor”路径：它必须用旧 LAUNCHING token/version 原子替换已消费 handoff。
-        String resumeToken = AgentContext.getToolJobResumeToken();
-        Long resumeLeaseVersion = AgentContext.getToolJobResumeLeaseVersion();
-        boolean preparingPersisted;
-        if (resumeToken != null && !resumeToken.isBlank()
-                && resumeLeaseVersion != null && resumeLeaseVersion > 0) {
-            preparingPersisted = pythonSandboxDispatchStore.persistPreparingFromResume(
-                    runId, anchor, resumeToken, resumeLeaseVersion);
-            if (preparingPersisted) {
-                // 旧 handoff 已被这一版 PREPARING 消费；同一 worker 后续同步工具回到普通空-anchor CAS。
-                AgentContext.clearToolJobResumeHandoff();
-            }
-        } else {
-            preparingPersisted = pythonSandboxDispatchStore.persistPreparing(runId, anchor);
-        }
-        if (!preparingPersisted) {
+        String createRequestJson = JsonFormat.printer()
+                .omittingInsignificantWhitespace().print(request);
+        SandboxToolJobLifecycle.PrepareDispatchResult dispatch = SandboxToolJobLifecycle.prepareDispatch(
+                pythonSandboxDispatchStore,
+                new SandboxToolJobLifecycle.PrepareDispatchRequest(
+                        runId,
+                        ToolJobAnchor.EXECUTE_PYTHON_TOOL,
+                        toolCallId,
+                        DATA_ANALYSIS_ATTEMPT,
+                        DATA_INTENSE_ANCHOR_SCHEMA_VERSION,
+                        identity.operationId(),
+                        spec.requestFingerprint(),
+                        canonicalSpecJson,
+                        createRequestJson,
+                        waitPolicy.runDisposition(),
+                        waitPolicy.autoResume(),
+                        waitPolicy.durableSuspend(),
+                        objectMapper.writeValueAsString(reservation),
+                        objectMapper.writeValueAsString(estimate),
+                        objectMapper.writeValueAsString(datasetSnapshot),
+                        datasetSnapshot.immutableDigest(),
+                        spec.timeoutMillis(),
+                        POLL_INTERVAL_MS),
+                extras -> {
+                    extras.setPythonRequestFingerprint(pythonRequestFingerprint);
+                    // 新请求已经写了自己的数据库进度记录，上一轮终态后等待启动的修复阶段到此结束。
+                    extras.setPythonRepairPending(false);
+                    extras.setPythonRepairExhausted(false);
+                    if (plan.repairContext() != null) {
+                        extras.setPythonRepairAttempt(plan.repairContext().repairAttempt());
+                        extras.setPythonFailedRequestFingerprints(plan.repairContext().failedRequestFingerprints());
+                    }
+                    if (financeRecordChannelConfigLoader != null) {
+                        extras.setFinanceRecordLimitsJson(financeRecordChannelConfigLoader.frozenSnapshotJson());
+                    }
+                });
+        if (!dispatch.persisted()) {
             // 未取得 anchor owner 时释放尚未转交的容量。
             releasePreDispatch(reservation);
             // retryable=false：进度记录被别的流程占用时，同一 Run 内立刻重试必然再次失败
@@ -995,6 +974,7 @@ public class PythonSandboxTools {
                     "Failed to persist PREPARING tool-job anchor",
                     Map.of("operation_id", identity.operationId(), "retryable", false));
         }
+        ToolJobAnchor anchor = dispatch.anchor();
         hitFaultPoint(runId, ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT);
 
         /*
