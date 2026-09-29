@@ -28,6 +28,28 @@ public final class SandboxJobAdapterRegistry {
         }
     }
 
+    /**
+     * Spring 多上下文场景的登记：同一 JVM 里第二个上下文会构造出另一束实例。
+     * 同名且四个适配器类完全相同时保留先来者（接线等价），否则按重复登记失败。
+     */
+    public static synchronized void registerEquivalent(SandboxJobAdapters adapters) {
+        SandboxJobAdapters existing = ADAPTERS.get(adapters.toolName());
+        if (existing == null) {
+            register(adapters);
+            return;
+        }
+        if (existing == adapters) {
+            return;
+        }
+        boolean equivalent = existing.request().getClass() == adapters.request().getClass()
+                && existing.runner().getClass() == adapters.runner().getClass()
+                && existing.result().getClass() == adapters.result().getClass()
+                && existing.metering().getClass() == adapters.metering().getClass();
+        if (!equivalent) {
+            throw new IllegalStateException("工具 " + adapters.toolName() + " 的适配器束被重复登记");
+        }
+    }
+
     public static Optional<SandboxJobAdapters> find(String toolName) {
         if (toolName == null || toolName.isBlank()) {
             return Optional.empty();

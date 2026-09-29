@@ -8,7 +8,7 @@ package world.willfrog.agent.tools.sandboxjob;
  */
 public record SandboxJobAdapters(
         SandboxJobRequestAdapter<?> request,
-        SandboxJobRunnerAdapter<?, ?> runner,
+        SandboxJobRunnerAdapter<?, ?, ?> runner,
         SandboxJobResultAdapter result,
         SandboxJobMeteringAdapter metering) {
 

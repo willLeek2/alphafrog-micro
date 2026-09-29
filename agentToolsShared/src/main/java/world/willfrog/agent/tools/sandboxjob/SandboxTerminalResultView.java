@@ -13,6 +13,9 @@ package world.willfrog.agent.tools.sandboxjob;
  * @param resultJson      结构化结果 JSON（没有结构化结果时为 null）
  * @param usageJson       资源用量 JSON（cpuMillis、memoryPeakBytes 等键的原始映射，没有则为 null）
  * @param errorDetail     沙箱侧错误详情（没有则为 null）
+ * @param retryable       沙箱明示的「可重试」标记；响应没带这个字段时为 null（语义等同 proto presence）
+ * @param rawRef          原始结果引用（如沙箱产物目录）；没有则为 null
+ * @param nativePayload   工具原生终态响应对象，框架不透明、只透传给工具的终态副作用钩子
  */
 public record SandboxTerminalResultView(
         String statusName,
@@ -21,7 +24,10 @@ public record SandboxTerminalResultView(
         String stderr,
         String resultJson,
         String usageJson,
-        String errorDetail) {
+        String errorDetail,
+        Boolean retryable,
+        String rawRef,
+        Object nativePayload) {
 
     public boolean succeeded() {
         return "SUCCEEDED".equals(statusName);

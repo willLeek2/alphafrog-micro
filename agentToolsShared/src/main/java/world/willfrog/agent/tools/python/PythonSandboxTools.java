@@ -2,28 +2,30 @@ package world.willfrog.agent.tools.python;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
-import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
+import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
 import world.willfrog.agent.tools.sandboxjob.SandboxToolJobLifecycle;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.exception.ToolJobTransferException;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionRequest;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionResult;
 import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
 import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
-import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
-import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
@@ -36,7 +38,6 @@ import world.willfrog.alphafrogmicro.sandbox.idl.*;
 import com.google.protobuf.util.JsonFormat;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -45,7 +46,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -147,6 +147,76 @@ public class PythonSandboxTools {
         this.objectMapper = objectMapper;
         this.metadataReader = new DatasetEntryMetadataReader(objectMapper);
         this.financeToolResultFormatter = new FinanceToolResultFormatter(objectMapper);
+    }
+
+    // ==================== 适配器装配（生命周期框架的四个出口） ====================
+
+    private volatile SandboxJobObservability observability;
+    private volatile SandboxJobAdapters sandboxJobAdapters;
+
+    /** 观测出口惰性组装：optional 注入字段在构造后才就绪，首次使用时定格。 */
+    private SandboxJobObservability observability() {
+        SandboxJobObservability current = observability;
+        if (current == null) {
+            current = new SandboxJobObservability(debugObservabilityService);
+            observability = current;
+        }
+        return current;
+    }
+
+    /** 适配器束惰性组装：请求/运行器/结果/计量四个出口，框架按工具名协作。 */
+    private SandboxJobAdapters sandboxJobAdapters() {
+        SandboxJobAdapters current = sandboxJobAdapters;
+        if (current == null) {
+            synchronized (this) {
+                current = sandboxJobAdapters;
+                if (current == null) {
+                    current = new SandboxJobAdapters(
+                            new PythonSandboxJobRequestAdapter(),
+                            new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
+                            new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter),
+                            new PythonSandboxJobMeteringAdapter(objectMapper));
+                    sandboxJobAdapters = current;
+                }
+            }
+        }
+        return current;
+    }
+
+    private PythonSandboxJobRequestAdapter requestAdapter() {
+        return (PythonSandboxJobRequestAdapter) sandboxJobAdapters().request();
+    }
+
+    private PythonSandboxJobRunnerAdapter runnerAdapter() {
+        return (PythonSandboxJobRunnerAdapter) sandboxJobAdapters().runner();
+    }
+
+    private PythonSandboxJobResultAdapter resultAdapter() {
+        return (PythonSandboxJobResultAdapter) sandboxJobAdapters().result();
+    }
+
+    private PythonSandboxJobMeteringAdapter meteringAdapter() {
+        return (PythonSandboxJobMeteringAdapter) sandboxJobAdapters().metering();
+    }
+
+    /** Spring 装配完成后把适配器束登记进注册表；不走 Spring 的单元测试注册表保持为空。 */
+    @PostConstruct
+    void registerSandboxJobAdapters() {
+        SandboxJobAdapterRegistry.registerEquivalent(sandboxJobAdapters());
+    }
+
+    /** 生命周期框架的共享依赖束：每次调用现组，字段的可空语义与既有 null 检查一致。 */
+    private SandboxToolJobLifecycle.LifecycleDeps lifecycleDeps() {
+        return new SandboxToolJobLifecycle.LifecycleDeps(
+                pythonSandboxDispatchStore, dataAnalysisCapacityService, dataAnalysisTerminalRecorder,
+                waitGroupStore, toolJobFaultInjector, observability(), objectMapper,
+                POLL_INTERVAL_MS, DAG_LEASE_RENEW_AHEAD_MILLIS, fastPathMs);
+    }
+
+    /** finance 记录通道是 executePython 的自有终态副作用；框架在结果格式化前回调这里。 */
+    private SandboxToolJobLifecycle.TerminalSideEffect terminalSideEffect() {
+        return (runId, identity, anchor, view) -> processFinanceResult(
+                runId, identity, anchor, view.statusName(), (TaskResultResponse) view.nativePayload());
     }
 
     /**
@@ -610,41 +680,14 @@ public class PythonSandboxTools {
         return new CapacityPlan(estimate, decision, spec, pythonRequestFingerprint, repairContext);
     }
 
-    /** 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。 */
-    private static ExecuteRequest withCapacityRequest(ExecuteRequest baseRequest,
-                                                      DataAnalysisReservation reservation,
-                                                      DataAnalysisEstimate estimate,
-                                                      CanonicalSandboxCreateSpec spec) {
-        return baseRequest.toBuilder()
-                .setResourceClass(reservation.resourceClass().name())
-                .setEstimatedRows(estimate.estimatedRows())
-                .setEstimatedBytes(estimate.estimatedBytes())
-                .setFileCount(estimate.fileCount())
-                .setCapacityUnits(estimate.capacityUnits())
-                .setOperationId(spec.operationId())
-                .setRequestFingerprint(spec.requestFingerprint())
-                .setMemoryLimitBytes(spec.memoryLimitBytes())
-                .setTimeoutMillis(spec.timeoutMillis())
-                .setRuntimeEnvironmentVersion(spec.runtimeEnvironmentVersion())
-                .setCanonicalSpecSchemaVersion(spec.schemaVersion())
-                .setCodeHash(spec.codeHash())
-                .setImmutableDatasetSnapshotDigest(spec.immutableDatasetSnapshotDigest())
-                .setLibrariesDigest(spec.librariesDigest())
-                .setSandboxOptionsDigest(spec.sandboxOptionsDigest())
-                .build();
-    }
-
     // ==================== 等待成员：建后台任务并把派发证明交出去 ====================
 
     /**
      * 新调度器版本上的一次 {@code executePython}：把这次调用建成沙箱后台任务，然后立刻交出去。
      *
-     * <p>与旧路径的差别都在「事实写在哪」：旧路径把任务凭证、名额预留与运行状态写进一条 Run 级的
-     * 长工具进度记录，一条 Run 同时只放得下一个；这里把同样的事实装进派发证明，由派发器写进这个
-     * 成员自己的行。这次调用也从不等待结果——建好任务就抛出挂起信号，当前线程把节点执行名额交还。</p>
-     *
-     * <p>返回字符串时表示这次调用当场就结束了，内容是给模型看的失败文本（{@code ok=false} 的 JSON）；
-     * 建好任务、或建任务结果还不明确时用挂起信号返回，不走这里。</p>
+     * <p>名额预留之后的编排（创建证明落库、幂等创建、取消墓碑与派发证明移交）已下沉到
+     * {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}；这里只保留工具自有的
+     * 接线检查、成员身份比对与容量事实冻结（planCapacity）。</p>
      */
     private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       AgentRunDatasetSnapshot datasetSnapshot,
@@ -681,190 +724,12 @@ public class PythonSandboxTools {
         } catch (DataIntenseRefusal refusal) {
             return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
         }
-        DataAnalysisReservation reservation;
-        try {
-            reservation = dataAnalysisCapacityService.reserve(identity, plan.estimate());
-        } catch (CapacityAdmissionException admission) {
-            String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
-                    ? "DATA_ANALYSIS_TASK_TOO_LARGE"
-                    : "DATA_ANALYSIS_SERVER_BUSY";
-            return fail("executePython", code, admission.getMessage(), Map.of("retryable",
-                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
-        }
-        // 取消与外部 createTask 之间需要一份已经落库的请求指纹。若取消先赢，
-        // 成员已不再待派发，不能继续创建一个无人负责的 Sandbox 任务。
-        boolean preparingRecorded = false;
-        try {
-            WaitMemberDispatchProof preparingProof = proofForWaitGroup(plan, reservation, null);
-            preparingRecorded = waitGroupStore != null && waitGroupStore.recordMemberPreparing(
-                    member.groupId(), member.memberIdentity(), identity.operationId(),
-                    preparingProof.toJson(objectMapper));
-        } catch (RuntimeException persistenceFailure) {
-            log.warn("Sandbox 创建前未能保存成员身份：{}", member.describe(), persistenceFailure);
-        }
-        if (!preparingRecorded) {
-            // 预留只存在于本进程的容量账本中；尚未持久化创建证明，也没有发起外部请求。
-            // 包括构造证明时的异常在内，都必须把这份本地预留归还。进程在此处退出时账本随进程消失。
-            if (!releasePreDispatch(reservation)) {
-                log.error("成员创建证明未落库，且本地预留归还失败：{} reservation={}",
-                        member.describe(), reservation.reservationId());
-                return fail("executePython", "WAIT_GROUP_PREPARING_RELEASE_FAILED",
-                        "Sandbox request identity could not be saved and local capacity could not be released",
-                        Map.of());
-            }
-            return fail("executePython", "WAIT_GROUP_PREPARING_NOT_RECORDED",
-                    "Sandbox request identity could not be saved before dispatch", Map.of());
-        }
-        ExecuteRequest request = withCapacityRequest(baseRequest, reservation, plan.estimate(), plan.spec());
-        long createStartMs = System.currentTimeMillis();
-        CreateVerdict verdict;
-        try {
-            installDebugRpcAttachments();
-            verdict = verdictOf(pythonSandboxService.createTask(request), plan.spec());
-        } catch (Exception createFailure) {
-            verdict = verdictOf(createFailure, plan.spec());
-        }
-        if (verdict instanceof CreateVerdict.Absent absent) {
-            // 即使当前回查不存在，原 create RPC 仍可能迟到；接收侧会先写稳定取消墓碑，
-            // 再按 Sandbox 的真实取消终态结算容量与用量。
-            log.info("成员创建当前未找到，交给结果接收侧写取消墓碑并收尾：{} 原因={}",
-                    member.describe(), absent.detail());
-            throw pendingForWaitGroup(member, plan, reservation, null);
-        }
-        if (verdict instanceof CreateVerdict.Unknown unknown) {
-            // 还没有结论：名额留着，成员照样按执行中记，由结果接收侧按外部作业身份回查。
-            // 这条路上既不能释放名额，也不能把成员记成失败——两种做法都会让一个可能真实存在的
-            // 后台任务无人负责。
-            log.warn("成员建任务的结果还没被证实，先按执行中记，由结果接收侧回查：{} 原因={}",
-                    member.describe(), unknown.detail());
-            throw pendingForWaitGroup(member, plan, reservation, null);
-        }
-        String taskId = ((CreateVerdict.Confirmed) verdict).taskId();
-        // 任务编号与 canonical 指纹都确认之后，名额凭证从「准备中」改成绑在这个任务上。
-        DataAnalysisReservation attached = transitionReservation(
-                reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
-        // 容量账本必须接受同一份名额的附着状态，这道检查与旧路径一致。账本不接受时不能当成派发失败：
-        // 沙箱任务已经真实存在，把这次调用记成失败就再也没人认领它。所以证明照写、成员照转后台，
-        // 冲突只留在日志里，由结果接收侧按证明收尾时再遇到。
-        if (dataAnalysisCapacityService.restoreReservation(attached) == DataAnalysisRestoreOutcome.CONFLICT) {
-            log.error("等待成员的名额附着被容量账本拒绝，仍按执行中记：{} taskId={}",
-                    member.describe(), taskId);
-        }
-        emitSandboxEvent("sandbox_create_task", Map.of(
-                "durationMs", System.currentTimeMillis() - createStartMs,
-                "status", "OK",
-                "taskId", taskId,
-                "operationId", identity.operationId()));
-        throw pendingForWaitGroup(member, plan, attached, taskId);
-    }
-
-    /** 建沙箱任务的三种结论。 */
-    private sealed interface CreateVerdict {
-
-        /** 已经确认这个后台任务属于这次调用。 */
-        record Confirmed(String taskId) implements CreateVerdict {
-        }
-
-        /** 权威答复说这次调用没有建出任务。 */
-        record Absent(String detail) implements CreateVerdict {
-        }
-
-        /** 还没有结论：既没有确认，也没有「没建出来」的证明。 */
-        record Unknown(String detail) implements CreateVerdict {
-        }
-    }
-
-    /**
-     * 读建任务响应：确认、没建出来，还是还没有结论。
-     *
-     * <p>响应里的 canonical 指纹是任务编号的身份凭据。错误、空响应或身份不全时按稳定的
-     * operationId 回读；有响应任务号时还必须与回读一致，指纹也必须精确且非空。</p>
-     */
-    private CreateVerdict verdictOf(ExecuteResponse createResp, CanonicalSandboxCreateSpec spec) {
-        String taskId = createResp == null ? "" : createResp.getTaskId();
-        if (createResp != null && createResp.getError().isBlank()
-                && !createResp.hasErrorDetail() && !taskId.isBlank()
-                && !createResp.getRequestFingerprint().isBlank()
-                && spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
-            return new CreateVerdict.Confirmed(taskId);
-        }
-        return lookupCreateVerdict(spec, taskId,
-                createResp == null ? "empty create response" : nvl(createResp.getError()));
-    }
-
-    /**
-     * 建任务抛异常时的三种判定。
-     *
-     * <p>RPC 抛异常不代表服务端没建：先按外部作业身份回读。只有权威答复「没找到、且查询本身没有
-     * 报错」才能当成没建出来；查询也失败时保留名额，留给结果接收侧继续回查。</p>
-     */
-    private CreateVerdict verdictOf(Exception createFailure, CanonicalSandboxCreateSpec spec) {
-        return lookupCreateVerdict(spec, "", nvl(createFailure.getMessage()));
-    }
-
-    private CreateVerdict lookupCreateVerdict(CanonicalSandboxCreateSpec spec,
-                                               String responseTaskId,
-                                               String detail) {
-        GetTaskByOperationIdResponse lookup;
-        try {
-            lookup = pythonSandboxService.getTaskByOperationId(GetTaskByOperationIdRequest.newBuilder()
-                    .setOperationId(spec.operationId()).build());
-        } catch (Exception lookupFailure) {
-            log.warn("沙箱建任务结果回读失败：operationId={}", spec.operationId(), lookupFailure);
-            return new CreateVerdict.Unknown("operation lookup failed: " + detail);
-        }
-        if (lookup != null && lookup.getError().isBlank() && !lookup.hasErrorDetail()
-                && lookup.getFound() && !lookup.getTaskId().isBlank()
-                && !lookup.getRequestFingerprint().isBlank()
-                && spec.requestFingerprint().equals(lookup.getRequestFingerprint())
-                && (responseTaskId.isBlank() || responseTaskId.equals(lookup.getTaskId()))) {
-            return new CreateVerdict.Confirmed(lookup.getTaskId());
-        }
-        if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()
-                && !lookup.hasErrorDetail() && lookup.getTaskId().isBlank()
-                && lookup.getRequestFingerprint().isBlank() && responseTaskId.isBlank()) {
-            return new CreateVerdict.Absent(detail);
-        }
-        return new CreateVerdict.Unknown("create outcome is ambiguous");
-    }
-
-    /**
-     * 把这次后台作业整理成挂起信号：证明里带上 canonical 规格、预估值、名额凭证与任务编号。
-     *
-     * <p>这些事实是结果接收侧收尾的全部依据，所以在这里一次拼完整再带出去。任务编号为空表示
-     * 建任务的结果还没有被证实。</p>
-     */
-    private WaitGroupMemberPendingException pendingForWaitGroup(
-            WaitGroupMemberExecutionContext.Snapshot member,
-            CapacityPlan plan,
-            DataAnalysisReservation reservation,
-            String taskId) {
-        WaitMemberDispatchProof proof = proofForWaitGroup(plan, reservation, taskId);
-        return new WaitGroupMemberPendingException(proof,
-                "wait group member dispatched: " + member.describe());
-    }
-
-    private WaitMemberDispatchProof proofForWaitGroup(CapacityPlan plan,
-                                                     DataAnalysisReservation reservation,
-                                                     String taskId) {
-        return new WaitMemberDispatchProof(
-                WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
-                reservation.identity().operationId(),
-                taskId,
-                plan.spec().requestFingerprint(),
-                toJsonOrThrow("canonical 请求规格", plan.spec()),
-                toJsonOrThrow("预估值", plan.estimate()),
-                toJsonOrThrow("名额预留凭证", reservation),
-                Instant.now().toString());
-    }
-
-    /** 序列化不成功就抛错：写不出派发证明时宁可让这次调用失败，也不能交出一份不完整的证明。 */
-    private String toJsonOrThrow(String what, Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            throw new IllegalStateException(what + "写不成 JSON", e);
-        }
+        return SandboxToolJobLifecycle.dispatchWaitGroupMember(
+                lifecycleDeps(),
+                new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
+                        member, identity, plan.spec(), plan.estimate(), baseRequest,
+                        requestAdapter(), runnerAdapter(),
+                        ToolJobAnchor.EXECUTE_PYTHON_TOOL, toolStartMs));
     }
 
     private String executeDataIntense(
@@ -923,7 +788,7 @@ public class PythonSandboxTools {
         }
 
         // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
-        ExecuteRequest request = withCapacityRequest(baseRequest, reservation, estimate, spec);
+        ExecuteRequest request = requestAdapter().enrichWithCapacity(baseRequest, reservation, estimate, spec);
 
         // 锚点组装与 PREPARING 抢占（四段持久第一段）已下沉到通用生命周期框架；
         // 这里只补 executePython 自有字段（修复计数、finance 通道冻结快照）。
@@ -967,7 +832,7 @@ public class PythonSandboxTools {
                 });
         if (!dispatch.persisted()) {
             // 未取得 anchor owner 时释放尚未转交的容量。
-            releasePreDispatch(reservation);
+            SandboxToolJobLifecycle.releasePreDispatch(lifecycleDeps(), reservation);
             // retryable=false：进度记录被别的流程占用时，同一 Run 内立刻重试必然再次失败
             // （曾有模型无停止信号连试 7 次烧完 480 秒的先例），所以直接告诉模型不可重试。
             return fail("executePython", "TOOL_JOB_ANCHOR_INVALID",
@@ -981,202 +846,37 @@ public class PythonSandboxTools {
          * 从数据库里的 PREPARING（准备中）抢占成功开始，DAG 线程的任何异常退场都必须先移交
          * 负责者。局部路径负责更精确的 abort/poll 分类；这里的外层备用路径覆盖序列化、
          * 名额恢复、persistAttached 以及 create 身份不确定等未被局部 catch 的异常。
+         *
+         * 创建裁决、墓碑、ATTACHED 持久化与两种等待策略的轮询都已下沉到通用生命周期框架，
+         * executePython 只提供四个适配器与 finance 终态副作用。
          */
+        SandboxToolJobLifecycle.LifecycleDeps deps = lifecycleDeps();
         try {
-            // createResp 可能来自首次 RPC，也可能来自 operationId 灾后查询。
-            ExecuteResponse createResp;
-            try {
-                installDebugRpcAttachments();
-                // Sandbox 必须按 operationId/requestFingerprint 幂等创建。
-                createResp = pythonSandboxService.createTask(request);
-            } catch (Exception createFailure) {
-                try {
-                    // RPC 异常不代表服务端未创建；先按 operationId 查找，禁止立即重建第二任务。
-                    GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
-                            GetTaskByOperationIdRequest.newBuilder()
-                                    .setOperationId(identity.operationId()).build());
-                    if (lookup != null && lookup.getFound()
-                            && !lookup.getTaskId().isBlank()
-                            && !lookup.getRequestFingerprint().isBlank()
-                            && spec.requestFingerprint().equals(lookup.getRequestFingerprint())) {
-                        // canonical operation 必须返回完全相同且非空的 fingerprint，才能附着已有任务。
-                        createResp = ExecuteResponse.newBuilder()
-                                .setTaskId(lookup.getTaskId())
-                                .setRequestFingerprint(spec.requestFingerprint())
-                                .build();
-                    } else if (lookup != null && !lookup.getFound()
-                            && lookup.getError().isBlank()) {
-                        if (!waitPolicy.durableSuspend()) {
-                            if (!renewDagBlockingLease(runId, anchor, true)) {
-                                return dagBlockingLeaseLost(
-                                        null, toolStartMs,
-                                        "DAG worker lost its lease before canceling an uncertain create");
-                            }
-                        }
-                        // 查到暂时不存在也不能释放名额：迟到的 create RPC 仍可能到达。
-                        // 先用同一 operation/fingerprint 写取消墓碑，取得稳定 taskId，
-                        // 再像普通 Sandbox 任务一样接收终态并释放容量。
-                        log.warn("DAG Sandbox create response lost and lookup absent; preserving capacity "
-                                        + "until cancellation tombstone: runId={} operationId={}",
-                                runId, identity.operationId());
-                        createResp = tombstoneCreateUncertain(
-                                identity.operationId(), spec.requestFingerprint(), "");
-                    } else {
-                        // 查询也无法证明结果时保留 PREPARING，交给 startup recovery 决定，不能猜测释放。
-                        throw new IllegalStateException(
-                                "createTask outcome is ambiguous; PREPARING anchor retained", createFailure);
-                    }
-                } catch (Exception lookupFailure) {
-                    if (lookupFailure != createFailure) {
-                        createFailure.addSuppressed(lookupFailure);
-                    }
-                    throw createFailure;
-                }
+            SandboxToolJobLifecycle.AttachOutcome attachOutcome = SandboxToolJobLifecycle.attachAfterCreate(
+                    deps,
+                    new SandboxToolJobLifecycle.AttachAfterCreateRequest<>(
+                            runId, identity, spec, request, runnerAdapter(),
+                            reservation, estimate, anchor,
+                            waitPolicy.durableSuspend(), toolStartMs));
+            if (attachOutcome instanceof SandboxToolJobLifecycle.AttachOutcome.FailureText failureText) {
+                return failureText.text();
             }
-            // 无效响应也不能直接释放 PREPARING；按外部作业身份写墓碑并接回终态。
-            if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
-                    || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
-                if (!waitPolicy.durableSuspend()) {
-                    if (!renewDagBlockingLease(runId, anchor, true)) {
-                        return dagBlockingLeaseLost(
-                                null, toolStartMs,
-                                "DAG worker lost its lease before canceling an uncertain create");
-                    }
-                }
-                log.warn("DAG Sandbox create response unverified; preserving capacity "
-                                + "until cancellation tombstone: runId={} operationId={}",
-                        runId, identity.operationId());
-                createResp = tombstoneCreateUncertain(identity.operationId(),
-                        spec.requestFingerprint(), createResp == null ? "" : nvl(createResp.getTaskId()));
-            }
-            String taskId = createResp.getTaskId();
-            /*
-             * create 响应里的 canonical fingerprint 是 taskId 的身份凭据，不是可选诊断字段。
-             * 直接响应若为空或漂移，必须先用 operationId 做一次权威回读；只有同 taskId、精确且
-             * 非空的 fingerprint 才允许 PREPARING→ATTACHED。查询错误、未找到、taskId 漂移
-             * 都保留 PREPARING，严禁转普通 PENDING 后让 reconciler 消费未验证任务。
-             */
-            if (createResp.getRequestFingerprint().isBlank()
-                    || !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
-                GetTaskByOperationIdResponse lookup = null;
-                try {
-                    lookup = pythonSandboxService.getTaskByOperationId(
-                            GetTaskByOperationIdRequest.newBuilder()
-                                    .setOperationId(identity.operationId()).build());
-                } catch (Exception lookupFailure) {
-                    log.error("Sandbox create identity lookup failed for run={}, operationId={}, taskId={}",
-                            runId, identity.operationId(), taskId, lookupFailure);
-                }
-                boolean canonicalIdentityConfirmed = lookup != null
-                        && lookup.getFound()
-                        && taskId.equals(lookup.getTaskId())
-                        && !lookup.getRequestFingerprint().isBlank()
-                        && spec.requestFingerprint().equals(lookup.getRequestFingerprint());
-                if (!canonicalIdentityConfirmed) {
-                    log.error("Sandbox create identity unverified for run={}, operationId={}, taskId={}; "
-                                    + "PREPARING anchor retained for fail-closed recovery",
-                            runId, identity.operationId(), taskId);
-                    throw new IllegalStateException(
-                            "createTask identity is unverified; PREPARING anchor retained");
-                }
-            }
-
-            // 这个检查点位于 Sandbox 已确认接受、taskId 尚未写回 Agent 数据库的精确窗口。
-            hitFaultPoint(runId, ToolJobFaultInjector.AFTER_SANDBOX_ACCEPTED);
-
-            // taskId 与 canonical fingerprint 同时确认后，才把 reservation 转为 TASK_ATTACHED。
-            reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
-            /*
-             * 先生成完整 ATTACHED 快照，再改变本地 anchor；序列化失败时 outer fallback
-             * 仍以 PREPARING 做 operationId recovery，成功后则 capacity 异常也携带 task proof。
-             */
-            String attachedReservationJson = objectMapper.writeValueAsString(reservation);
-            anchor.setTaskId(taskId);
-            anchor.setAnchorState("ATTACHED");
-            anchor.setReservationJson(attachedReservationJson);
-            // 容量账本必须接受同一 reservation 的附着状态，冲突时停止推进。
-            if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
-                throw new IllegalStateException("capacity reservation attachment conflicted for task=" + taskId);
-            }
-            // taskId、ATTACHED 和名额状态一起写进数据库进度记录。
-            if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
-                if (!waitPolicy.durableSuspend()) {
-                    return dagBlockingLeaseLost(
-                            taskId, toolStartMs, "attach CAS rejected the live DAG owner");
-                }
-                throw new IllegalStateException("failed to persist attached Sandbox task");
-            }
+            SandboxToolJobLifecycle.AttachOutcome.Attached attached =
+                    (SandboxToolJobLifecycle.AttachOutcome.Attached) attachOutcome;
+            String taskId = attached.taskId();
+            reservation = attached.reservation();
 
             // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
-            long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);
-            while (System.currentTimeMillis() < fastDeadline) {
-                // 状态查询短而轻量，终态时再拉取结果体。
-                TaskStatusResponse statusResp;
-                try {
-                    if (!waitPolicy.durableSuspend()
-                            && !renewDagBlockingLease(runId, anchor, false)) {
-                        return dagBlockingLeaseLost(
-                                taskId, toolStartMs, "lease renewal was rejected before fast-path poll");
-                    }
-                    statusResp = getTaskStatus(taskId);
-                } catch (Exception pollFailure) {
-                    if (!waitPolicy.durableSuspend()) {
-                        return promoteDagBlockingFailure(
-                                runId,
-                                anchor,
-                                "DAG_BLOCKING_POLL_FAILED",
-                                "DAG Sandbox status polling failed",
-                                toolStartMs,
-                                Map.of("task_id", taskId,
-                                        "message", nvl(pollFailure.getMessage())));
-                    }
-                    throw pollFailure;
-                }
-                String status = statusResp == null ? "" : nvl(statusResp.getStatus());
-                if (isTerminal(status)) {
-                    return finishTerminalByWaitPolicy(
-                            runId, identity, estimate, reservation, anchor, status,
-                            waitPolicy, toolStartMs);
-                }
-                if (!waitPolicy.durableSuspend()
-                        && statusResp != null
-                        && !nvl(statusResp.getError()).isBlank()) {
-                    return promoteDagBlockingFailure(
-                            runId,
-                            anchor,
-                            "DAG_BLOCKING_POLL_FAILED",
-                            "DAG Sandbox status polling failed",
-                            toolStartMs,
-                            Map.of("task_id", taskId,
-                                    "message", nvl(statusResp.getError())));
-                }
-                // 每次最多睡 100ms，并且不越过 fastDeadline。
-                try {
-                    TimeUnit.MILLISECONDS.sleep(
-                            Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    if (!waitPolicy.durableSuspend()) {
-                        return promoteDagBlockingFailure(
-                                runId,
-                                anchor,
-                                "DAG_BLOCKING_INTERRUPTED",
-                                "DAG Sandbox task polling was interrupted",
-                                toolStartMs,
-                                Map.of("task_id", taskId));
-                    }
-                    throw interrupted;
-                }
-            }
-            // 线性模式在快路径后转后台等待；DAG 留在当前线程，禁止生成 WAITING_TOOL_JOB。
-            if (waitPolicy.durableSuspend()) {
-                return suspend(runId, anchor, reservation, taskId);
-            }
-            return pollDagBlocking(
-                    runId, identity, estimate, reservation, anchor, toolStartMs);
+            return SandboxToolJobLifecycle.pollFastPath(
+                    deps,
+                    new SandboxToolJobLifecycle.PollRequest(
+                            runId, identity, estimate, reservation, anchor, taskId,
+                            waitPolicy.durableSuspend(), toolStartMs,
+                            runnerAdapter(), resultAdapter(), meteringAdapter(), terminalSideEffect()));
         } catch (Exception lifecycleFailure) {
             if (!waitPolicy.durableSuspend()) {
-                return promoteDagBlockingFailure(
+                return SandboxToolJobLifecycle.promoteDagBlockingFailure(
+                        deps,
                         runId,
                         anchor,
                         "DAG_BLOCKING_LIFECYCLE_FAILED",
@@ -1190,443 +890,10 @@ public class PythonSandboxTools {
         }
     }
 
-    /**
-     * 处理已经观察到的沙箱终态。线性模式如果同步走完终态流程失败，就把任务转成后台等待；
-     * DAG 模式只能正常返回显式失败、保留数据库里的进度记录，交给恢复流程按「执行线程丢失」处理。
-     */
-    private String finishTerminalByWaitPolicy(
-            String runId,
-            DataAnalysisOperationIdentity identity,
-            DataAnalysisEstimate estimate,
-            DataAnalysisReservation reservation,
-            ToolJobAnchor anchor,
-            String status,
-            PythonWaitPolicy waitPolicy,
-            long toolStartMs) throws Exception {
-        String taskId = anchor.getTaskId();
-        // 终态结果必须同时证明 taskId、status、payload 完整性与 retryable 字段存在。
-        if (!waitPolicy.durableSuspend()
-                && !renewDagBlockingLease(runId, anchor, true)) {
-            return dagBlockingLeaseLost(
-                    taskId, toolStartMs, "lease renewal was rejected before terminal result fetch");
-        }
-        TaskResultResponse result;
-        try {
-            result = fetchTerminalResult(runId, taskId, status);
-        } catch (Exception resultFailure) {
-            if (!waitPolicy.durableSuspend()) {
-                return promoteDagBlockingFailure(
-                        runId,
-                        anchor,
-                        "DAG_BLOCKING_RESULT_FETCH_FAILED",
-                        "DAG Sandbox terminal result fetch failed",
-                        toolStartMs,
-                        Map.of("task_id", taskId,
-                                "status", status,
-                                "message", nvl(resultFailure.getMessage())));
-            }
-            throw resultFailure;
-        }
-        if (!waitPolicy.durableSuspend()
-                && !renewDagBlockingLease(runId, anchor, true)) {
-            return dagBlockingLeaseLost(
-                    taskId, toolStartMs, "lease renewal was rejected after terminal result fetch");
-        }
-        if (result != null && result.hasRetryable()) {
-            try {
-                String completed = completeSynchronously(
-                        runId, identity, estimate, reservation, anchor, status, result);
-                if (completed != null) {
-                    emitSandboxToolTotal(toolStartMs, "OK", "");
-                    return completed;
-                }
-            } catch (Exception terminalFailure) {
-                log.warn("Synchronous terminal finalization incomplete: run={}, taskId={}, "
-                                + "waitPolicy={}, error={}",
-                        runId, taskId, waitPolicy, terminalFailure.getMessage());
-            }
-        }
-        if (waitPolicy.durableSuspend()) {
-            return suspend(runId, anchor, reservation, taskId);
-        }
-        return promoteDagBlockingFailure(
-                runId,
-                anchor,
-                "DAG_BLOCKING_TERMINAL_INCOMPLETE",
-                "DAG Sandbox task reached terminal state but durable finalization proof is incomplete",
-                toolStartMs,
-                Map.of("task_id", taskId, "status", status));
-    }
-
-    /**
-     * DAG 节点在同一 worker 内阻塞轮询到 anchor 已冻结的 timeoutAt。
-     * 本方法从不调用 transferToPending，也不抛 ExternalToolJobPendingException。
-     */
-    private String pollDagBlocking(
-            String runId,
-            DataAnalysisOperationIdentity identity,
-            DataAnalysisEstimate estimate,
-            DataAnalysisReservation reservation,
-            ToolJobAnchor anchor,
-            long toolStartMs) throws Exception {
-        String taskId = anchor.getTaskId();
-        Instant timeoutAt = anchor.getTimeoutAt();
-        int pollIndex = 0;
-        String lastRemoteStatus = "";
-        while (true) {
-            TaskStatusResponse statusResp;
-            try {
-                if (!renewDagBlockingLease(runId, anchor, false)) {
-                    return dagBlockingLeaseLost(
-                            taskId, toolStartMs, "lease renewal was rejected before blocking poll");
-                }
-                statusResp = getTaskStatus(taskId);
-            } catch (Exception pollFailure) {
-                log.warn("DAG blocking poll failed: run={}, taskId={}, error={}",
-                        runId, taskId, pollFailure.getMessage());
-                return promoteDagBlockingFailure(
-                        runId,
-                        anchor,
-                        "DAG_BLOCKING_POLL_FAILED",
-                        "DAG Sandbox status polling failed",
-                        toolStartMs,
-                        Map.of("task_id", taskId, "message", nvl(pollFailure.getMessage())));
-            }
-            String status = statusResp == null ? "" : nvl(statusResp.getStatus());
-            if (pollIndex == 0 || !status.equals(lastRemoteStatus) || pollIndex % 5 == 0) {
-                emitSandboxEvent("sandbox_poll", Map.of(
-                        "status", "OK",
-                        "pollIndex", pollIndex,
-                        "remoteStatus", status,
-                        "taskId", taskId,
-                        "waitPolicy", PythonWaitPolicy.BLOCKING_POLL.name()));
-            }
-            lastRemoteStatus = status;
-            pollIndex++;
-            if (isTerminal(status)) {
-                return finishTerminalByWaitPolicy(
-                        runId, identity, estimate, reservation, anchor, status,
-                        PythonWaitPolicy.BLOCKING_POLL, toolStartMs);
-            }
-            if (statusResp != null && !nvl(statusResp.getError()).isBlank()) {
-                return promoteDagBlockingFailure(
-                        runId,
-                        anchor,
-                        "DAG_BLOCKING_POLL_FAILED",
-                        "DAG Sandbox status polling failed",
-                        toolStartMs,
-                        Map.of("task_id", taskId,
-                                "message", nvl(statusResp.getError())));
-            }
-
-            long remainingMillis = timeoutAt.toEpochMilli() - System.currentTimeMillis();
-            if (remainingMillis <= 0L) {
-                return promoteDagBlockingFailure(
-                        runId,
-                        anchor,
-                        "DAG_BLOCKING_TIMEOUT",
-                        "DAG Sandbox task did not reach terminal state before the frozen timeout",
-                        toolStartMs,
-                        Map.of("task_id", taskId, "timeout_at", timeoutAt.toString()));
-            }
-            try {
-                TimeUnit.MILLISECONDS.sleep(Math.min(POLL_INTERVAL_MS, remainingMillis));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                return promoteDagBlockingFailure(
-                        runId,
-                        anchor,
-                        "DAG_BLOCKING_INTERRUPTED",
-                        "DAG Sandbox task polling was interrupted",
-                        toolStartMs,
-                        Map.of("task_id", taskId));
-            }
-        }
-    }
-
-    private boolean renewDagBlockingLease(
-            String runId,
-            ToolJobAnchor anchor,
-            boolean force) {
-        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
-        Instant now = Instant.now();
-        if (expectedLeaseUntil == null
-                || anchor.getBlockingOwnerId() == null
-                || anchor.getBlockingOwnerId().isBlank()) {
-            return false;
-        }
-        if (!force && expectedLeaseUntil.isAfter(
-                now.plusMillis(DAG_LEASE_RENEW_AHEAD_MILLIS))) {
-            return true;
-        }
-        Instant renewedUntil = DagBlockingWorkerLease.renewedUntil(now);
-        anchor.setBlockingLeaseUntil(renewedUntil);
-        boolean renewed;
-        try {
-            renewed = pythonSandboxDispatchStore.renewDagBlockingLease(
-                    runId, anchor, expectedLeaseUntil);
-        } catch (Exception renewalFailure) {
-            log.warn("DAG blocking lease renewal failed: run={}, taskId={}, owner={}, error={}",
-                    runId, anchor.getTaskId(), anchor.getBlockingOwnerId(),
-                    renewalFailure.getMessage());
-            renewed = false;
-        }
-        if (!renewed) {
-            // 续租失败后，旧线程不能拿着新租约继续写数据库。
-            anchor.setBlockingLeaseUntil(expectedLeaseUntil);
-        }
-        return renewed;
-    }
-
-    private String promoteDagBlockingFailure(
-            String runId,
-            ToolJobAnchor anchor,
-            String errorCode,
-            String message,
-            long toolStartMs,
-            Map<String, Object> details) {
-        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
-        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
-        anchor.setAutoResume(false);
-        anchor.setFinalizerError(errorCode);
-        anchor.setNextPollAt(Instant.now());
-        boolean promoted;
-        try {
-            promoted = pythonSandboxDispatchStore.promoteDagBlockingWorkerLost(
-                    runId, anchor, expectedLeaseUntil);
-        } catch (Exception promotionFailure) {
-            log.warn("DAG blocking cleanup ownership transfer failed: run={}, taskId={}, "
-                            + "owner={}, error={}",
-                    runId, anchor.getTaskId(), anchor.getBlockingOwnerId(),
-                    promotionFailure.getMessage());
-            promoted = false;
-        }
-        if (!promoted) {
-            return dagBlockingLeaseLost(
-                    anchor.getTaskId(), toolStartMs,
-                    "live-to-cleanup ownership CAS was rejected");
-        }
-        emitSandboxToolTotal(toolStartMs,
-                "DAG_BLOCKING_TIMEOUT".equals(errorCode) ? "TIMEOUT" : "ERROR",
-                errorCode);
-        return fail("executePython", errorCode, message, details);
-    }
-
-    private String dagBlockingLeaseLost(
-            String taskId,
-            long toolStartMs,
-            String reason) {
-        emitSandboxToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_LEASE_LOST");
-        return fail("executePython", "DAG_BLOCKING_LEASE_LOST",
-                "DAG Sandbox worker lost its durable blocking lease",
-                Map.of("task_id", nvl(taskId), "reason", nvl(reason)));
-    }
-
-    private String completeSynchronously(
-            String runId,
-            DataAnalysisOperationIdentity identity,
-            DataAnalysisEstimate estimate,
-            DataAnalysisReservation attached,
-            ToolJobAnchor anchor,
-            String status,
-            TaskResultResponse result) throws Exception {
-        DataAnalysisReservation confirmed = transitionReservation(
-                attached, DataAnalysisReservationState.TERMINAL_CONFIRMED, attached.taskId());
-        if (dataAnalysisCapacityService.restoreReservation(confirmed) == DataAnalysisRestoreOutcome.CONFLICT) {
-            return null;
-        }
-        FinanceRecordExtractionResult financeResult = processFinanceResult(
-                runId, identity, anchor, status, result);
-        // Build the public allowlist before persisting ENVELOPE. A projection/serialization
-        // failure must never leave a durable success preview behind.
-        String output = formatResult(status, result, financeResult);
-        String preview = output;
-        String rawRef = blankToNull(result.getDatasetDir());
-        String errorCode = blankToNull(result.getError());
-        if (!"SUCCEEDED".equals(status) && errorCode == null) {
-            errorCode = status;
-        }
-        Instant terminalAt = Instant.now();
-        anchor.setAnchorState("TERMINAL");
-        anchor.setTerminalStatus(status);
-        anchor.setSandboxTerminalStatus(status);
-        anchor.setTerminalResultPreview(preview);
-        anchor.setTerminalRawRef(rawRef);
-        anchor.setTerminalErrorCode(errorCode);
-        anchor.setTerminalRetryable(result.getRetryable());
-        anchor.setTerminalAt(terminalAt);
-        anchor.setTerminalUsageJson(JsonFormat.printer()
-                .omittingInsignificantWhitespace().print(result.getResourceUsage()));
-        anchor.setReservationJson(objectMapper.writeValueAsString(confirmed));
-        anchor.setFinalizerStep("ENVELOPE");
-        if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
-            return null;
-        }
-        DataAnalysisResourceUsage usage = toUsage(confirmed.resourceClass(), result);
-        DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
-                runId, identity.toolCallId(), identity.attempt(), identity.operationId(),
-                attached.taskId(), status, "SUCCEEDED".equals(status), preview, rawRef,
-                errorCode, "SUCCEEDED".equals(status) ? null : "sandbox " + status,
-                result.getRetryable(), estimate, confirmed, usage, terminalAt, false);
-
-        DataAnalysisReleaseOutcome released = dataAnalysisCapacityService.releaseReservation(
-                new DataAnalysisReleaseRequest(confirmed,
-                        new DataAnalysisReleaseProof.Terminal(envelope),
-                        DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED));
-        if (released != DataAnalysisReleaseOutcome.RELEASED
-                && released != DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
-            return null;
-        }
-        DataAnalysisReservation releasedReservation = transitionReservation(
-                confirmed, DataAnalysisReservationState.RELEASED, confirmed.taskId());
-        anchor.setReservationJson(objectMapper.writeValueAsString(releasedReservation));
-        anchor.setFinalizerStep("RELEASE");
-        if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
-            return null;
-        }
-        DataAnalysisUpsertOutcome recorded = dataAnalysisTerminalRecorder.upsert(envelope);
-        if (recorded != DataAnalysisUpsertOutcome.INSERTED
-                && recorded != DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME) {
-            return null;
-        }
-        anchor.setUsagePersisted(true);
-        anchor.setFinalizerStep("USAGE");
-        if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
-            return null;
-        }
-        return output;
-    }
-
-    private String suspend(
-            String runId,
-            ToolJobAnchor anchor,
-            DataAnalysisReservation current,
-            String taskId) throws Exception {
-        // 这个 Python 任务无法在短时间内完成。下面把它从当前线程移交给后台：先把占用的
-        // 资源名额过户给后台任务（线程一旦释放，名额就没人管了），再把任务凭证
-        // 和 Run 状态一起写进数据库，最后通知上层可以释放线程。
-        // 先看数据库进度记录里有没有最新的资源占用信息，有就用它，防止拿调用栈里的旧数据覆盖新状态。
-        if (anchor.getReservationJson() != null && !anchor.getReservationJson().isBlank()) {
-            current = objectMapper.readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
-        }
-        // 只有 TASK_ATTACHED（任务已交给沙箱）需要转成 PENDING_TRANSFERRED（待过户给后台）；
-        // 更靠后的状态保持原样，让本方法可以安全重入。
-        DataAnalysisReservation pending = current.state() == DataAnalysisReservationState.TASK_ATTACHED
-                ? transitionReservation(current, DataAnalysisReservationState.PENDING_TRANSFERRED, taskId)
-                : current;
-        // 把占用的资源名额从当前线程过户给后台任务。
-        if (current.state() == DataAnalysisReservationState.TASK_ATTACHED
-                && dataAnalysisCapacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
-            // 这是失败：过户冲突时绝不能释放线程，否则任务和名额都无人负责。
-            throw new ToolJobTransferException("capacity transfer to pending conflicted");
-        }
-        // 把后台状态和最新的名额记录写进内存凭证，并安排好第一次后台轮询时间（同时写数据库和 Redis 到期索引）。
-        anchor.setAnchorState("PENDING");
-        anchor.setReservationJson(objectMapper.writeValueAsString(pending));
-        anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
-        // 一条 SQL 同时写任务凭证、并把 Run 状态从执行中改为等待长工具，要么都成功、要么都不改。
-        if (!pythonSandboxDispatchStore.transferToPending(runId, anchor)) {
-            // 这是失败：落库没成功就不抛挂起信号，防止上层释放线程。
-            throw new ToolJobTransferException("durable transfer to WAITING_TOOL_JOB failed");
-        }
-        // 这是信号：后台任务、名额和 Run 状态都已写进数据库，上层看到它就释放线程，
-        // 随后把信号转换成正常的挂起结果。
-        throw new ExternalToolJobPendingException(
-                runId, anchor.getToolCallId(), anchor.getAttempt(),
-                "Python Sandbox task continues in background: " + taskId);
-    }
-
     private void hitFaultPoint(String runId, String checkpoint) {
         if (toolJobFaultInjector != null) {
             toolJobFaultInjector.hit(runId, checkpoint);
         }
-    }
-
-    private TaskResultResponse fetchTerminalResult(
-            String runId,
-            String taskId,
-            String expectedStatus) {
-        installDebugRpcAttachments();
-        TaskResultResponse result = pythonSandboxService.getTaskResult(
-                GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
-        return SandboxTerminalResultValidator.validate(
-                taskId, runId, result, expectedStatus);
-    }
-
-    private static boolean isTerminal(String status) {
-        return "SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status);
-    }
-
-    private DataAnalysisResourceUsage toUsage(
-            DataAnalysisResourceClass resourceClass,
-            TaskResultResponse result) throws Exception {
-        if (!result.hasResourceUsage()) {
-            return DataAnalysisResourceUsage.missing(resourceClass);
-        }
-        return SandboxResourceUsageParser.parse(
-                objectMapper,
-                resourceClass,
-                JsonFormat.printer().omittingInsignificantWhitespace()
-                        .print(result.getResourceUsage()));
-    }
-
-    private boolean releasePreDispatch(DataAnalysisReservation reservation) {
-        return releasePreDispatch(reservation, DataAnalysisReleaseReason.CREATE_NOT_STARTED);
-    }
-
-    private ExecuteResponse tombstoneCreateUncertain(
-            String operationId, String fingerprint, String responseTaskId) {
-        String cancelId = "tool-job-create-" + UUID.nameUUIDFromBytes(
-                operationId.getBytes(StandardCharsets.UTF_8));
-        CancelTaskResponse canceled = pythonSandboxService.cancelTask(CancelTaskRequest.newBuilder()
-                .setByOperation(OperationCancelTarget.newBuilder()
-                        .setOperationId(operationId)
-                        .setRequestFingerprint(fingerprint))
-                .setCancelRequestId(cancelId)
-                .setReason("CREATE_RESULT_UNCERTAIN")
-                .build());
-        if (canceled == null || canceled.hasErrorDetail() || !canceled.getError().isBlank()
-                || canceled.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
-                || canceled.getOutcome() == CancelOutcome.NOT_FOUND
-                || canceled.getTaskId().isBlank()) {
-            throw new IllegalStateException("Sandbox creation outcome remains uncertain");
-        }
-        GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
-                GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
-        if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()
-                || !lookup.getFound() || !canceled.getTaskId().equals(lookup.getTaskId())
-                || !fingerprint.equals(lookup.getRequestFingerprint())
-                || responseTaskId != null && !responseTaskId.isBlank()
-                    && !responseTaskId.equals(lookup.getTaskId())) {
-            throw new IllegalStateException("Sandbox cancel tombstone identity could not be verified");
-        }
-        log.info("Sandbox create cancellation tombstone verified: operationId={} taskId={} outcome={}",
-                operationId, lookup.getTaskId(), canceled.getOutcome());
-        return ExecuteResponse.newBuilder()
-                .setTaskId(lookup.getTaskId())
-                .setRequestFingerprint(fingerprint)
-                .build();
-    }
-
-    private boolean releasePreDispatch(
-            DataAnalysisReservation reservation,
-            DataAnalysisReleaseReason reason) {
-        DataAnalysisReleaseOutcome outcome = dataAnalysisCapacityService.releaseReservation(
-                new DataAnalysisReleaseRequest(
-                reservation,
-                new DataAnalysisReleaseProof.PreDispatchAbort(reservation.identity()),
-                reason));
-        return outcome == DataAnalysisReleaseOutcome.RELEASED
-                || outcome == DataAnalysisReleaseOutcome.ALREADY_RELEASED;
-    }
-
-    private static DataAnalysisReservation transitionReservation(
-            DataAnalysisReservation current,
-            DataAnalysisReservationState state,
-            String taskId) {
-        return new DataAnalysisReservation(
-                current.reservationId(), current.identity(), current.resourceClass(),
-                current.capacityUnits(), state, taskId, current.acquiredAt());
     }
 
     private static String sha256(String value) {
@@ -1639,81 +906,19 @@ public class PythonSandboxTools {
         }
     }
 
-    private static String blankToNull(String value) {
-        return value == null || value.isBlank() ? null : value.trim();
-    }
-
-    /**
-     * 向调试观测服务发送结构化事件。未启用 {@link DebugObservabilityService} 时不执行任何操作。
-     *
-     * @param eventType 事件类型，如 {@code sandbox_poll}、{@code sandbox_create_task}
-     * @param fields 与 eventType 配套的键值对，方法内会追加 {@code eventType} 字段
-     */
+    /** 观测事件整体委托给生命周期框架的观测出口，事件名与字段保持原样。 */
     private void emitSandboxEvent(String eventType, Map<String, Object> fields) {
-        if (debugObservabilityService == null || !debugObservabilityService.isEnabled()) {
-            return;
-        }
-        try {
-            Map<String, Object> payload = new LinkedHashMap<>(fields);
-            payload.put("eventType", eventType);
-            debugObservabilityService.emit(payload);
-        } catch (Exception ignored) {
-            // 调试观测路径上的异常不应影响工具主流程
-        }
+        observability().emit(eventType, fields);
     }
 
-    /**
-     * 在发起 Dubbo 调用前，把调试会话 id、run id、会话目录写入 RpcContext attachment，
-     * 以便沙箱服务侧把日志与产物归档到同一调试目录。
-     */
+    /** 在发起 Dubbo 调用前安装调试 attachment（委托框架观测出口）。 */
     private void installDebugRpcAttachments() {
-        if (debugObservabilityService == null || !debugObservabilityService.isEnabled()) {
-            return;
-        }
-        try {
-            String sessionId = AgentContext.getDebugObservabilitySessionId();
-            if (sessionId == null || sessionId.isBlank()) {
-                return;
-            }
-            RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.SESSION_ID, sessionId);
-            String runId = AgentContext.getRunId();
-            if (runId != null && !runId.isBlank()) {
-                RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.RUN_ID, runId);
-            }
-            String sessionDir = debugObservabilityService.sessionDirFor(sessionId);
-            if (sessionDir != null) {
-                RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.SESSION_DIR, sessionDir);
-            }
-        } catch (Exception ignored) {
-            // 调试观测路径上的异常不应影响工具主流程
-        }
+        observability().installDebugRpcAttachments();
     }
 
-    /** 工具调用结束时发送汇总事件，附带总耗时、终态 status，以及可选的主机堆内存快照。 */
+    /** 工具调用结束时发送汇总事件（委托框架观测出口）。 */
     private void emitSandboxToolTotal(long toolStartMs, String status, String errorCategory) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("durationMs", System.currentTimeMillis() - toolStartMs);
-        payload.put("status", status);
-        if (errorCategory != null && !errorCategory.isBlank()) {
-            payload.put("errorCategory", errorCategory);
-        }
-        appendHostSnapshot(payload);
-        emitSandboxEvent("sandbox_tool_total", payload);
-    }
-
-    /** 把当前 JVM 堆使用与 OS 负载写入 payload，供性能排查时对照沙箱耗时。 */
-    private void appendHostSnapshot(Map<String, Object> payload) {
-        try {
-            Runtime runtime = Runtime.getRuntime();
-            payload.put("heapFreeBytes", runtime.freeMemory());
-            payload.put("heapTotalBytes", runtime.totalMemory());
-            payload.put("heapMaxBytes", runtime.maxMemory());
-            java.lang.management.OperatingSystemMXBean osBean = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
-            payload.put("systemLoadAverage", osBean.getSystemLoadAverage());
-            payload.put("availableProcessors", osBean.getAvailableProcessors());
-        } catch (Exception ignored) {
-            // 主机资源快照为可选项，采集失败时忽略
-        }
+        observability().emitToolTotal(toolStartMs, status, errorCategory);
     }
 
     /**
@@ -1924,53 +1129,23 @@ public class PythonSandboxTools {
     /**
      * 把一次已经确认终态的沙箱任务结果包成模型看到的那份 JSON。
      *
-     * <p>同步执行与后台作业的结果接回必须写成同一个形状，所以这里给结果接收方一个入口，
-     * 不让第二处自己拼一遍。后台作业只跑 {@code executePython}，没有 finance 记录通道那一路，
-     * 所以按没有 finance 结果处理。</p>
+     * <p>同步执行与后台作业的结果接回必须写成同一个形状，格式化实现已收敛到
+     * {@link PythonSandboxJobResultAdapter}（三条路径共用唯一出口）。后台作业只跑
+     * {@code executePython}，没有 finance 记录通道那一路，所以按没有 finance 结果处理。</p>
      */
     public String formatTerminalResult(String status, TaskResultResponse result) {
         return formatResult(status, result, null);
     }
 
     /**
-     * 把沙箱执行结果转为工具统一的 JSON 响应。
-     * 进程 exit code 为 0 时走 {@link #ok}；非零时仍附带 stdout/stderr 到 {@code data}，但 {@code ok=false}，
-     * 方便 LLM 读取输出内容的同时识别执行失败。
+     * 把沙箱执行结果转为工具统一的 JSON 响应（委托结果适配器；proto 先映射成工具中立视图）。
      */
     private String formatResult(
             String status,
             TaskResultResponse result,
             FinanceRecordExtractionResult financeResult) {
-        String stdout = financeResult == null
-                ? nvl(result.getStdout()) : financeResult.ordinaryStdout();
-
-        if ("SUCCEEDED".equals(status) && result.getExitCode() == 0) {
-            if (financeResult == null) {
-                return formatter().formatSuccess(stdout, List.of(), List.of());
-            }
-            if (financeResultModelAdapter == null) {
-                throw new FinanceRecordProcessingException(
-                        "FINANCE_RESULT_PROJECTOR_UNAVAILABLE",
-                        "Finance result projector is unavailable");
-            }
-            FinanceResultModelAdapter.ProjectionBatch projection =
-                    financeResultModelAdapter.project(financeResult);
-            return formatter().formatSuccess(
-                    stdout, projection.results(), projection.notices());
-        }
-
-        String errorCode = "CANCELED".equals(status)
-                ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
-        String message = "CANCELED".equals(status)
-                ? "Python 执行已取消" : "Python 执行失败";
-        String action = result.getRetryable()
-                ? "根据 stderr 修正代码或输入后重试"
-                : "检查输入和资源限制；如问题持续，请联系管理员";
-        return formatter().formatFailure(
-                stdout,
-                nvl(result.getStderr()),
-                new FinanceToolResultFormatter.FailureDetail(
-                        errorCode, message, result.getRetryable(), action));
+        return resultAdapter().formatTerminalResult(
+                runnerAdapter().toTerminalView(result, status), financeResult);
     }
 
     private FinanceRecordExtractionResult processFinanceResult(
@@ -2023,17 +1198,12 @@ public class PythonSandboxTools {
 
     /** 构造 {@code ok=true} 的标准 JSON 工具响应。 */
     private String ok(String tool, Map<String, Object> data) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("ok", true);
-        payload.put("tool", tool);
-        payload.put("data", data == null ? Map.of() : data);
-        payload.put("error", null);
-        return writeJson(payload);
+        return SandboxJobResponses.ok(objectMapper, tool, data);
     }
 
     /** 构造 {@code ok=false} 的标准 JSON 工具响应；{@code details} 供 LLM 或上层做结构化重试。 */
     private String fail(String tool, String code, String message, Map<String, Object> details) {
-        return fail(tool, code, message, details, Map.of());
+        return SandboxJobResponses.fail(objectMapper, tool, code, message, details);
     }
 
     /**
@@ -2045,37 +1215,11 @@ public class PythonSandboxTools {
                         String message,
                         Map<String, Object> details,
                         Map<String, Object> data) {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("ok", false);
-        payload.put("tool", tool);
-        payload.put("data", data == null ? Map.of() : data);
-        Map<String, Object> err = new LinkedHashMap<>();
-        err.put("code", nvl(code));
-        err.put("message", nvl(message));
-        err.put("details", details == null ? Map.of() : details);
-        payload.put("error", err);
-        return writeJson(payload);
-    }
-
-    /** 序列化工具响应；序列化本身失败时返回最小可用的硬编码 JSON 错误串。 */
-    private String writeJson(Object payload) {
-        try {
-            return objectMapper.writeValueAsString(payload);
-        } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"executePython\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\"" + escapeJson(nvl(e.getMessage())) + "\"}}";
-        }
+        return SandboxJobResponses.fail(objectMapper, tool, code, message, details, data);
     }
 
     private String nvl(String text) {
         return text == null ? "" : text;
-    }
-
-    private String escapeJson(String text) {
-        return nvl(text)
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
     }
 
     /**

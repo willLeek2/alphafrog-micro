@@ -1,6 +1,8 @@
 package world.willfrog.agent.tools.sandboxjob;
 
 import world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 
 /**
  * 请求适配器：把工具入参变成可幂等、可重放、可指纹的创建请求。
@@ -18,6 +20,10 @@ public interface SandboxJobRequestAdapter<REQ> {
 
     /** 从创建请求导出规范化规格：容量估算、名额预留与恢复核对都用这同一份。 */
     CanonicalSandboxCreateSpec buildCanonicalSpec(REQ request);
+
+    /** 把容量准入结果与 canonical 身份写进真正发送给沙箱的请求（名额预留之后调用）。 */
+    REQ enrichWithCapacity(REQ request, DataAnalysisReservation reservation,
+                           DataAnalysisEstimate estimate, CanonicalSandboxCreateSpec spec);
 
     /** 请求指纹：绑定本次入参，阻止同一 operationId 被不同请求复用。 */
     String requestFingerprint(REQ request);

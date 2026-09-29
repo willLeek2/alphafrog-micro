@@ -14,6 +14,11 @@ public interface SandboxJobResultAdapter {
     /** 终态对应的用户可见错误码（如 PYTHON_EXECUTION_FAILED）。 */
     String errorCodeOf(SandboxTerminalResultView result);
 
-    /** 把终态结果格式化成给模型的文本，三条路径共用。 */
-    String formatTerminalResult(SandboxTerminalResultView result);
+    /**
+     * 把终态结果格式化成给模型的文本，三条路径共用。
+     *
+     * @param formatContext 终态副作用钩子产出的格式化上下文（如 finance 提取结果），
+     *                      由工具自己的钩子与适配器约定类型；没有副作用的路径传 null
+     */
+    String formatTerminalResult(SandboxTerminalResultView result, Object formatContext);
 }

@@ -91,6 +91,10 @@ class SandboxToolJobLifecycleTest {
         StubRequestAdapter(String toolName) { this.toolName = toolName; }
         @Override public String toolName() { return toolName; }
         @Override public world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec buildCanonicalSpec(String request) { return null; }
+        @Override public String enrichWithCapacity(String request,
+                world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation reservation,
+                world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate estimate,
+                world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec spec) { return request; }
         @Override public String requestFingerprint(String request) { return "fp"; }
         @Override public String parseStoredCreateRequest(String createRequestJson) { return createRequestJson; }
         @Override public String payloadPreview(String createRequestJson) { return ""; }
