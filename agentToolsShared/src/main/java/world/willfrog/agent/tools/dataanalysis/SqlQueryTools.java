@@ -12,7 +12,6 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
-import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
@@ -71,10 +70,16 @@ public class SqlQueryTools {
     /** 引擎线程数固定为 2：查询受语句超时与内存上限约束，线程不是产品档位维度。 */
     static final int DUCKDB_THREADS = 2;
 
-    /** 语句超时（秒）按产品档位固定，与运行器内 TIER_LIMITS 对齐。 */
-    static final Map<String, Integer> TIER_STATEMENT_TIMEOUT_S = Map.of(
-            "INTERACTIVE", 30,
-            "BACKGROUND", 120);
+    /**
+     * 产品档位的语句超时与返回行数上限（方案固定值，模型不能自定义）。
+     * 估计行数上限不在此列：它与容量账本阈值同源，渲染规格时从
+     * {@link DataAnalysisCapacityProperties} 现取（标准档上限 / 单任务硬上限）。
+     */
+    record ProductTier(int statementTimeoutSeconds, int rowCap) {}
+
+    static final Map<String, ProductTier> PRODUCT_TIERS = Map.of(
+            "INTERACTIVE", new ProductTier(30, 100),
+            "BACKGROUND", new ProductTier(120, 1000));
     /** 沙箱任务超时 = 语句超时 + 固定开销（5 秒中断宽限 + 引擎启动/挂载/EXPLAIN 约 10 秒）。 */
     static final int TASK_OVERHEAD_SECONDS = 15;
 
@@ -159,7 +164,8 @@ public class SqlQueryTools {
             String tier = productTier == null || productTier.isBlank()
                     ? "INTERACTIVE"
                     : productTier.trim().toUpperCase(Locale.ROOT);
-            if (!TIER_STATEMENT_TIMEOUT_S.containsKey(tier)) {
+            ProductTier tierLimits = PRODUCT_TIERS.get(tier);
+            if (tierLimits == null) {
                 return fail("UNKNOWN_TIER", "Unknown product_tier; use INTERACTIVE or BACKGROUND",
                         Map.of("legal_tiers", List.of("INTERACTIVE", "BACKGROUND"), "retryable", true));
             }
@@ -194,13 +200,6 @@ public class SqlQueryTools {
                         details);
             }
 
-            // --- 第一期不接等待组成员派发（只在顺序执行开放挂起/恢复）。 ---
-            if (WaitGroupMemberExecutionContext.current() != null) {
-                return fail("WAIT_GROUP_NOT_SUPPORTED",
-                        "executeQuery is not available as a wait-group member in this release; use it in sequential execution",
-                        Map.of("retryable", false));
-            }
-
             // 等待策略必须来自 executor 已冻结的 effective workflow；未知值不能猜成 LINEAR。
             Optional<SandboxJobWaitPolicy> resolvedWaitPolicy =
                     SandboxJobWaitPolicy.fromWorkflow(AgentContext.getWorkflow());
@@ -211,6 +210,19 @@ public class SqlQueryTools {
                                 ? "" : AgentContext.getWorkflow()));
             }
             SandboxJobWaitPolicy waitPolicy = resolvedWaitPolicy.get();
+
+            /*
+             * DAG 上的后台档第一期不开放挂起：超过 1.5 秒运行时直接拒绝（断言在代码里，
+             * 不在提示词里）。BACKGROUND 档存在的意义就是 30 秒以上的查询，提前拒绝与
+             * 「跑过 1.5 秒再拒」等价，且不必为一个注定被拒的调用占用沙箱容量。
+             * DAG + INTERACTIVE 保留阻塞轮询（语句 30 秒封顶）。
+             */
+            if (!waitPolicy.durableSuspend() && "BACKGROUND".equals(tier)) {
+                return fail("DAG_BACKGROUND_NOT_SUPPORTED",
+                        "BACKGROUND tier is not available on parallel (dag) workflow in this release; "
+                                + "use INTERACTIVE or run in sequential execution",
+                        Map.of("retryable", false));
+            }
 
             // toolCallId 来自当前 Todo 的 AgentContext，是跨 worker 恢复的稳定逻辑调用身份。
             String toolCallId = AgentContext.getToolCallId();
@@ -237,7 +249,7 @@ public class SqlQueryTools {
             AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(resolvedDatasets, List.of());
             String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
             String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(subSnapshot);
-            int statementTimeoutSeconds = TIER_STATEMENT_TIMEOUT_S.get(tier);
+            int statementTimeoutSeconds = tierLimits.statementTimeoutSeconds();
             int taskTimeoutSeconds = statementTimeoutSeconds + TASK_OVERHEAD_SECONDS;
             CapacityPlan plan;
             try {
@@ -251,7 +263,11 @@ public class SqlQueryTools {
             // --- 渲染固定运行器：模型 SQL 与挂载规格经 base64 内嵌，无引号转义问题。 ---
             String runnerCode;
             try {
-                runnerCode = renderRunner(sql, tier, resolvedDatasets, decision.memoryLimitBytes());
+                long estimatedRowCap = "BACKGROUND".equals(tier)
+                        ? dataAnalysisCapacityProperties.getMaxRowsPerTask()
+                        : dataAnalysisCapacityProperties.getStandardRowsMax();
+                runnerCode = renderRunner(sql, tier, tierLimits, resolvedDatasets,
+                        decision.memoryLimitBytes(), estimatedRowCap);
             } catch (IllegalStateException renderFailure) {
                 return fail("RUNNER_RENDER_FAILED", renderFailure.getMessage(), Map.of("retryable", false));
             }
@@ -454,8 +470,9 @@ public class SqlQueryTools {
      * 数据集在沙箱内的路径 = 兼容符号链接 /sandbox/input 下的 _run_dataset_<编号>/<文件名>，
      * 视图名是 run 级编号的确定性映射（t1、t2……），模型在工具说明里按此写 SQL。
      */
-    String renderRunner(String sql, String tier, List<AgentRunDatasetEntry> datasets,
-                        long memoryLimitBytes) {
+    String renderRunner(String sql, String tier, ProductTier tierLimits,
+                        List<AgentRunDatasetEntry> datasets, long memoryLimitBytes,
+                        long estimatedRowCap) {
         Map<String, Object> spec = new LinkedHashMap<>();
         spec.put("sql", sql);
         spec.put("tier", tier);
@@ -465,6 +482,10 @@ public class SqlQueryTools {
         // 内存上限用容量分类的冻结值，换算成 DuckDB 配置串（配置均为整 MiB，整除无损）。
         limits.put("memory_limit", (memoryLimitBytes / (1024 * 1024)) + "MB");
         limits.put("threads", DUCKDB_THREADS);
+        // 语句超时、返回行数上限、估计行数上限全部由这里下发，运行器不持有副本。
+        limits.put("statement_timeout_s", tierLimits.statementTimeoutSeconds());
+        limits.put("row_cap", tierLimits.rowCap());
+        limits.put("estimated_row_cap", estimatedRowCap);
         spec.put("limits", limits);
         List<Map<String, Object>> mounts = new ArrayList<>();
         for (AgentRunDatasetEntry dataset : datasets) {

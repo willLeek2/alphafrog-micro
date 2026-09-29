@@ -189,7 +189,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
             LangchainDatasetRefContext.set(datasetRefs);
-            output = appendDatasetRetryHintIfNeeded(output, datasetRefs);
+            output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
             return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
         } finally {
             AgentContext.clearToolCallId();
@@ -267,7 +267,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * executePython 等工具若因 dataset_ids / manifest_ids 错误失败，把当前 run 已知的 ref 列表写进 hint，
      * 引导模型先用 listMyData 解析 run-level 整数 ID，避免继续重试 raw id / path / placeholder。
      */
-    private String appendDatasetRetryHintIfNeeded(String output, Map<String, String> datasetRefs) {
+    private String appendDatasetRetryHintIfNeeded(String toolName, String output, Map<String, String> datasetRefs) {
         if (output == null || output.isBlank()) {
             return output;
         }
@@ -287,8 +287,13 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             return output;
         }
         StringBuilder hint = new StringBuilder(output);
-        hint.append("\n\n_retry_hint_: executePython failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
-        hint.append("executePython expects current run-level integer dataset_ids / manifest_ids, not raw dataset_id / manifest_id strings, paths, or scope hashes. ");
+        // 提示按实际工具名生成：executePython 与 executeQuery 共用这套 run 级编号约定。
+        hint.append("\n\n_retry_hint_: ").append(toolName).append(" failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
+        if ("executeQuery".equals(toolName)) {
+            hint.append(toolName).append(" expects current run-level integer dataset_ids, not raw dataset_id strings, paths, or scope hashes. ");
+        } else {
+            hint.append(toolName).append(" expects current run-level integer dataset_ids / manifest_ids, not raw dataset_id / manifest_id strings, paths, or scope hashes. ");
+        }
         hint.append("Call listMyData first (query_type=dataset or query_type=manifest) to resolve the integer ids for this run before retrying. ");
         if (lower.contains("run_level_ids_unavailable")) {
             hint.append("RUN_LEVEL_IDS_UNAVAILABLE means the active run registry is not available; do not keep retrying the same raw ids. ");

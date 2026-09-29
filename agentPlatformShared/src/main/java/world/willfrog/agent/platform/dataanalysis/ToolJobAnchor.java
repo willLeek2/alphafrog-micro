@@ -132,6 +132,9 @@ public class ToolJobAnchor {
     private Instant terminalAt;
     // nullable 用于区分“明确不可重试”和“旧协议未返回分类”；缺失时 fail-closed。
     private Boolean terminalRetryable;
+    // terminalBusinessSuccess 是业务成败（由工具的结果适配器判定，如 executeQuery 的信封状态）；
+    // 旧锚点没有该字段，恢复侧读到 null 时回退到「沙箱终态是否 SUCCEEDED」的旧判据。
+    private Boolean terminalBusinessSuccess;
 
     // pythonRequestFingerprint 排除 operationId，用于跨 worker 判断模型是否原样重放已失败代码。
     private String pythonRequestFingerprint;
@@ -428,6 +431,10 @@ public class ToolJobAnchor {
 
     public Boolean getTerminalRetryable() { return terminalRetryable; }
     public void setTerminalRetryable(Boolean terminalRetryable) { this.terminalRetryable = terminalRetryable; }
+    public Boolean getTerminalBusinessSuccess() { return terminalBusinessSuccess; }
+    public void setTerminalBusinessSuccess(Boolean terminalBusinessSuccess) {
+        this.terminalBusinessSuccess = terminalBusinessSuccess;
+    }
 
     public String getPythonRequestFingerprint() { return pythonRequestFingerprint; }
     public void setPythonRequestFingerprint(String pythonRequestFingerprint) {

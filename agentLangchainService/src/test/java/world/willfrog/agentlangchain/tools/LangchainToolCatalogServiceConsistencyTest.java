@@ -102,7 +102,7 @@ class LangchainToolCatalogServiceConsistencyTest {
         assertEquals(runtimeNames, apiNames,
                 "API 目录应与运行时 builder 在能力门控全开时的结果一致");
         assertEquals(AgentToolRegistry.declaredToolNames(), apiNames,
-                "API 全量视图应包含注册表全部 25 个声明");
+                "API 全量视图应包含注册表全部 28 个声明");
     }
 
     @Test

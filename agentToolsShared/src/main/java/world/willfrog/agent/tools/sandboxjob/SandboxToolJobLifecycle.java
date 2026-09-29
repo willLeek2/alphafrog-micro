@@ -731,7 +731,17 @@ public final class SandboxToolJobLifecycle {
         String output = req.resultAdapter().formatTerminalResult(result, formatContext);
         String preview = output;
         String rawRef = SandboxJobResponses.blankToNull(result.rawRef());
+        /*
+         * 业务成败以工具的结果适配器为准：沙箱 SUCCEEDED 只代表运行器正常跑完
+         * （沙箱终态 SUCCEEDED 当且仅当退出码 0）。executeQuery 的计划拒绝、执行失败、
+         * 语句超时都装在运行器信封里，沙箱状态全是 SUCCEEDED；executePython 的业务
+         * 判据（SUCCEEDED 且退出码 0）与旧沙箱判据完全等价，行为不变。
+         */
+        boolean businessSuccess = req.resultAdapter().isSuccess(result);
         String errorCode = SandboxJobResponses.blankToNull(result.errorDetail());
+        if (errorCode == null && !businessSuccess) {
+            errorCode = req.resultAdapter().errorCodeOf(result);
+        }
         if (!"SUCCEEDED".equals(status) && errorCode == null) {
             errorCode = status;
         }
@@ -739,6 +749,7 @@ public final class SandboxToolJobLifecycle {
         anchor.setAnchorState("TERMINAL");
         anchor.setTerminalStatus(status);
         anchor.setSandboxTerminalStatus(status);
+        anchor.setTerminalBusinessSuccess(businessSuccess);
         anchor.setTerminalResultPreview(preview);
         anchor.setTerminalRawRef(rawRef);
         anchor.setTerminalErrorCode(errorCode);
@@ -755,8 +766,8 @@ public final class SandboxToolJobLifecycle {
         DataAnalysisResourceUsage usage = req.meteringAdapter().toUsage(result, confirmed.resourceClass());
         DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
                 runId, identity.toolCallId(), identity.attempt(), identity.operationId(),
-                attached.taskId(), status, "SUCCEEDED".equals(status), preview, rawRef,
-                errorCode, "SUCCEEDED".equals(status) ? null : "sandbox " + status,
+                attached.taskId(), status, businessSuccess, preview, rawRef,
+                errorCode, businessSuccess ? null : "sandbox " + status,
                 result.retryable(), req.estimate(), confirmed, usage, terminalAt, false);
 
         DataAnalysisReleaseOutcome released = deps.capacityService().releaseReservation(

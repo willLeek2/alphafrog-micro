@@ -53,11 +53,18 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
         }
         JsonNode envelope = findEnvelope(result.stdout());
         if (envelope == null) {
-            // 沙箱成功但拿不到信封：运行器在打印信封前崩溃，或 stdout 被输出上限截断。
+            /*
+             * 沙箱成功但拿不到信封，两种成因要分开：stderr 非空说明运行器在打印信封前
+             * 崩溃（traceback 在 stderr），重试同样的调用没有意义；stderr 为空说明 stdout
+             * 在输出上限处被截断（结果集过大），模型收窄查询后可以重试。
+             */
+            boolean crashed = result.stderr() != null && !result.stderr().isBlank();
             return SandboxJobResponses.fail(objectMapper, "executeQuery", "QUERY_RESULT_UNAVAILABLE",
-                    "Sandbox task finished but the query result envelope is missing",
+                    crashed
+                            ? "Query runner crashed before producing the result envelope"
+                            : "Query result exceeded the output size limit; narrow the query and retry",
                     Map.of("stderr_preview", preview(result.stderr()),
-                            "retryable", false));
+                            "retryable", !crashed));
         }
         String status = envelope.path("status").asText("");
         if ("SUCCEEDED".equals(status)) {
@@ -78,6 +85,9 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
         }
         if (envelope.has("gate")) {
             details.put("gate", objectMapper.convertValue(envelope.path("gate"), Map.class));
+        }
+        if (envelope.has("limits")) {
+            details.put("limits", objectMapper.convertValue(envelope.path("limits"), Map.class));
         }
         // 引擎配置与挂载失败是平台侧故障，重试同样的调用没有意义；其余失败模型改写 SQL 后可重试。
         boolean platformStage = "configure".equals(envelope.path("stage").asText(""))

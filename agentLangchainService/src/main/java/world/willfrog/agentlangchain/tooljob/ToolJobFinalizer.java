@@ -19,7 +19,6 @@ import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
 
@@ -908,18 +907,9 @@ public class ToolJobFinalizer {
         anchor.setPythonFailedRequestFingerprints(List.copyOf(history));
     }
 
-    /** Truncate to 16KB UTF-8 respecting MAX_RESULT_PREVIEW_BYTES including suffix. */
+    /** 16KB UTF-8 安全截断：算法全仓库单份，在 SandboxJobResponses。 */
     static String boundedPreview(String s) {
-        if (s == null) return null;
-        String suffix = "…(truncated)";
-        byte[] raw = s.getBytes(StandardCharsets.UTF_8);
-        int max = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES;
-        if (raw.length <= max) return s;
-        byte[] suffixBytes = suffix.getBytes(StandardCharsets.UTF_8);
-        int cut = max - suffixBytes.length;
-        if (cut <= 0) return suffix;
-        while (cut > 0 && (raw[cut] & 0xC0) == 0x80) cut--;
-        return new String(raw, 0, cut, StandardCharsets.UTF_8) + suffix;
+        return world.willfrog.agent.tools.sandboxjob.SandboxJobResponses.boundedPreview(s);
     }
 
 }

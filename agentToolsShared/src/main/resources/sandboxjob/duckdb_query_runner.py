@@ -1,10 +1,18 @@
 """executeQuery 固定运行器：模型只提供 SQL，本程序由平台维护、随调用一并下发。
 
-流程：锁定引擎配置 -> 挂载授权数据集为视图 -> EXPLAIN 三项准入检查 -> 执行（语句超时可中断）。
+流程：文本级禁令（多语句、ATTACH/COPY/INSTALL/LOAD）-> 锁定引擎配置 ->
+只读挂载授权数据集为视图 -> EXPLAIN 准入检查 -> 执行（语句超时可中断）。
 输出：stdout 最后一行打印 `__EXECUTE_QUERY_RESULT__` 前缀的 JSON 信封，Java 侧只认这一行。
+
+档位数值（语句超时、返回行数上限、估计行数上限）全部由 Java 侧经规格下发，
+本文件不持有一份副本——容量阈值在 Java 侧是可配置项，双份硬编码必然漂移。
 """
 import base64
+import datetime
+import decimal
 import json
+import os
+import re
 import sys
 import threading
 
@@ -12,21 +20,27 @@ import duckdb
 
 RESULT_MARKER = "__EXECUTE_QUERY_RESULT__"
 
-TIER_LIMITS = {
-    # 语句超时（秒）与返回行数上限按产品档位固定，模型不能自定义。
-    "INTERACTIVE": {"statement_timeout_s": 30, "row_cap": 100},
-    "BACKGROUND": {"statement_timeout_s": 120, "row_cap": 1000},
-}
+# 沙箱 stdout 硬上限是 1 MiB（写入瞬间截断、保留头部）。信封打在最后且包含全部结果行，
+# 超过安全阈值时换成失败信封，宁可拒也不让 Java 侧拿到半截 JSON。
+SAFE_ENVELOPE_BYTES = 900 * 1024
 
-# 估计行数档位上限：标准档 20 万行，HEAVY（BACKGROUND 一律按它申请）60 万行硬上限。
-TIER_ESTIMATED_ROW_CAP = {
-    "INTERACTIVE": 200_000,
-    "BACKGROUND": 600_000,
-}
+
+def _to_jsonable(value):
+    """DuckDB 驱动的返回类型里 JSON 原生不收的，显式转换：日期/时间转 ISO 字符串，
+    Decimal 转 float，二进制转 base64，其余兜底 str。"""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    return str(value)
 
 
 def emit(envelope):
-    print(RESULT_MARKER + json.dumps(envelope, ensure_ascii=False))
+    print(RESULT_MARKER + json.dumps(envelope, ensure_ascii=False, default=_to_jsonable))
 
 
 def fail(stage, code, message, **extra):
@@ -62,8 +76,10 @@ def configure_engine(spec):
     # 目录模式），最后设资源上限并整体锁定。
     con = duckdb.connect(database=":memory:")
     limits = spec["limits"]
+    # allowed_directories 的值必须是 SQL 字符串字面量（单引号），双引号会被当成标识符。
+    root = _resolve_root(spec).replace("'", "''")
     con.execute(f"SET temp_directory='{limits['temp_directory']}'")
-    con.execute(f"SET allowed_directories=['{spec['mount_dir']}']")
+    con.execute(f"SET allowed_directories=['{root}']")
     con.execute("SET enable_external_access=false")
     con.execute(f"SET memory_limit='{limits['memory_limit']}'")
     con.execute(f"SET threads={int(limits['threads'])}")
@@ -71,12 +87,33 @@ def configure_engine(spec):
     return con
 
 
-def mount_datasets(con, datasets):
+def _resolve_root(spec):
+    """输入根目录双通道：优先兼容符号链接 /sandbox/input（逐任务建立）；
+    该链接在容器并发开大时会被沙箱自动关掉，此时回落到任务工作区的 input 目录
+    （bounded wrapper 以任务工作区为工作目录启动本脚本）。"""
+    mount_dir = spec["mount_dir"]
+    if os.path.isdir(mount_dir):
+        return mount_dir
+    fallback = os.path.abspath("input")
+    return fallback
+
+
+def _resolve_path(spec, path):
+    """规格里的数据路径以 mount_dir 为前缀；按实际生效的根目录重定根。"""
+    root = _resolve_root(spec)
+    mount_dir = spec["mount_dir"].rstrip("/")
+    if path.startswith(mount_dir + "/"):
+        path = root.rstrip("/") + path[len(mount_dir):]
+    return path
+
+
+def mount_datasets(con, spec):
     """每个数据集注册成视图，表名是 run 级编号的确定性映射（t1、t2……）。"""
     mounted = {}
-    for entry in datasets:
+    for entry in spec["datasets"]:
         alias = entry["alias"]
-        path = entry["path"]
+        # 平台生成的文件名也按 SQL 字符串字面量规则转义，单引号双写。
+        path = _resolve_path(spec, entry["path"]).replace("'", "''")
         fmt = entry.get("format", "").lower()
         if fmt == "parquet" or path.endswith(".parquet"):
             read = f"read_parquet('{path}')"
@@ -87,36 +124,114 @@ def mount_datasets(con, datasets):
     return mounted
 
 
+def _code_skeleton(sql):
+    """剥掉字符串字面量（单/双引号）与注释（行/块），返回只剩代码骨架的文本。
+    禁令检查在骨架上做，字符串里的分号和关键字不会误伤。"""
+    out = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append(" ")
+        elif c == '"':
+            i += 1
+            while i < n and sql[i] != '"':
+                i += 1
+            i += 1
+            out.append(" ")
+        elif c == "-" and i + 1 < n and sql[i + 1] == "-":
+            while i < n and sql[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and sql[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def preflight(sql, report):
+    """文本级禁令：引擎闸管不了的两条在这里拒——多语句（引擎会照跑并只回最后一条）
+    与 ATTACH（内存型 ATTACH 不受 external access 关闭影响）。COPY/INSTALL/LOAD
+    引擎闸已实测拦截，这里再按文档禁令清单显式拒一次，保证不随引擎版本漂移。"""
+    skeleton = _code_skeleton(sql)
+    parts = [p.strip() for p in skeleton.split(";")]
+    if len([p for p in parts if p]) > 1:
+        report["checks"].append("multi_statement")
+        plan_reject("PLAN_MULTI_STATEMENT", "只允许单条查询，多语句准入拒绝", report)
+    for keyword in ("ATTACH", "COPY", "INSTALL", "LOAD"):
+        if re.search(rf"\b{keyword}\b", skeleton, re.IGNORECASE):
+            report["checks"].append("forbidden_keyword:" + keyword)
+            plan_reject("PLAN_FORBIDDEN_STATEMENT",
+                    f"查询包含被禁止的语句 {keyword}，准入拒绝", report)
+
+
 def _plan_text(plan_rows):
     return "\n".join(str(row[1]) for row in plan_rows)
 
 
 def _max_estimated_rows(plan_text):
     """EXPLAIN 文本里每个算子框底部标注估计行数（如 `~20,000 rows`），取最大值对照档位上限。"""
-    import re
     estimated = [int(m.replace(",", "")) for m in re.findall(r"~([\d,]+)\s*rows", plan_text)]
     return max(estimated) if estimated else 0
 
 
-def gate(con, sql, tier):
-    """EXPLAIN 只出计划不执行主查询；三项检查任一不过即拒收。返回 (放行?, 报告)。"""
+def _operator_boxes(plan_text):
+    """把计划 ASCII 按算子框切开（每个框以 ┌ 顶边开头），逐框返回文本。"""
+    return re.split(r"┌[─]+┐", plan_text)
+
+
+def _box_estimated_rows(box_text):
+    m = re.search(r"~([\d,]+)\s*rows", box_text)
+    return int(m.group(1).replace(",", "")) if m else 0
+
+
+def gate(con, sql, tier, spec):
+    """EXPLAIN 只出计划不执行主查询；任一检查不过即拒收。返回 (放行?, 报告)。"""
+    limits = spec["limits"]
+    report = {"estimated_rows_max": 0, "checks": []}
+    preflight(sql, report)
+
     try:
         plan_rows = con.execute(f"EXPLAIN {sql}").fetchall()
     except Exception as exc:
         return False, {"stage": "explain", "error": str(exc)}
     plan_text = _plan_text(plan_rows)
-    report = {"estimated_rows_max": _max_estimated_rows(plan_text), "checks": []}
+    report["estimated_rows_max"] = _max_estimated_rows(plan_text)
 
-    # 检查一：结构规则——笛卡尔积、无 LIMIT 的全局排序在计划里有独立算子名。
+    # 结构规则一：笛卡尔积有独立算子名。
     if "CROSS_PRODUCT" in plan_text:
         report["checks"].append("cross_product")
         plan_reject("PLAN_CROSS_PRODUCT", "查询包含笛卡尔积连接，准入拒绝", report)
-    if "ORDER_BY" in plan_text and "TOP_N" not in plan_text:
-        report["checks"].append("global_sort_without_limit")
-        plan_reject("PLAN_GLOBAL_SORT", "全局排序缺少 LIMIT，准入拒绝", report)
 
-    # 检查二：估计行数对照档位上限。
-    cap = TIER_ESTIMATED_ROW_CAP[tier]
+    # 结构规则二：无界全局排序。计划里 ORDER_BY 算子框自身的估计行数超过
+    # 返回行数上限，说明这个排序不是 TOP_N 之后的有界重排（那种框估计极小），
+    # 按无界全局排序拒。任何位置出现 TOP_N 不再整体豁免本检查。
+    row_cap = int(limits["row_cap"])
+    for box in _operator_boxes(plan_text):
+        if re.search(r"│\s*ORDER_BY\s*│", box):
+            box_est = _box_estimated_rows(box)
+            if box_est > row_cap:
+                report["checks"].append("global_sort_over_row_cap")
+                plan_reject("PLAN_GLOBAL_SORT",
+                            f"全局排序估计处理 {box_est} 行，超过返回行数上限 {row_cap}，准入拒绝",
+                            report)
+
+    # 估计行数对照档位上限（上限由 Java 容量配置经规格下发，两边同源）。
+    cap = int(limits["estimated_row_cap"])
     if report["estimated_rows_max"] > cap:
         report["checks"].append("estimated_rows_over_cap")
         plan_reject("PLAN_ESTIMATED_ROWS_OVER_CAP",
@@ -149,9 +264,9 @@ def execute_with_timeout(con, sql, timeout_s):
 def main():
     spec = parse_spec()
     tier = spec.get("tier", "INTERACTIVE")
-    if tier not in TIER_LIMITS:
+    if tier not in ("INTERACTIVE", "BACKGROUND"):
         fail("input", "UNKNOWN_TIER", f"未知产品档位 {tier}")
-    limits = TIER_LIMITS[tier]
+    limits = spec["limits"]
 
     try:
         con = configure_engine(spec)
@@ -159,36 +274,47 @@ def main():
         fail("configure", "ENGINE_CONFIGURE_FAILED", str(exc))
 
     try:
-        mount_datasets(con, spec["datasets"])
+        mount_datasets(con, spec)
     except Exception as exc:
         fail("mount", "DATASET_MOUNT_FAILED", str(exc))
 
-    passed, gate_report = gate(con, spec["sql"], tier)
+    passed, gate_report = gate(con, spec["sql"], tier, spec)
     if not passed:
         # gate 内部已按 PLAN_REJECTED 信封退出；EXPLAIN 本身失败单独标记。
         fail("gate", "EXPLAIN_FAILED", gate_report.get("error", "explain failed"), gate=gate_report)
 
-    status, cursor, error = execute_with_timeout(con, spec["sql"], limits["statement_timeout_s"])
+    statement_timeout_s = int(limits["statement_timeout_s"])
+    status, cursor, error = execute_with_timeout(con, spec["sql"], statement_timeout_s)
     if status == "TIMEOUT":
-        emit({"status": "STATEMENT_TIMEOUT", "gate": gate_report,
-              "limits": {"statement_timeout_s": limits["statement_timeout_s"]}})
+        emit({"status": "STATEMENT_TIMEOUT",
+              "error": {"code": "STATEMENT_TIMEOUT",
+                        "message": f"语句超过 {statement_timeout_s} 秒档位上限被中断"},
+              "gate": gate_report,
+              "limits": {"statement_timeout_s": statement_timeout_s}})
         return
     if status == "ERROR":
         fail("execute", "QUERY_EXECUTION_FAILED", str(error), gate=gate_report)
 
     columns = [desc[0] for desc in cursor.description]
-    cap = limits["row_cap"]
+    cap = int(limits["row_cap"])
     rows = cursor.fetchmany(cap + 1)
     truncated = len(rows) > cap
     rows = rows[:cap]
-    emit({
+    envelope = {
         "status": "SUCCEEDED",
         "columns": columns,
-        "rows": [list(r) for r in rows],
+        "rows": [[_to_jsonable(v) for v in r] for r in rows],
         "row_count": len(rows),
         "truncated": truncated,
         "gate": gate_report,
-    })
+    }
+    # 信封体积守卫：超安全阈值时改发失败信封，不让半截 JSON 流到 Java 侧。
+    payload = json.dumps(envelope, ensure_ascii=False, default=_to_jsonable)
+    if len(payload.encode("utf-8")) > SAFE_ENVELOPE_BYTES:
+        fail("serialize", "QUERY_RESULT_TOO_LARGE",
+             "结果集超过单次返回体积上限，请收窄查询（加过滤、减少列或降低行数）后重试",
+             row_count=len(rows))
+    print(RESULT_MARKER + payload)
 
 
 # SPEC_B64 由 Java 侧在投递前替换为 base64 编码的规格 JSON。必须先赋值再进 main()。
