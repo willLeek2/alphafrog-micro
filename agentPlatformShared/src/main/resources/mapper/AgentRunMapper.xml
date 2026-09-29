@@ -871,12 +871,15 @@
     <!--
         同一用户其它 Run 上仍占用的 executeQuery 锚点。排除当前 Run，避免恢复路径把自己算进去。
         executePython 锚点的 toolName 不是 executeQuery，计数为 0。
+        只计非终态 Run。启动/孤儿回收器会把崩溃 Run 标成 FAILED 但不清锚点；
+        终态集合与 failOrphanedNonTerminalRunsForDeploymentGeneration 相同。
     -->
     <select id="countInFlightExecuteQueryByUser" resultType="int">
         SELECT COUNT(*)
           FROM alphafrog_agent_run
          WHERE user_id = #{userId}
            AND id &lt;&gt; #{excludeRunId}
+           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
            AND tool_job_anchor_json IS NOT NULL
            AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
            AND tool_job_anchor_json #&gt;&gt; '{toolName}' = #{toolName}

@@ -165,7 +165,8 @@ public class ToolJobAnchorService {
      *
      * <p>守卫按锚点上的 {@code toolName} 判断，只对 {@link ToolJobAnchor#EXECUTE_QUERY_TOOL}
      * 生效。executePython 走同一 {@code persistPreparing} 入口，但 toolName 不是
-     * executeQuery，这里直接返回，不取锁、不计数、不抛 409。</p>
+     * executeQuery，这里直接返回，不取锁、不计数、不抛
+     * {@code SESSION_QUERY_IN_PROGRESS}。</p>
      */
     private void guardExecuteQuerySession(String runId, ToolJobAnchor anchor) {
         if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())) {

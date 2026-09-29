@@ -128,14 +128,14 @@ public class AgentRunBudgetService {
      * 当前 Run 剩余墙钟毫秒数。起点锁 {@code alphafrog_agent_run.started_at}，
      * 上限取 {@link #effectiveConfig()} 的 maxWallClockMs。
      *
-     * <p>没有 runId 或墙钟上限未设（&lt;=0）时返回 {@link Long#MAX_VALUE}，表示不夹超时。
-     * started_at 缺失、Run 不存在或 mapper 未接线时抛 {@link RunStartedAtMissingException}，
-     * 不回落到 observability JSON 里的 startedAtMillis。</p>
+     * <p>墙钟上限未设（&lt;=0）时返回 {@link Long#MAX_VALUE}，表示不夹超时。
+     * 没有 runId、started_at 缺失、Run 不存在或 mapper 未接线时抛
+     * {@link RunStartedAtMissingException}，不回落到 observability JSON 里的 startedAtMillis。</p>
      */
     public long remainingWallClockMs() {
         String runId = AgentContext.getRunId();
         if (runId == null || runId.isBlank()) {
-            return Long.MAX_VALUE;
+            throw new RunStartedAtMissingException(runId);
         }
         if (runMapper == null) {
             throw new RunStartedAtMissingException(runId);

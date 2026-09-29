@@ -332,6 +332,12 @@ class AgentRunBudgetServiceTest {
         assertThrows(RunStartedAtMissingException.class, service::remainingWallClockMs);
     }
 
+    @Test
+    void remainingWallClockMs_rejectsMissingRunId() {
+        AgentContext.clear();
+        assertThrows(RunStartedAtMissingException.class, service::remainingWallClockMs);
+    }
+
     private void stubObservability(long toolCalls, long llmCalls, long totalTokens) {
         String json = """
                 {"summary":{"startedAtMillis":%d,"toolCalls":%d,"llmCalls":%d,"totalTokens":%d}}

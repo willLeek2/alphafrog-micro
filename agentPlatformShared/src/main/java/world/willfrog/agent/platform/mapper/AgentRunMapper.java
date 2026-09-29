@@ -353,9 +353,11 @@ public interface AgentRunMapper {
     int lockExecuteQuerySession(@Param("userId") String userId);
 
     /**
-     * 统计同一用户其它 Run 上仍占用的 executeQuery 锚点。
+     * 统计同一用户其它非终态 Run 上仍占用的 executeQuery 锚点。
      * 锚点非空且 {@code toolName} 等于指定工具名即视为在途：同步完成会清成空对象，
      * LINEAR 挂起期间锚点一直持有到恢复消费。
+     * 终态（COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED）的残留锚点不计，
+     * 因为启动/孤儿回收器会把崩溃 Run 标成 FAILED 但不清锚点。
      */
     int countInFlightExecuteQueryByUser(@Param("userId") String userId,
                                         @Param("excludeRunId") String excludeRunId,

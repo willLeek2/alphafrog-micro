@@ -621,6 +621,9 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-other-user", "EXECUTING",
                 "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
         updateUserId("run-other-user", "someone-else");
+        insertRun("run-failed-orphan", "FAILED",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        updateUserId("run-failed-orphan", "user-session");
 
         AgentRunMapper mapper = newMapper();
         assertThat(mapper.countInFlightExecuteQueryByUser(

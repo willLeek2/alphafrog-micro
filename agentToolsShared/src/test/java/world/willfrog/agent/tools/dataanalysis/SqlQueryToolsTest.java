@@ -4,17 +4,27 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
+import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalRecorder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * executeQuery 工具侧语义的单元测试：入口参数校验、运行器渲染与 SQL 回填、
@@ -144,6 +154,41 @@ class SqlQueryToolsTest {
             assertEquals(false, details.get("retryable"));
         } catch (ReflectiveOperationException reflectionFailure) {
             fail(reflectionFailure);
+        }
+    }
+
+    @Test
+    void executeQueryReturnsRunStartedAtMissingCode() throws Exception {
+        Path dir = Files.createTempDirectory("sq-started-at");
+        Path csv = dir.resolve("t.csv");
+        Files.writeString(csv, "id\n1\n");
+        Files.writeString(dir.resolve("t.meta.json"), "{\"rowCount\":1,\"bytes\":8}");
+        var dataset = AgentRunDatasetEntry.forDataset(
+                1, "ds-1", csv.toString(), "000001.SZ", "t.csv");
+        AgentRunDatasetRegistry registry = mock(AgentRunDatasetRegistry.class);
+        when(registry.findDatasetByNumber("run-1", 1)).thenReturn(Optional.of(dataset));
+        AgentRunBudgetService budget = mock(AgentRunBudgetService.class);
+        when(budget.remainingWallClockMs()).thenThrow(new RunStartedAtMissingException("run-1"));
+        ReflectionTestUtils.setField(tools, "agentRunDatasetRegistry", registry);
+        ReflectionTestUtils.setField(tools, "dataAnalysisCapacityProperties",
+                new DataAnalysisCapacityProperties());
+        ReflectionTestUtils.setField(tools, "pythonSandboxDispatchStore",
+                mock(PythonSandboxDispatchStore.class));
+        ReflectionTestUtils.setField(tools, "dataAnalysisCapacityService",
+                mock(DataAnalysisCapacityService.class));
+        ReflectionTestUtils.setField(tools, "dataAnalysisTerminalRecorder",
+                mock(DataAnalysisTerminalRecorder.class));
+        ReflectionTestUtils.setField(tools, "agentRunBudgetService", budget);
+        AgentContext.setRunId("run-1");
+        AgentContext.setToolCallId("call-1");
+        AgentContext.setWorkflow("linear");
+        try {
+            JsonNode out = objectMapper.readTree(tools.executeQuery("SELECT 1", "1", "INTERACTIVE"));
+            assertFalse(out.path("ok").asBoolean());
+            assertEquals("RUN_STARTED_AT_MISSING", out.path("error").path("code").asText());
+            assertEquals(false, out.path("error").path("details").path("retryable").booleanValue());
+        } finally {
+            AgentContext.clear();
         }
     }
 

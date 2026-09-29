@@ -88,7 +88,10 @@ public class SqlQueryTools {
      * INTERACTIVE 30+15=45，BACKGROUND 120+15=135；有效进程超时公式里的加数用同一个常量。
      */
     static final int TASK_OVERHEAD_SECONDS = 15;
-    /** Run 快结束时留给终态写回与恢复的收尾余量，与进程缓冲不是同一个数。 */
+    /**
+     * 夹语句超时用的收尾余量：有效语句超时 = min(档位上限, 剩余秒 − 该值)。
+     * 进程超时上限取整个剩余时间，不含这一项。与进程缓冲不是同一个数。
+     */
     static final int WALL_CLOCK_TAIL_SECONDS = 5;
 
     private static final int POLL_INTERVAL_MS = 1000;
@@ -454,13 +457,6 @@ public class SqlQueryTools {
         }
         int effectiveProcess = (int) Math.min(processCapSeconds,
                 Math.min((long) effectiveStatement + TASK_OVERHEAD_SECONDS, remainingSeconds));
-        if (effectiveProcess < effectiveStatement) {
-            throw new DataIntenseRefusal("RUN_WALL_CLOCK_INSUFFICIENT",
-                    "remaining run wall clock cannot keep process timeout above statement timeout",
-                    Map.of("remaining_ms", remainingWallClockMs,
-                            "effective_statement_seconds", effectiveStatement,
-                            "retryable", false));
-        }
         return new QueryTimeouts(effectiveStatement, effectiveProcess);
     }
 
