@@ -744,7 +744,9 @@ public final class SandboxToolJobLifecycle {
         anchor.setTerminalErrorCode(errorCode);
         anchor.setTerminalRetryable(result.retryable());
         anchor.setTerminalAt(terminalAt);
-        anchor.setTerminalUsageJson(result.usageJson());
+        // 锚点落库格式与既有行保持一致：沙箱未上报用量时旧实现落 "{}"（Proto 默认实例序列化）。
+        // 计量适配器仍以 usageJson==null 区分「用量缺失」，两处语义不要混用。
+        anchor.setTerminalUsageJson(result.usageJson() == null ? "{}" : result.usageJson());
         anchor.setReservationJson(deps.objectMapper().writeValueAsString(confirmed));
         anchor.setFinalizerStep("ENVELOPE");
         if (!deps.dispatchStore().persistAttached(runId, anchor)) {
