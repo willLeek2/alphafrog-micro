@@ -552,7 +552,7 @@ class AgentLlmLocalConfigLoaderTest {
 
         var ok = org.junit.jupiter.api.Assertions.assertInstanceOf(
                 world.willfrog.agent.platform.finance.FinanceMethodResolverClient.Ok.class, result);
-        String expectedDigest = "sha256:" + java.util.HexFormat.of().formatHex(
+        String expectedDigest = java.util.HexFormat.of().formatHex(
                 java.security.MessageDigest.getInstance("SHA-256")
                         .digest(localTemplate.getBytes(StandardCharsets.UTF_8)));
         assertEquals(expectedDigest, ok.resolverPromptVersion());
@@ -562,7 +562,7 @@ class AgentLlmLocalConfigLoaderTest {
                 "/prompts/finance/finance_method_resolver_system.txt")) {
             classpathBytes = is == null ? new byte[0] : is.readAllBytes();
         }
-        String classpathDigest = "sha256:" + java.util.HexFormat.of().formatHex(
+        String classpathDigest = java.util.HexFormat.of().formatHex(
                 java.security.MessageDigest.getInstance("SHA-256").digest(classpathBytes));
         assertEquals(classpathDigest, ok.resolverPromptVersion(),
                 "外置投影不能产生不同于 classpath 权威正文的 promptVersion");

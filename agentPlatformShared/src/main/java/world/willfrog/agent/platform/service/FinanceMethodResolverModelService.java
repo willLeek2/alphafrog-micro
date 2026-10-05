@@ -110,7 +110,9 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                     "resolver system prompt template must contain exactly one " + CATALOG_PLACEHOLDER
                             + " placeholder, found " + placeholderCount);
         }
-        String resolverPromptVersion = "sha256:" + sha256Hex(template.getBytes(StandardCharsets.UTF_8));
+        // 裸 hex 不带 "sha256:" 前缀：落库列 resolver_prompt_version 是 VARCHAR(64)，
+        // 带前缀共 71 字符必然溢出（261005 泳道实测 value too long）；同表 resolution_content_digest 同为裸 hex。
+        String resolverPromptVersion = sha256Hex(template.getBytes(StandardCharsets.UTF_8));
         String systemPrompt = template.replace(CATALOG_PLACEHOLDER, safeCatalog);
 
         // 请求字节上限钉实际送给 ChatModel 的两个 message content（render 后 systemPrompt + 序列化 user JSON）
