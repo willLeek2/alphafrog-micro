@@ -76,7 +76,7 @@ class ToolCatalogBuilderRegistryContractTest {
 
         assertEquals(AgentToolRegistry.declaredToolNames(), built,
                 "两个门控都开启时，构建出的目录应与注册表声明完全一致");
-        assertEquals(28, built.size(), "注册表声明面应保持 28 个工具");
+        assertEquals(29, built.size(), "注册表声明面应保持 29 个工具");
     }
 
     @Test
