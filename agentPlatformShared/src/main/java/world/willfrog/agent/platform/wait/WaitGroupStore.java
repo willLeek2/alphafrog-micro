@@ -181,6 +181,28 @@ public interface WaitGroupStore {
      */
     Optional<WaitMember> findMemberByOperation(String runId, String externalOperationId);
 
+    /**
+     * 这条 Run 上是否还有未结清的等待组成员占用同一外部作业身份。
+     * 会话串行用的 Run 级锚点不能当成 LINEAR 长工具切到 WAITING_TOOL_JOB，
+     * 否则成员接收器会因 run 不在执行中而拒收。
+     */
+    default boolean hasUnresolvedMember(String runId, String externalOperationId) {
+        if (runId == null || runId.isBlank() || externalOperationId == null || externalOperationId.isBlank()) {
+            return false;
+        }
+        Optional<WaitMember> member;
+        try {
+            member = findMemberByOperation(runId, externalOperationId);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+        if (member.isEmpty()) {
+            return false;
+        }
+        WaitMemberState state = member.get().stateEnum();
+        return state == WaitMemberState.PENDING || state == WaitMemberState.RUNNING;
+    }
+
     Optional<WaitMember> findMemberByIdentity(long groupId, String memberIdentity);
 
     List<RecoveryNotification> listNotifications(long groupId);

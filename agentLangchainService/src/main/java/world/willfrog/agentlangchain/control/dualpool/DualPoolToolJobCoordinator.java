@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobFaultInjector;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkerProcessProof;
 import world.willfrog.agent.platform.workitem.NodeWorkItemClaim;
@@ -106,6 +107,17 @@ public class DualPoolToolJobCoordinator {
         }
         NodeWorkItemIdentity identity = identity(runId, anchor);
         NodeWorkItem current = workItemStore.findByIdentity(identity).orElse(null);
+        if (current != null && current.stateEnum() == NodeWorkItemState.RESULT_COMMITTED) {
+            // 等待组挂起已经把派发分段写成结果已提交。崩溃恢复若把 Run 误切到
+            // WAITING_TOOL_JOB，不能再按 LINEAR 把这段推进成 RESUMABLE，否则会 0 行更新、
+            // 成员接收器也因 run 不在执行中拒收。只把 Run 拉回 EXECUTING，会话锚点留给
+            // 成员结清时清掉。不投递这段，也不改工作项状态。
+            boolean restored = anchorService.casUpdateStatus(
+                    runId, AgentRunStatus.EXECUTING, AgentRunStatus.WAITING_TOOL_JOB);
+            log.info("等待组派发分段已提交，跳过 LINEAR 恢复推进: identity={} restoredExecuting={}",
+                    identity.describe(), restored);
+            return true;
+        }
         if (current != null && current.stateEnum() == NodeWorkItemState.RESUMABLE
                 && RESUME_STATE.equals(anchor.getResumeState())) {
             if (!ensureRecoveryAdmission(runId)) {
