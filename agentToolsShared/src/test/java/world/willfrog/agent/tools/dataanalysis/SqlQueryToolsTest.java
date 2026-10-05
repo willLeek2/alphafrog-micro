@@ -79,6 +79,17 @@ class SqlQueryToolsTest {
         }
     }
 
+    @Test
+    void prepareDispatchWritesFrozenFinanceSnapshotOntoTheAnchor() {
+        var loader = mock(world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader.class);
+        when(loader.frozenSnapshotJson()).thenReturn("{\"snapshot\":1}");
+        ReflectionTestUtils.setField(tools, "financeRecordChannelConfigLoader", loader);
+        var extras = new world.willfrog.agent.platform.dataanalysis.ToolJobAnchor();
+        tools.writeQueryAnchorExtras(extras);
+        assertEquals("{\"snapshot\":1}", extras.getFinanceRecordLimitsJson());
+        tools.writeQueryAnchorExtras(null);
+    }
+
     // ---------- 扫描量准入（元数据行数/字节数求和对照容量硬上限） ----------
 
     @Test

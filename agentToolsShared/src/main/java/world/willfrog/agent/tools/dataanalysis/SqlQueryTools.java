@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
@@ -145,6 +146,9 @@ public class SqlQueryTools {
 
     @Autowired(required = false)
     private DataAnalysisTerminalRecorder dataAnalysisTerminalRecorder;
+
+    @Autowired(required = false)
+    private FinanceRecordChannelConfigLoader financeRecordChannelConfigLoader;
 
     @Value("${agent.tool-job.fast-path-ms:1500}")
     private long fastPathMs = 1500L;
@@ -329,7 +333,8 @@ public class SqlQueryTools {
             String canonicalSpecJson = objectMapper.writeValueAsString(spec);
             String createRequestJson = JsonFormat.printer()
                     .omittingInsignificantWhitespace().print(request);
-            // executeQuery 没有工具自有的锚点字段（无修复计数、无 finance 通道），extras 传 null。
+            // executeQuery 没有修复计数；金融记录通道快照必须写：沙箱每个任务都会带通道元数据，
+            // 终态对账缺这份冻结配置会永远停在 finance_snapshot_missing。
             SandboxToolJobLifecycle.PrepareDispatchResult dispatch;
             try {
                 dispatch = SandboxToolJobLifecycle.prepareDispatch(
@@ -353,7 +358,7 @@ public class SqlQueryTools {
                             subSnapshot.immutableDigest(),
                             spec.timeoutMillis(),
                             POLL_INTERVAL_MS),
-                    null);
+                    this::writeQueryAnchorExtras);
             } catch (SessionQueryAdmissionException sessionBusy) {
                 SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
                 return fail(sessionBusy.code(), sessionBusy.getMessage(),
@@ -549,7 +554,7 @@ public class SqlQueryTools {
                                     subSnapshot.immutableDigest(),
                                     spec.timeoutMillis(),
                                     POLL_INTERVAL_MS),
-                            null);
+                            this::writeQueryAnchorExtras);
             if (!dispatch.persisted()) {
                 SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
                 return fail("TOOL_JOB_ANCHOR_INVALID",
@@ -581,6 +586,17 @@ public class SqlQueryTools {
             }
             throw dispatchFailure;
         }
+    }
+
+    /**
+     * 把派发时的金融记录通道冻结快照写进锚点。沙箱有界包装器对每个任务都产出通道元数据，
+     * 终态对账必须能还原这份快照；缺了会永远卡在 finance_snapshot_missing。
+     */
+    void writeQueryAnchorExtras(ToolJobAnchor extras) {
+        if (extras == null || financeRecordChannelConfigLoader == null) {
+            return;
+        }
+        extras.setFinanceRecordLimitsJson(financeRecordChannelConfigLoader.frozenSnapshotJson());
     }
 
     /**
