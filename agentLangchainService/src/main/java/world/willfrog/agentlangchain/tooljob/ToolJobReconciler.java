@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
@@ -59,6 +60,9 @@ public class ToolJobReconciler {
 
     @Autowired(required = false)
     private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
+
+    @Autowired(required = false)
+    private WaitGroupStore waitGroupStore;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -111,6 +115,14 @@ public class ToolJobReconciler {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
+                if (waitGroupOwnsUnresolvedMember(run.getId(), a)) {
+                    if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB
+                            && dualPoolToolJobCoordinator != null
+                            && dualPoolToolJobCoordinator.supports(a)) {
+                        dualPoolToolJobCoordinator.promoteResumable(run.getId(), a);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         a.getRunDisposition())) {
                     processItem(run.getId());
@@ -175,6 +187,18 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
+                if (dualPoolToolJobCoordinator != null
+                        && dualPoolToolJobCoordinator.supports(anchor)
+                        && !runIsExecuting(runId)) {
+                    // 已误切到 WAITING_TOOL_JOB 的会话锁：把 Run 拉回 EXECUTING，
+                    // 让等待组成员接收器能结清。不走 LINEAR 推进，也不轮询 Sandbox。
+                    dualPoolToolJobCoordinator.promoteResumable(runId, anchor);
+                }
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+                return;
+            }
             if (dualPoolToolJobCoordinator != null
                     && dualPoolToolJobCoordinator.supports(anchor)
                     && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())
@@ -437,6 +461,9 @@ public class ToolJobReconciler {
     private void transferRecoveredAttached(String runId,
                                              ToolJobAnchor anchor,
                                              DataAnalysisReservation attached) {
+        if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
+            return;
+        }
         try {
             if (attached == null || attached.state() != DataAnalysisReservationState.TASK_ATTACHED) {
                 return;
@@ -572,5 +599,23 @@ public class ToolJobReconciler {
         log.error("DAG PREPARING abort retained for run={}, outcome={}; "
                         + "no Sandbox lookup or workflow resume is allowed",
                 runId, outcome);
+    }
+
+    /**
+     * 等待组未结清成员占用了本 operationId 时，LINEAR 侧不能把 Run 级会话锁当成 durable suspend。
+     */
+    private boolean waitGroupOwnsUnresolvedMember(String runId, ToolJobAnchor anchor) {
+        if (waitGroupStore == null || anchor == null || anchor.getOperationId() == null) {
+            return false;
+        }
+        return waitGroupStore.hasUnresolvedMember(runId, anchor.getOperationId());
+    }
+
+    private boolean runIsExecuting(String runId) {
+        if (ownershipGateway == null) {
+            return false;
+        }
+        AgentRun owned = ownershipGateway.findOwnedRun(runId);
+        return owned != null && owned.getStatus() == AgentRunStatus.EXECUTING;
     }
 }

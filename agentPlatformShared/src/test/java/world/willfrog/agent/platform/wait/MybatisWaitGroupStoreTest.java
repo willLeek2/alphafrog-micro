@@ -255,6 +255,22 @@ class MybatisWaitGroupStoreTest {
         assertThat(store.findMemberByIdentity(77L, "call_1")).contains(member);
     }
 
+    @Test
+    void unresolvedMemberMeansPendingOrRunning() {
+        WaitMember running = new WaitMember();
+        running.setState("RUNNING");
+        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(running);
+        assertThat(store.hasUnresolvedMember("run-1", "op-1")).isTrue();
+
+        WaitMember succeeded = new WaitMember();
+        succeeded.setState("SUCCEEDED");
+        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(succeeded);
+        assertThat(store.hasUnresolvedMember("run-1", "op-1")).isFalse();
+
+        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(null);
+        assertThat(store.hasUnresolvedMember("run-1", "op-1")).isFalse();
+    }
+
     // ===== 入参自检：明显不对的输入不许走到 SQL =====
 
     @Test

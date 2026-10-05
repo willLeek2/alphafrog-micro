@@ -114,6 +114,27 @@ class DualPoolToolJobCoordinatorTest {
     }
 
     @Test
+    void committedWaitGroupSegmentRestoresExecutingWithoutLinearPromote() {
+        ToolJobAnchor anchor = anchor(3);
+        NodeWorkItem committed = item("RESULT_COMMITTED", 3);
+        when(store.findByIdentity(committed.identity())).thenReturn(Optional.of(committed));
+        when(anchorService.casUpdateStatus(
+                "run-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING,
+                world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB))
+                .thenReturn(true);
+
+        assertThat(coordinator.promoteResumable("run-1", anchor)).isTrue();
+
+        verify(anchorService).casUpdateStatus(
+                "run-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING,
+                world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB);
+        verify(store, never()).promoteToolJobResumable(any(), any(), any(), any(), any());
+        verify(dispatcher, never()).offerNode(any());
+    }
+
+    @Test
     void interruptedCurrentWorkerRequeuesClaimedResumeWithNextEpoch() {
         ToolJobAnchor anchor = anchor(3);
         anchor.setResumeState(DualPoolToolJobCoordinator.RESUME_STATE);

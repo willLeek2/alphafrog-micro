@@ -413,6 +413,15 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if (waitGroupStore != null
+                        && waitGroupStore.hasUnresolvedMember(run.getId(), anchor.getOperationId())) {
+                    if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB
+                            && dualPoolToolJobCoordinator != null
+                            && dualPoolToolJobCoordinator.supports(anchor)) {
+                        dualPoolToolJobCoordinator.promoteResumable(run.getId(), anchor);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())) {
                     recoverPreparingAbort(run.getId(), anchor);
@@ -676,6 +685,13 @@ public class ToolJobStartupRecovery {
     }
 
     private boolean transferRecoveredAttached(String runId, ToolJobAnchor anchor) {
+        if (waitGroupStore != null && waitGroupStore.hasUnresolvedMember(runId, anchor.getOperationId())) {
+            // 等待组成员仍未结清：Run 级锚点只是会话串行锁，不能切到 WAITING_TOOL_JOB，
+            // 否则成员接收器会拒收，等待组永远挂起。
+            log.info("wait-group session lock: skip WAITING_TOOL_JOB transfer run={} operationId={}",
+                    runId, anchor.getOperationId());
+            return true;
+        }
         // 没有数据库里的 reservation 记录就无法证明和恢复容量，拒绝转 WAITING_TOOL_JOB。
         if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) {
             return false;
