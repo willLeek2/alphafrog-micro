@@ -95,7 +95,9 @@ public class FinanceMethodResolverCatalog {
         StringBuilder sb = new StringBuilder();
         sb.append("当前可用金融方法目录（按 methodId 排序）：\n");
         for (ResolverCatalogEntry e : entries) {
-            sb.append("- ").append(e.methodId()).append(" v").append(e.version());
+            // 版本号原样输出，不加 "v" 等装饰：模型会照抄目录文本回填 version 字段，
+            // 装饰前缀会让校验器按裸版本号查目录时永远失配（261005 泳道实测 v1.0.0 vs 1.0.0）。
+            sb.append("- ").append(e.methodId()).append(" ").append(e.version());
             sb.append(" / ").append(e.displayName()).append("  ").append(e.specDigest()).append("\n");
             if (!e.aliases().isEmpty()) {
                 sb.append("  别名：").append(String.join("、", e.aliases())).append("\n");
