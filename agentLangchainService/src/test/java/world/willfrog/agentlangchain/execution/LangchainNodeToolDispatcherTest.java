@@ -144,25 +144,26 @@ class LangchainNodeToolDispatcherTest {
     }
 
     @Test
-    void aDurableToolWithoutWaitGroupSupportIsRejectedBeforeExecution() {
-        // executeQuery 本期不接等待组：成员派发在装上下文、执行工具之前直接拒，
-        // 与工作流类型无关（顺序执行挂起没人认领、并行执行占住 worker 到超时）。
-        AtomicReference<Boolean> executed = new AtomicReference<>(false);
+    void anExecuteQueryMemberIsDispatchedWithThePersistedOperationIdentity() {
+        String expectedOperationId = queryExpectedOperationId();
+        AtomicReference<WaitGroupMemberExecutionContext.Snapshot> seen = new AtomicReference<>();
         executors.put(ToolJobAnchor.EXECUTE_QUERY_TOOL, (request, memoryId) -> {
-            executed.set(true);
-            return "{\"ok\":true}";
+            seen.set(WaitGroupMemberExecutionContext.current());
+            throw new WaitGroupMemberPendingException(
+                    proof(expectedOperationId, "task-q"), "沙箱任务已交出");
         });
 
-        NodeToolDispatcher.DispatchOutcome outcome = dispatcher.dispatch(
-                new NodeToolDispatcher.DispatchRequest(RUN_ID, SEGMENT, 77L, 2, MEMBER_IDENTITY,
-                        "call-q", ToolJobAnchor.EXECUTE_QUERY_TOOL, "{}"));
+        NodeToolDispatcher.DispatchOutcome outcome = dispatcher.dispatch(queryRequest());
 
-        assertThat(outcome).isInstanceOfSatisfying(NodeToolDispatcher.DispatchOutcome.Failed.class,
-                failed -> assertThat(failed.reason())
-                        .isEqualTo("wait_group_member_unsupported_tool:executeQuery"));
-        assertThat(executed.get()).as("派发前即拒，工具体不得执行").isFalse();
+        assertThat(outcome).isInstanceOfSatisfying(NodeToolDispatcher.DispatchOutcome.Pending.class,
+                pending -> {
+                    assertThat(pending.operationId()).isEqualTo(expectedOperationId);
+                    assertThat(pending.taskId()).isEqualTo("task-q");
+                });
+        assertThat(seen.get()).as("派发期间工具层能看到成员上下文").isNotNull();
+        assertThat(seen.get().expectedOperationId()).isEqualTo(expectedOperationId);
         assertThat(WaitGroupMemberExecutionContext.current())
-                .as("拒绝不得留下成员上下文").isNull();
+                .as("派发结束后上下文必须恢复，不能留给同一线程上的下一次调用").isNull();
     }
 
     // ==================== 同步工具与失败 ====================
@@ -268,6 +269,17 @@ class LangchainNodeToolDispatcherTest {
     }
 
     // ==================== 测试脚手架 ====================
+
+    private NodeToolDispatcher.DispatchRequest queryRequest() {
+        return new NodeToolDispatcher.DispatchRequest(RUN_ID, SEGMENT, 77L, 2, MEMBER_IDENTITY,
+                "call-q", ToolJobAnchor.EXECUTE_QUERY_TOOL, "{}");
+    }
+
+    private String queryExpectedOperationId() {
+        String durableCallId = DurableToolCallIds.forTool(
+                ToolJobAnchor.EXECUTE_QUERY_TOOL, "call-q", SEGMENT);
+        return new DataAnalysisOperationIdentity(RUN_ID, durableCallId, 1).operationId();
+    }
 
     private NodeToolDispatcher.DispatchRequest asyncRequest() {
         return new NodeToolDispatcher.DispatchRequest(RUN_ID, SEGMENT, 77L, 1, MEMBER_IDENTITY,
