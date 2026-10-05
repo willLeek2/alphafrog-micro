@@ -52,6 +52,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -115,7 +116,8 @@ class WaitMemberResultReceiverTest {
 
         Mockito.lenient().when(waitGroupStore.rescheduleMember(anyLong(), anyString(), any(), anyInt()))
                 .thenReturn(true);
-        Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(anyString(), any()))
+        Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(
+                anyString(), any(), any(), any(), any(), any()))
                 .thenReturn("{\"ok\":true,\"stdout\":\"done\"}");
     }
 
@@ -218,9 +220,31 @@ class WaitMemberResultReceiverTest {
                         java.util.Map.of("taskId", "task-1"), 4096));
 
         verify(recoveryDispatcher).wake(99L);
+        verify(pythonSandboxTools).formatTerminalResult(
+                eq("SUCCEEDED"), any(), eq(RUN_ID), isNull(), eq("node-1"), eq("tc-1"));
         assertThat(receiver.snapshot())
                 .containsEntry("waitMemberReceiverCompletedTotal", 1L)
                 .containsEntry("waitMemberReceiverWakeupsTotal", 1L);
+    }
+
+    /** 金融通道格式化失败时不写成员终态，推后下一轮，避免带着标记的正文永远拒收。 */
+    @Test
+    void aFinanceFormattingFailureDefersTheMember() {
+        givenDueMember();
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "done");
+        when(pythonSandboxTools.formatTerminalResult(
+                anyString(), any(), any(), any(), any(), any()))
+                .thenThrow(new world.willfrog.agent.platform.finance.FinanceRecordProcessingException(
+                        "FINANCE_RECORD_CONFIG_SNAPSHOT_MISSING", "snapshot missing"));
+
+        receiver.round();
+
+        verify(waitGroupStore, never()).completeMember(any());
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        assertThat(receiver.snapshot())
+                .containsEntry("waitMemberReceiverDeferredTotal", 1L)
+                .containsEntry("waitMemberReceiverFailuresTotal", 1L);
     }
 
     /** 失败的作业：成员落失败，载荷里带明确的错误码。 */
@@ -247,7 +271,8 @@ class WaitMemberResultReceiverTest {
         givenDueMember();
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
-        Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(anyString(), any()))
+        Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(
+                anyString(), any(), any(), any(), any(), any()))
                 .thenReturn("x".repeat(4097));
         Mockito.lenient().when(waitGroupStore.completeMember(any())).thenReturn(
                 new MemberCompletionResult(true, WaitMemberState.FAILED, WaitGroupState.READY, 1, 1, null));

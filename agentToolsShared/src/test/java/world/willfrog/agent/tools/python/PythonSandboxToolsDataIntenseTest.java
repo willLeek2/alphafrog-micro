@@ -411,6 +411,42 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
+    void waitMemberTerminalResultConsumesFinanceMarkersBeforeFormatting() throws Exception {
+        FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
+        FinanceRecordChannelProcessor processor = mock(FinanceRecordChannelProcessor.class);
+        FinanceResultModelAdapter adapter = mock(FinanceResultModelAdapter.class);
+        inject("financeRecordChannelConfigLoader", configLoader);
+        inject("financeRecordChannelProcessor", processor);
+        inject("financeResultModelAdapter", adapter);
+        when(configLoader.frozenSnapshotJson()).thenReturn("{\"snapshot\":1}");
+        when(configLoader.parseFrozenSnapshot("{\"snapshot\":1}"))
+                .thenReturn(financeSnapshot());
+        when(processor.process(any())).thenReturn(financeExtractionResult());
+        when(adapter.project(any())).thenReturn(new FinanceResultModelAdapter.ProjectionBatch(
+                List.of(new FinanceToolResultFormatter.FinanceModelResult(
+                        "复合增长率", 0.12468265, "ratio", "按规范参数计算")),
+                List.of()));
+
+        String output = tools.formatTerminalResult(
+                "SUCCEEDED", financeTerminalResult(),
+                "run-test", "user-1", "todo-1", "call-1");
+
+        assertThat(output)
+                .contains("\"ok\":true", "\"stdout\":\"rows=5\"", "\"results\"")
+                .contains("\"method\":\"复合增长率\"")
+                .doesNotContain("__AF_FINANCE_RESULT_");
+        ArgumentCaptor<FinanceRecordExtractionRequest> request =
+                ArgumentCaptor.forClass(FinanceRecordExtractionRequest.class);
+        verify(processor).process(request.capture());
+        assertThat(request.getValue().runId()).isEqualTo("run-test");
+        assertThat(request.getValue().userId()).isEqualTo("user-1");
+        assertThat(request.getValue().todoId()).isEqualTo("todo-1");
+        assertThat(request.getValue().executePythonToolCallId()).isEqualTo("call-1");
+        assertThat(request.getValue().entryPoint()).isEqualTo("wait-member");
+        assertThat(request.getValue().taskId()).isEqualTo("task-finance");
+    }
+
+    @Test
     void financeFailureDemarkersWithoutProjectionAndPersistsExactFailurePreview() throws Exception {
         fixtureDataset();
         FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
