@@ -354,8 +354,8 @@ public class ToolJobStartupRecovery {
 
     private void appendWaitMemberReservation(WaitMember member,
                                              List<DataAnalysisReservation> reservations) {
-        if (!"executePython".equals(member.getToolName())) {
-            throw new IllegalStateException("scan returned a non-Python member");
+        if (DurableSandboxTool.fromToolName(member.getToolName()).isEmpty()) {
+            throw new IllegalStateException("scan returned a member that is not a durable sandbox tool");
         }
         WaitMemberState state = member.stateEnum();
         if (state != WaitMemberState.PENDING && state != WaitMemberState.RUNNING

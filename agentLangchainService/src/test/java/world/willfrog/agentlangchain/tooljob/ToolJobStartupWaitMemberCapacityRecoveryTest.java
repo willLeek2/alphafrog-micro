@@ -81,6 +81,20 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
     }
 
     @Test
+    void restoresExecuteQueryMemberFromDurableProof() throws Exception {
+        DataAnalysisOperationIdentity id = operation("run-q", "call-q", "executeQuery");
+        DataAnalysisReservation attached = reservation(id, DataAnalysisReservationState.TASK_ATTACHED, "task-q");
+        WaitMember member = member(5, attached, "RUNNING", "executeQuery");
+        when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200))
+                .thenReturn(List.of(member));
+        when(capacity.recover(anyList(), anyInt(), anyInt())).thenReturn(emptyReport());
+
+        recovery().onReady();
+
+        verify(capacity).recover(eq(List.of(attached)), anyInt(), anyInt());
+    }
+
+    @Test
     void missingProofOnCancelledStopKeepsAdmissionClosed() {
         WaitMember member = new WaitMember();
         member.setId(4L);
@@ -118,6 +132,11 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
     }
 
     private WaitMember member(long rowId, DataAnalysisReservation reservation, String state) throws Exception {
+        return member(rowId, reservation, state, "executePython");
+    }
+
+    private WaitMember member(long rowId, DataAnalysisReservation reservation, String state, String toolName)
+            throws Exception {
         WaitMember member = new WaitMember();
         member.setId(rowId);
         member.setGroupId(rowId);
@@ -135,7 +154,7 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
         group.setModelTurn(1);
         when(groups.findGroup(rowId)).thenReturn(Optional.of(group));
         member.setExternalOperationId(reservation.operationId());
-        member.setToolName("executePython");
+        member.setToolName(toolName);
         member.setState(state);
         member.setDispatchProofJson(new WaitMemberDispatchProof(
                 WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION, reservation.operationId(),
@@ -146,8 +165,12 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
     }
 
     private static DataAnalysisOperationIdentity operation(String runId, String rawCallId) {
+        return operation(runId, rawCallId, "executePython");
+    }
+
+    private static DataAnalysisOperationIdentity operation(String runId, String rawCallId, String toolName) {
         return new DataAnalysisOperationIdentity(runId, DurableToolCallIds.forTool(
-                "executePython", rawCallId, new NodeWorkItemIdentity(runId, 1, "node", 1, 1)), 1);
+                toolName, rawCallId, new NodeWorkItemIdentity(runId, 1, "node", 1, 1)), 1);
     }
 
     private static DataAnalysisReservation reservation(DataAnalysisOperationIdentity id,
