@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.tools;
 
+import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 
 import java.nio.charset.StandardCharsets;
@@ -12,7 +13,7 @@ import java.util.UUID;
  * 完全可能都得到 {@code executePython_2}；直接拿它去 Sandbox 建任务，第二个真实任务会被当成
  * 第一个任务的幂等重放。</p>
  *
- * <p>所以 {@code executePython} 的持久身份要在模型给的名字后面追加节点分段身份的稳定摘要。同一段
+ * <p>所以沙箱后台长工具的持久身份要在模型给的名字后面追加节点分段身份的稳定摘要。同一段
  * 中断、重启或重新领取时摘要不变；换了计划代际、节点、节点尝试或执行分段就换一个摘要输入。
  * 其他工具没有跨进程持久作业，继续用模型给的原始身份。</p>
  *
@@ -21,9 +22,6 @@ import java.util.UUID;
  * 慢慢走偏。</p>
  */
 public final class DurableToolCallIds {
-
-    /** 会转后台、需要稳定身份的工具。 */
-    public static final String ASYNC_PYTHON_TOOL = "executePython";
 
     /** 追加在模型给出的调用身份后面的节点摘要前缀。 */
     public static final String WORK_ITEM_SUFFIX = "--wi-";
@@ -39,7 +37,8 @@ public final class DurableToolCallIds {
      * @param segment       当前执行分段的五字段身份，可为空（为空时按原始身份处理）
      */
     public static String forTool(String toolName, String rawToolCallId, NodeWorkItemIdentity segment) {
-        if (!ASYNC_PYTHON_TOOL.equals(toolName) || segment == null || rawToolCallId == null) {
+        // 是否「会转后台」以描述符注册表为准：登记过的沙箱长工具才需要稳定身份。
+        if (DurableSandboxTool.fromToolName(toolName).isEmpty() || segment == null || rawToolCallId == null) {
             return rawToolCallId;
         }
         String workItemScope = segment.describe();

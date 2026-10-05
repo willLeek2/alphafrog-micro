@@ -270,7 +270,8 @@
           "getEtfAdj": { "weight": 2, "maxBatchItems": 8, "requiresAdjFactorEnabled": true },
           "getListedAssetShareSize": { "weight": 2, "maxBatchItems": 8 },
           "ragSearch": { "weight": 2, "maxBatchItems": 1 },
-          "executePython": { "weight": 4, "maxBatchItems": 1 }
+          "executePython": { "weight": 4, "maxBatchItems": 1 },
+          "executeQuery": { "weight": 4, "maxBatchItems": 1 }
         }
       }
     },

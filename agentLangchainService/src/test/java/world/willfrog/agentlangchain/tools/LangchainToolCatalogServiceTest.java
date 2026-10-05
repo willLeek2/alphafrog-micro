@@ -36,6 +36,7 @@ class LangchainToolCatalogServiceTest {
                 null,
                 null,
                 null,
+                null,
                 new ListMyDataTool(objectMapper),
                 null,
                 null,
@@ -73,6 +74,7 @@ class LangchainToolCatalogServiceTest {
                 null,
                 null,
                 null,
+                null,
                 new ListMyDataTool(objectMapper),
                 null,
                 null,
@@ -93,6 +95,7 @@ class LangchainToolCatalogServiceTest {
     @Test
     void listToolMessages_shouldExposeResolveFinanceMethodsAlways() throws Exception {
         LangchainToolCatalogService service = new LangchainToolCatalogService(
+                null,
                 null,
                 null,
                 null,

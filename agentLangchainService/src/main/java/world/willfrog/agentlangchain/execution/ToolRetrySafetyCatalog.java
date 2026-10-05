@@ -31,6 +31,8 @@ public class ToolRetrySafetyCatalog {
         }
         // Sandbox 执行被限制在当前 Run 的隔离目录；相同逻辑重放不会产生外部系统写入。
         safety.put("executePython", ToolRetrySafety.IDEMPOTENT);
+        // executeQuery 同样只在沙箱内只读执行，且 operationId 幂等防重，重放安全。
+        safety.put("executeQuery", ToolRetrySafety.IDEMPOTENT);
         // 创建子 Agent 会启动新的执行单元，重复调用可能重复消耗资源，明确禁止自动重放。
         safety.put("spawnSubAgent", ToolRetrySafety.UNSAFE);
         SAFETY_BY_TOOL = Map.copyOf(safety);

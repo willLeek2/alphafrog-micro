@@ -346,6 +346,26 @@ public interface AgentRunMapper {
                                     @Param("expectedStatus") AgentRunStatus expectedStatus);
 
     /**
+     * executeQuery 会话串行：在当前事务内按 user_id 取 PostgreSQL 事务级咨询锁。
+     * 锁键是 {@code hashtextextended(userId, 0)}，与 Beta 工具任务控制面同一函数，避免 32 位 hashtext 碰撞。
+     * 必须与后续计数、claim UPDATE 落在同一 Spring 事务里，否则语句一提交锁就释放。
+     */
+    int lockExecuteQuerySession(@Param("userId") String userId);
+
+    /**
+     * 统计同一用户其它非终态 Run 上仍占用的 executeQuery 锚点。
+     * 锚点非空且 {@code toolName} 等于指定工具名即视为在途：同步完成会清成空对象，
+     * LINEAR 挂起期间锚点一直持有到恢复消费。
+     * 终态残留锚点不计。当前代进程崩溃后 Run 会停在 EXECUTING，代际清扫器不碰当前代，
+     * 所以还要排除 {@code updated_at} 早于陈旧阈值的行；阈值由
+     * {@code alphafrog.data-analysis.session-stale-seconds} 提供，缺省 600 秒。
+     */
+    int countInFlightExecuteQueryByUser(@Param("userId") String userId,
+                                        @Param("excludeRunId") String excludeRunId,
+                                        @Param("toolName") String toolName,
+                                        @Param("staleSeconds") int staleSeconds);
+
+    /**
      * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。
      * token/version/resultConsumed 共同防止旧 launcher 覆盖新的工具任务。
      */

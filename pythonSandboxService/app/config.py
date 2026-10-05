@@ -503,7 +503,7 @@ def load_config() -> SandboxConfig:
         item.strip().lower()
         for item in os.getenv(
             "AF_SANDBOX_PREINSTALLED_LIBRARIES",
-            "numpy,pandas,matplotlib,scipy",
+            "numpy,pandas,matplotlib,scipy,duckdb",
         ).split(",")
         if item.strip()
     )

@@ -28,6 +28,7 @@ import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
@@ -114,6 +115,8 @@ public class ToolRouter {
     private final SearchTools searchTools;
     /** Python 沙箱执行工具集（executePython） */
     private final PythonSandboxTools pythonSandboxTools;
+    /** SQL 取数工具集（executeQuery）：沙箱内固定 DuckDB 运行器 */
+    private final SqlQueryTools sqlQueryTools;
     /** 金融方法建议工具（resolveFinanceMethods），只读建议工具。 */
     private final FinanceMethodTools financeMethodTools;
     /** 平台工具指南加载工具（loadToolGuide） */
@@ -423,6 +426,18 @@ public class ToolRouter {
         );
     }
 
+    /**
+     * executeQuery 的参数归集：sql / dataset_ids / product_tier 三个参数，
+     * 别名兼容（argN 与驼峰）与 executePython 保持同一层处理。
+     */
+    private String invokeExecuteQuery(Map<String, Object> params) {
+        return sqlQueryTools.executeQuery(
+                str(params.get("sql"), params.get("arg0")),
+                str(params.get("dataset_ids"), params.get("datasetIds"), params.get("arg1")),
+                str(params.get("product_tier"), params.get("productTier"), params.get("arg2"))
+        );
+    }
+
     private boolean isStaticPrecheckEnabled() {
         if (localConfigLoader != null) {
             Boolean local = localConfigLoader.current()
@@ -650,6 +665,7 @@ public class ToolRouter {
                         str(params.get("context"), params.get("arg1"))
                 );
                 case "executePython" -> invokeExecutePython(params);
+                case "executeQuery" -> invokeExecuteQuery(params);
                 case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
                         str(params.get("topic"), params.get("arg0"))
                 );

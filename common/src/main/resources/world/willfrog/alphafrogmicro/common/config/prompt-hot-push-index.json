@@ -45,6 +45,7 @@
   "toolNames": [
     "checkParallelLimits",
     "executePython",
+    "executeQuery",
     "getEtfAdj",
     "getExchangeAssetDaily",
     "getFinancialReport",
