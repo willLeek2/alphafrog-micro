@@ -252,6 +252,9 @@ agent:
 # 生产环境仍可根据宿主机内存独立下调这三个显式变量。
 alphafrog:
   data-analysis:
+    # executeQuery 会话在途计数：updated_at 早于该秒数的残锚点不算在途。
+    # 缺省 600，大于后台档进程上限 135 秒；排队变长时用环境变量调。
+    session-stale-seconds: ${AF_DATA_ANALYSIS_SESSION_STALE_SECONDS:600}
     capacity:
       max-units: ${AF_DATA_ANALYSIS_CAPACITY_MAX_UNITS:20}
       max-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_ACTIVE:20}

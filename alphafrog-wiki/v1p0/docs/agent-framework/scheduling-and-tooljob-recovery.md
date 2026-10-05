@@ -330,7 +330,7 @@ Spring 终态事件不是持久消息，所以系统还用 `WorkspacePollingObse
 - `agentPlatformShared/.../AgentRunDagNodeMapper.java`
 - `agentPlatformShared/.../FinanceSharedResidenceAllowlist.java`
 - `agentToolsShared/.../PythonSandboxTools.java`
-- `agentToolsShared/.../PythonWaitPolicy.java`
+- `agentToolsShared/.../SandboxJobWaitPolicy.java`
 - `agentToolsShared/.../DataAnalysisCapacityServiceImpl.java`
 - `pythonSandboxService/app/bounded_exec_wrapper.py`
 - `pythonSandboxService/app/capture_reader.py`

@@ -678,6 +678,38 @@ class DataAnalysisCapacityServiceImplTest {
     }
 
     @Nested
+    @DisplayName("C5a capacity unit accounting")
+    class CapacityUnitAccounting {
+
+        @Test
+        void standardIsOneUnitHeavyIsThreeAndPreparingOccupiesMaxActive() {
+            assertEquals(1, DataAnalysisResourceClass.STANDARD.defaultCapacityUnits());
+            assertEquals(3, DataAnalysisResourceClass.HEAVY.defaultCapacityUnits());
+            openAfterEmptyRecover();
+            DataAnalysisReservation standard = service.reserve(
+                    identity("run-1", "call-1", 1), standardEstimate());
+            assertEquals(DataAnalysisReservationState.PREPARING, standard.state());
+            assertEquals(1, standard.capacityUnits());
+            assertEquals(1, service.usedUnitsSnapshot());
+            DataAnalysisReservation heavy = service.reserve(
+                    identity("run-2", "call-1", 1), heavyEstimate());
+            assertEquals(DataAnalysisReservationState.PREPARING, heavy.state());
+            assertEquals(3, heavy.capacityUnits());
+            assertEquals(4, service.usedUnitsSnapshot());
+
+            properties.setMaxActive(2);
+            service = new DataAnalysisCapacityServiceImpl(properties);
+            openAfterEmptyRecover();
+            service.reserve(identity("run-3", "call-1", 1), standardEstimate());
+            service.reserve(identity("run-3", "call-2", 1), standardEstimate());
+            CapacityAdmissionException third = assertThrows(CapacityAdmissionException.class,
+                    () -> service.reserve(identity("run-3", "call-3", 1), standardEstimate()));
+            assertEquals(CapacityAdmissionException.Reason.SERVER_BUSY, third.reason());
+            assertEquals(2, service.usedUnitsSnapshot());
+        }
+    }
+
+    @Nested
     @DisplayName("Capacity service contract surface")
     class ContractSurface {
 

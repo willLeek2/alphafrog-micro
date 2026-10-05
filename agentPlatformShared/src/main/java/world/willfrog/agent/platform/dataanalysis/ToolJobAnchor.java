@@ -36,6 +36,8 @@ public class ToolJobAnchor {
     private int schemaVersion = 1;
     // checkpointVersion 每次原子合并后递增，是防止丢失更新的版本栅栏。
     private int checkpointVersion;
+    // toolName 标识这个锚点属于哪个沙箱后台长工具；旧锚点没有该字段，读取时归一化为 executePython。
+    private String toolName;
     // operationId 标识一次可幂等创建的外部操作，不随进程重启变化。
     private String operationId;
     // requestFingerprint 绑定本次工具入参，阻止同一 operationId 被不同请求复用。
@@ -130,6 +132,9 @@ public class ToolJobAnchor {
     private Instant terminalAt;
     // nullable 用于区分“明确不可重试”和“旧协议未返回分类”；缺失时 fail-closed。
     private Boolean terminalRetryable;
+    // terminalBusinessSuccess 是业务成败（由工具的结果适配器判定，如 executeQuery 的信封状态）；
+    // 旧锚点没有该字段，恢复侧读到 null 时回退到「沙箱终态是否 SUCCEEDED」的旧判据。
+    private Boolean terminalBusinessSuccess;
 
     // pythonRequestFingerprint 排除 operationId，用于跨 worker 判断模型是否原样重放已失败代码。
     private String pythonRequestFingerprint;
@@ -182,6 +187,7 @@ public class ToolJobAnchor {
             ToolJobAnchor anchor = MAPPER.readValue(json, ToolJobAnchor.class);
             normalizeLegacyResultConsumed(anchor);
             normalizeRepairAttempts(anchor);
+            normalizeLegacyToolName(anchor);
             return anchor;
         } catch (JsonProcessingException e) {
             // 锚点损坏必须显式失败；静默构造空对象会绕过 CAS 身份保护。
@@ -219,6 +225,9 @@ public class ToolJobAnchor {
 
     public static final String EXECUTE_PYTHON_TOOL = "executePython";
 
+    /** SQL 取数工具的稳定工具名：沙箱内固定 DuckDB 运行器执行模型给出的 SQL。 */
+    public static final String EXECUTE_QUERY_TOOL = "executeQuery";
+
     /**
      * 读历史 JSON 时：若新键没有 executePython，把旧三字段迁进 {@code repairAttempts}。
      * 迁完清掉内存里的旧字段，后续 {@link #toJson()} 不再写出旧键。
@@ -238,6 +247,16 @@ public class ToolJobAnchor {
         anchor.pythonRepairExhausted = false;
     }
 
+    /**
+     * 旧锚点没有 toolName 字段。本字段引入前只有 executePython 会创建锚点，
+     * 因此读取旧 JSON 时归一化为 executePython，保证终态事件与计价能拿到工具名。
+     */
+    private static void normalizeLegacyToolName(ToolJobAnchor anchor) {
+        if (anchor.toolName == null || anchor.toolName.isBlank()) {
+            anchor.toolName = EXECUTE_PYTHON_TOOL;
+        }
+    }
+
     public String toJson() {
         try {
             // 每次写库前序列化完整状态，数据库 CAS 决定是否接受这份新快照。
@@ -255,6 +274,9 @@ public class ToolJobAnchor {
 
     public int getCheckpointVersion() { return checkpointVersion; }
     public void setCheckpointVersion(int checkpointVersion) { this.checkpointVersion = checkpointVersion; }
+
+    public String getToolName() { return toolName; }
+    public void setToolName(String toolName) { this.toolName = toolName; }
 
     public String getOperationId() { return operationId; }
     public void setOperationId(String operationId) { this.operationId = operationId; }
@@ -409,6 +431,10 @@ public class ToolJobAnchor {
 
     public Boolean getTerminalRetryable() { return terminalRetryable; }
     public void setTerminalRetryable(Boolean terminalRetryable) { this.terminalRetryable = terminalRetryable; }
+    public Boolean getTerminalBusinessSuccess() { return terminalBusinessSuccess; }
+    public void setTerminalBusinessSuccess(Boolean terminalBusinessSuccess) {
+        this.terminalBusinessSuccess = terminalBusinessSuccess;
+    }
 
     public String getPythonRequestFingerprint() { return pythonRequestFingerprint; }
     public void setPythonRequestFingerprint(String pythonRequestFingerprint) {

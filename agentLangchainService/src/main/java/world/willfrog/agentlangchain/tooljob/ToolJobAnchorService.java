@@ -1,8 +1,10 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -27,10 +29,19 @@ import java.util.List;
 public class ToolJobAnchorService {
 
     private final AgentRunMapper agentRunMapper;
+    private final int sessionStaleSeconds;
 
     @Autowired
-    public ToolJobAnchorService(AgentRunMapper agentRunMapper) {
+    public ToolJobAnchorService(
+            AgentRunMapper agentRunMapper,
+            @Value("${alphafrog.data-analysis.session-stale-seconds:600}") int sessionStaleSeconds) {
         this.agentRunMapper = agentRunMapper;
+        this.sessionStaleSeconds = sessionStaleSeconds > 0 ? sessionStaleSeconds : 600;
+    }
+
+    /** 测试与手工构造：陈旧阈值用缺省 600 秒。 */
+    public ToolJobAnchorService(AgentRunMapper agentRunMapper) {
+        this(agentRunMapper, 600);
     }
 
     /**
@@ -136,12 +147,15 @@ public class ToolJobAnchorService {
                 pending, exhausted) == 1;
     }
 
+    @Transactional
     public boolean claimPreparing(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
         // 只有空 anchor 才能创建 PREPARING owner，重复分发会返回 false。
+        guardExecuteQuerySession(runId, anchor);
         return agentRunMapper.claimPreparingToolJobAnchor(
                 runId, anchor.toJson(), expectedStatus) == 1;
     }
 
+    @Transactional
     public boolean claimPreparingFromResume(String runId,
                                              ToolJobAnchor anchor,
                                              String expectedResumeToken,
@@ -150,8 +164,41 @@ public class ToolJobAnchorService {
                 || expectedResumeLeaseVersion <= 0) {
             return false;
         }
+        guardExecuteQuerySession(runId, anchor);
         return agentRunMapper.claimPreparingToolJobAnchorFromResume(
                 runId, anchor.toJson(), expectedResumeToken, expectedResumeLeaseVersion) == 1;
+    }
+
+    /**
+     * 同一用户同一时刻只允许一条 executeQuery 在途。锁和计数必须与随后的 claim UPDATE
+     * 在同一事务里，否则咨询锁在语句提交时就会释放。
+     *
+     * <p>守卫按锚点上的 {@code toolName} 判断，只对 {@link ToolJobAnchor#EXECUTE_QUERY_TOOL}
+     * 生效。executePython 走同一 {@code persistPreparing} 入口，但 toolName 不是
+     * executeQuery，这里直接返回，不取锁、不计数、不抛
+     * {@code SESSION_QUERY_IN_PROGRESS}。</p>
+     */
+    private void guardExecuteQuerySession(String runId, ToolJobAnchor anchor) {
+        if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())) {
+            return;
+        }
+        AgentRun run = agentRunMapper.findById(runId);
+        String userId = run == null ? null : run.getUserId();
+        if (userId == null || userId.isBlank()) {
+            throw new SessionQueryAdmissionException(
+                    "SESSION_USER_ID_MISSING",
+                    "alphafrog_agent_run.user_id is missing; cannot serialize executeQuery by session",
+                    false);
+        }
+        agentRunMapper.lockExecuteQuerySession(userId);
+        int inFlight = agentRunMapper.countInFlightExecuteQueryByUser(
+                userId, runId, ToolJobAnchor.EXECUTE_QUERY_TOOL, sessionStaleSeconds);
+        if (inFlight > 0) {
+            throw new SessionQueryAdmissionException(
+                    "SESSION_QUERY_IN_PROGRESS",
+                    "another executeQuery is already running in this session; wait for it to finish or retry shortly",
+                    true);
+        }
     }
 
     public boolean updateActive(String runId, ToolJobAnchor anchor,

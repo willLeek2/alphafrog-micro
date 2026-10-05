@@ -12,6 +12,7 @@ import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
@@ -56,6 +57,7 @@ class ToolRouterFinanceMethodRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 financeMethodTools,
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),
@@ -85,6 +87,7 @@ class ToolRouterFinanceMethodRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),

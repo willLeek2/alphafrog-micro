@@ -71,6 +71,7 @@ class AgentToolRegistryContractTest {
     void excludedSet_matchesFrozenGroundTruth() {
         Set<String> expected = Set.of(
                 "executePython",
+                "executeQuery",
                 "searchWeb",
                 "spawnSubAgent",
                 "waitForSubAgent"

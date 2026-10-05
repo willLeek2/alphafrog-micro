@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
@@ -112,10 +113,10 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             // emit STARTED
             emitToolCallStarted(toolCallId, request.name(), params);
 
-            if ("executePython".equals(request.name())
+            if (DurableSandboxTool.fromToolName(request.name()).isPresent()
                     && pythonSandboxDispatchStore != null
                     && pythonSandboxDispatchStore.isInvocationBlocked(AgentContext.getRunId())) {
-                String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: executePython requires a "
+                String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: " + request.name() + " requires a "
                         + "persisted node identity before creating a Sandbox task";
                 emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
                 return output;
@@ -183,12 +184,12 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             }
             emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs,
                     throttleRejected, throttleLayer);
-            acknowledgeSynchronousPythonCompletion(toolCallId, request.name());
+            acknowledgeSynchronousDurableCompletion(toolCallId, request.name());
 
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
             LangchainDatasetRefContext.set(datasetRefs);
-            output = appendDatasetRetryHintIfNeeded(output, datasetRefs);
+            output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
             return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
         } finally {
             AgentContext.clearToolCallId();
@@ -246,12 +247,13 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * 因此两个不同工作项都可能得到 {@code executePython_2}；直接拿它生成 operationId 会让
      * Sandbox 把第二个真实任务当成第一个任务的幂等重放。
      *
-     * <p>executePython 的持久身份追加节点工作项的稳定五字段摘要。同一工作项中断、重启或
+     * <p>沙箱后台长工具的持久身份追加节点工作项的稳定五字段摘要。同一工作项中断、重启或
      * 重新领取时摘要不变，不同计划代际、节点、节点尝试或执行分段则使用不同的摘要输入。
      * 其他工具没有跨进程持久作业，继续保留模型原始 id。</p>
      */
     private String durableToolCallId(String toolName, String rawToolCallId) {
-        if (!DurableToolCallIds.ASYNC_PYTHON_TOOL.equals(toolName)) {
+        // 是否「会转后台」以描述符注册表为准（executePython、executeQuery），不再按名单硬编码。
+        if (DurableSandboxTool.fromToolName(toolName).isEmpty()) {
             return rawToolCallId;
         }
         DualPoolToolJobExecutionContext.Snapshot snapshot = DualPoolToolJobExecutionContext.current();
@@ -265,7 +267,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * executePython 等工具若因 dataset_ids / manifest_ids 错误失败，把当前 run 已知的 ref 列表写进 hint，
      * 引导模型先用 listMyData 解析 run-level 整数 ID，避免继续重试 raw id / path / placeholder。
      */
-    private String appendDatasetRetryHintIfNeeded(String output, Map<String, String> datasetRefs) {
+    private String appendDatasetRetryHintIfNeeded(String toolName, String output, Map<String, String> datasetRefs) {
         if (output == null || output.isBlank()) {
             return output;
         }
@@ -285,8 +287,13 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             return output;
         }
         StringBuilder hint = new StringBuilder(output);
-        hint.append("\n\n_retry_hint_: executePython failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
-        hint.append("executePython expects current run-level integer dataset_ids / manifest_ids, not raw dataset_id / manifest_id strings, paths, or scope hashes. ");
+        // 提示按实际工具名生成：executePython 与 executeQuery 共用这套 run 级编号约定。
+        hint.append("\n\n_retry_hint_: ").append(toolName).append(" failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
+        if ("executeQuery".equals(toolName)) {
+            hint.append(toolName).append(" expects current run-level integer dataset_ids, not raw dataset_id strings, paths, or scope hashes. ");
+        } else {
+            hint.append(toolName).append(" expects current run-level integer dataset_ids / manifest_ids, not raw dataset_id / manifest_id strings, paths, or scope hashes. ");
+        }
         hint.append("Call listMyData first (query_type=dataset or query_type=manifest) to resolve the integer ids for this run before retrying. ");
         if (lower.contains("run_level_ids_unavailable")) {
             hint.append("RUN_LEVEL_IDS_UNAVAILABLE means the active run registry is not available; do not keep retrying the same raw ids. ");
@@ -404,7 +411,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
-        if ("executePython".equals(toolName)) {
+        // 沙箱后台长工具的终态由 finalizer 按同一 dedupeKey 幂等写入，这里用 appendOnce 防重复。
+        if (DurableSandboxTool.fromToolName(toolName).isPresent()) {
             String dedupeKey = runId + ":" + toolCallId + ":logical_terminal";
             agentEventService.appendOnce(runId, userId, "TOOL_CALL_FINISHED", dedupeKey, payload);
         } else {
@@ -412,8 +420,9 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         }
     }
 
-    private void acknowledgeSynchronousPythonCompletion(String toolCallId, String toolName) {
-        if (!"executePython".equals(toolName) || pythonSandboxDispatchStore == null) {
+    /** 同步完成的沙箱后台长工具要清掉派发凭证，防止恢复链把已完成调用当成待恢复任务。 */
+    private void acknowledgeSynchronousDurableCompletion(String toolCallId, String toolName) {
+        if (DurableSandboxTool.fromToolName(toolName).isEmpty() || pythonSandboxDispatchStore == null) {
             return;
         }
         String runId = AgentContext.getRunId();

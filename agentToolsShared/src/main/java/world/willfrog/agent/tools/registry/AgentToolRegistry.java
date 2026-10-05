@@ -29,7 +29,7 @@ public final class AgentToolRegistry {
 
     /** 工具域。 */
     public enum Domain {
-        MARKET_DATA, RAG, WEB_SEARCH, PYTHON_SANDBOX, FINANCE, DOCS, DATASET, COMPACTION, META
+        MARKET_DATA, RAG, WEB_SEARCH, PYTHON_SANDBOX, SQL_SANDBOX, FINANCE, DOCS, DATASET, COMPACTION, META
     }
 
     /** 能力开关门控。NONE=常开；WEB_SEARCH/CODE_INTERPRETER 在目录构建期过滤；ADJ_FACTOR 在执行期校验。 */
@@ -163,6 +163,11 @@ public final class AgentToolRegistry {
             new ToolDeclaration("executePython", Domain.PYTHON_SANDBOX, CapabilityGate.CODE_INTERPRETER,
                     Compression.EXCLUDED, null, CacheFamily.NONE,
                     Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "PythonSandboxTools"),
+            // executeQuery 是沙箱内固定 DuckDB 运行器的 SQL 取数工具：SQL 取数不是代码执行，
+            // 不跟随代码解释器开关（NONE 常开）；输出随档位可达千行，同 executePython 不参与压缩。
+            new ToolDeclaration("executeQuery", Domain.SQL_SANDBOX, CapabilityGate.NONE,
+                    Compression.EXCLUDED, null, CacheFamily.NONE,
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "SqlQueryTools"),
             new ToolDeclaration("resolveFinanceMethods", Domain.FINANCE, CapabilityGate.NONE,
                     Compression.EXEMPT, "返回方法建议卡/结构化清单，体量小；现状未纳入压缩白名单",
                     CacheFamily.NONE, Set.of(), BatchCountKeys.NONE, CanonicalSpec.MANUAL_FINANCE, "FinanceMethodTools"),

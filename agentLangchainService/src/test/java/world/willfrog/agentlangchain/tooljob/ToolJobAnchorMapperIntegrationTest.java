@@ -78,7 +78,7 @@ class ToolJobAnchorMapperIntegrationTest {
                     id VARCHAR(64) PRIMARY KEY,
                     user_id VARCHAR(64),
                     deployment_id VARCHAR(64),
-                    deployment_generation_id VARCHAR(64),
+                    deployment_generation_id VARCHAR(68),
                     lane_tag VARCHAR(128),
                     status VARCHAR(32) NOT NULL,
                     current_step INT DEFAULT 0,
@@ -191,6 +191,17 @@ class ToolJobAnchorMapperIntegrationTest {
              var ps = conn.prepareStatement(
                      "UPDATE alphafrog_agent_run SET user_id = ? WHERE id = ?")) {
             ps.setString(1, userId);
+            ps.setString(2, id);
+            ps.executeUpdate();
+        }
+    }
+
+    private static void ageUpdatedAt(String id, String interval) throws Exception {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE alphafrog_agent_run SET updated_at = CURRENT_TIMESTAMP - CAST(? AS interval) WHERE id = ?")) {
+            ps.setString(1, interval);
             ps.setString(2, id);
             ps.executeUpdate();
         }
@@ -604,6 +615,35 @@ class ToolJobAnchorMapperIntegrationTest {
                 AgentRunStatus.EXECUTING, "run-dispatch-cas:call-1:1")).isEqualTo(1);
         assertThat(mapper.findById("run-dispatch-cas").getStatus())
                 .isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
+    }
+
+    @Test
+    void executeQuerySessionCountSeesOtherUsersQueryAndIgnoresPython() throws Exception {
+        insertRun("run-self", "EXECUTING", "{}");
+        insertRun("run-other-query", "EXECUTING",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        insertRun("run-other-python", "EXECUTING",
+                "{\"toolName\":\"executePython\",\"anchorState\":\"PREPARING\"}");
+        insertRun("run-other-empty", "EXECUTING", "{}");
+        updateUserId("run-self", "user-session");
+        updateUserId("run-other-query", "user-session");
+        updateUserId("run-other-python", "user-session");
+        updateUserId("run-other-empty", "user-session");
+        insertRun("run-other-user", "EXECUTING",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        updateUserId("run-other-user", "someone-else");
+        insertRun("run-failed-orphan", "FAILED",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        updateUserId("run-failed-orphan", "user-session");
+        insertRun("run-stale-crash", "EXECUTING",
+                "{\"toolName\":\"executeQuery\",\"anchorState\":\"PREPARING\"}");
+        updateUserId("run-stale-crash", "user-session");
+        ageUpdatedAt("run-stale-crash", "20 minutes");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.countInFlightExecuteQueryByUser(
+                "user-session", "run-self", ToolJobAnchor.EXECUTE_QUERY_TOOL, 600)).isEqualTo(1);
+        assertThat(mapper.lockExecuteQuerySession("user-session")).isEqualTo(1);
     }
 
     @Test

@@ -19,6 +19,7 @@ import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
@@ -38,6 +39,7 @@ public class LangchainToolCatalogService {
     private final RagTools ragTools;
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
+    private final SqlQueryTools sqlQueryTools;
     private final ListMyDataTool listMyDataTool;
     private final LoadToolGuideTool loadToolGuideTool;
     private final RereadToolHandler rereadToolHandler;
@@ -60,6 +62,7 @@ public class LangchainToolCatalogService {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 listMyDataTool,
                 loadToolGuideTool,
                 rereadToolHandler,
