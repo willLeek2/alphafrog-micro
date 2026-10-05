@@ -731,7 +731,7 @@ public class PythonSandboxTools {
                 new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                         member, identity, plan.spec(), plan.estimate(), baseRequest,
                         requestAdapter(), runnerAdapter(),
-                        ToolJobAnchor.EXECUTE_PYTHON_TOOL, toolStartMs));
+                        ToolJobAnchor.EXECUTE_PYTHON_TOOL, toolStartMs, null));
     }
 
     private String executeDataIntense(

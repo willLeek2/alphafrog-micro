@@ -882,7 +882,13 @@ public final class SandboxToolJobLifecycle {
 
     // ==================== 等待成员派发：建后台任务并把派发证明交出去 ====================
 
-    /** 等待成员派发的输入包。冻结事实（estimate/spec/指纹）由调用方的容量规划给出。 */
+    /**
+     * 等待成员派发的输入包。冻结事实（estimate/spec/指纹）由调用方的容量规划给出。
+     *
+     * <p>{@code alreadyReserved} 非空表示调用方已经占过 PREPARING 名额（executeQuery
+     * 会话串行要先把这份预约写进 Run 级锚点），本方法不再调用 {@code reserve}。
+     * 为空则从名额预留开始，与 executePython 成员路径一致。</p>
+     */
     public record WaitGroupDispatchRequest<REQ>(
             WaitGroupMemberExecutionContext.Snapshot member,
             DataAnalysisOperationIdentity identity,
@@ -892,7 +898,8 @@ public final class SandboxToolJobLifecycle {
             SandboxJobRequestAdapter<REQ> requestAdapter,
             SandboxJobRunnerAdapter<REQ, ?, ?> runner,
             String toolName,
-            long toolStartMs) {}
+            long toolStartMs,
+            DataAnalysisReservation alreadyReserved) {}
 
     /**
      * 新调度器版本上的一次沙箱调用：把这次调用建成沙箱后台任务，然后立刻交出去。
@@ -903,9 +910,10 @@ public final class SandboxToolJobLifecycle {
      * 当前线程把节点执行名额交还。</p>
      *
      * <p>容量接线完整性检查与成员身份一致性比对在调用方完成（它们依赖框架拿不到的工具侧
-     * 配置）；本方法从名额预留开始。返回字符串时表示这次调用当场就结束了，内容是给模型看的
-     * 失败文本（{@code ok=false} 的 JSON）；建好任务、或建任务结果还不明确时用挂起信号返回，
-     * 不走这里。</p>
+     * 配置）。{@code alreadyReserved} 为空时本方法从名额预留开始；非空时沿用调用方已占的
+     * PREPARING 名额，不再二次 {@code reserve}。返回字符串时表示这次调用当场就结束了，
+     * 内容是给模型看的失败文本（{@code ok=false} 的 JSON）；建好任务、或建任务结果还不明确
+     * 时用挂起信号返回，不走这里。</p>
      */
     public static <REQ> String dispatchWaitGroupMember(
             LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req) {
@@ -919,16 +927,18 @@ public final class SandboxToolJobLifecycle {
         DataAnalysisOperationIdentity identity = req.identity();
         DataAnalysisEstimate estimate = req.estimate();
         CanonicalSandboxCreateSpec spec = req.spec();
-        DataAnalysisReservation reservation;
-        try {
-            reservation = deps.capacityService().reserve(identity, estimate);
-        } catch (CapacityAdmissionException admission) {
-            String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
-                    ? "DATA_ANALYSIS_TASK_TOO_LARGE"
-                    : "DATA_ANALYSIS_SERVER_BUSY";
-            return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), code, admission.getMessage(),
-                    Map.of("retryable",
-                            admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+        DataAnalysisReservation reservation = req.alreadyReserved();
+        if (reservation == null) {
+            try {
+                reservation = deps.capacityService().reserve(identity, estimate);
+            } catch (CapacityAdmissionException admission) {
+                String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                        ? "DATA_ANALYSIS_TASK_TOO_LARGE"
+                        : "DATA_ANALYSIS_SERVER_BUSY";
+                return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), code, admission.getMessage(),
+                        Map.of("retryable",
+                                admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+            }
         }
         // 取消与外部 createTask 之间需要一份已经落库的请求指纹。若取消先赢，
         // 成员已不再待派发，不能继续创建一个无人负责的 Sandbox 任务。

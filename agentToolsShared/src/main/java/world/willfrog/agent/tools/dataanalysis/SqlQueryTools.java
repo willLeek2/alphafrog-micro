@@ -433,9 +433,9 @@ public class SqlQueryTools {
      * 等待组成员：把这次查询建成沙箱后台任务，然后立刻把线程交出去。
      *
      * <p>名额预留之后的编排已下沉到 {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}。
-     * 这里只做查询工具自有的接线检查、成员身份比对、容量事实冻结，以及 C5 会话串行：
-     * 抢占 PREPARING 锚点的同一事务按 userId 计数，成员不另开例外。成员路径不读 DAG
-     * 阻塞轮询。</p>
+     * 这里只做查询工具自有的接线检查、成员身份比对、容量事实冻结，以及会话串行：
+     * 先占 PREPARING 名额，再把真实预约 JSON 写进 Run 级锚点（同一事务按 userId 计数），
+     * 然后把已占名额交给成员派发，禁止再写空对象 "{}"。成员路径不读 DAG 阻塞轮询。</p>
      */
     private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       String sql,
@@ -515,10 +515,20 @@ public class SqlQueryTools {
         SandboxJobWaitPolicy sessionClaimPolicy = SandboxJobWaitPolicy.DURABLE_SUSPEND;
         String createRequestJson = JsonFormat.printer()
                 .omittingInsignificantWhitespace().print(baseRequest);
-        boolean sessionClaimed = false;
+        DataAnalysisReservation reservation;
         try {
-            SandboxToolJobLifecycle.PrepareDispatchResult dispatch =
-                    SandboxToolJobLifecycle.prepareDispatch(
+            reservation = dataAnalysisCapacityService.reserve(identity, plan.estimate());
+        } catch (CapacityAdmissionException admission) {
+            String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                    ? "DATA_ANALYSIS_TASK_TOO_LARGE"
+                    : "DATA_ANALYSIS_SERVER_BUSY";
+            return fail(code, admission.getMessage(), Map.of("retryable",
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+        }
+        boolean sessionClaimed = false;
+        SandboxToolJobLifecycle.PrepareDispatchResult dispatch = null;
+        try {
+            dispatch = SandboxToolJobLifecycle.prepareDispatch(
                             pythonSandboxDispatchStore,
                             new SandboxToolJobLifecycle.PrepareDispatchRequest(
                                     member.runId(),
@@ -533,7 +543,7 @@ public class SqlQueryTools {
                                     sessionClaimPolicy.runDisposition(),
                                     sessionClaimPolicy.autoResume(),
                                     sessionClaimPolicy.durableSuspend(),
-                                    "{}",
+                                    objectMapper.writeValueAsString(reservation),
                                     objectMapper.writeValueAsString(plan.estimate()),
                                     objectMapper.writeValueAsString(subSnapshot),
                                     subSnapshot.immutableDigest(),
@@ -541,6 +551,7 @@ public class SqlQueryTools {
                                     POLL_INTERVAL_MS),
                             null);
             if (!dispatch.persisted()) {
+                SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
                 return fail("TOOL_JOB_ANCHOR_INVALID",
                         "Failed to persist PREPARING tool-job anchor",
                         Map.of("operation_id", identity.operationId(), "retryable", false));
@@ -551,22 +562,54 @@ public class SqlQueryTools {
                     new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                             member, identity, spec, plan.estimate(), baseRequest,
                             requestAdapter(), runnerAdapter(),
-                            ToolJobAnchor.EXECUTE_QUERY_TOOL, toolStartMs));
+                            ToolJobAnchor.EXECUTE_QUERY_TOOL, toolStartMs, reservation));
             pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
             return dispatched;
         } catch (SessionQueryAdmissionException sessionBusy) {
+            SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
             if (sessionClaimed) {
                 pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
             }
             return fail(sessionBusy.code(), sessionBusy.getMessage(),
                     Map.of("retryable", sessionBusy.retryable()));
         } catch (WaitGroupMemberPendingException pending) {
+            attachWaitGroupSessionAnchor(member.runId(), dispatch == null ? null : dispatch.anchor(), pending);
             throw pending;
         } catch (RuntimeException dispatchFailure) {
             if (sessionClaimed) {
                 pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
             }
             throw dispatchFailure;
+        }
+    }
+
+    /**
+     * 等待组成员建好沙箱任务后，把 Run 级会话锚点从 PREPARING 推进到 ATTACHED，
+     * 写入与成员派发证明同一份 TASK_ATTACHED 预约。启动恢复才解析得出真实名额，
+     * 不会把空对象 "{}" 当成预约、也不会把已建任务再当「创建中途崩溃」重放。
+     * 任务编号尚未证实时保持 PREPARING，真实预约 JSON 已经在抢占锚点时写过。
+     */
+    private void attachWaitGroupSessionAnchor(String runId,
+                                              ToolJobAnchor preparing,
+                                              WaitGroupMemberPendingException pending) {
+        if (pythonSandboxDispatchStore == null || preparing == null || pending == null) {
+            return;
+        }
+        String taskId = pending.getTaskId();
+        if (taskId == null || taskId.isBlank()) {
+            return;
+        }
+        preparing.setTaskId(taskId);
+        preparing.setAnchorState("ATTACHED");
+        preparing.setReservationJson(pending.getProof().reservationJson());
+        try {
+            if (!pythonSandboxDispatchStore.persistAttached(runId, preparing)) {
+                log.warn("waitGroup.sessionAnchorAttachFailed: executeQuery 成员已派发，但 Run 级锚点未能推进到 ATTACHED runId={} operationId={} taskId={}",
+                        runId, pending.getOperationId(), taskId);
+            }
+        } catch (RuntimeException attachFailure) {
+            log.warn("waitGroup.sessionAnchorAttachFailed: executeQuery 成员已派发，推进 ATTACHED 时出错 runId={} operationId={} taskId={}",
+                    runId, pending.getOperationId(), taskId, attachFailure);
         }
     }
 
