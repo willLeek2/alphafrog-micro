@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
@@ -17,6 +18,8 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisRestoreOutcome;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalRecorder;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisUpsertOutcome;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
@@ -53,6 +56,7 @@ public class WaitMemberSettlement {
     private final DataAnalysisCapacityService capacityService;
     private final DataAnalysisTerminalRecorder terminalRecorder;
     private final ObjectMapper objectMapper;
+    private PythonSandboxDispatchStore dispatchStore;
 
     public WaitMemberSettlement(DataAnalysisCapacityService capacityService,
                                 DataAnalysisTerminalRecorder terminalRecorder,
@@ -60,6 +64,11 @@ public class WaitMemberSettlement {
         this.capacityService = capacityService;
         this.terminalRecorder = terminalRecorder;
         this.objectMapper = objectMapper;
+    }
+
+    @Autowired(required = false)
+    public void setDispatchStore(PythonSandboxDispatchStore dispatchStore) {
+        this.dispatchStore = dispatchStore;
     }
 
     /** 一次收尾的结果：成了没有；没成时给一句能查的原因。 */
@@ -199,6 +208,7 @@ public class WaitMemberSettlement {
             DataAnalysisUpsertOutcome outcome = terminalRecorder.upsert(envelope);
             if (outcome == DataAnalysisUpsertOutcome.INSERTED
                     || outcome == DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME) {
+                clearExecuteQuerySessionClaim(member, reservation);
                 return Outcome.success();
             }
             log.warn("成员的用量记录没有写进去，这一轮不下结论：member={} operation={} outcome={}",
@@ -209,6 +219,25 @@ public class WaitMemberSettlement {
                     member.getMemberIdentity(), reservation.operationId(), e.getMessage());
             return Outcome.blocked("usage_error");
         }
+    }
+
+    /**
+     * executeQuery 等待组成员抢占过 Run 级 PREPARING 锚点做会话串行；
+     * 查询终态落账后清掉，避免会话锁一直占到 Run 结束。
+     */
+    private void clearExecuteQuerySessionClaim(WaitMember member, DataAnalysisReservation reservation) {
+        if (dispatchStore == null || member == null || reservation == null) {
+            return;
+        }
+        if (!ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())) {
+            return;
+        }
+        String runId = member.getRunId();
+        String operationId = reservation.operationId();
+        if (runId == null || runId.isBlank() || operationId == null || operationId.isBlank()) {
+            return;
+        }
+        dispatchStore.clearActive(runId, operationId);
     }
 
     /**

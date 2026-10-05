@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
@@ -55,8 +56,8 @@ import java.util.Optional;
  * 生命周期编排（PREPARING 抢占、创建裁决、轮询、终态、挂起移交）全部走
  * {@link SandboxToolJobLifecycle} 框架，本类按四适配器契约提供请求/结果两个
  * 工具自有适配器，并复用 executePython 的沙箱 RPC 运行器适配器与计量适配器
- * （同一沙箱通道、同一用量模型）。第一期只在顺序执行（LINEAR）开放挂起恢复，
- * 不接等待组成员派发。</p>
+ * （同一沙箱通道、同一用量模型）。等待组成员走 {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}：
+ * 建完后台任务就把线程交出去，不读 DAG 阻塞轮询。</p>
  */
 @Component
 @Slf4j
@@ -174,18 +175,6 @@ public class SqlQueryTools {
     private String executeQueryInternal(String sql, String datasetIds, String productTier) {
         long toolStartMs = System.currentTimeMillis();
         try {
-            /*
-             * 第一期不接等待组成员派发。第一道防线在派发器：成员派发在装成员上下文之前
-             * 就被拒了，生产路径到不了这里；这里是第二道，留给成员上下文直装的调用方
-             * 与单元测试。拒绝与工作流类型无关（顺序执行挂起后没人认领、并行执行占住
-             * worker 到任务超时，两个洞一起堵）。
-             */
-            if (WaitGroupMemberExecutionContext.current() != null) {
-                return fail("WAIT_GROUP_NOT_SUPPORTED",
-                        "executeQuery is not available as a wait-group member in this release; "
-                                + "call it as a standalone tool call",
-                        Map.of("retryable", false));
-            }
             // --- 档位解析： blank 默认 INTERACTIVE；未知档位直接拒，带上合法名单。 ---
             String tier = productTier == null || productTier.isBlank()
                     ? "INTERACTIVE"
@@ -224,6 +213,13 @@ public class SqlQueryTools {
                 return fail("ILLEGAL_RUN_LEVEL_IDS",
                         "Some dataset_ids are not valid run-level numbers; pass values from the legal list below",
                         details);
+            }
+
+            WaitGroupMemberExecutionContext.Snapshot waitGroupMember =
+                    WaitGroupMemberExecutionContext.current();
+            if (waitGroupMember != null) {
+                return submitForWaitGroup(waitGroupMember, sql, tier, tierLimits,
+                        resolvedDatasets, toolStartMs);
             }
 
             // 等待策略必须来自 executor 已冻结的 effective workflow；未知值不能猜成 LINEAR。
@@ -419,6 +415,9 @@ public class SqlQueryTools {
         } catch (ToolJobInjectedInterruption interruption) {
             // 验收故障点表示当前 worker 必须立即退场，原样上抛。
             throw interruption;
+        } catch (WaitGroupMemberPendingException pending) {
+            // 等待组成员：后台任务、名额与派发证明均已落库，原样上抛由派发器写进成员行。
+            throw pending;
         } catch (ExternalToolJobPendingException pending) {
             // 挂起信号：后台任务、名额与 Run 状态均已落库，原样上抛由上层释放线程。
             throw pending;
@@ -427,6 +426,147 @@ public class SqlQueryTools {
             observability().emitToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("TOOL_ERROR", "Query sandbox invocation error",
                     Map.of("message", e.getMessage() == null ? "" : e.getMessage()));
+        }
+    }
+
+    /**
+     * 等待组成员：把这次查询建成沙箱后台任务，然后立刻把线程交出去。
+     *
+     * <p>名额预留之后的编排已下沉到 {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}。
+     * 这里只做查询工具自有的接线检查、成员身份比对、容量事实冻结，以及 C5 会话串行：
+     * 抢占 PREPARING 锚点的同一事务按 userId 计数，成员不另开例外。成员路径不读 DAG
+     * 阻塞轮询。</p>
+     */
+    private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
+                                      String sql,
+                                      String tier,
+                                      ProductTier tierLimits,
+                                      List<AgentRunDatasetEntry> datasets,
+                                      long toolStartMs) throws Exception {
+        SandboxToolJobLifecycle.LifecycleDeps deps = lifecycleDeps();
+        if (!deps.wiringAvailable() || dataAnalysisCapacityProperties == null) {
+            log.error("waitGroup.withoutCapacity: executeQuery 成员调用缺少容量接线，拒绝建任务 member={}",
+                    member.describe());
+            observability().emitToolTotal(toolStartMs, "ERROR", "SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+            return fail("SANDBOX_CAPACITY_WIRING_INCOMPLETE",
+                    "Query sandbox wiring incomplete; a wait-group member "
+                            + "requires capacity reservation and a durable dispatch proof",
+                    Map.of("retryable", false));
+        }
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
+                member.runId(), member.durableToolCallId(), DATA_ANALYSIS_ATTEMPT);
+        if (!identity.operationId().equals(member.expectedOperationId())) {
+            observability().emitToolTotal(toolStartMs, "ERROR", "WAIT_GROUP_OPERATION_IDENTITY_MISMATCH");
+            return fail("WAIT_GROUP_OPERATION_IDENTITY_MISMATCH",
+                    "The member's external operation identity does not match the persisted one",
+                    Map.of("expected_operation_id", member.expectedOperationId(),
+                            "derived_operation_id", identity.operationId(),
+                            "retryable", false));
+        }
+        AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(datasets, List.of());
+        String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
+        String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(subSnapshot);
+        long remainingWallClockMs;
+        try {
+            if (agentRunBudgetService == null) {
+                throw new RunStartedAtMissingException(member.runId());
+            }
+            remainingWallClockMs = agentRunBudgetService.remainingWallClockMs();
+        } catch (RunStartedAtMissingException missingStartedAt) {
+            return fail("RUN_STARTED_AT_MISSING", missingStartedAt.getMessage(),
+                    Map.of("run_id", member.runId(), "retryable", false));
+        }
+        QueryTimeouts timeouts;
+        try {
+            timeouts = clampQueryTimeouts(tierLimits.statementTimeoutSeconds(), remainingWallClockMs);
+        } catch (DataIntenseRefusal wallClockRefusal) {
+            return fail(wallClockRefusal.code(), wallClockRefusal.getMessage(), wallClockRefusal.details());
+        }
+        CapacityPlan plan;
+        try {
+            plan = planCapacity(tier, datasets);
+        } catch (DataIntenseRefusal refusal) {
+            return fail(refusal.code(), refusal.getMessage(), refusal.details());
+        }
+        String runnerCode;
+        try {
+            long estimatedRowCap = "BACKGROUND".equals(tier)
+                    ? dataAnalysisCapacityProperties.getMaxRowsPerTask()
+                    : dataAnalysisCapacityProperties.getStandardRowsMax();
+            runnerCode = renderRunner(sql, tier,
+                    new ProductTier(timeouts.statementTimeoutSeconds(), tierLimits.rowCap()),
+                    datasets, plan.decision().memoryLimitBytes(), estimatedRowCap);
+        } catch (IllegalStateException renderFailure) {
+            return fail("RUNNER_RENDER_FAILED", renderFailure.getMessage(), Map.of("retryable", false));
+        }
+        CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
+                CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
+                identity.operationId(),
+                sha256(runnerCode),
+                subSnapshot.immutableDigest(),
+                plan.decision().resourceClass(),
+                plan.decision().memoryLimitBytes(),
+                timeouts.taskTimeoutSeconds() * 1000L,
+                runtimeEnvironmentVersion,
+                sha256(""),
+                sha256(""));
+        ExecuteRequest baseRequest = buildBaseRequest(
+                runnerCode, datasets, timeouts.taskTimeoutSeconds(), pathsDatasetCsv, pathManifestCsv);
+        SandboxJobWaitPolicy sessionClaimPolicy = SandboxJobWaitPolicy.DURABLE_SUSPEND;
+        String createRequestJson = JsonFormat.printer()
+                .omittingInsignificantWhitespace().print(baseRequest);
+        boolean sessionClaimed = false;
+        try {
+            SandboxToolJobLifecycle.PrepareDispatchResult dispatch =
+                    SandboxToolJobLifecycle.prepareDispatch(
+                            pythonSandboxDispatchStore,
+                            new SandboxToolJobLifecycle.PrepareDispatchRequest(
+                                    member.runId(),
+                                    ToolJobAnchor.EXECUTE_QUERY_TOOL,
+                                    member.durableToolCallId(),
+                                    DATA_ANALYSIS_ATTEMPT,
+                                    ANCHOR_SCHEMA_VERSION,
+                                    identity.operationId(),
+                                    spec.requestFingerprint(),
+                                    objectMapper.writeValueAsString(spec),
+                                    createRequestJson,
+                                    sessionClaimPolicy.runDisposition(),
+                                    sessionClaimPolicy.autoResume(),
+                                    sessionClaimPolicy.durableSuspend(),
+                                    "{}",
+                                    objectMapper.writeValueAsString(plan.estimate()),
+                                    objectMapper.writeValueAsString(subSnapshot),
+                                    subSnapshot.immutableDigest(),
+                                    spec.timeoutMillis(),
+                                    POLL_INTERVAL_MS),
+                            null);
+            if (!dispatch.persisted()) {
+                return fail("TOOL_JOB_ANCHOR_INVALID",
+                        "Failed to persist PREPARING tool-job anchor",
+                        Map.of("operation_id", identity.operationId(), "retryable", false));
+            }
+            sessionClaimed = true;
+            String dispatched = SandboxToolJobLifecycle.dispatchWaitGroupMember(
+                    deps,
+                    new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
+                            member, identity, spec, plan.estimate(), baseRequest,
+                            requestAdapter(), runnerAdapter(),
+                            ToolJobAnchor.EXECUTE_QUERY_TOOL, toolStartMs));
+            pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
+            return dispatched;
+        } catch (SessionQueryAdmissionException sessionBusy) {
+            if (sessionClaimed) {
+                pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
+            }
+            return fail(sessionBusy.code(), sessionBusy.getMessage(),
+                    Map.of("retryable", sessionBusy.retryable()));
+        } catch (WaitGroupMemberPendingException pending) {
+            throw pending;
+        } catch (RuntimeException dispatchFailure) {
+            if (sessionClaimed) {
+                pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
+            }
+            throw dispatchFailure;
         }
     }
 

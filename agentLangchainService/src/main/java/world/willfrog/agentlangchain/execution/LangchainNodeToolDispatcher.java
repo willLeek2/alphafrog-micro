@@ -16,7 +16,6 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
-import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
@@ -95,17 +94,6 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
                         ? "{}" : request.argumentsJson())
                 .build();
         Optional<WaitGroupMemberExecutionContext.Snapshot> waitGroup = waitGroupContext(request);
-        if (!isAsyncTool(request.toolName())
-                && DurableSandboxTool.fromToolName(request.toolName()).isPresent()) {
-            /*
-             * 经过本派发器的调用都是等待组成员派发。会挂起的沙箱作业工具里，本期只有
-             * executePython 支持成员上下文；其余（executeQuery）在成员里挂起后没人认领
-             * （顺序执行留下孤儿作业、并行执行占住 worker 到任务超时），所以派发前直接拒，
-             * 与工作流类型无关。普通工具不会挂起，作为成员同步跑完，不受本检查影响。
-             * 工具内部的同名检查是第二道防线，生产上主要靠这里拦。
-             */
-            return new DispatchOutcome.Failed("wait_group_member_unsupported_tool:" + request.toolName());
-        }
         if (isAsyncTool(request.toolName()) && waitGroup.isEmpty()) {
             // 会转后台的工具必须有预先算好的外部作业身份，否则工具层建出来的作业没人认得回来。
             return new DispatchOutcome.Failed("wait_group_member_without_operation_id:" + request.toolName());
@@ -158,11 +146,11 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
     /**
      * 会转后台、需要在派发前装上成员上下文的工具。
      *
-     * <p>等待组成员派发目前只有 executePython 接入；executeQuery 第一期只在顺序执行开放，
-     * 不接等待组，所以这里仍按 executePython 单列，不用描述符注册表。</p>
+     * <p>以既有沙箱长工具描述符为准（executePython、executeQuery）。成员一律走
+     * {@code dispatchWaitGroupMember}，不在这里再按工具名单分叉。</p>
      */
     private boolean isAsyncTool(String toolName) {
-        return ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName);
+        return DurableSandboxTool.fromToolName(toolName).isPresent();
     }
 
     /** 这次派发对应的成员上下文；不是转后台的工具或算不出身份时返回空。 */
@@ -187,7 +175,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             String scope = segment.describe() + "|" + toolName + "|" + rawToolCallId;
             return Optional.of("sub-agent-tool:" + UUID.nameUUIDFromBytes(scope.getBytes(StandardCharsets.UTF_8)));
         }
-        if (!ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName)
+        if (DurableSandboxTool.fromToolName(toolName).isEmpty()
                 || rawToolCallId == null || rawToolCallId.isBlank()) {
             return Optional.empty();
         }
@@ -198,7 +186,8 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
 
     @Override
     public boolean requiresStableOperationId(String toolName) {
-        return ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName) || SUB_AGENT_TOOL_NAMES.contains(toolName);
+        return DurableSandboxTool.fromToolName(toolName).isPresent()
+                || SUB_AGENT_TOOL_NAMES.contains(toolName);
     }
 
     private ToolExecutor executorFor(String toolName) {
