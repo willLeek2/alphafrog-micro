@@ -85,7 +85,7 @@ agent:
       #
       # 版本只在创建 Run 时读一次并写进数据库；已经创建的 Run 永远按它自己的版本跑。
       # 认不出的值失败关闭（新 Run 会被拒绝），不会悄悄回落到旧版本。
-      new-run-scheduler-version: ${AF_AGENT_NEW_RUN_SCHEDULER_VERSION:LEGACY}
+      new-run-scheduler-version: ${AF_AGENT_NEW_RUN_SCHEDULER_VERSION:DUAL_POOL_V2}
       # 下面几个只能在启动时生效（改了要重启），读数里会标明。
       business-admission-limit: ${AF_AGENT_DUAL_POOL_BUSINESS_ADMISSION_LIMIT:100}
       # 每个 Run 同时存在的未完成工作项上限；创建工作项前按数据库实时计数。改完只影响之后新建的工作项。
