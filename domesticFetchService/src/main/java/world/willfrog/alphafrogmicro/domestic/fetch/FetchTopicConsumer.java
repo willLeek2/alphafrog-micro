@@ -134,7 +134,14 @@ public class FetchTopicConsumer {
             
             if (taskUuid != null) {
                 runningTasks.put(taskUuid, future);
-                future.whenComplete((result, ex) -> runningTasks.remove(finalTaskUuid));
+                // processFetchTask 只捕获 Exception；Error 类型的可抛对象（链接错误等）
+                // 会绕过 catch 直接进入 future，若不在此记录将完全无日志，只能看到 success=false。
+                future.whenComplete((result, ex) -> {
+                    runningTasks.remove(finalTaskUuid);
+                    if (ex != null) {
+                        log.error("Fetch task [{}] terminated with uncaught throwable", finalTaskUuid, ex);
+                    }
+                });
             }
             
         } catch (Exception e) {
@@ -177,6 +184,9 @@ public class FetchTopicConsumer {
             int result;
 
             if (taskName == null) {
+                // 该分支此前完全不落日志，排查时只能看到 success=false，无法区分原因。
+                log.warn("Fetch task [{}] rejected: missing task_name, received keys={}",
+                        taskUuid, rawMessageJSON.keySet());
                 result = -2;
                 sendTaskResult(taskUuid, null, taskSubTypeValue, result, "Missing task_name");
                 return;
