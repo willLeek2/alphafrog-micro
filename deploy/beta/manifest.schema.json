@@ -166,6 +166,35 @@
             "type": "string"
           }
         },
+        "bindMounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "source", "target", "mode"],
+            "properties": {
+              "key": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{0,62}$"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^/[^:\\u0000-\\u001f\\u007f]*$"
+              },
+              "target": {
+                "type": "string",
+                "pattern": "^/[^:\\u0000-\\u001f\\u007f]*$"
+              },
+              "mode": {
+                "enum": ["ro", "rw"]
+              },
+              "env": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              }
+            }
+          }
+        },
         "runtimeConfigSha256": {
           "anyOf": [
             {

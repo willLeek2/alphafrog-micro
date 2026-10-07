@@ -9,6 +9,8 @@ import com.networknt.schema.SpecVersion;
 import com.networknt.schema.ValidationMessage;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
@@ -73,6 +75,7 @@ public class BetaContractValidator {
             if (!JsonSupport.serviceSha256(mapper, service).equals(service.path("serviceSpecSha256").asText())) {
                 throw new ControllerException("MANIFEST_INVALID", "Service digest mismatch for " + name);
             }
+            validateBindMounts(service, name);
             int applicationDrainSeconds = service.path("runtime").path("applicationDrainSeconds").asInt();
             if (applicationDrainSeconds != this.applicationDrainSeconds)
                 throw new ControllerException("MANIFEST_INVALID", "Service drain deadline differs from the controller-wide deadline");
@@ -105,6 +108,34 @@ public class BetaContractValidator {
             for (JsonNode port : service.path("runtime").path("hostPorts")) {
                 String key = service.path("machineId").asText() + ':' + port.asInt();
                 if (!ports.add(key)) throw new ControllerException("MANIFEST_INVALID", "Reserved port collision " + key);
+            }
+        }
+    }
+
+    private static void validateBindMounts(JsonNode service, String serviceName) {
+        Set<String> keys = new HashSet<>();
+        Set<String> targets = new HashSet<>();
+        for (JsonNode mount : service.path("bindMounts")) {
+            String key = mount.path("key").asText();
+            String source = mount.path("source").asText();
+            String target = mount.path("target").asText();
+            if (!keys.add(key) || !targets.add(target))
+                throw new ControllerException("MANIFEST_INVALID", "Duplicate bind mount key or target for " + serviceName);
+            try {
+                Path sourcePath = Path.of(source);
+                Path targetPath = Path.of(target);
+                if (!sourcePath.isAbsolute() || !targetPath.isAbsolute()
+                        || !targetPath.normalize().toString().equals(target)
+                        || sourcePath.getFileName() != null
+                        && ".env".equalsIgnoreCase(sourcePath.getFileName().toString())
+                        || target.equals("/var/run/docker.sock")
+                        || target.equals("/proc") || target.startsWith("/proc/")
+                        || target.equals("/sys") || target.startsWith("/sys/")
+                        || target.equals("/dev") || target.startsWith("/dev/")) {
+                    throw new ControllerException("MANIFEST_INVALID", "Unsafe bind mount path for " + serviceName);
+                }
+            } catch (InvalidPathException failure) {
+                throw new ControllerException("MANIFEST_INVALID", "Invalid bind mount path for " + serviceName, failure);
             }
         }
     }

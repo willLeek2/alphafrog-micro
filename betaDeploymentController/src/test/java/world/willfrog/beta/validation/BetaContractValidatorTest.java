@@ -152,6 +152,62 @@ class BetaContractValidatorTest {
                 () -> validator.validateManifest(manifest)).code());
     }
 
+    @Test
+    void validatesBindMountIdentityPathsAndServiceDigest() {
+        ObjectMapper mapper = new ObjectMapper();
+        BetaContractValidator validator = new BetaContractValidator(mapper, new BetaControllerProperties());
+        ObjectNode manifest = manifest(mapper, "com.alphafrog.StockService",
+                "providers:com.alphafrog.StockService::");
+        ObjectNode service = (ObjectNode) manifest.path("services").path(0);
+        String originalDigest = service.path("serviceSpecSha256").asText();
+        ObjectNode mount = service.putArray("bindMounts").addObject()
+                .put("key", "data")
+                .put("source", "/srv/alphafrog/data")
+                .put("target", "/data/workspace")
+                .put("mode", "rw")
+                .put("env", "WORKSPACE_ROOT");
+        String newDigest = JsonSupport.serviceSha256(mapper, service);
+        org.junit.jupiter.api.Assertions.assertNotEquals(originalDigest, newDigest);
+        service.put("serviceSpecSha256", newDigest);
+        assertDoesNotThrow(() -> validator.validateManifest(manifest));
+
+        mount.remove("mode");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+
+        mount.put("mode", "rw");
+        service.withArray("bindMounts").addObject()
+                .put("key", "data")
+                .put("source", "/srv/alphafrog/other")
+                .put("target", "/data/other")
+                .put("mode", "ro");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+
+        service.withArray("bindMounts").remove(1);
+        service.withArray("bindMounts").addObject()
+                .put("key", "other")
+                .put("source", "/srv/alphafrog/other")
+                .put("target", "/data/workspace")
+                .put("mode", "ro");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+
+        service.withArray("bindMounts").remove(1);
+        mount.put("source", "/srv/alphafrog/.env");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+
+        mount.put("source", "/srv/alphafrog/data").put("target", "/proc/data");
+        service.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, service));
+        assertEquals("MANIFEST_INVALID", assertThrows(ControllerException.class,
+                () -> validator.validateManifest(manifest)).code());
+    }
+
     private static ObjectNode manifest(ObjectMapper mapper, String serviceKey, String nacosServiceName) {
         ObjectNode root = mapper.createObjectNode();
         root.put("schemaVersion", 1);

@@ -204,6 +204,53 @@ class DockerComposeContainerRuntimeTest {
     }
 
     @Test
+    void composeIncludesManifestMountAfterTemplateAndUsesItsTargetForEnvironment() throws Exception {
+        properties.getServices().get("agent-service").setVolumes(List.of("/srv/shared:/data/shared:ro"));
+        ((ObjectNode) service).putObject("environmentOverrides")
+                .put("WORKSPACE_ROOT", "/incorrect")
+                .put("AF_DEPLOYMENT_ID", "incorrect");
+        ((ObjectNode) service).putArray("bindMounts").addObject()
+                .put("key", "workspace")
+                .put("source", "/srv/alphafrog/workspace")
+                .put("target", "/data/workspace")
+                .put("mode", "rw")
+                .put("env", "WORKSPACE_ROOT");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.validateManifest(manifest);
+        runtime.create(manifest, service, plan);
+
+        JsonNode app = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app");
+        JsonNode volumes = app.path("volumes");
+        assertTrue(containsVolume(volumes, "/srv/alphafrog/workspace:/data/workspace:rw"));
+        assertEquals("/srv/alphafrog/workspace:/data/workspace:rw",
+                volumes.path(volumes.size() - 1).asText());
+        assertEquals("/data/workspace", app.path("environment").path("WORKSPACE_ROOT").asText());
+        assertEquals("beta-main-001", app.path("environment").path("AF_DEPLOYMENT_ID").asText());
+    }
+
+    @Test
+    void rejectsManifestMountOverControllerAndTemplateVolumes() throws Exception {
+        ObjectNode mount = ((ObjectNode) service).putArray("bindMounts").addObject()
+                .put("key", "workspace")
+                .put("source", "/srv/alphafrog/workspace")
+                .put("target", "/app/logs")
+                .put("mode", "rw");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        properties.getServices().get("agent-service").setVolumes(List.of("/srv/shared:/data/shared:ro"));
+        mount.put("target", "/data/shared");
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+    }
+
+    @Test
     void createsByLocalImageIdRegardlessOfWhatTheReadableTagPointsAt() throws Exception {
         ((ObjectNode) service.path("image")).put("repositoryDigest", "agent-langchain-service:local");
         FakeCommands commands = new FakeCommands(false);

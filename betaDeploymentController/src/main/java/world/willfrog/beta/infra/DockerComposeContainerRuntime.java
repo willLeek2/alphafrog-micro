@@ -12,8 +12,10 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -128,6 +130,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             if (template.getVolumes().stream().anyMatch(this::usesControllerManagedMount))
                 throw new ControllerException("SERVICE_CONFIG_INVALID",
                         "Service volumes must not replace controller-managed observability mounts");
+            validateBindMountTargets(service, template);
             validateJavaAgent(template);
             prepareLogDirectory(serviceName);
         }
@@ -151,6 +154,7 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (template.getVolumes().stream().anyMatch(this::usesControllerManagedMount))
             throw new ControllerException("SERVICE_CONFIG_INVALID",
                     "Service volumes must not replace controller-managed observability mounts");
+        validateBindMountTargets(service, template);
         validateJavaAgent(template);
         ensureBetaNetwork(machineId, machine);
         Path compose = writeCompose(manifest, service, plan, name, machine);
@@ -387,6 +391,10 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         if (overrides.isObject()) {
             overrides.fields().forEachRemaining(entry -> environment.put(entry.getKey(), entry.getValue().asText()));
         }
+        for (JsonNode mount : service.path("bindMounts")) {
+            if (mount.has("env"))
+                environment.put(mount.path("env").asText(), mount.path("target").asText());
+        }
         environment.put("AF_DEPLOYMENT_ID", plan.deploymentId());
         environment.put("AF_DEPLOYMENT_GENERATION_ID", plan.generationId());
         environment.put("AF_LANE_TAG", plan.trafficScopeId());
@@ -494,6 +502,10 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
             }
             volumes.add(prepareLogDirectory(service.path("serviceName").asText()) + ":/app/logs");
             template.getVolumes().forEach(volumes::add);
+        }
+        for (JsonNode mount : service.path("bindMounts")) {
+            volumes.add((mount.path("source").asText() + ':' + mount.path("target").asText()
+                    + ':' + mount.path("mode").asText()).replace("$", "$$"));
         }
         // Compose 在建容器前会先对文件里的 ${...} 做变量插值，而环境值里的
         // ${AF_CONFIG_NACOS_USERNAME:} 这类 Spring 占位符不是合法的插值语法，会让
@@ -661,6 +673,26 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
         String normalized = volume.replace(" ", "");
         return normalized.matches(".*:/app/logs(?::(?:ro|rw))?$")
                 || normalized.matches(".*:/otel/javaagent\\.jar(?::(?:ro|rw))?$");
+    }
+
+    private void validateBindMountTargets(JsonNode service, BetaControllerProperties.ServiceTemplate template) {
+        if (!service.path("bindMounts").isArray() || service.path("bindMounts").isEmpty()) return;
+        Set<String> targets = new HashSet<>();
+        targets.add(properties.getHealthcheckScript().normalize().toString());
+        if ("agent-service".equals(service.path("serviceName").asText()))
+            targets.add("/run/alphafrog/host-machine-id");
+        targets.add("/app/logs");
+        if (template.isJavaAgentEnabled()) targets.add("/otel/javaagent.jar");
+        for (String volume : template.getVolumes()) {
+            String[] fields = volume.split(":", -1);
+            if (fields.length >= 2) targets.add(Path.of(fields[1]).normalize().toString());
+        }
+        for (JsonNode mount : service.path("bindMounts")) {
+            String target = Path.of(mount.path("target").asText()).normalize().toString();
+            if (!targets.add(target))
+                throw new ControllerException("SERVICE_CONFIG_INVALID",
+                        "Bind mount target conflicts with a controller or service volume: " + target);
+        }
     }
 
     private Path prepareLogDirectory(String serviceName) {

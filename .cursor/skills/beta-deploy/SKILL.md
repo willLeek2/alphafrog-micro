@@ -55,7 +55,7 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 
 - `status`：查看当前部署与滚动状态。
 - `git fetch --branch <分支名>`：当前分支成功执行 `git push` 后，调用 `bash deploy/beta/af-beta-remote.sh git fetch --branch <分支名>`，让 Beta 本机拉取刚推送的分支。把命令输出原样转告用户，并使用输出里的 `commit=` 作为后续 `lane start` 或 `file-config` 的 `--git` 参数。分支名使用刚推送的当前分支；fetch 失败时把错误原文交给用户。这条不是 `main roll`，不需要用户另一次同意滚动主环境。
-- `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build] [--preset <名字>]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。`--preset` 按名字把 Beta 本机 preset 写入这次点名服务的环境变量覆盖（只传名字，取值由 Beta 本机解析写入）。
+- `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build] [--preset <名字>] [--mount-plan <摘要>]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。`--preset` 按名字把 Beta 本机 preset 写入这次点名服务的环境变量覆盖（只传名字，取值由 Beta 本机解析写入）。`--mount-plan` 可重复，使用 `mounts plan` 输出的 `plan=` 摘要在首次创建时配置挂载；挂载失败则整次启动失败。
 - `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加；同样可带 `--preset <名字>`。见上文硬性边界：必须用户明确要求。
 - `retry`：对失败部署重试。
 - `how-to-test`：拿到本次部署的验证指引，成功后原样转告用户。
@@ -67,6 +67,12 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 - `preset ls`：列出 Beta 本机已登记的 preset 名（命名的环境变量预设组，用于数据源等端点切换；变量取值只存 Beta 本机）。
 - `preset inspect <名字> [--json]`：查看该 preset 的变量名与打码取值；打码输出原样转告用户，不猜测、不补全取值。
 - `preset apply --name <名字> --services <短名>[,<短名>...] (--main|--lane <泳道>)`：把 preset 写入已有部署的环境变量覆盖并滚动点名服务。`--main` 作用于主环境，**必须用户在当前对话里明确说了才允许调用**（与 `main roll` 同一硬性边界）；`--lane` 只作用于该泳道。成功后把命令输出原样转告用户，失败时把错误原文交给用户。
+- `mounts policy [--service <短名>]`：只读查看 Beta 本机允许的宿主根目录、服务与挂载用途；根路径以命令输出为准，不从本文件猜测。
+- `mounts plan --lane <泳道>|--main --service <短名> --key <用途> --subdir <相对目录> [--target <容器绝对路径>] [--mode ro|rw] [--create]`：预检查挂载计划，不创建宿主目录、不修改部署。把输出中的 `plan=` 摘要原样交给 `mounts apply` 或 `lane start --mount-plan`。
+- `mounts apply --plan <摘要>`：把挂载声明写入已有部署，并滚动点名服务。主 Beta 写入必须先取得当前对话中的明确授权。
+- `mounts inspect --lane <泳道>|--main --service <短名> [--json]`：对照部署单声明与运行容器的实际挂载。
+- `mounts plan --remove ...` 后接 `mounts remove --plan <摘要>`：撤销挂载声明，不删除宿主文件。主 Beta 写入必须先取得当前对话中的明确授权。
+- `mounts purge --lane <泳道>|--main --service <短名> --subdir <相对目录>`：删除已无挂载声明的宿主子目录及其中的文件。开发机 Agent **不得自动调用**；只有人类在当前对话明确要求删除这些目录时才可执行。失败时把命令输出原文交给用户。
 
 ## 联调前置
 
