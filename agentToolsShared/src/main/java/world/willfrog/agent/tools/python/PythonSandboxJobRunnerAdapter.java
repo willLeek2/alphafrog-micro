@@ -66,19 +66,22 @@ public final class PythonSandboxJobRunnerAdapter
     }
 
     /**
-     * Run 级 durable 路径的回查判定（宽松档）：found 且任务号、指纹均非空且一致即证实；
-     * 未找到且错误文本为空即不存在；其余不确定。
+     * Run 级持久路径的回查判定：任务号和指纹必须匹配；任何错误详情都不能证明任务不存在。
      */
     @Override
     public SandboxCreateVerdict verdictFromLookupForRunPath(
             GetTaskByOperationIdResponse lookup, String requestFingerprint) {
-        if (lookup != null && lookup.getFound()
+        if (lookup != null && !lookup.hasErrorDetail() && lookup.getError().isBlank()
+                && lookup.getFound()
                 && !lookup.getTaskId().isBlank()
                 && !lookup.getRequestFingerprint().isBlank()
                 && requestFingerprint.equals(lookup.getRequestFingerprint())) {
             return new SandboxCreateVerdict.Confirmed(lookup.getTaskId());
         }
-        if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()) {
+        if (lookup != null && !lookup.hasErrorDetail() && !lookup.getFound()
+                && lookup.getError().isBlank()
+                && lookup.getTaskId().isBlank()
+                && lookup.getRequestFingerprint().isBlank()) {
             return new SandboxCreateVerdict.Absent("operation lookup reports absent");
         }
         return new SandboxCreateVerdict.Unknown("create outcome is ambiguous");

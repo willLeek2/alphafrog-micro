@@ -1,6 +1,7 @@
 package world.willfrog.agent.tools.sandboxjob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
@@ -134,7 +135,7 @@ class SandboxToolJobLifecycleTest {
     @Test
     @SuppressWarnings("unchecked")
     void pythonMemberPersistsCompleteRequestBeforeCreateAndPreservesWorkspaceRefusal() {
-        ObjectMapper mapper = new ObjectMapper();
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity("run-1", "call-1", 1);
         DataAnalysisReservation reservation = new DataAnalysisReservation(identity.reservationId(), identity,
                 DataAnalysisResourceClass.STANDARD, 1, DataAnalysisReservationState.PREPARING,

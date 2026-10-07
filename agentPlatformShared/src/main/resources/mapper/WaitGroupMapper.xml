@@ -1360,7 +1360,7 @@
                 OR (m.state = 'CANCELED' AND EXISTS (
                     SELECT 1 FROM alphafrog_agent_run_wait_member_stop confirmed
                      WHERE confirmed.wait_member_id = m.id AND confirmed.state = 'CONFIRMED')))
-           AND m.dispatch_proof_json -&gt;&gt; 'schemaVersion' = '2'
+           AND m.dispatch_proof_json -&gt;&gt; 'schemaVersion' = CAST(2 AS TEXT)
            AND m.dispatch_proof_json -&gt;&gt; 'createRequestJson' IS NOT NULL
            AND NOT EXISTS (
                SELECT 1 FROM alphafrog_agent_run_wait_member_stop s

@@ -169,7 +169,7 @@ class LangchainNodeToolDispatcherTest {
 
     @Test
     void missingOriginalPythonRequestEscapesMemberDispatchAsRunFailure() {
-        executors.put(DurableToolCallIds.ASYNC_PYTHON_TOOL, (request, memoryId) -> {
+        executors.put(ToolJobAnchor.EXECUTE_PYTHON_TOOL, (request, memoryId) -> {
             throw new PythonRiskReplayEvidenceMissingException(expectedOperationId());
         });
 
