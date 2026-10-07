@@ -1,0 +1,29 @@
+schemaVersion: "1"
+methodId: finance.crossover.ah_premium
+version: 1.0.0
+displayName: AH溢价
+definition: 采用 AH 比价接口的溢价率数值，接口单位是（A/H）%，直接使用；无值时不输出记录。
+resolverHints:
+  aliases: [AH溢价, AH溢价率, AH比价溢价]
+  commonPhrases: [A股相对H股贵多少]
+  clarificationDimensions:
+    - id: pairAndDate
+      question: 哪对 A/H 股票、哪个交易日
+parameters:
+  ahPremium:
+    type: number
+    required: true
+    meaning: AH 比价接口的溢价率（A/H）百分比数值，无值传 null
+conventions:
+  direct_use:
+    canonicalPath: 接口值直接采用（百分比口径）
+    returnType: percent
+    narrativeTemplate: 采用 AH 比价接口在目标交易日的溢价率 {ahPremium}%（A/H 口径）
+outputs:
+  - {name: ahPremium, unit: percent, description: AH 溢价率（A/H）, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: ah_premium
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.crossover.ah_premium@1.0.0

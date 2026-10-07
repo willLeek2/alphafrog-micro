@@ -1,8 +1,8 @@
-查询上市公司财务报表数据（利润表/资产负债表/现金流量表/业绩快报）。
+查询上市公司财务数据（利润表/资产负债表/现金流量表/业绩快报/财务指标/券商盈利预测）。
 
 【参数规范 - 必须严格遵循】
   tsCode      - 股票代码（TuShare 格式，如 600519.SH）
-  reportType  - 报告类型：income（利润表）| balancesheet（资产负债表）| cashflow（现金流量表）| express（业绩快报）
+  reportType  - 报告类型：income（利润表）| balancesheet（资产负债表）| cashflow（现金流量表）| express（业绩快报）| fina_indicator（财务指标，日期参数为报告期）| report_rc（券商盈利预测，日期参数为券商报告发布日，不是报告期）
   startPeriod - 报告期开始，YYYYMMDD，如 20240101
   endPeriod   - 报告期结束，YYYYMMDD，如 20241231
 
@@ -22,3 +22,9 @@
 - 2024半年报：startPeriod=20240101, endPeriod=20240630
 - 2024一季报：startPeriod=20240101, endPeriod=20240331
 - 2024三季报：startPeriod=20240101, endPeriod=20240930
+
+【指标库扩充新增 reportType（260929）】
+  reportType=fina_indicator - 财务指标（TuShare fina_indicator_vip，按报告期）：返回 roe/roa/利润率等财务指标，以五列 JSON 字符串返回——profitability（盈利与回报）、per_share（每股）、capital_cash（营运偿债现金流与资本结构）、growth（增长）、extended（未分类）；键名沿用 TuShare 字段名，指标值为字符串、缺失键表示无该项。startPeriod/endPeriod 过滤的是报告期 end_date。
+  reportType=report_rc - 券商盈利预测（按报告日期）：返回各券商对个股的预测（eps 每股收益、np 净利润、pe 预测市盈率、tp 目标价、roe、ev_ebitda、rating 评级、quarter 预测期等）；数值字段券商未给出时为 null 不是 0，预测市盈率/PEG 类计算按缺失处理。startPeriod/endPeriod 过滤的是券商报告发布日 report_date（与四大报表的报告期语义不同，注意区分）。
+✅ 查茅台财务指标（2024 各报告期）：{"tool":"getFinancialReport","params":{"tsCode":"600519.SH","reportType":"fina_indicator","startPeriod":"20240101","endPeriod":"20241231"}}
+✅ 查茅台近一年券商盈利预测：{"tool":"getFinancialReport","params":{"tsCode":"600519.SH","reportType":"report_rc","startPeriod":"20240101","endPeriod":"20241231"}}

@@ -47,7 +47,9 @@ public final class DatasetSchemaHintResolver {
         return column.equals("open") || column.equals("high") || column.equals("low")
                 || column.equals("close") || column.equals("pre_close") || column.equals("change")
                 || column.equals("pct_chg") || column.equals("vol") || column.equals("volume")
-                || column.equals("amount") || column.endsWith("_return") || column.endsWith("_ratio");
+                || column.equals("amount") || column.equals("adj_factor")
+                || column.equals("pe_ttm") || column.equals("pb")
+                || column.endsWith("_return") || column.endsWith("_ratio");
     }
 
     private static List<String> select(List<String> columns, String... preferred) {

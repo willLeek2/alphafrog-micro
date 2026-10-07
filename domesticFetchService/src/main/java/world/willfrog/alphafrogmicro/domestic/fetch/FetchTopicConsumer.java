@@ -134,7 +134,14 @@ public class FetchTopicConsumer {
             
             if (taskUuid != null) {
                 runningTasks.put(taskUuid, future);
-                future.whenComplete((result, ex) -> runningTasks.remove(finalTaskUuid));
+                // processFetchTask 只捕获 Exception；Error 类型的可抛对象（链接错误等）
+                // 会绕过 catch 直接进入 future，若不在此记录将完全无日志，只能看到 success=false。
+                future.whenComplete((result, ex) -> {
+                    runningTasks.remove(finalTaskUuid);
+                    if (ex != null) {
+                        log.error("Fetch task [{}] terminated with uncaught throwable", finalTaskUuid, ex);
+                    }
+                });
             }
             
         } catch (Exception e) {
@@ -177,6 +184,9 @@ public class FetchTopicConsumer {
             int result;
 
             if (taskName == null) {
+                // 该分支此前完全不落日志，排查时只能看到 success=false，无法区分原因。
+                log.warn("Fetch task [{}] rejected: missing task_name, received keys={}",
+                        taskUuid, rawMessageJSON.keySet());
                 result = -2;
                 sendTaskResult(taskUuid, null, taskSubTypeValue, result, "Missing task_name");
                 return;
@@ -779,6 +789,81 @@ public class FetchTopicConsumer {
                                         .setLimit(num(p, "limit"))
                                         .build();
                         result = domesticStockFetchService.fetchStockShareFloatByDateRange(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "daily_basic":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticDailyBasicFetchByTradeDateRequest request =
+                                DomesticDailyBasicFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchDailyBasicByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "adj_factor":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticAdjFactorFetchByTradeDateRequest request =
+                                DomesticAdjFactorFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchAdjFactorByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "cb_daily":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticCbDailyFetchByTradeDateRequest request =
+                                DomesticCbDailyFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchCbDailyByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                case "stk_ah_comparison":
+                    if (taskSubType == 1) {
+                        long tradeDate = dateToTs(p.get("trade_date"));
+                        DomesticStkAhFetchByTradeDateRequest request =
+                                DomesticStkAhFetchByTradeDateRequest.newBuilder()
+                                        .setTradeDate(tradeDate)
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchStkAhByTradeDate(request).getFetchedItemsCount();
+                    } else {
+                        result = -1;
+                    }
+                    break;
+
+                // 财务指标（fina_indicator_vip，按报告期）：⑥ 扣非ROE 与杜邦三组件的数据来源
+                case "fina_indicator":
+                    if (taskSubType == 1) {
+                        DomesticFinaIndicatorFetchByPeriodRequest request =
+                                DomesticFinaIndicatorFetchByPeriodRequest.newBuilder()
+                                        .setPeriod(str(p, "period"))
+                                        .setOffset(num(p, "offset"))
+                                        .setLimit(num(p, "limit"))
+                                        .build();
+                        result = domesticStockFetchService.fetchFinaIndicatorByPeriod(request).getFetchedItemsCount();
                     } else {
                         result = -1;
                     }

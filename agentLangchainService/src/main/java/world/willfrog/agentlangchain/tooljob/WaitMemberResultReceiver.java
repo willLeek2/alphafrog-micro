@@ -668,7 +668,8 @@ public class WaitMemberResultReceiver {
                         PolicyOutcome outcome) {
         ForcedFailure refusal = outcome == null ? null : outcome.refusal();
         String output = pythonSandboxTools.formatTerminalResult(
-                terminal.statusName(), terminal.result());
+                terminal.statusName(), terminal.result(),
+                member.getRunId(), run.getUserId(), group.getNodeId(), member.getToolCallId());
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
         boolean success = SUCCEEDED.equals(terminal.statusName())
                 && terminal.result().getExitCode() == 0

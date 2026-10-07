@@ -12,18 +12,26 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.component.MeiliSearchIndexManager;
 import world.willfrog.alphafrogmicro.common.component.MeiliSearchDataSyncService;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.CbDailyDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StkAhDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockQuoteDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockIncomeDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockBalancesheetDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockCashflowDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockExpressDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockFinaIndicatorDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockReportRcDao;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.CbDaily;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StkAh;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockDaily;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockInfo;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockIncome;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockBalancesheet;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockCashflow;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockExpress;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockFinaIndicator;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockReportRc;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticStockServiceTriple.*;
@@ -53,11 +61,15 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
     private final StockBalancesheetDao stockBalancesheetDao;
     private final StockCashflowDao stockCashflowDao;
     private final StockExpressDao stockExpressDao;
+    private final StockFinaIndicatorDao stockFinaIndicatorDao;
+    private final StockReportRcDao stockReportRcDao;
+    private final CbDailyDao cbDailyDao;
+    private final StkAhDao stkAhDao;
     private final Environment environment;
     private volatile Client meiliClient;
     private volatile String meiliClientHost;
     private volatile String meiliClientApiKey;
-    
+
     // MeiliSearch 索引管理
     private volatile MeiliSearchIndexManager indexManager;
     private volatile MeiliSearchDataSyncService syncService;
@@ -68,6 +80,10 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                                     StockBalancesheetDao stockBalancesheetDao,
                                     StockCashflowDao stockCashflowDao,
                                     StockExpressDao stockExpressDao,
+                                    StockFinaIndicatorDao stockFinaIndicatorDao,
+                                    StockReportRcDao stockReportRcDao,
+                                    CbDailyDao cbDailyDao,
+                                    StkAhDao stkAhDao,
                                     Environment environment) {
         this.stockInfoDao = stockInfoDao;
         this.stockQuoteDao = stockQuoteDao;
@@ -75,6 +91,10 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         this.stockBalancesheetDao = stockBalancesheetDao;
         this.stockCashflowDao = stockCashflowDao;
         this.stockExpressDao = stockExpressDao;
+        this.stockFinaIndicatorDao = stockFinaIndicatorDao;
+        this.stockReportRcDao = stockReportRcDao;
+        this.cbDailyDao = cbDailyDao;
+        this.stkAhDao = stkAhDao;
         this.environment = environment;
     }
 
@@ -476,6 +496,28 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                     .setVol(stockDaily.getVol())
                     .setAmount(stockDaily.getAmount());
 
+            // 指标库扩充：请求带对应列名时才填新列
+            for (String column : request.getIncludeColumnsList()) {
+                switch (column) {
+                    case "adj_factor" -> {
+                        if (stockDaily.getAdjFactor() != null) {
+                            itemBuilder.setAdjFactor(stockDaily.getAdjFactor());
+                        }
+                    }
+                    case "valuation" -> {
+                        if (stockDaily.getValuation() != null) {
+                            itemBuilder.setValuation(stockDaily.getValuation());
+                        }
+                    }
+                    case "share_turnover" -> {
+                        if (stockDaily.getShareTurnover() != null) {
+                            itemBuilder.setShareTurnover(stockDaily.getShareTurnover());
+                        }
+                    }
+                    default -> log.warn("Unknown includeColumn requested: {}", column);
+                }
+            }
+
             responseBuilder.addItems(itemBuilder.build());
         }
 
@@ -630,6 +672,176 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         return DomesticStockExpressQueryResponse.newBuilder()
                 .addAllItems(items)
                 .build();
+    }
+
+    // 指标库扩充新增：财务指标查询（四类 JSONB + extended 以原始 JSON 字符串返回，startPeriod/endPeriod 过滤报告期）
+    @Override
+    public DomesticStockFinaIndicatorQueryResponse queryStockFinaIndicator(DomesticStockFinancialQueryRequest request) {
+        String tsCode = request.getTsCode();
+        long startDate = DateConvertUtils.convertDateStrToLong(request.getStartPeriod(), "yyyyMMdd");
+        long endDate = DateConvertUtils.convertDateStrToLong(request.getEndPeriod(), "yyyyMMdd");
+
+        List<StockFinaIndicator> rows = stockFinaIndicatorDao.getByTsCodeAndEndDateRange(tsCode, startDate, endDate);
+
+        List<StockFinaIndicatorItem> items = rows.stream().map(r -> {
+            String endDateStr = DateConvertUtils.convertTimestampToString(r.getEndDate(), "yyyyMMdd");
+            String annDateStr = r.getAnnDate() == null ? "" : DateConvertUtils.convertTimestampToString(r.getAnnDate(), "yyyyMMdd");
+            return StockFinaIndicatorItem.newBuilder()
+                    .setTsCode(nvl(r.getTsCode()))
+                    .setEndDate(nvl(endDateStr))
+                    .setAnnDate(nvl(annDateStr))
+                    .setProfitability(nvl(r.getProfitability()))
+                    .setPerShare(nvl(r.getPerShare()))
+                    .setCapitalCash(nvl(r.getCapitalCash()))
+                    .setGrowth(nvl(r.getGrowth()))
+                    .setExtended(nvl(r.getExtended()))
+                    .build();
+        }).toList();
+
+        return DomesticStockFinaIndicatorQueryResponse.newBuilder()
+                .addAllItems(items)
+                .build();
+    }
+
+    // 指标库扩充新增：券商盈利预测查询（startPeriod/endPeriod 过滤报告日期 report_date，数值字段仅非空才设置）
+    @Override
+    public DomesticStockReportRcQueryResponse queryStockReportRc(DomesticStockFinancialQueryRequest request) {
+        String tsCode = request.getTsCode();
+        long startDate = DateConvertUtils.convertDateStrToLong(request.getStartPeriod(), "yyyyMMdd");
+        long endDate = DateConvertUtils.convertDateStrToLong(request.getEndPeriod(), "yyyyMMdd");
+
+        List<StockReportRc> rows = stockReportRcDao.getByTsCodeAndReportDateRange(tsCode, startDate, endDate);
+
+        List<StockReportRcItem> items = rows.stream().map(r -> {
+            String reportDateStr = DateConvertUtils.convertTimestampToString(r.getReportDate(), "yyyyMMdd");
+            StockReportRcItem.Builder builder = StockReportRcItem.newBuilder()
+                    .setTsCode(nvl(r.getTsCode()))
+                    .setName(nvl(r.getName()))
+                    .setReportDate(nvl(reportDateStr))
+                    .setOrgName(nvl(r.getOrgName()))
+                    .setAuthorName(nvl(r.getAuthorName()))
+                    .setQuarter(nvl(r.getQuarter()))
+                    .setReportTitle(nvl(r.getReportTitle()))
+                    .setClassify(nvl(r.getClassify()))
+                    .setRating(nvl(r.getRating()));
+            if (r.getOpRt() != null) {
+                builder.setOpRt(r.getOpRt());
+            }
+            if (r.getOpPr() != null) {
+                builder.setOpPr(r.getOpPr());
+            }
+            if (r.getTp() != null) {
+                builder.setTp(r.getTp());
+            }
+            if (r.getNp() != null) {
+                builder.setNp(r.getNp());
+            }
+            if (r.getEps() != null) {
+                builder.setEps(r.getEps());
+            }
+            if (r.getPe() != null) {
+                builder.setPe(r.getPe());
+            }
+            if (r.getRd() != null) {
+                builder.setRd(r.getRd());
+            }
+            if (r.getRoe() != null) {
+                builder.setRoe(r.getRoe());
+            }
+            if (r.getEvEbitda() != null) {
+                builder.setEvEbitda(r.getEvEbitda());
+            }
+            if (r.getMaxPrice() != null) {
+                builder.setMaxPrice(r.getMaxPrice());
+            }
+            if (r.getMinPrice() != null) {
+                builder.setMinPrice(r.getMinPrice());
+            }
+            return builder.build();
+        }).toList();
+
+        return DomesticStockReportRcQueryResponse.newBuilder()
+                .addAllItems(items)
+                .build();
+    }
+
+    // 指标库扩充新增：可转债日线查询（溢价四字段以 premium 原始 JSON 字符串返回）
+    @Override
+    public DomesticCbDailyByTsCodeAndDateRangeResponse getCbDailyByTsCodeAndDateRange(DomesticCbDailyByTsCodeAndDateRangeRequest request) {
+        String tsCode = request.getTsCode();
+        List<CbDaily> rows = cbDailyDao.getByTsCodeAndDateRange(tsCode, request.getStartDate(), request.getEndDate());
+
+        DomesticCbDailyByTsCodeAndDateRangeResponse.Builder responseBuilder = DomesticCbDailyByTsCodeAndDateRangeResponse.newBuilder();
+        for (CbDaily row : rows) {
+            CbDailyItem.Builder itemBuilder = CbDailyItem.newBuilder()
+                    .setTsCode(nvl(row.getTsCode()))
+                    .setTradeDate(row.getTradeDate() == null ? 0L : row.getTradeDate())
+                    .setPremium(nvl(row.getPremium()));
+            if (row.getPreClose() != null) {
+                itemBuilder.setPreClose(row.getPreClose());
+            }
+            if (row.getOpen() != null) {
+                itemBuilder.setOpen(row.getOpen());
+            }
+            if (row.getHigh() != null) {
+                itemBuilder.setHigh(row.getHigh());
+            }
+            if (row.getLow() != null) {
+                itemBuilder.setLow(row.getLow());
+            }
+            if (row.getClose() != null) {
+                itemBuilder.setClose(row.getClose());
+            }
+            if (row.getChange() != null) {
+                itemBuilder.setChange(row.getChange());
+            }
+            if (row.getPctChg() != null) {
+                itemBuilder.setPctChg(row.getPctChg());
+            }
+            if (row.getVol() != null) {
+                itemBuilder.setVol(row.getVol());
+            }
+            if (row.getAmount() != null) {
+                itemBuilder.setAmount(row.getAmount());
+            }
+            responseBuilder.addItems(itemBuilder.build());
+        }
+        return responseBuilder.build();
+    }
+
+    // 指标库扩充新增：AH 比价查询（A/H 收盘、涨跌幅、比价与溢价）
+    @Override
+    public DomesticStkAhByTsCodeAndDateRangeResponse getStkAhByTsCodeAndDateRange(DomesticStkAhByTsCodeAndDateRangeRequest request) {
+        String tsCode = request.getTsCode();
+        List<StkAh> rows = stkAhDao.getByTsCodeAndDateRange(tsCode, request.getStartDate(), request.getEndDate());
+
+        DomesticStkAhByTsCodeAndDateRangeResponse.Builder responseBuilder = DomesticStkAhByTsCodeAndDateRangeResponse.newBuilder();
+        for (StkAh row : rows) {
+            StkAhItem.Builder itemBuilder = StkAhItem.newBuilder()
+                    .setTsCode(nvl(row.getTsCode()))
+                    .setHkCode(nvl(row.getHkCode()))
+                    .setTradeDate(row.getTradeDate() == null ? 0L : row.getTradeDate());
+            if (row.getClose() != null) {
+                itemBuilder.setClose(row.getClose());
+            }
+            if (row.getHkClose() != null) {
+                itemBuilder.setHkClose(row.getHkClose());
+            }
+            if (row.getPctChg() != null) {
+                itemBuilder.setPctChg(row.getPctChg());
+            }
+            if (row.getHkPctChg() != null) {
+                itemBuilder.setHkPctChg(row.getHkPctChg());
+            }
+            if (row.getAhComparison() != null) {
+                itemBuilder.setAhComparison(row.getAhComparison());
+            }
+            if (row.getAhPremium() != null) {
+                itemBuilder.setAhPremium(row.getAhPremium());
+            }
+            responseBuilder.addItems(itemBuilder.build());
+        }
+        return responseBuilder.build();
     }
 
     private double orZero(Double v) { return v == null ? 0.0 : v; }

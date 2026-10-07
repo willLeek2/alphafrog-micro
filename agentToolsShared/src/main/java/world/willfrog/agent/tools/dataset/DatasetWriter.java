@@ -100,7 +100,7 @@ public class DatasetWriter {
             for (T item : data) {
                 List<Object> row = rowMapper.apply(item);
                 String line = row.stream()
-                        .map(value -> value == null ? "" : String.valueOf(value))
+                        .map(value -> value == null ? "" : csvEscape(String.valueOf(value)))
                         .collect(Collectors.joining(","));
                 writer.write(line);
                 writer.newLine();
@@ -133,6 +133,21 @@ public class DatasetWriter {
         }
 
         return datasetId;
+    }
+
+    /**
+     * CSV 字段的条件引号包裹（RFC 4180）：字段含逗号/双引号/换行时用双引号包住、内部双引号加倍。
+     *
+     * <p>不含这些字符的字段输出与裸字符串逐字节相同，既有数据集与读取方不受影响。
+     * 指标库扩充后估值/股本换手/财务指标分类等 JSONB 列以原始 JSON 字符串进数据集，
+     * 其中天然含逗号与双引号，不包裹会把 CSV 列分隔破坏掉、读取端整行错列。</p>
+     */
+    private static String csvEscape(String value) {
+        if (value.indexOf(',') < 0 && value.indexOf('"') < 0
+                && value.indexOf('\n') < 0 && value.indexOf('\r') < 0) {
+            return value;
+        }
+        return '"' + value.replace("\"", "\"\"") + '"';
     }
 
     private void ensureDirectory() {

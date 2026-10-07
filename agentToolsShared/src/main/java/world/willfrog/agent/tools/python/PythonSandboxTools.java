@@ -19,6 +19,7 @@ import world.willfrog.agent.tools.sandboxjob.SandboxToolJobLifecycle;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceRecordDecoder;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionRequest;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionResult;
 import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
@@ -1086,12 +1087,26 @@ public class PythonSandboxTools {
     /**
      * 把一次已经确认终态的沙箱任务结果包成模型看到的那份 JSON。
      *
-     * <p>同步执行与后台作业的结果接回必须写成同一个形状，格式化实现已收敛到
-     * {@link PythonSandboxJobResultAdapter}（三条路径共用唯一出口）。后台作业只跑
-     * {@code executePython}，没有 finance 记录通道那一路，所以按没有 finance 结果处理。</p>
+     * <p>同步执行与后台等待组成员接回共用 {@link PythonSandboxJobResultAdapter}。
+     * stdout 或通道元数据里带有金融记录时，先按冻结配置提取、落库，再把去掉标记后的正文交给格式化；
+     * 两参数入口给测试和旧调用方，身份字段为空时仍会按当前结果体判断要不要走通道。</p>
      */
     public String formatTerminalResult(String status, TaskResultResponse result) {
-        return formatResult(status, result, null);
+        return formatTerminalResult(status, result, null, null, null, null);
+    }
+
+    /**
+     * 等待组成员接回：带上 Run、待办节点、工具调用身份，金融通道才能按同一套键落库。
+     */
+    public String formatTerminalResult(String status,
+                                       TaskResultResponse result,
+                                       String runId,
+                                       String userId,
+                                       String todoId,
+                                       String toolCallId) {
+        FinanceRecordExtractionResult finance = extractFinanceIfPresent(
+                runId, userId, todoId, toolCallId, status, result);
+        return formatResult(status, result, finance);
     }
 
     /**
@@ -1111,9 +1126,7 @@ public class PythonSandboxTools {
             ToolJobAnchor anchor,
             String status,
             TaskResultResponse result) {
-        boolean hasFinancePayload = result.hasFinanceRecordChannel()
-                || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_");
-        if (!hasFinancePayload) {
+        if (!hasFinancePayload(result)) {
             return null;
         }
         if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
@@ -1121,24 +1134,81 @@ public class PythonSandboxTools {
                     "FINANCE_RECORD_PROCESSOR_UNAVAILABLE",
                     "Finance record processor/config loader is unavailable");
         }
-
         if (anchor.getFinanceRecordLimitsJson() == null
                 || anchor.getFinanceRecordLimitsJson().isBlank()) {
             throw new FinanceRecordProcessingException(
                     "FINANCE_RECORD_CONFIG_SNAPSHOT_MISSING",
                     "Finance record payload is present but the frozen configuration snapshot is missing");
         }
-        FinanceRecordChannelConfigLoader.Snapshot frozen =
-                financeRecordChannelConfigLoader.parseFrozenSnapshot(
-                        anchor.getFinanceRecordLimitsJson());
-
-        return financeRecordChannelProcessor.process(new FinanceRecordExtractionRequest(
+        return processFinanceWithSnapshot(
                 runId,
                 AgentContext.getUserId(),
                 anchor.getTodoId(),
                 identity.toolCallId(),
-                "sync",
                 anchor.getTaskId(),
+                "sync",
+                status,
+                result,
+                anchor.getFinanceRecordLimitsJson());
+    }
+
+    /**
+     * 等待组成员接回没有 Run 级锚点：stdout 或通道元数据带金融记录时，用当前冻结配置提取并落库。
+     * 没有金融载荷时返回空，格式化仍走普通 stdout。
+     */
+    private FinanceRecordExtractionResult extractFinanceIfPresent(
+            String runId,
+            String userId,
+            String todoId,
+            String toolCallId,
+            String status,
+            TaskResultResponse result) {
+        if (!hasFinancePayload(result)) {
+            return null;
+        }
+        if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
+            throw new FinanceRecordProcessingException(
+                    "FINANCE_RECORD_PROCESSOR_UNAVAILABLE",
+                    "Finance record processor/config loader is unavailable");
+        }
+        String snapshotJson = financeRecordChannelConfigLoader.frozenSnapshotJson();
+        if (snapshotJson == null || snapshotJson.isBlank()) {
+            throw new FinanceRecordProcessingException(
+                    "FINANCE_RECORD_CONFIG_SNAPSHOT_MISSING",
+                    "Finance record payload is present but the frozen configuration snapshot is missing");
+        }
+        String taskId = result.getTaskId();
+        return processFinanceWithSnapshot(
+                firstNonBlank(runId, AgentContext.getRunId()),
+                firstNonBlank(userId, AgentContext.getUserId()),
+                firstNonBlank(todoId, AgentContext.getTodoId()),
+                firstNonBlank(toolCallId, AgentContext.getToolCallId()),
+                taskId,
+                "wait-member",
+                status,
+                result,
+                snapshotJson);
+    }
+
+    private FinanceRecordExtractionResult processFinanceWithSnapshot(
+            String runId,
+            String userId,
+            String todoId,
+            String toolCallId,
+            String taskId,
+            String entryPoint,
+            String status,
+            TaskResultResponse result,
+            String snapshotJson) {
+        FinanceRecordChannelConfigLoader.Snapshot frozen =
+                financeRecordChannelConfigLoader.parseFrozenSnapshot(snapshotJson);
+        return financeRecordChannelProcessor.process(new FinanceRecordExtractionRequest(
+                runId,
+                userId,
+                todoId,
+                toolCallId,
+                entryPoint,
+                taskId,
                 status,
                 result.getExitCode(),
                 result.getStdout(),
@@ -1147,6 +1217,22 @@ public class PythonSandboxTools {
                 FinanceRecordProtoAdapter.executionEnvironment(result),
                 frozen.targetEnvironment(),
                 frozen.limits()));
+    }
+
+    private static boolean hasFinancePayload(TaskResultResponse result) {
+        if (result == null) {
+            return false;
+        }
+        String stdout = result.getStdout();
+        return result.hasFinanceRecordChannel()
+                || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY));
+    }
+
+    private static String firstNonBlank(String preferred, String fallback) {
+        if (preferred != null && !preferred.isBlank()) {
+            return preferred;
+        }
+        return fallback;
     }
 
     private FinanceToolResultFormatter formatter() {

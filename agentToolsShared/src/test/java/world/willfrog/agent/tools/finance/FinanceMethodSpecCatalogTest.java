@@ -25,7 +25,7 @@ class FinanceMethodSpecCatalogTest {
     void shouldLoadAllCanonicalSpecs() {
         FinanceMethodSpecCatalog catalog = new FinanceMethodSpecCatalog(objectMapper);
         List<FinanceMethodSpec> all = catalog.listAll();
-        assertEquals(3, all.size(), "首批目录应包含 CAGR、年化波动率、夏普比率三个方法");
+        assertEquals(18, all.size(), "目录应包含既有三个方法与预设金融指标库十五个方法");
     }
 
     @Test

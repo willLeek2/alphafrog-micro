@@ -178,6 +178,10 @@ public class FinanceMethodTools {
             try {
                 resolutionSink.saveAll(snapshots);
             } catch (FinanceMethodResolutionSinkException sinkEx) {
+                // 根因必须落日志：sink 只回传固定文案，吞掉 cause 会让人无从定位
+                // （261005 泳道实测 RESOLVER_SNAPSHOT_SAVE_FAILED 但 stdout 无任何 SQL 异常栈）。
+                log.error("保存金融方法解析快照失败: runId={} toolCallId={} snapshots={}",
+                        runId, resolverToolCallId, snapshots.size(), sinkEx);
                 return fail("RESOLVER_SNAPSHOT_SAVE_FAILED", sinkEx.getMessage());
             }
         }

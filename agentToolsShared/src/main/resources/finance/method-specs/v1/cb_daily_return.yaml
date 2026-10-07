@@ -1,0 +1,35 @@
+schemaVersion: "1"
+methodId: finance.return.cb_daily_return
+version: 1.0.0
+displayName: 可转债日收益与区间收益
+definition: 日收益 = 当日涨跌幅/100；区间收益 = 区间内日收益连乘减一（prod(1+ret) - 1）。双输出：最后一个有值日的日收益，以及区间连乘收益（window 不传对整个传入序列连乘、传入时对最后 window 个有值日连乘）。转债价格序列不加复权因子；缺值日跳过并计入警告。
+resolverHints:
+  aliases: [转债日收益, 可转债收益, 转债区间收益]
+  commonPhrases: [这只转债涨了多少, 转债这段时间收益多少]
+  clarificationDimensions:
+    - id: cbAndRange
+      question: 哪只转债、哪个日期区间
+parameters:
+  pctChgs:
+    type: array
+    required: true
+    meaning: 按日期升序排列的日涨跌幅（百分比数值）序列，缺值日传 null
+  window:
+    type: integer
+    required: false
+    minimum: 1
+    meaning: 区间连乘的有值日个数；不传对整个传入序列连乘
+conventions:
+  daily_compound:
+    canonicalPath: 日收益连乘
+    returnType: simple return
+    narrativeTemplate: 日收益按当日涨跌幅除以 100，区间收益按区间内日收益连乘减一（最后一个有值日的日收益单独输出）
+outputs:
+  - {name: dailyReturn, unit: ratio, description: 最后有值日的日收益, displayFormat: percent}
+  - {name: intervalReturn, unit: ratio, description: 区间日收益连乘收益率, displayFormat: percent}
+libraryBinding:
+  package: alphafrog_finance
+  function: cb_daily_return
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.return.cb_daily_return@1.0.0

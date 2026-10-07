@@ -539,7 +539,8 @@ public class ToolRouter {
                 case "getStockDaily" -> marketDataTools.getStockDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
                 );
                 case "getStockSwIndustryInfo" -> marketDataTools.getStockSwIndustryInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
@@ -556,7 +557,8 @@ public class ToolRouter {
                 case "getIndexDaily" -> marketDataTools.getIndexDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("index_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
                 );
                 case "searchIndex" -> AdvancedSearchRequest.isAdvancedMap(params)
                         ? marketDataTools.searchIndexAdvanced(params)
@@ -604,7 +606,14 @@ public class ToolRouter {
                 case "getOffExchangeAssetDaily" -> marketDataTools.getOffExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeDataset"), params.get("include_dataset"), params.get("arg3"))
+                );
+                case "getSpecialAssetDaily" -> marketDataTools.getSpecialAssetDaily(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3"))
                 );
                 case "getEtfAdj" -> {
                     if (!isAdjFactorEnabled()) {

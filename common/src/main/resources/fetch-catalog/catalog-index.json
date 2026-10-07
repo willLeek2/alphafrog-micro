@@ -31,6 +31,11 @@
     { "name": "stock_moneyflow", "file": "fetch-catalog/stock_moneyflow.json" },
     { "name": "stock_top10_holders", "file": "fetch-catalog/stock_top10_holders.json" },
     { "name": "stock_share_float", "file": "fetch-catalog/stock_share_float.json" },
+    { "name": "daily_basic", "file": "fetch-catalog/daily_basic.json" },
+    { "name": "adj_factor", "file": "fetch-catalog/adj_factor.json" },
+    { "name": "cb_daily", "file": "fetch-catalog/cb_daily.json" },
+    { "name": "stk_ah_comparison", "file": "fetch-catalog/stk_ah_comparison.json" },
+    { "name": "fina_indicator", "file": "fetch-catalog/fina_indicator.json" },
     { "name": "trade_calendar", "file": "fetch-catalog/trade_calendar.json" }
   ]
 }

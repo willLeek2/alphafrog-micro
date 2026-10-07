@@ -2666,6 +2666,10 @@ public class AgentLlmProperties {
         private Integer queueCapacity;
         private String threadNamePrefix;
         private ExecutorParallelConfig parallel;
+        // v1.3 示例配置里的文档性字段（说明 hard/current 改动何时需要滚动重启），
+        // 显式声明以免严格反序列化拒载整个示例文件；运行时不读取。
+        @com.fasterxml.jackson.annotation.JsonProperty("_restartNote")
+        private String restartNote;
 
         public Integer getCorePoolSize() {
             return corePoolSize;

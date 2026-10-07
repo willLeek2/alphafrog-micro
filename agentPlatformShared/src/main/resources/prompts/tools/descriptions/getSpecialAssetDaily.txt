@@ -1,0 +1,17 @@
+查询 A 股资产特色数据：可转债日线与 AH 比价（两类小众资产数据整合在本工具，不用于股票/ETF/指数/场外基金等常规资产）。
+
+【参数规范】
+  tsCode    - 资产代码（TuShare 格式；可转债如 113050.SH，AH 比价用 A 股代码如 601318.SH）
+  assetType - 资产类型：cb（可转债日线）| ah（AH 比价）
+  startDate/endDate - YYYYMMDD
+
+【返回字段】
+  assetType=cb：ts_code、trade_date、pre_close、open、high、low、close、change、pct_chg、vol、amount、premium（溢价 JSON 字符串：bond_value 纯债价值、bond_over_rate 纯债溢价率、cb_value 转股价值、cb_over_rate 转股溢价率，接口给出的百分比）
+  assetType=ah：ts_code、hk_code（H 股代码）、trade_date、close（A 股收盘）、hk_close（H 股收盘）、pct_chg、hk_pct_chg、ah_comparison（比价）、ah_premium（A/H 溢价 %）
+  数值缺失时为 null 不是 0；仅同时登录 A/H 两地的股票有 AH 比价数据。返回与数据集行序不保证，需要顺序时自行按 trade_date 排序。
+
+【数据机制】数据集启用时返回整段序列的 dataset_id（供指标计算复用），未启用时返回前 20 行预览（trade_date、close、premium 或 hk_close、ah_premium）。
+
+【调用示例】
+✅ 查转债 2024 年日线：{"tool":"getSpecialAssetDaily","params":{"tsCode":"113050.SH","assetType":"cb","startDate":"20240101","endDate":"20241231"}}
+✅ 查平安 AH 溢价：{"tool":"getSpecialAssetDaily","params":{"tsCode":"601318.SH","assetType":"ah","startDate":"20240101","endDate":"20241231"}}

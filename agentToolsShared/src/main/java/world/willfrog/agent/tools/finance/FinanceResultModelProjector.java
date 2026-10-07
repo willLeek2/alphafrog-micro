@@ -94,8 +94,31 @@ public class FinanceResultModelProjector {
             return Optional.empty();
         }
 
+        // 多输出规格：按 report parameters 携带的 output 键（与 yaml outputs[].name 同名）
+        // 定位本条记录对应的输出，unit 取该输出的 canonical unit；缺键、非字符串或
+        // 不匹配任何输出名 → 不可投影。单输出规格保持原行为（无需 output 键）。
+        String outputName = null;
+        List<FinanceMethodSpec.FinanceOutput> outputs = spec.getOutputs();
+        if (outputs != null && outputs.size() > 1) {
+            Object declared = in.parameters() == null ? null : in.parameters().get("output");
+            if (!(declared instanceof String s) || s.isBlank()) {
+                return Optional.empty();
+            }
+            boolean matches = false;
+            for (FinanceMethodSpec.FinanceOutput o : outputs) {
+                if (s.equals(o.getName())) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (!matches) {
+                return Optional.empty();
+            }
+            outputName = s;
+        }
+
         // canonical unit 精确校验
-        String canonicalUnit = canonicalUnit(spec);
+        String canonicalUnit = canonicalUnit(spec, outputName);
         String inputUnit = in.unit() == null ? "" : in.unit().trim();
         if (canonicalUnit == null || !inputUnit.equals(canonicalUnit)) {
             return Optional.empty();
@@ -116,7 +139,7 @@ public class FinanceResultModelProjector {
         if (howCalculated.length() > MAX_HOW_CALCULATED_LENGTH) {
             return Optional.empty();
         }
-        return Optional.of(new FinanceResultProjection(spec.getDisplayName(), in.value(), canonicalUnit, howCalculated));
+        return Optional.of(new FinanceResultProjection(displayName(spec, outputName), in.value(), canonicalUnit, howCalculated));
     }
 
     private Optional<FinanceResultProjection> projectCustom(FinanceResultProjectionInput in) {
@@ -222,16 +245,39 @@ public class FinanceResultModelProjector {
         return null;
     }
 
-    private String canonicalUnit(FinanceMethodSpec spec) {
+    private String canonicalUnit(FinanceMethodSpec spec, String outputName) {
         List<FinanceMethodSpec.FinanceOutput> outputs = spec.getOutputs();
-        if (outputs == null || outputs.size() != 1) {
+        if (outputs == null || outputs.isEmpty()) {
             return null;
         }
-        String unit = outputs.get(0).getUnit();
+        FinanceMethodSpec.FinanceOutput target = null;
+        if (outputs.size() == 1) {
+            target = outputs.get(0);
+        } else if (outputName != null) {
+            target = outputs.stream()
+                    .filter(o -> outputName.equals(o.getName()))
+                    .findFirst()
+                    .orElse(null);
+        }
+        if (target == null) {
+            return null;
+        }
+        String unit = target.getUnit();
         if (unit == null || unit.isBlank()) {
             return null;
         }
         return unit.trim();
+    }
+
+    private String displayName(FinanceMethodSpec spec, String outputName) {
+        if (outputName == null) {
+            return spec.getDisplayName();
+        }
+        return spec.getOutputs().stream()
+                .filter(o -> outputName.equals(o.getName()))
+                .findFirst()
+                .map(o -> spec.getDisplayName() + "·" + o.getDescription())
+                .orElse(spec.getDisplayName());
     }
 
     private boolean allParameterTypesValid(FinanceMethodSpec spec, Map<String, Object> params) {

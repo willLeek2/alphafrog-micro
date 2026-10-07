@@ -17,10 +17,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AgentToolRegistryContractTest {
 
     @Test
-    void declaredToolNames_hasExactly28UniqueNames() {
+    void declaredToolNames_hasExactly29UniqueNames() {
         Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertEquals(28, names.size(), "生产声明面应保持 28 个工具名");
-        assertEquals(28, names.stream().distinct().count(), "工具名必须唯一");
+        assertEquals(29, names.size(), "生产声明面应保持 29 个工具名");
+        assertEquals(29, names.stream().distinct().count(), "工具名必须唯一");
     }
 
     @Test
@@ -59,6 +59,7 @@ class AgentToolRegistryContractTest {
                 "getEtfAdj",
                 "getListedAssetShareSize",
                 "getFinancialReport",
+                "getSpecialAssetDaily",
                 "ragSearch",
                 "loadDocument"
         );
@@ -101,7 +102,8 @@ class AgentToolRegistryContractTest {
                 "getExchangeAssetDaily",
                 "getOffExchangeAssetDaily",
                 "getListedAssetShareSize",
-                "getEtfAdj"
+                "getEtfAdj",
+                "getSpecialAssetDaily"
         );
         Set<String> actual = AgentToolRegistry.namesInCacheFamily(AgentToolRegistry.CacheFamily.DATASET);
         assertEquals(expected, actual);

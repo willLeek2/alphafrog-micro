@@ -17,6 +17,32 @@ public interface StockQuoteDao {
     })
     int insertStockDaily(StockDaily stockDaily);
 
+    // 每日指标写入：行不存在则写入骨架行（行情列留空），行已存在只更新估值与股本换手两列
+    @Insert({
+            "INSERT INTO alphafrog_stock_daily (ts_code, trade_date, valuation, share_turnover) " +
+                    "VALUES (#{tsCode}, #{tradeDate}, #{valuation}::jsonb, #{shareTurnover}::jsonb) " +
+                    "ON CONFLICT(ts_code, trade_date) DO UPDATE SET " +
+                    "valuation = EXCLUDED.valuation, share_turnover = EXCLUDED.share_turnover"
+    })
+    int insertDailyBasicOnConflictUpdate(StockDaily stockDaily);
+
+    // 复权因子写入：行不存在则写入骨架行，行已存在只更新复权因子列
+    @Insert({
+            "INSERT INTO alphafrog_stock_daily (ts_code, trade_date, adj_factor) " +
+                    "VALUES (#{tsCode}, #{tradeDate}, #{adjFactor}) " +
+                    "ON CONFLICT(ts_code, trade_date) DO UPDATE SET " +
+                    "adj_factor = EXCLUDED.adj_factor"
+    })
+    int insertAdjFactorOnConflictUpdate(StockDaily stockDaily);
+
+    // 日线任务补齐骨架行行情列：插入语句保持「已有行跳过」，同一批次追加本更新
+    @Update({
+            "UPDATE alphafrog_stock_daily SET close = #{close}, open = #{open}, high = #{high}, low = #{low}," +
+                    " pre_close = #{preClose}, change = #{change}, pct_chg = #{pctChg}, vol = #{vol}, amount = #{amount}" +
+                    " WHERE ts_code = #{tsCode} AND trade_date = #{tradeDate}"
+    })
+    int updateStockDailyQuoteColumns(StockDaily stockDaily);
+
     @Select("SELECT * FROM alphafrog_stock_daily WHERE ts_code = #{tsCode} AND trade_date between #{startDate} and #{endDate}")
     @Results({
             @Result(property = "stockDailyId", column = "id", id = true),

@@ -31,13 +31,16 @@ public class TuShareRequestUtils {
 
     private final TushareRequestTraceService traceService;
 
-    private static final int MAX_LOG_BODY_LENGTH = 8000;
 
     public TuShareRequestUtils(TushareRequestTraceService traceService) {
         this.traceService = traceService;
     }
 
     public JSONObject createTusharePostRequest(Map<String, Object> params) {
+        if (tushareToken == null || tushareToken.isBlank()) {
+            log.error("TuShare token is not configured, aborting request");
+            return null;
+        }
         try ( CloseableHttpClient httpClient = HttpClients.createDefault() ) {
             HttpPost request = new HttpPost("http://api.tushare.pro");
             request.setHeader("Content-Type", "application/json");
@@ -47,15 +50,6 @@ public class TuShareRequestUtils {
             jsonParams.putAll(params);
             String jsonParamsString = jsonParams.toString();
             traceService.record(jsonParamsString);
-//            if (log.isDebugEnabled()) {
-//                JSONObject safeParams = new JSONObject(jsonParams);
-//                safeParams.put("token", maskToken(tushareToken));
-//                log.debug("TuShare raw request payload: {}", safeParams.toString());
-//                log.debug("TuShare request payload length: {}", jsonParamsString.length());
-//                if (tushareToken == null || tushareToken.isBlank()) {
-//                    log.debug("TuShare token is empty");
-//                }
-//            }
             StringEntity entity = new StringEntity(jsonParamsString, ContentType.APPLICATION_JSON);
             request.setEntity(entity);
 
@@ -65,14 +59,10 @@ public class TuShareRequestUtils {
                 if (responseEntity != null) {
                     String responseBody = EntityUtils.toString(responseEntity);
                     long costMs = System.currentTimeMillis() - startMs;
-//                    if (log.isDebugEnabled()) {
-//                        log.debug("TuShare response status={} cost_ms={} body_len={}",
-//                                response.getCode(), costMs, responseBody.length());
-//                        log.debug("TuShare raw response body: {}", trimBody(responseBody));
-//                    }
-//                    if (response.getCode() != 200) {
-//                        log.warn("TuShare HTTP status not OK: {}", response.getCode());
-//                    }
+                    if (response.getCode() != 200) {
+                        log.warn("TuShare HTTP status not OK: status={} cost_ms={}", response.getCode(), costMs);
+                        return null;
+                    }
                     JSONObject responseJson = JSONObject.parseObject(responseBody);
                     if (responseJson == null) {
                         log.warn("TuShare response is not JSON");
@@ -81,18 +71,18 @@ public class TuShareRequestUtils {
 
                     Integer code = responseJson.getInteger("code");
                     String msg = responseJson.getString("msg");
-                    JSONObject dataObject = responseJson.getJSONObject("data");
-                    JSONArray fetchedFields = dataObject == null ? null : dataObject.getJSONArray("fields");
-                    JSONArray fetchedData = dataObject == null ? null : dataObject.getJSONArray("items");
-                    int fieldsSize = fetchedFields == null ? 0 : fetchedFields.size();
-                    int dataSize = fetchedData == null ? 0 : fetchedData.size();
-//                    if (log.isDebugEnabled()) {
-//                        log.debug("TuShare response parsed code={} msg={} fields_size={} items_size={}",
-//                                code, msg, fieldsSize, dataSize);
-//                    }
-//                    if (code != null && code != 0) {
-//                        log.warn("TuShare response code not zero: code={} msg={}", code, msg);
-//                    }
+                    // TuShare 以 code!=0 表示接口层错误（权限不足、参数非法、限流等）；
+                    // 此时 items 为空，必须按失败返回 null，否则调用方会把错误当成「成功、0 行」。
+                    if (code != null && code != 0) {
+                        JSONObject dataObject = responseJson.getJSONObject("data");
+                        JSONArray fetchedFields = dataObject == null ? null : dataObject.getJSONArray("fields");
+                        JSONArray fetchedData = dataObject == null ? null : dataObject.getJSONArray("items");
+                        int fieldsSize = fetchedFields == null ? 0 : fetchedFields.size();
+                        int dataSize = fetchedData == null ? 0 : fetchedData.size();
+                        log.warn("TuShare response code not zero: code={} msg={} fields_size={} items_size={} cost_ms={}",
+                                code, msg, fieldsSize, dataSize, costMs);
+                        return null;
+                    }
 
                     return responseJson;
                 } else {
@@ -103,36 +93,13 @@ public class TuShareRequestUtils {
                 log.error("Error occurred while fetching data from TuShare!");
                 log.error("jsonParamString: " + jsonParamsString);
                 log.error("Error stack trace", e);
-//                e.printStackTrace();
                 return null;
             }
 
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Error building TuShare request", e);
             return null;
         }
-    }
-
-    private String maskToken(String token) {
-        if (token == null || token.isBlank()) {
-            return "";
-        }
-        int length = token.length();
-        if (length <= 6) {
-            return "***";
-        }
-        return token.substring(0, 3) + "***" + token.substring(length - 3);
-    }
-
-    private String trimBody(String body) {
-        if (body == null) {
-            return "";
-        }
-        if (body.length() <= MAX_LOG_BODY_LENGTH) {
-            return body;
-        }
-        return body.substring(0, MAX_LOG_BODY_LENGTH) +
-                "...(truncated, total_len=" + body.length() + ")";
     }
 }

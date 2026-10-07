@@ -328,7 +328,7 @@ class MarketDataToolsSearchStockFundDailyTest {
 
     @Test
     void stockDailyInvalidDateFailsBeforeDubbo() throws Exception {
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "not-a-date", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "not-a-date", "20240331", null));
 
         assertEquals(Boolean.FALSE, response.get("ok"));
         assertEquals("getStockDaily", response.get("tool"));
@@ -354,7 +354,7 @@ class MarketDataToolsSearchStockFundDailyTest {
                                 .setTsCode("000001.SZ").build())
                         .build());
 
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240331", "20240101"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240331", "20240101", null));
 
         assertEquals(Boolean.FALSE, response.get("ok"));
         Map<String, Object> error = errorOf(response);
@@ -378,7 +378,7 @@ class MarketDataToolsSearchStockFundDailyTest {
         when(stockService.getStockInfoByTsCode(any()))
                 .thenReturn(DomesticStockInfoByTsCodeResponse.newBuilder().build());
 
-        Map<String, Object> response = parse(tools.getStockDaily("999999.SH", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("999999.SH", "20240101", "20240331", null));
 
         assertEquals(Boolean.FALSE, response.get("ok"));
         Map<String, Object> error = errorOf(response);
@@ -400,7 +400,7 @@ class MarketDataToolsSearchStockFundDailyTest {
         when(meta.getEndDate()).thenReturn("20240331");
         when(datasetRegistry.findReusable(any(), any(), any(), any(), any())).thenReturn(Optional.of(meta));
 
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331", null));
 
         assertEquals(Boolean.TRUE, response.get("ok"));
         Map<String, Object> data = dataOf(response);
@@ -427,7 +427,7 @@ class MarketDataToolsSearchStockFundDailyTest {
                         .addItems(dailyItem("000001.SZ", 20240102L, 10.2))
                         .build());
 
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331", null));
 
         assertEquals(Boolean.TRUE, response.get("ok"));
         Map<String, Object> data = dataOf(response);
@@ -461,7 +461,7 @@ class MarketDataToolsSearchStockFundDailyTest {
         }
         when(stockService.getStockDailyByTsCodeAndDateRange(any())).thenReturn(builder.build());
 
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331", null));
 
         assertEquals(Boolean.TRUE, response.get("ok"));
         Map<String, Object> data = dataOf(response);
@@ -482,7 +482,7 @@ class MarketDataToolsSearchStockFundDailyTest {
     @Test
     void stockDailyBatchLimitExceededBeforeDubbo() throws Exception {
         // 默认 daily.maxItems=2，3 个代码超限
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ|600519.SH|000300.SH", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ|600519.SH|000300.SH", "20240101", "20240331", null));
 
         assertEquals(Boolean.FALSE, response.get("ok"));
         Map<String, Object> error = errorOf(response);
@@ -510,7 +510,7 @@ class MarketDataToolsSearchStockFundDailyTest {
         when(stockService.getStockInfoByTsCode(any()))
                 .thenReturn(DomesticStockInfoByTsCodeResponse.newBuilder().build());
 
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ|999999.SH", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ|999999.SH", "20240101", "20240331", null));
 
         assertEquals(Boolean.TRUE, response.get("ok"), "局部失败不拖垮整批");
         Map<String, Object> data = dataOf(response);
@@ -537,7 +537,7 @@ class MarketDataToolsSearchStockFundDailyTest {
         when(stockService.getStockDailyByTsCodeAndDateRange(any()))
                 .thenThrow(new RuntimeException("stock daily dubbo timeout"));
 
-        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331"));
+        Map<String, Object> response = parse(tools.getStockDaily("000001.SZ", "20240101", "20240331", null));
 
         assertEquals(Boolean.FALSE, response.get("ok"));
         Map<String, Object> error = errorOf(response);
