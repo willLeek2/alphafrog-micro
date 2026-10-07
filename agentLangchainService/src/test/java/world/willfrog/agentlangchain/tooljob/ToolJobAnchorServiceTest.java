@@ -5,9 +5,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
@@ -34,11 +38,75 @@ class ToolJobAnchorServiceTest {
     @Mock
     private AgentRunMapper agentRunMapper;
 
+    @Mock
+    private AgentRunFinalizationService finalizationService;
+
     private ToolJobAnchorService anchorService;
 
     @BeforeEach
     void setUp() {
         anchorService = new ToolJobAnchorService(agentRunMapper);
+        ReflectionTestUtils.setField(anchorService, "finalizationService", finalizationService);
+    }
+
+    @Test
+    void publishesCanceledEventOnlyAfterWorkspaceRefusalClosesRun() {
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setUserId("123");
+        run.setStatus(AgentRunStatus.CANCELED);
+        when(agentRunMapper.completeWorkspaceRefusal(
+                "run-1", "run-1:tc-1:1", "fingerprint", "WORKSPACE_DIRTY"))
+                .thenReturn(1);
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+
+        assertThat(anchorService.completeWorkspaceRefusal(
+                "run-1", "run-1:tc-1:1", "fingerprint", "WORKSPACE_DIRTY"))
+                .isTrue();
+
+        verify(finalizationService).publishFinalizedEvent("run-1", "123", "CANCELED");
+    }
+
+    @Test
+    void capturesTerminalStatusBeforeConcurrentResumeAndPublishesAfterCommit() {
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setUserId("123");
+        run.setStatus(AgentRunStatus.FAILED);
+        when(agentRunMapper.completeWorkspaceRefusal(
+                "run-1", "run-1:tc-1:1", "fingerprint", "WORKSPACE_DIRTY"))
+                .thenReturn(1);
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            assertThat(anchorService.completeWorkspaceRefusal(
+                    "run-1", "run-1:tc-1:1", "fingerprint", "WORKSPACE_DIRTY"))
+                    .isTrue();
+            verifyNoInteractions(finalizationService);
+
+            run.setStatus(AgentRunStatus.RECEIVED);
+            for (TransactionSynchronization synchronization :
+                    TransactionSynchronizationManager.getSynchronizations()) {
+                synchronization.afterCommit();
+            }
+            verify(finalizationService).publishFinalizedEvent("run-1", "123", "FAILED");
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    void doesNotPublishTerminalEventWhenRefusalCasLoses() {
+        when(agentRunMapper.completeWorkspaceRefusal(
+                "run-1", "run-1:tc-1:1", "fingerprint", "WORKSPACE_DIRTY"))
+                .thenReturn(0);
+
+        assertThat(anchorService.completeWorkspaceRefusal(
+                "run-1", "run-1:tc-1:1", "fingerprint", "WORKSPACE_DIRTY"))
+                .isFalse();
+
+        verifyNoInteractions(finalizationService);
     }
 
     @Test
@@ -73,6 +141,16 @@ class ToolJobAnchorServiceTest {
         run.setToolJobAnchorJson("");
 
         when(agentRunMapper.findById("run-1")).thenReturn(run);
+        assertThat(anchorService.loadAnchor("run-1")).isNull();
+    }
+
+    @Test
+    void shouldReturnNullAfterWorkspaceRefusalClearsAnchorToEmptyJson() {
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setToolJobAnchorJson("{}");
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+
         assertThat(anchorService.loadAnchor("run-1")).isNull();
     }
 

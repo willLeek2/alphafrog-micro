@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.wait;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
 import java.util.Optional;
@@ -73,9 +74,106 @@ class WaitMemberDispatchProofTest {
     @Test
     void anUnknownSchemaVersionIsRejected() {
         assertThatThrownBy(() -> new WaitMemberDispatchProof(
-                WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION + 1, OPERATION, "task-9", "sha256:a", "{}", "{}",
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION + 1, OPERATION, "task-9", "sha256:a", "{}", "{}",
                 "{}", "2026-09-22T00:00:00Z"))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void replayableProofRequiresTheOriginalRequestWhileLegacyProofRemainsReadable() {
+        WaitMemberDispatchProof legacy = proof(OPERATION, null);
+        assertThat(WaitMemberDispatchProof.fromJson(objectMapper, legacy.toJson(objectMapper)))
+                .get().extracting(WaitMemberDispatchProof::replayable).isEqualTo(false);
+
+        WaitMemberDispatchProof current = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, null,
+                "sha256:tests", "{}", "{}", "{}", "2026-09-22T00:00:00Z",
+                "{\"operationId\":\"" + OPERATION + "\"}");
+        assertThat(WaitMemberDispatchProof.fromJson(objectMapper, current.toJson(objectMapper)))
+                .get().extracting(WaitMemberDispatchProof::replayable).isEqualTo(true);
+        assertThatThrownBy(() -> new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, null,
+                "sha256:tests", "{}", "{}", "{}", "2026-09-22T00:00:00Z", null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void workspaceRefusalKeepsTheOriginalRequestAndSurvivesJsonRecovery() {
+        WaitMemberDispatchProof original = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, null,
+                "sha256:tests", "{}", "{}", "{}", "2026-09-22T00:00:00Z",
+                "{\"operationId\":\"" + OPERATION + "\"}");
+
+        WaitMemberDispatchProof refused = original.withWorkspaceRefusal("WORKSPACE_DIRTY");
+        WaitMemberDispatchProof recovered = WaitMemberDispatchProof.fromJson(
+                objectMapper, refused.toJson(objectMapper)).orElseThrow();
+
+        assertThat(recovered.workspaceRefused()).isTrue();
+        assertThat(recovered.workspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(recovered.createRequestJson()).isEqualTo(original.createRequestJson());
+        assertThatThrownBy(() -> original.withWorkspaceRefusal("WORKSPACE_RESULT_UNSPECIFIED"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void runIneligibleRefusalCanBePersistedAndRecovered() {
+        WaitMemberDispatchProof original = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, null,
+                "sha256:tests", "{}", "{}", "{}", "2026-09-22T00:00:00Z",
+                "{\"operationId\":\"" + OPERATION + "\"}");
+
+        WaitMemberDispatchProof refused = original.withWorkspaceRefusal("WORKSPACE_RUN_INELIGIBLE");
+        WaitMemberDispatchProof recovered = WaitMemberDispatchProof.fromJson(
+                objectMapper, refused.toJson(objectMapper)).orElseThrow();
+
+        assertThat(recovered.workspaceRefused()).isTrue();
+        assertThat(recovered.workspaceRefusalCode()).isEqualTo("WORKSPACE_RUN_INELIGIBLE");
+        assertThat(recovered.createRequestJson()).isEqualTo(original.createRequestJson());
+    }
+
+    @Test
+    void settledProofRemainsReadableAfterOnlyReplayBodyExpires() throws Exception {
+        WaitMemberDispatchProof original = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, "task-9",
+                "sha256:tests", "{\"codeHash\":\"sha256:code\"}", "{}", "{}",
+                "2026-09-22T00:00:00Z", "{\"code\":\"private script\"}");
+        ObjectNode compact = (ObjectNode) objectMapper.readTree(original.toJson(objectMapper));
+        compact.remove("createRequestJson");
+        compact.put("createRequestExpired", true);
+
+        WaitMemberDispatchProof recovered = WaitMemberDispatchProof.fromJson(
+                objectMapper, compact.toString()).orElseThrow();
+        assertThat(recovered.replayable()).isFalse();
+        assertThat(recovered.operationId()).isEqualTo(OPERATION);
+        assertThat(recovered.taskId()).isEqualTo("task-9");
+        assertThat(recovered.requestFingerprint()).isEqualTo("sha256:tests");
+        assertThat(recovered.canonicalCreateSpecJson()).contains("codeHash");
+        assertThat(recovered.createRequestJson()).isNull();
+
+        compact.remove("createRequestExpired");
+        assertThat(WaitMemberDispatchProof.fromJson(objectMapper, compact.toString()))
+                .as("原始 schema2 证明缺完整请求仍是损坏数据")
+                .isEmpty();
+    }
+
+    @Test
+    void oldSchemaTwoProofWithoutExpiryKeyKeepsWorkspaceRefusalCasShape() throws Exception {
+        WaitMemberDispatchProof initial = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, null,
+                "sha256:tests", "{}", "{}", "{}", "2026-09-22T00:00:00Z",
+                "{\"operationId\":\"" + OPERATION + "\"}");
+        ObjectNode stored = (ObjectNode) objectMapper.readTree(initial.toJson(objectMapper));
+        stored.remove("createRequestExpired");
+
+        WaitMemberDispatchProof recovered = WaitMemberDispatchProof.fromJson(
+                objectMapper, stored.toString()).orElseThrow();
+        ObjectNode refusal = (ObjectNode) objectMapper.readTree(
+                recovered.withWorkspaceRefusal("WORKSPACE_DIRTY").toJson(objectMapper));
+        assertThat(refusal.has("createRequestExpired")).isFalse();
+        assertThat(refusal.remove("workspaceRefusalCode")).isNotNull();
+        stored.remove("workspaceRefusalCode");
+        assertThat(refusal).as("数据库只排除拒绝码后，两份证明仍逐字段一致")
+                .isEqualTo(stored);
     }
 
     @Test

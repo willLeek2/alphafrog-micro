@@ -11,6 +11,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
@@ -111,6 +112,21 @@ class ToolRouterToolExecutorTest {
         assertTrue((Long) finishedPayload.get("duration_ms") >= 0);
         assertEquals("todo-1", finishedPayload.get("todo_id"));
         assertEquals("linear", finishedPayload.get("workflow"));
+    }
+
+    @Test
+    void missingOriginalPythonRequestIsNotConvertedToToolResult() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("python-call")
+                .name("executePython")
+                .arguments("{\"code\":\"print(1)\"}")
+                .build();
+        when(toolRouter.invokeWithMeta(eq("executePython"), anyMap()))
+                .thenThrow(new PythonRiskReplayEvidenceMissingException("run-123:python-call:1"));
+
+        assertThrows(PythonRiskReplayEvidenceMissingException.class,
+                () -> executor.execute(request, null));
+        verify(eventService, never()).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), anyMap());
     }
 
     @Test

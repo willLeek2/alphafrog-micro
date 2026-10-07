@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.util.JsonFormat;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.wait.WaitGroup;
@@ -21,6 +22,8 @@ import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 
@@ -144,5 +147,74 @@ class PendingPythonMemberRecoveryTest {
                         && request.getByOperation().getOperationId().equals(OPERATION_ID)
                         && request.getByOperation().getRequestFingerprint().equals(FINGERPRINT)));
         verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
+    }
+
+    @Test
+    void replayableMemberIsResentOnlyAfterAnAuthoritativeMiss() throws Exception {
+        ExecuteRequest original = installReplayableProof();
+        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
+                .thenReturn(true);
+        when(sandbox.getTaskByOperationId(any()))
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setTaskId("replayed-task").setRequestFingerprint(FINGERPRINT).build());
+        when(groups.recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
+                .thenReturn(true);
+
+        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
+                ignored -> true).reconcile();
+
+        verify(sandbox).createTask(original);
+        verify(sandbox, never()).cancelTask(any());
+        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
+    }
+
+    @Test
+    void acceptedBeforeCrashIsFoundWithoutSendingASecondCreate() throws Exception {
+        installReplayableProof();
+        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
+                .thenReturn(true);
+        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(true).setTaskId("already-accepted")
+                .setRequestFingerprint(FINGERPRINT).build());
+
+        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
+                ignored -> true).reconcile();
+
+        verify(sandbox, never()).createTask(any());
+        verify(sandbox, never()).cancelTask(any());
+        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
+    }
+
+    @Test
+    void ambiguousReplayResponseKeepsTheSavedRequestPending() throws Exception {
+        installReplayableProof();
+        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
+                .thenReturn(true);
+        when(sandbox.getTaskByOperationId(any()))
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("response lost"));
+
+        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
+                ignored -> true).reconcile();
+
+        verify(groups, never()).recoverPendingPythonMember(anyLong(), anyLong(), anyInt(),
+                any(), any(), any());
+        verify(sandbox, never()).cancelTask(any());
+    }
+
+    private ExecuteRequest installReplayableProof() throws Exception {
+        WaitMemberDispatchProof old = WaitMemberDispatchProof.fromJson(
+                json, member.getDispatchProofJson()).orElseThrow();
+        ExecuteRequest original = ExecuteRequest.newBuilder()
+                .setOperationId(OPERATION_ID).setRequestFingerprint(FINGERPRINT)
+                .setCode("print('saved before dispatch')").build();
+        member.setDispatchProofJson(new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, old.operationId(), null,
+                old.requestFingerprint(), old.canonicalCreateSpecJson(), old.estimateJson(),
+                old.reservationJson(), old.submittedAt(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original))
+                .toJson(json));
+        return original;
     }
 }

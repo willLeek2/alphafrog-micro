@@ -25,7 +25,12 @@ public class AgentLlmResolver {
      * @return 解析后的 LLM 配置
      */
     public ResolvedLlm resolve(String endpointName, String modelName) {
-        AgentLlmProperties local = localConfigLoader.current().orElse(null);
+        return resolveFromSnapshot(endpointName, modelName, localConfigLoader.current().orElse(null));
+    }
+
+    /** 调用方已冻结热配置时使用，模型路由不能在本次调用中再读另一版配置。 */
+    public ResolvedLlm resolveFromSnapshot(String endpointName, String modelName,
+                                           AgentLlmProperties local) {
         Map<String, AgentLlmProperties.Endpoint> endpoints = mergeEndpoints(properties, local);
         List<String> models = chooseModels(properties, local, endpoints);
 

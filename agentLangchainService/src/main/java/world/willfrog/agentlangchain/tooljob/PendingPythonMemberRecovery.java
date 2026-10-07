@@ -31,8 +31,9 @@ import java.util.function.Predicate;
 /**
  * 旧派发调用栈退出后，把创建前已落库、但还没记下 createTask 结果的成员接回。
  *
- * <p>完整创建参数不能从成员证明重放。因此用固定取消身份在 Sandbox 建立同一 operationId 的
- * 持久墓碑：它会拦住旧 createTask 的迟到请求，再由普通结果接收器按 operationId 收到取消终态。
+ * <p>新版成员证明带有完整创建请求，先按原操作号查询，未找到才原样重发。
+ * 旧版证明没有完整参数，仍以固定取消身份在 Sandbox 建立同一 operationId 的持久墓碑，
+ * 拦住旧 createTask 的迟到请求，再由普通结果接收器收到取消终态。
  * 只有原执行者的持久领取身份属于当前容器，且该代 ACTIVE_NODE 额度已经归还时才发取消请求。
  * 额度的归还只发生在 Java 工具调用栈退出后，或旧进程的退出被证实后；RPC 结果不确定时保留
  * PENDING 和容量，下一轮使用相同 cancelRequestId 重试。</p>
@@ -127,7 +128,37 @@ public class PendingPythonMemberRecovery {
                 item.getClaimEpoch(), item.getClaimedBy(), proof.operationId(),
                 proof.requestFingerprint())) return;
 
-        // 同一个成员 ID 只对应这一次请求；崩溃与多个恢复器并发都使用相同取消身份。
+        if (proof.workspaceRefused()) {
+            groups.recoverPendingPythonMember(member.getId(), item.getId(),
+                    item.getClaimEpoch(), item.getClaimedBy(), proof.operationId(),
+                    proof.requestFingerprint());
+            return;
+        }
+
+        if (WaitMemberDurableRequestResolver.hasValidRequest(proof)) {
+            WaitMemberDurableRequestResolver.Resolution resolution =
+                    WaitMemberDurableRequestResolver.resolveOutcome(proof, sandbox);
+            if (resolution.workspaceRefusalCode() != null) {
+                groups.recordMemberWorkspaceRefusal(member.getGroupId(), member.getMemberIdentity(),
+                        proof.operationId(), proof.requestFingerprint(),
+                        proof.withWorkspaceRefusal(resolution.workspaceRefusalCode()).toJson(objectMapper));
+                return;
+            }
+            String recoveredTaskId = resolution.taskId();
+            if (recoveredTaskId == null) {
+                // 查询或重发结果不确定时保留 PENDING；下一轮仍先按同一操作号查询。
+                return;
+            }
+            if (groups.recoverPendingPythonMember(member.getId(), item.getId(),
+                    item.getClaimEpoch(), item.getClaimedBy(), proof.operationId(),
+                    proof.requestFingerprint())) {
+                log.info("已按原请求接回待派发 Python 成员：member={} task={}",
+                        member.getId(), recoveredTaskId);
+            }
+            return;
+        }
+
+        // 旧版或损坏的完整请求无法重放。同一个成员 ID 始终使用同一取消身份。
         CancelTaskResponse cancel = sandbox.cancelTask(CancelTaskRequest.newBuilder()
                 .setByOperation(OperationCancelTarget.newBuilder()
                         .setOperationId(proof.operationId())

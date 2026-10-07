@@ -269,6 +269,22 @@ public final class SandboxToolJobLifecycle {
                 throw createFailure;
             }
         }
+        String refusalCode = runner.workspaceRefusalCodeOf(createResp);
+        if (refusalCode != null) {
+            // 工作区拒绝没有任务终态；先确认同一操作号没有建成任务，
+            // 再持久记录拒绝并归还准备中的名额。
+            L lookup = runner.lookupRaw(identity.operationId());
+            SandboxCreateVerdict refusalLookup = runner.verdictFromLookupForMemberPath(
+                    lookup, spec.requestFingerprint(), "");
+            if (refusalLookup instanceof SandboxCreateVerdict.Confirmed confirmed) {
+                createResp = runner.confirmedResponse(confirmed.taskId(), spec.requestFingerprint());
+            } else if (refusalLookup instanceof SandboxCreateVerdict.Absent) {
+                return finishRunWorkspaceRefusal(deps, req, refusalCode);
+            } else {
+                throw new IllegalStateException(
+                        "workspace create outcome is ambiguous; PREPARING anchor retained");
+            }
+        }
         // 无效响应也不能直接释放 PREPARING；按外部作业身份写墓碑并接回终态。
         if (createResp == null || runner.errorOf(createResp) != null && !runner.errorOf(createResp).isEmpty()
                 || runner.taskIdOf(createResp) == null || runner.taskIdOf(createResp).isBlank()) {
@@ -347,6 +363,69 @@ public final class SandboxToolJobLifecycle {
             throw new IllegalStateException("failed to persist attached Sandbox task");
         }
         return new AttachOutcome.Attached(taskId, attached);
+    }
+
+    private static <REQ> AttachOutcome finishRunWorkspaceRefusal(
+            LifecycleDeps deps, AttachAfterCreateRequest<REQ> req, String code) {
+        ToolJobAnchor anchor = req.anchor();
+        String runId = req.runId();
+        if (!req.durableSuspend() && !renewDagBlockingLease(deps, runId, anchor, true)) {
+            return new AttachOutcome.FailureText(dagBlockingLeaseLost(
+                    deps, anchor.getToolName(), null, req.toolStartMs(),
+                    "DAG worker lost its lease before recording workspace refusal"));
+        }
+        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        anchor.setWorkspaceRefusalCode(code);
+        boolean recorded;
+        try {
+            recorded = deps.dispatchStore().recordWorkspaceRefusal(runId, anchor, expectedLeaseUntil);
+        } catch (Exception persistenceFailure) {
+            log.warn("workspace refusal could not be recorded: run={} operation={}",
+                    runId, anchor.getOperationId(), persistenceFailure);
+            recorded = false;
+        }
+        if (!recorded) {
+            return new AttachOutcome.FailureText(SandboxJobResponses.fail(
+                    deps.objectMapper(), anchor.getToolName(), "WORKSPACE_REFUSAL_RECORD_PENDING",
+                    "Python workspace refusal is awaiting durable settlement",
+                    Map.of("operation_id", anchor.getOperationId(), "retryable", false)));
+        }
+        DataAnalysisReservation preparing = req.reservation();
+        DataAnalysisReleaseOutcome released;
+        try {
+            released = deps.capacityService().releaseReservation(new DataAnalysisReleaseRequest(
+                    preparing,
+                    new DataAnalysisReleaseProof.WorkspaceRefusal(preparing.identity(), code),
+                    DataAnalysisReleaseReason.WORKSPACE_CREATE_REFUSED));
+        } catch (Exception releaseFailure) {
+            log.warn("workspace refusal capacity release deferred: run={} operation={}",
+                    runId, anchor.getOperationId(), releaseFailure);
+            released = DataAnalysisReleaseOutcome.CONFLICT;
+        }
+        if (released == DataAnalysisReleaseOutcome.RELEASED
+                || released == DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
+            try {
+                DataAnalysisReservation settled = transitionReservation(
+                        preparing, DataAnalysisReservationState.RELEASED, null);
+                anchor.setReservationJson(deps.objectMapper().writeValueAsString(settled));
+                if (deps.dispatchStore().recordWorkspaceRefusalReleased(runId, anchor)) {
+                    deps.dispatchStore().completeWorkspaceRefusal(runId, anchor.getOperationId(),
+                            anchor.getRequestFingerprint(), code);
+                }
+            } catch (Exception completionFailure) {
+                log.warn("workspace refusal finalization deferred: run={} operation={}",
+                        runId, anchor.getOperationId(), completionFailure);
+            }
+        }
+        deps.observability().emitToolTotal(req.toolStartMs(), "ERROR", code);
+        return new AttachOutcome.FailureText(SandboxJobResponses.fail(
+                deps.objectMapper(), anchor.getToolName(), code,
+                released == DataAnalysisReleaseOutcome.RELEASED
+                        || released == DataAnalysisReleaseOutcome.ALREADY_RELEASED
+                        ? "Python workspace rejected this call: " + code
+                        : "Python workspace rejected this call; capacity settlement is pending",
+                Map.of("operation_id", anchor.getOperationId(), "retryable", false)));
     }
 
     /**
@@ -524,8 +603,9 @@ public final class SandboxToolJobLifecycle {
                                 "message", SandboxJobResponses.nvl(statusView.error())));
             }
 
-            long remainingMillis = timeoutAt.toEpochMilli() - System.currentTimeMillis();
-            if (remainingMillis <= 0L) {
+            long remainingMillis = timeoutAt == null ? deps.pollIntervalMs()
+                    : timeoutAt.toEpochMilli() - System.currentTimeMillis();
+            if (timeoutAt != null && remainingMillis <= 0L) {
                 return promoteDagBlockingFailure(
                         deps,
                         runId,
@@ -940,11 +1020,30 @@ public final class SandboxToolJobLifecycle {
                                 admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
             }
         }
+        // 完整请求必须先于外部 createTask 落库，恢复线程才能用同一身份重放。
+        REQ request;
+        String createRequestJson;
+        try {
+            request = req.requestAdapter().enrichWithCapacity(
+                    req.baseRequest(), reservation, estimate, spec);
+            createRequestJson = req.requestAdapter().durableCreateRequestJson(request);
+        } catch (RuntimeException requestFailure) {
+            if (!releasePreDispatch(deps, reservation)) {
+                return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(),
+                        "WAIT_GROUP_PREPARING_RELEASE_FAILED",
+                        "Sandbox request could not be assembled and local capacity could not be released",
+                        Map.of());
+            }
+            return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(),
+                    "WAIT_GROUP_REQUEST_INVALID",
+                    "Sandbox request could not be assembled before dispatch", Map.of());
+        }
         // 取消与外部 createTask 之间需要一份已经落库的请求指纹。若取消先赢，
         // 成员已不再待派发，不能继续创建一个无人负责的 Sandbox 任务。
         boolean preparingRecorded = false;
         try {
-            WaitMemberDispatchProof preparingProof = proofForWaitGroup(deps, spec, estimate, reservation, null);
+            WaitMemberDispatchProof preparingProof = proofForWaitGroup(
+                    deps, spec, estimate, reservation, null, createRequestJson);
             preparingRecorded = deps.waitGroupStore() != null && deps.waitGroupStore().recordMemberPreparing(
                     member.groupId(), member.memberIdentity(), identity.operationId(),
                     preparingProof.toJson(deps.objectMapper()));
@@ -964,23 +1063,43 @@ public final class SandboxToolJobLifecycle {
             return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_NOT_RECORDED",
                     "Sandbox request identity could not be saved before dispatch", Map.of());
         }
-        // 名额凭证落库之后，把准入结果与 canonical identity 写进真正发送给沙箱的请求。
-        REQ request = req.requestAdapter().enrichWithCapacity(
-                req.baseRequest(), reservation, estimate, spec);
         long createStartMs = System.currentTimeMillis();
         SandboxCreateVerdict verdict;
+        String workspaceRefusalCode = null;
         try {
             deps.observability().installDebugRpcAttachments();
-            verdict = runner.verdictOf(runner.createTask(request), request);
+            RESP response = runner.createTask(request);
+            workspaceRefusalCode = runner.workspaceRefusalCodeOf(response);
+            if (workspaceRefusalCode != null) {
+                L lookup = runner.lookupRaw(identity.operationId());
+                verdict = runner.verdictFromLookupForMemberPath(
+                        lookup, spec.requestFingerprint(), "");
+            } else {
+                verdict = runner.verdictOf(response, request);
+            }
         } catch (Exception createFailure) {
             verdict = runner.verdictOfFailure(createFailure, request);
+        }
+        if (workspaceRefusalCode != null && verdict instanceof SandboxCreateVerdict.Absent) {
+            WaitMemberDispatchProof refused = proofForWaitGroup(
+                    deps, spec, estimate, reservation, null, createRequestJson)
+                    .withWorkspaceRefusal(workspaceRefusalCode);
+            boolean recorded = deps.waitGroupStore().recordMemberWorkspaceRefusal(
+                    member.groupId(), member.memberIdentity(), identity.operationId(),
+                    spec.requestFingerprint(), refused.toJson(deps.objectMapper()));
+            if (!recorded) {
+                throw pendingForWaitGroup(deps, member, spec, estimate, reservation,
+                        null, createRequestJson);
+            }
+            throw new WaitGroupMemberPendingException(refused,
+                    "workspace refused the persisted Python request: " + workspaceRefusalCode);
         }
         if (verdict instanceof SandboxCreateVerdict.Absent absent) {
             // 即使当前回查不存在，原 create RPC 仍可能迟到；接收侧会先写稳定取消墓碑，
             // 再按 Sandbox 的真实取消终态结算容量与用量。
             log.info("成员创建当前未找到，交给结果接收侧写取消墓碑并收尾：{} 原因={}",
                     member.describe(), absent.detail());
-            throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null);
+            throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null, createRequestJson);
         }
         if (verdict instanceof SandboxCreateVerdict.Unknown unknown) {
             // 还没有结论：名额留着，成员照样按执行中记，由结果接收侧按外部作业身份回查。
@@ -988,7 +1107,7 @@ public final class SandboxToolJobLifecycle {
             // 后台任务无人负责。
             log.warn("成员建任务的结果还没被证实，先按执行中记，由结果接收侧回查：{} 原因={}",
                     member.describe(), unknown.detail());
-            throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null);
+            throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null, createRequestJson);
         }
         String taskId = ((SandboxCreateVerdict.Confirmed) verdict).taskId();
         // 任务编号与 canonical 指纹都确认之后，名额凭证从「准备中」改成绑在这个任务上。
@@ -1006,7 +1125,7 @@ public final class SandboxToolJobLifecycle {
                 "status", "OK",
                 "taskId", taskId,
                 "operationId", identity.operationId()));
-        throw pendingForWaitGroup(deps, member, spec, estimate, attached, taskId);
+        throw pendingForWaitGroup(deps, member, spec, estimate, attached, taskId, createRequestJson);
     }
 
     /**
@@ -1021,8 +1140,10 @@ public final class SandboxToolJobLifecycle {
             CanonicalSandboxCreateSpec spec,
             DataAnalysisEstimate estimate,
             DataAnalysisReservation reservation,
-            String taskId) {
-        WaitMemberDispatchProof proof = proofForWaitGroup(deps, spec, estimate, reservation, taskId);
+            String taskId,
+            String createRequestJson) {
+        WaitMemberDispatchProof proof = proofForWaitGroup(
+                deps, spec, estimate, reservation, taskId, createRequestJson);
         return new WaitGroupMemberPendingException(proof,
                 "wait group member dispatched: " + member.describe());
     }
@@ -1032,16 +1153,19 @@ public final class SandboxToolJobLifecycle {
             CanonicalSandboxCreateSpec spec,
             DataAnalysisEstimate estimate,
             DataAnalysisReservation reservation,
-            String taskId) {
+            String taskId,
+            String createRequestJson) {
         return new WaitMemberDispatchProof(
-                WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
+                createRequestJson == null
+                        ? WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION
+                        : WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION,
                 reservation.identity().operationId(),
                 taskId,
                 spec.requestFingerprint(),
                 toJsonOrThrow(deps.objectMapper(), "canonical 请求规格", spec),
                 toJsonOrThrow(deps.objectMapper(), "预估值", estimate),
                 toJsonOrThrow(deps.objectMapper(), "名额预留凭证", reservation),
-                Instant.now().toString());
+                Instant.now().toString(), createRequestJson);
     }
 
     /** 序列化不成功就抛错：写不出派发证明时宁可让这次调用失败，也不能交出一份不完整的证明。 */

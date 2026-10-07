@@ -8,6 +8,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -71,6 +73,8 @@ class AgentRunEventServiceTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
+        org.mockito.Mockito.lenient().when(llmLocalConfigLoader.hotConfigIsAuthoritative()).thenReturn(true);
+        org.mockito.Mockito.lenient().when(llmLocalConfigLoader.current()).thenReturn(Optional.empty());
         coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
         org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
         service = new AgentRunEventService(
@@ -467,6 +471,71 @@ class AgentRunEventServiceTest {
         assertEquals("2026-06-24", df.get("end_date"));
         assertEquals("2026-06-24", df.get("as_of_date"));
         assertEquals("test snapshot", df.get("description"));
+    }
+
+    @Test
+    void pythonWorkspaceSettingIsFrozenPerRunAndInheritedByChild() throws Exception {
+        ReflectionTestUtils.setField(service, "pythonWorkspaceEnabled", true);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(run("r-workspace", "u-workspace"));
+
+        service.createRun("u-workspace", "hello", "{}", "workspace-idem", "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                DEPLOYMENT_GENERATION_ID, false, false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        AgentRun parent = runCaptor.getValue();
+        assertTrue(objectMapper.readTree(parent.getExt()).path("python_workspace_enabled").asBoolean());
+
+        // 新建 Run 的配置随后变化，已创建的父 Run 和由它派生的子 Run 仍保留原值。
+        ReflectionTestUtils.setField(service, "pythonWorkspaceEnabled", false);
+        parent.setSchedulerVersion("DUAL_POOL_V2");
+        AgentRun child = createChild(parent, "workspace-child",
+                member(1, "branch-a", 0, 2, 3, 0, "call-a"));
+        assertTrue(objectMapper.readTree(child.getExt()).path("python_workspace_enabled").asBoolean());
+        assertEquals("workspace-child", child.getId());
+    }
+
+    @Test
+    void newRunFreezesLatestNacosWorkspaceSwitchAndFailsClosedBeforeSync() throws Exception {
+        ReflectionTestUtils.setField(service, "pythonWorkspaceEnabled", true);
+        AgentLlmProperties disabled = objectMapper.readValue(
+                "{\"agent\":{\"python-workspace\":{\"enabled\":false}}}", AgentLlmProperties.class);
+        AgentLlmProperties enabled = objectMapper.readValue(
+                "{\"agent\":{\"python-workspace\":{\"enabled\":true}}}", AgentLlmProperties.class);
+        AtomicReference<Optional<AgentLlmProperties>> current = new AtomicReference<>(Optional.of(disabled));
+        AtomicReference<Boolean> authoritative = new AtomicReference<>(true);
+        when(llmLocalConfigLoader.current()).thenAnswer(ignored -> current.get());
+        when(llmLocalConfigLoader.hotConfigIsAuthoritative())
+                .thenAnswer(ignored -> authoritative.get());
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(run("r-workspace-hot", "u-workspace-hot"));
+
+        createWorkspaceTestRun("disabled");
+        current.set(Optional.of(enabled));
+        createWorkspaceTestRun("enabled");
+        authoritative.set(false);
+        createWorkspaceTestRun("not-synced");
+
+        ArgumentCaptor<AgentRun> inserted = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper, org.mockito.Mockito.times(3)).insert(inserted.capture());
+        List<AgentRun> runs = inserted.getAllValues();
+        assertFalse(objectMapper.readTree(runs.get(0).getExt()).path("python_workspace_enabled").asBoolean());
+        assertTrue(objectMapper.readTree(runs.get(1).getExt()).path("python_workspace_enabled").asBoolean());
+        assertFalse(objectMapper.readTree(runs.get(2).getExt()).path("python_workspace_enabled").asBoolean());
+    }
+
+    private void createWorkspaceTestRun(String key) {
+        service.createRun("u-workspace-hot", "hello", "{}", key, "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                DEPLOYMENT_GENERATION_ID, false, false);
     }
 
     /**

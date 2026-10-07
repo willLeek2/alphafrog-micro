@@ -27,6 +27,9 @@ public class MybatisChildRunIntentStore implements ChildRunIntentStore {
     public ChildRunReservation reserveIntent(ChildRunReserveRequest request, int maxActiveChildren) {
         validate(request, maxActiveChildren);
         ChildRunParentSnapshot parent = requireParent(request.parentRunId());
+        if (mapper.isParentDeletionStarted(request.parentRunId())) {
+            throw new IllegalStateException("父 Run 正在删除，不能受理新的子 Run");
+        }
         ChildRunIntentRow existing = mapper.findByCall(request);
         if (existing != null) {
             if (!sameRequest(existing, request)) {

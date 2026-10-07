@@ -61,7 +61,7 @@ manifest_path = mf_idx[mf_idx["agent_run_manifest_id"] == 1].iloc[0]["manifest_f
 ## 参数要求
 
 - `code` 必填。
-- `dataset_ids` 与 `manifest_ids` 至少传一个。
+- 临时沙箱的 `dataset_ids` 与 `manifest_ids` 至少传一个。当前 Run 已启用持久工作区时，后续调用可以都不传，直接读取前一次调用留在工作区的文件。
 - `libraries` 可选，逗号分隔，例如 `"numpy,pandas"`；优先使用预装库。
 - `timeout_seconds` 可选，默认 30。
 
@@ -71,6 +71,6 @@ numpy、pandas、matplotlib、scipy 已预装；优先使用预装库，减少�
 
 ## 错误恢复
 
-- `MISSING_IDS`：dataset_ids 与 manifest_ids 都为空 → 至少传一个。
+- `MISSING_IDS`：当前 Run 未启用持久工作区，且 dataset_ids 与 manifest_ids 都为空 → 至少传一个。
 - `ILLEGAL_RUN_LEVEL_IDS`：编号不在当前 run 合法集合 → 用错误详情中的 legal lists 重试，或先调用 listMyData。
 - 连续 2 次失败均与编号/路径有关时，停止重试，改为调用 listMyData 或换用其他工具策略。

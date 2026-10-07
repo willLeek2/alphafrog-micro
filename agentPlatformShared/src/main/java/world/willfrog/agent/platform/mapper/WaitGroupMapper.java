@@ -187,6 +187,12 @@ public interface WaitGroupMapper {
                               @Param("externalOperationId") String externalOperationId,
                               @Param("dispatchProofJson") String dispatchProofJson);
 
+    int recordMemberWorkspaceRefusal(@Param("groupId") long groupId,
+                                     @Param("memberIdentity") String memberIdentity,
+                                     @Param("operationId") String operationId,
+                                     @Param("expectedFingerprint") String expectedFingerprint,
+                                     @Param("proofJson") String proofJson);
+
     /**
      * 派发成功：成员从待派发进入执行中，并把外部作业身份与派发证明写上。
      *
@@ -198,6 +204,9 @@ public interface WaitGroupMapper {
                              @Param("dispatchProofJson") String dispatchProofJson,
                              @Param("nextPollAt") OffsetDateTime nextPollAt,
                              @Param("runControlVersion") long runControlVersion);
+
+    /** Run 已确认删盘后，只从已结清 Python 成员证明中清除完整创建请求。 */
+    int compactExpiredWaitMemberProofs(@Param("runId") String runId);
 
     // ===== 成员轮询 =====
 

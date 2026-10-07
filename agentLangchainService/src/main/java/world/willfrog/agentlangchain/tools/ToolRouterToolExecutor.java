@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
@@ -151,6 +152,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                         throttleRejected = true;
                         throttleLayer = "weight_limit";
                     }
+                } catch (PythonRiskReplayEvidenceMissingException missing) {
+                    throw missing;
                 } catch (ToolJobInjectedInterruption interruption) {
                     // 不发普通 FINISHED：当前 worker 要模拟在精确进程窗口退出，恢复链会接管。
                     throw interruption;

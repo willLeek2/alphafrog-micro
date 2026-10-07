@@ -18,6 +18,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agentlangchain.tools.DurableToolCallIds;
@@ -106,6 +107,9 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
         } catch (WaitGroupMemberPendingException pending) {
             return toPending(request, pending);
         } catch (RuntimeException e) {
+            if (e instanceof PythonRiskReplayEvidenceMissingException) {
+                throw e;
+            }
             if (LangchainTerminalToolErrorHandler.isTerminalSignal(e)) {
                 // 取消、暂停、额度不足都是控制信号：它们要求当前 Worker 松开调用栈，
                 // 不能在这里变成一次普通的工具失败文本。

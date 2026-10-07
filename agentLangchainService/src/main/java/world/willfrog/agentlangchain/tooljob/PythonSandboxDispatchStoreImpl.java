@@ -142,6 +142,23 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     }
 
     @Override
+    public boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                          Instant expectedLeaseUntil) {
+        return anchorService.recordWorkspaceRefusal(runId, anchor, expectedLeaseUntil);
+    }
+
+    @Override
+    public boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        return anchorService.recordWorkspaceRefusalReleased(runId, anchor);
+    }
+
+    @Override
+    public boolean completeWorkspaceRefusal(String runId, String operationId,
+                                            String fingerprint, String code) {
+        return anchorService.completeWorkspaceRefusal(runId, operationId, fingerprint, code);
+    }
+
+    @Override
     public boolean transferToPending(String runId, ToolJobAnchor anchor) {
         // PENDING anchor 已把占用的资源名额转给后台任务继续管理，此时才能释放 Agent worker。
         if (!"PENDING".equals(anchor.getAnchorState())) {

@@ -18,6 +18,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.WaitGroupIdentity;
@@ -205,6 +206,37 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.events()).as("短失败载荷写进去之后组照样齐备")
                 .anyMatch(event -> event.startsWith("group_ready:"));
         assertThat(publisher.published).as("组齐备之后立刻放行下一段").hasSize(1);
+    }
+
+    @Test
+    void missingRiskReplayEvidenceFinishesTheGroupAndFailsTheNodeWithoutAnotherModelCall() {
+        model.enqueue(AiMessage.from(List.of(
+                toolCall("call-a", "searchWeb", "{}"),
+                toolCall("call-b", "executePython", "{\"code\":\"print(1)\"}"))));
+        dispatcher.requiresOperationId = true;
+        dispatcher.beforeDispatch = () -> {
+            if (dispatcher.dispatched.size() == 1) {
+                throw new PythonRiskReplayEvidenceMissingException(RUN_ID + ":call-b:1");
+            }
+        };
+
+        DualPoolWaitGroupNodeExecutor.Outcome first = executor.executeSegment(firstSegment(List.of()));
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) first).groupId();
+        assertThat(store.memberRows(groupId)).extracting(row -> row.state)
+                .containsExactly(WaitMemberState.SUCCEEDED.name(), WaitMemberState.FAILED.name());
+        assertThat(store.memberRows(groupId).get(1).resultRefJson)
+                .contains("python_risk_replay_evidence_missing");
+        assertThat(publisher.published).hasSize(1);
+
+        DualPoolWaitGroupNodeExecutor.Outcome resumed = executor.executeSegment(
+                segment(segmentIdentity(1), nextPayload(0, 0)));
+        assertThat(resumed).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class,
+                completed -> assertThat(completed.resultPatch())
+                        .containsEntry("success", false)
+                        .containsEntry("failureReason", "python_risk_replay_evidence_missing"));
+        assertThat(model.requests).as("风险决定缺少原请求时不再询问模型或重新派发脚本").hasSize(1);
+        assertThat(dispatcher.dispatched).hasSize(1);
     }
 
     /** 夹具点名按失败收尾：工具当场成功，写进成员行的也是失败，并写清是场景点名的。 */
@@ -620,6 +652,52 @@ class DualPoolWaitGroupNodeExecutorTest {
                 .as("转后台的成员必须写下一次查询时间，否则接收方扫不到它")
                 .isNotNull();
         assertThat(publisher.published).as("还有一个成员没结束，不能放行下一段").isEmpty();
+    }
+
+    @Test
+    void aPersistedPythonRequestIsLeftForRecoveryWhenTheSegmentRunsAgain() {
+        dispatcher.requiresOperationId = true;
+        AiMessage reply = AiMessage.from(List.of(toolCall("call-a", "executePython", "{}")));
+        model.enqueue(reply);
+        dispatcher.beforeDispatch = () -> {
+            long groupId = store.groupRows().get(0).id;
+            store.memberRows(groupId).get(0).dispatchProofJson =
+                    "{\"operationId\":\"" + RUN_ID + ":call-a:1\"}";
+            throw new IllegalStateException("原派发线程退出");
+        };
+
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("原派发线程退出");
+        long groupId = store.groupRows().get(0).id;
+        assertThat(store.memberRows(groupId).get(0).state).isEqualTo(WaitMemberState.PENDING.name());
+
+        dispatcher.beforeDispatch = () -> { };
+        model.enqueue(reply);
+        executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(dispatcher.dispatched).as("重跑不能再次调用工具").isEmpty();
+        assertThat(store.memberRows(groupId).get(0).state).as("交给持久请求恢复器").isEqualTo(WaitMemberState.PENDING.name());
+        assertThat(publisher.published).as("尚无结果，不能放行模型下一段").isEmpty();
+    }
+
+    @Test
+    void aLateProofWritePreventsAnOldDispatcherFromCompletingTheMember() {
+        dispatcher.requiresOperationId = true;
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "executePython", "{}"))));
+        dispatcher.beforeDispatch = () -> {
+            long groupId = store.groupRows().get(0).id;
+            store.memberRows(groupId).get(0).dispatchProofJson =
+                    "{\"operationId\":\"" + RUN_ID + ":call-a:1\"}";
+        };
+
+        executor.executeSegment(firstSegment(List.of()));
+
+        long groupId = store.groupRows().get(0).id;
+        assertThat(store.memberRows(groupId).get(0).state)
+                .as("派发快照之后落下的持久请求也不能被普通结果覆盖")
+                .isEqualTo(WaitMemberState.PENDING.name());
+        assertThat(publisher.published).isEmpty();
     }
 
     @Test

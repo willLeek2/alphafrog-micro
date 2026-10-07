@@ -33,6 +33,35 @@ public interface AgentRunMapper {
     /** 锁住本根树已建立的子 Run；未受理的意图没有对应主记录。 */
     List<AgentRun> listChildRunsByRootForUpdate(@Param("rootRunId") String rootRunId);
 
+    /** 删除前持久封住 Run；已封住时仍返回一行，便于原请求重试。 */
+    int markDeletionStarted(@Param("id") String id, @Param("userId") String userId);
+
+    /** 恢复和新的持久资源派发共用这一条数据库真相。 */
+    boolean isDeletionStarted(@Param("id") String id);
+
+    /** 清理中或已过期的 Run 不得再取得持久资源。 */
+    String findWorkspaceLifecycleState(@Param("id") String id);
+
+    /** 终态且所有异步责任已结清的 Run 才能进入自动清理；数据库条件负责并发复核。 */
+    int markWorkspaceCleanupStarted(@Param("id") String id);
+
+    /** 沙箱报告活跃时间变化后，只撤销尚未完成的自动清理标记。 */
+    int clearWorkspaceCleanupStarted(@Param("id") String id);
+
+    /** 沙箱确认删盘后永久阻止同一 Run 再创建工作区，并清掉已结清锚点的完整请求正文。 */
+    int markWorkspaceExpired(@Param("id") String id);
+
+    /** 补偿上一轮中途停止的自动清理，不按 Agent 部署代际过滤。 */
+    List<String> scanWorkspaceCleanupStarted(@Param("deploymentId") String deploymentId,
+                                             @Param("afterRunId") String afterRunId,
+                                             @Param("limit") int limit);
+
+    /** 当前部署所有代际中出现过的工作区泳道；返回 Run 载体保留空泳道行。 */
+    List<AgentRun> listWorkspaceRetentionLanes(@Param("deploymentId") String deploymentId);
+
+    /** 最终物理删除只允许已封住的 Run。 */
+    int deleteMarkedByIdAndUser(@Param("id") String id, @Param("userId") String userId);
+
     /** 所有子 Run 删除后，移除父子关系；待投递记录由外键级联删除。 */
     int deleteChildIntentsByRoot(@Param("rootRunId") String rootRunId);
 
@@ -380,6 +409,32 @@ public interface AgentRunMapper {
                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
                                   @Param("expectedOperationId") String expectedOperationId);
+
+    /** PREPARING 且无 Sandbox 任务时，按操作、指纹、处置及 DAG 租约窄写工作区拒绝。 */
+    int recordWorkspaceRefusal(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("expectedRunDisposition") String expectedRunDisposition,
+            @Param("expectedAutoResume") boolean expectedAutoResume,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("workspaceRefusalCode") String workspaceRefusalCode);
+
+    /** 拒绝已持久化后，只把同一 reservation 的状态从 PREPARING 更新为 RELEASED。 */
+    int recordWorkspaceRefusalReleased(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("workspaceRefusalCode") String workspaceRefusalCode,
+            @Param("releasedReservationJson") String releasedReservationJson);
+
+    /** 拒绝名额已释放后原子清理锚点，仍在执行的 Run 标为明确失败。 */
+    int completeWorkspaceRefusal(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("workspaceRefusalCode") String workspaceRefusalCode);
 
     /**
      * DAG blocking live worker 的 owner/lease fenced 写入口。

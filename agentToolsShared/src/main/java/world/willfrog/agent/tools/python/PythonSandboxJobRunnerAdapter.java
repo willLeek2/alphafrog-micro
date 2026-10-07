@@ -6,6 +6,7 @@ import world.willfrog.agent.tools.sandboxjob.SandboxJobRunnerAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobStatusView;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
@@ -43,6 +44,19 @@ public final class PythonSandboxJobRunnerAdapter
     @Override
     public ExecuteResponse createTask(ExecuteRequest request) {
         return pythonSandboxService.createTask(request);
+    }
+
+    @Override
+    public String workspaceRefusalCodeOf(ExecuteResponse response) {
+        if (response == null || !response.hasWorkspaceResult()) {
+            return null;
+        }
+        String code = response.getWorkspaceResult().name();
+        return WaitMemberDispatchProof.isWorkspaceRefusalCode(code)
+                && !response.hasErrorDetail() && response.getError().isBlank()
+                && response.getTaskId().isBlank()
+                && response.getRequestFingerprint().isBlank()
+                && response.getStatus().isBlank() ? code : null;
     }
 
     @Override

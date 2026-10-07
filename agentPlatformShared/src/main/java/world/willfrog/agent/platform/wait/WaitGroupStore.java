@@ -74,6 +74,13 @@ public interface WaitGroupStore {
         throw new UnsupportedOperationException("member preparing proof is not implemented");
     }
 
+    /** 已按原操作号证实无任务后，保存业务拒绝并交给结果接收器归还容量。 */
+    default boolean recordMemberWorkspaceRefusal(long groupId, String memberIdentity,
+                                                  String operationId, String expectedFingerprint,
+                                                  String proofJson) {
+        throw new UnsupportedOperationException("member workspace refusal is not implemented");
+    }
+
     /** 按组编号分页找一条 Run 尚未关闭的等待链，供取消与重启恢复逐组收口。 */
     default List<WaitGroup> listOpenGroupsByRun(String runId, long afterGroupId, int limit) {
         throw new UnsupportedOperationException("open wait-group scan is not implemented");

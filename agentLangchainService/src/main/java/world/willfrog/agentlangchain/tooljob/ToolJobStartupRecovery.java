@@ -135,6 +135,33 @@ public class ToolJobStartupRecovery {
                 // 注册 Java Time 模块以还原 acquiredAt 等时间字段。
                 DataAnalysisReservation reservation = proofMapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
+                if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                    // 拒绝证明已经在 PostgreSQL 中，绝不可再重发创建请求。容量账本
+                    // 先按持久状态恢复；开放准入后由在线收口器幂等释放并显示业务码。
+                    if (!WaitMemberDispatchProof.isWorkspaceRefusalCode(
+                            anchor.getWorkspaceRefusalCode())
+                            || reservation == null || reservation.identity() == null
+                            || anchor.getOperationId() == null
+                            || !run.getId().equals(reservation.identity().runId())
+                            || !anchor.getOperationId().equals(reservation.operationId())
+                            || reservation.taskId() != null
+                            || reservation.state() != DataAnalysisReservationState.PREPARING
+                               && reservation.state() != DataAnalysisReservationState.RELEASED) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    if (reservation.state() == DataAnalysisReservationState.PREPARING) {
+                        durableReservations.add(reservation);
+                    }
+                    anchor.setNextPollAt(Instant.now());
+                    try {
+                        redisCache.upsertDue(run.getId(), anchor);
+                    } catch (Exception cacheFailure) {
+                        log.warn("工作区拒绝的到期索引暂不能重建：run={}",
+                                run.getId(), cacheFailure);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())) {
                     ToolJobPreparingAbortRecoveryService.Outcome outcome =
@@ -211,6 +238,54 @@ public class ToolJobStartupRecovery {
                     if (resolution.outcome()
                             == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
                         reservation = resolution.reservation();
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(Instant.now());
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (Exception cacheFailure) {
+                            log.warn("工作区拒绝收口的到期索引暂不能重建：run={}",
+                                    run.getId(), cacheFailure);
+                        }
+                        continue;
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.DURABLE_WRITE_UNCERTAIN) {
+                        // 拒绝标记可能已经提交，只是数据库响应丢失。重新从数据库读取
+                        // 同一操作的名额凭证，不能把可恢复的普通 Run 永久隔离。
+                        ToolJobAnchor current = anchorService.loadAnchor(run.getId());
+                        if (current == null) {
+                            // 本路径清锚点只能在名额已释放后发生；当前快照不可再计账。
+                            continue;
+                        }
+                        if (!anchor.getOperationId().equals(current.getOperationId())
+                                || !anchor.getRequestFingerprint().equals(
+                                        current.getRequestFingerprint())) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        DataAnalysisReservation currentReservation = proofMapper.readValue(
+                                current.getReservationJson(), DataAnalysisReservation.class);
+                        if (currentReservation == null || currentReservation.identity() == null
+                                || !run.getId().equals(currentReservation.identity().runId())
+                                || !anchor.getOperationId().equals(
+                                        currentReservation.operationId())) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        if (currentReservation.state()
+                                != DataAnalysisReservationState.RELEASED) {
+                            durableReservations.add(currentReservation);
+                        }
+                        current.setNextPollAt(
+                                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), current);
+                        } catch (Exception redisFailure) {
+                            log.warn("Failed to schedule uncertain workspace refusal for run={}",
+                                    run.getId(), redisFailure);
+                        }
+                        continue;
                     } else if ("CANCELED".equals(anchor.getRunDisposition())
                             && resolution.outcome()
                             != ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
@@ -413,6 +488,11 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                    anchor.setNextPollAt(Instant.now());
+                    redisCache.upsertDue(run.getId(), anchor);
+                    continue;
+                }
                 if (waitGroupStore != null
                         && waitGroupStore.hasUnresolvedMember(run.getId(), anchor.getOperationId())) {
                     if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB

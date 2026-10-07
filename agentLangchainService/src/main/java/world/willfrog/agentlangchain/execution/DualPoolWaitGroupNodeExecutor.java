@@ -22,6 +22,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.MemberCompletionResult;
@@ -85,6 +86,7 @@ public class DualPoolWaitGroupNodeExecutor {
      * 覆盖「工具在本次调用里当场出结果、或者被额度与控制信号中止」这些没有进入等待的情况。</p>
      */
     private static final String RULE_ACTION_NOT_APPLIED_CODE = "acceptance_fixture_rule_action_not_applied";
+    private static final String RISK_REPLAY_EVIDENCE_MISSING_CODE = "python_risk_replay_evidence_missing";
 
     private final AgentPromptService promptService;
     @Autowired
@@ -220,15 +222,22 @@ public class DualPoolWaitGroupNodeExecutor {
         NodeSegmentCheckpoint stored = NodeSegmentCheckpoint.read(input.payload());
         List<ChatMessage> messages = new ArrayList<>();
         NodeSegmentCheckpoint checkpoint;
+        boolean riskReplayEvidenceMissing = false;
         if (stored == null) {
             messages.addAll(initialMessages(input));
             checkpoint = new NodeSegmentCheckpoint(0, null, messages, 0);
         } else {
             messages.addAll(stored.messages());
             if (stored.resumeGroupTurn() != null) {
-                appendMemberResults(messages, input, stored.resumeGroupTurn());
+                riskReplayEvidenceMissing = appendMemberResults(messages, input, stored.resumeGroupTurn());
             }
             checkpoint = stored;
+        }
+        if (riskReplayEvidenceMissing) {
+            // 决定已落库但原完整请求缺失时，沙箱没有收到调用。让节点明确失败，
+            // 由 Run 协调侧收成终态；不能再问模型重试，也不能留下待派发成员悬挂。
+            return new Outcome.Completed(failurePatch(input, checkpoint,
+                    RISK_REPLAY_EVIDENCE_MISSING_CODE, null));
         }
         ensureRunnable(input.request());
         AiMessage reply;
@@ -317,7 +326,7 @@ public class DualPoolWaitGroupNodeExecutor {
 
     // ==================== 接回上一次的成员结果 ====================
 
-    private void appendMemberResults(List<ChatMessage> messages, SegmentExecution input, int groupTurn) {
+    private boolean appendMemberResults(List<ChatMessage> messages, SegmentExecution input, int groupTurn) {
         WaitGroupIdentity groupIdentity = new WaitGroupIdentity(
                 previousSegmentIdentity(input.identity()), groupTurn);
         WaitGroup group = waitGroupStore.findGroup(groupIdentity)
@@ -327,6 +336,7 @@ public class DualPoolWaitGroupNodeExecutor {
         if (members.isEmpty()) {
             throw new IllegalStateException("等待组里没有成员：" + group.getId());
         }
+        boolean riskReplayEvidenceMissing = false;
         for (WaitMember member : members) {
             if (!member.terminal()) {
                 throw new IllegalStateException("等待组还没齐备，这一段不该被领取：group=" + group.getId()
@@ -336,7 +346,10 @@ public class DualPoolWaitGroupNodeExecutor {
                     messageToolCallId(member),
                     member.getToolName(),
                     WaitMemberResultPayload.modelText(member.getResultRefJson(), objectMapper)));
+            riskReplayEvidenceMissing |= RISK_REPLAY_EVIDENCE_MISSING_CODE.equals(
+                    WaitMemberResultPayload.errorCode(member.getResultRefJson(), objectMapper));
         }
+        return riskReplayEvidenceMissing;
     }
 
     private static NodeWorkItemIdentity previousSegmentIdentity(NodeWorkItemIdentity identity) {
@@ -688,6 +701,12 @@ public class DualPoolWaitGroupNodeExecutor {
                 if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING) {
                     continue;
                 }
+                if (awaitingPersistedPythonDispatch(member)) {
+                    // 创建请求已在外部调用前落库。原派发线程可能已经退出；重跑节点不得把它
+                    // 当作新调用，也不得将预留请求写成普通工具失败。恢复器会核对旧领取者已退出、
+                    // 容量已归还，再按原操作号查询或原样重发。
+                    continue;
+                }
                 ToolExecutionRequest call = locateCall(member, calls);
                 if (call == null) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
@@ -721,6 +740,14 @@ public class DualPoolWaitGroupNodeExecutor {
                     }
                 }
             }
+        } catch (PythonRiskReplayEvidenceMissingException missing) {
+            // 分段和整组已先于工具调用落库，原调用没有可信请求可以重放。
+            // 将未派发成员写成明确失败，等整组齐备后下一分段直接让节点失败。
+            notificationId = keepNotification(notificationId,
+                    abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
+                            RISK_REPLAY_EVIDENCE_MISSING_CODE));
+            log.warn("Python 风险审查决定缺少可重放请求，等待组成员按失败收尾：groupId={} segment={}",
+                    groupId, input.identity().describe(), missing);
         } catch (RunBudgetException budget) {
             // 额度耗尽：还没拿到结果的成员记成失败，让整组仍然能齐备；本段按挂起收场，
             // 下一段恢复后模型调用会再次撞上额度检查，由那一次给出节点失败结果。
@@ -751,7 +778,8 @@ public class DualPoolWaitGroupNodeExecutor {
                                        String errorCode) {
         Long notificationId = null;
         for (WaitMember member : members) {
-            if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING) {
+            if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING
+                    || awaitingPersistedPythonDispatch(member)) {
                 continue;
             }
             Map<String, Object> failure = "run_budget_exceeded".equals(errorCode)
@@ -762,6 +790,12 @@ public class DualPoolWaitGroupNodeExecutor {
                     policyMatches, member, false, "", failure, null));
         }
         return notificationId;
+    }
+
+    private static boolean awaitingPersistedPythonDispatch(WaitMember member) {
+        return member.stateEnum() == WaitMemberState.PENDING
+                && "executePython".equals(member.getToolName())
+                && member.getDispatchProofJson() != null;
     }
 
     private Long keepNotification(Long current, Long candidate) {

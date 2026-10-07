@@ -317,17 +317,47 @@ public class WaitMemberResultReceiver {
                     group.getId(), memberKey(member), e.getMessage());
         }
 
+        if (proof.workspaceRefused()) {
+            finishWorkspaceRefusal(member, group, segment, run, proof, now);
+            return;
+        }
+
         String taskId = proof.taskId();
         if (taskId == null) {
             TaskLookup lookup = lookupByOperation(proof);
             if (lookup.taskId() == null) {
                 if (lookup.notFound()) {
-                    // createTask 的网络请求可能尚未抵达 Sandbox。先写持久取消墓碑，
-                    // 再确认相同操作身份，才能排除迟到创建；仅凭此刻 found=false 不释放容量。
-                    taskId = tombstoneAbsentOperation(member, proof);
-                    if (taskId == null) {
-                        defer(member, now, "cancel_tombstone_unavailable");
-                        return;
+                    if (WaitMemberDurableRequestResolver.hasValidRequest(proof)) {
+                        // 新版证明已经在首次 RPC 前保存完整请求。按原编号再查并原样重发，
+                        // 不能因为当前未找到就抢先写取消墓碑。
+                        WaitMemberDurableRequestResolver.Resolution resolution =
+                                WaitMemberDurableRequestResolver.resolveOutcome(proof, sandboxService);
+                        if (resolution.workspaceRefusalCode() != null) {
+                            WaitMemberDispatchProof refused = proof.withWorkspaceRefusal(
+                                    resolution.workspaceRefusalCode());
+                            if (waitGroupStore.recordMemberWorkspaceRefusal(
+                                    member.getGroupId(), member.getMemberIdentity(),
+                                    proof.operationId(), proof.requestFingerprint(),
+                                    refused.toJson(objectMapper))) {
+                                finishWorkspaceRefusal(member, group, segment, run, refused, now);
+                            } else {
+                                defer(member, now, "workspace_refusal_persist_unavailable");
+                            }
+                            return;
+                        }
+                        taskId = resolution.taskId();
+                        if (taskId == null) {
+                            defer(member, now, "durable_replay_unavailable");
+                            return;
+                        }
+                    } else {
+                        // 旧版或损坏的请求无法重放；先写持久取消墓碑，
+                        // 再确认相同操作身份，才能排除迟到创建。
+                        taskId = tombstoneAbsentOperation(member, proof);
+                        if (taskId == null) {
+                            defer(member, now, "cancel_tombstone_unavailable");
+                            return;
+                        }
                     }
                 } else {
                     defer(member, now, "task_lookup_unavailable");
@@ -397,6 +427,35 @@ public class WaitMemberResultReceiver {
 
     /** 按策略把一条成员收成失败：错误码与说明由策略拒绝给出。 */
     private record ForcedFailure(String code, String detail) {
+    }
+
+    private void finishWorkspaceRefusal(WaitMember member, WaitGroup group,
+                                        NodeWorkItem segment, AgentRun run,
+                                        WaitMemberDispatchProof proof, OffsetDateTime now) {
+        WaitMemberSettlement.Outcome settled = settlement.settleWorkspaceRefusal(member, proof);
+        if (!settled.ok()) {
+            settlementFailures.incrementAndGet();
+            defer(member, now, "workspace_refusal_settlement:" + settled.reason());
+            return;
+        }
+        String code = proof.workspaceRefusalCode();
+        String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
+                member.getToolCallId(), false, "Python workspace rejected the task: " + code,
+                Map.of("errorCode", code, "errorDetail", "Python workspace rejected the task: " + code,
+                        "retryable", false), maxMemberResultChars);
+        MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
+                member.getGroupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
+                resultJson, member.getExternalOperationId(), group.getPlanGeneration(),
+                segment.getContextVersion(), run.getRunControlVersion()), member, "");
+        if (!result.applied()) {
+            duplicates.incrementAndGet();
+            return;
+        }
+        completed.incrementAndGet();
+        if (result.groupBecameReady()) {
+            recoveryDispatcher.wake(result.notificationId());
+            wakeups.incrementAndGet();
+        }
     }
 
     /**

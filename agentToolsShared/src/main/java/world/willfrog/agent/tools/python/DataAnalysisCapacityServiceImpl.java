@@ -314,7 +314,8 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
                 // Idempotent: the ledger already shows RELEASED for this reservationId.
                 return DataAnalysisReleaseOutcome.ALREADY_RELEASED;
             }
-            if (request.proof() instanceof DataAnalysisReleaseProof.PreDispatchAbort
+            if ((request.proof() instanceof DataAnalysisReleaseProof.PreDispatchAbort
+                    || request.proof() instanceof DataAnalysisReleaseProof.WorkspaceRefusal)
                     && current.state() != DataAnalysisReservationState.PREPARING) {
                 return DataAnalysisReleaseOutcome.CONFLICT;
             }

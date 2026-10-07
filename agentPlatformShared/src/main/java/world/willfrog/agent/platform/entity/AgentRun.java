@@ -57,6 +57,10 @@ public class AgentRun {
     private OffsetDateTime startedAt;
     private OffsetDateTime updatedAt;
     private OffsetDateTime completedAt;
+    /** 工作区自动清理已封住本 Run；沙箱发现新活动时可以撤销。 */
+    private OffsetDateTime workspaceCleanupStartedAt;
+    /** 沙箱确认删除工作区后的永久过期事实。 */
+    private OffsetDateTime workspaceExpiredAt;
     private String ext; // JSON string
     /**
      * 工作流级粗粒度恢复检查点。它只描述冻结 Plan 的执行边界，不保存长工具任务身份，

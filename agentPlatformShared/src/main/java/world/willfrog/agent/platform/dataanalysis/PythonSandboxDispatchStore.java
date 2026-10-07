@@ -35,6 +35,26 @@ public interface PythonSandboxDispatchStore {
     /** 按 operationId 保存 Sandbox taskId 和 ATTACHED/TERMINAL 状态。 */
     boolean persistAttached(String runId, ToolJobAnchor anchor);
 
+    /**
+     * 工作区明确拒绝且按原操作号查无任务后，窄写持久拒绝原因。
+     * {@code expectedLeaseUntil} 只用于仍由当前 DAG worker 持有的调用。
+     */
+    default boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                           Instant expectedLeaseUntil) {
+        return false;
+    }
+
+    /** 容量凭证明已释放后，只把同一拒绝锚点的 reservation 快照推进为 RELEASED。 */
+    default boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        return false;
+    }
+
+    /** 按原操作身份和已释放证明清锚点，并给仍在执行的 Run 写入明确失败码。 */
+    default boolean completeWorkspaceRefusal(String runId, String operationId,
+                                             String fingerprint, String code) {
+        return false;
+    }
+
     /** 原子写 PENDING anchor 并把 Run 转为 WAITING_TOOL_JOB；true 才允许释放 worker。 */
     boolean transferToPending(String runId, ToolJobAnchor anchor);
 

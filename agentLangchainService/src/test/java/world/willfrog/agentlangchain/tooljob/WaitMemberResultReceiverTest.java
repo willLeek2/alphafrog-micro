@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.util.JsonFormat;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -35,6 +36,8 @@ import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
@@ -330,6 +333,56 @@ class WaitMemberResultReceiverTest {
                         && cancel.getByOperation().getOperationId().equals("op-1")
                         && cancel.getByOperation().getRequestFingerprint().equals("sha256:fingerprint")));
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 0L);
+    }
+
+    @Test
+    void replayableMissingOperationUsesTheSavedRequestInsteadOfCanceling() throws Exception {
+        ExecuteRequest original = ExecuteRequest.newBuilder()
+                .setOperationId("op-1").setRequestFingerprint("sha256:fingerprint")
+                .setCode("print('saved')").build();
+        WaitMemberDispatchProof saved = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
+                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original));
+        givenDueMemberWithProof(saved);
+        when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+        when(sandboxService.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setTaskId("replayed-task").setRequestFingerprint("sha256:fingerprint").build());
+        status("RUNNING");
+
+        receiver.round();
+
+        verify(sandboxService).createTask(original);
+        verify(sandboxService, never()).cancelTask(any());
+        verify(sandboxService).getTaskStatus(
+                GetTaskStatusRequest.newBuilder().setTaskId("replayed-task").build());
+        verify(waitGroupStore, never()).completeMember(any());
+    }
+
+    @Test
+    void savedWorkspaceRefusalSettlesWithoutReplayingOrCanceling() throws Exception {
+        ExecuteRequest original = ExecuteRequest.newBuilder()
+                .setOperationId("op-1").setRequestFingerprint("sha256:fingerprint")
+                .setCode("print('saved')").build();
+        WaitMemberDispatchProof saved = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
+                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original))
+                .withWorkspaceRefusal("WORKSPACE_DIRTY");
+        givenDueMemberWithProof(saved);
+        when(settlement.settleWorkspaceRefusal(any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(true, null));
+        completion(true, WaitMemberState.FAILED, 55L);
+
+        receiver.round();
+
+        verify(settlement).settleWorkspaceRefusal(any(), eq(saved));
+        verify(sandboxService, never()).createTask(any());
+        verify(sandboxService, never()).cancelTask(any());
+        verify(sandboxService, never()).getTaskByOperationId(any());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("WORKSPACE_DIRTY");
     }
 
     /** 墓碑外调不确定时不能把瞬间不存在误当最终结论。 */

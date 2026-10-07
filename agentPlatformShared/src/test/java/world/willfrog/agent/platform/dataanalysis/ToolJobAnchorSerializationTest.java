@@ -126,6 +126,21 @@ class ToolJobAnchorSerializationTest {
     }
 
     @Test
+    void roundTripsWorkspaceRefusalWithoutInventingTaskIdentity() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:call-1:1");
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        anchor.setWorkspaceRefusalCode("WORKSPACE_DIRTY");
+
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+        assertThat(restored.getOperationId()).isEqualTo("run-1:call-1:1");
+        assertThat(restored.getAnchorState()).isEqualTo("WORKSPACE_REFUSED");
+        assertThat(restored.getWorkspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(restored.getTaskId()).isNull();
+    }
+
+    @Test
     void roundTripsDualPoolWorkItemIdentityAndVersions() {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setWorkItemPlanGeneration(3);

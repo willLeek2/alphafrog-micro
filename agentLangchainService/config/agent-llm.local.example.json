@@ -398,6 +398,16 @@
     "redisFlushStaleMs": 3000
   },
   "agent": {
+    "python-workspace": {
+      "enabled": false,
+      "retention-hours": 24
+    },
+    "python-risk-review": {
+      "enabled": false,
+      "endpointName": "",
+      "modelName": "",
+      "threshold": 50
+    },
     "call-raw-content": {
       "ttl-seconds": 7200
     },

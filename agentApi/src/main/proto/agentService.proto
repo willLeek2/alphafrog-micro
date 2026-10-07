@@ -215,6 +215,23 @@ message AgentRunStatusMessage {
   bool observability_full_available = 17;
 }
 
+// 仅供沙箱网关在取得 Run 关联的持久资源前回查。请求不接受用户或模型提供的
+// 部署身份、泳道和状态；Agent 从自己的数据库与 Dubbo 入站标签核对。
+message CheckRunPersistentResourceEligibilityRequest {
+  string run_id = 1;
+}
+
+enum RunPersistentResourceEligibility {
+  RUN_PERSISTENT_RESOURCE_ELIGIBILITY_UNSPECIFIED = 0;
+  RUN_PERSISTENT_RESOURCE_ELIGIBILITY_ALLOWED = 1;
+  RUN_PERSISTENT_RESOURCE_ELIGIBILITY_REFUSED = 2;
+  RUN_PERSISTENT_RESOURCE_ELIGIBILITY_TEMPORARILY_UNAVAILABLE = 3;
+}
+
+message CheckRunPersistentResourceEligibilityResponse {
+  RunPersistentResourceEligibility eligibility = 1;
+}
+
 message AgentToolMessage {
   string name = 1;
   string description = 2;
@@ -566,4 +583,10 @@ service AgentDubboService {
   rpc ListMessages(ListAgentMessagesRequest) returns (ListAgentMessagesResponse);
   rpc GetSnapshotPartsMeta(GetAgentSnapshotPartsRequest) returns (AgentSnapshotPartsMetaMessage);
   rpc GetSnapshotPart(GetAgentSnapshotPartRequest) returns (AgentSnapshotPartMessage);
+}
+
+// 内部只读回查，不复用面向用户且可能推进过期状态的 GetRun/GetStatus。
+service AgentRunPersistentResourceEligibilityService {
+  rpc CheckEligibility(CheckRunPersistentResourceEligibilityRequest)
+      returns (CheckRunPersistentResourceEligibilityResponse);
 }

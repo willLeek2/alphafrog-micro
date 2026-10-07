@@ -20,6 +20,8 @@
         <result property="startedAt" column="started_at"/>
         <result property="updatedAt" column="updated_at"/>
         <result property="completedAt" column="completed_at"/>
+        <result property="workspaceCleanupStartedAt" column="workspace_cleanup_started_at"/>
+        <result property="workspaceExpiredAt" column="workspace_expired_at"/>
         <result property="ext" column="ext"/>
         <result property="schedulerVersion" column="scheduler_version"/>
         <result property="idempotencyKey" column="idempotency_key"/>
@@ -85,6 +87,8 @@
                started_at,
                updated_at,
                completed_at,
+               workspace_cleanup_started_at,
+               workspace_expired_at,
                ext::text AS ext,
                scheduler_version,
                plan_generation,
@@ -181,6 +185,131 @@
          ORDER BY child.id
          FOR UPDATE OF child
     </select>
+
+    <update id="markDeletionStarted">
+        UPDATE alphafrog_agent_run
+           SET deletion_started_at = COALESCE(deletion_started_at, CURRENT_TIMESTAMP),
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{id} AND user_id = #{userId}
+    </update>
+
+    <select id="isDeletionStarted" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM alphafrog_agent_run
+             WHERE id = #{id} AND deletion_started_at IS NOT NULL)
+    </select>
+
+    <select id="findWorkspaceLifecycleState" resultType="string">
+        SELECT CASE WHEN workspace_expired_at IS NOT NULL THEN 'EXPIRED'
+                    WHEN workspace_cleanup_started_at IS NOT NULL THEN 'CLEANING'
+                    ELSE NULL END
+          FROM alphafrog_agent_run WHERE id = #{id}
+    </select>
+
+    <!-- 清理前在同一条 UPDATE 中复核所有仍可能需要工作区或派发凭据的责任。 -->
+    <sql id="workspaceRetentionSettled">
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_group g
+                WHERE g.run_id = r.id AND g.state IN ('WAITING', 'READY'))
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member m
+                WHERE m.run_id = r.id AND m.tool_name = 'executePython'
+                  AND (m.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELED', 'LATE')
+                       OR (m.state = 'CANCELED' AND m.dispatch_proof_json IS NOT NULL
+                           AND NOT EXISTS (
+                               SELECT 1 FROM alphafrog_agent_run_wait_member_stop confirmed
+                                WHERE confirmed.wait_member_id = m.id
+                                  AND confirmed.state = 'CONFIRMED'))
+                       OR (m.state = 'LATE' AND EXISTS (
+                           SELECT 1 FROM alphafrog_agent_run_wait_member_stop pending_stop
+                            WHERE pending_stop.wait_member_id = m.id
+                              AND pending_stop.state &lt;&gt; 'CONFIRMED')))
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                WHERE s.run_id = r.id AND s.state &lt;&gt; 'CONFIRMED')
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_child_intent i
+                WHERE (i.root_run_id = r.id OR i.parent_run_id = r.id OR i.child_run_id = r.id)
+                  AND i.capacity_released_at IS NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_tree_capacity c
+                WHERE c.root_run_id = r.id AND c.active_child_count &gt; 0)
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_tree_budget b
+                WHERE b.root_run_id = r.id
+                  AND (b.active_nodes &gt; 0 OR b.external_waits &gt; 0))
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_recovery_notification n
+                WHERE n.run_id = r.id AND n.state = 'WAITING')
+           AND (
+               r.tool_job_anchor_json IS NULL OR r.tool_job_anchor_json = '{}'::jsonb
+               OR (r.status = 'FAILED'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CHECKPOINT_FAILED'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'anchorState' = 'TERMINAL'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'finalizerStep' = 'EVENT'
+                   AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+                   AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'usagePersisted')::boolean, false)
+                   AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'terminalEventEmitted')::boolean, false)
+                   AND (r.tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state' = 'RELEASED')
+           )
+    </sql>
+
+    <update id="markWorkspaceCleanupStarted">
+        UPDATE alphafrog_agent_run r
+           SET workspace_cleanup_started_at = COALESCE(workspace_cleanup_started_at, CURRENT_TIMESTAMP)
+         WHERE r.id = #{id}
+           AND r.ext -&gt;&gt; 'python_workspace_enabled' = 'true'
+           AND r.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+           AND r.deletion_started_at IS NULL
+           AND r.workspace_expired_at IS NULL
+           <include refid="workspaceRetentionSettled"/>
+    </update>
+
+    <update id="clearWorkspaceCleanupStarted">
+        UPDATE alphafrog_agent_run
+           SET workspace_cleanup_started_at = NULL
+         WHERE id = #{id}
+           AND workspace_cleanup_started_at IS NOT NULL
+           AND workspace_expired_at IS NULL
+           AND deletion_started_at IS NULL
+    </update>
+
+    <update id="markWorkspaceExpired">
+        UPDATE alphafrog_agent_run r
+           SET workspace_expired_at = COALESCE(workspace_expired_at, CURRENT_TIMESTAMP),
+               workspace_cleanup_started_at = NULL,
+               tool_job_anchor_json = r.tool_job_anchor_json - 'createRequestJson'
+         WHERE r.id = #{id}
+           AND r.workspace_cleanup_started_at IS NOT NULL
+           AND r.workspace_expired_at IS NULL
+           AND r.deletion_started_at IS NULL
+           AND r.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+           <include refid="workspaceRetentionSettled"/>
+    </update>
+
+    <select id="scanWorkspaceCleanupStarted" resultType="string">
+        SELECT id FROM alphafrog_agent_run
+         WHERE workspace_cleanup_started_at IS NOT NULL
+           AND workspace_expired_at IS NULL
+           AND deployment_id = #{deploymentId}
+           AND id &gt; #{afterRunId}
+         ORDER BY id LIMIT #{limit}
+    </select>
+
+    <select id="listWorkspaceRetentionLanes" resultMap="AgentRunResultMap">
+        SELECT MIN(id) AS id, lane_tag
+          FROM alphafrog_agent_run
+         WHERE deployment_id = #{deploymentId}
+           AND ext -&gt;&gt; 'python_workspace_enabled' = 'true'
+         GROUP BY lane_tag
+         ORDER BY lane_tag NULLS FIRST
+    </select>
+
+    <delete id="deleteMarkedByIdAndUser">
+        DELETE FROM alphafrog_agent_run
+         WHERE id = #{id} AND user_id = #{userId}
+           AND deletion_started_at IS NOT NULL
+    </delete>
 
     <delete id="deleteChildIntentsByRoot">
         DELETE FROM alphafrog_agent_run_child_intent WHERE root_run_id = #{rootRunId}
@@ -725,7 +854,12 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
+          AND deletion_started_at IS NULL
+          AND workspace_cleanup_started_at IS NULL
+          AND workspace_expired_at IS NULL
           AND status IN ('FAILED', 'CANCELED', 'WAITING')
+          AND COALESCE(tool_job_anchor_json -&gt;&gt; 'anchorState', '')
+                NOT IN ('PREPARING', 'WORKSPACE_REFUSED')
     </update>
 
     <update id="admitFollowUpForDeployment">
@@ -747,6 +881,9 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
+          AND deletion_started_at IS NULL
+          AND workspace_cleanup_started_at IS NULL
+          AND workspace_expired_at IS NULL
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status = 'COMPLETED'
@@ -1024,6 +1161,120 @@
           AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
                OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
+    </update>
+
+    <!--
+        Sandbox 工作区拒绝必须先作为持久事实落库。只合并拒绝状态和代码，
+        不把旧内存锚点整份写回；取消、任务附着、换操作和 DAG 租约接管均会使条件失败。
+    -->
+    <update id="recordWorkspaceRefusal">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'anchorState', 'WORKSPACE_REFUSED',
+                'workspaceRefusalCode', #{workspaceRefusalCode}
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'WAITING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'PREPARING'
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition')
+                IS NOT DISTINCT FROM #{expectedRunDisposition,jdbcType=VARCHAR}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+                = #{expectedAutoResume}
+          AND (tool_job_anchor_json -&gt;&gt; 'blockingOwnerId')
+                IS NOT DISTINCT FROM #{expectedOwnerId,jdbcType=VARCHAR}
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state')
+                = 'PREPARING'
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                -&gt;&gt; 'reservationId') = #{expectedOperationId}
+          <choose>
+            <when test="expectedLeaseUntil != null">
+              AND status IN ('EXECUTING', 'WAITING')
+              AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_NO_RESUME'
+              AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+              AND CAST(tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' AS timestamptz)
+                    &gt; CURRENT_TIMESTAMP
+            </when>
+            <otherwise>
+              AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                    IS DISTINCT FROM 'DAG_BLOCKING_NO_RESUME'
+            </otherwise>
+          </choose>
+    </update>
+
+    <!-- 容量服务已接受工作区拒绝证明后，只推进原 reservation 的 state。 -->
+    <update id="recordWorkspaceRefusalReleased">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = jsonb_set(
+                tool_job_anchor_json,
+                '{reservationJson}',
+                to_jsonb(CAST(#{releasedReservationJson} AS text)),
+                true
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'WAITING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'WORKSPACE_REFUSED'
+          AND tool_job_anchor_json -&gt;&gt; 'workspaceRefusalCode' = #{workspaceRefusalCode}
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state')
+                = 'PREPARING'
+          AND (CAST(#{releasedReservationJson} AS jsonb) -&gt;&gt; 'state')
+                = 'RELEASED'
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb - 'state')
+                = (CAST(#{releasedReservationJson} AS jsonb) - 'state')
+          AND (CAST(#{releasedReservationJson} AS jsonb) -&gt;&gt; 'reservationId')
+                = #{expectedOperationId}
+    </update>
+
+    <!--
+        无 Sandbox task 的拒绝不伪造任务终态；原操作的 RELEASED 证明齐全后
+        原子清锚点。并发取消意图在 EXECUTING/WAITING 时写 CANCELED，保留
+        取消快照和 last_error；单纯暂停的 WAITING 保持可恢复状态，保存拒绝码。
+    -->
+    <update id="completeWorkspaceRefusal">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = '{}'::jsonb,
+            status = CASE
+                WHEN status IN ('EXECUTING', 'WAITING')
+                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                THEN 'CANCELED'
+                WHEN status = 'EXECUTING' THEN 'FAILED'
+                ELSE status END,
+            last_error = CASE
+                WHEN status = 'EXECUTING'
+                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                         IS DISTINCT FROM 'CANCELED'
+                THEN #{workspaceRefusalCode}
+                WHEN status = 'WAITING'
+                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                         IS DISTINCT FROM 'CANCELED'
+                THEN #{workspaceRefusalCode} ELSE last_error END,
+            completed_at = CASE WHEN status = 'EXECUTING'
+                    OR (status = 'WAITING'
+                        AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED')
+                THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'WAITING', 'FAILED', 'CANCELED')
+          AND (status NOT IN ('EXECUTING', 'WAITING')
+                OR tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                    IS DISTINCT FROM 'CANCELED'
+                OR COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false)
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'WORKSPACE_REFUSED'
+          AND tool_job_anchor_json -&gt;&gt; 'workspaceRefusalCode' = #{workspaceRefusalCode}
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state')
+                = 'RELEASED'
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                -&gt;&gt; 'reservationId') = #{expectedOperationId}
     </update>
 
     <!--
@@ -1429,7 +1680,8 @@
     <!--
         补扫真相源中的 active anchor。除常规 active 状态外，还纳入两类终态 Run：
         ①DAG cleanup/abort 处置的 FAILED / CANCELED（pipeline 先失败/取消、容量后收尾）；
-        ②终态取消残留——筛选条件与 closeResidualCanceledAnchorOnTerminalRun 的
+        ②工作区明确拒绝的 FAILED / CANCELED（无任务但容量可能尚待归还）；
+        ③终态取消残留——筛选条件与 closeResidualCanceledAnchorOnTerminalRun 的
         清理能力严格对齐（显式 autoResume=false + finalizerStep 已达 EVENT），只发现
         直接清理语句确实能处理的记录。已终态但只走到早期步骤（ENVELOPE/RELEASE/USAGE/
         缺失）或 autoResume 缺失/为 true 的残留不入选：它们无法在终态状态下推进步骤，
@@ -1484,6 +1736,10 @@
                     status IN ('FAILED', 'CANCELED')
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
                         IN ('DAG_BLOCKING_WORKER_LOST', 'DAG_BLOCKING_PREPARING_ABORT')
+                )
+                OR (
+                    status IN ('FAILED', 'CANCELED')
+                    AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'WORKSPACE_REFUSED'
                 )
                 OR (
                     -- 终态取消残留必须能被补扫重新

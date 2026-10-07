@@ -28,6 +28,11 @@ public interface SandboxJobRequestAdapter<REQ> {
     /** 请求指纹：绑定本次入参，阻止同一 operationId 被不同请求复用。 */
     String requestFingerprint(REQ request);
 
+    /** 可重放的完整创建请求；不支持持久重放的既有工具返回 null。 */
+    default String durableCreateRequestJson(REQ request) {
+        return null;
+    }
+
     /** 把锚点里冻存的 createRequestJson 解析回创建请求，供 PREPARING 恢复重放。 */
     REQ parseStoredCreateRequest(String createRequestJson);
 

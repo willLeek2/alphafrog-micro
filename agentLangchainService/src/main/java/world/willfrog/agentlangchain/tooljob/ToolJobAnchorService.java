@@ -2,11 +2,18 @@ package world.willfrog.agentlangchain.tooljob;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.annotation.Transactional;
 import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
@@ -28,8 +35,12 @@ import java.util.List;
 @Service
 public class ToolJobAnchorService {
 
+    private static final Logger log = LoggerFactory.getLogger(ToolJobAnchorService.class);
     private final AgentRunMapper agentRunMapper;
     private final int sessionStaleSeconds;
+
+    @Autowired(required = false)
+    private AgentRunFinalizationService finalizationService;
 
     @Autowired
     public ToolJobAnchorService(
@@ -52,7 +63,9 @@ public class ToolJobAnchorService {
         // 归属由 gateway 在认领处判定；这里只按 run id 读当前 anchor。
         AgentRun run = agentRunMapper.findById(runId);
         // 空 JSON 表示当前 Run 没有可恢复的外部工具任务。
-        if (run == null || run.getToolJobAnchorJson() == null || run.getToolJobAnchorJson().isBlank()) {
+        if (run == null || run.getToolJobAnchorJson() == null
+                || run.getToolJobAnchorJson().isBlank()
+                || "{}".equals(run.getToolJobAnchorJson().trim())) {
             return null;
         }
         // 解析失败显式抛出，避免把损坏 anchor 当成“没有任务”。
@@ -206,6 +219,92 @@ public class ToolJobAnchorService {
         // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。
         return agentRunMapper.updateActiveToolJobAnchor(
                 runId, anchor.toJson(), expectedStatus, operationId) == 1;
+    }
+
+    /** 只给仍由原 PREPARING 操作持有的锚点写工作区拒绝，保留其余字段原样。 */
+    public boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                          Instant expectedLeaseUntil) {
+        if (anchor == null || !"WORKSPACE_REFUSED".equals(anchor.getAnchorState())
+                || !WaitMemberDispatchProof.isWorkspaceRefusalCode(anchor.getWorkspaceRefusalCode())
+                || anchor.getOperationId() == null || anchor.getOperationId().isBlank()
+                || anchor.getRequestFingerprint() == null || anchor.getRequestFingerprint().isBlank()
+                || anchor.getTaskId() != null && !anchor.getTaskId().isBlank()) {
+            return false;
+        }
+        boolean liveDag = ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition());
+        if (liveDag != (expectedLeaseUntil != null)
+                || liveDag && (!expectedLeaseUntil.equals(anchor.getBlockingLeaseUntil())
+                || anchor.getBlockingOwnerId() == null || anchor.getBlockingOwnerId().isBlank())) {
+            return false;
+        }
+        return agentRunMapper.recordWorkspaceRefusal(
+                runId, anchor.getOperationId(), anchor.getRequestFingerprint(),
+                anchor.getRunDisposition(), anchor.isAutoResume(),
+                anchor.getBlockingOwnerId(),
+                expectedLeaseUntil == null ? null : expectedLeaseUntil.toString(),
+                anchor.getWorkspaceRefusalCode()) == 1;
+    }
+
+    /** 不覆盖取消等并发处置，只推进同一拒绝名额的持久状态。 */
+    public boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        if (anchor == null || !"WORKSPACE_REFUSED".equals(anchor.getAnchorState())
+                || !WaitMemberDispatchProof.isWorkspaceRefusalCode(anchor.getWorkspaceRefusalCode())
+                || anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()
+                || anchor.getOperationId() == null || anchor.getRequestFingerprint() == null) {
+            return false;
+        }
+        return agentRunMapper.recordWorkspaceRefusalReleased(
+                runId, anchor.getOperationId(), anchor.getRequestFingerprint(),
+                anchor.getWorkspaceRefusalCode(), anchor.getReservationJson()) == 1;
+    }
+
+    /** 仅在同一拒绝的容量释放证明已持久化时清锚点、写明确失败。 */
+    @Transactional
+    public boolean completeWorkspaceRefusal(String runId, String operationId,
+                                            String fingerprint, String code) {
+        if (operationId == null || operationId.isBlank()
+                || fingerprint == null || fingerprint.isBlank()
+                || !WaitMemberDispatchProof.isWorkspaceRefusalCode(code)) {
+            return false;
+        }
+        if (agentRunMapper.completeWorkspaceRefusal(runId, operationId, fingerprint, code) != 1) {
+            return false;
+        }
+        // UPDATE 持有的行锁一直到本事务提交。趁此时读取本次更新产生的终态，
+        // 再在提交后发布；用户的并发恢复不能抢先把状态改成 RECEIVED 使事件丢失。
+        if (finalizationService != null) {
+            AgentRun run = agentRunMapper.findById(runId);
+            if (run != null && (run.getStatus() == AgentRunStatus.FAILED
+                    || run.getStatus() == AgentRunStatus.CANCELED)) {
+                String userId = run.getUserId();
+                String status = run.getStatus().name();
+                Runnable publish = () -> publishWorkspaceRefusalTerminal(
+                        runId, userId, status);
+                if (TransactionSynchronizationManager.isSynchronizationActive()) {
+                    TransactionSynchronizationManager.registerSynchronization(
+                            new TransactionSynchronization() {
+                                @Override
+                                public void afterCommit() {
+                                    publish.run();
+                                }
+                            });
+                } else {
+                    publish.run();
+                }
+            }
+        }
+        return true;
+    }
+
+    private void publishWorkspaceRefusalTerminal(String runId, String userId,
+                                                 String status) {
+        try {
+            finalizationService.publishFinalizedEvent(runId, userId, status);
+        } catch (RuntimeException publishFailure) {
+            // 终态和名额释放已提交；轮询器仍可补查，不能回滚为 PREPARING。
+            log.warn("Workspace refusal terminal event will be retried by polling: run={}",
+                    runId, publishFailure);
+        }
     }
 
     public boolean updateLiveDagBlocking(
