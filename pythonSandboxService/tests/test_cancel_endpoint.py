@@ -75,18 +75,31 @@ from app.task_store import DurableTaskStore  # noqa: E402
 class _QueueStub:
     """Deterministic stand-in for the bounded acceptance queue.
 
-    create_task only ever consults ``full()`` and admits via ``put_nowait``;
-    this stub controls both independently so the admission race (queue fills
-    BETWEEN the full() check and the put) and the genuinely-full case can be
-    tested without any real queue capacity juggling.
+    create_task consults ``full()`` (after a stale-resident purge pass)
+    and admits via ``put_nowait`` with one purge-retry; this stub controls
+    both independently so the admission race (queue fills BETWEEN the
+    full() check and the put) and the genuinely-full case can be tested
+    without any real queue capacity juggling. A "full" stub carries one
+    phantom resident no store knows: the purge pass drops it as stale,
+    and the endpoint still reaches the tested refusal / rollback path.
     """
 
     def __init__(self, full: bool) -> None:
         self._full = full
         self.put_nowait_calls: list = []
+        self._residents: list = ["stub-phantom-resident"] if full else []
 
     def full(self) -> bool:
-        return self._full
+        return self._full and bool(self._residents)
+
+    def empty(self) -> bool:
+        return not self._residents
+
+    def get_nowait(self):
+        return self._residents.pop(0)
+
+    def task_done(self) -> None:
+        pass
 
     def qsize(self) -> int:
         return len(self.put_nowait_calls)
@@ -556,7 +569,11 @@ class CancelEndpointTest(unittest.IsolatedAsyncioTestCase):
                 await main.create_task(self.request(operation_id=operation_id))
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(len(stub.put_nowait_calls), 1)
+        # Two enqueue attempts are the contract now: the initial put, then
+        # one retry after the stale-resident purge (the purge found nothing
+        # drainable on this stub, so the retry fails identically and the
+        # QueueFull propagates into the rollback).
+        self.assertEqual(len(stub.put_nowait_calls), 2)
         # A rejected create leaves no durable trace: the rollback removed the
         # task AND the operation binding under the same store lock.
         self.assertEqual(len(self.store.tasks), 0)
@@ -571,7 +588,11 @@ class CancelEndpointTest(unittest.IsolatedAsyncioTestCase):
                 await main.create_task(self.request(operation_id=operation_id))
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(stub.put_nowait_calls, [])
+        # The pre-check no longer refuses on stale residents: the purge
+        # drops the phantom, the admission proceeds and BOTH enqueue
+        # attempts fail (the stub always raises), so the 503 comes from the
+        # rolled-back admission — still no durable trace.
+        self.assertEqual(len(stub.put_nowait_calls), 2)
         self.assertEqual(len(self.store.tasks), 0)
         self.assertEqual(self.store.operations, {})
 

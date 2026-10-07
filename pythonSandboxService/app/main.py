@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import shutil
+import threading
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import (
@@ -23,20 +27,34 @@ from .canonical_fingerprint import (
 from .config import load_config
 from .cancel_registry import registry as cancel_registry, shutdown_marker_write_pool
 from .models import (
+    AcquireWorkspaceRequest,
+    AcquireWorkspaceResponse,
     CancelOutcome,
     CancelTaskRequest,
     CancelTaskResponse,
     CancellationEvidence,
     CreateTaskResponse,
+    DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse,
     EffectiveOutputLimits,
     ExecuteRequest,
     ExecuteResult,
     ExecutionEnvironment,
     FinanceRecordChannel,
+    ListWorkspaceExpiryCandidatesRequest,
+    ListWorkspaceExpiryCandidatesResponse,
     OperationLookupResponse,
+    QueryWorkspaceRequest,
+    QueryWorkspaceResponse,
     SandboxResourceUsage,
+    SealWorkspaceRequest,
+    SealWorkspaceResponse,
     Task,
     TaskStatus,
+    WorkspaceDeleteOutcome,
+    WorkspaceInfo,
+    WorkspaceQueryOutcome,
+    WorkspaceStatus,
 )
 from .nacos_config import DynamicSandboxConfig, start_nacos_listener
 from .pool_scheduler import (
@@ -45,12 +63,26 @@ from .pool_scheduler import (
 )
 from .retry_classification import classify_terminal_retryable
 from .runtime_image_verify import build_docker_client, verify_local_image_id
-from .sandbox_runner import run_in_sandbox
+from .sandbox_runner import (
+    WorkspaceMount,
+    reconcile_workspace_containers,
+    run_in_sandbox,
+    verify_workspace_containers_stopped,
+)
 from .task_store import (
+    DELETE_BUSY,
+    DELETE_DONE,
+    DELETE_MISSING,
+    DELETE_RETRYABLE,
+    DELETE_REVOKED,
+    DELETE_STARTED,
+    AdmissionExhaustedError,
     CancelRequestBindingError,
     CompletionCandidate,
     DurableTaskStore,
     OperationConflictError,
+    _format_activity_utc,
+    _workspace_info,
     build_canceled_result,
 )
 
@@ -95,8 +127,341 @@ tasks: Dict[str, Task] = task_store.tasks
 # AF_SANDBOX_QUEUE_MAX_SIZE (default 128, config.queue_max_size).
 task_queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_size)
 
+# Persistent-workspace wiring. The admission quota is the durable
+# count of QUEUED tasks inside the store — asyncio.Queue.qsize() is never the
+# authority, and the bounded queue can no longer refuse an admitted task
+# (queue residents are a subset of QUEUED tasks, which the create critical
+# section caps at the same limit). The creation switch blocks NEW workspaces
+# only; existing ones keep being served after the feature is turned off.
+task_store.admission_limit = config.queue_max_size
+task_store.workspace_creation_enabled = config.persistent_workspace_enabled
+
+
+def _purge_stale_queue_ids() -> int:
+    """Drop queue residents whose durable state is no longer QUEUED.
+
+    The in-memory queue is a WAKEUP TRANSPORT, never an admission
+    authority: a task canceled while queued stays terminal in the store
+    (its durable quota slot is already released) but its id lingers here
+    until a worker dequeues it. Left in place, stale ids would make a
+    bounded queue look full and wrongly refuse fresh creates with 503.
+    Draining and refilling the live ids in one synchronous pass (no
+    awaits, so no worker interleaving) preserves FIFO order; refilling
+    exactly what was removed can never overflow. Returns the number of
+    stale ids dropped.
+    """
+    purged = 0
+    live: List[str] = []
+    while not task_queue.empty():
+        task_id = task_queue.get_nowait()
+        task = task_store.get(task_id)
+        if task is not None and task.status == TaskStatus.QUEUED:
+            live.append(task_id)
+        else:
+            purged += 1
+        task_queue.task_done()
+    for task_id in live:
+        task_queue.put_nowait(task_id)
+    return purged
+
+
+def _admit_to_queue(task_id: str) -> None:
+    """Best-effort enqueue with one stale-purge retry.
+
+    Runs inside the store's create critical section. A QueueFull here can
+    only come from stale (terminal) residents: the durable admission
+    check has already capped live QUEUED tasks at the same limit the
+    queue is sized with, and deferred workspace tasks are not queue
+    residents. Purging the stale ids once therefore always makes room;
+    if the put STILL fails, the raised QueueFull rolls the just-written
+    records back under the same lock (no durable trace).
+    """
+    try:
+        task_queue.put_nowait(task_id)
+    except asyncio.QueueFull:
+        _purge_stale_queue_ids()
+        task_queue.put_nowait(task_id)
+
+
+class _WorkspaceDeferralRegistry:
+    """In-memory deferred-task side table: one FIFO per workspace.
+
+    A QUEUED task whose workspace is held by another task waits here
+    instead of occupying a worker. The table is memory-only by design: the
+    durable truth is the task's QUEUED status in the state document, so a
+    restart loses nothing (recover_after_restart re-enqueues every healthy
+    QUEUED task) and a lost wake is repaired by the periodic sweeper.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queues: Dict[str, deque] = {}
+
+    def defer(self, workspace_id: str, task_id: str) -> None:
+        with self._lock:
+            self._queues.setdefault(workspace_id, deque()).append(task_id)
+
+    def pop_head(self, workspace_id: str) -> str | None:
+        with self._lock:
+            queue = self._queues.get(workspace_id)
+            return queue.popleft() if queue else None
+
+    def push_front(self, workspace_id: str, task_id: str) -> None:
+        """Restore a popped head that could not be admitted yet.
+
+        Used when the release hook finds the workspace busy AGAIN: the
+        entry must return to the FRONT so FIFO order survives and the
+        next release signal still wakes the longest-waiting task.
+        """
+        with self._lock:
+            self._queues.setdefault(workspace_id, deque()).appendleft(task_id)
+
+    def purge(self, workspace_id: str) -> None:
+        with self._lock:
+            self._queues.pop(workspace_id, None)
+
+    def pending(self) -> Dict[str, List[str]]:
+        with self._lock:
+            return {k: list(v) for k, v in self._queues.items() if v}
+
 # Container scheduler (created in lifespan)
 pool: ContainerPoolScheduler | None = None
+
+workspace_deferrals = _WorkspaceDeferralRegistry()
+# Single-flight guard so the completion hook and the sweeper never admit two
+# heads of one workspace at the same moment (the worker-side begin CAS would
+# re-defer the loser anyway; this keeps the wake-one-head rule clean).
+_readmit_inflight: set[str] = set()
+
+
+def _queue_timeout_result(task: Task, queued_ms: int) -> ExecuteResult:
+    """The shared honest queue-wait timeout result.
+
+    Used by BOTH the worker's post-dequeue check and the deferral sweeper;
+    the wait anchor is always task.created_at — deferral and re-admission
+    never reset it.
+    """
+    resource_usage = SandboxResourceUsage(
+        resource_class=task.request.resource_class,
+        queue_wait_millis=queued_ms,
+        exit_reason="QUEUE_TIMEOUT",
+        attribution_complete=False,
+        missing_fields=[
+            "cpuMillis",
+            "memoryPeakBytes",
+            "logicalBytesScanned",
+            "prepareMillis",
+            "executionWallMillis",
+            "cleanupMillis",
+            "datasetOpenCount",
+        ],
+    )
+    return ExecuteResult(
+        exit_code=-1,
+        stdout="",
+        stderr="sandbox queue wait timeout",
+        dataset_dir=f"{config.workdir}/input/{task.request.dataset_id or ''}",
+        resource_usage=resource_usage,
+        retryable=classify_terminal_retryable(
+            status=TaskStatus.FAILED,
+            exit_code=-1,
+            resource_usage=resource_usage,
+        ),
+    )
+
+
+async def _readmit_workspace_head(workspace_id: str) -> None:
+    """Release hook: re-admit the head of one freed workspace's FIFO.
+
+    Spawned as an independent asyncio task by the completing worker (or by
+    the sweeper), so no worker ever waits on the bounded queue — the
+    re-admission path is deadlock-free by construction. Dead heads (the
+    entry was canceled or timed out while deferred, or the workspace turned
+    dirty/deleting) are skipped and the next entry is considered, so one
+    canceled head cannot strand the tasks behind it. The worker-side begin
+    CAS re-checks the holder under the store lock, so a race can only defer
+    a task again, never double-run it.
+    """
+    if workspace_id in _readmit_inflight:
+        return
+    _readmit_inflight.add(workspace_id)
+    try:
+        while True:
+            task_id = workspace_deferrals.pop_head(workspace_id)
+            if task_id is None:
+                return
+            task = task_store.get(task_id)
+            workspace = task_store.get_workspace(workspace_id)
+            if task is None or task.status != TaskStatus.QUEUED:
+                # Dead head (canceled/timed out/terminalized while
+                # deferred): dropping it is correct — nothing needs a wake.
+                continue
+            if workspace is None or workspace.status != WorkspaceStatus.ACTIVE:
+                # Dirty/deleting workspaces terminalize their QUEUED
+                # siblings inside the store, so a still-QUEUED task here
+                # is unreachable through normal transitions.
+                continue
+            if workspace.holder_task_id is not None:
+                # Busy AGAIN (another task took the slot between the
+                # release signal and this wake): the popped head goes
+                # BACK to the front — silently continuing would drop it
+                # from the FIFO while it stays durably QUEUED with no
+                # remaining wake (the sweeper only sees FIFO residents).
+                workspace_deferrals.push_front(workspace_id, task_id)
+                return
+            # Bounded queue: the admitted-task cap makes a full queue
+            # impossible here, but await put stays safe regardless and never
+            # discards a durable task.
+            await task_queue.put(task_id)
+            return
+    finally:
+        _readmit_inflight.discard(workspace_id)
+
+
+def _release_workspace_after_completion(final_task: Task) -> None:
+    """Schedule the workspace release hook for one finished attempt.
+
+    Success freed the workspace in the same atomic store write that
+    terminalized the task — exactly one deferred head is re-admitted.
+    Any other outcome left the workspace DIRTY and the store already
+    terminalized every still-QUEUED task of it; the in-memory FIFO is
+    dropped so the memory follows the durable state.
+    """
+    request = final_task.request
+    if request is None or not request.workspace_id:
+        return
+    workspace = task_store.get_workspace(request.workspace_id)
+    if workspace is None:
+        return
+    if (
+        workspace.status == WorkspaceStatus.ACTIVE
+        and workspace.holder_task_id is None
+    ):
+        asyncio.create_task(_readmit_workspace_head(request.workspace_id))
+    elif workspace.status == WorkspaceStatus.DIRTY:
+        workspace_deferrals.purge(request.workspace_id)
+
+
+_DEFERRAL_SWEEP_INTERVAL_SECONDS = 5.0
+
+
+def _admission_callback(task_id: str, request: ExecuteRequest):
+    """Post-persist admission for one accepted create (runs under the store
+    lock with rollback). A workspace task whose workspace is already held
+    goes to the per-workspace deferral FIFO instead of the global queue; a
+    free workspace — and every legacy task — enters the bounded queue
+    directly. The worker-side begin CAS resolves any race: a task admitted
+    to the queue for a workspace that turns busy is deferred there, and a
+    task deferred just as the holder clears is picked up by the periodic
+    sweeper within one interval.
+    """
+    workspace_id = request.workspace_id if request is not None else None
+    if not workspace_id:
+        return lambda: _admit_to_queue(task_id)
+
+    def _admit() -> None:
+        workspace = task_store.get_workspace(workspace_id)
+        if workspace is not None and workspace.holder_task_id is not None:
+            workspace_deferrals.defer(workspace_id, task_id)
+            return
+        _admit_to_queue(task_id)
+
+    return _admit
+
+
+def _workspace_directory(workspace_id: str) -> Path:
+    """Resolve a workspace's persistent directory under the trusted root.
+
+    Only server-generated UUID identifiers ever reach here (the registry
+    gate rejected everything else), but the resolution stays defensive:
+    the normalized path must sit strictly INSIDE the configured root, and
+    callers must never be able to steer host paths through an id.
+    """
+    root = config.persistent_workspace_root.resolve()
+    candidate = (root / workspace_id).resolve()
+    if candidate == root or root not in candidate.parents:
+        raise ValueError("workspace id resolves outside the workspace root")
+    return candidate
+
+
+def _remove_workspace_directory(workspace_id: str) -> bool:
+    """Best-attempt directory removal; the CALLER decides the durable
+    outcome from this return value (only a confirmed removal writes the
+    irrevocable DELETED audit row in the store)."""
+    try:
+        directory = _workspace_directory(workspace_id)
+    except ValueError as error:
+        logger.error(
+            "WORKSPACE_DIR_RESOLVE_FAILED id=%s error=%s", workspace_id, error
+        )
+        return False
+    try:
+        if directory.is_symlink() or directory.is_file():
+            # A workspace root entry must be a real directory; anything
+            # else is unexpected state — report failure, never delete blind.
+            logger.error("WORKSPACE_PATH_NOT_A_DIRECTORY path=%s", directory)
+            return False
+        if not directory.exists():
+            return True  # already gone: idempotent success
+        shutil.rmtree(directory)
+        return True
+    except OSError as error:
+        logger.error(
+            "WORKSPACE_DIR_REMOVAL_FAILED id=%s error=%s", workspace_id, error
+        )
+        return False
+
+
+async def _workspace_deferral_sweeper():
+    """Periodic bottom-up safety net for the deferral side table.
+
+    Two jobs per round: (1) terminalize deferred tasks whose queue wait
+    exceeded the configured timeout (anchor stays created_at); (2) re-admit
+    heads that became admissible without a completion signal — the classic
+    case is a head canceled while deferred, or a completion racing the
+    admission-time deferral. Both are idempotent with the completion hook.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_DEFERRAL_SWEEP_INTERVAL_SECONDS)
+            now = datetime.utcnow()
+            for workspace_id, task_ids in workspace_deferrals.pending().items():
+                for task_id in task_ids:
+                    task = task_store.get(task_id)
+                    if task is None or task.status != TaskStatus.QUEUED:
+                        continue
+                    queued_ms = int(
+                        (now - task.created_at).total_seconds() * 1000
+                    )
+                    if queued_ms <= int(
+                        config.queue_wait_timeout_seconds * 1000
+                    ):
+                        continue
+                    task_store.complete_execution(
+                        task_id,
+                        CompletionCandidate(
+                            status=TaskStatus.FAILED,
+                            result=_queue_timeout_result(task, queued_ms),
+                            evidence=CancellationEvidence.NONE,
+                            error="sandbox queue wait timeout",
+                        ),
+                    )
+                    logger.info(
+                        "TASK_DEFERRED_QUEUE_TIMEOUT task=%s workspace=%s"
+                        " queued_ms=%s",
+                        task_id, workspace_id, queued_ms,
+                    )
+                workspace = task_store.get_workspace(workspace_id)
+                if (
+                    workspace is not None
+                    and workspace.status == WorkspaceStatus.ACTIVE
+                    and workspace.holder_task_id is None
+                ):
+                    asyncio.create_task(_readmit_workspace_head(workspace_id))
+        except asyncio.CancelledError:
+            break
+        except Exception as error:
+            logger.error("workspace deferral sweeper error: %s", error)
 
 
 async def _log_pool_stats():
@@ -204,37 +569,10 @@ async def _process_task_inner(task: Task, worker_id: int):
     started_at = datetime.utcnow()
     queued_ms = int((started_at - task.created_at).total_seconds() * 1000)
     if queued_ms > int(config.queue_wait_timeout_seconds * 1000):
-        resource_usage = SandboxResourceUsage(
-            resource_class=task.request.resource_class,
-            queue_wait_millis=queued_ms,
-            exit_reason="QUEUE_TIMEOUT",
-            attribution_complete=False,
-            missing_fields=[
-                "cpuMillis",
-                "memoryPeakBytes",
-                "logicalBytesScanned",
-                "prepareMillis",
-                "executionWallMillis",
-                "cleanupMillis",
-                "datasetOpenCount",
-            ],
-        )
-        result = ExecuteResult(
-            exit_code=-1,
-            stdout="",
-            stderr="sandbox queue wait timeout",
-            dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
-            resource_usage=resource_usage,
-            retryable=classify_terminal_retryable(
-                status=TaskStatus.FAILED,
-                exit_code=-1,
-                resource_usage=resource_usage,
-            ),
-            # 260808-finance-methodspec-v5 work package D: queue timeout runs
-            # before sandbox opens, so no execution_environment is available;
-            # presence-aware consumers see hasExecutionEnvironment() == false.
-            execution_environment=None,
-        )
+        # 260808-finance-methodspec-v5 work package D: queue timeout runs
+        # before sandbox opens, so no execution_environment is available;
+        # presence-aware consumers see hasExecutionEnvironment() == false.
+        result = _queue_timeout_result(task, queued_ms)
         # D11: the terminal state is persisted through the same
         # complete_execution gate as every other outcome — if a cancel
         # already terminalized the task in the store lock, the CANCELED
@@ -250,14 +588,24 @@ async def _process_task_inner(task: Task, worker_id: int):
             ),
         )
         return
-    # D11 (task #108, codex c6c49248 review): begin_execution returns a
-    # deep copy snapshot so the execution path reads a stable frozen task
-    # and cannot accidentally overwrite a cancel terminal-state through a
-    # stray save().  None means the task is no longer QUEUED inside the
-    # store lock — a cancel terminalized it (QUEUED_CANCEL) and the worker
-    # must not touch it.
+    # The begin gate returns a deep copy snapshot so the execution path
+    # reads a stable frozen task and cannot accidentally overwrite a
+    # cancel terminal-state through a stray save().  For workspace tasks
+    # the SAME atomic commit also takes the workspace single-writer slot;
+    # busy means another task holds it — the task is deferred to the
+    # per-workspace FIFO and the worker moves on.  task=None without busy
+    # means the task is no longer QUEUED inside the store lock — a cancel
+    # terminalized it and the worker must not touch it.
     task_id = task.task_id
-    task = task_store.begin_execution(task_id)
+    begin = task_store.begin_execution_exclusive(task_id)
+    if begin.busy:
+        workspace_deferrals.defer(task.request.workspace_id, task_id)
+        logger.info(
+            "TASK_WORKSPACE_DEFERRED task=%s worker=%s workspace=%s queued_ms=%s",
+            task_id, worker_id, task.request.workspace_id, queued_ms,
+        )
+        return
+    task = begin.task
     if task is None:
         logger.info(
             "TASK_CANCELED_BEFORE_START task=%s worker=%s queued_ms=%s",
@@ -279,8 +627,19 @@ async def _process_task_inner(task: Task, worker_id: int):
         else None
     )
     try:
-        # Run synchronous sandbox runner in thread pool
-        if pool is not None and config.pool_enabled:
+        # Run synchronous sandbox runner in thread pool.  Workspace tasks
+        # NEVER ride the warm pool: a pooled container is reused across
+        # tasks and carries no per-Run mount, so an old Run would silently
+        # lose its persistent directory.  This also covers the restart
+        # where the feature was switched OFF while workspaces exist (the
+        # startup mutex only fires while the feature is ON) and the pool
+        # was enabled — legacy tasks keep pooling, workspace tasks take a
+        # fresh container with their mount.
+        if (
+            pool is not None
+            and config.pool_enabled
+            and not task.request.workspace_id
+        ):
             result_dict = await asyncio.to_thread(
                 pool.run_task,
                 task.task_id,
@@ -296,6 +655,23 @@ async def _process_task_inner(task: Task, worker_id: int):
                 effective_output_limits=frozen_limits,
             )
         else:
+            # Workspace tasks: persist the container identity tuple BEFORE
+            # the container exists and bind the Run's persistent directory
+            # into the task container (the write probe runs inside the
+            # runner before any user code starts).
+            workspace_mount = None
+            if task.request.workspace_id:
+                identity_labels = task_store.prepare_container_identity(
+                    task.task_id, config.deployment_id
+                )
+                try:
+                    host_dir = _workspace_directory(task.request.workspace_id)
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"unresolvable workspace directory for"
+                        f" {task.request.workspace_id}: {error}"
+                    ) from error
+                workspace_mount = WorkspaceMount(host_dir=str(host_dir), labels=identity_labels)
             result_dict = await asyncio.to_thread(
                 run_in_sandbox,
                 config,
@@ -312,7 +688,16 @@ async def _process_task_inner(task: Task, worker_id: int):
                 resource_class=task.request.resource_class,
                 memory_limit_bytes=task.request.memory_limit_bytes,
                 effective_output_limits=frozen_limits,
+                **(
+                    {"workspace_mount": workspace_mount}
+                    if workspace_mount is not None
+                    else {}
+                ),
             )
+            if workspace_mount is not None:
+                task_store.record_container_id(
+                    task.task_id, result_dict.get("container_id")
+                )
         usage_payload = result_dict.get("resource_usage")
         resource_usage = None
         if usage_payload:
@@ -445,6 +830,7 @@ async def _process_task_inner(task: Task, worker_id: int):
             error=str(e),
         )
     final_task = task_store.complete_execution(task.task_id, candidate)
+    _release_workspace_after_completion(final_task)
     duration_ms = int(
         (final_task.finished_at - final_task.started_at).total_seconds() * 1000
     )
@@ -513,6 +899,25 @@ async def lifespan(app: FastAPI):
     # exist (workers drain the queue while the backlog is being put).
     recovered_task_ids = list(task_store.recover_after_restart())
 
+    # Restart container reconciliation (identity-checked, best effort): the
+    # store recovery above already terminalized abandoned RUNNING tasks and
+    # marked their workspaces dirty, so this pass only reclaims leftover
+    # containers whose FULL persisted label tuple matches a record in THIS
+    # state document — another deployment's containers, generic-label
+    # containers and tampered labels are never touched. Docker being
+    # unreachable fails soft with an alarm (workspaces stay dirty either
+    # way; nothing is auto-released).
+    try:
+        sweep_report = reconcile_workspace_containers(config, task_store)
+        if sweep_report.get("stopped") or sweep_report.get("foreign"):
+            logger.info("WORKSPACE_CONTAINER_SWEEP %s", sweep_report)
+    except Exception as sweep_error:
+        logger.error(
+            "WORKSPACE_CONTAINER_SWEEP_FAILED error=%s (containers left"
+            " untouched; workspaces already dirty from store recovery)",
+            sweep_error,
+        )
+
     # Start Nacos config listener for hot-reloadable values.
     start_nacos_listener(config, dynamic_config)
 
@@ -530,13 +935,17 @@ async def lifespan(app: FastAPI):
     for recovered_task_id in recovered_task_ids:
         await task_queue.put(recovered_task_id)
     stats_task = asyncio.create_task(_log_pool_stats())
+    deferral_sweeper_task = asyncio.create_task(_workspace_deferral_sweeper())
     yield
 
     # Shutdown workers
     stats_task.cancel()
+    deferral_sweeper_task.cancel()
     for worker_task in worker_tasks:
         worker_task.cancel()
-    await asyncio.gather(*worker_tasks, stats_task, return_exceptions=True)
+    await asyncio.gather(
+        *worker_tasks, stats_task, deferral_sweeper_task, return_exceptions=True
+    )
 
     # Close pool
     if pool is not None:
@@ -579,9 +988,14 @@ async def cancel_validation_handler(request: Request, exc: RequestValidationErro
     # (only 400 / 409 / 500 / 503).  Every body defect on the /tasks/cancel
     # route must answer 400 → Gateway INVALID_ARGUMENT, which is what the
     # endpoint already does for the business-rule validations inside the
-    # handler body.  Other routes keep their builtin 422 behavior untouched
-    # (this handler is deliberately route-scoped, not global).
-    if request.url.path == "/tasks/cancel":
+    # handler body.  The workspace routes follow the same convention: a
+    # half-known recovery identity or a blank id is a parameter error, and
+    # the frozen vocabulary has no 422 slot for it.  Other routes keep their
+    # builtin 422 behavior untouched (this handler is deliberately
+    # route-scoped, not global).
+    if request.url.path == "/tasks/cancel" or request.url.path.startswith(
+        "/workspaces/"
+    ):
         return JSONResponse(
             status_code=400,
             content={"detail": "invalid request body"},
@@ -594,7 +1008,13 @@ async def cancel_validation_handler(request: Request, exc: RequestValidationErro
 
 @app.get("/health")
 async def health() -> dict:
-    result = {"status": "ok", "pool_enabled": config.pool_enabled}
+    result = {
+        "status": "ok",
+        "pool_enabled": config.pool_enabled,
+        # The effective boolean only — no user file or code content is ever
+        # reflected here.
+        "persistent_workspace_enabled": config.persistent_workspace_enabled,
+    }
     if pool is not None:
         try:
             stats = pool.get_stats()
@@ -740,6 +1160,14 @@ async def create_task(request: ExecuteRequest):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if early_decision is not None:
+        if early_decision.workspace_result is not None:
+            # The workspace state gate refused before any replay answer:
+            # no task exists or is returned for this call.
+            return CreateTaskResponse(
+                task_id="",
+                existing=False,
+                workspace_result=early_decision.workspace_result,
+            )
         return CreateTaskResponse(
             task_id=early_decision.task.task_id,
             status=early_decision.task.status,
@@ -764,6 +1192,11 @@ async def create_task(request: ExecuteRequest):
     # tombstone needs no queue slot.  Only a genuinely unknown operation is
     # rejected with 503 while the queue is full.
     if task_queue.full():
+        # A full transport queue may be stale residents only (canceled
+        # while queued): the durable quota — the real authority — may
+        # still have room. Purge before refusing anyone.
+        _purge_stale_queue_ids()
+    if task_queue.full():
         try:
             full_decision = task_store.find_existing_or_adopt_tombstone(
                 request, frozen_limits, frozen_image_ref
@@ -773,6 +1206,12 @@ async def create_task(request: ExecuteRequest):
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         if full_decision is not None:
+            if full_decision.workspace_result is not None:
+                return CreateTaskResponse(
+                    task_id="",
+                    existing=False,
+                    workspace_result=full_decision.workspace_result,
+                )
             return CreateTaskResponse(
                 task_id=full_decision.task.task_id,
                 status=full_decision.task.status,
@@ -794,17 +1233,33 @@ async def create_task(request: ExecuteRequest):
     # on the next startup — the documented honest resolution.)
     try:
         decision = task_store.create_with_admission(
-            task, admission=lambda: task_queue.put_nowait(task.task_id)
+            task, admission=_admission_callback(task.task_id, task.request)
         )
     except OperationConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except AdmissionExhaustedError as error:
+        # The durable admission quota (count of QUEUED tasks) is the
+        # authority; the queue-full pre-check above is only a cheap filter.
+        logger.warning("sandbox.create.admission_exhausted limit=%s", config.queue_max_size)
+        raise HTTPException(
+            status_code=503,
+            detail="sandbox admission quota exhausted; retry later",
+        ) from error
     except asyncio.QueueFull as error:
         raise HTTPException(
             status_code=503,
             detail="sandbox task queue is full; retry later",
         ) from error
+    if decision.workspace_result is not None:
+        # 200 + machine field: the workspace refused, nothing was created.
+        # No task reference is attached — callers decide on this field.
+        return CreateTaskResponse(
+            task_id="",
+            existing=False,
+            workspace_result=decision.workspace_result,
+        )
     return CreateTaskResponse(
         task_id=decision.task.task_id,
         status=decision.task.status,
@@ -900,6 +1355,199 @@ async def cancel_task(request: CancelTaskRequest):
         task_id=decision.task_id,
         status=decision.status,
         error=None,
+    )
+
+
+@app.post("/workspaces/acquire", response_model=AcquireWorkspaceResponse)
+async def acquire_workspace(request: AcquireWorkspaceRequest):
+    """取得或创建工作区.
+
+    Business outcomes answer 200 + the workspace/workspace_result body per
+    the frozen transport contract (presence decides; the error channel is
+    reserved for transport faults). The sandbox never judges Run-level
+    eligibility here — a first acquisition simply creates or returns the
+    Run's workspace; callers that must check Run state do it before
+    calling.
+    """
+    response = task_store.acquire_workspace(request)
+    if response.workspace_result is not None:
+        logger.info(
+            "WORKSPACE_ACQUIRE_REFUSED run=%s result=%s",
+            request.run_id, response.workspace_result.value,
+        )
+    else:
+        logger.info(
+            "WORKSPACE_ACQUIRED run=%s workspace=%s generation=%s status=%s",
+            request.run_id,
+            response.workspace.workspace_id,
+            response.workspace.workspace_generation,
+            response.workspace.status.value,
+        )
+    return response
+
+
+@app.post("/workspaces/delete", response_model=DeleteWorkspaceResponse)
+async def delete_workspace(request: DeleteWorkspaceRequest):
+    """Delete a workspace (manual unconditional path and the expiry
+    coordinator's conditional path share this entry).
+
+    Phase 1 flips the durable state to DELETING (a concurrent worker
+    acquire loses in the store lock); phase 2 removes the directory and
+    only a CONFIRMED removal writes the irrevocable DELETED audit row. A
+    failed removal keeps the retryable DELETING state — repeat calls
+    continue the removal. A conditional delete whose scan-time activity
+    moment no longer matches is refused with REVOKED_NEW_ACTIVITY
+    (deleted=false, retryable_failure=false): nothing was deleted and the
+    coordinator revokes its cleanup mark.
+    """
+    decision = task_store.delete_workspace_begin(
+        request.workspace_id,
+        request.idempotency_key,
+        expected_last_active_at=request.expected_last_active_at,
+    )
+    if decision.outcome == DELETE_MISSING:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    if decision.outcome == DELETE_REVOKED:
+        logger.info(
+            "WORKSPACE_DELETE_REVOKED id=%s (new activity since the scan)",
+            request.workspace_id,
+        )
+        return DeleteWorkspaceResponse(
+            deleted=False,
+            retryable_failure=False,
+            outcome=WorkspaceDeleteOutcome.WORKSPACE_DELETE_REVOKED_NEW_ACTIVITY,
+        )
+    if decision.outcome == DELETE_BUSY:
+        # A concurrent acquire won; the delete retries later.
+        return DeleteWorkspaceResponse(
+            deleted=False,
+            retryable_failure=True,
+            outcome=(
+                WorkspaceDeleteOutcome.WORKSPACE_DELETE_TEMPORARILY_UNAVAILABLE
+            ),
+        )
+    if decision.outcome == DELETE_DONE:
+        return DeleteWorkspaceResponse(
+            deleted=True, outcome=WorkspaceDeleteOutcome.WORKSPACE_DELETE_DELETED
+        )
+    # DELETE_STARTED: the DELETING state is durable. Before touching the
+    # disk, verify no LIVE container still binds the directory (crash-window
+    # containers whose sweep failed, or a container another deployment
+    # owns): an unchecked removal would strand a running container on a
+    # deleted directory while the audit row already says gone. Any doubt
+    # keeps the retryable DELETING state — a repeated delete continues.
+    if not verify_workspace_containers_stopped(
+        config, task_store, request.workspace_id
+    ):
+        logger.warning(
+            "WORKSPACE_DELETE_CONTAINERS_UNVERIFIED id=%s", request.workspace_id
+        )
+        return DeleteWorkspaceResponse(
+            deleted=False,
+            retryable_failure=True,
+            outcome=(
+                WorkspaceDeleteOutcome.WORKSPACE_DELETE_TEMPORARILY_UNAVAILABLE
+            ),
+        )
+    disk_removed = _remove_workspace_directory(request.workspace_id)
+    finish = task_store.delete_workspace_finish(request.workspace_id, disk_removed)
+    if finish.outcome == DELETE_DONE:
+        # Memory hygiene only — the store already terminalized every
+        # still-QUEUED task of this workspace when it entered DELETING.
+        workspace_deferrals.purge(request.workspace_id)
+        logger.info(
+            "WORKSPACE_DELETED id=%s idempotency_key=%s",
+            request.workspace_id, request.idempotency_key,
+        )
+        return DeleteWorkspaceResponse(
+            deleted=True, outcome=WorkspaceDeleteOutcome.WORKSPACE_DELETE_DELETED
+        )
+    logger.warning(
+        "WORKSPACE_DELETE_RETRYABLE id=%s disk_removed=%s",
+        request.workspace_id, disk_removed,
+    )
+    return DeleteWorkspaceResponse(
+        deleted=False,
+        retryable_failure=True,
+        outcome=WorkspaceDeleteOutcome.WORKSPACE_DELETE_TEMPORARILY_UNAVAILABLE,
+    )
+
+
+@app.post("/workspaces/seal", response_model=SealWorkspaceResponse)
+async def seal_workspace(request: SealWorkspaceRequest):
+    """Idempotent seal: persist the cleanup intent for one Run.
+
+    Decided under the same state lock that arbitrates acquire and task
+    admission, so the create side of an eligibility-to-creation race
+    always loses to a persisted seal. The attached workspace (when the
+    Run has one) reports its status as-is: sealed after this call, or
+    deleting/deleted when a deletion was already underway.
+    """
+    decision = task_store.seal_workspace(request.run_id, request.idempotency_key)
+    logger.info(
+        "WORKSPACE_SEALED run=%s workspace=%s status=%s",
+        request.run_id,
+        decision.workspace.workspace_id if decision.workspace else None,
+        decision.workspace.status.value if decision.workspace else "diskless",
+    )
+    return SealWorkspaceResponse(
+        sealed=decision.sealed,
+        workspace=(
+            _workspace_info(decision.workspace)
+            if decision.workspace is not None
+            else None
+        ),
+    )
+
+
+@app.post("/workspaces/query", response_model=QueryWorkspaceResponse)
+async def query_workspace(request: QueryWorkspaceRequest):
+    """Read-only three-state query for one Run; never creates a record.
+
+    NOT_FOUND means this instance holds no record of the Run — callers
+    must not read it as a successful deletion (the disk may live on
+    another lane or another deployment generation's instance), and after
+    a persisted seal it marks unclear routing/state rather than a
+    confirmed diskless Run. Only FOUND_DELETED vouches a completed
+    deletion (with the old identity attached); FOUND without a workspace
+    is the durable diskless seal.
+    """
+    decision = task_store.query_workspace(request.run_id)
+    response = QueryWorkspaceResponse(outcome=decision.outcome)
+    if decision.workspace is not None:
+        response.workspace = _workspace_info(decision.workspace)
+        if decision.workspace.last_active_at is not None:
+            response.last_active_at = _format_activity_utc(
+                decision.workspace.last_active_at
+            )
+        if decision.workspace.deleted_at is not None:
+            response.deleted_at = _format_activity_utc(
+                decision.workspace.deleted_at
+            )
+    elif decision.run_seal is not None:
+        response.last_active_at = _format_activity_utc(decision.run_seal.sealed_at)
+    return response
+
+
+@app.post(
+    "/workspaces/expiry-candidates",
+    response_model=ListWorkspaceExpiryCandidatesResponse,
+)
+async def list_workspace_expiry_candidates(
+    request: ListWorkspaceExpiryCandidatesRequest,
+):
+    """One bounded page of this instance's local, non-DELETED workspaces.
+
+    The coordinator walks pages across every deployment generation and
+    re-checks each row (due-ness with its current retention configuration,
+    lane ownership from its database) before acting; DELETED audit rows
+    stay per-Run queryable forever and never appear here.
+    """
+    candidates, next_token = task_store.list_workspace_expiry_candidates(
+        request.page_size, request.page_token
+    )
+    return ListWorkspaceExpiryCandidatesResponse(
+        candidates=candidates, next_page_token=next_token
     )
 
 

@@ -32,6 +32,7 @@ from app.models import (
 )
 from app.task_store import (
     SCHEMA_VERSION_V3,
+    SCHEMA_VERSION_V5,
     SYNTHETIC_EXIT_CODE,
     CancelRequestBindingError,
     CompletionCandidate,
@@ -303,14 +304,18 @@ class CancelBindingDurabilityTests(_TaskStoreTestBase):
         self.assertEqual(self.store.get("task-3").status, TaskStatus.CANCELED)
 
     def test_cancel_requests_survive_schema_v3_round_trip(self) -> None:
-        # Contract: cancel_requests are part of the schema v3 document; after
+        # Contract: cancel_requests are part of the durable document; after
         # a restart the same-target replay still answers correctly.
+        # The CURRENT write format is v5 (the
+        # v3 document layout plus the workspaces registry, the
+        # store_instance_id and the workspace activity/seal fields);
+        # v3 files stay readable with the feature off.
         self.add_queued_task("task-rt")
         self.store.cancel_by_task_id("cr-rt", "task-rt", "USER_REQUEST")
 
         document = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(document["schema_version"], SCHEMA_VERSION_V3)
-        self.assertEqual(document["schema_version"], "sandbox_task_store_v3")
+        self.assertEqual(document["schema_version"], SCHEMA_VERSION_V5)
+        self.assertEqual(document["schema_version"], "sandbox_task_store_v5")
         self.assertIn("cr-rt", document["cancel_requests"])
         self.assertEqual(
             document["cancel_requests"]["cr-rt"]["target_type"], "by_task_id"

@@ -1140,6 +1140,47 @@ def parse_wrapper_input(path: Path) -> dict:
             "global sitecustomize.py)"
         )
 
+    # Persistent-workspace mode: the Run's persistent user directory mounted
+    # into the container becomes the user child's cwd. Field-level rules
+    # (AF_TASK_WORKSPACE follows the child cwd; disjointness from the
+    # control workspace) are enforced by the shared payload contract; the
+    # parser adds the filesystem evidence — the mount point must exist as a
+    # REAL directory (not a symlink), because the runner probes writability
+    # there before the child ever starts.
+    persistent_workspace = payload.get("persistentWorkspace")
+    if persistent_workspace is not None:
+        if (
+            not isinstance(persistent_workspace, str)
+            or not persistent_workspace.strip()
+        ):
+            raise WrapperInputError(
+                "persistentWorkspace must be a non-empty string when present"
+            )
+        persistent_real = Path(persistent_workspace)
+        if persistent_real.is_symlink():
+            raise WrapperInputError(
+                f"persistentWorkspace={persistent_workspace!r} must be a "
+                "real directory, not a symlink"
+            )
+        persistent_real = persistent_real.resolve()
+        control_real = Path(task_workspace).resolve()
+        if persistent_real == control_real or str(
+            persistent_real
+        ).startswith(str(control_real).rstrip("/") + "/") or str(
+            control_real
+        ).startswith(str(persistent_real).rstrip("/") + "/"):
+            raise WrapperInputError(
+                f"persistentWorkspace={persistent_workspace!r} and "
+                f"taskWorkspace={task_workspace!r} must be disjoint real "
+                "directories (neither inside the other)"
+            )
+        if not persistent_real.is_dir():
+            raise WrapperInputError(
+                f"persistentWorkspace={persistent_workspace!r} must exist "
+                "as a real directory (the runner mounts and probes it "
+                "before the child starts)"
+            )
+
     task_env_payload = payload.get("taskEnvironment")
     if not isinstance(task_env_payload, dict):
         raise WrapperInputError(
@@ -1255,6 +1296,7 @@ def parse_wrapper_input(path: Path) -> dict:
         "timeout_seconds": timeout_seconds,
         "limits": limits,
         "task_workspace": task_workspace,
+        "persistent_workspace": persistent_workspace,
         "task_environment": task_environment,
         "loader_python_path": loader_python_path,
         "cancel_marker_path": cancel_marker_path,
@@ -1484,6 +1526,7 @@ def run_bounded_capture(
     limits: dict,
     capture_dir: Path,
     task_workspace: str | None = None,
+    persistent_workspace: str | None = None,
     task_environment: dict[str, str] | None = None,
     workdir_for_pythonpath: str | None = None,
     cancel_marker_path: str | None = None,
@@ -1633,10 +1676,13 @@ def run_bounded_capture(
             ):
                 if sub_dir:
                     Path(sub_dir).mkdir(parents=True, exist_ok=True)
+        # The user child runs IN the persistent Run directory when one is
+        # mounted; otherwise the legacy per-task control workspace. The
+        # runner probed writability of the mount before the wrapper started.
         spawn_cwd = (
-            task_workspace
-            if task_workspace
-            else str(Path(script_path).resolve().parent)
+            persistent_workspace
+            or task_workspace
+            or str(Path(script_path).resolve().parent)
         )
 
         # Build the child env: wrapper's own env + AF_TASK_* (task-scoped).
@@ -1899,6 +1945,7 @@ def main(argv: list[str] | None = None) -> int:
             limits=parsed["limits"],
             capture_dir=capture_dir,
             task_workspace=parsed["task_workspace"],
+            persistent_workspace=parsed.get("persistent_workspace"),
             task_environment=parsed["task_environment"],
             workdir_for_pythonpath=parsed.get("loader_python_path"),
             cancel_marker_path=cancel_marker_path,
