@@ -16,6 +16,8 @@ import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
+import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
@@ -169,8 +171,11 @@ public class ToolJobFinalizer {
                 boolean success = "SUCCEEDED".equals(terminalStatus);
                 boolean hasFinanceData = resultResp.hasFinanceRecordChannel()
                         || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY));
+                boolean workspaceDirty = PythonSandboxJobResultAdapter.isWorkspaceDirty(
+                        terminalStatus, resultResp);
 
                 String previewJson;
+                String failureCode = null;
                 if (success) {
                     if (hasFinanceData) {
                         if (anchor.getFinanceRecordLimitsJson() == null
@@ -225,14 +230,6 @@ public class ToolJobFinalizer {
                     }
                 } else {
                     // FAILED / CANCELED
-                    boolean retryable = resultResp.hasRetryable() && resultResp.getRetryable();
-                    String failureCode = "CANCELED".equals(terminalStatus)
-                            ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
-                    FinanceToolResultFormatter.FailureDetail failure =
-                            new FinanceToolResultFormatter.FailureDetail(
-                                    failureCode, "Sandbox " + terminalStatus, retryable,
-                                    retryable ? "检查代码后重试" : "检查代码或联系管理员");
-
                     if (hasFinanceData) {
                         if (anchor.getFinanceRecordLimitsJson() == null
                                 || anchor.getFinanceRecordLimitsJson().isBlank()) {
@@ -270,13 +267,32 @@ public class ToolJobFinalizer {
                                 .filter(line -> !line.contains(FinanceRecordDecoder.MARKER_FAMILY))
                                 .collect(java.util.stream.Collectors.joining("\n"));
                     }
-                    previewJson = formatter.formatFailure(stdout, stderr, failure);
+                    // 金融记录清理后共用工具结果分类，工作区跳过的说明与其他接收路径一致。
+                    SandboxTerminalResultView failureResult = new SandboxTerminalResultView(
+                            terminalStatus, resultResp.getExitCode(), stdout, stderr,
+                            null, null, resultResp.getError(),
+                            resultResp.hasRetryable() ? resultResp.getRetryable() : null,
+                            resultResp.getDatasetDir(), resultResp);
+                    PythonSandboxJobResultAdapter resultAdapter =
+                            new PythonSandboxJobResultAdapter(formatter, adapter);
+                    failureCode = resultAdapter.errorCodeOf(failureResult);
+                    if (workspaceDirty) {
+                        previewJson = resultAdapter.formatTerminalResult(failureResult, null);
+                    } else {
+                        // 普通脚本失败与取消保留原有提示和重试判断。
+                        boolean retryable = resultResp.hasRetryable() && resultResp.getRetryable();
+                        previewJson = formatter.formatFailure(stdout, stderr,
+                                new FinanceToolResultFormatter.FailureDetail(
+                                        failureCode, "Sandbox " + terminalStatus, retryable,
+                                        retryable ? "检查代码后重试" : "检查代码或联系管理员"));
+                    }
                 }
                 anchor.setTerminalResultPreview(previewJson);
                 anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
                 anchor.setTerminalStderrPreview(boundedPreview(stderr));
-                // error 保存结构化失败码，不用异常 message 替代。
-                anchor.setTerminalErrorCode(emptyToNull(resultResp.getError()));
+                // 工作区错误保存工具统一分类，其他结果保留原有错误详情。
+                anchor.setTerminalErrorCode(workspaceDirty
+                        ? failureCode : emptyToNull(resultResp.getError()));
                 anchor.setTerminalExitReason(emptyToNull(resultResp.getResourceUsage().getExitReason()));
                 if (!"SUCCEEDED".equals(terminalStatus)) {
                     appendFailedPythonFingerprint(anchor);
@@ -289,8 +305,10 @@ public class ToolJobFinalizer {
                 } catch (Exception e) {
                     log.warn("Failed to serialize resourceUsage for run={}", runId, e);
                 }
-                // presence-aware 字段区分 false 与协议缺失；缺失时直接阻断 release，不留中间状态。
-                if (resultResp.hasRetryable()) {
+                // 工作区标脏明确不可重试；其他结果区分 false 与字段缺失，缺失时阻断容量释放。
+                if (workspaceDirty) {
+                    anchor.setTerminalRetryable(false);
+                } else if (resultResp.hasRetryable()) {
                     anchor.setTerminalRetryable(resultResp.getRetryable());
                 }
             } else if ("RESULT_LOST".equals(terminalStatus)) {
