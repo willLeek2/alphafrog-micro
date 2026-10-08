@@ -2,6 +2,7 @@ package world.willfrog.agent.tools.market.advanced;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import lombok.Builder;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
@@ -23,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 
 @Slf4j
 public class AdvancedSearchDatasetWriter {
@@ -47,10 +49,10 @@ public class AdvancedSearchDatasetWriter {
                                     Map<String, Object> canonicalQuery,
                                     Map<String, Object> dataset,
                                     int previewLimit) {
-        String querySignature = querySignature(toolName, assetType, canonicalQuery);
+        String contentSignature = contentSignature(toolName, assetType, canonicalQuery, dataset);
         if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
             Optional<DatasetRegistry.DatasetMeta> existing = datasetRegistry.findReusable(
-                    DATASET_TYPE, querySignature, "NONE", "NONE", COLUMNS);
+                    DATASET_TYPE, contentSignature, "NONE", "NONE", COLUMNS);
             if (existing.isPresent()) {
                 List<Map<String, Object>> previewRows = readPreviewRows(existing.get(), previewLimit);
                 return WriteResult.builder()
@@ -70,13 +72,13 @@ public class AdvancedSearchDatasetWriter {
                     .build();
         }
 
-        String datasetId = "adv-" + querySignature.substring(0, 12);
+        String datasetId = "adv-" + contentSignature.substring(0, 12);
         String dataFileName = "data.json";
         String topic = DatabaseFetchedPathStrategy.resolveTopic(DATASET_TYPE);
-        String encodedStr = DatabaseFetchedPathStrategy.encodedString(DATASET_TYPE, querySignature,
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(DATASET_TYPE, contentSignature,
                 "NONE", "NONE", COLUMNS);
         Path dir = DatabaseFetchedPathStrategy.resolveDataPath(
-                Paths.get(datasetWriter.getDatabaseFetchedPath()), topic, querySignature, encodedStr);
+                Paths.get(datasetWriter.getDatabaseFetchedPath()), topic, contentSignature, encodedStr);
         try {
             Files.createDirectories(dir);
             Path jsonFile = dir.resolve(dataFileName);
@@ -92,12 +94,21 @@ public class AdvancedSearchDatasetWriter {
             meta.put("row_count", dataset.get("row_count"));
             meta.put("data_file", dataFileName);
             meta.put("created_at", Instant.now().toEpochMilli());
+            // 统计来自已写产物，JSON 记录位于 results，不能把格式标识当作实际列名。
+            Integer rowCount = dataset.get("results") instanceof List<?> rows ? rows.size() : null;
+            List<String> columns = resultColumns(dataset);
+            meta.put("rowCount", rowCount);
+            meta.put("bytes", Files.size(jsonFile));
+            meta.put("columns", columns);
+            meta.put("recordsPath", "results");
+            meta.put("metadataStatus", rowCount == null || columns.isEmpty() ? "partial" : "complete");
+            objectMapper.writerWithDefaultPrettyPrinter().writeValue(dir.resolve("data.meta.json").toFile(), meta);
+            // 旧文件名仍供已有读取方使用，两份元数据描述同一个 JSON 产物。
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(dir.resolve(datasetId + ".meta.json").toFile(), meta);
 
             if (datasetRegistry.isEnabled()) {
-                int rowCount = ((Number) dataset.getOrDefault("row_count", 0)).intValue();
-                datasetRegistry.registerDataset(DATASET_TYPE, querySignature, "NONE", "NONE",
-                        COLUMNS, datasetId, rowCount, "json", dataFileName);
+                datasetRegistry.registerDataset(DATASET_TYPE, contentSignature, "NONE", "NONE",
+                        COLUMNS, datasetId, rowCount == null ? 0 : rowCount, "json", dataFileName);
             }
             return WriteResult.builder()
                     .datasetId(datasetId)
@@ -108,6 +119,21 @@ public class AdvancedSearchDatasetWriter {
         } catch (IOException e) {
             throw new AdvancedSearchException("TOOL_ERROR", "Failed to write advanced search dataset: " + e.getMessage());
         }
+    }
+
+    private List<String> resultColumns(Map<String, Object> dataset) {
+        if (!(dataset.get("results") instanceof List<?> rows)) {
+            return List.of();
+        }
+        TreeSet<String> columns = new TreeSet<>();
+        for (Object row : rows) {
+            if (row instanceof Map<?, ?> record) {
+                record.keySet().forEach(key -> columns.add(String.valueOf(key)));
+            }
+        }
+        // 空结果仍遵循高级搜索引擎的记录结构。
+        return rows.isEmpty() ? List.of("ts_code", "name", "asset_type", "match_conditions")
+                : List.copyOf(columns);
     }
 
     private List<Map<String, Object>> readPreviewRows(DatasetRegistry.DatasetMeta meta, int previewLimit) {
@@ -146,18 +172,21 @@ public class AdvancedSearchDatasetWriter {
         return preview;
     }
 
-    private String querySignature(String toolName, String assetType, Map<String, Object> canonicalQuery) {
+    private String contentSignature(String toolName, String assetType, Map<String, Object> canonicalQuery,
+                                  Map<String, Object> dataset) {
         try {
-            String raw = objectMapper.writeValueAsString(Map.of(
+            // 完整结果参与身份，避免同一查询在数据源更新后仍复用旧文件；对象键排序，数组保序。
+            String raw = objectMapper.writer(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS).writeValueAsString(Map.of(
                     "schema_version", 1,
                     "tool", toolName == null ? "" : toolName,
                     "asset_type", assetType == null ? "" : assetType,
-                    "query", canonicalQuery == null ? Map.of() : canonicalQuery
+                    "query", canonicalQuery == null ? Map.of() : canonicalQuery,
+                    "dataset", dataset
             ));
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(raw.getBytes(StandardCharsets.UTF_8)));
         } catch (Exception e) {
-            throw new AdvancedSearchException("TOOL_ERROR", "Failed to build advanced search query signature.");
+            throw new AdvancedSearchException("TOOL_ERROR", "Failed to build advanced search content signature.");
         }
     }
 
