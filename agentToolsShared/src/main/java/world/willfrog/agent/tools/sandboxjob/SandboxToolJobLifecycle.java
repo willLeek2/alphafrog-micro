@@ -1063,6 +1063,8 @@ public final class SandboxToolJobLifecycle {
             return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_NOT_RECORDED",
                     "Sandbox request identity could not be saved before dispatch", Map.of());
         }
+        // 完整准备请求已落库，但尚未调用沙箱；故障信号不能被下方 RPC 异常裁决捕获。
+        hitFaultPoint(deps, member.runId(), ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT);
         long createStartMs = System.currentTimeMillis();
         SandboxCreateVerdict verdict;
         String workspaceRefusalCode = null;
@@ -1110,6 +1112,8 @@ public final class SandboxToolJobLifecycle {
             throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null, createRequestJson);
         }
         String taskId = ((SandboxCreateVerdict.Confirmed) verdict).taskId();
+        // 沙箱任务身份已确认，但带任务编号的派发证明尚未交给调用方落库。
+        hitFaultPoint(deps, member.runId(), ToolJobFaultInjector.AFTER_SANDBOX_ACCEPTED);
         // 任务编号与 canonical 指纹都确认之后，名额凭证从「准备中」改成绑在这个任务上。
         DataAnalysisReservation attached = transitionReservation(
                 reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
