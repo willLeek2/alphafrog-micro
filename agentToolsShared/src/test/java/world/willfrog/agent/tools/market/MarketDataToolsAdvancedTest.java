@@ -9,11 +9,13 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
-import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByTsCodeAndDateRangeRequest;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByTsCodeAndDateRangeResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyItem;
@@ -30,6 +32,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -42,7 +45,7 @@ class MarketDataToolsAdvancedTest {
 
     private MarketDataTools tools;
     private DomesticStockService stockService;
-    private IndexWeightDao indexWeightDao;
+    private DomesticIndexService indexService;
     private SwIndustryMemberDao swIndustryMemberDao;
     private AgentLlmLocalConfigLoader localConfigLoader;
 
@@ -60,8 +63,8 @@ class MarketDataToolsAdvancedTest {
         );
         stockService = mock(DomesticStockService.class);
         ReflectionTestUtils.setField(tools, "domesticStockService", stockService);
-        indexWeightDao = mock(IndexWeightDao.class);
-        ReflectionTestUtils.setField(tools, "indexWeightDao", indexWeightDao);
+        indexService = mock(DomesticIndexService.class);
+        ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
         swIndustryMemberDao = mock(SwIndustryMemberDao.class);
         ReflectionTestUtils.setField(tools, "swIndustryMemberDao", swIndustryMemberDao);
         localConfigLoader = mock(AgentLlmLocalConfigLoader.class);
@@ -112,12 +115,12 @@ class MarketDataToolsAdvancedTest {
 
     @Test
     void getExchangeAssetDaily_advanced_indexComponent_shouldFetchConstituentDailies() throws Exception {
-        when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(
-                eq("000300.SH"), eq(toTimestamp("20240101")), eq(toTimestamp("20241231"))))
-                .thenReturn(List.of(
-                        indexWeightPojo("000300.SH", "000001.SZ", "20240115", 5.0),
-                        indexWeightPojo("000300.SH", "600519.SH", "20240115", 3.0)
-                ));
+        ReflectionTestUtils.setField(tools, "swIndustryMemberDao", null);
+        when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(argThat(this::matchesIndexWeightRequest)))
+                .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
+                        .addItems(indexWeightItem("000300.SH", "000001.SZ", "20240115", 5.0))
+                        .addItems(indexWeightItem("000300.SH", "600519.SH", "20240115", 3.0))
+                        .build());
         DomesticStockDailyItem item1 = DomesticStockDailyItem.newBuilder()
                 .setTsCode("000001.SZ").setTradeDate(20240102L)
                 .setOpen(10.0).setHigh(10.5).setLow(9.8).setClose(10.2)
@@ -150,6 +153,7 @@ class MarketDataToolsAdvancedTest {
 
     @Test
     void getExchangeAssetDaily_advanced_swIndustryL3_shouldFetchConstituentDailies() throws Exception {
+        ReflectionTestUtils.setField(tools, "domesticIndexService", null);
         SwIndustryMember member = new SwIndustryMember();
         member.setL1Code("430000");
         member.setL1Name("金融");
@@ -184,6 +188,53 @@ class MarketDataToolsAdvancedTest {
     }
 
     @Test
+    void getExchangeAssetDaily_advanced_swIndustry_shouldRequireIndustryDao() throws Exception {
+        ReflectionTestUtils.setField(tools, "swIndustryMemberDao", null);
+        String advancedQuery = """
+                {"asset_type":"stock","conditions":[{"type":"sw_industry_l3_component","industry_code":"430101"}]}
+                """;
+
+        String response = tools.getExchangeAssetDaily(null, "stock", "20240101", "20240131", "raw_ohlc", "advanced", advancedQuery);
+        Map<String, Object> root = objectMapper.readValue(response, new TypeReference<>() {});
+
+        assertEquals(Boolean.FALSE, root.get("ok"));
+        assertEquals("SERVICE_UNAVAILABLE", castMap(root.get("error")).get("code"));
+        verify(stockService, never()).getStockDailyByTsCodeAndDateRange(any());
+    }
+
+    @Test
+    void getExchangeAssetDaily_advanced_emptyIndexWeights_shouldReturnNoData() throws Exception {
+        when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(argThat(this::matchesIndexWeightRequest)))
+                .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.getDefaultInstance());
+        String advancedQuery = """
+                {"asset_type":"stock","conditions":[{"type":"index_component","index_code":"000300.SH","start_date":"20240101","end_date":"20241231"}]}
+                """;
+
+        String response = tools.getExchangeAssetDaily(null, "stock", "20240101", "20240131", "raw_ohlc", "advanced", advancedQuery);
+        Map<String, Object> root = objectMapper.readValue(response, new TypeReference<>() {});
+
+        assertEquals(Boolean.FALSE, root.get("ok"));
+        assertEquals("NO_DATA", castMap(root.get("error")).get("code"));
+        verify(stockService, never()).getStockDailyByTsCodeAndDateRange(any());
+    }
+
+    @Test
+    void getExchangeAssetDaily_advanced_failedIndexWeights_shouldReturnUpstreamError() throws Exception {
+        when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(argThat(this::matchesIndexWeightRequest)))
+                .thenThrow(new IllegalStateException("index weight service unavailable"));
+        String advancedQuery = """
+                {"asset_type":"stock","conditions":[{"type":"index_component","index_code":"000300.SH","start_date":"20240101","end_date":"20241231"}]}
+                """;
+
+        String response = tools.getExchangeAssetDaily(null, "stock", "20240101", "20240131", "raw_ohlc", "advanced", advancedQuery);
+        Map<String, Object> root = objectMapper.readValue(response, new TypeReference<>() {});
+
+        assertEquals(Boolean.FALSE, root.get("ok"));
+        assertEquals("UPSTREAM_ERROR", castMap(root.get("error")).get("code"));
+        verify(stockService, never()).getStockDailyByTsCodeAndDateRange(any());
+    }
+
+    @Test
     void getExchangeAssetDaily_advanced_invalidAssetType_shouldReject() throws Exception {
         String advancedQuery = """
                 {"asset_type":"etf","conditions":[{"type":"index_component","index_code":"000300.SH"}]}
@@ -198,13 +249,12 @@ class MarketDataToolsAdvancedTest {
 
     @Test
     void getExchangeAssetDaily_advanced_shouldRejectWhenMatchedStocksExceedLimit() throws Exception {
-        List<IndexWeight> weights = new java.util.ArrayList<>();
+        List<DomesticIndexWeightItem> weights = new java.util.ArrayList<>();
         for (int i = 0; i < 6; i++) {
-            weights.add(indexWeightPojo("000300.SH", String.format("%06d.SZ", i + 1), "20240115", 1.0));
+            weights.add(indexWeightItem("000300.SH", String.format("%06d.SZ", i + 1), "20240115", 1.0));
         }
-        when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(
-                eq("000300.SH"), eq(toTimestamp("20240101")), eq(toTimestamp("20241231"))))
-                .thenReturn(weights);
+        when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(argThat(this::matchesIndexWeightRequest)))
+                .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder().addAllItems(weights).build());
 
         AgentLlmProperties limited = new AgentLlmProperties();
         AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
@@ -242,16 +292,15 @@ class MarketDataToolsAdvancedTest {
                 null, new AgentLlmProperties(), objectMapper
         );
         ReflectionTestUtils.setField(toolsWithWriter, "domesticStockService", stockService);
-        ReflectionTestUtils.setField(toolsWithWriter, "indexWeightDao", indexWeightDao);
+        ReflectionTestUtils.setField(toolsWithWriter, "domesticIndexService", indexService);
         ReflectionTestUtils.setField(toolsWithWriter, "swIndustryMemberDao", swIndustryMemberDao);
         ReflectionTestUtils.setField(toolsWithWriter, "localConfigLoader", localConfigLoader);
 
-        when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(
-                eq("000300.SH"), eq(toTimestamp("20240101")), eq(toTimestamp("20241231"))))
-                .thenReturn(List.of(
-                        indexWeightPojo("000300.SH", "000001.SZ", "20240115", 5.0),
-                        indexWeightPojo("000300.SH", "600519.SH", "20240115", 3.0)
-                ));
+        when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(argThat(this::matchesIndexWeightRequest)))
+                .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
+                        .addItems(indexWeightItem("000300.SH", "000001.SZ", "20240115", 5.0))
+                        .addItems(indexWeightItem("000300.SH", "600519.SH", "20240115", 3.0))
+                        .build());
         DomesticStockDailyItem item1 = DomesticStockDailyItem.newBuilder()
                 .setTsCode("000001.SZ").setTradeDate(20240102L)
                 .setOpen(10.0).setHigh(10.5).setLow(9.8).setClose(10.2)
@@ -294,13 +343,16 @@ class MarketDataToolsAdvancedTest {
         return DateConvertUtils.convertDateStrToLong(date, "yyyyMMdd");
     }
 
-    private IndexWeight indexWeightPojo(String indexCode, String conCode, String tradeDate, double weight) {
-        IndexWeight w = new IndexWeight();
-        w.setIndexCode(indexCode);
-        w.setConCode(conCode);
-        w.setTradeDate(Long.parseLong(tradeDate));
-        w.setWeight(weight);
-        return w;
+    private boolean matchesIndexWeightRequest(DomesticIndexWeightByTsCodeAndDateRangeRequest request) {
+        return request != null && "000300.SH".equals(request.getTsCode())
+                && request.getStartDate() == toTimestamp("20240101")
+                && request.getEndDate() == toTimestamp("20241231");
+    }
+
+    private DomesticIndexWeightItem indexWeightItem(String indexCode, String conCode, String tradeDate, double weight) {
+        return DomesticIndexWeightItem.newBuilder()
+                .setIndexCode(indexCode).setConCode(conCode)
+                .setTradeDate(toTimestamp(tradeDate)).setWeight(weight).build();
     }
 
     @SuppressWarnings("unchecked")

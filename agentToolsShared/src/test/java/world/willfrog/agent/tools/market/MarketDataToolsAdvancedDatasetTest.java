@@ -10,7 +10,6 @@ import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyItem;
 
@@ -68,7 +67,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 datasetWriter, registry, manifestWriter,
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class));
+                mock(SwIndustryMemberDao.class));
         ReflectionTestUtils.setField(tools, "emitManifest", true);
         List<Map<String, Object>> results = List.of(
                 Map.of("ts_code", "000001.SZ", "ok", true,
@@ -117,7 +116,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 writer, registry, mock(ManifestWriter.class),
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class)
+                mock(SwIndustryMemberDao.class)
         );
 
         Map<String, Object> canonicalQuery = new LinkedHashMap<>();
@@ -283,7 +282,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 writer, registry, mock(ManifestWriter.class),
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class)
+                mock(SwIndustryMemberDao.class)
         );
 
         Map<String, Object> canonicalQuery = Map.of("asset_type", "stock");
@@ -321,7 +320,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 writer, registry, mock(ManifestWriter.class),
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class)
+                mock(SwIndustryMemberDao.class)
         );
 
         Method method = MarketDataTools.class.getDeclaredMethod(

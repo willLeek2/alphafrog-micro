@@ -22,7 +22,6 @@ import world.willfrog.agent.tools.market.advanced.AdvancedSearchDatasetWriter;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchEngine;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchException;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
@@ -96,7 +95,7 @@ public class MarketDataTools {
     @DubboReference
     private DomesticFundService domesticFundService;
 
-    /** 指数服务，提供指数基础信息、日线数据查询。 */
+    /** 指数服务，提供指数基础信息、日线和成分权重查询。 */
     @DubboReference
     private DomesticIndexService domesticIndexService;
 
@@ -135,9 +134,6 @@ public class MarketDataTools {
     /** JSON 序列化器，用于工具返回值的 JSON 编码和批量结果解析。 */
     private final ObjectMapper objectMapper;
 
-    /** 指数成分权重 DAO，advanced 搜索使用本地查询以支持日期单位转换与最新快照。 */
-    private final IndexWeightDao indexWeightDao;
-
     /** 申万行业成分 DAO，用于新工具 getStockSwIndustryInfo 及 advanced 行业成分日线拉取。 */
     private final SwIndustryMemberDao swIndustryMemberDao;
 
@@ -147,17 +143,7 @@ public class MarketDataTools {
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper) {
-        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null, null);
-    }
-
-    public MarketDataTools(DatasetWriter datasetWriter,
-                           DatasetRegistry datasetRegistry,
-                           ManifestWriter manifestWriter,
-                           AgentLlmLocalConfigLoader localConfigLoader,
-                           AgentLlmProperties llmProperties,
-                           ObjectMapper objectMapper,
-                           IndexWeightDao indexWeightDao) {
-        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, indexWeightDao, null);
+        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null);
     }
 
     @Autowired
@@ -167,7 +153,6 @@ public class MarketDataTools {
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper,
-                           IndexWeightDao indexWeightDao,
                            SwIndustryMemberDao swIndustryMemberDao) {
         this.datasetWriter = datasetWriter;
         this.datasetRegistry = datasetRegistry;
@@ -175,7 +160,6 @@ public class MarketDataTools {
         this.localConfigLoader = localConfigLoader;
         this.llmProperties = llmProperties;
         this.objectMapper = objectMapper;
-        this.indexWeightDao = indexWeightDao;
         this.swIndustryMemberDao = swIndustryMemberDao;
     }
 
@@ -715,9 +699,6 @@ public class MarketDataTools {
             return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
                     Map.of("priceMode", nvl(priceMode)));
         }
-        if (indexWeightDao == null || swIndustryMemberDao == null) {
-            return serviceUnavailable("getExchangeAssetDaily", "Advanced daily fetch DAOs are not available");
-        }
         try {
             AdvancedSearchRequest request = AdvancedSearchRequest.from("getExchangeAssetDaily", advancedPayload, objectMapper);
             if (!"stock".equals(request.getAssetType())) {
@@ -734,10 +715,16 @@ public class MarketDataTools {
                     throw new AdvancedSearchException("INVALID_ARGUMENT",
                             "Unsupported daily-fetch condition type: " + condition.getType());
                 }
+                if ("index_component".equals(condition.getType()) && domesticIndexService == null) {
+                    return serviceUnavailable("getExchangeAssetDaily", "Index weight service is not available");
+                }
+                if (!"index_component".equals(condition.getType()) && swIndustryMemberDao == null) {
+                    return serviceUnavailable("getExchangeAssetDaily", "SW industry member DAO is not available");
+                }
             }
 
             AdvancedSearchEngine engine = new AdvancedSearchEngine(
-                    domesticIndexService, domesticListedAssetService, indexWeightDao, swIndustryMemberDao);
+                    domesticIndexService, domesticListedAssetService, swIndustryMemberDao);
             int maxCodes = resolveMaxParallelQueriesInAdvancedMode();
             List<String> stockCodes = engine.resolveStockCodes(request, maxCodes);
             List<String> upstreamErrors = engine.getUpstreamErrors();
@@ -1643,7 +1630,7 @@ public class MarketDataTools {
             if ("searchIndex".equals(toolName) && request.getAssetType() != null && !request.getAssetType().isBlank()) {
                 log.info("searchIndex advanced ignores unexpected asset_type={}", request.getAssetType());
             }
-            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, indexWeightDao, swIndustryMemberDao);
+            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, swIndustryMemberDao);
             Map<String, Object> dataset = engine.execute(request, resolveMaxParallelQueriesInAdvancedMode());
             String upstreamError = dataset.get("upstream_error") instanceof String s ? s : null;
             String emptyReason = dataset.get("empty_reason") instanceof String s ? s : null;
