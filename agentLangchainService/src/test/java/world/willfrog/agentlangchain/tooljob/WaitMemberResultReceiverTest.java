@@ -42,6 +42,7 @@ import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.SandboxResourceUsage;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 
 import java.time.OffsetDateTime;
@@ -265,6 +266,28 @@ class WaitMemberResultReceiverTest {
         assertThat(request.resultRefJson())
                 .contains("PYTHON_EXECUTION_FAILED")
                 .contains("\"status\":\"FAILED\"");
+        verify(recoveryDispatcher, never()).wake(anyLong());
+    }
+
+    @Test
+    void queuedTaskSkippedAfterDirtyWorkspacePersistsExplicitFailure() {
+        givenDueMember();
+        status("FAILED");
+        Mockito.lenient().when(sandboxService.getTaskResult(any(GetTaskResultRequest.class)))
+                .thenAnswer(invocation -> TaskResultResponse.newBuilder()
+                        .setTaskId(invocation.getArgument(0, GetTaskResultRequest.class).getTaskId())
+                        .setStatus("FAILED")
+                        .setError("queued task skipped")
+                        .setRetryable(false)
+                        .setResourceUsage(SandboxResourceUsage.newBuilder()
+                                .setExitReason("WORKSPACE_DIRTY").build())
+                        .build());
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("WORKSPACE_DIRTY");
         verify(recoveryDispatcher, never()).wake(anyLong());
     }
 

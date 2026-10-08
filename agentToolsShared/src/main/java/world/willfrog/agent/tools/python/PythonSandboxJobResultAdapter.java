@@ -6,6 +6,7 @@ import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
+import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 import java.util.List;
 
@@ -37,8 +38,19 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
 
     @Override
     public String errorCodeOf(SandboxTerminalResultView result) {
+        if (isWorkspaceDirty(result.statusName(), result.nativePayload())) {
+            return "WORKSPACE_DIRTY";
+        }
         return "CANCELED".equals(result.statusName())
                 ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
+    }
+
+    /** 排队任务因同一工作区前一个任务失败而被跳过时，沙箱在资源用量中给出明确原因。 */
+    public static boolean isWorkspaceDirty(String statusName, Object nativePayload) {
+        return "FAILED".equals(statusName)
+                && nativePayload instanceof TaskResultResponse response
+                && response.hasResourceUsage()
+                && "WORKSPACE_DIRTY".equals(response.getResourceUsage().getExitReason());
     }
 
     @Override
@@ -64,13 +76,14 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
                     stdout, projection.results(), projection.notices());
         }
 
-        boolean retryable = Boolean.TRUE.equals(result.retryable());
-        String errorCode = "CANCELED".equals(result.statusName())
-                ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
-        String message = "CANCELED".equals(result.statusName())
+        boolean dirty = isWorkspaceDirty(result.statusName(), result.nativePayload());
+        boolean retryable = !dirty && Boolean.TRUE.equals(result.retryable());
+        String errorCode = errorCodeOf(result);
+        String message = dirty ? "同一 Run 的前一个任务失败，工作区已标脏；本任务未执行"
+                : "CANCELED".equals(result.statusName())
                 ? "Python 执行已取消" : "Python 执行失败";
-        String action = retryable
-                ? "根据 stderr 修正代码或输入后重试"
+        String action = dirty ? "检查前一个任务的失败原因后，使用新的 Run 重新执行"
+                : retryable ? "根据 stderr 修正代码或输入后重试"
                 : "检查输入和资源限制；如问题持续，请联系管理员";
         return financeToolResultFormatter.formatFailure(
                 stdout,

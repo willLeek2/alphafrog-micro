@@ -21,6 +21,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
@@ -753,14 +754,14 @@ public class WaitMemberResultReceiver {
             success = false;
             designatedApplied = true;
             if (failedAlready) {
-                extra.put("errorCode", errorCodeOf(terminal.statusName()));
+                extra.put("errorCode", errorCodeOf(terminal));
                 extra.put("designatedFailure", designated);
             } else {
                 extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
                 extra.put("errorDetail", designated);
             }
         } else if (failedAlready) {
-            extra.put("errorCode", errorCodeOf(terminal.statusName()));
+            extra.put("errorCode", errorCodeOf(terminal));
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
@@ -853,7 +854,11 @@ public class WaitMemberResultReceiver {
         }
     }
 
-    private static String errorCodeOf(String statusName) {
+    private static String errorCodeOf(Terminal terminal) {
+        String statusName = terminal.statusName();
+        if (PythonSandboxJobResultAdapter.isWorkspaceDirty(statusName, terminal.result())) {
+            return "WORKSPACE_DIRTY";
+        }
         if (statusName == null) {
             return "PYTHON_EXECUTION_FAILED";
         }
