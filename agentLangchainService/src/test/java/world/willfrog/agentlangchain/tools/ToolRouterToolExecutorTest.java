@@ -59,6 +59,23 @@ class ToolRouterToolExecutorTest {
     }
 
     @Test
+    void typedResultRetainsRouterBusinessStatusWithoutInterpretingItsOutput() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("tool-call-typed").name("loadToolGuide").arguments("{}").build();
+        // 正文故意与业务状态不一致，证明执行器服从路由器已有判断，不重新猜测工具 JSON。
+        when(toolRouter.invokeWithMeta("loadToolGuide", Map.of())).thenReturn(
+                ToolRouter.ToolInvocationResult.builder().output("{\"ok\":false}").success(true).build(),
+                ToolRouter.ToolInvocationResult.builder().output("业务拒绝完整正文").success(false).build());
+
+        ToolRouterToolExecutor.InvocationResult successful = executor.executeWithResult(request, null);
+        assertTrue(successful.success());
+        assertEquals("{\"ok\":false}", successful.output());
+        ToolRouterToolExecutor.InvocationResult refused = executor.executeWithResult(request, null);
+        assertFalse(refused.success());
+        assertEquals("业务拒绝完整正文", refused.output());
+    }
+
+    @Test
     void execute_successfulToolCall_emitsStartedAndFinishedWithAttribution() {
         AgentContext.setPhase("linear_execution");
         AgentContext.setStage("todo_execution");

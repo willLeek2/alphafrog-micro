@@ -23,6 +23,7 @@ import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
+import world.willfrog.agentlangchain.tools.ToolRouterToolExecutor;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -102,6 +103,14 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
         countToolCall(request);
         try (WaitGroupMemberExecutionContext.Scope ignored = waitGroup
                 .map(WaitGroupMemberExecutionContext::install).orElse(null)) {
+            if (executor instanceof ToolRouterToolExecutor routerExecutor) {
+                ToolRouterToolExecutor.InvocationResult result =
+                        routerExecutor.executeWithResult(executionRequest, null);
+                String output = result.output() == null ? "" : result.output();
+                // 业务拒绝无需创建沙箱任务；原失败正文进入成员结果，不能因同步返回而改成成功。
+                return result.success() ? new DispatchOutcome.Completed(output)
+                        : new DispatchOutcome.Failed(output);
+            }
             String output = executor.execute(executionRequest, null);
             return new DispatchOutcome.Completed(output == null ? "" : output);
         } catch (WaitGroupMemberPendingException pending) {

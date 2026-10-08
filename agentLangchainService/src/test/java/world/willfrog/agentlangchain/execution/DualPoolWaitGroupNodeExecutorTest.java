@@ -13,6 +13,11 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import dev.langchain4j.service.tool.ToolProvider;
+import dev.langchain4j.service.tool.ToolProviderResult;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
@@ -33,6 +38,29 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureRuleHitStore;
 import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.config.StressTestProperties;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
+import world.willfrog.agent.platform.service.PythonRiskReviewService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agent.tools.router.ToolResultCacheService;
+import world.willfrog.agent.tools.router.ToolRouter;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.tools.ToolRouterToolExecutor;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.alphafrogmicro.sandbox.idl.AcquireWorkspaceResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
+import world.willfrog.alphafrogmicro.sandbox.idl.WorkspaceResult;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayDeque;
@@ -42,6 +70,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -54,6 +83,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.doAnswer;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 
@@ -100,6 +131,95 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     // ==================== 完成与失败 ====================
+
+    @ParameterizedTest
+    @ValueSource(strings = {"WORKSPACE_DIRTY", "PYTHON_RISK_REJECTED"})
+    @SuppressWarnings("unchecked")
+    void immediatePythonRefusalKeepsItsFullFailureThroughTheRealDispatchChain(String errorCode) throws Exception {
+        // 真工具生成拒绝正文，真路由器判定 ok=false；只替换数据库、风险评估与远端 RPC 边界。
+        PythonSandboxTools pythonTools = spy(new PythonSandboxTools(objectMapper));
+        PythonSandboxService sandbox = mock(PythonSandboxService.class);
+        AgentRunMapper runs = mock(AgentRunMapper.class);
+        AgentRun run = new AgentRun();
+        run.setExt("{\"python_workspace_enabled\":true}");
+        String deploymentGeneration = "gen-" + "a".repeat(64);
+        when(runs.findByIdForDeployment(eq(RUN_ID), eq("stable"), eq(deploymentGeneration)))
+                .thenReturn(run);
+        ReflectionTestUtils.setField(pythonTools, "agentRunMapper", runs);
+        ReflectionTestUtils.setField(pythonTools, "deploymentIdentityProvider", (DeploymentIdentityProvider)
+                () -> new DeploymentIdentity("stable", deploymentGeneration));
+        ReflectionTestUtils.setField(pythonTools, "pythonSandboxService", sandbox);
+        AgentRunDatasetRegistry datasets = mock(AgentRunDatasetRegistry.class);
+        when(datasets.snapshot(RUN_ID)).thenReturn(new AgentRunDatasetSnapshot(List.of(), List.of()));
+        ReflectionTestUtils.setField(pythonTools, "agentRunDatasetRegistry", datasets);
+        PythonRiskReviewService review = mock(PythonRiskReviewService.class);
+        when(review.evaluate(any(), any(), any())).thenReturn(new PythonRiskReviewService.Evaluation(
+                !"PYTHON_RISK_REJECTED".equals(errorCode), 90, false));
+        ReflectionTestUtils.setField(pythonTools, "pythonRiskReviewService", review);
+        if ("WORKSPACE_DIRTY".equals(errorCode)) {
+            when(sandbox.acquireWorkspace(any())).thenReturn(AcquireWorkspaceResponse.newBuilder()
+                    .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
+        }
+        AtomicReference<String> originalOutput = new AtomicReference<>();
+        doAnswer(invocation -> {
+            String output = (String) invocation.callRealMethod();
+            originalOutput.set(output);
+            return output;
+        }).when(pythonTools).executePython(any(), any(), any(), any(), any());
+
+        AgentLlmLocalConfigLoader config = mock(AgentLlmLocalConfigLoader.class);
+        when(config.current()).thenReturn(Optional.empty());
+        SimpleMeterRegistry meters = new SimpleMeterRegistry();
+        ToolOutputCompactionService compaction = new ToolOutputCompactionService(null, null, config, objectMapper);
+        ToolResultCacheService cache = new ToolResultCacheService(null, objectMapper, config, compaction, meters);
+        cache.init();
+        AgentLlmProperties properties = new AgentLlmProperties();
+        properties.getRuntime().getExecution().setStaticPrecheckEnabled(false);
+        // 这个请求只调用 Python，其余工具不需要接线。缓存与路由器都是实际实现。
+        ToolRouter router = new ToolRouter(null, null, null, pythonTools, null, null, null, null,
+                null, properties, cache, null, mock(AgentRunObservabilityService.class),
+                objectMapper, meters, new StressTestProperties());
+        ToolRouterToolExecutor toolExecutor = new ToolRouterToolExecutor(router, objectMapper,
+                mock(AgentRunEventService.class), new LangchainToolConcurrencyThrottle(false, 20, 60),
+                mock(PythonSandboxDispatchStore.class));
+        ToolSpecification spec = ToolSpecification.builder().name("executePython").build();
+        ToolProvider provider = request -> new ToolProviderResult(Map.of(spec, toolExecutor));
+        ObjectProvider<ToolProvider> providers = mock(ObjectProvider.class);
+        when(providers.getIfAvailable()).thenReturn(provider);
+        LangchainNodeToolDispatcher actualDispatcher = new LangchainNodeToolDispatcher(providers, objectMapper);
+        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, actualDispatcher, publisher,
+                objectMapper, TestSchedulerSettings.propertyOnly(
+                        "agent.langchain.dual-pool.wait-group.max-members", "16"),
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+        model.enqueue(AiMessage.from(List.of(toolCall("python-refusal", "executePython",
+                "{\"code\":\"print(1)\"}"))));
+
+        AgentContext.setRunId(RUN_ID);
+        AgentContext.setUserId("user-1");
+        try {
+            DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of(spec)));
+            long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
+            assertThat(store.memberRows(groupId)).hasSize(1);
+            InMemoryWaitGroupStore.FakeMember member = store.memberRows(groupId).get(0);
+            assertThat(member.state).isEqualTo(WaitMemberState.FAILED.name());
+            JsonNode persisted = objectMapper.readTree(member.resultRefJson);
+            assertThat(persisted.path("status").asText()).isEqualTo("FAILED");
+            assertThat(persisted.path("output").asText()).isEqualTo(originalOutput.get());
+            JsonNode body = objectMapper.readTree(persisted.path("output").asText());
+            assertThat(body.path("ok").asBoolean(true)).isFalse();
+            assertThat(body.path("error").path("code").asText()).isEqualTo(errorCode);
+            assertThat(body.path("data").has("taskId")).isFalse();
+            assertThat(body.path("data").has("task_id")).isFalse();
+            assertThat(persisted.has("taskId")).isFalse();
+            assertThat(member.dispatchProofJson).isNull();
+            verify(sandbox, never()).createTask(any());
+            verify(review).evaluate(any(), eq(RUN_ID), eq("print(1)"));
+            assertThat(publisher.published).as("拒绝已作为失败终态入库，等待组齐备后可恢复模型回合").hasSize(1);
+        } finally {
+            AgentContext.clear();
+            meters.close();
+        }
+    }
 
     @Test
     void aReplyWithoutToolRequestsCompletesTheNode() {
