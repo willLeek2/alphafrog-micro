@@ -334,6 +334,30 @@ class ToolRouterToolExecutorTest {
     }
 
     @Test
+    void successfulMarketDatasetResultDoesNotReceiveFailureRetryHint() {
+        Map<String, Object> arguments = Map.of(
+                "tsCode", "000300.SH", "startDate", "20230101", "endDate", "20230110");
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("market-dataset-call")
+                .name("getIndexDaily")
+                .arguments("{\"tsCode\":\"000300.SH\",\"startDate\":\"20230101\",\"endDate\":\"20230110\"}")
+                .build();
+        String successfulOutput = "{\"ok\":true,\"tool\":\"getIndexDaily\",\"data\":{"
+                + "\"rows\":6,\"dataset_id\":\"run-123-index-prices\","
+                + "\"dataset_ids\":[\"run-123-index-prices\"]},\"error\":null}";
+        when(toolRouter.invokeWithMeta("getIndexDaily", arguments)).thenReturn(
+                ToolRouter.ToolInvocationResult.builder()
+                        .output(successfulOutput).success(true).build());
+
+        ToolRouterToolExecutor.InvocationResult result = executor.executeWithResult(request, null);
+
+        assertTrue(result.success());
+        assertEquals(successfulOutput, result.output(),
+                "成功取数的标准 JSON 应原样返回，不能被追加缺少数据集编号的失败提示");
+        assertFalse(result.output().contains("_retry_hint_"));
+    }
+
+    @Test
     void execute_pythonCallWithRunLevelIdsUnavailableError_appendsRunLevelRetryHint() {
         ToolExecutionRequest request = ToolExecutionRequest.builder()
                 .name("executePython")

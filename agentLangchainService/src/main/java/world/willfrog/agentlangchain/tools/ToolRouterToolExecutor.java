@@ -200,7 +200,10 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
             LangchainDatasetRefContext.set(datasetRefs);
-            output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
+            // 成功结果也可能包含 dataset_ids 和 error 字段；纠正提示只用于已判定失败的调用。
+            if (!success) {
+                output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
+            }
             return new InvocationResult(appendRepeatedToolCallHintIfNeeded(output, repeatDecision), success);
         } finally {
             AgentContext.clearToolCallId();
