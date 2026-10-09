@@ -49,7 +49,7 @@ class PythonWorkspaceRetentionSqlTest {
     @Test
     void markingAndExpirationBindIdAndCloseEverySubquery() throws Exception {
         Configuration configuration = mapper(AgentRunMapper.class, "mapper/AgentRunMapper.xml");
-        String runId = "6169288dd70e4bc28b018e49eb63779a";
+        String runId = System.getProperty("workspace.retention.probe-run-id", "run-retention");
         Map<String, Object> parameters = Map.of("id", runId);
         for (String name : new String[]{"markWorkspaceCleanupStarted", "markWorkspaceExpired"}) {
             var statement = configuration.getMappedStatement(AgentRunMapper.class.getName() + '.' + name);
@@ -78,7 +78,7 @@ class PythonWorkspaceRetentionSqlTest {
                 Path directory = Path.of(probeDirectory);
                 Files.createDirectories(directory);
                 String where = sql.substring(sql.indexOf("WHERE r.id"))
-                        .replace("?", "'" + runId + "'");
+                        .replace("?", "'" + runId.replace("'", "''") + "'");
                 Files.writeString(directory.resolve(name + ".sql"),
                         "SELECT count(*) AS eligible_count FROM alphafrog_agent_run r " + where + "\n");
             }
