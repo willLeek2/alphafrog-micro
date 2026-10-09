@@ -432,6 +432,7 @@ public class LangchainRunControlService {
         }
         boolean durableReceived = false;
         try {
+            rejectUnsettledCanceledSqlSessionBeforeResume(run);
             disposePausedAnchorBeforeResume(run);
             if (request.getPlanOverrideJson() != null && !request.getPlanOverrideJson().isBlank()) {
                 stateStore.clearTasks(run.getId());
@@ -468,6 +469,17 @@ public class LangchainRunControlService {
                         run.getId(), dualPoolReservation);
             }
             throw e;
+        }
+    }
+
+    /** 取消SQL成员尚未收尾时，不能先修改恢复计划或重新启动同一Run。 */
+    private void rejectUnsettledCanceledSqlSessionBeforeResume(AgentRun run) {
+        if (!"DUAL_POOL_V2".equals(run.getSchedulerVersion())) return;
+        ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+        if (anchor != null && "executeQuery".equals(anchor.getToolName())
+                && "CANCELED".equals(anchor.getRunDisposition())
+                && anchor.getOperationId() != null && !anchor.getOperationId().isBlank()) {
+            throw new IllegalStateException("SQL查询取消仍在收尾，请在原会话清理后重试恢复");
         }
     }
 

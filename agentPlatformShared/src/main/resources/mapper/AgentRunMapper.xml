@@ -890,6 +890,12 @@
           AND status IN ('FAILED', 'CANCELED', 'WAITING')
           AND COALESCE(tool_job_anchor_json -&gt;&gt; 'anchorState', '')
                 NOT IN ('PREPARING', 'WORKSPACE_REFUSED')
+          AND NOT (
+                scheduler_version = 'DUAL_POOL_V2'
+                AND COALESCE(tool_job_anchor_json -&gt;&gt; 'toolName', '') = 'executeQuery'
+                AND COALESCE(tool_job_anchor_json -&gt;&gt; 'runDisposition', '') = 'CANCELED'
+                AND COALESCE(tool_job_anchor_json -&gt;&gt; 'operationId', '') != ''
+          )
     </update>
 
     <update id="admitFollowUpForDeployment">

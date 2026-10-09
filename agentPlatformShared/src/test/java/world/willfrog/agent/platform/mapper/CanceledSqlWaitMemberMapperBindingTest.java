@@ -48,4 +48,23 @@ class CanceledSqlWaitMemberMapperBindingTest {
                 "deploymentGenerationId", "generation", "limit", 200)).getSql();
         assertThat(scan).contains("'COMPLETED', 'PARTIAL', 'EXPIRED'", "scheduler_version = 'DUAL_POOL_V2'");
     }
+
+    @Test
+    void resumeWaitsForTheOriginalCanceledSqlSessionAndUsesTheSameRunRow() throws Exception {
+        Configuration configuration = new Configuration();
+        configuration.addMapper(AgentRunMapper.class);
+        String resource = "mapper/AgentRunMapper.xml";
+        try (var in = Resources.getResourceAsStream(resource)) {
+            new XMLMapperBuilder(in, configuration, resource, configuration.getSqlFragments()).parse();
+        }
+        var resume = configuration.getMappedStatement(AgentRunMapper.class.getName() + ".resetForResume")
+                .getBoundSql(Map.of("id", "run", "userId", "user", "ttlExpiresAt", "2026-10-10T00:00:00Z"));
+        String text = resume.getSql().replaceAll("\\s+", " ").trim();
+        assertThat(text).contains("UPDATE alphafrog_agent_run", "status IN ('FAILED', 'CANCELED', 'WAITING')",
+                "AND NOT ( scheduler_version = 'DUAL_POOL_V2'", "'toolName', '') = 'executeQuery'",
+                "'runDisposition', '') = 'CANCELED'", "'operationId', '') != ''");
+        var lock = configuration.getMappedStatement(AgentRunMapper.class.getName() + ".findByIdForUpdate")
+                .getBoundSql(Map.of("id", "run")).getSql();
+        assertThat(lock).contains("FROM alphafrog_agent_run", "WHERE id = ?", "FOR UPDATE");
+    }
 }

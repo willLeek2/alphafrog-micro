@@ -3,6 +3,8 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
@@ -37,16 +39,19 @@ public class CanceledSqlWaitMemberRecovery {
     private final AgentRunFinalizationService finalization;
     private final NodeWorkItemStore workItems;
     private final ObjectMapper json;
+    private final TransactionTemplate transaction;
 
     public CanceledSqlWaitMemberRecovery(AgentRunMapper runs, WaitGroupStore groups,
                                         WaitMemberStopStore stops, NodeWorkItemStore workItems,
-                                        AgentRunFinalizationService finalization, ObjectMapper json) {
+                                        AgentRunFinalizationService finalization, ObjectMapper json,
+                                        PlatformTransactionManager transactionManager) {
         this.runs = runs;
         this.groups = groups;
         this.stops = stops;
         this.workItems = workItems;
         this.finalization = finalization;
         this.json = json;
+        this.transaction = new TransactionTemplate(transactionManager);
     }
 
     public Ownership ownership(String runId, ToolJobAnchor anchor) {
@@ -58,8 +63,31 @@ public class CanceledSqlWaitMemberRecovery {
      * 返回false时仍由现有锚点扫描重试，不能绕过成员停止责任。
      */
     public boolean complete(String runId, ToolJobAnchor anchor) {
-        Inspection inspected = inspect(runId, anchor);
-        if (inspected.ownership() != Ownership.MEMBER_OWNED) return false;
+        Closure closed = transaction.execute(ignored -> completeUnderRunLock(runId, anchor));
+        if (closed == null) return false;
+        // 事件在事务提交后发布，保持这次收口的终态，不读取并发恢复后的新状态。
+        try {
+            finalization.publishFinalizedEvent(runId, closed.userId(), closed.status());
+        } catch (RuntimeException unavailable) {
+            log.warn("取消SQL成员资源已收尾，Run终态通知暂不可用：run={}", runId, unavailable);
+        }
+        return true;
+    }
+
+    private Closure completeUnderRunLock(String runId, ToolJobAnchor anchor) {
+        AgentRun observed = runs.findById(runId);
+        if (observed == null) return null;
+        Long controlVersion = observed.getRunControlVersion();
+        Integer planGeneration = observed.getPlanGeneration();
+        // 恢复的条件更新也锁同一行；先锁Run，再收口等待链和节点，避免旧取消碰新计划。
+        AgentRun locked = runs.findByIdForUpdate(runId);
+        if (locked == null || !Objects.equals(controlVersion, locked.getRunControlVersion())
+                || !Objects.equals(planGeneration, locked.getPlanGeneration())) return null;
+        ToolJobAnchor active = ToolJobAnchor.fromJson(locked.getToolJobAnchorJson());
+        if (active == null || anchor == null
+                || !Objects.equals(active.getOperationId(), anchor.getOperationId())) return null;
+        Inspection inspected = inspect(runId, anchor, locked);
+        if (inspected.ownership() != Ownership.MEMBER_OWNED) return null;
         long afterGroupId = 0;
         while (true) {
             var open = groups.listOpenGroupsByRun(runId, afterGroupId, 100);
@@ -74,41 +102,43 @@ public class CanceledSqlWaitMemberRecovery {
             var result = workItems.cancel(item.identity(),
                     item.getRunControlVersion() == null ? 0L : item.getRunControlVersion(),
                     item.getClaimEpoch() == null ? 0 : item.getClaimEpoch(), "run_explicitly_canceled");
-            if (!result.applied()) return false;
+            if (!result.applied()) return null;
         }
         if (Set.of("PENDING", "RUNNING").contains(inspected.member().getState())) {
             // 控制接口可能已写取消意图而等待链暂未写成；复用原事务补足停止责任。
             groups.cancelChain(inspected.member().getGroupId());
-            return false;
+            return null;
         }
         if (inspected.stop() == null) {
             groups.ensureCanceledMemberStopTasks(inspected.member().getGroupId());
-            return false;
+            return null;
         }
-        if (!"CONFIRMED".equals(inspected.stop().getState())) return false;
+        if (!"CONFIRMED".equals(inspected.stop().getState())) return null;
         int rows = runs.completeCanceledSqlWaitMember(runId, anchor.getOperationId(),
                 anchor.getRequestFingerprint(), inspected.member().getId(),
                 inspected.member().getDispatchProofJson(), anchor.getReservationJson(),
                 inspected.terminalReservationJson());
-        if (rows != 1) return false;
+        if (rows != 1) return null;
         AgentRun closed = runs.findById(runId);
-        // 已落业务终态保持原值；事件监听失败由现有终态数据库补扫接管。
-        if (closed != null && closed.getStatus() != null) {
-            try {
-                finalization.publishFinalizedEvent(runId, closed.getUserId(), closed.getStatus().name());
-            } catch (RuntimeException unavailable) {
-                log.warn("取消SQL成员资源已收尾，Run终态通知暂不可用：run={}", runId, unavailable);
-            }
-        }
-        return true;
+        return closed == null || closed.getStatus() == null ? null
+                : new Closure(closed.getUserId(), closed.getStatus().name());
     }
+
+    private record Closure(String userId, String status) { }
 
     private Inspection inspect(String runId, ToolJobAnchor anchor) {
         if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())
                 || !"CANCELED".equals(anchor.getRunDisposition()) || anchor.isAutoResume()) {
             return Inspection.notApplicable();
         }
-        AgentRun run = runs.findById(runId);
+        return inspect(runId, anchor, runs.findById(runId));
+    }
+
+    private Inspection inspect(String runId, ToolJobAnchor anchor, AgentRun run) {
+        if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())
+                || !"CANCELED".equals(anchor.getRunDisposition()) || anchor.isAutoResume()) {
+            return Inspection.notApplicable();
+        }
         if (run == null || !"DUAL_POOL_V2".equals(run.getSchedulerVersion())) {
             return Inspection.notApplicable();
         }
