@@ -1530,6 +1530,7 @@ def run_bounded_capture(
     task_environment: dict[str, str] | None = None,
     workdir_for_pythonpath: str | None = None,
     cancel_marker_path: str | None = None,
+    completion_evidence: dict | None = None,
 ) -> tuple:
     """Run the user script under bounded capture.
 
@@ -1855,6 +1856,14 @@ def run_bounded_capture(
             # never reports success, even if the kill raced a clean exit.
             exit_code = 124
         summary["exitCode"] = exit_code
+        # 只由包装器写入的执行证据，不改变金融记录摘要的固定字段。
+        # 超时和取消即使恰好遇到正退出码，也不能算普通脚本失败。
+        if completion_evidence is not None:
+            completion_evidence.update(
+                childExited=proc.returncode is not None,
+                timedOut=timed_out,
+                processTreeCleaned=sweep_ok,
+            )
 
         # Presence in the envelope means "the wrapper held that fd": a
         # dropped record batch closed+unlinked its file, and the audit file
@@ -1938,6 +1947,7 @@ def main(argv: list[str] | None = None) -> int:
     # === end D11 gate ========================================================
 
     capture_dir = input_path.resolve().parent / CAPTURE_DIR_NAME
+    completion_evidence: dict = {}
     try:
         summary, capture_files, sweep_ok = run_bounded_capture(
             script_path=parsed["script_path"],
@@ -1949,6 +1959,7 @@ def main(argv: list[str] | None = None) -> int:
             task_environment=parsed["task_environment"],
             workdir_for_pythonpath=parsed.get("loader_python_path"),
             cancel_marker_path=cancel_marker_path,
+            completion_evidence=completion_evidence,
         )
     except WrapperInputError as exc:
         # D15 §4.2.3 round-2: _write_loader_bootstrap raises WrapperInputError
@@ -2009,6 +2020,7 @@ def main(argv: list[str] | None = None) -> int:
             _close_quietly(handle)
     # PIN 2: stdout carries EXACTLY ONE bounded envelope JSON document and
     # zero other bytes before or after it (no trailing newline).
+    envelope["completion"] = completion_evidence
     sys.stdout.write(json.dumps(envelope))
     sys.stdout.flush()
     # === end work-package-C =================================================

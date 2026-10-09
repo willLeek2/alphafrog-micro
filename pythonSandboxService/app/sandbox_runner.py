@@ -1657,6 +1657,71 @@ def _container_oom_killed(container_id: str) -> bool:
                 pass
 
 
+def verify_completed_task_container(
+    container_id: str, expected_labels: Dict[str, str], *, after_close: bool = False
+) -> bool:
+    """只读核验精确旧容器，绝不停止、删除或按工作区搜索其他任务。
+
+    关闭前必须读到完整身份和明确非 OOM 状态；关闭后只接受停止状态
+    或 Docker 明确报告该完整 ID 不存在。调用方仅在关闭前核验成功时
+    才能把关闭后的不存在作为证据，SDK 吞掉清理异常不影响此检查。
+    """
+    required = {
+        "com.alphafrog.sandbox.store-instance",
+        "com.alphafrog.sandbox.task-id",
+        "com.alphafrog.sandbox.deployment-id",
+        "com.alphafrog.sandbox.workspace-id",
+        "com.alphafrog.sandbox.workspace-generation",
+    }
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", container_id or "")
+        or set(expected_labels) != required
+        or any(not isinstance(value, str) or not value for value in expected_labels.values())
+    ):
+        return False
+    client = None
+    try:
+        from docker.errors import NotFound
+
+        client = build_docker_client()
+        try:
+            container = client.containers.get(container_id)
+            container.reload()
+        except NotFound:
+            return after_close
+        attrs = container.attrs
+        labels = (attrs.get("Config") or {}).get("Labels") or {}
+        actual_identity = {
+            key: value for key, value in labels.items()
+            if key.startswith("com.alphafrog.sandbox.")
+        }
+        state = attrs.get("State") or {}
+        if (
+            attrs.get("Id") != container_id
+            or actual_identity != expected_labels
+            or labels.get("com.alphafrog.role") != "python-sandbox-worker"
+            or state.get("OOMKilled") is not False
+            or state.get("Restarting") is not False
+        ):
+            return False
+        if after_close:
+            return (
+                state.get("Running") is False
+                and state.get("Status") in {"exited", "dead"}
+                and state.get("Pid") == 0
+            )
+        return state.get("Running") is True and state.get("Status") == "running"
+    except Exception as error:
+        logger.warning("WORKSPACE_TASK_CONTAINER_UNVERIFIED container=%s error=%s", container_id, error)
+        return False
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 # === work-package-C: §7.1 bounded wrapper production wiring ================
 
 
@@ -1713,12 +1778,14 @@ def validate_effective_output_limits(payload: Dict[str, Any]) -> Dict[str, int]:
 class _WrappedScriptResult:
     """ConsoleOutput stand-in for the wrapper path (exit_code/stdout/stderr)."""
 
-    __slots__ = ("exit_code", "stdout", "stderr")
+    __slots__ = ("exit_code", "stdout", "stderr", "ordinary_failure", "timed_out")
 
     def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+        self.ordinary_failure = False
+        self.timed_out = False
 
 
 def _resolve_wrapper_interpreter(
@@ -2155,6 +2222,23 @@ def _run_bounded_wrapper_path(
     # including the rule-3 case where the child finished before the stop
     # took effect and kept its genuine result.
     cancel_observed = bool(artifacts["summary"].get("cancelObserved", False))
+    completion = json.loads(output.stdout).get("completion")
+    if completion is not None:
+        if (
+            not isinstance(completion, dict)
+            or set(completion) != {"childExited", "timedOut", "processTreeCleaned"}
+            or any(type(value) is not bool for value in completion.values())
+        ):
+            raise RuntimeError(f"invalid wrapper completion evidence task={task_id}")
+        result.timed_out = completion["timedOut"]
+        # 保守排除信号退出、超时保留码、无法启动和 shell 信号转换码。
+        result.ordinary_failure = (
+            completion["childExited"]
+            and completion["processTreeCleaned"]
+            and not result.timed_out
+            and not cancel_observed
+            and 0 < result.exit_code < 124
+        )
     return result, artifacts["channel"], phase_timings, cancel_observed
 
 
@@ -2434,6 +2518,9 @@ def run_in_open_session(
         # CANCELED classification itself happens in the store).
         if cancel_observed:
             exit_reason = "CANCELED"
+        elif getattr(result, "timed_out", False):
+            timed_out = True
+            exit_reason = "TIMEOUT"
         else:
             exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
 
@@ -2471,6 +2558,7 @@ def run_in_open_session(
             exit_reason = "OOM_KILLED"
         t_cleanup_start = time.monotonic()
         cleanup_ok = True
+        control_cleanup_ok = True
         if workspace_created:
             cleanup_ok = _cleanup_task_workspace(session, task_id, config)
             # D11 (task #108): remove this task's control dir alongside its
@@ -2480,6 +2568,7 @@ def run_in_open_session(
             # marker write window is over by now.
             if bounded_path_selected:
                 if not _cleanup_task_control_dir(session, task_id):
+                    control_cleanup_ok = False
                     container_recycled = True
                     if recycle_reason is None:
                         recycle_reason = RECYCLE_REASON_CONTROL_CLEANUP_FAILED
@@ -2553,6 +2642,13 @@ def run_in_open_session(
     )
 
     return {
+        # 仍须调用者关闭并只读核验原容器，才可升级为允许同盘继续的证据。
+        "ordinary_script_failure": (
+            getattr(result, "ordinary_failure", False)
+            and cleanup_ok and control_cleanup_ok
+            and not timed_out and not oom_killed and not cancel_observed
+            and exit_reason == "NON_ZERO_EXIT"
+        ),
         "exit_code": result.exit_code,
         "stdout": result.stdout or "",
         "stderr": result.stderr or "",
@@ -2623,6 +2719,8 @@ def run_in_sandbox(
     )
     container_create_ms = int((time.monotonic() - t_create_start) * 1000)
     container_id = get_session_container_id(session)
+    result: dict | None = None
+    identity_verified = False
     # 260808-finance-methodspec-v5 work package D: single-source env collection.
     # The same ExecutionEnvironment instance drives the workdir file (written
     # here), the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container
@@ -2680,6 +2778,23 @@ def run_in_sandbox(
             container_create_ms,
             timings["total_duration_ms"],
         )
+        if workspace_mount is not None and result.get("ordinary_script_failure") is True:
+            identity_verified = verify_completed_task_container(
+                container_id, workspace_mount.labels,
+            )
         return result
     finally:
         session.close()
+        if result is not None:
+            result["workspace_failure_safe_to_continue"] = (
+                identity_verified
+                and workspace_mount is not None
+                and verify_completed_task_container(
+                    container_id, workspace_mount.labels, after_close=True,
+                )
+            )
+            if result["workspace_failure_safe_to_continue"]:
+                logger.info(
+                    "WORKSPACE_SCRIPT_FAILURE_SAFE_TO_CONTINUE task=%s container=%s",
+                    task_id, container_id,
+                )

@@ -321,11 +321,9 @@ async def _readmit_workspace_head(workspace_id: str) -> None:
 def _release_workspace_after_completion(final_task: Task) -> None:
     """Schedule the workspace release hook for one finished attempt.
 
-    Success freed the workspace in the same atomic store write that
-    terminalized the task — exactly one deferred head is re-admitted.
-    Any other outcome left the workspace DIRTY and the store already
-    terminalized every still-QUEUED task of it; the in-memory FIFO is
-    dropped so the memory follows the durable state.
+    成功或可信普通脚本失败在终态同一次持久写入中释放工作区，因此
+    只唤醒一个延后任务。真正标脏时，store 已失败该盘全部排队任务，
+    内存队列也随之清除，避免把这些任务重新投入执行。
     """
     request = final_task.request
     if request is None or not request.workspace_id:
@@ -752,6 +750,9 @@ async def _process_task_inner(task: Task, worker_id: int):
             status=status,
             result=result,
             evidence=evidence,
+            workspace_failure_safe_to_continue=(
+                result_dict.get("workspace_failure_safe_to_continue") is True
+            ),
             error=(
                 f"sandbox exited with code {result_dict['exit_code']}"
                 if status == TaskStatus.FAILED

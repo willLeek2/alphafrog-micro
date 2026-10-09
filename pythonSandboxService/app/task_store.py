@@ -253,6 +253,8 @@ class CompletionCandidate:
     result: ExecuteResult
     evidence: CancellationEvidence = CancellationEvidence.NONE
     error: Optional[str] = None
+    # 仅 runner 在完整执行和精确旧容器停止核验之后设置；不接收请求字段。
+    workspace_failure_safe_to_continue: bool = False
 
 
 def request_payload_digest(request: ExecuteRequest) -> str:
@@ -893,19 +895,31 @@ class DurableTaskStore:
             # inside the same lock and written by the same single persist
             # below — no durable intermediate state exists where the
             # workspace is free but the holder's failure is unknown.
-            self._apply_workspace_completion_locked(task)
+            self._apply_workspace_completion_locked(
+                task,
+                safe_failed_completion=(
+                    candidate.workspace_failure_safe_to_continue is True
+                    and task.status == TaskStatus.FAILED
+                    and candidate.evidence == CancellationEvidence.NONE
+                    and not task.cancel_requested
+                    and 0 < task.result.exit_code < 124
+                    and task.resource_usage is not None
+                    and task.resource_usage.exit_reason == "NON_ZERO_EXIT"
+                    and not task.resource_usage.oom_killed
+                    and not task.resource_usage.timed_out
+                ),
+            )
             self._persist_locked()
             return task
 
-    def _apply_workspace_completion_locked(self, task: Task) -> None:
-        """Only a SUCCEEDED holder frees the workspace.
+    def _apply_workspace_completion_locked(
+        self, task: Task, *, safe_failed_completion: bool = False
+    ) -> None:
+        """成功或已有可信停止证据的普通脚本失败释放工作区。
 
-        Every other terminal outcome of the HOLDER — FAILED, CANCELED,
-        timeout — marks the workspace DIRTY and explicitly fails every
-        still-QUEUED task of the same workspace (typed result, no
-        re-admission). A completion arriving for a task that never held
-        the slot (queue-timeout before begin, QUEUED cancel) leaves the
-        workspace untouched: nothing was ever written through it.
+        普通失败缺少可信执行/停止证据，以及取消、超时等其他持有者终态，
+        仍把工作区标脏，并明确失败同盘排队任务。没有持有过工作区的
+        队列超时或取消不会改变工作区：这些任务未通过该盘执行。
         """
         request = task.request
         if request is None or not request.workspace_id:
@@ -925,7 +939,7 @@ class DurableTaskStore:
             workspace.holder_task_id = None
             workspace.status_changed_at = now
             return
-        if task.status == TaskStatus.SUCCEEDED:
+        if task.status == TaskStatus.SUCCEEDED or safe_failed_completion:
             workspace.holder_task_id = None
             workspace.status_changed_at = now
             return
