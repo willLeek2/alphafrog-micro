@@ -41,12 +41,19 @@ import pandas as pd
 # dataset 索引
 ds_idx = pd.read_csv("/sandbox/paths_dataset.csv")
 path = ds_idx[ds_idx["agent_run_dataset_id"] == 1].iloc[0]["dataset_file_path"]
-df = pd.read_csv(path)
+import json
+from pathlib import Path
+from af_dataset_loader import read_dataset_file
+with open("/sandbox/paths_dataset_meta.json", encoding="utf-8") as handle:
+    metadata = json.load(handle)["datasets"]["1"]
+df = read_dataset_file(Path(path), metadata)
 
 # manifest 索引
 mf_idx = pd.read_csv("/sandbox/path_manifest.csv")
 manifest_path = mf_idx[mf_idx["agent_run_manifest_id"] == 1].iloc[0]["manifest_file_path"]
 ```
+
+加载器支持登记的JSON、CSV和Parquet；路径索引是CSV，数据文件不一定是CSV。JSON记录位置由 `/sandbox/paths_dataset_meta.json` 的 `recordsPath` 指定；无此字段时，根对象作为一行、对象数组作为多行。嵌套列表和字典保持原样；其他JSON结构用解析后的路径及 `json.load` 读取。
 
 `from_ts_code` 可能为 `UNCERTAIN`，仅表示系统无法从工具入参简单判定资产代码，不代表数据损坏。
 
@@ -56,7 +63,7 @@ manifest_path = mf_idx[mf_idx["agent_run_manifest_id"] == 1].iloc[0]["manifest_f
 |------|------|
 | `/sandbox/input/{dataset_id}/{dataset_id}.csv` | `load_datasets("1")` 或读 `/sandbox/paths_dataset.csv` |
 | `glob.glob('/sandbox/input/*')` | `load_manifest("1")` 或读 `/sandbox/path_manifest.csv` |
-| `data.csv` | 通过 CSV 索引拿到真实 `dataset_file_path` 后再 `pd.read_csv(path)` |
+| `data.csv` | 通过 CSV 索引拿到真实路径，按格式读取或使用 `load_datasets("1")` |
 
 ## trade_date 解析（极易出错）
 

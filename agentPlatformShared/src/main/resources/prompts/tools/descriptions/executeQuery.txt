@@ -10,6 +10,8 @@
   - 每个数据集在 SQL 里是一张视图，表名是 t<编号>：编号 1 的数据集叫 t1，编号 2 叫 t2，以此类推
   - 表结构（列名与类型）在 listMyData 的结果里查看；SQL 里只能引用你传入 dataset_ids 的表（数据以视图形式挂载好，无需也不应自行调用 read_csv/read_parquet 等文件读取函数）
 
+  - CSV、Parquet和登记的表格JSON均按实际格式挂载。JSON声明recordsPath时读取该顶层对象数组；未声明时，根对象是一行、对象数组是多行。嵌套列表和字典保留为DuckDB列表与结构列，不自动展开；空数组保留元数据列。
+
 参数说明：
   sql           - 一条 DuckDB SQL 查询语句，必填。只接受单条语句；多语句以及 ATTACH/COPY/INSTALL/LOAD 语句在准入阶段直接拒绝
   dataset_ids   - 要挂载的数据集编号，逗号分隔（如 "1,2"）或 JSON 数组（如 "[1,2]"），必填

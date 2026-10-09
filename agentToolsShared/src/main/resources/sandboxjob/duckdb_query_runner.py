@@ -115,12 +115,27 @@ def mount_datasets(con, spec):
     for entry in spec["datasets"]:
         alias = entry["alias"]
         # 平台生成的文件名也按 SQL 字符串字面量规则转义，单引号双写。
-        path = _resolve_path(spec, entry["path"]).replace("'", "''")
-        fmt = entry.get("format", "").lower()
-        if fmt == "parquet" or path.endswith(".parquet"):
+        resolved_path = _resolve_path(spec, entry["path"])
+        path = resolved_path.replace("'", "''")
+        fmt = str(entry.get("format") or os.path.splitext(resolved_path)[1].lstrip(".")).lower()
+        if fmt == "parquet":
             read = f"read_parquet('{path}')"
-        else:
+        elif fmt == "json":
+            from pathlib import Path
+            from af_dataset_loader import read_dataset_file
+            # Python读取也必须遵守引擎同一挂载根目录，禁止符号链接越界。
+            if not Path(resolved_path).resolve().is_relative_to(Path(_resolve_root(spec)).resolve()):
+                raise ValueError("JSON dataset path is outside the approved mount directory")
+            frame = read_dataset_file(Path(resolved_path), entry)
+            if not len(frame.columns):
+                raise ValueError("JSON dataset has no record columns; provide columns metadata for an empty array")
+            con.register(alias, frame)
+            mounted[alias] = path
+            continue
+        elif fmt in ("", "csv"):
             read = f"read_csv('{path}', header=true, auto_detect=true)"
+        else:
+            raise ValueError(f"unsupported dataset format: {fmt!r}")
         con.execute(f"CREATE VIEW {alias} AS SELECT * FROM {read}")
         mounted[alias] = path
     return mounted

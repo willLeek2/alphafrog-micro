@@ -57,6 +57,8 @@ public final class DatasetSandboxMetadataWriter {
 
     private Map<String, Object> publicMetadata(DatasetEntryMetadataReader.EntryMetadata metadata) {
         Map<String, Object> view = new LinkedHashMap<>();
+        view.put("format", metadata.format());
+        view.put("recordsPath", metadata.recordsPath());
         view.put("rowCount", metadata.rowCount());
         view.put("bytes", metadata.bytes());
         view.put("columns", metadata.columns());

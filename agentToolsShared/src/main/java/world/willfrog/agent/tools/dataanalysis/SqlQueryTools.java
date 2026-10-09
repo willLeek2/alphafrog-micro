@@ -755,8 +755,10 @@ public class SqlQueryTools {
             Map<String, Object> mount = new LinkedHashMap<>();
             mount.put("alias", "t" + dataset.number());
             mount.put("path", SANDBOX_INPUT_ROOT + "/_run_dataset_" + dataset.number() + "/" + dataset.sortKey());
-            mount.put("format", dataset.sortKey() != null
-                    && dataset.sortKey().toLowerCase(Locale.ROOT).endsWith(".parquet") ? "parquet" : "csv");
+            DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
+            mount.put("format", metadata.format());
+            mount.put("recordsPath", metadata.recordsPath());
+            mount.put("columns", metadata.columns());
             mounts.add(mount);
         }
         spec.put("datasets", mounts);

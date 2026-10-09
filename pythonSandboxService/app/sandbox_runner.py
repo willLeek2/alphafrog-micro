@@ -187,6 +187,8 @@ def _dataset_public_metadata(source_path: str) -> Dict[str, Any]:
         byte_count = document.get("bytes")
     row_count = document.get("rowCount")
     return {
+        "format": document.get("format") or source.suffix.lstrip(".").lower(),
+        "recordsPath": document.get("recordsPath"),
         "rowCount": row_count if isinstance(row_count, int) else None,
         "bytes": byte_count if isinstance(byte_count, int) else None,
         "columns": columns,

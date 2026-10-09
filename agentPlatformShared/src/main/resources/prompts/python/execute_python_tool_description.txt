@@ -25,7 +25,9 @@ SANDBOX INPUT SURFACE (injected automatically):
 - /sandbox/paths_dataset.csv maps agent_run_dataset_id → sandbox file path + from_ts_code.
 - /sandbox/path_manifest.csv maps agent_run_manifest_id → manifest file path + related_dataset_ids.
 - Manifests with no on-disk file are materialized at <task_input>/_agent_run_manifest_<id>/manifest.json.
-- Read these CSVs in your code, or use the helper: from af_dataset_loader import load_manifest, load_datasets.
+- Prefer the helper: from af_dataset_loader import load_manifest, load_datasets. It reads registered CSV, Parquet and tabular JSON by their actual format.
+- /sandbox/paths_dataset_meta.json contains format, recordsPath and columns by dataset number. recordsPath names a top-level JSON array of record objects. Without recordsPath, a JSON object is one row and an array of objects is a table. Nested dictionaries/lists remain nested cell values; do not flatten them automatically. Empty arrays retain metadata columns. Other JSON values require json.load on the resolved file path.
+- The path indexes are CSV; the dataset file itself may be JSON or Parquet. Do not apply pd.read_csv to every dataset path.
 
 PYTHON HELPER EXAMPLES:
 - Single dataset by number:
@@ -45,7 +47,11 @@ PYTHON HELPER EXAMPLES:
     import pandas as pd
     ds_idx = pd.read_csv("/sandbox/paths_dataset.csv")
     path = ds_idx[ds_idx["agent_run_dataset_id"] == 1].iloc[0]["dataset_file_path"]
-    df = pd.read_csv(path)
+    import json
+    from pathlib import Path
+    from af_dataset_loader import read_dataset_file
+    metadata = json.load(open("/sandbox/paths_dataset_meta.json"))["datasets"]["1"]
+    df = read_dataset_file(Path(path), metadata)
 
 RUNTIME (preinstalled, no install needed):
 - numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0
