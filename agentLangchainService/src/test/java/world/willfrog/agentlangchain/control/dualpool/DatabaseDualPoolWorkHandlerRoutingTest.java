@@ -69,6 +69,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     private final FrozenEffectiveSettings frozenEffectiveSettings = new FrozenEffectiveSettings();
 
     private DatabaseDualPoolWorkHandler handler;
+    private FreshRunPipeline freshRunPipeline;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -89,9 +90,10 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
         Mockito.lenient().when(versionPolicy.isDualPoolFamily(any(world.willfrog.agent.platform.entity.AgentRun.class)))
                 .thenReturn(true);
+        freshRunPipeline = Mockito.mock(FreshRunPipeline.class);
         handler = new DatabaseDualPoolWorkHandler(
                 runMapper,
-                Mockito.mock(FreshRunPipeline.class),
+                freshRunPipeline,
                 workItemStore,
                 Mockito.mock(NodeWorkPlanAdapter.class),
                 Mockito.mock(LangchainTodoNodeExecutor.class),
@@ -118,6 +120,81 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
      * <p>读数里这几项报的是这里登记的数，不是属性请求值；服务租约时长这一项要求至少 5 秒，所以请求
      * 1 秒时登记的是 5 秒——报出 1 秒会让验收与排查以为真的只保 1 秒。</p>
      */
+    @Test
+    void preparingInterruptedExitRetriesOriginalClaimEpochAndRestoresInterrupt() {
+        NodeWorkItemIdentity original = new NodeWorkItemIdentity("run", 2, "node", 1, 0);
+        java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+        org.mockito.Mockito.doAnswer(call -> {
+            if (attempts.incrementAndGet() == 1) throw new IllegalStateException("DB unavailable");
+            return null;
+        }).when(workItemStore).acknowledgeWorkerExit(original, 3);
+        Thread.currentThread().interrupt();
+        try {
+            handler.acknowledgePreparingInterruptedWorkerExit(original, 3);
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            verify(workItemStore, org.mockito.Mockito.times(2)).acknowledgeWorkerExit(original, 3);
+            verify(workItemStore, never()).acknowledgeWorkerExit(original, 4);
+            verify(workItemStore, never()).reportExecutionFailure(any(), anyInt(), anyString(), anyString());
+        } finally {
+            Thread.interrupted();
+            world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.consume();
+        }
+    }
+
+    @Test
+    void normalWorkerFinallyConsumesPreparingMarkerAndRetriesItsOriginalExitReceipt() {
+        String runId = "run-interrupted-receipt";
+        NodeWorkItemIdentity identity = new NodeWorkItemIdentity(runId, 0, "__dual_pool_planning__", 0, 0);
+        AgentRun run = run(runId, "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.RECEIVED);
+        NodeWorkItem item = new NodeWorkItem();
+        item.setRunId(runId);
+        item.setPlanGeneration(0);
+        item.setNodeId(identity.nodeId());
+        item.setNodeAttempt(0);
+        item.setSegmentSequence(0);
+        item.setState(NodeWorkItemState.RUNNABLE.name());
+        item.setSchedulerVersion("DUAL_POOL_V2");
+        item.setContextVersion(0L);
+        item.setRunControlVersion(0L);
+        item.setClaimEpoch(0);
+        item.setPayloadJson("{\"kind\":\"PLANNING\"}");
+        ServiceOwnershipFence fence = new ServiceOwnershipFence(TEST_INSTANCE, 1L);
+        when(admissionRegistry.isAdmitted(runId)).thenReturn(true);
+        when(admissionRegistry.currentOwnershipFence(runId)).thenReturn(Optional.of(fence));
+        when(runMapper.findById(runId)).thenReturn(run);
+        when(workItemStore.findByIdentity(identity)).thenReturn(Optional.of(item));
+        when(workItemStore.claim(eq(identity), any(), anyString(), any(), any(), eq(fence)))
+                .thenAnswer(call -> Optional.of(new world.willfrog.agent.platform.workitem.NodeWorkItemClaim(
+                        identity, call.getArgument(2), 3, OffsetDateTime.now().plusMinutes(1))));
+        when(workItemStore.startExecution(eq(identity), eq(3), anyString()))
+                .thenReturn(world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult.success());
+        when(freshRunPipeline.prepareDualPoolRun(run)).thenAnswer(call -> {
+            world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.mark();
+            Thread.currentThread().interrupt();
+            return null;
+        });
+        when(workItemStore.commitSegmentResult(eq(identity), any(), anyString(), any()))
+                .thenReturn(world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult.success());
+        java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
+        Mockito.doAnswer(call -> {
+            if (attempts.incrementAndGet() == 1) throw new IllegalStateException("DB temporarily unavailable");
+            return null;
+        }).when(workItemStore).acknowledgeWorkerExit(identity, 3);
+        try {
+            handler.executeNode(identity);
+            verify(workItemStore, Mockito.times(2)).acknowledgeWorkerExit(identity, 3);
+            verify(workItemStore, never()).acknowledgeWorkerExit(identity, 4);
+            verify(workItemStore, never()).reportExecutionFailure(any(), anyInt(), anyString(), anyString());
+            verify(freshRunPipeline).clearDualPoolNodeContext(runId);
+            assertThat(world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.consume()).isFalse();
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+            world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.consume();
+        }
+    }
+
     @Test
     void theEffectiveLeaseAndRetryValuesAreRegisteredForTheReading() {
         assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_NODE_WORKER_CLAIM_LEASE_SECONDS))

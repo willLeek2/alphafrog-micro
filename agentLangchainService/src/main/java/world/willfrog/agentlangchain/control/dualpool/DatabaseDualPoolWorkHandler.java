@@ -778,7 +778,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         try {
             started = workItemStore.startExecution(identity, claim.claimEpoch(), claimant);
         } catch (RuntimeException e) {
-            workItemStore.acknowledgeWorkerExit(identity, claim.claimEpoch());
+            acknowledgeNodeWorkerExit(identity, claim.claimEpoch());
             throw e;
         }
         if (!started.applied()) {
@@ -786,7 +786,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 reportRejection(identity.runId(), started);
             } finally {
                 // 取消可能发生在领取与启动之间；此线程此刻已经停下，才能归还那次领取的额度。
-                workItemStore.acknowledgeWorkerExit(identity, claim.claimEpoch());
+                acknowledgeNodeWorkerExit(identity, claim.claimEpoch());
             }
             return;
         }
@@ -874,10 +874,44 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             dispatcher.offerRun(new RunCoordinationHint(identity.runId(), RunCoordinationHint.Reason.NODE_RESULT));
         } finally {
             try {
-                workItemStore.acknowledgeWorkerExit(identity, claim.claimEpoch());
+                acknowledgeNodeWorkerExit(identity, claim.claimEpoch());
             } finally {
                 freshRunPipeline.clearDualPoolNodeContext(identity.runId());
             }
+        }
+    }
+
+    private void acknowledgeNodeWorkerExit(NodeWorkItemIdentity identity, int claimEpoch) {
+        if (world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.consume()) {
+            acknowledgePreparingInterruptedWorkerExit(identity, claimEpoch);
+        } else {
+            workItemStore.acknowledgeWorkerExit(identity, claimEpoch);
+        }
+    }
+
+    void acknowledgePreparingInterruptedWorkerExit(NodeWorkItemIdentity identity, int claimEpoch) {
+        boolean interrupted = Thread.interrupted();
+        long attempts = 0;
+        try {
+            while (true) {
+                try {
+                    workItemStore.acknowledgeWorkerExit(identity, claimEpoch);
+                    return;
+                } catch (RuntimeException unavailable) {
+                    if (++attempts == 1 || attempts % 30 == 0) {
+                        log.warn("SQL裁决后原worker退出回执暂未确认，保留原领取代际重试: identity={} claimEpoch={}",
+                                identity.describe(), claimEpoch);
+                    }
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException repeatedStop) {
+                        interrupted = true;
+                    }
+                    interrupted |= Thread.interrupted();
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 

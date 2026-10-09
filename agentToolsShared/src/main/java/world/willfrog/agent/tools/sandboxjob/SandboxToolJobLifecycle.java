@@ -113,6 +113,17 @@ public final class SandboxToolJobLifecycle {
     /** 结果：persisted=false 表示 CAS 未取得锚点所有权，调用方必须释放容量并失败退出。 */
     public record PrepareDispatchResult(ToolJobAnchor anchor, boolean persisted) {}
 
+    @FunctionalInterface
+    public interface PreparingAnchorWriter {
+        boolean persist(String runId, ToolJobAnchor anchor, String resumeToken, Long resumeLeaseVersion);
+    }
+
+    /** 框架只生成一份完整证明；SQL用此入口把会话占用与成员证明一起提交。 */
+    @FunctionalInterface
+    public interface MemberPreparingWriter {
+        boolean persist(WaitMemberDispatchProof proof);
+    }
+
     /**
      * 组装并 CAS 持久化 PREPARING 锚点，覆盖 createTask 前的 RPC 成败不确定窗口。
      *
@@ -127,6 +138,12 @@ public final class SandboxToolJobLifecycle {
             PythonSandboxDispatchStore dispatchStore,
             PrepareDispatchRequest req,
             java.util.function.Consumer<ToolJobAnchor> toolExtras) {
+        return prepareDispatch(dispatchStore, req, toolExtras, null);
+    }
+
+    public static PrepareDispatchResult prepareDispatch(
+            PythonSandboxDispatchStore dispatchStore, PrepareDispatchRequest req,
+            java.util.function.Consumer<ToolJobAnchor> toolExtras, PreparingAnchorWriter writer) {
         // 在调用 createTask 之前先构造完整 PREPARING anchor，覆盖 RPC 成败不确定窗口。
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setSchemaVersion(req.schemaVersion());
@@ -168,7 +185,13 @@ public final class SandboxToolJobLifecycle {
         String resumeToken = AgentContext.getToolJobResumeToken();
         Long resumeLeaseVersion = AgentContext.getToolJobResumeLeaseVersion();
         boolean persisted;
-        if (resumeToken != null && !resumeToken.isBlank()
+        if (writer != null) {
+            persisted = writer.persist(req.runId(), anchor, resumeToken, resumeLeaseVersion);
+            if (persisted && resumeToken != null && !resumeToken.isBlank()
+                    && resumeLeaseVersion != null && resumeLeaseVersion > 0) {
+                AgentContext.clearToolJobResumeHandoff();
+            }
+        } else if (resumeToken != null && !resumeToken.isBlank()
                 && resumeLeaseVersion != null && resumeLeaseVersion > 0) {
             persisted = dispatchStore.persistPreparingFromResume(
                     req.runId(), anchor, resumeToken, resumeLeaseVersion);
@@ -997,12 +1020,17 @@ public final class SandboxToolJobLifecycle {
      */
     public static <REQ> String dispatchWaitGroupMember(
             LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req) {
-        return dispatchWaitGroupMemberTyped(deps, req, req.runner());
+        return dispatchWaitGroupMember(deps, req, null);
+    }
+
+    public static <REQ> String dispatchWaitGroupMember(
+            LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req, MemberPreparingWriter writer) {
+        return dispatchWaitGroupMemberTyped(deps, req, req.runner(), writer);
     }
 
     private static <REQ, RESP, L> String dispatchWaitGroupMemberTyped(
             LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req,
-            SandboxJobRunnerAdapter<REQ, RESP, L> runner) {
+            SandboxJobRunnerAdapter<REQ, RESP, L> runner, MemberPreparingWriter writer) {
         WaitGroupMemberExecutionContext.Snapshot member = req.member();
         DataAnalysisOperationIdentity identity = req.identity();
         DataAnalysisEstimate estimate = req.estimate();
@@ -1044,10 +1072,18 @@ public final class SandboxToolJobLifecycle {
         try {
             WaitMemberDispatchProof preparingProof = proofForWaitGroup(
                     deps, spec, estimate, reservation, null, createRequestJson);
-            preparingRecorded = deps.waitGroupStore() != null && deps.waitGroupStore().recordMemberPreparing(
+            preparingRecorded = writer != null ? writer.persist(preparingProof)
+                    : deps.waitGroupStore() != null && deps.waitGroupStore().recordMemberPreparing(
                     member.groupId(), member.memberIdentity(), identity.operationId(),
                     preparingProof.toJson(deps.objectMapper()));
+        } catch (world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException admission) {
+            // SQL准入已确认未写入；由工具层保留原业务错误码并归还本地预约。
+            throw admission;
+        } catch (WaitGroupMemberPendingException pending) {
+            throw pending;
         } catch (RuntimeException persistenceFailure) {
+            // 自定义事务写入的异常不能被当成确认未提交；裁决与控制信号由写入器负责。
+            if (writer != null) throw persistenceFailure;
             log.warn("Sandbox 创建前未能保存成员身份：{}", member.describe(), persistenceFailure);
         }
         if (!preparingRecorded) {
@@ -1062,6 +1098,10 @@ public final class SandboxToolJobLifecycle {
             }
             return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_NOT_RECORDED",
                     "Sandbox request identity could not be saved before dispatch", Map.of());
+        }
+        if (writer != null && Thread.currentThread().isInterrupted()) {
+            // 事务已确认提交，中断后的原worker不再create；完整证明交回原成员恢复。
+            throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null, createRequestJson);
         }
         // 完整准备请求已落库，但尚未调用沙箱；故障信号不能被下方 RPC 异常裁决捕获。
         hitFaultPoint(deps, member.runId(), ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT);

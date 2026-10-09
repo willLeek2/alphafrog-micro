@@ -224,6 +224,28 @@ class DualPoolWaitGroupNodeExecutorTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void interruptedSqlOutcomeDoesNotLeaveOtherMembersUndispatched(boolean committed) {
+        dispatcher.requiresOperationId = true;
+        model.enqueue(AiMessage.from(List.of(toolCall("sql", "executeQuery", "{}"),
+                toolCall("other", "lookup", "{}"))));
+        dispatcher.pending.put("executeQuery", committed
+                ? new NodeToolDispatcher.DispatchOutcome.Pending(RUN_ID + ":sql:1", null,
+                    dispatchProof(RUN_ID + ":sql:1", null))
+                : new NodeToolDispatcher.DispatchOutcome.Failed("WAIT_GROUP_PREPARING_NOT_RECORDED"));
+        dispatcher.beforeDispatch = () -> Thread.currentThread().interrupt();
+        try {
+            executor.executeSegment(firstSegment(List.of()));
+            long group = store.groupRows().get(0).id;
+            assertThat(store.memberRows(group).get(0).state).isEqualTo(committed ? "RUNNING" : "FAILED");
+            assertThat(store.memberRows(group).get(1).state).isEqualTo("SUCCEEDED");
+            assertThat(dispatcher.dispatched).hasSize(2);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
     @Test
     void aReplyWithoutToolRequestsCompletesTheNode() {
         model.enqueue(AiMessage.from("  结论如下  "));
@@ -925,10 +947,11 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(publisher.published).as("还有一个成员没结束，不能放行下一段").isEmpty();
     }
 
-    @Test
-    void aPersistedPythonRequestIsLeftForRecoveryWhenTheSegmentRunsAgain() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"executePython", "executeQuery"})
+    void aPersistedSandboxRequestIsLeftForRecoveryWhenTheSegmentRunsAgain(String sandboxTool) {
         dispatcher.requiresOperationId = true;
-        AiMessage reply = AiMessage.from(List.of(toolCall("call-a", "executePython", "{}")));
+        AiMessage reply = AiMessage.from(List.of(toolCall("call-a", sandboxTool, "{}")));
         model.enqueue(reply);
         dispatcher.beforeDispatch = () -> {
             long groupId = store.groupRows().get(0).id;
@@ -952,10 +975,11 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(publisher.published).as("尚无结果，不能放行模型下一段").isEmpty();
     }
 
-    @Test
-    void aLateProofWritePreventsAnOldDispatcherFromCompletingTheMember() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"executePython", "executeQuery"})
+    void aLateProofWritePreventsAnOldDispatcherFromCompletingTheMember(String sandboxTool) {
         dispatcher.requiresOperationId = true;
-        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "executePython", "{}"))));
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", sandboxTool, "{}"))));
         dispatcher.beforeDispatch = () -> {
             long groupId = store.groupRows().get(0).id;
             store.memberRows(groupId).get(0).dispatchProofJson =
@@ -1338,7 +1362,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         @Override
         public Optional<String> stableOperationId(String toolName, String rawToolCallId,
                                                   NodeWorkItemIdentity segment) {
-            if (!requiresOperationId || !"executePython".equals(toolName)) {
+            if (!requiresOperationId || world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(toolName).isEmpty()) {
                 return subAgentOperationId && ("spawnSubAgent".equals(toolName)
                         || "waitForSubAgent".equals(toolName))
                         ? Optional.of("sub-agent-tool:test-" + rawToolCallId) : Optional.empty();
@@ -1348,7 +1372,7 @@ class DualPoolWaitGroupNodeExecutorTest {
 
         @Override
         public boolean requiresStableOperationId(String toolName) {
-            return (requiresOperationId && "executePython".equals(toolName))
+            return (requiresOperationId && world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(toolName).isPresent())
                     || (subAgentOperationId && ("spawnSubAgent".equals(toolName)
                     || "waitForSubAgent".equals(toolName)));
         }

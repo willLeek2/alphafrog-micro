@@ -21,6 +21,13 @@ public interface PythonSandboxDispatchStore {
     /** 在 createTask 前抢占空 anchor；成功后 PREPARING reservation 才有持久化 owner。 */
     boolean persistPreparing(String runId, ToolJobAnchor anchor);
 
+    /** SQL会话占用与成员完整请求必须同事务提交；false仅表示确认未取得创建资格。 */
+    default boolean persistPreparingWaitMember(String runId, ToolJobAnchor anchor, long groupId,
+                                               String memberIdentity, String proofJson,
+                                               String resumeToken, Long resumeLeaseVersion) {
+        throw new UnsupportedOperationException("atomic member preparation is not implemented");
+    }
+
     /**
      * 恢复 worker 的第二次长工具分发：只允许持有精确旧 LAUNCHING token/version 的 worker
      * 原子替换已消费 handoff，并保持 Run 为 EXECUTING。

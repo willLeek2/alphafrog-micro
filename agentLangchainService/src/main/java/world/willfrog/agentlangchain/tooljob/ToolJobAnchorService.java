@@ -15,6 +15,9 @@ import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.mapper.WaitGroupMapper;
+import world.willfrog.agent.platform.wait.WaitMember;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.time.Instant;
@@ -180,6 +183,117 @@ public class ToolJobAnchorService {
         guardExecuteQuerySession(runId, anchor);
         return agentRunMapper.claimPreparingToolJobAnchorFromResume(
                 runId, anchor.toJson(), expectedResumeToken, expectedResumeLeaseVersion) == 1;
+    }
+
+    @Autowired
+    private WaitGroupMapper waitGroupMapper;
+
+    /** 异常穿过Spring事务代理，前一项Run写入才会一起回滚。 */
+    public static final class MemberPreparingRollback extends RuntimeException {
+        MemberPreparingRollback(String message) { super(message); }
+    }
+
+    public enum MemberPreparingReadback { COMMITTED, COMMITTED_DEFERRED, NOT_WRITTEN, OWNERSHIP_LOST }
+
+    /** Run会话占用和成员完整请求只允许同时成功，不产生中间可见状态。 */
+    @Transactional
+    public boolean claimPreparingWaitMember(String runId, ToolJobAnchor anchor, long groupId,
+                                             String memberIdentity, String proofJson,
+                                             String resumeToken, Long resumeVersion) {
+        validatePreparingProof(anchor, proofJson);
+        guardExecuteQuerySession(runId, anchor);
+        boolean resumed = resumeToken != null && !resumeToken.isBlank()
+                && resumeVersion != null && resumeVersion > 0;
+        int claimed = resumed ? agentRunMapper.claimPreparingToolJobAnchorFromResume(
+                runId, anchor.toJson(), resumeToken, resumeVersion)
+                : agentRunMapper.claimPreparingToolJobAnchor(runId, anchor.toJson(), AgentRunStatus.EXECUTING);
+        if (claimed != 1) {
+            // CAS未写入不等于这张预约无人持有；须经锁定读回再决定是否可释放。
+            throw new MemberPreparingRollback("Run未取得本次创建权，等待核对持久预约责任");
+        }
+        // claim持有Run行锁，取消/控制变化与下方成员写入按同一顺序串行。
+        if (!"RESULT_COMMITTED".equals(waitGroupMapper.lockPreparingSqlMemberContext(runId, groupId, memberIdentity))
+                || waitGroupMapper.countPreparingSqlMemberOwner(
+                runId, groupId, memberIdentity, anchor.toJson(), proofJson) != 1) {
+            throw new MemberPreparingRollback("原SQL成员或工作项身份已改变");
+        }
+        WaitMember member = waitGroupMapper.findMemberByIdentity(groupId, memberIdentity);
+        if (member == null || member.getDispatchProofJson() != null
+                || !runId.equals(member.getRunId())
+                || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())
+                || !anchor.getOperationId().equals(member.getExternalOperationId())
+                || waitGroupMapper.recordMemberPreparing(groupId, memberIdentity,
+                    anchor.getOperationId(), proofJson) != 1) {
+            throw new MemberPreparingRollback("成员完整请求未取得首次登记资格");
+        }
+        return true;
+    }
+
+    /** 提交响应不确定后锁住同一Run再读两项，等待原事务真正结束。 */
+    @Transactional
+    public MemberPreparingReadback readPreparingWaitMember(String runId, ToolJobAnchor expected,
+                                                            long groupId, String memberIdentity,
+                                                            String proofJson, String resumeToken,
+                                                            Long resumeVersion) {
+        lockAndReadExecuteQuerySession(runId);
+        AgentRun current = agentRunMapper.findByIdForUpdate(runId);
+        if (current == null) return MemberPreparingReadback.OWNERSHIP_LOST;
+        String segmentState = waitGroupMapper.lockPreparingSqlMemberContext(runId, groupId, memberIdentity);
+        WaitMember member = waitGroupMapper.findMemberByIdentity(groupId, memberIdentity);
+        if (segmentState == null || member == null) return MemberPreparingReadback.OWNERSHIP_LOST;
+        boolean originalWorker = waitGroupMapper.countPreparingSqlMemberOwner(
+                runId, groupId, memberIdentity, expected.toJson(), proofJson) == 1;
+        String json = current.getToolJobAnchorJson();
+        ToolJobAnchor active = json == null || json.isBlank() || "{}".equals(json.trim())
+                ? null : ToolJobAnchor.fromJson(json);
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            if (member.getDispatchProofJson() != null
+                    && mapper.readTree(proofJson).equals(mapper.readTree(member.getDispatchProofJson()))) {
+                // 原子事务中这份唯一生成的证明已经提交；Run后来变动只移交责任，不能创建。
+                if (active == null || !mapper.readTree(expected.toJson()).equals(mapper.readTree(json))
+                        || !originalWorker) return MemberPreparingReadback.COMMITTED_DEFERRED;
+                try {
+                    ensureExecuteQuerySessionFree(runId, expected, current);
+                } catch (SessionQueryAdmissionException busy) {
+                    if (busy.retryable()) return MemberPreparingReadback.COMMITTED_DEFERRED;
+                    throw busy;
+                }
+                return agentRunMapper.renewExecuteQueryReplayClaim(runId, groupId, memberIdentity,
+                        expected.getOperationId(), expected.getRequestFingerprint(), expected.getCreateRequestJson(),
+                        expected.getWorkItemPlanGeneration(), expected.getWorkItemRunControlVersion()) == 1
+                        ? MemberPreparingReadback.COMMITTED : MemberPreparingReadback.COMMITTED_DEFERRED;
+            }
+            boolean oldResume = active != null && resumeToken != null && resumeVersion != null
+                    && resumeToken.equals(active.getResumeToken())
+                    && resumeVersion.equals(active.getResumeLeaseVersion()) && active.isResultConsumed()
+                    && ("LAUNCHING".equals(active.getResumeState()) || "ACCEPTED".equals(active.getResumeState()))
+                    && active.isAutoResume();
+            // 原分段已经交出或终止，不能被重新claim；空锚点+空证明才确认本次本地预留未提交。
+            boolean exitedSegment = java.util.Set.of("RESULT_COMMITTED", "CANCELED", "STALE", "EXECUTION_FAILED")
+                    .contains(segmentState);
+            if (exitedSegment && (active == null || oldResume) && member.getDispatchProofJson() == null) {
+                return MemberPreparingReadback.NOT_WRITTEN;
+            }
+            return MemberPreparingReadback.OWNERSHIP_LOST;
+        } catch (java.io.IOException invalidJson) {
+            throw new IllegalStateException("SQL提交读回无法解析", invalidJson);
+        }
+    }
+
+    private void validatePreparingProof(ToolJobAnchor anchor, String proofJson) {
+        WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(new ObjectMapper(), proofJson).orElse(null);
+        if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())
+                || !"PREPARING".equals(anchor.getAnchorState()) || proof == null
+                || !WaitMemberDurableRequestResolver.hasValidRequest(proof) || proof.taskConfirmed()
+                || !anchor.getOperationId().equals(proof.operationId())
+                || !anchor.getRequestFingerprint().equals(proof.requestFingerprint())
+                || !anchor.getCreateRequestJson().equals(proof.createRequestJson())
+                || !anchor.getReservationJson().equals(proof.reservationJson())
+                || !anchor.getEstimateJson().equals(proof.estimateJson())
+                || !anchor.getCanonicalCreateSpecJson().equals(proof.canonicalCreateSpecJson())) {
+            throw new MemberPreparingRollback("SQL会话与成员准备证明不一致");
+        }
     }
 
     /**

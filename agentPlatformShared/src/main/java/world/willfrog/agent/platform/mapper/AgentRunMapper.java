@@ -17,6 +17,9 @@ public interface AgentRunMapper {
 
     AgentRun findById(@Param("id") String id);
 
+    /** 事务中锁定Run后读取当前已提交事实。 */
+    AgentRun findByIdForUpdate(@Param("id") String id);
+
     AgentRun findByIdForDeployment(
             @Param("id") String id,
             @Param("deploymentId") String deploymentId,

@@ -53,7 +53,7 @@ class SqlWaitMemberSessionAdmissionTest {
         when(runs.findById("run-1")).thenReturn(run);
         ToolJobAnchorService anchors = new ToolJobAnchorService(runs);
         PythonSandboxDispatchStore store = mock(PythonSandboxDispatchStore.class);
-        when(store.persistPreparing(eq("run-1"), any())).thenAnswer(invocation ->
+        when(store.persistPreparingWaitMember(eq("run-1"), any(), anyLong(), anyString(), anyString(), any(), any())).thenAnswer(invocation ->
                 anchors.claimPreparing("run-1", invocation.getArgument(1), AgentRunStatus.EXECUTING));
         DataAnalysisCapacityService capacity = mock(DataAnalysisCapacityService.class);
         when(capacity.reserve(any(), any())).thenAnswer(invocation -> {

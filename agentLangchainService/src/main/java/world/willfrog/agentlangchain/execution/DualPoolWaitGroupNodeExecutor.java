@@ -734,7 +734,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING) {
                     continue;
                 }
-                if (awaitingPersistedPythonDispatch(member)) {
+                if (awaitingPersistedSandboxDispatch(member)) {
                     // 创建请求已在外部调用前落库。原派发线程可能已经退出；重跑节点不得把它
                     // 当作新调用，也不得将预留请求写成普通工具失败。恢复器会核对旧领取者已退出、
                     // 容量已归还，再按原操作号查询或原样重发。
@@ -812,7 +812,7 @@ public class DualPoolWaitGroupNodeExecutor {
         Long notificationId = null;
         for (WaitMember member : members) {
             if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING
-                    || awaitingPersistedPythonDispatch(member)) {
+                    || awaitingPersistedSandboxDispatch(member)) {
                 continue;
             }
             Map<String, Object> failure = "run_budget_exceeded".equals(errorCode)
@@ -825,9 +825,9 @@ public class DualPoolWaitGroupNodeExecutor {
         return notificationId;
     }
 
-    private static boolean awaitingPersistedPythonDispatch(WaitMember member) {
+    private static boolean awaitingPersistedSandboxDispatch(WaitMember member) {
         return member.stateEnum() == WaitMemberState.PENDING
-                && "executePython".equals(member.getToolName())
+                && world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(member.getToolName()).isPresent()
                 && member.getDispatchProofJson() != null;
     }
 

@@ -101,6 +101,36 @@
         LIMIT 1
     </select>
 
+    <select id="findByIdForUpdate" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               deployment_id,
+               deployment_generation_id,
+               lane_tag,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               workspace_cleanup_started_at,
+               workspace_expired_at,
+               ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
+               tool_job_anchor_json::text AS tool_job_anchor_json
+        FROM alphafrog_agent_run
+        WHERE id = #{id}
+        FOR UPDATE
+    </select>
+
     <select id="findByIdForDeployment" resultMap="AgentRunResultMap">
         SELECT id,
                user_id,

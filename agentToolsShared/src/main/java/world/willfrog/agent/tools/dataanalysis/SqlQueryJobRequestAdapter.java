@@ -53,6 +53,11 @@ public final class SqlQueryJobRequestAdapter implements SandboxJobRequestAdapter
     }
 
     @Override
+    public String durableCreateRequestJson(ExecuteRequest request) {
+        return protoMechanics.durableCreateRequestJson(request);
+    }
+
+    @Override
     public String requestFingerprint(ExecuteRequest request) {
         return protoMechanics.requestFingerprint(request);
     }

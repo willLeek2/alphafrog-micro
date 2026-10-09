@@ -24,6 +24,17 @@ import java.util.List;
 @Mapper
 public interface WaitGroupMapper {
 
+    /** 锁定同一成员和原分段，返回分段当前状态；不能只用旧caller版本推断未提交。 */
+    String lockPreparingSqlMemberContext(@Param("runId") String runId, @Param("groupId") long groupId,
+                                         @Param("memberIdentity") String memberIdentity);
+
+    /** 原SQL调用线程尚持有同一工作项/控制版本与节点容量，才可裁决首次提交。 */
+    int countPreparingSqlMemberOwner(@Param("runId") String runId,
+                                     @Param("groupId") long groupId,
+                                     @Param("memberIdentity") String memberIdentity,
+                                     @Param("anchorJson") String anchorJson,
+                                     @Param("proofJson") String proofJson);
+
     // ===== 读 =====
 
     WaitGroup findGroup(@Param("runId") String runId,

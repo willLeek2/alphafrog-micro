@@ -164,7 +164,7 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
                 .filter(row -> row.memberIdentity.equals(request.memberIdentity()))
                 .findFirst().orElseThrow(() -> new IllegalArgumentException("成员不存在：" + request.memberIdentity()));
         if (WaitMemberState.PENDING.name().equals(member.state)
-                && "executePython".equals(member.toolName) && member.dispatchProofJson != null) {
+                && world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(member.toolName).isPresent() && member.dispatchProofJson != null) {
             return describe(request.groupId(), false, null);
         }
         if (member.finishedAt != null) {
