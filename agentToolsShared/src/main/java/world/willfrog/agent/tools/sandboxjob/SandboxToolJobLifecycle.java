@@ -1101,6 +1101,8 @@ public final class SandboxToolJobLifecycle {
         }
         if (writer != null && Thread.currentThread().isInterrupted()) {
             // 事务已确认提交，中断后的原worker不再create；完整证明交回原成员恢复。
+            // 正常提交也可能在返回时才收到中断，原worker退出回执同样必须可靠写入。
+            world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.mark();
             throw pendingForWaitGroup(deps, member, spec, estimate, reservation, null, createRequestJson);
         }
         // 完整准备请求已落库，但尚未调用沙箱；故障信号不能被下方 RPC 异常裁决捕获。

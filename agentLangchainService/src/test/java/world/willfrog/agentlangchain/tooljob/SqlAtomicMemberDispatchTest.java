@@ -28,7 +28,7 @@ import static org.mockito.Mockito.*;
 
 class SqlAtomicMemberDispatchTest {
     @TempDir Path temp;
-    enum Mode { FRESH, BEFORE, AFTER, INTERRUPTED_COMMITTED, INTERRUPTED_NOT_WRITTEN, BUSY_READBACK, CANCELED_READBACK, CANCELED_NO_WRITE, RESTORE_FAILED, CAS_ZERO_NO_WRITE, CAS_ZERO_COMMITTED }
+    enum Mode { FRESH, BEFORE, AFTER, INTERRUPTED_COMMITTED, INTERRUPTED_NOT_WRITTEN, BUSY_READBACK, CANCELED_READBACK, CANCELED_NO_WRITE, RESTORE_FAILED, CAS_ZERO_NO_WRITE, CAS_ZERO_COMMITTED, COMMIT_INTERRUPTED }
     @AfterEach void cleanThread() { Thread.interrupted(); MemberPreparingInterruption.consume(); AgentContext.clear(); }
 
     @ParameterizedTest @EnumSource(Mode.class)
@@ -74,6 +74,7 @@ class SqlAtomicMemberDispatchTest {
             if (mode == Mode.INTERRUPTED_COMMITTED) {
                 Thread.currentThread().interrupt(); throw new IllegalStateException("commit response lost");
             }
+            if (mode == Mode.COMMIT_INTERRUPTED) Thread.currentThread().interrupt();
             return committed;
         });
         when(service.readPreparingWaitMember(any(), any(), anyLong(), any(), any(), any(), any())).thenAnswer(call ->
@@ -142,6 +143,12 @@ class SqlAtomicMemberDispatchTest {
                     throw new AssertionError("Unexpected returned result: " + returned); })
                         .isInstanceOf(WaitGroupMemberPendingException.class);
             }
+        }
+        if (mode == Mode.COMMIT_INTERRUPTED) {
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            assertThat(MemberPreparingInterruption.consume()).isTrue();
+            assertThat(MemberPreparingInterruption.consume()).isFalse();
+            verify(service, never()).readPreparingWaitMember(any(), any(), anyLong(), any(), any(), any(), any());
         }
         int createCount = mode == Mode.FRESH || mode == Mode.AFTER || mode == Mode.RESTORE_FAILED ? 1 : 0;
         verify(sandbox, times(createCount)).createTask(any());
