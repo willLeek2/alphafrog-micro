@@ -203,6 +203,84 @@ class PendingPythonMemberRecoveryTest {
         verify(sandbox, never()).cancelTask(any());
     }
 
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"1,1,false", "0,0,false", "0,1,true"})
+    void pendingSqlReplayUsesOriginalUserGuardBeforeCreating(int otherQueries, int renewed, boolean created)
+            throws Exception {
+        installSqlProof();
+        ExecuteRequest original = installReplayableProof();
+        String originalProof = member.getDispatchProofJson();
+        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
+                .thenReturn(true);
+        AgentRun run = ownership.findOwnedRun("run-1");
+        run.setUserId("user-1");
+        run.setRunControlVersion(5L);
+        var anchor = new world.willfrog.agent.platform.dataanalysis.ToolJobAnchor();
+        anchor.setToolName("executeQuery");
+        anchor.setOperationId(OPERATION_ID);
+        anchor.setRequestFingerprint(FINGERPRINT);
+        anchor.setAnchorState("PREPARING");
+        run.setToolJobAnchorJson(anchor.toJson());
+        var mapper = mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
+        when(mapper.findById("run-1")).thenReturn(run);
+        when(mapper.countInFlightExecuteQueryByUser("user-1", "run-1", "executeQuery", 600))
+                .thenReturn(otherQueries);
+        var proof = WaitMemberDispatchProof.fromJson(json, originalProof).orElseThrow();
+        when(mapper.renewExecuteQueryReplayClaim("run-1", 7L, "member-1", OPERATION_ID,
+                FINGERPRINT, proof.createRequestJson(), 1, 5L)).thenReturn(renewed);
+        var recovery = new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership, ignored -> true);
+        org.springframework.test.util.ReflectionTestUtils.setField(recovery, "queryAdmission", new ToolJobAnchorService(mapper));
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(call -> {
+            if (renewed == 0) run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.CANCELED);
+            return GetTaskByOperationIdResponse.getDefaultInstance();
+        });
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setTaskId("replayed-query").setRequestFingerprint(FINGERPRINT).build());
+
+        recovery.reconcile();
+
+        verify(mapper).lockExecuteQuerySession("user-1");
+        verify(sandbox, created ? times(1) : never()).createTask(original);
+        verify(sandbox, never()).cancelTask(any());
+        verify(groups, created ? times(1) : never()).recoverPendingPythonMember(
+                41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
+        org.assertj.core.api.Assertions.assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
+    }
+
+    @Test
+    void acceptedSqlTaskIsRecoveredWithoutRenewalOrSecondCreate() throws Exception {
+        installSqlProof();
+        installReplayableProof();
+        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
+                .thenReturn(true);
+        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(true).setTaskId("accepted-query").setRequestFingerprint(FINGERPRINT).build());
+        var admission = mock(ToolJobAnchorService.class);
+        var recovery = new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership, ignored -> true);
+        org.springframework.test.util.ReflectionTestUtils.setField(recovery, "queryAdmission", admission);
+
+        recovery.reconcile();
+
+        verifyNoInteractions(admission);
+        verify(sandbox, never()).createTask(any());
+        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
+    }
+
+    private void installSqlProof() throws Exception {
+        member.setToolName("executeQuery");
+        member.setMemberIdentity("member-1");
+        var proof = WaitMemberDispatchProof.fromJson(json, member.getDispatchProofJson()).orElseThrow();
+        DataAnalysisOperationIdentity sqlIdentity = new DataAnalysisOperationIdentity("run-1", DurableToolCallIds.forTool(
+                "executeQuery", "call-1", new NodeWorkItemIdentity("run-1", 1, "node-1", 1, 1)), 1);
+        var reservation = new DataAnalysisReservation(sqlIdentity.reservationId(), sqlIdentity,
+                DataAnalysisResourceClass.STANDARD, 1, DataAnalysisReservationState.PREPARING, null, Instant.now());
+        member.setExternalOperationId(sqlIdentity.operationId());
+        member.setDispatchProofJson(new WaitMemberDispatchProof(1, sqlIdentity.operationId(), null, FINGERPRINT,
+                proof.canonicalCreateSpecJson(), proof.estimateJson(), json.writeValueAsString(reservation),
+                proof.submittedAt()).toJson(json));
+    }
+
     private ExecuteRequest installReplayableProof() throws Exception {
         WaitMemberDispatchProof old = WaitMemberDispatchProof.fromJson(
                 json, member.getDispatchProofJson()).orElseThrow();

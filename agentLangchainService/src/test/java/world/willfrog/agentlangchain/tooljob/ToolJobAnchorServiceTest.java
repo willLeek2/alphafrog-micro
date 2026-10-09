@@ -49,6 +49,52 @@ class ToolJobAnchorServiceTest {
         ReflectionTestUtils.setField(anchorService, "finalizationService", finalizationService);
     }
 
+
+    @Test
+    void replayRenewalLocksBeforeCheckingOtherRunsAndRefreshesOnlyOriginalProof() {
+        AgentRun run = new AgentRun();
+        run.setUserId("user-1");
+        ToolJobAnchor original = new ToolJobAnchor();
+        original.setToolName("executeQuery");
+        original.setOperationId("original-op");
+        original.setAnchorState("PREPARING");
+        run.setToolJobAnchorJson(original.toJson());
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+        when(agentRunMapper.countInFlightExecuteQueryByUser("user-1", "run-1", "executeQuery", 600)).thenReturn(0);
+        when(agentRunMapper.renewExecuteQueryReplayClaim("run-1", 7, "member-1", "original-op",
+                "fp", "saved-request", 2, 5)).thenReturn(1);
+
+        assertThat(anchorService.renewExecuteQueryReplayClaim("run-1", 7, "member-1", "original-op",
+                "fp", "saved-request", 2, 5)).isTrue();
+
+        var order = inOrder(agentRunMapper);
+        order.verify(agentRunMapper).findById("run-1");
+        order.verify(agentRunMapper).lockExecuteQuerySession("user-1");
+        order.verify(agentRunMapper).findById("run-1");
+        order.verify(agentRunMapper).countInFlightExecuteQueryByUser("user-1", "run-1", "executeQuery", 600);
+        order.verify(agentRunMapper).renewExecuteQueryReplayClaim("run-1", 7, "member-1", "original-op",
+                "fp", "saved-request", 2, 5);
+    }
+
+    @Test
+    void replayBusySessionNeverRenewsOrReplacesTheOriginalAnchor() {
+        AgentRun run = new AgentRun();
+        run.setUserId("user-1");
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+        when(agentRunMapper.countInFlightExecuteQueryByUser("user-1", "run-1", "executeQuery", 600)).thenReturn(1);
+
+        assertThatThrownBy(() -> anchorService.renewExecuteQueryReplayClaim("run-1", 7, "member-1",
+                "original-op", "fp", "saved-request", 2, 5))
+                .isInstanceOf(SessionQueryAdmissionException.class)
+                .satisfies(error -> {
+                    var busy = (SessionQueryAdmissionException) error;
+                    assertThat(busy.code()).isEqualTo("SESSION_QUERY_IN_PROGRESS");
+                    assertThat(busy.retryable()).isTrue();
+                });
+        verify(agentRunMapper, never()).renewExecuteQueryReplayClaim(anyString(), anyLong(), anyString(),
+                anyString(), anyString(), anyString(), anyLong(), anyLong());
+    }
+
     @Test
     void publishesCanceledEventOnlyAfterWorkspaceRefusalClosesRun() {
         AgentRun run = new AgentRun();

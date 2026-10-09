@@ -5,6 +5,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.wait.WaitGroup;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
@@ -50,6 +53,9 @@ public class PendingPythonMemberRecovery {
     private long scanCursor;
 
     @Autowired
+    private ToolJobAnchorService queryAdmission;
+
+    @Autowired
     public PendingPythonMemberRecovery(WaitGroupStore groups, NodeWorkItemStore workItems,
                                        PythonSandboxService sandbox, ObjectMapper objectMapper,
                                        RunOwnershipGateway ownership) {
@@ -83,7 +89,7 @@ public class PendingPythonMemberRecovery {
             try {
                 var run = ownership.findOwnedRun(member.getRunId());
                 if (run != null) {
-                    LaneScopeGateway.wrap(run, () -> recover(member)).run();
+                    LaneScopeGateway.wrap(run, () -> recover(member, run)).run();
                 }
             } catch (RuntimeException e) {
                 log.warn("待派发 Python 成员暂不能恢复：member={} reason={}", member.getId(), e.getMessage());
@@ -91,7 +97,7 @@ public class PendingPythonMemberRecovery {
         }
     }
 
-    private void recover(WaitMember member) {
+    private void recover(WaitMember member, AgentRun run) {
         WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(
                 objectMapper, member.getDispatchProofJson()).orElse(null);
         if (proof == null || proof.taskConfirmed() || member.getId() == null
@@ -137,7 +143,8 @@ public class PendingPythonMemberRecovery {
 
         if (WaitMemberDurableRequestResolver.hasValidRequest(proof)) {
             WaitMemberDurableRequestResolver.Resolution resolution =
-                    WaitMemberDurableRequestResolver.resolveOutcome(proof, sandbox);
+                    WaitMemberDurableRequestResolver.resolveOutcome(proof, sandbox,
+                            () -> renewQueryReplayClaim(member, group, run, proof));
             if (resolution.workspaceRefusalCode() != null) {
                 groups.recordMemberWorkspaceRefusal(member.getGroupId(), member.getMemberIdentity(),
                         proof.operationId(), proof.requestFingerprint(),
@@ -184,4 +191,22 @@ public class PendingPythonMemberRecovery {
                     member.getId(), lookup.getTaskId());
         }
     }
+
+    private boolean renewQueryReplayClaim(WaitMember member, WaitGroup group,
+                                          AgentRun run,
+                                          WaitMemberDispatchProof proof) {
+        if (!ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())) {
+            return true;
+        }
+        if (queryAdmission == null) return false;
+        try {
+            return queryAdmission.renewExecuteQueryReplayClaim(member.getRunId(), member.getGroupId(),
+                    member.getMemberIdentity(), proof.operationId(), proof.requestFingerprint(),
+                    proof.createRequestJson(), group.getPlanGeneration(), run.getRunControlVersion());
+        } catch (SessionQueryAdmissionException busy) {
+            log.info("待派发查询继续保留原请求，下一轮重新准入：member={} code={}", member.getId(), busy.code());
+            return false;
+        }
+    }
+
 }

@@ -10,6 +10,8 @@ import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import world.willfrog.alphafrogmicro.sandbox.idl.WorkspaceResult;
 
+import java.util.function.BooleanSupplier;
+
 /** 已持久保存完整请求的等待成员，按原操作号查询并在确实未找到时原样重发。 */
 @Slf4j
 final class WaitMemberDurableRequestResolver {
@@ -31,6 +33,11 @@ final class WaitMemberDurableRequestResolver {
     }
 
     static Resolution resolveOutcome(WaitMemberDispatchProof proof, PythonSandboxService sandbox) {
+        return resolveOutcome(proof, sandbox, () -> true);
+    }
+
+    static Resolution resolveOutcome(WaitMemberDispatchProof proof, PythonSandboxService sandbox,
+                                     BooleanSupplier admitReplay) {
         if (proof == null || !proof.replayable()) {
             return Resolution.unavailable();
         }
@@ -57,6 +64,8 @@ final class WaitMemberDurableRequestResolver {
             if (!lookup.getTaskId().isBlank() || !lookup.getRequestFingerprint().isBlank()) {
                 return Resolution.unavailable();
             }
+            // 已存在的任务只查回；只有确认不存在、即将重建时才重新核验查询名额。
+            if (!admitReplay.getAsBoolean()) return Resolution.unavailable();
             ExecuteResponse created = sandbox.createTask(request);
             if (created != null && created.hasWorkspaceResult()) {
                 WorkspaceResult result = created.getWorkspaceResult();

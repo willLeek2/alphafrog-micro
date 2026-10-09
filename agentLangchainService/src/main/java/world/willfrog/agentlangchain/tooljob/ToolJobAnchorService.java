@@ -229,6 +229,20 @@ public class ToolJobAnchorService {
         }
     }
 
+    /** 用户咨询锁、在途检查与原查询续占在同一事务内完成，提交后其它查询能看见新占用。 */
+    @Transactional
+    public boolean renewExecuteQueryReplayClaim(String runId, long groupId, String memberIdentity,
+                                                String operationId, String requestFingerprint,
+                                                String createRequestJson, long planGeneration,
+                                                long runControlVersion) {
+        ToolJobAnchor expected = new ToolJobAnchor();
+        expected.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        expected.setOperationId(operationId);
+        guardExecuteQuerySession(runId, expected);
+        return agentRunMapper.renewExecuteQueryReplayClaim(runId, groupId, memberIdentity,
+                operationId, requestFingerprint, createRequestJson, planGeneration, runControlVersion) == 1;
+    }
+
     public boolean updateActive(String runId, ToolJobAnchor anchor,
                                 AgentRunStatus expectedStatus, String operationId) {
         // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。

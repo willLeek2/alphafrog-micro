@@ -7,6 +7,8 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
@@ -208,6 +210,9 @@ public class WaitMemberResultReceiver {
         return current;
     }
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private ToolJobAnchorService queryAdmission;
+
     /** 周期接结果：按成员行的下次查询时间取一批到点的成员。 */
     @Scheduled(fixedDelayString = "${agent.langchain.wait-member.receiver.poll-interval-ms:1000}")
     public void pollDueMembers() {
@@ -335,7 +340,8 @@ public class WaitMemberResultReceiver {
                         // 新版证明已经在首次 RPC 前保存完整请求。按原编号再查并原样重发，
                         // 不能因为当前未找到就抢先写取消墓碑。
                         WaitMemberDurableRequestResolver.Resolution resolution =
-                                WaitMemberDurableRequestResolver.resolveOutcome(proof, sandboxService);
+                                WaitMemberDurableRequestResolver.resolveOutcome(proof, sandboxService,
+                                        () -> renewQueryReplayClaim(member, group, run, proof));
                         if (resolution.workspaceRefusalCode() != null) {
                             WaitMemberDispatchProof refused = proof.withWorkspaceRefusal(
                                     resolution.workspaceRefusalCode());
@@ -390,6 +396,28 @@ public class WaitMemberResultReceiver {
         finish(member, group, segment, run, proof,
                 new Terminal(taskId, statusName, result, status.getFinishedAt()),
                 policy, outcome);
+    }
+
+    private boolean renewQueryReplayClaim(WaitMember member, WaitGroup group, AgentRun run,
+                                           WaitMemberDispatchProof proof) {
+        if (!ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())) {
+            return true;
+        }
+        if (queryAdmission == null) {
+            log.warn("查询原请求尚未重新准入：member={} code=query_replay_admission_unavailable", member.getId());
+            return false;
+        }
+        try {
+            if (queryAdmission.renewExecuteQueryReplayClaim(member.getRunId(), member.getGroupId(),
+                    member.getMemberIdentity(), proof.operationId(), proof.requestFingerprint(),
+                    proof.createRequestJson(), group.getPlanGeneration(), run.getRunControlVersion())) {
+                return true;
+            }
+            log.info("查询原请求尚未重新准入：member={} code=query_replay_claim_changed", member.getId());
+        } catch (SessionQueryAdmissionException busy) {
+            log.info("查询原请求尚未重新准入：member={} code={}", member.getId(), busy.code());
+        }
+        return false;
     }
 
     /** 这一轮对一条成员的处置：压住、照常接结果、或者照常接结果但按策略拒绝收成失败。 */

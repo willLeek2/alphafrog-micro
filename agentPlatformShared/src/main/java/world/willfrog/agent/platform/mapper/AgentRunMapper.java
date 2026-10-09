@@ -394,6 +394,16 @@ public interface AgentRunMapper {
                                         @Param("toolName") String toolName,
                                         @Param("staleSeconds") int staleSeconds);
 
+    /** 原样重放前续占既有查询，原成员证明和 Run 控制版本不匹配时不得刷新。 */
+    int renewExecuteQueryReplayClaim(@Param("runId") String runId,
+                                    @Param("groupId") long groupId,
+                                    @Param("memberIdentity") String memberIdentity,
+                                    @Param("operationId") String operationId,
+                                    @Param("requestFingerprint") String requestFingerprint,
+                                    @Param("createRequestJson") String createRequestJson,
+                                    @Param("planGeneration") long planGeneration,
+                                    @Param("runControlVersion") long runControlVersion);
+
     /**
      * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。
      * token/version/resultConsumed 共同防止旧 launcher 覆盖新的工具任务。
