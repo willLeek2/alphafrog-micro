@@ -223,7 +223,7 @@
                        OR (m.state = 'LATE' AND EXISTS (
                            SELECT 1 FROM alphafrog_agent_run_wait_member_stop pending_stop
                             WHERE pending_stop.wait_member_id = m.id
-                              AND pending_stop.state &lt;&gt; 'CONFIRMED')))
+                              AND pending_stop.state &lt;&gt; 'CONFIRMED'))))
            AND NOT EXISTS (
                SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
                 WHERE s.run_id = r.id AND s.state &lt;&gt; 'CONFIRMED')

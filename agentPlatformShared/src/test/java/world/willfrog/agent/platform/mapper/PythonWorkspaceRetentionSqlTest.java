@@ -2,13 +2,21 @@ package world.willfrog.agent.platform.mapper;
 
 import org.apache.ibatis.builder.xml.XMLMapperBuilder;
 import org.apache.ibatis.io.Resources;
+import org.apache.ibatis.mapping.BoundSql;
+import org.apache.ibatis.scripting.defaults.DefaultParameterHandler;
 import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.PreparedStatement;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 /** 校验到期标记与删盘确认两处 SQL 都有异步责任栅栏。 */
 class PythonWorkspaceRetentionSqlTest {
@@ -36,6 +44,45 @@ class PythonWorkspaceRetentionSqlTest {
         }
         assertThat(bound(configuration, AgentRunMapper.class, "markWorkspaceExpired"))
                 .contains("tool_job_anchor_json = r.tool_job_anchor_json - 'createRequestJson'");
+    }
+
+    @Test
+    void markingAndExpirationBindIdAndCloseEverySubquery() throws Exception {
+        Configuration configuration = mapper(AgentRunMapper.class, "mapper/AgentRunMapper.xml");
+        String runId = "6169288dd70e4bc28b018e49eb63779a";
+        Map<String, Object> parameters = Map.of("id", runId);
+        for (String name : new String[]{"markWorkspaceCleanupStarted", "markWorkspaceExpired"}) {
+            var statement = configuration.getMappedStatement(AgentRunMapper.class.getName() + '.' + name);
+            BoundSql boundSql = statement.getBoundSql(parameters);
+            assertThat(boundSql.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                    .containsExactly("id");
+            PreparedStatement jdbc = mock(PreparedStatement.class);
+            new DefaultParameterHandler(statement, parameters, boundSql).setParameters(jdbc);
+            verify(jdbc).setString(1, runId);
+            verifyNoMoreInteractions(jdbc);
+
+            // 从实际绑定 SQL 检查全部子查询闭合，字符串中的括号不参与计算。
+            String sql = boundSql.getSql();
+            String structuralSql = sql.replaceAll("'(?:''|[^'])*'", "''");
+            int depth = 0;
+            for (char token : structuralSql.toCharArray()) {
+                if (token == '(') depth++;
+                if (token == ')') depth--;
+                assertThat(depth).as("%s 子查询不得提前闭合", name).isGreaterThanOrEqualTo(0);
+            }
+            assertThat(depth).as("%s 每个子查询都必须完整闭合", name).isZero();
+
+            // 只导出 SELECT 探针，直接复用绑定后的全部 WHERE，不执行状态写入。
+            String probeDirectory = System.getProperty("workspace.retention.probe-dir");
+            if (probeDirectory != null && !probeDirectory.isBlank()) {
+                Path directory = Path.of(probeDirectory);
+                Files.createDirectories(directory);
+                String where = sql.substring(sql.indexOf("WHERE r.id"))
+                        .replace("?", "'" + runId + "'");
+                Files.writeString(directory.resolve(name + ".sql"),
+                        "SELECT count(*) AS eligible_count FROM alphafrog_agent_run r " + where + "\n");
+            }
+        }
     }
 
     @Test
