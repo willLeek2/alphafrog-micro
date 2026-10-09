@@ -7,6 +7,7 @@ import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -23,6 +24,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
@@ -89,7 +91,8 @@ import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 
 /**
- * 共用节点执行器的行为自检：一次领取只发一次模型请求；有工具请求就先落整组再派发；同步结果当场写终态；
+ * 共用节点执行器的行为自检：正常领取只发一次模型请求，未执行的准入错误允许有限修正；
+ * 有合法工具请求就先落整组再派发；同步结果当场写终态；
  * 恢复时按成员原始序号把结果接回；连续多个等待组的分段序号依次加一。
  *
  * <p>这里用的是内存版存储与脚本化模型，证明的是执行器自己的顺序与配对规则。真库上的并发条件更新、
@@ -663,14 +666,14 @@ class DualPoolWaitGroupNodeExecutorTest {
                     assertThat(completed.resultPatch()).containsEntry("cumulativeToolCallsUsed", 5);
                 });
         List<ChatMessage> messages = model.lastRequest();
-        assertThat(messages).as("系统 + 用户 + 助手 + 三条工具结果").hasSize(6);
-        assertThat(messages.subList(3, 6)).allSatisfy(message ->
+        assertThat(messages).as("系统 + 本轮限制 + 用户 + 助手 + 三条工具结果").hasSize(7);
+        assertThat(messages.subList(4, 7)).allSatisfy(message ->
                 assertThat(message).isInstanceOf(ToolExecutionResultMessage.class));
-        assertThat(messages.subList(3, 6)).extracting(message ->
+        assertThat(messages.subList(4, 7)).extracting(message ->
                         ((ToolExecutionResultMessage) message).id())
                 .as("按成员原始序号接回，与完成先后无关")
                 .containsExactly("call-a", "call-b", "call-c");
-        assertThat(messages.subList(3, 6)).extracting(message ->
+        assertThat(messages.subList(4, 7)).extracting(message ->
                         ((ToolExecutionResultMessage) message).text())
                 .containsExactly("第一个结果", "第二个结果", "第三个结果");
     }
@@ -704,11 +707,13 @@ class DualPoolWaitGroupNodeExecutorTest {
     // ==================== 派发之前就把不该写的挡下来 ====================
 
     @Test
-    void tooManyMembersFailTheNodeBeforeAnythingIsWritten() {
+    void repeatedOversizeGroupsStopAfterTwoCorrectionsWithoutDispatch() {
         List<ToolExecutionRequest> calls = new ArrayList<>();
         for (int index = 0; index < 17; index++) {
             calls.add(toolCall("call-" + index, "getStockDaily", "{}"));
         }
+        model.enqueue(AiMessage.from(calls));
+        model.enqueue(AiMessage.from(calls));
         model.enqueue(AiMessage.from(calls));
 
         DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
@@ -718,6 +723,90 @@ class DualPoolWaitGroupNodeExecutorTest {
                         .startsWith("wait_group_member_limit_exceeded"));
         assertThat(store.events()).isEmpty();
         assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(model.requests).hasSize(3);
+    }
+
+    @Test
+    void oversizedTurnCanBeCorrectedWithEveryOriginalCallPairedAndCheckpointed() throws Exception {
+        RootTreeCallBudget budget = mock(RootTreeCallBudget.class);
+        ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 19; index++) {
+            rejected.add(toolCall("rejected-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from(List.of(toolCall("accepted", "getStockDaily", "{}"))));
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(outcome).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Suspended.class,
+                suspended -> assertThat(suspended.modelTurn()).isEqualTo(1));
+        assertThat(dispatcher.dispatched).extracting(NodeToolDispatcher.DispatchRequest::toolCallId)
+                .containsExactly("accepted");
+        List<ToolExecutionResultMessage> errors = model.lastRequest().stream()
+                .filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).toList();
+        assertThat(errors).extracting(ToolExecutionResultMessage::id)
+                .containsExactlyElementsOf(rejected.stream().map(ToolExecutionRequest::id).toList());
+        for (ToolExecutionResultMessage error : errors) {
+            JsonNode body = objectMapper.readTree(error.text());
+            assertThat(body.path("error").path("requested").asInt()).isEqualTo(19);
+            assertThat(body.path("error").path("maxToolCallsPerTurn").asInt()).isEqualTo(16);
+            assertThat(body.path("error").path("message").asText()).contains("没有执行任何工具");
+        }
+        assertThat(model.lastRequest().stream().filter(SystemMessage.class::isInstance)
+                .map(SystemMessage.class::cast).map(SystemMessage::text))
+                .anySatisfy(text -> assertThat(text).contains("16个工具调用", "单次批量参数数量不同"));
+        JsonNode payload = nextPayload(0, 1);
+        NodeSegmentCheckpoint saved = NodeSegmentCheckpoint.read(payload);
+        assertThat(saved.modelTurn()).isEqualTo(2);
+        assertThat(saved.toolCallsUsed()).isEqualTo(1);
+        assertThat(saved.messages().stream().filter(ToolExecutionResultMessage.class::isInstance)).hasSize(19);
+        verify(budget).beforeModelCall(eq(segmentIdentity(0)), eq("0"));
+        verify(budget).beforeModelCall(eq(segmentIdentity(0)), eq("1"));
+        model.enqueue(AiMessage.from("根据返回的数据继续完成"));
+        executor.executeSegment(segment(segmentIdentity(1), payload));
+        assertThat(model.lastRequest().stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).map(ToolExecutionResultMessage::id))
+                .contains("accepted", "rejected-0", "rejected-18");
+    }
+
+    @Test
+    void admissionCorrectionStillStopsAtTheOriginalModelBudget() {
+        RootTreeCallBudget budget = mock(RootTreeCallBudget.class);
+        ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("call-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        doThrow(new RunBudgetException("model_calls", 1, 1, false))
+                .when(budget).beforeModelCall(eq(segmentIdentity(0)), eq("1"));
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(outcome).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class,
+                completed -> assertThat(completed.resultPatch()).containsEntry("failureReason", "run_budget_exceeded"));
+        assertThat(store.events()).isEmpty();
+        assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(model.requests).hasSize(1);
+    }
+
+    @Test
+    void cancellationBetweenAdmissionRefusalAndCorrectionStopsBeforeAnotherModelCall() {
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("call-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty(), Optional.of("CANCELED"));
+
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .isInstanceOf(RunInterruptedException.class).hasMessageContaining("CANCELED");
+
+        assertThat(store.events()).isEmpty();
+        assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(model.requests).hasSize(1);
     }
 
     @Test

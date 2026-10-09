@@ -59,7 +59,8 @@ import java.util.Set;
 /**
  * 新调度器版本（DUAL_POOL_V2）的节点分段执行器：LINEAR 与 DAG 共用同一份模型与工具循环。
  *
- * <p>一次领取只做一件事：发一次模型请求。回复里没有工具请求，这个节点就到此结束；有工具请求，
+ * <p>正常领取发一次模型请求。尚未派发的整轮工具请求超过上限时，最多增加两次模型修正，
+ * 每次仍检查取消和原运行预算。回复里没有工具请求，这个节点就到此结束；有合法工具请求，
  * 就先把整组请求、检查点和下一条等待分段原子写进数据库，再逐个派发。派发完成后本线程立刻交还
  * 节点执行名额，不在原分段里继续跑模型——下一位 Worker 会按同一份检查点把会话接回来。</p>
  *
@@ -79,6 +80,8 @@ public class DualPoolWaitGroupNodeExecutor {
     private static final List<String> SUB_AGENT_TOOL_NAMES = List.of("spawnSubAgent", "waitForSubAgent");
     /** 模型没有给出工具调用身份时，工具结果消息用的占位名字；只在本组内配对使用。 */
     private static final String SYNTHETIC_CALL_ID_PREFIX = "waitcall-";
+    /** 只修正尚未执行的准入错误，避免模型反复违规长期占用节点线程。 */
+    private static final int MAX_TOOL_ADMISSION_CORRECTIONS = 2;
     /**
      * 夹具点名的动作没有落到成员身上（这条成员没有进入等待）：这一条按失败收场，原因就是这个码。
      *
@@ -239,21 +242,33 @@ public class DualPoolWaitGroupNodeExecutor {
             return new Outcome.Completed(failurePatch(input, checkpoint,
                     RISK_REPLAY_EVIDENCE_MISSING_CODE, null));
         }
-        ensureRunnable(input.request());
-        AiMessage reply;
-        try {
-            reply = chatOnce(input, messages, checkpoint.modelTurn());
-        } catch (RunBudgetException budget) {
-            // 额度耗尽发生在挂起之前：这一段还没有交出去，直接按失败结果提交，
-            // 由 Run 协调侧按既有语义收尾（与旧执行路径把额度失败写成节点失败结果一致）。
-            return new Outcome.Completed(failurePatch(input, checkpoint,
-                    "run_budget_exceeded", LangchainTodoNodeExecutor.extractBudgetFailureMetadata(budget)));
+        for (int corrections = 0; ; corrections++) {
+            ensureRunnable(input.request());
+            // 同一次请求的提示和准入使用同一个配置值，避免热更新使两者不一致。
+            int maxMembers = settings.waitGroupMaxMembers().intValue();
+            AiMessage reply;
+            try {
+                reply = chatOnce(input, messages, checkpoint.modelTurn(), maxMembers);
+            } catch (RunBudgetException budget) {
+                return new Outcome.Completed(failurePatch(input, checkpoint,
+                        "run_budget_exceeded", LangchainTodoNodeExecutor.extractBudgetFailureMetadata(budget)));
+            }
+            List<ToolExecutionRequest> calls = toolRequests(reply);
+            if (calls.isEmpty()) {
+                return new Outcome.Completed(turnResultPatch(input, checkpoint, reply.text()));
+            }
+            if (calls.size() <= maxMembers) {
+                return suspendForToolCalls(input, checkpoint, messages, reply, calls);
+            }
+            if (corrections >= MAX_TOOL_ADMISSION_CORRECTIONS) {
+                return new Outcome.Completed(failurePatch(input, checkpoint,
+                        "wait_group_member_limit_exceeded:" + calls.size() + "/" + maxMembers, null));
+            }
+            appendAdmissionRefusals(messages, reply, calls, maxMembers);
+            // 拒绝的调用没有执行，不计工具次数；模型修正仍使用新的回合身份和预算。
+            checkpoint = new NodeSegmentCheckpoint(checkpoint.modelTurn() + 1, null,
+                    messages, checkpoint.toolCallsUsed());
         }
-        List<ToolExecutionRequest> calls = toolRequests(reply);
-        if (calls.isEmpty()) {
-            return new Outcome.Completed(turnResultPatch(input, checkpoint, reply.text()));
-        }
-        return suspendForToolCalls(input, checkpoint, messages, reply, calls);
     }
 
     // ==================== 一次模型回合 ====================
@@ -274,9 +289,15 @@ public class DualPoolWaitGroupNodeExecutor {
         return messages;
     }
 
-    private AiMessage chatOnce(SegmentExecution input, List<ChatMessage> messages, int modelTurn) {
+    private AiMessage chatOnce(SegmentExecution input, List<ChatMessage> messages,
+                               int modelTurn, int maxMembers) {
+        List<ChatMessage> requestMessages = new ArrayList<>(messages);
+        requestMessages.add(Math.min(1, requestMessages.size()), SystemMessage.from(
+                "本次模型回复最多包含" + maxMembers + "个工具调用，所有工具合计。"
+                        + "这是整轮调用数量限制，与checkParallelLimits返回的单次批量参数数量不同。"
+                        + "超过整轮限制时全部调用都不会执行；请减少本轮调用数量，等结果返回后再继续余下批次。"));
         ChatRequest chatRequest = ChatRequest.builder()
-                .messages(messages)
+                .messages(requestMessages)
                 .toolSpecifications(visibleToolSpecifications(input.identity().runId(),
                         input.request().getToolSpecifications()))
                 .build();
@@ -297,6 +318,23 @@ public class DualPoolWaitGroupNodeExecutor {
             throw new IllegalStateException("模型没有返回回复，无法继续这个节点：" + input.identity().describe());
         }
         return reply;
+    }
+
+    /** 给每个被拒绝的原调用配一个结果，保留完整对话配对关系，不派发任何工具。 */
+    private void appendAdmissionRefusals(List<ChatMessage> messages, AiMessage reply,
+                                         List<ToolExecutionRequest> calls, int maxMembers) {
+        messages.add(withSyntheticCallIds(reply, calls));
+        String output = json(Map.of("ok", false, "error", Map.of(
+                "code", "WAIT_GROUP_MEMBER_LIMIT_EXCEEDED", "retryable", true,
+                "requested", calls.size(), "maxToolCallsPerTurn", maxMembers,
+                "message", "本轮" + calls.size() + "个工具调用超过上限" + maxMembers
+                        + "；本轮没有执行任何工具。请减少本轮调用数量，余下调用等本轮结果返回后再继续。")));
+        for (int index = 0; index < calls.size(); index++) {
+            ToolExecutionRequest call = calls.get(index);
+            String callId = call.id() == null || call.id().isBlank()
+                    ? SYNTHETIC_CALL_ID_PREFIX + index : call.id();
+            messages.add(ToolExecutionResultMessage.from(callId, call.name(), output));
+        }
     }
 
     /**
@@ -376,11 +414,6 @@ public class DualPoolWaitGroupNodeExecutor {
                                         List<ChatMessage> messages,
                                         AiMessage reply,
                                         List<ToolExecutionRequest> calls) {
-        int maxMembers = settings.waitGroupMaxMembers().intValue();
-        if (calls.size() > maxMembers) {
-            return new Outcome.Completed(failurePatch(input, checkpoint,
-                    "wait_group_member_limit_exceeded:" + calls.size() + "/" + maxMembers, null));
-        }
         List<WaitMemberDraft> drafts = new ArrayList<>();
         for (int index = 0; index < calls.size(); index++) {
             ToolExecutionRequest call = calls.get(index);
