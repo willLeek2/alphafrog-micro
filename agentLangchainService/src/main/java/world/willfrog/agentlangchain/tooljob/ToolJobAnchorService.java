@@ -204,6 +204,21 @@ public class ToolJobAnchorService {
                     false);
         }
         agentRunMapper.lockExecuteQuerySession(userId);
+        // 同 Run 的等待成员也必须串行。取锁后重读，不能使用取锁前的空锚点快照。
+        AgentRun lockedRun = agentRunMapper.findById(runId);
+        String activeJson = lockedRun == null ? null : lockedRun.getToolJobAnchorJson();
+        ToolJobAnchor active = activeJson == null || activeJson.isBlank() || "{}".equals(activeJson.trim())
+                ? null : ToolJobAnchor.fromJson(activeJson);
+        // 结果已被恢复 worker 接收的终态任务不再在途；后续 UPDATE 仍核验恢复 token/version。
+        boolean consumedTerminal = active != null && "TERMINAL".equals(active.getAnchorState())
+                && active.isResultConsumed();
+        if (active != null && !consumedTerminal && ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(active.getToolName())
+                && !java.util.Objects.equals(active.getOperationId(), anchor.getOperationId())) {
+            throw new SessionQueryAdmissionException(
+                    "SESSION_QUERY_IN_PROGRESS",
+                    "another executeQuery is already running in this session; wait for it to finish or retry shortly",
+                    true);
+        }
         int inFlight = agentRunMapper.countInFlightExecuteQueryByUser(
                 userId, runId, ToolJobAnchor.EXECUTE_QUERY_TOOL, sessionStaleSeconds);
         if (inFlight > 0) {

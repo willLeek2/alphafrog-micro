@@ -41,6 +41,9 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
         if (isWorkspaceDirty(result.statusName(), result.nativePayload())) {
             return "WORKSPACE_DIRTY";
         }
+        if ("RESULT_LOST".equals(result.statusName())) {
+            return "PYTHON_RESULT_LOST";
+        }
         return "CANCELED".equals(result.statusName())
                 ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
     }
@@ -55,8 +58,14 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
 
     @Override
     public String formatTerminalResult(SandboxTerminalResultView result, Object formatContext) {
-        FinanceRecordExtractionResult financeResult =
-                formatContext == null ? null : (FinanceRecordExtractionResult) formatContext;
+        // 普通收尾保留既有失败提示；分类始终由本适配器决定，提示不能覆盖错误码。
+        FinanceRecordExtractionResult financeResult = formatContext instanceof FinanceRecordExtractionResult extraction
+                ? extraction : null;
+        FinanceToolResultFormatter.FailureDetail guidance = formatContext instanceof FinanceToolResultFormatter.FailureDetail detail
+                ? detail : null;
+        if (formatContext != null && financeResult == null && guidance == null) {
+            throw new IllegalArgumentException("Unsupported Python result format context");
+        }
         String stdout = financeResult == null
                 ? nvl(result.stdout()) : financeResult.ordinaryStdout();
 
@@ -77,19 +86,23 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
         }
 
         boolean dirty = isWorkspaceDirty(result.statusName(), result.nativePayload());
-        boolean retryable = !dirty && Boolean.TRUE.equals(result.retryable());
+        boolean resultLost = "RESULT_LOST".equals(result.statusName());
+        boolean retryable = !dirty && !resultLost && Boolean.TRUE.equals(result.retryable());
         String errorCode = errorCodeOf(result);
-        String message = dirty ? "同一 Run 的前一个任务失败，工作区已标脏；本任务未执行"
+        String message = "RESULT_LOST".equals(result.statusName()) ? "沙箱结果永久丢失"
+                : dirty ? "同一 Run 的前一个任务失败，工作区已标脏；本任务未执行"
                 : "CANCELED".equals(result.statusName())
                 ? "Python 执行已取消" : "Python 执行失败";
-        String action = dirty ? "检查前一个任务的失败原因后，使用新的 Run 重新执行"
+        String action = resultLost ? "重新提交计算任务"
+                : dirty ? "检查前一个任务的失败原因后，使用新的 Run 重新执行"
                 : retryable ? "根据 stderr 修正代码或输入后重试"
                 : "检查输入和资源限制；如问题持续，请联系管理员";
         return financeToolResultFormatter.formatFailure(
                 stdout,
                 nvl(result.stderr()),
-                new FinanceToolResultFormatter.FailureDetail(
-                        errorCode, message, retryable, action));
+                new FinanceToolResultFormatter.FailureDetail(errorCode,
+                        guidance == null ? message : guidance.message(),
+                        retryable, guidance == null ? action : guidance.action()));
     }
 
     private static String nvl(String text) {

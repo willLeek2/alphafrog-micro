@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
@@ -30,6 +33,7 @@ class ToolJobFinalizerWorkspaceResultTest {
 
     @BeforeEach
     void setUp() {
+        SandboxJobAdapterRegistry.clearForTests();
         when(anchorService.updateAnchor(eq("run-a"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
         when(anchorService.updateAnchorAndStatus(eq("run-a"), any(),
@@ -43,6 +47,51 @@ class ToolJobFinalizerWorkspaceResultTest {
                 new FinanceToolResultFormatter(objectMapper), mock(FinanceResultModelAdapter.class));
         ReflectionTestUtils.setField(finalizer, "usageHook", usageHook);
         ReflectionTestUtils.setField(finalizer, "eventHook", eventHook);
+    }
+
+    @AfterEach
+    void clearAdapters() {
+        SandboxJobAdapterRegistry.clearForTests();
+    }
+
+    @Test
+    void sqlBusinessFailureKeepsSqlEnvelopeAcrossFinalizerRetry() throws Exception {
+        SqlQueryTools query = new SqlQueryTools(objectMapper);
+        ReflectionTestUtils.invokeMethod(query, "registerSandboxJobAdapters");
+        ToolJobAnchor anchor = anchor();
+        anchor.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        when(usageHook.upsertUsage(eq("run-a"), any())).thenReturn(false, true);
+        TaskResultResponse response = TaskResultResponse.newBuilder().setTaskId("task-b")
+                .setStatus("SUCCEEDED").setExitCode(0).setRetryable(false)
+                .setStdout("__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"stage\":\"gate\","
+                        + "\"error\":{\"code\":\"EXPLAIN_FAILED\",\"message\":\"Binder Error\"}}")
+                .build();
+
+        assertThat(finalizer.handleTerminal("run-a", anchor, "SUCCEEDED", response, true).done()).isFalse();
+
+        JsonNode output = objectMapper.readTree(anchor.getTerminalResultPreview());
+        assertThat(output.path("tool").asText()).isEqualTo("executeQuery");
+        assertThat(output.path("ok").asBoolean()).isFalse();
+        assertThat(output.path("error").path("code").asText()).isEqualTo("EXPLAIN_FAILED");
+        assertThat(anchor.getTerminalBusinessSuccess()).isFalse();
+        assertThat(anchor.getSandboxTerminalStatus()).isEqualTo("SUCCEEDED");
+        assertThat(anchor.getTerminalErrorCode()).isEqualTo("EXPLAIN_FAILED");
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+        assertThat(finalizer.handleTerminal("run-a", restored, "SUCCEEDED", null, true).done()).isTrue();
+        assertThat(restored.getTerminalBusinessSuccess()).isFalse();
+        assertThat(restored.getTerminalResultPreview()).isEqualTo(anchor.getTerminalResultPreview());
+    }
+
+    @Test
+    void nonZeroExitDoesNotInventWorkspaceDirty() throws Exception {
+        ToolJobAnchor anchor = anchor();
+        TaskResultResponse response = TaskResultResponse.newBuilder().setStatus("FAILED").setExitCode(1)
+                .setRetryable(true).setStderr("KeyError")
+                .setResourceUsage(SandboxResourceUsage.newBuilder().setExitReason("NON_ZERO_EXIT")).build();
+        assertThat(finalizer.handleTerminal("run-a", anchor, "FAILED", response, false).done()).isTrue();
+        assertThat(anchor.getTerminalBusinessSuccess()).isFalse();
+        assertThat(anchor.getTerminalResultPreview()).contains("PYTHON_EXECUTION_FAILED")
+                .doesNotContain("WORKSPACE_DIRTY", "本任务未执行", "新的 Run");
     }
 
     @Test

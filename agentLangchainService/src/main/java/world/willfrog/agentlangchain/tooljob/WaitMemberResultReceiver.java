@@ -20,8 +20,11 @@ import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobRunnerAdapter;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
-import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
@@ -727,13 +730,20 @@ public class WaitMemberResultReceiver {
                         AcceptanceReleasePolicy policy,
                         PolicyOutcome outcome) {
         ForcedFailure refusal = outcome == null ? null : outcome.refusal();
-        String output = pythonSandboxTools.formatTerminalResult(
-                terminal.statusName(), terminal.result(),
-                member.getRunId(), run.getUserId(), group.getNodeId(), member.getToolCallId());
+        SandboxJobAdapters adapters = SandboxJobAdapterRegistry.find(member.getToolName())
+                .orElseThrow(() -> new IllegalStateException("Sandbox result adapter is unavailable: "
+                        + member.getToolName()));
+        // 两种工具共用已核验的 Python 沙箱协议；业务解释由成员工具自己的适配器负责。
+        var terminalView = new PythonSandboxJobRunnerAdapter(sandboxService, null)
+                .toTerminalView(terminal.result(), terminal.statusName());
+        SandboxJobResultAdapter.ResolvedResult resolved = adapters.resolveTerminal(
+                new SandboxJobAdapters.TerminalContext(member.getRunId(), run.getUserId(),
+                        group.getNodeId(), member.getToolCallId()), terminalView);
+        String output = resolved.output();
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
-        boolean success = SUCCEEDED.equals(terminal.statusName())
-                && terminal.result().getExitCode() == 0
-                && !WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
+        boolean oversized = WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
+        boolean success = resolved.success() && !oversized;
+        String failureCode = oversized ? WaitMemberResultPayload.TOO_LARGE : resolved.errorCode();
         boolean failedAlready = !success;
         boolean designatedApplied = false;
         Map<String, Object> extra = new LinkedHashMap<>();
@@ -754,14 +764,14 @@ public class WaitMemberResultReceiver {
             success = false;
             designatedApplied = true;
             if (failedAlready) {
-                extra.put("errorCode", errorCodeOf(terminal));
+                extra.put("errorCode", failureCode);
                 extra.put("designatedFailure", designated);
             } else {
                 extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
                 extra.put("errorDetail", designated);
             }
         } else if (failedAlready) {
-            extra.put("errorCode", errorCodeOf(terminal));
+            extra.put("errorCode", failureCode);
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
@@ -852,23 +862,6 @@ public class WaitMemberResultReceiver {
                 throw e;
             }
         }
-    }
-
-    private static String errorCodeOf(Terminal terminal) {
-        String statusName = terminal.statusName();
-        if (PythonSandboxJobResultAdapter.isWorkspaceDirty(statusName, terminal.result())) {
-            return "WORKSPACE_DIRTY";
-        }
-        if (statusName == null) {
-            return "PYTHON_EXECUTION_FAILED";
-        }
-        if (CANCELED.equals(statusName)) {
-            return "PYTHON_EXECUTION_CANCELED";
-        }
-        if (RESULT_LOST.equals(statusName)) {
-            return "PYTHON_RESULT_LOST";
-        }
-        return "PYTHON_EXECUTION_FAILED";
     }
 
     /** 到点的成员还没结论：按退避推后下次查询时间。 */

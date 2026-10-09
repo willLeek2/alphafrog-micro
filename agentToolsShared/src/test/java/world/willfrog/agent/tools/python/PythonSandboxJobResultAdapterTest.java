@@ -48,6 +48,15 @@ class PythonSandboxJobResultAdapterTest {
                 .contains("\"retryable\":true");
     }
 
+    @Test
+    void resultLostHasItsOwnNonRetryableFailure() {
+        var resolved = adapter.resolveTerminal(new SandboxTerminalResultView(
+                "RESULT_LOST", null, "", "", null, null, null, true, null, null), null);
+        assertThat(resolved.success()).isFalse();
+        assertThat(resolved.errorCode()).isEqualTo("PYTHON_RESULT_LOST");
+        assertThat(resolved.output()).contains("\"code\":\"PYTHON_RESULT_LOST\"", "\"retryable\":false");
+    }
+
     private static SandboxTerminalResultView view(TaskResultResponse response) {
         return new SandboxTerminalResultView(response.getStatus(), response.getExitCode(),
                 response.getStdout(), response.getStderr(), null, null, response.getError(),

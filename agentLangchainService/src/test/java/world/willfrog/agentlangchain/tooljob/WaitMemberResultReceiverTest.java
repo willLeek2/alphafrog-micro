@@ -1,9 +1,23 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.protobuf.util.JsonFormat;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.tools.sandboxjob.*;
+import world.willfrog.agent.tools.python.PythonSandboxJobRequestAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
+import world.willfrog.agent.platform.finance.*;
+import world.willfrog.agent.platform.mapper.FinanceRecordBatchMapper;
+import world.willfrog.agent.platform.mapper.FinanceMetricRecordMapper;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
+import world.willfrog.agent.tools.finance.FinanceResultModelProjector;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -95,6 +109,7 @@ class WaitMemberResultReceiverTest {
 
     @BeforeEach
     void setUp() {
+        SandboxJobAdapterRegistry.clearForTests();
         waitGroupStore = Mockito.mock(WaitGroupStore.class);
         ownership = Mockito.mock(RunOwnershipGateway.class);
         Mockito.lenient().when(ownership.requireIdentity()).thenReturn(
@@ -123,6 +138,193 @@ class WaitMemberResultReceiverTest {
         Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(
                 anyString(), any(), any(), any(), any(), any()))
                 .thenReturn("{\"ok\":true,\"stdout\":\"done\"}");
+        // 既有接收器编排用例只替换正文；业务分类仍用真实 Python 适配器。
+        var classifier = new PythonSandboxJobResultAdapter(new FinanceToolResultFormatter(objectMapper), null);
+        SandboxJobResultAdapter textStub = new SandboxJobResultAdapter() {
+            public boolean isSuccess(SandboxTerminalResultView terminal) { return classifier.isSuccess(terminal); }
+            public String errorCodeOf(SandboxTerminalResultView terminal) { return classifier.errorCodeOf(terminal); }
+            public String formatTerminalResult(SandboxTerminalResultView terminal, Object ignored) {
+                return pythonSandboxTools.formatTerminalResult(terminal.statusName(),
+                        (TaskResultResponse) terminal.nativePayload(), RUN_ID, null, "node-1", "tc-1");
+            }
+        };
+        SandboxJobAdapterRegistry.register(new SandboxJobAdapters(
+                new PythonSandboxJobRequestAdapter(), null, textStub, null));
+    }
+
+    @AfterEach
+    void clearAdapters() {
+        SandboxJobAdapterRegistry.clearForTests();
+    }
+
+    private PythonSandboxTools installRealAdapters() {
+        SandboxJobAdapterRegistry.clearForTests();
+        PythonSandboxTools python = new PythonSandboxTools(objectMapper);
+        ReflectionTestUtils.setField(python, "pythonSandboxService", sandboxService);
+        ReflectionTestUtils.invokeMethod(python, "registerSandboxJobAdapters");
+        SqlQueryTools query = new SqlQueryTools(objectMapper);
+        ReflectionTestUtils.setField(query, "pythonSandboxService", sandboxService);
+        ReflectionTestUtils.invokeMethod(query, "registerSandboxJobAdapters");
+        return python;
+    }
+
+    @Test
+    void realSqlAdapterKeepsBusinessFailuresEvenWhenSandboxSucceeded() throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "__EXECUTE_QUERY_RESULT__{\"status\":\"PLAN_REJECTED\","
+                + "\"stage\":\"gate\",\"error\":{\"code\":\"PLAN_GLOBAL_SORT\",\"message\":\"add LIMIT\"}}");
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        JsonNode saved = objectMapper.readTree(capturedRequest().resultRefJson());
+        JsonNode output = objectMapper.readTree(saved.path("output").asText());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(saved.path("errorCode").asText()).isEqualTo("PLAN_GLOBAL_SORT");
+        assertThat(output.path("tool").asText()).isEqualTo("executeQuery");
+        assertThat(output.path("ok").asBoolean()).isFalse();
+        assertThat(output.path("error").path("code").asText()).isEqualTo("PLAN_GLOBAL_SORT");
+        assertThat(output.path("error").path("details").path("retryable").asBoolean()).isTrue();
+        verify(pythonSandboxTools, never()).formatTerminalResult(any(), any(), any(), any(), any(), any());
+        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), eq(saved.path("output").asText()), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"gate,EXPLAIN_FAILED,true", "configure,ENGINE_CONFIGURATION_FAILED,false", "execute,STATEMENT_TIMEOUT,true"})
+    void realSqlFailuresKeepOriginalCodeStageAndRetryGuidance(String stage, String code, boolean retryable)
+            throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"stage\":\"" + stage
+                + "\",\"error\":{\"code\":\"" + code + "\",\"message\":\"query failed\"}}");
+        completion(true, WaitMemberState.FAILED, null);
+        receiver.round();
+        JsonNode saved = objectMapper.readTree(capturedRequest().resultRefJson());
+        JsonNode output = objectMapper.readTree(saved.path("output").asText());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(saved.path("errorCode").asText()).isEqualTo(code);
+        assertThat(output.path("error").path("code").asText()).isEqualTo(code);
+        assertThat(output.path("error").path("details").path("stage").asText()).isEqualTo(stage);
+        assertThat(output.path("error").path("details").path("retryable").asBoolean()).isEqualTo(retryable);
+    }
+
+    @Test
+    void realSqlCanceledResultKeepsQueryCancellation() throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("CANCELED");
+        result("CANCELED", -1, "canceled");
+        completion(true, WaitMemberState.FAILED, null);
+        receiver.round();
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("QUERY_CANCELED", "executeQuery")
+                .doesNotContain("PYTHON_EXECUTION_CANCELED");
+    }
+
+    @Test
+    void realSqlAdapterReturnsRowsAndTruncationAsSqlSuccess() throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "__EXECUTE_QUERY_RESULT__{\"status\":\"SUCCEEDED\","
+                + "\"columns\":[\"n\"],\"rows\":[[3]],\"row_count\":1,\"truncated\":true}");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+
+        JsonNode saved = objectMapper.readTree(capturedRequest().resultRefJson());
+        JsonNode output = objectMapper.readTree(saved.path("output").asText());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        assertThat(saved.has("errorCode")).isFalse();
+        assertThat(output.path("tool").asText()).isEqualTo("executeQuery");
+        assertThat(output.path("data").path("rows").get(0).get(0).asInt()).isEqualTo(3);
+        assertThat(output.path("data").path("truncated").asBoolean()).isTrue();
+    }
+
+    @Test
+    void realPythonNonZeroExitDoesNotInventDirtyWorkspace() throws Exception {
+        installRealAdapters();
+        givenDueMember();
+        status("FAILED");
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(
+                TaskResultResponse.newBuilder().setTaskId("task-1").setStatus("FAILED")
+                        .setExitCode(1).setStderr("KeyError").setRetryable(true)
+                        .setResourceUsage(SandboxResourceUsage.newBuilder().setExitReason("NON_ZERO_EXIT")).build());
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("PYTHON_EXECUTION_FAILED")
+                .doesNotContain("WORKSPACE_DIRTY", "本任务未执行", "新的 Run");
+    }
+
+    @Test
+    void financialPersistenceFailureDefersAndReplayKeepsOnlyOneBatch() throws Exception {
+        PythonSandboxTools python = installRealAdapters();
+        FinanceRecordBatchMapper batches = Mockito.mock(FinanceRecordBatchMapper.class);
+        FinanceMetricRecordMapper records = Mockito.mock(FinanceMetricRecordMapper.class);
+        AtomicReference<FinanceRecordBatch> persisted = new AtomicReference<>();
+        when(batches.insertIgnore(any())).thenAnswer(invocation -> {
+            FinanceRecordBatch batch = invocation.getArgument(0);
+            return persisted.compareAndSet(null, batch) ? 1 : 0;
+        });
+        when(batches.findByIdentity(any(), any(), any())).thenAnswer(invocation -> persisted.get());
+        when(records.listByBatch(any(), any(), any())).thenReturn(List.of());
+        // 不完整的通道信息产生审计批次；真实处理器仍必须先保存再把标记清理后的正文给模型。
+        FinanceRecordPersister persister = Mockito.spy(new FinanceRecordPersister(batches, records));
+        Mockito.doThrow(new IllegalStateException("database unavailable")).doCallRealMethod()
+                .when(persister).persist(any(), any());
+        FinanceRecordChannelProcessor processor = new FinanceRecordChannelProcessor(
+                new FinanceRecordDecoder(objectMapper), new FinanceRecordSchemaValidator(),
+                new FinanceEnvironmentVerifier(), Mockito.mock(FinanceMethodResolutionQuery.class),
+                persister, Mockito.mock(FinanceRecordChannelObservability.class), objectMapper);
+        ReflectionTestUtils.setField(python, "financeRecordChannelProcessor", processor);
+        FinanceRecordChannelProperties properties = new FinanceRecordChannelProperties();
+        properties.setEnabled(true);
+        ReflectionTestUtils.setField(python, "financeRecordChannelConfigLoader",
+                new FinanceRecordChannelConfigLoader(objectMapper, properties));
+        ReflectionTestUtils.setField(python, "financeResultModelAdapter", new FinanceResultModelAdapter(
+                objectMapper, Mockito.mock(FinanceResultModelProjector.class)));
+        // 重新组装，把刚接好的真实财务投影器绑定进结果适配器。
+        ReflectionTestUtils.setField(python, "sandboxJobAdapters", null);
+        SandboxJobAdapterRegistry.clearForTests();
+        ReflectionTestUtils.invokeMethod(python, "registerSandboxJobAdapters");
+        givenDueMember();
+        AgentRun run = run(AgentRunStatus.EXECUTING);
+        run.setUserId("user-1");
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(run);
+        status("SUCCEEDED");
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(
+                TaskResultResponse.newBuilder().setTaskId("task-1").setStatus("SUCCEEDED")
+                        .setStdout("__AF_FINANCE_RESULT_v1__{\"value\":0.1}\nrows=5")
+                        .setFinanceRecordChannel(world.willfrog.alphafrogmicro.sandbox.idl.FinanceRecordChannelMetadata
+                                .newBuilder().setEmittedRecordCount(1)).build());
+        completion(false, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+        verify(waitGroupStore, never()).completeMember(any());
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        receiver.round();
+        receiver.round();
+
+        verify(batches, times(2)).insertIgnore(any());
+        verify(batches).findByIdentity(eq(RUN_ID), eq("node-1"), eq("tc-1"));
+        assertThat(persisted.get()).isNotNull();
+        ArgumentCaptor<MemberCompletionRequest> saved = ArgumentCaptor.forClass(MemberCompletionRequest.class);
+        verify(waitGroupStore, times(2)).completeMember(saved.capture());
+        assertThat(saved.getAllValues()).allSatisfy(request -> {
+            assertThat(request.memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+            assertThat(request.resultRefJson()).contains("rows=5")
+                    .doesNotContain(FinanceRecordDecoder.MARKER_FAMILY);
+        });
     }
 
     /** 按回合读的参数改完下一轮就生效：批次从 8 改成 3，下一次扫描就按 3 要。 */

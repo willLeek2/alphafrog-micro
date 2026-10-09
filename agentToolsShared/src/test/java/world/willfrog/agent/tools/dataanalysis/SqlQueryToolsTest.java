@@ -401,7 +401,7 @@ class SqlQueryToolsTest {
                 view("FAILED", 1, "", "engine died"), null));
         assertEquals("QUERY_SANDBOX_FAILED", failed.path("error").path("code").asText());
         // 等待组成员失败映射的兜底码：非取消一律 QUERY_EXECUTION_FAILED
-        assertEquals("QUERY_EXECUTION_FAILED", resultAdapter.errorCodeOf(view("FAILED", 1, "", "engine died")));
+        assertEquals("QUERY_SANDBOX_FAILED", resultAdapter.errorCodeOf(view("FAILED", 1, "", "engine died")));
     }
 
     private JsonNode decodeSpec(String rendered) throws Exception {

@@ -194,7 +194,10 @@ public class PythonSandboxTools {
                             new PythonSandboxJobRequestAdapter(),
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
                             new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter),
-                            new PythonSandboxJobMeteringAdapter(objectMapper));
+                            new PythonSandboxJobMeteringAdapter(objectMapper),
+                            (context, terminal) -> extractFinanceIfPresent(
+                                    context.runId(), context.userId(), context.todoId(), context.toolCallId(),
+                                    terminal.statusName(), (TaskResultResponse) terminal.nativePayload()));
                     sandboxJobAdapters = current;
                 }
             }
