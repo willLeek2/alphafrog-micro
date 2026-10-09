@@ -47,6 +47,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.models import (
+    SandboxResourceUsage,
     AcquireWorkspaceRequest,
     CancellationEvidence,
     DeleteWorkspaceRequest,
@@ -120,7 +121,11 @@ def ws_request(
 
 def ok_result() -> ExecuteResult:
     return ExecuteResult(
-        exit_code=0, stdout="ok", stderr="", dataset_dir="/tmp/done"
+        exit_code=0, stdout="ok", stderr="", dataset_dir="/tmp/done",
+        resource_usage=SandboxResourceUsage(
+            resource_class="STANDARD", exit_reason="SUCCEEDED",
+            oom_killed=False, timed_out=False,
+        )
     )
 
 
@@ -141,6 +146,7 @@ def complete(store: DurableTaskStore, task_id: str, result: ExecuteResult):
             ),
             result=result,
             evidence=CancellationEvidence.NONE,
+            workspace_safe_to_continue=result.exit_code == 0,
         ),
     )
 

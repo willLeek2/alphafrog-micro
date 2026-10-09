@@ -750,8 +750,8 @@ async def _process_task_inner(task: Task, worker_id: int):
             status=status,
             result=result,
             evidence=evidence,
-            workspace_failure_safe_to_continue=(
-                result_dict.get("workspace_failure_safe_to_continue") is True
+            workspace_safe_to_continue=(
+                result_dict.get("workspace_safe_to_continue") is True
             ),
             error=(
                 f"sandbox exited with code {result_dict['exit_code']}"

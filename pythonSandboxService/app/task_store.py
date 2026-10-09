@@ -254,7 +254,7 @@ class CompletionCandidate:
     evidence: CancellationEvidence = CancellationEvidence.NONE
     error: Optional[str] = None
     # 仅 runner 在完整执行和精确旧容器停止核验之后设置；不接收请求字段。
-    workspace_failure_safe_to_continue: bool = False
+    workspace_safe_to_continue: bool = False
 
 
 def request_payload_digest(request: ExecuteRequest) -> str:
@@ -897,14 +897,19 @@ class DurableTaskStore:
             # workspace is free but the holder's failure is unknown.
             self._apply_workspace_completion_locked(
                 task,
-                safe_failed_completion=(
-                    candidate.workspace_failure_safe_to_continue is True
-                    and task.status == TaskStatus.FAILED
+                safe_completion=(
+                    candidate.workspace_safe_to_continue is True
+                    and task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
                     and candidate.evidence == CancellationEvidence.NONE
                     and not task.cancel_requested
-                    and 0 < task.result.exit_code < 124
+                    and (
+                        (task.status == TaskStatus.SUCCEEDED and task.result.exit_code == 0)
+                        or (task.status == TaskStatus.FAILED and 0 < task.result.exit_code < 124)
+                    )
                     and task.resource_usage is not None
-                    and task.resource_usage.exit_reason == "NON_ZERO_EXIT"
+                    and task.resource_usage.exit_reason == (
+                        "SUCCEEDED" if task.status == TaskStatus.SUCCEEDED else "NON_ZERO_EXIT"
+                    )
                     and not task.resource_usage.oom_killed
                     and not task.resource_usage.timed_out
                 ),
@@ -913,11 +918,11 @@ class DurableTaskStore:
             return task
 
     def _apply_workspace_completion_locked(
-        self, task: Task, *, safe_failed_completion: bool = False
+        self, task: Task, *, safe_completion: bool = False
     ) -> None:
-        """成功或已有可信停止证据的普通脚本失败释放工作区。
+        """成功和普通脚本失败都仅在已有可信停止证据时释放工作区。
 
-        普通失败缺少可信执行/停止证据，以及取消、超时等其他持有者终态，
+        成功或普通失败缺少可信执行/停止证据，以及取消、超时等其他持有者终态，
         仍把工作区标脏，并明确失败同盘排队任务。没有持有过工作区的
         队列超时或取消不会改变工作区：这些任务未通过该盘执行。
         """
@@ -939,7 +944,7 @@ class DurableTaskStore:
             workspace.holder_task_id = None
             workspace.status_changed_at = now
             return
-        if task.status == TaskStatus.SUCCEEDED or safe_failed_completion:
+        if safe_completion:
             workspace.holder_task_id = None
             workspace.status_changed_at = now
             return

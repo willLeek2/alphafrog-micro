@@ -24,7 +24,7 @@ from app import sandbox_runner
 from app.models import (
     AcquireWorkspaceRequest, EffectiveOutputLimits, ExecuteResult,
     SandboxResourceUsage, Task, TaskStatus, WorkspaceStatus,
-    CancellationEvidence,
+    CancellationEvidence, WorkspaceResult,
 )
 from app.task_store import CompletionCandidate, DurableTaskStore
 
@@ -84,6 +84,18 @@ class ContainerProofTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 self.assertFalse(self.check({}, after_close=True, error=error))
 
+    def test_non_workspace_close_error_keeps_existing_exception_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = _test_config(Path(directory), skip_environment_setup=False)
+            session = SimpleNamespace(container_id=CONTAINER_ID,
+                                      close=mock.Mock(side_effect=RuntimeError("close failed")))
+            with mock.patch.object(sandbox_runner, "create_sandbox_session", return_value=session), \
+                 mock.patch.object(sandbox_runner, "initialize_runtime_environment", return_value=None), \
+                 mock.patch.object(sandbox_runner, "run_in_open_session", return_value={"exit_code": 0}):
+                with self.assertRaisesRegex(RuntimeError, "close failed"):
+                    sandbox_runner.run_in_sandbox(config, "plain", "ds1", None,
+                        "print('ok')", None, None, None)
+
     def test_every_identity_label_is_required_in_both_directions(self):
         for key in LABELS:
             with self.subTest(key=key):
@@ -129,7 +141,7 @@ class StoreFailureTests(_WorkspaceStoreTestBase):
                 ),
             ),
             evidence=evidence,
-            workspace_failure_safe_to_continue=safe,
+            workspace_safe_to_continue=safe,
         )
 
     def test_trusted_failure_stays_failed_and_queued_task_takes_same_disk(self):
@@ -161,6 +173,28 @@ class StoreFailureTests(_WorkspaceStoreTestBase):
                 self.assertEqual(self.store.get_workspace(workspace_id).status, WorkspaceStatus.DIRTY)
                 self.assertEqual(self.store.get("queued").status, TaskStatus.FAILED)
 
+    def test_success_without_internal_proof_is_dirty_and_keeps_true_success(self):
+        workspace_id = self.setup_holder()
+        result = ExecuteResult(exit_code=0, stdout="ok", stderr="", dataset_dir="/input",
+            resource_usage=SandboxResourceUsage(resource_class="STANDARD", exit_reason="SUCCEEDED"))
+        self.store.complete_execution("failed", CompletionCandidate(status=TaskStatus.SUCCEEDED, result=result))
+        self.assertEqual(self.store.get("failed").status, TaskStatus.SUCCEEDED)
+        self.assertEqual(self.store.get_workspace(workspace_id).status, WorkspaceStatus.DIRTY)
+        self.assertEqual(self.store.get("queued").status, TaskStatus.FAILED)
+
+    def test_success_proof_lost_before_commit_does_not_reverse_restart_dirty(self):
+        workspace_id = self.setup_holder()
+        candidate = CompletionCandidate(status=TaskStatus.SUCCEEDED,
+            result=ExecuteResult(exit_code=0, stdout="ok", stderr="", dataset_dir="/input",
+                resource_usage=SandboxResourceUsage(resource_class="STANDARD", exit_reason="SUCCEEDED")),
+            workspace_safe_to_continue=True)
+        reloaded = self.reload_store()
+        reloaded.recover_after_restart()
+        reloaded.complete_execution("failed", candidate)
+        self.assertEqual(reloaded.get("failed").status, TaskStatus.FAILED)
+        self.assertEqual(reloaded.get("failed").result.resource_usage.exit_reason, "UNKNOWN")
+        self.assertEqual(reloaded.get_workspace(workspace_id).status, WorkspaceStatus.DIRTY)
+
     def test_cancel_intent_does_not_gain_release_from_trusted_failure(self):
         workspace_id = self.setup_holder()
         self.store.cancel_by_task_id("cancel-id", "failed", "user request")
@@ -171,7 +205,7 @@ class StoreFailureTests(_WorkspaceStoreTestBase):
         workspace_id = self.setup_holder()
         # 即使锁外已完成执行/容器核验，未提交的证据不持久化、不用于恢复。
         prepared_candidate = self.candidate()
-        self.assertTrue(prepared_candidate.workspace_failure_safe_to_continue)
+        self.assertTrue(prepared_candidate.workspace_safe_to_continue)
         reloaded = self.reload_store()
         reloaded.recover_after_restart()
         self.assertEqual(reloaded.get_workspace(workspace_id).status, WorkspaceStatus.DIRTY)
@@ -232,6 +266,8 @@ class WorkspaceFailureChainTests(unittest.IsolatedAsyncioTestCase):
                     owner.attrs["State"].update(Running=False, Status="exited", Pid=0)
                 elif owner.close_mode == "unknown":
                     owner.removed = None
+                elif owner.close_mode == "raise":
+                    raise RuntimeError("close failed")
                 # 模拟 SDK 吞掉 stop 失败，close 正常返回但容器仍在运行。
 
         def create_session(*args, **kwargs):
@@ -296,6 +332,66 @@ class WorkspaceFailureChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("corrected", second.result.stdout)
         self.assertEqual(first.status, TaskStatus.FAILED)
 
+    async def test_success_requires_verified_close_before_same_disk_continue(self):
+        first = await self.execute("success", "from pathlib import Path\nPath('success.txt').write_text('saved')")
+        self.assertEqual(first.status, TaskStatus.SUCCEEDED)
+        self.assertEqual(self.store.get_workspace(self.workspace_id).status, WorkspaceStatus.ACTIVE)
+        second = await self.execute("success-next", "from pathlib import Path\nassert Path('success.txt').read_text() == 'saved'")
+        self.assertEqual(second.status, TaskStatus.SUCCEEDED)
+
+    async def test_success_with_unverified_close_preserves_success_but_blocks_writers(self):
+        for mode in ("running", "unknown", "raise"):
+            with self.subTest(mode=mode):
+                self.close_mode = mode
+                run_id = "run-success-" + mode
+                self.workspace_id = self.store.acquire_workspace(
+                    AcquireWorkspaceRequest(run_id=run_id)
+                ).workspace.workspace_id
+                first = Task(task_id="success-" + mode, status=TaskStatus.QUEUED,
+                    request=ws_request(run_id, self.workspace_id, call="first", code="print('real success')"),
+                    effective_output_limits=EffectiveOutputLimits(**_LIMITS))
+                sibling = Task(task_id="queued-" + mode, status=TaskStatus.QUEUED,
+                    request=ws_request(run_id, self.workspace_id, call="queued", code="raise AssertionError('must not run')"))
+                self.store.create_with_admission(first)
+                self.store.create_with_admission(sibling)
+                await self.main.process_task(first, worker_id=1)
+                self.assertEqual(first.status, TaskStatus.SUCCEEDED)
+                self.assertEqual(first.result.exit_code, 0)
+                self.assertIn("real success", first.result.stdout)
+                self.assertEqual(self.store.get_workspace(self.workspace_id).status, WorkspaceStatus.DIRTY)
+                self.assertEqual(sibling.status, TaskStatus.FAILED)
+                self.assertEqual(sibling.result.resource_usage.exit_reason, "WORKSPACE_DIRTY")
+                self.assertIsNone(self.store.begin_execution_exclusive(sibling.task_id).task)
+                late = Task(task_id="late-" + mode, status=TaskStatus.QUEUED,
+                    request=ws_request(run_id, self.workspace_id, call="late", code="print('must not run')"))
+                decision = self.store.create_with_admission(late)
+                self.assertIsNone(decision.task)
+                self.assertEqual(decision.workspace_result, WorkspaceResult.WORKSPACE_DIRTY)
+                reloaded = DurableTaskStore(self.root / "state.json")
+                reloaded.recover_after_restart()
+                self.assertEqual(reloaded.get(first.task_id).status, TaskStatus.SUCCEEDED)
+                self.assertEqual(reloaded.get_workspace(self.workspace_id).status, WorkspaceStatus.DIRTY)
+
+    async def test_success_without_complete_wrapper_or_cleanup_proof_is_dirty(self):
+        cases = [("protocol_mode", "legacy"), ("protocol_mode", "sweep_incomplete"),
+                 ("cleanup_ok", False), ("extra_oom", True)]
+        for name, value in cases:
+            with self.subTest(name=name, value=value):
+                previous = getattr(self, name)
+                setattr(self, name, value)
+                run_id = "run-success-proof-" + name + str(value)
+                self.workspace_id = self.store.acquire_workspace(
+                    AcquireWorkspaceRequest(run_id=run_id)
+                ).workspace.workspace_id
+                task = Task(task_id=run_id, status=TaskStatus.QUEUED,
+                    request=ws_request(run_id, self.workspace_id, call="first", code="print('finished')"),
+                    effective_output_limits=EffectiveOutputLimits(**_LIMITS))
+                self.store.create_with_admission(task)
+                await self.main.process_task(task, worker_id=1)
+                self.assertEqual(task.status, TaskStatus.SUCCEEDED)
+                self.assertEqual(self.store.get_workspace(self.workspace_id).status, WorkspaceStatus.DIRTY)
+                setattr(self, name, previous)
+
     async def test_stopped_container_is_sufficient_without_removal(self):
         self.close_mode = "stopped"
         task = await self.execute("stopped", "raise ValueError('ordinary')")
@@ -304,7 +400,7 @@ class WorkspaceFailureChainTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incomplete_or_unsafe_execution_cannot_release(self):
         cases = [
-            ("close_mode", "running"), ("close_mode", "unknown"),
+            ("close_mode", "running"), ("close_mode", "unknown"), ("close_mode", "raise"),
             ("extra_oom", True), ("protocol_mode", "lost"),
             ("protocol_mode", "wrapper_error"), ("protocol_mode", "invalid"),
             ("protocol_mode", "legacy"), ("cleanup_ok", False),
@@ -375,7 +471,7 @@ class WorkspaceFailureChainTests(unittest.IsolatedAsyncioTestCase):
             effective_output_limits=_LIMITS,
             workspace_mount=sandbox_runner.WorkspaceMount(str(self.workspace_dir), labels),
         )
-        self.assertIs(result["workspace_failure_safe_to_continue"], True)
+        self.assertIs(result["workspace_safe_to_continue"], True)
         self.store.record_container_id(task.task_id, result["container_id"])
         reloaded = DurableTaskStore(self.root / "state.json")
         reloaded.recover_after_restart()

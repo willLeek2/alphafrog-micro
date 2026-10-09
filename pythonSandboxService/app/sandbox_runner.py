@@ -1780,13 +1780,13 @@ def validate_effective_output_limits(payload: Dict[str, Any]) -> Dict[str, int]:
 class _WrappedScriptResult:
     """ConsoleOutput stand-in for the wrapper path (exit_code/stdout/stderr)."""
 
-    __slots__ = ("exit_code", "stdout", "stderr", "ordinary_failure", "timed_out")
+    __slots__ = ("exit_code", "stdout", "stderr", "completed_safely", "timed_out")
 
     def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
-        self.ordinary_failure = False
+        self.completed_safely = False
         self.timed_out = False
 
 
@@ -2234,12 +2234,12 @@ def _run_bounded_wrapper_path(
             raise RuntimeError(f"invalid wrapper completion evidence task={task_id}")
         result.timed_out = completion["timedOut"]
         # 保守排除信号退出、超时保留码、无法启动和 shell 信号转换码。
-        result.ordinary_failure = (
+        result.completed_safely = (
             completion["childExited"]
             and completion["processTreeCleaned"]
             and not result.timed_out
             and not cancel_observed
-            and 0 < result.exit_code < 124
+            and 0 <= result.exit_code < 124
         )
     return result, artifacts["channel"], phase_timings, cancel_observed
 
@@ -2645,11 +2645,11 @@ def run_in_open_session(
 
     return {
         # 仍须调用者关闭并只读核验原容器，才可升级为允许同盘继续的证据。
-        "ordinary_script_failure": (
-            getattr(result, "ordinary_failure", False)
+        "workspace_script_completed_safely": (
+            getattr(result, "completed_safely", False)
             and cleanup_ok and control_cleanup_ok
             and not timed_out and not oom_killed and not cancel_observed
-            and exit_reason == "NON_ZERO_EXIT"
+            and exit_reason in {"SUCCEEDED", "NON_ZERO_EXIT"}
         ),
         "exit_code": result.exit_code,
         "stdout": result.stdout or "",
@@ -2780,23 +2780,33 @@ def run_in_sandbox(
             container_create_ms,
             timings["total_duration_ms"],
         )
-        if workspace_mount is not None and result.get("ordinary_script_failure") is True:
+        if workspace_mount is not None and result.get("workspace_script_completed_safely") is True:
             identity_verified = verify_completed_task_container(
                 container_id, workspace_mount.labels,
             )
         return result
     finally:
-        session.close()
+        close_ok = True
+        try:
+            session.close()
+        except Exception as error:
+            # 脚本已完成时保留真实结果；关闭失败只取消工作区继续资格。
+            if result is None or workspace_mount is None:
+                raise
+            close_ok = False
+            logger.warning("WORKSPACE_TASK_CONTAINER_CLOSE_FAILED task=%s container=%s error=%s",
+                           task_id, container_id, error)
         if result is not None:
-            result["workspace_failure_safe_to_continue"] = (
-                identity_verified
+            result["workspace_safe_to_continue"] = (
+                close_ok
+                and identity_verified
                 and workspace_mount is not None
                 and verify_completed_task_container(
                     container_id, workspace_mount.labels, after_close=True,
                 )
             )
-            if result["workspace_failure_safe_to_continue"]:
+            if result["workspace_safe_to_continue"]:
                 logger.info(
-                    "WORKSPACE_SCRIPT_FAILURE_SAFE_TO_CONTINUE task=%s container=%s",
+                    "WORKSPACE_TASK_SAFE_TO_CONTINUE task=%s container=%s",
                     task_id, container_id,
                 )

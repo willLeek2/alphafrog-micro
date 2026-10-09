@@ -10,9 +10,8 @@ Covered groups:
 
 * positive acceptance: legacy path unchanged, workspace path
   acquire → create → begin (holder slot) → complete → release;
-* busy deferral and the dirty rule: only a SUCCEEDED holder frees the
-  workspace; every other holder outcome dirties it and explicitly fails
-  every still-QUEUED sibling (typed result, never re-admitted);
+* 同盘排队和标脏规则：只有带可信停止证明的成功或普通失败释放工作区；
+  其他持有者终态标脏工作区，并明确失败仍在排队的同盘任务；
 * late-duplicate safety: a create refused by the workspace gate refuses
   again when a duplicate of the same operation arrives later (the gate
   is a pure function of monotone durable state, so no orphan task can
@@ -56,6 +55,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.models import (
+    SandboxResourceUsage,
     AcquireWorkspaceRequest,
     AcquireWorkspaceResponse,
     CancellationEvidence,
@@ -143,7 +143,11 @@ def legacy_request(
 
 def ok_result() -> ExecuteResult:
     return ExecuteResult(
-        exit_code=0, stdout="ok", stderr="", dataset_dir="/tmp/done"
+        exit_code=0, stdout="ok", stderr="", dataset_dir="/tmp/done",
+        resource_usage=SandboxResourceUsage(
+            resource_class="STANDARD", exit_reason="SUCCEEDED",
+            oom_killed=False, timed_out=False,
+        )
     )
 
 
@@ -164,6 +168,7 @@ def complete(store: DurableTaskStore, task_id: str, result: ExecuteResult):
             ),
             result=result,
             evidence=CancellationEvidence.NONE,
+            workspace_safe_to_continue=result.exit_code == 0,
         ),
     )
 
