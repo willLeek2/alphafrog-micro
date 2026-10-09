@@ -14,6 +14,9 @@ import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.*;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryJobResultAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobRunnerAdapter;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
@@ -221,9 +224,18 @@ class CanceledSqlWaitMemberStopWorkerTest {
                 .setOutcome(CancelOutcome.ALREADY_TERMINAL).setTaskId(TASK).setStatus("SUCCEEDED").build());
         when(sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder()
                 .setTaskId(TASK).setStatus("SUCCEEDED").setFinishedAt(FINISHED).build());
-        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+        TaskResultResponse sqlResult = TaskResultResponse.newBuilder()
                 .setTaskId(TASK).setStatus("SUCCEEDED").setExitCode(0)
-                .setStdout("{\"success\":false,\"error\":{\"code\":\"PLAN_REJECTED\"}}").build());
+                .setStdout("__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"error\":{\"code\":\"PLAN_REJECTED\"}}\n").build();
+        var terminal = new PythonSandboxJobRunnerAdapter(sandbox, new SandboxJobObservability(null))
+                .toTerminalView(sqlResult, "SUCCEEDED");
+        var sqlAdapter = new SqlQueryJobResultAdapter(json);
+        var business = sqlAdapter.resolveTerminal(terminal, null);
+        assertThat(sqlAdapter.isSuccess(terminal)).isFalse();
+        assertThat(business.success()).isFalse();
+        assertThat(business.errorCode()).isEqualTo("PLAN_REJECTED");
+        assertThat(json.readTree(business.output()).path("ok").asBoolean()).isFalse();
+        when(sandbox.getTaskResult(any())).thenReturn(sqlResult);
         when(stops.confirmSandboxTerminal(9L, "original-claim", TASK, "SUCCEEDED")).thenReturn(true);
         assertThat(worker.runBatch()).isEqualTo(1);
         occupyReleasedSlot();
