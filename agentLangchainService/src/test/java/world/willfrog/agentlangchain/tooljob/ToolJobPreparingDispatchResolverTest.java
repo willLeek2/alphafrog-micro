@@ -183,6 +183,7 @@ class ToolJobPreparingDispatchResolverTest {
         assertThat(anchor.getAnchorState()).isEqualTo("WORKSPACE_REFUSED");
         assertThat(anchor.getWorkspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
         verify(sandbox, never()).cancelTask(any());
+        verify(anchorService, never()).renewExecuteQueryPreparingReplayClaim(any(), any());
     }
 
     @Test

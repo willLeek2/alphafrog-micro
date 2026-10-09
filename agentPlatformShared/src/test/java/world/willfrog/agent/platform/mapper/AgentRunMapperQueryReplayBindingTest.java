@@ -15,6 +15,33 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** 解析真实 MyBatis 映射，核对续占写入只刷新时间且绑定原成员、控制版本及请求。 */
 class AgentRunMapperQueryReplayBindingTest {
     @Test
+    void preparingReplayRenewalCannotReplaceAnyPersistedMember() throws Exception {
+        var configuration = new Configuration();
+        configuration.addMapper(AgentRunMapper.class);
+        String resource = "mapper/AgentRunMapper.xml";
+        try (var input = Resources.getResourceAsStream(resource)) {
+            new XMLMapperBuilder(input, configuration, resource, configuration.getSqlFragments()).parse();
+        }
+        var statement = configuration.getMappedStatement(AgentRunMapper.class.getName() + ".renewExecuteQueryPreparingReplayClaim");
+        assertThat(statement.getSqlCommandType()).isEqualTo(SqlCommandType.UPDATE);
+        var bound = statement.getBoundSql(Map.of("runId", "run", "operationId", "op", "requestFingerprint", "fp",
+                "createRequestJson", "request", "reservationJson", "reservation", "planGeneration", 2, "runControlVersion", 5L));
+        var method = Arrays.stream(AgentRunMapper.class.getMethods())
+                .filter(candidate -> candidate.getName().equals("renewExecuteQueryPreparingReplayClaim")).findFirst().orElseThrow();
+        var javaNames = Arrays.stream(method.getParameters())
+                .map(parameter -> parameter.getAnnotation(org.apache.ibatis.annotations.Param.class).value()).collect(Collectors.toSet());
+        assertThat(bound.getParameterMappings().stream().map(mapping -> mapping.getProperty()).collect(Collectors.toSet()))
+                .isEqualTo(javaNames);
+        String sql = bound.getSql().replaceAll("\\s+", " ").trim();
+        assertThat(sql).startsWith("UPDATE alphafrog_agent_run r SET updated_at = clock_timestamp() WHERE")
+                .contains("r.status = 'EXECUTING'", "'anchorState' = 'PREPARING'", "'taskId'", "'autoResume'", "'runDisposition'",
+                        "'operationId' = ?", "'requestFingerprint' = ?", "'createRequestJson' = ?", "'reservationJson' = ?",
+                        "r.plan_generation IS NOT DISTINCT FROM ?", "r.run_control_version IS NOT DISTINCT FROM ?",
+                        "NOT EXISTS", "m.external_operation_id = ?")
+                .doesNotContain("m.state", "SET tool_job_anchor_json", "SET dispatch_proof_json");
+    }
+
+    @Test
     void replayRenewalBindsEveryIdentityAndLeavesProofAndAnchorUntouched() throws Exception {
         var configuration = new Configuration();
         configuration.addMapper(AgentRunMapper.class);

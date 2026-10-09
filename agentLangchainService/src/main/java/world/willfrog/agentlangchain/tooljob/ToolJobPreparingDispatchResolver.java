@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -44,6 +45,7 @@ final class ToolJobPreparingDispatchResolver {
     enum Outcome {
         RESOLVED,
         REMOTE_UNAVAILABLE,
+        REPLAY_ADMISSION_DEFERRED,
         INVALID_EVIDENCE,
         WORKSPACE_REFUSED,
         DURABLE_WRITE_UNCERTAIN,
@@ -58,6 +60,10 @@ final class ToolJobPreparingDispatchResolver {
 
         static Resolution remoteUnavailable() {
             return new Resolution(Outcome.REMOTE_UNAVAILABLE, null);
+        }
+
+        static Resolution replayAdmissionDeferred() {
+            return new Resolution(Outcome.REPLAY_ADMISSION_DEFERRED, null);
         }
 
         static Resolution invalidEvidence() {
@@ -122,6 +128,24 @@ final class ToolJobPreparingDispatchResolver {
             ExecuteRequest request = parseDurableCreateRequest(anchor);
             if (request == null) {
                 return Resolution.invalidEvidence();
+            }
+            if (ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())) {
+                try {
+                    if (!anchorService.renewExecuteQueryPreparingReplayClaim(runId, anchor)) {
+                        return Resolution.ownershipLost();
+                    }
+                } catch (SessionQueryAdmissionException admission) {
+                    if (admission.retryable() && "SESSION_QUERY_IN_PROGRESS".equals(admission.code())) {
+                        log.info("原查询重放延期，保留PREPARING证明：run={} operation={} code={}",
+                                runId, anchor.getOperationId(), admission.code());
+                        return Resolution.replayAdmissionDeferred();
+                    }
+                    return Resolution.invalidEvidence();
+                } catch (RuntimeException durableFailure) {
+                    log.warn("原查询重放续占暂不能确认：run={} operation={}", runId,
+                            anchor.getOperationId(), durableFailure);
+                    return Resolution.durableWriteUncertain();
+                }
             }
             ExecuteResponse created;
             try {

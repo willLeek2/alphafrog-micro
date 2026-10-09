@@ -1054,6 +1054,26 @@
                 AND COALESCE((m.dispatch_proof_json -&gt;&gt; 'createRequestExpired')::boolean, false) = false)
     </update>
 
+    <!-- LINEAR 未确认受理的原请求只能续占当前 PREPARING 锚点，不能替代等待成员的准入。 -->
+    <update id="renewExecuteQueryPreparingReplayClaim">
+        UPDATE alphafrog_agent_run r SET updated_at = clock_timestamp()
+        WHERE r.id = #{runId} AND r.status = 'EXECUTING'
+          AND r.plan_generation IS NOT DISTINCT FROM #{planGeneration}
+          AND r.run_control_version IS NOT DISTINCT FROM #{runControlVersion}
+          AND r.tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+          AND r.tool_job_anchor_json -&gt;&gt; 'anchorState' = 'PREPARING'
+          AND r.tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+          AND r.tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+          AND r.tool_job_anchor_json -&gt;&gt; 'createRequestJson' = #{createRequestJson}
+          AND r.tool_job_anchor_json -&gt;&gt; 'reservationJson' = #{reservationJson}
+          AND COALESCE(r.tool_job_anchor_json -&gt;&gt; 'taskId', '') = ''
+          AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+          AND COALESCE(r.tool_job_anchor_json -&gt;&gt; 'runDisposition', '') &lt;&gt; 'CANCELED'
+          AND NOT EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_wait_member m
+              WHERE m.run_id = r.id AND m.external_operation_id = #{operationId})
+    </update>
+
     <!--
         取消意图专用窄写。只在与读取时相同的 Run 状态和精确
         operationId 下，用 jsonb 合并 autoResume=false 与 runDisposition=CANCELED。

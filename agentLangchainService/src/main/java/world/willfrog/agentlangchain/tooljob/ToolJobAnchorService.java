@@ -195,6 +195,10 @@ public class ToolJobAnchorService {
         if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())) {
             return;
         }
+        ensureExecuteQuerySessionFree(runId, anchor, lockAndReadExecuteQuerySession(runId));
+    }
+
+    private AgentRun lockAndReadExecuteQuerySession(String runId) {
         AgentRun run = agentRunMapper.findById(runId);
         String userId = run == null ? null : run.getUserId();
         if (userId == null || userId.isBlank()) {
@@ -206,6 +210,19 @@ public class ToolJobAnchorService {
         agentRunMapper.lockExecuteQuerySession(userId);
         // 同 Run 的等待成员也必须串行。取锁后重读，不能使用取锁前的空锚点快照。
         AgentRun lockedRun = agentRunMapper.findById(runId);
+        if (lockedRun != null && !userId.equals(lockedRun.getUserId())) {
+            throw new SessionQueryAdmissionException("SESSION_USER_ID_MISSING",
+                    "executeQuery session identity changed while acquiring the user lock", false);
+        }
+        return lockedRun;
+    }
+
+    private void ensureExecuteQuerySessionFree(String runId, ToolJobAnchor anchor, AgentRun lockedRun) {
+        if (lockedRun == null) {
+            throw new SessionQueryAdmissionException("SESSION_USER_ID_MISSING",
+                    "executeQuery run disappeared while acquiring the user lock", false);
+        }
+        String userId = lockedRun.getUserId();
         String activeJson = lockedRun == null ? null : lockedRun.getToolJobAnchorJson();
         ToolJobAnchor active = activeJson == null || activeJson.isBlank() || "{}".equals(activeJson.trim())
                 ? null : ToolJobAnchor.fromJson(activeJson);
@@ -241,6 +258,23 @@ public class ToolJobAnchorService {
         guardExecuteQuerySession(runId, expected);
         return agentRunMapper.renewExecuteQueryReplayClaim(runId, groupId, memberIdentity,
                 operationId, requestFingerprint, createRequestJson, planGeneration, runControlVersion) == 1;
+    }
+
+    /** 原 PREPARING SQL 请求的恢复准入，和首次派发共用用户锁；不替换锚点。 */
+    @Transactional
+    public boolean renewExecuteQueryPreparingReplayClaim(String runId, ToolJobAnchor expected) {
+        if (expected == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(expected.getToolName())) return false;
+        AgentRun current = lockAndReadExecuteQuerySession(runId);
+        if (current == null || current.getStatus() != AgentRunStatus.EXECUTING) return false;
+        ToolJobAnchor active = current.getToolJobAnchorJson() == null ? null
+                : ToolJobAnchor.fromJson(current.getToolJobAnchorJson());
+        if (active == null || !expected.getOperationId().equals(active.getOperationId())
+                || !"PREPARING".equals(active.getAnchorState()) || !active.isAutoResume()
+                || "CANCELED".equals(active.getRunDisposition())) return false;
+        ensureExecuteQuerySessionFree(runId, expected, current);
+        return agentRunMapper.renewExecuteQueryPreparingReplayClaim(runId, expected.getOperationId(),
+                expected.getRequestFingerprint(), expected.getCreateRequestJson(), expected.getReservationJson(),
+                current.getPlanGeneration(), current.getRunControlVersion()) == 1;
     }
 
     public boolean updateActive(String runId, ToolJobAnchor anchor,

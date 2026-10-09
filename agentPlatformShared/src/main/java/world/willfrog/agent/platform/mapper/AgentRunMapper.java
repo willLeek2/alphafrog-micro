@@ -404,6 +404,15 @@ public interface AgentRunMapper {
                                     @Param("planGeneration") long planGeneration,
                                     @Param("runControlVersion") long runControlVersion);
 
+    /** 无等待成员的原 PREPARING SQL 锚点重放前续占；不得越过成员恢复准入。 */
+    int renewExecuteQueryPreparingReplayClaim(@Param("runId") String runId,
+                                             @Param("operationId") String operationId,
+                                             @Param("requestFingerprint") String requestFingerprint,
+                                             @Param("createRequestJson") String createRequestJson,
+                                             @Param("reservationJson") String reservationJson,
+                                             @Param("planGeneration") Integer planGeneration,
+                                             @Param("runControlVersion") Long runControlVersion);
+
     /**
      * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。
      * token/version/resultConsumed 共同防止旧 launcher 覆盖新的工具任务。
