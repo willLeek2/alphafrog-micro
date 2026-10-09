@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.wait.WaitMemberStopStore;
 import world.willfrog.agent.platform.wait.WaitMemberStopTask;
+import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 
 import java.util.Objects;
@@ -34,14 +35,16 @@ public class CanceledSqlWaitMemberRecovery {
     private final WaitGroupStore groups;
     private final WaitMemberStopStore stops;
     private final AgentRunFinalizationService finalization;
+    private final NodeWorkItemStore workItems;
     private final ObjectMapper json;
 
     public CanceledSqlWaitMemberRecovery(AgentRunMapper runs, WaitGroupStore groups,
-                                        WaitMemberStopStore stops,
+                                        WaitMemberStopStore stops, NodeWorkItemStore workItems,
                                         AgentRunFinalizationService finalization, ObjectMapper json) {
         this.runs = runs;
         this.groups = groups;
         this.stops = stops;
+        this.workItems = workItems;
         this.finalization = finalization;
         this.json = json;
     }
@@ -65,6 +68,13 @@ public class CanceledSqlWaitMemberRecovery {
                 groups.cancelChain(group.getId());
                 afterGroupId = group.getId();
             }
+        }
+        // 取消意图可能先于控制接口的节点收口落库；旧控制版本的节点仍需原身份条件取消。
+        for (var item : workItems.listUnfinishedByRun(runId)) {
+            var result = workItems.cancel(item.identity(),
+                    item.getRunControlVersion() == null ? 0L : item.getRunControlVersion(),
+                    item.getClaimEpoch() == null ? 0 : item.getClaimEpoch(), "run_explicitly_canceled");
+            if (!result.applied()) return false;
         }
         if (Set.of("PENDING", "RUNNING").contains(inspected.member().getState())) {
             // 控制接口可能已写取消意图而等待链暂未写成；复用原事务补足停止责任。

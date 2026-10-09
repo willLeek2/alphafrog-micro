@@ -20,6 +20,11 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.*;
 import world.willfrog.agent.platform.wait.*;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryJobResultAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobRunnerAdapter;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
@@ -122,15 +127,26 @@ class SqlWaitMemberCancellationLifecycleTest {
                 .setOutcome(CancelOutcome.ALREADY_TERMINAL).setTaskId(TASK).setStatus(terminal).build());
         when(f.sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder().setTaskId(TASK)
                 .setStatus(terminal).setFinishedAt("2026-10-09T00:01:00Z").build());
-        String stdout = "__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"success\":false,"
-                + "\"error\":\"EXPLAIN_FAILED\"}__EXECUTE_QUERY_RESULT_END__";
-        when(f.sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder().setTaskId(TASK)
+        String stdout = "__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"error\":{\"code\":\"PLAN_REJECTED\"}}\n";
+        TaskResultResponse result = TaskResultResponse.newBuilder().setTaskId(TASK)
                 .setStatus(terminal).setExitCode(terminal.equals("SUCCEEDED") ? 0 : 1)
-                .setStdout(stdout).setError(terminal.equals("FAILED") ? "script failed" : "").build());
+                .setStdout(stdout).setError(terminal.equals("FAILED") ? "script failed" : "").build();
+        var view = new PythonSandboxJobRunnerAdapter(f.sandbox, new SandboxJobObservability(null))
+                .toTerminalView(result, terminal);
+        var sql = new SqlQueryJobResultAdapter(f.json);
+        var business = sql.resolveTerminal(view, null);
+        assertThat(sql.isSuccess(view)).isFalse();
+        assertThat(business.success()).isFalse();
+        assertThat(business.errorCode()).isEqualTo(terminal.equals("SUCCEEDED") ? "PLAN_REJECTED" : "QUERY_SANDBOX_FAILED");
+        assertThat(f.json.readTree(business.output()).path("ok").asBoolean()).isFalse();
+        when(f.sandbox.getTaskResult(any())).thenReturn(result);
         f.cancel(); f.worker.runBatch(); f.reconciler.reconcileFromDue();
         assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
         assertThat(f.stop.getTerminalStatus()).isEqualTo(terminal);
         assertThat(f.calls.get(OPERATION).terminalStatus()).isEqualTo(terminal);
+        assertThat(f.calls.get(OPERATION).success()).isEqualTo(terminal.equals("SUCCEEDED"));
+        assertThat(f.member.getState()).isEqualTo("CANCELED");
+        verifyNoInteractions(f.resume);
         assertThat(f.calls).hasSize(1);
         assertThat(f.anchor()).isNull();
     }
@@ -292,6 +308,77 @@ class SqlWaitMemberCancellationLifecycleTest {
         assertThat(f.anchor()).isNull(); assertThat(f.calls).hasSize(1);
     }
 
+    @Test
+    void coldStartStopCannotSettleBeforeTheRecoveringCapacityLedgerIsRebuilt() throws Exception {
+        Fixture f = new Fixture(true);
+        assertThat(f.capacity.admissionState()).isEqualTo(DataAnalysisAdmissionState.RECOVERING);
+        f.cancel();
+        f.worker.runBatch();
+        assertThat(f.capacity.admissionState()).isEqualTo(DataAnalysisAdmissionState.RECOVERING);
+        assertThat(f.stop.getState()).isEqualTo("PENDING");
+        assertThat(f.stop.getLastError()).isEqualTo("sandbox_settlement_incomplete");
+        assertThat(f.calls).isEmpty();
+        verify(f.stopMapper, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
+        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+        assertThat(f.anchor()).isNotNull();
+        f.startup().onReady();
+        assertThat(f.capacity.admissionState()).isEqualTo(DataAnalysisAdmissionState.OPEN);
+        assertThat(((java.util.concurrent.atomic.AtomicInteger)
+                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isEqualTo(1);
+        assertThat(f.capacity.restoreReservation(f.reservation)).isEqualTo(DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME);
+        // 模拟重试记录的下次可见时刻已经到达；领取仍按状态、代际、令牌与租期条件。
+        f.stop.setNextAttemptAt(OffsetDateTime.now().minusSeconds(1));
+        f.worker.runBatch(); f.reconciler.reconcileFromDue();
+        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
+        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        assertThat(f.anchor()).isNull();
+        assertThat(f.calls).hasSize(1);
+        assertThat(((java.util.concurrent.atomic.AtomicInteger)
+                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isZero();
+    }
+
+    @Test
+    void failedApiNodeCancellationIsRepairedBeforeTheConfirmedSqlSessionCloses() throws Exception {
+        Fixture f = new Fixture(); f.addExtraNode("RUNNABLE"); f.nodeCancelFailures = 1;
+        f.cancel(); f.worker.runBatch();
+        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
+        f.reconciler.reconcileFromDue(); f.reconciler.reconcileFromDue();
+        assertThat(f.extraNode.getState()).isEqualTo("CANCELED");
+        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        assertThat(f.anchor()).isNull();
+        verify(f.nodes, times(2)).cancel(eq(f.extraNode.identity()), eq(0L), eq(3), eq("run_explicitly_canceled"));
+    }
+
+    @Test
+    void interruptionAfterPersistentCancelIntentRepairsTheIndependentWaitingNode() throws Exception {
+        Fixture f = new Fixture(); f.addExtraNode("WAITING");
+        assertThat(f.anchors.persistCancelDisposition(RUN, OPERATION, AgentRunStatus.EXECUTING)).isTrue();
+        assertThat(f.run.getRunControlVersion()).isEqualTo(1L);
+        f.reconciler.reconcileFromDue(); f.worker.runBatch(); f.reconciler.reconcileFromDue();
+        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
+        assertThat(f.extraNode.getState()).isEqualTo("CANCELED");
+        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        assertThat(f.anchor()).isNull();
+        verify(f.nodes).cancel(eq(f.extraNode.identity()), eq(0L), eq(3), eq("run_explicitly_canceled"));
+    }
+
+    @Test
+    void aChangedNodeClaimRejectsCancellationAndPreservesTheOriginalSqlSession() throws Exception {
+        Fixture f = new Fixture(); f.addExtraNode("RUNNABLE"); f.nodeCancelFailures = 1;
+        f.cancel(); f.worker.runBatch(); f.advanceNodeEpochOnCancel = true;
+        f.reconciler.reconcileFromDue();
+        assertThat(f.extraNode.getState()).isEqualTo("RUNNABLE");
+        assertThat(f.extraNode.getClaimEpoch()).isEqualTo(4);
+        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+        assertThat(f.anchor()).isNotNull();
+        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
+        verifyNoInteractions(f.finalization);
+        f.advanceNodeEpochOnCancel = false; f.reconciler.reconcileFromDue();
+        assertThat(f.extraNode.getState()).isEqualTo("CANCELED");
+        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        assertThat(f.anchor()).isNull();
+    }
+
     private static final class Fixture {
         final ObjectMapper json = new ObjectMapper().findAndRegisterModules();
         final AgentRun run = new AgentRun();
@@ -302,8 +389,13 @@ class SqlWaitMemberCancellationLifecycleTest {
         final WaitGroupMapper groupMapper = mock(WaitGroupMapper.class);
         final WaitMemberStopMapper stopMapper = mock(WaitMemberStopMapper.class);
         final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
+        final NodeWorkItemStore nodes = mock(NodeWorkItemStore.class);
+        NodeWorkItem extraNode;
+        int nodeCancelFailures;
+        boolean advanceNodeEpochOnCancel;
         final AgentRunEventService events = mock(AgentRunEventService.class);
         final AgentRunFinalizationService finalization = mock(AgentRunFinalizationService.class);
+        final ToolJobResumeService resume = mock(ToolJobResumeService.class);
         final AtomicReference<String> redisStatus = new AtomicReference<>("EXECUTING");
         final Map<String, DataAnalysisObservabilityCall> calls = new LinkedHashMap<>();
         DataAnalysisTerminalEnvelope recordedEnvelope;
@@ -329,7 +421,9 @@ class SqlWaitMemberCancellationLifecycleTest {
         int finalizerWriteRejected;
         int clearRejected;
 
-        Fixture() throws Exception {
+        Fixture() throws Exception { this(false); }
+
+        Fixture(boolean coldStart) throws Exception {
             run.setId(RUN); run.setUserId(USER); run.setStatus(AgentRunStatus.EXECUTING);
             run.setSchedulerVersion("DUAL_POOL_V2"); run.setDeploymentId("stable");
             run.setDeploymentGenerationId(GENERATION); run.setLaneTag("lane-test");
@@ -355,7 +449,7 @@ class SqlWaitMemberCancellationLifecycleTest {
                     json.writeValueAsString(reservation), "2026-10-09T00:00:00Z",
                     JsonFormat.printer().print(ExecuteRequest.newBuilder().setOperationId(OPERATION)
                             .setRequestFingerprint(FINGERPRINT).setCode("print('query')").build()))));
-            capacity.recover(List.of(reservation), capacityConfig.getMaxUnits(), capacityConfig.getMaxHeavyActive());
+            if (!coldStart) capacity.recover(List.of(reservation), capacityConfig.getMaxUnits(), capacityConfig.getMaxHeavyActive());
             installRunMapperConditions(); installWaitMapperConditions(); installStopMapperConditions();
             anchors = new ToolJobAnchorService(runMapper);
             var ownership = GatewayTestFixtures.withIdentity(runMapper, "stable", GENERATION);
@@ -375,8 +469,17 @@ class SqlWaitMemberCancellationLifecycleTest {
             SchedulerVersionPolicy policy = new SchedulerVersionPolicy(null);
             ReflectionTestUtils.setField(control, "schedulerVersionPolicy", policy);
             ReflectionTestUtils.setField(control, "waitGroupStore", groups);
-            NodeWorkItemStore nodes = mock(NodeWorkItemStore.class);
-            when(nodes.listUnfinishedByRun(RUN)).thenReturn(List.of());
+            when(nodes.listUnfinishedByRun(RUN)).thenAnswer(i -> extraNode != null && !extraNode.stateEnum().isTerminal()
+                    ? List.of(json.convertValue(extraNode, NodeWorkItem.class)) : List.of());
+            when(nodes.cancel(any(), anyLong(), anyInt(), anyString())).thenAnswer(i -> {
+                if (nodeCancelFailures > 0) { nodeCancelFailures--; throw new IllegalStateException("node cancellation temporarily unavailable"); }
+                if (advanceNodeEpochOnCancel) extraNode.setClaimEpoch(extraNode.getClaimEpoch() + 1);
+                if (extraNode == null || extraNode.stateEnum().isTerminal()
+                        || !extraNode.identity().equals(i.getArgument(0))
+                        || extraNode.getRunControlVersion() != (long) i.getArgument(1)
+                        || extraNode.getClaimEpoch() != (int) i.getArgument(2)) return NodeWorkItemMutationResult.rejected(null);
+                extraNode.setState("CANCELED"); return NodeWorkItemMutationResult.success();
+            });
             ReflectionTestUtils.setField(control, "nodeWorkItemStore", nodes);
             DataAnalysisObservabilityService realRecorder = new DataAnalysisObservabilityService(
                     runMapper, stateStore, json);
@@ -398,15 +501,15 @@ class SqlWaitMemberCancellationLifecycleTest {
             worker = new CanceledWaitMemberStopWorker(new MybatisWaitMemberStopStore(stopMapper), groups,
                     sandbox, settlement, json, tx, ownership, 2, 120, 5);
             ToolJobFinalizer finalizer = new ToolJobFinalizer(anchors, cache, capacity,
-                    mock(ToolJobResumeService.class), config, mock(FinanceRecordChannelProcessor.class),
+                    resume, config, mock(FinanceRecordChannelProcessor.class),
                     mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
                     mock(FinanceResultModelAdapter.class), runMapper, finalization, ownership);
             reconciler = new ToolJobReconciler(cache, anchors, finalizer,
-                    mock(ToolJobResumeService.class), config, capacity, ownership);
+                    resume, config, capacity, ownership);
             ReflectionTestUtils.setField(reconciler, "waitGroupStore", groups);
             ReflectionTestUtils.setField(reconciler, "sandboxService", sandbox);
             recovery = new CanceledSqlWaitMemberRecovery(runMapper, groups,
-                    new MybatisWaitMemberStopStore(stopMapper), finalization, json);
+                    new MybatisWaitMemberStopStore(stopMapper), nodes, finalization, json);
             ReflectionTestUtils.setField(reconciler, "canceledSqlWaitMemberRecovery", recovery);
             when(cache.fetchDue(20)).thenReturn(Set.of(RUN));
             when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
@@ -419,9 +522,16 @@ class SqlWaitMemberCancellationLifecycleTest {
                     .setTaskId(TASK).setStatus("CANCELED").setError("canceled").build());
         }
 
+        void addExtraNode(String state) {
+            extraNode = new NodeWorkItem(); extraNode.setId(88L); extraNode.setRunId(RUN);
+            extraNode.setPlanGeneration(0); extraNode.setNodeId("other-todo"); extraNode.setNodeAttempt(0);
+            extraNode.setSegmentSequence(0); extraNode.setRunControlVersion(0L); extraNode.setClaimEpoch(3);
+            extraNode.setSchedulerVersion("DUAL_POOL_V2"); extraNode.setState(state);
+        }
+
         ToolJobStartupRecovery startup() {
             var startup = new ToolJobStartupRecovery(anchors, cache, capacity, capacityConfig,
-                    mock(ToolJobFinalizer.class), mock(ToolJobResumeService.class), new ToolJobConfig(),
+                    mock(ToolJobFinalizer.class), resume, new ToolJobConfig(),
                     GatewayTestFixtures.withIdentity(runMapper, "stable", GENERATION),
                     new MybatisWaitGroupStore(groupMapper));
             ReflectionTestUtils.setField(startup, "canceledSqlWaitMemberRecovery", recovery);
@@ -528,7 +638,8 @@ class SqlWaitMemberCancellationLifecycleTest {
                                 || !stop.getRequestFingerprint().equals(i.getArgument(2))
                                 || !stop.getRunId().equals(RUN) || !stop.getGroupId().equals(member.getGroupId())
                                 || !Objects.equals(stop.getTaskId(), stop.getTerminalTaskId())
-                                || otherUnfinished != null || Set.of("WAITING", "READY").contains(group.getState())
+                                || otherUnfinished != null || extraNode != null && !extraNode.stateEnum().isTerminal()
+                                || Set.of("WAITING", "READY").contains(group.getState())
                                 || Set.of("PENDING", "RUNNING").contains(member.getState())) return 0;
                         var proof = WaitMemberDispatchProof.fromJson(json, member.getDispatchProofJson()).orElseThrow();
                         if (!proof.replayable() || !proof.operationId().equals(i.getArgument(1))
@@ -610,6 +721,13 @@ class SqlWaitMemberCancellationLifecycleTest {
             });
             when(stopMapper.findById(9L)).thenAnswer(i -> stop);
             when(stopMapper.findByWaitMemberId(41L)).thenAnswer(i -> stop);
+            when(stopMapper.retry(eq(9L), any(), any(), any())).thenAnswer(i -> {
+                if (stop == null || !"CLAIMED".equals(stop.getState())
+                        || !stop.getClaimToken().equals(i.getArgument(1))
+                        || !stop.getLeaseUntil().isAfter(OffsetDateTime.now())) return 0;
+                stop.setState("PENDING"); stop.setClaimToken(null); stop.setLeaseUntil(null);
+                stop.setNextAttemptAt(i.getArgument(2)); stop.setLastError(i.getArgument(3)); return 1;
+            });
             when(stopMapper.confirmSandboxTerminal(eq(9L), any(), any(), any())).thenAnswer(i -> {
                 DataAnalysisObservabilityCall call = null;
                 var persisted = json.readTree(run.getSnapshotJson()).path("data_analysis_observability").path("calls");
