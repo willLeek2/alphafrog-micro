@@ -146,7 +146,7 @@ public class LangchainRunControlService {
         // 认领/受理入口的归属判定在 gateway：只允许控制本部署代际的 Run。
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
-        boolean dualPoolRun = schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPool(run);
+        boolean dualPoolRun = schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPoolFamily(run);
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }

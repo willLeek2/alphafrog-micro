@@ -66,6 +66,9 @@ public class ToolJobReconciler {
     @Autowired(required = false)
     private WaitGroupStore waitGroupStore;
 
+    @Autowired(required = false)
+    private CanceledSqlWaitMemberRecovery canceledSqlWaitMemberRecovery;
+
     @DubboReference
     private PythonSandboxService sandboxService;
 
@@ -189,6 +192,18 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (canceledSqlWaitMemberRecovery != null
+                    && canceledSqlWaitMemberRecovery.ownership(runId, anchor)
+                    != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                if (canceledSqlWaitMemberRecovery.complete(runId, anchor)) {
+                    redisCache.removeDue(runId);
+                    redisCache.deletePendingCache(runId);
+                } else {
+                    anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                    redisCache.upsertDue(runId, anchor);
+                }
+                return;
+            }
             if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
                 if (dualPoolToolJobCoordinator != null
                         && dualPoolToolJobCoordinator.supports(anchor)

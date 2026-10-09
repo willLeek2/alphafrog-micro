@@ -64,6 +64,9 @@ public class ToolJobStartupRecovery {
     @Autowired(required = false)
     private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
 
+    @Autowired(required = false)
+    private CanceledSqlWaitMemberRecovery canceledSqlWaitMemberRecovery;
+
     @DubboReference
     private PythonSandboxService sandboxService;
 
@@ -132,6 +135,17 @@ public class ToolJobStartupRecovery {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
             if (anchor == null || anchor.getReservationJson() == null) continue;
             try {
+                if (canceledSqlWaitMemberRecovery != null) {
+                    var ownership = canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor);
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.INVALID_PROOF) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.MEMBER_OWNED) {
+                        // 未确认成员由下方成员扫描重建；已确认停止的旧Run预约不再占容量。
+                        continue;
+                    }
+                }
                 // 注册 Java Time 模块以还原 acquiredAt 等时间字段。
                 DataAnalysisReservation reservation = proofMapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
@@ -529,6 +543,18 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if (canceledSqlWaitMemberRecovery != null
+                        && canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor)
+                        != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                    if (canceledSqlWaitMemberRecovery.complete(run.getId(), anchor)) {
+                        redisCache.removeDue(run.getId());
+                        redisCache.deletePendingCache(run.getId());
+                    } else {
+                        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        redisCache.upsertDue(run.getId(), anchor);
+                    }
+                    continue;
+                }
                 if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
                     anchor.setNextPollAt(Instant.now());
                     redisCache.upsertDue(run.getId(), anchor);

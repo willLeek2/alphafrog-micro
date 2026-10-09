@@ -1531,6 +1531,75 @@
     <!--
         清理 active anchor 仍需 operationId 所有权；不存在“按 runId 无条件清空”的旁路。
     -->
+    <!-- SQL成员停止独占记账；不再由Run级Finalizer重写同一次操作的用量。 -->
+    <update id="completeCanceledSqlWaitMember">
+        UPDATE alphafrog_agent_run r
+           SET status = CASE WHEN r.status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+                             THEN r.status ELSE 'CANCELED' END,
+               tool_job_anchor_json = '{}'::jsonb,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE r.id = #{runId}
+           AND r.scheduler_version = 'DUAL_POOL_V2'
+           AND r.status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'RECEIVED',
+                            'FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+           AND r.tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+           AND r.tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+           AND r.tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+           AND r.tool_job_anchor_json -&gt;&gt; 'reservationJson' = #{reservationJson}
+           AND r.tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+           AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+           AND EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member m
+               JOIN alphafrog_agent_run_wait_member_stop s ON s.wait_member_id = m.id
+                WHERE m.id = #{waitMemberId} AND m.run_id = r.id
+                  AND m.tool_name = 'executeQuery' AND m.state IN ('CANCELED', 'LATE')
+                  AND m.external_operation_id = #{operationId}
+                  AND m.dispatch_proof_json = CAST(#{dispatchProofJson} AS jsonb)
+                  AND m.dispatch_proof_json -&gt;&gt; 'schemaVersion' = '2'
+                  AND NULLIF(m.dispatch_proof_json -&gt;&gt; 'createRequestJson', '') IS NOT NULL
+                  AND COALESCE((m.dispatch_proof_json -&gt;&gt; 'createRequestExpired')::boolean, false) = false
+                  AND m.dispatch_proof_json -&gt;&gt; 'operationId' = #{operationId}
+                  AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+                  AND s.run_id = r.id AND s.group_id = m.group_id
+                  AND s.operation_id = #{operationId} AND s.request_fingerprint = #{requestFingerprint}
+                  AND s.state = 'CONFIRMED'
+                  AND s.task_id = s.terminal_task_id
+                  AND s.terminal_status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+                  AND (NULLIF(r.tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+                       OR r.tool_job_anchor_json -&gt;&gt; 'taskId' = s.terminal_task_id)
+                  AND (NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', '') IS NULL
+                       OR m.dispatch_proof_json -&gt;&gt; 'taskId' = s.terminal_task_id)
+                  AND EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(COALESCE(
+                          r.snapshot_json #&gt; '{data_analysis_observability,calls}', '[]'::jsonb)) AS terminal(call)
+                       WHERE terminal.call -&gt;&gt; 'operationId' = s.operation_id
+                         AND terminal.call -&gt;&gt; 'taskId' = s.terminal_task_id
+                         AND terminal.call -&gt;&gt; 'terminalStatus' = s.terminal_status
+                         AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                         AND terminal.call -&gt; 'reservation' = CAST(#{terminalReservationJson} AS jsonb)
+                         AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_member_stop other
+                            WHERE other.run_id = r.id AND other.state != 'CONFIRMED')
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member sibling
+                WHERE sibling.run_id = r.id AND sibling.state IN ('CANCELED', 'LATE')
+                  AND sibling.tool_name IN ('executePython', 'executeQuery')
+                  AND sibling.external_operation_id IS NOT NULL
+                  AND sibling.dispatch_proof_json IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM alphafrog_agent_run_wait_member_stop settled
+                       WHERE settled.wait_member_id = sibling.id AND settled.state = 'CONFIRMED'
+                         AND settled.operation_id = sibling.external_operation_id
+                         AND settled.request_fingerprint = sibling.dispatch_proof_json -&gt;&gt; 'requestFingerprint'))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_group g
+                            WHERE g.run_id = r.id AND g.state IN ('WAITING', 'READY'))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_member other
+                            WHERE other.run_id = r.id AND other.state IN ('PENDING', 'RUNNING'))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_work_item wi
+                            WHERE wi.run_id = r.id
+                              AND wi.state NOT IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE'))
+    </update>
+
     <update id="clearActiveToolJobAnchor">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST('{}' AS jsonb),
@@ -1811,6 +1880,12 @@
               )
           AND (
                 status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING')
+                OR (status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+                    AND scheduler_version = 'DUAL_POOL_V2'
+                    AND tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+                    AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                    AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false)
+
                 OR (
                     status IN ('FAILED', 'CANCELED')
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'

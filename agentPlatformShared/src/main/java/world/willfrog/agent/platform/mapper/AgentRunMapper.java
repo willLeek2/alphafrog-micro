@@ -538,6 +538,15 @@ public interface AgentRunMapper {
             @Param("id") String id,
             @Param("expectedOperationId") String expectedOperationId);
 
+    /** SQL取消成员已经独占完成资源收尾后，原子取消Run并清原会话锁。 */
+    int completeCanceledSqlWaitMember(@Param("runId") String runId,
+                                     @Param("operationId") String operationId,
+                                     @Param("requestFingerprint") String requestFingerprint,
+                                     @Param("waitMemberId") long waitMemberId,
+                                     @Param("dispatchProofJson") String dispatchProofJson,
+                                     @Param("reservationJson") String reservationJson,
+                                     @Param("terminalReservationJson") String terminalReservationJson);
+
     /** 只清理仍属于指定 operation 且尚未记录取消的活跃 anchor，防止旧线程抹掉取消收尾凭据。 */
     int clearActiveToolJobAnchor(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
