@@ -810,6 +810,68 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     @Test
+    void losingSegmentOwnershipDuringCorrectionDispatchesNothing() {
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("rejected-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from(List.of(toolCall("accepted", "getStockDaily", "{}"))));
+        model.beforeReply = () -> {
+            if (model.requests.size() == 2) {
+                store.expectedClaimEpoch = 99;
+            }
+        };
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(outcome).isInstanceOf(DualPoolWaitGroupNodeExecutor.Outcome.NotOwned.class);
+        assertThat(model.requests).hasSize(2);
+        assertThat(model.lastRequest().stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).map(ToolExecutionResultMessage::id))
+                .containsExactlyElementsOf(rejected.stream().map(ToolExecutionRequest::id).toList());
+        assertThat(store.groupRows()).isEmpty();
+        assertThat(store.events()).singleElement().asString().startsWith("segment_not_matched:");
+        assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(publisher.published).isEmpty();
+    }
+
+    @Test
+    void interruptedCorrectionIsRebuiltFromTheOriginalSegmentCheckpoint() {
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("rejected-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from("这条修正回复在退出前尚未保存"));
+        model.beforeReply = () -> {
+            if (model.requests.size() == 2) {
+                throw new IllegalStateException("修正期间原执行进程退出");
+            }
+        };
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .isInstanceOf(IllegalStateException.class).hasMessage("修正期间原执行进程退出");
+        assertThat(store.groupRows()).isEmpty();
+        assertThat(dispatcher.dispatched).isEmpty();
+
+        model.beforeReply = () -> { };
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from(List.of(toolCall("accepted", "getStockDaily", "{}"))));
+        DualPoolWaitGroupNodeExecutor.Outcome recovered = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(recovered).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Suspended.class,
+                suspended -> assertThat(suspended.modelTurn()).isEqualTo(1));
+        assertThat(model.requests).hasSize(4);
+        assertThat(model.requests.get(2).stream().filter(ToolExecutionResultMessage.class::isInstance))
+                .as("挂起前的修正历史只在内存，恢复使用原持久分段").isEmpty();
+        assertThat(model.lastRequest().stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).map(ToolExecutionResultMessage::id))
+                .containsExactlyElementsOf(rejected.stream().map(ToolExecutionRequest::id).toList());
+        assertThat(dispatcher.dispatched).extracting(NodeToolDispatcher.DispatchRequest::toolCallId)
+                .containsExactly("accepted");
+    }
+
+    @Test
     void anAsyncToolWithoutCallIdFailsClosedInsteadOfPersistingAStranger() {
         dispatcher.requiresOperationId = true;
         model.enqueue(AiMessage.from(List.of(ToolExecutionRequest.builder()
@@ -1223,6 +1285,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         private final Deque<AiMessage> replies = new ArrayDeque<>();
         private final List<List<ChatMessage>> requests = new ArrayList<>();
         private final List<List<ToolSpecification>> specifications = new ArrayList<>();
+        Runnable beforeReply = () -> { };
 
         void enqueue(AiMessage reply) {
             replies.add(reply);
@@ -1245,6 +1308,7 @@ class DualPoolWaitGroupNodeExecutorTest {
             if (reply == null) {
                 throw new IllegalStateException("脚本里的模型回复不够用了");
             }
+            beforeReply.run();
             return ChatResponse.builder().aiMessage(reply).build();
         }
     }
