@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.wait.WaitMemberStopStore;
 import world.willfrog.agent.platform.wait.WaitMemberStopTask;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
@@ -67,7 +68,8 @@ class CanceledWaitMemberStopWorkerTest {
         PlatformTransactionManager transaction = mock(PlatformTransactionManager.class);
         when(transaction.getTransaction(any())).thenAnswer(ignored -> new SimpleTransactionStatus());
         worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox,
-                settlement, objectMapper, transaction, ownership, 2, 120, 5);
+                settlement, objectMapper, transaction, ownership,
+                mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
         stop = new WaitMemberStopTask();
         stop.setId(9L);
         stop.setWaitMemberId(41L);

@@ -134,7 +134,8 @@ public class WaitGroupRecoveryIntake {
     private void reportDecision(RecoveryNotification notification, IntakeResult result,
                                 String decision, String outcome, String summary) {
         ObservabilityEvents.recoveryDecided()
-                .rootRunId(notification.getRunId())
+                .rootRunId(admissionRegistry.rootRunIdIfAdmitted(notification.getRunId())
+                        .orElse(notification.getRunId()))
                 .operationId(notification.getId() == null ? null : String.valueOf(notification.getId()))
                 .decision(decision)
                 .outcome(outcome)
