@@ -609,6 +609,8 @@ public class AgentLlmProperties {
         private FinalAnswerStage finalAnswer = new FinalAnswerStage();
         private Request request = new Request();
         private Scheduler scheduler = new Scheduler();
+        @JsonAlias({"observability-events", "observability_events"})
+        private ObservabilityEventsSettings observabilityEvents = new ObservabilityEventsSettings();
 
         public Resume getResume() {
             return resume;
@@ -704,6 +706,34 @@ public class AgentLlmProperties {
 
         public void setScheduler(Scheduler scheduler) {
             this.scheduler = scheduler == null ? new Scheduler() : scheduler;
+        }
+
+        public ObservabilityEventsSettings getObservabilityEvents() {
+            return observabilityEvents;
+        }
+
+        public void setObservabilityEvents(ObservabilityEventsSettings observabilityEvents) {
+            this.observabilityEvents = observabilityEvents == null ? new ObservabilityEventsSettings() : observabilityEvents;
+        }
+    }
+
+    /**
+     * 结构化可观测事件上报的开关（合同里的「日志事件」切面）。
+     *
+     * <p>整份热配置运行时热更，泳道覆盖只影响该泳道；字段可空：没写时按「环境属性 → 代码默认（关）」
+     * 回落。{@code world.willfrog.agent.platform.observability.ObservabilityEvents} 每报一条取一次，
+     * 所以改完下一轮上报就生效。</p>
+     */
+    public static class ObservabilityEventsSettings {
+
+        private Boolean enabled;
+
+        public Boolean getEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(Boolean enabled) {
+            this.enabled = enabled;
         }
     }
 
