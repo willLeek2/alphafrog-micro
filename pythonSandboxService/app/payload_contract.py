@@ -182,15 +182,51 @@ def validate_payload_contract(
             "taskWorkspace must be a non-empty string"
         )
 
-    # === Field-level: AF_TASK_WORKSPACE == taskWorkspace ===
+    # === Field-level: optional persistentWorkspace (persistent-workspace
+    # mode). Absent → legacy shape, behavior identical. Present → the Run's
+    # persistent user directory (bind-mounted into the container) becomes
+    # the user child's cwd, and AF_TASK_WORKSPACE follows the CHILD cwd.
+    # The two directories must stay DISJOINT (neither contains the other):
+    # control artifacts (wrapper input, captures, metrics, cancel marker)
+    # live only under taskWorkspace; user data lives only under the
+    # persistent directory. Nesting one inside the other would let user code
+    # write into control paths (or control cleanup delete user data).
+    persistent_workspace = payload.get("persistentWorkspace")
     af_workspace = task_env["AF_TASK_WORKSPACE"]
-    if af_workspace != task_workspace:
-        raise PayloadContractError(
-            "taskEnvironment.AF_TASK_WORKSPACE must equal taskWorkspace "
-            f"(AF_TASK_WORKSPACE={af_workspace!r}, "
-            f"taskWorkspace={task_workspace!r}; D15 §4.2.3 round-4: a "
-            f"payload whose workspace and env disagree is fail-closed)"
-        )
+    if persistent_workspace is None:
+        # === Field-level: AF_TASK_WORKSPACE == taskWorkspace (legacy) ===
+        if af_workspace != task_workspace:
+            raise PayloadContractError(
+                "taskEnvironment.AF_TASK_WORKSPACE must equal taskWorkspace "
+                f"(AF_TASK_WORKSPACE={af_workspace!r}, "
+                f"taskWorkspace={task_workspace!r}; D15 §4.2.3 round-4: a "
+                f"payload whose workspace and env disagree is fail-closed)"
+            )
+    else:
+        if (
+            not isinstance(persistent_workspace, str)
+            or not persistent_workspace.strip()
+        ):
+            raise PayloadContractError(
+                "persistentWorkspace must be a non-empty string when present"
+            )
+        if af_workspace != persistent_workspace:
+            raise PayloadContractError(
+                "taskEnvironment.AF_TASK_WORKSPACE must equal "
+                "persistentWorkspace when the payload carries one "
+                f"(AF_TASK_WORKSPACE={af_workspace!r}, "
+                f"persistentWorkspace={persistent_workspace!r}; the user "
+                f"child's cwd and its advertised workspace must agree)"
+            )
+        if is_within(
+            task_workspace, persistent_workspace
+        ) or is_within(persistent_workspace, task_workspace):
+            raise PayloadContractError(
+                f"persistentWorkspace={persistent_workspace!r} and "
+                f"taskWorkspace={task_workspace!r} must be disjoint "
+                "directories (neither inside the other); control files and "
+                "user data may never share a tree"
+            )
 
     # === Field-level: AF_TASK_ARTIFACT_DIR / TMP_DIR / METRICS_PATH STRICTLY
     # beneath taskWorkspace (realpath-resolved). Equal-to-workspace is

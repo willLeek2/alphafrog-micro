@@ -13,6 +13,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[4]
 RUNNER_SRC = REPO / "agentToolsShared/src/main/resources/sandboxjob/duckdb_query_runner.py"
+LOADER_DIR = REPO / "pythonSandboxService/app"
+sys.path.insert(0, str(LOADER_DIR))
+os.environ["PYTHONPATH"] = str(LOADER_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
 WORK = Path(tempfile.mkdtemp(prefix="dq-runner-test-"))
 MOUNT = WORK / "mount"
 MOUNT.mkdir()
@@ -403,6 +407,62 @@ run_e2e("oversize_guard", {
 }, "FAILED", lambda e: (e.get("stage") == "serialize"
                         and e["error"]["code"] == "QUERY_RESULT_TOO_LARGE",
                         f"stage={e.get('stage')} code={e.get('error', {}).get('code')}"))
+
+# JSON与Python加载器使用同一记录合同，保留嵌套列表和字典。
+def json_mount(name, document, metadata):
+    path = MOUNT / name / "data.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return {"alias": "t1", "path": str(path), "format": "json", **metadata}
+
+json_rows = [{"label": "a", "nested": [[20230103, .5]], "detail": {"valid": True}},
+             {"label": "b", "nested": [], "detail": None}]
+json_entry = json_mount("json-wrapper", {"records": json_rows, "row_count": 99},
+                        {"recordsPath": "records", "columns": ["label", "nested", "detail"]})
+run_e2e("json_wrapped_records", {**spec_base, "datasets": [json_entry],
+        "sql": "SELECT label, nested[1][1] AS date, nested[1][2] AS weight, detail.valid AS valid FROM t1 WHERE label='a'"},
+        "SUCCEEDED", lambda e: (e["rows"] == [["a", 20230103, .5, True]], str(e["rows"])))
+run_e2e("json_root_array", {**spec_base, "datasets": [json_mount("json-array", json_rows, {})],
+        "sql": "SELECT COUNT(*) AS n FROM t1"}, "SUCCEEDED", lambda e: (e["rows"] == [[2]], str(e["rows"])))
+run_e2e("json_plain_object", {**spec_base, "datasets": [json_mount("json-object", {"label": "x", "records": json_rows}, {})],
+        "sql": "SELECT label, len(records) AS n FROM t1"}, "SUCCEEDED", lambda e: (e["rows"] == [["x", 2]], str(e["rows"])))
+run_e2e("json_empty_records_columns", {**spec_base, "datasets": [json_mount("json-empty", {"records": []},
+        {"recordsPath": "records", "columns": ["label", "nested"]})],
+        "sql": "SELECT label,nested FROM t1 LIMIT 1"}, "SUCCEEDED",
+        lambda e: (e["rows"] == [] and e["columns"] == ["label", "nested"], str(e)))
+for name, doc, meta in (("missing", {"other": []}, {"recordsPath": "records"}),
+                        ("mixed", [{"label": "a"}, 3], {}),
+                        ("not-array", {"records": {}}, {"recordsPath": "records"})):
+    run_e2e("json_invalid_" + name, {**spec_base, "datasets": [json_mount("json-invalid-" + name, doc, meta)],
+            "sql": "SELECT COUNT(*) FROM t1"}, "FAILED",
+            lambda e: (e.get("stage") == "mount" and e["error"]["code"] == "DATASET_MOUNT_FAILED", str(e)))
+outside = WORK / "outside.json"
+outside.write_text(json.dumps(json_rows))
+symlink = MOUNT / "outside-link.json"
+symlink.symlink_to(outside)
+run_e2e("json_symlink_outside_mount", {**spec_base, "datasets": [{"alias": "t1", "path": str(symlink), "format": "json"}],
+        "sql": "SELECT COUNT(*) FROM t1"}, "FAILED",
+        lambda e: (e.get("stage") == "mount", str(e)))
+
+if os.environ.get("AF_REAL_MEMBERS_DIR"):
+    for year in (2023, 2024):
+        original = Path(os.environ["AF_REAL_MEMBERS_DIR"]) / f"members-{year}.json"
+        document = json.loads(original.read_text())
+        entry = json_mount(f"_run_dataset_{year}", document,
+                           {"recordsPath": "results", "columns": list(document["results"][0])})
+        shutil.copyfile(original, entry["path"])
+        expected_weights = sum(row["match_conditions"][0][1] for row in document["results"])
+        spec = {**spec_base, "datasets": [entry],
+                "sql": "SELECT COUNT(*) AS n,COUNT(DISTINCT ts_code) AS codes,SUM(match_conditions[1][2]) AS weights FROM t1"}
+        run_e2e(f"real_members_{year}_counts_and_nested_weights", spec, "SUCCEEDED",
+                lambda e, n=len(document["results"]), total=expected_weights:
+                (e["rows"][0][:2] == [n, n] and abs(e["rows"][0][2]-total) < 1e-8, str(e["rows"])))
+        con = runner.configure_engine(spec)
+        runner.mount_datasets(con, spec)
+        codes = {row[0] for row in con.execute("SELECT ts_code FROM t1").fetchall()}
+        check(f"real_members_{year}_full_code_set", codes == {row["ts_code"] for row in document["results"]})
+        con.close()
+
 
 print(f"\n== {len(PASS)} passed, {len(FAIL)} failed ==")
 if FAIL:

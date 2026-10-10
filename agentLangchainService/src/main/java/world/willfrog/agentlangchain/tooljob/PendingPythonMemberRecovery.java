@@ -5,6 +5,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.wait.WaitGroup;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
@@ -31,8 +34,9 @@ import java.util.function.Predicate;
 /**
  * 旧派发调用栈退出后，把创建前已落库、但还没记下 createTask 结果的成员接回。
  *
- * <p>完整创建参数不能从成员证明重放。因此用固定取消身份在 Sandbox 建立同一 operationId 的
- * 持久墓碑：它会拦住旧 createTask 的迟到请求，再由普通结果接收器按 operationId 收到取消终态。
+ * <p>新版成员证明带有完整创建请求，先按原操作号查询，未找到才原样重发。
+ * 旧版证明没有完整参数，仍以固定取消身份在 Sandbox 建立同一 operationId 的持久墓碑，
+ * 拦住旧 createTask 的迟到请求，再由普通结果接收器收到取消终态。
  * 只有原执行者的持久领取身份属于当前容器，且该代 ACTIVE_NODE 额度已经归还时才发取消请求。
  * 额度的归还只发生在 Java 工具调用栈退出后，或旧进程的退出被证实后；RPC 结果不确定时保留
  * PENDING 和容量，下一轮使用相同 cancelRequestId 重试。</p>
@@ -47,6 +51,9 @@ public class PendingPythonMemberRecovery {
     private final RunOwnershipGateway ownership;
     private final Predicate<String> recognizedClaimant;
     private long scanCursor;
+
+    @Autowired
+    private ToolJobAnchorService queryAdmission;
 
     @Autowired
     public PendingPythonMemberRecovery(WaitGroupStore groups, NodeWorkItemStore workItems,
@@ -82,7 +89,7 @@ public class PendingPythonMemberRecovery {
             try {
                 var run = ownership.findOwnedRun(member.getRunId());
                 if (run != null) {
-                    LaneScopeGateway.wrap(run, () -> recover(member)).run();
+                    LaneScopeGateway.wrap(run, () -> recover(member, run)).run();
                 }
             } catch (RuntimeException e) {
                 log.warn("待派发 Python 成员暂不能恢复：member={} reason={}", member.getId(), e.getMessage());
@@ -90,7 +97,7 @@ public class PendingPythonMemberRecovery {
         }
     }
 
-    private void recover(WaitMember member) {
+    private void recover(WaitMember member, AgentRun run) {
         WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(
                 objectMapper, member.getDispatchProofJson()).orElse(null);
         if (proof == null || proof.taskConfirmed() || member.getId() == null
@@ -127,7 +134,38 @@ public class PendingPythonMemberRecovery {
                 item.getClaimEpoch(), item.getClaimedBy(), proof.operationId(),
                 proof.requestFingerprint())) return;
 
-        // 同一个成员 ID 只对应这一次请求；崩溃与多个恢复器并发都使用相同取消身份。
+        if (proof.workspaceRefused()) {
+            groups.recoverPendingPythonMember(member.getId(), item.getId(),
+                    item.getClaimEpoch(), item.getClaimedBy(), proof.operationId(),
+                    proof.requestFingerprint());
+            return;
+        }
+
+        if (WaitMemberDurableRequestResolver.hasValidRequest(proof)) {
+            WaitMemberDurableRequestResolver.Resolution resolution =
+                    WaitMemberDurableRequestResolver.resolveOutcome(proof, sandbox,
+                            () -> renewQueryReplayClaim(member, group, run, proof));
+            if (resolution.workspaceRefusalCode() != null) {
+                groups.recordMemberWorkspaceRefusal(member.getGroupId(), member.getMemberIdentity(),
+                        proof.operationId(), proof.requestFingerprint(),
+                        proof.withWorkspaceRefusal(resolution.workspaceRefusalCode()).toJson(objectMapper));
+                return;
+            }
+            String recoveredTaskId = resolution.taskId();
+            if (recoveredTaskId == null) {
+                // 查询或重发结果不确定时保留 PENDING；下一轮仍先按同一操作号查询。
+                return;
+            }
+            if (groups.recoverPendingPythonMember(member.getId(), item.getId(),
+                    item.getClaimEpoch(), item.getClaimedBy(), proof.operationId(),
+                    proof.requestFingerprint())) {
+                log.info("已按原请求接回待派发 Python 成员：member={} task={}",
+                        member.getId(), recoveredTaskId);
+            }
+            return;
+        }
+
+        // 旧版或损坏的完整请求无法重放。同一个成员 ID 始终使用同一取消身份。
         CancelTaskResponse cancel = sandbox.cancelTask(CancelTaskRequest.newBuilder()
                 .setByOperation(OperationCancelTarget.newBuilder()
                         .setOperationId(proof.operationId())
@@ -153,4 +191,22 @@ public class PendingPythonMemberRecovery {
                     member.getId(), lookup.getTaskId());
         }
     }
+
+    private boolean renewQueryReplayClaim(WaitMember member, WaitGroup group,
+                                          AgentRun run,
+                                          WaitMemberDispatchProof proof) {
+        if (!ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())) {
+            return true;
+        }
+        if (queryAdmission == null) return false;
+        try {
+            return queryAdmission.renewExecuteQueryReplayClaim(member.getRunId(), member.getGroupId(),
+                    member.getMemberIdentity(), proof.operationId(), proof.requestFingerprint(),
+                    proof.createRequestJson(), group.getPlanGeneration(), run.getRunControlVersion());
+        } catch (SessionQueryAdmissionException busy) {
+            log.info("待派发查询继续保留原请求，下一轮重新准入：member={} code={}", member.getId(), busy.code());
+            return false;
+        }
+    }
+
 }

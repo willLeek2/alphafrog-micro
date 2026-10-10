@@ -64,6 +64,9 @@ public class ToolJobStartupRecovery {
     @Autowired(required = false)
     private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
 
+    @Autowired(required = false)
+    private CanceledSqlWaitMemberRecovery canceledSqlWaitMemberRecovery;
+
     @DubboReference
     private PythonSandboxService sandboxService;
 
@@ -132,9 +135,47 @@ public class ToolJobStartupRecovery {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
             if (anchor == null || anchor.getReservationJson() == null) continue;
             try {
+                if (canceledSqlWaitMemberRecovery != null) {
+                    var ownership = canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor);
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.INVALID_PROOF) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.MEMBER_OWNED) {
+                        // 未确认成员由下方成员扫描重建；已确认停止的旧Run预约不再占容量。
+                        continue;
+                    }
+                }
                 // 注册 Java Time 模块以还原 acquiredAt 等时间字段。
                 DataAnalysisReservation reservation = proofMapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
+                if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                    // 拒绝证明已经在 PostgreSQL 中，绝不可再重发创建请求。容量账本
+                    // 先按持久状态恢复；开放准入后由在线收口器幂等释放并显示业务码。
+                    if (!WaitMemberDispatchProof.isWorkspaceRefusalCode(
+                            anchor.getWorkspaceRefusalCode())
+                            || reservation == null || reservation.identity() == null
+                            || anchor.getOperationId() == null
+                            || !run.getId().equals(reservation.identity().runId())
+                            || !anchor.getOperationId().equals(reservation.operationId())
+                            || reservation.taskId() != null
+                            || reservation.state() != DataAnalysisReservationState.PREPARING
+                               && reservation.state() != DataAnalysisReservationState.RELEASED) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    if (reservation.state() == DataAnalysisReservationState.PREPARING) {
+                        durableReservations.add(reservation);
+                    }
+                    anchor.setNextPollAt(Instant.now());
+                    try {
+                        redisCache.upsertDue(run.getId(), anchor);
+                    } catch (Exception cacheFailure) {
+                        log.warn("工作区拒绝的到期索引暂不能重建：run={}",
+                                run.getId(), cacheFailure);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())) {
                     ToolJobPreparingAbortRecoveryService.Outcome outcome =
@@ -163,6 +204,35 @@ public class ToolJobStartupRecovery {
                     }
                     quarantinedRuns.add(run.getId());
                     continue;
+                }
+                // Run会话锚点不能抢先代替等待成员创建。已有完整成员证明时，容量与恢复都交回成员。
+                if (waitGroupStore != null && reservation != null
+                        && reservation.state() == DataAnalysisReservationState.PREPARING) {
+                    WaitMember member = waitGroupStore.findMemberByOperation(run.getId(), anchor.getOperationId()).orElse(null);
+                    if (member != null && (member.stateEnum() == WaitMemberState.PENDING
+                            || member.stateEnum() == WaitMemberState.RUNNING)) {
+                        WaitMemberDispatchProof memberProof = WaitMemberDispatchProof.fromJson(
+                                proofMapper, member.getDispatchProofJson()).orElse(null);
+                        if (memberProof != null && WaitMemberDurableRequestResolver.hasValidRequest(memberProof)) {
+                            // 同时核容量身份；已接受的成员可能比Run锚点先推进，但原预约规格必须相同。
+                            List<DataAnalysisReservation> checked = new ArrayList<>();
+                            appendWaitMemberReservation(member, checked);
+                            DataAnalysisReservation memberReservation = checked.get(0);
+                            DataAnalysisReservation originalPreparing = new DataAnalysisReservation(
+                                    memberReservation.reservationId(), memberReservation.identity(),
+                                    memberReservation.resourceClass(), memberReservation.capacityUnits(),
+                                    DataAnalysisReservationState.PREPARING, null, memberReservation.acquiredAt());
+                            if (!anchor.getOperationId().equals(memberProof.operationId())
+                                    || !anchor.getRequestFingerprint().equals(memberProof.requestFingerprint())
+                                    || !reservation.equals(originalPreparing)) {
+                                throw new IllegalStateException("Run与等待成员的原预约证明不一致");
+                            }
+                            // 全量恢复由下方成员扫描完成；这里不重复纳入较旧的Run预约。
+                            log.info("启动恢复把原查询交回完整等待成员证明：run={} member={} operation={}",
+                                    run.getId(), member.getId(), memberProof.operationId());
+                            continue;
+                        }
+                    }
                 }
                 // PREPARING 表示进程可能在 createTask 前后崩溃，需要按 operationId 查找/重放。
                 if (reservation != null
@@ -211,6 +281,66 @@ public class ToolJobStartupRecovery {
                     if (resolution.outcome()
                             == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
                         reservation = resolution.reservation();
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(Instant.now());
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (Exception cacheFailure) {
+                            log.warn("工作区拒绝收口的到期索引暂不能重建：run={}",
+                                    run.getId(), cacheFailure);
+                        }
+                        continue;
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.REPLAY_ADMISSION_DEFERRED) {
+                        // 证明有效且用户查询名额正忙，仍需计入原容量，不能把正常等待视为证据损坏。
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (RuntimeException cacheFailure) {
+                            log.warn("原查询延期的唤醒索引暂不可用，仍保留可靠容量：run={}", run.getId(), cacheFailure);
+                        }
+                        continue;
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.DURABLE_WRITE_UNCERTAIN
+                            || resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.OWNERSHIP_LOST) {
+                        // 拒绝标记可能已经提交，只是数据库响应丢失。重新从数据库读取
+                        // 同一操作的名额凭证，不能把可恢复的普通 Run 永久隔离。
+                        ToolJobAnchor current = anchorService.loadAnchor(run.getId());
+                        if (current == null) {
+                            // 本路径清锚点只能在名额已释放后发生；当前快照不可再计账。
+                            continue;
+                        }
+                        if (!anchor.getOperationId().equals(current.getOperationId())
+                                || !anchor.getRequestFingerprint().equals(
+                                        current.getRequestFingerprint())) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        DataAnalysisReservation currentReservation = proofMapper.readValue(
+                                current.getReservationJson(), DataAnalysisReservation.class);
+                        if (currentReservation == null || currentReservation.identity() == null
+                                || !run.getId().equals(currentReservation.identity().runId())
+                                || !anchor.getOperationId().equals(
+                                        currentReservation.operationId())) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        if (currentReservation.state()
+                                != DataAnalysisReservationState.RELEASED) {
+                            durableReservations.add(currentReservation);
+                        }
+                        current.setNextPollAt(
+                                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), current);
+                        } catch (Exception redisFailure) {
+                            log.warn("Failed to schedule uncertain workspace refusal for run={}",
+                                    run.getId(), redisFailure);
+                        }
+                        continue;
                     } else if ("CANCELED".equals(anchor.getRunDisposition())
                             && resolution.outcome()
                             != ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
@@ -413,6 +543,23 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if (canceledSqlWaitMemberRecovery != null
+                        && canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor)
+                        != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                    if (canceledSqlWaitMemberRecovery.complete(run.getId(), anchor)) {
+                        redisCache.removeDue(run.getId());
+                        redisCache.deletePendingCache(run.getId());
+                    } else {
+                        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        redisCache.upsertDue(run.getId(), anchor);
+                    }
+                    continue;
+                }
+                if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                    anchor.setNextPollAt(Instant.now());
+                    redisCache.upsertDue(run.getId(), anchor);
+                    continue;
+                }
                 if (waitGroupStore != null
                         && waitGroupStore.hasUnresolvedMember(run.getId(), anchor.getOperationId())) {
                     if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB

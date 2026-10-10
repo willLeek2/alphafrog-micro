@@ -37,6 +37,12 @@ public record DataAnalysisReleaseRequest(
                     && reason != DataAnalysisReleaseReason.PREPARING_ABORTED) {
                 throw new IllegalArgumentException("pre-dispatch proof requires a pre-dispatch release reason");
             }
+        } else if (proof instanceof DataAnalysisReleaseProof.WorkspaceRefusal refusal) {
+            if (reservation.state() != DataAnalysisReservationState.PREPARING
+                    || !reservation.identity().equals(refusal.identity())
+                    || reason != DataAnalysisReleaseReason.WORKSPACE_CREATE_REFUSED) {
+                throw new IllegalArgumentException("workspace refusal can release only its preparing reservation");
+            }
         }
     }
 }

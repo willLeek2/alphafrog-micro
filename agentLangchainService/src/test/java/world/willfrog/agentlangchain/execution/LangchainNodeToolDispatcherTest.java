@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
@@ -164,6 +165,16 @@ class LangchainNodeToolDispatcherTest {
         assertThat(seen.get().expectedOperationId()).isEqualTo(expectedOperationId);
         assertThat(WaitGroupMemberExecutionContext.current())
                 .as("派发结束后上下文必须恢复，不能留给同一线程上的下一次调用").isNull();
+    }
+
+    @Test
+    void missingOriginalPythonRequestEscapesMemberDispatchAsRunFailure() {
+        executors.put(ToolJobAnchor.EXECUTE_PYTHON_TOOL, (request, memoryId) -> {
+            throw new PythonRiskReplayEvidenceMissingException(expectedOperationId());
+        });
+
+        assertThatThrownBy(() -> dispatcher.dispatch(asyncRequest()))
+                .isInstanceOf(PythonRiskReplayEvidenceMissingException.class);
     }
 
     // ==================== 同步工具与失败 ====================

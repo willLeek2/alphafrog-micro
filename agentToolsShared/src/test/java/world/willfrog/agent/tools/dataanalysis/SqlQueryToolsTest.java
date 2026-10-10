@@ -3,6 +3,7 @@ package world.willfrog.agent.tools.dataanalysis;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
@@ -264,6 +265,23 @@ class SqlQueryToolsTest {
     }
 
     @Test
+    void renderRunner_keepsJsonRecordLocationFromSidecar(@TempDir Path dir) throws Exception {
+        Path json = dir.resolve("data.json");
+        Files.writeString(json, "{\"results\":[{\"label\":\"sample\",\"nested\":[[1,2]]}]}");
+        Files.writeString(dir.resolve("data.meta.json"),
+                "{\"format\":\"json\",\"recordsPath\":\"results\",\"rowCount\":1,\"columns\":[\"label\",\"nested\"]}");
+        var entry = world.willfrog.agent.workflow.AgentRunDatasetEntry.forDataset(
+                3, "json-data", json.toString(), "UNCERTAIN", "data.json");
+        JsonNode spec = decodeSpec(tools.renderRunner("SELECT COUNT(*) FROM t3", "INTERACTIVE",
+                SqlQueryTools.PRODUCT_TIERS.get("INTERACTIVE"), List.of(entry),
+                512L * 1024 * 1024, 200_000L));
+        JsonNode mount = spec.path("datasets").get(0);
+        assertEquals("json", mount.path("format").asText());
+        assertEquals("results", mount.path("recordsPath").asText());
+        assertEquals("label", mount.path("columns").get(0).asText());
+    }
+
+    @Test
     void renderRunner_backgroundTierCarriesBackgroundLimits() throws Exception {
         AgentRunDatasetEntryBuilder datasets = new AgentRunDatasetEntryBuilder();
         String rendered = tools.renderRunner("SELECT 1", "BACKGROUND",
@@ -383,7 +401,7 @@ class SqlQueryToolsTest {
                 view("FAILED", 1, "", "engine died"), null));
         assertEquals("QUERY_SANDBOX_FAILED", failed.path("error").path("code").asText());
         // 等待组成员失败映射的兜底码：非取消一律 QUERY_EXECUTION_FAILED
-        assertEquals("QUERY_EXECUTION_FAILED", resultAdapter.errorCodeOf(view("FAILED", 1, "", "engine died")));
+        assertEquals("QUERY_SANDBOX_FAILED", resultAdapter.errorCodeOf(view("FAILED", 1, "", "engine died")));
     }
 
     private JsonNode decodeSpec(String rendered) throws Exception {

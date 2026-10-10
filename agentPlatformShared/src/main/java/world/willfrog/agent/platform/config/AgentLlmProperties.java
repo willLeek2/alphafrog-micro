@@ -154,6 +154,10 @@ public class AgentLlmProperties {
     public static class Agent {
         @JsonAlias({"call-raw-content", "call_raw_content"})
         private CallRawContent callRawContent = new CallRawContent();
+        @JsonAlias({"python-workspace", "python_workspace"})
+        private PythonWorkspace pythonWorkspace = new PythonWorkspace();
+        @JsonAlias({"python-risk-review", "python_risk_review"})
+        private PythonRiskReview pythonRiskReview = new PythonRiskReview();
         private Workspace workspace = new Workspace();
         private Dataset dataset = new Dataset();
 
@@ -163,6 +167,22 @@ public class AgentLlmProperties {
 
         public void setCallRawContent(CallRawContent callRawContent) {
             this.callRawContent = callRawContent == null ? new CallRawContent() : callRawContent;
+        }
+
+        public PythonWorkspace getPythonWorkspace() {
+            return pythonWorkspace;
+        }
+
+        public void setPythonWorkspace(PythonWorkspace pythonWorkspace) {
+            this.pythonWorkspace = pythonWorkspace == null ? new PythonWorkspace() : pythonWorkspace;
+        }
+
+        public PythonRiskReview getPythonRiskReview() {
+            return pythonRiskReview;
+        }
+
+        public void setPythonRiskReview(PythonRiskReview pythonRiskReview) {
+            this.pythonRiskReview = pythonRiskReview == null ? new PythonRiskReview() : pythonRiskReview;
         }
 
         public Workspace getWorkspace() {
@@ -180,6 +200,47 @@ public class AgentLlmProperties {
         public void setDataset(Dataset dataset) {
             this.dataset = dataset == null ? new Dataset() : dataset;
         }
+    }
+
+    /** 新 Run 是否启用 Python 持久工作区；null 表示沿用应用配置。 */
+    public static class PythonWorkspace {
+        private Boolean enabled;
+        /** 从最后一次活跃算起的保存时长，最短 24 小时。 */
+        @JsonAlias({"retention-hours", "retention_hours"})
+        private Integer retentionHours = 24;
+
+        public Boolean getEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(Boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public Integer getRetentionHours() {
+            return retentionHours;
+        }
+
+        public void setRetentionHours(Integer retentionHours) {
+            this.retentionHours = retentionHours;
+        }
+    }
+
+    /** 每次 Python 调用读取一次；关闭时不调用模型，仍保存本次直通决定。 */
+    public static class PythonRiskReview {
+        private Boolean enabled = false;
+        private String endpointName;
+        private String modelName;
+        private Integer threshold;
+
+        public Boolean getEnabled() { return enabled; }
+        public void setEnabled(Boolean enabled) { this.enabled = enabled; }
+        public String getEndpointName() { return endpointName; }
+        public void setEndpointName(String endpointName) { this.endpointName = endpointName; }
+        public String getModelName() { return modelName; }
+        public void setModelName(String modelName) { this.modelName = modelName; }
+        public Integer getThreshold() { return threshold; }
+        public void setThreshold(Integer threshold) { this.threshold = threshold; }
     }
 
     public static class CallRawContent {

@@ -7,17 +7,25 @@ import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import dev.langchain4j.service.tool.ToolProvider;
+import dev.langchain4j.service.tool.ToolProviderResult;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunInterruptedException;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.WaitGroupIdentity;
@@ -32,6 +40,29 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureRuleHitStore;
 import world.willfrog.agentlangchain.acceptance.ScriptedChatModel;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.config.StressTestProperties;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
+import world.willfrog.agent.platform.service.PythonRiskReviewService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agent.tools.router.ToolResultCacheService;
+import world.willfrog.agent.tools.router.ToolRouter;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.tools.ToolRouterToolExecutor;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.alphafrogmicro.sandbox.idl.AcquireWorkspaceResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
+import world.willfrog.alphafrogmicro.sandbox.idl.WorkspaceResult;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayDeque;
@@ -41,6 +72,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -53,11 +85,14 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.doAnswer;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 
 /**
- * 共用节点执行器的行为自检：一次领取只发一次模型请求；有工具请求就先落整组再派发；同步结果当场写终态；
+ * 共用节点执行器的行为自检：正常领取只发一次模型请求，未执行的准入错误允许有限修正；
+ * 有合法工具请求就先落整组再派发；同步结果当场写终态；
  * 恢复时按成员原始序号把结果接回；连续多个等待组的分段序号依次加一。
  *
  * <p>这里用的是内存版存储与脚本化模型，证明的是执行器自己的顺序与配对规则。真库上的并发条件更新、
@@ -99,6 +134,117 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     // ==================== 完成与失败 ====================
+
+    @ParameterizedTest
+    @ValueSource(strings = {"WORKSPACE_DIRTY", "PYTHON_RISK_REJECTED"})
+    @SuppressWarnings("unchecked")
+    void immediatePythonRefusalKeepsItsFullFailureThroughTheRealDispatchChain(String errorCode) throws Exception {
+        // 真工具生成拒绝正文，真路由器判定 ok=false；只替换数据库、风险评估与远端 RPC 边界。
+        PythonSandboxTools pythonTools = spy(new PythonSandboxTools(objectMapper));
+        PythonSandboxService sandbox = mock(PythonSandboxService.class);
+        AgentRunMapper runs = mock(AgentRunMapper.class);
+        AgentRun run = new AgentRun();
+        run.setExt("{\"python_workspace_enabled\":true}");
+        String deploymentGeneration = "gen-" + "a".repeat(64);
+        when(runs.findByIdForDeployment(eq(RUN_ID), eq("stable"), eq(deploymentGeneration)))
+                .thenReturn(run);
+        ReflectionTestUtils.setField(pythonTools, "agentRunMapper", runs);
+        ReflectionTestUtils.setField(pythonTools, "deploymentIdentityProvider", (DeploymentIdentityProvider)
+                () -> new DeploymentIdentity("stable", deploymentGeneration));
+        ReflectionTestUtils.setField(pythonTools, "pythonSandboxService", sandbox);
+        AgentRunDatasetRegistry datasets = mock(AgentRunDatasetRegistry.class);
+        when(datasets.snapshot(RUN_ID)).thenReturn(new AgentRunDatasetSnapshot(List.of(), List.of()));
+        ReflectionTestUtils.setField(pythonTools, "agentRunDatasetRegistry", datasets);
+        PythonRiskReviewService review = mock(PythonRiskReviewService.class);
+        when(review.evaluate(any(), any(), any())).thenReturn(new PythonRiskReviewService.Evaluation(
+                !"PYTHON_RISK_REJECTED".equals(errorCode), 90, false));
+        ReflectionTestUtils.setField(pythonTools, "pythonRiskReviewService", review);
+        if ("WORKSPACE_DIRTY".equals(errorCode)) {
+            when(sandbox.acquireWorkspace(any())).thenReturn(AcquireWorkspaceResponse.newBuilder()
+                    .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
+        }
+        AtomicReference<String> originalOutput = new AtomicReference<>();
+        doAnswer(invocation -> {
+            String output = (String) invocation.callRealMethod();
+            originalOutput.set(output);
+            return output;
+        }).when(pythonTools).executePython(any(), any(), any(), any(), any());
+
+        AgentLlmLocalConfigLoader config = mock(AgentLlmLocalConfigLoader.class);
+        when(config.current()).thenReturn(Optional.empty());
+        SimpleMeterRegistry meters = new SimpleMeterRegistry();
+        ToolOutputCompactionService compaction = new ToolOutputCompactionService(null, null, config, objectMapper);
+        ToolResultCacheService cache = new ToolResultCacheService(null, objectMapper, config, compaction, meters);
+        cache.init();
+        AgentLlmProperties properties = new AgentLlmProperties();
+        properties.getRuntime().getExecution().setStaticPrecheckEnabled(false);
+        // 这个请求只调用 Python，其余工具不需要接线。缓存与路由器都是实际实现。
+        ToolRouter router = new ToolRouter(null, null, null, pythonTools, null, null, null, null,
+                null, properties, cache, null, mock(AgentRunObservabilityService.class),
+                objectMapper, meters, new StressTestProperties());
+        ToolRouterToolExecutor toolExecutor = new ToolRouterToolExecutor(router, objectMapper,
+                mock(AgentRunEventService.class), new LangchainToolConcurrencyThrottle(false, 20, 60),
+                mock(PythonSandboxDispatchStore.class));
+        ToolSpecification spec = ToolSpecification.builder().name("executePython").build();
+        ToolProvider provider = request -> new ToolProviderResult(Map.of(spec, toolExecutor));
+        ObjectProvider<ToolProvider> providers = mock(ObjectProvider.class);
+        when(providers.getIfAvailable()).thenReturn(provider);
+        LangchainNodeToolDispatcher actualDispatcher = new LangchainNodeToolDispatcher(providers, objectMapper);
+        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, actualDispatcher, publisher,
+                objectMapper, TestSchedulerSettings.propertyOnly(
+                        "agent.langchain.dual-pool.wait-group.max-members", "16"),
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+        model.enqueue(AiMessage.from(List.of(toolCall("python-refusal", "executePython",
+                "{\"code\":\"print(1)\"}"))));
+
+        AgentContext.setRunId(RUN_ID);
+        AgentContext.setUserId("user-1");
+        try {
+            DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of(spec)));
+            long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
+            assertThat(store.memberRows(groupId)).hasSize(1);
+            InMemoryWaitGroupStore.FakeMember member = store.memberRows(groupId).get(0);
+            assertThat(member.state).isEqualTo(WaitMemberState.FAILED.name());
+            JsonNode persisted = objectMapper.readTree(member.resultRefJson);
+            assertThat(persisted.path("status").asText()).isEqualTo("FAILED");
+            assertThat(persisted.path("output").asText()).isEqualTo(originalOutput.get());
+            JsonNode body = objectMapper.readTree(persisted.path("output").asText());
+            assertThat(body.path("ok").asBoolean(true)).isFalse();
+            assertThat(body.path("error").path("code").asText()).isEqualTo(errorCode);
+            assertThat(body.path("data").has("taskId")).isFalse();
+            assertThat(body.path("data").has("task_id")).isFalse();
+            assertThat(persisted.has("taskId")).isFalse();
+            assertThat(member.dispatchProofJson).isNull();
+            verify(sandbox, never()).createTask(any());
+            verify(review).evaluate(any(), eq(RUN_ID), eq("print(1)"));
+            assertThat(publisher.published).as("拒绝已作为失败终态入库，等待组齐备后可恢复模型回合").hasSize(1);
+        } finally {
+            AgentContext.clear();
+            meters.close();
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void interruptedSqlOutcomeDoesNotLeaveOtherMembersUndispatched(boolean committed) {
+        dispatcher.requiresOperationId = true;
+        model.enqueue(AiMessage.from(List.of(toolCall("sql", "executeQuery", "{}"),
+                toolCall("other", "lookup", "{}"))));
+        dispatcher.pending.put("executeQuery", committed
+                ? new NodeToolDispatcher.DispatchOutcome.Pending(RUN_ID + ":sql:1", null,
+                    dispatchProof(RUN_ID + ":sql:1", null))
+                : new NodeToolDispatcher.DispatchOutcome.Failed("WAIT_GROUP_PREPARING_NOT_RECORDED"));
+        dispatcher.beforeDispatch = () -> Thread.currentThread().interrupt();
+        try {
+            executor.executeSegment(firstSegment(List.of()));
+            long group = store.groupRows().get(0).id;
+            assertThat(store.memberRows(group).get(0).state).isEqualTo(committed ? "RUNNING" : "FAILED");
+            assertThat(store.memberRows(group).get(1).state).isEqualTo("SUCCEEDED");
+            assertThat(dispatcher.dispatched).hasSize(2);
+        } finally {
+            Thread.interrupted();
+        }
+    }
 
     @Test
     void aReplyWithoutToolRequestsCompletesTheNode() {
@@ -205,6 +351,37 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(store.events()).as("短失败载荷写进去之后组照样齐备")
                 .anyMatch(event -> event.startsWith("group_ready:"));
         assertThat(publisher.published).as("组齐备之后立刻放行下一段").hasSize(1);
+    }
+
+    @Test
+    void missingRiskReplayEvidenceFinishesTheGroupAndFailsTheNodeWithoutAnotherModelCall() {
+        model.enqueue(AiMessage.from(List.of(
+                toolCall("call-a", "searchWeb", "{}"),
+                toolCall("call-b", "executePython", "{\"code\":\"print(1)\"}"))));
+        dispatcher.requiresOperationId = true;
+        dispatcher.beforeDispatch = () -> {
+            if (dispatcher.dispatched.size() == 1) {
+                throw new PythonRiskReplayEvidenceMissingException(RUN_ID + ":call-b:1");
+            }
+        };
+
+        DualPoolWaitGroupNodeExecutor.Outcome first = executor.executeSegment(firstSegment(List.of()));
+
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) first).groupId();
+        assertThat(store.memberRows(groupId)).extracting(row -> row.state)
+                .containsExactly(WaitMemberState.SUCCEEDED.name(), WaitMemberState.FAILED.name());
+        assertThat(store.memberRows(groupId).get(1).resultRefJson)
+                .contains("python_risk_replay_evidence_missing");
+        assertThat(publisher.published).hasSize(1);
+
+        DualPoolWaitGroupNodeExecutor.Outcome resumed = executor.executeSegment(
+                segment(segmentIdentity(1), nextPayload(0, 0)));
+        assertThat(resumed).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class,
+                completed -> assertThat(completed.resultPatch())
+                        .containsEntry("success", false)
+                        .containsEntry("failureReason", "python_risk_replay_evidence_missing"));
+        assertThat(model.requests).as("风险决定缺少原请求时不再询问模型或重新派发脚本").hasSize(1);
+        assertThat(dispatcher.dispatched).hasSize(1);
     }
 
     /** 夹具点名按失败收尾：工具当场成功，写进成员行的也是失败，并写清是场景点名的。 */
@@ -511,14 +688,14 @@ class DualPoolWaitGroupNodeExecutorTest {
                     assertThat(completed.resultPatch()).containsEntry("cumulativeToolCallsUsed", 5);
                 });
         List<ChatMessage> messages = model.lastRequest();
-        assertThat(messages).as("系统 + 用户 + 助手 + 三条工具结果").hasSize(6);
-        assertThat(messages.subList(3, 6)).allSatisfy(message ->
+        assertThat(messages).as("系统 + 本轮限制 + 用户 + 助手 + 三条工具结果").hasSize(7);
+        assertThat(messages.subList(4, 7)).allSatisfy(message ->
                 assertThat(message).isInstanceOf(ToolExecutionResultMessage.class));
-        assertThat(messages.subList(3, 6)).extracting(message ->
+        assertThat(messages.subList(4, 7)).extracting(message ->
                         ((ToolExecutionResultMessage) message).id())
                 .as("按成员原始序号接回，与完成先后无关")
                 .containsExactly("call-a", "call-b", "call-c");
-        assertThat(messages.subList(3, 6)).extracting(message ->
+        assertThat(messages.subList(4, 7)).extracting(message ->
                         ((ToolExecutionResultMessage) message).text())
                 .containsExactly("第一个结果", "第二个结果", "第三个结果");
     }
@@ -552,11 +729,13 @@ class DualPoolWaitGroupNodeExecutorTest {
     // ==================== 派发之前就把不该写的挡下来 ====================
 
     @Test
-    void tooManyMembersFailTheNodeBeforeAnythingIsWritten() {
+    void repeatedOversizeGroupsStopAfterTwoCorrectionsWithoutDispatch() {
         List<ToolExecutionRequest> calls = new ArrayList<>();
         for (int index = 0; index < 17; index++) {
             calls.add(toolCall("call-" + index, "getStockDaily", "{}"));
         }
+        model.enqueue(AiMessage.from(calls));
+        model.enqueue(AiMessage.from(calls));
         model.enqueue(AiMessage.from(calls));
 
         DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
@@ -566,6 +745,152 @@ class DualPoolWaitGroupNodeExecutorTest {
                         .startsWith("wait_group_member_limit_exceeded"));
         assertThat(store.events()).isEmpty();
         assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(model.requests).hasSize(3);
+    }
+
+    @Test
+    void oversizedTurnCanBeCorrectedWithEveryOriginalCallPairedAndCheckpointed() throws Exception {
+        RootTreeCallBudget budget = mock(RootTreeCallBudget.class);
+        ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 19; index++) {
+            rejected.add(toolCall("rejected-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from(List.of(toolCall("accepted", "getStockDaily", "{}"))));
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(outcome).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Suspended.class,
+                suspended -> assertThat(suspended.modelTurn()).isEqualTo(1));
+        assertThat(dispatcher.dispatched).extracting(NodeToolDispatcher.DispatchRequest::toolCallId)
+                .containsExactly("accepted");
+        List<ToolExecutionResultMessage> errors = model.lastRequest().stream()
+                .filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).toList();
+        assertThat(errors).extracting(ToolExecutionResultMessage::id)
+                .containsExactlyElementsOf(rejected.stream().map(ToolExecutionRequest::id).toList());
+        for (ToolExecutionResultMessage error : errors) {
+            JsonNode body = objectMapper.readTree(error.text());
+            assertThat(body.path("error").path("requested").asInt()).isEqualTo(19);
+            assertThat(body.path("error").path("maxToolCallsPerTurn").asInt()).isEqualTo(16);
+            assertThat(body.path("error").path("message").asText()).contains("没有执行任何工具");
+        }
+        assertThat(model.lastRequest().stream().filter(SystemMessage.class::isInstance)
+                .map(SystemMessage.class::cast).map(SystemMessage::text))
+                .anySatisfy(text -> assertThat(text).contains("16个工具调用", "单次批量参数数量不同"));
+        JsonNode payload = nextPayload(0, 1);
+        NodeSegmentCheckpoint saved = NodeSegmentCheckpoint.read(payload);
+        assertThat(saved.modelTurn()).isEqualTo(2);
+        assertThat(saved.toolCallsUsed()).isEqualTo(1);
+        assertThat(saved.messages().stream().filter(ToolExecutionResultMessage.class::isInstance)).hasSize(19);
+        verify(budget).beforeModelCall(eq(segmentIdentity(0)), eq("0"));
+        verify(budget).beforeModelCall(eq(segmentIdentity(0)), eq("1"));
+        model.enqueue(AiMessage.from("根据返回的数据继续完成"));
+        executor.executeSegment(segment(segmentIdentity(1), payload));
+        assertThat(model.lastRequest().stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).map(ToolExecutionResultMessage::id))
+                .contains("accepted", "rejected-0", "rejected-18");
+    }
+
+    @Test
+    void admissionCorrectionStillStopsAtTheOriginalModelBudget() {
+        RootTreeCallBudget budget = mock(RootTreeCallBudget.class);
+        ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("call-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        doThrow(new RunBudgetException("model_calls", 1, 1, false))
+                .when(budget).beforeModelCall(eq(segmentIdentity(0)), eq("1"));
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(outcome).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Completed.class,
+                completed -> assertThat(completed.resultPatch()).containsEntry("failureReason", "run_budget_exceeded"));
+        assertThat(store.events()).isEmpty();
+        assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(model.requests).hasSize(1);
+    }
+
+    @Test
+    void cancellationBetweenAdmissionRefusalAndCorrectionStopsBeforeAnotherModelCall() {
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("call-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty(), Optional.of("CANCELED"));
+
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .isInstanceOf(RunInterruptedException.class).hasMessageContaining("CANCELED");
+
+        assertThat(store.events()).isEmpty();
+        assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(model.requests).hasSize(1);
+    }
+
+    @Test
+    void losingSegmentOwnershipDuringCorrectionDispatchesNothing() {
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("rejected-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from(List.of(toolCall("accepted", "getStockDaily", "{}"))));
+        model.beforeReply = () -> {
+            if (model.requests.size() == 2) {
+                store.expectedClaimEpoch = 99;
+            }
+        };
+
+        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(outcome).isInstanceOf(DualPoolWaitGroupNodeExecutor.Outcome.NotOwned.class);
+        assertThat(model.requests).hasSize(2);
+        assertThat(model.lastRequest().stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).map(ToolExecutionResultMessage::id))
+                .containsExactlyElementsOf(rejected.stream().map(ToolExecutionRequest::id).toList());
+        assertThat(store.groupRows()).isEmpty();
+        assertThat(store.events()).singleElement().asString().startsWith("segment_not_matched:");
+        assertThat(dispatcher.dispatched).isEmpty();
+        assertThat(publisher.published).isEmpty();
+    }
+
+    @Test
+    void interruptedCorrectionIsRebuiltFromTheOriginalSegmentCheckpoint() {
+        List<ToolExecutionRequest> rejected = new ArrayList<>();
+        for (int index = 0; index < 17; index++) {
+            rejected.add(toolCall("rejected-" + index, "getStockDaily", "{}"));
+        }
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from("这条修正回复在退出前尚未保存"));
+        model.beforeReply = () -> {
+            if (model.requests.size() == 2) {
+                throw new IllegalStateException("修正期间原执行进程退出");
+            }
+        };
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .isInstanceOf(IllegalStateException.class).hasMessage("修正期间原执行进程退出");
+        assertThat(store.groupRows()).isEmpty();
+        assertThat(dispatcher.dispatched).isEmpty();
+
+        model.beforeReply = () -> { };
+        model.enqueue(AiMessage.from(rejected));
+        model.enqueue(AiMessage.from(List.of(toolCall("accepted", "getStockDaily", "{}"))));
+        DualPoolWaitGroupNodeExecutor.Outcome recovered = executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(recovered).isInstanceOfSatisfying(DualPoolWaitGroupNodeExecutor.Outcome.Suspended.class,
+                suspended -> assertThat(suspended.modelTurn()).isEqualTo(1));
+        assertThat(model.requests).hasSize(4);
+        assertThat(model.requests.get(2).stream().filter(ToolExecutionResultMessage.class::isInstance))
+                .as("挂起前的修正历史只在内存，恢复使用原持久分段").isEmpty();
+        assertThat(model.lastRequest().stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast).map(ToolExecutionResultMessage::id))
+                .containsExactlyElementsOf(rejected.stream().map(ToolExecutionRequest::id).toList());
+        assertThat(dispatcher.dispatched).extracting(NodeToolDispatcher.DispatchRequest::toolCallId)
+                .containsExactly("accepted");
     }
 
     @Test
@@ -620,6 +945,54 @@ class DualPoolWaitGroupNodeExecutorTest {
                 .as("转后台的成员必须写下一次查询时间，否则接收方扫不到它")
                 .isNotNull();
         assertThat(publisher.published).as("还有一个成员没结束，不能放行下一段").isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"executePython", "executeQuery"})
+    void aPersistedSandboxRequestIsLeftForRecoveryWhenTheSegmentRunsAgain(String sandboxTool) {
+        dispatcher.requiresOperationId = true;
+        AiMessage reply = AiMessage.from(List.of(toolCall("call-a", sandboxTool, "{}")));
+        model.enqueue(reply);
+        dispatcher.beforeDispatch = () -> {
+            long groupId = store.groupRows().get(0).id;
+            store.memberRows(groupId).get(0).dispatchProofJson =
+                    "{\"operationId\":\"" + RUN_ID + ":call-a:1\"}";
+            throw new IllegalStateException("原派发线程退出");
+        };
+
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("原派发线程退出");
+        long groupId = store.groupRows().get(0).id;
+        assertThat(store.memberRows(groupId).get(0).state).isEqualTo(WaitMemberState.PENDING.name());
+
+        dispatcher.beforeDispatch = () -> { };
+        model.enqueue(reply);
+        executor.executeSegment(firstSegment(List.of()));
+
+        assertThat(dispatcher.dispatched).as("重跑不能再次调用工具").isEmpty();
+        assertThat(store.memberRows(groupId).get(0).state).as("交给持久请求恢复器").isEqualTo(WaitMemberState.PENDING.name());
+        assertThat(publisher.published).as("尚无结果，不能放行模型下一段").isEmpty();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"executePython", "executeQuery"})
+    void aLateProofWritePreventsAnOldDispatcherFromCompletingTheMember(String sandboxTool) {
+        dispatcher.requiresOperationId = true;
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", sandboxTool, "{}"))));
+        dispatcher.beforeDispatch = () -> {
+            long groupId = store.groupRows().get(0).id;
+            store.memberRows(groupId).get(0).dispatchProofJson =
+                    "{\"operationId\":\"" + RUN_ID + ":call-a:1\"}";
+        };
+
+        executor.executeSegment(firstSegment(List.of()));
+
+        long groupId = store.groupRows().get(0).id;
+        assertThat(store.memberRows(groupId).get(0).state)
+                .as("派发快照之后落下的持久请求也不能被普通结果覆盖")
+                .isEqualTo(WaitMemberState.PENDING.name());
+        assertThat(publisher.published).isEmpty();
     }
 
     @Test
@@ -936,6 +1309,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         private final Deque<AiMessage> replies = new ArrayDeque<>();
         private final List<List<ChatMessage>> requests = new ArrayList<>();
         private final List<List<ToolSpecification>> specifications = new ArrayList<>();
+        Runnable beforeReply = () -> { };
 
         void enqueue(AiMessage reply) {
             replies.add(reply);
@@ -958,6 +1332,7 @@ class DualPoolWaitGroupNodeExecutorTest {
             if (reply == null) {
                 throw new IllegalStateException("脚本里的模型回复不够用了");
             }
+            beforeReply.run();
             return ChatResponse.builder().aiMessage(reply).build();
         }
     }
@@ -987,7 +1362,7 @@ class DualPoolWaitGroupNodeExecutorTest {
         @Override
         public Optional<String> stableOperationId(String toolName, String rawToolCallId,
                                                   NodeWorkItemIdentity segment) {
-            if (!requiresOperationId || !"executePython".equals(toolName)) {
+            if (!requiresOperationId || world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(toolName).isEmpty()) {
                 return subAgentOperationId && ("spawnSubAgent".equals(toolName)
                         || "waitForSubAgent".equals(toolName))
                         ? Optional.of("sub-agent-tool:test-" + rawToolCallId) : Optional.empty();
@@ -997,7 +1372,7 @@ class DualPoolWaitGroupNodeExecutorTest {
 
         @Override
         public boolean requiresStableOperationId(String toolName) {
-            return (requiresOperationId && "executePython".equals(toolName))
+            return (requiresOperationId && world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(toolName).isPresent())
                     || (subAgentOperationId && ("spawnSubAgent".equals(toolName)
                     || "waitForSubAgent".equals(toolName)));
         }

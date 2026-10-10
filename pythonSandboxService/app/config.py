@@ -350,6 +350,21 @@ class SandboxConfig:
     # currently resolve to the SAME local Image ID at startup. Resolution
     # happens exactly once; task creation never re-resolves it.
     image_tag_check: str = ""
+    # Persistent workspace feature (default off). The switch only controls
+    # CREATING workspaces for Runs that have none; Runs whose workspace
+    # already exists in the state document keep being served (execution
+    # and deletion included) after the switch is turned off.
+    persistent_workspace_enabled: bool = False
+    # Trusted host-side root that the deployment mounts into the service
+    # container at the SAME absolute path; per-workspace user directories
+    # live directly under it, separate from the per-task control
+    # directories. Stored in NORMALIZED (resolved) form.
+    persistent_workspace_root: Path = Path("/sandbox/persistent_workspaces")
+    # Deployment identity carried on every task container's labels so the
+    # sweep and the delete flow only ever touch containers THIS deployment
+    # started. A real deployment must set it explicitly when the workspace
+    # feature is on; "stable" is a placeholder for feature-off deployments.
+    deployment_id: str = "stable"
 
 
 # --- D13 (26Q3) release timeout binding keys --------------------------------
@@ -539,6 +554,71 @@ def load_config() -> SandboxConfig:
         os.getenv(MAX_TASK_TIMEOUT_SECONDS_ENV),
         os.getenv(MAX_TASK_TIMEOUT_MILLIS_ENV),
     )
+    # Persistent workspace feature: default off. The root is a host-side
+    # absolute directory the deployment mounts into the service container
+    # at the same path; it must be explicit, absolute and distinct from the
+    # control tree whenever the feature is on, and is always stored
+    # normalized. The deployment identity distinguishes THIS deployment's
+    # containers on a shared Docker host; with the feature on it must be
+    # explicitly provided (never the "stable" placeholder), because the
+    # sweep and delete flows stop/remove containers from it.
+    persistent_workspace_enabled = _parse_bool(
+        os.getenv("AF_SANDBOX_PERSISTENT_WORKSPACE_ENABLED"), default=False
+    )
+    persistent_workspace_root_env = os.getenv("AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT")
+    if persistent_workspace_enabled:
+        # The root is a deployment decision, never a fallback: with the
+        # feature on, the variable itself must be present and non-blank
+        # before any path validation runs, so a deployment that forgot to
+        # set it fails startup instead of silently using a default
+        # location it never mounted.
+        if persistent_workspace_root_env is None or not persistent_workspace_root_env.strip():
+            raise ValueError(
+                "AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT must be explicitly set"
+                " to a non-empty value when the persistent workspace feature"
+                " is enabled; there is no default location because each"
+                " deployment must choose and mount the host directory itself"
+            )
+        root_candidate = persistent_workspace_root_env
+        if root_candidate != root_candidate.strip():
+            # The deployment mount substitutes this value VERBATIM into the
+            # volume spec, so the service may not silently normalize it:
+            # storing a stripped copy while the host mount keeps the padded
+            # text would split the service root and the mounted directory
+            # apart. Reject and let the deployment fix the value.
+            raise ValueError(
+                "AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT must not carry leading"
+                " or trailing whitespace when the persistent workspace"
+                " feature is enabled; the compose volume mount uses the"
+                " value verbatim, so any padding would make the service"
+                " root and the mounted directory diverge"
+            )
+        if not Path(root_candidate).is_absolute():
+            raise ValueError(
+                "AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT must be a non-empty"
+                " absolute host path when the persistent workspace feature"
+                " is enabled (relative paths resolve differently inside the"
+                " service container and on the Docker host)"
+            )
+        persistent_workspace_root_raw = root_candidate
+    else:
+        persistent_workspace_root_raw = (
+            persistent_workspace_root_env
+            if persistent_workspace_root_env is not None
+            else "/sandbox/persistent_workspaces"
+        )
+    persistent_workspace_root = Path(persistent_workspace_root_raw).expanduser().resolve()
+    deployment_env = os.getenv("AF_DEPLOYMENT_ID")
+    deployment_id = (deployment_env or "").strip() or "stable"
+    if persistent_workspace_enabled and (
+        deployment_env is None or not deployment_id or deployment_id == "stable"
+    ):
+        raise ValueError(
+            "AF_DEPLOYMENT_ID must be explicitly set to a real deployment"
+            " identity (non-blank, not the 'stable' placeholder) when the"
+            " persistent workspace feature is enabled; container sweep and"
+            " delete decisions rely on it"
+        )
 
     # Config validation
     if pool_enabled and pool_min_size > pool_max_size:
@@ -554,6 +634,30 @@ def load_config() -> SandboxConfig:
         raise ValueError("AF_SANDBOX_USAGE_SAMPLE_MILLIS must be positive")
     if queue_max_size < 1:
         raise ValueError("AF_SANDBOX_QUEUE_MAX_SIZE must be >= 1")
+    # Hard mutual exclusion: the persistent-workspace single-writer
+    # bookkeeping and the warm-container pool cannot run together — pooled
+    # containers are reused across tasks, which would let two tasks touch
+    # one workspace through the same recycled container. Fail the startup
+    # with an explicit error instead of corrupting workspace guarantees.
+    if persistent_workspace_enabled and pool_enabled:
+        raise ValueError(
+            "Invalid config: AF_SANDBOX_PERSISTENT_WORKSPACE_ENABLED and"
+            " AF_SANDBOX_POOL_ENABLED cannot both be enabled; the persistent"
+            " workspace single-writer contract requires one fresh container"
+            " per task."
+        )
+    if persistent_workspace_enabled:
+        control_root = Path(workdir).expanduser().resolve()
+        if (
+            persistent_workspace_root == control_root
+            or persistent_workspace_root == control_root / "runs"
+            or control_root in persistent_workspace_root.parents
+        ):
+            raise ValueError(
+                "AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT must not equal or sit"
+                " inside the control directory tree; pick a dedicated root"
+                " (compared on normalized paths)."
+            )
     # D13 (26Q3, codex 5457b713 MUST-FIX 2): execution_timeout_seconds is
     # the FINAL effective timeout for tasks created with both timeout fields
     # absent (frozen at create time, see main.create_task). It must
@@ -611,6 +715,9 @@ def load_config() -> SandboxConfig:
         queue_max_size=queue_max_size,
         max_task_timeout_seconds=max_task_timeout_seconds,
         allow_create_without_operation_id=allow_create_without_operation_id,
+        persistent_workspace_enabled=persistent_workspace_enabled,
+        persistent_workspace_root=persistent_workspace_root,
+        deployment_id=deployment_id,
     )
 
 

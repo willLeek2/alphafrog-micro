@@ -415,7 +415,7 @@
          WHERE <include refid="safePendingPythonRecovery"/>
     </select>
 
-    <!-- Sandbox 已接纳同一 cancelRequestId 的墓碑后才开放轮询；再次核对原 worker 的额度已归还。 -->
+    <!-- 旧证明已确认取消墓碑，或新版证明已按原操作号接回任务，才开放轮询；再次核对原 worker 的额度已归还。 -->
     <update id="recoverPendingPythonMember">
         UPDATE alphafrog_agent_run_wait_member m
            SET state = 'RUNNING', next_poll_at = CURRENT_TIMESTAMP,
@@ -732,6 +732,10 @@
               AND ((m.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
                    OR m.external_operation_id = #{externalOperationId}::varchar)
               AND m.state IN ('PENDING', 'RUNNING')
+              -- 沙箱创建请求已落库但尚未转 RUNNING 时，旧/重跑线程不能把它写成普通
+              -- 工具终态；只有原请求恢复并转 RUNNING 后才允许结果接收器结算。
+              AND NOT (m.state = 'PENDING' AND m.tool_name IN ('executePython', 'executeQuery')
+                       AND m.dispatch_proof_json IS NOT NULL)
               AND EXISTS (SELECT 1 FROM run_fence)
             RETURNING m.id, m.group_id, m.member_seq, m.state
         ),
@@ -1242,18 +1246,85 @@
       Run 必须还在执行中且控制版本没变：计划代际失效或取消之后，旧 Worker 不能再去改等待事实。
     -->
     <!-- 请求发往 Sandbox 前先落完整身份。取消先赢时成员已非 PENDING，不能再创建外部任务。 -->
+    <select id="lockPreparingSqlMemberContext" resultType="java.lang.String">
+        SELECT wi.state FROM alphafrog_agent_run_wait_group g
+        JOIN alphafrog_agent_run_wait_member m ON m.group_id = g.id AND m.run_id = g.run_id
+        JOIN alphafrog_agent_run_work_item wi ON wi.run_id = g.run_id
+          AND wi.plan_generation = g.plan_generation AND wi.node_id = g.node_id
+          AND wi.node_attempt = g.node_attempt AND wi.segment_sequence = g.segment_sequence
+        WHERE g.run_id = #{runId} AND g.id = #{groupId} AND m.member_identity = #{memberIdentity}
+        FOR UPDATE OF m, wi
+    </select>
+
+    <select id="countPreparingSqlMemberOwner" resultType="int">
+        SELECT COUNT(*) FROM alphafrog_agent_run r
+        JOIN alphafrog_agent_run_wait_group g ON g.run_id = r.id
+        JOIN alphafrog_agent_run_wait_member m ON m.group_id = g.id AND m.run_id = r.id
+        JOIN alphafrog_agent_run_work_item wi ON wi.run_id = r.id
+          AND wi.plan_generation = g.plan_generation AND wi.node_id = g.node_id
+          AND wi.node_attempt = g.node_attempt AND wi.segment_sequence = g.segment_sequence
+        JOIN alphafrog_agent_run_tree_budget_operation b
+          ON b.operation_id = 'active-node:' || wi.id || ':' || wi.claim_epoch
+          AND b.kind = 'ACTIVE_NODE' AND b.state = 'CONFIRMED'
+        WHERE r.id = #{runId} AND r.status = 'EXECUTING'
+          AND r.plan_generation = g.plan_generation
+          AND g.id = #{groupId} AND g.state = 'WAITING'
+          AND m.member_identity = #{memberIdentity} AND m.state = 'PENDING'
+          AND m.tool_name = 'executeQuery'
+          AND m.external_operation_id = CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'operationId'
+          AND (m.dispatch_proof_json IS NULL OR m.dispatch_proof_json = CAST(#{proofJson} AS jsonb))
+          AND g.plan_generation = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemPlanGeneration')::int
+          AND g.node_id = CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemNodeId'
+          AND g.node_attempt = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemNodeAttempt')::int
+          AND g.segment_sequence = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemSegmentSequence')::int
+          AND r.run_control_version = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemRunControlVersion')::bigint
+          AND wi.run_control_version = r.run_control_version
+          AND wi.context_version = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemContextVersion')::bigint
+          AND wi.claim_epoch = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemClaimEpoch')::int
+          AND wi.claimed_by = CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemClaimedBy'
+          AND wi.state = 'RESULT_COMMITTED'
+    </select>
+
     <update id="recordMemberPreparing">
         UPDATE alphafrog_agent_run_wait_member m SET
-            dispatch_proof_json = COALESCE(m.dispatch_proof_json, CAST(#{dispatchProofJson} AS jsonb)),
+            dispatch_proof_json = CAST(#{dispatchProofJson} AS jsonb),
             updated_at = CURRENT_TIMESTAMP
         WHERE m.group_id = #{groupId}
           AND m.member_identity = #{memberIdentity}
           AND m.state = 'PENDING'
           AND m.external_operation_id = #{externalOperationId}
-          AND (m.dispatch_proof_json IS NULL
-               OR (m.dispatch_proof_json -&gt;&gt; 'operationId' = #{externalOperationId}
-                   AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
-                       = CAST(#{dispatchProofJson} AS jsonb) -&gt;&gt; 'requestFingerprint'))
+          -- 第一次落库的完整请求不可被重试线程换掉；它必须交由恢复器原样重放。
+          AND m.dispatch_proof_json IS NULL
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_wait_group g
+              JOIN alphafrog_agent_run r ON r.id = g.run_id
+              WHERE g.id = m.group_id AND g.state = 'WAITING' AND r.status = 'EXECUTING')
+    </update>
+
+    <!-- 权威未找到后保存拒绝事实；原完整请求逐字保留，恢复者不能再重放它。 -->
+    <update id="recordMemberWorkspaceRefusal">
+        UPDATE alphafrog_agent_run_wait_member m SET
+            state = 'RUNNING',
+            dispatch_proof_json = CAST(#{proofJson} AS jsonb),
+            next_poll_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE m.group_id = #{groupId}
+          AND m.member_identity = #{memberIdentity}
+          AND m.state IN ('PENDING', 'RUNNING')
+          AND m.tool_name = 'executePython'
+          AND m.external_operation_id = #{operationId}
+          AND m.dispatch_proof_json -&gt;&gt; 'operationId' = #{operationId}
+          AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint' = #{expectedFingerprint}
+          AND m.dispatch_proof_json -&gt;&gt; 'taskId' IS NULL
+          AND m.dispatch_proof_json -&gt;&gt; 'workspaceRefusalCode' IS NULL
+          AND m.dispatch_proof_json -&gt;&gt; 'createRequestJson' IS NOT NULL
+          AND m.dispatch_proof_json -&gt;&gt; 'createRequestJson'
+              = CAST(#{proofJson} AS jsonb) -&gt;&gt; 'createRequestJson'
+          AND m.dispatch_proof_json - 'workspaceRefusalCode'
+              = CAST(#{proofJson} AS jsonb) - 'workspaceRefusalCode'
+          AND CAST(#{proofJson} AS jsonb) -&gt;&gt; 'operationId' = #{operationId}
+          AND CAST(#{proofJson} AS jsonb) -&gt;&gt; 'requestFingerprint' = #{expectedFingerprint}
+          AND CAST(#{proofJson} AS jsonb) -&gt;&gt; 'workspaceRefusalCode' IS NOT NULL
           AND EXISTS (
               SELECT 1 FROM alphafrog_agent_run_wait_group g
               JOIN alphafrog_agent_run r ON r.id = g.run_id
@@ -1312,6 +1383,27 @@
         WHERE group_id = #{groupId}
           AND member_identity = #{memberIdentity}
           AND state = 'RUNNING'
+    </update>
+
+    <!-- 仅在 Run 已永久过期、成员已结清且停机任务完成后压缩正文；保留其余派发证明。 -->
+    <update id="compactExpiredWaitMemberProofs">
+        UPDATE alphafrog_agent_run_wait_member m
+           SET dispatch_proof_json = (m.dispatch_proof_json - 'createRequestJson')
+                   || jsonb_build_object('createRequestExpired', true),
+               updated_at = CURRENT_TIMESTAMP
+          FROM alphafrog_agent_run r
+         WHERE r.id = #{runId} AND m.run_id = r.id
+           AND r.workspace_expired_at IS NOT NULL
+           AND m.tool_name = 'executePython'
+           AND (m.state IN ('SUCCEEDED', 'FAILED', 'LATE')
+                OR (m.state = 'CANCELED' AND EXISTS (
+                    SELECT 1 FROM alphafrog_agent_run_wait_member_stop confirmed
+                     WHERE confirmed.wait_member_id = m.id AND confirmed.state = 'CONFIRMED')))
+           AND m.dispatch_proof_json -&gt;&gt; 'schemaVersion' = CAST(2 AS TEXT)
+           AND m.dispatch_proof_json -&gt;&gt; 'createRequestJson' IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                WHERE s.wait_member_id = m.id AND s.state &lt;&gt; 'CONFIRMED')
     </update>
 
 </mapper>

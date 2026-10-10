@@ -1,6 +1,7 @@
 package world.willfrog.agent.tools.python;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import dev.langchain4j.agent.tool.Tool;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -17,6 +18,8 @@ import world.willfrog.agent.tools.sandboxjob.SandboxJobWaitPolicy;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
 import world.willfrog.agent.tools.sandboxjob.SandboxToolJobLifecycle;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
 import world.willfrog.agent.platform.finance.FinanceRecordDecoder;
@@ -26,9 +29,11 @@ import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
 import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
+import world.willfrog.agent.platform.service.PythonRiskReviewService;
 import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
@@ -37,6 +42,8 @@ import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import com.google.protobuf.util.JsonFormat;
 import java.nio.charset.StandardCharsets;
@@ -97,6 +104,12 @@ public class PythonSandboxTools {
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
 
+    @Autowired
+    private AgentRunMapper agentRunMapper;
+
+    @Autowired
+    private DeploymentIdentityProvider deploymentIdentityProvider;
+
     @Autowired(required = false)
     private DebugObservabilityService debugObservabilityService;
 
@@ -111,6 +124,9 @@ public class PythonSandboxTools {
 
     @Autowired(required = false)
     private PythonSandboxDispatchStore pythonSandboxDispatchStore;
+
+    @Autowired
+    private PythonRiskReviewService pythonRiskReviewService;
 
     @Autowired(required = false)
     private ToolJobFaultInjector toolJobFaultInjector;
@@ -178,7 +194,10 @@ public class PythonSandboxTools {
                             new PythonSandboxJobRequestAdapter(),
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
                             new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter),
-                            new PythonSandboxJobMeteringAdapter(objectMapper));
+                            new PythonSandboxJobMeteringAdapter(objectMapper),
+                            (context, terminal) -> extractFinanceIfPresent(
+                                    context.runId(), context.userId(), context.todoId(), context.toolCallId(),
+                                    terminal.statusName(), (TaskResultResponse) terminal.nativePayload()));
                     sandboxJobAdapters = current;
                 }
             }
@@ -222,6 +241,42 @@ public class PythonSandboxTools {
                 runId, identity, anchor, view.statusName(), (TaskResultResponse) view.nativePayload());
     }
 
+    /** 每次工具调用都按当前 Run 的持久快照读取，避免热配置改变旧 Run 的磁盘语义。 */
+    boolean pythonWorkspaceEnabledForRun(String runId) {
+        // 直接构造本工具的旧单元测试没有 Spring 接线，按历史关闭路径运行。
+        if (agentRunMapper == null && deploymentIdentityProvider == null) {
+            return false;
+        }
+        if (agentRunMapper == null || deploymentIdentityProvider == null) {
+            throw new IllegalStateException("Python 工作区 Run 归属查询接线不完整");
+        }
+        DeploymentIdentity identity = deploymentIdentityProvider.current();
+        AgentRun run = agentRunMapper.findByIdForDeployment(
+                runId, identity.deploymentId(), identity.generationId());
+        if (run == null) {
+            throw new IllegalStateException("当前部署找不到 Python 调用所属的 Run");
+        }
+        if (run.getExt() == null || run.getExt().isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode ext = objectMapper.readTree(run.getExt());
+            if (ext == null || !ext.isObject()) {
+                throw new IllegalStateException("Run 的 Python 工作区配置不是 JSON 对象");
+            }
+            JsonNode enabled = ext.path("python_workspace_enabled");
+            if (enabled.isMissingNode()) {
+                return false;
+            }
+            if (!enabled.isBoolean()) {
+                throw new IllegalStateException("Run 的 Python 工作区开关快照格式无效");
+            }
+            return enabled.booleanValue();
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new IllegalStateException("Run 的 Python 工作区开关快照无法读取", e);
+        }
+    }
+
     /**
      * LangChain4j 暴露给 LLM 的五参数入口；参数名与权威说明中的字段一一对应。
      * 方法上的 {@code @Tool} 不再带正文，目录构建时会覆盖成权威文件。
@@ -262,12 +317,6 @@ public class PythonSandboxTools {
             // LLM 可能传入逗号分隔数字，也可能传入 JSON 数组形态（如 "[1, 3]"），统一经 parseDatasetIds 规范化。
             String[] parsedDatasetNumbers = parseDatasetIds(dataset_ids);
             String[] parsedManifestNumbers = parseDatasetIds(manifest_ids);
-            // 两个参数至少填一个；都为空则无法确定要挂载哪些数据，直接返回 MISSING_IDS。
-            if (parsedDatasetNumbers.length == 0 && parsedManifestNumbers.length == 0) {
-                return fail("executePython", "MISSING_IDS",
-                        "dataset_ids and manifest_ids are both empty; at least one is required",
-                        Map.of());
-            }
 
             // --- 第二阶段：读取当前 agent 运行的 registry 快照 ---
             // dataset_ids 与 manifest_ids 均为当前 agent 运行内的局部编号（由 listMyData 分配），
@@ -276,11 +325,33 @@ public class PythonSandboxTools {
             // dataset 与 manifest 使用两套独立编号空间，各自单独解析。
             String runId = AgentContext.getRunId();
             AgentRunDatasetRegistry registry = this.agentRunDatasetRegistry;
+            // 临时沙箱必须挂新数据；已启用持久工作区的 Run 可以只读取上次调用留下的文件。
+            boolean workspaceEnabled = runId != null && !runId.isBlank()
+                    && pythonWorkspaceEnabledForRun(runId);
+            if (parsedDatasetNumbers.length == 0 && parsedManifestNumbers.length == 0
+                    && !workspaceEnabled) {
+                return fail("executePython", "MISSING_IDS",
+                        "dataset_ids and manifest_ids are both empty; at least one is required",
+                        Map.of());
+            }
             // 编号解析依赖「正在进行的 run」以及已注入的 registry；单元测试或未在 run 内调用时会失败。
             if (runId == null || runId.isBlank() || registry == null) {
                 return fail("executePython", "RUN_LEVEL_IDS_UNAVAILABLE",
                         "Agent run-level dataset ids require an active run and AgentRunDatasetRegistry",
                         Map.of("runId", nvl(runId)));
+            }
+            // 用户删除整棵 Run 前会先持久标记；新脚本不能在封口和删盘期间派发。
+            if (agentRunMapper != null && agentRunMapper.isDeletionStarted(runId)) {
+                return fail("executePython", "RUN_DELETION_IN_PROGRESS",
+                        "The agent run is being deleted; new Python calls are unavailable", Map.of());
+            }
+            if (agentRunMapper != null && workspaceEnabled) {
+                String lifecycle = agentRunMapper.findWorkspaceLifecycleState(runId);
+                if ("CLEANING".equals(lifecycle) || "EXPIRED".equals(lifecycle)) {
+                    return fail("executePython", "EXPIRED".equals(lifecycle)
+                                    ? "WORKSPACE_EXPIRED" : "WORKSPACE_CLEANUP_IN_PROGRESS",
+                            "The persistent workspace is unavailable for this run", Map.of());
+                }
             }
 
             // snapshot 含本 run 已注册的全部 dataset / manifest，后续补全成员 dataset 时要查表。
@@ -380,7 +451,7 @@ public class PythonSandboxTools {
             for (AgentRunDatasetEntry ds : relatedDatasets) {
                 originalIdsToMount.add(ds.originalId());
             }
-            if (originalIdsToMount.isEmpty()) {
+            if (originalIdsToMount.isEmpty() && !workspaceEnabled) {
                 return fail("executePython", "EMPTY_RESOLVED_IDS",
                         "No dataset / manifest resolved from dataset_ids / manifest_ids", Map.of());
             }
@@ -391,8 +462,13 @@ public class PythonSandboxTools {
             List<AgentRunDatasetEntry> allDatasets = new ArrayList<>(resolvedDatasets);
             allDatasets.addAll(relatedDatasets);
             AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(allDatasets, resolvedManifests);
-            String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
-            String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(snapshot);
+            // 仅处理工作区已有文件时没有新的输入要挂载。头部-only CSV 也不能发送：
+            // Sandbox 会把“给了 CSV 却没有任何数据行”判为配置错误，阻止用户代码运行。
+            boolean workspaceFilesOnly = workspaceEnabled && originalIdsToMount.isEmpty();
+            String pathsDatasetCsv = workspaceFilesOnly ? ""
+                    : AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
+            String pathManifestCsv = workspaceFilesOnly ? ""
+                    : AgentRunDatasetCsvWriter.writePathManifestCsv(snapshot);
 
             emitSandboxEvent("sandbox_prepare_registry", Map.of(
                     "durationMs", System.currentTimeMillis() - prepareStartMs,
@@ -405,14 +481,69 @@ public class PythonSandboxTools {
             ));
 
             // datasetId（单数）字段保留兼容旧接口，取挂载列表首项；完整列表通过 datasetIds（复数）重复字段传递。
-            String primaryOriginalId = originalIdsToMount.get(0);
+            String primaryOriginalId = originalIdsToMount.isEmpty() ? "" : originalIdsToMount.get(0);
             log.info("Executing python task for run-level ids: primary={}, total={}, datasetCount={}, manifestCount={}, relatedDatasetCount={}",
                     primaryOriginalId, originalIdsToMount.size(), resolvedDatasets.size(), resolvedManifests.size(), relatedDatasets.size());
+
+            // 持久操作号先于工作区取得确定；拒绝的脚本不能创建工作区或沙箱任务。
+            String riskRefusal = reviewPythonBeforeWorkspace(runId, code);
+            if (riskRefusal != null) {
+                return riskRefusal;
+            }
 
             // --- 第五阶段：组装 ExecuteRequest 并创建沙箱任务 ---
             ExecuteRequest.Builder requestBuilder = ExecuteRequest.newBuilder()
                     .setCode(nvl(code))
                     .setDatasetId(primaryOriginalId);
+
+            if (workspaceEnabled) {
+                AcquireWorkspaceResponse acquired;
+                try {
+                    acquired = pythonSandboxService.acquireWorkspace(
+                            AcquireWorkspaceRequest.newBuilder().setRunId(runId).build());
+                } catch (Exception acquireFailure) {
+                    log.warn("当前 Run 暂不能取得 Python 工作区: run={}", runId, acquireFailure);
+                    return fail("executePython", "WORKSPACE_ACQUIRE_UNAVAILABLE",
+                            "Python workspace acquisition is temporarily unavailable", Map.of());
+                }
+                if (acquired == null || acquired.hasErrorDetail()
+                        || !acquired.getError().isBlank()
+                        || acquired.hasWorkspace() == acquired.hasWorkspaceResult()) {
+                    return fail("executePython", "WORKSPACE_ACQUIRE_UNAVAILABLE",
+                            "Python workspace acquisition returned an invalid or failed response", Map.of());
+                }
+                if (acquired.hasWorkspaceResult()) {
+                    WorkspaceResult result = acquired.getWorkspaceResult();
+                    if (result == WorkspaceResult.WORKSPACE_RESULT_UNSPECIFIED
+                            || result == WorkspaceResult.UNRECOGNIZED) {
+                        return fail("executePython", "WORKSPACE_ACQUIRE_UNAVAILABLE",
+                                "Python workspace acquisition returned an unknown result", Map.of());
+                    }
+                    return fail("executePython", result.name(),
+                            "Python workspace cannot be acquired: " + result.name(), Map.of());
+                }
+                WorkspaceInfo workspace = acquired.getWorkspace();
+                if (!runId.equals(workspace.getOwnedByRunId())
+                        || workspace.getWorkspaceId().isBlank()
+                        || workspace.getWorkspaceGeneration().isBlank()) {
+                    return fail("executePython", "WORKSPACE_IDENTITY_CONFLICT",
+                            "Python workspace identity does not belong to this run", Map.of());
+                }
+                String status = workspace.getStatus();
+                if (!"active".equals(status)) {
+                    String errorCode = switch (status) {
+                        case "dirty" -> "WORKSPACE_DIRTY";
+                        case "deleting" -> "WORKSPACE_DELETING";
+                        case "deleted" -> "WORKSPACE_DELETED";
+                        default -> "WORKSPACE_ACQUIRE_UNAVAILABLE";
+                    };
+                    return fail("executePython", errorCode,
+                            "Python workspace is not active: " + status, Map.of());
+                }
+                requestBuilder.setRunId(runId)
+                        .setWorkspaceId(workspace.getWorkspaceId())
+                        .setWorkspaceGeneration(workspace.getWorkspaceGeneration());
+            }
 
             for (String oid : originalIdsToMount) {
                 requestBuilder.addDatasetIds(oid);
@@ -541,10 +672,99 @@ public class PythonSandboxTools {
             // 等待成员的后台作业已经交出去了。把它转成工具失败文本会让模型以为这次调用结束，
             // 而库里还没有记下这个成员已经派发，所以原样上抛，由派发器写进成员行。
             throw pending;
+        } catch (PythonRiskReplayEvidenceMissingException missing) {
+            throw missing;
         } catch (Exception e) {
             log.error("Execute python tool error", e);
             emitSandboxToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    private String reviewPythonBeforeWorkspace(String runId, String code) {
+        if (pythonRiskReviewService == null) {
+            return fail("executePython", "PYTHON_RISK_REVIEW_UNAVAILABLE",
+                    "Python review service is unavailable", Map.of());
+        }
+        WaitGroupMemberExecutionContext.Snapshot member = WaitGroupMemberExecutionContext.current();
+        String toolCallId = member == null
+                ? AgentContext.getToolCallId() : member.durableToolCallId();
+        if (toolCallId == null || toolCallId.isBlank()) {
+            return fail("executePython", "PYTHON_RISK_REVIEW_UNAVAILABLE",
+                    "Python review requires a durable tool call identity", Map.of());
+        }
+        String operationId;
+        try {
+            operationId = new DataAnalysisOperationIdentity(runId, toolCallId,
+                    DATA_ANALYSIS_ATTEMPT).operationId();
+        } catch (RuntimeException invalidIdentity) {
+            return fail("executePython", "PYTHON_RISK_REVIEW_UNAVAILABLE",
+                    "Python review could not determine the durable operation identity", Map.of());
+        }
+        if (member != null && !operationId.equals(member.expectedOperationId())) {
+            return fail("executePython", "WAIT_GROUP_OPERATION_IDENTITY_MISMATCH",
+                    "The member's persisted operation identity does not match this call", Map.of());
+        }
+        PythonRiskReviewService.Evaluation evaluation;
+        try {
+            evaluation = pythonRiskReviewService.evaluate(operationId, runId, code);
+        } catch (PythonRiskReviewService.Unavailable unavailable) {
+            log.warn("Python 调用前审查不可用：run={} operation={}", runId, operationId, unavailable);
+            return fail("executePython", "PYTHON_RISK_REVIEW_UNAVAILABLE",
+                    "Python review is temporarily unavailable", Map.of());
+        }
+        if (!evaluation.allowed()) {
+            return fail("executePython", "PYTHON_RISK_REJECTED",
+                    "Python script was rejected before Sandbox dispatch",
+                    Map.of("risk_score", evaluation.riskScore()));
+        }
+        if (evaluation.reused() && !hasTrustworthyReplayRequest(runId, operationId, code, member)) {
+            throw new PythonRiskReplayEvidenceMissingException(operationId);
+        }
+        return null;
+    }
+
+    private boolean hasTrustworthyReplayRequest(String runId, String operationId, String code,
+                                                WaitGroupMemberExecutionContext.Snapshot member) {
+        String requestJson;
+        try {
+            if (member != null) {
+                if (waitGroupStore == null) {
+                    return false;
+                }
+                var stored = waitGroupStore.findMemberByOperation(runId, operationId).orElse(null);
+                if (stored == null) {
+                    return false;
+                }
+                WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(
+                        objectMapper, stored.getDispatchProofJson()).orElse(null);
+                if (proof == null || !proof.replayable() || !operationId.equals(proof.operationId())) {
+                    return false;
+                }
+                requestJson = proof.createRequestJson();
+            } else {
+                DeploymentIdentity deployment = deploymentIdentityProvider.current();
+                AgentRun run = agentRunMapper.findByIdForDeployment(
+                        runId, deployment.deploymentId(), deployment.generationId());
+                if (run == null || run.getToolJobAnchorJson() == null
+                        || run.getToolJobAnchorJson().isBlank()) {
+                    return false;
+                }
+                ToolJobAnchor anchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
+                if (!operationId.equals(anchor.getOperationId())) {
+                    return false;
+                }
+                requestJson = anchor.getCreateRequestJson();
+            }
+            if (requestJson == null || requestJson.isBlank()) {
+                return false;
+            }
+            ExecuteRequest.Builder original = ExecuteRequest.newBuilder();
+            JsonFormat.parser().merge(requestJson, original);
+            return operationId.equals(original.getOperationId()) && code.equals(original.getCode());
+        } catch (Exception malformed) {
+            log.warn("原 Python 完整请求无法确认：run={} operation={}", runId, operationId, malformed);
+            return false;
         }
     }
 
@@ -822,6 +1042,10 @@ public class PythonSandboxTools {
                         POLL_INTERVAL_MS),
                 extras -> {
                     extras.setPythonRequestFingerprint(pythonRequestFingerprint);
+                    // 持久工作区任务可能在沙箱队列中等待，执行超时由沙箱实际开始时刻计。
+                    if (!request.getWorkspaceId().isBlank()) {
+                        extras.setTimeoutAt(null);
+                    }
                     // 新请求已经写了自己的数据库进度记录，上一轮终态后等待启动的修复阶段到此结束。
                     extras.setPythonRepairPending(false);
                     extras.setPythonRepairExhausted(false);

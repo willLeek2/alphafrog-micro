@@ -36,6 +36,14 @@ message ExecuteRequest {
   string immutableDatasetSnapshotDigest = 21;
   string librariesDigest = 22;
   string sandboxOptionsDigest = 23;
+  // 持久工作区身份：三字段必须同时提供或同时缺省（部分携带是参数错误）。
+  // 齐全时三者进入沙箱端计算的载荷摘要（operationId 内嵌的 runId 必须与
+  // runId 一致，不一致拒绝）；缺省时旧请求保持原有摘要字节，升级窗口内
+  // 同编号重放的幂等匹配不受影响。三身份齐全的请求可以不带任何新数据集
+  // （后续调用只读工作区内既有文件）；缺省时 datasetId 必须非空。
+  string runId = 24;
+  string workspaceId = 25;
+  string workspaceGeneration = 26;
 }
 
 message ExecuteResponse {
@@ -49,6 +57,14 @@ message ExecuteResponse {
   // is the authoritative machine signal. Parent `error` remains the sole
   // human-readable text and must stay non-blank on every failure path.
   SandboxErrorDetail errorDetail = 6;
+  // 持久工作区业务拒绝。存在即本次调用未创建任务（taskId 为空、status
+  // 缺省、不占任何受理额度、不启动容器）；调用方按枚举值分支，禁止读
+  // error 文本判分支。业务结果的唯一传输方式就是本字段——HTTP/gRPC 错误
+  // 通道保留给传输层与系统故障。注意边界：拒绝只证明「本次请求没有新建
+  // 任务」；在先受理、后变脏、调用方丢失响应的恢复窗口内，同一
+  // operationId 可能已存在任务，调用方必须先经 getTaskByOperationId 权威
+  // 查询确认不存在，才能按本拒绝结果收尾。
+  optional WorkspaceResult workspaceResult = 7;
 }
 
 message GetTaskStatusRequest {
@@ -323,6 +339,189 @@ message CancelTaskResponse {
   SandboxErrorDetail errorDetail = 5;
 }
 
+// 持久工作区业务结果。全部经 200 普通响应字段传输（presence 决定语义），
+// 不依赖 HTTP/gRPC 错误分类。WORKSPACE_RESULT_UNSPECIFIED 是 proto3 缺省值，
+// 生产方永不显式发送；消费方以 has*() presence 判断，不读缺省值。
+enum WorkspaceResult {
+  WORKSPACE_RESULT_UNSPECIFIED = 0;
+  // 工作区因持有者失败/超时/取消/重启被标脏：成员落脏终态，不可重试。
+  WORKSPACE_DIRTY = 1;
+  // 请求携带的工作区身份在状态文档中不存在（启用态下）。
+  WORKSPACE_NOT_FOUND = 2;
+  // 工作区归属另一个 Run：拒绝并告警。
+  WORKSPACE_OWNERSHIP_MISMATCH = 3;
+  // 工作区已删除（不推断 Run 数据库行已删）；按 Run 级处理决定后续。
+  WORKSPACE_DELETED = 4;
+  // 工作区删除处理中：稍后重试等待删除完成。
+  WORKSPACE_DELETING = 5;
+  // 恢复请求携带的已知身份（含代际）与当前不符：按一致性故障处理，
+  // 响应不附带任何可替换的新工作区身份。
+  WORKSPACE_IDENTITY_CONFLICT = 6;
+  // 部署错配：本端未给该 Run 建过工作区且新建开关关闭。告警+成员失败，
+  // 不降级重发。
+  WORKSPACE_UNSUPPORTED = 7;
+  // Run 无持久资源资格（资格接口明确拒绝）：业务拒绝，不是传输/系统
+  // 故障。网关在下发 Python 前返回，不附带工作区。
+  WORKSPACE_RUN_INELIGIBLE = 8;
+}
+
+message WorkspaceInfo {
+  string workspaceId = 1;
+  string workspaceGeneration = 2;
+  // active / dirty / deleting / deleted
+  string status = 3;
+  string ownedByRunId = 4;
+}
+
+message AcquireWorkspaceRequest {
+  string runId = 1;
+  // 恢复核对用已知身份：两者必须同时提供或同时缺省（部分携带是参数
+  // 错误）。携带时必须与当前记录完全匹配（含代际），否则返回
+  // WORKSPACE_IDENTITY_CONFLICT 且不附带可替换的新身份——Run 不得静默换盘。
+  optional string knownWorkspaceId = 2;
+  optional string knownWorkspaceGeneration = 3;
+}
+
+message AcquireWorkspaceResponse {
+  // workspace 与 workspaceResult 互斥：取得成功（含返回既有脏/删除态的
+  // 真实状态）附带 workspace；业务拒绝只带 workspaceResult。
+  optional WorkspaceInfo workspace = 1;
+  optional WorkspaceResult workspaceResult = 2;
+  // 人类可读文本（仅日志/诊断）；分支判断用 workspaceResult 或
+  // errorDetail.category，不读 error。
+  string error = 3;
+  // 网关侧请求缺陷与下游传输/系统故障的稳定分类：字段存在=已分类，
+  // 字段缺失=无故障。业务拒绝不占此字段。
+  SandboxErrorDetail errorDetail = 4;
+}
+
+// 删除结果的机器可读三分类。与 deleted/retryableFailure 两布尔一一对应，
+// 旧调用方不读本字段时行为不变。
+enum WorkspaceDeleteOutcome {
+  WORKSPACE_DELETE_OUTCOME_UNSPECIFIED = 0;
+  // 本次删成，或此前已删（同一审计的幂等重放）。对应 deleted=true。
+  WORKSPACE_DELETE_DELETED = 1;
+  // 条件不符：请求携带的观测最近活动时刻与当前记录不同——观测后有新
+  // 活动。删除未执行，调用方应撤销该 Run 的清理中标记。
+  // 对应 deleted=false 且 retryableFailure=false。
+  WORKSPACE_DELETE_REVOKED_NEW_ACTIVITY = 2;
+  // 暂不可用（并发取得获胜/容器未确认停止/删盘失败）：稍后重试。
+  // 对应 retryableFailure=true。
+  WORKSPACE_DELETE_TEMPORARILY_UNAVAILABLE = 3;
+}
+
+message DeleteWorkspaceRequest {
+  string workspaceId = 1;
+  string idempotencyKey = 2;
+  // 可选：自动条件删除携带扫描时观测的最近活动时刻（RFC3339 UTC），
+  // 服务端在同一状态锁内复核，与当前值不同则拒绝删除并回答
+  // WORKSPACE_DELETE_REVOKED_NEW_ACTIVITY。手动路径不携带（无条件删除）。
+  optional string expectedLastActiveAt = 3;
+}
+
+message DeleteWorkspaceResponse {
+  // deleted=true 仅在目录删除经确认且不可复活的审计记录落库之后返回；
+  // 失败保留可重试的删除处理中状态（retryableFailure=true），重复删除
+  // 继续推进直到成功。
+  bool deleted = 1;
+  bool retryableFailure = 2;
+  // 人类可读文本（仅日志/诊断）。
+  string error = 3;
+  // 同 AcquireWorkspaceResponse.errorDetail 的分类语义。
+  SandboxErrorDetail errorDetail = 4;
+  // 三结果的机器可读分类；存在时以上表为准，两布尔照常按对应关系填写。
+  optional WorkspaceDeleteOutcome outcome = 5;
+}
+
+// 幂等封口请求：按 Run 落下「清理意图已持久」的记录。有盘工作区转入
+// 封口态（拒绝新取得与新任务受理）；从未建盘的 Run 落下 Run 级无盘封口
+// 记录，供崩溃接回与手动路径确认。封口与取得/受理在同一状态锁内仲裁：
+// 资格查询通过到实际创建之间的并发删除，由封口保证输掉的是创建方。
+message SealWorkspaceRequest {
+  string runId = 1;
+  // 幂等键：同一 Run 的重复封口返回同一份记录，不产生第二条。
+  string idempotencyKey = 2;
+}
+
+message SealWorkspaceResponse {
+  // sealed=true：封口记录已持久。
+  bool sealed = 1;
+  // 有盘时携带（含 status）；纯无盘封口且尚无工作区身份时缺失。
+  optional WorkspaceInfo workspace = 2;
+  // 人类可读文本（仅日志/诊断）。
+  string error = 3;
+  // 同 AcquireWorkspaceResponse.errorDetail 的分类语义。
+  SandboxErrorDetail errorDetail = 4;
+}
+
+// 按 Run 只读查盘的三态结果。查询永不创建任何记录。
+enum WorkspaceQueryOutcome {
+  WORKSPACE_QUERY_OUTCOME_UNSPECIFIED = 0;
+  // 从未建盘：本服务实例没有该 Run 的任何记录。调用方不得凭此补记
+  // 「已过期」——盘可能在别的泳道/代际实例上，须按 Run 持久泳道再核对。
+  WORKSPACE_QUERY_NOT_FOUND = 1;
+  // 记录在（各状态原样返回，含封口/删除处理中）。FOUND 但 workspace
+  // 缺失 = 该 Run 只有持久封口记录、从未建盘。
+  WORKSPACE_QUERY_FOUND = 2;
+  // 已删除审计在库：删盘与不可复活审计均已确认。调用方只有见到此态
+  // 才能补记「已过期」；手动删除重试也以此态为终态。
+  WORKSPACE_QUERY_FOUND_DELETED = 3;
+}
+
+message QueryWorkspaceRequest {
+  string runId = 1;
+}
+
+message QueryWorkspaceResponse {
+  WorkspaceQueryOutcome outcome = 1;
+  // FOUND 有盘时携带（status 原样）；FOUND_DELETED 时必带——已删审计仍
+  // 供调用方核对旧工作区身份（旧 workspaceId、generation、归属 Run、
+  // status=deleted），以便拒绝错路由与错误审计。仅 FOUND 无盘封口时缺失。
+  optional WorkspaceInfo workspace = 2;
+  // RFC3339 UTC。FOUND 有盘时为当前最近活动时刻；FOUND 仅封口时为
+  // 封口时刻；FOUND_DELETED 时为删除前记录的最后活动时刻。调用方用
+  // 当前保留时长配置自行重算到期，服务端不预计算到期时间。
+  optional string lastActiveAt = 3;
+  // 仅 FOUND_DELETED 携带（删除审计时刻，RFC3339 UTC）。
+  optional string deletedAt = 4;
+  // 人类可读文本（仅日志/诊断）。
+  string error = 5;
+  // 同 AcquireWorkspaceResponse.errorDetail 的分类语义。
+  SandboxErrorDetail errorDetail = 6;
+}
+
+// 到期候选分页请求：跨全部部署代际，只列本实例本地盘，不含 DELETED
+// 终态（审计改由按 Run 只读查盘永久可查，避免候选页被历史审计淹没）。
+message ListWorkspaceExpiryCandidatesRequest {
+  // 有界分页：>0，服务端封顶（上限 500，超出按上限处理）。
+  int32 pageSize = 1;
+  // 上一页返回的继续令牌；空=首页。
+  string pageToken = 2;
+}
+
+message WorkspaceExpiryCandidate {
+  string runId = 1;
+  string workspaceId = 2;
+  string workspaceGeneration = 3;
+  // active / dirty / deleting / sealed。
+  string status = 4;
+  // RFC3339 UTC。调用方逐行按当前保留时长配置重算到期，并按 Run
+  // 持久泳道核对归属后再决定动作。
+  string lastActiveAt = 5;
+}
+
+message ListWorkspaceExpiryCandidatesResponse {
+  // 按 workspaceId 字典序稳定排序，令牌=上一页最后一行的 workspaceId。
+  // 弱一致游标：并发写入可能导致个别行重复/跳过，调用方逐行再核对。
+  repeated WorkspaceExpiryCandidate candidates = 1;
+  // 空=末页。
+  string nextPageToken = 2;
+  // 人类可读文本（仅日志/诊断）。
+  string error = 3;
+  // 同 AcquireWorkspaceResponse.errorDetail 的分类语义。
+  SandboxErrorDetail errorDetail = 4;
+}
+
 service PythonSandboxService {
   rpc createTask(ExecuteRequest) returns (ExecuteResponse);
   rpc getTaskStatus(GetTaskStatusRequest) returns (TaskStatusResponse);
@@ -334,4 +533,21 @@ service PythonSandboxService {
   // 本波只落 proto additive + Gateway 默认 UNIMPLEMENTED（不写假 override，
   // codex a3aee2ad 第 六 节裁定 4）。
   rpc cancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  // 取得或创建工作区：首次取得只带 runId；恢复调用可带已知身份核对。
+  // 网关转发前先回查该 Run 的持久资源资格：仅明确允许才下发 Python；
+  // 明确拒绝返回 WORKSPACE_RUN_INELIGIBLE，资格暂不可用按
+  // OVERLOADED_OR_UNAVAILABLE 失败关闭（不下发）。
+  rpc acquireWorkspace(AcquireWorkspaceRequest) returns (AcquireWorkspaceResponse);
+  // 显式删除与到期自动清理共用同一入口：两阶段（持久进入删除处理中→
+  // 删盘→确认后写不可复活审计）。手动路径不带 expectedLastActiveAt
+  // （无条件）；自动条件删除携带扫描观测值，同锁复核不一致则拒绝。
+  rpc deleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+  // 幂等封口：清理意图落盘；与取得/受理同锁仲裁。有盘转入封口态，
+  // 无盘落 Run 级永久封口记录（终态，不推进 DELETED）。
+  rpc sealWorkspace(SealWorkspaceRequest) returns (SealWorkspaceResponse);
+  // 按 Run 只读查盘：三态；永不创建记录。空结果不得当作删盘成功。
+  rpc queryWorkspace(QueryWorkspaceRequest) returns (QueryWorkspaceResponse);
+  // 到期候选分页：跨全部代际；不含 DELETED；只列本实例本地盘。
+  rpc listWorkspaceExpiryCandidates(ListWorkspaceExpiryCandidatesRequest)
+      returns (ListWorkspaceExpiryCandidatesResponse);
 }

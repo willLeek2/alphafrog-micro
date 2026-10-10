@@ -8,6 +8,15 @@ package world.willfrog.agent.tools.sandboxjob;
  */
 public interface SandboxJobResultAdapter {
 
+    /** 同一份工具结果解释同时提供正文、业务状态和失败分类。 */
+    record ResolvedResult(String output, boolean success, String errorCode) {}
+
+    default ResolvedResult resolveTerminal(SandboxTerminalResultView result, Object formatContext) {
+        String output = formatTerminalResult(result, formatContext);
+        boolean success = isSuccess(result);
+        return new ResolvedResult(output, success, success ? null : errorCodeOf(result));
+    }
+
     /** 终态是否算业务成功（例如 SUCCEEDED 且退出码为 0）。 */
     boolean isSuccess(SandboxTerminalResultView result);
 

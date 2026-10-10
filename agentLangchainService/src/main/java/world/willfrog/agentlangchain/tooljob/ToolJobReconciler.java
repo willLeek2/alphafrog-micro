@@ -54,6 +54,8 @@ public class ToolJobReconciler {
     private final RunOwnershipGateway ownershipGateway;
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
+    private final ToolJobWorkspaceRefusalRecoveryService workspaceRefusalRecovery =
+            new ToolJobWorkspaceRefusalRecoveryService();
 
     @Autowired(required = false)
     private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
@@ -63,6 +65,9 @@ public class ToolJobReconciler {
 
     @Autowired(required = false)
     private WaitGroupStore waitGroupStore;
+
+    @Autowired(required = false)
+    private CanceledSqlWaitMemberRecovery canceledSqlWaitMemberRecovery;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -187,6 +192,18 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (canceledSqlWaitMemberRecovery != null
+                    && canceledSqlWaitMemberRecovery.ownership(runId, anchor)
+                    != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                if (canceledSqlWaitMemberRecovery.complete(runId, anchor)) {
+                    redisCache.removeDue(runId);
+                    redisCache.deletePendingCache(runId);
+                } else {
+                    anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                    redisCache.upsertDue(runId, anchor);
+                }
+                return;
+            }
             if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
                 if (dualPoolToolJobCoordinator != null
                         && dualPoolToolJobCoordinator.supports(anchor)
@@ -224,6 +241,10 @@ public class ToolJobReconciler {
             if (ToolJobRunDisposition.isDagPreparingAbort(
                     anchor.getRunDisposition())) {
                 recoverPreparingAbort(runId, anchor);
+                return;
+            }
+            if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                settleWorkspaceRefusal(runId, anchor);
                 return;
             }
             if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
@@ -362,6 +383,24 @@ public class ToolJobReconciler {
         }
     }
 
+    private void settleWorkspaceRefusal(String runId, ToolJobAnchor anchor) {
+        ToolJobWorkspaceRefusalRecoveryService.Outcome outcome =
+                workspaceRefusalRecovery.recover(
+                        runId, anchor, capacityService, anchorService);
+        if (outcome == ToolJobWorkspaceRefusalRecoveryService.Outcome.COMPLETE
+                || outcome == ToolJobWorkspaceRefusalRecoveryService.Outcome.INVALID_EVIDENCE) {
+            if (outcome == ToolJobWorkspaceRefusalRecoveryService.Outcome.INVALID_EVIDENCE) {
+                log.error("工作区拒绝的持久凭证无效，停止热循环：run={}", runId);
+            }
+            redisCache.removeDue(runId);
+            redisCache.deletePendingCache(runId);
+            return;
+        }
+        // 未完成时只保留 runId 唤醒；下一轮必须重新读取数据库，不能覆盖新锚点。
+        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+        redisCache.upsertDue(runId, anchor);
+    }
+
     private void resolveCleanupPreparing(String runId, ToolJobAnchor anchor) {
         DataAnalysisReservation preparing;
         try {
@@ -392,6 +431,10 @@ public class ToolJobReconciler {
                         runId, anchor, preparing, sandboxService, anchorService);
         if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
             redisCache.atomicWritePendingAndDue(runId, anchor);
+            return;
+        }
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+            settleWorkspaceRefusal(runId, anchor);
             return;
         }
         if (resolution.outcome()
@@ -446,6 +489,10 @@ public class ToolJobReconciler {
                         runId, anchor, preparing, sandboxService, anchorService);
         if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
             transferRecoveredAttached(runId, anchor, resolution.reservation());
+            return;
+        }
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+            settleWorkspaceRefusal(runId, anchor);
             return;
         }
         if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {

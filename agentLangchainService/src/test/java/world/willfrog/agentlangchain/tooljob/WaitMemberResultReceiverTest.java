@@ -1,8 +1,23 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.google.protobuf.util.JsonFormat;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.tools.sandboxjob.*;
+import world.willfrog.agent.tools.python.PythonSandboxJobRequestAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
+import world.willfrog.agent.platform.finance.*;
+import world.willfrog.agent.platform.mapper.FinanceRecordBatchMapper;
+import world.willfrog.agent.platform.mapper.FinanceMetricRecordMapper;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
+import world.willfrog.agent.tools.finance.FinanceResultModelProjector;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -35,10 +50,13 @@ import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.SandboxResourceUsage;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 
 import java.time.OffsetDateTime;
@@ -91,6 +109,7 @@ class WaitMemberResultReceiverTest {
 
     @BeforeEach
     void setUp() {
+        SandboxJobAdapterRegistry.clearForTests();
         waitGroupStore = Mockito.mock(WaitGroupStore.class);
         ownership = Mockito.mock(RunOwnershipGateway.class);
         Mockito.lenient().when(ownership.requireIdentity()).thenReturn(
@@ -119,6 +138,193 @@ class WaitMemberResultReceiverTest {
         Mockito.lenient().when(pythonSandboxTools.formatTerminalResult(
                 anyString(), any(), any(), any(), any(), any()))
                 .thenReturn("{\"ok\":true,\"stdout\":\"done\"}");
+        // 既有接收器编排用例只替换正文；业务分类仍用真实 Python 适配器。
+        var classifier = new PythonSandboxJobResultAdapter(new FinanceToolResultFormatter(objectMapper), null);
+        SandboxJobResultAdapter textStub = new SandboxJobResultAdapter() {
+            public boolean isSuccess(SandboxTerminalResultView terminal) { return classifier.isSuccess(terminal); }
+            public String errorCodeOf(SandboxTerminalResultView terminal) { return classifier.errorCodeOf(terminal); }
+            public String formatTerminalResult(SandboxTerminalResultView terminal, Object ignored) {
+                return pythonSandboxTools.formatTerminalResult(terminal.statusName(),
+                        (TaskResultResponse) terminal.nativePayload(), RUN_ID, null, "node-1", "tc-1");
+            }
+        };
+        SandboxJobAdapterRegistry.register(new SandboxJobAdapters(
+                new PythonSandboxJobRequestAdapter(), null, textStub, null));
+    }
+
+    @AfterEach
+    void clearAdapters() {
+        SandboxJobAdapterRegistry.clearForTests();
+    }
+
+    private PythonSandboxTools installRealAdapters() {
+        SandboxJobAdapterRegistry.clearForTests();
+        PythonSandboxTools python = new PythonSandboxTools(objectMapper);
+        ReflectionTestUtils.setField(python, "pythonSandboxService", sandboxService);
+        ReflectionTestUtils.invokeMethod(python, "registerSandboxJobAdapters");
+        SqlQueryTools query = new SqlQueryTools(objectMapper);
+        ReflectionTestUtils.setField(query, "pythonSandboxService", sandboxService);
+        ReflectionTestUtils.invokeMethod(query, "registerSandboxJobAdapters");
+        return python;
+    }
+
+    @Test
+    void realSqlAdapterKeepsBusinessFailuresEvenWhenSandboxSucceeded() throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "__EXECUTE_QUERY_RESULT__{\"status\":\"PLAN_REJECTED\","
+                + "\"stage\":\"gate\",\"error\":{\"code\":\"PLAN_GLOBAL_SORT\",\"message\":\"add LIMIT\"}}");
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        JsonNode saved = objectMapper.readTree(capturedRequest().resultRefJson());
+        JsonNode output = objectMapper.readTree(saved.path("output").asText());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(saved.path("errorCode").asText()).isEqualTo("PLAN_GLOBAL_SORT");
+        assertThat(output.path("tool").asText()).isEqualTo("executeQuery");
+        assertThat(output.path("ok").asBoolean()).isFalse();
+        assertThat(output.path("error").path("code").asText()).isEqualTo("PLAN_GLOBAL_SORT");
+        assertThat(output.path("error").path("details").path("retryable").asBoolean()).isTrue();
+        verify(pythonSandboxTools, never()).formatTerminalResult(any(), any(), any(), any(), any(), any());
+        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), eq(saved.path("output").asText()), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"gate,EXPLAIN_FAILED,true", "configure,ENGINE_CONFIGURATION_FAILED,false", "execute,STATEMENT_TIMEOUT,true"})
+    void realSqlFailuresKeepOriginalCodeStageAndRetryGuidance(String stage, String code, boolean retryable)
+            throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"stage\":\"" + stage
+                + "\",\"error\":{\"code\":\"" + code + "\",\"message\":\"query failed\"}}");
+        completion(true, WaitMemberState.FAILED, null);
+        receiver.round();
+        JsonNode saved = objectMapper.readTree(capturedRequest().resultRefJson());
+        JsonNode output = objectMapper.readTree(saved.path("output").asText());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(saved.path("errorCode").asText()).isEqualTo(code);
+        assertThat(output.path("error").path("code").asText()).isEqualTo(code);
+        assertThat(output.path("error").path("details").path("stage").asText()).isEqualTo(stage);
+        assertThat(output.path("error").path("details").path("retryable").asBoolean()).isEqualTo(retryable);
+    }
+
+    @Test
+    void realSqlCanceledResultKeepsQueryCancellation() throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("CANCELED");
+        result("CANCELED", -1, "canceled");
+        completion(true, WaitMemberState.FAILED, null);
+        receiver.round();
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("QUERY_CANCELED", "executeQuery")
+                .doesNotContain("PYTHON_EXECUTION_CANCELED");
+    }
+
+    @Test
+    void realSqlAdapterReturnsRowsAndTruncationAsSqlSuccess() throws Exception {
+        installRealAdapters();
+        WaitMember member = givenDueMember();
+        member.setToolName("executeQuery");
+        status("SUCCEEDED");
+        result("SUCCEEDED", 0, "__EXECUTE_QUERY_RESULT__{\"status\":\"SUCCEEDED\","
+                + "\"columns\":[\"n\"],\"rows\":[[3]],\"row_count\":1,\"truncated\":true}");
+        completion(true, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+
+        JsonNode saved = objectMapper.readTree(capturedRequest().resultRefJson());
+        JsonNode output = objectMapper.readTree(saved.path("output").asText());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+        assertThat(saved.has("errorCode")).isFalse();
+        assertThat(output.path("tool").asText()).isEqualTo("executeQuery");
+        assertThat(output.path("data").path("rows").get(0).get(0).asInt()).isEqualTo(3);
+        assertThat(output.path("data").path("truncated").asBoolean()).isTrue();
+    }
+
+    @Test
+    void realPythonNonZeroExitDoesNotInventDirtyWorkspace() throws Exception {
+        installRealAdapters();
+        givenDueMember();
+        status("FAILED");
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(
+                TaskResultResponse.newBuilder().setTaskId("task-1").setStatus("FAILED")
+                        .setExitCode(1).setStderr("KeyError").setRetryable(true)
+                        .setResourceUsage(SandboxResourceUsage.newBuilder().setExitReason("NON_ZERO_EXIT")).build());
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("PYTHON_EXECUTION_FAILED")
+                .doesNotContain("WORKSPACE_DIRTY", "本任务未执行", "新的 Run");
+    }
+
+    @Test
+    void financialPersistenceFailureDefersAndReplayKeepsOnlyOneBatch() throws Exception {
+        PythonSandboxTools python = installRealAdapters();
+        FinanceRecordBatchMapper batches = Mockito.mock(FinanceRecordBatchMapper.class);
+        FinanceMetricRecordMapper records = Mockito.mock(FinanceMetricRecordMapper.class);
+        AtomicReference<FinanceRecordBatch> persisted = new AtomicReference<>();
+        when(batches.insertIgnore(any())).thenAnswer(invocation -> {
+            FinanceRecordBatch batch = invocation.getArgument(0);
+            return persisted.compareAndSet(null, batch) ? 1 : 0;
+        });
+        when(batches.findByIdentity(any(), any(), any())).thenAnswer(invocation -> persisted.get());
+        when(records.listByBatch(any(), any(), any())).thenReturn(List.of());
+        // 不完整的通道信息产生审计批次；真实处理器仍必须先保存再把标记清理后的正文给模型。
+        FinanceRecordPersister persister = Mockito.spy(new FinanceRecordPersister(batches, records));
+        Mockito.doThrow(new IllegalStateException("database unavailable")).doCallRealMethod()
+                .when(persister).persist(any(), any());
+        FinanceRecordChannelProcessor processor = new FinanceRecordChannelProcessor(
+                new FinanceRecordDecoder(objectMapper), new FinanceRecordSchemaValidator(),
+                new FinanceEnvironmentVerifier(), Mockito.mock(FinanceMethodResolutionQuery.class),
+                persister, Mockito.mock(FinanceRecordChannelObservability.class), objectMapper);
+        ReflectionTestUtils.setField(python, "financeRecordChannelProcessor", processor);
+        FinanceRecordChannelProperties properties = new FinanceRecordChannelProperties();
+        properties.setEnabled(true);
+        ReflectionTestUtils.setField(python, "financeRecordChannelConfigLoader",
+                new FinanceRecordChannelConfigLoader(objectMapper, properties));
+        ReflectionTestUtils.setField(python, "financeResultModelAdapter", new FinanceResultModelAdapter(
+                objectMapper, Mockito.mock(FinanceResultModelProjector.class)));
+        // 重新组装，把刚接好的真实财务投影器绑定进结果适配器。
+        ReflectionTestUtils.setField(python, "sandboxJobAdapters", null);
+        SandboxJobAdapterRegistry.clearForTests();
+        ReflectionTestUtils.invokeMethod(python, "registerSandboxJobAdapters");
+        givenDueMember();
+        AgentRun run = run(AgentRunStatus.EXECUTING);
+        run.setUserId("user-1");
+        when(ownership.findOwnedRun(RUN_ID)).thenReturn(run);
+        status("SUCCEEDED");
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(
+                TaskResultResponse.newBuilder().setTaskId("task-1").setStatus("SUCCEEDED")
+                        .setStdout("__AF_FINANCE_RESULT_v1__{\"value\":0.1}\nrows=5")
+                        .setFinanceRecordChannel(world.willfrog.alphafrogmicro.sandbox.idl.FinanceRecordChannelMetadata
+                                .newBuilder().setEmittedRecordCount(1)).build());
+        completion(false, WaitMemberState.SUCCEEDED, null);
+
+        receiver.round();
+        verify(waitGroupStore, never()).completeMember(any());
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        receiver.round();
+        receiver.round();
+
+        verify(batches, times(2)).insertIgnore(any());
+        verify(batches).findByIdentity(eq(RUN_ID), eq("node-1"), eq("tc-1"));
+        assertThat(persisted.get()).isNotNull();
+        ArgumentCaptor<MemberCompletionRequest> saved = ArgumentCaptor.forClass(MemberCompletionRequest.class);
+        verify(waitGroupStore, times(2)).completeMember(saved.capture());
+        assertThat(saved.getAllValues()).allSatisfy(request -> {
+            assertThat(request.memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
+            assertThat(request.resultRefJson()).contains("rows=5")
+                    .doesNotContain(FinanceRecordDecoder.MARKER_FAMILY);
+        });
     }
 
     /** 按回合读的参数改完下一轮就生效：批次从 8 改成 3，下一次扫描就按 3 要。 */
@@ -265,6 +471,28 @@ class WaitMemberResultReceiverTest {
         verify(recoveryDispatcher, never()).wake(anyLong());
     }
 
+    @Test
+    void queuedTaskSkippedAfterDirtyWorkspacePersistsExplicitFailure() {
+        givenDueMember();
+        status("FAILED");
+        Mockito.lenient().when(sandboxService.getTaskResult(any(GetTaskResultRequest.class)))
+                .thenAnswer(invocation -> TaskResultResponse.newBuilder()
+                        .setTaskId(invocation.getArgument(0, GetTaskResultRequest.class).getTaskId())
+                        .setStatus("FAILED")
+                        .setError("queued task skipped")
+                        .setRetryable(false)
+                        .setResourceUsage(SandboxResourceUsage.newBuilder()
+                                .setExitReason("WORKSPACE_DIRTY").build())
+                        .build());
+        completion(true, WaitMemberState.FAILED, null);
+
+        receiver.round();
+
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("WORKSPACE_DIRTY");
+        verify(recoveryDispatcher, never()).wake(anyLong());
+    }
+
     /** 结果体超过上限：成员也跟着落失败，不能成员说成功、模型看到失败。 */
     @Test
     void aTooLargeResultFailsTheMemberAsWell() {
@@ -330,6 +558,198 @@ class WaitMemberResultReceiverTest {
                         && cancel.getByOperation().getOperationId().equals("op-1")
                         && cancel.getByOperation().getRequestFingerprint().equals("sha256:fingerprint")));
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 0L);
+    }
+
+    @Test
+    void replayableMissingOperationUsesTheSavedRequestInsteadOfCanceling() throws Exception {
+        ExecuteRequest original = ExecuteRequest.newBuilder()
+                .setOperationId("op-1").setRequestFingerprint("sha256:fingerprint")
+                .setCode("print('saved')").build();
+        WaitMemberDispatchProof saved = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
+                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original));
+        givenDueMemberWithProof(saved);
+        when(sandboxService.getTaskByOperationId(any(GetTaskByOperationIdRequest.class)))
+                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+        when(sandboxService.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setTaskId("replayed-task").setRequestFingerprint("sha256:fingerprint").build());
+        status("RUNNING");
+
+        receiver.round();
+
+        verify(sandboxService).createTask(original);
+        verify(sandboxService, never()).cancelTask(any());
+        verify(sandboxService).getTaskStatus(
+                GetTaskStatusRequest.newBuilder().setTaskId("replayed-task").build());
+        verify(waitGroupStore, never()).completeMember(any());
+    }
+
+
+    /** 实际接收器、请求解析器及用户准入守卫连用；数据库行更新由 mapper 边界模拟。 */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"1,1,false", "0,0,false", "0,1,true"})
+    void sqlReplayRequiresFreeSessionAndUnchangedOriginalClaim(int otherQueries, int renewed, boolean created)
+            throws Exception {
+        ExecuteRequest original = ExecuteRequest.newBuilder()
+                .setOperationId("op-1").setRequestFingerprint("sha256:fingerprint")
+                .setCode("print('saved SQL')").build();
+        WaitMemberDispatchProof saved = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
+                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original));
+        WaitMember member = givenDueMemberWithProof(saved);
+        member.setToolName("executeQuery");
+        String originalProof = member.getDispatchProofJson();
+        var mapper = org.mockito.Mockito.mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
+        AgentRun owned = run(AgentRunStatus.EXECUTING);
+        owned.setUserId("user-1");
+        var anchor = new world.willfrog.agent.platform.dataanalysis.ToolJobAnchor();
+        anchor.setToolName("executeQuery");
+        anchor.setOperationId("op-1");
+        anchor.setRequestFingerprint("sha256:fingerprint");
+        anchor.setAnchorState("PREPARING");
+        owned.setToolJobAnchorJson(anchor.toJson());
+        when(mapper.findById(RUN_ID)).thenReturn(owned);
+        when(mapper.countInFlightExecuteQueryByUser("user-1", RUN_ID, "executeQuery", 600))
+                .thenReturn(otherQueries);
+        Mockito.lenient().when(mapper.renewExecuteQueryReplayClaim(RUN_ID, GROUP_ID, MEMBER_IDENTITY,
+                saved.operationId(), saved.requestFingerprint(), saved.createRequestJson(), 2, RUN_CONTROL_VERSION))
+                .thenReturn(renewed);
+        ReflectionTestUtils.setField(receiver, "queryAdmission", new ToolJobAnchorService(mapper));
+        when(sandboxService.getTaskByOperationId(any())).thenAnswer(call -> {
+            // 读取后、原操作重放前发生取消，数据库续占条件失效。
+            if (renewed == 0) owned.setStatus(AgentRunStatus.CANCELED);
+            return GetTaskByOperationIdResponse.getDefaultInstance();
+        });
+        Mockito.lenient().when(sandboxService.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setTaskId("replayed-query").setRequestFingerprint(saved.requestFingerprint()).build());
+        status("RUNNING");
+
+        receiver.round();
+
+        verify(mapper).lockExecuteQuerySession("user-1");
+        verify(sandboxService, created ? Mockito.times(1) : never()).createTask(original);
+        verify(sandboxService, never()).cancelTask(any());
+        verify(waitGroupStore, never()).completeMember(any());
+        assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
+        if (renewed == 0) assertThat(owned.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        if (created) {
+            var order = Mockito.inOrder(mapper, sandboxService);
+            order.verify(mapper).lockExecuteQuerySession("user-1");
+            order.verify(mapper).renewExecuteQueryReplayClaim(RUN_ID, GROUP_ID, MEMBER_IDENTITY,
+                    saved.operationId(), saved.requestFingerprint(), saved.createRequestJson(), 2, RUN_CONTROL_VERSION);
+            order.verify(sandboxService).createTask(original);
+        }
+    }
+
+
+    @Test
+    void staleSqlProofMustWaitForTheQueryAdmittedAfterSixHundredSecondsThenRenewItsOwnSlot() throws Exception {
+        ExecuteRequest original = ExecuteRequest.newBuilder().setOperationId("op-1")
+                .setRequestFingerprint("sha256:fingerprint").setCode("print('original SQL')").build();
+        var saved = new WaitMemberDispatchProof(WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
+                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original));
+        WaitMember member = givenDueMemberWithProof(saved);
+        member.setToolName("executeQuery");
+        String originalProof = member.getDispatchProofJson();
+        var mapper = Mockito.mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
+        AgentRun oldRun = run(AgentRunStatus.EXECUTING);
+        oldRun.setUserId("user-1");
+        oldRun.setUpdatedAt(OffsetDateTime.now().minusSeconds(601));
+        var oldAnchor = new world.willfrog.agent.platform.dataanalysis.ToolJobAnchor();
+        oldAnchor.setToolName("executeQuery"); oldAnchor.setOperationId("op-1"); oldAnchor.setAnchorState("PREPARING");
+        oldAnchor.setRequestFingerprint(saved.requestFingerprint());
+        oldRun.setToolJobAnchorJson(oldAnchor.toJson());
+        AgentRun otherRun = run(AgentRunStatus.EXECUTING);
+        otherRun.setId("other-run"); otherRun.setUserId("user-1"); otherRun.setToolJobAnchorJson(null);
+        otherRun.setUpdatedAt(OffsetDateTime.now());
+        java.util.Map<String, AgentRun> rows = new java.util.HashMap<>();
+        rows.put(RUN_ID, oldRun); rows.put("other-run", otherRun);
+        when(mapper.findById(anyString())).thenAnswer(call -> rows.get(call.getArgument(0)));
+        // 用实际行年龄驱动计数边界；本测试不连接 PostgreSQL，真实 SQL 绑定另有用例核对。
+        when(mapper.countInFlightExecuteQueryByUser(anyString(), anyString(), eq("executeQuery"), eq(600)))
+                .thenAnswer(call -> (int) rows.values().stream()
+                        .filter(row -> !row.getId().equals(call.getArgument(1)))
+                        .filter(row -> row.getStatus() == AgentRunStatus.EXECUTING)
+                        .filter(row -> row.getToolJobAnchorJson() != null)
+                        .filter(row -> row.getUpdatedAt().isAfter(OffsetDateTime.now().minusSeconds(call.<Integer>getArgument(3))))
+                        .count());
+        when(mapper.claimPreparingToolJobAnchor(eq("other-run"), anyString(), eq(AgentRunStatus.EXECUTING)))
+                .thenAnswer(call -> { otherRun.setToolJobAnchorJson(call.getArgument(1)); return 1; });
+        var admission = new ToolJobAnchorService(mapper);
+        var otherAnchor = new world.willfrog.agent.platform.dataanalysis.ToolJobAnchor();
+        otherAnchor.setToolName("executeQuery"); otherAnchor.setOperationId("other-op"); otherAnchor.setAnchorState("PREPARING");
+        assertThat(admission.claimPreparing("other-run", otherAnchor, AgentRunStatus.EXECUTING)).isTrue();
+        assertThat(oldRun.getUpdatedAt()).isBefore(OffsetDateTime.now().minusSeconds(600));
+        ReflectionTestUtils.setField(receiver, "queryAdmission", admission);
+        when(sandboxService.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
+
+        receiver.round();
+
+        verify(sandboxService, never()).createTask(any());
+        verify(mapper, never()).renewExecuteQueryReplayClaim(anyString(), anyLong(), anyString(), anyString(),
+                anyString(), anyString(), anyLong(), anyLong());
+        assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
+        otherRun.setStatus(AgentRunStatus.COMPLETED);
+        when(mapper.renewExecuteQueryReplayClaim(RUN_ID, GROUP_ID, MEMBER_IDENTITY, "op-1",
+                saved.requestFingerprint(), saved.createRequestJson(), 2, RUN_CONTROL_VERSION))
+                .thenAnswer(call -> { oldRun.setUpdatedAt(OffsetDateTime.now()); return 1; });
+        when(sandboxService.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setTaskId("replayed-query").setRequestFingerprint(saved.requestFingerprint()).build());
+        status("RUNNING");
+
+        receiver.round();
+
+        verify(sandboxService).createTask(original);
+        assertThat(oldRun.getUpdatedAt()).isAfter(OffsetDateTime.now().minusSeconds(1));
+        otherRun.setStatus(AgentRunStatus.EXECUTING); otherRun.setToolJobAnchorJson(null);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> admission.claimPreparing(
+                "other-run", otherAnchor, AgentRunStatus.EXECUTING))
+                .isInstanceOf(world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException.class);
+    }
+
+    @Test
+    void sqlTaskAlreadyAcceptedIsOnlyPolledEvenWhenNoReplayAdmissionIsAvailable() {
+        WaitMember member = givenDueMemberWithProof(proof(null));
+        member.setToolName("executeQuery");
+        var admission = Mockito.mock(ToolJobAnchorService.class);
+        ReflectionTestUtils.setField(receiver, "queryAdmission", admission);
+        when(sandboxService.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(true).setTaskId("accepted-query").setRequestFingerprint("sha256:fingerprint").build());
+        status("RUNNING");
+
+        receiver.round();
+
+        Mockito.verifyNoInteractions(admission);
+        verify(sandboxService, never()).createTask(any());
+        verify(sandboxService).getTaskStatus(GetTaskStatusRequest.newBuilder().setTaskId("accepted-query").build());
+    }
+
+    @Test
+    void savedWorkspaceRefusalSettlesWithoutReplayingOrCanceling() throws Exception {
+        ExecuteRequest original = ExecuteRequest.newBuilder()
+                .setOperationId("op-1").setRequestFingerprint("sha256:fingerprint")
+                .setCode("print('saved')").build();
+        WaitMemberDispatchProof saved = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
+                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
+                JsonFormat.printer().omittingInsignificantWhitespace().print(original))
+                .withWorkspaceRefusal("WORKSPACE_DIRTY");
+        givenDueMemberWithProof(saved);
+        when(settlement.settleWorkspaceRefusal(any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(true, null));
+        completion(true, WaitMemberState.FAILED, 55L);
+
+        receiver.round();
+
+        verify(settlement).settleWorkspaceRefusal(any(), eq(saved));
+        verify(sandboxService, never()).createTask(any());
+        verify(sandboxService, never()).cancelTask(any());
+        verify(sandboxService, never()).getTaskByOperationId(any());
+        assertThat(capturedRequest().memberState()).isEqualTo(WaitMemberState.FAILED);
+        assertThat(capturedRequest().resultRefJson()).contains("WORKSPACE_DIRTY");
     }
 
     /** 墓碑外调不确定时不能把瞬间不存在误当最终结论。 */

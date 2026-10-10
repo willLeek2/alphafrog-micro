@@ -71,6 +71,15 @@ public final class PythonSandboxJobRequestAdapter implements SandboxJobRequestAd
     }
 
     @Override
+    public String durableCreateRequestJson(ExecuteRequest request) {
+        try {
+            return JsonFormat.printer().omittingInsignificantWhitespace().print(request);
+        } catch (Exception e) {
+            throw new IllegalStateException("完整 Sandbox 创建请求写不成 JSON", e);
+        }
+    }
+
+    @Override
     public ExecuteRequest parseStoredCreateRequest(String createRequestJson) {
         try {
             ExecuteRequest.Builder builder = ExecuteRequest.newBuilder();

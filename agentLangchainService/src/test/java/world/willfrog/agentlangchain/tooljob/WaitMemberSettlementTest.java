@@ -121,6 +121,34 @@ class WaitMemberSettlementTest {
         assertThat(recorded.getValue().operationId()).isEqualTo(operationId());
     }
 
+    @Test
+    void aDurableWorkspaceRefusalReleasesPreparingCapacityWithoutInventingTaskUsage() throws Exception {
+        DataAnalysisReservation preparing = new DataAnalysisReservation(
+                reservation.reservationId(), reservation.identity(), reservation.resourceClass(),
+                reservation.capacityUnits(), DataAnalysisReservationState.PREPARING, null,
+                reservation.acquiredAt());
+        WaitMemberDispatchProof proof = new WaitMemberDispatchProof(
+                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, operationId(), null,
+                "sha256:fingerprint", "{}", "{}", objectMapper.writeValueAsString(preparing),
+                "2026-09-29T00:00:00Z", "{\"operationId\":\"" + operationId() + "\"}")
+                .withWorkspaceRefusal("WORKSPACE_DIRTY");
+        when(capacityService.restoreReservation(preparing))
+                .thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any()))
+                .thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+
+        assertThat(settlement.settleWorkspaceRefusal(member, proof).ok()).isTrue();
+
+        ArgumentCaptor<DataAnalysisReleaseRequest> release =
+                ArgumentCaptor.forClass(DataAnalysisReleaseRequest.class);
+        verify(capacityService).releaseReservation(release.capture());
+        assertThat(release.getValue().reason())
+                .isEqualTo(DataAnalysisReleaseReason.WORKSPACE_CREATE_REFUSED);
+        assertThat(release.getValue().proof())
+                .isInstanceOf(DataAnalysisReleaseProof.WorkspaceRefusal.class);
+        verify(terminalRecorder, never()).upsert(any());
+    }
+
     /** 模型可在后续分段复用同一个调用编号；两次真实任务分别按持久操作身份结清。 */
     @Test
     void firstAndLaterPythonMembersWithTheSameRawCallIdSettleTheirOwnReservations() {

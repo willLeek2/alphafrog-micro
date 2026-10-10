@@ -121,6 +121,46 @@ public class WaitMemberSettlement {
         return releaseWithUsage(member, stored, estimate, statusName, result, preview, finishedAt);
     }
 
+    /** 沙箱明确拒绝创建、原操作号权威无任务时，没有任务终态与资源用量可记录。 */
+    public Outcome settleWorkspaceRefusal(WaitMember member, WaitMemberDispatchProof proof) {
+        if (member == null || proof == null || !proof.workspaceRefused()
+                || !proof.operationId().equals(member.getExternalOperationId())) {
+            return Outcome.blocked("workspace_refusal_identity_mismatch");
+        }
+        DataAnalysisReservation preparing;
+        try {
+            preparing = objectMapper.readValue(proof.reservationJson(), DataAnalysisReservation.class);
+        } catch (Exception unreadable) {
+            return Outcome.blocked("reservation_unreadable");
+        }
+        if (preparing.state() != DataAnalysisReservationState.PREPARING
+                || preparing.taskId() != null
+                || !preparing.operationId().equals(proof.operationId())
+                || !preparing.identity().runId().equals(member.getRunId())) {
+            return Outcome.blocked("reservation_identity_mismatch");
+        }
+        DataAnalysisReleaseRequest request = new DataAnalysisReleaseRequest(preparing,
+                new DataAnalysisReleaseProof.WorkspaceRefusal(preparing.identity(),
+                        proof.workspaceRefusalCode()),
+                DataAnalysisReleaseReason.WORKSPACE_CREATE_REFUSED);
+        try {
+            DataAnalysisRestoreOutcome restored = capacityService.restoreReservation(preparing);
+            if (restored == DataAnalysisRestoreOutcome.CONFLICT) {
+                DataAnalysisReleaseOutcome prior = capacityService.releaseReservation(request);
+                return prior == DataAnalysisReleaseOutcome.ALREADY_RELEASED
+                        ? Outcome.success() : Outcome.blocked("capacity_reservation_conflict");
+            }
+            DataAnalysisReleaseOutcome released = capacityService.releaseReservation(request);
+            return released == DataAnalysisReleaseOutcome.RELEASED
+                    || released == DataAnalysisReleaseOutcome.ALREADY_RELEASED
+                    ? Outcome.success() : Outcome.blocked("release:" + released);
+        } catch (RuntimeException e) {
+            log.warn("工作区拒绝后容量归还暂不可用：member={} operation={}",
+                    member.getMemberIdentity(), proof.operationId(), e);
+            return Outcome.blocked("workspace_refusal_release_error");
+        }
+    }
+
     /** 有结论的作业：名额还回去、用量记下来。两步都幂等。 */
     private Outcome releaseWithUsage(WaitMember member,
                                      DataAnalysisReservation stored,

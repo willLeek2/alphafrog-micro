@@ -64,6 +64,15 @@
           FROM alphafrog_agent_run WHERE id = #{runId} FOR UPDATE
     </select>
 
+    <select id="isParentDeletionStarted" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM alphafrog_agent_run
+             WHERE id = #{runId}
+               AND (deletion_started_at IS NOT NULL
+                    OR workspace_cleanup_started_at IS NOT NULL
+                    OR workspace_expired_at IS NOT NULL))
+    </select>
+
     <select id="findByCall" resultMap="IntentRow">
         SELECT <include refid="intentColumns"/>
           FROM alphafrog_agent_run_child_intent i

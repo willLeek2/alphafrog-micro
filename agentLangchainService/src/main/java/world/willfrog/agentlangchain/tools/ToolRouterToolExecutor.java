@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
@@ -65,7 +66,7 @@ import java.util.UUID;
  */
 @RequiredArgsConstructor
 @Slf4j
-final class ToolRouterToolExecutor implements ToolExecutor {
+public final class ToolRouterToolExecutor implements ToolExecutor {
 
     /** 事件 payload 中 output 预览的最大字符数，避免超大结果超出事件体大小限制。 */
     private static final int OUTPUT_PREVIEW_MAX_CHARS = 500;
@@ -98,6 +99,14 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      */
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
+        return executeWithResult(request, memoryId).output();
+    }
+
+    /** 同步工具的正文与已判定的业务状态，供等待成员持久化；挂起控制信号仍原样抛出。 */
+    public record InvocationResult(String output, boolean success) { }
+
+    /** 保留路由器的业务状态，避免返回失败正文后被等待成员当作成功。 */
+    public InvocationResult executeWithResult(ToolExecutionRequest request, Object memoryId) {
         String toolCallId = durableToolCallId(request.name(), resolveToolCallId(request));
         AgentContext.setToolCallId(toolCallId);
         try {
@@ -107,7 +116,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             if (repeatDecision.blocked()) {
                 // 重复调用被拦截时也发射 FINISHED 事件，避免前端 UI card 一直转圈
                 emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
-                return repeatDecision.outputOrHint();
+                return new InvocationResult(repeatDecision.outputOrHint(), false);
             }
 
             // emit STARTED
@@ -119,7 +128,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                 String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: " + request.name() + " requires a "
                         + "persisted node identity before creating a Sandbox task";
                 emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
-                return output;
+                return new InvocationResult(output, false);
             }
 
             Instant start = Instant.now();
@@ -151,6 +160,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                         throttleRejected = true;
                         throttleLayer = "weight_limit";
                     }
+                } catch (PythonRiskReplayEvidenceMissingException missing) {
+                    throw missing;
                 } catch (ToolJobInjectedInterruption interruption) {
                     // 不发普通 FINISHED：当前 worker 要模拟在精确进程窗口退出，恢复链会接管。
                     throw interruption;
@@ -189,8 +200,11 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
             LangchainDatasetRefContext.set(datasetRefs);
-            output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
-            return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
+            // 成功结果也可能包含 dataset_ids 和 error 字段；纠正提示只用于已判定失败的调用。
+            if (!success) {
+                output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
+            }
+            return new InvocationResult(appendRepeatedToolCallHintIfNeeded(output, repeatDecision), success);
         } finally {
             AgentContext.clearToolCallId();
         }

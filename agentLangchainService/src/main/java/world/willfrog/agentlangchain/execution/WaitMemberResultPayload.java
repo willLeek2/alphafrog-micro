@@ -141,6 +141,12 @@ public final class WaitMemberResultPayload {
         return node != null && "SUCCEEDED".equals(node.path("status").asText(""));
     }
 
+    /** 读取已持久化的失败码，供下一分段决定是否还能继续执行模型。 */
+    public static String errorCode(String resultRefJson, ObjectMapper objectMapper) {
+        JsonNode node = parse(resultRefJson, objectMapper);
+        return node == null ? "" : node.path("errorCode").asText("");
+    }
+
     /**
      * 恢复时交给模型的工具结果正文。
      *
