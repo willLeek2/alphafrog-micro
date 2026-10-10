@@ -7,6 +7,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.observability.ObservabilityEvents;
 import world.willfrog.agent.platform.wait.RecoveryConsumptionResult;
 import world.willfrog.agent.platform.wait.RecoveryNotification;
 import world.willfrog.agent.platform.wait.RecoveryRejection;
@@ -109,6 +110,40 @@ public class WaitGroupRecoveryIntake {
      * @param caller       调用方标识，写进日志便于分辨是哪条入口
      */
     public IntakeResult take(RecoveryNotification notification, AgentRun run, String caller) {
+        IntakeResult result = doTake(notification, run, caller);
+        reportDecision(notification, result);
+        return result;
+    }
+
+    /**
+     * 合同里的恢复判定事件：只报三种已经定下来的结论（消费成功、收口、已被别人取走），
+     * 延期每一轮扫描都会出现，同一通知不重复报成新决定。上报放在消费语句执行完之后，
+     * 不给那次条件更新添任何等待；关闭时是空操作。
+     */
+    private void reportDecision(RecoveryNotification notification, IntakeResult result) {
+        switch (result.outcome()) {
+            case DEFERRED -> {
+                // 延期不是新决定：下一轮扫描还会看到同一条通知，这里不报。
+            }
+            case CONSUMED -> reportDecision(notification, result, "granted", "恢复通知被消费，下一段放行");
+            case CLOSED -> reportDecision(notification, result, "rejected", "恢复通知已关闭，不会再被服务");
+            case LOST_RACE -> reportDecision(notification, result, "duplicate", "恢复通知已被别人取走或关闭");
+        }
+    }
+
+    private void reportDecision(RecoveryNotification notification, IntakeResult result,
+                                String decision, String summary) {
+        ObservabilityEvents.recoveryDecided()
+                .rootRunId(notification.getRunId())
+                .operationId(notification.getId() == null ? null : String.valueOf(notification.getId()))
+                .decision(decision)
+                .outcome("success")
+                .reasonCode(result.rejection() != null ? result.rejection().name() : result.detail())
+                .summary(summary)
+                .emit();
+    }
+
+    private IntakeResult doTake(RecoveryNotification notification, AgentRun run, String caller) {
         SchedulerVersion version = versionOf(run);
         if (version == null) {
             // 这条通知指向一个读不回来或者版本不认识的 Run：等待链永远不会再往前，收口。

@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.observability.ObservabilityEvents;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkerExitUnconfirmedException;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
@@ -57,6 +58,14 @@ public class DualPoolRunAdmissionRegistry {
         private static Admission rejected() {
             return new Admission(false, -1L);
         }
+    }
+
+    /** 一次新建运行准入的判定结果：受理了没有，以及没受理时的稳定原因编号。 */
+    private record NewRunAdmissionDecision(boolean admitted, String reasonCode) {
+    }
+
+    /** 一次已有运行准入的判定结果：预留（或拒绝），以及没通过时的稳定原因编号。 */
+    private record ExistingRunAdmission(Admission admission, String reasonCode) {
     }
 
     /**
@@ -667,8 +676,23 @@ public class DualPoolRunAdmissionRegistry {
         if (runId == null || runId.isBlank()) {
             throw new IllegalArgumentException("run_id_required");
         }
+        NewRunAdmissionDecision decision = decideNewRunAdmission(runId, versionName);
+        // 合同里的准入事件：判定已经做出、持锁临界区已经退出，这里把它报成一条结构化日志。
+        // 关闭时是空操作，不影响准入本身。
+        ObservabilityEvents.admissionDecided()
+                .rootRunId(runId)
+                .decision(decision.admitted() ? "admitted" : "rejected")
+                .outcome(decision.admitted() ? "success" : "failure")
+                .reasonCode(decision.reasonCode())
+                .summary(decision.admitted() ? "新建运行获得执行名额" : "新建运行未获执行名额")
+                .emit();
+        return decision.admitted();
+    }
+
+    /** 新建运行准入的实际判定；返回值带上没通过的原因，供调用方上报。 */
+    private NewRunAdmissionDecision decideNewRunAdmission(String runId, String versionName) {
         if (startupResidueBlockedFor(versionName)) {
-            return false;
+            return new NewRunAdmissionDecision(false, "startup_residue_blocked");
         }
         // 先取得这条 Run 的服务所有权：一条 Run 同一时刻只由一个进程服务，这件事必须是数据库里的事实，
         // 不能只是本进程的一个集合。拿不到说明别的进程正在服务它，这次不受理。
@@ -676,19 +700,19 @@ public class DualPoolRunAdmissionRegistry {
         Optional<RunServiceLease> acquired = acquireOwnership(runId);
         if (acquired.isEmpty()) {
             log.error("这条 Run 的服务所有权在别人手上，本进程不受理: runId={} version={}", runId, versionName);
-            return false;
+            return new NewRunAdmissionDecision(false, "ownership_unavailable");
         }
         boolean alreadyMine = before != null;
         knownRunIds.add(runId);
         if (activateNewRun(runId)) {
-            return true;
+            return new NewRunAdmissionDecision(true, null);
         }
         // 业务名额没拿到：把刚取得的租约让出去，别握着租约空占这条 Run。
         knownRunIds.remove(runId);
         releaseOwnershipIfFreshlyTaken(runId,
                 new ServiceOwnershipFence(acquired.get().ownerInstanceId(), acquired.get().fencingToken()),
                 alreadyMine);
-        return false;
+        return new NewRunAdmissionDecision(false, "permit_unavailable");
     }
 
     /**
@@ -794,14 +818,29 @@ public class DualPoolRunAdmissionRegistry {
      * 与 {@link #admitExistingRun(String)} 相同，但把本次取得的 epoch 返回给需要失败回滚的入口。
      */
     public Admission admitExistingRunWithLease(String runId) {
+        ExistingRunAdmission decision = decideExistingRunAdmission(runId);
+        // 合同里的准入事件：判定已经做出、持锁临界区已经退出，这里把它报成一条结构化日志。
+        // 关闭时是空操作，不影响准入本身。
+        ObservabilityEvents.admissionDecided()
+                .rootRunId(runId)
+                .decision(decision.admission().admitted() ? "admitted" : "rejected")
+                .outcome(decision.admission().admitted() ? "success" : "failure")
+                .reasonCode(decision.reasonCode())
+                .summary(decision.admission().admitted() ? "已建运行重新获得执行名额" : "已建运行的准入未通过")
+                .emit();
+        return decision.admission();
+    }
+
+    /** 已有运行准入的实际判定；返回值带上没通过的原因，供调用方上报。 */
+    private ExistingRunAdmission decideExistingRunAdmission(String runId) {
         if (!knownRunIds.contains(runId)) {
-            return Admission.rejected();
+            return new ExistingRunAdmission(Admission.rejected(), "unknown_run");
         }
         if (!holdsOwnership(runId)) {
             // 没有服务所有权就不该受理：受理之后每一次推进都会因为凭据不匹配落空，
             // 与其造一个写不动的生命周期，不如在这里就拒绝。
             log.error("没有服务所有权凭据，拒绝受理这条 Run: runId={}", runId);
-            return Admission.rejected();
+            return new ExistingRunAdmission(Admission.rejected(), "ownership_unavailable");
         }
         long reservationEpoch = admissionEpochSequence.incrementAndGet();
         AtomicBoolean reserved = new AtomicBoolean();
@@ -827,8 +866,8 @@ public class DualPoolRunAdmissionRegistry {
             });
         }
         return reserved.get()
-                ? new Admission(true, reservationEpoch)
-                : Admission.rejected();
+                ? new ExistingRunAdmission(new Admission(true, reservationEpoch), null)
+                : new ExistingRunAdmission(Admission.rejected(), "permit_unavailable");
     }
 
     /** 数据库已把 Run 持久化为新一轮 RECEIVED 后，把对应预留激活。 */

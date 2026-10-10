@@ -7,6 +7,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import world.willfrog.agent.platform.observability.ObservabilityEvents;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
@@ -228,7 +229,17 @@ public class CanceledWaitMemberStopWorker {
                 stop.getId(), stop.getClaimToken(), confirmedTaskId, confirmedStatus));
         if (!Boolean.TRUE.equals(confirmed)) {
             retry(stop, "terminal_evidence_not_committed");
+            return;
         }
+        // 合同里的停止确认事件：终态证据已经提交成功，这里报一次「外部停止已确认」。
+        // 逐次核对的结果不报——那是这条工作循环的热路径，报多了拖执行；关闭时是空操作。
+        ObservabilityEvents.externalStopChecked()
+                .rootRunId(stop.getRunId())
+                .operationId(stop.getOperationId())
+                .decision("confirmed")
+                .outcome("success")
+                .summary("外部停止已确认，终态证据已提交")
+                .emit();
     }
 
     private void retry(WaitMemberStopTask stop, String reason) {

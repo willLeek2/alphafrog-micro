@@ -23,6 +23,7 @@ import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.observability.ObservabilityEvents;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
@@ -766,6 +767,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             return;
         }
         NodeWorkItemClaim claim = claimed.get();
+        // 合同里的领取事件：工作项表只有领取人与代次，没有独立的领取时刻列，所以在条件更新
+        // 成功这一刻补上一条「谁在什么时候领走了这一段」。关闭时是空操作，不影响领取本身。
+        ObservabilityEvents.workClaimed()
+                .rootRunId(identity.runId())
+                .nodeId(identity.nodeId())
+                .segmentSequence(identity.segmentSequence())
+                .decision("claimed")
+                .outcome("success")
+                .summary("工作项被领取")
+                .emit();
         // 领取成功才算这张图真的拿到了节点执行机会：写失败只记日志，不影响这次执行。
         try {
             coordinationStore.markDispatchServed(identity.runId(), dispatchTurnRound,
