@@ -768,9 +768,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
         NodeWorkItemClaim claim = claimed.get();
         // 合同里的领取事件：工作项表只有领取人与代次，没有独立的领取时刻列，所以在条件更新
-        // 成功这一刻补上一条「谁在什么时候领走了这一段」。关闭时是空操作，不影响领取本身。
+        // 成功这一刻补上一条「谁在什么时候领走了这一段」。rootRunId 要的是根运行编号：已受理的
+        // Run 内存里带着根树身份，拿不到时退回当前运行编号。关闭时是空操作，不影响领取本身。
         ObservabilityEvents.workClaimed()
-                .rootRunId(identity.runId())
+                .rootRunId(admissionRegistry.rootRunIdIfAdmitted(identity.runId())
+                        .orElse(identity.runId()))
                 .nodeId(identity.nodeId())
                 .segmentSequence(identity.segmentSequence())
                 .decision("claimed")

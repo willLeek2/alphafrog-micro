@@ -145,6 +145,9 @@ public class DualPoolRunAdmissionRegistry {
     private final Map<SchedulerVersion, Boolean> residueBlockedByVersion = new ConcurrentHashMap<>();
     private final Map<SchedulerVersion, String> residueReasonByVersion = new ConcurrentHashMap<>();
     private final Map<SchedulerVersion, Map<String, String>> residueIsolatedByVersion = new ConcurrentHashMap<>();
+
+    /** 准入拒绝的降噪记账：一条 Run 上一次报过的拒绝原因；同一原因只报第一次。 */
+    private final Map<String, String> lastReportedAdmissionRejection = new ConcurrentHashMap<>();
     private final AtomicLong requeuedAbandonedClaims = new AtomicLong();
     private final AtomicLong requeueFailures = new AtomicLong();
     private final AtomicLong startupLeaseHeldElsewhere = new AtomicLong();
@@ -677,15 +680,8 @@ public class DualPoolRunAdmissionRegistry {
             throw new IllegalArgumentException("run_id_required");
         }
         NewRunAdmissionDecision decision = decideNewRunAdmission(runId, versionName);
-        // 合同里的准入事件：判定已经做出、持锁临界区已经退出，这里把它报成一条结构化日志。
-        // 关闭时是空操作，不影响准入本身。
-        ObservabilityEvents.admissionDecided()
-                .rootRunId(runId)
-                .decision(decision.admitted() ? "admitted" : "rejected")
-                .outcome(decision.admitted() ? "success" : "failure")
-                .reasonCode(decision.reasonCode())
-                .summary(decision.admitted() ? "新建运行获得执行名额" : "新建运行未获执行名额")
-                .emit();
+        reportAdmissionDecision(runId, decision.admitted(), decision.reasonCode(),
+                decision.admitted() ? "新建运行获得执行名额" : "新建运行未获执行名额");
         return decision.admitted();
     }
 
@@ -778,6 +774,7 @@ public class DualPoolRunAdmissionRegistry {
         if (isolation != null) {
             // 启动扫描判定这条 Run 的恢复事实说不清：不许借着一次恢复受理把它接回执行链。
             log.warn("这条 Run 在启动时被隔离，恢复受理一律拒绝: runId={} reason={}", runId, isolation);
+            reportAdmissionDecision(runId, false, "startup_isolated", "启动隔离中的运行不受理恢复");
             return Admission.rejected();
         }
         // 没有凭据就按数据库取一次。这一句以前写成「已经有凭据就不再取，否则取一次」，受理不成时
@@ -789,6 +786,7 @@ public class DualPoolRunAdmissionRegistry {
         if (!holdsOwnership(runId)) {
             // 所有权在别人手上：这次恢复消费不该发生，也不该占预留。
             log.warn("这条 Run 的服务所有权在别人手上，恢复受理拒绝: runId={}", runId);
+            reportAdmissionDecision(runId, false, "ownership_unavailable", "这条运行的服务所有权在别的实例上");
             return Admission.rejected();
         }
         knownRunIds.add(runId);
@@ -819,15 +817,8 @@ public class DualPoolRunAdmissionRegistry {
      */
     public Admission admitExistingRunWithLease(String runId) {
         ExistingRunAdmission decision = decideExistingRunAdmission(runId);
-        // 合同里的准入事件：判定已经做出、持锁临界区已经退出，这里把它报成一条结构化日志。
-        // 关闭时是空操作，不影响准入本身。
-        ObservabilityEvents.admissionDecided()
-                .rootRunId(runId)
-                .decision(decision.admission().admitted() ? "admitted" : "rejected")
-                .outcome(decision.admission().admitted() ? "success" : "failure")
-                .reasonCode(decision.reasonCode())
-                .summary(decision.admission().admitted() ? "已建运行重新获得执行名额" : "已建运行的准入未通过")
-                .emit();
+        reportAdmissionDecision(runId, decision.admission().admitted(), decision.reasonCode(),
+                decision.admission().admitted() ? "已建运行重新获得执行名额" : "已建运行的准入未通过");
         return decision.admission();
     }
 
@@ -868,6 +859,53 @@ public class DualPoolRunAdmissionRegistry {
         return reserved.get()
                 ? new ExistingRunAdmission(new Admission(true, reservationEpoch), null)
                 : new ExistingRunAdmission(Admission.rejected(), "permit_unavailable");
+    }
+
+    /**
+     * 合同里的准入事件：判定已经做出、持锁临界区已经退出，这里把它报成一条结构化日志。
+     * 恢复补扫每一轮都会重试同一条 Run，所以同一运行、同一拒绝原因只报第一次；原因变了
+     * 或者后来真正拿到名额，再报。关闭时是空操作，不影响准入本身。
+     */
+    private void reportAdmissionDecision(String runId, boolean admitted, String reasonCode, String summary) {
+        if (admitted) {
+            // 拿到名额算新情况：清掉拒绝记账，后面若再被拒仍然报第一次。
+            lastReportedAdmissionRejection.remove(runId);
+        } else if (!shouldReportAdmissionRejection(runId, reasonCode)) {
+            return;
+        }
+        ObservabilityEvents.admissionDecided()
+                .rootRunId(rootRunIdForEvent(runId))
+                .decision(admitted ? "admitted" : "rejected")
+                .outcome(admitted ? "success" : "failure")
+                .reasonCode(reasonCode)
+                .summary(summary)
+                .emit();
+    }
+
+    /** 同一运行、同一拒绝原因只报第一次；换了原因算新情况。 */
+    private boolean shouldReportAdmissionRejection(String runId, String reasonCode) {
+        String key = reasonCode == null || reasonCode.isBlank() ? "rejected" : reasonCode;
+        String previous = lastReportedAdmissionRejection.putIfAbsent(runId, key);
+        if (previous == null) {
+            return true;
+        }
+        if (previous.equals(key)) {
+            return false;
+        }
+        lastReportedAdmissionRejection.put(runId, key);
+        return true;
+    }
+
+    /** 事件里的 rootRunId：受理中的 Run 内存里就带根树身份；拿不到时退回当前运行编号。 */
+    private String rootRunIdForEvent(String runId) {
+        return rootRunIdIfAdmitted(runId).orElse(runId);
+    }
+
+    /** 已受理 Run 的根身份；没有受理状态或身份缺失时返回空。事件上报用，不抛错。 */
+    public Optional<String> rootRunIdIfAdmitted(String runId) {
+        RunState state = runId == null ? null : runs.get(runId);
+        String root = state == null ? null : state.rootRunId();
+        return root == null || root.isBlank() ? Optional.empty() : Optional.of(root);
     }
 
     /** 数据库已把 Run 持久化为新一轮 RECEIVED 后，把对应预留激活。 */

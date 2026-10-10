@@ -125,19 +125,19 @@ public class WaitGroupRecoveryIntake {
             case DEFERRED -> {
                 // 延期不是新决定：下一轮扫描还会看到同一条通知，这里不报。
             }
-            case CONSUMED -> reportDecision(notification, result, "granted", "恢复通知被消费，下一段放行");
-            case CLOSED -> reportDecision(notification, result, "rejected", "恢复通知已关闭，不会再被服务");
-            case LOST_RACE -> reportDecision(notification, result, "duplicate", "恢复通知已被别人取走或关闭");
+            case CONSUMED -> reportDecision(notification, result, "granted", "success", "恢复通知被消费，下一段放行");
+            case CLOSED -> reportDecision(notification, result, "rejected", "failure", "恢复通知已关闭，不会再被服务");
+            case LOST_RACE -> reportDecision(notification, result, "duplicate", "failure", "恢复通知已被别人取走或关闭");
         }
     }
 
     private void reportDecision(RecoveryNotification notification, IntakeResult result,
-                                String decision, String summary) {
+                                String decision, String outcome, String summary) {
         ObservabilityEvents.recoveryDecided()
                 .rootRunId(notification.getRunId())
                 .operationId(notification.getId() == null ? null : String.valueOf(notification.getId()))
                 .decision(decision)
-                .outcome("success")
+                .outcome(outcome)
                 .reasonCode(result.rejection() != null ? result.rejection().name() : result.detail())
                 .summary(summary)
                 .emit();
