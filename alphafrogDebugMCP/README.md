@@ -43,7 +43,7 @@ PostgreSQL DSN 写在第 1 份文件里，谁启动同一份 `dist/server.js` �
 - `remote_git_log(env, repo_path?, limit?)` — 远程 `git log`
 - `remote_docker_logs(env, container, tail?, grep?, timestamps?, since?, until?, max_bytes?, timeout_seconds?, save_to_file?)` — 抓取容器日志
 - `remote_docker_follow(env, container, follow_seconds?, tail?, grep?, timestamps?, max_bytes?, save_to_file?)` — 限时 follow 日志
-- `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。需要该目标已配置 `ALPHAFROG_PG_<ID>_DSN`。工具返回不含连接方式。
+- `remote_pg_query(env, sql)` — 只读 `SELECT`（`alphafrog_*` 表，以及只读视图 `pg_stat_replication`）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。需要该目标已配置 `ALPHAFROG_PG_<ID>_DSN`。工具返回不含连接方式。
 - `remote_redis_query(env, operation, pattern?, limit?, offset?, keys?, timeout_seconds?)` — 只读 Redis 查询（经 SSH 在远程 Redis 容器内执行 `redis-cli`）。`operation` 支持：
   - `scan_keys`：按 `pattern` 列出 key，支持 `limit`（默认 100，最大 500）与 `offset`（默认 0，最大 10000）
   - `get_values`：按 `keys` 数组（最多 50 个）批量读取键值；支持 string/hash/list/set/zset，集合类最多返回 100 项

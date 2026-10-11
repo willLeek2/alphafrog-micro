@@ -24,6 +24,7 @@ import {
   planPgConnect,
   type SshTunnelHandle,
 } from "./pgQuery.js";
+import { validateSql } from "./sqlGuard.js";
 import {
   buildLogBody,
   buildLogFileName,
@@ -226,11 +227,6 @@ async function runSsh(
   };
 }
 
-// ---------- SQL 校验（与 Python 一致）----------
-const ALLOWED_TABLE_PREFIX = "alphafrog_";
-const DANGEROUS_KEYWORDS =
-  /\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE|COPY|VACUUM|MERGE)\b/i;
-const TABLE_REF_RE = /\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gi;
 const MAX_ROWS = 100;
 
 /** 解析最外层位于语句末尾的 LIMIT（忽略子查询内的 LIMIT）。 */
@@ -273,23 +269,6 @@ function applyRowLimit(sql: string): { sql: string; effectiveLimit: number } {
   const clause = safeSql.slice(outer.start, outer.end);
   const cappedClause = clause.replace(/\bLIMIT\s+\d+/i, `LIMIT ${effectiveLimit}`);
   return { sql: (before + cappedClause).trim(), effectiveLimit };
-}
-
-function validateSql(sql: string): string | null {
-  const stripped = sql.trim();
-  if (!stripped.toUpperCase().startsWith("SELECT")) {
-    return "Only SELECT statements are allowed";
-  }
-  if (DANGEROUS_KEYWORDS.test(stripped)) {
-    return "Dangerous keyword detected";
-  }
-  const tables = [...stripped.matchAll(TABLE_REF_RE)].map((m) => m[1]);
-  for (const t of tables) {
-    if (!t.toLowerCase().startsWith(ALLOWED_TABLE_PREFIX)) {
-      return `Table '${t}' is not allowed (must start with 'alphafrog_')`;
-    }
-  }
-  return null;
 }
 
 function toolJson(data: Record<string, unknown>) {
@@ -839,7 +818,7 @@ server.registerTool(
   {
     description: `Execute a read-only SELECT query against the alphafrog PostgreSQL database.
 env: Logical target id from list_remote_targets; requires a DSN configured for that id.
-Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; values above 100 are capped to 100. If no outer LIMIT is present, LIMIT 100 is appended. OFFSET is preserved.`,
+Only alphafrog_* tables and the read-only view pg_stat_replication are allowed. Outer LIMIT in SQL is kept when <= 100; values above 100 are capped to 100. If no outer LIMIT is present, LIMIT 100 is appended. OFFSET is preserved.`,
     inputSchema: {
       env: envSchema,
       sql: z.string(),
