@@ -112,10 +112,16 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("none", environmentNode.path("OTEL_LOGS_EXPORTER").asText());
         assertEquals("-javaagent:/otel/javaagent.jar", environmentNode.path("JAVA_TOOL_OPTIONS").asText());
         assertEquals("alphafrog-beta-config", environmentNode.path("AF_CONFIG_NACOS_GROUP").asText());
+        assertEquals("false", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("false", environmentNode.path("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED").asText());
+        assertEquals("false", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
+        assertEquals("false", environmentNode.path(
+                "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
         // 主 Beta 容器不带泳道名，配置候选链只查主 data-id，不去查 "main-beta.{dataId}"
         assertFalse(environmentNode.has("AF_LANE_TRAFFIC_SCOPE_ID"));
         // agent 这类服务没有 HTTP 上游，compose 里不出现沙箱地址变量。
         assertFalse(environmentNode.has("AF_SANDBOX_SERVICE_URL"));
+        assertFalse(environmentNode.has("AF_SANDBOX_IMAGE"));
         assertTrue(content.contains("deployment.id=beta-main-001,lane.tag=main-beta,service.version=release-1"));
         assertTrue(content.contains("image.digest=sha256:" + "b".repeat(64)));
         assertFalse(content.contains("image.digest=registry.local"));
@@ -166,7 +172,12 @@ class DockerComposeContainerRuntimeTest {
         assertEquals("5000", environmentNode.path("DUBBO_SERVICE_SHUTDOWN_WAIT").asText());
         assertEquals("65s", mapper.readTree(content).path("services").path("app")
                 .path("stop_grace_period").asText());
+        assertEquals("unless-stopped", mapper.readTree(content).path("services").path("app")
+                .path("restart").asText());
+        assertEquals("host", mapper.readTree(content).path("services").path("app")
+                .path("pid").asText());
         JsonNode volumes = mapper.readTree(content).path("services").path("app").path("volumes");
+        assertTrue(containsVolume(volumes, "/etc/machine-id:/run/alphafrog/host-machine-id:ro"));
         assertTrue(containsVolume(volumes, properties.getObservability().getJavaAgentJar()
                 + ":/otel/javaagent.jar:ro"));
         assertTrue(containsVolume(volumes, temporary.resolve("state/data/logs/agent-service") + ":/app/logs"));
@@ -174,6 +185,69 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
         assertFalse(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
         assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void manifestOverridesEnvFileButControllerComputedPortWins() throws Exception {
+        ((ObjectNode) service).putObject("environmentOverrides")
+                .put("AF_SANDBOX_IMAGE", "sha256:" + "c".repeat(64))
+                .put("DUBBO_PORT_TO_REGISTRY", "9999");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode environment = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app").path("environment");
+        assertEquals("sha256:" + "c".repeat(64), environment.path("AF_SANDBOX_IMAGE").asText());
+        assertEquals("28080", environment.path("DUBBO_PORT_TO_REGISTRY").asText());
+    }
+
+    @Test
+    void composeIncludesManifestMountAfterTemplateAndUsesItsTargetForEnvironment() throws Exception {
+        properties.getServices().get("agent-service").setVolumes(List.of("/srv/shared:/data/shared:ro"));
+        ((ObjectNode) service).putObject("environmentOverrides")
+                .put("WORKSPACE_ROOT", "/incorrect")
+                .put("AF_DEPLOYMENT_ID", "incorrect");
+        ((ObjectNode) service).putArray("bindMounts").addObject()
+                .put("key", "workspace")
+                .put("source", "/srv/alphafrog/workspace")
+                .put("target", "/data/workspace")
+                .put("mode", "rw")
+                .put("env", "WORKSPACE_ROOT");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.validateManifest(manifest);
+        runtime.create(manifest, service, plan);
+
+        JsonNode app = mapper.readTree(Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app");
+        JsonNode volumes = app.path("volumes");
+        assertTrue(containsVolume(volumes, "/srv/alphafrog/workspace:/data/workspace:rw"));
+        assertEquals("/srv/alphafrog/workspace:/data/workspace:rw",
+                volumes.path(volumes.size() - 1).asText());
+        assertEquals("/data/workspace", app.path("environment").path("WORKSPACE_ROOT").asText());
+        assertEquals("beta-main-001", app.path("environment").path("AF_DEPLOYMENT_ID").asText());
+    }
+
+    @Test
+    void rejectsManifestMountOverControllerAndTemplateVolumes() throws Exception {
+        ObjectNode mount = ((ObjectNode) service).putArray("bindMounts").addObject()
+                .put("key", "workspace")
+                .put("source", "/srv/alphafrog/workspace")
+                .put("target", "/app/logs")
+                .put("mode", "rw");
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
+
+        properties.getServices().get("agent-service").setVolumes(List.of("/srv/shared:/data/shared:ro"));
+        mount.put("target", "/data/shared");
+        assertEquals("SERVICE_CONFIG_INVALID", assertThrows(ControllerException.class,
+                () -> runtime.validateManifest(manifest)).code());
     }
 
     @Test
@@ -394,6 +468,7 @@ class DockerComposeContainerRuntimeTest {
     @Test
     void laneProviderRegistersItsOfficialDubboTag() throws Exception {
         ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        ((ObjectNode) service.path("runtime")).put("allowToolJobProcessHalt", true);
         plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
                 JsonSupport.deploymentGeneration(manifest), "A", 28080);
         FakeCommands commands = new FakeCommands(false);
@@ -409,6 +484,57 @@ class DockerComposeContainerRuntimeTest {
         // 泳道容器（不只 frontend）都带泳道名：Nacos 配置桥/沙箱监听靠它构造
         // "{scopeId}.{dataId}" 候选，漏注会让泳道容器读不到泳道覆盖配置
         assertEquals("lane-a", environmentNode.path("AF_LANE_TRAFFIC_SCOPE_ID").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
+        assertEquals("true", environmentNode.path(
+                "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
+    }
+
+    @Test
+    void laneProcessHaltStaysDisabledWithoutTheManifestPermission() throws Exception {
+        ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(
+                mapper, new FakeCommands(false), properties);
+
+        runtime.create(manifest, service, plan);
+
+        JsonNode environmentNode = mapper.readTree(
+                Files.readString(temporary.resolve("state/compose/i-one.json")))
+                .path("services").path("app").path("environment");
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_ACCEPTANCE_FIXTURE_ENABLED").asText());
+        assertEquals("true", environmentNode.path("AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED").asText());
+        assertEquals("false", environmentNode.path(
+                "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT").asText());
+    }
+
+    @Test
+    void readsOnlyTheFixedToolJobRuntimeEvidenceAndRestartsTheSameContainer() {
+        ((ObjectNode) manifest).put("trafficScopeId", "lane-a");
+        ((ObjectNode) service.path("runtime")).put("allowToolJobProcessHalt", true);
+        plan = new ContainerRuntime.CandidatePlan("beta-lane-a", "lane-a", "i-one",
+                JsonSupport.deploymentGeneration(manifest), "A", 28080);
+        FakeCommands commands = new FakeCommands(true);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ContainerRuntime.ToolJobTestRuntime evidence = runtime.inspectToolJobTestRuntime(
+                "beta-machine-1", runtime.containerName(plan, "agent-service"));
+        ContainerRuntime.ContainerObservation restarted = runtime.restart("beta-machine-1",
+                runtime.containerName(plan, "agent-service"), Duration.ofSeconds(2));
+
+        assertEquals("beta-lane-a", evidence.deploymentId());
+        assertEquals("lane-a", evidence.trafficScopeId());
+        assertEquals(plan.generationId(), evidence.generationId());
+        assertTrue(evidence.durableRecoveryEnabled());
+        assertTrue(evidence.faultInjectionEnabled());
+        assertTrue(evidence.processHaltEnabled());
+        assertTrue(evidence.restartUnlessStopped());
+        assertEquals("d".repeat(64), restarted.containerId());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("restart")
+                && command.contains("--time") && command.contains("0")));
     }
 
     @Test
@@ -500,8 +626,15 @@ class DockerComposeContainerRuntimeTest {
         // ${AF_CONFIG_NACOS_USERNAME:} 当插值语法直接拒绝，整个部署卡死在建容器前。
         List<String> names = new ArrayList<>();
         environmentNode.fieldNames().forEachRemaining(names::add);
-        for (String name : names)
-            assertTrue(environmentNode.path(name).asText().matches("(?:[^$]|\\$\\$)*"), name);
+        for (String name : names) {
+            String value = environmentNode.path(name).asText();
+            for (int index = 0; index < value.length(); index++) {
+                if (value.charAt(index) != '$')
+                    continue;
+                assertTrue(index + 1 < value.length() && value.charAt(index + 1) == '$', name);
+                index++;
+            }
+        }
         // 容器层面：compose 把 $$ 还原成字面 $，Spring 照常解析这两个占位符。
         assertTrue(environmentNode.path("SPRING_APPLICATION_JSON").asText()
                 .contains("$${AF_CONFIG_NACOS_USERNAME:}"));
@@ -717,15 +850,23 @@ class DockerComposeContainerRuntimeTest {
                           "State":{"Running":true,"Health":{"Status":"healthy"}}}]
                         """.formatted("d".repeat(64), name, plan.hostPort());
             }
+            boolean lane = !"main-beta".equals(plan.trafficScopeId());
+            boolean processHalt = lane && service.path("runtime").path("allowToolJobProcessHalt").asBoolean(false);
             return """
                     [{"Id":"%s","Name":"/%s","Image":"%s",
                       "Config":{"Labels":{"alphafrog.deployment-id":"%s","alphafrog.traffic-scope-id":"%s",
                       "alphafrog.service-name":"%s","alphafrog.instance-id":"%s","alphafrog.release-id":"%s",
-                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"%d"}},"State":{"Running":true,"Health":{"Status":"healthy"}},
+                      "alphafrog.deployment-generation-id":"%s","alphafrog.host-port":"%d"},
+                      "Env":["AF_GIT_COMMIT=%s","AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED=%s",
+                      "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ENABLED=%s",
+                      "AF_AGENT_TOOL_JOB_FAULT_INJECTION_ALLOW_PROCESS_HALT=%s"]},
+                      "HostConfig":{"RestartPolicy":{"Name":"unless-stopped"}},"RestartCount":1,
+                      "State":{"Running":true,"StartedAt":"2026-09-20T00:00:00Z","Health":{"Status":"healthy"}},
                       "NetworkSettings":{"Ports":{"%d/tcp":[{"HostIp":"127.0.0.1","HostPort":"%d"}]}}}]
                     """.formatted("d".repeat(64), name,
                     service.path("image").path("localImageId").asText(), plan.deploymentId(), plan.trafficScopeId(),
                     serviceName, "i-one", service.path("releaseId").asText(), plan.generationId(), plan.hostPort(),
+                    manifest.path("gitCommit").asText(), lane, lane, processHalt,
                     service.path("runtime").path("containerPort").asInt(), plan.hostPort());
         }
     }

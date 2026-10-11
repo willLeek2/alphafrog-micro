@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
@@ -60,6 +61,13 @@ public class BetaDeploymentService {
     @PostConstruct
     void verifyPersistentStateAtStartup() {
         containers.validateHostPrerequisites();
+        ObjectNode snapshot = store.snapshot();
+        if (fillMissingRetainedFailedCandidate(snapshot.deepCopy())) {
+            store.update(state -> {
+                fillMissingRetainedFailedCandidate(state);
+                return null;
+            });
+        }
         recoverManifestLead();
         validateAll(store.snapshot());
     }
@@ -111,6 +119,8 @@ public class BetaDeploymentService {
                 for (JsonNode service : deployment.path("services"))
                     if ("FACTS_UNCERTAIN".equals(service.path("lastError").path("recoveryClass").asText()))
                         throw new ControllerException("FACTS_UNCERTAIN", "Conflicting external facts must be repaired before deletion");
+                for (JsonNode service : deployment.path("services"))
+                    discardRetainedFailedCandidate((ObjectNode) service);
                 deployment.put("phase", "DELETING");
                 startNextDelete(deployment);
                 empty[0] = deployment.path("services").isEmpty();
@@ -140,6 +150,7 @@ public class BetaDeploymentService {
                 if (service.path("lastError").isNull())
                     throw new ControllerException("RETRY_NOT_ALLOWED", "Only a failed service can be retried");
                 String failedType = service.path("lastError").path("failedOperationType").asText();
+                discardRetainedFailedCandidate(service);
                 service.putNull("failedManifestVersion");
                 service.putNull("lastError");
                 if ("CREATE".equals(failedType) && service.path("activeInstance").isObject()
@@ -200,6 +211,7 @@ public class BetaDeploymentService {
         try {
             OperationRef ref = null;
             try {
+                sweepExpiredRetainedFailedCandidates();
                 ref = store.read(this::currentOperation);
                 if (ref == null && store.read(state -> nextService(state) != null)) {
                     store.update(state -> {
@@ -266,7 +278,115 @@ public class BetaDeploymentService {
         return store.read(state -> requireDeployment(state, deploymentId).deepCopy());
     }
 
+    public ToolJobTestTarget toolJobTestTarget(String deploymentId, String generationId,
+                                                boolean requireProcessHalt) {
+        mutationLock.lock();
+        try {
+            ToolJobTestTarget target = store.read(state -> {
+                ObjectNode deployment = requireDeployment(state, deploymentId);
+                if ("main-beta".equals(deployment.path("trafficScopeId").asText())) {
+                    throw new ControllerException("TOOL_JOB_TEST_MAIN_BETA_FORBIDDEN",
+                            "Tool-job fault controls are limited to an isolated lane");
+                }
+                if (!"ACTIVE".equals(deployment.path("phase").asText())) {
+                    throw new ControllerException("TOOL_JOB_TEST_DEPLOYMENT_BUSY",
+                            "The lane deployment is not active");
+                }
+                ObjectNode service = requireService(deployment, "agent-service");
+                if (!"STABLE".equals(service.path("phase").asText())
+                        || !service.path("activeInstance").isObject()
+                        || !service.path("candidateInstance").isNull()
+                        || !service.path("drainingInstance").isNull()
+                        || !service.path("operation").isNull()) {
+                    throw new ControllerException("TOOL_JOB_TEST_SERVICE_BUSY",
+                            "The lane Agent service is not in a single stable-instance state");
+                }
+                JsonNode active = service.path("activeInstance");
+                if (!generationId.equals(active.path("deploymentGenerationId").asText())) {
+                    throw new ControllerException("TOOL_JOB_TEST_GENERATION_MISMATCH",
+                            "The requested deployment generation is not active");
+                }
+                JsonNode manifest = store.readManifest(deploymentId);
+                JsonNode agentSpec = findService(manifest, "agent-service");
+                boolean manifestAllowsProcessHalt = agentSpec != null
+                        && agentSpec.path("runtime").path("allowToolJobProcessHalt").asBoolean(false);
+                if (requireProcessHalt && !manifestAllowsProcessHalt) {
+                    throw new ControllerException("TOOL_JOB_TEST_PROCESS_HALT_NOT_ALLOWED",
+                            "The lane manifest does not allow process-halt testing");
+                }
+                return new ToolJobTestTarget(deploymentId, deployment.path("trafficScopeId").asText(),
+                        generationId, manifest.path("gitCommit").asText(), active.path("machineId").asText(),
+                        active.path("containerName").asText(), active.path("containerId").asText(),
+                        manifestAllowsProcessHalt, null);
+            });
+            ContainerRuntime.ToolJobTestRuntime runtime = containers.inspectToolJobTestRuntime(
+                    target.machineId(), target.containerName());
+            requireMatchingToolJobTestRuntime(target, runtime, requireProcessHalt);
+            return new ToolJobTestTarget(target.deploymentId(), target.trafficScopeId(), target.generationId(),
+                    target.gitCommit(), target.machineId(), target.containerName(), target.containerId(),
+                    target.manifestAllowsProcessHalt(), runtime);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    public ToolJobTestTarget restartToolJobAgent(String deploymentId, String generationId) {
+        mutationLock.lock();
+        try {
+            ToolJobTestTarget target = toolJobTestTarget(deploymentId, generationId, true);
+            ContainerRuntime.ContainerObservation restarted = containers.restart(target.machineId(),
+                    target.containerName(), properties.getToolJobTestControl().getRestartTimeout());
+            if (!target.containerId().equals(restarted.containerId())) {
+                throw new ControllerException("CONTAINER_IDENTITY_CONFLICT",
+                        "The controlled restart replaced the Agent container");
+            }
+            ContainerRuntime.ToolJobTestRuntime runtime = containers.inspectToolJobTestRuntime(
+                    target.machineId(), target.containerName());
+            requireMatchingToolJobTestRuntime(target, runtime, true);
+            return new ToolJobTestTarget(target.deploymentId(), target.trafficScopeId(), target.generationId(),
+                    target.gitCommit(), target.machineId(), target.containerName(), target.containerId(),
+                    target.manifestAllowsProcessHalt(), runtime);
+        } finally {
+            mutationLock.unlock();
+        }
+    }
+
+    private void requireMatchingToolJobTestRuntime(ToolJobTestTarget target,
+                                                   ContainerRuntime.ToolJobTestRuntime runtime,
+                                                   boolean requireProcessHalt) {
+        if (!runtime.running() || !runtime.healthy()
+                || !target.containerId().equals(runtime.containerId())
+                || !target.deploymentId().equals(runtime.deploymentId())
+                || !target.trafficScopeId().equals(runtime.trafficScopeId())
+                || !target.generationId().equals(runtime.generationId())
+                || !target.gitCommit().equals(runtime.gitCommit())) {
+            throw new ControllerException("TOOL_JOB_TEST_RUNTIME_MISMATCH",
+                    "The active Agent container does not match the persisted lane state");
+        }
+        if (!runtime.durableRecoveryEnabled() || !runtime.faultInjectionEnabled()) {
+            throw new ControllerException("TOOL_JOB_TEST_RUNTIME_DISABLED",
+                    "The active Agent container has not enabled durable recovery and fault injection");
+        }
+        if (requireProcessHalt && (!runtime.processHaltEnabled() || !runtime.restartUnlessStopped())) {
+            throw new ControllerException("TOOL_JOB_TEST_PROCESS_HALT_DISABLED",
+                    "The active Agent container is not configured for process-halt recovery");
+        }
+    }
+
+    public record ToolJobTestTarget(String deploymentId, String trafficScopeId, String generationId,
+                                    String gitCommit, String machineId, String containerName,
+                                    String containerId, boolean manifestAllowsProcessHalt,
+                                    ContainerRuntime.ToolJobTestRuntime runtime) { }
+
     private void startCandidate(OperationRef ref) {
+        if (ref.service().path("retainedFailedCandidate").isObject()) {
+            store.update(state -> {
+                discardRetainedFailedCandidate(requireService(
+                        requireDeployment(state, ref.deploymentId()), ref.serviceName()));
+                validateAll(state);
+                return null;
+            });
+        }
         JsonNode manifest = store.readManifest(ref.deploymentId());
         JsonNode spec = findService(manifest, ref.serviceName());
         if (spec == null) throw new ControllerException("SERVICE_SPEC_MISSING", "Service is absent from the manifest");
@@ -324,8 +444,7 @@ public class BetaDeploymentService {
         if (!ready && !expired && observed.health() != ContainerRuntime.ContainerObservation.Health.UNHEALTHY
                 && observed.health() != ContainerRuntime.ContainerObservation.Health.MISSING) return;
         if (!ready) {
-            cleanupCandidate(candidate);
-            markFailed(ref, "CANDIDATE_NOT_READY", "Candidate did not become ready", "CLEAN_RETRYABLE", true);
+            retainOrCleanupFailedCandidate(ref, candidate);
             return;
         }
         store.update(state -> {
@@ -480,6 +599,11 @@ public class BetaDeploymentService {
     }
 
     private void markFailed(OperationRef ref, String code, String message, String recovery, boolean candidateCleaned) {
+        markFailed(ref, code, message, recovery, candidateCleaned, null, null);
+    }
+
+    private void markFailed(OperationRef ref, String code, String message, String recovery, boolean candidateCleaned,
+                            ObjectNode retainedFailedCandidate, String containerName) {
         store.update(state -> {
             ObjectNode service = checkedService(state, ref);
             if (candidateCleaned) service.putNull("candidateInstance");
@@ -494,11 +618,71 @@ public class BetaDeploymentService {
             error.put("at", Instant.now(clock).toString());
             error.put("failedOperationType", ref.type());
             error.put("recoveryClass", recovery);
+            if (containerName != null && !containerName.isBlank()) error.put("containerName", containerName);
             service.set("lastError", error);
+            if (retainedFailedCandidate != null) service.set("retainedFailedCandidate", retainedFailedCandidate);
             scheduleNext(state);
             validateAll(state);
             return null;
         });
+    }
+
+    private void retainOrCleanupFailedCandidate(OperationRef ref, JsonNode candidate) {
+        String containerName = candidate.path("containerName").asText();
+        String message = "Candidate did not become ready; container=" + containerName;
+        Duration retain = properties.getFailedCandidateRetain();
+        Instant retainUntil = Instant.now(clock).plus(retain);
+        if (retain.isZero() || !Instant.now(clock).isBefore(retainUntil)) {
+            cleanupCandidate(candidate);
+            markFailed(ref, "CANDIDATE_NOT_READY", message, "CLEAN_RETRYABLE", true, null, containerName);
+            return;
+        }
+        ObjectNode retained = mapper.createObjectNode();
+        retained.put("machineId", candidate.path("machineId").asText());
+        retained.put("instanceId", candidate.path("instanceId").asText());
+        retained.put("containerName", containerName);
+        retained.put("retainUntil", retainUntil.toString());
+        markFailed(ref, "CANDIDATE_NOT_READY", message, "CLEAN_RETRYABLE", true, retained, containerName);
+    }
+
+    private void sweepExpiredRetainedFailedCandidates() {
+        Instant now = Instant.now(clock);
+        java.util.List<JsonNode> expired = new java.util.ArrayList<>();
+        ObjectNode snapshot = store.snapshot();
+        boolean missingField = false;
+        for (JsonNode deployment : snapshot.path("deployments")) {
+            for (JsonNode service : deployment.path("services")) {
+                if (!service.has("retainedFailedCandidate")) missingField = true;
+                JsonNode retained = service.path("retainedFailedCandidate");
+                if (retained.isObject() && !now.isBefore(Instant.parse(retained.path("retainUntil").asText())))
+                    expired.add(retained.deepCopy());
+            }
+        }
+        if (!missingField && expired.isEmpty()) return;
+        for (JsonNode retained : expired) {
+            containers.remove(retained.path("machineId").asText(), retained.path("containerName").asText());
+            containers.removeCompose(retained.path("instanceId").asText());
+        }
+        store.update(state -> {
+            Instant deadline = Instant.now(clock);
+            for (JsonNode deployment : state.path("deployments")) {
+                for (JsonNode service : deployment.path("services")) {
+                    JsonNode retained = service.path("retainedFailedCandidate");
+                    if (retained.isObject() && !deadline.isBefore(Instant.parse(retained.path("retainUntil").asText())))
+                        ((ObjectNode) service).putNull("retainedFailedCandidate");
+                }
+            }
+            validateAll(state);
+            return null;
+        });
+    }
+
+    private void discardRetainedFailedCandidate(ObjectNode service) {
+        JsonNode retained = service.path("retainedFailedCandidate");
+        if (!retained.isObject()) return;
+        containers.remove(retained.path("machineId").asText(), retained.path("containerName").asText());
+        containers.removeCompose(retained.path("instanceId").asText());
+        service.putNull("retainedFailedCandidate");
     }
 
     private void cleanupCandidate(JsonNode candidate) {
@@ -568,6 +752,7 @@ public class BetaDeploymentService {
     }
 
     private void validateAll(ObjectNode state) {
+        fillMissingRetainedFailedCandidate(state);
         validator.validateState(state);
         Set<String> deploymentIds = new HashSet<>();
         Set<String> trafficScopes = new HashSet<>();
@@ -784,6 +969,7 @@ public class BetaDeploymentService {
         service.putNull("operation");
         service.putNull("failedManifestVersion");
         service.putNull("lastError");
+        service.putNull("retainedFailedCandidate");
         return service;
     }
 
@@ -854,8 +1040,8 @@ public class BetaDeploymentService {
         java.util.List<ServiceRef> queue = new java.util.ArrayList<>();
         for (JsonNode deployment : state.path("deployments")) {
             if (!"ACTIVE".equals(deployment.path("phase").asText())) continue;
-            if (hasFailure(deployment)) continue;
             for (JsonNode service : deployment.path("services")) {
+                if (!service.path("lastError").isNull()) continue;
                 boolean create = "CREATING".equals(service.path("phase").asText()) && service.path("operation").isNull();
                 // 按服务内容摘要而不是部署单版本号决定滚动：版本号升高但服务摘要没变的
                 // 服务保持当前容器，只有真正改过的服务进入蓝绿；网关在摘要没变时还
@@ -1114,6 +1300,19 @@ public class BetaDeploymentService {
         return "i-" + prefix(deployment.path("deploymentId").asText(), 20) + '-'
                 + prefix(service.path("serviceName").asText(), 20) + '-'
                 + UUID.randomUUID().toString().substring(0, 12);
+    }
+
+    private boolean fillMissingRetainedFailedCandidate(ObjectNode state) {
+        boolean changed = false;
+        for (JsonNode deployment : state.path("deployments")) {
+            for (JsonNode service : deployment.path("services")) {
+                if (!service.has("retainedFailedCandidate")) {
+                    ((ObjectNode) service).putNull("retainedFailedCandidate");
+                    changed = true;
+                }
+            }
+        }
+        return changed;
     }
 
     private String prefix(String value, int length) { return value.substring(0, Math.min(length, value.length())); }

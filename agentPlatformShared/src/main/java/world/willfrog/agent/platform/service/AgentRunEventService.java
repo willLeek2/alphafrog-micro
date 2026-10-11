@@ -1,20 +1,35 @@
 package world.willfrog.agent.platform.service;
 
+import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException;
+import world.willfrog.agent.platform.idempotency.RunRequestDigest;
+import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
+import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
@@ -87,6 +102,15 @@ public class AgentRunEventService {
     private final AgentMessageService messageService;
     /** 提示词服务：用于在 run 创建时快照当前 dataFreshness */
     private final AgentPromptService agentPromptService;
+    /** 事务管理器：Run 主记录与它的事件必须在同一条事务里落库 */
+    private final PlatformTransactionManager transactionManager;
+    /**
+     * 共享候选资格表：三个版本的调度器共用一份候选，资格行是「这条 Run 排在里面」的凭据。
+     *
+     * <p>它必须与 Run 同时出现，所以写在创建那条事务里；放在这个类里而不是别处，是因为
+     * Run 主记录只有这一处插入点。</p>
+     */
+    private final RunCoordinationStore coordinationStore;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -100,6 +124,15 @@ public class AgentRunEventService {
     @Value("${agent.run.checkpoint-version:v2}")
     private String checkpointVersion;
 
+    /** 热配置缺省时的 Python 持久工作区开关；新 Run 创建时读取当下生效值。 */
+    @Value("${agent.python-workspace.enabled:false}")
+    private boolean pythonWorkspaceEnabled;
+
+    @PostConstruct
+    void logPythonWorkspaceSetting() {
+        log.info("Python 持久工作区新 Run 应用配置默认值: enabled={}", pythonWorkspaceEnabled);
+    }
+
     /** 单事件 payload JSON 最大字符数,超出会被截断为摘要对象 */
     @Value("${agent.event.payload.max-chars:10000}")
     private int payloadMaxChars;
@@ -110,8 +143,11 @@ public class AgentRunEventService {
 
     /**
      * 创建并冻结部署身份。调用方只能传入当前服务实例已经验证过的可信值。
+     *
+     * <p>这个旧重载不接收调度器版本，固定按 {@link SchedulerVersion#DEFAULT_FOR_EXISTING_ROWS}（LEGACY）创建，
+     * 与存量 Run 的取值一致。要用新路径的调用方走带版本的重载。</p>
      */
-    public AgentRun createRun(String userId,
+    public RunCreation createRun(String userId,
                               String message,
                               String contextJson,
                               String idempotencyKey,
@@ -131,7 +167,7 @@ public class AgentRunEventService {
                 deploymentId, deploymentGenerationId, null, generateArtifacts, isAdmin);
     }
 
-    public AgentRun createRun(String userId,
+    public RunCreation createRun(String userId,
                               String message,
                               String contextJson,
                               String idempotencyKey,
@@ -147,7 +183,60 @@ public class AgentRunEventService {
                               String laneTag,
                               boolean generateArtifacts,
                               boolean isAdmin) {
-        log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
+        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson,
+                deploymentId, deploymentGenerationId, laneTag,
+                SchedulerVersion.DEFAULT_FOR_EXISTING_ROWS.name(), generateArtifacts, isAdmin);
+    }
+
+    /**
+     * 创建 Run 并显式冻结调度器版本。
+     *
+     * <p>调用方在创建入口读「此后新 Run 用哪个版本」的开关，把这个值传进来。取值在这里用
+     * {@link SchedulerVersion#fromWire(String)} 解析：认不出的取值直接抛
+     * {@link world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException}，失败关闭，
+     * 不落回 LEGACY。这个值只影响此后新建的 Run；存量 Run 与追问始终按库里已经冻结的取值路由。</p>
+     *
+     * <p>带幂等键时按用户范围内的键去重：同一个键配同一个请求摘要读回原来那条 Run，配不同摘要抛
+     * {@link RunIdempotencyConflictException}，两种情况都不会新建第二条 Run。读回发生在写任何东西之前，
+     * 所以重复提交不会多出事件、消息或提示词快照。</p>
+     */
+    public RunCreation createRun(String userId,
+                              String message,
+                              String contextJson,
+                              String idempotencyKey,
+                              String modelName,
+                              String endpointName,
+                              boolean captureLlmRequests,
+                              String provider,
+                              int plannerCandidateCount,
+                              boolean debugMode,
+                              String stageConfigJson,
+                              String deploymentId,
+                              String deploymentGenerationId,
+                              String laneTag,
+                              String schedulerVersion,
+                              boolean generateArtifacts,
+                              boolean isAdmin) {
+        SchedulerVersion frozenSchedulerVersion = SchedulerVersion.fromWire(schedulerVersion);
+        String normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey);
+        String requestDigest = normalizedIdempotencyKey == null ? null : RunRequestDigest.digest(
+                new RunRequestFingerprint(userId, message, contextJson, modelName, endpointName,
+                        provider, captureLlmRequests, plannerCandidateCount, debugMode,
+                        generateArtifacts, stageConfigJson),
+                objectMapper);
+        if (normalizedIdempotencyKey != null) {
+            AgentRun existing = runMapper.findByUserIdempotencyKey(userId, normalizedIdempotencyKey);
+            if (existing != null) {
+                log.info("[AgentRunEventService] 幂等键命中，读回原来的 Run: userId={}, runId={}",
+                        userId, existing.getId());
+                return new RunCreation(
+                        reprojectReceivedFact(requireSameRequestDigest(existing, requestDigest, userId)),
+                        false);
+            }
+        }
+        log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}, schedulerVersion={}",
+                userId, stageConfigJson, isAdmin, frozenSchedulerVersion);
         // 生成无连字符 UUID 作为 runId
         String runId = java.util.UUID.randomUUID().toString().replace("-", "");
 
@@ -165,6 +254,7 @@ public class AgentRunEventService {
             ext.put("planner_candidate_count", plannerCandidateCount);
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
+        ext.put("python_workspace_enabled", resolvePythonWorkspaceEnabled());
         PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
                 runId, userId, contextJson);
         ext.put("prompt_selection", promptSelection.toExtMap());
@@ -218,6 +308,10 @@ public class AgentRunEventService {
         run.setDeploymentGenerationId(
                 DeploymentIdentity.requireActiveGenerationId(deploymentGenerationId));
         run.setLaneTag(normalizeLaneTag(laneTag));
+        // 调度器版本在这里一次写死：整次运行只由认识该版本的一种调度器实现消费
+        run.setSchedulerVersion(frozenSchedulerVersion.name());
+        run.setPlanGeneration(-1);
+        run.setRunControlVersion(0L);
         run.setStatus(AgentRunStatus.RECEIVED);
         run.setCurrentStep(0);
         run.setMaxSteps(12);
@@ -230,11 +324,45 @@ public class AgentRunEventService {
         run.setRestartAttempt(0);
         run.setToolJobAnchorJson("{}");
 
-        runMapper.insert(run);
-        // 紧接着写入 RUN_RECEIVED 事件,保留 ext 全文作为事件 payload 便于审计
-        append(runId, userId, "RUN_RECEIVED", ext);
+        run.setIdempotencyKey(normalizedIdempotencyKey);
+        run.setRequestDigest(requestDigest);
+        // Run 主记录与 RUN_RECEIVED 事件在同一条事务里落库：进程恰好在两者之间退出时，库里不会留下
+        // 「有 Run、没有接收事实」的半成品——那种记录会被幂等重试直接读回，缺失的事实再也没人补。
+        AgentRunEvent received;
+        try {
+            received = transactionTemplate().execute(status -> {
+                runMapper.insert(run);
+                // 排进共享候选与创建同一条事务：资格行缺了，这条 Run 在候选里就没有位置，
+                // 而候选是三个版本共用的唯一入口——旧版本的 Run 也没有第二条路会来补它。
+                // 与版本无关：记的是这条 Run 自己冻结的版本，新建的每一条都在候选里。
+                if (!coordinationStore.ensure(runId)) {
+                    log.warn("这条 Run 建出来却没有排进共享候选，需要人看一眼: runId={}", runId);
+                }
+                // 接收事实与 Run 主记录同一条事务：只落库，投射留到提交之后。
+                return persistEvent(runId, "RUN_RECEIVED", ext);
+            });
+        } catch (DuplicateKeyException duplicate) {
+            // 同一瞬间两个请求带着同一个键一起进来：唯一索引只放行一条，另一条在这里读回同一个 Run。
+            if (normalizedIdempotencyKey == null) {
+                throw duplicate;
+            }
+            AgentRun raced = runMapper.findByUserIdempotencyKey(userId, normalizedIdempotencyKey);
+            if (raced == null) {
+                // 唯一索引报的是别的冲突（例如主键重复），这种情况不能猜，原样抛出。
+                throw duplicate;
+            }
+            log.info("[AgentRunEventService] 幂等键并发命中，读回先写入的那条 Run: userId={}, runId={}",
+                    userId, raced.getId());
+            return new RunCreation(
+                    reprojectReceivedFact(requireSameRequestDigest(raced, requestDigest, userId)), false);
+        }
 
-        // 写入首条用户消息（initial）
+        // 事务已经提交，Run 与接收事实都在库里了，这时才把接收事实投射到 Redis 与实时频道。
+        // 投射失败不回退创建：数据库那一行是权威，事件流可以由它重建。
+        projectAppended(received);
+
+        // 写入首条用户消息（initial）。它不在上面那条事务里，写失败只记日志：这是明确保留的
+        // 用户可见缺口——Run 已经可执行，而首条用户消息可能缺失。
         try {
             messageService.createInitialMessage(runId, message);
         } catch (Exception e) {
@@ -243,8 +371,218 @@ public class AgentRunEventService {
         }
 
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
-        return runMapper.findByIdAndUserForDeployment(
+        AgentRun persisted = runMapper.findByIdAndUserForDeployment(
                 runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
+        if (persisted == null) {
+            throw new IllegalStateException("Run 刚刚写入却读不回来：runId=" + runId);
+        }
+        return new RunCreation(persisted, true);
+    }
+
+    /**
+     * 一次创建请求的结果。
+     *
+     * <p>{@code created} 区分「这次真的建了一条新 Run」与「幂等键命中，读回原来那条」。调用方只有拿到
+     * 新建的那条才允许准入与启动：读回的 Run 已经在别处跑着，再启动一次会让同一次请求执行两遍。</p>
+     */
+    public record RunCreation(AgentRun run, boolean created) {
+    }
+
+    /**
+     * Create one child Run from a durable spawn intent. The caller owns the transaction that
+     * also marks the intent accepted; neither side may commit without the other.
+     */
+    public AgentRun createChildRun(AgentRun parent,
+                                   String childRunId,
+                                   String rootRunId,
+                                   String goal,
+                                   String context,
+                                   String modelName,
+                                   String endpointName,
+                                   int maxSteps,
+                                   ChildRunAcceptanceControls.MemberIdentity bindingIdentity) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("Child Run creation requires the outbox acceptance transaction");
+        }
+        if (parent == null || parent.getId() == null || childRunId == null || childRunId.isBlank()
+                || rootRunId == null || rootRunId.isBlank() || goal == null || goal.isBlank()
+                || bindingIdentity == null) {
+            throw new IllegalArgumentException("Child Run creation requires parent, child, root and goal");
+        }
+        if (!SchedulerVersion.DUAL_POOL_V2.name().equals(parent.getSchedulerVersion())) {
+            throw new IllegalArgumentException("Only dual-pool V2 Run can create a child Run");
+        }
+        if (childRunId.equals(parent.getId()) || childRunId.equals(rootRunId)
+                || maxSteps <= 0 || maxSteps > 12) {
+            throw new IllegalArgumentException("Invalid child Run identity or step limit");
+        }
+
+        ObjectNode ext = requireObjectJson(parent.getExt(), "parent ext").deepCopy();
+        if (ext.path("child_run").asBoolean(false)) {
+            throw new IllegalArgumentException("A child Run cannot create another child Run");
+        }
+        ObjectNode childContext = sanitizeChildContext(ext.path("context_json"), bindingIdentity);
+        if (context != null && !context.isBlank()) {
+            childContext.put("sub_agent_context", context);
+        }
+        String childGoal = context == null || context.isBlank()
+                ? goal : goal + "\n\nContext:\n" + context;
+        ext.put("user_goal", childGoal);
+        ext.put("context_json", childContext.toString());
+        ext.put("idempotency_key", "");
+        ext.put("execution_mode", PlanExecutionMode.AUTO.name());
+        ext.put("child_run", true);
+        ext.put("parent_run_id", parent.getId());
+        ext.put("root_run_id", rootRunId);
+        ext.put("sub_agent_depth", 1);
+        ext.remove("acceptanceFixtureId");
+        ext.remove("acceptanceControlId");
+        ext.remove(ChildRunAcceptanceControls.CONTEXT_FIELD);
+        ext.remove("acceptance_fixture_id");
+        ext.remove("acceptance_control_id");
+        ext.remove("debug_observability");
+        if (modelName != null && !modelName.isBlank()) {
+            ext.put("model_name", modelName);
+        }
+        if (endpointName != null && !endpointName.isBlank()) {
+            ext.put("endpoint_name", endpointName);
+        }
+
+        AgentRun child = new AgentRun();
+        child.setId(childRunId);
+        child.setUserId(parent.getUserId());
+        child.setDeploymentId(parent.getDeploymentId());
+        child.setDeploymentGenerationId(parent.getDeploymentGenerationId());
+        child.setLaneTag(parent.getLaneTag());
+        child.setSchedulerVersion(parent.getSchedulerVersion());
+        child.setPlanGeneration(-1);
+        child.setRunControlVersion(0L);
+        child.setStatus(AgentRunStatus.RECEIVED);
+        child.setCurrentStep(0);
+        child.setMaxSteps(maxSteps);
+        child.setPlanJson("{}");
+        child.setSnapshotJson("{}");
+        child.setLastError(null);
+        child.setTtlExpiresAt(nextTtlExpiresAt());
+        child.setExt(ext.toString());
+        child.setExecutionCheckpointJson("{}");
+        child.setRestartAttempt(0);
+        child.setToolJobAnchorJson("{}");
+        child.setIdempotencyKey(null);
+        child.setRequestDigest(null);
+
+        runMapper.insert(child);
+        if (!coordinationStore.ensure(childRunId)) {
+            throw new IllegalStateException("Child Run did not receive a coordination row: " + childRunId);
+        }
+        AgentRunEvent received = persistEvent(childRunId, "RUN_RECEIVED", ext);
+        messageService.createInitialMessage(childRunId, childGoal);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                projectAppended(received);
+            }
+        });
+        return child;
+    }
+
+    private ObjectNode requireObjectJson(String value, String label) {
+        try {
+            JsonNode node = objectMapper.readTree(value);
+            if (node instanceof ObjectNode object) {
+                return object;
+            }
+        } catch (Exception ignored) {
+            // The frozen parent contract is invalid; refuse to create a child with guessed settings.
+        }
+        throw new IllegalStateException(label + " must be a JSON object");
+    }
+
+    private ObjectNode sanitizeChildContext(JsonNode raw,
+                                            ChildRunAcceptanceControls.MemberIdentity bindingIdentity) {
+        ObjectNode context;
+        if (raw.isTextual()) {
+            String text = raw.asText();
+            if (text.isBlank()) {
+                context = objectMapper.createObjectNode();
+            } else {
+                try {
+                    context = requireObjectJson(text, "parent context");
+                } catch (IllegalStateException invalidJson) {
+                    context = objectMapper.createObjectNode();
+                    context.put("parent_context_text", text);
+                }
+            }
+        } else if (raw instanceof ObjectNode object) {
+            context = object.deepCopy();
+        } else if (raw.isMissingNode() || raw.isNull()) {
+            context = objectMapper.createObjectNode();
+        } else {
+            throw new IllegalStateException("parent context must be a JSON object");
+        }
+        String childControlId = ChildRunAcceptanceControls.controlFor(context, bindingIdentity).orElse(null);
+        context.remove("acceptanceFixtureId");
+        context.remove("acceptanceControlId");
+        context.remove(ChildRunAcceptanceControls.CONTEXT_FIELD);
+        context.remove("acceptance_fixture_id");
+        context.remove("acceptance_control_id");
+        context.remove("executionMode");
+        context.remove("execution_mode");
+        if (childControlId != null) {
+            context.put("acceptanceControlId", childControlId);
+        }
+        return context;
+    }
+
+    /**
+     * 读回一条已经存在的 Run 时，把它的接收事实补投一次。
+     *
+     * <p>投射挪到提交之后，就有「库里有、事件流里没有」的可能。同键重试正是最可能碰上这种情况的
+     * 请求：它当时就在场，而且上一次多半刚失败过。走的是补投那条写入（缺了才补、已有不动、
+     * 也不续期），不是普通投射——普通写入会把整条 Run 的事件重新设成完整保留期，用户反复用同一个
+     * 请求键重试就能让这条事件流一直不过期。补投只写持久事件流，不重发实时事件；失败不影响返回，
+     * 周期修补还会再试。</p>
+     */
+    private AgentRun reprojectReceivedFact(AgentRun run) {
+        try {
+            AgentRunEvent received = eventMapper.findFirstByRunIdAndType(run.getId(), "RUN_RECEIVED");
+            if (received != null) {
+                eventRedisStore.repairMissing(received);
+            }
+        } catch (Exception e) {
+            log.warn("读回 Run 时补投接收事实失败，周期修补会再试: runId={}, error={}",
+                    run.getId(), e.getMessage());
+        }
+        return run;
+    }
+
+    /** 事务模板按需构造：它只是配置的载体，每次调用新建一个比放进字段更省心。 */
+    private TransactionTemplate transactionTemplate() {
+        return new TransactionTemplate(transactionManager);
+    }
+
+    /** 空串与纯空白都按「没有带幂等键」处理：历史客户端会把空串传进来。 */
+    private static String normalizeIdempotencyKey(String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return null;
+        }
+        return idempotencyKey.strip();
+    }
+
+    /**
+     * 读回的 Run 必须与这次请求内容一致。
+     *
+     * <p>摘要不一致说明同一个键被拿去提交了另一份内容：既不读回（内容不一样），也不新建（同一键两条 Run
+     * 会让重复提交失去意义），直接按业务错误拒绝。</p>
+     */
+    private AgentRun requireSameRequestDigest(AgentRun existing, String requestDigest, String userId) {
+        if (existing.getRequestDigest() == null
+                || !existing.getRequestDigest().equals(requestDigest)) {
+            throw new RunIdempotencyConflictException(
+                    "同一个幂等键已经对应另一份创建请求：userId=" + userId + ", runId=" + existing.getId());
+        }
+        return existing;
     }
 
     private static String normalizeLaneTag(String laneTag) {
@@ -315,6 +653,10 @@ public class AgentRunEventService {
      * 也能保证事件顺序唯一。落库失败时直接抛 {@link IllegalStateException} fail-fast,
      * 避免静默丢事件导致数据流缺失。</p>
      *
+     * <p>顺序是先落库、再把这份事实投射到 Redis 与实时频道。反过来先投 Redis 的话，落库失败时
+     * 回滚不掉已经发出去的那条，读者会看到一条不存在的 Run 的事件；数据库这一行才是权威，
+     * 投射失败可以从它重建。</p>
+     *
      * @param runId     任务 ID
      * @param userId    用户 ID
      * @param eventType 事件类型
@@ -325,6 +667,19 @@ public class AgentRunEventService {
         if (run == null) {
             return;
         }
+        projectAppended(persistEvent(runId, eventType, payload));
+    }
+
+    /**
+     * 只把事件写进数据库，不碰 Redis 与实时频道；返回落库后的那一行。
+     *
+     * <p>给创建 Run 那条路用：它要在同一条事务里写 Run 与接收事实，投射必须等事务提交之后再做，
+     * 否则事务回滚会把已经发出去的事件留在外面。</p>
+     *
+     * <p>事件序号仍然是 Redis 的自增计数：它只是一次号码预留，不发布任何内容，事务回滚最多浪费
+     * 一个号，不会在读者那边留下孤儿事件。</p>
+     */
+    private AgentRunEvent persistEvent(String runId, String eventType, Object payload) {
         // 事件序号采用 Redis 原子递增，避免并发落库时 seq 冲突。
         int nextSeq = nextSeq(runId);
         AgentRunEvent event = new AgentRunEvent();
@@ -333,15 +688,8 @@ public class AgentRunEventService {
         event.setEventType(eventType);
         // payload 已经是字符串则直接使用,否则序列化为 JSON
         String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
-        String normalizedPayloadJson = normalizePayloadJson(eventType, payloadJson);
-        event.setPayloadJson(normalizedPayloadJson);
-        OffsetDateTime publishedAt = OffsetDateTime.now();
-        event.setCreatedAt(publishedAt);
-        eventRedisStore.append(event);
-        // Terminal events flush the pending buffer immediately so no events are lost.
-        if (isTerminalEventType(eventType)) {
-            eventRedisStore.flush(runId);
-        }
+        event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
+        event.setCreatedAt(OffsetDateTime.now());
         // TRANSITIONAL: dual-write to PostgreSQL until all readers are Redis-only.
         // This database insert will be removed in a near-term release.
         try {
@@ -354,7 +702,46 @@ public class AgentRunEventService {
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
         }
-        publishLiveEvent(runId, nextSeq, eventType, normalizedPayloadJson, publishedAt);
+        return canonicalEvent(runId, nextSeq, eventType);
+    }
+
+    /**
+     * 拿数据库里刚写进去的那一行当投射来源。
+     *
+     * <p>插入不写 {@code created_at}（用库自己的当前时间），负载又存成 jsonb：读回来的时间与文本
+     * 与 Java 对象里的那两样都不保证一样。事件流的成员里带着它们，于是「按 Java 对象投一次、
+     * 按库里的行再投一次」会写出两个不同的成员，同一个事件在流里出现两条。补投是按库里的行做的，
+     * 所以首次投射也要用库里的行——两条路取的必须是同一份值。</p>
+     */
+    private AgentRunEvent canonicalEvent(String runId, int seq, String eventType) {
+        AgentRunEvent persisted = eventMapper.findByRunIdAndSeq(runId, seq);
+        if (persisted == null) {
+            // 刚写进去却读不回来：往外投一个与库里不一致的成员，比在这里停下更糟。
+            throw new IllegalStateException("事件刚落库却读不回来: runId=" + runId
+                    + ", eventType=" + eventType + ", seq=" + seq);
+        }
+        return persisted;
+    }
+
+    /**
+     * 把已经落库的事件投射到 Redis 与实时频道。
+     *
+     * <p>投射失败不抛错：数据库那一行已经是权威，事件流可以由它重建（{@link #appendOnce} 的重复调用
+     * 就是按已落库的行补齐 Redis 的那条路），这里把失败记清楚就够，不能让已经提交的事实变成一次失败。</p>
+     */
+    private void projectAppended(AgentRunEvent event) {
+        try {
+            eventRedisStore.append(event);
+            // Terminal events flush the pending buffer immediately so no events are lost.
+            if (isTerminalEventType(event.getEventType())) {
+                eventRedisStore.flush(event.getRunId());
+            }
+            publishLiveEvent(event.getRunId(), event.getSeq(), event.getEventType(),
+                    event.getPayloadJson(), event.getCreatedAt());
+        } catch (Exception e) {
+            log.warn("事件已落库但投射失败（可由已落库的行重建）: runId={}, eventType={}, seq={}, error={}",
+                    event.getRunId(), event.getEventType(), event.getSeq(), e.getMessage());
+        }
     }
 
     /**
@@ -393,15 +780,21 @@ public class AgentRunEventService {
                 throw new IllegalStateException("Dedupe conflict without persisted event: runId=" + runId
                         + ", dedupeKey=" + event.getDedupeKey());
             }
-            eventRedisStore.append(existing);
+            // 这里也是「按已落库的事实补缺」，不是普通投射：普通写入会顺手把整条 Run 的事件
+            // 重新设成完整保留期，重复写同一个逻辑事件就能一次次把它续满。
+            eventRedisStore.repairMissing(existing);
             return false;
         }
 
-        eventRedisStore.append(event);
+        // 同样按库里的那一行投射：这条路的另一半（去重冲突读回）本来就是按行投的，
+        // 两边取同一份值，同一个逻辑事件才不会在流里变成两个成员。
+        AgentRunEvent persisted = canonicalEvent(runId, event.getSeq(), eventType);
+        eventRedisStore.append(persisted);
         if (isTerminalEventType(eventType) || "TOOL_CALL_FINISHED".equals(eventType)) {
             eventRedisStore.flush(runId);
         }
-        publishLiveEvent(runId, event.getSeq(), eventType, event.getPayloadJson(), event.getCreatedAt());
+        publishLiveEvent(runId, persisted.getSeq(), eventType, persisted.getPayloadJson(),
+                persisted.getCreatedAt());
         return true;
     }
 
@@ -1234,6 +1627,22 @@ public class AgentRunEventService {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    /**
+     * 新 Run 只冻结创建瞬间的有效开关。Nacos 尚未形成可信热配置时保持关闭，
+     * 避免启动种子文件或应用默认值提前启用持久工作区。
+     */
+    private boolean resolvePythonWorkspaceEnabled() {
+        if (!llmLocalConfigLoader.hotConfigIsAuthoritative()) {
+            return false;
+        }
+        return Optional.ofNullable(llmLocalConfigLoader.current())
+                .flatMap(value -> value)
+                .map(AgentLlmProperties::getAgent)
+                .map(AgentLlmProperties.Agent::getPythonWorkspace)
+                .map(AgentLlmProperties.PythonWorkspace::getEnabled)
+                .orElse(pythonWorkspaceEnabled);
     }
 
     /**

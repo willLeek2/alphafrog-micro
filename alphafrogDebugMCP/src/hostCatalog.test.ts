@@ -221,6 +221,36 @@ test("repoPath 与 dataRoot 优先使用清单字段", () => {
   }
 });
 
+test("pg_via_ssh 写入内部目标，list 不返回该字段与 ssh_host", () => {
+  const filePath = "/secret/hosts.json";
+  const catalog = loadHostCatalog(
+    makeDeps({
+      env: { ALPHAFROG_DEBUG_HOSTS_FILE: filePath },
+      files: {
+        [filePath]: JSON.stringify({
+          targets: [
+            {
+              id: "beta_cn",
+              label: "beta环境(CN)",
+              ssh_host: "secret-alias-a",
+              pg_via_ssh: true,
+            },
+          ],
+        }),
+      },
+    })
+  );
+  assert.equal(catalog.targets[0].pgViaSsh, true);
+  const publicList = listPublicTargets(catalog, (key) =>
+    key === "ALPHAFROG_PG_BETA_CN_DSN" ? "postgresql://u:p@127.0.0.1/db" : undefined
+  );
+  const text = JSON.stringify(publicList);
+  assert.equal(text.includes("secret-alias"), false);
+  assert.equal(text.includes("pg_via_ssh"), false);
+  assert.equal(text.includes("pgViaSsh"), false);
+  assert.ok(publicList[0].capabilities.includes("pg"));
+});
+
 test("allSshHosts 返回内部 host 列表供脱敏使用", () => {
   const catalog = loadHostCatalog(
     makeDeps({

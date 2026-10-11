@@ -694,6 +694,14 @@ public class LangchainLinearWorkflowExecutor {
         return fallback == null ? "" : fallback;
     }
 
+    void emitDualPoolTodoNodeEvent(String runId, String userId, String eventType,
+                                   TodoItem item, String reason, long durationMs,
+                                   Map<String, Object> failureMetadata,
+                                   boolean recovered, String recoveryOutcome) {
+        emitTodoNodeEvent(runId, userId, eventType, item, reason, durationMs,
+                failureMetadata, recovered, recoveryOutcome);
+    }
+
     private void emitTodoNodeEvent(String runId, String userId, String eventType,
                                     TodoItem item, String reason, long durationMs,
                                     Map<String, Object> failureMetadata,

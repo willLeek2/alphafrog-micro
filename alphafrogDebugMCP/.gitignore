@@ -4,6 +4,7 @@ dist/
 *.log
 debug-mcp-hosts.json
 hosts.local.json
+debug-mcp.env
 
 
 # 拉取远程log的工具，本地默认落盘文件夹

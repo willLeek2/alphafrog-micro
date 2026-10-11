@@ -17,12 +17,67 @@ public interface AgentRunMapper {
 
     AgentRun findById(@Param("id") String id);
 
+    /** 事务中锁定Run后读取当前已提交事实。 */
+    AgentRun findByIdForUpdate(@Param("id") String id);
+
     AgentRun findByIdForDeployment(
             @Param("id") String id,
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId);
 
     AgentRun findByIdAndUser(@Param("id") String id, @Param("userId") String userId);
+
+    /** 删除调用树时锁住根 Run，防止状态在检查与删除之间变化。 */
+    AgentRun findByIdAndUserForUpdate(@Param("id") String id, @Param("userId") String userId);
+
+    /** 子 Run 是内部执行记录，不接受用户直接暂停、恢复或删除。 */
+    boolean isChildRun(@Param("id") String id);
+
+    /** 锁住本根树已建立的子 Run；未受理的意图没有对应主记录。 */
+    List<AgentRun> listChildRunsByRootForUpdate(@Param("rootRunId") String rootRunId);
+
+    /** 删除前持久封住 Run；已封住时仍返回一行，便于原请求重试。 */
+    int markDeletionStarted(@Param("id") String id, @Param("userId") String userId);
+
+    /** 恢复和新的持久资源派发共用这一条数据库真相。 */
+    boolean isDeletionStarted(@Param("id") String id);
+
+    /** 清理中或已过期的 Run 不得再取得持久资源。 */
+    String findWorkspaceLifecycleState(@Param("id") String id);
+
+    /** 终态且所有异步责任已结清的 Run 才能进入自动清理；数据库条件负责并发复核。 */
+    int markWorkspaceCleanupStarted(@Param("id") String id);
+
+    /** 沙箱报告活跃时间变化后，只撤销尚未完成的自动清理标记。 */
+    int clearWorkspaceCleanupStarted(@Param("id") String id);
+
+    /** 沙箱确认删盘后永久阻止同一 Run 再创建工作区，并清掉已结清锚点的完整请求正文。 */
+    int markWorkspaceExpired(@Param("id") String id);
+
+    /** 补偿上一轮中途停止的自动清理，不按 Agent 部署代际过滤。 */
+    List<String> scanWorkspaceCleanupStarted(@Param("deploymentId") String deploymentId,
+                                             @Param("afterRunId") String afterRunId,
+                                             @Param("limit") int limit);
+
+    /** 当前部署所有代际中出现过的工作区泳道；返回 Run 载体保留空泳道行。 */
+    List<AgentRun> listWorkspaceRetentionLanes(@Param("deploymentId") String deploymentId);
+
+    /** 最终物理删除只允许已封住的 Run。 */
+    int deleteMarkedByIdAndUser(@Param("id") String id, @Param("userId") String userId);
+
+    /** 所有子 Run 删除后，移除父子关系；待投递记录由外键级联删除。 */
+    int deleteChildIntentsByRoot(@Param("rootRunId") String rootRunId);
+
+    /** 零占用行不再阻止用户删除已结清的根 Run。 */
+    int deleteEmptyTreeCapacityByRoot(@Param("rootRunId") String rootRunId);
+
+    /**
+     * 按用户与幂等键读回创建请求对应的 Run。
+     *
+     * <p>库里有「同一用户同键唯一」的部分唯一索引，所以最多只有一条；没有带键的 Run 时返回 null。</p>
+     */
+    AgentRun findByUserIdempotencyKey(@Param("userId") String userId,
+                                      @Param("idempotencyKey") String idempotencyKey);
 
     AgentRun findByIdAndUserForDeployment(
             @Param("id") String id,
@@ -58,6 +113,21 @@ public interface AgentRunMapper {
                        @Param("userId") String userId,
                        @Param("expectedStatus") AgentRunStatus expectedStatus,
                        @Param("planJson") String planJson);
+
+    /**
+     * 为新一轮计划原子分配代际。Run 行是权威，工作项最大代际只作为防回退下限。
+     * 返回 null 表示 Run 状态、调用方读取的旧代际或者这条 Run 的服务所有权已经变化。
+     *
+     * <p>服务所有权在同一条语句里核对：开一轮新计划是 Run 级推进，只有现在还在服务这条 Run 的
+     * 那个进程能做。先查租约再写，中间隔着租约到期与别人接管的时间窗。</p>
+     */
+    Integer advancePlanGeneration(@Param("id") String id,
+                                  @Param("userId") String userId,
+                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                  @Param("expectedGeneration") int expectedGeneration,
+                                  @Param("observedWorkItemGeneration") int observedWorkItemGeneration,
+                                  @Param("ownerInstanceId") String ownerInstanceId,
+                                  @Param("fencingToken") long fencingToken);
 
     /** 恢复路径唯一的 checkpoint 写入口：条件只用业务字段，不再按部署身份分叉。 */
     int updateExecutionCheckpoint(@Param("id") String id,
@@ -96,13 +166,14 @@ public interface AgentRunMapper {
                             @Param("expectedStatus") AgentRunStatus expectedStatus,
                             @Param("lastError") String lastError);
 
-    /** 查询仍有未结束 Run 的部署代际，供实例消亡后的有界补漏清扫使用。 */
+    /** 查询仍有未结束旧版 Run 的部署代际；可恢复的 V2 Run 不因实例暂时缺席而失败。 */
     List<DeploymentGenerationRecord> listNonTerminalDeploymentGenerations(
             @Param("excludedDeploymentId") String excludedDeploymentId,
             @Param("excludedDeploymentGenerationId") String excludedDeploymentGenerationId);
 
     /**
-     * 当前实例在自然处理窗口结束时，只为本实例所属代际补写失败终态。
+     * 当前实例在自然处理窗口结束时，只为本实例所属代际的旧版 Run 补写失败终态。
+     * 可恢复的 V2 Run 保留数据库检查点，允许同容器 Java 进程强制退出后续跑。
      * 这条语句不由部署控制器调用，也不用于切流时提前终止业务。
      */
     int failNonTerminalRunsForDeploymentGeneration(
@@ -115,7 +186,8 @@ public interface AgentRunMapper {
             @Param("deploymentGenerationId") String deploymentGenerationId);
 
     /**
-     * 已确认没有存活实例的代际补漏写。调用方必须先记录注册缺席，在确认期限后仍未
+     * 已确认没有存活实例的代际旧版 Run 补漏写；V2 Run 不因注册缺席而失败。
+     * 调用方必须先记录注册缺席，在确认期限后仍未
      * 发现存活实例，并在执行本语句前再次核对；SQL 仍以原部署身份和非终态作为窄条件。
      */
     int failOrphanedNonTerminalRunsForDeploymentGeneration(
@@ -163,9 +235,9 @@ public interface AgentRunMapper {
                                @Param("lastError") String lastError);
 
     /**
-     * 无活跃锚点取消的终态写入：快照 + 状态 + TTL 一条 UPDATE 原子落库，
-     * 数据库已是终态时返回 0（先落库的终态赢）。返回 0 时调用方必须跳过
-     * CANCELED 事件与 Redis 终态写，按现状返回，不广播未提交的终态。
+     * 无活跃锚点取消的终态写入：快照 + 状态 + TTL 一条 UPDATE 原子落库。
+     * 数据库已是终态或执行线程已取得长工具锚点时返回 0；调用方需重读，
+     * 若新锚点出现则改走有锚点取消，由长工具收尾组件负责容量释放。
      */
     int cancelTerminalSnapshotWithTtl(@Param("id") String id,
                                       @Param("userId") String userId,
@@ -306,6 +378,45 @@ public interface AgentRunMapper {
                                     @Param("expectedStatus") AgentRunStatus expectedStatus);
 
     /**
+     * executeQuery 会话串行：在当前事务内按 user_id 取 PostgreSQL 事务级咨询锁。
+     * 锁键是 {@code hashtextextended(userId, 0)}，与 Beta 工具任务控制面同一函数，避免 32 位 hashtext 碰撞。
+     * 必须与后续计数、claim UPDATE 落在同一 Spring 事务里，否则语句一提交锁就释放。
+     */
+    int lockExecuteQuerySession(@Param("userId") String userId);
+
+    /**
+     * 统计同一用户其它非终态 Run 上仍占用的 executeQuery 锚点。
+     * 锚点非空且 {@code toolName} 等于指定工具名即视为在途：同步完成会清成空对象，
+     * LINEAR 挂起期间锚点一直持有到恢复消费。
+     * 终态残留锚点不计。当前代进程崩溃后 Run 会停在 EXECUTING，代际清扫器不碰当前代，
+     * 所以还要排除 {@code updated_at} 早于陈旧阈值的行；阈值由
+     * {@code alphafrog.data-analysis.session-stale-seconds} 提供，缺省 600 秒。
+     */
+    int countInFlightExecuteQueryByUser(@Param("userId") String userId,
+                                        @Param("excludeRunId") String excludeRunId,
+                                        @Param("toolName") String toolName,
+                                        @Param("staleSeconds") int staleSeconds);
+
+    /** 原样重放前续占既有查询，原成员证明和 Run 控制版本不匹配时不得刷新。 */
+    int renewExecuteQueryReplayClaim(@Param("runId") String runId,
+                                    @Param("groupId") long groupId,
+                                    @Param("memberIdentity") String memberIdentity,
+                                    @Param("operationId") String operationId,
+                                    @Param("requestFingerprint") String requestFingerprint,
+                                    @Param("createRequestJson") String createRequestJson,
+                                    @Param("planGeneration") long planGeneration,
+                                    @Param("runControlVersion") long runControlVersion);
+
+    /** 无等待成员的原 PREPARING SQL 锚点重放前续占；不得越过成员恢复准入。 */
+    int renewExecuteQueryPreparingReplayClaim(@Param("runId") String runId,
+                                             @Param("operationId") String operationId,
+                                             @Param("requestFingerprint") String requestFingerprint,
+                                             @Param("createRequestJson") String createRequestJson,
+                                             @Param("reservationJson") String reservationJson,
+                                             @Param("planGeneration") Integer planGeneration,
+                                             @Param("runControlVersion") Long runControlVersion);
+
+    /**
      * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。
      * token/version/resultConsumed 共同防止旧 launcher 覆盖新的工具任务。
      */
@@ -320,6 +431,32 @@ public interface AgentRunMapper {
                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
                                   @Param("expectedOperationId") String expectedOperationId);
+
+    /** PREPARING 且无 Sandbox 任务时，按操作、指纹、处置及 DAG 租约窄写工作区拒绝。 */
+    int recordWorkspaceRefusal(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("expectedRunDisposition") String expectedRunDisposition,
+            @Param("expectedAutoResume") boolean expectedAutoResume,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil,
+            @Param("workspaceRefusalCode") String workspaceRefusalCode);
+
+    /** 拒绝已持久化后，只把同一 reservation 的状态从 PREPARING 更新为 RELEASED。 */
+    int recordWorkspaceRefusalReleased(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("workspaceRefusalCode") String workspaceRefusalCode,
+            @Param("releasedReservationJson") String releasedReservationJson);
+
+    /** 拒绝名额已释放后原子清理锚点，仍在执行的 Run 标为明确失败。 */
+    int completeWorkspaceRefusal(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint,
+            @Param("workspaceRefusalCode") String workspaceRefusalCode);
 
     /**
      * DAG blocking live worker 的 owner/lease fenced 写入口。
@@ -401,7 +538,16 @@ public interface AgentRunMapper {
             @Param("id") String id,
             @Param("expectedOperationId") String expectedOperationId);
 
-    /** 只清理仍属于指定 operation 的活跃 anchor，防止旧清理动作删除新一轮工具上下文。 */
+    /** SQL取消成员已经独占完成资源收尾后，原子取消Run并清原会话锁。 */
+    int completeCanceledSqlWaitMember(@Param("runId") String runId,
+                                     @Param("operationId") String operationId,
+                                     @Param("requestFingerprint") String requestFingerprint,
+                                     @Param("waitMemberId") long waitMemberId,
+                                     @Param("dispatchProofJson") String dispatchProofJson,
+                                     @Param("reservationJson") String reservationJson,
+                                     @Param("terminalReservationJson") String terminalReservationJson);
+
+    /** 只清理仍属于指定 operation 且尚未记录取消的活跃 anchor，防止旧线程抹掉取消收尾凭据。 */
     int clearActiveToolJobAnchor(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
                                  @Param("expectedOperationId") String expectedOperationId);

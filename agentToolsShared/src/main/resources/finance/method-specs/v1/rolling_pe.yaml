@@ -1,0 +1,38 @@
+schemaVersion: "1"
+methodId: finance.valuation.rolling_pe
+version: 1.0.0
+displayName: 滚动市盈率与历史分位
+definition: 以股票日线估值序列最后一个有值日的市盈率（TTM）为滚动市盈率，其倒数即盈利收益率（E/P），并给出窗口内有值日中不高于当前值的占比作为历史分位（含当日）。当前亏损（无值或非正）时不输出盈利收益率与分位。
+resolverHints:
+  aliases: [滚动市盈率, 市盈率, 市盈率TTM, 历史分位, PE TTM]
+  commonPhrases: [现在估值贵不贵, 市盈率在历史上处于什么位置, 盈利收益率是多少]
+  clarificationDimensions:
+    - id: tsCodeAndDate
+      question: 哪只股票、哪个交易日
+    - id: percentileWindow
+      question: 历史分位回看多少个有值交易日
+parameters:
+  peTtmSeries:
+    type: array
+    required: true
+    meaning: 按日期升序排列的 pe_ttm 序列，亏损或缺失日传 null
+  window:
+    type: integer
+    required: false
+    minimum: 1
+    meaning: 历史分位回看的有值交易日个数，不传按整个传入序列计算
+conventions:
+  percentile_in_window:
+    canonicalPath: 末端值 + 窗口内不高于当前值的占比（含当日）
+    returnType: valuation ratio
+    narrativeTemplate: 取传入市盈率序列最后有值日的滚动市盈率，其倒数记为盈利收益率，历史分位取窗口内有值日中不高于当前值的占比（含当日）；当前值非正或无值时不输出盈利收益率与分位
+outputs:
+  - {name: peTtm, unit: ratio, description: 滚动市盈率（TTM）, displayFormat: number}
+  - {name: ep, unit: ratio, description: 盈利收益率（E/P）, displayFormat: percent}
+  - {name: pePercentile, unit: ratio, description: 窗口内历史分位（0~1，含当日）, displayFormat: number}
+libraryBinding:
+  package: alphafrog_finance
+  function: rolling_pe
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.valuation.rolling_pe@1.0.0

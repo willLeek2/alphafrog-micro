@@ -10,12 +10,16 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisRestoreOutcome;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Duration;
@@ -50,9 +54,20 @@ public class ToolJobReconciler {
     private final RunOwnershipGateway ownershipGateway;
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
+    private final ToolJobWorkspaceRefusalRecoveryService workspaceRefusalRecovery =
+            new ToolJobWorkspaceRefusalRecoveryService();
 
     @Autowired(required = false)
     private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
+
+    @Autowired(required = false)
+    private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
+
+    @Autowired(required = false)
+    private WaitGroupStore waitGroupStore;
+
+    @Autowired(required = false)
+    private CanceledSqlWaitMemberRecovery canceledSqlWaitMemberRecovery;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -105,6 +120,14 @@ public class ToolJobReconciler {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
+                if (waitGroupOwnsUnresolvedMember(run.getId(), a)) {
+                    if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB
+                            && dualPoolToolJobCoordinator != null
+                            && dualPoolToolJobCoordinator.supports(a)) {
+                        dualPoolToolJobCoordinator.promoteResumable(run.getId(), a);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         a.getRunDisposition())) {
                     processItem(run.getId());
@@ -145,6 +168,19 @@ public class ToolJobReconciler {
     }
 
     private void processItem(String runId) {
+        if (ownershipGateway == null) {
+            // Narrow constructor is retained for existing in-memory tests; production always injects ownership.
+            processItemScoped(runId);
+            return;
+        }
+        AgentRun run = ownershipGateway.findOwnedRun(runId);
+        if (run == null) {
+            return;
+        }
+        LaneScopeGateway.wrap(run, () -> processItemScoped(runId)).run();
+    }
+
+    private void processItemScoped(String runId) {
         try {
             // checkpoint 写失败 marker 优先处理；未解决前不能继续轮询并恢复一个缺上下文的 Run。
             if (checkpointFailureRecoveryService != null
@@ -156,6 +192,39 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (canceledSqlWaitMemberRecovery != null
+                    && canceledSqlWaitMemberRecovery.ownership(runId, anchor)
+                    != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                if (canceledSqlWaitMemberRecovery.complete(runId, anchor)) {
+                    redisCache.removeDue(runId);
+                    redisCache.deletePendingCache(runId);
+                } else {
+                    anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                    redisCache.upsertDue(runId, anchor);
+                }
+                return;
+            }
+            if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
+                if (dualPoolToolJobCoordinator != null
+                        && dualPoolToolJobCoordinator.supports(anchor)
+                        && !runIsExecuting(runId)) {
+                    // 已误切到 WAITING_TOOL_JOB 的会话锁：把 Run 拉回 EXECUTING，
+                    // 让等待组成员接收器能结清。不走 LINEAR 推进，也不轮询 Sandbox。
+                    dualPoolToolJobCoordinator.promoteResumable(runId, anchor);
+                }
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+                return;
+            }
+            if (dualPoolToolJobCoordinator != null
+                    && dualPoolToolJobCoordinator.supports(anchor)
+                    && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())
+                    && anchor.isAutoResume()) {
+                if (!dualPoolToolJobCoordinator.dispatchOnlineResumable(runId, anchor)) {
+                    log.warn("双池长工具恢复工作项仍未能重新开放: runId={}", runId);
+                }
+                return;
+            }
             // 已接受 handoff 的真实状态是 ACCEPTED（CONSUMED 同源）；
             // 旧的 "LAUNCHING && isResultConsumed()" 组合在四态模型下永远为 false（死分支），
             // 会让 EXECUTING+ACCEPTED 的 Run 被 60 秒补扫重新写回 due 并反复进入 Sandbox
@@ -172,6 +241,10 @@ public class ToolJobReconciler {
             if (ToolJobRunDisposition.isDagPreparingAbort(
                     anchor.getRunDisposition())) {
                 recoverPreparingAbort(runId, anchor);
+                return;
+            }
+            if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                settleWorkspaceRefusal(runId, anchor);
                 return;
             }
             if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
@@ -203,6 +276,8 @@ public class ToolJobReconciler {
                                 + "removing hot-loop due", runId);
                         redisCache.removeDue(runId);
                     }
+                } else if ("PREPARING".equals(anchor.getAnchorState())) {
+                    recoverPreparingDispatch(runId, anchor);
                 }
                 return;
             }
@@ -308,6 +383,24 @@ public class ToolJobReconciler {
         }
     }
 
+    private void settleWorkspaceRefusal(String runId, ToolJobAnchor anchor) {
+        ToolJobWorkspaceRefusalRecoveryService.Outcome outcome =
+                workspaceRefusalRecovery.recover(
+                        runId, anchor, capacityService, anchorService);
+        if (outcome == ToolJobWorkspaceRefusalRecoveryService.Outcome.COMPLETE
+                || outcome == ToolJobWorkspaceRefusalRecoveryService.Outcome.INVALID_EVIDENCE) {
+            if (outcome == ToolJobWorkspaceRefusalRecoveryService.Outcome.INVALID_EVIDENCE) {
+                log.error("工作区拒绝的持久凭证无效，停止热循环：run={}", runId);
+            }
+            redisCache.removeDue(runId);
+            redisCache.deletePendingCache(runId);
+            return;
+        }
+        // 未完成时只保留 runId 唤醒；下一轮必须重新读取数据库，不能覆盖新锚点。
+        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+        redisCache.upsertDue(runId, anchor);
+    }
+
     private void resolveCleanupPreparing(String runId, ToolJobAnchor anchor) {
         DataAnalysisReservation preparing;
         try {
@@ -340,6 +433,10 @@ public class ToolJobReconciler {
             redisCache.atomicWritePendingAndDue(runId, anchor);
             return;
         }
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+            settleWorkspaceRefusal(runId, anchor);
+            return;
+        }
         if (resolution.outcome()
                 == ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
             log.error("DAG cleanup PREPARING evidence is invalid for run={}; "
@@ -369,6 +466,82 @@ public class ToolJobReconciler {
          * 下一轮仍从 PG 读取最新 anchor，不信任当前对象。
          */
         redisCache.upsertDue(runId, anchor);
+    }
+
+    /**
+     * 服务持续运行时也修复普通 LINEAR 的 PREPARING，不再要求等下一次进程启动。
+     * 查询明确不存在时，共享解析器才会用原 operationId 和原请求重放创建。
+     */
+    private void recoverPreparingDispatch(String runId, ToolJobAnchor anchor) {
+        DataAnalysisReservation preparing;
+        try {
+            preparing = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules()
+                    .readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
+        } catch (Exception invalidReservation) {
+            log.error("PREPARING reservation is invalid for run={}; refusing online replay",
+                    runId, invalidReservation);
+            redisCache.removeDue(runId);
+            return;
+        }
+        ToolJobPreparingDispatchResolver.Resolution resolution =
+                ToolJobPreparingDispatchResolver.resolve(
+                        runId, anchor, preparing, sandboxService, anchorService);
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
+            transferRecoveredAttached(runId, anchor, resolution.reservation());
+            return;
+        }
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+            settleWorkspaceRefusal(runId, anchor);
+            return;
+        }
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
+            log.error("PREPARING evidence is invalid for run={}; removing hot-loop due", runId);
+            redisCache.removeDue(runId);
+            return;
+        }
+        // 远端或数据库暂时不可决、或者另一恢复者已经赢得 CAS：只保留唤醒，下一轮重读 PG。
+        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+        redisCache.upsertDue(runId, anchor);
+    }
+
+    private void transferRecoveredAttached(String runId,
+                                             ToolJobAnchor anchor,
+                                             DataAnalysisReservation attached) {
+        if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
+            return;
+        }
+        try {
+            if (attached == null || attached.state() != DataAnalysisReservationState.TASK_ATTACHED) {
+                return;
+            }
+            if (capacityService == null
+                    || capacityService.restoreReservation(attached) == DataAnalysisRestoreOutcome.CONFLICT) {
+                log.warn("PREPARING online recovery could not attach capacity: runId={}", runId);
+                return;
+            }
+            DataAnalysisReservation pending = new DataAnalysisReservation(
+                    attached.reservationId(), attached.identity(), attached.resourceClass(),
+                    attached.capacityUnits(), DataAnalysisReservationState.PENDING_TRANSFERRED,
+                    attached.taskId(), attached.acquiredAt());
+            if (capacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
+                log.warn("PREPARING online recovery could not transfer capacity: runId={}", runId);
+                return;
+            }
+            anchor.setAnchorState("PENDING");
+            anchor.setReservationJson(new com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules().writeValueAsString(pending));
+            anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+            if (!anchorService.updateActiveAndStatus(
+                    runId, anchor, AgentRunStatus.WAITING_TOOL_JOB,
+                    AgentRunStatus.EXECUTING, anchor.getOperationId())) {
+                return;
+            }
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+        } catch (Exception failure) {
+            log.error("PREPARING online recovery transfer failed for run={}", runId, failure);
+            redisCache.upsertDue(runId, anchor);
+        }
     }
 
     private void checkPausedTerminal(String runId, ToolJobAnchor anchor) {
@@ -473,5 +646,23 @@ public class ToolJobReconciler {
         log.error("DAG PREPARING abort retained for run={}, outcome={}; "
                         + "no Sandbox lookup or workflow resume is allowed",
                 runId, outcome);
+    }
+
+    /**
+     * 等待组未结清成员占用了本 operationId 时，LINEAR 侧不能把 Run 级会话锁当成 durable suspend。
+     */
+    private boolean waitGroupOwnsUnresolvedMember(String runId, ToolJobAnchor anchor) {
+        if (waitGroupStore == null || anchor == null || anchor.getOperationId() == null) {
+            return false;
+        }
+        return waitGroupStore.hasUnresolvedMember(runId, anchor.getOperationId());
+    }
+
+    private boolean runIsExecuting(String runId) {
+        if (ownershipGateway == null) {
+            return false;
+        }
+        AgentRun owned = ownershipGateway.findOwnedRun(runId);
+        return owned != null && owned.getStatus() == AgentRunStatus.EXECUTING;
     }
 }

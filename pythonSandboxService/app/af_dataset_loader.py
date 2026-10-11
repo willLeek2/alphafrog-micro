@@ -76,10 +76,14 @@ def _read_atomic_csv(
     csv_candidates = [
         dataset_mount / f"{dataset_id}.csv",
         dataset_mount / "data.csv",
+        dataset_mount / f"{dataset_id}.json",
+        dataset_mount / "data.json",
+        dataset_mount / f"{dataset_id}.parquet",
+        dataset_mount / "data.parquet",
     ]
     csv_path = next((path for path in csv_candidates if path.is_file()), None)
     if csv_path is None:
-        raise FileNotFoundError(f"atomic dataset csv not found under {dataset_mount}")
+        raise FileNotFoundError(f"atomic dataset file not found under {dataset_mount}")
     frame = _read_csv(csv_path, dataset_id, "load_datasets", usecols=usecols, dtype=dtype)
     if ts_code and "ts_code" not in frame.columns:
         frame = frame.copy()
@@ -153,9 +157,10 @@ def _read_run_dataset_csv(
     *,
     usecols=None,
     dtype=None,
+    metadata=None,
 ) -> pd.DataFrame:
     frame = _read_csv(
-        Path(file_path), dataset_number, loader_method, usecols=usecols, dtype=dtype
+        Path(file_path), dataset_number, loader_method, usecols=usecols, dtype=dtype, metadata=metadata
     )
     if from_ts_code and "ts_code" not in frame.columns:
         frame = frame.copy()
@@ -188,6 +193,7 @@ def _load_run_datasets_by_number(
         loader_method,
         usecols=usecols,
         dtype=dtype,
+        metadata=_run_dataset_metadata(paths_csv, dataset_number),
     )
     return {from_ts_code: frame}
 
@@ -280,30 +286,125 @@ def _load_run_manifest_by_number(
 # Public API
 # ---------------------------------------------------------------------------
 
-def _read_csv(
-    path: Path,
-    dataset_number: str,
-    loader_method: str,
-    *,
-    usecols=None,
-    dtype=None,
-) -> pd.DataFrame:
-    frame = pd.read_csv(path, usecols=usecols, dtype=dtype)
-    _append_loader_metric(path, dataset_number, loader_method, frame.columns, usecols)
+def _run_dataset_metadata(paths_csv: Path, number: str) -> Dict[str, Any]:
+    path = paths_csv.with_name("paths_dataset_meta.json")
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    return (document.get("datasets") or {}).get(str(number)) or {}
+
+
+def _file_metadata(path: Path) -> Dict[str, Any]:
+    for candidate in (path.with_suffix(".meta.json"), path.parent / "meta.json"):
+        if candidate.is_file():
+            with candidate.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+    return {}
+
+
+def _project_frame(frame: pd.DataFrame, usecols=None, dtype=None) -> pd.DataFrame:
+    source_columns = list(frame.columns)
+    if usecols is not None:
+        selected = [column for column in frame.columns if usecols(column)] if callable(usecols) else list(usecols)
+        frame = frame.loc[:, selected]
+    if dtype is not None:
+        effective = {key: value for key, value in dtype.items() if key in frame.columns} if isinstance(dtype, dict) else dtype
+        frame = frame.astype(effective)
+    frame.attrs["_af_source_columns"] = source_columns
     return frame
 
 
-def _iter_csv(
-    path: Path,
-    dataset_number: str,
-    loader_method: str,
-    chunksize: int,
-    *,
-    usecols=None,
-    dtype=None,
-) -> Iterator[pd.DataFrame]:
+def _parquet_reader(con, path: Path, usecols):
+    relation = con.read_parquet(str(path))
+    columns = relation.columns
+    if usecols is None:
+        return relation, columns
+    selected = [column for column in columns if usecols(column)] if callable(usecols) else list(usecols)
+    missing = [column for column in selected if column not in columns]
+    if missing:
+        raise KeyError(f"columns not found: {missing}")
+    if selected:
+        projection = ",".join('"' + column.replace('"', '""') + '"' for column in selected)
+        relation = relation.project(projection)
+    return relation, columns
+
+
+def read_dataset_file(path: Path, metadata=None, *, usecols=None, dtype=None) -> pd.DataFrame:
+    """按登记格式读取表格；JSON记录中的字典和列表保持嵌套，不自动展开。"""
+    path = Path(path)
+    metadata = _file_metadata(path) if metadata is None else metadata
+    fmt = str(metadata.get("format") or path.suffix.lstrip(".")).lower()
+    if fmt == "csv":
+        return pd.read_csv(path, usecols=usecols, dtype=dtype)
+    if fmt == "parquet":
+        import duckdb
+        with duckdb.connect() as con:
+            relation, source_columns = _parquet_reader(con, path, usecols)
+            frame = relation.fetchdf()
+        frame = _project_frame(frame, usecols, dtype)
+        frame.attrs["_af_source_columns"] = source_columns
+        return frame
+    if fmt != "json":
+        raise ValueError(f"unsupported dataset format: {fmt!r}")
+    with path.open("r", encoding="utf-8") as handle:
+        records = json.load(handle)
+    records_path = metadata.get("recordsPath")
+    if records_path is not None:
+        if not isinstance(records_path, str) or not records_path or not isinstance(records, dict) or records_path not in records:
+            raise ValueError("JSON recordsPath must name an existing top-level record array")
+        records = records[records_path]
+        if not isinstance(records, list):
+            raise ValueError("JSON recordsPath must contain an array of objects")
+    elif isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
+        raise ValueError("tabular JSON must be an object or an array of objects; use json.load for other JSON values")
+    frame = pd.DataFrame.from_records(records) if records else pd.DataFrame(columns=metadata.get("columns") or [])
+    return _project_frame(frame, usecols, dtype)
+
+
+def _read_csv(path: Path, dataset_number: str, loader_method: str, *, usecols=None, dtype=None, metadata=None) -> pd.DataFrame:
+    frame = read_dataset_file(path, metadata, usecols=usecols, dtype=dtype)
+    total_columns = frame.attrs.get("_af_source_columns")
+    if total_columns is None:
+        total_columns = (metadata or _file_metadata(path)).get("columns")
+    # JSON/Parquet不重新按CSV读取表头；无元数据时从实际表格取得列数。
+    if total_columns is None and path.suffix.lower() != ".csv":
+        total_columns = frame.attrs.get("_af_source_columns", list(frame.columns))
+    _append_loader_metric(path, dataset_number, loader_method, frame.columns, usecols, total_columns=total_columns)
+    return frame
+
+
+def _iter_csv(path: Path, dataset_number: str, loader_method: str, chunksize: int, *, usecols=None, dtype=None, metadata=None) -> Iterator[pd.DataFrame]:
     if chunksize <= 0:
         raise ValueError("chunksize must be a positive number of complete rows")
+    metadata = _file_metadata(path) if metadata is None else metadata
+    fmt = str(metadata.get("format") or path.suffix.lstrip(".")).lower()
+    if fmt == "json":
+        # 普通JSON需解析完整文档；分块只限制每次返回的行数，不宣称流式解析。
+        frame = _read_csv(path, dataset_number, loader_method, usecols=usecols, dtype=dtype, metadata=metadata)
+        for start in range(0, len(frame), chunksize):
+            yield frame.iloc[start:start + chunksize].copy()
+        return
+    if fmt == "parquet":
+        import duckdb
+        with duckdb.connect() as con:
+            cursor, source_columns = _parquet_reader(con, path, usecols)
+            columns = cursor.columns
+            opened = False
+            while rows := cursor.fetchmany(chunksize):
+                chunk = _project_frame(pd.DataFrame.from_records(rows, columns=columns), usecols, dtype)
+                if not opened:
+                    _append_loader_metric(path, dataset_number, loader_method, chunk.columns, usecols, total_columns=source_columns)
+                    opened = True
+                yield chunk
+            if not opened:
+                frame = _project_frame(pd.DataFrame(columns=columns), usecols, dtype)
+                _append_loader_metric(path, dataset_number, loader_method, frame.columns, usecols, total_columns=source_columns)
+        return
+    if fmt != "csv":
+        raise ValueError(f"unsupported dataset format: {fmt!r}")
     opened = False
     for chunk in pd.read_csv(path, usecols=usecols, dtype=dtype, chunksize=chunksize):
         if not opened:
@@ -321,12 +422,15 @@ def _append_loader_metric(
     loader_method: str,
     selected_columns,
     requested_usecols,
+    *,
+    total_columns=None,
 ) -> None:
     metrics_path = os.getenv("AF_TASK_METRICS_PATH", "").strip()
     if not metrics_path:
         return
     try:
-        total_columns = list(pd.read_csv(path, nrows=0).columns)
+        if total_columns is None:
+            total_columns = list(pd.read_csv(path, nrows=0).columns)
         selected = list(selected_columns)
         payload = {
             "schema_version": "loader_metric_v1",
@@ -522,7 +626,7 @@ def iter_datasets(
     usecols=None,
     dtype=None,
 ) -> Iterator[pd.DataFrame]:
-    """Yield complete-row DataFrame chunks without loading the whole run-level dataset."""
+    """返回完整行分块；CSV/Parquet流式读取，普通JSON先解析完整文档。"""
     if chunksize <= 0:
         raise ValueError("chunksize must be a positive number of complete rows")
     root = Path(input_root)
@@ -539,7 +643,8 @@ def iter_datasets(
             if not from_ts_code or from_ts_code.upper() == "UNCERTAIN":
                 from_ts_code = number
             for chunk in _iter_csv(
-                Path(file_path), number, "iter_datasets", chunksize, usecols=usecols, dtype=dtype
+                Path(file_path), number, "iter_datasets", chunksize, usecols=usecols, dtype=dtype,
+                metadata=_run_dataset_metadata(paths_csv, number)
             ):
                 if "ts_code" not in chunk.columns:
                     chunk = chunk.copy()

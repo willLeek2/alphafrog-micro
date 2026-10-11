@@ -44,6 +44,36 @@ public interface StockReportRcDao {
     })
     List<StockReportRc> getByTsCode(@Param("tsCode") String tsCode);
 
+    @Select("SELECT * FROM alphafrog_stock_report_rc WHERE ts_code = #{tsCode} " +
+            "AND report_date BETWEEN #{startDate} AND #{endDate}")
+    @Results({
+            @Result(property = "id", column = "id"),
+            @Result(property = "tsCode", column = "ts_code"),
+            @Result(property = "name", column = "name"),
+            @Result(property = "reportDate", column = "report_date"),
+            @Result(property = "reportTitle", column = "report_title"),
+            @Result(property = "reportType", column = "report_type"),
+            @Result(property = "classify", column = "classify"),
+            @Result(property = "orgName", column = "org_name"),
+            @Result(property = "authorName", column = "author_name"),
+            @Result(property = "quarter", column = "quarter"),
+            @Result(property = "opRt", column = "op_rt"),
+            @Result(property = "opPr", column = "op_pr"),
+            @Result(property = "tp", column = "tp"),
+            @Result(property = "np", column = "np"),
+            @Result(property = "eps", column = "eps"),
+            @Result(property = "pe", column = "pe"),
+            @Result(property = "rd", column = "rd"),
+            @Result(property = "roe", column = "roe"),
+            @Result(property = "evEbitda", column = "ev_ebitda"),
+            @Result(property = "rating", column = "rating"),
+            @Result(property = "maxPrice", column = "max_price"),
+            @Result(property = "minPrice", column = "min_price")
+    })
+    List<StockReportRc> getByTsCodeAndReportDateRange(@Param("tsCode") String tsCode,
+                                                      @Param("startDate") long startDate,
+                                                      @Param("endDate") long endDate);
+
     @Select("SELECT * FROM alphafrog_stock_report_rc WHERE report_date BETWEEN #{startDate} AND #{endDate}")
     @Results({
             @Result(property = "id", column = "id"),

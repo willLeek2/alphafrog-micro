@@ -125,7 +125,10 @@ class PythonSandboxToolsP001FastPathTest {
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMPTZ,
                     ext JSONB DEFAULT '{}',
-                    tool_job_anchor_json JSONB DEFAULT '{}'
+                    tool_job_anchor_json JSONB DEFAULT '{}',
+                    scheduler_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY',
+                    plan_generation INT NOT NULL DEFAULT -1,
+                    run_control_version BIGINT NOT NULL DEFAULT 0
                 )""");
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS alphafrog_agent_run_event (
@@ -375,10 +378,12 @@ class PythonSandboxToolsP001FastPathTest {
         // Build real AgentRunEventService (spy for verification + InOrder)
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, om, llmConfigLoader);
+                redisTemplate, om, llmConfigLoader, 7L);
         AgentRunEventService realEventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
-                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
+                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(realEventService);
         AgentRunEventService eventService = spy(realEventService);
 
@@ -486,10 +491,12 @@ class PythonSandboxToolsP001FastPathTest {
         // Real AgentRunEventService (spy) + real ToolJobEventHookImpl
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, om, llmConfigLoader);
+                redisTemplate, om, llmConfigLoader, 7L);
         AgentRunEventService realEventSvc = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
-                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
+                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(realEventSvc);
         AgentRunEventService eventServiceSpy = spy(realEventSvc);
 
@@ -710,10 +717,13 @@ class PythonSandboxToolsP001FastPathTest {
 
         // Real event hook for EVENT step
         AgentLlmLocalConfigLoader llmLoader1 = mock(AgentLlmLocalConfigLoader.class);
-        AgentRunEventRedisStore eventRedis1 = new AgentRunEventRedisStore(redisTemplate, om, llmLoader1);
+        AgentRunEventRedisStore eventRedis1 =
+                new AgentRunEventRedisStore(redisTemplate, om, llmLoader1, 7L);
         AgentRunEventService eventSvc1 = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedis1, om, redisTemplate,
-                llmLoader1, mock(AgentMessageService.class), mock(AgentPromptService.class));
+                llmLoader1, mock(AgentMessageService.class), mock(AgentPromptService.class),
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(eventSvc1);
         ToolJobEventHookImpl eventHook1 = new ToolJobEventHookImpl(newMapper(), eventSvc1);
 
@@ -916,10 +926,12 @@ class PythonSandboxToolsP001FastPathTest {
         ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, om, llmConfigLoader);
+                redisTemplate, om, llmConfigLoader, 7L);
         AgentRunEventService eventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
-                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
+                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
+                mock(org.springframework.transaction.PlatformTransactionManager.class),
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
         injectEventServiceFields(eventService);
 
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);

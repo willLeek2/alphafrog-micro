@@ -123,6 +123,8 @@ import matplotlib
 print("sandbox-smoke: matplotlib", matplotlib.__version__)
 import scipy
 print("sandbox-smoke: scipy", scipy.__version__)
+import duckdb
+print("sandbox-smoke: duckdb", duckdb.__version__)
 # Verify /sandbox is writable
 test_path = "/sandbox/.write_test"
 with open(test_path, "w") as f:
@@ -132,7 +134,7 @@ print("sandbox-smoke: /sandbox writable")
 print("sandbox-smoke: all checks passed")
 PY
 RUN /sandbox/.sandbox-venv/bin/python - <<'PY'
-import numpy, pandas, matplotlib, scipy
+import numpy, pandas, matplotlib, scipy, duckdb
 print("sandbox-smoke: venv imports passed")
 PY
 

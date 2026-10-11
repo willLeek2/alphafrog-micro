@@ -53,6 +53,26 @@ class DatasetSandboxMetadataWriterTest {
     }
 
     @Test
+    void shouldPreserveJsonFormatAndRecordLocation() throws Exception {
+        Path json = tempDir.resolve("data.json");
+        Files.writeString(json, "{\"results\":[]}");
+        Files.writeString(tempDir.resolve("data.meta.json"),
+                "{\"format\":\"json\",\"recordsPath\":\"results\",\"rowCount\":0,\"columns\":[\"label\",\"nested\"]}");
+        var entry = AgentRunDatasetEntry.forDataset(1, "json-data", json.toString(), "UNCERTAIN", "data.json");
+        var read = new DatasetEntryMetadataReader().read(entry);
+        assertEquals("json", read.format());
+        assertEquals("results", read.recordsPath());
+        assertEquals(0, read.rowCount());
+        assertEquals(Files.size(json), read.bytes());
+        JsonNode metadata = objectMapper.readTree(new DatasetSandboxMetadataWriter()
+                .writeDatasetMetadata(new AgentRunDatasetSnapshot(List.of(entry), List.of())))
+                .path("datasets").path("1");
+        assertEquals("json", metadata.path("format").asText());
+        assertEquals("results", metadata.path("recordsPath").asText());
+        assertEquals("nested", metadata.path("columns").get(1).asText());
+    }
+
+    @Test
     void missingMetadataShouldUseStatAndHeaderWithoutInventingRowCount() throws Exception {
         Path csv = tempDir.resolve("partial.csv");
         Files.writeString(csv, "trade_date,close\n20240101,10.5\n");

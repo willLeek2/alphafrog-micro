@@ -15,6 +15,15 @@ public class StockDaily extends Quote {
     @Column(name = "id")
     Long stockDailyId;
 
+    @Column(name = "adj_factor")
+    Double adjFactor;
+
+    @Column(name = "valuation", columnDefinition = "JSONB")
+    String valuation;
+
+    @Column(name = "share_turnover", columnDefinition = "JSONB")
+    String shareTurnover;
+
     @Override
     public String toString() {
         return "StockDaily{" +

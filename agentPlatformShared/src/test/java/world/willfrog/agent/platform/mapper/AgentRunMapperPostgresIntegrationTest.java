@@ -69,7 +69,10 @@ class AgentRunMapperPostgresIntegrationTest {
                         ext JSONB NOT NULL DEFAULT '{}',
                         execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
                         restart_attempt INT NOT NULL DEFAULT 0,
-                        tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'
+                        tool_job_anchor_json JSONB NOT NULL DEFAULT '{}',
+                        scheduler_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY',
+                        plan_generation INT NOT NULL DEFAULT -1,
+                        run_control_version BIGINT NOT NULL DEFAULT 0
                     )
                     """);
             statement.execute("""
@@ -123,6 +126,57 @@ class AgentRunMapperPostgresIntegrationTest {
             assertThat(stored.getToolJobAnchorJson()).isEqualTo("{}");
             assertThat(stored.getExecutionCheckpointJson()).isEqualTo("{}");
             assertThat(stored.getRestartAttempt()).isZero();
+        }
+    }
+
+    @Test
+    void terminalCancelOnlyWinsWhileToolJobAnchorIsStillEmpty() throws Exception {
+        insertRun("cancel-empty-anchor", AgentRunStatus.EXECUTING, "{}");
+        insertRun("cancel-claimed-anchor", AgentRunStatus.EXECUTING,
+                synchronousAnchor("cancel-claimed-anchor:call-1:1", "PREPARING", "PREPARING", false));
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            OffsetDateTime expiresAt = OffsetDateTime.now().plusMinutes(10);
+            assertThat(mapper.cancelTerminalSnapshotWithTtl(
+                    "cancel-empty-anchor", "user-1", "{}", expiresAt)).isEqualTo(1);
+            assertThat(mapper.cancelTerminalSnapshotWithTtl(
+                    "cancel-claimed-anchor", "user-1", "{}", expiresAt)).isZero();
+            assertThat(mapper.findById("cancel-empty-anchor").getStatus())
+                    .isEqualTo(AgentRunStatus.CANCELED);
+            AgentRun claimed = mapper.findById("cancel-claimed-anchor");
+            assertThat(claimed.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+            assertThat(claimed.getToolJobAnchorJson())
+                    .contains("cancel-claimed-anchor:call-1:1");
+        }
+    }
+
+    @Test
+    void oldWorkerCannotClearAnAnchorAfterCancelDispositionWasPersisted() throws Exception {
+        String operationId = "clear-after-cancel:call-1:1";
+        insertRun("clear-after-cancel", AgentRunStatus.EXECUTING,
+                synchronousAnchor(operationId, "PREPARING", "PREPARING", false));
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.clearActiveToolJobAnchor(
+                    "clear-after-cancel", AgentRunStatus.EXECUTING, operationId))
+                    .isEqualTo(1);
+        }
+
+        insertRun("clear-after-cancel-2", AgentRunStatus.EXECUTING,
+                synchronousAnchor("clear-after-cancel-2:call-1:1", "PREPARING", "PREPARING", false));
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            String canceledOperationId = "clear-after-cancel-2:call-1:1";
+            assertThat(mapper.persistCancelDisposition(
+                    "clear-after-cancel-2", AgentRunStatus.EXECUTING,
+                    canceledOperationId)).isEqualTo(1);
+            assertThat(mapper.clearActiveToolJobAnchor(
+                    "clear-after-cancel-2", AgentRunStatus.EXECUTING, canceledOperationId))
+                    .isZero();
+            assertThat(mapper.findById("clear-after-cancel-2").getToolJobAnchorJson())
+                    .contains("CANCELED", canceledOperationId);
         }
     }
 

@@ -1,9 +1,9 @@
 # AlphaFrog pythonSandboxService runtime-image package lockfile (MethodSpec V5, Spec §12).
 #
-# NEW FILE (work package H). The four package versions below are moved VERBATIM
+# NEW FILE (work package H). The first four package versions below were moved VERBATIM
 # from the inline PKGS literal that used to live in Dockerfile.runtime
 # (Spec §12 实施要求: "四个现有 Python 包版本从 Dockerfile 内联文字移到锁文件").
-# Nothing was added or upgraded -- this is a move, not an invention.
+# duckdb 是其后新增：executeQuery 固定运行器的执行引擎（1.5 线最新补丁）。
 #
 # This file is the single source of truth for the EXPECTED runtime library set:
 #   - Dockerfile.runtime installs exactly these pins;
@@ -28,3 +28,5 @@ numpy==2.4.1
 pandas==2.3.3
 matplotlib==3.10.8
 scipy==1.17.0
+# executeQuery 固定运行器的执行引擎；跟随 1.5 线最新补丁（1.5.6 含越界读写安全回填）。
+duckdb==1.5.6

@@ -96,7 +96,7 @@ class FinanceMethodResolverModelServiceTest {
         assertEquals("openai-compatible", ok.route().provider());
         assertEquals("https://example.com/v1", ok.route().endpoint());
         assertEquals("resolver-model", ok.route().model());
-        assertEquals("sha256:" + sha256Hex(TEMPLATE), ok.resolverPromptVersion());
+        assertEquals(sha256Hex(TEMPLATE), ok.resolverPromptVersion());
     }
 
     @Test
@@ -243,9 +243,9 @@ class FinanceMethodResolverModelServiceTest {
         ResolverResult first = service.resolve("query", null, "catalog-text");
         ResolverResult second = service.resolve("query", null, "catalog-text");
 
-        assertEquals("sha256:" + sha256Hex("TEMPLATE_A {{RESOLVER_CATALOG}}"),
+        assertEquals(sha256Hex("TEMPLATE_A {{RESOLVER_CATALOG}}"),
                 assertInstanceOf(Ok.class, first).resolverPromptVersion());
-        assertEquals("sha256:" + sha256Hex("TEMPLATE_B {{RESOLVER_CATALOG}}"),
+        assertEquals(sha256Hex("TEMPLATE_B {{RESOLVER_CATALOG}}"),
                 assertInstanceOf(Ok.class, second).resolverPromptVersion());
     }
 

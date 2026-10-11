@@ -435,7 +435,12 @@ public class ToolJobResumeService {
         ctx.setDatasetSnapshotDigest(anchor.getDatasetSnapshotDigest());
         // 延续工具预算与终态结果。
         ctx.setToolCallsUsed(anchor.getToolCallsUsed());
-        ctx.setTerminalSuccess("SUCCEEDED".equals(anchor.getTerminalStatus()));
+        // 优先用锚点记下的业务成败（结果适配器判定）；旧锚点没有该字段，
+        // 回退到「沙箱终态 SUCCEEDED」的旧判据——对 executePython 两者等价
+        // （沙箱 SUCCEEDED 当且仅当退出码 0），对 executeQuery 只有新字段是对的。
+        ctx.setTerminalSuccess(anchor.getTerminalBusinessSuccess() != null
+                ? anchor.getTerminalBusinessSuccess()
+                : "SUCCEEDED".equals(anchor.getTerminalStatus()));
         ctx.setTerminalStatus(anchor.getTerminalStatus());
         ctx.setTerminalResultPreview(anchor.getTerminalResultPreview());
         ctx.setTerminalRawRef(anchor.getTerminalRawRef());
@@ -457,6 +462,19 @@ public class ToolJobResumeService {
         if (anchor == null || anchor.getCreateRequestJson() == null
                 || anchor.getCreateRequestJson().isBlank()) {
             return null;
+        }
+        // 登记过的沙箱长工具用自己的请求适配器还原载荷预览（executeQuery 解出模型写的
+        // 原 SQL 而不是整段运行器脚本）；未登记（如非 Spring 单测环境）回退到旧直读。
+        java.util.Optional<world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters> adapters =
+                world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry.find(anchor.getToolName());
+        if (adapters.isPresent()) {
+            try {
+                return adapters.get().request().payloadPreview(anchor.getCreateRequestJson());
+            } catch (Exception previewFailure) {
+                log.warn("Cannot recover payload preview via adapter operation={}",
+                        anchor.getOperationId(), previewFailure);
+                return null;
+            }
         }
         try {
             ExecuteRequest.Builder builder = ExecuteRequest.newBuilder();

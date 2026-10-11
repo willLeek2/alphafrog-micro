@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -7,16 +8,27 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitMember;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
+import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.tools.DurableToolCallIds;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 服务启动后的上下文切换灾后恢复入口。
@@ -41,12 +53,24 @@ public class ToolJobStartupRecovery {
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
     private final RunOwnershipGateway ownershipGateway;
+    private final WaitGroupStore waitGroupStore;
+    private final ObjectMapper proofMapper = new ObjectMapper().findAndRegisterModules();
     private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
             new ToolJobPreparingAbortRecoveryService();
+
+    @Autowired(required = false)
+    private DualPoolToolJobCoordinator dualPoolToolJobCoordinator;
+
+    @Autowired(required = false)
+    private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
+
+    @Autowired(required = false)
+    private CanceledSqlWaitMemberRecovery canceledSqlWaitMemberRecovery;
 
     @DubboReference
     private PythonSandboxService sandboxService;
 
+    @Autowired
     public ToolJobStartupRecovery(ToolJobAnchorService anchorService,
                                   ToolJobRedisCache redisCache,
                                   DataAnalysisCapacityService capacityService,
@@ -54,7 +78,8 @@ public class ToolJobStartupRecovery {
                                   ToolJobFinalizer finalizer,
                                   ToolJobResumeService resumeService,
                                   ToolJobConfig config,
-                                  RunOwnershipGateway ownershipGateway) {
+                                  RunOwnershipGateway ownershipGateway,
+                                  WaitGroupStore waitGroupStore) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
@@ -63,6 +88,20 @@ public class ToolJobStartupRecovery {
         this.resumeService = resumeService;
         this.config = config;
         this.ownershipGateway = ownershipGateway;
+        this.waitGroupStore = waitGroupStore;
+    }
+
+    /** Existing narrow unit tests construct the legacy anchor-only recovery path directly. */
+    public ToolJobStartupRecovery(ToolJobAnchorService anchorService,
+                                  ToolJobRedisCache redisCache,
+                                  DataAnalysisCapacityService capacityService,
+                                  DataAnalysisCapacityProperties capacityProperties,
+                                  ToolJobFinalizer finalizer,
+                                  ToolJobResumeService resumeService,
+                                  ToolJobConfig config,
+                                  RunOwnershipGateway ownershipGateway) {
+        this(anchorService, redisCache, capacityService, capacityProperties, finalizer,
+                resumeService, config, ownershipGateway, null);
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -71,7 +110,10 @@ public class ToolJobStartupRecovery {
         log.info("T3 startup recovery beginning");
         try {
             // 第一阶段恢复容量真相，决定 admission 能否从 RECOVERING 转 OPEN。
-            recoverCapacityLedger();
+            if (!recoverCapacityLedger()) {
+                log.error("T3 startup recovery stopped before anchor replay: capacity admission remains closed");
+                return;
+            }
             // 第二阶段恢复轮询索引、finalizer 进度和恢复 launcher。
             recoverToolJobAnchors();
             log.info("T3 startup recovery complete");
@@ -80,9 +122,9 @@ public class ToolJobStartupRecovery {
         }
     }
 
-    private void recoverCapacityLedger() {
+    private boolean recoverCapacityLedger() {
         // 只扫描仍有 active anchor 的 Run，终态已清理 anchor 不再占用容量。
-        List<AgentRun> activeRuns = ownershipGateway.listActiveAnchors(200);
+        List<AgentRun> activeRuns = activeRunsForRecovery(200);
         // durableReservations 会一次性提交给容量服务重建。
         List<DataAnalysisReservation> durableReservations = new ArrayList<>();
         // 无法解析/确认的 reservation 必须隔离并阻止 admission 开放。
@@ -93,11 +135,47 @@ public class ToolJobStartupRecovery {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
             if (anchor == null || anchor.getReservationJson() == null) continue;
             try {
+                if (canceledSqlWaitMemberRecovery != null) {
+                    var ownership = canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor);
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.INVALID_PROOF) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.MEMBER_OWNED) {
+                        // 未确认成员由下方成员扫描重建；已确认停止的旧Run预约不再占容量。
+                        continue;
+                    }
+                }
                 // 注册 Java Time 模块以还原 acquiredAt 等时间字段。
-                com.fasterxml.jackson.databind.ObjectMapper mapper =
-                        new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
-                DataAnalysisReservation reservation = mapper.readValue(
+                DataAnalysisReservation reservation = proofMapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
+                if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                    // 拒绝证明已经在 PostgreSQL 中，绝不可再重发创建请求。容量账本
+                    // 先按持久状态恢复；开放准入后由在线收口器幂等释放并显示业务码。
+                    if (!WaitMemberDispatchProof.isWorkspaceRefusalCode(
+                            anchor.getWorkspaceRefusalCode())
+                            || reservation == null || reservation.identity() == null
+                            || anchor.getOperationId() == null
+                            || !run.getId().equals(reservation.identity().runId())
+                            || !anchor.getOperationId().equals(reservation.operationId())
+                            || reservation.taskId() != null
+                            || reservation.state() != DataAnalysisReservationState.PREPARING
+                               && reservation.state() != DataAnalysisReservationState.RELEASED) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    if (reservation.state() == DataAnalysisReservationState.PREPARING) {
+                        durableReservations.add(reservation);
+                    }
+                    anchor.setNextPollAt(Instant.now());
+                    try {
+                        redisCache.upsertDue(run.getId(), anchor);
+                    } catch (Exception cacheFailure) {
+                        log.warn("工作区拒绝的到期索引暂不能重建：run={}",
+                                run.getId(), cacheFailure);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())) {
                     ToolJobPreparingAbortRecoveryService.Outcome outcome =
@@ -126,6 +204,35 @@ public class ToolJobStartupRecovery {
                     }
                     quarantinedRuns.add(run.getId());
                     continue;
+                }
+                // Run会话锚点不能抢先代替等待成员创建。已有完整成员证明时，容量与恢复都交回成员。
+                if (waitGroupStore != null && reservation != null
+                        && reservation.state() == DataAnalysisReservationState.PREPARING) {
+                    WaitMember member = waitGroupStore.findMemberByOperation(run.getId(), anchor.getOperationId()).orElse(null);
+                    if (member != null && (member.stateEnum() == WaitMemberState.PENDING
+                            || member.stateEnum() == WaitMemberState.RUNNING)) {
+                        WaitMemberDispatchProof memberProof = WaitMemberDispatchProof.fromJson(
+                                proofMapper, member.getDispatchProofJson()).orElse(null);
+                        if (memberProof != null && WaitMemberDurableRequestResolver.hasValidRequest(memberProof)) {
+                            // 同时核容量身份；已接受的成员可能比Run锚点先推进，但原预约规格必须相同。
+                            List<DataAnalysisReservation> checked = new ArrayList<>();
+                            appendWaitMemberReservation(member, checked);
+                            DataAnalysisReservation memberReservation = checked.get(0);
+                            DataAnalysisReservation originalPreparing = new DataAnalysisReservation(
+                                    memberReservation.reservationId(), memberReservation.identity(),
+                                    memberReservation.resourceClass(), memberReservation.capacityUnits(),
+                                    DataAnalysisReservationState.PREPARING, null, memberReservation.acquiredAt());
+                            if (!anchor.getOperationId().equals(memberProof.operationId())
+                                    || !anchor.getRequestFingerprint().equals(memberProof.requestFingerprint())
+                                    || !reservation.equals(originalPreparing)) {
+                                throw new IllegalStateException("Run与等待成员的原预约证明不一致");
+                            }
+                            // 全量恢复由下方成员扫描完成；这里不重复纳入较旧的Run预约。
+                            log.info("启动恢复把原查询交回完整等待成员证明：run={} member={} operation={}",
+                                    run.getId(), member.getId(), memberProof.operationId());
+                            continue;
+                        }
+                    }
                 }
                 // PREPARING 表示进程可能在 createTask 前后崩溃，需要按 operationId 查找/重放。
                 if (reservation != null
@@ -167,11 +274,93 @@ public class ToolJobStartupRecovery {
                             continue;
                         }
                     }
+                    DataAnalysisReservation preparing = reservation;
                     ToolJobPreparingDispatchResolver.Resolution resolution =
-                            resolvePreparingDispatch(run, anchor, reservation);
+                            LaneScopeGateway.call(run,
+                                    () -> resolvePreparingDispatch(run, anchor, preparing));
                     if (resolution.outcome()
                             == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
                         reservation = resolution.reservation();
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.WORKSPACE_REFUSED) {
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(Instant.now());
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (Exception cacheFailure) {
+                            log.warn("工作区拒绝收口的到期索引暂不能重建：run={}",
+                                    run.getId(), cacheFailure);
+                        }
+                        continue;
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.REPLAY_ADMISSION_DEFERRED) {
+                        // 证明有效且用户查询名额正忙，仍需计入原容量，不能把正常等待视为证据损坏。
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (RuntimeException cacheFailure) {
+                            log.warn("原查询延期的唤醒索引暂不可用，仍保留可靠容量：run={}", run.getId(), cacheFailure);
+                        }
+                        continue;
+                    } else if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.DURABLE_WRITE_UNCERTAIN
+                            || resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.OWNERSHIP_LOST) {
+                        // 拒绝标记可能已经提交，只是数据库响应丢失。重新从数据库读取
+                        // 同一操作的名额凭证，不能把可恢复的普通 Run 永久隔离。
+                        ToolJobAnchor current = anchorService.loadAnchor(run.getId());
+                        if (current == null) {
+                            // 本路径清锚点只能在名额已释放后发生；当前快照不可再计账。
+                            continue;
+                        }
+                        if (!anchor.getOperationId().equals(current.getOperationId())
+                                || !anchor.getRequestFingerprint().equals(
+                                        current.getRequestFingerprint())) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        DataAnalysisReservation currentReservation = proofMapper.readValue(
+                                current.getReservationJson(), DataAnalysisReservation.class);
+                        if (currentReservation == null || currentReservation.identity() == null
+                                || !run.getId().equals(currentReservation.identity().runId())
+                                || !anchor.getOperationId().equals(
+                                        currentReservation.operationId())) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        if (currentReservation.state()
+                                != DataAnalysisReservationState.RELEASED) {
+                            durableReservations.add(currentReservation);
+                        }
+                        current.setNextPollAt(
+                                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), current);
+                        } catch (Exception redisFailure) {
+                            log.warn("Failed to schedule uncertain workspace refusal for run={}",
+                                    run.getId(), redisFailure);
+                        }
+                        continue;
+                    } else if ("CANCELED".equals(anchor.getRunDisposition())
+                            && resolution.outcome()
+                            != ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
+                        /*
+                         * The pre-create cancel tombstone may be temporarily unreachable, or
+                         * another instance may have attached it already. PREPARING remains a
+                         * real capacity reservation. Keep admission available for other runs
+                         * and wake the online reconciler to reread the database; never replay
+                         * createTask for this canceled operation.
+                         */
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(
+                                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (Exception redisFailure) {
+                            log.warn("Failed to schedule canceled PREPARING recovery for run={}",
+                                    run.getId(), redisFailure);
+                        }
+                        continue;
                     } else if (ToolJobRunDisposition.isDagCleanupOnly(
                             anchor.getRunDisposition())
                             && resolution.outcome()
@@ -218,13 +407,15 @@ public class ToolJobStartupRecovery {
             }
         }
 
+        appendUnresolvedWaitMemberReservations(durableReservations, quarantinedRuns);
+
         // 任一 reservation 无法证明时就拒绝开放准入，避免漏算容量后超额准入。
         if (!quarantinedRuns.isEmpty()) {
-            log.error("CAPACITY QUARANTINE: {} run(s) have unparseable reservationJson — "
-                    + "BLOCKING admission recovery to prevent over-admission. Runs: {}",
+            log.error("CAPACITY QUARANTINE: {} anchor/member proof or scan error(s) — "
+                    + "BLOCKING admission recovery to prevent over-admission. Identities: {}",
                     quarantinedRuns.size(), quarantinedRuns);
             // 保持 admission=RECOVERING，由运维处理隔离 Run；不能部分恢复后开放。
-            return;
+            return false;
         }
 
         // 无隔离项时才按当前配置恢复账本并允许 RECOVERING→OPEN。
@@ -236,11 +427,114 @@ public class ToolJobStartupRecovery {
                 report.restoredReservations(), report.activeCount(),
                 report.heavyActiveCount(), report.usedUnits(),
                 report.configuredMaxUnits(), report.admissionState(), report.conflicts());
+        return true;
+    }
+
+    private void appendUnresolvedWaitMemberReservations(List<DataAnalysisReservation> reservations,
+                                                        List<String> quarantined) {
+        if (waitGroupStore == null) {
+            // Production constructor requires this store. Only older anchor-only unit tests use the narrow constructor.
+            return;
+        }
+        long afterId = 0;
+        final int pageSize = 200;
+        var identity = ownershipGateway.requireIdentity();
+        while (true) {
+            List<WaitMember> page;
+            try {
+                page = waitGroupStore.scanUnresolvedPythonMembersForCapacity(
+                        identity.deploymentId(), identity.generationId(), afterId, pageSize);
+            } catch (RuntimeException scanFailure) {
+                log.error("Cannot scan unresolved Python wait members; capacity admission remains closed", scanFailure);
+                quarantined.add("wait-member-scan-after:" + afterId);
+                return;
+            }
+            if (page == null) {
+                quarantined.add("wait-member-scan-null-after:" + afterId);
+                return;
+            }
+            if (page.size() > pageSize) {
+                quarantined.add("wait-member-scan-oversized-after:" + afterId);
+                return;
+            }
+            for (WaitMember member : page) {
+                if (member == null || member.getId() == null || member.getId() <= afterId) {
+                    quarantined.add("wait-member-page-order-after:" + afterId);
+                    return;
+                }
+                afterId = member.getId();
+                try {
+                    // The wait-member table is shared by main Beta and every lane. Only this
+                    // deployment generation may rebuild its own in-process capacity ledger.
+                    if (ownershipGateway.findOwnedRun(member.getRunId()) == null) {
+                        continue;
+                    }
+                    appendWaitMemberReservation(member, reservations);
+                } catch (RuntimeException invalid) {
+                    log.error("Unresolved Python member has no reliable capacity proof: member={} run={} reason={}",
+                            member.getId(), member.getRunId(), invalid.getMessage());
+                    quarantined.add("wait-member:" + member.getId());
+                }
+            }
+            if (page.size() < pageSize) {
+                return;
+            }
+        }
+    }
+
+    private void appendWaitMemberReservation(WaitMember member,
+                                             List<DataAnalysisReservation> reservations) {
+        if (DurableSandboxTool.fromToolName(member.getToolName()).isEmpty()) {
+            throw new IllegalStateException("scan returned a member that is not a durable sandbox tool");
+        }
+        WaitMemberState state = member.stateEnum();
+        if (state != WaitMemberState.PENDING && state != WaitMemberState.RUNNING
+                && state != WaitMemberState.CANCELED && state != WaitMemberState.LATE) {
+            throw new IllegalStateException("scan returned a settled member");
+        }
+        String proofJson = member.getDispatchProofJson();
+        if (proofJson == null || proofJson.isBlank()) {
+            if (state == WaitMemberState.PENDING) {
+                // No pre-create proof was persisted, hence there is no durable reservation to rebuild.
+                return;
+            }
+            throw new IllegalStateException("unresolved member is missing dispatch proof");
+        }
+        WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(proofMapper, proofJson)
+                .orElseThrow(() -> new IllegalStateException("dispatch proof is unreadable"));
+        DataAnalysisReservation reservation;
+        try {
+            reservation = proofMapper.readValue(proof.reservationJson(), DataAnalysisReservation.class);
+        } catch (Exception invalid) {
+            throw new IllegalStateException("reservation proof is unreadable", invalid);
+        }
+        if (member.getRunId() == null || member.getGroupId() == null
+                || member.getToolCallId() == null || member.getExternalOperationId() == null) {
+            throw new IllegalStateException("member identity is incomplete");
+        }
+        var group = waitGroupStore.findGroup(member.getGroupId()).orElse(null);
+        if (group == null || !member.getRunId().equals(group.getRunId())) {
+            throw new IllegalStateException("member has no matching persisted segment");
+        }
+        String durableCallId = DurableToolCallIds.forTool(
+                member.getToolName(), member.getToolCallId(), group.identity().segment());
+        if (!member.getRunId().equals(reservation.identity().runId())
+                || !durableCallId.equals(reservation.identity().toolCallId())
+                || !member.getExternalOperationId().equals(proof.operationId())
+                || !proof.operationId().equals(reservation.operationId())) {
+            throw new IllegalStateException("member, proof and reservation identities differ");
+        }
+        if (reservation.state() == DataAnalysisReservationState.RELEASED
+                || proof.taskId() == null && reservation.state() != DataAnalysisReservationState.PREPARING
+                || proof.taskId() != null && !proof.taskId().equals(reservation.taskId())) {
+            throw new IllegalStateException("reservation state or task identity differs from dispatch proof");
+        }
+        reservations.add(reservation);
     }
 
     private void recoverToolJobAnchors() {
         // activeRuns 用于恢复轮询/finalizer；resumeReadyRuns 用于恢复 launch handoff。
-        List<AgentRun> activeRuns = ownershipGateway.listActiveAnchors(200);
+        List<AgentRun> activeRuns = activeRunsForRecovery(200);
         List<AgentRun> resumeReadyRuns = ownershipGateway.listResumeReadyAnchors(200);
 
         for (AgentRun run : activeRuns) {
@@ -249,6 +543,32 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if (canceledSqlWaitMemberRecovery != null
+                        && canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor)
+                        != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                    if (canceledSqlWaitMemberRecovery.complete(run.getId(), anchor)) {
+                        redisCache.removeDue(run.getId());
+                        redisCache.deletePendingCache(run.getId());
+                    } else {
+                        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        redisCache.upsertDue(run.getId(), anchor);
+                    }
+                    continue;
+                }
+                if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+                    anchor.setNextPollAt(Instant.now());
+                    redisCache.upsertDue(run.getId(), anchor);
+                    continue;
+                }
+                if (waitGroupStore != null
+                        && waitGroupStore.hasUnresolvedMember(run.getId(), anchor.getOperationId())) {
+                    if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB
+                            && dualPoolToolJobCoordinator != null
+                            && dualPoolToolJobCoordinator.supports(anchor)) {
+                        dualPoolToolJobCoordinator.promoteResumable(run.getId(), anchor);
+                    }
+                    continue;
+                }
                 if (ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())) {
                     recoverPreparingAbort(run.getId(), anchor);
@@ -257,6 +577,14 @@ public class ToolJobStartupRecovery {
                 // cleanup-only 可跨 EXECUTING/FAILED/CANCELED 重入；业务终态不能阻断容量收尾。
                 if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                     resolveActiveAnchor(run, anchor);
+                    continue;
+                }
+                if (dualPoolToolJobCoordinator != null
+                        && dualPoolToolJobCoordinator.supports(anchor)
+                        && DualPoolToolJobCoordinator.RESUME_STATE.equals(anchor.getResumeState())) {
+                    if (!dualPoolToolJobCoordinator.recoverResumableAtStartup(run.getId(), anchor)) {
+                        log.warn("Startup could not requeue dual-pool tool result for run={}", run.getId());
+                    }
                     continue;
                 }
                 // EXECUTING + active anchor 表示进程可能在工具已附着但 Run 尚未转 WAITING 时崩溃。
@@ -326,6 +654,10 @@ public class ToolJobStartupRecovery {
     }
 
     private void resolveActiveAnchor(AgentRun run, ToolJobAnchor anchor) {
+        LaneScopeGateway.wrap(run, () -> resolveActiveAnchorScoped(run, anchor)).run();
+    }
+
+    private void resolveActiveAnchorScoped(AgentRun run, ToolJobAnchor anchor) {
         // taskId 缺失无法查询 Sandbox，保留 anchor 并等待人工/后续 PREPARING 修复。
         String taskId = anchor.getTaskId();
         if (taskId == null || taskId.isBlank()) {
@@ -500,6 +832,13 @@ public class ToolJobStartupRecovery {
     }
 
     private boolean transferRecoveredAttached(String runId, ToolJobAnchor anchor) {
+        if (waitGroupStore != null && waitGroupStore.hasUnresolvedMember(runId, anchor.getOperationId())) {
+            // 等待组成员仍未结清：Run 级锚点只是会话串行锁，不能切到 WAITING_TOOL_JOB，
+            // 否则成员接收器会拒收，等待组永远挂起。
+            log.info("wait-group session lock: skip WAITING_TOOL_JOB transfer run={} operationId={}",
+                    runId, anchor.getOperationId());
+            return true;
+        }
         // 没有数据库里的 reservation 记录就无法证明和恢复容量，拒绝转 WAITING_TOOL_JOB。
         if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) {
             return false;
@@ -548,6 +887,32 @@ public class ToolJobStartupRecovery {
             log.error("Failed to transfer recovered dispatch for run={}", runId, failure);
             return false;
         }
+    }
+
+    /**
+     * 通用锚点列表之外，再合并启动准入阶段已经逐项证明安全的双池遗留 Run。
+     * 通用列表有固定 LIMIT，旧的异常锚点不能让本次进程退出留下的有效工作项长期饿死。
+     */
+    private List<AgentRun> activeRunsForRecovery(int limit) {
+        Map<String, AgentRun> runs = new LinkedHashMap<>();
+        for (AgentRun run : ownershipGateway.listActiveAnchors(limit)) {
+            if (run != null && run.getId() != null) {
+                runs.put(run.getId(), run);
+            }
+        }
+        if (dualPoolRunAdmissionRegistry == null) {
+            return new ArrayList<>(runs.values());
+        }
+        for (String runId : dualPoolRunAdmissionRegistry.startupRecoveredToolJobRunIds()) {
+            if (runs.containsKey(runId)) {
+                continue;
+            }
+            AgentRun run = ownershipGateway.findOwnedRun(runId);
+            if (run != null) {
+                runs.put(runId, run);
+            }
+        }
+        return new ArrayList<>(runs.values());
     }
 
     private void recoverPreparingAbort(String runId, ToolJobAnchor anchor) {

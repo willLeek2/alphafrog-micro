@@ -118,6 +118,10 @@ message DomesticStockDailyItem {
   double pctChg = 10;
   double vol = 11;
   double amount = 12;
+  // 指标库扩充新增：请求带对应列名时才返回（optional 区分「无值」与「值为 0」）
+  optional double adjFactor = 13;
+  string valuation = 14;
+  string shareTurnover = 15;
 }
 
 
@@ -131,6 +135,8 @@ message DomesticStockDailyByTsCodeAndDateRangeRequest {
   string tsCode = 1;
   int64 startDate = 2;
   int64 endDate = 3;
+  // 可选列：adj_factor / valuation / share_turnover；为空时只返回基础行情列
+  repeated string includeColumns = 4;
 }
 
 message DomesticStockDailyByTsCodeAndDateRangeResponse {
@@ -148,6 +154,57 @@ message DomesticStockDailyByTradeDateRequest {
 message DomesticStockDailyByTradeDateResponse {
   repeated DomesticStockDailyItem items = 1;
   // 未来可以添加更多自定义分析字段
+}
+
+// 指标库扩充新增：A 股资产特色数据查询（可转债日线 / AH 比价，按代码+交易日窗口）
+// 数值字段 optional 区分「无值」与「值为 0」
+
+message DomesticCbDailyByTsCodeAndDateRangeRequest {
+  string tsCode = 1;
+  int64 startDate = 2;
+  int64 endDate = 3;
+}
+
+message CbDailyItem {
+  string tsCode = 1;
+  int64 tradeDate = 2;
+  optional double preClose = 3;
+  optional double open = 4;
+  optional double high = 5;
+  optional double low = 6;
+  optional double close = 7;
+  optional double change = 8;
+  optional double pctChg = 9;
+  optional double vol = 10;
+  optional double amount = 11;
+  // 溢价 JSON：bond_value/bond_over_rate/cb_value/cb_over_rate（原始 JSON 字符串）
+  string premium = 12;
+}
+
+message DomesticCbDailyByTsCodeAndDateRangeResponse {
+  repeated CbDailyItem items = 1;
+}
+
+message DomesticStkAhByTsCodeAndDateRangeRequest {
+  string tsCode = 1;
+  int64 startDate = 2;
+  int64 endDate = 3;
+}
+
+message StkAhItem {
+  string tsCode = 1;
+  string hkCode = 2;
+  int64 tradeDate = 3;
+  optional double close = 4;
+  optional double hkClose = 5;
+  optional double pctChg = 6;
+  optional double hkPctChg = 7;
+  optional double ahComparison = 8;
+  optional double ahPremium = 9;
+}
+
+message DomesticStkAhByTsCodeAndDateRangeResponse {
+  repeated StkAhItem items = 1;
 }
 
 /**
@@ -314,6 +371,66 @@ message DomesticStockShareFloatFetchByDateRangeResponse {
   int32 fetchedItemsCount = 2;
 }
 
+// 4.11 每日指标爬取（写入日线表估值 JSON 与股本换手 JSON 列）
+message DomesticDailyBasicFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticDailyBasicFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.12 复权因子爬取（写入日线表复权因子列）
+message DomesticAdjFactorFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticAdjFactorFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.13 可转债日线爬取（行情用列，溢价进 premium JSON）
+message DomesticCbDailyFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticCbDailyFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.14 AH 比价爬取（全部普通列）
+message DomesticStkAhFetchByTradeDateRequest {
+  int64 tradeDate = 1;  // 交易日时间戳
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticStkAhFetchByTradeDateResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
+// 4.15 财务指标爬取（fina_indicator_vip，按报告期；字段按四类收进 JSONB 列）
+message DomesticFinaIndicatorFetchByPeriodRequest {
+  string period = 1;  // 报告期 yyyyMMdd，如 20241231
+  int32 offset = 2;
+  int32 limit = 3;
+}
+
+message DomesticFinaIndicatorFetchByPeriodResponse {
+  string status = 1;
+  int32 fetchedItemsCount = 2;
+}
+
 
 // P7-06：财务报表查询消息
 // 公共请求体（income / balancesheet / cashflow / express 共用）
@@ -395,11 +512,56 @@ message DomesticStockExpressQueryResponse {
   repeated StockExpressItem items = 1;
 }
 
+// --- 财务指标（指标库扩充：四类 JSONB + extended 以原始 JSON 字符串返回，报告期窗口查询） ---
+message StockFinaIndicatorItem {
+  string ts_code      = 1;
+  string end_date     = 2;   // 报告期 YYYYMMDD
+  string ann_date     = 3;   // 公告日期 YYYYMMDD，可空
+  string profitability = 4;  // JSON：盈利与回报（roe*/roa*/roic*、利润率、扣非）
+  string per_share    = 5;   // JSON：每股（*ps、eps、bps）
+  string capital_cash = 6;   // JSON：营运偿债现金流与资本结构
+  string growth       = 7;   // JSON：增长（yoy、qoq、研发）
+  string extended     = 8;   // JSON：未进四类的字段
+}
+message DomesticStockFinaIndicatorQueryResponse {
+  repeated StockFinaIndicatorItem items = 1;
+}
+
+// --- 券商盈利预测（report_rc，报告日期窗口查询单只股票；数值字段 optional 区分「未给出」与 0） ---
+message StockReportRcItem {
+  string ts_code       = 1;
+  string name          = 2;
+  string report_date   = 3;   // 报告日期 YYYYMMDD
+  string org_name      = 4;
+  string author_name   = 5;
+  string quarter       = 6;   // 预测期，如 2024Q4
+  string report_title  = 7;
+  string classify      = 8;
+  optional double op_rt = 9;
+  optional double op_pr = 10;
+  optional double tp    = 11;  // 目标价
+  optional double np    = 12;  // 预测净利润
+  optional double eps   = 13;  // 预测每股收益
+  optional double pe    = 14;  // 预测市盈率
+  optional double rd    = 15;
+  optional double roe   = 16;
+  optional double ev_ebitda = 17;
+  string rating        = 18;
+  optional double max_price = 19;
+  optional double min_price = 20;
+}
+message DomesticStockReportRcQueryResponse {
+  repeated StockReportRcItem items = 1;
+}
+
 service DomesticStockService {
   rpc getStockInfoByTsCode(DomesticStockInfoByTsCodeRequest) returns (DomesticStockInfoByTsCodeResponse);
   rpc searchStock(DomesticStockSearchRequest) returns (DomesticStockSearchResponse);
   rpc getStockDailyByTsCodeAndDateRange(DomesticStockDailyByTsCodeAndDateRangeRequest) returns (DomesticStockDailyByTsCodeAndDateRangeResponse);
   rpc getStockDailyByTradeDate(DomesticStockDailyByTradeDateRequest) returns (DomesticStockDailyByTradeDateResponse);
+  // 指标库扩充新增：A 股资产特色数据查询（可转债日线 / AH 比价）
+  rpc getCbDailyByTsCodeAndDateRange(DomesticCbDailyByTsCodeAndDateRangeRequest) returns (DomesticCbDailyByTsCodeAndDateRangeResponse);
+  rpc getStkAhByTsCodeAndDateRange(DomesticStkAhByTsCodeAndDateRangeRequest) returns (DomesticStkAhByTsCodeAndDateRangeResponse);
   rpc searchStockES(DomesticStockSearchESRequest) returns (DomesticStockSearchESResponse);
   rpc getStockTsCode(DomesticStockTsCodeRequest) returns (DomesticStockTsCodeResponse);
 
@@ -408,6 +570,10 @@ service DomesticStockService {
   rpc queryStockBalancesheet(DomesticStockFinancialQueryRequest) returns (DomesticStockBalancesheetQueryResponse);
   rpc queryStockCashflow(DomesticStockFinancialQueryRequest) returns (DomesticStockCashflowQueryResponse);
   rpc queryStockExpress(DomesticStockFinancialQueryRequest) returns (DomesticStockExpressQueryResponse);
+
+  // 指标库扩充新增：财务指标 / 券商盈利预测查询
+  rpc queryStockFinaIndicator(DomesticStockFinancialQueryRequest) returns (DomesticStockFinaIndicatorQueryResponse);
+  rpc queryStockReportRc(DomesticStockFinancialQueryRequest) returns (DomesticStockReportRcQueryResponse);
 }
 
 
@@ -427,4 +593,13 @@ service DomesticStockFetchService {
   rpc fetchStockMoneyflowByTradeDate(DomesticStockMoneyflowFetchByTradeDateRequest) returns (DomesticStockMoneyflowFetchByTradeDateResponse);
   rpc fetchStockTop10HoldersByTsCode(DomesticStockTop10HoldersFetchByTsCodeRequest) returns (DomesticStockTop10HoldersFetchByTsCodeResponse);
   rpc fetchStockShareFloatByDateRange(DomesticStockShareFloatFetchByDateRangeRequest) returns (DomesticStockShareFloatFetchByDateRangeResponse);
+
+  // 预设金融指标库新增：每日指标 / 复权因子 / 转债日线 / AH 比价
+  rpc fetchDailyBasicByTradeDate(DomesticDailyBasicFetchByTradeDateRequest) returns (DomesticDailyBasicFetchByTradeDateResponse);
+  rpc fetchAdjFactorByTradeDate(DomesticAdjFactorFetchByTradeDateRequest) returns (DomesticAdjFactorFetchByTradeDateResponse);
+  rpc fetchCbDailyByTradeDate(DomesticCbDailyFetchByTradeDateRequest) returns (DomesticCbDailyFetchByTradeDateResponse);
+  rpc fetchStkAhByTradeDate(DomesticStkAhFetchByTradeDateRequest) returns (DomesticStkAhFetchByTradeDateResponse);
+
+  // 财务指标（fina_indicator_vip，按报告期）：⑥ 扣非ROE 与杜邦三组件的数据来源
+  rpc fetchFinaIndicatorByPeriod(DomesticFinaIndicatorFetchByPeriodRequest) returns (DomesticFinaIndicatorFetchByPeriodResponse);
 }

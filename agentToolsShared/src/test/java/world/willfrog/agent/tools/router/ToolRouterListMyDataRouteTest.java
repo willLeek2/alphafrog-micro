@@ -9,12 +9,14 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
@@ -59,6 +61,7 @@ class ToolRouterListMyDataRouteTest {
         });
         ToolRouter router = new ToolRouter(
                 mock(MarketDataTools.class), mock(RagTools.class), mock(SearchTools.class), python,
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class), mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(), llmPropertiesWithStaticPrecheck(false),
@@ -71,6 +74,32 @@ class ToolRouterListMyDataRouteTest {
                         "code", "print(1)", "dataset_ids", "1")));
 
         assertEquals(pending, thrown);
+    }
+
+    @Test
+    void executePythonInjectedInterruptionIsRethrownWithoutFailureJson() {
+        PythonSandboxTools python = mock(PythonSandboxTools.class);
+        ToolJobInjectedInterruption interruption =
+                new ToolJobInjectedInterruption("scenario-1", "BEFORE_SANDBOX_SUBMIT");
+        when(python.executePython(anyString(), anyString(), anyString(), any(), any()))
+                .thenThrow(interruption);
+        ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
+        when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
+            Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
+            return ToolResultCacheService.CachedToolCallResult.builder()
+                    .result(supplier.get().getResult()).build();
+        });
+        ToolRouter router = new ToolRouter(
+                mock(MarketDataTools.class), mock(RagTools.class), mock(SearchTools.class), python,
+                mock(SqlQueryTools.class),
+                mock(FinanceMethodTools.class), mock(LoadToolGuideTool.class), mock(ListMyDataTool.class),
+                new PythonStaticPrecheckService(), llmPropertiesWithStaticPrecheck(false),
+                cacheService, mock(RereadToolHandler.class), mock(AgentRunObservabilityService.class),
+                new ObjectMapper(), new SimpleMeterRegistry(), new StressTestProperties());
+
+        assertEquals(interruption, assertThrows(ToolJobInjectedInterruption.class,
+                () -> router.invokeWithMeta("executePython", Map.of(
+                        "code", "print(1)", "dataset_ids", "1"))));
     }
 
     @SuppressWarnings("unchecked")
@@ -104,6 +133,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 listMyDataTool,
@@ -177,6 +207,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 listMyDataTool,
@@ -252,6 +283,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 listMyDataTool,
@@ -296,6 +328,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),

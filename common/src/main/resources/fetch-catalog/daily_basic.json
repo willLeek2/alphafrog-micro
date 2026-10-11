@@ -1,0 +1,81 @@
+{
+  "dataType": "daily_basic",
+  "label": "股票每日指标",
+  "description": "通过 TuShare daily_basic 接口按交易日抓取全部股票每日指标（估值写入日线表估值 JSON，股本与换手写入股本换手 JSON；接口返回的 close 不入库）",
+  "serviceModule": "domesticStockFetchService",
+
+  "taskVariants": [
+    {
+      "subType": 1,
+      "label": "按交易日抓取",
+      "description": "按单个交易日抓取当日全部股票每日指标，写回日线表",
+      "requiredParams": ["trade_date"],
+      "optionalParams": ["offset", "limit"],
+      "paramDefs": {
+        "trade_date": {
+          "label": "交易日",
+          "description": "目标交易日，格式 yyyyMMdd，直接传给 TuShare",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "offset": {
+          "label": "偏移量",
+          "description": "TuShare 分页偏移量",
+          "type": "number",
+          "default": 0
+        },
+        "limit": {
+          "label": "每页条数",
+          "description": "TuShare 分页每页条数，默认 6000",
+          "type": "number",
+          "default": 6000
+        }
+      },
+      "specialFlags": []
+    }
+  ],
+
+  "taskSetVariants": [
+    {
+      "subType": 1,
+      "label": "按交易日逐日展开",
+      "description": "将指定的日期范围内每个交易日生成一个叶子任务，抓取当日全部股票每日指标",
+      "expandParam": "trade_dates",
+      "expandDescription": "将 trade_dates.start_date 到 trade_dates.end_date 之间的每个交易日生成一条叶子任务",
+      "expandStrategy": "trade_dates",
+      "requiredParams": ["trade_dates"],
+      "optionalParams": ["offset", "limit"],
+      "paramDefs": {
+        "trade_dates.start_date": {
+          "label": "开始日期",
+          "description": "交易日范围的开始日期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "trade_dates.end_date": {
+          "label": "结束日期",
+          "description": "交易日范围的结束日期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "offset": {
+          "label": "偏移量",
+          "description": "TuShare 分页偏移量",
+          "type": "number",
+          "default": 0
+        },
+        "limit": {
+          "label": "每页条数",
+          "description": "TuShare 分页每页条数，默认 6000",
+          "type": "number",
+          "default": 6000
+        }
+      },
+      "specialFlags": [],
+      "outputTaskVariantSubType": 1
+    }
+  ]
+}

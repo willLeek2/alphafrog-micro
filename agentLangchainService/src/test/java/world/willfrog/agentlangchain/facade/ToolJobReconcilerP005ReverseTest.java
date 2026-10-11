@@ -172,7 +172,10 @@ class ToolJobReconcilerP005ReverseTest {
                     ext JSONB DEFAULT '{}',
                     execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
                     restart_attempt INT NOT NULL DEFAULT 0,
-                    tool_job_anchor_json JSONB DEFAULT '{}'
+                    tool_job_anchor_json JSONB DEFAULT '{}',
+                    scheduler_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY',
+                    plan_generation INT NOT NULL DEFAULT -1,
+                    run_control_version BIGINT NOT NULL DEFAULT 0
                 )""");
         }
 
@@ -642,6 +645,41 @@ class ToolJobReconcilerP005ReverseTest {
      * because the run status is CANCELED instead of WAITING_TOOL_JOB.
      */
     private static class StubPythonSandboxService implements PythonSandboxService {
+
+        @Override
+        public AcquireWorkspaceResponse acquireWorkspace(AcquireWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<AcquireWorkspaceResponse> acquireWorkspaceAsync(
+                AcquireWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public DeleteWorkspaceResponse deleteWorkspace(DeleteWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<DeleteWorkspaceResponse> deleteWorkspaceAsync(
+                DeleteWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override public world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceResponse sealWorkspace(
+                world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceResponse> sealWorkspaceAsync(
+                world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceResponse queryWorkspace(
+                world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceResponse> queryWorkspaceAsync(
+                world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesResponse listWorkspaceExpiryCandidates(
+                world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesRequest r) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesResponse> listWorkspaceExpiryCandidatesAsync(
+                world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesRequest r) { throw new UnsupportedOperationException(); }
 
         @Override
         public TaskStatusResponse getTaskStatus(GetTaskStatusRequest request) {

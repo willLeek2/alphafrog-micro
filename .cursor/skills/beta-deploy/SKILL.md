@@ -15,9 +15,10 @@ description: 开发机 Agent 通过 SSH 包装脚本调用 Beta 机本机接待�
 - **开某个服务的泳道前，主 Beta 要先有该服务的活动实例**；主 Beta 没有（该服务还在回落生产）时，先让用户确认是否把它纳入主环境，不要直接开泳道。
 - 镜像构建、部署单填写、端口分配、口令读取都发生在 Beta 本机，由 `af-beta` 完成；开发机 Agent 的职责是选对子命令和参数（泳道名、服务短名、git 提交）。
 - 对 Beta 的访问只有包装脚本这一条路：专用受限钥匙（Beta 侧 authorized_keys 绑定强制命令 af-beta-shell，服务端只放行 af-beta 白名单子命令，拿不到 shell、不能端口转发）。**不得尝试用其它钥匙、其它用户、直接 ssh、scp、端口转发或任何方式连 Beta**。
-- 不读取、不修改 `/etc/alphafrog-beta/` 下的任何文件。
+- 不读取、不修改 `/etc/alphafrog-beta/` 下的任何文件（含 `presets/`；preset 的取值只存 Beta 本机）。
 - 不执行 `docker rm`、`systemctl` 等主机操作。
 - 不在对话里打印口令文件内容或任何密钥（包括专用私钥）。
+- preset（命名的环境变量预设组）只按名字引用：命令里只传名字，不传地址、口令或任何取值；对话里不打印 preset 取值，`preset inspect` 的打码输出原样转告用户。
 
 ## 调用方式
 
@@ -29,7 +30,7 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 
 - 主机地址来自开发机环境变量 `AF_BETA_SSH`（每台开发机自己配置，例如 `user@beta-host`），专用私钥路径 `AF_BETA_KEY`（默认 `~/.ssh/af-beta-ed25519`）；仓库和对话里都不出现真实地址和密钥。
 - 成功后把 `how-to-test` 子命令的输出**原样**转告用户（那是 Beta 侧生成的验证指引）。
-- 失败时优先调用 `retry`；retry 无法解决或报错不在接待命令职责内时，把错误**原文**交给用户，不自行猜测修法。
+- 部署或构建失败时优先调用 `retry`；`records`、`allowlists` 等命令失败时把错误**原文**交给用户，不自行猜测修法。
 
 ## 服务短名对照
 
@@ -53,11 +54,25 @@ bash deploy/beta/af-beta-remote.sh <af-beta 子命令> [参数]
 ## 常用子命令
 
 - `status`：查看当前部署与滚动状态。
-- `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。
-- `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加。见上文硬性边界：必须用户明确要求。
+- `git fetch --branch <分支名>`：当前分支成功执行 `git push` 后，调用 `bash deploy/beta/af-beta-remote.sh git fetch --branch <分支名>`，让 Beta 本机拉取刚推送的分支。把命令输出原样转告用户，并使用输出里的 `commit=` 作为后续 `lane start` 或 `file-config` 的 `--git` 参数。分支名使用刚推送的当前分支；fetch 失败时把错误原文交给用户。这条不是 `main roll`，不需要用户另一次同意滚动主环境。
+- `lane start --name <泳道名> --services <短名>[,<短名>...] --git <提交> [--skip-build] [--preset <名字>] [--mount-plan <摘要>]`：开一条泳道（形态如上；主 Beta 缺该服务活动实例时见硬性边界，先确认主环境）。`--skip-build` 表示不重新构建、复用已有镜像。`--preset` 按名字把 Beta 本机 preset 写入这次点名服务的环境变量覆盖（只传名字，取值由 Beta 本机解析写入）。`--mount-plan` 可重复，使用 `mounts plan` 输出的 `plan=` 摘要在首次创建时配置挂载；挂载失败则整次启动失败。
+- `main roll`：更新主 Beta 环境——已在主环境部署单里的服务换镜像，不在的从模板追加；同样可带 `--preset <名字>`。见上文硬性边界：必须用户明确要求。
 - `retry`：对失败部署重试。
 - `how-to-test`：拿到本次部署的验证指引，成功后原样转告用户。
 - `file-config --git <提交>`：把该提交里 agent-langchain 的 `prompts/` 同步到 Beta 挂载目录 `/var/lib/alphafrog-beta/data/agent-configs/prompts`（agent 服务按 `file:prompts/...` 读取这份目录，约 10 秒轮询一次；改动提示词资源后需要在 Beta 生效时用）。提交必须已经推到远端；成功后把命令输出（含 md5）原样转告用户。这条不是 `main roll`，不需要用户另一次同意滚动主环境。
+- `records kinds`：需要写泳道验收夹具或放行点时，先查看已登记的 kind。目前有 `acceptance-fixture` 和 `release-point`。
+- `records put --kind <kind> --lane <泳道> [--ttl-seconds 3600]`：写入泳道控制面记录，JSON 从标准输入传入，不传 SQL。`acceptance-fixture` 的 JSON 必须有 `fixtureId`、`scenarioId`、`modelScript`；`release-point` 必须有 `run_id`、`release_key`、`opened_by`。主 Beta 拒绝写入，口令留在 Beta 本机，不在对话中抄写。这不是 `main roll`，无需另行同意滚动主环境。完整 JSON 格式按《06-beta-af-beta-其他机器使用说明》。
+- `records show --kind <kind> --lane <泳道> [--id <编号>] [--run-id <Run>] [--release-key <点>] [--json]`：查看记录；按身份取一个放行点用 `records get --kind release-point --lane <泳道> --run-id <Run> --release-key <点> [--json]`，列出某个 Run 的放行点用 `records list --kind release-point --lane <泳道> --run-id <Run> [--release-key <点>] [--json]`。停用验收夹具用 `records disable --kind acceptance-fixture --lane <泳道> --id <编号>`；放行点不支持停用。成功后把命令输出原样转告用户。
+- `allowlists inspect [<短名>] [--json]`：查看已登记的库表 CHECK 允许名单；先不带短名查看有哪些名单。`allowlists update <短名> --add <取值> --confirm`：向已登记名单追加一个已登记取值，不接收 SQL。这会修改整库约束，所有泳道和主 Beta 一起生效；调用 `update` 前必须取得用户在当前对话中的明确同意。成功后把命令输出原样转告用户，失败时把错误原文交给用户。
+- `preset ls`：列出 Beta 本机已登记的 preset 名（命名的环境变量预设组，用于数据源等端点切换；变量取值只存 Beta 本机）。
+- `preset inspect <名字> [--json]`：查看该 preset 的变量名与打码取值；打码输出原样转告用户，不猜测、不补全取值。
+- `preset apply --name <名字> --services <短名>[,<短名>...] (--main|--lane <泳道>)`：把 preset 写入已有部署的环境变量覆盖并滚动点名服务。`--main` 作用于主环境，**必须用户在当前对话里明确说了才允许调用**（与 `main roll` 同一硬性边界）；`--lane` 只作用于该泳道。成功后把命令输出原样转告用户，失败时把错误原文交给用户。
+- `mounts policy [--service <短名>]`：只读查看 Beta 本机允许的宿主根目录、服务与挂载用途；根路径以命令输出为准，不从本文件猜测。
+- `mounts plan --lane <泳道>|--main --service <短名> --key <用途> --subdir <相对目录> [--target <容器绝对路径>] [--mode ro|rw] [--create]`：预检查挂载计划，不创建宿主目录、不修改部署。把输出中的 `plan=` 摘要原样交给 `mounts apply` 或 `lane start --mount-plan`。
+- `mounts apply --plan <摘要>`：把挂载声明写入已有部署，并滚动点名服务。主 Beta 写入必须先取得当前对话中的明确授权。
+- `mounts inspect --lane <泳道>|--main --service <短名> [--json]`：对照部署单声明与运行容器的实际挂载。
+- `mounts plan --remove ...` 后接 `mounts remove --plan <摘要>`：撤销挂载声明，不删除宿主文件。主 Beta 写入必须先取得当前对话中的明确授权。
+- `mounts purge --lane <泳道>|--main --service <短名> --subdir <相对目录>`：删除已无挂载声明的宿主子目录及其中的文件。开发机 Agent **不得自动调用**；只有人类在当前对话明确要求删除这些目录时才可执行。失败时把命令输出原文交给用户。
 
 ## 联调前置
 

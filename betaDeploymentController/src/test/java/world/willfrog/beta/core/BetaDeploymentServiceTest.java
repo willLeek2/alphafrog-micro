@@ -49,6 +49,7 @@ class BetaDeploymentServiceTest {
         machine.setBindIp("127.0.0.1");
         machine.setRoutableAddress("10.0.0.8");
         properties.setMachines(Map.of("beta-machine-1", machine));
+        properties.setFailedCandidateRetain(java.time.Duration.ZERO);
         return properties;
     }
 
@@ -97,6 +98,30 @@ class BetaDeploymentServiceTest {
         assertTrue(containers.values.containsKey(portfolioContainer));
         assertFalse(containers.stopped.containsKey(portfolioContainer));
         assertFalse(agentContainer.equals(stateOf("agent-service").path("activeInstance").path("containerName").asText()));
+    }
+
+    @Test
+    void changingOnlyEnvironmentOverridesCreatesAnInstanceWithTheNewValue() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        String oldInstance = state().path("activeInstance").path("instanceId").asText();
+        String oldDigest = state().path("activeInstance").path("serviceSpecSha256").asText();
+
+        ObjectNode updated = manifest(2, "release-1", '1', 'a', 'b', "main-beta");
+        ObjectNode spec = (ObjectNode) updated.path("services").path(0);
+        spec.putObject("environmentOverrides").put("EXAMPLE_OPTION", "updated");
+        spec.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, spec));
+        service.submitManifest(updated);
+        reconcile(4);
+
+        JsonNode active = state().path("activeInstance");
+        assertEquals("STABLE", state().path("phase").asText());
+        assertFalse(oldInstance.equals(active.path("instanceId").asText()));
+        assertFalse(oldDigest.equals(active.path("serviceSpecSha256").asText()));
+        assertEquals("updated", containers.createdSpecs.get(active.path("containerName").asText())
+                .path("environmentOverrides").path("EXAMPLE_OPTION").asText());
+        assertEquals(28081, active.path("hostPort").asInt());
+        assertTrue(containers.stopped.containsKey("af-" + oldInstance));
     }
 
     @Test
@@ -209,6 +234,41 @@ class BetaDeploymentServiceTest {
         service.reconcileOne();
 
         assertEquals(0, store.snapshot().path("deployments").size());
+    }
+
+    @Test
+    void toolJobTestControlRejectsMainBeta() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        String generation = state().path("activeInstance").path("deploymentGenerationId").asText();
+
+        ControllerException failure = assertThrows(ControllerException.class,
+                () -> service.toolJobTestTarget("beta-main-001", generation, false));
+
+        assertEquals("TOOL_JOB_TEST_MAIN_BETA_FORBIDDEN", failure.code());
+    }
+
+    @Test
+    void toolJobTestControlBindsTheStableLaneGenerationAndRuntime() {
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        ObjectNode lane = manifest("beta-lane-a", 1, "release-1", '1', 'a', 'b', "lane-a", 38080);
+        ObjectNode agent = (ObjectNode) lane.path("services").path(0);
+        ((ObjectNode) agent.path("runtime")).put("allowToolJobProcessHalt", true);
+        agent.put("serviceSpecSha256", JsonSupport.serviceSha256(mapper, agent));
+        service.submitManifest(lane);
+        reconcile(3);
+        String generation = state("lane-a").path("activeInstance").path("deploymentGenerationId").asText();
+
+        BetaDeploymentService.ToolJobTestTarget target = service.toolJobTestTarget(
+                "beta-lane-a", generation, true);
+
+        assertEquals("lane-a", target.trafficScopeId());
+        assertEquals(generation, target.generationId());
+        assertTrue(target.runtime().durableRecoveryEnabled());
+        assertTrue(target.runtime().faultInjectionEnabled());
+        assertTrue(target.runtime().processHaltEnabled());
+        assertTrue(target.runtime().restartUnlessStopped());
     }
 
     @Test
@@ -436,6 +496,179 @@ class BetaDeploymentServiceTest {
         assertEquals("STABLE", state().path("phase").asText());
         assertEquals(oldId, state().path("activeInstance").path("instanceId").asText());
         assertFalse(state().path("lastError").isNull());
+        assertEquals("CANDIDATE_NOT_READY", state().path("lastError").path("code").asText());
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertEquals(1, containers.values.size());
+        assertTrue(containers.values.containsKey(state().path("activeInstance").path("containerName").asText()));
+    }
+
+    @Test
+    void retainedFailedCandidateStaysUntilRetainDeadlineThenIsRemoved() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+
+        ObjectNode first = manifest(1, "release-1", '1', 'a', 'b', "main-beta");
+        withPortfolioService(first);
+        service.submitManifest(first);
+        reconcile(6);
+
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        ObjectNode second = manifest(2, "release-2", '2', 'c', 'd', "main-beta");
+        withPortfolioService(second);
+        service.submitManifest(second);
+        service.reconcileOne();
+        service.reconcileOne();
+
+        JsonNode agent = stateOf("agent-service");
+        JsonNode retained = agent.path("retainedFailedCandidate");
+        String failedName = retained.path("containerName").asText();
+        String failedId = retained.path("instanceId").asText();
+        assertEquals("CANDIDATE_NOT_READY", agent.path("lastError").path("code").asText());
+        assertEquals(failedName, agent.path("lastError").path("containerName").asText());
+        assertTrue(agent.path("lastError").path("message").asText().endsWith("container=" + failedName));
+        assertTrue(containers.values.containsKey(failedName));
+        assertFalse(containers.removedComposeInstanceIds.contains(failedId));
+        assertEquals("STARTING_CANDIDATE", stateOf("portfolio-service").path("operation").path("phase").asText());
+
+        clock.set(Instant.parse(retained.path("retainUntil").asText()).plusSeconds(1));
+        service.reconcileOne();
+
+        assertTrue(stateOf("agent-service").path("retainedFailedCandidate").isNull());
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+    }
+
+    @Test
+    void retryDuringRetainRemovesFailedCandidateThenStartsANewOne() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
+        service.reconcileOne();
+        service.reconcileOne();
+
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        assertTrue(containers.values.containsKey(failedName));
+
+        service.retry("beta-main-001", "agent-service");
+
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        assertFalse(failedId.equals(state().path("operation").path("candidateInstanceId").asText()));
+    }
+
+    @Test
+    void requestDeleteDuringRetainRemovesFailedCandidateAndClearsDeployment() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        String activeId = state().path("activeInstance").path("instanceId").asText();
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
+        service.reconcileOne();
+        service.reconcileOne();
+
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        assertTrue(containers.values.containsKey(failedName));
+
+        service.requestDelete("beta-main-001");
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+
+        reconcile(2);
+        assertEquals(0, store.snapshot().path("deployments").size());
+        assertTrue(containers.removedComposeInstanceIds.contains(activeId));
+    }
+
+    @Test
+    void startingCandidateKeepsRetainedIdentityWhenOldContainerRemoveFails() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        retainUnhealthyCandidate(clock);
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        int created = containers.createdContainers;
+        containers.failRemoveName = failedName;
+
+        service.submitManifest(manifest(3, "release-3", '3', 'e', 'f', "main-beta"));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+
+        JsonNode retained = state().path("retainedFailedCandidate");
+        assertEquals(failedName, retained.path("containerName").asText());
+        assertEquals(failedId, retained.path("instanceId").asText());
+        assertTrue(containers.values.containsKey(failedName));
+        assertFalse(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("candidateInstance").isNull());
+        assertEquals(created, containers.createdContainers);
+
+        containers.failRemoveName = null;
+        service.retry("beta-main-001", "agent-service");
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertFalse(containers.values.containsKey(failedName));
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+        assertTrue(state().path("candidateInstance").isObject());
+        assertEquals(created + 1, containers.createdContainers);
+    }
+
+    @Test
+    void startingCandidateKeepsRetainedIdentityWhenOldComposeRemoveFails() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-01T00:00:00Z"));
+        retainUnhealthyCandidate(clock);
+        String failedName = state().path("retainedFailedCandidate").path("containerName").asText();
+        String failedId = state().path("retainedFailedCandidate").path("instanceId").asText();
+        int created = containers.createdContainers;
+        containers.failRemoveComposeInstanceId = failedId;
+
+        service.submitManifest(manifest(3, "release-3", '3', 'e', 'f', "main-beta"));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+
+        JsonNode retained = state().path("retainedFailedCandidate");
+        assertEquals(failedName, retained.path("containerName").asText());
+        assertEquals(failedId, retained.path("instanceId").asText());
+        assertFalse(containers.values.containsKey(failedName));
+        assertFalse(containers.removedComposeInstanceIds.contains(failedId));
+        assertTrue(state().path("candidateInstance").isNull());
+        assertEquals(created, containers.createdContainers);
+
+        containers.failRemoveComposeInstanceId = null;
+        service.retry("beta-main-001", "agent-service");
+        assertTrue(state().path("retainedFailedCandidate").isNull());
+        assertTrue(containers.removedComposeInstanceIds.contains(failedId));
+        assertEquals("STARTING_CANDIDATE", state().path("operation").path("phase").asText());
+        service.reconcileOne();
+        assertTrue(state().path("candidateInstance").isObject());
+        assertEquals(created + 1, containers.createdContainers);
     }
 
     @Test
@@ -527,6 +760,22 @@ class BetaDeploymentServiceTest {
 
     private void reconcile(int count) {
         for (int index = 0; index < count; index++) service.reconcileOne();
+    }
+
+    private void retainUnhealthyCandidate(MutableClock clock) {
+        BetaControllerProperties properties = testProperties();
+        properties.setFailedCandidateRetain(java.time.Duration.ofSeconds(120));
+        store = new AtomicJsonStore(mapper, properties);
+        containers = new FakeContainers();
+        registrationProbe = new FakeRegistrationProbe();
+        service = new BetaDeploymentService(mapper, store, new BetaContractValidator(mapper, properties), containers,
+                registrationProbe, properties, clock);
+        service.submitManifest(manifest(1, "release-1", '1', 'a', 'b', "main-beta"));
+        reconcile(3);
+        containers.health = ContainerRuntime.ContainerObservation.Health.UNHEALTHY;
+        service.submitManifest(manifest(2, "release-2", '2', 'c', 'd', "main-beta"));
+        service.reconcileOne();
+        service.reconcileOne();
     }
 
     private JsonNode state() {
@@ -674,6 +923,10 @@ class BetaDeploymentServiceTest {
     private final class FakeContainers implements ContainerRuntime {
         ContainerObservation.Health health = ContainerObservation.Health.HEALTHY;
         final Map<String, ContainerObservation> values = new LinkedHashMap<>();
+        final Map<String, CandidatePlan> plans = new LinkedHashMap<>();
+        final Map<String, JsonNode> createdSpecs = new LinkedHashMap<>();
+        final Map<String, String> commits = new LinkedHashMap<>();
+        final Map<String, Boolean> processHaltAllowed = new LinkedHashMap<>();
         final Map<String, Boolean> stopped = new LinkedHashMap<>();
         final java.util.Set<String> removedComposeInstanceIds = new java.util.LinkedHashSet<>();
         int stopTimeoutSeconds;
@@ -683,6 +936,8 @@ class BetaDeploymentServiceTest {
         int observedPortOffset;
         boolean failAfterCreating;
         int createdContainers;
+        String failRemoveName;
+        String failRemoveComposeInstanceId;
 
         @Override public void validateManifestEnvironment(JsonNode manifest) {
             if (manifest.path("deploymentId").asText().equals(invalidManifestId)) {
@@ -696,6 +951,10 @@ class BetaDeploymentServiceTest {
             ContainerObservation value = new ContainerObservation(String.format("%064x", ++createdContainers),
                     name, "10.0.0.8", plan.hostPort(), true, health);
             values.put(name, value);
+            plans.put(name, plan);
+            createdSpecs.put(name, spec.deepCopy());
+            commits.put(name, manifest.path("gitCommit").asText());
+            processHaltAllowed.put(name, spec.path("runtime").path("allowToolJobProcessHalt").asBoolean(false));
             if (failAfterCreating) throw new ControllerException("CONTAINER_START_FAILED", "post-create check failed");
             return value;
         }
@@ -711,8 +970,31 @@ class BetaDeploymentServiceTest {
             stopTimeoutSeconds = timeoutSeconds;
             if (!leaveRunningAfterStop) stopped.put(name, true);
         }
-        @Override public void remove(String machineId, String name) { values.remove(name); }
-        @Override public void removeCompose(String instanceId) { removedComposeInstanceIds.add(instanceId); }
+        @Override public void remove(String machineId, String name) {
+            if (name.equals(failRemoveName))
+                throw new ControllerException("CONTAINER_REMOVE_FAILED", "forced remove failure");
+            values.remove(name);
+        }
+        @Override public ToolJobTestRuntime inspectToolJobTestRuntime(String machineId, String name) {
+            CandidatePlan plan = plans.get(name);
+            ContainerObservation container = values.get(name);
+            if (plan == null || container == null) {
+                throw new ControllerException("TOOL_JOB_TEST_CONTAINER_MISSING", "missing");
+            }
+            boolean lane = !"main-beta".equals(plan.trafficScopeId());
+            return new ToolJobTestRuntime(container.containerId(), true, true, plan.deploymentId(),
+                    plan.trafficScopeId(), plan.generationId(), commits.get(name), lane, lane,
+                    lane && Boolean.TRUE.equals(processHaltAllowed.get(name)), true, 0,
+                    "2026-09-20T00:00:00Z");
+        }
+        @Override public ContainerObservation restart(String machineId, String name, java.time.Duration timeout) {
+            return inspect(machineId, name);
+        }
+        @Override public void removeCompose(String instanceId) {
+            if (instanceId.equals(failRemoveComposeInstanceId))
+                throw new ControllerException("COMPOSE_REMOVE_FAILED", "forced compose remove failure");
+            removedComposeInstanceIds.add(instanceId);
+        }
         @Override public String containerName(CandidatePlan plan, String serviceName) {
             return "af-" + plan.instanceId();
         }
@@ -736,5 +1018,21 @@ class BetaDeploymentServiceTest {
             lastPort = port;
             return visible;
         }
+    }
+
+    private static final class MutableClock extends Clock {
+        private Instant instant;
+
+        private MutableClock(Instant instant) {
+            this.instant = instant;
+        }
+
+        private void set(Instant next) {
+            this.instant = next;
+        }
+
+        @Override public java.time.ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(java.time.ZoneId zone) { return Clock.fixed(instant, zone); }
+        @Override public Instant instant() { return instant; }
     }
 }

@@ -1,4 +1,26 @@
 [ {
+  "aliases" : [ "AH溢价", "AH溢价率", "AH比价溢价" ],
+  "clarificationDimensions" : [ {
+    "id" : "pairAndDate",
+    "question" : "哪对 A/H 股票、哪个交易日"
+  } ],
+  "commonPhrases" : [ "A股相对H股贵多少" ],
+  "displayName" : "AH溢价",
+  "methodId" : "finance.crossover.ah_premium",
+  "specDigest" : "sha256:177a8c04110c31fc5c7a8e6f05f21cadfe9f56f4015cbbec2e245d15370611e3",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "预测市盈率", "前瞻市盈率", "PEG", "预测PE" ],
+  "clarificationDimensions" : [ {
+    "id" : "reportWindow",
+    "question" : "取哪个发布日期窗口内的预测报告行"
+  } ],
+  "commonPhrases" : [ "按券商预测算贵不贵", "估值和预测增速匹配吗" ],
+  "displayName" : "预测市盈率与PEG",
+  "methodId" : "finance.forecast.forward_pe_peg",
+  "specDigest" : "sha256:f91c13bbb90f741f347b73788123fe51f718f3d2dbd8a097dbe5fb1997968226",
+  "version" : "1.0.0"
+}, {
   "aliases" : [ "复合增长率", "CAGR", "年复合增长率" ],
   "clarificationDimensions" : [ {
     "id" : "rangeBoundary",
@@ -13,6 +35,64 @@
   "specDigest" : "sha256:cff05d88e83b787478edfd0252c414ded02b8236b9b1032126f5cd51c4d7b25e",
   "version" : "1.0.0"
 }, {
+  "aliases" : [ "价格动量", "动量", "区间动量" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndWindow",
+    "question" : "哪只标的、窗口取 63/126/252 哪个"
+  }, {
+    "id" : "adjusted",
+    "question" : "序列是否需要方法内乘复权因子"
+  } ],
+  "commonPhrases" : [ "过去三个月涨了多少", "动量强不强" ],
+  "displayName" : "价格动量",
+  "methodId" : "finance.momentum.price_momentum",
+  "specDigest" : "sha256:7628e0d4df23b4f89002bf0900ea52b1e471b4a780c756bdb7a0101429f4a3e2",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "扣非ROE", "杜邦分解", "净资产收益率", "ROE" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndPeriod",
+    "question" : "哪只股票、哪个报告期（默认最新）"
+  } ],
+  "commonPhrases" : [ "赚钱效率拆开看", "净利率、周转、杠杆各贡献多少" ],
+  "displayName" : "扣非净资产收益率与杜邦分解",
+  "methodId" : "finance.quality.dupont_roe",
+  "specDigest" : "sha256:d73018ebeacf1bc1f465fce51b5005fb46f20009ae9440ae3b6c5252e9e30b09",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "转债日收益", "可转债收益", "转债区间收益" ],
+  "clarificationDimensions" : [ {
+    "id" : "cbAndRange",
+    "question" : "哪只转债、哪个日期区间"
+  } ],
+  "commonPhrases" : [ "这只转债涨了多少", "转债这段时间收益多少" ],
+  "displayName" : "可转债日收益与区间收益",
+  "methodId" : "finance.return.cb_daily_return",
+  "specDigest" : "sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "ETF区间收益", "ETF复权收益", "ETF收益率" ],
+  "clarificationDimensions" : [ {
+    "id" : "etfAndRange",
+    "question" : "哪只ETF、哪个日期区间"
+  } ],
+  "commonPhrases" : [ "这只ETF这段时间赚了多少", "这只ETF今年以来复权涨了多少" ],
+  "displayName" : "ETF复权区间收益",
+  "methodId" : "finance.return.etf_adj_return",
+  "specDigest" : "sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "基金区间收益", "累计净值收益", "公募基金收益" ],
+  "clarificationDimensions" : [ {
+    "id" : "fundAndRange",
+    "question" : "哪只基金、哪个日期区间"
+  } ],
+  "commonPhrases" : [ "这只基金这段时间赚了多少" ],
+  "displayName" : "公募累计净值区间收益",
+  "methodId" : "finance.return.fund_accum_nav_return",
+  "specDigest" : "sha256:53b7613839e145715964ae3777e400f9748a367b862400a3809794b52f41bed9",
+  "version" : "1.0.0"
+}, {
   "aliases" : [ "年化波动率", "波动率", "annualized volatility" ],
   "clarificationDimensions" : [ {
     "id" : "rangeBoundary",
@@ -25,6 +105,20 @@
   "displayName" : "年化波动率",
   "methodId" : "finance.risk.annualized_volatility",
   "specDigest" : "sha256:2843745f0c4903083430ef0b4eef6be253b09a4c014c28decbf5884466f0d668",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "最大回撤", "回撤", "Sortino", "Calmar" ],
+  "clarificationDimensions" : [ {
+    "id" : "assetAndRange",
+    "question" : "哪个标的、哪个日期区间"
+  }, {
+    "id" : "riskFree",
+    "question" : "无风险利率取值与口径（年化或每期）"
+  } ],
+  "commonPhrases" : [ "最惨的时候跌多少", "下行风险调整后的收益" ],
+  "displayName" : "最大回撤与Sortino与Calmar",
+  "methodId" : "finance.risk.drawdown_sortino_calmar",
+  "specDigest" : "sha256:178380bd64306f323409394ac706782516847c39ea438cb58d48527992bb8c3b",
   "version" : "1.0.0"
 }, {
   "aliases" : [ "夏普比率", "夏普", "Sharpe", "Sharpe ratio" ],
@@ -42,5 +136,88 @@
   "displayName" : "夏普比率",
   "methodId" : "finance.risk.sharpe_ratio",
   "specDigest" : "sha256:fccc1f0f9264dc90730f7a3b6a35abce2c6f2884c79a3e3b9ce0a7190058db90",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "均线", "移动平均", "移动平均线", "MA", "EMA" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndWindow",
+    "question" : "哪只标的、窗口取多少个交易日"
+  }, {
+    "id" : "adjusted",
+    "question" : "序列是否需要方法内乘复权因子"
+  } ],
+  "commonPhrases" : [ "股价在均线上方还是下方", "五十日均线是多少" ],
+  "displayName" : "移动平均线",
+  "methodId" : "finance.trend.moving_average",
+  "specDigest" : "sha256:57d985c96639eeb72a1206bce503d4a57bf1caa83922f261f42779007198e823",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "转股溢价率", "纯债溢价率", "转债溢价" ],
+  "clarificationDimensions" : [ {
+    "id" : "cbAndDate",
+    "question" : "哪只转债、哪个交易日"
+  } ],
+  "commonPhrases" : [ "转债相对正股贵多少", "转债的债底溢价多少" ],
+  "displayName" : "可转债转股与纯债溢价率",
+  "methodId" : "finance.valuation.cb_premium",
+  "specDigest" : "sha256:36597d40c478c978358e61325615a64290ac4a0ff36eeee96ac70577b78abf15",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "股息率", "股息率TTM", "dividend yield" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndDate",
+    "question" : "哪只股票、哪个交易日"
+  } ],
+  "commonPhrases" : [ "分红回报有多少" ],
+  "displayName" : "股息率",
+  "methodId" : "finance.valuation.dividend_yield",
+  "specDigest" : "sha256:8c003d379da4532358c366a5a74f7ccbef854dabcf7588cad87fd959ab5eb3db",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "自由流通换手率", "换手率", "自由流通换手" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndDate",
+    "question" : "哪只股票、哪个交易日"
+  } ],
+  "commonPhrases" : [ "筹码换手活跃吗", "成交活跃度用自由流通盘衡量是多少" ],
+  "displayName" : "自由流通换手率",
+  "methodId" : "finance.valuation.free_float_turnover",
+  "specDigest" : "sha256:a849e7ed36b10948dcfdbfffc671196fbc7b6cbfd60b8a76e72a030ef7a50564",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "指数市盈率", "指数市净率", "指数估值", "大盘估值" ],
+  "clarificationDimensions" : [ {
+    "id" : "indexAndDate",
+    "question" : "哪个指数、哪个交易日"
+  } ],
+  "commonPhrases" : [ "大盘现在估值多高", "指数贵不贵", "沪深300市盈率多少", "中证500市净率多少", "沪深300的市盈率和市净率是多少" ],
+  "displayName" : "指数滚动市盈率与市净率",
+  "methodId" : "finance.valuation.index_pe_pb",
+  "specDigest" : "sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "市净率", "市净率PB", "PB" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndDate",
+    "question" : "哪只股票、哪个交易日"
+  } ],
+  "commonPhrases" : [ "股价是净资产的几倍" ],
+  "displayName" : "市净率",
+  "methodId" : "finance.valuation.price_to_book",
+  "specDigest" : "sha256:924468f3ba30e8343d988d1e9b7cca6072b5df0be1bffafd3fbd46bfc0ccbf20",
+  "version" : "1.0.0"
+}, {
+  "aliases" : [ "滚动市盈率", "市盈率", "市盈率TTM", "历史分位", "PE TTM" ],
+  "clarificationDimensions" : [ {
+    "id" : "tsCodeAndDate",
+    "question" : "哪只股票、哪个交易日"
+  }, {
+    "id" : "percentileWindow",
+    "question" : "历史分位回看多少个有值交易日"
+  } ],
+  "commonPhrases" : [ "现在估值贵不贵", "市盈率在历史上处于什么位置", "盈利收益率是多少" ],
+  "displayName" : "滚动市盈率与历史分位",
+  "methodId" : "finance.valuation.rolling_pe",
+  "specDigest" : "sha256:8b1e5c4dc7a2e3f46895f4907ff63043a4e20e6ab0f3b89bd86dbdfa9a85bcb3",
   "version" : "1.0.0"
 } ]

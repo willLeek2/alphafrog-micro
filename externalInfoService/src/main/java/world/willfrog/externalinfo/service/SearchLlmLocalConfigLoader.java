@@ -2,15 +2,19 @@ package world.willfrog.externalinfo.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationListener;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalCachePaths;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 import world.willfrog.alphafrogmicro.common.utils.PlaceholderResolver;
 import world.willfrog.externalinfo.config.SearchLlmProperties;
 
@@ -26,7 +30,7 @@ import java.util.Optional;
 @Component
 @RequiredArgsConstructor
 @Slf4j
-public class SearchLlmLocalConfigLoader {
+public class SearchLlmLocalConfigLoader implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     private final ObjectMapper objectMapper;
 
@@ -42,6 +46,9 @@ public class SearchLlmLocalConfigLoader {
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")
     private String instanceId;
 
+    @Value("${AF_LANE_TRAFFIC_SCOPE_ID:}")
+    private String laneTrafficScopeId;
+
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
 
@@ -51,6 +58,11 @@ public class SearchLlmLocalConfigLoader {
     private volatile byte[] loadedConfigBytes = new byte[0];
     private volatile Map<String, Long> loadedPromptFileModifiedTimes = new LinkedHashMap<>();
     private final Object reloadLock = new Object();
+    /**
+     * Nacos 缓存文件是 camelCase。绑定 POJO 时用这份 mapper，不跟应用里可能被改成
+     * SNAKE_CASE 的 ObjectMapper 走同一套命名。{@code readTree} 仍用注入 mapper，键按字面量查找。
+     */
+    private volatile ObjectMapper fileMapper;
 
     private static final String FILE_PREFIX = "file:";
     private static final String FILE_PREFIX_ALT = "file://";
@@ -66,12 +78,40 @@ public class SearchLlmLocalConfigLoader {
         reloadIfNeeded(false);
     }
 
+    @Override
+    public void onApplicationEvent(NacosLocalConfigWrittenEvent event) {
+        applyNacosWrittenFile(event.getTargetFile());
+    }
+
+    /**
+     * Nacos 已经把生效内容写进 {@code targetFile}。路径对得上才重读，避免泳道吃到主环境那份未加前缀的缓存。
+     */
+    public void applyNacosWrittenFile(String targetFile) {
+        if (targetFile == null || targetFile.isBlank()) {
+            return;
+        }
+        String file = resolvedConfigFile();
+        if (file.isEmpty()) {
+            return;
+        }
+        Path configured = Paths.get(file).toAbsolutePath().normalize();
+        Path written = Paths.get(targetFile).toAbsolutePath().normalize();
+        if (!configured.equals(written)) {
+            return;
+        }
+        reloadIfNeeded(true);
+    }
+
     public Optional<SearchLlmProperties> current() {
         return Optional.ofNullable(localConfig);
     }
 
+    private String resolvedConfigFile() {
+        return NacosLocalCachePaths.isolate(configFile == null ? "" : configFile.trim(), laneTrafficScopeId);
+    }
+
     private void reloadIfNeeded(boolean force) {
-        String file = configFile == null ? "" : configFile.trim();
+        String file = resolvedConfigFile();
         if (file.isEmpty()) {
             if (force) {
                 log.info("external-info.search-llm.config-file is empty, skip local search config loading");
@@ -108,7 +148,7 @@ public class SearchLlmLocalConfigLoader {
                     byte[] bytes = in.readAllBytes();
                     JsonNode root = objectMapper.readTree(bytes);
                     failIfLegacyConfig(root, normalizedPath);
-                    SearchLlmProperties parsed = objectMapper.treeToValue(root, SearchLlmProperties.class);
+                    SearchLlmProperties parsed = fileMapper().treeToValue(root, SearchLlmProperties.class);
                     PlaceholderResolver.resolve(parsed);
                     SearchLlmProperties sanitized = sanitize(parsed, normalizedPath);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, resolvePromptBaseDir(path));
@@ -135,6 +175,21 @@ public class SearchLlmLocalConfigLoader {
     private void reportState(byte[] contentBytes) {
         ConfigLoadStateReporter.report(redisTemplate, serviceName, instanceId,
                 "search-llm.json", loadedConfigPath, contentBytes);
+    }
+
+    private ObjectMapper fileMapper() {
+        ObjectMapper cached = fileMapper;
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (reloadLock) {
+            if (fileMapper == null) {
+                ObjectMapper copy = objectMapper.copy();
+                copy.setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
+                fileMapper = copy;
+            }
+            return fileMapper;
+        }
     }
 
     private Path resolvePromptBaseDir(Path configPath) {

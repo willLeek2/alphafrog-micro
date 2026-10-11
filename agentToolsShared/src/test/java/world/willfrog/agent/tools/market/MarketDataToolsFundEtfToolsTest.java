@@ -73,7 +73,7 @@ class MarketDataToolsFundEtfToolsTest {
     }
 
     private Map<String, Object> invokeOffExchange(String tsCode, String start, String end) throws Exception {
-        return objectMapper.readValue(tools.getOffExchangeAssetDaily(tsCode, start, end),
+        return objectMapper.readValue(tools.getOffExchangeAssetDaily(tsCode, start, end, null),
                 new TypeReference<>() {});
     }
 

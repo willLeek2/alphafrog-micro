@@ -26,7 +26,7 @@ class FinanceMethodResolverCatalogTest {
     @Test
     void shouldLoadCatalogAndComputeDigest() {
         FinanceMethodResolverCatalog catalog = new FinanceMethodResolverCatalog(objectMapper);
-        assertEquals(3, catalog.getEntries().size());
+        assertEquals(18, catalog.getEntries().size());
         assertNotNull(catalog.getCatalogDigest());
         assertTrue(catalog.getCatalogDigest().startsWith("sha256:"));
     }
@@ -57,7 +57,7 @@ class FinanceMethodResolverCatalogTest {
             assertNotNull(is);
             index = objectMapper.readValue(is, new TypeReference<>() {});
         }
-        assertEquals(3, catalog.getEntries().size());
+        assertEquals(18, catalog.getEntries().size());
         for (FinanceMethodResolverCatalog.ResolverCatalogEntry entry : catalog.getEntries()) {
             assertNotNull(entry.specDigest());
             assertTrue(entry.specDigest().startsWith("sha256:"));

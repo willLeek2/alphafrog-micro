@@ -14,7 +14,14 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
+import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
+import world.willfrog.agent.platform.wait.WaitGroup;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
+import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.agentlangchain.tooljob.ToolJobFinalizer;
@@ -25,6 +32,7 @@ import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -77,20 +85,46 @@ public class LangchainRunControlService {
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
 
+    @Autowired(required = false)
+    private SchedulerVersionPolicy schedulerVersionPolicy;
+
+    @Autowired(required = false)
+    private DualPoolRunAdmissionRegistry dualPoolRunAdmissionRegistry;
+
+    @Autowired(required = false)
+    private NodeWorkItemStore nodeWorkItemStore;
+
+    @Autowired(required = false)
+    private WaitGroupStore waitGroupStore;
+
+    @Autowired
+    private AgentRunFamilyDeletionService familyDeletionService;
+
+    @Autowired(required = false)
+    private RunWorkspaceDeletionCoordinator workspaceDeletionCoordinator;
+
     /**
      * 删除 run 及其关联的状态数据（Redis）。
      * 仅允许在非运行状态下删除；正在执行的 run 需要先 cancel 或 pause。
      */
     public AgentEmpty deleteRun(DeleteAgentRunRequest request) {
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
-        if (isRunning(run.getStatus())) {
-            throw new IllegalStateException("run is running, cancel/pause first");
+        rejectDirectChildControl(run);
+        if (familyDeletionService == null) {
+            throw new IllegalStateException("调用树删除服务不可用");
         }
-        int deleted = runMapper.deleteByIdAndUser(run.getId(), run.getUserId());
-        if (deleted <= 0) {
-            throw new IllegalArgumentException("run not found");
+        AgentRunFamilyDeletionService.DeletionPlan deletion =
+                familyDeletionService.beginDeletion(run.getId(), run.getUserId());
+        if (!deletion.workspaceRunIds().isEmpty()) {
+            if (workspaceDeletionCoordinator == null) {
+                throw new IllegalStateException("沙箱工作区删除协调服务暂不可用，请稍后重试");
+            }
+            workspaceDeletionCoordinator.sealFindAndDelete(deletion.workspaceRunIds());
         }
-        stateStore.clear(run.getId());
+        for (String deletedRunId : familyDeletionService.finishDeletionAfterResourcesConfirmed(
+                run.getId(), run.getUserId(), deletion.runIds())) {
+            stateStore.clear(deletedRunId);
+        }
         return AgentEmpty.newBuilder().build();
     }
 
@@ -104,9 +138,15 @@ public class LangchainRunControlService {
 
     private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRunWhileActive(
             CancelAgentRunRequest request) {
+        return cancelRunWhileActive(request, true);
+    }
+
+    private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRunWhileActive(
+            CancelAgentRunRequest request, boolean retryAfterConcurrentChange) {
         // 认领/受理入口的归属判定在 gateway：只允许控制本部署代际的 Run。
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
+        boolean dualPoolRun = schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPoolFamily(run);
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
@@ -115,7 +155,8 @@ public class LangchainRunControlService {
 
         // 0. 先写取消标记：取消一个正在等待长工具的 Run 时，不能直接把数据库状态改成 CANCELED。
         //    收尾组件后续还要以「等待长工具」状态为前提接管终态结果、释放沙箱容量并走完终态流程，
-        //    所以这里只在进度记录里关闭自动恢复开关、记下取消意图。任何进度记录读写失败都保持
+        //    所以这里只在进度记录里关闭自动恢复开关、记下取消意图。V2 同一语句递增控制版本，
+        //    子执行的创建与收尾因此能从数据库识别父级取消。任何进度记录读写失败都保持
         //    Run 原状，让恢复扫描未来仍能处理；顺序必须是数据库先于 Redis。
         boolean hasActiveAnchor = false;
         try {
@@ -185,21 +226,38 @@ public class LangchainRunControlService {
                         restoreRedisAfterLostCancelWrite(runId, userId));
             }
         } else {
-            // 快照+状态+TTL 一条原子写入，带终态栅栏：数据库已是终态（执行刚提交的
-            // COMPLETED 等）时返回 0，先落库的终态赢。迟到取消拿不到行时不发
-            // CANCELED 事件、不写 Redis 终态、不结算，直接按现状返回——不广播
-            // 数据库里不存在的终态。
+            // 快照+状态+TTL 一条原子写入，并要求锚点仍为空。执行线程若在读取锚点后
+            // 已抢到长工具所有权，本次条件更新返回 0；重读后改走有锚点取消，保留
+            // Sandbox 任务与容量的收尾责任。已写入的业务终态仍由先提交者决定。
             canceledPersisted = runMapper.cancelTerminalSnapshotWithTtl(
                     runId, userId, snapshot, agentEventService.nextInterruptedExpiresAt()) == 1;
             if (!canceledPersisted) {
-                log.warn("CANCELED refused by terminal fence (run already terminal or invisible): "
-                        + "runId={} — returning current state without terminal broadcast", runId);
-                AgentRun current = restoreRedisAfterLostCancelWrite(runId, userId);
-                return AgentLangchainRunMessageMapper.toRunMessage(current);
+                AgentRun current = ownershipGateway.requireOwnedRunForUser(runId, userId);
+                if (!isTerminal(current.getStatus()) && retryAfterConcurrentChange) {
+                    // 状态或锚点在读取后改变；最多重新选择一次取消路径，防止新锚点
+                    // 被当成普通 Run 直接终结，也避免持续竞争时无界重试。
+                    log.warn("Cancel state changed during terminal write; rechecking current "
+                                    + "anchor: runId={} status={}", runId, current.getStatus());
+                    return cancelRunWhileActive(request, false);
+                }
+                AgentRun restored = restoreRedisAfterLostCancelWrite(runId, userId);
+                if (!isTerminal(restored.getStatus())) {
+                    log.warn("Cancel state changed again; caller must retry: runId={} status={}",
+                            runId, restored.getStatus());
+                    throw new IllegalStateException(
+                            "cancel_state_changed: unable to persist cancel after concurrent change");
+                }
+                return AgentLangchainRunMessageMapper.toRunMessage(restored);
             }
         }
         if (canceledPersisted && schedulerMetrics != null) {
             schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
+        }
+        // 双池工作项保存的是节点级执行责任，必须在用户取消生效时立即收口。
+        // 活跃长工具只需要把 Run 主记录留给 finalizer 完成容量释放和终态 CAS；
+        // 它不需要、也不应该让节点工作项继续停在 WAITING 等待下次进程启动清理。
+        if (dualPoolRun) {
+            cancelDualPoolWorkItems(runId);
         }
         // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
         agentEventService.append(runId, userId, "CANCELED", Map.of(
@@ -230,6 +288,55 @@ public class LangchainRunControlService {
         return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
     }
 
+    /**
+     * 显式取消必须同时收口数据库里的双池工作项。尤其在服务重启后，这条 Run 不会重新加入
+     * 当前进程的自动扫描集合；如果这里只改 Run 主记录，遗留工作项会一直阻塞后续双池准入。
+     */
+    private void cancelDualPoolWorkItems(String runId) {
+        if (waitGroupStore == null) {
+            log.error("双池 Run 已取消，但等待组存储不可用，外部任务无法排队停机: runId={}", runId);
+        } else {
+            // 等待组取消会同时落 Sandbox 停机记录。先留下外部任务责任，再关闭节点工作项。
+            try {
+                long afterGroupId = 0;
+                while (true) {
+                    java.util.List<WaitGroup> groups = waitGroupStore.listOpenGroupsByRun(
+                            runId, afterGroupId, 100);
+                    if (groups.isEmpty()) {
+                        break;
+                    }
+                    for (WaitGroup group : groups) {
+                        waitGroupStore.cancelChain(group.getId());
+                        afterGroupId = group.getId();
+                    }
+                }
+            } catch (RuntimeException e) {
+                log.error("双池 Run 已取消，但等待组及外部任务停机记录收口失败: runId={}", runId, e);
+            }
+        }
+        if (nodeWorkItemStore == null) {
+            log.error("双池 Run 已取消，但工作项存储不可用，无法同步收口: runId={}", runId);
+            return;
+        }
+        try {
+            for (NodeWorkItem item : nodeWorkItemStore.listUnfinishedByRun(runId)) {
+                NodeWorkItemMutationResult result = nodeWorkItemStore.cancel(
+                        item.identity(),
+                        item.getRunControlVersion() == null ? 0L : item.getRunControlVersion(),
+                        item.getClaimEpoch() == null ? 0 : item.getClaimEpoch(),
+                        "run_explicitly_canceled");
+                if (!result.applied()) {
+                    log.warn("双池 Run 已取消，但工作项条件取消未命中: runId={} identity={}",
+                            runId, item.identity().describe());
+                }
+            }
+        } catch (RuntimeException e) {
+            // 取消意图已经生效，不能因为节点清理失败把 API 伪装成未取消。
+            // 遗留行会继续留作可观测事实，并由启动恢复再次收口。
+            log.error("双池 Run 已取消，但工作项收口失败: runId={}", runId, e);
+        }
+    }
+
     /** 工作区归档事件发送失败时走数据库轮询备用路径，不能反向破坏已经提交的取消终态。 */
     private void publishFinalizedEventSafely(String runId, String userId, AgentRunStatus status) {
         try {
@@ -258,6 +365,10 @@ public class LangchainRunControlService {
             PauseAgentRunRequest request) {
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
+        rejectDirectChildControl(run);
+        if (schedulerVersionPolicy != null) {
+            schedulerVersionPolicy.versionOf(run);
+        }
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
@@ -294,6 +405,7 @@ public class LangchainRunControlService {
         // 归属判定在 gateway 的受理入口完成，之后才允许读取服务执行既有的过期收敛副作用。
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
+        rejectDirectChildControl(run);
         if (run.getStatus() == AgentRunStatus.EXPIRED) {
             throw new IllegalStateException("run expired");
         }
@@ -302,28 +414,73 @@ public class LangchainRunControlService {
                 && run.getStatus() != AgentRunStatus.WAITING) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
-        if (request.getPlanOverrideJson() != null && !request.getPlanOverrideJson().isBlank()) {
-            stateStore.clearTasks(run.getId());
-            stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
+        if (schedulerVersionPolicy != null && dualPoolRunAdmissionRegistry != null
+                && schedulerVersionPolicy.isDualPool(run)
+                && !dualPoolRunAdmissionRegistry.isKnownInCurrentProcess(run.getId())) {
+            throw new IllegalStateException(
+                    "双池 Run 来自本次进程启动之前，不能自动恢复；请新建 Run");
         }
-        disposePausedAnchorBeforeResume(run);
-        if (runMapper.resetForResume(
-                run.getId(), run.getUserId(), agentEventService.nextTtlExpiresAt()) != 1) {
-            throw new IllegalStateException("Run 状态已变化，无法恢复到待执行");
+        boolean dualPoolRun = schedulerVersionPolicy != null
+                && dualPoolRunAdmissionRegistry != null
+                && schedulerVersionPolicy.isDualPool(run);
+        DualPoolRunAdmissionRegistry.Admission dualPoolReservation = null;
+        if (dualPoolRun) {
+            dualPoolReservation = dualPoolRunAdmissionRegistry.admitExistingRunWithLease(run.getId());
+            if (!dualPoolReservation.admitted()) {
+                throw new IllegalStateException("双池业务准入名额已满，请稍后重试");
+            }
         }
-        agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
-                "run_id", run.getId(),
-                "engine", "agentLangchainService"));
-        stateStore.markRunStatus(run.getId(), AgentRunStatus.RECEIVED.name());
-        AgentRun refreshed = runMapper.findByIdAndUser(run.getId(), run.getUserId());
-        if (refreshed == null) {
-            throw new IllegalStateException("恢复领取后无法读取 Run");
+        boolean durableReceived = false;
+        try {
+            rejectUnsettledCanceledSqlSessionBeforeResume(run);
+            disposePausedAnchorBeforeResume(run);
+            if (request.getPlanOverrideJson() != null && !request.getPlanOverrideJson().isBlank()) {
+                stateStore.clearTasks(run.getId());
+                stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
+            }
+            if (runMapper.resetForResume(
+                    run.getId(), run.getUserId(), agentEventService.nextTtlExpiresAt()) != 1) {
+                throw new IllegalStateException("Run 状态已变化，无法恢复到待执行");
+            }
+            if (dualPoolReservation != null && dualPoolReservation.admitted()
+                    && !dualPoolRunAdmissionRegistry.activateReservedAdmission(
+                    run.getId(), dualPoolReservation)) {
+                throw new IllegalStateException("恢复已落库，但双池准入预留无法激活");
+            }
+            // 数据库状态已经进入 RECEIVED。后续辅助状态或提示投递即使失败，也不能释放
+            // 双池业务名额；保留准入后，数据库扫描仍能把这条 Run 重新交给协调池。
+            durableReceived = true;
+            agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
+                    "run_id", run.getId(),
+                    "engine", "agentLangchainService"));
+            stateStore.markRunStatus(run.getId(), AgentRunStatus.RECEIVED.name());
+            AgentRun refreshed = runMapper.findByIdAndUser(run.getId(), run.getUserId());
+            if (refreshed == null) {
+                throw new IllegalStateException("恢复领取后无法读取 Run");
+            }
+            // 这一行把 Run 重新交给全局调度闸门：线程池有空位就立刻执行，满了就进有界优先级
+            // 队列排队；手动恢复和长工具自动恢复走的是同一个调度入口。调度器和队列都满时
+            // 这一行会直接抛「队列已满」异常，调用方收到失败，不会阻塞等待。
+            pipeline.launchAsync(refreshed);
+            return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
+        } catch (RuntimeException e) {
+            if (dualPoolReservation != null && dualPoolReservation.admitted() && !durableReceived) {
+                dualPoolRunAdmissionRegistry.rollbackReservedAdmission(
+                        run.getId(), dualPoolReservation);
+            }
+            throw e;
         }
-        // 这一行把 Run 重新交给全局调度闸门：线程池有空位就立刻执行，满了就进有界优先级
-        // 队列排队；手动恢复和长工具自动恢复走的是同一个调度入口。调度器和队列都满时
-        // 这一行会直接抛「队列已满」异常，调用方收到失败，不会阻塞等待。
-        pipeline.launchAsync(refreshed);
-        return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
+    }
+
+    /** 取消SQL成员尚未收尾时，不能先修改恢复计划或重新启动同一Run。 */
+    private void rejectUnsettledCanceledSqlSessionBeforeResume(AgentRun run) {
+        if (!"DUAL_POOL_V2".equals(run.getSchedulerVersion())) return;
+        ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+        if (anchor != null && "executeQuery".equals(anchor.getToolName())
+                && "CANCELED".equals(anchor.getRunDisposition())
+                && anchor.getOperationId() != null && !anchor.getOperationId().isBlank()) {
+            throw new IllegalStateException("SQL查询取消仍在收尾，请在原会话清理后重试恢复");
+        }
     }
 
     /**
@@ -376,6 +533,11 @@ public class LangchainRunControlService {
                 || anchor.getOperationId().isBlank()) {
             return;
         }
+        if ("PREPARING".equals(anchor.getAnchorState())
+                || "WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+            throw new IllegalStateException(
+                    "Python workspace call is still being settled: retry resume after cleanup");
+        }
         if (!ToolJobRunDisposition.PAUSED.equals(anchor.getRunDisposition())) {
             return;
         }
@@ -423,11 +585,10 @@ public class LangchainRunControlService {
                 || status == AgentRunStatus.EXPIRED;
     }
 
-    /** RECEIVED / PLANNING / EXECUTING / SUMMARIZING 均为运行中可中断状态 */
-    private boolean isRunning(AgentRunStatus status) {
-        return status == AgentRunStatus.RECEIVED
-                || status == AgentRunStatus.PLANNING
-                || status == AgentRunStatus.EXECUTING
-                || status == AgentRunStatus.SUMMARIZING;
+    private void rejectDirectChildControl(AgentRun run) {
+        if (run != null && runMapper.isChildRun(run.getId())) {
+            throw new IllegalStateException("子代理是内部执行记录，请通过父 Run 管理");
+        }
     }
+
 }

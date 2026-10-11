@@ -15,16 +15,19 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -81,6 +84,59 @@ class LangchainRunControlServiceTest {
     }
 
     @Test
+    void publicControlsDoNotPauseResumeOrDeleteInternalChild() {
+        when(readService.requireWritableRun("r1", "u1"))
+                .thenReturn(run(AgentRunStatus.CANCELED));
+        when(runMapper.isChildRun("r1")).thenReturn(true);
+
+        assertThrows(IllegalStateException.class, () ->
+                service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+        assertThrows(IllegalStateException.class, () -> service.resumeRun(resumeRequest()));
+        assertThrows(IllegalStateException.class, () ->
+                service.deleteRun(DeleteAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+        verify(runMapper, never()).deleteByIdAndUser(anyString(), anyString());
+    }
+
+    @Test
+    void deleteKeepsDatabaseRowsWhenSandboxCoordinatorIsUnavailable() {
+        AgentRunFamilyDeletionService family = mock(AgentRunFamilyDeletionService.class);
+        ReflectionTestUtils.setField(service, "familyDeletionService", family);
+        when(readService.requireWritableRun("r1", "u1"))
+                .thenReturn(run(AgentRunStatus.COMPLETED));
+        when(family.beginDeletion("r1", "u1"))
+                .thenReturn(new AgentRunFamilyDeletionService.DeletionPlan(
+                        List.of("r1"), List.of("r1")));
+
+        assertThrows(IllegalStateException.class, () -> service.deleteRun(
+                DeleteAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        verify(family).beginDeletion("r1", "u1");
+        verify(family, never()).finishDeletionAfterResourcesConfirmed(anyString(), anyString(), anyList());
+        verify(stateStore, never()).clear(anyString());
+    }
+
+    @Test
+    void disabledWorkspaceRunDeletesWithoutCallingSandboxCoordinator() {
+        AgentRunFamilyDeletionService family = mock(AgentRunFamilyDeletionService.class);
+        ReflectionTestUtils.setField(service, "familyDeletionService", family);
+        when(readService.requireWritableRun("r1", "u1"))
+                .thenReturn(run(AgentRunStatus.COMPLETED));
+        when(family.beginDeletion("r1", "u1"))
+                .thenReturn(new AgentRunFamilyDeletionService.DeletionPlan(
+                        List.of("r1"), List.of()));
+        when(family.finishDeletionAfterResourcesConfirmed("r1", "u1", List.of("r1")))
+                .thenReturn(List.of("r1"));
+
+        service.deleteRun(DeleteAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        verify(family).beginDeletion("r1", "u1");
+        verify(family).finishDeletionAfterResourcesConfirmed("r1", "u1", List.of("r1"));
+        verify(stateStore).clear("r1");
+    }
+
+    @Test
     void cancelFlushesObservabilityAndMarksCanceled() {
         AgentRun running = run(AgentRunStatus.EXECUTING);
         AgentRun canceled = run(AgentRunStatus.CANCELED);
@@ -130,9 +186,10 @@ class LangchainRunControlServiceTest {
     @Test
     void cancelPersistenceMismatchDoesNotPublish() {
         AgentRun running = run(AgentRunStatus.EXECUTING);
-        AgentRun refreshed = run(AgentRunStatus.EXECUTING);
+        AgentRun refreshed = run(AgentRunStatus.COMPLETED);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(running, refreshed, refreshed);
         when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
-        when(readService.requireReadableRun("r1", "u1")).thenReturn(refreshed);
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
@@ -144,12 +201,50 @@ class LangchainRunControlServiceTest {
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
-        assertEquals("EXECUTING", response.getStatus());
+        assertEquals("COMPLETED", response.getStatus());
         verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
         verify(eventService, never()).append(anyString(), anyString(), eq("CANCELED"), anyMap());
         verify(stateStore, never()).markRunStatus("r1", AgentRunStatus.CANCELED.name());
         verify(stateStore).markRunStatus("r1", AgentRunStatus.CANCELING.name());
-        verify(stateStore).markRunStatus("r1", AgentRunStatus.EXECUTING.name());
+        verify(stateStore).markRunStatus("r1", AgentRunStatus.COMPLETED.name());
+    }
+
+    @Test
+    void cancelRechecksNewToolJobOwnerBeforeEndingRun() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        AgentRun waiting = run(AgentRunStatus.WAITING_TOOL_JOB);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running, waiting);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(waiting);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(running, waiting);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        ToolJobAnchor claimed = new ToolJobAnchor();
+        claimed.setOperationId("r1:tc-1:1");
+        AtomicReference<ToolJobAnchor> durableAnchor = new AtomicReference<>();
+        when(anchorService.loadAnchor("r1")).thenAnswer(ignored -> durableAnchor.get());
+        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
+                .thenAnswer(ignored -> {
+                    // The worker claimed PREPARING after the first anchor read. PostgreSQL's
+                    // empty-anchor condition rejects the ordinary terminal cancellation.
+                    durableAnchor.set(claimed);
+                    return 0;
+                });
+        when(anchorService.persistCancelDisposition(
+                "r1", "r1:tc-1:1", AgentRunStatus.WAITING_TOOL_JOB)).thenReturn(true);
+
+        var response = service.cancelRun(
+                CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verify(runMapper, times(1)).cancelTerminalSnapshotWithTtl(
+                eq("r1"), eq("u1"), anyString(), any());
+        verify(anchorService).persistCancelDisposition(
+                "r1", "r1:tc-1:1", AgentRunStatus.WAITING_TOOL_JOB);
+        verify(runMapper).updateSnapshotIfStatus(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB), anyString());
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
     }
 
     @Test
@@ -227,6 +322,64 @@ class LangchainRunControlServiceTest {
         assertTrue(ex.getMessage().contains("still in flight"));
         verify(runMapper, never()).resetForResume(
                 anyString(), anyString(), any());
+        verify(pipeline, never()).launchAsync(any());
+    }
+
+    @Test
+    void resumeWaitsForWorkspaceRefusalToReleaseCapacityAndClearAnchor() {
+        AgentRun waiting = run(AgentRunStatus.WAITING);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(waiting);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("r1:tc-1:1");
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        when(anchorService.loadAnchor("r1")).thenReturn(anchor);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> service.resumeRun(resumeRequest()));
+
+        assertTrue(error.getMessage().contains("still being settled"));
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+        verify(pipeline, never()).launchAsync(any());
+    }
+
+    @Test
+    void refusedResumeWithPlanOverrideDoesNotAlterStoredTasksOrPlan() {
+        AgentRun waiting = run(AgentRunStatus.WAITING);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(waiting);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("r1:tc-1:1");
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        when(anchorService.loadAnchor("r1")).thenReturn(anchor);
+        ResumeAgentRunRequest request = resumeRequest().toBuilder()
+                .setPlanOverrideJson("{\"steps\":[]}").build();
+
+        assertThrows(IllegalStateException.class, () -> service.resumeRun(request));
+
+        verify(stateStore, never()).clearTasks("r1");
+        verify(stateStore, never()).storePlanOverride(anyString(), anyString());
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+    }
+
+    @Test
+    void resumeWaitsForUnresolvedPreparingCallBeforeRefusalIsRecorded() {
+        AgentRun failed = run(AgentRunStatus.FAILED);
+        when(runMapper.findByIdAndUserForDeployment("r1", "u1", "stable", GENERATION))
+                .thenReturn(failed);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(failed);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("r1:tc-1:1");
+        anchor.setAnchorState("PREPARING");
+        when(anchorService.loadAnchor("r1")).thenReturn(anchor);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> service.resumeRun(resumeRequest()));
+
+        assertTrue(error.getMessage().contains("still being settled"));
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
         verify(pipeline, never()).launchAsync(any());
     }
 

@@ -21,6 +21,28 @@ public class AgentRun {
     private String deploymentGenerationId;
     /** 创建请求携带的泳道标签；主 Beta 和生产流量为 null。 */
     private String laneTag;
+    /**
+     * 这个 Run 冻结的调度器版本，创建时一次写死、之后不再改；取值只有 LEGACY 与 DUAL_POOL_V1。
+     * 库里是原始字符串，读出来必须显式经过 {@code SchedulerVersion.fromWire}，未知取值失败关闭。
+     */
+    private String schedulerVersion;
+    /**
+     * 创建请求携带的幂等键；只在用户范围内唯一，不携带时为 null。
+     *
+     * <p>同一个用户拿同一个键重复提交时读回原来那条 Run，不会再建第二条。历史 Run 只把键写在
+     * {@code ext.idempotency_key} 里，这一列不做事后回填。</p>
+     */
+    private String idempotencyKey;
+    /**
+     * 创建请求内容的摘要；与幂等键成对出现。
+     *
+     * <p>同一个键配同一个摘要读回原 Run，配不同摘要直接拒绝，两种情况都不会新建第二条 Run。</p>
+     */
+    private String requestDigest;
+    /** 当前已经分配到的计划代际；尚未创建双池计划时为 -1。 */
+    private Integer planGeneration;
+    /** 暂停、恢复、取消等控制动作的持久版本；节点提交必须与当前值一致。 */
+    private Long runControlVersion;
     /** 当前 Run 状态；WAITING_TOOL_JOB 表示内存 worker 已退出、但外部作业仍拥有后续恢复权。 */
     private AgentRunStatus status;
     private Integer currentStep;
@@ -35,6 +57,10 @@ public class AgentRun {
     private OffsetDateTime startedAt;
     private OffsetDateTime updatedAt;
     private OffsetDateTime completedAt;
+    /** 工作区自动清理已封住本 Run；沙箱发现新活动时可以撤销。 */
+    private OffsetDateTime workspaceCleanupStartedAt;
+    /** 沙箱确认删除工作区后的永久过期事实。 */
+    private OffsetDateTime workspaceExpiredAt;
     private String ext; // JSON string
     /**
      * 工作流级粗粒度恢复检查点。它只描述冻结 Plan 的执行边界，不保存长工具任务身份，

@@ -64,4 +64,43 @@ class CodeRefineLocalConfigLoaderTest {
                 eq(Duration.ofSeconds(30))
         );
     }
+
+    @Test
+    void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath() throws Exception {
+        Path shared = tempDir.resolve("code-refine.local.json");
+        Path isolated = shared.getParent().resolve("stage3-dag-0922.code-refine.local.json");
+        Files.writeString(shared, "{\"maxAttempts\": 1}");
+        Files.writeString(isolated, "{\"maxAttempts\": 9}");
+
+        CodeRefineProperties properties = new CodeRefineProperties();
+        properties.setConfigFile(shared.toString());
+        CodeRefineLocalConfigLoader loader = new CodeRefineLocalConfigLoader(
+                new ObjectMapper(), (StringRedisTemplate) null, properties);
+        ReflectionTestUtils.setField(loader, "laneTrafficScopeId", "stage3-dag-0922");
+
+        loader.applyNacosWrittenFile(shared.toString());
+        assertTrue(loader.current().isEmpty(), "共用路径上的主环境缓存不得被泳道加载器当成覆盖");
+
+        loader.applyNacosWrittenFile(isolated.toString());
+        assertEquals(9, loader.current().orElseThrow().getMaxAttempts());
+        loader.refresh();
+        assertEquals(9, loader.current().orElseThrow().getMaxAttempts());
+    }
+
+    @Test
+    void snakeCaseApplicationMapper_stillBindsCamelCaseMaxAttempts() throws Exception {
+        Path configFile = tempDir.resolve("code-refine.local.json");
+        Files.writeString(configFile, "{\"maxAttempts\": 5}");
+
+        ObjectMapper snake = new ObjectMapper()
+                .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+        CodeRefineProperties properties = new CodeRefineProperties();
+        properties.setConfigFile(configFile.toString());
+        CodeRefineLocalConfigLoader loader = new CodeRefineLocalConfigLoader(
+                snake, (StringRedisTemplate) null, properties);
+
+        loader.load();
+
+        assertEquals(5, loader.current().orElseThrow().getMaxAttempts());
+    }
 }

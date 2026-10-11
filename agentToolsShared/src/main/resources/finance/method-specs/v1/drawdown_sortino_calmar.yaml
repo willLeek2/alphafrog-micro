@@ -1,0 +1,54 @@
+schemaVersion: "1"
+methodId: finance.risk.drawdown_sortino_calmar
+version: 1.0.0
+displayName: 最大回撤与Sortino与Calmar
+definition: 价格序列（股票/ETF 用复权收盘、指数用收盘、公募用累计净值）的三个风险指标：最大回撤（区间内相对历史峰值的最大跌幅）；Sortino 与现有夏普同一套超额收益定义、下行偏差只统计负超额（样本标准差 ddof=1）后年化；Calmar = 区间复合收益 / 绝对最大回撤。负超额不足两期不输出 Sortino，区间无回撤（maxDD=0）不输出 Calmar。复权因子可选传入方法内相乘，缺因子日与无行情日分开跳过。
+resolverHints:
+  aliases: [最大回撤, 回撤, Sortino, Calmar]
+  commonPhrases: [最惨的时候跌多少, 下行风险调整后的收益]
+  clarificationDimensions:
+    - id: assetAndRange
+      question: 哪个标的、哪个日期区间
+    - id: riskFree
+      question: 无风险利率取值与口径（年化或每期）
+parameters:
+  prices:
+    type: array
+    required: true
+    meaning: 按日期升序排列的价格或净值序列，无行情日传 null
+  riskFreeRate:
+    type: number
+    required: false
+    default: 0
+    meaning: 无风险利率数值
+  riskFreeRateConvention:
+    type: string
+    required: false
+    default: annual
+    enum: [annual, period]
+    meaning: annual 表示年化值按 periodsPerYear 折算到每期，period 表示每期值直接使用
+  periodsPerYear:
+    type: integer
+    required: false
+    default: 252
+    minimum: 1
+    meaning: 每年包含的期数
+  adjFactors:
+    type: array
+    required: false
+    meaning: 与 prices 等长的复权因子序列（股票/ETF 传入），缺值传 null；指数与公募不传
+conventions:
+  drawdown_downside_annualized:
+    canonicalPath: 峰值回撤 + 负超额下行偏差（ddof=1）+ 复合收益除以绝对回撤
+    returnType: ratio 与 ratio_per_annum
+    narrativeTemplate: 最大回撤取区间内相对历史峰值的最大跌幅；Sortino 按 {periodsPerYear} 期年化、下行偏差只统计负超额（样本标准差 ddof=1）、无风险利率 {riskFreeRate}（{riskFreeRateConvention} 口径）；Calmar 为区间复合收益除以绝对最大回撤
+outputs:
+  - {name: maxDrawdown, unit: ratio, description: 区间最大回撤（非正值）, displayFormat: percent}
+  - {name: sortino, unit: ratio_per_annum, description: 年化 Sortino 比率, displayFormat: number}
+  - {name: calmar, unit: ratio_per_annum, description: 年化 Calmar 比率, displayFormat: number}
+libraryBinding:
+  package: alphafrog_finance
+  function: drawdown_sortino_calmar
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.risk.drawdown_sortino_calmar@1.0.0

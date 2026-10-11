@@ -154,6 +154,10 @@ public class AgentLlmProperties {
     public static class Agent {
         @JsonAlias({"call-raw-content", "call_raw_content"})
         private CallRawContent callRawContent = new CallRawContent();
+        @JsonAlias({"python-workspace", "python_workspace"})
+        private PythonWorkspace pythonWorkspace = new PythonWorkspace();
+        @JsonAlias({"python-risk-review", "python_risk_review"})
+        private PythonRiskReview pythonRiskReview = new PythonRiskReview();
         private Workspace workspace = new Workspace();
         private Dataset dataset = new Dataset();
 
@@ -163,6 +167,22 @@ public class AgentLlmProperties {
 
         public void setCallRawContent(CallRawContent callRawContent) {
             this.callRawContent = callRawContent == null ? new CallRawContent() : callRawContent;
+        }
+
+        public PythonWorkspace getPythonWorkspace() {
+            return pythonWorkspace;
+        }
+
+        public void setPythonWorkspace(PythonWorkspace pythonWorkspace) {
+            this.pythonWorkspace = pythonWorkspace == null ? new PythonWorkspace() : pythonWorkspace;
+        }
+
+        public PythonRiskReview getPythonRiskReview() {
+            return pythonRiskReview;
+        }
+
+        public void setPythonRiskReview(PythonRiskReview pythonRiskReview) {
+            this.pythonRiskReview = pythonRiskReview == null ? new PythonRiskReview() : pythonRiskReview;
         }
 
         public Workspace getWorkspace() {
@@ -180,6 +200,47 @@ public class AgentLlmProperties {
         public void setDataset(Dataset dataset) {
             this.dataset = dataset == null ? new Dataset() : dataset;
         }
+    }
+
+    /** 新 Run 是否启用 Python 持久工作区；null 表示沿用应用配置。 */
+    public static class PythonWorkspace {
+        private Boolean enabled;
+        /** 从最后一次活跃算起的保存时长，最短 24 小时。 */
+        @JsonAlias({"retention-hours", "retention_hours"})
+        private Integer retentionHours = 24;
+
+        public Boolean getEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(Boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public Integer getRetentionHours() {
+            return retentionHours;
+        }
+
+        public void setRetentionHours(Integer retentionHours) {
+            this.retentionHours = retentionHours;
+        }
+    }
+
+    /** 每次 Python 调用读取一次；关闭时不调用模型，仍保存本次直通决定。 */
+    public static class PythonRiskReview {
+        private Boolean enabled = false;
+        private String endpointName;
+        private String modelName;
+        private Integer threshold;
+
+        public Boolean getEnabled() { return enabled; }
+        public void setEnabled(Boolean enabled) { this.enabled = enabled; }
+        public String getEndpointName() { return endpointName; }
+        public void setEndpointName(String endpointName) { this.endpointName = endpointName; }
+        public String getModelName() { return modelName; }
+        public void setModelName(String modelName) { this.modelName = modelName; }
+        public Integer getThreshold() { return threshold; }
+        public void setThreshold(Integer threshold) { this.threshold = threshold; }
     }
 
     public static class CallRawContent {
@@ -608,6 +669,9 @@ public class AgentLlmProperties {
         private RunBudget runBudget = new RunBudget();
         private FinalAnswerStage finalAnswer = new FinalAnswerStage();
         private Request request = new Request();
+        private Scheduler scheduler = new Scheduler();
+        @JsonAlias({"observability-events", "observability_events"})
+        private ObservabilityEventsSettings observabilityEvents = new ObservabilityEventsSettings();
 
         public Resume getResume() {
             return resume;
@@ -695,6 +759,214 @@ public class AgentLlmProperties {
 
         public void setRequest(Request request) {
             this.request = request == null ? new Request() : request;
+        }
+
+        public Scheduler getScheduler() {
+            return scheduler;
+        }
+
+        public void setScheduler(Scheduler scheduler) {
+            this.scheduler = scheduler == null ? new Scheduler() : scheduler;
+        }
+
+        public ObservabilityEventsSettings getObservabilityEvents() {
+            return observabilityEvents;
+        }
+
+        public void setObservabilityEvents(ObservabilityEventsSettings observabilityEvents) {
+            this.observabilityEvents = observabilityEvents == null ? new ObservabilityEventsSettings() : observabilityEvents;
+        }
+    }
+
+    /**
+     * 结构化可观测事件上报的开关（合同里的「日志事件」切面）。
+     *
+     * <p>整份热配置运行时热更，泳道覆盖只影响该泳道；字段可空：没写时按「环境属性 → 代码默认（关）」
+     * 回落。{@code world.willfrog.agent.platform.observability.ObservabilityEvents} 每报一条取一次，
+     * 所以改完下一轮上报就生效。</p>
+     */
+    public static class ObservabilityEventsSettings {
+
+        private Boolean enabled;
+
+        public Boolean getEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(Boolean enabled) {
+            this.enabled = enabled;
+        }
+    }
+
+    /**
+     * 双池调度里那些「不重启也能改」的参数。
+     *
+     * <p>这一组走热配置（Nacos 的 {@code agent-llm}，泳道覆盖只影响该泳道），字段全部可空：
+     * 没写的按「环境属性 → 代码默认」回落。读它们的组件每用一次取一次，所以改完下一轮就生效。</p>
+     *
+     * <p>池大小、许可上限、线程名前缀这类只能在启动时生效的参数不在这里——它们由环境属性决定，
+     * 改完要重启，运行时的读数会标明这一点。</p>
+     */
+    public static class Scheduler {
+        @JsonAlias({"newRunSchedulerVersion", "new-run-scheduler-version", "new_run_scheduler_version"})
+        private String newRunSchedulerVersion;
+        @JsonAlias({"per-turn-new-node-limit", "per_turn_new_node_limit"})
+        private Integer perTurnNewNodeLimit;
+        @JsonAlias({"per-run-unfinished-limit", "per_run_unfinished_limit"})
+        private Integer perRunUnfinishedLimit;
+        @JsonAlias({"global-unfinished-high-watermark", "global_unfinished_high_watermark"})
+        private Integer globalUnfinishedHighWatermark;
+        @JsonAlias({"global-unfinished-low-watermark", "global_unfinished_low_watermark"})
+        private Integer globalUnfinishedLowWatermark;
+        @JsonAlias({"wait-group-max-members", "wait_group_max_members"})
+        private Integer waitGroupMaxMembers;
+        @JsonAlias({"recovery-batch-size", "recovery_batch_size"})
+        private Integer recoveryBatchSize;
+        @JsonAlias({"recovery-scan-quota", "recovery_scan_quota"})
+        private Integer recoveryScanQuota;
+        @JsonAlias({"recovery-wakeup-capacity", "recovery_wakeup_capacity"})
+        private Integer recoveryWakeupCapacity;
+        @JsonAlias({"recovery-startup-pages", "recovery_startup_pages"})
+        private Integer recoveryStartupPages;
+        @JsonAlias({"recovery-backoff-base-ms", "recovery_backoff_base_ms"})
+        private Long recoveryBackoffBaseMs;
+        @JsonAlias({"recovery-backoff-max-ms", "recovery_backoff_max_ms"})
+        private Long recoveryBackoffMaxMs;
+        @JsonAlias({"member-receiver-batch-size", "member_receiver_batch_size"})
+        private Integer memberReceiverBatchSize;
+        @JsonAlias({"member-receiver-backoff-base-ms", "member_receiver_backoff_base_ms"})
+        private Long memberReceiverBackoffBaseMs;
+        @JsonAlias({"member-receiver-backoff-max-ms", "member_receiver_backoff_max_ms"})
+        private Long memberReceiverBackoffMaxMs;
+        @JsonAlias({"member-receiver-max-backoff-step", "member_receiver_max_backoff_step"})
+        private Integer memberReceiverMaxBackoffStep;
+
+        public String getNewRunSchedulerVersion() {
+            return newRunSchedulerVersion;
+        }
+
+        public void setNewRunSchedulerVersion(String newRunSchedulerVersion) {
+            this.newRunSchedulerVersion = newRunSchedulerVersion;
+        }
+
+        public Integer getPerTurnNewNodeLimit() {
+            return perTurnNewNodeLimit;
+        }
+
+        public void setPerTurnNewNodeLimit(Integer perTurnNewNodeLimit) {
+            this.perTurnNewNodeLimit = perTurnNewNodeLimit;
+        }
+
+        public Integer getPerRunUnfinishedLimit() {
+            return perRunUnfinishedLimit;
+        }
+
+        public void setPerRunUnfinishedLimit(Integer perRunUnfinishedLimit) {
+            this.perRunUnfinishedLimit = perRunUnfinishedLimit;
+        }
+
+        public Integer getGlobalUnfinishedHighWatermark() {
+            return globalUnfinishedHighWatermark;
+        }
+
+        public void setGlobalUnfinishedHighWatermark(Integer globalUnfinishedHighWatermark) {
+            this.globalUnfinishedHighWatermark = globalUnfinishedHighWatermark;
+        }
+
+        public Integer getGlobalUnfinishedLowWatermark() {
+            return globalUnfinishedLowWatermark;
+        }
+
+        public void setGlobalUnfinishedLowWatermark(Integer globalUnfinishedLowWatermark) {
+            this.globalUnfinishedLowWatermark = globalUnfinishedLowWatermark;
+        }
+
+        public Integer getWaitGroupMaxMembers() {
+            return waitGroupMaxMembers;
+        }
+
+        public void setWaitGroupMaxMembers(Integer waitGroupMaxMembers) {
+            this.waitGroupMaxMembers = waitGroupMaxMembers;
+        }
+
+        public Integer getRecoveryBatchSize() {
+            return recoveryBatchSize;
+        }
+
+        public void setRecoveryBatchSize(Integer recoveryBatchSize) {
+            this.recoveryBatchSize = recoveryBatchSize;
+        }
+
+        public Integer getRecoveryScanQuota() {
+            return recoveryScanQuota;
+        }
+
+        public void setRecoveryScanQuota(Integer recoveryScanQuota) {
+            this.recoveryScanQuota = recoveryScanQuota;
+        }
+
+        public Integer getRecoveryWakeupCapacity() {
+            return recoveryWakeupCapacity;
+        }
+
+        public void setRecoveryWakeupCapacity(Integer recoveryWakeupCapacity) {
+            this.recoveryWakeupCapacity = recoveryWakeupCapacity;
+        }
+
+        public Integer getRecoveryStartupPages() {
+            return recoveryStartupPages;
+        }
+
+        public void setRecoveryStartupPages(Integer recoveryStartupPages) {
+            this.recoveryStartupPages = recoveryStartupPages;
+        }
+
+        public Long getRecoveryBackoffBaseMs() {
+            return recoveryBackoffBaseMs;
+        }
+
+        public void setRecoveryBackoffBaseMs(Long recoveryBackoffBaseMs) {
+            this.recoveryBackoffBaseMs = recoveryBackoffBaseMs;
+        }
+
+        public Long getRecoveryBackoffMaxMs() {
+            return recoveryBackoffMaxMs;
+        }
+
+        public void setRecoveryBackoffMaxMs(Long recoveryBackoffMaxMs) {
+            this.recoveryBackoffMaxMs = recoveryBackoffMaxMs;
+        }
+
+        public Integer getMemberReceiverBatchSize() {
+            return memberReceiverBatchSize;
+        }
+
+        public void setMemberReceiverBatchSize(Integer memberReceiverBatchSize) {
+            this.memberReceiverBatchSize = memberReceiverBatchSize;
+        }
+
+        public Long getMemberReceiverBackoffBaseMs() {
+            return memberReceiverBackoffBaseMs;
+        }
+
+        public void setMemberReceiverBackoffBaseMs(Long memberReceiverBackoffBaseMs) {
+            this.memberReceiverBackoffBaseMs = memberReceiverBackoffBaseMs;
+        }
+
+        public Long getMemberReceiverBackoffMaxMs() {
+            return memberReceiverBackoffMaxMs;
+        }
+
+        public void setMemberReceiverBackoffMaxMs(Long memberReceiverBackoffMaxMs) {
+            this.memberReceiverBackoffMaxMs = memberReceiverBackoffMaxMs;
+        }
+
+        public Integer getMemberReceiverMaxBackoffStep() {
+            return memberReceiverMaxBackoffStep;
+        }
+
+        public void setMemberReceiverMaxBackoffStep(Integer memberReceiverMaxBackoffStep) {
+            this.memberReceiverMaxBackoffStep = memberReceiverMaxBackoffStep;
         }
     }
 
@@ -2485,6 +2757,10 @@ public class AgentLlmProperties {
         private Integer queueCapacity;
         private String threadNamePrefix;
         private ExecutorParallelConfig parallel;
+        // v1.3 示例配置里的文档性字段（说明 hard/current 改动何时需要滚动重启），
+        // 显式声明以免严格反序列化拒载整个示例文件；运行时不读取。
+        @com.fasterxml.jackson.annotation.JsonProperty("_restartNote")
+        private String restartNote;
 
         public Integer getCorePoolSize() {
             return corePoolSize;

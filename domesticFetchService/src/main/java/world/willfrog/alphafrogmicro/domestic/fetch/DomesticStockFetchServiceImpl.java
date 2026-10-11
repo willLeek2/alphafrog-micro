@@ -618,4 +618,211 @@ public class DomesticStockFetchServiceImpl extends DomesticStockFetchServiceImpl
         return DomesticStockDailyFetchAllByDateRangeResponse.newBuilder()
                 .setStatus("success").setFetchedItemsCount(result).build();
     }
+
+    // ==================== 指标库扩充新增：每日指标 / 复权因子 / 转债日线 / AH 比价 ====================
+
+    @Override
+    public DomesticDailyBasicFetchByTradeDateResponse fetchDailyBasicByTradeDate(
+            DomesticDailyBasicFetchByTradeDateRequest request
+    ) {
+        long tradeDateTimestamp = request.getTradeDate();
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        String tradeDate = DateConvertUtils.convertTimestampToString(tradeDateTimestamp, "yyyyMMdd");
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "daily_basic");
+        queryParams.put("trade_date", tradeDate);
+        queryParams.put("limit", limit);
+        queryParams.put("offset", offset);
+        // 每日指标接口返回的 close 不入库，收盘价用日线表已有 close 列
+        params.put("fields", "ts_code,trade_date,turnover_rate,turnover_rate_f,volume_ratio," +
+                "pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm," +
+                "total_share,float_share,free_share,total_mv,circ_mv,limit_status");
+        params.put("params", queryParams);
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticDailyBasicFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+        JSONArray fields = response.getJSONObject("data").getJSONArray("fields");
+
+        int result = domesticStockStoreUtils.storeDailyBasicByRawTuShareOutput(data, fields);
+
+        if (result < 0) {
+            return DomesticDailyBasicFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+        return DomesticDailyBasicFetchByTradeDateResponse.newBuilder().setStatus("success")
+                .setFetchedItemsCount(result).build();
+    }
+
+    @Override
+    public DomesticAdjFactorFetchByTradeDateResponse fetchAdjFactorByTradeDate(
+            DomesticAdjFactorFetchByTradeDateRequest request
+    ) {
+        long tradeDateTimestamp = request.getTradeDate();
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        String tradeDate = DateConvertUtils.convertTimestampToString(tradeDateTimestamp, "yyyyMMdd");
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "adj_factor");
+        queryParams.put("trade_date", tradeDate);
+        queryParams.put("limit", limit);
+        queryParams.put("offset", offset);
+        params.put("fields", "ts_code,trade_date,adj_factor");
+        params.put("params", queryParams);
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticAdjFactorFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+        JSONArray fields = response.getJSONObject("data").getJSONArray("fields");
+
+        int result = domesticStockStoreUtils.storeAdjFactorByRawTuShareOutput(data, fields);
+
+        if (result < 0) {
+            return DomesticAdjFactorFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+        return DomesticAdjFactorFetchByTradeDateResponse.newBuilder().setStatus("success")
+                .setFetchedItemsCount(result).build();
+    }
+
+    @Override
+    public DomesticCbDailyFetchByTradeDateResponse fetchCbDailyByTradeDate(
+            DomesticCbDailyFetchByTradeDateRequest request
+    ) {
+        long tradeDateTimestamp = request.getTradeDate();
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        String tradeDate = DateConvertUtils.convertTimestampToString(tradeDateTimestamp, "yyyyMMdd");
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "cb_daily");
+        queryParams.put("trade_date", tradeDate);
+        queryParams.put("limit", limit);
+        queryParams.put("offset", offset);
+        params.put("fields", "ts_code,trade_date,pre_close,open,high,low,close,change,pct_chg," +
+                "vol,amount,bond_value,bond_over_rate,cb_value,cb_over_rate");
+        params.put("params", queryParams);
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticCbDailyFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+        JSONArray fields = response.getJSONObject("data").getJSONArray("fields");
+
+        int result = domesticStockStoreUtils.storeCbDailyByRawTuShareOutput(data, fields);
+
+        if (result < 0) {
+            return DomesticCbDailyFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+        return DomesticCbDailyFetchByTradeDateResponse.newBuilder().setStatus("success")
+                .setFetchedItemsCount(result).build();
+    }
+
+    @Override
+    public DomesticStkAhFetchByTradeDateResponse fetchStkAhByTradeDate(
+            DomesticStkAhFetchByTradeDateRequest request
+    ) {
+        long tradeDateTimestamp = request.getTradeDate();
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        String tradeDate = DateConvertUtils.convertTimestampToString(tradeDateTimestamp, "yyyyMMdd");
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "stk_ah_comparison");
+        queryParams.put("trade_date", tradeDate);
+        queryParams.put("limit", limit);
+        queryParams.put("offset", offset);
+        params.put("fields", "ts_code,hk_code,trade_date,close,hk_close,pct_chg,hk_pct_chg," +
+                "ah_comparison,ah_premium");
+        params.put("params", queryParams);
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticStkAhFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+        JSONArray fields = response.getJSONObject("data").getJSONArray("fields");
+
+        int result = domesticStockStoreUtils.storeStkAhByRawTuShareOutput(data, fields);
+
+        if (result < 0) {
+            return DomesticStkAhFetchByTradeDateResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+        return DomesticStkAhFetchByTradeDateResponse.newBuilder().setStatus("success")
+                .setFetchedItemsCount(result).build();
+    }
+
+    // 4.15 财务指标爬取（fina_indicator_vip，按报告期）
+    // limit 默认 8000：一个报告期全市场约 5600 行（生产库 alphafrog_stock_info 实测 5601 只），
+    // 一页装得下；仍由 flow 配置的 offset_range 排页，个股数增长后不会静默截断。
+    @Override
+    public DomesticFinaIndicatorFetchByPeriodResponse fetchFinaIndicatorByPeriod(
+            DomesticFinaIndicatorFetchByPeriodRequest request) {
+
+        String period = request.getPeriod();
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "fina_indicator_vip");
+        queryParams.put("period", period);
+        queryParams.put("limit", limit > 0 ? limit : 8000);
+        queryParams.put("offset", offset);
+        params.put("params", queryParams);
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticFinaIndicatorFetchByPeriodResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+        JSONArray fields = response.getJSONObject("data").getJSONArray("fields");
+
+        int result = domesticStockStoreUtils.storeFinaIndicatorByRawTuShareOutput(data, fields);
+
+        if (result < 0) {
+            return DomesticFinaIndicatorFetchByPeriodResponse.newBuilder().setStatus("failure")
+                    .setFetchedItemsCount(-1).build();
+        }
+        return DomesticFinaIndicatorFetchByPeriodResponse.newBuilder().setStatus("success")
+                .setFetchedItemsCount(result).build();
+    }
 }

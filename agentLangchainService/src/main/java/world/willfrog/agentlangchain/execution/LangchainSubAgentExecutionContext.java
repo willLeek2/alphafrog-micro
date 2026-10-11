@@ -65,6 +65,7 @@ public final class LangchainSubAgentExecutionContext {
                 .planningModelName(source.getPlanningModelName())
                 .planningProviderOrder(source.getPlanningProviderOrder() == null
                         ? null : List.copyOf(source.getPlanningProviderOrder()))
+                .acceptanceReleasePolicy(source.getAcceptanceReleasePolicy())
                 .build();
     }
 

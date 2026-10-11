@@ -43,23 +43,83 @@ _PYPROJECT = os.path.join(_RUNTIME_DIR, "pyproject.toml")
 # Spec §6 frozen identities (>=3 gate).
 _FROZEN_IDS = frozenset(
     {
+        "finance.crossover.ah_premium",
+        "finance.forecast.forward_pe_peg",
         "finance.growth.cagr",
+        "finance.momentum.price_momentum",
+        "finance.quality.dupont_roe",
+        "finance.return.cb_daily_return",
+        "finance.return.etf_adj_return",
+        "finance.return.fund_accum_nav_return",
         "finance.risk.annualized_volatility",
+        "finance.risk.drawdown_sortino_calmar",
         "finance.risk.sharpe_ratio",
+        "finance.trend.moving_average",
+        "finance.valuation.cb_premium",
+        "finance.valuation.dividend_yield",
+        "finance.valuation.free_float_turnover",
+        "finance.valuation.index_pe_pb",
+        "finance.valuation.price_to_book",
+        "finance.valuation.rolling_pe",
     }
 )
 
 # Frozen Spec §6 digests, VERBATIM as delivered in A's final index.json /
 # resolver-catalog.json / spec files (codex 97ea103a).
 _FROZEN_SPEC_DIGESTS = {
+    "finance.crossover.ah_premium": (
+        "sha256:177a8c04110c31fc5c7a8e6f05f21cadfe9f56f4015cbbec2e245d15370611e3"
+    ),
+    "finance.forecast.forward_pe_peg": (
+        "sha256:f91c13bbb90f741f347b73788123fe51f718f3d2dbd8a097dbe5fb1997968226"
+    ),
     "finance.growth.cagr": (
         "sha256:cff05d88e83b787478edfd0252c414ded02b8236b9b1032126f5cd51c4d7b25e"
+    ),
+    "finance.momentum.price_momentum": (
+        "sha256:7628e0d4df23b4f89002bf0900ea52b1e471b4a780c756bdb7a0101429f4a3e2"
+    ),
+    "finance.quality.dupont_roe": (
+        "sha256:d73018ebeacf1bc1f465fce51b5005fb46f20009ae9440ae3b6c5252e9e30b09"
+    ),
+    "finance.return.cb_daily_return": (
+        "sha256:2bb39c43b399586ac7957e94eb7c773d632d38e4a96bb5f31b3ff8ea63f723e7"
+    ),
+    "finance.return.etf_adj_return": (
+        "sha256:3370e81c12c064cb00bf8953c7cad074136ca357d9d6697091113678b0bec8ab"
+    ),
+    "finance.return.fund_accum_nav_return": (
+        "sha256:53b7613839e145715964ae3777e400f9748a367b862400a3809794b52f41bed9"
     ),
     "finance.risk.annualized_volatility": (
         "sha256:2843745f0c4903083430ef0b4eef6be253b09a4c014c28decbf5884466f0d668"
     ),
+    "finance.risk.drawdown_sortino_calmar": (
+        "sha256:178380bd64306f323409394ac706782516847c39ea438cb58d48527992bb8c3b"
+    ),
     "finance.risk.sharpe_ratio": (
         "sha256:fccc1f0f9264dc90730f7a3b6a35abce2c6f2884c79a3e3b9ce0a7190058db90"
+    ),
+    "finance.trend.moving_average": (
+        "sha256:57d985c96639eeb72a1206bce503d4a57bf1caa83922f261f42779007198e823"
+    ),
+    "finance.valuation.cb_premium": (
+        "sha256:36597d40c478c978358e61325615a64290ac4a0ff36eeee96ac70577b78abf15"
+    ),
+    "finance.valuation.dividend_yield": (
+        "sha256:8c003d379da4532358c366a5a74f7ccbef854dabcf7588cad87fd959ab5eb3db"
+    ),
+    "finance.valuation.free_float_turnover": (
+        "sha256:a849e7ed36b10948dcfdbfffc671196fbc7b6cbfd60b8a76e72a030ef7a50564"
+    ),
+    "finance.valuation.index_pe_pb": (
+        "sha256:cb3e6ae575342747b74b21468a52f6c5352ef6dec4a467a6c345454cb24503c6"
+    ),
+    "finance.valuation.price_to_book": (
+        "sha256:924468f3ba30e8343d988d1e9b7cca6072b5df0be1bffafd3fbd46bfc0ccbf20"
+    ),
+    "finance.valuation.rolling_pe": (
+        "sha256:8b1e5c4dc7a2e3f46895f4907ff63043a4e20e6ab0f3b89bd86dbdfa9a85bcb3"
     ),
 }
 
@@ -67,7 +127,7 @@ _FROZEN_SPEC_DIGESTS = {
 # generator over the committed fixture dir must produce a method_specs.json
 # with EXACTLY this sha256. Any drift is a regression.
 _FROZEN_METHOD_SPECS_SHA256 = (
-    "1d3ef8ad56b42ec9fd15715389e5b3097e4469f7c8d1571ecd2bbb2d9f80ec6d"
+    "9c9c5d1a83c126fd2e7fa9b5b53a93b12077f0701681ab6980079944a40e29b6"
 )
 
 # Env gate for the live e2e run against A's final generated directory.
@@ -150,7 +210,7 @@ class GenerateMethodBindingsTests(unittest.TestCase):
         self.assertIsInstance(payload, dict)
         self.assertEqual(payload, {"methods": expected})
         self.assertEqual(set(payload["methods"]), _FROZEN_IDS)
-        self.assertEqual(len(payload["methods"]), 3)
+        self.assertEqual(len(payload["methods"]), 18)
         for entry in payload["methods"].values():
             self.assertEqual(set(entry), {"methodVersion", "specDigest"})
         # Direct loader-compat check: reporting._method_specs() must accept it.
@@ -168,9 +228,9 @@ class GenerateMethodBindingsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         with open(out, encoding="utf-8") as fh:
             payload = json.load(fh)
-        # Exactly 3 bindings, each carrying the frozen Spec §6 triple values
+        # Exactly 18 bindings, each carrying the frozen Spec §6 triple values
         # VERBATIM as delivered in A's final generated directory.
-        self.assertEqual(len(payload["methods"]), 3)
+        self.assertEqual(len(payload["methods"]), 18)
         for method_id, digest in _FROZEN_SPEC_DIGESTS.items():
             self.assertIn(method_id, payload["methods"])
             self.assertEqual(payload["methods"][method_id]["specDigest"], digest)
@@ -190,7 +250,7 @@ class GenerateMethodBindingsTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(_sha256_file(out1), _sha256_file(out2))
         with open(out1, encoding="utf-8") as fh:
-            self.assertEqual(len(json.load(fh)["methods"]), 3)
+            self.assertEqual(len(json.load(fh)["methods"]), 18)
 
     def test_byte_deterministic_serialization(self):
         first, out1 = self._generate(out_name="first.json")
@@ -220,7 +280,7 @@ class GenerateMethodBindingsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = result.stdout.strip()
         self.assertEqual(summary.count("\n"), 0)  # one line
-        self.assertIn("3 method spec(s)", summary)
+        self.assertIn("18 method spec(s)", summary)
         for method_id in sorted(_FROZEN_IDS):
             self.assertIn(method_id, summary)
         self.assertIn(out, summary)
@@ -847,7 +907,7 @@ class LiveAFinalGeneratedDirTests(unittest.TestCase):
         with open(live_out, encoding="utf-8") as fh:
             payload = json.load(fh)
         self.assertEqual(set(payload["methods"]), _FROZEN_IDS)
-        self.assertEqual(len(payload["methods"]), 3)
+        self.assertEqual(len(payload["methods"]), 18)
         self.assertEqual(_sha256_file(live_out), _sha256_file(fixture_out))
         # The two new outputs must ALSO be byte-identical live vs fixture.
         self.assertEqual(_sha256_file(live_doc), _sha256_file(fixture_doc))

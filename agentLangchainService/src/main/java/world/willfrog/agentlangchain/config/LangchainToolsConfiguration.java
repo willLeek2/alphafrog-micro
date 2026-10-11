@@ -3,18 +3,22 @@ package world.willfrog.agentlangchain.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.service.tool.ToolProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
+import world.willfrog.agentlangchain.execution.PersistentSubAgentToolBridge;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 
 /**
@@ -32,26 +36,32 @@ public class LangchainToolsConfiguration {
                                        RagTools ragTools,
                                        SearchTools searchTools,
                                        PythonSandboxTools pythonSandboxTools,
+                                       SqlQueryTools sqlQueryTools,
                                        ListMyDataTool listMyDataTool,
                                        LoadToolGuideTool loadToolGuideTool,
                                        RereadToolHandler rereadToolHandler,
                                        ObjectMapper objectMapper,
                                        AgentRunEventService eventService,
                                        LangchainToolConcurrencyThrottle toolThrottle,
-                                       PythonSandboxDispatchStore pythonSandboxDispatchStore) {
+                                       PythonSandboxDispatchStore pythonSandboxDispatchStore,
+                                       ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
+                                       AgentPromptService promptService) {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 listMyDataTool,
                 loadToolGuideTool,
                 rereadToolHandler,
                 objectMapper,
                 eventService,
                 toolThrottle,
-                pythonSandboxDispatchStore
+                pythonSandboxDispatchStore,
+                subAgentBridge,
+                promptService
         );
     }
 }

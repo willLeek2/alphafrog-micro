@@ -580,6 +580,106 @@ class FinanceResultComposerTest {
         assertThat(result).contains("12.34%");
     }
 
+    // ========== 显示格式：多输出规格的 output 键定位（与投影器同一套规则） ==========
+
+    @Test
+    void append_shouldFormatMultiOutputRecordByOutputKey() {
+        FinanceMetricRecord record = renderableRecord("rec-1", 0).toBuilder()
+                .valueJson("0.1234")
+                .parametersJson("{\"ts_code\":\"000300.SH\",\"output\":\"maxDrawdown\"}")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(record));
+        when(specCatalog.find("tushare_index_daily", "1.0.0", "0123456789abcdef"))
+                .thenReturn(Optional.of(multiOutputSpec()));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "");
+
+        // 命中 maxDrawdown 输出（列表第二个）的 percent 格式；第一个输出 sharpe 无格式，
+        // 能取到 12.34% 证明定位不是盲取第一个
+        assertThat(result).contains("12.34%");
+    }
+
+    @Test
+    void append_shouldUseNoFormatWhenMultiOutputRecordMissingOutputKey() {
+        FinanceMetricRecord record = renderableRecord("rec-1", 0).toBuilder()
+                .valueJson("0.1234")
+                .build(); // parametersJson 用默认值，只带 ts_code，无 output 键
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(record));
+        when(specCatalog.find("tushare_index_daily", "1.0.0", "0123456789abcdef"))
+                .thenReturn(Optional.of(multiOutputSpec()));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "");
+
+        assertThat(result).contains("| 0.1234 |");
+        assertThat(result).doesNotContain("%");
+    }
+
+    @Test
+    void append_shouldUseNoFormatWhenMultiOutputRecordHasUnknownOutputName() {
+        FinanceMetricRecord record = renderableRecord("rec-1", 0).toBuilder()
+                .valueJson("0.1234")
+                .parametersJson("{\"ts_code\":\"000300.SH\",\"output\":\"bogusOutput\"}")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(record));
+        when(specCatalog.find("tushare_index_daily", "1.0.0", "0123456789abcdef"))
+                .thenReturn(Optional.of(multiOutputSpec()));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "");
+
+        assertThat(result).contains("| 0.1234 |");
+        assertThat(result).doesNotContain("%");
+    }
+
+    @Test
+    void append_shouldUseNoFormatWhenMultiOutputRecordOutputKeyNotStringOrBlank() {
+        FinanceMetricRecord notString = renderableRecord("rec-not-string", 0).toBuilder()
+                .valueJson("0.1234")
+                .parametersJson("{\"ts_code\":\"000300.SH\",\"output\":7}")
+                .build();
+        FinanceMetricRecord blank = renderableRecord("rec-blank", 1).toBuilder()
+                .valueJson("0.5678")
+                .parametersJson("{\"ts_code\":\"000300.SH\",\"output\":\"   \"}")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(notString, blank));
+        when(specCatalog.find("tushare_index_daily", "1.0.0", "0123456789abcdef"))
+                .thenReturn(Optional.of(multiOutputSpec()));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "");
+
+        // 非字符串（数字）与空白字符串的 output 键都按无格式处理，但记录仍渲染
+        assertThat(result).contains("| 0.1234 |");
+        assertThat(result).contains("| 0.5678 |");
+        assertThat(result).doesNotContain("%");
+    }
+
+    @Test
+    void append_shouldFormatSingleOutputRecordEvenWithOutputKeyPresent() {
+        // 单输出回归：规格只有一个输出时不需要 output 键，键存在与否、值是什么都不影响取格式
+        FinanceMetricRecord record = renderableRecord("rec-1", 0).toBuilder()
+                .valueJson("0.1234")
+                .parametersJson("{\"ts_code\":\"000300.SH\",\"output\":\"whatever\"}")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(record));
+        FinanceMethodSpec spec = FinanceMethodSpec.builder()
+                .methodId("tushare_index_daily")
+                .version("1.0.0")
+                .specDigest("0123456789abcdef")
+                .outputs(List.of(FinanceMethodSpec.FinanceOutput.builder()
+                        .name("value").displayFormat("percent").build()))
+                .build();
+        when(specCatalog.find("tushare_index_daily", "1.0.0", "0123456789abcdef"))
+                .thenReturn(Optional.of(spec));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "");
+
+        assertThat(result).contains("12.34%");
+    }
+
     // ========== 故障容错 ==========
 
     @Test
@@ -623,6 +723,20 @@ class FinanceResultComposerTest {
                 .formulaDescription("收盘价均值")
                 .declaredEvidence("LIBRARY_CALL_DECLARED")
                 .renderable(true)
+                .build();
+    }
+
+    /** 多输出规格：第一个输出 sharpe 无格式，第二个 maxDrawdown 为 percent，用于 output 键定位测试。 */
+    private FinanceMethodSpec multiOutputSpec() {
+        return FinanceMethodSpec.builder()
+                .methodId("tushare_index_daily")
+                .version("1.0.0")
+                .specDigest("0123456789abcdef")
+                .outputs(List.of(
+                        FinanceMethodSpec.FinanceOutput.builder()
+                                .name("sharpe").unit("ratio").build(),
+                        FinanceMethodSpec.FinanceOutput.builder()
+                                .name("maxDrawdown").unit("percent").displayFormat("percent").build()))
                 .build();
     }
 

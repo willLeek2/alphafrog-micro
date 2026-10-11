@@ -24,6 +24,9 @@ AlphaFrog 数据库迁移工具（v2）
     # 迁移到当前分支的最新状态（用于开发分支验证）
     python migrate/migrate.py migrate --from v0.5 --to current
 
+    # 使用指定的 .env（必须传绝对路径）
+    python migrate/migrate.py migrate --env-file /absolute/path/to/.env --from v1.0 --to current
+
     # 强制执行，不提示确认
     python migrate/migrate.py migrate --auto --force
 
@@ -351,43 +354,42 @@ class MigrationPlanner:
         if not upgrades_dir.exists():
             return migrations, version_changes
 
-        # 扫描所有版本目录，按目录名排序
+        # 扫描所有版本目录，按目录名排序。当前仓库的版本目录使用可按名称排序的 v0.x/v1.x 格式。
         version_dirs = sorted([d for d in upgrades_dir.iterdir() if d.is_dir()], key=lambda d: d.name)
+        version_names = [d.name for d in version_dirs]
+        manifest_indexes = {version["tag"]: i for i, version in enumerate(self.versions)}
+        from_manifest_idx = manifest_indexes.get(from_version)
+        from_directory_idx = version_names.index(from_version) if from_version in version_names else None
 
-        for version_dir in version_dirs:
+        if from_manifest_idx is None and from_directory_idx is None:
+            raise ValueError(f"未知起始版本: {from_version}")
+
+        for directory_idx, version_dir in enumerate(version_dirs):
             version_tag = version_dir.name
 
-            # 跳过起始版本及之前的版本
-            # 找到 manifest 中 from_version 的索引，只包含之后的版本
-            from_idx = -1
-            for i, v in enumerate(self.versions):
-                if v["tag"] == from_version:
-                    from_idx = i
-                    break
+            # 跳过起始版本及之前的整个目录。原实现的 continue 只继续了内层 manifest
+            # 遍历，随后仍然收集旧目录脚本，导致 --from v1.0 还会列出 v0.x 检查脚本。
+            if from_directory_idx is not None:
+                if directory_idx <= from_directory_idx:
+                    continue
+            elif version_tag in manifest_indexes and manifest_indexes[version_tag] <= from_manifest_idx:
+                continue
 
-            # 如果该版本目录在 manifest 中存在且索引 <= from_idx，跳过
-            version_in_manifest = False
-            for i, v in enumerate(self.versions):
-                if v["tag"] == version_tag:
-                    version_in_manifest = True
-                    if i <= from_idx:
-                        continue
-                    break
+            version_in_manifest = version_tag in manifest_indexes
 
             # 如果目录名不在 manifest 中（开发中的新版本），也包含进来
             if version_in_manifest:
-                for i, v in enumerate(self.versions):
-                    if v["tag"] == version_tag and i > from_idx:
-                        if version_tag not in seen_versions:
-                            seen_versions.add(version_tag)
-                            prev_version = self.versions[i - 1]["tag"]
-                            version_changes.append({
-                                "from": prev_version,
-                                "to": version_tag,
-                                "services_added": list(set(v.get("services", [])) - set(self.versions[i - 1].get("services", []))),
-                                "infra_changed": list(set(v.get("infra", [])) - set(self.versions[i - 1].get("infra", []))),
-                            })
-                        break
+                i = manifest_indexes[version_tag]
+                v = self.versions[i]
+                if version_tag not in seen_versions:
+                    seen_versions.add(version_tag)
+                    prev_version = self.versions[i - 1]["tag"]
+                    version_changes.append({
+                        "from": prev_version,
+                        "to": version_tag,
+                        "services_added": list(set(v.get("services", [])) - set(self.versions[i - 1].get("services", []))),
+                        "infra_changed": list(set(v.get("infra", [])) - set(self.versions[i - 1].get("infra", []))),
+                    })
             else:
                 # 开发中的版本，不在 manifest 中
                 if version_tag not in seen_versions:
@@ -749,6 +751,18 @@ def find_config_file(config_path: Optional[str] = None) -> Optional[Path]:
     return None
 
 
+def find_env_file(env_file: str) -> Optional[Path]:
+    """校验并返回用户明确指定的 .env 文件绝对路径。"""
+    path = Path(env_file)
+    if not path.is_absolute():
+        log_error(f"--env-file 必须使用绝对路径: {env_file}")
+        return None
+    if not path.is_file():
+        log_error(f"指定的 .env 文件不存在或不是普通文件: {path}")
+        return None
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AlphaFrog 数据库迁移工具 v2",
@@ -770,6 +784,9 @@ def main():
   # 迁移到当前分支最新状态（开发分支验证）
   python migrate/migrate.py migrate --from v0.5 --to current
 
+  # 使用指定的 .env（必须传绝对路径）
+  python migrate/migrate.py migrate --env-file /absolute/path/to/.env --from v1.0 --to current
+
   # 强制执行，不提示确认
   python migrate/migrate.py migrate --auto --force
         """
@@ -779,7 +796,9 @@ def main():
         choices=["status", "plan", "migrate"],
         help="命令: status=查看状态, plan=查看计划, migrate=执行迁移"
     )
-    parser.add_argument("--config", "-c", help="配置文件路径")
+    config_group = parser.add_mutually_exclusive_group()
+    config_group.add_argument("--config", "-c", help="YAML 配置文件路径；文件名为 .env 时兼容按 .env 读取")
+    config_group.add_argument("--env-file", help=".env 文件的绝对路径")
     parser.add_argument("--force", "-f", action="store_true", help="强制执行，不提示确认")
     parser.add_argument("--from", dest="from_version", help="起始版本号")
     parser.add_argument("--to", dest="to_version", help="目标版本号，使用 'current' 表示当前分支最新状态")
@@ -789,9 +808,12 @@ def main():
 
     args = parser.parse_args()
 
-    # 查找配置文件
-    config_path = find_config_file(args.config)
+    # 查找配置文件。--env-file 明确指定格式，不依赖文件名判断。
+    explicit_env_file = args.env_file is not None
+    config_path = find_env_file(args.env_file) if explicit_env_file else find_config_file(args.config)
     if not config_path:
+        if explicit_env_file:
+            sys.exit(1)
         log_error("未找到配置文件，请创建 migrate/migrate_config.yml 或确保 .env 文件存在")
         print("\n配置文件选项（按优先级）：")
         print("1. migrate/migrate_config.yml（YAML 格式）")
@@ -809,7 +831,7 @@ database:
 
     # 加载配置
     try:
-        if config_path.name == ".env":
+        if explicit_env_file or config_path.name == ".env":
             db_config = DatabaseConfig.from_env(config_path)
             log_info(f"从 .env 文件加载数据库配置: {config_path}")
         else:

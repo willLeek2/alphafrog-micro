@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.finance;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -10,6 +11,7 @@ import world.willfrog.agent.platform.finance.FinanceMethodResolutionQuery;
 import world.willfrog.agent.platform.finance.FinanceMetricRecord;
 import world.willfrog.agent.platform.finance.FinanceRecordQuery;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.tools.finance.FinanceMethodSpec;
 import world.willfrog.agent.tools.finance.FinanceMethodSpecCatalog;
 import world.willfrog.agent.tools.finance.FinanceResultModelProjector;
 
@@ -223,20 +225,73 @@ public class FinanceResultComposer {
         }
     }
 
+    /**
+     * 取记录对应输出的 displayFormat。与投影器（{@link FinanceResultModelProjector#project}）
+     * 同一套 output 键定位规则：单输出规格直接取唯一输出的格式（不需要 output 键，行为不变）；
+     * 多输出规格按记录 parameters 携带的 {@code "output"} 键定位对应输出（yaml outputs[].name
+     * 同名精确匹配）。缺键、非字符串、空白或不匹配任何输出名 → 返回 null，走 formatValue 的
+     * 无格式路径：与投影器 fail-closed 同样「不猜输出」，但格式本是增强信息，不因此让整条
+     * 记录渲染失败。
+     */
     private String displayFormatOf(FinanceMetricRecord record) {
         try {
             if (isBlank(record.getMethodId()) || isBlank(record.getMethodVersion())
                     || isBlank(record.getSpecDigest())) {
                 return null;
             }
-            return specCatalog.find(record.getMethodId(), record.getMethodVersion(), record.getSpecDigest())
-                    .map(spec -> spec.getOutputs() != null && spec.getOutputs().size() == 1
-                            ? spec.getOutputs().get(0).getDisplayFormat()
-                            : null)
-                    .orElse(null);
+            // 不用 Optional.map：解析 parametersJson 会抛受检异常，lambda 里传不出来。
+            Optional<FinanceMethodSpec> spec = specCatalog.find(
+                    record.getMethodId(), record.getMethodVersion(), record.getSpecDigest());
+            return spec.isEmpty() ? null : displayFormatForRecord(spec.get(), record);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * 按 output 键定位输出后取 displayFormat。判定口径与投影器保持一致：
+     * 仅多输出规格（outputs.size() &gt; 1）要求 output 键；字符串且非空白（isBlank 拒绝）
+     * 才参与匹配；输出名精确 equals，不做 trim / 大小写归一。
+     */
+    private String displayFormatForRecord(FinanceMethodSpec spec, FinanceMetricRecord record)
+            throws JsonProcessingException {
+        List<FinanceMethodSpec.FinanceOutput> outputs = spec.getOutputs();
+        if (outputs == null || outputs.isEmpty()) {
+            return null;
+        }
+        FinanceMethodSpec.FinanceOutput target;
+        if (outputs.size() == 1) {
+            // 单输出规格：不需要 output 键，保持原有行为
+            target = outputs.get(0);
+        } else {
+            String outputName = declaredOutputName(record);
+            if (outputName == null) {
+                return null;
+            }
+            target = outputs.stream()
+                    .filter(o -> outputName.equals(o.getName()))
+                    .findFirst()
+                    .orElse(null);
+        }
+        return target == null ? null : target.getDisplayFormat();
+    }
+
+    /**
+     * 从记录 parametersJson 提取 {@code "output"} 键声明的输出名。
+     * 与投影器判型一致：必须是字符串（JSON 文本节点）且非空白，其余情形一律视作未声明。
+     * 解析失败按未声明处理（异常由 {@link #displayFormatOf} 的兜底 catch 吞掉）。
+     */
+    private String declaredOutputName(FinanceMetricRecord record) throws JsonProcessingException {
+        JsonNode parametersNode = objectMapper.readTree(record.getParametersJson());
+        if (parametersNode == null || !parametersNode.isObject()) {
+            return null;
+        }
+        JsonNode declared = parametersNode.get("output");
+        if (declared == null || !declared.isTextual()) {
+            return null;
+        }
+        String outputName = declared.asText();
+        return outputName.isBlank() ? null : outputName;
     }
 
     private FinanceResultModelProjector.FinanceDeclaredEvidence parseDeclaredEvidence(String value) {

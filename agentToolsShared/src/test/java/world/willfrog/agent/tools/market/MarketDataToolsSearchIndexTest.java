@@ -196,7 +196,7 @@ class MarketDataToolsSearchIndexTest {
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
 
         Map<String, Object> response = objectMapper.readValue(
-                tools.getIndexDaily("931998.CSI", "20260601", "20260602"),
+                tools.getIndexDaily("931998.CSI", "20260601", "20260602", null),
                 new TypeReference<>() {}
         );
 

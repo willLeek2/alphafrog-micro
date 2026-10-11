@@ -15,6 +15,8 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
+import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
@@ -26,7 +28,9 @@ import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
@@ -112,6 +116,8 @@ public class ToolRouter {
     private final SearchTools searchTools;
     /** Python 沙箱执行工具集（executePython） */
     private final PythonSandboxTools pythonSandboxTools;
+    /** SQL 取数工具集（executeQuery）：沙箱内固定 DuckDB 运行器 */
+    private final SqlQueryTools sqlQueryTools;
     /** 金融方法建议工具（resolveFinanceMethods），只读建议工具。 */
     private final FinanceMethodTools financeMethodTools;
     /** 平台工具指南加载工具（loadToolGuide） */
@@ -398,9 +404,10 @@ public class ToolRouter {
         /*
          * executePython 是最容易把上游数据、模型生成代码和沙箱执行耦合在一起的工具。
          * 260623-harness-optimization-02: dataset_ids / manifest_ids 是两个独立编号空间，
-         * 这里先分别收集，再做静态预校验（要求至少一个非空），最后才交给 PythonSandboxTools
+         * 这里先分别收集，再做静态预校验，最后才交给 PythonSandboxTools
          * 的 5 形参 overload。这样可以在真正执行前拦截明显危险或无效的代码，
-         * 失败结果也仍然走统一 JSON 格式。
+         * 失败结果也仍然走统一 JSON 格式。空编号能否执行取决于工具取得的工作区身份，
+         * 不能仅凭静态入参判断。
          */
         String code = str(params.get("code"), params.get("arg0"));
         String datasetIds = collectExecutePythonDatasetIds(params);
@@ -418,6 +425,18 @@ public class ToolRouter {
                 manifestIds,
                 str(params.get("libraries"), params.get("arg3")),
                 toNullableInt(params.get("timeout_seconds"), params.get("timeoutSeconds"), params.get("arg4"))
+        );
+    }
+
+    /**
+     * executeQuery 的参数归集：sql / dataset_ids / product_tier 三个参数，
+     * 别名兼容（argN 与驼峰）与 executePython 保持同一层处理。
+     */
+    private String invokeExecuteQuery(Map<String, Object> params) {
+        return sqlQueryTools.executeQuery(
+                str(params.get("sql"), params.get("arg0")),
+                str(params.get("dataset_ids"), params.get("datasetIds"), params.get("arg1")),
+                str(params.get("product_tier"), params.get("productTier"), params.get("arg2"))
         );
     }
 
@@ -522,7 +541,8 @@ public class ToolRouter {
                 case "getStockDaily" -> marketDataTools.getStockDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
                 );
                 case "getStockSwIndustryInfo" -> marketDataTools.getStockSwIndustryInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
@@ -539,7 +559,8 @@ public class ToolRouter {
                 case "getIndexDaily" -> marketDataTools.getIndexDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("index_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
                 );
                 case "searchIndex" -> AdvancedSearchRequest.isAdvancedMap(params)
                         ? marketDataTools.searchIndexAdvanced(params)
@@ -587,7 +608,14 @@ public class ToolRouter {
                 case "getOffExchangeAssetDaily" -> marketDataTools.getOffExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
-                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2"))
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeDataset"), params.get("include_dataset"), params.get("arg3"))
+                );
+                case "getSpecialAssetDaily" -> marketDataTools.getSpecialAssetDaily(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3"))
                 );
                 case "getEtfAdj" -> {
                     if (!isAdjFactorEnabled()) {
@@ -648,6 +676,7 @@ public class ToolRouter {
                         str(params.get("context"), params.get("arg1"))
                 );
                 case "executePython" -> invokeExecutePython(params);
+                case "executeQuery" -> invokeExecuteQuery(params);
                 case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
                         str(params.get("topic"), params.get("arg0"))
                 );
@@ -675,6 +704,11 @@ public class ToolRouter {
                         : subAgentControlHandler.waitFor(params);
                 default -> unsupported(toolName);
             };
+        } catch (PythonRiskReplayEvidenceMissingException missing) {
+            throw missing;
+        } catch (ToolJobInjectedInterruption interruption) {
+            // 一次性故障演练要求当前 worker 直接退出，不能被统一异常协议改写成工具失败 JSON。
+            throw interruption;
         } catch (ExternalToolJobPendingException pending) {
             // pending 是跨层控制信号，不是可缓存的工具失败结果。
             // PythonSandboxTools 在抛出前已经把后台任务、reservation 与 WAITING_TOOL_JOB handoff
@@ -699,6 +733,12 @@ public class ToolRouter {
             // - 不清理 anchor，清理权属于带 token/version 的恢复消费者；
             // - 不释放 Sandbox reservation，它会在 finalizer 确认终态后准确释放。
             // 任一“方便的统一异常处理”都会破坏上述 durable handoff 顺序。
+            throw pending;
+        } catch (WaitGroupMemberPendingException pending) {
+            // 新调度器版本的等待成员：沙箱任务已经建好，只是这次调用不再等它。
+            // 事实由派发器写进成员行（成员行在派发之前就已经落库），终态结果由接收方按派发证明写入。
+            // 与上面的 pending 一样，这里也不能把信号改写成工具失败 JSON，否则当前分段会继续跑模型，
+            // 而库里已经有了一条「这个成员在执行中」的记录。
             throw pending;
         } catch (Exception e) {
             // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息

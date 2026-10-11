@@ -181,6 +181,48 @@ class ToolJobResumeServiceTest {
     }
 
     @Test
+    void shouldRecoverSqlPreviewViaRegisteredAdapter() throws Exception {
+        // executeQuery 的恢复预览必须走注册表解出模型写的原 SQL，
+        // 而不是把整段渲染后的运行器脚本（含 base64 规格）塞给模型。
+        String sql = "SELECT industry, avg(ret) FROM t1 GROUP BY industry";
+        String specB64 = java.util.Base64.getEncoder().encodeToString(
+                ("{\"sql\":" + objectMapper.writeValueAsString(sql) + ",\"tier\":\"INTERACTIVE\"}")
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String runnerCode = "#!/usr/bin/env python3\nSPEC_B64 = \"" + specB64 + "\"\n";
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        anchor.setCreateRequestJson(objectMapper.writeValueAsString(java.util.Map.of("code", runnerCode)));
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(ownershipGateway.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
+        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
+
+        boolean preRegistered = world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry
+                .find(ToolJobAnchor.EXECUTE_QUERY_TOOL).isPresent();
+        if (!preRegistered) {
+            world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry.registerEquivalent(
+                    new world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters(
+                            new world.willfrog.agent.tools.dataanalysis.SqlQueryJobRequestAdapter(),
+                            new world.willfrog.agent.tools.python.PythonSandboxJobRunnerAdapter(null, null),
+                            new world.willfrog.agent.tools.dataanalysis.SqlQueryJobResultAdapter(objectMapper),
+                            new world.willfrog.agent.tools.python.PythonSandboxJobMeteringAdapter(objectMapper)));
+        }
+        try {
+            assertThat(resumeService.tryResume("run-1")).isTrue();
+            ArgumentCaptor<ToolJobResumeContext> ctxCaptor = ArgumentCaptor.forClass(ToolJobResumeContext.class);
+            verify(resumeLauncher).launch(eq("run-1"), ctxCaptor.capture());
+            assertThat(ctxCaptor.getValue().getPythonFailedCodePreview())
+                    .as("恢复预览是模型写的原 SQL，不是整段运行器脚本")
+                    .isEqualTo(sql);
+        } finally {
+            if (!preRegistered) {
+                world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry.clearForTests();
+            }
+        }
+    }
+
+    @Test
     void shouldNotLaunchWhenCasFails() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);

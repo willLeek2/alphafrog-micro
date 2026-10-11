@@ -8,8 +8,25 @@ import java.time.Instant;
  */
 public interface PythonSandboxDispatchStore {
 
+    /**
+     * 当前 Run 是否必须在调用 Python 沙箱前失败关闭。
+     *
+     * <p>默认返回 {@code false}，兼容没有调度器版本概念的调用方。具体实现可以据 Run 的冻结调度器
+     * 版本阻止不支持的“后台长工具挂起”协议，避免已经产生外部副作用后才发现当前执行器无法恢复。</p>
+     */
+    default boolean isInvocationBlocked(String runId) {
+        return false;
+    }
+
     /** 在 createTask 前抢占空 anchor；成功后 PREPARING reservation 才有持久化 owner。 */
     boolean persistPreparing(String runId, ToolJobAnchor anchor);
+
+    /** SQL会话占用与成员完整请求必须同事务提交；false仅表示确认未取得创建资格。 */
+    default boolean persistPreparingWaitMember(String runId, ToolJobAnchor anchor, long groupId,
+                                               String memberIdentity, String proofJson,
+                                               String resumeToken, Long resumeLeaseVersion) {
+        throw new UnsupportedOperationException("atomic member preparation is not implemented");
+    }
 
     /**
      * 恢复 worker 的第二次长工具分发：只允许持有精确旧 LAUNCHING token/version 的 worker
@@ -24,6 +41,26 @@ public interface PythonSandboxDispatchStore {
 
     /** 按 operationId 保存 Sandbox taskId 和 ATTACHED/TERMINAL 状态。 */
     boolean persistAttached(String runId, ToolJobAnchor anchor);
+
+    /**
+     * 工作区明确拒绝且按原操作号查无任务后，窄写持久拒绝原因。
+     * {@code expectedLeaseUntil} 只用于仍由当前 DAG worker 持有的调用。
+     */
+    default boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                           Instant expectedLeaseUntil) {
+        return false;
+    }
+
+    /** 容量凭证明已释放后，只把同一拒绝锚点的 reservation 快照推进为 RELEASED。 */
+    default boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        return false;
+    }
+
+    /** 按原操作身份和已释放证明清锚点，并给仍在执行的 Run 写入明确失败码。 */
+    default boolean completeWorkspaceRefusal(String runId, String operationId,
+                                             String fingerprint, String code) {
+        return false;
+    }
 
     /** 原子写 PENDING anchor 并把 Run 转为 WAITING_TOOL_JOB；true 才允许释放 worker。 */
     boolean transferToPending(String runId, ToolJobAnchor anchor);

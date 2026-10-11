@@ -5,6 +5,9 @@ import org.slf4j.MDC;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+
 /**
  * 入站泳道作用域：把 Run 上持久化过的泳道标签带进实际执行线程，供出站 Dubbo 过滤器打标。
  *
@@ -42,6 +45,13 @@ public final class LaneScopeGateway {
             }
         };
         return TtlRunnable.get(scoped, false, true);
+    }
+
+    /** 用 Run 的持久化泳道执行一次同步计算，并在返回或抛错后恢复线程作用域。 */
+    public static <T> T call(AgentRun run, Supplier<T> task) {
+        AtomicReference<T> result = new AtomicReference<>();
+        wrap(run, () -> result.set(task.get())).run();
+        return result.get();
     }
 
     /** 快照当前线程的泳道作用域（含日志 MDC），供跨线程搬运后还原。 */

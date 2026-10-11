@@ -9,6 +9,12 @@ import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
+import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
+import world.willfrog.agentlangchain.tooljob.WaitMemberResultReceiver;
+import world.willfrog.agent.platform.capacity.SchedulerBackpressureProbe;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -41,6 +47,25 @@ class AgentLangchainToolThrottleScopeControllerTest {
 
     @MockBean
     private AgentLangchainOrchestrator orchestrator;
+
+    @MockBean
+    private DualPoolDispatcher dualPoolDispatcher;
+
+    @MockBean
+    private SchedulerBackpressureProbe schedulerBackpressureProbe;
+
+    // 控制器构造器上的其余读数来源：少一个上下文就起不来，替身要与入参一一对上。
+    @MockBean
+    private DualPoolRecoveryDispatcher dualPoolRecoveryDispatcher;
+
+    @MockBean
+    private DualPoolSchedulerSettings dualPoolSchedulerSettings;
+
+    @MockBean
+    private FrozenEffectiveSettings frozenEffectiveSettings;
+
+    @MockBean
+    private WaitMemberResultReceiver waitMemberResultReceiver;
 
     @Test
     void toolThrottleExposesStablePerNodeScope() throws Exception {

@@ -18,6 +18,7 @@ import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
@@ -83,6 +84,7 @@ class ToolRouterRegistryConsistencyTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(SqlQueryTools.class),
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),
@@ -136,12 +138,12 @@ class ToolRouterRegistryConsistencyTest {
         MarketDataTools marketDataTools = mock(MarketDataTools.class);
         when(marketDataTools.checkParallelLimits()).thenReturn(okJson("checkParallelLimits"));
         when(marketDataTools.getStockInfo(anyString())).thenReturn(okJson("getStockInfo"));
-        when(marketDataTools.getStockDaily(anyString(), anyString(), anyString())).thenReturn(okJson("getStockDaily"));
+        when(marketDataTools.getStockDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getStockDaily"));
         when(marketDataTools.getStockSwIndustryInfo(anyString())).thenReturn(okJson("getStockSwIndustryInfo"));
         when(marketDataTools.searchStock(anyString())).thenReturn(okJson("searchStock"));
         when(marketDataTools.searchFund(anyString())).thenReturn(okJson("searchFund"));
         when(marketDataTools.getIndexInfo(anyString())).thenReturn(okJson("getIndexInfo"));
-        when(marketDataTools.getIndexDaily(anyString(), anyString(), anyString())).thenReturn(okJson("getIndexDaily"));
+        when(marketDataTools.getIndexDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getIndexDaily"));
         when(marketDataTools.searchIndex(anyString(), any(), any())).thenReturn(okJson("searchIndex"));
         when(marketDataTools.searchIndexAdvanced(any())).thenReturn(okJson("searchIndex"));
         when(marketDataTools.searchAssetInfo(anyString(), anyString(), anyString(), any(), any())).thenReturn(okJson("searchAssetInfo"));
@@ -150,7 +152,8 @@ class ToolRouterRegistryConsistencyTest {
         when(marketDataTools.isTradingDay(anyString(), anyString())).thenReturn(okJson("isTradingDay"));
         when(marketDataTools.getExchangeAssetDaily(anyString(), anyString(), anyString(), anyString(), anyString(), any(), any())).thenReturn(okJson("getExchangeAssetDaily"));
         when(marketDataTools.getExchangeAssetDailyAdvanced(any(), anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getExchangeAssetDaily"));
-        when(marketDataTools.getOffExchangeAssetDaily(anyString(), anyString(), anyString())).thenReturn(okJson("getOffExchangeAssetDaily"));
+        when(marketDataTools.getOffExchangeAssetDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getOffExchangeAssetDaily"));
+        when(marketDataTools.getSpecialAssetDaily(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getSpecialAssetDaily"));
         when(marketDataTools.getEtfAdj(anyString(), anyString(), anyString())).thenReturn(okJson("getEtfAdj"));
         when(marketDataTools.getListedAssetShareSize(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getListedAssetShareSize"));
         when(marketDataTools.getFinancialReport(anyString(), anyString(), anyString(), anyString())).thenReturn(okJson("getFinancialReport"));
@@ -164,6 +167,8 @@ class ToolRouterRegistryConsistencyTest {
 
         PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
         when(pythonSandboxTools.executePython(anyString(), anyString(), anyString(), anyString(), any())).thenReturn(okJson("executePython"));
+        SqlQueryTools sqlQueryTools = mock(SqlQueryTools.class);
+        when(sqlQueryTools.executeQuery(any(), any(), any())).thenReturn(okJson("executeQuery"));
 
         FinanceMethodTools financeMethodTools = mock(FinanceMethodTools.class);
         when(financeMethodTools.resolveFinanceMethods(anyString(), anyString())).thenReturn(okJson("resolveFinanceMethods"));
@@ -194,6 +199,7 @@ class ToolRouterRegistryConsistencyTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 financeMethodTools,
                 loadToolGuideTool,
                 listMyDataTool,
@@ -219,6 +225,7 @@ class ToolRouterRegistryConsistencyTest {
             case "getStockDaily", "getIndexDaily", "getOffExchangeAssetDaily",
                  "getEtfAdj", "getListedAssetShareSize" -> Map.of("tsCode", "000001.SZ", "startDateStr", "20240101", "endDateStr", "20240105");
             case "getExchangeAssetDaily" -> Map.of("tsCode", "000001.SZ", "assetType", "stock", "startDateStr", "20240101", "endDateStr", "20240105", "priceMode", "raw_ohlc");
+            case "getSpecialAssetDaily" -> Map.of("tsCode", "113050.SH", "assetType", "cb", "startDateStr", "20240101", "endDateStr", "20240105");
             case "getStockInfo", "getIndexInfo", "getStockSwIndustryInfo" -> Map.of("tsCode", "000001.SZ");
             case "searchStock", "searchFund", "searchIndex" -> Map.of("keyword", "q");
             case "searchAssetInfo" -> Map.of("query", "q", "assetTypes", "stock", "marketScope", "domestic");

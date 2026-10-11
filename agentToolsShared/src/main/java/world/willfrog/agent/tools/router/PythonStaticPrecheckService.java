@@ -29,19 +29,15 @@ public class PythonStaticPrecheckService {
         if (normalizedCode.isBlank()) {
             issues.add("code 不能为空");
         }
-        if (parsedDatasetIds.isEmpty() && parsedManifestIds.isEmpty()) {
-            // 260623-harness-optimization-02: dataset_ids 与 manifest_ids 是两个独立编号空间，
-            // 至少传一个。两者都为空时直接报 MISSING_IDS（不细分是哪一侧缺，避免 LLM 反复尝试）。
-            issues.add("dataset_ids 与 manifest_ids 至少需要传一个");
-        } else {
-            if (!parsedDatasetIds.isEmpty()
-                    && parsedDatasetIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
-                issues.add("dataset_id 格式非法，仅允许字母数字._-");
-            }
-            if (!parsedManifestIds.isEmpty()
-                    && parsedManifestIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
-                issues.add("manifest_id 格式非法，仅允许字母数字._-");
-            }
+        // 空编号是否允许取决于工具最终取得的完整工作区身份；静态预检没有这份事实。
+        // 临时盘模式的 MISSING_IDS 仍由 PythonSandboxTools 在派任务前返回。
+        if (!parsedDatasetIds.isEmpty()
+                && parsedDatasetIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
+            issues.add("dataset_id 格式非法，仅允许字母数字._-");
+        }
+        if (!parsedManifestIds.isEmpty()
+                && parsedManifestIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
+            issues.add("manifest_id 格式非法，仅允许字母数字._-");
         }
 
         if (!normalizedCode.isBlank() && FORBIDDEN_DATASETS_PATH_PATTERN.matcher(normalizedCode).find()) {
@@ -63,16 +59,10 @@ public class PythonStaticPrecheckService {
         report.put("issues", issues);
 
         if (!issues.isEmpty()) {
-            String errorCode;
-            if (parsedDatasetIds.isEmpty() && parsedManifestIds.isEmpty()) {
-                errorCode = "MISSING_IDS";
-            } else {
-                errorCode = "STATIC_PRECHECK_FAILED";
-            }
             return Result.builder()
                     .passed(false)
                     .category(TodoFailureCategory.STATIC)
-                    .errorCode(errorCode)
+                    .errorCode("STATIC_PRECHECK_FAILED")
                     .message(String.join("; ", issues))
                     .report(report)
                     .build();
@@ -118,4 +108,3 @@ public class PythonStaticPrecheckService {
         private Map<String, Object> report;
     }
 }
-

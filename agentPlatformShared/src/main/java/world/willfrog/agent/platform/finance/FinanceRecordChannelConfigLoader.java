@@ -1,10 +1,15 @@
 package world.willfrog.agent.platform.finance;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalCachePaths;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -17,13 +22,23 @@ import java.util.Set;
 /** Loads Nacos-written JSON over application defaults, then clamps every value to code ceilings. */
 @Component
 @Slf4j
-public class FinanceRecordChannelConfigLoader {
+public class FinanceRecordChannelConfigLoader implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     private final ObjectMapper objectMapper;
     private final FinanceRecordChannelProperties defaults;
     private volatile Snapshot current;
     private volatile String loadedPath = "";
     private volatile long loadedLastModified = Long.MIN_VALUE;
+
+    @Value("${AF_LANE_TRAFFIC_SCOPE_ID:}")
+    private String laneTrafficScopeId;
+
+    /**
+     * Nacos 缓存文件是 camelCase。解析动态文件时用这份 mapper，不跟应用里可能被改成
+     * SNAKE_CASE 的 ObjectMapper 走同一套命名。冻结快照仍用注入 mapper 读写，两边都是本服务写出的 JSON。
+     */
+    private volatile ObjectMapper fileMapper;
+    private final Object fileMapperLock = new Object();
 
     public FinanceRecordChannelConfigLoader(
             ObjectMapper objectMapper,
@@ -41,6 +56,30 @@ public class FinanceRecordChannelConfigLoader {
     @Scheduled(fixedDelayString = "${agent.finance-record-channel.config-refresh-interval-ms:10000}")
     public void refresh() {
         reloadIfNeeded(false);
+    }
+
+    @Override
+    public void onApplicationEvent(NacosLocalConfigWrittenEvent event) {
+        applyNacosWrittenFile(event.getTargetFile());
+    }
+
+    /**
+     * Nacos 已经把生效内容写进 {@code targetFile}。路径对得上才重读，避免泳道吃到主环境那份未加前缀的缓存。
+     */
+    public void applyNacosWrittenFile(String targetFile) {
+        if (targetFile == null || targetFile.isBlank()) {
+            return;
+        }
+        String file = resolvedConfigFile();
+        if (file.isEmpty()) {
+            return;
+        }
+        Path configured = Paths.get(file).toAbsolutePath().normalize();
+        Path written = Paths.get(targetFile).toAbsolutePath().normalize();
+        if (!configured.equals(written)) {
+            return;
+        }
+        reloadIfNeeded(true);
     }
 
     public Snapshot current() {
@@ -103,8 +142,27 @@ public class FinanceRecordChannelConfigLoader {
         }
     }
 
+    private String resolvedConfigFile() {
+        return NacosLocalCachePaths.isolate(trim(defaults.getConfigFile()), laneTrafficScopeId);
+    }
+
+    private ObjectMapper fileMapper() {
+        ObjectMapper cached = fileMapper;
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (fileMapperLock) {
+            if (fileMapper == null) {
+                ObjectMapper copy = objectMapper.copy();
+                copy.setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
+                fileMapper = copy;
+            }
+            return fileMapper;
+        }
+    }
+
     void reloadIfNeeded(boolean force) {
-        String configured = trim(defaults.getConfigFile());
+        String configured = resolvedConfigFile();
         if (configured.isEmpty()) {
             current = sanitize(null, "application-defaults");
             return;
@@ -120,7 +178,7 @@ public class FinanceRecordChannelConfigLoader {
                 return;
             }
             byte[] bytes = Files.readAllBytes(path);
-            DynamicConfig dynamic = objectMapper.readValue(bytes, DynamicConfig.class);
+            DynamicConfig dynamic = fileMapper().readValue(bytes, DynamicConfig.class);
             validateDynamic(dynamic);
             current = sanitize(dynamic, "sha256:" + FinanceRecordDecoder.sha256Hex(bytes));
             loadedPath = path.toString();

@@ -17,6 +17,8 @@ export type HostTarget = {
   sshHost: string;
   repoPath?: string;
   dataRoot?: string;
+  /** 查库时经该目标的 ssh_host 做本地转发。不对外暴露。 */
+  pgViaSsh?: boolean;
 };
 
 export type HostCatalog = {
@@ -73,6 +75,15 @@ function optionalNonEmpty(value: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function parsePgViaSsh(value: unknown): boolean {
+  if (value === true || value === 1) return true;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
+  }
+  return false;
+}
+
 function parseTargetsArray(raw: unknown, logError?: CatalogDeps["logError"]): HostTarget[] | { error: string } {
   if (!Array.isArray(raw)) {
     logError?.("hosts catalog invalid: targets is not an array");
@@ -105,6 +116,7 @@ function parseTargetsArray(raw: unknown, logError?: CatalogDeps["logError"]): Ho
     const label = optionalNonEmpty(rec.label) ?? id;
     const repoPath = optionalNonEmpty(rec.repo_path);
     const dataRoot = optionalNonEmpty(rec.data_root);
+    const pgViaSsh = parsePgViaSsh(rec.pg_via_ssh);
     if (repoPath && /[\0\n\r]/.test(repoPath)) {
       logError?.("hosts catalog invalid: repo_path contains illegal characters");
       return { error: "远程目标清单格式无效" };
@@ -120,6 +132,7 @@ function parseTargetsArray(raw: unknown, logError?: CatalogDeps["logError"]): Ho
       sshHost,
       ...(repoPath ? { repoPath } : {}),
       ...(dataRoot ? { dataRoot } : {}),
+      ...(pgViaSsh ? { pgViaSsh: true } : {}),
     });
   }
 

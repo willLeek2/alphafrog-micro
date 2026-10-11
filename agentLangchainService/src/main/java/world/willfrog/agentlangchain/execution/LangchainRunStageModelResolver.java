@@ -13,9 +13,13 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
 import world.willfrog.agent.platform.service.StageConfigResolver;
 import world.willfrog.agent.platform.service.StageConfigValidator;
+import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
+import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agentlangchain.acceptance.AcceptanceRunPolicyRegistry;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 为一次 agent run 解析 planning（规划）、execution（执行）、final-answer（最终答案）三个阶段各自使用的 ChatModel。
@@ -52,6 +56,8 @@ public class LangchainRunStageModelResolver {
     private final AgentAiServiceFactory aiServiceFactory;
     private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
+    private final AcceptanceFixtureModelRegistry acceptanceFixtureModels;
+    private final AcceptanceRunPolicyRegistry acceptancePolicies;
 
     /**
      * 解析一次 run 的三阶段 ChatModel。
@@ -74,6 +80,20 @@ public class LangchainRunStageModelResolver {
      * @return 包含三阶段 ChatModel 和 planning 阶段元信息的 StageModels
      */
     public StageModels resolve(AgentRun run) {
+        Optional<AcceptanceFixtureModelRegistry.ScriptedStage> scripted =
+                acceptanceFixtureModels.stageForRun(run);
+        if (scripted.isPresent()) {
+            return acceptanceFixtureStageModels(scripted.get(),
+                    acceptancePolicies.policyForRun(run).orElse(null), run);
+        }
+        return resolveOrdinaryModels(run);
+    }
+
+    /**
+     * 按原路径建规划、执行、写答案三个真实模型。夹具 Run 第一次碰到未声明调用时才走这里，
+     * 纯预录 Run 不会解析供应商、也不会建客户端。
+     */
+    private StageModels resolveOrdinaryModels(AgentRun run) {
         RunStageConfig stageConfig = stageConfigResolver.resolve(run.getExt());
         stageConfigValidator.validate(stageConfig);
 
@@ -126,7 +146,72 @@ public class LangchainRunStageModelResolver {
                 finalAnswerModel,
                 planningEndpointName,
                 planningModelName,
-                planningProviderOrder);
+                planningProviderOrder,
+                null);
+    }
+
+    /**
+     * 带验收夹具的 Run 走这一条：三个阶段共用同一个脚本模型。
+     *
+     * <p>脚本 {@code for} 点名的回合发预录。没点名的调用按阶段去取真实模型：规划走规划客户端，
+     * 节点和图判定走执行客户端，写答案走写答案客户端。真实客户端在第一次未声明调用时才建，
+     * 纯预录 Run 不解析供应商、不碰密钥。</p>
+     *
+     * <p>规划端点的两个名字仍写成夹具标记：事件里一眼看得出这条 Run 带了预录名单。
+     * 未声明调用真正打到哪一家供应商，记在那一次真实模型调用自己的事件里。</p>
+     *
+     * <p>结果放行策略跟着一起带上：节点执行器在工具当场完成、直接给成员写终态那一步要用它。
+     * 夹具没写放行策略时是空，成员照原来的方式立刻收尾。</p>
+     */
+    private StageModels acceptanceFixtureStageModels(AcceptanceFixtureModelRegistry.ScriptedStage stage,
+                                                     AcceptanceReleasePolicy releasePolicy,
+                                                     AgentRun run) {
+        LazyOrdinaryModels lazy = new LazyOrdinaryModels(run);
+        ChatModel scripted = stage.model().withRealModel(identity -> {
+            StageModels ordinary = lazy.get();
+            return switch (identity.stage()) {
+                case PLANNING -> ordinary.planningModel();
+                case ANSWER -> ordinary.finalAnswerModel();
+                case NODE, JUDGE -> ordinary.executionModel();
+            };
+        });
+        return new StageModels(
+                scripted,
+                scripted,
+                scripted,
+                AcceptanceFixtureModelRegistry.ScriptedStage.ENDPOINT_NAME,
+                stage.modelName(),
+                List.of(),
+                releasePolicy);
+    }
+
+    /** 夹具 Run 上的真实客户端：第一次未声明调用才解析，失败记住，避免并行两次各建一次。 */
+    private final class LazyOrdinaryModels {
+        private final AgentRun run;
+        private StageModels cached;
+        private RuntimeException failed;
+
+        private LazyOrdinaryModels(AgentRun run) {
+            this.run = run;
+        }
+
+        private StageModels get() {
+            synchronized (this) {
+                if (failed != null) {
+                    throw failed;
+                }
+                if (cached != null) {
+                    return cached;
+                }
+                try {
+                    cached = resolveOrdinaryModels(run);
+                    return cached;
+                } catch (RuntimeException error) {
+                    failed = error;
+                    throw error;
+                }
+            }
+        }
     }
 
     /**
@@ -136,6 +221,10 @@ public class LangchainRunStageModelResolver {
      * 不返回 execution 和 final-answer 的？
      * 因为 observability 和 event 系统主要关注 planning 阶段的模型信息（它决定了计划的生成质量），
      * execution 和 final-answer 的模型信息可以在需要时从 run.ext 中重新提取。</p>
+     *
+     * <p>最后的 {@code acceptanceReleasePolicy} 只有验收夹具 Run 会带上（夹具没写放行策略时也是空），
+     * 普通 Run 一律为空：它决定「工具当场完成时被点名的那条成员要不要按失败收尾」，不参与模型解析。
+     * 压住结果那种规则走的是结果接收方，读的是同一份策略，不经过这个字段。</p>
      */
     public record StageModels(
             ChatModel planningModel,
@@ -143,7 +232,21 @@ public class LangchainRunStageModelResolver {
             ChatModel finalAnswerModel,
             String planningEndpointName,
             String planningModelName,
-            List<String> planningProviderOrder) {
+            List<String> planningProviderOrder,
+            AcceptanceReleasePolicy acceptanceReleasePolicy) {
+
+        /**
+         * 不带放行策略的那一版：普通 Run 用这个形状就够了，调用方不必写一个用不到的 null。
+         */
+        public StageModels(ChatModel planningModel,
+                           ChatModel executionModel,
+                           ChatModel finalAnswerModel,
+                           String planningEndpointName,
+                           String planningModelName,
+                           List<String> planningProviderOrder) {
+            this(planningModel, executionModel, finalAnswerModel,
+                    planningEndpointName, planningModelName, planningProviderOrder, null);
+        }
     }
 
     /**

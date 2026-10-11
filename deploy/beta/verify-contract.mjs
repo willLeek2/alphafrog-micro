@@ -108,7 +108,8 @@ const service = {
   phase: 'STABLE', targetManifestVersion: 2,
   targetServiceSpecSha256: manifest.services[0].serviceSpecSha256,
   activeInstance: active, candidateInstance: null, drainingInstance: null,
-  operation: null, failedManifestVersion: null, lastError: null
+  operation: null, failedManifestVersion: null, lastError: null,
+  retainedFailedCandidate: null
 };
 const state = {
   schemaVersion: 1, stateVersion: 12, updatedAt: '2026-09-01T00:02:00Z',

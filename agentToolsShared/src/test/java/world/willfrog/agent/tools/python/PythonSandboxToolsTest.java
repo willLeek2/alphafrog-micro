@@ -54,6 +54,11 @@ class PythonSandboxToolsTest {
     @BeforeEach
     void setUp() {
         tools = new PythonSandboxTools(mapper);
+        world.willfrog.agent.platform.service.PythonRiskReviewService review =
+                mock(world.willfrog.agent.platform.service.PythonRiskReviewService.class);
+        org.springframework.test.util.ReflectionTestUtils.setField(tools, "pythonRiskReviewService", review);
+        when(review.evaluate(any(), any(), any())).thenReturn(
+                new world.willfrog.agent.platform.service.PythonRiskReviewService.Evaluation(true, null, false));
         sandboxService = mock(PythonSandboxService.class);
         registry = mock(AgentRunDatasetRegistry.class);
         // executePython 是实例方法，registry 通过 setter 注入（业务路径是 Spring @Autowired(required=false)）
@@ -74,6 +79,7 @@ class PythonSandboxToolsTest {
             throw new RuntimeException(e);
         }
         AgentContext.setRunId("run-test");
+        AgentContext.setToolCallId("legacy-fixture-call");
     }
 
     @AfterEach

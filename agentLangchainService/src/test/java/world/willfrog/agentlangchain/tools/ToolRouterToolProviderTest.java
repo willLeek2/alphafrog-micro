@@ -15,10 +15,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
@@ -27,11 +29,13 @@ import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.execution.PersistentSubAgentToolBridge;
 
 import java.util.Map;
 import java.util.Set;
@@ -41,6 +45,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -54,12 +59,24 @@ class ToolRouterToolProviderTest {
     @Mock
     private AgentRunEventService eventService;
 
+    @Mock
+    private AgentPromptService promptService;
+
     private ToolRouterToolProvider provider;
+    private ObjectMapper objectMapper;
+    private MarketDataTools marketDataTools;
+    private RagTools ragTools;
+    private SearchTools searchTools;
+    private PythonSandboxTools pythonSandboxTools;
+    private SqlQueryTools sqlQueryTools;
+    private ListMyDataTool listMyDataTool;
+    private LoadToolGuideTool loadToolGuideTool;
+    private RereadToolHandler rereadToolHandler;
 
     @BeforeEach
     void setUp() {
-        ObjectMapper objectMapper = new ObjectMapper();
-        MarketDataTools marketDataTools = new MarketDataTools(
+        objectMapper = new ObjectMapper();
+        marketDataTools = new MarketDataTools(
                 mock(DatasetWriter.class),
                 mock(DatasetRegistry.class),
                 mock(ManifestWriter.class),
@@ -67,12 +84,13 @@ class ToolRouterToolProviderTest {
                 new AgentLlmProperties(),
                 objectMapper
         );
-        RagTools ragTools = new RagTools(objectMapper);
-        SearchTools searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
-        PythonSandboxTools pythonSandboxTools = new PythonSandboxTools(objectMapper);
-        ListMyDataTool listMyDataTool = new ListMyDataTool(objectMapper);
-        LoadToolGuideTool loadToolGuideTool = new LoadToolGuideTool(objectMapper);
-        RereadToolHandler rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
+        ragTools = new RagTools(objectMapper);
+        searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
+        pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        sqlQueryTools = new SqlQueryTools(objectMapper);
+        listMyDataTool = new ListMyDataTool(objectMapper);
+        loadToolGuideTool = new LoadToolGuideTool(objectMapper);
+        rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
 
         provider = new ToolRouterToolProvider(
                 toolRouter,
@@ -80,14 +98,18 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                sqlQueryTools,
                 listMyDataTool,
                 loadToolGuideTool,
                 rereadToolHandler,
                 objectMapper,
                 eventService,
                 new LangchainToolConcurrencyThrottle(false, 20, 60),
-                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class)
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class),
+                null,
+                promptService
         );
+        lenient().when(promptService.subAgentEnabled()).thenReturn(true);
     }
 
     @AfterEach
@@ -128,6 +150,21 @@ class ToolRouterToolProviderTest {
     }
 
     @Test
+    void provideTools_shouldFollowSubAgentFeatureToggleForEachModelCall() {
+        when(promptService.subAgentEnabled()).thenReturn(false, true);
+
+        Set<String> disabledNames = provider.provideTools(request(Map.of())).tools().keySet().stream()
+                .map(ToolSpecification::name).collect(Collectors.toSet());
+        assertFalse(disabledNames.contains("spawnSubAgent"));
+        assertFalse(disabledNames.contains("waitForSubAgent"));
+
+        Set<String> enabledNames = provider.provideTools(request(Map.of())).tools().keySet().stream()
+                .map(ToolSpecification::name).collect(Collectors.toSet());
+        assertTrue(enabledNames.contains("spawnSubAgent"));
+        assertTrue(enabledNames.contains("waitForSubAgent"));
+    }
+
+    @Test
     void provideTools_shouldHideSubAgentControlsInsideChildPhase() {
         AgentContext.setPhase(world.willfrog.agent.platform.service.AgentRunObservabilityService.PHASE_SUB_AGENT);
 
@@ -138,6 +175,28 @@ class ToolRouterToolProviderTest {
 
         assertFalse(toolNames.contains("spawnSubAgent"));
         assertFalse(toolNames.contains("waitForSubAgent"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void persistentChildRunCannotSeeSubAgentControlsEvenOutsideLegacyChildPhase() {
+        PersistentSubAgentToolBridge bridge = mock(PersistentSubAgentToolBridge.class);
+        ObjectProvider<PersistentSubAgentToolBridge> bridgeProvider = mock(ObjectProvider.class);
+        when(bridgeProvider.getIfAvailable()).thenReturn(bridge);
+        AgentContext.setRunId("child-run-1");
+        when(bridge.isChildRun("child-run-1")).thenReturn(true);
+        ToolRouterToolProvider childProvider = new ToolRouterToolProvider(
+                toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+                listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, eventService,
+                new LangchainToolConcurrencyThrottle(false, 20, 60),
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class),
+                bridgeProvider, promptService);
+
+        Set<String> names = childProvider.provideTools(request(Map.of())).tools().keySet().stream()
+                .map(ToolSpecification::name).collect(Collectors.toSet());
+
+        assertFalse(names.contains("spawnSubAgent"));
+        assertFalse(names.contains("waitForSubAgent"));
     }
 
     @Test

@@ -1,16 +1,20 @@
 package world.willfrog.agent.platform.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationListener;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalCachePaths;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 import world.willfrog.alphafrogmicro.common.utils.PlaceholderResolver;
 
 import java.io.InputStream;
@@ -26,7 +30,7 @@ import java.util.Optional;
  */
 @Component
 @Slf4j
-public class CodeRefineLocalConfigLoader {
+public class CodeRefineLocalConfigLoader implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     private final ObjectMapper objectMapper;
     private final StringRedisTemplate redisTemplate;
@@ -38,10 +42,19 @@ public class CodeRefineLocalConfigLoader {
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")
     private String instanceId;
 
+    @Value("${AF_LANE_TRAFFIC_SCOPE_ID:}")
+    private String laneTrafficScopeId;
+
     private volatile CodeRefineProperties localConfig;
     private volatile String loadedConfigPath = "";
     private volatile long loadedConfigLastModified = -1;
     private volatile byte[] loadedConfigBytes = new byte[0];
+    /**
+     * Nacos 缓存文件是 camelCase。解析整份文件时用这份 mapper，不跟应用里可能被改成
+     * SNAKE_CASE 的 ObjectMapper 走同一套命名。
+     */
+    private volatile ObjectMapper fileMapper;
+    private final Object fileMapperLock = new Object();
 
     @Autowired
     public CodeRefineLocalConfigLoader(ObjectMapper objectMapper,
@@ -68,8 +81,37 @@ public class CodeRefineLocalConfigLoader {
         reloadIfNeeded(false);
     }
 
+    @Override
+    public void onApplicationEvent(NacosLocalConfigWrittenEvent event) {
+        applyNacosWrittenFile(event.getTargetFile());
+    }
+
+    /**
+     * Nacos 已经把生效内容写进 {@code targetFile}。路径对得上才重读，避免泳道吃到主环境那份未加前缀的缓存。
+     */
+    public void applyNacosWrittenFile(String targetFile) {
+        if (targetFile == null || targetFile.isBlank()) {
+            return;
+        }
+        String file = resolvedConfigFile();
+        if (file.isEmpty()) {
+            return;
+        }
+        Path configured = Paths.get(file).toAbsolutePath().normalize();
+        Path written = Paths.get(targetFile).toAbsolutePath().normalize();
+        if (!configured.equals(written)) {
+            return;
+        }
+        reloadIfNeeded(true);
+    }
+
+    private String resolvedConfigFile() {
+        String configured = properties.getConfigFile() == null ? "" : properties.getConfigFile().trim();
+        return NacosLocalCachePaths.isolate(configured, laneTrafficScopeId);
+    }
+
     private void reloadIfNeeded(boolean force) {
-        String file = properties.getConfigFile() == null ? "" : properties.getConfigFile().trim();
+        String file = resolvedConfigFile();
         if (file.isEmpty()) {
             if (force) {
                 log.info("agent.flow.code-refine.config-file is empty, skip local code refine config loading");
@@ -94,7 +136,7 @@ public class CodeRefineLocalConfigLoader {
 
             try (InputStream in = Files.newInputStream(path)) {
                 byte[] bytes = in.readAllBytes();
-                CodeRefineProperties parsed = objectMapper.readValue(bytes, CodeRefineProperties.class);
+                CodeRefineProperties parsed = fileMapper().readValue(bytes, CodeRefineProperties.class);
 
                 // 解析 ${ENV_VAR} 占位符
                 PlaceholderResolver.resolve(parsed);
@@ -125,6 +167,21 @@ public class CodeRefineLocalConfigLoader {
             cfg.setMaxAttempts(3);
         }
         return cfg;
+    }
+
+    private ObjectMapper fileMapper() {
+        ObjectMapper cached = fileMapper;
+        if (cached != null) {
+            return cached;
+        }
+        synchronized (fileMapperLock) {
+            if (fileMapper == null) {
+                ObjectMapper copy = objectMapper.copy();
+                copy.setPropertyNamingStrategy(PropertyNamingStrategies.LOWER_CAMEL_CASE);
+                fileMapper = copy;
+            }
+            return fileMapper;
+        }
     }
 
     /**

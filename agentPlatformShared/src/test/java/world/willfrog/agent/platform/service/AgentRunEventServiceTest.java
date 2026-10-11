@@ -8,10 +8,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.data.redis.core.ZSetOperations;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
@@ -24,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -59,13 +63,20 @@ class AgentRunEventServiceTest {
     private AgentRunEventRedisStore eventRedisStore;
     @Mock
     private AgentPromptService mockPromptService;
+    @Mock
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
+    private world.willfrog.agent.platform.coordination.RunCoordinationStore coordinationStore;
     private AgentRunEventService service;
     private ObjectMapper objectMapper;
 
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
+        org.mockito.Mockito.lenient().when(llmLocalConfigLoader.hotConfigIsAuthoritative()).thenReturn(true);
+        org.mockito.Mockito.lenient().when(llmLocalConfigLoader.current()).thenReturn(Optional.empty());
+        coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
+        org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
         service = new AgentRunEventService(
                 runMapper,
                 eventMapper,
@@ -74,7 +85,9 @@ class AgentRunEventServiceTest {
                 redisTemplate,
                 llmLocalConfigLoader,
                 messageService,
-                mockPromptService
+                mockPromptService,
+                transactionManager,
+                coordinationStore
         );
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any()))
@@ -82,7 +95,106 @@ class AgentRunEventServiceTest {
                         PromptRunSelection.SCHEMA_VERSION,
                         "default-v1", "control", "bundle-digest", "capability-digest",
                         LocalDate.of(2025, 2, 3)));
+        stubCanonicalEventReadBack(eventMapper);
     }
+
+    /**
+     * 让「写进去的那一条」和「读回来的那一条」是同一份内容。
+     *
+     * <p>投射按库里读回来的那一行做，所以这两条在测试里要指向同一份内容，断言看的才是投出去的东西。
+     * 真库上时间与负载文本由库决定（写入不写 created_at、负载存成 jsonb）——那部分行为由真库用例量。</p>
+     */
+    private static void mirrorPersistedEvent(java.util.Map<String, AgentRunEvent> persisted,
+                                             AgentRunEvent event) {
+        if (event != null && event.getRunId() != null && event.getSeq() != null) {
+            persisted.put(event.getRunId() + ":" + event.getSeq(), event);
+        }
+    }
+
+    private static void stubCanonicalEventReadBack(AgentRunEventMapper eventMapper) {
+        java.util.Map<String, AgentRunEvent> persisted = new java.util.concurrent.ConcurrentHashMap<>();
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            mirrorPersistedEvent(persisted, invocation.getArgument(0));
+            return 1;
+        }).when(eventMapper).insert(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.lenient().doAnswer(invocation -> {
+            mirrorPersistedEvent(persisted, invocation.getArgument(0));
+            return 1;
+        }).when(eventMapper).insertOnce(org.mockito.ArgumentMatchers.any());
+        org.mockito.Mockito.lenient()
+                .when(eventMapper.findByRunIdAndSeq(
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyInt()))
+                .thenAnswer(invocation -> persisted.get(
+                        invocation.getArgument(0) + ":" + invocation.getArgument(1)));
+    }
+
+    @Test
+    void childControlsFollowExactParentSpawnMembers() throws Exception {
+        AgentRun parent = parentWithContext("""
+                {"acceptanceFixtureId":"parent-fixture","acceptanceControlId":"parent-control",
+                 "childAcceptanceControls":[
+                   {"for":{"planGeneration":1,"nodeId":"branch-a","nodeAttempt":0,
+                           "segmentSequence":2,"modelTurn":3,"memberSeq":0,"toolCallId":"call-a"},
+                    "acceptanceControlId":"control-a"},
+                   {"for":{"planGeneration":1,"nodeId":"branch-a","nodeAttempt":0,
+                           "segmentSequence":2,"modelTurn":3,"memberSeq":1,"toolCallId":"call-b"},
+                    "acceptanceControlId":"control-b"}]}
+                """);
+
+        AgentRun first = createChild(parent, "child-a", member(1, "branch-a", 0, 2, 3, 0, "call-a"));
+        AgentRun second = createChild(parent, "child-b", member(1, "branch-a", 0, 2, 3, 1, "call-b"));
+        AgentRun anotherTurn = createChild(parent, "child-later",
+                member(1, "branch-a", 0, 2, 4, 0, "call-a"));
+
+        assertEquals("control-a", childContext(first).path("acceptanceControlId").asText());
+        assertEquals("control-b", childContext(second).path("acceptanceControlId").asText());
+        assertFalse(childContext(anotherTurn).has("acceptanceControlId"));
+        for (AgentRun child : List.of(first, second, anotherTurn)) {
+            var context = childContext(child);
+            assertFalse(context.has("acceptanceFixtureId"));
+            assertFalse(context.has("childAcceptanceControls"));
+            assertEquals("AUTO", objectMapper.readTree(child.getExt()).path("execution_mode").asText());
+        }
+    }
+
+    private AgentRun parentWithContext(String contextJson) {
+        AgentRun parent = new AgentRun();
+        parent.setId("parent-run");
+        parent.setUserId("user-1");
+        parent.setDeploymentId(DEPLOYMENT_ID);
+        parent.setDeploymentGenerationId(DEPLOYMENT_GENERATION_ID);
+        parent.setSchedulerVersion("DUAL_POOL_V2");
+        parent.setExt("{\"context_json\":" + objectMapper.valueToTree(contextJson) + "}");
+        return parent;
+    }
+
+    private AgentRun createChild(AgentRun parent, String childId,
+                                 ChildRunAcceptanceControls.MemberIdentity identity) {
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:" + childId)).thenReturn(1L);
+        TransactionSynchronizationManager.setActualTransactionActive(true);
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            return service.createChildRun(parent, childId, parent.getId(), "calculate", "",
+                    null, null, 6, identity);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+            TransactionSynchronizationManager.setActualTransactionActive(false);
+        }
+    }
+
+    private com.fasterxml.jackson.databind.JsonNode childContext(AgentRun run) throws Exception {
+        return objectMapper.readTree(objectMapper.readTree(run.getExt()).path("context_json").asText());
+    }
+
+    private static ChildRunAcceptanceControls.MemberIdentity member(int plan, String node, int attempt,
+                                                                     int segment, int turn, int sequence,
+                                                                     String call) {
+        return new ChildRunAcceptanceControls.MemberIdentity(plan, node, attempt, segment, turn,
+                sequence, call);
+    }
+
 
     @Test
     void diagnosticDatabaseReadsDoNotFlushPendingRedisEventsButOrdinaryReadStillDoes() {
@@ -93,7 +205,7 @@ class AgentRunEventServiceTest {
         when(llmLocalConfigLoader.current()).thenReturn(Optional.of(properties));
 
         AgentRunEventRedisStore realRedisStore = new AgentRunEventRedisStore(
-                redisTemplate, objectMapper, llmLocalConfigLoader);
+                redisTemplate, objectMapper, llmLocalConfigLoader, 7L);
         AgentRunEventService realService = new AgentRunEventService(
                 runMapper,
                 eventMapper,
@@ -102,7 +214,9 @@ class AgentRunEventServiceTest {
                 redisTemplate,
                 llmLocalConfigLoader,
                 messageService,
-                mockPromptService
+                mockPromptService,
+                transactionManager,
+                coordinationStore
         );
         AgentRunEvent pending = new AgentRunEvent();
         pending.setRunId("r1");
@@ -140,7 +254,6 @@ class AgentRunEventServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(7L);
-        when(eventMapper.insert(any())).thenReturn(1);
 
         service.append("r1", "u1", "PLAN_READY", Map.of("ok", true));
 
@@ -161,7 +274,6 @@ class AgentRunEventServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
         doThrow(new RuntimeException("redis down"))
                 .when(redisTemplate)
                 .convertAndSend(anyString(), anyString());
@@ -174,7 +286,6 @@ class AgentRunEventServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run("r1", "u1"));
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(8L);
-        when(eventMapper.insertOnce(any())).thenReturn(1);
 
         boolean inserted = service.appendOnce(
                 "r1", "u1", "TOOL_CALL_FINISHED", "r1:tc1:logical_terminal", Map.of("success", true));
@@ -207,7 +318,8 @@ class AgentRunEventServiceTest {
                 "r1", "u1", "TOOL_CALL_FINISHED", "r1:tc1:logical_terminal", Map.of("success", true));
 
         assertFalse(inserted);
-        verify(eventRedisStore).append(persisted);
+        verify(eventRedisStore).repairMissing(persisted);
+        verify(eventRedisStore, never()).append(any());
         verify(eventRedisStore, never()).flush(anyString());
         verify(redisTemplate, never()).convertAndSend(anyString(), anyString());
     }
@@ -329,10 +441,9 @@ class AgentRunEventServiceTest {
         when(mockPromptService.snapshotDataFreshness()).thenReturn(freshness);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
 
+        // 创建这条路不再回头读一次 Run：接收事实直接跟在刚插入的那一行后面写。
         AgentRun run = run("r-test", "u-test");
-        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString())).thenReturn(run);
 
@@ -363,14 +474,100 @@ class AgentRunEventServiceTest {
     }
 
     @Test
+    void pythonWorkspaceSettingIsFrozenPerRunAndInheritedByChild() throws Exception {
+        ReflectionTestUtils.setField(service, "pythonWorkspaceEnabled", true);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(run("r-workspace", "u-workspace"));
+
+        service.createRun("u-workspace", "hello", "{}", "workspace-idem", "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                DEPLOYMENT_GENERATION_ID, false, false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        AgentRun parent = runCaptor.getValue();
+        assertTrue(objectMapper.readTree(parent.getExt()).path("python_workspace_enabled").asBoolean());
+
+        // 新建 Run 的配置随后变化，已创建的父 Run 和由它派生的子 Run 仍保留原值。
+        ReflectionTestUtils.setField(service, "pythonWorkspaceEnabled", false);
+        parent.setSchedulerVersion("DUAL_POOL_V2");
+        AgentRun child = createChild(parent, "workspace-child",
+                member(1, "branch-a", 0, 2, 3, 0, "call-a"));
+        assertTrue(objectMapper.readTree(child.getExt()).path("python_workspace_enabled").asBoolean());
+        assertEquals("workspace-child", child.getId());
+    }
+
+    @Test
+    void newRunFreezesLatestNacosWorkspaceSwitchAndFailsClosedBeforeSync() throws Exception {
+        ReflectionTestUtils.setField(service, "pythonWorkspaceEnabled", true);
+        AgentLlmProperties disabled = objectMapper.readValue(
+                "{\"agent\":{\"python-workspace\":{\"enabled\":false}}}", AgentLlmProperties.class);
+        AgentLlmProperties enabled = objectMapper.readValue(
+                "{\"agent\":{\"python-workspace\":{\"enabled\":true}}}", AgentLlmProperties.class);
+        AtomicReference<Optional<AgentLlmProperties>> current = new AtomicReference<>(Optional.of(disabled));
+        AtomicReference<Boolean> authoritative = new AtomicReference<>(true);
+        when(llmLocalConfigLoader.current()).thenAnswer(ignored -> current.get());
+        when(llmLocalConfigLoader.hotConfigIsAuthoritative())
+                .thenAnswer(ignored -> authoritative.get());
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(run("r-workspace-hot", "u-workspace-hot"));
+
+        createWorkspaceTestRun("disabled");
+        current.set(Optional.of(enabled));
+        createWorkspaceTestRun("enabled");
+        authoritative.set(false);
+        createWorkspaceTestRun("not-synced");
+
+        ArgumentCaptor<AgentRun> inserted = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper, org.mockito.Mockito.times(3)).insert(inserted.capture());
+        List<AgentRun> runs = inserted.getAllValues();
+        assertFalse(objectMapper.readTree(runs.get(0).getExt()).path("python_workspace_enabled").asBoolean());
+        assertTrue(objectMapper.readTree(runs.get(1).getExt()).path("python_workspace_enabled").asBoolean());
+        assertFalse(objectMapper.readTree(runs.get(2).getExt()).path("python_workspace_enabled").asBoolean());
+    }
+
+    private void createWorkspaceTestRun(String key) {
+        service.createRun("u-workspace-hot", "hello", "{}", key, "m", "e",
+                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                DEPLOYMENT_GENERATION_ID, false, false);
+    }
+
+    /**
+     * 新建的每一条 Run 都在共享候选里排队，不管它将来由哪一种调度器消费。
+     *
+     * <p>资格行缺了，这条 Run 在候选里没有位置；候选是三个版本共用的唯一入口，旧版本那条路
+     * 也不会来补它，所以这一步必须跟着创建走。断言按创建时的那个 runId 核。</p>
+     */
+    @Test
+    void createRun_shouldPutTheRunIntoTheSharedCandidateSet() throws Exception {
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        AgentRun run = run("r-candidate", "u-candidate");
+        when(runMapper.findByIdAndUserForDeployment(
+                anyString(), anyString(), anyString(), anyString())).thenReturn(run);
+
+        service.createRun("u-candidate", "hello", "{}",
+                "idem-candidate", "m", "e", false, "openrouter", 2, false, "{}",
+                DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        verify(coordinationStore).ensure(runCaptor.getValue().getId());
+    }
+
+    @Test
     void createRun_shouldNotWriteDataFreshnessWhenSnapshotReturnsNull() throws Exception {
         when(mockPromptService.snapshotDataFreshness()).thenReturn(null);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
 
         AgentRun run = run("r-test2", "u-test2");
-        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString())).thenReturn(run);
 
@@ -389,9 +586,6 @@ class AgentRunEventServiceTest {
     void createRun_shouldFreezeExplicitArtifactRequestInExt() throws Exception {
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(1L);
-        when(eventMapper.insert(any())).thenReturn(1);
-        when(runMapper.findByIdAndUser(anyString(), anyString()))
-                .thenReturn(run("r-artifact", "u-artifact"));
         when(runMapper.findByIdAndUserForDeployment(
                 anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(run("r-artifact", "u-artifact"));

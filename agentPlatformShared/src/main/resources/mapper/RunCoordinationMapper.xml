@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.RunCoordinationMapper">
+
+    <!--
+      Run 协调资格。取候选 Run 时把「最近协调轮次」放在排序第一位，同一轮里先按最早可见时间，
+      最后按 Run 身份稳定排序：这样从没被服务过的 Run 排最前，服务过的往后排，
+      任何一张图都不会连续错过两个完整轮次。
+
+      三件纪律写在下面每条语句里：
+
+      1. 一次扫描就是一次全局扫描。旧版本、V1、V2 一起排在同一份候选里，不再按版本分池——
+         分成三池时每种版本各取一份 LIMIT，谁先谁后由各自的池子决定，谈不上共用轮转。
+         路由由调用方按记录里的冻结版本决定。
+      2. 版本与计划代际从 Run 主表派生，不信调用方传进来的值：滚动部署期间同一条 Run 的
+         冻结版本只有一个出处，协调子记录不许跟主记录说两套话。
+      3. 所有推进与延期都带期望值做条件更新，并且只前进不后退：迟到的旧线程、旧轮次、
+         旧计划代际写进来必须影响 0 行，而不是把新事实改回旧事实。
+
+      协调与派发各有一组轮转位置，各自的写入与刷新语句只碰自己那一组。
+    -->
+
+    <resultMap id="RunCoordinationResultMap"
+               type="world.willfrog.agent.platform.coordination.RunCoordination">
+        <id property="runId" column="run_id"/>
+        <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="deferReason" column="defer_reason"/>
+        <result property="nextVisibleAt" column="next_visible_at"/>
+        <result property="coordinationServedRound" column="coordination_served_round"/>
+        <result property="coordinationMissedRounds" column="coordination_missed_rounds"/>
+        <result property="dispatchServedRound" column="dispatch_served_round"/>
+        <result property="dispatchMissedRounds" column="dispatch_missed_rounds"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="coordinationColumns">
+        c.run_id,
+        c.scheduler_version,
+        c.plan_generation,
+        c.defer_reason,
+        c.next_visible_at,
+        c.coordination_served_round,
+        c.coordination_missed_rounds,
+        c.dispatch_served_round,
+        c.dispatch_missed_rounds,
+        c.created_at,
+        c.updated_at
+    </sql>
+
+    <!--
+      只留还没结束、也不是「取消中」的 Run：终态与取消中的 Run 不再参与协调轮转。
+      这段清单与 AgentRunStatus 逐项对应，扫描与轮次刷新共用同一份口径，
+      免得「谁算这一轮的候选」在两处各说一套。
+    -->
+    <sql id="liveRunStatuses">
+        'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'WAITING_TOOL_JOB'
+    </sql>
+
+    <!--
+      建一条资格记录：版本与计划代际直接取 Run 主表上的值，调用方传什么都没用。
+      Run 不存在时影响 0 行，调用方据此知道「这条 Run 不在库里」。
+
+      三个调度器版本共用这一张表、共用同一份候选排序：旧版本、两个双池版本排在一起按轮次竞争，
+      谁先轮到谁先被服务。选出来之后按每一行自己冻结的版本交给对应入口，扫描的这一步不按版本分家。
+      给某一个版本单独开一份候选，等于让它按另一套轮次单独插队，两边的公平性都无从比较。
+    -->
+    <insert id="ensure">
+        INSERT INTO alphafrog_agent_run_coordination (run_id, scheduler_version, plan_generation)
+        SELECT r.id, r.scheduler_version, COALESCE(r.plan_generation, -1)
+        FROM alphafrog_agent_run r
+        WHERE r.id = #{runId}
+        ON CONFLICT (run_id) DO NOTHING
+    </insert>
+
+    <!--
+      延期：必须带这一轮开始时读到的计划代际与协调轮次做条件。
+      条件不满足说明这张图已经被服务过（轮次前进）或者已经换了计划代际，这次延期是旧观察，
+      写进去只会把新事实拉回旧事实。
+
+      父 Run 上的当前代际也要一起核：子记录可能还没来得及跟着同步，只比子记录会让升代之后的
+      旧延期照样写进去，把已经作废的那一轮说成还在排队。
+    -->
+    <update id="deferFor">
+        UPDATE alphafrog_agent_run_coordination c SET
+            defer_reason = #{deferReason},
+            next_visible_at = #{nextVisibleAt},
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.coordination_served_round = #{expectedServedRound}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{runId}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
+    </update>
+
+    <!--
+      协调成功推进：清掉延期原因、记下这一轮服务过它、连续未获协调轮数归零。
+      轮次只许前进，迟到的旧轮次写进来影响 0 行。
+
+      父 Run 与资格记录上的计划代际都要还是调用方这一回合开始时读到的那一代：计划已经推进之后，
+      旧回合的成功写不许清掉延期原因、不许改轮转位置，否则等于拿旧回合冒充新回合。
+    -->
+    <update id="markCoordinationServed">
+        UPDATE alphafrog_agent_run_coordination c SET
+            defer_reason = NULL,
+            next_visible_at = CURRENT_TIMESTAMP,
+            coordination_served_round = #{roundNumber},
+            coordination_missed_rounds = 0,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.coordination_served_round &lt; #{roundNumber}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{runId}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
+    </update>
+
+    <!--
+      派发成功推进：只动派发那一组轮转位置。延期原因是协调层的事实，派发不替它做主。
+      同样只许前进，同样要核父 Run 与资格记录上的计划代际：换了计划之后，旧回合的领取
+      不该再改写轮转位置。
+    -->
+    <update id="markDispatchServed">
+        UPDATE alphafrog_agent_run_coordination c SET
+            dispatch_served_round = #{roundNumber},
+            dispatch_missed_rounds = 0,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.dispatch_served_round &lt; #{roundNumber}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{runId}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
+    </update>
+
+    <!--
+      把计划代际同步成 Run 主表上的当前值。三个条件缺一不可：调用方声明的这一代必须就是
+      Run 上的当前一代（防止拿着旧读到的代际推描述）、必须是往前推进（不许倒退）、
+      确实和库里记录的不一样（没变就不写）。
+    -->
+    <update id="syncPlanGeneration">
+        UPDATE alphafrog_agent_run_coordination c SET
+            plan_generation = r.plan_generation,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND r.plan_generation = #{planGeneration}
+          AND c.plan_generation &lt; #{planGeneration}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{runId}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
+    </update>
+
+    <!--
+      旧版本 Run 交给旧入口这一步的记账：与上面两条同形，但**不带服务所有权条件**。
+      授权来源不同——这一笔不是「我在服务这条 Run」，而是「本进程刚决定把这条旧 Run 交给旧入口」，
+      双池这一层对它从来没有所有权。两条语句分开写就是为了让这件事在 SQL 里看得见，
+      而不是给所有权条件加一个「可空」的开关。
+    -->
+    <update id="markHandoffServed">
+        UPDATE alphafrog_agent_run_coordination c SET
+            defer_reason = NULL,
+            next_visible_at = CURRENT_TIMESTAMP,
+            coordination_served_round = #{roundNumber},
+            coordination_missed_rounds = 0,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.coordination_served_round &lt; #{roundNumber}
+    </update>
+
+    <update id="deferHandoff">
+        UPDATE alphafrog_agent_run_coordination c SET
+            defer_reason = #{deferReason},
+            next_visible_at = #{nextVisibleAt},
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE c.run_id = #{runId}
+          AND r.id = c.run_id
+          AND c.plan_generation = #{expectedPlanGeneration}
+          AND r.plan_generation = #{expectedPlanGeneration}
+          AND c.coordination_served_round = #{expectedServedRound}
+    </update>
+
+    <!--
+      这一轮可以被协调的 Run，一次全局扫描：两个双池版本不各自分池，排在同一份候选里，
+      调用方按每行记录的冻结版本路由。已结束的 Run 不再需要协调，取消中的 Run 交给取消路径推进。
+
+      候选里只放双池家族：旧版本的 Run 由旧引擎服务，它不读这张表。把旧行留在候选里会白占
+      扫描条数——排在前面的旧行永远没人接走，后面的双池 Run 连被看见的机会都没有。
+    -->
+    <select id="scanDue" resultMap="RunCoordinationResultMap">
+        SELECT <include refid="coordinationColumns"/>
+        FROM alphafrog_agent_run_coordination c
+        JOIN alphafrog_agent_run r ON r.id = c.run_id
+        WHERE c.next_visible_at &lt;= CURRENT_TIMESTAMP
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+        ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id
+        LIMIT #{limit}
+    </select>
+
+    <!--
+      一轮结束时，给「这一轮确实站着排队却没轮到」的记录各加一轮。
+
+      口径是每轮加一，不按全局轮次差补算。差值法会把「没在竞争的那段时间」也算成没被服务：
+      一张图延期一百轮之后重新可见，差值是 99，可它这九十九轮根本没排队。按轮递增只数真正
+      有资格却没拿到机会的轮数。
+
+      有资格的条件与扫描同一份：还活着、且已经到下次可见时间。这一轮里被服务过的
+      （服务轮次就是刚结束这一轮）不加，主动延期等待中的不加。计数只增不减。
+    -->
+    <update id="refreshCoordinationMissedRounds">
+        UPDATE alphafrog_agent_run_coordination c SET
+            coordination_missed_rounds = c.coordination_missed_rounds + 1,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE r.id = c.run_id
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+          AND c.next_visible_at &lt;= CURRENT_TIMESTAMP
+          AND c.coordination_served_round &lt; #{roundNumber}
+    </update>
+
+    <!--
+      派发那一组的刷新，口径相同（每轮加一）、字段不同。这一组的「有资格竞争」还要求这张图此刻
+      确实有到期可领取的节点：没有可领节点的图谈不上被派发机会漏掉。
+    -->
+    <update id="refreshDispatchMissedRounds">
+        UPDATE alphafrog_agent_run_coordination c SET
+            dispatch_missed_rounds = c.dispatch_missed_rounds + 1,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE r.id = c.run_id
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+          AND c.dispatch_served_round &lt; #{roundNumber}
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_work_item wi
+              WHERE wi.run_id = c.run_id
+                AND wi.state IN ('RUNNABLE', 'RESUMABLE')
+                AND wi.next_visible_at &lt;= CURRENT_TIMESTAMP
+          )
+    </update>
+
+    <select id="find" resultMap="RunCoordinationResultMap">
+        SELECT <include refid="coordinationColumns"/>
+        FROM alphafrog_agent_run_coordination c
+        WHERE c.run_id = #{runId}
+    </select>
+
+</mapper>

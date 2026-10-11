@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# 受限 SSH 入口调用的长工具验收命令。只访问 Beta 控制器的回环地址，不接收 URL、
+# 请求头、SQL 或文件路径，避免把一次性故障能力扩成通用远程执行入口。
+set -euo pipefail
+
+TOKEN_FILE="${AF_BETA_CONTROLLER_API_TOKEN_FILE:-/etc/alphafrog-beta/secrets/controller-api-token}"
+CONTROLLER_BASE="${AF_BETA_CONTROLLER_LOOPBACK_URL:-http://127.0.0.1:19090}"
+
+fail() {
+  echo "af-beta tool-job-test: $*" >&2
+  exit 64
+}
+
+require_value() {
+  [ "$#" -ge 2 ] && [ -n "$2" ] || fail "参数 $1 缺少取值"
+}
+
+deployment=""
+generation=""
+run_id=""
+scenario=""
+checkpoint=""
+action=""
+ttl=""
+plan_generation=""
+control_version=""
+operation_id=""
+
+command="${1:-}"
+[ -n "$command" ] || fail "需要 arm、show、invalidate-plan 或 restart"
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --deployment) require_value "$@"; deployment="$2"; shift 2 ;;
+    --generation) require_value "$@"; generation="$2"; shift 2 ;;
+    --run-id) require_value "$@"; run_id="$2"; shift 2 ;;
+    --scenario) require_value "$@"; scenario="$2"; shift 2 ;;
+    --checkpoint) require_value "$@"; checkpoint="$2"; shift 2 ;;
+    --action) require_value "$@"; action="$2"; shift 2 ;;
+    --ttl-seconds) require_value "$@"; ttl="$2"; shift 2 ;;
+    --expected-plan-generation) require_value "$@"; plan_generation="$2"; shift 2 ;;
+    --expected-run-control-version) require_value "$@"; control_version="$2"; shift 2 ;;
+    --expected-operation-id) require_value "$@"; operation_id="$2"; shift 2 ;;
+    *) fail "不支持的参数: $1" ;;
+  esac
+done
+
+[[ "$deployment" =~ ^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$ ]] || fail "deployment 格式无效"
+[[ "$generation" =~ ^gen-[a-f0-9]{64}$ ]] || fail "generation 格式无效"
+[ "$deployment" != "stable" ] || fail "禁止对主 Beta 执行验收控制动作"
+
+[ -f "$TOKEN_FILE" ] && [ ! -L "$TOKEN_FILE" ] || fail "控制器凭证文件不可用"
+token="$(tr -d '\n' < "$TOKEN_FILE")"
+[ "${#token}" -ge 32 ] || fail "控制器凭证文件无效"
+
+base="$CONTROLLER_BASE/internal/beta/tool-job-tests/deployments/$deployment/generations/$generation"
+curl_json() {
+  method="$1"
+  url="$2"
+  body="${3:-}"
+  if [ -n "$body" ]; then
+    curl --silent --show-error --fail-with-body --connect-timeout 5 --max-time 180 \
+      --request "$method" --header "Authorization: Bearer $token" \
+      --header 'Content-Type: application/json' --data "$body" "$url"
+  else
+    curl --silent --show-error --fail-with-body --connect-timeout 5 --max-time 180 \
+      --request "$method" --header "Authorization: Bearer $token" "$url"
+  fi
+}
+
+case "$command" in
+  arm)
+    [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]] || fail "run-id 格式无效"
+    case "$checkpoint" in
+      BEFORE_SANDBOX_SUBMIT|AFTER_SANDBOX_ACCEPTED|AFTER_RESUME_COMMITTED|AFTER_MODEL_COMPLETED) ;;
+      *) fail "checkpoint 不在固定枚举中" ;;
+    esac
+    case "$action" in THREAD_INTERRUPT|PROCESS_HALT) ;; *) fail "action 不在固定枚举中" ;; esac
+    [[ "$ttl" =~ ^[0-9]+$ ]] || fail "ttl-seconds 必须是整数"
+    curl_json POST "$base/runs/$run_id/faults" \
+      "{\"checkpoint\":\"$checkpoint\",\"action\":\"$action\",\"ttlSeconds\":$ttl}"
+    ;;
+  show)
+    [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]] || fail "run-id 格式无效"
+    [[ "$scenario" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || fail "scenario 格式无效"
+    curl_json GET "$base/runs/$run_id/faults/$scenario"
+    ;;
+  invalidate-plan)
+    [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$ ]] || fail "run-id 格式无效"
+    [[ "$plan_generation" =~ ^[0-9]+$ ]] || fail "expected-plan-generation 必须是整数"
+    [[ "$control_version" =~ ^[0-9]+$ ]] || fail "expected-run-control-version 必须是整数"
+    [[ "$operation_id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] || fail "expected-operation-id 格式无效"
+    curl_json POST "$base/runs/$run_id/invalidate-plan-generation" \
+      "{\"expectedPlanGeneration\":$plan_generation,\"expectedRunControlVersion\":$control_version,\"expectedOperationId\":\"$operation_id\"}"
+    ;;
+  restart)
+    [ -z "$run_id$scenario$checkpoint$action$ttl$plan_generation$control_version$operation_id" ] \
+      || fail "restart 不接受 Run 或故障参数"
+    curl_json POST "$base/agent-service/restart"
+    ;;
+  *) fail "不支持的动作: $command" ;;
+esac
+printf '\n'

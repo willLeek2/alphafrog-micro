@@ -9,6 +9,9 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.entity.AgentRun;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -76,6 +79,10 @@ public class AgentRunBudgetService {
     @Autowired(required = false)
     private AgentLlmLocalConfigLoader localConfigLoader;
 
+    /** V2 的调用次数由持久根树额度判断；这里继续检查挂钟和 token。 */
+    @Autowired(required = false)
+    private AgentRunMapper runMapper;
+
     /** 挂钟时间硬上限（毫秒），默认 600000ms = 10 分钟 */
     @Value("${agent.run.budget.max-wall-clock-ms:600000}")
     private long defaultMaxWallClockMs;
@@ -115,6 +122,35 @@ public class AgentRunBudgetService {
     /** 返回生效的单次逻辑 LLM 调用最大 HTTP 重试次数（至少为 1）。 */
     public int maxHttpAttemptsPerLogicalCall() {
         return Math.max(1, effectiveConfig().maxHttpAttemptsPerLogicalCall());
+    }
+
+    /**
+     * 当前 Run 剩余墙钟毫秒数。起点锁 {@code alphafrog_agent_run.started_at}，
+     * 上限取 {@link #effectiveConfig()} 的 maxWallClockMs。
+     *
+     * <p>墙钟上限未设（&lt;=0）时返回 {@link Long#MAX_VALUE}，表示不夹超时。
+     * 没有 runId、started_at 缺失、Run 不存在或 mapper 未接线时抛
+     * {@link RunStartedAtMissingException}，不回落到 observability JSON 里的 startedAtMillis。</p>
+     */
+    public long remainingWallClockMs() {
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            throw new RunStartedAtMissingException(runId);
+        }
+        if (runMapper == null) {
+            throw new RunStartedAtMissingException(runId);
+        }
+        AgentRun run = runMapper.findById(runId);
+        if (run == null || run.getStartedAt() == null) {
+            throw new RunStartedAtMissingException(runId);
+        }
+        long maxWallClockMs = effectiveConfig().maxWallClockMs();
+        if (maxWallClockMs <= 0L) {
+            return Long.MAX_VALUE;
+        }
+        long startedAtMillis = run.getStartedAt().toInstant().toEpochMilli();
+        long elapsed = Math.max(0L, System.currentTimeMillis() - startedAtMillis);
+        return Math.max(0L, maxWallClockMs - elapsed);
     }
 
     /**
@@ -180,12 +216,15 @@ public class AgentRunBudgetService {
         }
         // 2. LLM 调用次数检查：仅 llm_call 入口触发，tool_call 入口跳过
         long llmCalls = toLong(summary.get("llmCalls"));
-        if ("llm_call".equals(operation) && budget.maxLlmCalls() > 0 && llmCalls >= budget.maxLlmCalls()) {
+        boolean persistentTreeCalls = isPersistentTreeCall(runId);
+        if (!persistentTreeCalls && "llm_call".equals(operation)
+                && budget.maxLlmCalls() > 0 && llmCalls >= budget.maxLlmCalls()) {
             throw exceeded("llm_calls", llmCalls, budget.maxLlmCalls());
         }
         // 3. 工具调用次数检查：仅 tool_call 入口触发，llm_call 入口跳过
         long toolCalls = toLong(summary.get("toolCalls"));
-        if ("tool_call".equals(operation) && budget.maxToolCalls() > 0 && toolCalls >= budget.maxToolCalls()) {
+        if (!persistentTreeCalls && "tool_call".equals(operation)
+                && budget.maxToolCalls() > 0 && toolCalls >= budget.maxToolCalls()) {
             throw exceeded("tool_calls", toolCalls, budget.maxToolCalls());
         }
         // 4. Token 检查：无论什么入口都检查，因为 token 消耗可能在 LLM 调用后上报、也可能在工具调用中被附带
@@ -193,6 +232,14 @@ public class AgentRunBudgetService {
         if (budget.maxTokens() > 0 && tokens >= budget.maxTokens()) {
             throw exceeded("tokens", tokens, budget.maxTokens());
         }
+    }
+
+    private boolean isPersistentTreeCall(String runId) {
+        if (runMapper == null) {
+            return false;
+        }
+        AgentRun run = runMapper.findById(runId);
+        return run != null && "DUAL_POOL_V2".equals(run.getSchedulerVersion());
     }
 
     /**

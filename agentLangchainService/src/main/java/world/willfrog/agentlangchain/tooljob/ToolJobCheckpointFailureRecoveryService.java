@@ -137,6 +137,7 @@ public class ToolJobCheckpointFailureRecoveryService {
             // operation/toolCall/attempt/task/version 任一变化都表示所有权已经转移。
             ToolJobAnchor anchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
             return anchor != null
+                    && !"CANCELED".equals(anchor.getRunDisposition())
                     && Objects.equals(anchor.getOperationId(), request.getOperationId())
                     && Objects.equals(anchor.getToolCallId(), request.getToolCallId())
                     && anchor.getAttempt() == request.getAttempt()

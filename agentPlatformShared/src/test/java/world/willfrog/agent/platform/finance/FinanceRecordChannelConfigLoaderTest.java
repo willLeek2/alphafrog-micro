@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -270,5 +271,47 @@ class FinanceRecordChannelConfigLoaderTest {
                 .isInstanceOf(FinanceRecordProcessingException.class)
                 .extracting("code")
                 .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
+    }
+
+    @Test
+    void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath(@TempDir Path tempDir) throws Exception {
+        Path shared = tempDir.resolve("finance-record-channel.local.json");
+        Path isolated = shared.getParent().resolve("stage3-dag-0922.finance-record-channel.local.json");
+        Files.writeString(shared, "{\"enabled\":true,\"recordCountMax\":12}");
+        Files.writeString(isolated, "{\"enabled\":true,\"recordCountMax\":7}");
+
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        defaults.setEnabled(false);
+        defaults.setConfigFile(shared.toString());
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(objectMapper, defaults);
+        ReflectionTestUtils.setField(loader, "laneTrafficScopeId", "stage3-dag-0922");
+
+        loader.applyNacosWrittenFile(shared.toString());
+        assertThat(loader.current().limits().enabled()).isFalse();
+        assertThat(loader.current().sourceRevision()).isEqualTo("application-defaults");
+
+        loader.applyNacosWrittenFile(isolated.toString());
+        assertThat(loader.current().limits().enabled()).isTrue();
+        assertThat(loader.current().limits().recordCountMax()).isEqualTo(7);
+        loader.refresh();
+        assertThat(loader.current().limits().recordCountMax()).isEqualTo(7);
+    }
+
+    @Test
+    void snakeCaseApplicationMapper_stillBindsCamelCaseRecordCountMax(@TempDir Path tempDir) throws Exception {
+        Path config = tempDir.resolve("finance-record-channel.json");
+        Files.writeString(config, "{\"enabled\":true,\"recordCountMax\":12}");
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        defaults.setEnabled(false);
+        defaults.setRecordCountMax(128);
+        defaults.setConfigFile(config.toString());
+        ObjectMapper snake = new ObjectMapper()
+                .setPropertyNamingStrategy(com.fasterxml.jackson.databind.PropertyNamingStrategies.SNAKE_CASE);
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(snake, defaults);
+
+        loader.load();
+
+        assertThat(loader.current().limits().enabled()).isTrue();
+        assertThat(loader.current().limits().recordCountMax()).isEqualTo(12);
     }
 }

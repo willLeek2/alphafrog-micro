@@ -464,4 +464,78 @@ class FinanceResultModelProjectorTest {
                         Map.of(), "公式", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
         assertFalse(projector.project(input).isPresent());
     }
+
+    @Test
+    void multiOutputWithOutputKeyProjectsPerOutputUnit() {
+        FinanceMethodSpec dsc = catalog.findByMethodId("finance.risk.drawdown_sortino_calmar").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        dsc.getMethodId(), dsc.getVersion(), dsc.getSpecDigest(),
+                        -0.0972, "ratio",
+                        Map.of("prices", List.of(100.0, 120.0, 90.0), "output", "maxDrawdown"),
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
+        assertTrue(result.isPresent());
+        assertEquals("ratio", result.get().unit());
+        assertTrue(result.get().method().startsWith(dsc.getDisplayName() + "·"));
+        assertTrue(result.get().method().contains("最大回撤"));
+    }
+
+    @Test
+    void multiOutputWithoutOutputKeyReturnsEmpty() {
+        FinanceMethodSpec dsc = catalog.findByMethodId("finance.risk.drawdown_sortino_calmar").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        dsc.getMethodId(), dsc.getVersion(), dsc.getSpecDigest(),
+                        1.5, "ratio_per_annum",
+                        Map.of("prices", List.of(100.0, 120.0, 90.0)),
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        assertFalse(projector.project(input).isPresent(), "多输出规格缺 output 键不可投影");
+    }
+
+    @Test
+    void multiOutputUnknownOutputKeyReturnsEmpty() {
+        FinanceMethodSpec dsc = catalog.findByMethodId("finance.risk.drawdown_sortino_calmar").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        dsc.getMethodId(), dsc.getVersion(), dsc.getSpecDigest(),
+                        1.5, "ratio_per_annum",
+                        Map.of("prices", List.of(100.0, 120.0, 90.0), "output", "notAnOutput"),
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        assertFalse(projector.project(input).isPresent());
+    }
+
+    @Test
+    void multiOutputUnitMustMatchThatOutputNotTheFirst() {
+        FinanceMethodSpec dsc = catalog.findByMethodId("finance.risk.drawdown_sortino_calmar").orElseThrow();
+        // sortino 输出的 unit 是 ratio_per_annum；拿 ratio 校验必须失败（不能落到第一个输出的 unit）
+        FinanceResultModelProjector.FinanceResultProjectionInput wrongUnit =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        dsc.getMethodId(), dsc.getVersion(), dsc.getSpecDigest(),
+                        1.5, "ratio",
+                        Map.of("prices", List.of(100.0, 120.0, 90.0), "output", "sortino"),
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        assertFalse(projector.project(wrongUnit).isPresent());
+        FinanceResultModelProjector.FinanceResultProjectionInput rightUnit =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        dsc.getMethodId(), dsc.getVersion(), dsc.getSpecDigest(),
+                        1.5, "ratio_per_annum",
+                        Map.of("prices", List.of(100.0, 120.0, 90.0), "output", "sortino"),
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        assertTrue(projector.project(rightUnit).isPresent());
+    }
+
+    @Test
+    void singleOutputStillProjectsExtraOutputKeyIgnored() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
+                        0.1246, "ratio",
+                        Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4, "output", "cagr"),
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
+        assertTrue(result.isPresent());
+        assertEquals(cagr.getDisplayName(), result.get().method());
+    }
 }

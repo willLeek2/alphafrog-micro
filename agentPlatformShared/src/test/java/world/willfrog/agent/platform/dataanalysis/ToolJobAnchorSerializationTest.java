@@ -124,4 +124,45 @@ class ToolJobAnchorSerializationTest {
         assertThat(restored.getFinanceRecordLimitsJson())
                 .isEqualTo("{\"enabled\":false,\"recordCountMax\":128}");
     }
+
+    @Test
+    void roundTripsWorkspaceRefusalWithoutInventingTaskIdentity() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:call-1:1");
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        anchor.setWorkspaceRefusalCode("WORKSPACE_DIRTY");
+
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+        assertThat(restored.getOperationId()).isEqualTo("run-1:call-1:1");
+        assertThat(restored.getAnchorState()).isEqualTo("WORKSPACE_REFUSED");
+        assertThat(restored.getWorkspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(restored.getTaskId()).isNull();
+    }
+
+    @Test
+    void roundTripsDualPoolWorkItemIdentityAndVersions() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setWorkItemPlanGeneration(3);
+        anchor.setWorkItemNodeId("todo-2");
+        anchor.setWorkItemNodeAttempt(1);
+        anchor.setWorkItemSegmentSequence(0);
+        anchor.setWorkItemContextVersion(7L);
+        anchor.setWorkItemRunControlVersion(9L);
+        anchor.setWorkItemClaimEpoch(4);
+        anchor.setWorkItemClaimedBy("node-worker-a");
+        anchor.setWorkItemPayloadJson("{\"kind\":\"TODO\"}");
+
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+        assertThat(restored.getWorkItemPlanGeneration()).isEqualTo(3);
+        assertThat(restored.getWorkItemNodeId()).isEqualTo("todo-2");
+        assertThat(restored.getWorkItemNodeAttempt()).isEqualTo(1);
+        assertThat(restored.getWorkItemSegmentSequence()).isZero();
+        assertThat(restored.getWorkItemContextVersion()).isEqualTo(7L);
+        assertThat(restored.getWorkItemRunControlVersion()).isEqualTo(9L);
+        assertThat(restored.getWorkItemClaimEpoch()).isEqualTo(4);
+        assertThat(restored.getWorkItemClaimedBy()).isEqualTo("node-worker-a");
+        assertThat(restored.getWorkItemPayloadJson()).isEqualTo("{\"kind\":\"TODO\"}");
+    }
 }

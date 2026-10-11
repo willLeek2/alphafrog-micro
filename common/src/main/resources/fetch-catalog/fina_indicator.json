@@ -1,0 +1,80 @@
+{
+  "dataType": "fina_indicator",
+  "label": "股票财务指标",
+  "description": "通过 TuShare fina_indicator_vip 接口按报告期抓取上市公司财务指标（roe/roe_dt/净利率/周转率等约 170 个字段）。limit 默认 8000：一个报告期全市场约 5600 行（生产库 alphafrog_stock_info 实测 5601 只），一页装得下。写入按 ts_code + end_date 唯一键，同一报告期后到的公告覆盖前值。",
+  "serviceModule": "domesticStockFetchService",
+
+  "taskVariants": [
+    {
+      "subType": 1,
+      "label": "按报告期抓取",
+      "description": "按指定的财务报告期抓取全市场财务指标",
+      "requiredParams": ["period"],
+      "optionalParams": ["offset", "limit"],
+      "paramDefs": {
+        "period": {
+          "label": "报告期",
+          "description": "财务报告期，格式 yyyyMMdd，如 20241231 表示 2024 年年报",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "offset": {
+          "label": "偏移量",
+          "description": "TuShare 分页偏移量",
+          "type": "number",
+          "default": 0
+        },
+        "limit": {
+          "label": "每页条数",
+          "description": "TuShare 分页每页条数，默认 8000（一个报告期全市场约 5600 行，一页够用；仍按 offset 排页以防个股数增长后静默截断）",
+          "type": "number",
+          "default": 8000
+        }
+      },
+      "specialFlags": []
+    }
+  ],
+
+  "taskSetVariants": [
+    {
+      "subType": 1,
+      "label": "按 offset 步进展开",
+      "description": "按 offset 步进分页抓取同一报告期的财务指标",
+      "expandParam": "offset_range",
+      "expandDescription": "从 offset_range.start 开始，每次步进 offset_range.step，直到 offset_range.end，每个 offset 生成一条叶子任务，用于分页抓取同一报告期的大量数据",
+      "expandStrategy": "offsets",
+      "requiredParams": ["period", "offset_range"],
+      "optionalParams": [],
+      "paramDefs": {
+        "period": {
+          "label": "报告期",
+          "description": "财务报告期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "offset_range.start": {
+          "label": "Offset 起始",
+          "description": "分页起始偏移量",
+          "type": "number",
+          "default": 0
+        },
+        "offset_range.end": {
+          "label": "Offset 结束",
+          "description": "分页结束偏移量",
+          "type": "number",
+          "default": null
+        },
+        "offset_range.step": {
+          "label": "Offset 步长",
+          "description": "每次步进的偏移量，也作为每页条数",
+          "type": "number",
+          "default": 8000
+        }
+      },
+      "specialFlags": [],
+      "outputTaskVariantSubType": 1
+    }
+  ]
+}

@@ -7,19 +7,30 @@ import org.slf4j.LoggerFactory;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.OperationCancelTarget;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
+import world.willfrog.alphafrogmicro.sandbox.idl.WorkspaceResult;
+
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 
 /**
  * 恢复 PREPARING dispatch 的共享解析器。
  *
  * <p>调用方必须区分远端暂不可决与数据库里的证据损坏。前者可以按同一 operationId
- * 在线重试；后者不能继续查询或重放，以免把错误任务附着到 Run。</p>
+ * 在线重试；后者不能继续查询或重放，以免把错误任务附着到 Run。已取消的 Run 和失去
+ * 执行线程的 DAG 节点只能先按 operationId 留下持久取消墓碑，再接收真实终态；不能重放创建。</p>
  */
 final class ToolJobPreparingDispatchResolver {
 
@@ -34,7 +45,9 @@ final class ToolJobPreparingDispatchResolver {
     enum Outcome {
         RESOLVED,
         REMOTE_UNAVAILABLE,
+        REPLAY_ADMISSION_DEFERRED,
         INVALID_EVIDENCE,
+        WORKSPACE_REFUSED,
         DURABLE_WRITE_UNCERTAIN,
         OWNERSHIP_LOST
     }
@@ -49,8 +62,16 @@ final class ToolJobPreparingDispatchResolver {
             return new Resolution(Outcome.REMOTE_UNAVAILABLE, null);
         }
 
+        static Resolution replayAdmissionDeferred() {
+            return new Resolution(Outcome.REPLAY_ADMISSION_DEFERRED, null);
+        }
+
         static Resolution invalidEvidence() {
             return new Resolution(Outcome.INVALID_EVIDENCE, null);
+        }
+
+        static Resolution workspaceRefused() {
+            return new Resolution(Outcome.WORKSPACE_REFUSED, null);
         }
 
         static Resolution durableWriteUncertain() {
@@ -72,6 +93,11 @@ final class ToolJobPreparingDispatchResolver {
             return Resolution.invalidEvidence();
         }
 
+        if ("CANCELED".equals(anchor.getRunDisposition())
+                || ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+            return resolveStoppedPreparing(runId, anchor, preparing, sandboxService, anchorService);
+        }
+
         GetTaskByOperationIdResponse lookup;
         try {
             lookup = sandboxService.getTaskByOperationId(
@@ -83,7 +109,7 @@ final class ToolJobPreparingDispatchResolver {
                     runId, anchor.getOperationId(), remoteFailure);
             return Resolution.remoteUnavailable();
         }
-        if (lookup == null || !lookup.getError().isBlank()) {
+        if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()) {
             return Resolution.remoteUnavailable();
         }
 
@@ -96,9 +122,30 @@ final class ToolJobPreparingDispatchResolver {
                 return Resolution.invalidEvidence();
             }
         } else {
+            if (!lookup.getTaskId().isBlank() || !lookup.getRequestFingerprint().isBlank()) {
+                return Resolution.remoteUnavailable();
+            }
             ExecuteRequest request = parseDurableCreateRequest(anchor);
             if (request == null) {
                 return Resolution.invalidEvidence();
+            }
+            if (ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())) {
+                try {
+                    if (!anchorService.renewExecuteQueryPreparingReplayClaim(runId, anchor)) {
+                        return Resolution.ownershipLost();
+                    }
+                } catch (SessionQueryAdmissionException admission) {
+                    if (admission.retryable() && "SESSION_QUERY_IN_PROGRESS".equals(admission.code())) {
+                        log.info("原查询重放延期，保留PREPARING证明：run={} operation={} code={}",
+                                runId, anchor.getOperationId(), admission.code());
+                        return Resolution.replayAdmissionDeferred();
+                    }
+                    return Resolution.invalidEvidence();
+                } catch (RuntimeException durableFailure) {
+                    log.warn("原查询重放续占暂不能确认：run={} operation={}", runId,
+                            anchor.getOperationId(), durableFailure);
+                    return Resolution.durableWriteUncertain();
+                }
             }
             ExecuteResponse created;
             try {
@@ -108,6 +155,53 @@ final class ToolJobPreparingDispatchResolver {
                         runId, anchor.getOperationId(), remoteFailure);
                 return Resolution.remoteUnavailable();
             }
+            if (created != null && created.hasWorkspaceResult()) {
+                WorkspaceResult refusal = created.getWorkspaceResult();
+                if (!WaitMemberDispatchProof.isWorkspaceRefusalCode(refusal.name())
+                        || created.hasErrorDetail() || !created.getError().isBlank()
+                        || !created.getTaskId().isBlank()
+                        || !created.getRequestFingerprint().isBlank()
+                        || !created.getStatus().isBlank()) {
+                    return Resolution.remoteUnavailable();
+                }
+                // 重放后的拒绝也需以原操作号复查：有任务则附着；权威无任务才
+                // 持久化拒绝，之后恢复只释放名额，不会再重发这个请求。
+                GetTaskByOperationIdResponse afterRefusal;
+                try {
+                    afterRefusal = sandboxService.getTaskByOperationId(
+                            GetTaskByOperationIdRequest.newBuilder()
+                                    .setOperationId(anchor.getOperationId()).build());
+                } catch (Exception lookupFailure) {
+                    return Resolution.remoteUnavailable();
+                }
+                if (afterRefusal == null || afterRefusal.hasErrorDetail()
+                        || !afterRefusal.getError().isBlank()) {
+                    return Resolution.remoteUnavailable();
+                }
+                if (afterRefusal.getFound()) {
+                    if (!hasMatchingTaskIdentity(anchor, afterRefusal.getTaskId(),
+                            afterRefusal.getRequestFingerprint())) {
+                        return Resolution.invalidEvidence();
+                    }
+                    return attachResolvedTask(runId, anchor, preparing,
+                            afterRefusal.getTaskId(), anchorService);
+                }
+                if (!afterRefusal.getTaskId().isBlank()
+                        || !afterRefusal.getRequestFingerprint().isBlank()) {
+                    return Resolution.remoteUnavailable();
+                }
+                anchor.setAnchorState("WORKSPACE_REFUSED");
+                anchor.setWorkspaceRefusalCode(refusal.name());
+                try {
+                    return anchorService.recordWorkspaceRefusal(
+                            runId, anchor, anchor.getBlockingLeaseUntil())
+                            ? Resolution.workspaceRefused() : Resolution.ownershipLost();
+                } catch (Exception durableFailure) {
+                    log.warn("工作区拒绝结论暂不能保存：run={} operation={}",
+                            runId, anchor.getOperationId(), durableFailure);
+                    return Resolution.durableWriteUncertain();
+                }
+            }
             /*
              * create 已到达 Sandbox 但响应丢失、报错或身份不完整时，下一轮必须先按
              * operationId 再查，不能把这种不确定结果当作数据库里的身份证据损坏。
@@ -115,6 +209,7 @@ final class ToolJobPreparingDispatchResolver {
              * 这是可判定的错误证据，必须隔离，不能无限重放同一矛盾响应。
              */
             if (created == null
+                    || created.hasErrorDetail()
                     || !created.getError().isBlank()
                     || created.getTaskId().isBlank()
                     || created.getRequestFingerprint().isBlank()) {
@@ -127,6 +222,15 @@ final class ToolJobPreparingDispatchResolver {
             fingerprint = created.getRequestFingerprint();
         }
 
+        return attachResolvedTask(runId, anchor, preparing, taskId, anchorService);
+    }
+
+    private static Resolution attachResolvedTask(
+            String runId,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation preparing,
+            String taskId,
+            ToolJobAnchorService anchorService) {
         DataAnalysisReservation attached = new DataAnalysisReservation(
                 preparing.reservationId(),
                 preparing.identity(),
@@ -182,6 +286,57 @@ final class ToolJobPreparingDispatchResolver {
              * 不能再把本地 PREPARING 快照写回覆盖可能已提交的 ATTACHED。
              */
             return Resolution.durableWriteUncertain();
+        }
+    }
+
+    private static Resolution resolveStoppedPreparing(
+            String runId,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation preparing,
+            PythonSandboxService sandboxService,
+            ToolJobAnchorService anchorService) {
+        String operationId = anchor.getOperationId();
+        String fingerprint = anchor.getRequestFingerprint();
+        String cancelId = "tool-job-create-" + UUID.nameUUIDFromBytes(
+                operationId.getBytes(StandardCharsets.UTF_8));
+        try {
+            // The same cancel identity is used by the original worker and both recovery paths.
+            // It prevents a delayed create RPC from becoming an unowned Sandbox task.
+            CancelTaskResponse canceled = sandboxService.cancelTask(CancelTaskRequest.newBuilder()
+                    .setByOperation(OperationCancelTarget.newBuilder()
+                            .setOperationId(operationId)
+                            .setRequestFingerprint(fingerprint))
+                    .setCancelRequestId(cancelId)
+                    .setReason("CANCELED".equals(anchor.getRunDisposition())
+                            ? "RUN_CANCELED" : "DAG_WORKER_LOST")
+                    .build());
+            if (canceled == null || canceled.hasErrorDetail() || !canceled.getError().isBlank()
+                    || canceled.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
+                    || canceled.getOutcome() == CancelOutcome.NOT_FOUND
+                    || canceled.getTaskId().isBlank()) {
+                return Resolution.remoteUnavailable();
+            }
+            GetTaskByOperationIdResponse lookup = sandboxService.getTaskByOperationId(
+                    GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
+            if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()
+                    || !lookup.getFound()) {
+                return Resolution.remoteUnavailable();
+            }
+            if (!canceled.getTaskId().equals(lookup.getTaskId())
+                    || !fingerprint.equals(lookup.getRequestFingerprint())) {
+                log.error("Stopped PREPARING tombstone identity mismatch: run={} operation={} "
+                                + "cancelTaskId={} lookupTaskId={}",
+                        runId, operationId, canceled.getTaskId(), lookup.getTaskId());
+                return Resolution.invalidEvidence();
+            }
+            log.info("Stopped PREPARING tombstone verified: run={} operation={} taskId={} "
+                            + "disposition={}",
+                    runId, operationId, lookup.getTaskId(), anchor.getRunDisposition());
+            return attachResolvedTask(runId, anchor, preparing, lookup.getTaskId(), anchorService);
+        } catch (Exception remoteFailure) {
+            log.warn("Stopped PREPARING operation still awaits Sandbox tombstone: run={} operation={}",
+                    runId, operationId, remoteFailure);
+            return Resolution.remoteUnavailable();
         }
     }
 

@@ -6,10 +6,13 @@ import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationListener;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalCachePaths;
+import world.willfrog.alphafrogmicro.common.config.nacos.NacosLocalConfigWrittenEvent;
 import world.willfrog.alphafrogmicro.common.utils.PlaceholderResolver;
 
 import java.io.File;
@@ -25,7 +28,7 @@ import java.nio.file.Paths;
  */
 @Component
 @Slf4j
-public class FetchJobsConfig {
+public class FetchJobsConfig implements ApplicationListener<NacosLocalConfigWrittenEvent> {
 
     private static final String CONFIG_FILE_NAME = "fetch-jobs.json";
     
@@ -40,6 +43,9 @@ public class FetchJobsConfig {
 
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")
     private String instanceId;
+
+    @Value("${AF_LANE_TRAFFIC_SCOPE_ID:}")
+    private String laneTrafficScopeId;
 
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
@@ -65,6 +71,30 @@ public class FetchJobsConfig {
     @Scheduled(fixedDelayString = "${af.fetch.jobs.config-refresh-interval-ms:10000}")
     public void refresh() {
         reloadIfNeeded(false);
+    }
+
+    @Override
+    public void onApplicationEvent(NacosLocalConfigWrittenEvent event) {
+        applyNacosWrittenFile(event.getTargetFile());
+    }
+
+    /**
+     * Nacos 已经把生效内容写进 {@code targetFile}。路径对得上才重读，避免泳道吃到主环境那份未加前缀的缓存。
+     */
+    public void applyNacosWrittenFile(String targetFile) {
+        if (targetFile == null || targetFile.isBlank()) {
+            return;
+        }
+        String file = resolveConfigPath();
+        if (file == null || file.isBlank()) {
+            return;
+        }
+        Path configured = Paths.get(file).toAbsolutePath().normalize();
+        Path written = Paths.get(targetFile).toAbsolutePath().normalize();
+        if (!configured.equals(written)) {
+            return;
+        }
+        reloadIfNeeded(true);
     }
     
     /**
@@ -146,7 +176,7 @@ public class FetchJobsConfig {
     private String resolveConfigPath() {
         // 1. 如果配置了具体路径，优先使用
         if (configFilePath != null && !configFilePath.trim().isEmpty()) {
-            return configFilePath.trim();
+            return NacosLocalCachePaths.isolate(configFilePath.trim(), laneTrafficScopeId);
         }
         
         // 2. 尝试当前目录的 config 文件夹

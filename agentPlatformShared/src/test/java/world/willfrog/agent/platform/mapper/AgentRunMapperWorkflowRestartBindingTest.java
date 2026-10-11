@@ -34,6 +34,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
             "updateExecutionCheckpoint",
             "updateTerminalSnapshot",
             "updateSnapshotIfStatus",
+            "persistCancelDisposition",
             "pauseSnapshotWithTtl",
             "cancelTerminalSnapshotWithTtl",
             "updateResumedTerminal",
@@ -111,6 +112,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("deployment_generation_id = ?")
                 .contains("'WAITING_TOOL_JOB'")
                 .contains("'CANCELING'")
+                .contains("COALESCE(tool_job_anchor_json, '{}'::jsonb) <> '{}'::jsonb")
                 .doesNotContain("'WAITING'");
     }
 
@@ -151,7 +153,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
-    void restartClaimIsNarrowCasAndClearsOnlyLegacyToolAnchor() {
+    void restartClaimIsNarrowCasAndCannotClearAnActiveToolAnchor() {
         String sql = normalizedSql(statement("claimStartupRestartForDeployment").getBoundSql(Map.of(
                 "id", "run-1",
                 "deploymentId", "stable",
@@ -168,6 +170,7 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("restart_attempt < ?")
                 .contains("deployment_id = ?")
                 .contains("deployment_generation_id = ?")
+                .contains("COALESCE(tool_job_anchor_json, '{}'::jsonb) = '{}'::jsonb")
                 .doesNotContain("execution_checkpoint_json = '{}'::jsonb");
     }
 
@@ -206,14 +209,18 @@ class AgentRunMapperWorkflowRestartBindingTest {
 
         assertThat(shutdown)
                 .contains("deployment_id = ?", "deployment_generation_id = ?", "status = 'FAILED'")
-                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
+                .contains("scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'");
         assertThat(orphan)
                 .contains("WITH candidates AS", "LIMIT ?", "FOR UPDATE SKIP LOCKED")
                 .contains("deployment_id <> 'stable'", "deployment_id = ?",
-                        "deployment_generation_id = ?", "status = 'FAILED'");
+                        "deployment_generation_id = ?", "status = 'FAILED'")
+                .contains("scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'",
+                        "run.scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'");
         assertThat(candidates)
                 .contains("SELECT DISTINCT deployment_id")
                 .contains("deployment_id <> 'stable'")
+                .contains("scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'")
                 .contains("NOT (deployment_id = ? AND deployment_generation_id = ?)")
                 .doesNotContain("LIMIT ?", "(deployment_id, deployment_generation_id) > (?, ?)");
     }
@@ -236,6 +243,14 @@ class AgentRunMapperWorkflowRestartBindingTest {
             assertThat(sql).as(id)
                     .contains("deployment_id = ?")
                     .contains("deployment_generation_id = ?");
+        }
+    }
+
+    @Test
+    void userFollowUpAndResumeCannotReopenRunAfterDeletionStarts() {
+        for (String id : List.of("admitFollowUpForDeployment", "resetForResume")) {
+            String sql = normalizedSql(statement(id).getBoundSql(dummyParameters(methodParams.get(id))));
+            assertThat(sql).as(id).contains("deletion_started_at IS NULL");
         }
     }
 
@@ -270,27 +285,47 @@ class AgentRunMapperWorkflowRestartBindingTest {
     void cancelAndPauseControlWritesStayAtomicWithBusinessFieldConditions() {
         String snapshot = normalizedSql(statement("updateSnapshotIfStatus")
                 .getBoundSql(dummyParameters(methodParams.get("updateSnapshotIfStatus"))));
+        String anchoredCancel = normalizedSql(statement("persistCancelDisposition")
+                .getBoundSql(dummyParameters(methodParams.get("persistCancelDisposition"))));
         String pause = normalizedSql(statement("pauseSnapshotWithTtl")
                 .getBoundSql(dummyParameters(methodParams.get("pauseSnapshotWithTtl"))));
         String cancel = normalizedSql(statement("cancelTerminalSnapshotWithTtl")
                 .getBoundSql(dummyParameters(methodParams.get("cancelTerminalSnapshotWithTtl"))));
+        String clearActive = normalizedSql(statement("clearActiveToolJobAnchor")
+                .getBoundSql(dummyParameters(methodParams.get("clearActiveToolJobAnchor"))));
 
         assertThat(snapshot)
-                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("snapshot_json = CASE")
+                .contains("CAST(? AS jsonb)")
                 .contains("status = ?")
+                .doesNotContain("SET status = 'CANCELED'")
                 .doesNotContain("deployment_id", "deployment_generation_id");
+        assertThat(anchoredCancel)
+                .contains("'runDisposition', 'CANCELED'")
+                .contains("WHEN scheduler_version = 'DUAL_POOL_V2'")
+                .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'")
+                .contains("THEN run_control_version + 1")
+                .contains("tool_job_anchor_json ->> 'operationId' = ?")
+                .contains("status = ?");
+        assertThat(clearActive)
+                .contains("tool_job_anchor_json ->> 'operationId' = ?")
+                .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'");
         assertThat(pause)
                 .contains("status = 'WAITING'")
-                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("snapshot_json = CASE")
+                .contains("CAST(? AS jsonb)")
                 .contains("ttl_expires_at = ?")
                 .contains("status = ?")
                 .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
                 .doesNotContain("deployment_id", "deployment_generation_id");
         assertThat(cancel)
                 .contains("status = 'CANCELED'")
-                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("snapshot_json = CASE")
+                .contains("CAST(? AS jsonb)")
+                .contains("WHEN scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2') THEN run_control_version + 1")
                 .contains("ttl_expires_at = ?")
                 .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
+                .contains("tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb")
                 .doesNotContain("deployment_id", "deployment_generation_id");
     }
 
@@ -351,6 +386,22 @@ class AgentRunMapperWorkflowRestartBindingTest {
         assertThat(sql)
                 .contains("status IN ('WAITING_TOOL_JOB', 'EXECUTING', 'WAITING', 'RECEIVED')")
                 .contains("tool_job_anchor_json ->> 'operationId' = ?");
+    }
+
+    @Test
+    void canceledToolJobCannotBeChangedBackToCheckpointFailureOrStaleDisposition() {
+        for (String id : List.of("markToolJobCheckpointFailed", "markToolJobCheckpointFailurePending")) {
+            String sql = normalizedSql(statement(id).getBoundSql(Map.of()));
+            assertThat(sql).as(id)
+                    .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'");
+        }
+        for (String id : List.of("updateToolJobAnchor", "updateToolJobAnchorAndStatus",
+                "updateActiveToolJobAnchor", "updateToolJobAnchorAndStatusByOperation")) {
+            String sql = normalizedSql(statement(id).getBoundSql(Map.of()));
+            assertThat(sql).as(id)
+                    .contains("tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'")
+                    .contains("CAST(? AS jsonb) ->> 'runDisposition' = 'CANCELED'");
+        }
     }
 
     @Test

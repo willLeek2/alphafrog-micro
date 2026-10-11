@@ -6,8 +6,10 @@ import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockBalancesheetQueryResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockCashflowQueryResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockExpressQueryResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockFinaIndicatorQueryResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockFinancialQueryRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockIncomeQueryResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockReportRcQueryResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockService;
 
 import java.util.Arrays;
@@ -51,7 +53,7 @@ final class MarketDataFinancialTools {
             List<Map<String, Object>> items = fetchItems(type, request);
             if (items == null) {
                 return support.fail(tool, "INVALID_ARGUMENT", "Unknown reportType: " + type
-                        + ". Must be one of: income, balancesheet, cashflow, express", Map.of("reportType", type));
+                        + ". Must be one of: income, balancesheet, cashflow, express, fina_indicator, report_rc", Map.of("reportType", type));
             }
             if (items.isEmpty()) {
                 return support.fail(tool, "NO_DATA", "No financial data found", Map.of(
@@ -86,8 +88,54 @@ final class MarketDataFinancialTools {
             case "balancesheet" -> mapBalancesheet(domesticStockService.queryStockBalancesheet(request));
             case "cashflow" -> mapCashflow(domesticStockService.queryStockCashflow(request));
             case "express" -> mapExpress(domesticStockService.queryStockExpress(request));
+            case "fina_indicator" -> mapFinaIndicator(domesticStockService.queryStockFinaIndicator(request));
+            case "report_rc" -> mapReportRc(domesticStockService.queryStockReportRc(request));
             default -> null;
         };
+    }
+
+    // 指标库扩充：财务指标行——五列都是原始 JSON 字符串（四类 + extended），方法侧/分析侧自行转数值
+    private List<Map<String, Object>> mapFinaIndicator(DomesticStockFinaIndicatorQueryResponse response) {
+        return response.getItemsList().stream().map(item -> {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("ts_code", item.getTsCode());
+            row.put("end_date", item.getEndDate());
+            row.put("ann_date", item.getAnnDate());
+            row.put("profitability", item.getProfitability());
+            row.put("per_share", item.getPerShare());
+            row.put("capital_cash", item.getCapitalCash());
+            row.put("growth", item.getGrowth());
+            row.put("extended", item.getExtended());
+            return row;
+        }).toList();
+    }
+
+    // 指标库扩充：券商盈利预测行——数值字段未给出时为 null（不是 0），预测市盈率/PEG 计算按缺失处理
+    private List<Map<String, Object>> mapReportRc(DomesticStockReportRcQueryResponse response) {
+        return response.getItemsList().stream().map(item -> {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("ts_code", item.getTsCode());
+            row.put("name", item.getName());
+            row.put("report_date", item.getReportDate());
+            row.put("org_name", item.getOrgName());
+            row.put("author_name", item.getAuthorName());
+            row.put("quarter", item.getQuarter());
+            row.put("rating", item.getRating());
+            row.put("eps", item.hasEps() ? item.getEps() : null);
+            row.put("np", item.hasNp() ? item.getNp() : null);
+            row.put("pe", item.hasPe() ? item.getPe() : null);
+            row.put("tp", item.hasTp() ? item.getTp() : null);
+            row.put("max_price", item.hasMaxPrice() ? item.getMaxPrice() : null);
+            row.put("min_price", item.hasMinPrice() ? item.getMinPrice() : null);
+            row.put("roe", item.hasRoe() ? item.getRoe() : null);
+            row.put("rd", item.hasRd() ? item.getRd() : null);
+            row.put("ev_ebitda", item.hasEvEbitda() ? item.getEvEbitda() : null);
+            row.put("op_rt", item.hasOpRt() ? item.getOpRt() : null);
+            row.put("op_pr", item.hasOpPr() ? item.getOpPr() : null);
+            row.put("report_title", item.getReportTitle());
+            row.put("classify", item.getClassify());
+            return row;
+        }).toList();
     }
 
     private List<Map<String, Object>> mapIncome(DomesticStockIncomeQueryResponse response) {
@@ -194,6 +242,11 @@ final class MarketDataFinancialTools {
             case "express" -> Arrays.asList("ts_code", "end_date", "ann_date", "revenue", "operate_profit", "n_income",
                     "total_assets", "total_hldr_eqy_exc_min_int", "diluted_eps", "diluted_roe", "yoy_net_profit",
                     "yoy_sales", "perf_summary");
+            case "fina_indicator" -> Arrays.asList("ts_code", "end_date", "ann_date", "profitability", "per_share",
+                    "capital_cash", "growth", "extended");
+            case "report_rc" -> Arrays.asList("ts_code", "name", "report_date", "org_name", "author_name", "quarter",
+                    "rating", "eps", "np", "pe", "tp", "max_price", "min_price", "roe", "rd", "ev_ebitda",
+                    "op_rt", "op_pr", "report_title", "classify");
             default -> Arrays.asList("ts_code", "end_date");
         };
     }

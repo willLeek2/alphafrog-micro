@@ -20,7 +20,14 @@
         <result property="startedAt" column="started_at"/>
         <result property="updatedAt" column="updated_at"/>
         <result property="completedAt" column="completed_at"/>
+        <result property="workspaceCleanupStartedAt" column="workspace_cleanup_started_at"/>
+        <result property="workspaceExpiredAt" column="workspace_expired_at"/>
         <result property="ext" column="ext"/>
+        <result property="schedulerVersion" column="scheduler_version"/>
+        <result property="idempotencyKey" column="idempotency_key"/>
+        <result property="requestDigest" column="request_digest"/>
+        <result property="planGeneration" column="plan_generation"/>
+        <result property="runControlVersion" column="run_control_version"/>
         <result property="executionCheckpointJson" column="execution_checkpoint_json"/>
         <result property="restartAttempt" column="restart_attempt"/>
         <result property="toolJobAnchorJson" column="tool_job_anchor_json"/>
@@ -35,17 +42,33 @@
         <result property="deploymentGenerationId" column="deployment_generation_id"/>
     </resultMap>
 
+    <!-- Sandbox 用量凭证由独立 CAS 写入。整份业务快照重建时保留已落库凭证，
+         否则执行终态会抹掉任务停止证据，导致父子调用树的容量无法释放。 -->
+    <sql id="snapshotPreservingDataAnalysisObservability">
+        CASE WHEN jsonb_exists(COALESCE(snapshot_json, '{}'::jsonb), 'data_analysis_observability')
+             THEN CAST(#{snapshotJson} AS jsonb)
+                  || jsonb_build_object('data_analysis_observability',
+                                        snapshot_json -&gt; 'data_analysis_observability')
+             ELSE CAST(#{snapshotJson} AS jsonb)
+        END
+    </sql>
+
     <insert id="insert" parameterType="world.willfrog.agent.platform.entity.AgentRun">
         INSERT INTO alphafrog_agent_run
         (id, user_id, deployment_id, deployment_generation_id, lane_tag,
          status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext,
-         execution_checkpoint_json, restart_attempt, tool_job_anchor_json)
+         execution_checkpoint_json, restart_attempt, tool_job_anchor_json, scheduler_version,
+         idempotency_key, request_digest, plan_generation,
+         run_control_version)
         VALUES
         (#{id}, #{userId}, #{deploymentId}, #{deploymentGenerationId}, #{laneTag},
          #{status}, #{currentStep}, #{maxSteps},
          CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb),
          COALESCE(CAST(#{executionCheckpointJson} AS jsonb), '{}'::jsonb), COALESCE(#{restartAttempt}, 0),
-         COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb))
+         COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb),
+         COALESCE(#{schedulerVersion}, 'LEGACY'),
+         #{idempotencyKey}, #{requestDigest}, COALESCE(#{planGeneration}, -1),
+         COALESCE(#{runControlVersion}, 0))
     </insert>
 
     <select id="findById" resultMap="AgentRunResultMap">
@@ -64,13 +87,48 @@
                started_at,
                updated_at,
                completed_at,
+               workspace_cleanup_started_at,
+               workspace_expired_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
         LIMIT 1
+    </select>
+
+    <select id="findByIdForUpdate" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               deployment_id,
+               deployment_generation_id,
+               lane_tag,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               workspace_cleanup_started_at,
+               workspace_expired_at,
+               ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
+               tool_job_anchor_json::text AS tool_job_anchor_json
+        FROM alphafrog_agent_run
+        WHERE id = #{id}
+        FOR UPDATE
     </select>
 
     <select id="findByIdForDeployment" resultMap="AgentRunResultMap">
@@ -90,6 +148,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -117,12 +178,211 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
           AND user_id = #{userId}
+        LIMIT 1
+    </select>
+
+    <select id="findByIdAndUserForUpdate" resultMap="AgentRunResultMap">
+        SELECT id, user_id, status, scheduler_version, ext::text AS ext
+          FROM alphafrog_agent_run
+         WHERE id = #{id} AND user_id = #{userId}
+         FOR UPDATE
+    </select>
+
+    <select id="isChildRun" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM alphafrog_agent_run run_row
+             WHERE run_row.id = #{id}
+               AND (run_row.ext -&gt;&gt; 'child_run' = 'true'
+                    OR EXISTS (SELECT 1 FROM alphafrog_agent_run_child_intent child
+                                WHERE child.child_run_id = run_row.id
+                                  AND child.accepted_at IS NOT NULL)))
+    </select>
+
+    <select id="listChildRunsByRootForUpdate" resultMap="AgentRunResultMap">
+        SELECT child.id, child.user_id, child.status
+          FROM alphafrog_agent_run_child_intent intent
+          JOIN alphafrog_agent_run child ON child.id = intent.child_run_id
+         WHERE intent.root_run_id = #{rootRunId}
+         ORDER BY child.id
+         FOR UPDATE OF child
+    </select>
+
+    <update id="markDeletionStarted">
+        UPDATE alphafrog_agent_run
+           SET deletion_started_at = COALESCE(deletion_started_at, CURRENT_TIMESTAMP),
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = #{id} AND user_id = #{userId}
+    </update>
+
+    <select id="isDeletionStarted" resultType="boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM alphafrog_agent_run
+             WHERE id = #{id} AND deletion_started_at IS NOT NULL)
+    </select>
+
+    <select id="findWorkspaceLifecycleState" resultType="string">
+        SELECT CASE WHEN workspace_expired_at IS NOT NULL THEN 'EXPIRED'
+                    WHEN workspace_cleanup_started_at IS NOT NULL THEN 'CLEANING'
+                    ELSE NULL END
+          FROM alphafrog_agent_run WHERE id = #{id}
+    </select>
+
+    <!-- 清理前在同一条 UPDATE 中复核所有仍可能需要工作区或派发凭据的责任。 -->
+    <sql id="workspaceRetentionSettled">
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_group g
+                WHERE g.run_id = r.id AND g.state IN ('WAITING', 'READY'))
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member m
+                WHERE m.run_id = r.id AND m.tool_name = 'executePython'
+                  AND (m.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELED', 'LATE')
+                       OR (m.state = 'CANCELED' AND m.dispatch_proof_json IS NOT NULL
+                           AND NOT EXISTS (
+                               SELECT 1 FROM alphafrog_agent_run_wait_member_stop confirmed
+                                WHERE confirmed.wait_member_id = m.id
+                                  AND confirmed.state = 'CONFIRMED'))
+                       OR (m.state = 'LATE' AND EXISTS (
+                           SELECT 1 FROM alphafrog_agent_run_wait_member_stop pending_stop
+                            WHERE pending_stop.wait_member_id = m.id
+                              AND pending_stop.state &lt;&gt; 'CONFIRMED'))))
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                WHERE s.run_id = r.id AND s.state &lt;&gt; 'CONFIRMED')
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_child_intent i
+                WHERE (i.root_run_id = r.id OR i.parent_run_id = r.id OR i.child_run_id = r.id)
+                  AND i.capacity_released_at IS NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_tree_capacity c
+                WHERE c.root_run_id = r.id AND c.active_child_count &gt; 0)
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_tree_budget b
+                WHERE b.root_run_id = r.id
+                  AND (b.active_nodes &gt; 0 OR b.external_waits &gt; 0))
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_recovery_notification n
+                WHERE n.run_id = r.id AND n.state = 'WAITING')
+           AND (
+               r.tool_job_anchor_json IS NULL OR r.tool_job_anchor_json = '{}'::jsonb
+               OR (r.status = 'FAILED'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CHECKPOINT_FAILED'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'anchorState' = 'TERMINAL'
+                   AND r.tool_job_anchor_json -&gt;&gt; 'finalizerStep' = 'EVENT'
+                   AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+                   AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'usagePersisted')::boolean, false)
+                   AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'terminalEventEmitted')::boolean, false)
+                   AND (r.tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state' = 'RELEASED')
+           )
+    </sql>
+
+    <update id="markWorkspaceCleanupStarted">
+        UPDATE alphafrog_agent_run r
+           SET workspace_cleanup_started_at = COALESCE(workspace_cleanup_started_at, CURRENT_TIMESTAMP)
+         WHERE r.id = #{id}
+           AND r.ext -&gt;&gt; 'python_workspace_enabled' = 'true'
+           AND r.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+           AND r.deletion_started_at IS NULL
+           AND r.workspace_expired_at IS NULL
+           <include refid="workspaceRetentionSettled"/>
+    </update>
+
+    <update id="clearWorkspaceCleanupStarted">
+        UPDATE alphafrog_agent_run
+           SET workspace_cleanup_started_at = NULL
+         WHERE id = #{id}
+           AND workspace_cleanup_started_at IS NOT NULL
+           AND workspace_expired_at IS NULL
+           AND deletion_started_at IS NULL
+    </update>
+
+    <update id="markWorkspaceExpired">
+        UPDATE alphafrog_agent_run r
+           SET workspace_expired_at = COALESCE(workspace_expired_at, CURRENT_TIMESTAMP),
+               workspace_cleanup_started_at = NULL,
+               tool_job_anchor_json = r.tool_job_anchor_json - 'createRequestJson'
+         WHERE r.id = #{id}
+           AND r.workspace_cleanup_started_at IS NOT NULL
+           AND r.workspace_expired_at IS NULL
+           AND r.deletion_started_at IS NULL
+           AND r.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+           <include refid="workspaceRetentionSettled"/>
+    </update>
+
+    <select id="scanWorkspaceCleanupStarted" resultType="string">
+        SELECT id FROM alphafrog_agent_run
+         WHERE workspace_cleanup_started_at IS NOT NULL
+           AND workspace_expired_at IS NULL
+           AND deployment_id = #{deploymentId}
+           AND id &gt; #{afterRunId}
+         ORDER BY id LIMIT #{limit}
+    </select>
+
+    <select id="listWorkspaceRetentionLanes" resultMap="AgentRunResultMap">
+        SELECT MIN(id) AS id, lane_tag
+          FROM alphafrog_agent_run
+         WHERE deployment_id = #{deploymentId}
+           AND ext -&gt;&gt; 'python_workspace_enabled' = 'true'
+         GROUP BY lane_tag
+         ORDER BY lane_tag NULLS FIRST
+    </select>
+
+    <delete id="deleteMarkedByIdAndUser">
+        DELETE FROM alphafrog_agent_run
+         WHERE id = #{id} AND user_id = #{userId}
+           AND deletion_started_at IS NOT NULL
+    </delete>
+
+    <delete id="deleteChildIntentsByRoot">
+        DELETE FROM alphafrog_agent_run_child_intent WHERE root_run_id = #{rootRunId}
+    </delete>
+
+    <delete id="deleteEmptyTreeCapacityByRoot">
+        DELETE FROM alphafrog_agent_run_tree_capacity
+         WHERE root_run_id = #{rootRunId} AND active_child_count = 0
+    </delete>
+
+    <!--
+      按用户与幂等键读回创建请求对应的 Run。只读这一条，不做部署代际过滤：同一次创建请求在滚动部署
+      前后重复提交时应当读回原来那条 Run，换了代际不该变成第二条。
+    -->
+    <select id="findByUserIdempotencyKey" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               deployment_id,
+               deployment_generation_id,
+               lane_tag,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               scheduler_version,
+               idempotency_key,
+               request_digest,
+               plan_generation,
+               run_control_version,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
+               tool_job_anchor_json::text AS tool_job_anchor_json
+        FROM alphafrog_agent_run
+        WHERE user_id = #{userId}
+          AND idempotency_key = #{idempotencyKey}
+          AND idempotency_key IS NOT NULL
         LIMIT 1
     </select>
 
@@ -143,6 +403,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -167,6 +430,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                COALESCE(
                        CASE
                            WHEN (snapshot_json #>> '{observability,summary,totalDurationMs}') ~ '^[0-9]+$'
@@ -200,8 +466,9 @@
                            END,
                        0
                ) AS tool_calls
-        FROM alphafrog_agent_run
+        FROM alphafrog_agent_run run_row
         WHERE user_id = #{userId}
+          AND COALESCE(run_row.ext -&gt;&gt; 'child_run', 'false') &lt;&gt; 'true'
         <if test="status != null">
             AND status = #{status}
         </if>
@@ -215,8 +482,9 @@
 
     <select id="countByUser" resultType="int">
         SELECT COUNT(1)
-        FROM alphafrog_agent_run
+        FROM alphafrog_agent_run run_row
         WHERE user_id = #{userId}
+          AND COALESCE(run_row.ext -&gt;&gt; 'child_run', 'false') &lt;&gt; 'true'
         <if test="status != null">
             AND status = #{status}
         </if>
@@ -246,6 +514,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -278,6 +549,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -338,6 +612,30 @@
           AND status = #{expectedStatus}
     </update>
 
+    <!--
+      开一轮新计划是 Run 级推进：条件里除了 Run 自己的状态与代际，还要核「现在还是我在服务这条 Run」。
+      服务所有权条件（持有人 + 代际号 + 未过期）必须在这条语句里核，不能在调用方那里先查一遍——
+      查与写之间租约可能到期并被别的进程接管，那个时间窗里旧所有者不该还能推进计划代际。
+    -->
+    <select id="advancePlanGeneration" resultType="java.lang.Integer" affectData="true" flushCache="true">
+        UPDATE alphafrog_agent_run
+        SET plan_generation = GREATEST(plan_generation, #{observedWorkItemGeneration}) + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND status = #{expectedStatus}
+          AND plan_generation = #{expectedGeneration}
+          AND EXISTS (
+              SELECT 1
+              FROM alphafrog_agent_run_service_lease lease_row
+              WHERE lease_row.run_id = #{id}
+                AND lease_row.owner_instance_id = #{ownerInstanceId}
+                AND lease_row.fencing_token = #{fencingToken}
+                AND lease_row.expires_at &gt; CURRENT_TIMESTAMP
+          )
+        RETURNING plan_generation
+    </select>
+
     <!-- 恢复路径的唯一 checkpoint 写入口：条件只用业务字段，不再按部署身份分叉。 -->
     <update id="updateExecutionCheckpoint">
         UPDATE alphafrog_agent_run
@@ -365,6 +663,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                execution_checkpoint_json::text AS execution_checkpoint_json,
                restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
@@ -373,6 +674,10 @@
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'CANCELING')
+          AND NOT (
+              status IN ('EXECUTING', 'WAITING_TOOL_JOB')
+              AND COALESCE(tool_job_anchor_json, '{}'::jsonb) &lt;&gt; '{}'::jsonb
+          )
         ORDER BY started_at ASC, id ASC
         LIMIT #{limit}
     </select>
@@ -389,6 +694,10 @@
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status = #{expectedStatus}
+          AND (
+              #{expectedStatus} NOT IN ('EXECUTING', 'WAITING_TOOL_JOB')
+              OR COALESCE(tool_job_anchor_json, '{}'::jsonb) = '{}'::jsonb
+          )
           AND restart_attempt = #{expectedRestartAttempt}
           AND restart_attempt &lt; #{maxRestartAttempts}
     </update>
@@ -420,6 +729,7 @@
                         deployment_generation_id
         FROM alphafrog_agent_run
         WHERE status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
           AND deployment_id &lt;&gt; 'stable'
           AND NOT (deployment_id = #{excludedDeploymentId}
                    AND deployment_generation_id = #{excludedDeploymentGenerationId})
@@ -435,6 +745,7 @@
         WHERE deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
     </update>
 
     <select id="countNonTerminalRunsForDeploymentGeneration" resultType="int">
@@ -452,6 +763,7 @@
             WHERE deployment_id = #{deploymentId}
               AND deployment_generation_id = #{deploymentGenerationId}
               AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+              AND scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
             ORDER BY id
             LIMIT #{limit}
             FOR UPDATE SKIP LOCKED
@@ -467,6 +779,7 @@
           AND run.deployment_id = #{deploymentId}
           AND run.deployment_generation_id = #{deploymentGenerationId}
           AND run.status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND run.scheduler_version IS DISTINCT FROM 'DUAL_POOL_V2'
     </update>
 
     <update id="updateExt">
@@ -480,7 +793,7 @@
     <update id="updateSnapshot">
         UPDATE alphafrog_agent_run
         SET status = #{status},
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             last_error = #{lastError},
             updated_at = CURRENT_TIMESTAMP
             <if test="completed">
@@ -493,7 +806,7 @@
     <!-- 取消时只更新可观测快照，保持数据库状态留在等待终态收尾的位置。 -->
     <update id="updateSnapshotIfStatus">
         UPDATE alphafrog_agent_run
-        SET snapshot_json = CAST(#{snapshotJson} AS jsonb),
+        SET snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
@@ -503,7 +816,11 @@
     <update id="pauseSnapshotWithTtl">
         UPDATE alphafrog_agent_run
         SET status = 'WAITING',
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
@@ -516,7 +833,7 @@
     <update id="updateTerminalSnapshot">
         UPDATE alphafrog_agent_run
         SET status = #{status},
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             last_error = #{lastError},
             updated_at = CURRENT_TIMESTAMP
             <if test="completed">
@@ -536,25 +853,49 @@
     <update id="cancelTerminalSnapshotWithTtl">
         UPDATE alphafrog_agent_run
         SET status = 'CANCELED',
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
+            run_control_version = CASE
+                WHEN scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2') THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+          AND (tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb)
     </update>
 
     <update id="resetForResume">
         UPDATE alphafrog_agent_run
         SET status = 'RECEIVED',
             current_step = 0,
+            plan_generation = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN plan_generation + 1
+                ELSE plan_generation
+            END,
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             last_error = NULL,
             completed_at = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
+          AND deletion_started_at IS NULL
+          AND workspace_cleanup_started_at IS NULL
+          AND workspace_expired_at IS NULL
           AND status IN ('FAILED', 'CANCELED', 'WAITING')
+          AND COALESCE(tool_job_anchor_json -&gt;&gt; 'anchorState', '')
+                NOT IN ('PREPARING', 'WORKSPACE_REFUSED')
+          AND NOT (
+                scheduler_version = 'DUAL_POOL_V2'
+                AND COALESCE(tool_job_anchor_json -&gt;&gt; 'toolName', '') = 'executeQuery'
+                AND COALESCE(tool_job_anchor_json -&gt;&gt; 'runDisposition', '') = 'CANCELED'
+                AND COALESCE(tool_job_anchor_json -&gt;&gt; 'operationId', '') != ''
+          )
     </update>
 
     <update id="admitFollowUpForDeployment">
@@ -562,12 +903,23 @@
         SET status = 'RECEIVED',
             current_step = 0,
             plan_json = '{}'::jsonb,
+            plan_generation = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN plan_generation + 1
+                ELSE plan_generation
+            END,
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V1' THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             ttl_expires_at = #{ttlExpiresAt},
             last_error = NULL,
             completed_at = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
+          AND deletion_started_at IS NULL
+          AND workspace_cleanup_started_at IS NULL
+          AND workspace_expired_at IS NULL
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND status = 'COMPLETED'
@@ -644,6 +996,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -660,6 +1014,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -677,8 +1033,88 @@
     </update>
 
     <!--
+        事务级咨询锁：同一 user_id 的 executeQuery 抢占串行化。
+        hashtextextended 返回 64 位，避免 hashtext 的 32 位碰撞。
+        用 SELECT 1 包一层，是因为 pg_advisory_xact_lock 返回 void，MyBatis 不能把它当成 int 读。
+    -->
+    <select id="lockExecuteQuerySession" resultType="int">
+        SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(#{userId}, 0))) AS acquired
+    </select>
+
+    <!--
+        同一用户其它 Run 上仍占用的 executeQuery 锚点。排除当前 Run，避免恢复路径把自己算进去。
+        executePython 锚点的 toolName 不是 executeQuery，计数为 0。
+        只计非终态 Run。当前代崩溃后 Run 停在 EXECUTING，代际清扫器不碰当前代，
+        所以还要排除 updated_at 早于陈旧阈值的残留锚点。终态集合与
+        failOrphanedNonTerminalRunsForDeploymentGeneration 相同。
+    -->
+    <select id="countInFlightExecuteQueryByUser" resultType="int">
+        SELECT COUNT(*)
+          FROM alphafrog_agent_run
+         WHERE user_id = #{userId}
+           AND id &lt;&gt; #{excludeRunId}
+           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+           AND tool_job_anchor_json IS NOT NULL
+           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+           AND tool_job_anchor_json #&gt;&gt; '{toolName}' = #{toolName}
+           AND updated_at IS NOT NULL
+           AND updated_at &gt;= CURRENT_TIMESTAMP - (#{staleSeconds} * INTERVAL '1 second')
+    </select>
+
+    <!-- 原样重放必须重新取得用户查询名额。只续占原操作，不改锚点或成员的完整请求。 -->
+    <update id="renewExecuteQueryReplayClaim">
+        UPDATE alphafrog_agent_run r SET updated_at = clock_timestamp()
+        WHERE r.id = #{runId}
+          AND r.status = 'EXECUTING'
+          AND r.plan_generation = #{planGeneration}
+          AND r.run_control_version = #{runControlVersion}
+          AND r.tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+          AND r.tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+          AND r.tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+          AND r.tool_job_anchor_json -&gt;&gt; 'anchorState' IN ('PREPARING', 'ATTACHED', 'PENDING')
+          AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+          AND COALESCE(r.tool_job_anchor_json -&gt;&gt; 'runDisposition', '') &lt;&gt; 'CANCELED'
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_wait_member m
+              JOIN alphafrog_agent_run_wait_group g ON g.id = m.group_id
+              WHERE m.group_id = #{groupId} AND m.member_identity = #{memberIdentity}
+                AND g.run_id = r.id AND g.state = 'WAITING' AND g.plan_generation = #{planGeneration}
+                AND m.state IN ('PENDING', 'RUNNING') AND m.tool_name = 'executeQuery'
+                AND m.run_id = r.id
+                AND m.dispatch_proof_json -&gt;&gt; 'taskId' IS NULL
+                AND m.external_operation_id = #{operationId}
+                AND m.dispatch_proof_json -&gt;&gt; 'operationId' = #{operationId}
+                AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+                AND m.dispatch_proof_json -&gt;&gt; 'createRequestJson' = #{createRequestJson}
+                AND m.dispatch_proof_json -&gt;&gt; 'workspaceRefusalCode' IS NULL
+                AND COALESCE((m.dispatch_proof_json -&gt;&gt; 'createRequestExpired')::boolean, false) = false)
+    </update>
+
+    <!-- LINEAR 未确认受理的原请求只能续占当前 PREPARING 锚点，不能替代等待成员的准入。 -->
+    <update id="renewExecuteQueryPreparingReplayClaim">
+        UPDATE alphafrog_agent_run r SET updated_at = clock_timestamp()
+        WHERE r.id = #{runId} AND r.status = 'EXECUTING'
+          AND r.plan_generation IS NOT DISTINCT FROM #{planGeneration}
+          AND r.run_control_version IS NOT DISTINCT FROM #{runControlVersion}
+          AND r.tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+          AND r.tool_job_anchor_json -&gt;&gt; 'anchorState' = 'PREPARING'
+          AND r.tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+          AND r.tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+          AND r.tool_job_anchor_json -&gt;&gt; 'createRequestJson' = #{createRequestJson}
+          AND r.tool_job_anchor_json -&gt;&gt; 'reservationJson' = #{reservationJson}
+          AND COALESCE(r.tool_job_anchor_json -&gt;&gt; 'taskId', '') = ''
+          AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+          AND COALESCE(r.tool_job_anchor_json -&gt;&gt; 'runDisposition', '') &lt;&gt; 'CANCELED'
+          AND NOT EXISTS (
+              SELECT 1 FROM alphafrog_agent_run_wait_member m
+              WHERE m.run_id = r.id AND m.external_operation_id = #{operationId})
+    </update>
+
+    <!--
         取消意图专用窄写。只在与读取时相同的 Run 状态和精确
-        operationId 下，用 jsonb 合并仅写 autoResume=false 与 runDisposition=CANCELED，
+        operationId 下，用 jsonb 合并 autoResume=false 与 runDisposition=CANCELED。
+        V2 首次写入取消处置时同时递增控制版本，让子树当时就失去创建和执行资格；
+        同一锚点重复取消不再递增。等待状态仍留给长工具收尾。
         绝不把内存中的整份旧锚点写回——第二个长工具已替换锚点（operationId 变化）时
         返回 0，由调用方重读当前任务后重试或按既有语义失败关闭。
     -->
@@ -688,6 +1124,12 @@
                 'autoResume', false,
                 'runDisposition', 'CANCELED'
             ),
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V2'
+                 AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+                THEN run_control_version + 1
+                ELSE run_control_version
+            END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
@@ -801,7 +1243,123 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
+    </update>
+
+    <!--
+        Sandbox 工作区拒绝必须先作为持久事实落库。只合并拒绝状态和代码，
+        不把旧内存锚点整份写回；取消、任务附着、换操作和 DAG 租约接管均会使条件失败。
+    -->
+    <update id="recordWorkspaceRefusal">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'anchorState', 'WORKSPACE_REFUSED',
+                'workspaceRefusalCode', #{workspaceRefusalCode}
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'WAITING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'PREPARING'
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition')
+                IS NOT DISTINCT FROM #{expectedRunDisposition,jdbcType=VARCHAR}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+                = #{expectedAutoResume}
+          AND (tool_job_anchor_json -&gt;&gt; 'blockingOwnerId')
+                IS NOT DISTINCT FROM #{expectedOwnerId,jdbcType=VARCHAR}
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state')
+                = 'PREPARING'
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                -&gt;&gt; 'reservationId') = #{expectedOperationId}
+          <choose>
+            <when test="expectedLeaseUntil != null">
+              AND status IN ('EXECUTING', 'WAITING')
+              AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_NO_RESUME'
+              AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+              AND CAST(tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' AS timestamptz)
+                    &gt; CURRENT_TIMESTAMP
+            </when>
+            <otherwise>
+              AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                    IS DISTINCT FROM 'DAG_BLOCKING_NO_RESUME'
+            </otherwise>
+          </choose>
+    </update>
+
+    <!-- 容量服务已接受工作区拒绝证明后，只推进原 reservation 的 state。 -->
+    <update id="recordWorkspaceRefusalReleased">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = jsonb_set(
+                tool_job_anchor_json,
+                '{reservationJson}',
+                to_jsonb(CAST(#{releasedReservationJson} AS text)),
+                true
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'WAITING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'WORKSPACE_REFUSED'
+          AND tool_job_anchor_json -&gt;&gt; 'workspaceRefusalCode' = #{workspaceRefusalCode}
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state')
+                = 'PREPARING'
+          AND (CAST(#{releasedReservationJson} AS jsonb) -&gt;&gt; 'state')
+                = 'RELEASED'
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb - 'state')
+                = (CAST(#{releasedReservationJson} AS jsonb) - 'state')
+          AND (CAST(#{releasedReservationJson} AS jsonb) -&gt;&gt; 'reservationId')
+                = #{expectedOperationId}
+    </update>
+
+    <!--
+        无 Sandbox task 的拒绝不伪造任务终态；原操作的 RELEASED 证明齐全后
+        原子清锚点。并发取消意图在 EXECUTING/WAITING 时写 CANCELED，保留
+        取消快照和 last_error；单纯暂停的 WAITING 保持可恢复状态，保存拒绝码。
+    -->
+    <update id="completeWorkspaceRefusal">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = '{}'::jsonb,
+            status = CASE
+                WHEN status IN ('EXECUTING', 'WAITING')
+                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                THEN 'CANCELED'
+                WHEN status = 'EXECUTING' THEN 'FAILED'
+                ELSE status END,
+            last_error = CASE
+                WHEN status = 'EXECUTING'
+                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                         IS DISTINCT FROM 'CANCELED'
+                THEN #{workspaceRefusalCode}
+                WHEN status = 'WAITING'
+                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                         IS DISTINCT FROM 'CANCELED'
+                THEN #{workspaceRefusalCode} ELSE last_error END,
+            completed_at = CASE WHEN status = 'EXECUTING'
+                    OR (status = 'WAITING'
+                        AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED')
+                THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'WAITING', 'FAILED', 'CANCELED')
+          AND (status NOT IN ('EXECUTING', 'WAITING')
+                OR tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                    IS DISTINCT FROM 'CANCELED'
+                OR COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false)
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'WORKSPACE_REFUSED'
+          AND tool_job_anchor_json -&gt;&gt; 'workspaceRefusalCode' = #{workspaceRefusalCode}
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb -&gt;&gt; 'state')
+                = 'RELEASED'
+          AND ((tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                -&gt;&gt; 'reservationId') = #{expectedOperationId}
     </update>
 
     <!--
@@ -924,6 +1482,8 @@
                之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
               = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
+               OR CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'runDisposition' = 'CANCELED')
 
     </update>
 
@@ -977,6 +1537,75 @@
     <!--
         清理 active anchor 仍需 operationId 所有权；不存在“按 runId 无条件清空”的旁路。
     -->
+    <!-- SQL成员停止独占记账；不再由Run级Finalizer重写同一次操作的用量。 -->
+    <update id="completeCanceledSqlWaitMember">
+        UPDATE alphafrog_agent_run r
+           SET status = CASE WHEN r.status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+                             THEN r.status ELSE 'CANCELED' END,
+               tool_job_anchor_json = '{}'::jsonb,
+               updated_at = CURRENT_TIMESTAMP
+         WHERE r.id = #{runId}
+           AND r.scheduler_version = 'DUAL_POOL_V2'
+           AND r.status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'RECEIVED',
+                            'FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+           AND r.tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+           AND r.tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+           AND r.tool_job_anchor_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+           AND r.tool_job_anchor_json -&gt;&gt; 'reservationJson' = #{reservationJson}
+           AND r.tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+           AND COALESCE((r.tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+           AND EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member m
+               JOIN alphafrog_agent_run_wait_member_stop s ON s.wait_member_id = m.id
+                WHERE m.id = #{waitMemberId} AND m.run_id = r.id
+                  AND m.tool_name = 'executeQuery' AND m.state IN ('CANCELED', 'LATE')
+                  AND m.external_operation_id = #{operationId}
+                  AND m.dispatch_proof_json = CAST(#{dispatchProofJson} AS jsonb)
+                  AND m.dispatch_proof_json -&gt;&gt; 'schemaVersion' = '2'
+                  AND NULLIF(m.dispatch_proof_json -&gt;&gt; 'createRequestJson', '') IS NOT NULL
+                  AND COALESCE((m.dispatch_proof_json -&gt;&gt; 'createRequestExpired')::boolean, false) = false
+                  AND m.dispatch_proof_json -&gt;&gt; 'operationId' = #{operationId}
+                  AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+                  AND s.run_id = r.id AND s.group_id = m.group_id
+                  AND s.operation_id = #{operationId} AND s.request_fingerprint = #{requestFingerprint}
+                  AND s.state = 'CONFIRMED'
+                  AND s.task_id = s.terminal_task_id
+                  AND s.terminal_status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+                  AND (NULLIF(r.tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+                       OR r.tool_job_anchor_json -&gt;&gt; 'taskId' = s.terminal_task_id)
+                  AND (NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', '') IS NULL
+                       OR m.dispatch_proof_json -&gt;&gt; 'taskId' = s.terminal_task_id)
+                  AND EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(COALESCE(
+                          r.snapshot_json #&gt; '{data_analysis_observability,calls}', '[]'::jsonb)) AS terminal(call)
+                       WHERE terminal.call -&gt;&gt; 'operationId' = s.operation_id
+                         AND terminal.call -&gt;&gt; 'taskId' = s.terminal_task_id
+                         AND terminal.call -&gt;&gt; 'terminalStatus' = s.terminal_status
+                         AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                         AND terminal.call -&gt; 'reservation' = CAST(#{terminalReservationJson} AS jsonb)
+                         AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_member_stop other
+                            WHERE other.run_id = r.id AND other.state != 'CONFIRMED')
+           AND NOT EXISTS (
+               SELECT 1 FROM alphafrog_agent_run_wait_member sibling
+                WHERE sibling.run_id = r.id AND sibling.state IN ('CANCELED', 'LATE')
+                  AND sibling.tool_name IN ('executePython', 'executeQuery')
+                  AND sibling.external_operation_id IS NOT NULL
+                  AND sibling.dispatch_proof_json IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM alphafrog_agent_run_wait_member_stop settled
+                       WHERE settled.wait_member_id = sibling.id AND settled.state = 'CONFIRMED'
+                         AND settled.operation_id = sibling.external_operation_id
+                         AND settled.request_fingerprint = sibling.dispatch_proof_json -&gt;&gt; 'requestFingerprint'))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_group g
+                            WHERE g.run_id = r.id AND g.state IN ('WAITING', 'READY'))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_member other
+                            WHERE other.run_id = r.id AND other.state IN ('PENDING', 'RUNNING'))
+           AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_run_work_item wi
+                            WHERE wi.run_id = r.id
+                              AND wi.state NOT IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE'))
+    </update>
+
     <update id="clearActiveToolJobAnchor">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST('{}' AS jsonb),
@@ -984,6 +1613,7 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
     </update>
 
     <!--
@@ -1160,6 +1790,7 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
           AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
     </update>
 
     <!--
@@ -1179,6 +1810,7 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
           AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' IS DISTINCT FROM 'CANCELED'
           AND (last_error IS NULL OR last_error = #{marker})
     </update>
 
@@ -1202,7 +1834,8 @@
     <!--
         补扫真相源中的 active anchor。除常规 active 状态外，还纳入两类终态 Run：
         ①DAG cleanup/abort 处置的 FAILED / CANCELED（pipeline 先失败/取消、容量后收尾）；
-        ②终态取消残留——筛选条件与 closeResidualCanceledAnchorOnTerminalRun 的
+        ②工作区明确拒绝的 FAILED / CANCELED（无任务但容量可能尚待归还）；
+        ③终态取消残留——筛选条件与 closeResidualCanceledAnchorOnTerminalRun 的
         清理能力严格对齐（显式 autoResume=false + finalizerStep 已达 EVENT），只发现
         直接清理语句确实能处理的记录。已终态但只走到早期步骤（ENVELOPE/RELEASE/USAGE/
         缺失）或 autoResume 缺失/为 true 的残留不入选：它们无法在终态状态下推进步骤，
@@ -1225,6 +1858,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -1250,10 +1886,20 @@
               )
           AND (
                 status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING')
+                OR (status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+                    AND scheduler_version = 'DUAL_POOL_V2'
+                    AND tool_job_anchor_json -&gt;&gt; 'toolName' = 'executeQuery'
+                    AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                    AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false)
+
                 OR (
                     status IN ('FAILED', 'CANCELED')
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
                         IN ('DAG_BLOCKING_WORKER_LOST', 'DAG_BLOCKING_PREPARING_ABORT')
+                )
+                OR (
+                    status IN ('FAILED', 'CANCELED')
+                    AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'WORKSPACE_REFUSED'
                 )
                 OR (
                     -- 终态取消残留必须能被补扫重新
@@ -1295,6 +1941,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -1363,6 +2012,9 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               scheduler_version,
+               plan_generation,
+               run_control_version,
                tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
@@ -1633,7 +2285,7 @@
         UPDATE alphafrog_agent_run
         SET plan_json = COALESCE(CAST(#{planJson} AS jsonb), plan_json),
             status = #{status},
-            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            snapshot_json = <include refid="snapshotPreservingDataAnalysisObservability"/>,
             completed_at = CASE WHEN #{completed} THEN CURRENT_TIMESTAMP ELSE completed_at END,
             last_error = #{lastError},
             updated_at = CURRENT_TIMESTAMP

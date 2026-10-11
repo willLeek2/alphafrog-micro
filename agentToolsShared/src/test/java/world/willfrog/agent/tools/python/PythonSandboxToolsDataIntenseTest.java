@@ -8,19 +8,30 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.finance.*;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.wait.WaitGroupMemberExecutionContext;
+import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
+import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -29,11 +40,20 @@ import static org.mockito.Mockito.*;
 
 class PythonSandboxToolsDataIntenseTest {
 
+    /**
+     * 成员行上的外部作业身份。
+     *
+     * <p>它的形态就是「runId + 持久调用身份 + 轮次」，与工具层按成员上下文拼出来的值一致；
+     * 不一致时工具层什么都不做（有一条用例专门证明这件事）。</p>
+     */
+    private static final String EXPECTED_MEMBER_OPERATION = "run-test:call-1--wi-0000:1";
+
     @TempDir Path tempDir;
 
     private PythonSandboxTools tools;
     private PythonSandboxService sandbox;
     private DataAnalysisCapacityService capacity;
+    private WaitGroupStore waitGroupStore;
     private PythonSandboxDispatchStore dispatchStore;
     private DataAnalysisTerminalRecorder recorder;
     private AgentRunDatasetRegistry registry;
@@ -42,19 +62,28 @@ class PythonSandboxToolsDataIntenseTest {
     void setUp() throws Exception {
         ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
         tools = new PythonSandboxTools(objectMapper);
+        world.willfrog.agent.platform.service.PythonRiskReviewService review =
+                mock(world.willfrog.agent.platform.service.PythonRiskReviewService.class);
+        inject("pythonRiskReviewService", review);
+        when(review.evaluate(any(), any(), any())).thenReturn(
+                new world.willfrog.agent.platform.service.PythonRiskReviewService.Evaluation(true, null, false));
         sandbox = mock(PythonSandboxService.class);
         capacity = mock(DataAnalysisCapacityService.class);
+        waitGroupStore = mock(WaitGroupStore.class);
         dispatchStore = mock(PythonSandboxDispatchStore.class);
         recorder = mock(DataAnalysisTerminalRecorder.class);
         registry = mock(AgentRunDatasetRegistry.class);
         inject("pythonSandboxService", sandbox);
         inject("agentRunDatasetRegistry", registry);
         inject("dataAnalysisCapacityService", capacity);
+        inject("waitGroupStore", waitGroupStore);
         inject("dataAnalysisCapacityProperties", new DataAnalysisCapacityProperties());
         inject("pythonSandboxDispatchStore", dispatchStore);
         inject("dataAnalysisTerminalRecorder", recorder);
         inject("fastPathMs", 5L);
         when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), any()))
+                .thenReturn(true);
+        when(waitGroupStore.recordMemberPreparing(anyLong(), anyString(), anyString(), anyString()))
                 .thenReturn(true);
         when(dispatchStore.promoteDagBlockingWorkerLost(eq("run-test"), any(), any()))
                 .thenReturn(true);
@@ -120,6 +149,110 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(observedAnchors.get(0).getTaskId()).isNull();
         assertThat(observedAnchors.get(1).getTaskId()).isEqualTo("task-1");
         verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void injectedInterruptionEscapesToolFailureConversion() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        inject("toolJobFaultInjector", (ToolJobFaultInjector) (runId, checkpoint) -> {
+            if (ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT.equals(checkpoint)) {
+                throw new ToolJobInjectedInterruption("scenario-1", checkpoint);
+            }
+        });
+
+        assertThrows(ToolJobInjectedInterruption.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(dispatchStore).persistPreparing(eq("run-test"), any());
+        verify(sandbox, never()).createTask(any());
+    }
+
+    @Test
+    void workspaceTaskDoesNotFreezeAnAgentDeadlineBeforeSandboxQueueing() throws Exception {
+        fixtureDataset();
+        AgentRunMapper runs = mock(AgentRunMapper.class);
+        AgentRun run = new AgentRun();
+        run.setExt("{\"python_workspace_enabled\":true}");
+        String generation = "gen-" + "a".repeat(64);
+        when(runs.findByIdForDeployment(eq("run-test"), eq("stable"), eq(generation)))
+                .thenReturn(run);
+        inject("agentRunMapper", runs);
+        inject("deploymentIdentityProvider", (DeploymentIdentityProvider)
+                () -> new DeploymentIdentity("stable", generation));
+        when(sandbox.acquireWorkspace(any())).thenReturn(AcquireWorkspaceResponse.newBuilder()
+                .setWorkspace(WorkspaceInfo.newBuilder()
+                        .setWorkspaceId("workspace-a").setWorkspaceGeneration("1")
+                        .setOwnedByRunId("run-test").setStatus("active"))
+                .build());
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        AtomicReference<ToolJobAnchor> persisted = new AtomicReference<>();
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenAnswer(invocation -> {
+            persisted.set(snapshot(invocation.getArgument(1)));
+            return true;
+        });
+        inject("toolJobFaultInjector", (ToolJobFaultInjector) (runId, checkpoint) -> {
+            if (ToolJobFaultInjector.BEFORE_SANDBOX_SUBMIT.equals(checkpoint)) {
+                throw new ToolJobInjectedInterruption("before-create", checkpoint);
+            }
+        });
+
+        assertThrows(ToolJobInjectedInterruption.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        assertThat(persisted.get()).isNotNull();
+        assertThat(persisted.get().getTimeoutAt()).isNull();
+        ExecuteRequest.Builder savedRequest = ExecuteRequest.newBuilder();
+        com.google.protobuf.util.JsonFormat.parser().merge(
+                persisted.get().getCreateRequestJson(), savedRequest);
+        assertThat(savedRequest.getWorkspaceId()).isEqualTo("workspace-a");
+        verify(sandbox, never()).createTask(any());
+    }
+
+    @Test
+    void runLevelWorkspaceRefusalKeepsItsBusinessCodeAndReleasesPreparingCapacity()
+            throws Exception {
+        fixtureDataset();
+        AgentRunMapper runs = mock(AgentRunMapper.class);
+        AgentRun run = new AgentRun();
+        run.setExt("{\"python_workspace_enabled\":true}");
+        String generation = "gen-" + "a".repeat(64);
+        when(runs.findByIdForDeployment(eq("run-test"), eq("stable"), eq(generation)))
+                .thenReturn(run);
+        inject("agentRunMapper", runs);
+        inject("deploymentIdentityProvider", (DeploymentIdentityProvider)
+                () -> new DeploymentIdentity("stable", generation));
+        when(sandbox.acquireWorkspace(any())).thenReturn(AcquireWorkspaceResponse.newBuilder()
+                .setWorkspace(WorkspaceInfo.newBuilder()
+                        .setWorkspaceId("workspace-a").setWorkspaceGeneration("1")
+                        .setOwnedByRunId("run-test").setStatus("active"))
+                .build());
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+        when(dispatchStore.recordWorkspaceRefusal(eq("run-test"), any(),
+                nullable(Instant.class))).thenReturn(true);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.recordWorkspaceRefusalReleased(eq("run-test"), any()))
+                .thenReturn(true);
+        when(dispatchStore.completeWorkspaceRefusal(eq("run-test"),
+                eq("run-test:call-1:1"), anyString(), eq("WORKSPACE_DIRTY")))
+                .thenReturn(true);
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output).contains("\"code\":\"WORKSPACE_DIRTY\"");
+        verify(sandbox, never()).cancelTask(any());
+        verify(capacity).releaseReservation(argThat(request ->
+                request.proof() instanceof DataAnalysisReleaseProof.WorkspaceRefusal
+                        && request.reason()
+                        == DataAnalysisReleaseReason.WORKSPACE_CREATE_REFUSED));
+        verify(dispatchStore).completeWorkspaceRefusal(eq("run-test"),
+                eq("run-test:call-1:1"), anyString(), eq("WORKSPACE_DIRTY"));
     }
 
     @Test
@@ -371,6 +504,42 @@ class PythonSandboxToolsDataIntenseTest {
                 .doesNotContain("__AF_FINANCE_RESULT_", "task-finance");
         assertThat(seamOrder.get(1)).isEqualTo("envelope:" + output);
         verify(adapter).project(any());
+    }
+
+    @Test
+    void waitMemberTerminalResultConsumesFinanceMarkersBeforeFormatting() throws Exception {
+        FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
+        FinanceRecordChannelProcessor processor = mock(FinanceRecordChannelProcessor.class);
+        FinanceResultModelAdapter adapter = mock(FinanceResultModelAdapter.class);
+        inject("financeRecordChannelConfigLoader", configLoader);
+        inject("financeRecordChannelProcessor", processor);
+        inject("financeResultModelAdapter", adapter);
+        when(configLoader.frozenSnapshotJson()).thenReturn("{\"snapshot\":1}");
+        when(configLoader.parseFrozenSnapshot("{\"snapshot\":1}"))
+                .thenReturn(financeSnapshot());
+        when(processor.process(any())).thenReturn(financeExtractionResult());
+        when(adapter.project(any())).thenReturn(new FinanceResultModelAdapter.ProjectionBatch(
+                List.of(new FinanceToolResultFormatter.FinanceModelResult(
+                        "复合增长率", 0.12468265, "ratio", "按规范参数计算")),
+                List.of()));
+
+        String output = tools.formatTerminalResult(
+                "SUCCEEDED", financeTerminalResult(),
+                "run-test", "user-1", "todo-1", "call-1");
+
+        assertThat(output)
+                .contains("\"ok\":true", "\"stdout\":\"rows=5\"", "\"results\"")
+                .contains("\"method\":\"复合增长率\"")
+                .doesNotContain("__AF_FINANCE_RESULT_");
+        ArgumentCaptor<FinanceRecordExtractionRequest> request =
+                ArgumentCaptor.forClass(FinanceRecordExtractionRequest.class);
+        verify(processor).process(request.capture());
+        assertThat(request.getValue().runId()).isEqualTo("run-test");
+        assertThat(request.getValue().userId()).isEqualTo("user-1");
+        assertThat(request.getValue().todoId()).isEqualTo("todo-1");
+        assertThat(request.getValue().executePythonToolCallId()).isEqualTo("call-1");
+        assertThat(request.getValue().entryPoint()).isEqualTo("wait-member");
+        assertThat(request.getValue().taskId()).isEqualTo("task-finance");
     }
 
     @Test
@@ -1078,7 +1247,8 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(output)
                 .contains("\"ok\":false")
                 .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
-        verify(dispatchStore).renewDagBlockingLease(eq("run-test"), any(), any(Instant.class));
+        verify(dispatchStore).renewDagBlockingLease(
+                eq("run-test"), any(), any(Instant.class));
         verify(capacity, never()).releaseReservation(any());
         verify(dispatchStore, never()).beginDagBlockingPreparingAbort(anyString(), any(), any());
         verify(dispatchStore, never()).completeDagBlockingPreparingAbort(anyString(), any(), any());
@@ -1087,51 +1257,58 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
-    void dagInvalidCreateResponseUsesDurableTwoPhasePreparingAbort() throws Exception {
+    void dagInvalidCreateResponseUsesTombstoneAndReleasesOnlyAfterTerminalProof() throws Exception {
         fixtureDataset();
         AgentContext.setWorkflow("dag");
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
         when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
         when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
         when(sandbox.createTask(any())).thenReturn(
                 ExecuteResponse.newBuilder().setError("create rejected").build());
+        AtomicReference<String> fingerprint = new AtomicReference<>();
+        when(sandbox.cancelTask(any())).thenAnswer(invocation -> {
+            CancelTaskRequest request = invocation.getArgument(0);
+            fingerprint.set(request.getByOperation().getRequestFingerprint());
+            return CancelTaskResponse.newBuilder().setOutcome(CancelOutcome.CANCELED)
+                    .setTaskId("tombstone-dag").setStatus("CANCELED").build();
+        });
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation ->
+                GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("tombstone-dag")
+                        .setRequestFingerprint(fingerprint.get()).build());
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("CANCELED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("tombstone-dag").setStatus("CANCELED")
+                .setRetryable(false)
+                .setResourceUsage(preCreateCanceledUsage()).build());
 
         String output = tools.executePython("print(1)", "1", null, null, 30);
 
         assertThat(output)
                 .contains("\"ok\":false")
-                .contains("\"code\":\"CREATE_TASK_FAILED\"");
-        verify(dispatchStore).renewDagBlockingLease(eq("run-test"), any(), any(Instant.class));
-        verify(dispatchStore).beginDagBlockingPreparingAbort(
-                eq("run-test"),
-                argThat(anchor -> "ABORTING".equals(anchor.getAnchorState())
-                        && "DAG_BLOCKING_PREPARING_ABORT".equals(anchor.getRunDisposition())
-                        && anchor.getBlockingOwnerId() != null
-                        && anchor.getReservationJson().contains("\"state\":\"RELEASED\"")),
-                any(Instant.class));
-        verify(dispatchStore).completeDagBlockingPreparingAbort(
-                eq("run-test"),
-                argThat(anchor -> "ABORTING".equals(anchor.getAnchorState())
-                        && "DAG_BLOCKING_PREPARING_ABORT".equals(anchor.getRunDisposition())),
-                any(Instant.class));
-        var order = inOrder(dispatchStore, capacity);
-        order.verify(dispatchStore).beginDagBlockingPreparingAbort(
+                .contains("PYTHON_EXECUTION_CANCELED");
+        verify(dispatchStore, atLeastOnce()).renewDagBlockingLease(
                 eq("run-test"), any(), any(Instant.class));
+        var order = inOrder(sandbox, capacity);
+        order.verify(sandbox).getTaskResult(any());
         order.verify(capacity).releaseReservation(argThat(request ->
-                request.reason() == DataAnalysisReleaseReason.PREPARING_ABORTED));
-        order.verify(dispatchStore).completeDagBlockingPreparingAbort(
-                eq("run-test"), any(), any(Instant.class));
+                request.reason() == DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED
+                        && request.proof() instanceof DataAnalysisReleaseProof.Terminal));
+        verify(dispatchStore, never()).beginDagBlockingPreparingAbort(anyString(), any(), any());
         verify(dispatchStore, never()).clearActive(anyString(), anyString());
-        verifyNoInteractions(recorder);
     }
 
     @Test
-    void dagPreparingAbortFenceFailureDoesNotReleaseCapacity() throws Exception {
+    void dagLeaseLossBeforeTombstoneDoesNotIssueExternalCancelOrReleaseCapacity() throws Exception {
         fixtureDataset();
         AgentContext.setWorkflow("dag");
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
         when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
-        when(dispatchStore.beginDagBlockingPreparingAbort(eq("run-test"), any(), any()))
+        when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), any()))
                 .thenReturn(false);
         when(sandbox.createTask(any())).thenReturn(
                 ExecuteResponse.newBuilder().setError("create rejected").build());
@@ -1141,51 +1318,21 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(output)
                 .contains("\"ok\":false")
                 .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
-        verify(dispatchStore).beginDagBlockingPreparingAbort(
-                eq("run-test"), any(), any(Instant.class));
+        verify(sandbox, never()).cancelTask(any());
         verify(capacity, never()).releaseReservation(any());
-        verify(dispatchStore, never()).completeDagBlockingPreparingAbort(
-                anyString(), any(), any());
+        verify(dispatchStore, never()).beginDagBlockingPreparingAbort(anyString(), any(), any());
     }
 
     @Test
-    void dagPreparingAbortCompletionFailureLeavesReleasedIntentForReentry() throws Exception {
-        fixtureDataset();
-        AgentContext.setWorkflow("dag");
-        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
-        when(dispatchStore.completeDagBlockingPreparingAbort(eq("run-test"), any(), any()))
-                .thenReturn(false);
-        when(sandbox.createTask(any())).thenReturn(
-                ExecuteResponse.newBuilder().setError("create rejected").build());
-
-        String output = tools.executePython("print(1)", "1", null, null, 30);
-
-        assertThat(output)
-                .contains("\"ok\":false")
-                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
-        verify(dispatchStore).beginDagBlockingPreparingAbort(
-                eq("run-test"),
-                argThat(anchor -> "ABORTING".equals(anchor.getAnchorState())
-                        && anchor.getReservationJson().contains("\"state\":\"RELEASED\"")),
-                any(Instant.class));
-        verify(capacity).releaseReservation(argThat(request ->
-                request.reason() == DataAnalysisReleaseReason.PREPARING_ABORTED));
-        verify(dispatchStore).completeDagBlockingPreparingAbort(
-                eq("run-test"), any(), any(Instant.class));
-    }
-
-    @Test
-    void dagPreparingAbortBeginExceptionFallsBackToWorkerLostWithoutRelease() throws Exception {
+    void dagTombstoneFailureHandsPreparingReservationToCleanupRecovery() throws Exception {
         fixtureDataset();
         AgentContext.setWorkflow("dag");
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
         when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
-        when(dispatchStore.beginDagBlockingPreparingAbort(eq("run-test"), any(), any()))
-                .thenThrow(new IllegalStateException("abort CAS outcome unknown"));
         when(sandbox.createTask(any())).thenReturn(
                 ExecuteResponse.newBuilder().setError("create rejected").build());
+        when(sandbox.cancelTask(any()))
+                .thenThrow(new IllegalStateException("cancel service unavailable"));
 
         String output = tools.executePython("print(1)", "1", null, null, 30);
 
@@ -1199,8 +1346,37 @@ class PythonSandboxToolsDataIntenseTest {
                         && anchor.getReservationJson().contains("\"state\":\"PREPARING\"")),
                 any(Instant.class));
         verify(capacity, never()).releaseReservation(any());
-        verify(dispatchStore, never()).completeDagBlockingPreparingAbort(
-                anyString(), any(), any());
+        verify(dispatchStore, never()).beginDagBlockingPreparingAbort(anyString(), any(), any());
+    }
+
+    @Test
+    void dagLostCreateResponseAndAbsentLookupCannotReleaseBeforeTombstone() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any()))
+                .thenThrow(new IllegalStateException("create response lost"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+        when(sandbox.cancelTask(any()))
+                .thenThrow(new IllegalStateException("cancel service unavailable"));
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LIFECYCLE_FAILED\"");
+        verify(sandbox).cancelTask(argThat(request -> request.hasByOperation()
+                && "run-test:call-1:1".equals(request.getByOperation().getOperationId())));
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "PREPARING".equals(anchor.getAnchorState())
+                        && "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && anchor.getReservationJson().contains("\"state\":\"PREPARING\"")),
+                any(Instant.class));
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).beginDagBlockingPreparingAbort(anyString(), any(), any());
     }
 
     @Test
@@ -1411,6 +1587,71 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
+    void typedLookupErrorDoesNotAuthorizeCancelTombstone() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("rpc response lost"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false)
+                        .setErrorDetail(SandboxErrorDetail.newBuilder().build()).build());
+
+        String result = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(result).contains("\"ok\":false", "\"code\":\"TOOL_ERROR\"");
+        verify(sandbox, never()).cancelTask(any());
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).persistAttached(any(), any());
+    }
+
+    @Test
+    void delayedCreateAfterAbsentLookupIsCanceledByOperationAndKeptUntilTerminal() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        AtomicReference<ToolJobAnchor> attached = new AtomicReference<>();
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            attached.set(snapshot(invocation.getArgument(1)));
+            return true;
+        });
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        AtomicReference<ExecuteRequest> created = new AtomicReference<>();
+        AtomicInteger lookups = new AtomicInteger();
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            created.set(invocation.getArgument(0));
+            throw new IllegalStateException("create response lost");
+        });
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation ->
+                lookups.incrementAndGet() == 1
+                        ? GetTaskByOperationIdResponse.newBuilder().setFound(false).build()
+                        : GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                        .setTaskId("late-task")
+                        .setRequestFingerprint(created.get().getRequestFingerprint()).build());
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.CANCEL_INTENT_RECORDED)
+                .setTaskId("late-task").setStatus("RUNNING").build());
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(sandbox).cancelTask(argThat(request -> request.hasByOperation()
+                && created.get().getOperationId().equals(request.getByOperation().getOperationId())
+                && created.get().getRequestFingerprint().equals(
+                request.getByOperation().getRequestFingerprint())
+                && request.getCancelRequestId().equals("tool-job-create-"
+                + UUID.nameUUIDFromBytes(created.get().getOperationId()
+                .getBytes(StandardCharsets.UTF_8)))));
+        assertThat(attached.get().getTaskId()).isEqualTo("late-task");
+        assertThat(attached.get().getReservationJson()).contains("TASK_ATTACHED");
+        verify(dispatchStore).transferToPending(eq("run-test"), any());
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).clearActive(any(), any());
+    }
+
+    @Test
     void foundOperationWithoutFingerprintKeepsPreparingReservation() throws Exception {
         fixtureDataset();
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
@@ -1609,6 +1850,265 @@ class PythonSandboxToolsDataIntenseTest {
                 batch, List.of(record), "rows=5", List.of(), true);
     }
 
+    // ==================== 等待成员：用预计算身份建任务，不写 Run 级进度记录 ====================
+
+    @Test
+    void aWaitGroupMemberCreatesOneTaskUnderThePersistedIdentityAndSkipsTheRunAnchor() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-wg")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getOperationId()).isEqualTo(EXPECTED_MEMBER_OPERATION);
+        assertThat(pending.getTaskId()).isEqualTo("task-wg");
+        ArgumentCaptor<ExecuteRequest> request = ArgumentCaptor.forClass(ExecuteRequest.class);
+        verify(sandbox).createTask(request.capture());
+        assertThat(request.getValue().getOperationId())
+                .as("沙箱任务用的是整组落库时写进成员行的身份")
+                .isEqualTo(EXPECTED_MEMBER_OPERATION);
+        assertThat(request.getValue().getRequestFingerprint()).startsWith("sha256:");
+        assertThat(request.getValue().getEstimatedRows()).isEqualTo(2L);
+        assertThat(pending.getProof().operationId()).isEqualTo(EXPECTED_MEMBER_OPERATION);
+        assertThat(pending.getProof().taskConfirmed()).isTrue();
+        assertThat(pending.getProof().reservationJson()).contains("TASK_ATTACHED");
+        assertThat(pending.getProof().estimateJson()).contains("\"estimatedRows\":2");
+        ArgumentCaptor<String> savedProofJson = ArgumentCaptor.forClass(String.class);
+        org.mockito.InOrder dispatchOrder = inOrder(waitGroupStore, sandbox);
+        dispatchOrder.verify(waitGroupStore).recordMemberPreparing(anyLong(), anyString(),
+                eq(EXPECTED_MEMBER_OPERATION), savedProofJson.capture());
+        dispatchOrder.verify(sandbox).createTask(request.getValue());
+        WaitMemberDispatchProof saved = WaitMemberDispatchProof.fromJson(
+                new ObjectMapper(), savedProofJson.getValue()).orElseThrow();
+        assertThat(saved.replayable()).isTrue();
+        ExecuteRequest.Builder frozen = ExecuteRequest.newBuilder();
+        com.google.protobuf.util.JsonFormat.parser().merge(saved.createRequestJson(), frozen);
+        assertThat(frozen.build()).isEqualTo(request.getValue());
+        // 新路径没有 Run 级长工具进度记录：成员行才是这些事实的落点。
+        verify(dispatchStore, never()).persistPreparing(any(), any());
+        verify(dispatchStore, never()).persistAttached(any(), any());
+        verify(dispatchStore, never()).transferToPending(any(), any());
+        verify(dispatchStore, never()).isInvocationBlocked(any());
+    }
+
+    @Test
+    void aWaitGroupMemberWhoseIdentityDoesNotMatchThePersistedOneCreatesNothing() throws Exception {
+        fixtureDataset();
+
+        // 成员行上写着另一个身份：拼出来的值与它对不上，这次调用什么都不做。
+        String output = invokeAsWaitGroupMember("print(1)", "1", "run-test:someone-else:1");
+
+        assertThat(output).contains("\"ok\":false").contains("WAIT_GROUP_OPERATION_IDENTITY_MISMATCH");
+        verify(sandbox, never()).createTask(any());
+        verify(capacity, never()).reserve(any(), any());
+        verify(dispatchStore, never()).persistPreparing(any(), any());
+    }
+
+    @Test
+    void aWaitGroupMemberWhoseCreateOutcomeIsUnknownKeepsTheReservationAndTheAbsentTaskId() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("网关超时"));
+        // 回查也失败：既拿到不确认，也拿不到「没建出来」的证明。
+        when(sandbox.getTaskByOperationId(any())).thenThrow(new IllegalStateException("网关还是不通"));
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).as("任务编号还没证实就不写一个出来").isNull();
+        assertThat(pending.getProof().taskConfirmed()).isFalse();
+        assertThat(pending.getProof().reservationJson())
+                .as("名额还留着，不能猜着释放").contains("PREPARING");
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void anAuthoritativeAbsentCreateLeavesSettlementToTheReceiver() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("网关拒绝"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        assertThat(pending.getProof().reservationJson()).contains("PREPARING");
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).persistPreparing(any(), any());
+    }
+
+    @Test
+    void aWorkspaceRefusalWithNoExistingTaskIsSavedForExplicitMemberFailure() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+        when(waitGroupStore.recordMemberWorkspaceRefusal(anyLong(), anyString(),
+                eq(EXPECTED_MEMBER_OPERATION), anyString(), anyString())).thenReturn(true);
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getProof().workspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(pending.getProof().taskId()).isNull();
+        verify(waitGroupStore).recordMemberWorkspaceRefusal(anyLong(), anyString(),
+                eq(EXPECTED_MEMBER_OPERATION), anyString(), argThat(saved ->
+                        saved.contains("WORKSPACE_DIRTY") && saved.contains("createRequestJson")));
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void aWorkspaceRefusalCannotHideAnAlreadyAcceptedTask() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        AtomicReference<ExecuteRequest> original = new AtomicReference<>();
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            original.set(invocation.getArgument(0));
+            return ExecuteResponse.newBuilder()
+                    .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build();
+        });
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation ->
+                GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                    .setTaskId("task-before-dirty")
+                    .setRequestFingerprint(original.get().getRequestFingerprint()).build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isEqualTo("task-before-dirty");
+        verify(waitGroupStore, never()).recordMemberWorkspaceRefusal(anyLong(), anyString(),
+                anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void anErrorResponseCannotBeTreatedAsNoTaskWhenLookupIsUncertain() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setError("gateway timeout after dispatch").build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(false)
+                .setErrorDetail(SandboxErrorDetail.newBuilder().build())
+                .build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        verify(capacity, never()).releaseReservation(any());
+        verify(sandbox).getTaskByOperationId(argThat(request ->
+                EXPECTED_MEMBER_OPERATION.equals(request.getOperationId())));
+    }
+
+    @Test
+    void anErrorResponseCanBeConfirmedByTheStableOperationIdentity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
+                .setError("response was lost").build());
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation -> {
+            ArgumentCaptor<ExecuteRequest> created = ArgumentCaptor.forClass(ExecuteRequest.class);
+            verify(sandbox).createTask(created.capture());
+            return GetTaskByOperationIdResponse.newBuilder().setFound(true)
+                    .setTaskId("task-created")
+                    .setRequestFingerprint(created.getValue().getRequestFingerprint()).build();
+        });
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isEqualTo("task-created");
+        assertThat(pending.getProof().taskConfirmed()).isTrue();
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void aTypedCreateErrorCannotConfirmEvenIfItCarriesMatchingTaskIdentity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("contradictory-task")
+                    .setRequestFingerprint(request.getRequestFingerprint())
+                    .setErrorDetail(SandboxErrorDetail.newBuilder().build()).build();
+        });
+        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
+                .setFound(true).setTaskId("contradictory-task")
+                .setErrorDetail(SandboxErrorDetail.newBuilder().build()).build());
+
+        WaitGroupMemberPendingException pending = assertThrows(WaitGroupMemberPendingException.class,
+                () -> invokeAsWaitGroupMember("print(1)", "1"));
+
+        assertThat(pending.getTaskId()).isNull();
+        verify(sandbox).getTaskByOperationId(any());
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    /** 在成员上下文里调用工具：与派发器在真实链路里装上下文的方式一致。 */
+    private String invokeAsWaitGroupMember(String code, String datasetIds) {
+        return invokeAsWaitGroupMember(code, datasetIds, EXPECTED_MEMBER_OPERATION);
+    }
+
+    @Test
+    void canceledMemberCannotCreateSandboxTaskWithoutDurableRequestProof() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(waitGroupStore.recordMemberPreparing(anyLong(), anyString(), anyString(), anyString()))
+                .thenReturn(false);
+
+        String output = invokeAsWaitGroupMember("print(1)", "1");
+
+        assertThat(output).contains("WAIT_GROUP_PREPARING_NOT_RECORDED");
+        verify(sandbox, never()).createTask(any());
+        verify(capacity).releaseReservation(any());
+    }
+
+    @Test
+    void persistenceFailureBeforeCreateReleasesTheLocalReservation() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation(EXPECTED_MEMBER_OPERATION));
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(waitGroupStore.recordMemberPreparing(anyLong(), anyString(), anyString(), anyString()))
+                .thenThrow(new IllegalStateException("database unavailable"));
+
+        String output = invokeAsWaitGroupMember("print(1)", "1");
+
+        assertThat(output).contains("WAIT_GROUP_PREPARING_NOT_RECORDED");
+        verify(capacity).releaseReservation(any());
+        verify(sandbox, never()).createTask(any());
+    }
+
+    private String invokeAsWaitGroupMember(String code, String datasetIds, String expectedOperationId) {
+        WaitGroupMemberExecutionContext.Snapshot member = new WaitGroupMemberExecutionContext.Snapshot(
+                "run-test", 77L, "member-1", 0, "call-1--wi-0000", expectedOperationId, "segment");
+        try (WaitGroupMemberExecutionContext.Scope ignored =
+                     WaitGroupMemberExecutionContext.install(member)) {
+            return tools.executePython(code, datasetIds, null, null, 30);
+        }
+    }
+
+    private DataAnalysisReservation preparingReservation(String operationId) {
+        // 预计算身份的形态就是 runId:持久调用身份:轮次，这里按同样形态造一条。
+        String[] parts = operationId.split(":");
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
+                parts[0], parts[1], Integer.parseInt(parts[2]));
+        return new DataAnalysisReservation(identity.reservationId(), identity,
+                DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.PREPARING, null, Instant.now());
+    }
+
     private void fixtureDataset() throws Exception {
         Path csv = tempDir.resolve("prices.csv");
         Files.writeString(csv, "ts_code,close\n600000.SH,10\n600001.SH,11\n");
@@ -1625,10 +2125,7 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     private DataAnalysisReservation preparingReservation() {
-        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity("run-test", "call-1", 1);
-        return new DataAnalysisReservation(identity.reservationId(), identity,
-                DataAnalysisResourceClass.STANDARD, 1,
-                DataAnalysisReservationState.PREPARING, null, Instant.now());
+        return preparingReservation("run-test:call-1:1");
     }
 
     private SandboxResourceUsage completeUsage() {
@@ -1638,6 +2135,20 @@ class PythonSandboxToolsDataIntenseTest {
                 .setQueueWaitMillis(4).setPrepareMillis(5).setExecutionWallMillis(6)
                 .setCleanupMillis(7).setDatasetOpenCount(1).setExitReason("SUCCEEDED")
                 .setAttributionComplete(true).build();
+    }
+
+    private SandboxResourceUsage preCreateCanceledUsage() {
+        return SandboxResourceUsage.newBuilder()
+                .setResourceClass("UNKNOWN")
+                .setExitReason("CANCELED")
+                .setAttributionComplete(false)
+                .addAllMissingFields(List.of(
+                        "cpuMillis", "memoryPeakBytes", "memoryByteMillis",
+                        "logicalBytesScanned", "artifactBytesWritten",
+                        "temporaryBytesWritten", "queueWaitMillis", "prepareMillis",
+                        "executionWallMillis", "cleanupMillis", "datasetOpenCount",
+                        "samplingIntervalMillis"))
+                .build();
     }
 
     private ToolJobAnchor snapshot(ToolJobAnchor anchor) {
