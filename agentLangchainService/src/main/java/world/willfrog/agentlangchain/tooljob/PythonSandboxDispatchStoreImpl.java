@@ -93,6 +93,67 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                 runId, anchor, expectedResumeToken, expectedResumeLeaseVersion);
     }
 
+    @Override
+    public boolean persistPreparingWaitMember(String runId, ToolJobAnchor anchor, long groupId,
+                                               String memberIdentity, String proofJson,
+                                               String resumeToken, Long resumeVersion) {
+        if (!applyDualPoolIdentity(runId, anchor)) return false;
+        try {
+            return anchorService.claimPreparingWaitMember(runId, anchor, groupId, memberIdentity,
+                    proofJson, resumeToken, resumeVersion);
+        } catch (world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException admission) {
+            throw admission;
+        } catch (RuntimeException uncertainCommit) {
+            // CAS未取得创建权、明确回滚或提交响应不确定，都锁定读回预约责任；不重发事务或create。
+            // 中断必须延迟到读回有结论，不能另造成员半状态。
+            boolean interrupted = Thread.interrupted();
+            long attempts = 0;
+            try {
+                while (true) {
+                    try {
+                        ToolJobAnchorService.MemberPreparingReadback outcome =
+                                anchorService.readPreparingWaitMember(runId, anchor, groupId, memberIdentity,
+                                        proofJson, resumeToken, resumeVersion);
+                        if (outcome == ToolJobAnchorService.MemberPreparingReadback.COMMITTED) return true;
+                        if (outcome == ToolJobAnchorService.MemberPreparingReadback.NOT_WRITTEN) return false;
+                        if (outcome == ToolJobAnchorService.MemberPreparingReadback.OWNERSHIP_LOST) {
+                            // 不能把未确认的内存proof当作已提交，继续只读保留原预约。
+                            throw new IllegalStateException("SQL准备证明已变，尚不能确认原预约责任");
+                        }
+                        // 已确认两项提交但查询忙，或已交给别的控制版本，原调用不创建/不清除。
+                        if (resumeToken != null && !resumeToken.isBlank()) {
+                            world.willfrog.agent.platform.context.AgentContext.clearToolJobResumeHandoff();
+                        }
+                        world.willfrog.agent.platform.wait.WaitMemberDispatchProof proof =
+                                world.willfrog.agent.platform.wait.WaitMemberDispatchProof.fromJson(
+                                        new com.fasterxml.jackson.databind.ObjectMapper(), proofJson).orElseThrow();
+                        throw new world.willfrog.agent.platform.wait.WaitGroupMemberPendingException(proof,
+                                "SQL preparation retained for durable member recovery");
+                    } catch (world.willfrog.agent.platform.wait.WaitGroupMemberPendingException pending) {
+                        throw pending;
+                    } catch (RuntimeException unavailable) {
+                        if (++attempts == 1 || attempts % 30 == 0) {
+                            log.warn("SQL提交暂不能锁定读回，原线程保留预约并等待: run={} operation={} attempts={}",
+                                    runId, anchor.getOperationId(), attempts);
+                        }
+                        try {
+                            Thread.sleep(Math.max(1, Math.min(1000, config.getReconcilerIntervalMs())));
+                        } catch (InterruptedException stopRequested) {
+                            interrupted = true;
+                        }
+                        interrupted |= Thread.interrupted();
+                    }
+                }
+            } finally {
+                interrupted |= Thread.interrupted();
+                if (interrupted) {
+                    world.willfrog.agent.platform.dataanalysis.MemberPreparingInterruption.mark();
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
     private boolean applyDualPoolIdentity(String runId, ToolJobAnchor anchor) {
         DualPoolToolJobExecutionContext.Snapshot snapshot =
                 DualPoolToolJobExecutionContext.current();
@@ -139,6 +200,23 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
         }
         return anchorService.updateActive(
                 runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+    }
+
+    @Override
+    public boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                          Instant expectedLeaseUntil) {
+        return anchorService.recordWorkspaceRefusal(runId, anchor, expectedLeaseUntil);
+    }
+
+    @Override
+    public boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        return anchorService.recordWorkspaceRefusalReleased(runId, anchor);
+    }
+
+    @Override
+    public boolean completeWorkspaceRefusal(String runId, String operationId,
+                                            String fingerprint, String code) {
+        return anchorService.completeWorkspaceRefusal(runId, operationId, fingerprint, code);
     }
 
     @Override

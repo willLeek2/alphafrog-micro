@@ -14,6 +14,9 @@ import java.util.List;
 public interface ChildRunIntentMapper {
     ChildRunParentSnapshot lockParentRun(@Param("runId") String runId);
 
+    /** 父 Run 行锁取得之后检查删除标记，避免与整树删除交错。 */
+    boolean isParentDeletionStarted(@Param("runId") String runId);
+
     ChildRunIntentRow findByCall(@Param("request") ChildRunReserveRequest request);
 
     ChildRunIntentRow findByIntentId(@Param("intentId") long intentId);

@@ -158,6 +158,51 @@ class ToolJobStartupDispatchRecoveryTest {
                 any(), any(), any(), any(), any());
     }
 
+    @Test
+    void committedWorkspaceRefusalWithLostDbReplyStillOpensAdmission() throws Exception {
+        Fixture fixture = fixture();
+        ToolJobAnchor durableRefusal = preparingAnchor();
+        durableRefusal.setAnchorState("WORKSPACE_REFUSED");
+        durableRefusal.setWorkspaceRefusalCode("WORKSPACE_DIRTY");
+        when(fixture.anchorService.loadAnchor("run-1"))
+                .thenReturn(preparingAnchor(), durableRefusal);
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+        when(fixture.sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder()
+                        .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
+        when(fixture.anchorService.recordWorkspaceRefusal(eq("run-1"), any(), isNull()))
+                .thenThrow(new IllegalStateException("committed but reply lost"));
+
+        fixture.recovery.onReady();
+
+        ArgumentCaptor<List<DataAnalysisReservation>> reservations =
+                ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(reservations.capture(), anyInt(), anyInt());
+        assertThat(reservations.getValue()).singleElement().satisfies(reservation ->
+                assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING));
+        verify(fixture.redisCache, atLeastOnce()).upsertDue(eq("run-1"),
+                argThat(due -> "WORKSPACE_REFUSED".equals(due.getAnchorState())));
+    }
+
+    @Test
+    void completedWorkspaceRefusalAfterLostReplyDoesNotRestoreReleasedCapacity() throws Exception {
+        Fixture fixture = fixture();
+        when(fixture.anchorService.loadAnchor("run-1"))
+                .thenReturn(preparingAnchor(), null);
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+        when(fixture.sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder()
+                        .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
+        when(fixture.anchorService.recordWorkspaceRefusal(eq("run-1"), any(), isNull()))
+                .thenThrow(new IllegalStateException("committed but reply lost"));
+
+        fixture.recovery.onReady();
+
+        verify(fixture.capacity).recover(eq(List.of()), anyInt(), anyInt());
+    }
+
     private Fixture fixture() throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);

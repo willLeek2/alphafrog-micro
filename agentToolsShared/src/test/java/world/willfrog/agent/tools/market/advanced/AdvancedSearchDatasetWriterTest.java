@@ -11,9 +11,17 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.SetOperations;
+import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
+import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.workflow.DatasetPersistedEvent;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -21,10 +29,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -36,6 +48,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doAnswer;
 
 @ExtendWith(MockitoExtension.class)
 class AdvancedSearchDatasetWriterTest {
@@ -61,6 +75,161 @@ class AdvancedSearchDatasetWriterTest {
     @AfterEach
     void tearDown() {
         AgentContext.clear();
+    }
+
+    @Test
+    void createdAndReusedJsonExposeAccurateCompleteMetadata() throws Exception {
+        RealWriter fixture = new RealWriter();
+        Map<String, Object> query = Map.of("conditions", List.of(
+                Map.of("type", "index_component", "index_code", "000300.SH")));
+        List<Map<String, Object>> results = List.of(resultRow("000001.SZ", 1.0), Map.of(
+                "ts_code", "600519.SH", "name", "贵州茅台", "index_code", "000300.SH"));
+        // 读取方的真实统计必须来自完整结果数组，不能信任错误的行数标签。
+        Map<String, Object> dataset = Map.of("schema_version", 1, "row_count", 99, "results", results);
+        var created = fixture.writer.writeOrReuse("searchAssetInfo", "stock", query, dataset, 10);
+        AgentContext.setRunId("test-run-002");
+        var reused = fixture.writer.writeOrReuse("searchAssetInfo", "stock", query, dataset, 10);
+        assertFalse(created.isReused());
+        assertTrue(reused.isReused());
+        assertEquals(created.getDatasetId(), reused.getDatasetId());
+        for (String runId : List.of("test-run-001", "test-run-002")) {
+            var entry = fixture.runRegistry.snapshot(runId).datasets().get(0);
+            Path file = Path.of(entry.persistedPath());
+            var metadata = new DatasetEntryMetadataReader().read(entry);
+            assertEquals("complete", metadata.metadataStatus());
+            assertEquals(2L, metadata.rowCount());
+            assertEquals(Files.size(file), metadata.bytes());
+            assertEquals(List.of("index_code", "match_conditions", "name", "ts_code"), metadata.columns());
+            assertEquals(objectMapper.valueToTree(results), objectMapper.readTree(file.toFile()).path("results"));
+            var document = objectMapper.readTree(file.resolveSibling("data.meta.json").toFile());
+            assertEquals("json", document.path("format").asText());
+            assertEquals("results", document.path("recordsPath").asText());
+            assertEquals(1, document.path("schema_version").asInt());
+            assertTrue(Files.isRegularFile(file.resolveSibling(created.getDatasetId() + ".meta.json")));
+        }
+    }
+
+    @Test
+    void emptyResultsRetainJsonSchemaButInvalidShapeCannotBecomeComplete() throws Exception {
+        RealWriter fixture = new RealWriter();
+        var empty = fixture.writer.writeOrReuse("searchAssetInfo", "stock", Map.of(),
+                Map.of("schema_version", 1, "row_count", 0, "results", List.of()), 10);
+        var emptyEntry = fixture.runRegistry.snapshot("test-run-001").datasets().stream()
+                .filter(entry -> entry.originalId().equals(empty.getDatasetId())).findFirst().orElseThrow();
+        var emptyMetadata = new DatasetEntryMetadataReader().read(emptyEntry);
+        assertEquals("complete", emptyMetadata.metadataStatus());
+        assertEquals(0L, emptyMetadata.rowCount());
+        assertEquals(Files.size(Path.of(emptyEntry.persistedPath())), emptyMetadata.bytes());
+        assertEquals(List.of("ts_code", "name", "asset_type", "match_conditions"), emptyMetadata.columns());
+
+        var invalid = fixture.writer.writeOrReuse("searchAssetInfo", "stock", Map.of(),
+                Map.of("row_count", 10, "results", "not-an-array"), 10);
+        var invalidEntry = fixture.runRegistry.snapshot("test-run-001").datasets().stream()
+                .filter(entry -> entry.originalId().equals(invalid.getDatasetId())).findFirst().orElseThrow();
+        var invalidMetadata = new DatasetEntryMetadataReader().read(invalidEntry);
+        assertEquals("partial", invalidMetadata.metadataStatus());
+        assertNull(invalidMetadata.rowCount());
+    }
+
+    @Test
+    void changedContentsDoNotReuseEmptyMembersOrWeights() throws Exception {
+        RealWriter fixture = new RealWriter();
+        Map<String, Object> query = Map.of("conditions", List.of(
+                Map.of("type", "index_component", "index_code", "000300.SH")));
+        List<Map<String, Object>> datasets = List.of(
+                Map.of("row_count", 0, "results", List.of()),
+                Map.of("row_count", 1, "results", List.of(resultRow("000001.SZ", 1.0))),
+                Map.of("row_count", 1, "results", List.of(resultRow("600519.SH", 1.0))),
+                Map.of("row_count", 1, "results", List.of(resultRow("600519.SH", 2.0))));
+        List<String> identities = new ArrayList<>();
+        for (Map<String, Object> dataset : datasets) {
+            var written = fixture.writer.writeOrReuse("searchAssetInfo", "stock", query, dataset, 10);
+            assertFalse(written.isReused());
+            identities.add(written.getDatasetId());
+            var entry = fixture.runRegistry.snapshot("test-run-001").datasets().stream()
+                    .filter(item -> item.originalId().equals(written.getDatasetId())).findFirst().orElseThrow();
+            assertEquals(objectMapper.valueToTree(dataset), objectMapper.readTree(Path.of(entry.persistedPath()).toFile()));
+        }
+        assertEquals(4, identities.stream().distinct().count(), "行数相同也必须区分成员与权重变化");
+        assertEquals(4, fixture.runRegistry.snapshot("test-run-001").datasets().size());
+        var emptyEntry = fixture.runRegistry.snapshot("test-run-001").datasets().stream()
+                .filter(item -> item.originalId().equals(identities.get(0))).findFirst().orElseThrow();
+        assertEquals(0, objectMapper.readTree(Path.of(emptyEntry.persistedPath()).toFile()).path("row_count").asInt());
+    }
+
+    @Test
+    void identicalContentWithReorderedObjectKeysReusesFileButArrayOrderRemainsSignificant() throws Exception {
+        RealWriter fixture = new RealWriter();
+        Map<String, Object> query = Map.of("asset_type", "stock", "conditions", List.of(
+                Map.of("type", "index_component", "index_code", "000300.SH")));
+        List<Map<String, Object>> results = List.of(resultRow("000001.SZ", 1.0), resultRow("600519.SH", 2.0));
+        Map<String, Object> dataset = Map.of("query", query, "row_count", 2, "results", results);
+        var first = fixture.writer.writeOrReuse("searchAssetInfo", "stock", query, dataset, 10);
+        AgentContext.setRunId("test-run-002");
+        var second = fixture.writer.writeOrReuse("searchAssetInfo", "stock",
+                reverseObjectKeys(query), reverseObjectKeys(dataset), 10);
+        assertTrue(second.isReused());
+        assertEquals(first.getDatasetId(), second.getDatasetId());
+        var firstEntry = fixture.runRegistry.snapshot("test-run-001").datasets().get(0);
+        var secondEntry = fixture.runRegistry.snapshot("test-run-002").datasets().get(0);
+        assertEquals(firstEntry.persistedPath(), secondEntry.persistedPath());
+        assertEquals(objectMapper.valueToTree(dataset), objectMapper.readTree(Path.of(secondEntry.persistedPath()).toFile()));
+
+        Map<String, Object> reorderedResults = Map.of("query", query, "row_count", 2,
+                "results", List.of(results.get(1), results.get(0)));
+        var third = fixture.writer.writeOrReuse("searchAssetInfo", "stock", query, reorderedResults, 10);
+        assertFalse(third.isReused());
+        assertNotEquals(first.getDatasetId(), third.getDatasetId());
+    }
+
+    private Map<String, Object> resultRow(String code, double weight) {
+        return Map.of("ts_code", code, "match_conditions", Map.of(
+                "index_component-000300.SH", List.of(1704124800000L, weight)));
+    }
+
+    private Map<String, Object> reverseObjectKeys(Map<String, Object> map) {
+        Map<String, Object> reversed = new LinkedHashMap<>();
+        map.entrySet().stream().sorted(Map.Entry.<String, Object>comparingByKey().reversed())
+                .forEach(entry -> reversed.put(entry.getKey(), reverseNestedObjectKeys(entry.getValue())));
+        return reversed;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object reverseNestedObjectKeys(Object value) {
+        if (value instanceof Map<?, ?> map) return reverseObjectKeys((Map<String, Object>) map);
+        if (value instanceof List<?> list) return list.stream().map(this::reverseNestedObjectKeys).toList();
+        return value;
+    }
+
+    private class RealWriter {
+        private final AgentRunDatasetRegistry runRegistry = new AgentRunDatasetRegistry();
+        private final AdvancedSearchDatasetWriter writer;
+
+        @SuppressWarnings("unchecked")
+        private RealWriter() {
+            Map<String, String> storedMetadata = new HashMap<>();
+            StringRedisTemplate redis = mock(StringRedisTemplate.class);
+            ValueOperations<String, String> values = mock(ValueOperations.class);
+            when(redis.opsForValue()).thenReturn(values);
+            when(values.get(anyString())).thenAnswer(call -> storedMetadata.get(call.getArgument(0)));
+            doAnswer(call -> {
+                storedMetadata.put(call.getArgument(0), call.getArgument(1));
+                return null;
+            }).when(values).set(anyString(), anyString());
+            when(redis.opsForSet()).thenReturn(mock(SetOperations.class));
+            DatasetRegistry registry = new DatasetRegistry(redis, event -> {
+                if (event instanceof DatasetPersistedEvent persisted) runRegistry.onDatasetPersisted(persisted);
+            });
+            ReflectionTestUtils.setField(registry, "enabled", true);
+            ReflectionTestUtils.setField(registry, "databaseFetchedPath", tempDir.toString());
+            ReflectionTestUtils.setField(registry, "ttlSeconds", 3600L);
+            DatasetWriter actualWriter = new DatasetWriter(new AgentStoragePaths(
+                    tempDir.resolve("workspaces").toString(), tempDir.resolve("artifacts").toString(),
+                    tempDir.resolve("datasets").toString(), tempDir.resolve("obs.log").toString()));
+            ReflectionTestUtils.setField(actualWriter, "enabled", true);
+            ReflectionTestUtils.setField(actualWriter, "databaseFetchedPath", tempDir.toString());
+            writer = new AdvancedSearchDatasetWriter(actualWriter, registry, objectMapper);
+        }
     }
 
     @Nested
@@ -144,7 +313,7 @@ class AdvancedSearchDatasetWriterTest {
                     eq("NONE"), eq("NONE"), eq(AdvancedSearchDatasetWriter.COLUMNS)))
                     .thenReturn(Optional.of(meta));
 
-            Map<String, Object> dataset = Map.of("results", List.of(Map.of("ts_code", "999999.SZ")));
+            Map<String, Object> dataset = Map.of("results", List.of(Map.of("ts_code", "000001.SZ")));
             Map<String, Object> canonicalQuery = Map.of("name", "any");
 
             AdvancedSearchDatasetWriter.WriteResult result = writer.writeOrReuse(

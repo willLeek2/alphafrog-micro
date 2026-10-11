@@ -48,6 +48,8 @@ public class ToolJobAnchor {
     private String createRequestJson;
     // anchorState 描述 PREPARING 到 CONSUMED 的任务生命周期，不等同于 Run 状态。
     private String anchorState;
+    // 工作区在建任务前明确拒绝的机器可读原因；此时没有 Sandbox taskId。
+    private String workspaceRefusalCode;
     // taskId 是 Sandbox 返回的真实后台任务标识，轮询终态时使用。
     private String taskId;
     // toolCallId 是 Agent 侧逻辑调用标识，与 attempt 一起隔离重试轮次。
@@ -176,7 +178,7 @@ public class ToolJobAnchor {
 
     // nextPollAt 决定 Redis due 索引中的下一次检查时间。
     private Instant nextPollAt;
-    // timeoutAt 是外部任务最大等待期限，超时后进入终态收尾。
+    // 旧临时盘任务的 Agent 侧截止时间。共享工作区任务为 null，执行超时由沙箱从待执行入态起算。
     private Instant timeoutAt;
 
     public ToolJobAnchor() {}
@@ -292,6 +294,8 @@ public class ToolJobAnchor {
 
     public String getAnchorState() { return anchorState; }
     public void setAnchorState(String anchorState) { this.anchorState = anchorState; }
+    public String getWorkspaceRefusalCode() { return workspaceRefusalCode; }
+    public void setWorkspaceRefusalCode(String workspaceRefusalCode) { this.workspaceRefusalCode = workspaceRefusalCode; }
 
     public String getTaskId() { return taskId; }
     public void setTaskId(String taskId) { this.taskId = taskId; }

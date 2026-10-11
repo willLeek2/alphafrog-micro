@@ -30,6 +30,7 @@ import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
@@ -403,9 +404,10 @@ public class ToolRouter {
         /*
          * executePython 是最容易把上游数据、模型生成代码和沙箱执行耦合在一起的工具。
          * 260623-harness-optimization-02: dataset_ids / manifest_ids 是两个独立编号空间，
-         * 这里先分别收集，再做静态预校验（要求至少一个非空），最后才交给 PythonSandboxTools
+         * 这里先分别收集，再做静态预校验，最后才交给 PythonSandboxTools
          * 的 5 形参 overload。这样可以在真正执行前拦截明显危险或无效的代码，
-         * 失败结果也仍然走统一 JSON 格式。
+         * 失败结果也仍然走统一 JSON 格式。空编号能否执行取决于工具取得的工作区身份，
+         * 不能仅凭静态入参判断。
          */
         String code = str(params.get("code"), params.get("arg0"));
         String datasetIds = collectExecutePythonDatasetIds(params);
@@ -702,6 +704,8 @@ public class ToolRouter {
                         : subAgentControlHandler.waitFor(params);
                 default -> unsupported(toolName);
             };
+        } catch (PythonRiskReplayEvidenceMissingException missing) {
+            throw missing;
         } catch (ToolJobInjectedInterruption interruption) {
             // 一次性故障演练要求当前 worker 直接退出，不能被统一异常协议改写成工具失败 JSON。
             throw interruption;

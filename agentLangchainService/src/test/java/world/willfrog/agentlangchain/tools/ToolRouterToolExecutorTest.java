@@ -11,6 +11,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.service.AgentRunEventService;
@@ -55,6 +56,23 @@ class ToolRouterToolExecutorTest {
     @AfterEach
     void tearDown() {
         AgentContext.clear();
+    }
+
+    @Test
+    void typedResultRetainsRouterBusinessStatusWithoutInterpretingItsOutput() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("tool-call-typed").name("loadToolGuide").arguments("{}").build();
+        // 正文故意与业务状态不一致，证明执行器服从路由器已有判断，不重新猜测工具 JSON。
+        when(toolRouter.invokeWithMeta("loadToolGuide", Map.of())).thenReturn(
+                ToolRouter.ToolInvocationResult.builder().output("{\"ok\":false}").success(true).build(),
+                ToolRouter.ToolInvocationResult.builder().output("业务拒绝完整正文").success(false).build());
+
+        ToolRouterToolExecutor.InvocationResult successful = executor.executeWithResult(request, null);
+        assertTrue(successful.success());
+        assertEquals("{\"ok\":false}", successful.output());
+        ToolRouterToolExecutor.InvocationResult refused = executor.executeWithResult(request, null);
+        assertFalse(refused.success());
+        assertEquals("业务拒绝完整正文", refused.output());
     }
 
     @Test
@@ -111,6 +129,21 @@ class ToolRouterToolExecutorTest {
         assertTrue((Long) finishedPayload.get("duration_ms") >= 0);
         assertEquals("todo-1", finishedPayload.get("todo_id"));
         assertEquals("linear", finishedPayload.get("workflow"));
+    }
+
+    @Test
+    void missingOriginalPythonRequestIsNotConvertedToToolResult() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("python-call")
+                .name("executePython")
+                .arguments("{\"code\":\"print(1)\"}")
+                .build();
+        when(toolRouter.invokeWithMeta(eq("executePython"), anyMap()))
+                .thenThrow(new PythonRiskReplayEvidenceMissingException("run-123:python-call:1"));
+
+        assertThrows(PythonRiskReplayEvidenceMissingException.class,
+                () -> executor.execute(request, null));
+        verify(eventService, never()).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), anyMap());
     }
 
     @Test
@@ -298,6 +331,30 @@ class ToolRouterToolExecutorTest {
         // 核心边界：预览正文 + 截断后缀总长度不超过 OUTPUT_PREVIEW_MAX_CHARS + 后缀长度
         assertTrue(preview.length() <= 500 + "... (truncated, length=2000)".length(),
                 "Preview should not exceed OUTPUT_PREVIEW_MAX_CHARS + suffix");
+    }
+
+    @Test
+    void successfulMarketDatasetResultDoesNotReceiveFailureRetryHint() {
+        Map<String, Object> arguments = Map.of(
+                "tsCode", "000300.SH", "startDate", "20230101", "endDate", "20230110");
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("market-dataset-call")
+                .name("getIndexDaily")
+                .arguments("{\"tsCode\":\"000300.SH\",\"startDate\":\"20230101\",\"endDate\":\"20230110\"}")
+                .build();
+        String successfulOutput = "{\"ok\":true,\"tool\":\"getIndexDaily\",\"data\":{"
+                + "\"rows\":6,\"dataset_id\":\"run-123-index-prices\","
+                + "\"dataset_ids\":[\"run-123-index-prices\"]},\"error\":null}";
+        when(toolRouter.invokeWithMeta("getIndexDaily", arguments)).thenReturn(
+                ToolRouter.ToolInvocationResult.builder()
+                        .output(successfulOutput).success(true).build());
+
+        ToolRouterToolExecutor.InvocationResult result = executor.executeWithResult(request, null);
+
+        assertTrue(result.success());
+        assertEquals(successfulOutput, result.output(),
+                "成功取数的标准 JSON 应原样返回，不能被追加缺少数据集编号的失败提示");
+        assertFalse(result.output().contains("_retry_hint_"));
     }
 
     @Test

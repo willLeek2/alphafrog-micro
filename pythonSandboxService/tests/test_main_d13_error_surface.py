@@ -161,17 +161,30 @@ class MainD13ErrorSurfaceTest(unittest.IsolatedAsyncioTestCase):
 
     # --- bounded acceptance queue (503 → OVERLOADED_OR_UNAVAILABLE) --------
 
-    async def test_queue_full_rejects_create_with_503_before_persist(self) -> None:
+    async def test_queue_full_of_live_residents_rejects_with_503(self) -> None:
+        # The transport queue refuses only when its residents are LIVE:
+        # the placeholder is a genuinely QUEUED task, so the stale-resident
+        # purge cannot free a slot, both enqueue attempts fail and the
+        # create rolls back with no durable trace. (A queue full of STALE
+        # ids — canceled while queued — must NOT refuse; that counterexample
+        # lives in the workspace lifecycle suite.)
         bounded: asyncio.Queue = asyncio.Queue(maxsize=1)
-        await bounded.put("placeholder-task")
+        resident = Task(
+            task_id="live-resident",
+            status=TaskStatus.QUEUED,
+            request=self.request(operation_id="run-live:call-0:1"),
+        )
+        self.store.create_with_admission(resident)
+        await bounded.put("live-resident")
         with patch.object(main, "task_queue", bounded):
             with self.assertRaises(HTTPException) as raised:
                 await main.create_task(self.request())
 
         self.assertEqual(raised.exception.status_code, 503)
-        # Nothing was persisted: the pre-create full() check fires first.
-        self.assertEqual(len(self.store.tasks), 0)
-        self.assertEqual(bounded.qsize(), 1)
+        # Nothing new was persisted: the rolled-back create left only the
+        # pre-existing resident, and the queue still holds its live id.
+        self.assertEqual(list(self.store.tasks), ["live-resident"])
+        self.assertEqual(list(bounded._queue), ["live-resident"])
 
     def test_module_level_queue_is_bounded_by_config(self) -> None:
         self.assertEqual(

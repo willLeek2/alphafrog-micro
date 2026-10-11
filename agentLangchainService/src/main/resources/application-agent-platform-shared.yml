@@ -1,5 +1,8 @@
 # Shared agent platform config for active agent runtimes.
 agent:
+  python-workspace:
+    # 仅在创建 Run 时冻结；既有 Run 的工作区语义始终从 ext 读取。
+    enabled: ${AF_AGENT_PYTHON_WORKSPACE_ENABLED:false}
   # AgentStoragePaths 统一管理 Agent 运行时存储路径：
   # 解析顺序 = 新键 → 旧键别名 → 代码默认值；空白值视为未设置，回退旧键。
   # 旧键只作为迁移期别名，新配置使用下面的统一键。

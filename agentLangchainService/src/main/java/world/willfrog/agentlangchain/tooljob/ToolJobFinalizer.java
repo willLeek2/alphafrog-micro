@@ -16,6 +16,10 @@ import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
+import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
@@ -122,6 +126,17 @@ public class ToolJobFinalizer {
                 financeProcessor, configLoader, formatter, adapter, null, null, null);
     }
 
+    private SandboxJobResultAdapter resultAdapterFor(ToolJobAnchor anchor) {
+        String toolName = anchor.getToolName();
+        if (toolName == null || toolName.isBlank()) {
+            // 旧版持久锚点没有工具名，原合同只支持 executePython。
+            return new PythonSandboxJobResultAdapter(formatter, adapter);
+        }
+        return SandboxJobAdapterRegistry.find(toolName).map(bundle -> bundle.result())
+                .orElseGet(() -> ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName)
+                        ? new PythonSandboxJobResultAdapter(formatter, adapter) : null);
+    }
+
     // ========== public entry points ==========
 
     /**
@@ -164,142 +179,111 @@ public class ToolJobFinalizer {
             anchor.setTerminalAt(now);
             // resultResp 可能在 RESULT_LOST 路径为空。
             if (resultResp != null) {
+                SandboxJobResultAdapter resultAdapter = resultAdapterFor(anchor);
+                if (resultAdapter == null) {
+                    anchor.setFinalizerError("result_adapter_unavailable");
+                    persistFinalizerAnchor(runId, anchor);
+                    return FinalizerOutcome.incomplete(STEP_ENVELOPE, "result_adapter_unavailable");
+                }
                 String stdout = resultResp.getStdout();
                 String stderr = resultResp.getStderr();
-                boolean success = "SUCCEEDED".equals(terminalStatus);
-                boolean hasFinanceData = resultResp.hasFinanceRecordChannel()
-                        || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY));
-
-                String previewJson;
-                if (success) {
-                    if (hasFinanceData) {
-                        if (anchor.getFinanceRecordLimitsJson() == null
-                                || anchor.getFinanceRecordLimitsJson().isBlank()) {
-                            log.warn("Finance data present but snapshot missing for run={}", runId);
-                            anchor.setFinalizerError("finance_snapshot_missing");
-                            persistFinalizerAnchor(runId, anchor);
-                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_snapshot_missing");
-                        }
-                        try {
-                            FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
-                                    .parseFrozenSnapshot(anchor.getFinanceRecordLimitsJson());
-                            var channelMeta = FinanceRecordProtoAdapter.channelMetadata(resultResp);
-                            FinanceRecordExtractionRequest request = new FinanceRecordExtractionRequest(
-                                    runId,
-                                    "",
-                                    anchor.getTodoId(),
-                                    anchor.getToolCallId(),
-                                    "async",
-                                    anchor.getTaskId(),
-                                    terminalStatus,
-                                    resultResp.getExitCode(),
-                                    stdout,
-                                    stderr,
-                                    channelMeta,
-                                    FinanceRecordProtoAdapter.executionEnvironment(resultResp),
-                                    snapshot.targetEnvironment(),
-                                    snapshot.limits());
-                            FinanceRecordExtractionResult extraction =
-                                    financeProcessor.process(request);
-                            FinanceResultModelAdapter.ProjectionBatch projected =
-                                    adapter.project(extraction);
-                            previewJson = formatter.formatSuccess(
-                                    extraction.ordinaryStdout(),
-                                    projected.results(),
-                                    projected.notices());
-                        } catch (FinanceRecordProcessingException e) {
-                            log.warn("Finance processor failed for run={}: {} — "
-                                    + "ENVELOPE blocked, will retry", runId, e.getCode());
-                            anchor.setFinalizerError("finance_processing_failed");
-                            persistFinalizerAnchor(runId, anchor);
-                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_processing_failed");
-                        } catch (RuntimeException e) {
-                            log.warn("Finance pipeline unexpected error for run={} — "
-                                    + "ENVELOPE blocked, will retry", runId, e.getMessage());
-                            anchor.setFinalizerError("finance_processing_failed");
-                            persistFinalizerAnchor(runId, anchor);
-                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_processing_failed");
-                        }
-                    } else {
-                        previewJson = formatter.formatSuccess(stdout, List.of(), List.of());
+                boolean python = anchor.getToolName() == null || anchor.getToolName().isBlank()
+                        || ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(anchor.getToolName());
+                boolean hasFinanceData = python && (resultResp.hasFinanceRecordChannel()
+                        || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY)));
+                FinanceRecordExtractionResult formatContext = null;
+                if (hasFinanceData) {
+                    if (anchor.getFinanceRecordLimitsJson() == null || anchor.getFinanceRecordLimitsJson().isBlank()) {
+                        anchor.setFinalizerError("finance_snapshot_missing");
+                        persistFinalizerAnchor(runId, anchor);
+                        return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_snapshot_missing");
                     }
-                } else {
-                    // FAILED / CANCELED
-                    boolean retryable = resultResp.hasRetryable() && resultResp.getRetryable();
-                    String failureCode = "CANCELED".equals(terminalStatus)
-                            ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
-                    FinanceToolResultFormatter.FailureDetail failure =
-                            new FinanceToolResultFormatter.FailureDetail(
-                                    failureCode, "Sandbox " + terminalStatus, retryable,
-                                    retryable ? "检查代码后重试" : "检查代码或联系管理员");
-
-                    if (hasFinanceData) {
-                        if (anchor.getFinanceRecordLimitsJson() == null
-                                || anchor.getFinanceRecordLimitsJson().isBlank()) {
-                            log.warn("Finance data present but snapshot missing"
-                                    + " for FAILED/CANCELED run={}", runId);
-                            anchor.setFinalizerError("finance_snapshot_missing");
-                            persistFinalizerAnchor(runId, anchor);
-                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_snapshot_missing");
-                        }
-                        try {
-                            FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
-                                    .parseFrozenSnapshot(anchor.getFinanceRecordLimitsJson());
-                            FinanceRecordExtractionRequest request = new FinanceRecordExtractionRequest(
-                                    runId, "", anchor.getTodoId(), anchor.getToolCallId(),
-                                    "async", anchor.getTaskId(), terminalStatus,
-                                    resultResp.getExitCode(), stdout, stderr,
-                                    FinanceRecordProtoAdapter.channelMetadata(resultResp),
-                                    FinanceRecordProtoAdapter.executionEnvironment(resultResp),
-                                    snapshot.targetEnvironment(), snapshot.limits());
-                            FinanceRecordExtractionResult extraction =
-                                    financeProcessor.process(request);
-                            stdout = extraction.ordinaryStdout();
-                        } catch (FinanceRecordProcessingException e) {
-                            log.warn("Finance de-marker failed for run={}: {} — "
-                                    + "ENVELOPE blocked, will retry", runId, e.getCode());
-                            anchor.setFinalizerError("finance_demarker_failed");
-                            persistFinalizerAnchor(runId, anchor);
-                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_demarker_failed");
-                        }
+                    try {
+                        // 普通挂起任务使用派发时的冻结配置，保留既有持久化身份与幂等边界。
+                        FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
+                                .parseFrozenSnapshot(anchor.getFinanceRecordLimitsJson());
+                        formatContext = financeProcessor.process(new FinanceRecordExtractionRequest(
+                                runId, "", anchor.getTodoId(), anchor.getToolCallId(), "async", anchor.getTaskId(),
+                                terminalStatus, resultResp.getExitCode(), stdout, stderr,
+                                FinanceRecordProtoAdapter.channelMetadata(resultResp),
+                                FinanceRecordProtoAdapter.executionEnvironment(resultResp),
+                                snapshot.targetEnvironment(), snapshot.limits()));
+                        stdout = formatContext.ordinaryStdout();
+                    } catch (RuntimeException e) {
+                        String reason = "SUCCEEDED".equals(terminalStatus)
+                                ? "finance_processing_failed" : "finance_demarker_failed";
+                        log.warn("Finance terminal processing failed for run={} — will retry", runId, e);
+                        anchor.setFinalizerError(reason);
+                        persistFinalizerAnchor(runId, anchor);
+                        return FinalizerOutcome.incomplete(STEP_ENVELOPE, reason);
                     }
-                    // 移除 stderr 中的 finance marker 行，防止 formatter 永久拒绝
-                    if (stderr != null
-                            && stderr.contains(FinanceRecordDecoder.MARKER_FAMILY)) {
-                        stderr = stderr.lines()
-                                .filter(line -> !line.contains(FinanceRecordDecoder.MARKER_FAMILY))
-                                .collect(java.util.stream.Collectors.joining("\n"));
-                    }
-                    previewJson = formatter.formatFailure(stdout, stderr, failure);
                 }
+                // 普通 Python 失败保留既有去标记行为，原始结果仍留作沙箱状态证明。
+                if (python && !"SUCCEEDED".equals(terminalStatus) && stderr != null
+                        && stderr.contains(FinanceRecordDecoder.MARKER_FAMILY)) {
+                    stderr = stderr.lines().filter(line -> !line.contains(FinanceRecordDecoder.MARKER_FAMILY))
+                            .collect(java.util.stream.Collectors.joining("\n"));
+                }
+                SandboxTerminalResultView terminalView = new SandboxTerminalResultView(
+                        terminalStatus, resultResp.getExitCode(), stdout, stderr, null, null,
+                        resultResp.getError(), resultResp.hasRetryable() ? resultResp.getRetryable() : null,
+                        resultResp.getDatasetDir(), resultResp);
+                boolean workspaceDirty = python && PythonSandboxJobResultAdapter.isWorkspaceDirty(
+                        terminalStatus, resultResp);
+                Object resultContext = formatContext;
+                if (python && !resultAdapter.isSuccess(terminalView) && !workspaceDirty
+                        && !"RESULT_LOST".equals(terminalStatus)) {
+                    // 普通脚本失败和取消保留原有提示；失败分类仍由共用结果适配器给出。
+                    boolean retryable = resultResp.hasRetryable() && resultResp.getRetryable();
+                    resultContext = new FinanceToolResultFormatter.FailureDetail(
+                            resultAdapter.errorCodeOf(terminalView), "Sandbox " + terminalStatus, retryable,
+                            retryable ? "检查代码后重试" : "检查代码或联系管理员");
+                }
+                SandboxJobResultAdapter.ResolvedResult resolved;
+                try {
+                    resolved = resultAdapter.resolveTerminal(terminalView, resultContext);
+                } catch (RuntimeException e) {
+                    // 格式化或金融投影失败不能留下已完成 ENVELOPE，后续仍以同一身份重试。
+                    String reason = hasFinanceData ? "finance_processing_failed" : "result_formatting_failed";
+                    anchor.setFinalizerError(reason);
+                    persistFinalizerAnchor(runId, anchor);
+                    return FinalizerOutcome.incomplete(STEP_ENVELOPE, reason);
+                }
+                String previewJson = resolved.output();
+                boolean success = resolved.success();
+                anchor.setTerminalBusinessSuccess(success);
                 anchor.setTerminalResultPreview(previewJson);
                 anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
                 anchor.setTerminalStderrPreview(boundedPreview(stderr));
-                // error 保存结构化失败码，不用异常 message 替代。
-                anchor.setTerminalErrorCode(emptyToNull(resultResp.getError()));
+                anchor.setTerminalErrorCode(resolved.errorCode());
                 anchor.setTerminalExitReason(emptyToNull(resultResp.getResourceUsage().getExitReason()));
-                if (!"SUCCEEDED".equals(terminalStatus)) {
+                if (python && !"SUCCEEDED".equals(terminalStatus)) {
                     appendFailedPythonFingerprint(anchor);
                 }
                 try {
-                    // 实际用量先冻结到 anchor，后续 USAGE 步骤幂等落账。
-                    anchor.setTerminalUsageJson(JsonFormat.printer()
-                            .omittingInsignificantWhitespace()
+                    anchor.setTerminalUsageJson(JsonFormat.printer().omittingInsignificantWhitespace()
                             .print(resultResp.getResourceUsage()));
                 } catch (Exception e) {
                     log.warn("Failed to serialize resourceUsage for run={}", runId, e);
                 }
-                // presence-aware 字段区分 false 与协议缺失；缺失时直接阻断 release，不留中间状态。
-                if (resultResp.hasRetryable()) {
+                if (workspaceDirty || "RESULT_LOST".equals(terminalStatus)) {
+                    anchor.setTerminalRetryable(false);
+                } else if (resultResp.hasRetryable()) {
                     anchor.setTerminalRetryable(resultResp.getRetryable());
                 }
             } else if ("RESULT_LOST".equals(terminalStatus)) {
-                // 结果永久丢失是明确不可重试分类，而不是未知分类。
+                SandboxJobResultAdapter resultAdapter = resultAdapterFor(anchor);
+                if (resultAdapter == null) {
+                    anchor.setFinalizerError("result_adapter_unavailable");
+                    persistFinalizerAnchor(runId, anchor);
+                    return FinalizerOutcome.incomplete(STEP_ENVELOPE, "result_adapter_unavailable");
+                }
+                var lost = resultAdapter.resolveTerminal(new SandboxTerminalResultView(
+                        terminalStatus, null, "", "", null, null, null, false, null, null), null);
+                anchor.setTerminalBusinessSuccess(false);
                 anchor.setTerminalRetryable(false);
-                anchor.setTerminalResultPreview(formatter.formatFailure("", "",
-                        new FinanceToolResultFormatter.FailureDetail(
-                                "PYTHON_RESULT_LOST",
-                                "沙箱结果永久丢失", false, "重新提交计算任务")));
+                anchor.setTerminalErrorCode(lost.errorCode());
+                anchor.setTerminalResultPreview(lost.output());
             }
             // 先标记步骤，再连同 envelope 一起 CAS 写入，避免半步状态。
             anchor.setFinalizerStep(STEP_ENVELOPE);

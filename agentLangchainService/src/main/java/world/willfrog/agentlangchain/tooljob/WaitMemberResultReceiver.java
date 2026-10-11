@@ -7,6 +7,8 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
@@ -20,6 +22,10 @@ import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
+import world.willfrog.agent.tools.python.PythonSandboxJobRunnerAdapter;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureExecutionException;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePointStore;
@@ -204,6 +210,9 @@ public class WaitMemberResultReceiver {
         return current;
     }
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private ToolJobAnchorService queryAdmission;
+
     /** 周期接结果：按成员行的下次查询时间取一批到点的成员。 */
     @Scheduled(fixedDelayString = "${agent.langchain.wait-member.receiver.poll-interval-ms:1000}")
     public void pollDueMembers() {
@@ -317,17 +326,48 @@ public class WaitMemberResultReceiver {
                     group.getId(), memberKey(member), e.getMessage());
         }
 
+        if (proof.workspaceRefused()) {
+            finishWorkspaceRefusal(member, group, segment, run, proof, now);
+            return;
+        }
+
         String taskId = proof.taskId();
         if (taskId == null) {
             TaskLookup lookup = lookupByOperation(proof);
             if (lookup.taskId() == null) {
                 if (lookup.notFound()) {
-                    // createTask 的网络请求可能尚未抵达 Sandbox。先写持久取消墓碑，
-                    // 再确认相同操作身份，才能排除迟到创建；仅凭此刻 found=false 不释放容量。
-                    taskId = tombstoneAbsentOperation(member, proof);
-                    if (taskId == null) {
-                        defer(member, now, "cancel_tombstone_unavailable");
-                        return;
+                    if (WaitMemberDurableRequestResolver.hasValidRequest(proof)) {
+                        // 新版证明已经在首次 RPC 前保存完整请求。按原编号再查并原样重发，
+                        // 不能因为当前未找到就抢先写取消墓碑。
+                        WaitMemberDurableRequestResolver.Resolution resolution =
+                                WaitMemberDurableRequestResolver.resolveOutcome(proof, sandboxService,
+                                        () -> renewQueryReplayClaim(member, group, run, proof));
+                        if (resolution.workspaceRefusalCode() != null) {
+                            WaitMemberDispatchProof refused = proof.withWorkspaceRefusal(
+                                    resolution.workspaceRefusalCode());
+                            if (waitGroupStore.recordMemberWorkspaceRefusal(
+                                    member.getGroupId(), member.getMemberIdentity(),
+                                    proof.operationId(), proof.requestFingerprint(),
+                                    refused.toJson(objectMapper))) {
+                                finishWorkspaceRefusal(member, group, segment, run, refused, now);
+                            } else {
+                                defer(member, now, "workspace_refusal_persist_unavailable");
+                            }
+                            return;
+                        }
+                        taskId = resolution.taskId();
+                        if (taskId == null) {
+                            defer(member, now, "durable_replay_unavailable");
+                            return;
+                        }
+                    } else {
+                        // 旧版或损坏的请求无法重放；先写持久取消墓碑，
+                        // 再确认相同操作身份，才能排除迟到创建。
+                        taskId = tombstoneAbsentOperation(member, proof);
+                        if (taskId == null) {
+                            defer(member, now, "cancel_tombstone_unavailable");
+                            return;
+                        }
                     }
                 } else {
                     defer(member, now, "task_lookup_unavailable");
@@ -356,6 +396,28 @@ public class WaitMemberResultReceiver {
         finish(member, group, segment, run, proof,
                 new Terminal(taskId, statusName, result, status.getFinishedAt()),
                 policy, outcome);
+    }
+
+    private boolean renewQueryReplayClaim(WaitMember member, WaitGroup group, AgentRun run,
+                                           WaitMemberDispatchProof proof) {
+        if (!ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())) {
+            return true;
+        }
+        if (queryAdmission == null) {
+            log.warn("查询原请求尚未重新准入：member={} code=query_replay_admission_unavailable", member.getId());
+            return false;
+        }
+        try {
+            if (queryAdmission.renewExecuteQueryReplayClaim(member.getRunId(), member.getGroupId(),
+                    member.getMemberIdentity(), proof.operationId(), proof.requestFingerprint(),
+                    proof.createRequestJson(), group.getPlanGeneration(), run.getRunControlVersion())) {
+                return true;
+            }
+            log.info("查询原请求尚未重新准入：member={} code=query_replay_claim_changed", member.getId());
+        } catch (SessionQueryAdmissionException busy) {
+            log.info("查询原请求尚未重新准入：member={} code={}", member.getId(), busy.code());
+        }
+        return false;
     }
 
     /** 这一轮对一条成员的处置：压住、照常接结果、或者照常接结果但按策略拒绝收成失败。 */
@@ -397,6 +459,35 @@ public class WaitMemberResultReceiver {
 
     /** 按策略把一条成员收成失败：错误码与说明由策略拒绝给出。 */
     private record ForcedFailure(String code, String detail) {
+    }
+
+    private void finishWorkspaceRefusal(WaitMember member, WaitGroup group,
+                                        NodeWorkItem segment, AgentRun run,
+                                        WaitMemberDispatchProof proof, OffsetDateTime now) {
+        WaitMemberSettlement.Outcome settled = settlement.settleWorkspaceRefusal(member, proof);
+        if (!settled.ok()) {
+            settlementFailures.incrementAndGet();
+            defer(member, now, "workspace_refusal_settlement:" + settled.reason());
+            return;
+        }
+        String code = proof.workspaceRefusalCode();
+        String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
+                member.getToolCallId(), false, "Python workspace rejected the task: " + code,
+                Map.of("errorCode", code, "errorDetail", "Python workspace rejected the task: " + code,
+                        "retryable", false), maxMemberResultChars);
+        MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
+                member.getGroupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
+                resultJson, member.getExternalOperationId(), group.getPlanGeneration(),
+                segment.getContextVersion(), run.getRunControlVersion()), member, "");
+        if (!result.applied()) {
+            duplicates.incrementAndGet();
+            return;
+        }
+        completed.incrementAndGet();
+        if (result.groupBecameReady()) {
+            recoveryDispatcher.wake(result.notificationId());
+            wakeups.incrementAndGet();
+        }
     }
 
     /**
@@ -667,13 +758,20 @@ public class WaitMemberResultReceiver {
                         AcceptanceReleasePolicy policy,
                         PolicyOutcome outcome) {
         ForcedFailure refusal = outcome == null ? null : outcome.refusal();
-        String output = pythonSandboxTools.formatTerminalResult(
-                terminal.statusName(), terminal.result(),
-                member.getRunId(), run.getUserId(), group.getNodeId(), member.getToolCallId());
+        SandboxJobAdapters adapters = SandboxJobAdapterRegistry.find(member.getToolName())
+                .orElseThrow(() -> new IllegalStateException("Sandbox result adapter is unavailable: "
+                        + member.getToolName()));
+        // 两种工具共用已核验的 Python 沙箱协议；业务解释由成员工具自己的适配器负责。
+        var terminalView = new PythonSandboxJobRunnerAdapter(sandboxService, null)
+                .toTerminalView(terminal.result(), terminal.statusName());
+        SandboxJobResultAdapter.ResolvedResult resolved = adapters.resolveTerminal(
+                new SandboxJobAdapters.TerminalContext(member.getRunId(), run.getUserId(),
+                        group.getNodeId(), member.getToolCallId()), terminalView);
+        String output = resolved.output();
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
-        boolean success = SUCCEEDED.equals(terminal.statusName())
-                && terminal.result().getExitCode() == 0
-                && !WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
+        boolean oversized = WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
+        boolean success = resolved.success() && !oversized;
+        String failureCode = oversized ? WaitMemberResultPayload.TOO_LARGE : resolved.errorCode();
         boolean failedAlready = !success;
         boolean designatedApplied = false;
         Map<String, Object> extra = new LinkedHashMap<>();
@@ -694,14 +792,14 @@ public class WaitMemberResultReceiver {
             success = false;
             designatedApplied = true;
             if (failedAlready) {
-                extra.put("errorCode", errorCodeOf(terminal.statusName()));
+                extra.put("errorCode", failureCode);
                 extra.put("designatedFailure", designated);
             } else {
                 extra.put("errorCode", AcceptanceReleasePolicy.DESIGNATED_FAILURE_CODE);
                 extra.put("errorDetail", designated);
             }
         } else if (failedAlready) {
-            extra.put("errorCode", errorCodeOf(terminal.statusName()));
+            extra.put("errorCode", failureCode);
         }
         String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                 member.getToolCallId(), success, output, extra, maxMemberResultChars);
@@ -792,19 +890,6 @@ public class WaitMemberResultReceiver {
                 throw e;
             }
         }
-    }
-
-    private static String errorCodeOf(String statusName) {
-        if (statusName == null) {
-            return "PYTHON_EXECUTION_FAILED";
-        }
-        if (CANCELED.equals(statusName)) {
-            return "PYTHON_EXECUTION_CANCELED";
-        }
-        if (RESULT_LOST.equals(statusName)) {
-            return "PYTHON_RESULT_LOST";
-        }
-        return "PYTHON_EXECUTION_FAILED";
     }
 
     /** 到点的成员还没结论：按退避推后下次查询时间。 */

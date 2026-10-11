@@ -21,6 +21,11 @@ public interface SandboxJobRunnerAdapter<REQ, RESP, L> {
     /** 发起创建。调用前框架已落 PREPARING 锚点，覆盖 RPC 成败不确定窗口。 */
     RESP createTask(REQ request);
 
+    /** 已核验的业务拒绝码；普通响应和不完整响应返回 null。 */
+    default String workspaceRefusalCodeOf(RESP response) {
+        return null;
+    }
+
     /** 按 operationId 原始回查，答复原样返回（判定在 verdictFromLookup*）；查询本身失败抛异常。 */
     L lookupRaw(String operationId);
 

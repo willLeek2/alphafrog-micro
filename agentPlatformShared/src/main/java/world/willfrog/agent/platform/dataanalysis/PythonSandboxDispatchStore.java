@@ -21,6 +21,13 @@ public interface PythonSandboxDispatchStore {
     /** 在 createTask 前抢占空 anchor；成功后 PREPARING reservation 才有持久化 owner。 */
     boolean persistPreparing(String runId, ToolJobAnchor anchor);
 
+    /** SQL会话占用与成员完整请求必须同事务提交；false仅表示确认未取得创建资格。 */
+    default boolean persistPreparingWaitMember(String runId, ToolJobAnchor anchor, long groupId,
+                                               String memberIdentity, String proofJson,
+                                               String resumeToken, Long resumeLeaseVersion) {
+        throw new UnsupportedOperationException("atomic member preparation is not implemented");
+    }
+
     /**
      * 恢复 worker 的第二次长工具分发：只允许持有精确旧 LAUNCHING token/version 的 worker
      * 原子替换已消费 handoff，并保持 Run 为 EXECUTING。
@@ -34,6 +41,26 @@ public interface PythonSandboxDispatchStore {
 
     /** 按 operationId 保存 Sandbox taskId 和 ATTACHED/TERMINAL 状态。 */
     boolean persistAttached(String runId, ToolJobAnchor anchor);
+
+    /**
+     * 工作区明确拒绝且按原操作号查无任务后，窄写持久拒绝原因。
+     * {@code expectedLeaseUntil} 只用于仍由当前 DAG worker 持有的调用。
+     */
+    default boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                           Instant expectedLeaseUntil) {
+        return false;
+    }
+
+    /** 容量凭证明已释放后，只把同一拒绝锚点的 reservation 快照推进为 RELEASED。 */
+    default boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        return false;
+    }
+
+    /** 按原操作身份和已释放证明清锚点，并给仍在执行的 Run 写入明确失败码。 */
+    default boolean completeWorkspaceRefusal(String runId, String operationId,
+                                             String fingerprint, String code) {
+        return false;
+    }
 
     /** 原子写 PENDING anchor 并把 Run 转为 WAITING_TOOL_JOB；true 才允许释放 worker。 */
     boolean transferToPending(String runId, ToolJobAnchor anchor);

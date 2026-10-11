@@ -11,15 +11,16 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchException;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
-import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
+import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticFundInfoSimpleItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticFundSearchRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticFundSearchResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticFundService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexSearchResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByTsCodeAndDateRangeResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticListedAssetService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeResponse;
@@ -43,7 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -68,7 +69,6 @@ class MarketDataToolsSearchStockFundDailyTest {
     private DomesticFundService fundService;
     private DomesticIndexService indexService;
     private DomesticListedAssetService listedAssetService;
-    private IndexWeightDao indexWeightDao;
     private DatasetWriter datasetWriter;
     private DatasetRegistry datasetRegistry;
     private MarketDataTools tools;
@@ -79,7 +79,6 @@ class MarketDataToolsSearchStockFundDailyTest {
         fundService = mock(DomesticFundService.class);
         indexService = mock(DomesticIndexService.class);
         listedAssetService = mock(DomesticListedAssetService.class);
-        indexWeightDao = mock(IndexWeightDao.class);
         datasetWriter = mock(DatasetWriter.class);
         datasetRegistry = mock(DatasetRegistry.class);
         AgentLlmLocalConfigLoader localConfigLoader = mock(AgentLlmLocalConfigLoader.class);
@@ -92,7 +91,6 @@ class MarketDataToolsSearchStockFundDailyTest {
         ReflectionTestUtils.setField(tools, "domesticFundService", fundService);
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
         ReflectionTestUtils.setField(tools, "domesticListedAssetService", listedAssetService);
-        ReflectionTestUtils.setField(tools, "indexWeightDao", indexWeightDao);
         ReflectionTestUtils.setField(tools, "swIndustryMemberDao", mock(SwIndustryMemberDao.class));
     }
 
@@ -648,8 +646,9 @@ class MarketDataToolsSearchStockFundDailyTest {
 
     @Test
     void assetInfoAdvancedForwardSuccess() throws Exception {
-        when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(any(), anyLong(), anyLong()))
-                .thenReturn(List.of(indexWeightPojo("000300.SH", "000001.SZ", "20240115", 5.0)));
+        when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(any()))
+                .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
+                        .addItems(indexWeightItem("000300.SH", "000001.SZ", "20240115", 5.0)).build());
         when(listedAssetService.getListedAssetInfo(any())).thenReturn(ListedAssetInfoResponse.newBuilder()
                 .setItem(ListedAssetInfoItem.newBuilder().setTsCode("000001.SZ").setName("平安银行").build())
                 .build());
@@ -677,7 +676,9 @@ class MarketDataToolsSearchStockFundDailyTest {
         assertEquals("000001.SZ", row.get("ts_code"));
         assertEquals("平安银行", row.get("name"));
         assertEquals("stock", row.get("asset_type"));
-        verify(indexWeightDao).getLatestIndexWeightsByTsCodeAndDateRange(eq("000300.SH"), anyLong(), anyLong());
+        verify(indexService).getDomesticIndexWeightByTsCodeAndDateRange(argThat(request ->
+                "000300.SH".equals(request.getTsCode()) && request.getStartDate() == MS_20240101
+                        && request.getEndDate() == DateConvertUtils.convertDateStrToLong("20241231", "yyyyMMdd")));
     }
 
     @Test
@@ -711,12 +712,10 @@ class MarketDataToolsSearchStockFundDailyTest {
                 .build();
     }
 
-    private static IndexWeight indexWeightPojo(String indexCode, String conCode, String tradeDate, double weight) {
-        IndexWeight w = new IndexWeight();
-        w.setIndexCode(indexCode);
-        w.setConCode(conCode);
-        w.setTradeDate(Long.parseLong(tradeDate));
-        w.setWeight(weight);
-        return w;
+    private static DomesticIndexWeightItem indexWeightItem(String indexCode, String conCode, String tradeDate, double weight) {
+        return DomesticIndexWeightItem.newBuilder()
+                .setIndexCode(indexCode).setConCode(conCode)
+                .setTradeDate(DateConvertUtils.convertDateStrToLong(tradeDate, "yyyyMMdd"))
+                .setWeight(weight).build();
     }
 }

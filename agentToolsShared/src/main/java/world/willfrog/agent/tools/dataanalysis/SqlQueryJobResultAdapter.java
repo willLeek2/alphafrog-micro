@@ -30,41 +30,42 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
         this.objectMapper = objectMapper;
     }
 
-    /** 业务成功 = 沙箱 SUCCEEDED 且退出码 0 且信封 SUCCEEDED，三层缺一不可。 */
     @Override
     public boolean isSuccess(SandboxTerminalResultView result) {
-        return result.succeeded()
-                && result.exitCode() != null && result.exitCode() == 0
-                && envelopeStatus(result.stdout()) != null
+        return result.succeeded() && Integer.valueOf(0).equals(result.exitCode())
                 && "SUCCEEDED".equals(envelopeStatus(result.stdout()));
     }
 
-    /** 等待组成员失败映射用的错误码；executeQuery 第一期不接等待组，给出语义化兜底。 */
     @Override
     public String errorCodeOf(SandboxTerminalResultView result) {
-        return "CANCELED".equals(result.statusName()) ? "QUERY_CANCELED" : "QUERY_EXECUTION_FAILED";
+        return resolveTerminal(result, null).errorCode();
     }
 
     @Override
     public String formatTerminalResult(SandboxTerminalResultView result, Object formatContext) {
-        // formatContext 是终态副作用钩子的产出；executeQuery 没有副作用钩子，这里始终为 null。
-        if (!result.succeeded()) {
-            return formatSandboxFailure(result);
+        return resolveTerminal(result, formatContext).output();
+    }
+
+    /** 一次解析生成正文和失败分类，等待回传与同步返回使用相同业务结论。 */
+    @Override
+    public ResolvedResult resolveTerminal(SandboxTerminalResultView result, Object formatContext) {
+        if (!result.succeeded() || !Integer.valueOf(0).equals(result.exitCode())) {
+            if ("CANCELED".equals(result.statusName())) {
+                return failure("QUERY_CANCELED", "Query task was canceled", Map.of("retryable", false));
+            }
+            return failure("QUERY_SANDBOX_FAILED", "Sandbox task failed before producing a query result",
+                    Map.of("stderr_preview", preview(result.stderr()),
+                            "detail", result.errorDetail() == null ? "" : result.errorDetail(),
+                            "retryable", !"RESULT_LOST".equals(result.statusName())
+                                    && Boolean.TRUE.equals(result.retryable())));
         }
         JsonNode envelope = findEnvelope(result.stdout());
         if (envelope == null) {
-            /*
-             * 沙箱成功但拿不到信封，两种成因要分开：stderr 非空说明运行器在打印信封前
-             * 崩溃（traceback 在 stderr），重试同样的调用没有意义；stderr 为空说明 stdout
-             * 在输出上限处被截断（结果集过大），模型收窄查询后可以重试。
-             */
             boolean crashed = result.stderr() != null && !result.stderr().isBlank();
-            return SandboxJobResponses.fail(objectMapper, "executeQuery", "QUERY_RESULT_UNAVAILABLE",
-                    crashed
-                            ? "Query runner crashed before producing the result envelope"
+            return failure("QUERY_RESULT_UNAVAILABLE",
+                    crashed ? "Query runner crashed before producing the result envelope"
                             : "Query result exceeded the output size limit; narrow the query and retry",
-                    Map.of("stderr_preview", preview(result.stderr()),
-                            "retryable", !crashed));
+                    Map.of("stderr_preview", preview(result.stderr()), "retryable", !crashed));
         }
         String status = envelope.path("status").asText("");
         if ("SUCCEEDED".equals(status)) {
@@ -73,40 +74,25 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
             data.put("rows", objectMapper.convertValue(envelope.path("rows"), List.class));
             data.put("row_count", envelope.path("row_count").asInt(0));
             data.put("truncated", envelope.path("truncated").asBoolean(false));
-            return SandboxJobResponses.ok(objectMapper, "executeQuery", data);
+            return new ResolvedResult(SandboxJobResponses.ok(objectMapper, "executeQuery", data), true, null);
         }
         JsonNode error = envelope.path("error");
         String code = error.path("code").asText("QUERY_EXECUTION_FAILED");
         String message = error.path("message").asText("query failed");
         Map<String, Object> details = new LinkedHashMap<>();
         details.put("status", status);
-        if (envelope.has("stage")) {
-            details.put("stage", envelope.path("stage").asText());
-        }
-        if (envelope.has("gate")) {
-            details.put("gate", objectMapper.convertValue(envelope.path("gate"), Map.class));
-        }
-        if (envelope.has("limits")) {
-            details.put("limits", objectMapper.convertValue(envelope.path("limits"), Map.class));
-        }
-        // 引擎配置与挂载失败是平台侧故障，重试同样的调用没有意义；其余失败模型改写 SQL 后可重试。
+        if (envelope.has("stage")) details.put("stage", envelope.path("stage").asText());
+        if (envelope.has("gate")) details.put("gate", objectMapper.convertValue(envelope.path("gate"), Map.class));
+        if (envelope.has("limits")) details.put("limits", objectMapper.convertValue(envelope.path("limits"), Map.class));
         boolean platformStage = "configure".equals(envelope.path("stage").asText(""))
                 || "mount".equals(envelope.path("stage").asText(""));
         details.put("retryable", !platformStage);
-        return SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details);
+        return failure(code, message, details);
     }
 
-    /** 沙箱层失败（没跑到运行器信封）：取消与基础设施失败在这里映射。 */
-    private String formatSandboxFailure(SandboxTerminalResultView result) {
-        if ("CANCELED".equals(result.statusName())) {
-            return SandboxJobResponses.fail(objectMapper, "executeQuery", "QUERY_CANCELED",
-                    "Query task was canceled", Map.of("retryable", false));
-        }
-        return SandboxJobResponses.fail(objectMapper, "executeQuery", "QUERY_SANDBOX_FAILED",
-                "Sandbox task failed before producing a query result",
-                Map.of("stderr_preview", preview(result.stderr()),
-                        "detail", result.errorDetail() == null ? "" : result.errorDetail(),
-                        "retryable", Boolean.TRUE.equals(result.retryable())));
+    private ResolvedResult failure(String code, String message, Map<String, Object> details) {
+        return new ResolvedResult(SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details),
+                false, code);
     }
 
     /** 取 stdout 里最后一行信封；运行器保证最多打印一次，取不到返回 null。 */

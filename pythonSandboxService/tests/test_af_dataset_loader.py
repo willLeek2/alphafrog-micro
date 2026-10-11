@@ -403,5 +403,123 @@ class RunLevelDatasetLoaderTest(unittest.TestCase):
             self.assertNotIn(forbidden, encoded)
 
 
+class TabularDatasetContractTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sandbox = Path(self.tmp.name)
+        self.input_root = self.sandbox / "input"
+        self.input_root.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def mount_json(self, document, metadata):
+        from app.sandbox_runner import _build_agent_run_metadata_documents
+        source = self.sandbox / "source" / "data.json"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text(json.dumps(document), encoding="utf-8")
+        source.with_suffix(".meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+        frame_meta, _ = _build_agent_run_metadata_documents(
+            f"agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n1,{source},UNCERTAIN,{source}\n", "")
+        (self.sandbox / "paths_dataset_meta.json").write_text(json.dumps(frame_meta), encoding="utf-8")
+        _write_run_dataset_index(self.sandbox, [{"agent_run_dataset_id": "1", "dataset_file_path": str(source), "from_ts_code": "UNCERTAIN"}])
+        return source, frame_meta["datasets"]["1"]
+
+    def test_wrapper_records_preserve_nested_values_and_projection(self):
+        rows = [{"label": "a", "nested": [[20230103, .5]], "detail": {"valid": True}}, {"label": "b", "nested": [], "detail": None}]
+        source, metadata = self.mount_json({"results": rows, "row_count": 900}, {
+            "format": "json", "recordsPath": "results", "rowCount": 2, "columns": ["label", "nested", "detail"]})
+        self.assertEqual(metadata["format"], "json")
+        self.assertEqual(metadata["recordsPath"], "results")
+        self.assertEqual(metadata["bytes"], source.stat().st_size)
+        frame = next(iter(load_datasets("1", input_root=str(self.input_root)).values()))
+        self.assertEqual(len(frame), 2)
+        self.assertEqual(frame.loc[0, "nested"], rows[0]["nested"])
+        self.assertEqual(frame.loc[0, "detail"], rows[0]["detail"])
+        projected = next(iter(load_datasets("1", input_root=str(self.input_root), usecols=["label", "nested"], dtype={"label": "string"}).values()))
+        self.assertEqual(str(projected["label"].dtype), "string")
+        self.assertEqual(projected.loc[0, "nested"], rows[0]["nested"])
+        chunks = list(iter_datasets("1", 1, input_root=str(self.input_root)))
+        self.assertEqual([len(chunk) for chunk in chunks], [1, 1])
+        self.assertEqual(chunks[0].iloc[0]["nested"], rows[0]["nested"])
+
+    def test_root_object_and_object_array_do_not_guess_record_fields(self):
+        from app.af_dataset_loader import read_dataset_file
+        for document, expected in (({"label": "x", "results": [{"value": 3}]}, 1), ([{"label": "x"}, {"label": "y", "detail": {"a": 1}}], 2)):
+            source, _ = self.mount_json(document, {"format": "json"})
+            frame = read_dataset_file(source)
+            self.assertEqual(len(frame), expected)
+            if isinstance(document, dict):
+                self.assertEqual(frame.iloc[0]["results"], document["results"])
+
+    def test_empty_records_keep_declared_columns(self):
+        self.mount_json({"results": []}, {"format": "json", "recordsPath": "results", "rowCount": 0, "columns": ["label", "nested"]})
+        frame = next(iter(load_datasets("1", input_root=str(self.input_root)).values()))
+        self.assertEqual(len(frame), 0)
+        self.assertEqual(list(frame.columns), ["ts_code", "label", "nested"])
+
+    def test_invalid_record_shapes_fail_instead_of_falling_back_to_csv(self):
+        from app.af_dataset_loader import read_dataset_file
+        for document, meta in (({"wrong": []}, {"format": "json", "recordsPath": "records"}), ({"records": {}}, {"format": "json", "recordsPath": "records"}), ([{"a": 1}, 2], {"format": "json"}), (42, {"format": "json"})):
+            source, _ = self.mount_json(document, meta)
+            with self.assertRaises(ValueError):
+                read_dataset_file(source)
+        source.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            read_dataset_file(source)
+
+    def test_parquet_uses_available_duckdb_for_loading_and_complete_row_chunks(self):
+        import duckdb
+        path = self.sandbox / "table.parquet"
+        with duckdb.connect() as con:
+            con.execute("COPY (SELECT range AS id, range * 1.5 AS value FROM range(5)) TO ? (FORMAT PARQUET)", [str(path)])
+        _write_run_dataset_index(self.sandbox, [{"agent_run_dataset_id": "1", "dataset_file_path": str(path), "from_ts_code": "UNCERTAIN"}])
+        frame = next(iter(load_datasets("1", input_root=str(self.input_root), usecols=["id"], dtype={"id": "Int64"}).values()))
+        self.assertEqual(frame["id"].tolist(), list(range(5)))
+        self.assertEqual(str(frame["id"].dtype), "Int64")
+        chunks = list(iter_datasets("1", 2, input_root=str(self.input_root), usecols=["id"]))
+        self.assertEqual([len(part) for part in chunks], [2, 2, 1])
+        self.assertEqual(pd.concat(chunks)["id"].tolist(), list(range(5)))
+
+    def test_json_loader_metric_does_not_read_json_as_csv(self):
+        self.mount_json({"results": [{"label": "x", "nested": [1, 2]}]}, {"format": "json", "recordsPath": "results", "columns": ["label", "nested"]})
+        metrics = self.sandbox / "metrics.jsonl"
+        with patch.dict(os.environ, {"AF_TASK_METRICS_PATH": str(metrics)}):
+            load_datasets("1", input_root=str(self.input_root), usecols=["label"])
+        metric = json.loads(metrics.read_text())
+        self.assertEqual(metric["totalColumnCount"], 2)
+        self.assertEqual(metric["selectedColumnCount"], 1)
+        self.assertEqual(metric["openCount"], 1)
+
+    @unittest.skipUnless(os.environ.get("AF_REAL_MEMBERS_DIR"), "真实成员文件由本地验收显式提供")
+    def test_real_member_documents_through_materialized_run_index(self):
+        import shutil
+        from app.sandbox_runner import _materialize_agent_run_csvs, _copy_via_csv_source_paths
+        for year in (2023, 2024):
+            actual = Path(os.environ["AF_REAL_MEMBERS_DIR"]) / f"members-{year}.json"
+            document = json.loads(actual.read_text())
+            source, metadata = self.mount_json(document, {"format": "json", "recordsPath": "results", "rowCount": len(document["results"]), "columns": list(document["results"][0])})
+            source.write_bytes(actual.read_bytes())
+            self.assertEqual(source.read_bytes(), actual.read_bytes())
+            self.assertEqual(json.loads(source.read_text()), document)
+            paths_csv = f"agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n1,/__AF_INPUT__/_run_dataset_1/data.json,UNCERTAIN,{source}\n"
+            def copy_file(session, src, dest):
+                Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dest)
+            def copy_text(session, text, dest):
+                Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                Path(dest).write_text(text)
+            cfg = types.SimpleNamespace(workdir=str(self.sandbox))
+            with patch("app.sandbox_runner._copy_dataset_file", side_effect=copy_file), patch("app.sandbox_runner._log_in_container"), patch("app.sandbox_runner._copy_text_to_runtime", side_effect=copy_text), patch("app.sandbox_runner._atomic_copy_text_to_runtime", side_effect=copy_text):
+                count, expected, failed = _copy_via_csv_source_paths(object(), cfg, "local", str(self.input_root), paths_csv, "")
+                self.assertEqual((count, expected, failed), (1, 1, []))
+                _materialize_agent_run_csvs(object(), cfg, str(self.input_root), paths_csv, "")
+            frame = next(iter(load_datasets("1", input_root=str(self.input_root)).values()))
+            self.assertEqual(len(frame), len(document["results"]))
+            self.assertEqual(set(frame["ts_code"]), {row["ts_code"] for row in document["results"]})
+            self.assertEqual(frame["match_conditions"].tolist(), [row["match_conditions"] for row in document["results"]])
+            print(f"真实成员JSON加载通过：{year}年{len(frame)}行，代码集合和嵌套条件一致")
+
+
 if __name__ == "__main__":
     unittest.main()

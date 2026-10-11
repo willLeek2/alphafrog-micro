@@ -439,8 +439,8 @@ public class SqlQueryTools {
      *
      * <p>名额预留之后的编排已下沉到 {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}。
      * 这里只做查询工具自有的接线检查、成员身份比对、容量事实冻结，以及会话串行：
-     * 先占 PREPARING 名额，再把真实预约 JSON 写进 Run 级锚点（同一事务按 userId 计数），
-     * 然后把已占名额交给成员派发，禁止再写空对象 "{}"。成员路径不读 DAG 阻塞轮询。</p>
+     * 先占 PREPARING 名额，完整请求组装后在原用户锁事务中一起写Run会话锚点和成员证明，
+     * 两项全部提交才创建沙箱任务。成员路径不读 DAG 阻塞轮询。</p>
      */
     private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       String sql,
@@ -517,9 +517,8 @@ public class SqlQueryTools {
                 sha256(""));
         ExecuteRequest baseRequest = buildBaseRequest(
                 runnerCode, datasets, timeouts.taskTimeoutSeconds(), pathsDatasetCsv, pathManifestCsv);
+        String snapshotJson = objectMapper.writeValueAsString(subSnapshot);
         SandboxJobWaitPolicy sessionClaimPolicy = SandboxJobWaitPolicy.DURABLE_SUSPEND;
-        String createRequestJson = JsonFormat.printer()
-                .omittingInsignificantWhitespace().print(baseRequest);
         DataAnalysisReservation reservation;
         try {
             reservation = dataAnalysisCapacityService.reserve(identity, plan.estimate());
@@ -530,63 +529,67 @@ public class SqlQueryTools {
             return fail(code, admission.getMessage(), Map.of("retryable",
                     admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
         }
-        boolean sessionClaimed = false;
-        SandboxToolJobLifecycle.PrepareDispatchResult dispatch = null;
+        java.util.concurrent.atomic.AtomicReference<PreparedSqlMember> session =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean preparingInvoked = new java.util.concurrent.atomic.AtomicBoolean();
         try {
-            dispatch = SandboxToolJobLifecycle.prepareDispatch(
-                            pythonSandboxDispatchStore,
-                            new SandboxToolJobLifecycle.PrepareDispatchRequest(
-                                    member.runId(),
-                                    ToolJobAnchor.EXECUTE_QUERY_TOOL,
-                                    member.durableToolCallId(),
-                                    DATA_ANALYSIS_ATTEMPT,
-                                    ANCHOR_SCHEMA_VERSION,
-                                    identity.operationId(),
-                                    spec.requestFingerprint(),
-                                    objectMapper.writeValueAsString(spec),
-                                    createRequestJson,
-                                    sessionClaimPolicy.runDisposition(),
-                                    sessionClaimPolicy.autoResume(),
-                                    sessionClaimPolicy.durableSuspend(),
-                                    objectMapper.writeValueAsString(reservation),
-                                    objectMapper.writeValueAsString(plan.estimate()),
-                                    objectMapper.writeValueAsString(subSnapshot),
-                                    subSnapshot.immutableDigest(),
-                                    spec.timeoutMillis(),
-                                    POLL_INTERVAL_MS),
-                            this::writeQueryAnchorExtras);
-            if (!dispatch.persisted()) {
-                SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
-                return fail("TOOL_JOB_ANCHOR_INVALID",
-                        "Failed to persist PREPARING tool-job anchor",
-                        Map.of("operation_id", identity.operationId(), "retryable", false));
-            }
-            sessionClaimed = true;
             String dispatched = SandboxToolJobLifecycle.dispatchWaitGroupMember(
                     deps,
                     new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                             member, identity, spec, plan.estimate(), baseRequest,
                             requestAdapter(), runnerAdapter(),
-                            ToolJobAnchor.EXECUTE_QUERY_TOOL, toolStartMs, reservation));
-            pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
+                            ToolJobAnchor.EXECUTE_QUERY_TOOL, toolStartMs, reservation),
+                    proof -> {
+                        SandboxToolJobLifecycle.PrepareDispatchResult dispatch =
+                                SandboxToolJobLifecycle.prepareDispatch(pythonSandboxDispatchStore,
+                                        new SandboxToolJobLifecycle.PrepareDispatchRequest(
+                                                member.runId(), ToolJobAnchor.EXECUTE_QUERY_TOOL,
+                                                member.durableToolCallId(), DATA_ANALYSIS_ATTEMPT,
+                                                ANCHOR_SCHEMA_VERSION, identity.operationId(),
+                                                spec.requestFingerprint(), proof.canonicalCreateSpecJson(),
+                                                proof.createRequestJson(), sessionClaimPolicy.runDisposition(),
+                                                sessionClaimPolicy.autoResume(), sessionClaimPolicy.durableSuspend(),
+                                                proof.reservationJson(), proof.estimateJson(),
+                                                snapshotJson, subSnapshot.immutableDigest(),
+                                                spec.timeoutMillis(), POLL_INTERVAL_MS),
+                                        this::writeQueryAnchorExtras,
+                                        (runId, anchor, token, version) -> {
+                                            String proofJson = proof.toJson(objectMapper);
+                                            preparingInvoked.set(true);
+                                            return pythonSandboxDispatchStore.persistPreparingWaitMember(
+                                                    runId, anchor, member.groupId(), member.memberIdentity(),
+                                                    proofJson, token, version);
+                                        });
+                        if (dispatch.persisted()) session.set(new PreparedSqlMember(dispatch.anchor(), proof));
+                        return dispatch.persisted();
+                    });
+            if (session.get() != null) {
+                pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
+            }
             return dispatched;
         } catch (SessionQueryAdmissionException sessionBusy) {
             SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
-            if (sessionClaimed) {
-                pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
-            }
             return fail(sessionBusy.code(), sessionBusy.getMessage(),
                     Map.of("retryable", sessionBusy.retryable()));
         } catch (WaitGroupMemberPendingException pending) {
-            attachWaitGroupSessionAnchor(member.runId(), dispatch == null ? null : dispatch.anchor(), pending);
+            attachWaitGroupSessionAnchor(member.runId(), session.get() == null ? null : session.get().anchor(), pending);
             throw pending;
+        } catch (ToolJobInjectedInterruption interruption) {
+            throw interruption;
         } catch (RuntimeException dispatchFailure) {
-            if (sessionClaimed) {
-                pythonSandboxDispatchStore.clearActive(member.runId(), identity.operationId());
+            if (!preparingInvoked.get()) {
+                SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
+            }
+            if (session.get() != null) {
+                // 创建前两项已提交，异常不再有权清掉原预约；按原操作回查并继续收尾。
+                throw new WaitGroupMemberPendingException(session.get().proof(),
+                        "SQL dispatch interrupted after durable preparation");
             }
             throw dispatchFailure;
         }
     }
+
+    private record PreparedSqlMember(ToolJobAnchor anchor, world.willfrog.agent.platform.wait.WaitMemberDispatchProof proof) {}
 
     /**
      * 把派发时的金融记录通道冻结快照写进锚点。沙箱有界包装器对每个任务都产出通道元数据，
@@ -755,8 +758,10 @@ public class SqlQueryTools {
             Map<String, Object> mount = new LinkedHashMap<>();
             mount.put("alias", "t" + dataset.number());
             mount.put("path", SANDBOX_INPUT_ROOT + "/_run_dataset_" + dataset.number() + "/" + dataset.sortKey());
-            mount.put("format", dataset.sortKey() != null
-                    && dataset.sortKey().toLowerCase(Locale.ROOT).endsWith(".parquet") ? "parquet" : "csv");
+            DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
+            mount.put("format", metadata.format());
+            mount.put("recordsPath", metadata.recordsPath());
+            mount.put("columns", metadata.columns());
             mounts.add(mount);
         }
         spec.put("datasets", mounts);

@@ -2,12 +2,22 @@ package world.willfrog.agentlangchain.tooljob;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.annotation.Transactional;
 import world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
+import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.mapper.WaitGroupMapper;
+import world.willfrog.agent.platform.wait.WaitMember;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.time.Instant;
@@ -28,8 +38,12 @@ import java.util.List;
 @Service
 public class ToolJobAnchorService {
 
+    private static final Logger log = LoggerFactory.getLogger(ToolJobAnchorService.class);
     private final AgentRunMapper agentRunMapper;
     private final int sessionStaleSeconds;
+
+    @Autowired(required = false)
+    private AgentRunFinalizationService finalizationService;
 
     @Autowired
     public ToolJobAnchorService(
@@ -52,7 +66,9 @@ public class ToolJobAnchorService {
         // 归属由 gateway 在认领处判定；这里只按 run id 读当前 anchor。
         AgentRun run = agentRunMapper.findById(runId);
         // 空 JSON 表示当前 Run 没有可恢复的外部工具任务。
-        if (run == null || run.getToolJobAnchorJson() == null || run.getToolJobAnchorJson().isBlank()) {
+        if (run == null || run.getToolJobAnchorJson() == null
+                || run.getToolJobAnchorJson().isBlank()
+                || "{}".equals(run.getToolJobAnchorJson().trim())) {
             return null;
         }
         // 解析失败显式抛出，避免把损坏 anchor 当成“没有任务”。
@@ -169,6 +185,117 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), expectedResumeToken, expectedResumeLeaseVersion) == 1;
     }
 
+    @Autowired
+    private WaitGroupMapper waitGroupMapper;
+
+    /** 异常穿过Spring事务代理，前一项Run写入才会一起回滚。 */
+    public static final class MemberPreparingRollback extends RuntimeException {
+        MemberPreparingRollback(String message) { super(message); }
+    }
+
+    public enum MemberPreparingReadback { COMMITTED, COMMITTED_DEFERRED, NOT_WRITTEN, OWNERSHIP_LOST }
+
+    /** Run会话占用和成员完整请求只允许同时成功，不产生中间可见状态。 */
+    @Transactional
+    public boolean claimPreparingWaitMember(String runId, ToolJobAnchor anchor, long groupId,
+                                             String memberIdentity, String proofJson,
+                                             String resumeToken, Long resumeVersion) {
+        validatePreparingProof(anchor, proofJson);
+        guardExecuteQuerySession(runId, anchor);
+        boolean resumed = resumeToken != null && !resumeToken.isBlank()
+                && resumeVersion != null && resumeVersion > 0;
+        int claimed = resumed ? agentRunMapper.claimPreparingToolJobAnchorFromResume(
+                runId, anchor.toJson(), resumeToken, resumeVersion)
+                : agentRunMapper.claimPreparingToolJobAnchor(runId, anchor.toJson(), AgentRunStatus.EXECUTING);
+        if (claimed != 1) {
+            // CAS未写入不等于这张预约无人持有；须经锁定读回再决定是否可释放。
+            throw new MemberPreparingRollback("Run未取得本次创建权，等待核对持久预约责任");
+        }
+        // claim持有Run行锁，取消/控制变化与下方成员写入按同一顺序串行。
+        if (!"RESULT_COMMITTED".equals(waitGroupMapper.lockPreparingSqlMemberContext(runId, groupId, memberIdentity))
+                || waitGroupMapper.countPreparingSqlMemberOwner(
+                runId, groupId, memberIdentity, anchor.toJson(), proofJson) != 1) {
+            throw new MemberPreparingRollback("原SQL成员或工作项身份已改变");
+        }
+        WaitMember member = waitGroupMapper.findMemberByIdentity(groupId, memberIdentity);
+        if (member == null || member.getDispatchProofJson() != null
+                || !runId.equals(member.getRunId())
+                || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(member.getToolName())
+                || !anchor.getOperationId().equals(member.getExternalOperationId())
+                || waitGroupMapper.recordMemberPreparing(groupId, memberIdentity,
+                    anchor.getOperationId(), proofJson) != 1) {
+            throw new MemberPreparingRollback("成员完整请求未取得首次登记资格");
+        }
+        return true;
+    }
+
+    /** 提交响应不确定后锁住同一Run再读两项，等待原事务真正结束。 */
+    @Transactional
+    public MemberPreparingReadback readPreparingWaitMember(String runId, ToolJobAnchor expected,
+                                                            long groupId, String memberIdentity,
+                                                            String proofJson, String resumeToken,
+                                                            Long resumeVersion) {
+        lockAndReadExecuteQuerySession(runId);
+        AgentRun current = agentRunMapper.findByIdForUpdate(runId);
+        if (current == null) return MemberPreparingReadback.OWNERSHIP_LOST;
+        String segmentState = waitGroupMapper.lockPreparingSqlMemberContext(runId, groupId, memberIdentity);
+        WaitMember member = waitGroupMapper.findMemberByIdentity(groupId, memberIdentity);
+        if (segmentState == null || member == null) return MemberPreparingReadback.OWNERSHIP_LOST;
+        boolean originalWorker = waitGroupMapper.countPreparingSqlMemberOwner(
+                runId, groupId, memberIdentity, expected.toJson(), proofJson) == 1;
+        String json = current.getToolJobAnchorJson();
+        ToolJobAnchor active = json == null || json.isBlank() || "{}".equals(json.trim())
+                ? null : ToolJobAnchor.fromJson(json);
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            if (member.getDispatchProofJson() != null
+                    && mapper.readTree(proofJson).equals(mapper.readTree(member.getDispatchProofJson()))) {
+                // 原子事务中这份唯一生成的证明已经提交；Run后来变动只移交责任，不能创建。
+                if (active == null || !mapper.readTree(expected.toJson()).equals(mapper.readTree(json))
+                        || !originalWorker) return MemberPreparingReadback.COMMITTED_DEFERRED;
+                try {
+                    ensureExecuteQuerySessionFree(runId, expected, current);
+                } catch (SessionQueryAdmissionException busy) {
+                    if (busy.retryable()) return MemberPreparingReadback.COMMITTED_DEFERRED;
+                    throw busy;
+                }
+                return agentRunMapper.renewExecuteQueryReplayClaim(runId, groupId, memberIdentity,
+                        expected.getOperationId(), expected.getRequestFingerprint(), expected.getCreateRequestJson(),
+                        expected.getWorkItemPlanGeneration(), expected.getWorkItemRunControlVersion()) == 1
+                        ? MemberPreparingReadback.COMMITTED : MemberPreparingReadback.COMMITTED_DEFERRED;
+            }
+            boolean oldResume = active != null && resumeToken != null && resumeVersion != null
+                    && resumeToken.equals(active.getResumeToken())
+                    && resumeVersion.equals(active.getResumeLeaseVersion()) && active.isResultConsumed()
+                    && ("LAUNCHING".equals(active.getResumeState()) || "ACCEPTED".equals(active.getResumeState()))
+                    && active.isAutoResume();
+            // 原分段已经交出或终止，不能被重新claim；空锚点+空证明才确认本次本地预留未提交。
+            boolean exitedSegment = java.util.Set.of("RESULT_COMMITTED", "CANCELED", "STALE", "EXECUTION_FAILED")
+                    .contains(segmentState);
+            if (exitedSegment && (active == null || oldResume) && member.getDispatchProofJson() == null) {
+                return MemberPreparingReadback.NOT_WRITTEN;
+            }
+            return MemberPreparingReadback.OWNERSHIP_LOST;
+        } catch (java.io.IOException invalidJson) {
+            throw new IllegalStateException("SQL提交读回无法解析", invalidJson);
+        }
+    }
+
+    private void validatePreparingProof(ToolJobAnchor anchor, String proofJson) {
+        WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(new ObjectMapper(), proofJson).orElse(null);
+        if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())
+                || !"PREPARING".equals(anchor.getAnchorState()) || proof == null
+                || !WaitMemberDurableRequestResolver.hasValidRequest(proof) || proof.taskConfirmed()
+                || !anchor.getOperationId().equals(proof.operationId())
+                || !anchor.getRequestFingerprint().equals(proof.requestFingerprint())
+                || !anchor.getCreateRequestJson().equals(proof.createRequestJson())
+                || !anchor.getReservationJson().equals(proof.reservationJson())
+                || !anchor.getEstimateJson().equals(proof.estimateJson())
+                || !anchor.getCanonicalCreateSpecJson().equals(proof.canonicalCreateSpecJson())) {
+            throw new MemberPreparingRollback("SQL会话与成员准备证明不一致");
+        }
+    }
+
     /**
      * 同一用户同一时刻只允许一条 executeQuery 在途。锁和计数必须与随后的 claim UPDATE
      * 在同一事务里，否则咨询锁在语句提交时就会释放。
@@ -182,6 +309,10 @@ public class ToolJobAnchorService {
         if (anchor == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(anchor.getToolName())) {
             return;
         }
+        ensureExecuteQuerySessionFree(runId, anchor, lockAndReadExecuteQuerySession(runId));
+    }
+
+    private AgentRun lockAndReadExecuteQuerySession(String runId) {
         AgentRun run = agentRunMapper.findById(runId);
         String userId = run == null ? null : run.getUserId();
         if (userId == null || userId.isBlank()) {
@@ -191,6 +322,34 @@ public class ToolJobAnchorService {
                     false);
         }
         agentRunMapper.lockExecuteQuerySession(userId);
+        // 同 Run 的等待成员也必须串行。取锁后重读，不能使用取锁前的空锚点快照。
+        AgentRun lockedRun = agentRunMapper.findById(runId);
+        if (lockedRun != null && !userId.equals(lockedRun.getUserId())) {
+            throw new SessionQueryAdmissionException("SESSION_USER_ID_MISSING",
+                    "executeQuery session identity changed while acquiring the user lock", false);
+        }
+        return lockedRun;
+    }
+
+    private void ensureExecuteQuerySessionFree(String runId, ToolJobAnchor anchor, AgentRun lockedRun) {
+        if (lockedRun == null) {
+            throw new SessionQueryAdmissionException("SESSION_USER_ID_MISSING",
+                    "executeQuery run disappeared while acquiring the user lock", false);
+        }
+        String userId = lockedRun.getUserId();
+        String activeJson = lockedRun == null ? null : lockedRun.getToolJobAnchorJson();
+        ToolJobAnchor active = activeJson == null || activeJson.isBlank() || "{}".equals(activeJson.trim())
+                ? null : ToolJobAnchor.fromJson(activeJson);
+        // 结果已被恢复 worker 接收的终态任务不再在途；后续 UPDATE 仍核验恢复 token/version。
+        boolean consumedTerminal = active != null && "TERMINAL".equals(active.getAnchorState())
+                && active.isResultConsumed();
+        if (active != null && !consumedTerminal && ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(active.getToolName())
+                && !java.util.Objects.equals(active.getOperationId(), anchor.getOperationId())) {
+            throw new SessionQueryAdmissionException(
+                    "SESSION_QUERY_IN_PROGRESS",
+                    "another executeQuery is already running in this session; wait for it to finish or retry shortly",
+                    true);
+        }
         int inFlight = agentRunMapper.countInFlightExecuteQueryByUser(
                 userId, runId, ToolJobAnchor.EXECUTE_QUERY_TOOL, sessionStaleSeconds);
         if (inFlight > 0) {
@@ -201,11 +360,128 @@ public class ToolJobAnchorService {
         }
     }
 
+    /** 用户咨询锁、在途检查与原查询续占在同一事务内完成，提交后其它查询能看见新占用。 */
+    @Transactional
+    public boolean renewExecuteQueryReplayClaim(String runId, long groupId, String memberIdentity,
+                                                String operationId, String requestFingerprint,
+                                                String createRequestJson, long planGeneration,
+                                                long runControlVersion) {
+        ToolJobAnchor expected = new ToolJobAnchor();
+        expected.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);
+        expected.setOperationId(operationId);
+        guardExecuteQuerySession(runId, expected);
+        return agentRunMapper.renewExecuteQueryReplayClaim(runId, groupId, memberIdentity,
+                operationId, requestFingerprint, createRequestJson, planGeneration, runControlVersion) == 1;
+    }
+
+    /** 原 PREPARING SQL 请求的恢复准入，和首次派发共用用户锁；不替换锚点。 */
+    @Transactional
+    public boolean renewExecuteQueryPreparingReplayClaim(String runId, ToolJobAnchor expected) {
+        if (expected == null || !ToolJobAnchor.EXECUTE_QUERY_TOOL.equals(expected.getToolName())) return false;
+        AgentRun current = lockAndReadExecuteQuerySession(runId);
+        if (current == null || current.getStatus() != AgentRunStatus.EXECUTING) return false;
+        ToolJobAnchor active = current.getToolJobAnchorJson() == null ? null
+                : ToolJobAnchor.fromJson(current.getToolJobAnchorJson());
+        if (active == null || !expected.getOperationId().equals(active.getOperationId())
+                || !"PREPARING".equals(active.getAnchorState()) || !active.isAutoResume()
+                || "CANCELED".equals(active.getRunDisposition())) return false;
+        ensureExecuteQuerySessionFree(runId, expected, current);
+        return agentRunMapper.renewExecuteQueryPreparingReplayClaim(runId, expected.getOperationId(),
+                expected.getRequestFingerprint(), expected.getCreateRequestJson(), expected.getReservationJson(),
+                current.getPlanGeneration(), current.getRunControlVersion()) == 1;
+    }
+
     public boolean updateActive(String runId, ToolJobAnchor anchor,
                                 AgentRunStatus expectedStatus, String operationId) {
         // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。
         return agentRunMapper.updateActiveToolJobAnchor(
                 runId, anchor.toJson(), expectedStatus, operationId) == 1;
+    }
+
+    /** 只给仍由原 PREPARING 操作持有的锚点写工作区拒绝，保留其余字段原样。 */
+    public boolean recordWorkspaceRefusal(String runId, ToolJobAnchor anchor,
+                                          Instant expectedLeaseUntil) {
+        if (anchor == null || !"WORKSPACE_REFUSED".equals(anchor.getAnchorState())
+                || !WaitMemberDispatchProof.isWorkspaceRefusalCode(anchor.getWorkspaceRefusalCode())
+                || anchor.getOperationId() == null || anchor.getOperationId().isBlank()
+                || anchor.getRequestFingerprint() == null || anchor.getRequestFingerprint().isBlank()
+                || anchor.getTaskId() != null && !anchor.getTaskId().isBlank()) {
+            return false;
+        }
+        boolean liveDag = ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition());
+        if (liveDag != (expectedLeaseUntil != null)
+                || liveDag && (!expectedLeaseUntil.equals(anchor.getBlockingLeaseUntil())
+                || anchor.getBlockingOwnerId() == null || anchor.getBlockingOwnerId().isBlank())) {
+            return false;
+        }
+        return agentRunMapper.recordWorkspaceRefusal(
+                runId, anchor.getOperationId(), anchor.getRequestFingerprint(),
+                anchor.getRunDisposition(), anchor.isAutoResume(),
+                anchor.getBlockingOwnerId(),
+                expectedLeaseUntil == null ? null : expectedLeaseUntil.toString(),
+                anchor.getWorkspaceRefusalCode()) == 1;
+    }
+
+    /** 不覆盖取消等并发处置，只推进同一拒绝名额的持久状态。 */
+    public boolean recordWorkspaceRefusalReleased(String runId, ToolJobAnchor anchor) {
+        if (anchor == null || !"WORKSPACE_REFUSED".equals(anchor.getAnchorState())
+                || !WaitMemberDispatchProof.isWorkspaceRefusalCode(anchor.getWorkspaceRefusalCode())
+                || anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()
+                || anchor.getOperationId() == null || anchor.getRequestFingerprint() == null) {
+            return false;
+        }
+        return agentRunMapper.recordWorkspaceRefusalReleased(
+                runId, anchor.getOperationId(), anchor.getRequestFingerprint(),
+                anchor.getWorkspaceRefusalCode(), anchor.getReservationJson()) == 1;
+    }
+
+    /** 仅在同一拒绝的容量释放证明已持久化时清锚点、写明确失败。 */
+    @Transactional
+    public boolean completeWorkspaceRefusal(String runId, String operationId,
+                                            String fingerprint, String code) {
+        if (operationId == null || operationId.isBlank()
+                || fingerprint == null || fingerprint.isBlank()
+                || !WaitMemberDispatchProof.isWorkspaceRefusalCode(code)) {
+            return false;
+        }
+        if (agentRunMapper.completeWorkspaceRefusal(runId, operationId, fingerprint, code) != 1) {
+            return false;
+        }
+        // UPDATE 持有的行锁一直到本事务提交。趁此时读取本次更新产生的终态，
+        // 再在提交后发布；用户的并发恢复不能抢先把状态改成 RECEIVED 使事件丢失。
+        if (finalizationService != null) {
+            AgentRun run = agentRunMapper.findById(runId);
+            if (run != null && (run.getStatus() == AgentRunStatus.FAILED
+                    || run.getStatus() == AgentRunStatus.CANCELED)) {
+                String userId = run.getUserId();
+                String status = run.getStatus().name();
+                Runnable publish = () -> publishWorkspaceRefusalTerminal(
+                        runId, userId, status);
+                if (TransactionSynchronizationManager.isSynchronizationActive()) {
+                    TransactionSynchronizationManager.registerSynchronization(
+                            new TransactionSynchronization() {
+                                @Override
+                                public void afterCommit() {
+                                    publish.run();
+                                }
+                            });
+                } else {
+                    publish.run();
+                }
+            }
+        }
+        return true;
+    }
+
+    private void publishWorkspaceRefusalTerminal(String runId, String userId,
+                                                 String status) {
+        try {
+            finalizationService.publishFinalizedEvent(runId, userId, status);
+        } catch (RuntimeException publishFailure) {
+            // 终态和名额释放已提交；轮询器仍可补查，不能回滚为 PREPARING。
+            log.warn("Workspace refusal terminal event will be retried by polling: run={}",
+                    runId, publishFailure);
+        }
     }
 
     public boolean updateLiveDagBlocking(

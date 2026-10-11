@@ -163,6 +163,10 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
         FakeMember member = memberRows(request.groupId()).stream()
                 .filter(row -> row.memberIdentity.equals(request.memberIdentity()))
                 .findFirst().orElseThrow(() -> new IllegalArgumentException("成员不存在：" + request.memberIdentity()));
+        if (WaitMemberState.PENDING.name().equals(member.state)
+                && world.willfrog.agent.platform.dataanalysis.DurableSandboxTool.fromToolName(member.toolName).isPresent() && member.dispatchProofJson != null) {
+            return describe(request.groupId(), false, null);
+        }
         if (member.finishedAt != null) {
             events.add("duplicate_completion:" + member.memberIdentity);
             return describe(request.groupId(), false, null);
@@ -451,6 +455,7 @@ class InMemoryWaitGroupStore implements WaitGroupStore {
         row.setExternalOperationId(member.externalOperationId);
         row.setState(member.state);
         row.setResultRefJson(member.resultRefJson);
+        row.setDispatchProofJson(member.dispatchProofJson);
         row.setNextPollAt(member.nextPollAt);
         row.setPollCount(member.pollCount);
         row.setBackoffStep(member.backoffStep);

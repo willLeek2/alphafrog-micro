@@ -647,6 +647,41 @@ class ToolJobReconcilerP005ReverseTest {
     private static class StubPythonSandboxService implements PythonSandboxService {
 
         @Override
+        public AcquireWorkspaceResponse acquireWorkspace(AcquireWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<AcquireWorkspaceResponse> acquireWorkspaceAsync(
+                AcquireWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public DeleteWorkspaceResponse deleteWorkspace(DeleteWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<DeleteWorkspaceResponse> deleteWorkspaceAsync(
+                DeleteWorkspaceRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override public world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceResponse sealWorkspace(
+                world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceResponse> sealWorkspaceAsync(
+                world.willfrog.alphafrogmicro.sandbox.idl.SealWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceResponse queryWorkspace(
+                world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceResponse> queryWorkspaceAsync(
+                world.willfrog.alphafrogmicro.sandbox.idl.QueryWorkspaceRequest r) { throw new UnsupportedOperationException(); }
+        @Override public world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesResponse listWorkspaceExpiryCandidates(
+                world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesRequest r) { throw new UnsupportedOperationException(); }
+        @Override public CompletableFuture<world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesResponse> listWorkspaceExpiryCandidatesAsync(
+                world.willfrog.alphafrogmicro.sandbox.idl.ListWorkspaceExpiryCandidatesRequest r) { throw new UnsupportedOperationException(); }
+
+        @Override
         public TaskStatusResponse getTaskStatus(GetTaskStatusRequest request) {
             return TaskStatusResponse.newBuilder()
                     .setTaskId(request.getTaskId())

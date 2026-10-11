@@ -767,6 +767,22 @@ services:
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
       AF_SANDBOX_TASK_STORE_PATH: /data/sandbox_tasks/state.json
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
+      # 持久工作区（默认关闭）。开启时与预热池互斥（同真即拒绝启动）。
+      # AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT 是宿主绝对根目录：部署层把同一
+      # 目录按【相同绝对路径】挂进服务容器（见下方 volumes）。服务在容器内
+      # 以此值做可信根解析，并把它直接作为任务容器 bind 源交给宿主 Docker
+      # daemon；daemon 在宿主文件系统上解析该路径，所以宿主路径与容器路径
+      # 必须逐字相同。环境变量与挂载两侧共用同一 substitution source，从
+      # 结构上保证两侧不发散：一旦发散，任务容器会挂到宿主另一个目录，
+      # 前一次调用写入的文件在下一次调用的挂载里不可见。开关只阻止为没有
+      # 工作区的 Run 新建；已有工作区的旧 Run 在开关关闭后继续执行与删除。
+      AF_SANDBOX_PERSISTENT_WORKSPACE_ENABLED: ${AF_SANDBOX_PERSISTENT_WORKSPACE_ENABLED:-false}
+      AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT: ${AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT:-/data/persistent_workspaces}
+      # 部署身份：任务容器标签携带，清扫与删除只处理本部署启动的容器。
+      # 与外层 AF_DEPLOYMENT_ID 同 substitution source。不提供 stable 占位
+      # 缺省：持久工作区开启时服务侧要求显式设置（空值启动即拒），关闭时
+      # 服务内部回退占位值。
+      AF_DEPLOYMENT_ID: ${AF_DEPLOYMENT_ID:-}
       # Nacos dynamic config（mirrors Java services）。默认关闭：生产发布时显式
       # 设 AF_CONFIG_NACOS_ENABLED=true 才启用。动态配置只能调低输出上限，不能
       # 超过代码静态硬上限；四段输出上限测试（工作包 C/D）完成前，金融计算结果
@@ -784,6 +800,16 @@ services:
       - ./data/manifests:/data/manifests
       - ./data/agent_artifacts:/data/agent_artifacts
       - ./data/sandbox_tasks:/data/sandbox_tasks
+      # 持久工作区根目录：Run 的用户目录直接建在其下（<root>/<workspace_id>），
+      # 与 /sandbox/runs 控制目录分离；即使功能关闭也保持挂载（已有工作区的
+      # 旧 Run 在开关关闭后仍需继续读写）。
+      # 挂载的宿主侧与容器侧必须是【同一个宿主绝对路径】，并与上方
+      # AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT 逐字相同（同一 substitution
+      # source）：任务容器的 bind 源路径由宿主 Docker daemon 在宿主文件系统
+      # 上解析（本服务经 docker.sock 驱动宿主 daemon），compose 相对路径
+      # ./data 或两侧不一致都会被解析到另一个目录，任务容器挂到与工作区
+      # 无关的（自动新建的）空目录。
+      - ${AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT:-/data/persistent_workspaces}:${AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT:-/data/persistent_workspaces}
       - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8095"

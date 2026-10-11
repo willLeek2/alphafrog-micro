@@ -1,10 +1,10 @@
-Execute Python code in a secure sandbox to analyze datasets or manifests that have already been produced in the current agent run.
+Execute Python code in a secure sandbox to analyze datasets or manifests that have already been produced in the current agent run. When this run has a persistent Python workspace, successive calls in the same run share files in the current working directory; other runs cannot use those files.
 
 Prefer this tool for deterministic processing of large structured JSON/CSV-style market data, datasets, or manifests: filtering, sorting, joining, aggregation, comparison, return calculation, and backtesting. Do not repeatedly page through long structured outputs with rereadToolResult when the data is available as a dataset or manifest; resolve run-level numbers with listMyData and process them here.
 
 REQUIRED parameters:
 - code: the Python source code to execute.
-- At least one of dataset_ids or manifest_ids must be non-empty.
+- In the temporary sandbox mode, at least one of dataset_ids or manifest_ids must be non-empty. In a run with a persistent workspace, both may be empty when the code only uses files saved by an earlier call in this run.
 
 IDs are agent run-level numbers (NOT original datasetId strings):
 - dataset_ids: comma-separated run-level dataset numbers, e.g. "1" or "1,3". Get these from listMyData or from the legal_dataset_numbers list in an ILLEGAL_RUN_LEVEL_IDS error.
@@ -16,11 +16,18 @@ OPTIONAL parameters:
 - libraries: comma-separated pip packages, e.g. "numpy,pandas". Prefer preinstalled runtime libraries to reduce latency.
 - timeout_seconds: integer timeout override (default 30).
 
+PERSISTENT WORKSPACE (when enabled for this run):
+- Before using or changing an existing file, inspect the working directory and the beginning of the relevant file. Use Python directory listing or a short content preview when needed.
+- Keep a small WORKSPACE_FILES.md in the working directory describing files you create, what each contains, and which later step needs it. Update it when those files change. This is guidance, not a requirement for a successful call.
+- Use relative paths for files you want a later Python call in the same run to read. A failed, timed-out, or canceled write makes the workspace unavailable for further tasks.
+
 SANDBOX INPUT SURFACE (injected automatically):
 - /sandbox/paths_dataset.csv maps agent_run_dataset_id → sandbox file path + from_ts_code.
 - /sandbox/path_manifest.csv maps agent_run_manifest_id → manifest file path + related_dataset_ids.
 - Manifests with no on-disk file are materialized at <task_input>/_agent_run_manifest_<id>/manifest.json.
-- Read these CSVs in your code, or use the helper: from af_dataset_loader import load_manifest, load_datasets.
+- Prefer the helper: from af_dataset_loader import load_manifest, load_datasets. It reads registered CSV, Parquet and tabular JSON by their actual format.
+- /sandbox/paths_dataset_meta.json contains format, recordsPath and columns by dataset number. recordsPath names a top-level JSON array of record objects. Without recordsPath, a JSON object is one row and an array of objects is a table. Nested dictionaries/lists remain nested cell values; do not flatten them automatically. Empty arrays retain metadata columns. Other JSON values require json.load on the resolved file path.
+- The path indexes are CSV; the dataset file itself may be JSON or Parquet. Do not apply pd.read_csv to every dataset path.
 
 PYTHON HELPER EXAMPLES:
 - Single dataset by number:
@@ -40,14 +47,18 @@ PYTHON HELPER EXAMPLES:
     import pandas as pd
     ds_idx = pd.read_csv("/sandbox/paths_dataset.csv")
     path = ds_idx[ds_idx["agent_run_dataset_id"] == 1].iloc[0]["dataset_file_path"]
-    df = pd.read_csv(path)
+    import json
+    from pathlib import Path
+    from af_dataset_loader import read_dataset_file
+    metadata = json.load(open("/sandbox/paths_dataset_meta.json"))["datasets"]["1"]
+    df = read_dataset_file(Path(path), metadata)
 
 RUNTIME (preinstalled, no install needed):
 - numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0
 - Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33
 
 ERROR FEEDBACK AND RECOVERY:
-- MISSING_IDS: dataset_ids and manifest_ids are both empty → provide at least one.
+- MISSING_IDS: in temporary sandbox mode, dataset_ids and manifest_ids are both empty → provide at least one. In persistent workspace mode, both may be empty to use existing workspace files.
 - RUN_LEVEL_IDS_UNAVAILABLE: no active agent run / registry not wired → wait for run start.
 - ILLEGAL_RUN_LEVEL_IDS: a number is not in the run's legal set → response lists legal_dataset_numbers and legal_manifest_numbers; pass values from those lists. If you are unsure, call listMyData first.
 - TASK_FAILED / NON_ZERO_EXIT: code raised → fix and retry. If you hit this twice due to IDs or paths, stop and call listMyData or switch strategy.

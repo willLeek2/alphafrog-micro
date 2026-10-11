@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import world.willfrog.agent.platform.mapper.WaitGroupMapper;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.Mockito.mock;
@@ -15,6 +16,7 @@ class ToolJobResumeServiceSpringContextTest {
     @Test
     void springShouldInstantiateServiceWithoutAStringBean() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.registerBean(WaitGroupMapper.class, () -> mock(WaitGroupMapper.class));
             context.registerBean(ToolJobAnchorService.class, () -> mock(ToolJobAnchorService.class));
             context.registerBean(ToolJobRedisCache.class, () -> mock(ToolJobRedisCache.class));
             context.registerBean(ToolJobConfig.class, () -> mock(ToolJobConfig.class));

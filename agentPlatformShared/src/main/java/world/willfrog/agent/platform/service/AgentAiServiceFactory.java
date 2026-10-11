@@ -67,6 +67,14 @@ public class AgentAiServiceFactory {
         return buildChatModelWithTemperature(resolved, temperatureOverride, null);
     }
 
+    /** 风险评分脚本只交给不持久捕获请求正文的 OpenAI 兼容客户端。 */
+    public ChatModel buildPythonRiskReviewModel(AgentLlmResolver.ResolvedLlm resolved) {
+        if (resolved == null || isDashScopeEndpoint(resolved)) {
+            throw new IllegalArgumentException("Python 风险评分端点必须使用不捕获请求正文的 OpenAI 兼容客户端");
+        }
+        return buildChatModelWithTemperature(resolved, 0.0D, 256);
+    }
+
     public ChatModel buildChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
                                                  Double temperatureOverride,
                                                  Integer maxTokensOverride) {

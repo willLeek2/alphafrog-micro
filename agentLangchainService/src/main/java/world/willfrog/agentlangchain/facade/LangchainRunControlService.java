@@ -32,6 +32,7 @@ import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -99,6 +100,9 @@ public class LangchainRunControlService {
     @Autowired
     private AgentRunFamilyDeletionService familyDeletionService;
 
+    @Autowired(required = false)
+    private RunWorkspaceDeletionCoordinator workspaceDeletionCoordinator;
+
     /**
      * 删除 run 及其关联的状态数据（Redis）。
      * 仅允许在非运行状态下删除；正在执行的 run 需要先 cancel 或 pause。
@@ -109,7 +113,16 @@ public class LangchainRunControlService {
         if (familyDeletionService == null) {
             throw new IllegalStateException("调用树删除服务不可用");
         }
-        for (String deletedRunId : familyDeletionService.deleteRoot(run.getId(), run.getUserId())) {
+        AgentRunFamilyDeletionService.DeletionPlan deletion =
+                familyDeletionService.beginDeletion(run.getId(), run.getUserId());
+        if (!deletion.workspaceRunIds().isEmpty()) {
+            if (workspaceDeletionCoordinator == null) {
+                throw new IllegalStateException("沙箱工作区删除协调服务暂不可用，请稍后重试");
+            }
+            workspaceDeletionCoordinator.sealFindAndDelete(deletion.workspaceRunIds());
+        }
+        for (String deletedRunId : familyDeletionService.finishDeletionAfterResourcesConfirmed(
+                run.getId(), run.getUserId(), deletion.runIds())) {
             stateStore.clear(deletedRunId);
         }
         return AgentEmpty.newBuilder().build();
@@ -133,7 +146,7 @@ public class LangchainRunControlService {
         // 认领/受理入口的归属判定在 gateway：只允许控制本部署代际的 Run。
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
-        boolean dualPoolRun = schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPool(run);
+        boolean dualPoolRun = schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPoolFamily(run);
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
@@ -419,11 +432,12 @@ public class LangchainRunControlService {
         }
         boolean durableReceived = false;
         try {
+            rejectUnsettledCanceledSqlSessionBeforeResume(run);
+            disposePausedAnchorBeforeResume(run);
             if (request.getPlanOverrideJson() != null && !request.getPlanOverrideJson().isBlank()) {
                 stateStore.clearTasks(run.getId());
                 stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
             }
-            disposePausedAnchorBeforeResume(run);
             if (runMapper.resetForResume(
                     run.getId(), run.getUserId(), agentEventService.nextTtlExpiresAt()) != 1) {
                 throw new IllegalStateException("Run 状态已变化，无法恢复到待执行");
@@ -455,6 +469,17 @@ public class LangchainRunControlService {
                         run.getId(), dualPoolReservation);
             }
             throw e;
+        }
+    }
+
+    /** 取消SQL成员尚未收尾时，不能先修改恢复计划或重新启动同一Run。 */
+    private void rejectUnsettledCanceledSqlSessionBeforeResume(AgentRun run) {
+        if (!"DUAL_POOL_V2".equals(run.getSchedulerVersion())) return;
+        ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+        if (anchor != null && "executeQuery".equals(anchor.getToolName())
+                && "CANCELED".equals(anchor.getRunDisposition())
+                && anchor.getOperationId() != null && !anchor.getOperationId().isBlank()) {
+            throw new IllegalStateException("SQL查询取消仍在收尾，请在原会话清理后重试恢复");
         }
     }
 
@@ -507,6 +532,11 @@ public class LangchainRunControlService {
         if (anchor == null || anchor.getOperationId() == null
                 || anchor.getOperationId().isBlank()) {
             return;
+        }
+        if ("PREPARING".equals(anchor.getAnchorState())
+                || "WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
+            throw new IllegalStateException(
+                    "Python workspace call is still being settled: retry resume after cleanup");
         }
         if (!ToolJobRunDisposition.PAUSED.equals(anchor.getRunDisposition())) {
             return;

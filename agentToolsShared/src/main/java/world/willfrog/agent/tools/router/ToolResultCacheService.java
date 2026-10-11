@@ -1,6 +1,7 @@
 package world.willfrog.agent.tools.router;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -18,6 +19,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 
 import java.nio.charset.StandardCharsets;
@@ -231,7 +233,7 @@ public class ToolResultCacheService {
     }
 
     private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope) {
-        CacheMode mode = resolveMode(toolName);
+        CacheMode mode = resolveMode(toolName, params);
         /*
          * D07 fail-closed（Risks 3.3.2）：blank scope（无 userId 且无 runId）不得
          * 落 global 共享键；REDIS 共享缓存此时跳过读写、强制回源。DATASET_REGISTRY
@@ -251,6 +253,15 @@ public class ToolResultCacheService {
                 .key(key)
                 .ttlSeconds(Math.max(0, ttlSeconds))
                 .build();
+    }
+
+    private CacheMode resolveMode(String toolName, Map<String, Object> params) {
+        if (("searchIndex".equals(toolName) || "searchAssetInfo".equals(toolName)
+                || "getExchangeAssetDaily".equals(toolName)) && AdvancedSearchRequest.isAdvancedMap(params)) {
+            // 高级工具返回数据集身份，必须执行工具以写盘或复用，并登记到当前 Run。
+            return CacheMode.DATASET_REGISTRY;
+        }
+        return resolveMode(toolName);
     }
 
     private CacheMode resolveMode(String toolName) {
@@ -413,7 +424,28 @@ public class ToolResultCacheService {
                     putIfPresent(normalized, safeToken(entry.getKey()), normalizeGeneric(entry.getValue()));
                 }
         }
+        if (Set.of("searchIndex", "searchAssetInfo", "getExchangeAssetDaily").contains(nvl(toolName))
+                && AdvancedSearchRequest.isAdvancedMap(source)) {
+            // 高级条件决定股票范围；不能复用简单搜索或另一个期间的缓存结果。
+            normalized.put("mode", "advanced");
+            normalized.put("advancedQuery", normalizeAdvancedQuery(source.get("advancedQuery")));
+            // 查询正文没有名称时，高级查询会回退读取顶层名称参数。
+            putIfPresent(normalized, "name", normalizeGeneric(source.get("name")));
+            putIfPresent(normalized, "keyword", normalizeGeneric(source.get("keyword")));
+        }
         return normalized;
+    }
+
+    private String normalizeAdvancedQuery(Object value) {
+        try {
+            Object query = value instanceof String raw ? objectMapper.readValue(raw, Object.class) : value;
+            // 只统一对象字段顺序，保留条件数组顺序及所有查询字段。
+            return objectMapper.writer().with(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
+                    .writeValueAsString(query);
+        } catch (Exception e) {
+            // 无效输入仍保留原文，交给工具按原合同返回参数错误。
+            return normalizeGeneric(value);
+        }
     }
 
     private void putIfPresent(Map<String, String> map, String key, String value) {

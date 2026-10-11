@@ -1,20 +1,31 @@
 package world.willfrog.agent.tools.market;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.redis.core.SetOperations;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
+import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.workflow.DatasetPersistedEvent;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyItem;
 
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,18 +47,96 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Task #70 review fix: writeAdvancedDailyDataset must use stable group identity
- * and registerDataset with identical parameters to writer.
- *
- * <p>Tests the private {@code writeAdvancedDailyDataset} via reflection, asserting:
- * <ul>
- *   <li>Writer and registry receive the same non-"multiple" stable tsCode</li>
- *   <li>Same datasetId, rowCount, dates, headers passed to both</li>
- *   <li>Same canonicalQuery + same sorted stockCodes → same stable identity</li>
- *   <li>Different stockCodes → different stable identity (no collision)</li>
- * </ul>
+ * 高级日线的稳定标识必须让写盘与登记指向同一文件，并让读取方获得真实统计。
  */
 class MarketDataToolsAdvancedDatasetTest {
+
+    @TempDir
+    Path tempDir;
+
+    @Test
+    void advancedDatasetRegistersActualFileAndCompleteStatistics() throws Exception {
+        assertAdvancedDatasetStatistics(false);
+    }
+
+    @Test
+    void fallbackIdentityRegistersActualFileWithoutNegativeHashSeparator() throws Exception {
+        assertAdvancedDatasetStatistics(true);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertAdvancedDatasetStatistics(boolean failIdentitySerialization) throws Exception {
+        Path databaseRoot = tempDir.resolve("database_fetched");
+        DatasetWriter writer = new DatasetWriter(new AgentStoragePaths(
+                tempDir.resolve("workspaces").toString(), tempDir.resolve("artifacts").toString(),
+                tempDir.resolve("agent_datasets").toString(), tempDir.resolve("obs.log").toString()));
+        ReflectionTestUtils.setField(writer, "enabled", true);
+        ReflectionTestUtils.setField(writer, "databaseFetchedPath", databaseRoot.toString());
+
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        when(redis.opsForValue()).thenReturn(mock(ValueOperations.class));
+        when(redis.opsForSet()).thenReturn(mock(SetOperations.class));
+        AgentRunDatasetRegistry runRegistry = new AgentRunDatasetRegistry();
+        ApplicationEventPublisher publisher = event -> {
+            if (event instanceof DatasetPersistedEvent persisted) {
+                runRegistry.onDatasetPersisted(persisted);
+            }
+        };
+        DatasetRegistry registry = new DatasetRegistry(redis, publisher);
+        ReflectionTestUtils.setField(registry, "enabled", true);
+        ReflectionTestUtils.setField(registry, "databaseFetchedPath", databaseRoot.toString());
+
+        ObjectMapper identityMapper = new ObjectMapper();
+        if (failIdentitySerialization) {
+            identityMapper = mock(ObjectMapper.class);
+            when(identityMapper.writeValueAsBytes(any())).thenThrow(
+                    new JsonProcessingException("条件摘要序列化不可用") {});
+        }
+        MarketDataTools tools = new MarketDataTools(writer, registry, mock(ManifestWriter.class),
+                null, new AgentLlmProperties(), identityMapper, mock(SwIndustryMemberDao.class));
+        // 该条件摘要的哈希为负数，验证降级标识也不会再产生连字符。
+        Map<String, Object> query = Map.of("asset_type", "stock", "conditions", List.of(
+                Map.of("type", "index_component", "index_code", "000905.SH")));
+        List<String> stockCodes = List.of("600519.SH", "000001.SZ");
+        List<String> headers = List.of("ts_code", "trade_date", "open", "high", "low", "close",
+                "pre_close", "change", "pct_chg", "vol", "amount");
+        List<DomesticStockDailyItem> rows = stockCodes.stream().map(code ->
+                DomesticStockDailyItem.newBuilder().setTsCode(code).setTradeDate(1704124800000L)
+                        .setOpen(10).setHigh(12).setLow(9).setClose(11).setPreClose(10)
+                        .setChange(1).setPctChg(10).setVol(100).setAmount(1100).build()).toList();
+        String runId = "run-advanced-statistics";
+        AgentContext.setRunId(runId);
+        String datasetId;
+        try {
+            datasetId = ReflectionTestUtils.invokeMethod(tools, "writeAdvancedDailyDataset",
+                    "stock_daily_advanced", query, stockCodes, "20240102", "20240105", headers, rows);
+        } finally {
+            AgentContext.clear();
+        }
+
+        var snapshot = runRegistry.snapshot(runId);
+        assertEquals(1, snapshot.datasets().size());
+        var entry = snapshot.datasets().get(0);
+        assertEquals(datasetId, entry.originalId());
+        assertTrue(entry.fromTsCode().matches("group_[0-9a-f]+"));
+        if (failIdentitySerialization) {
+            int fallbackHash = "index_component-000905.SH-2".hashCode();
+            assertTrue(fallbackHash < 0);
+            assertEquals("group_" + Integer.toUnsignedString(fallbackHash, 16), entry.fromTsCode());
+        }
+        Path actualCsv;
+        try (var files = Files.walk(databaseRoot)) {
+            actualCsv = files.filter(path -> path.toString().endsWith(".csv")).findFirst().orElseThrow();
+        }
+        assertEquals(actualCsv.toAbsolutePath().toString(), entry.persistedPath());
+        assertEquals(rows.size(), Files.readAllLines(actualCsv).size() - 1);
+        var metadata = new DatasetEntryMetadataReader().read(entry);
+        assertEquals("complete", metadata.metadataStatus());
+        assertEquals((long) rows.size(), metadata.rowCount());
+        assertEquals(Files.size(actualCsv), metadata.bytes());
+        assertEquals(headers, metadata.columns());
+        assertEquals(headers, metadata.recommendedUsecols());
+    }
 
     @Test
     void directReadyCountMismatchMissRewritesManifestFromCurrentBatch() {
@@ -68,7 +157,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 datasetWriter, registry, manifestWriter,
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class));
+                mock(SwIndustryMemberDao.class));
         ReflectionTestUtils.setField(tools, "emitManifest", true);
         List<Map<String, Object>> results = List.of(
                 Map.of("ts_code", "000001.SZ", "ok", true,
@@ -117,7 +206,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 writer, registry, mock(ManifestWriter.class),
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class)
+                mock(SwIndustryMemberDao.class)
         );
 
         Map<String, Object> canonicalQuery = new LinkedHashMap<>();
@@ -189,7 +278,7 @@ class MarketDataToolsAdvancedDatasetTest {
 
         // Writer and registry must receive the SAME stable identity
         assertEquals(writerTsCode, registryTsCode, "Writer and registry must receive identical stable identity");
-        assertTrue(writerTsCode.startsWith("group-"), "tsCode must start with 'group-' prefix");
+        assertTrue(writerTsCode.startsWith("group_"), "tsCode must start with 'group_' prefix");
         assertTrue(!writerTsCode.equals("multiple"), "tsCode must not be literal 'multiple'");
     }
 
@@ -283,7 +372,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 writer, registry, mock(ManifestWriter.class),
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class)
+                mock(SwIndustryMemberDao.class)
         );
 
         Map<String, Object> canonicalQuery = Map.of("asset_type", "stock");
@@ -321,7 +410,7 @@ class MarketDataToolsAdvancedDatasetTest {
         MarketDataTools tools = new MarketDataTools(
                 writer, registry, mock(ManifestWriter.class),
                 null, new AgentLlmProperties(), new ObjectMapper(),
-                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class)
+                mock(SwIndustryMemberDao.class)
         );
 
         Method method = MarketDataTools.class.getDeclaredMethod(

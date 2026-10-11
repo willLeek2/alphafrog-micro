@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 
 /** Reads public, path-free metadata for a persisted dataset or manifest. */
 @Slf4j
@@ -37,7 +38,23 @@ public class DatasetEntryMetadataReader {
             bytes = firstLong(document, "bytes", "totalBytes");
         }
         List<String> columns = stringList(document, "columns");
-        if (columns.isEmpty() && entry.isDataset()) {
+        String format = document == null ? "" : document.path("format").asText("");
+        if (format.isBlank() && persisted != null) {
+            String name = persisted.getFileName().toString();
+            int dot = name.lastIndexOf('.');
+            if (dot < 0) {
+                name = entry.sortKey();
+                dot = name.lastIndexOf('.');
+            }
+            format = dot >= 0 ? name.substring(dot + 1) : "";
+        }
+        format = format.toLowerCase(Locale.ROOT);
+        JsonNode recordsNode = document == null ? null : document.get("recordsPath");
+        if (recordsNode != null && !recordsNode.isNull() && !recordsNode.isTextual()) {
+            throw new IllegalArgumentException("JSON recordsPath must be a top-level field name");
+        }
+        String recordsPath = recordsNode == null || recordsNode.isNull() ? null : recordsNode.textValue();
+        if (columns.isEmpty() && entry.isDataset() && "csv".equals(format)) {
             columns = readCsvHeader(persisted);
         }
         DatasetSchemaHintResolver.SchemaHints fallback = DatasetSchemaHintResolver.resolve(columns);
@@ -54,7 +71,7 @@ public class DatasetEntryMetadataReader {
             profiles = fallback.readProfiles();
         }
         String status = rowCount != null && bytes != null && !columns.isEmpty() ? "complete" : "partial";
-        return new EntryMetadata(rowCount, bytes, columns, usecols, dtypes, profiles, status);
+        return new EntryMetadata(rowCount, bytes, columns, usecols, dtypes, profiles, status, format, recordsPath);
     }
 
     private JsonNode readMetadataDocument(AgentRunDatasetEntry entry, Path persisted) {
@@ -196,7 +213,9 @@ public class DatasetEntryMetadataReader {
             List<String> recommendedUsecols,
             Map<String, String> recommendedDtype,
             Map<String, List<String>> readProfiles,
-            String metadataStatus
+            String metadataStatus,
+            String format,
+            String recordsPath
     ) {
     }
 }

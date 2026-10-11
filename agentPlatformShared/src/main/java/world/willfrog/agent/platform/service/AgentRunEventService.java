@@ -5,6 +5,7 @@ import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -122,6 +123,15 @@ public class AgentRunEventService {
     /** Checkpoint 协议版本,写入 ext 用于未来兼容性升级 */
     @Value("${agent.run.checkpoint-version:v2}")
     private String checkpointVersion;
+
+    /** 热配置缺省时的 Python 持久工作区开关；新 Run 创建时读取当下生效值。 */
+    @Value("${agent.python-workspace.enabled:false}")
+    private boolean pythonWorkspaceEnabled;
+
+    @PostConstruct
+    void logPythonWorkspaceSetting() {
+        log.info("Python 持久工作区新 Run 应用配置默认值: enabled={}", pythonWorkspaceEnabled);
+    }
 
     /** 单事件 payload JSON 最大字符数,超出会被截断为摘要对象 */
     @Value("${agent.event.payload.max-chars:10000}")
@@ -244,6 +254,7 @@ public class AgentRunEventService {
             ext.put("planner_candidate_count", plannerCandidateCount);
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
+        ext.put("python_workspace_enabled", resolvePythonWorkspaceEnabled());
         PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
                 runId, userId, contextJson);
         ext.put("prompt_selection", promptSelection.toExtMap());
@@ -1616,6 +1627,22 @@ public class AgentRunEventService {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    /**
+     * 新 Run 只冻结创建瞬间的有效开关。Nacos 尚未形成可信热配置时保持关闭，
+     * 避免启动种子文件或应用默认值提前启用持久工作区。
+     */
+    private boolean resolvePythonWorkspaceEnabled() {
+        if (!llmLocalConfigLoader.hotConfigIsAuthoritative()) {
+            return false;
+        }
+        return Optional.ofNullable(llmLocalConfigLoader.current())
+                .flatMap(value -> value)
+                .map(AgentLlmProperties::getAgent)
+                .map(AgentLlmProperties.Agent::getPythonWorkspace)
+                .map(AgentLlmProperties.PythonWorkspace::getEnabled)
+                .orElse(pythonWorkspaceEnabled);
     }
 
     /**

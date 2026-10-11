@@ -351,6 +351,24 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public boolean recordMemberWorkspaceRefusal(long groupId, String memberIdentity,
+                                                 String operationId, String expectedFingerprint,
+                                                 String proofJson) {
+        WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(
+                new com.fasterxml.jackson.databind.ObjectMapper(), proofJson).orElse(null);
+        if (groupId <= 0 || memberIdentity == null || memberIdentity.isBlank()
+                || operationId == null || operationId.isBlank()
+                || expectedFingerprint == null || expectedFingerprint.isBlank()
+                || proof == null || !proof.workspaceRefused()
+                || !operationId.equals(proof.operationId())
+                || !expectedFingerprint.equals(proof.requestFingerprint())) {
+            throw new IllegalArgumentException("成员工作区拒绝凭证参数不完整");
+        }
+        return mapper.recordMemberWorkspaceRefusal(groupId, memberIdentity, operationId,
+                expectedFingerprint, proofJson) == 1;
+    }
+
+    @Override
     public boolean markMemberDispatched(long groupId,
                                         String memberIdentity,
                                         String externalOperationId,

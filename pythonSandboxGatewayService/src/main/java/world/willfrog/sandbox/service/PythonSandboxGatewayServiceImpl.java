@@ -3,6 +3,7 @@ package world.willfrog.sandbox.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -15,6 +16,10 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import world.willfrog.agent.platform.debug.DebugObservabilityJsonlAppender;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunPersistentResourceEligibilityService;
+import world.willfrog.alphafrogmicro.agent.idl.CheckRunPersistentResourceEligibilityRequest;
+import world.willfrog.alphafrogmicro.agent.idl.CheckRunPersistentResourceEligibilityResponse;
+import world.willfrog.alphafrogmicro.agent.idl.RunPersistentResourceEligibility;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.net.URI;
@@ -34,6 +39,14 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     private final RestTemplate longHttpClient;
     private final RestTemplate shortHttpClient;
     private final ObjectMapper objectMapper;
+
+    /**
+     * Run 持久资源资格回查：acquireWorkspace 下发 Python 前的前置裁决。
+     * 提供方在 agentLangchain（group=langchain）；泳道标签由公共消费方
+     * 过滤器沿入境调用自动传播，这里不做第二重路由判断。
+     */
+    @DubboReference(group = "langchain", check = false)
+    private AgentRunPersistentResourceEligibilityService runEligibilityService;
 
     @Value("${sandbox.service.url}")
     private String sandboxUrl;
@@ -221,6 +234,36 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 // Non-production transitional clients only (gate above).
                 httpRequest.setResource_class(request.getResourceClass());
             }
+            // Persistent-workspace identity group: all three fields or none.
+            // A partial group is a caller defect — rejected locally with
+            // INVALID_ARGUMENT before any HTTP round trip (the sandbox
+            // enforces the same rule; failing earlier keeps the request
+            // from consuming downstream capacity). proto3 scalars have no
+            // presence, so blank-ness is the unset proxy.
+            String runId = request.getRunId() == null ? "" : request.getRunId().trim();
+            String workspaceId = request.getWorkspaceId() == null ? "" : request.getWorkspaceId().trim();
+            String workspaceGeneration =
+                    request.getWorkspaceGeneration() == null ? "" : request.getWorkspaceGeneration().trim();
+            boolean anyIdentity = !runId.isEmpty() || !workspaceId.isEmpty() || !workspaceGeneration.isEmpty();
+            boolean allIdentity = !runId.isEmpty() && !workspaceId.isEmpty() && !workspaceGeneration.isEmpty();
+            if (anyIdentity && !allIdentity) {
+                SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                        .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                        .build();
+                String text = "createTask rejected: runId, workspaceId and workspaceGeneration"
+                        + " must be provided together or all absent";
+                log.warn("sandbox.createTask.localRejectPartialWorkspaceIdentity: totalDurationMs={}",
+                        System.currentTimeMillis() - startMs);
+                return ExecuteResponse.newBuilder()
+                        .setError(text)
+                        .setErrorDetail(detail)
+                        .build();
+            }
+            if (allIdentity) {
+                httpRequest.setRun_id(runId);
+                httpRequest.setWorkspace_id(workspaceId);
+                httpRequest.setWorkspace_generation(workspaceGeneration);
+            }
 
             String endpoint = sandboxUrl + "/tasks";
             long httpStart = System.currentTimeMillis();
@@ -237,14 +280,52 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 log.info("sandbox.createTask.result: taskId={}, status={}, totalDurationMs={}",
                         response.getBody().getTask_id(), response.getBody().getStatus(),
                         System.currentTimeMillis() - startMs);
+                String workspaceResultRaw = response.getBody().getWorkspace_result();
+                boolean hasWorkspaceResultRaw = workspaceResultRaw != null
+                        && !workspaceResultRaw.isBlank();
+                WorkspaceResult workspaceResult = parseWorkspaceResult(workspaceResultRaw);
+                boolean hasTaskId = response.getBody().getTask_id() != null
+                        && !response.getBody().getTask_id().isBlank();
+                // Exactly ONE business form is legal on a 200 body: either a
+                // task reference (taskId present, verdict absent) or a pure
+                // workspace refusal (verdict present, taskId absent). An
+                // unknown verdict value, both forms at once, or neither form
+                // is a corrupted downstream protocol and must fail closed —
+                // never read as success and never surfaced as "task created
+                // AND refused".
+                String malformedReason = null;
+                if (hasWorkspaceResultRaw && workspaceResult == null) {
+                    malformedReason = "unknown workspaceResult value: " + workspaceResultRaw;
+                } else if (hasTaskId && workspaceResult != null) {
+                    malformedReason = "both a task reference and a workspace refusal present";
+                } else if (!hasTaskId && !hasWorkspaceResultRaw) {
+                    malformedReason = "no task reference and no workspace verdict";
+                }
+                if (malformedReason != null) {
+                    log.warn("sandbox.createTask.malformedResponse: reason={}, taskId={}, httpStatus={}",
+                            malformedReason, response.getBody().getTask_id(), downstreamStatus);
+                    SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                            .setDownstreamHttpStatus(downstreamStatus)
+                            .build();
+                    emitSandboxHttp("POST", endpoint, downstreamStatus, durationMs, "ERROR",
+                            "CREATE_TASK_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+                    return ExecuteResponse.newBuilder()
+                            .setError("Malformed create response from sandbox (" + malformedReason + ")")
+                            .setErrorDetail(detail)
+                            .build();
+                }
                 ExecuteResponse.Builder builder = ExecuteResponse.newBuilder()
-                        .setTaskId(response.getBody().getTask_id())
-                        .setStatus(response.getBody().getStatus());
+                        .setTaskId(response.getBody().getTask_id() == null ? "" : response.getBody().getTask_id())
+                        .setStatus(response.getBody().getStatus() == null ? "" : response.getBody().getStatus());
                 if (response.getBody().getExisting() != null) {
                     builder.setExisting(response.getBody().getExisting());
                 }
                 if (response.getBody().getRequest_fingerprint() != null) {
                     builder.setRequestFingerprint(response.getBody().getRequest_fingerprint());
+                }
+                if (workspaceResult != null) {
+                    builder.setWorkspaceResult(workspaceResult);
                 }
                 emitSandboxHttp("POST", endpoint, downstreamStatus, durationMs, "OK", null);
                 return builder.build();
@@ -707,6 +788,739 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 .setError(text)
                 .setErrorDetail(detail)
                 .build();
+    }
+
+    private static WorkspaceResult parseWorkspaceResult(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return WorkspaceResult.valueOf(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 资格回查裁决：null = 明确允许，调用方继续下发 Python；非 null 为
+     * 已成形的响应（明确拒绝走业务结果，其余一律失败关闭）。资格拒绝与
+     * 不可用都属于未发起下游 HTTP 的本地裁决，不写 sandbox_http 记录
+     * （与本地参数拒绝同一口径）。资格查询与 Python 侧创建之间的并发
+     * 删除由沙箱本地封口在同一状态锁内仲裁，网关不做第二重判断。
+     */
+    private AcquireWorkspaceResponse runEligibilityGate(String runId, String endpoint) {
+        CheckRunPersistentResourceEligibilityResponse response;
+        try {
+            response = runEligibilityService.checkEligibility(
+                    CheckRunPersistentResourceEligibilityRequest.newBuilder()
+                            .setRunId(runId)
+                            .build());
+        } catch (Exception e) {
+            // 资格服务不可达/超时：失败关闭，不下发。
+            log.warn("sandbox.acquireWorkspace.eligibilityUnavailable: runId={}, error={}",
+                    runId, e.getMessage());
+            return workspaceOpFailure(
+                    "acquireWorkspace rejected: run eligibility check unavailable",
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE,
+                    null, endpoint, 0, false)
+                    .toAcquireResponse();
+        }
+        RunPersistentResourceEligibility verdict = response == null
+                ? RunPersistentResourceEligibility.UNRECOGNIZED
+                : response.getEligibility();
+        switch (verdict) {
+            case RUN_PERSISTENT_RESOURCE_ELIGIBILITY_ALLOWED:
+                return null;
+            case RUN_PERSISTENT_RESOURCE_ELIGIBILITY_REFUSED:
+                // 明确拒绝：业务结果通道（WORKSPACE_RUN_INELIGIBLE），
+                // 不携带工作区，也不是传输/系统故障。
+                log.info("sandbox.acquireWorkspace.eligibilityRefused: runId={}", runId);
+                return AcquireWorkspaceResponse.newBuilder()
+                        .setWorkspaceResult(WorkspaceResult.WORKSPACE_RUN_INELIGIBLE)
+                        .build();
+            default:
+                // 暂不可用/空响应/未知枚举：失败关闭，不下发。
+                log.warn("sandbox.acquireWorkspace.eligibilityUndecided: runId={}, verdict={}",
+                        runId, verdict);
+                return workspaceOpFailure(
+                        "acquireWorkspace rejected: run eligibility temporarily unavailable",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE,
+                        null, endpoint, 0, false)
+                        .toAcquireResponse();
+        }
+    }
+
+    /**
+     * 取得或创建工作区：网关先回查该 Run 的持久资源资格，仅明确允许才
+     * 下发 Python。业务结果（取得成功/身份冲突/部署错配/资格拒绝）经
+     * workspace 与 workspaceResult 字段原样保留；请求缺陷与传输/系统
+     * 故障经 error + errorDetail 分类返回，绝不借开关布尔值绕过或退回
+     * 临时盘。
+     */
+    public AcquireWorkspaceResponse acquireWorkspace(AcquireWorkspaceRequest request) {
+        String endpoint = sandboxUrl + "/workspaces/acquire";
+        String defect = acquireRequestDefect(request);
+        if (defect != null) {
+            // Local rejection: no downstream request was made, so no record.
+            return workspaceOpFailure("acquireWorkspace rejected: " + defect,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                    null, endpoint, 0, false)
+                    .toAcquireResponse();
+        }
+        AcquireWorkspaceResponse eligibilityVerdict =
+                runEligibilityGate(request.getRunId().trim(), endpoint);
+        if (eligibilityVerdict != null) {
+            return eligibilityVerdict;
+        }
+        HttpAcquireWorkspaceRequest body = new HttpAcquireWorkspaceRequest();
+        body.setRun_id(request.getRunId().trim());
+        if (request.hasKnownWorkspaceId()) {
+            body.setKnown_workspace_id(request.getKnownWorkspaceId().trim());
+            body.setKnown_workspace_generation(request.getKnownWorkspaceGeneration().trim());
+        }
+        long startMs = System.currentTimeMillis();
+        try {
+            ResponseEntity<HttpAcquireWorkspaceResponse> response = longHttpClient.postForEntity(
+                    endpoint, body, HttpAcquireWorkspaceResponse.class);
+            int httpStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - startMs;
+            HttpAcquireWorkspaceResponse result = response.getBody();
+            if (httpStatus != 200 || result == null) {
+                // workspaceOpFailure is the single telemetry emission site for
+                // workspace-op failures that made a real HTTP call; emitting
+                // here as well would write two error records per request.
+                return workspaceOpFailure("Invalid acquire response from sandbox",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toAcquireResponse();
+            }
+            String workspaceResultRaw = result.getWorkspace_result();
+            boolean hasVerdictRaw = workspaceResultRaw != null && !workspaceResultRaw.isBlank();
+            WorkspaceResult verdict = parseWorkspaceResult(workspaceResultRaw);
+            boolean hasWorkspace = result.getWorkspace() != null;
+            // Exactly ONE business form is legal on a 200 body: a workspace
+            // (any durable status, the honest truth) XOR a machine refusal.
+            // Both at once, an unknown verdict value, or neither form is a
+            // corrupted downstream protocol: fail closed with a system
+            // failure instead of silently dropping one side of the body.
+            String malformedReason = null;
+            if (hasVerdictRaw && verdict == null) {
+                malformedReason = "unknown workspaceResult value: " + workspaceResultRaw;
+            } else if (hasWorkspace && verdict != null) {
+                malformedReason = "both workspace and workspaceResult present";
+            } else if (!hasWorkspace && !hasVerdictRaw) {
+                malformedReason = "no workspace and no workspaceResult";
+            }
+            if (malformedReason != null) {
+                log.warn("sandbox.acquireWorkspace.malformedResponse: reason={}, httpStatus={}",
+                        malformedReason, httpStatus);
+                // Same single-emission contract: workspaceOpFailure writes the
+                // one ERROR record for this request.
+                return workspaceOpFailure("Malformed acquire response from sandbox (" + malformedReason + ")",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toAcquireResponse();
+            }
+            emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "OK", null);
+            AcquireWorkspaceResponse.Builder mapped = AcquireWorkspaceResponse.newBuilder();
+            if (hasWorkspace) {
+                WorkspaceInfo.Builder info = WorkspaceInfo.newBuilder()
+                        .setWorkspaceId(nullSafe(result.getWorkspace().getWorkspace_id()))
+                        .setWorkspaceGeneration(nullSafe(result.getWorkspace().getWorkspace_generation()))
+                        .setStatus(nullSafe(result.getWorkspace().getStatus()))
+                        .setOwnedByRunId(nullSafe(result.getWorkspace().getOwned_by_run_id()));
+                mapped.setWorkspace(info);
+            } else {
+                mapped.setWorkspaceResult(verdict);
+            }
+            log.info("sandbox.acquireWorkspace: runId={}, workspaceId={}, result={}",
+                    request.getRunId(),
+                    result.getWorkspace() == null ? null : result.getWorkspace().getWorkspace_id(),
+                    verdict == null ? "ACQUIRED" : verdict);
+            return mapped.build();
+        } catch (HttpClientErrorException.BadRequest | HttpClientErrorException.UnprocessableEntity e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT, "acquireWorkspace")
+                    .toAcquireResponse();
+        } catch (HttpClientErrorException.Conflict e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_CONFLICT, "acquireWorkspace")
+                    .toAcquireResponse();
+        } catch (HttpClientErrorException e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 404
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED, "acquireWorkspace")
+                    .toAcquireResponse();
+        } catch (HttpServerErrorException e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 503
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE, "acquireWorkspace")
+                    .toAcquireResponse();
+        } catch (ResourceAccessException e) {
+            SandboxErrorDetail detail = buildTransportErrorDetail(e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "ACQUIRE_" + detail.getCategory());
+            return acquireFailure(nonBlankOr(e, "acquireWorkspace transport failure"), detail);
+        } catch (Exception e) {
+            log.error("sandbox.acquireWorkspace.failed: error={}", e.getMessage(), e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "ACQUIRE_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+            return acquireFailure(nonBlankOr(e, "acquireWorkspace failed"),
+                    SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                            .build());
+        }
+    }
+
+    /**
+     * 显式删除（测试/运维入口）：两阶段转发。deleted=true 仅在
+     * 删盘确认与不可复活审计落库后；失败保留 retryableFailure=true 的可
+     * 重试语义。删除中的并发取得竞争由沙箱侧状态锁仲裁，网关不重试。
+     */
+    public DeleteWorkspaceResponse deleteWorkspace(DeleteWorkspaceRequest request) {
+        String endpoint = sandboxUrl + "/workspaces/delete";
+        if (request == null || request.getWorkspaceId() == null || request.getWorkspaceId().isBlank()
+                || request.getIdempotencyKey() == null || request.getIdempotencyKey().isBlank()) {
+            return workspaceOpFailure("deleteWorkspace rejected: workspaceId and idempotencyKey are required",
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                    null, endpoint, 0, false)
+                    .toDeleteResponse();
+        }
+        HttpDeleteWorkspaceRequest body = new HttpDeleteWorkspaceRequest();
+        body.setWorkspace_id(request.getWorkspaceId().trim());
+        body.setIdempotency_key(request.getIdempotencyKey().trim());
+        if (request.hasExpectedLastActiveAt()) {
+            body.setExpected_last_active_at(request.getExpectedLastActiveAt().trim());
+        }
+        long startMs = System.currentTimeMillis();
+        try {
+            ResponseEntity<HttpDeleteWorkspaceResponse> response = longHttpClient.postForEntity(
+                    endpoint, body, HttpDeleteWorkspaceResponse.class);
+            int httpStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - startMs;
+            HttpDeleteWorkspaceResponse result = response.getBody();
+            if (httpStatus != 200 || result == null) {
+                emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "ERROR",
+                        "DELETE_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+                return deleteFailure("Invalid delete response from sandbox",
+                        SandboxErrorDetail.newBuilder()
+                                .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                                .setDownstreamHttpStatus(httpStatus)
+                                .build());
+            }
+            boolean deleted = Boolean.TRUE.equals(result.getDeleted());
+            boolean retryable = Boolean.TRUE.equals(result.getRetryable_failure());
+            // 核验顺序：outcome 有值时先按机器三分类核验——
+            // REVOKED_NEW_ACTIVITY 对应 deleted=false + retryableFailure=
+            // false，是合法形态，不得落入旧互斥布尔校验；两布尔还必须与
+            // 分类的对应关系一致。缺 outcome（旧部署）才回落互斥布尔校验：
+            // 两布尔相等即判响应损坏，失败关闭。
+            String outcomeRaw = result.getOutcome();
+            WorkspaceDeleteOutcome outcome = null;
+            String malformedReason = null;
+            if (outcomeRaw != null && !outcomeRaw.isBlank()) {
+                try {
+                    outcome = WorkspaceDeleteOutcome.valueOf(outcomeRaw.trim());
+                } catch (IllegalArgumentException e) {
+                    malformedReason = "unknown outcome value: " + outcomeRaw;
+                }
+                if (outcome == WorkspaceDeleteOutcome.WORKSPACE_DELETE_OUTCOME_UNSPECIFIED) {
+                    malformedReason = "unspecified outcome value";
+                }
+                if (malformedReason == null) {
+                    boolean expectDeleted =
+                            outcome == WorkspaceDeleteOutcome.WORKSPACE_DELETE_DELETED;
+                    boolean expectRetryable =
+                            outcome == WorkspaceDeleteOutcome.WORKSPACE_DELETE_TEMPORARILY_UNAVAILABLE;
+                    if (deleted != expectDeleted || retryable != expectRetryable) {
+                        malformedReason = "outcome " + outcomeRaw
+                                + " inconsistent with deleted=" + deleted
+                                + ", retryableFailure=" + retryable;
+                    }
+                }
+            } else if (deleted == retryable) {
+                malformedReason = "deleted and retryableFailure must differ";
+            }
+            if (malformedReason != null) {
+                log.warn("sandbox.deleteWorkspace.malformedResponse: reason={}, httpStatus={}",
+                        malformedReason, httpStatus);
+                emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "ERROR",
+                        "DELETE_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+                return deleteFailure("Malformed delete response from sandbox (" + malformedReason + ")",
+                        SandboxErrorDetail.newBuilder()
+                                .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                                .setDownstreamHttpStatus(httpStatus)
+                                .build());
+            }
+            emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "OK", null);
+            log.info("sandbox.deleteWorkspace: workspaceId={}, deleted={}, retryableFailure={}, outcome={}",
+                    request.getWorkspaceId(), deleted, retryable, outcome);
+            DeleteWorkspaceResponse.Builder mapped = DeleteWorkspaceResponse.newBuilder()
+                    .setDeleted(deleted)
+                    .setRetryableFailure(retryable);
+            if (outcome != null) {
+                mapped.setOutcome(outcome);
+            }
+            return mapped.build();
+        } catch (HttpClientErrorException.NotFound e) {
+            // Business not-found from the sandbox (unknown workspace id).
+            return deleteFailure("workspace not found",
+                    SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND)
+                            .setDownstreamHttpStatus(404)
+                            .build());
+        } catch (HttpClientErrorException.BadRequest | HttpClientErrorException.UnprocessableEntity e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT, "deleteWorkspace")
+                    .toDeleteResponse();
+        } catch (HttpClientErrorException.Conflict e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_CONFLICT, "deleteWorkspace")
+                    .toDeleteResponse();
+        } catch (HttpClientErrorException e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED, "deleteWorkspace")
+                    .toDeleteResponse();
+        } catch (HttpServerErrorException e) {
+            return workspaceOpHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 503
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE, "deleteWorkspace")
+                    .toDeleteResponse();
+        } catch (ResourceAccessException e) {
+            SandboxErrorDetail detail = buildTransportErrorDetail(e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "DELETE_" + detail.getCategory());
+            return deleteFailure(nonBlankOr(e, "deleteWorkspace transport failure"), detail);
+        } catch (Exception e) {
+            log.error("sandbox.deleteWorkspace.failed: error={}", e.getMessage(), e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "DELETE_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+            return deleteFailure(nonBlankOr(e, "deleteWorkspace failed"),
+                    SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                            .build());
+        }
+    }
+
+    /**
+     * 幂等封口：清理协调器在删除前先把清理意图落盘。200 应答的合法形态
+     * 只有一种：sealed=true（workspace 按 Run 是否有盘可选携带）；其余
+     * 一律按损坏应答失败关闭。
+     */
+    @Override
+    public SealWorkspaceResponse sealWorkspace(SealWorkspaceRequest request) {
+        String endpoint = sandboxUrl + "/workspaces/seal";
+        if (request == null || request.getRunId() == null || request.getRunId().isBlank()
+                || request.getIdempotencyKey() == null || request.getIdempotencyKey().isBlank()) {
+            return expiryOpFailure("sealWorkspace rejected: runId and idempotencyKey are required",
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                    null, endpoint, 0, false)
+                    .toSealResponse();
+        }
+        HttpSealWorkspaceRequest body = new HttpSealWorkspaceRequest();
+        body.setRun_id(request.getRunId().trim());
+        body.setIdempotency_key(request.getIdempotencyKey().trim());
+        long startMs = System.currentTimeMillis();
+        try {
+            ResponseEntity<HttpSealWorkspaceResponse> response = shortHttpClient.postForEntity(
+                    endpoint, body, HttpSealWorkspaceResponse.class);
+            int httpStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - startMs;
+            HttpSealWorkspaceResponse result = response.getBody();
+            if (httpStatus != 200 || result == null) {
+                return expiryOpFailure("Invalid seal response from sandbox",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toSealResponse();
+            }
+            if (!Boolean.TRUE.equals(result.getSealed())) {
+                log.warn("sandbox.sealWorkspace.malformedResponse: sealed={}, httpStatus={}",
+                        result.getSealed(), httpStatus);
+                return expiryOpFailure("Malformed seal response from sandbox (sealed must be true)",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toSealResponse();
+            }
+            emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "OK", null);
+            SealWorkspaceResponse.Builder mapped = SealWorkspaceResponse.newBuilder()
+                    .setSealed(true);
+            if (result.getWorkspace() != null) {
+                mapped.setWorkspace(mapWorkspaceInfo(result.getWorkspace()));
+            }
+            log.info("sandbox.sealWorkspace: runId={}, workspaceId={}",
+                    request.getRunId(),
+                    result.getWorkspace() == null ? null : result.getWorkspace().getWorkspace_id());
+            return mapped.build();
+        } catch (HttpClientErrorException.BadRequest | HttpClientErrorException.UnprocessableEntity e) {
+            return expiryOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT, "sealWorkspace")
+                    .toSealResponse();
+        } catch (HttpClientErrorException e) {
+            return expiryOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED, "sealWorkspace")
+                    .toSealResponse();
+        } catch (HttpServerErrorException e) {
+            return expiryOpHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 503
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE, "sealWorkspace")
+                    .toSealResponse();
+        } catch (ResourceAccessException e) {
+            SandboxErrorDetail detail = buildTransportErrorDetail(e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "SEAL_" + detail.getCategory());
+            return SealWorkspaceResponse.newBuilder()
+                    .setError(nonBlankOr(e, "sealWorkspace transport failure"))
+                    .setErrorDetail(detail)
+                    .build();
+        } catch (Exception e) {
+            log.error("sandbox.sealWorkspace.failed: error={}", e.getMessage(), e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "SEAL_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+            return SealWorkspaceResponse.newBuilder()
+                    .setError(nonBlankOr(e, "sealWorkspace failed"))
+                    .setErrorDetail(SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                            .build())
+                    .build();
+        }
+    }
+
+    /**
+     * 按 Run 只读查盘的三态转发。合法形态：outcome 必须是
+     * NOT_FOUND/FOUND/FOUND_DELETED 之一；NOT_FOUND 不得携带 workspace；
+     * FOUND_DELETED 必带 workspace（旧身份核对）；FOUND 可带可不带
+     * （无盘封口即不带）。其余一律失败关闭，绝不让调用方把损坏应答读成
+     * 「查无此盘」。
+     */
+    @Override
+    public QueryWorkspaceResponse queryWorkspace(QueryWorkspaceRequest request) {
+        String endpoint = sandboxUrl + "/workspaces/query";
+        if (request == null || request.getRunId() == null || request.getRunId().isBlank()) {
+            return expiryOpFailure("queryWorkspace rejected: runId is required",
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                    null, endpoint, 0, false)
+                    .toQueryResponse();
+        }
+        HttpQueryWorkspaceRequest body = new HttpQueryWorkspaceRequest();
+        body.setRun_id(request.getRunId().trim());
+        long startMs = System.currentTimeMillis();
+        try {
+            ResponseEntity<HttpQueryWorkspaceResponse> response = shortHttpClient.postForEntity(
+                    endpoint, body, HttpQueryWorkspaceResponse.class);
+            int httpStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - startMs;
+            HttpQueryWorkspaceResponse result = response.getBody();
+            if (httpStatus != 200 || result == null) {
+                return expiryOpFailure("Invalid query response from sandbox",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toQueryResponse();
+            }
+            String outcomeRaw = result.getOutcome();
+            WorkspaceQueryOutcome outcome = null;
+            String malformedReason = null;
+            if (outcomeRaw == null || outcomeRaw.isBlank()) {
+                malformedReason = "missing outcome";
+            } else {
+                try {
+                    outcome = WorkspaceQueryOutcome.valueOf(outcomeRaw.trim());
+                } catch (IllegalArgumentException e) {
+                    malformedReason = "unknown outcome value: " + outcomeRaw;
+                }
+                if (outcome == WorkspaceQueryOutcome.WORKSPACE_QUERY_OUTCOME_UNSPECIFIED) {
+                    malformedReason = "unspecified outcome value";
+                }
+            }
+            boolean hasWorkspace = result.getWorkspace() != null;
+            if (malformedReason == null) {
+                if (outcome == WorkspaceQueryOutcome.WORKSPACE_QUERY_NOT_FOUND && hasWorkspace) {
+                    malformedReason = "NOT_FOUND must not carry workspace";
+                } else if (outcome == WorkspaceQueryOutcome.WORKSPACE_QUERY_FOUND_DELETED
+                        && !hasWorkspace) {
+                    malformedReason = "FOUND_DELETED must carry workspace";
+                }
+            }
+            if (malformedReason != null) {
+                log.warn("sandbox.queryWorkspace.malformedResponse: reason={}, httpStatus={}",
+                        malformedReason, httpStatus);
+                return expiryOpFailure("Malformed query response from sandbox (" + malformedReason + ")",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toQueryResponse();
+            }
+            emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "OK", null);
+            QueryWorkspaceResponse.Builder mapped = QueryWorkspaceResponse.newBuilder()
+                    .setOutcome(outcome);
+            if (hasWorkspace) {
+                mapped.setWorkspace(mapWorkspaceInfo(result.getWorkspace()));
+            }
+            if (result.getLast_active_at() != null && !result.getLast_active_at().isBlank()) {
+                mapped.setLastActiveAt(result.getLast_active_at());
+            }
+            if (result.getDeleted_at() != null && !result.getDeleted_at().isBlank()) {
+                mapped.setDeletedAt(result.getDeleted_at());
+            }
+            log.info("sandbox.queryWorkspace: runId={}, outcome={}, hasWorkspace={}",
+                    request.getRunId(), outcome, hasWorkspace);
+            return mapped.build();
+        } catch (HttpClientErrorException.BadRequest | HttpClientErrorException.UnprocessableEntity e) {
+            return expiryOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT, "queryWorkspace")
+                    .toQueryResponse();
+        } catch (HttpClientErrorException e) {
+            return expiryOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED, "queryWorkspace")
+                    .toQueryResponse();
+        } catch (HttpServerErrorException e) {
+            return expiryOpHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 503
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE, "queryWorkspace")
+                    .toQueryResponse();
+        } catch (ResourceAccessException e) {
+            SandboxErrorDetail detail = buildTransportErrorDetail(e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "QUERY_" + detail.getCategory());
+            return QueryWorkspaceResponse.newBuilder()
+                    .setError(nonBlankOr(e, "queryWorkspace transport failure"))
+                    .setErrorDetail(detail)
+                    .build();
+        } catch (Exception e) {
+            log.error("sandbox.queryWorkspace.failed: error={}", e.getMessage(), e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "QUERY_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+            return QueryWorkspaceResponse.newBuilder()
+                    .setError(nonBlankOr(e, "queryWorkspace failed"))
+                    .setErrorDetail(SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                            .build())
+                    .build();
+        }
+    }
+
+    /**
+     * 到期候选分页转发：本地先校验 pageSize>0（服务端只承诺封顶，不替
+     * 调用方修正非正值）；页内行与继续令牌原样透传。
+     */
+    @Override
+    public ListWorkspaceExpiryCandidatesResponse listWorkspaceExpiryCandidates(
+            ListWorkspaceExpiryCandidatesRequest request) {
+        String endpoint = sandboxUrl + "/workspaces/expiry-candidates";
+        if (request == null || request.getPageSize() <= 0) {
+            return expiryOpFailure("listWorkspaceExpiryCandidates rejected: pageSize must be positive",
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                    null, endpoint, 0, false)
+                    .toCandidatesResponse();
+        }
+        HttpExpiryCandidatesRequest body = new HttpExpiryCandidatesRequest();
+        body.setPage_size(request.getPageSize());
+        body.setPage_token(request.getPageToken() == null ? "" : request.getPageToken());
+        long startMs = System.currentTimeMillis();
+        try {
+            ResponseEntity<HttpExpiryCandidatesResponse> response = shortHttpClient.postForEntity(
+                    endpoint, body, HttpExpiryCandidatesResponse.class);
+            int httpStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - startMs;
+            HttpExpiryCandidatesResponse result = response.getBody();
+            if (httpStatus != 200 || result == null) {
+                return expiryOpFailure("Invalid expiry-candidates response from sandbox",
+                        SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                        httpStatus, endpoint, durationMs, true)
+                        .toCandidatesResponse();
+            }
+            emitSandboxHttp("POST", endpoint, httpStatus, durationMs, "OK", null);
+            ListWorkspaceExpiryCandidatesResponse.Builder mapped =
+                    ListWorkspaceExpiryCandidatesResponse.newBuilder()
+                            .setNextPageToken(nullSafe(result.getNext_page_token()));
+            if (result.getCandidates() != null) {
+                for (HttpExpiryCandidate row : result.getCandidates()) {
+                    mapped.addCandidates(WorkspaceExpiryCandidate.newBuilder()
+                            .setRunId(nullSafe(row.getRun_id()))
+                            .setWorkspaceId(nullSafe(row.getWorkspace_id()))
+                            .setWorkspaceGeneration(nullSafe(row.getWorkspace_generation()))
+                            .setStatus(nullSafe(row.getStatus()))
+                            .setLastActiveAt(nullSafe(row.getLast_active_at())));
+                }
+            }
+            log.info("sandbox.listWorkspaceExpiryCandidates: pageSize={}, rows={}, hasNext={}",
+                    request.getPageSize(),
+                    result.getCandidates() == null ? 0 : result.getCandidates().size(),
+                    result.getNext_page_token() != null && !result.getNext_page_token().isBlank());
+            return mapped.build();
+        } catch (HttpClientErrorException.BadRequest | HttpClientErrorException.UnprocessableEntity e) {
+            return expiryOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                    "listWorkspaceExpiryCandidates")
+                    .toCandidatesResponse();
+        } catch (HttpClientErrorException e) {
+            return expiryOpHttpFailure(e, endpoint, startMs,
+                    SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                    "listWorkspaceExpiryCandidates")
+                    .toCandidatesResponse();
+        } catch (HttpServerErrorException e) {
+            return expiryOpHttpFailure(e, endpoint, startMs, e.getStatusCode().value() == 503
+                    ? SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE
+                    : SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE,
+                    "listWorkspaceExpiryCandidates")
+                    .toCandidatesResponse();
+        } catch (ResourceAccessException e) {
+            SandboxErrorDetail detail = buildTransportErrorDetail(e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "EXPIRY_CANDIDATES_" + detail.getCategory());
+            return ListWorkspaceExpiryCandidatesResponse.newBuilder()
+                    .setError(nonBlankOr(e, "listWorkspaceExpiryCandidates transport failure"))
+                    .setErrorDetail(detail)
+                    .build();
+        } catch (Exception e) {
+            log.error("sandbox.listWorkspaceExpiryCandidates.failed: error={}", e.getMessage(), e);
+            emitSandboxHttp("POST", endpoint, -1, System.currentTimeMillis() - startMs,
+                    "ERROR", "EXPIRY_CANDIDATES_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+            return ListWorkspaceExpiryCandidatesResponse.newBuilder()
+                    .setError(nonBlankOr(e, "listWorkspaceExpiryCandidates failed"))
+                    .setErrorDetail(SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                            .build())
+                    .build();
+        }
+    }
+
+    private static WorkspaceInfo mapWorkspaceInfo(HttpWorkspaceInfo info) {
+        return WorkspaceInfo.newBuilder()
+                .setWorkspaceId(nullSafe(info.getWorkspace_id()))
+                .setWorkspaceGeneration(nullSafe(info.getWorkspace_generation()))
+                .setStatus(nullSafe(info.getStatus()))
+                .setOwnedByRunId(nullSafe(info.getOwned_by_run_id()))
+                .build();
+    }
+
+    /** Shared failure carrier for the seal/query/expiry-candidates RPCs. */
+    private static final class ExpiryOpFailure {
+        final String error;
+        final SandboxErrorDetail detail;
+
+        ExpiryOpFailure(String error, SandboxErrorDetail detail) {
+            this.error = error;
+            this.detail = detail;
+        }
+
+        SealWorkspaceResponse toSealResponse() {
+            return SealWorkspaceResponse.newBuilder().setError(error).setErrorDetail(detail).build();
+        }
+
+        QueryWorkspaceResponse toQueryResponse() {
+            return QueryWorkspaceResponse.newBuilder().setError(error).setErrorDetail(detail).build();
+        }
+
+        ListWorkspaceExpiryCandidatesResponse toCandidatesResponse() {
+            return ListWorkspaceExpiryCandidatesResponse.newBuilder()
+                    .setError(error).setErrorDetail(detail).build();
+        }
+    }
+
+    /**
+     * Failure builder and the single telemetry emission site for the
+     * seal/query/expiry-candidates RPCs; same one-record contract as
+     * workspaceOpFailure (local rejections pass httpAttempted = false).
+     */
+    private ExpiryOpFailure expiryOpFailure(
+            String error, SandboxHttpErrorCategory category, Integer downstreamStatus,
+            String endpoint, long durationMs, boolean httpAttempted) {
+        if (httpAttempted) {
+            emitSandboxHttp("POST", endpoint, downstreamStatus == null ? -1 : downstreamStatus,
+                    durationMs, "ERROR", "WORKSPACE_EXPIRY_" + category);
+        }
+        SandboxErrorDetail.Builder detail = SandboxErrorDetail.newBuilder().setCategory(category);
+        if (downstreamStatus != null) {
+            detail.setDownstreamHttpStatus(downstreamStatus);
+        }
+        return new ExpiryOpFailure(error, detail.build());
+    }
+
+    private ExpiryOpFailure expiryOpHttpFailure(
+            RuntimeException e, String endpoint, long startMs,
+            SandboxHttpErrorCategory category, String opName) {
+        int status = extractDownstreamHttpStatus(e);
+        emitSandboxHttp("POST", endpoint, status, System.currentTimeMillis() - startMs,
+                "ERROR", opName.toUpperCase() + "_" + category);
+        return new ExpiryOpFailure(nonBlankOr(e, opName + " failed"),
+                SandboxErrorDetail.newBuilder().setCategory(category)
+                        .setDownstreamHttpStatus(status).build());
+    }
+
+    private static String acquireRequestDefect(AcquireWorkspaceRequest request) {
+        if (request == null || request.getRunId() == null || request.getRunId().isBlank()) {
+            return "runId is required";
+        }
+        boolean hasId = request.hasKnownWorkspaceId();
+        boolean hasGeneration = request.hasKnownWorkspaceGeneration();
+        if (hasId != hasGeneration) {
+            return "knownWorkspaceId and knownWorkspaceGeneration must be provided together or all absent";
+        }
+        return null;
+    }
+
+    /** Shared failure carrier for the two workspace RPCs (acquire/delete shapes). */
+    private static final class WorkspaceOpFailure {
+        final String error;
+        final SandboxErrorDetail detail;
+
+        WorkspaceOpFailure(String error, SandboxErrorDetail detail) {
+            this.error = error;
+            this.detail = detail;
+        }
+
+        AcquireWorkspaceResponse toAcquireResponse() {
+            return AcquireWorkspaceResponse.newBuilder().setError(error).setErrorDetail(detail).build();
+        }
+
+        DeleteWorkspaceResponse toDeleteResponse() {
+            return DeleteWorkspaceResponse.newBuilder().setError(error).setErrorDetail(detail).build();
+        }
+    }
+
+    private AcquireWorkspaceResponse acquireFailure(String error, SandboxErrorDetail detail) {
+        return AcquireWorkspaceResponse.newBuilder().setError(error).setErrorDetail(detail).build();
+    }
+
+    private DeleteWorkspaceResponse deleteFailure(String error, SandboxErrorDetail detail) {
+        return DeleteWorkspaceResponse.newBuilder().setError(error).setErrorDetail(detail).build();
+    }
+
+    /**
+     * Shared failure carrier builder and the single telemetry emission site
+     * for the two workspace RPCs. The one-record decision rests on whether a
+     * downstream HTTP request was actually attempted, never on the measured
+     * duration: a real exchange can complete inside one millisecond tick, so
+     * gating on {@code durationMs > 0} would silently drop the one record a
+     * fast failed call still owes. Local rejections pass
+     * {@code httpAttempted = false} and write no record.
+     */
+    WorkspaceOpFailure workspaceOpFailure(
+            String error, SandboxHttpErrorCategory category, Integer downstreamStatus,
+            String endpoint, long durationMs, boolean httpAttempted) {
+        if (httpAttempted) {
+            emitSandboxHttp("POST", endpoint, downstreamStatus == null ? -1 : downstreamStatus,
+                    durationMs, "ERROR", "WORKSPACE_" + category);
+        }
+        SandboxErrorDetail.Builder detail = SandboxErrorDetail.newBuilder().setCategory(category);
+        if (downstreamStatus != null) {
+            detail.setDownstreamHttpStatus(downstreamStatus);
+        }
+        return new WorkspaceOpFailure(error, detail.build());
+    }
+
+    private WorkspaceOpFailure workspaceOpHttpFailure(
+            RuntimeException e, String endpoint, long startMs,
+            SandboxHttpErrorCategory category, String opName) {
+        int status = extractDownstreamHttpStatus(e);
+        emitSandboxHttp("POST", endpoint, status, System.currentTimeMillis() - startMs,
+                "ERROR", opName.toUpperCase() + "_" + category);
+        return new WorkspaceOpFailure(nonBlankOr(e, opName + " failed"),
+                SandboxErrorDetail.newBuilder().setCategory(category)
+                        .setDownstreamHttpStatus(status).build());
+    }
+
+    private static String nullSafe(String value) {
+        return value == null ? "" : value;
     }
 
     @Override
@@ -1489,6 +2303,11 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String immutable_dataset_snapshot_digest;
         private String libraries_digest;
         private String sandbox_options_digest;
+        // Persistent-workspace identity group: forwarded as a whole or not at
+        // all (a partial group is rejected locally before HTTP).
+        private String run_id;
+        private String workspace_id;
+        private String workspace_generation;
     }
 
     @Data
@@ -1497,6 +2316,92 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String status;
         private Boolean existing;
         private String request_fingerprint;
+        // Present iff the workspace refused the create: no task was created,
+        // no admission was taken. Value vocabulary matches WorkspaceResult.
+        private String workspace_result;
+    }
+
+    @Data
+    static class HttpAcquireWorkspaceRequest {
+        private String run_id;
+        private String known_workspace_id;
+        private String known_workspace_generation;
+    }
+
+    @Data
+    static class HttpWorkspaceInfo {
+        private String workspace_id;
+        private String workspace_generation;
+        private String status;
+        private String owned_by_run_id;
+    }
+
+    @Data
+    static class HttpAcquireWorkspaceResponse {
+        private HttpWorkspaceInfo workspace;
+        private String workspace_result;
+    }
+
+    @Data
+    static class HttpDeleteWorkspaceRequest {
+        private String workspace_id;
+        private String idempotency_key;
+        // 自动条件删除携带的扫描观测时刻；手动路径不携带。
+        private String expected_last_active_at;
+    }
+
+    @Data
+    static class HttpDeleteWorkspaceResponse {
+        private Boolean deleted;
+        private Boolean retryable_failure;
+        // 机器三分类（WorkspaceDeleteOutcome 的字符串形）；旧部署缺失。
+        private String outcome;
+    }
+
+    @Data
+    static class HttpSealWorkspaceRequest {
+        private String run_id;
+        private String idempotency_key;
+    }
+
+    @Data
+    static class HttpSealWorkspaceResponse {
+        private Boolean sealed;
+        private HttpWorkspaceInfo workspace;
+    }
+
+    @Data
+    static class HttpQueryWorkspaceRequest {
+        private String run_id;
+    }
+
+    @Data
+    static class HttpQueryWorkspaceResponse {
+        private String outcome;
+        private HttpWorkspaceInfo workspace;
+        private String last_active_at;
+        private String deleted_at;
+    }
+
+    @Data
+    static class HttpExpiryCandidatesRequest {
+        private Integer page_size;
+        private String page_token;
+    }
+
+    @Data
+    static class HttpExpiryCandidate {
+        private String run_id;
+        private String workspace_id;
+        private String workspace_generation;
+        private String status;
+        private String last_active_at;
+    }
+
+    @Data
+    static class HttpExpiryCandidatesResponse {
+        private List<HttpExpiryCandidate> candidates;
+        private String next_page_token;
     }
 
     @Data

@@ -21,6 +21,12 @@ class PythonSandboxToolsDescriptionRegressionTest {
                 "tool description 必须包含 paths_dataset.csv");
         assertTrue(desc.contains("path_manifest.csv"),
                 "tool description 必须包含 path_manifest.csv");
+        assertTrue(desc.contains("tabular JSON") && desc.contains("Parquet"),
+                "工具说明应覆盖登记数据的实际格式");
+        assertTrue(desc.contains("recordsPath") && desc.contains("Nested dictionaries/lists remain nested"),
+                "工具说明应解释JSON记录位置和嵌套结构");
+        assertFalse(desc.contains("df = pd.read_csv(path)"),
+                "数据路径示例不能把所有产物声明为CSV");
         assertTrue(desc.contains("resolveFinanceMethods"),
                 "tool description 必须提示可把金融问题原始表达交给 resolveFinanceMethods");
         assertTrue(desc.contains("unresolved boundaries") || desc.contains("未解决边界") || desc.contains("do not invent"),

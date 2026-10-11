@@ -247,6 +247,14 @@ class AgentRunMapperWorkflowRestartBindingTest {
     }
 
     @Test
+    void userFollowUpAndResumeCannotReopenRunAfterDeletionStarts() {
+        for (String id : List.of("admitFollowUpForDeployment", "resetForResume")) {
+            String sql = normalizedSql(statement(id).getBoundSql(dummyParameters(methodParams.get(id))));
+            assertThat(sql).as(id).contains("deletion_started_at IS NULL");
+        }
+    }
+
+    @Test
     void ordinaryPipelineWritesCompareExactSourceStatusWithoutDeploymentIdentity() {
         for (String id : List.of(
                 "updateStatus",

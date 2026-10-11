@@ -43,6 +43,19 @@ alphafrog:
           - /var/lib/alphafrog-beta/data/manifests:/data/manifests
           - /var/lib/alphafrog-beta/data/agent_artifacts:/data/agent_artifacts
           - /var/lib/alphafrog-beta/data/sandbox_tasks:/data/sandbox_tasks
+          # 持久工作区根目录（默认关闭；开启后同一 Run 的多次 Python 调用经此目录
+          # 共享文件）。宿主绝对路径，容器内挂载点与宿主路径逐字相同：沙箱服务经
+          # docker.sock 驱动宿主 Docker daemon 起任务容器，任务容器的 bind 源由
+          # 宿主 daemon 在宿主文件系统上解析，两侧不一致会让任务容器挂到另一个
+          # 自动新建的空目录，前一次调用写入的文件在下一次调用不可见。功能关闭也
+          # 保持挂载：开关只阻止为没有工作区的 Run 新建，已有工作区的旧 Run 在
+          # 开关关闭后仍需继续读写与删除。开启时 env 文件必须同时显式设置三项：
+          # AF_SANDBOX_PERSISTENT_WORKSPACE_ENABLED=true、
+          # AF_SANDBOX_PERSISTENT_WORKSPACE_ROOT=/var/lib/alphafrog-beta/data/persistent_workspaces
+          # （与本行路径逐字相同，且不得落在沙箱控制目录树内）、AF_DEPLOYMENT_ID=
+          # 本部署身份（非空；清扫与删除只处理本部署启动的任务容器，空值拒绝启动）。
+          # 另注意该开关与 AF_SANDBOX_POOL_ENABLED 预热池互斥，同真拒绝启动。
+          - /var/lib/alphafrog-beta/data/persistent_workspaces:/var/lib/alphafrog-beta/data/persistent_workspaces
           - /var/run/docker.sock:/var/run/docker.sock
       python-sandbox-gateway-service:
         env-file: /etc/alphafrog-beta/services/python-sandbox-gateway-service.env

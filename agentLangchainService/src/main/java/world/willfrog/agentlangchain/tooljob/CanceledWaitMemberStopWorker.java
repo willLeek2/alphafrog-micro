@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agent.platform.wait.WaitMemberStopStore;
 import world.willfrog.agent.platform.wait.WaitMemberStopTask;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
@@ -126,7 +127,7 @@ public class CanceledWaitMemberStopWorker {
                 || !stop.getGroupId().equals(member.getGroupId())
                 || (member.stateEnum() != WaitMemberState.CANCELED
                     && member.stateEnum() != WaitMemberState.LATE)
-                || !"executePython".equals(member.getToolName())) {
+                || DurableSandboxTool.fromToolName(member.getToolName()).isEmpty()) {
             block(stop, "wait_member_identity_mismatch");
             return;
         }

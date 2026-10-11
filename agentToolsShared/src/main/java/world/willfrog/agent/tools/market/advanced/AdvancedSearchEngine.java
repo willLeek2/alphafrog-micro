@@ -2,9 +2,7 @@ package world.willfrog.agent.tools.market.advanced;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
-import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeRequest;
@@ -48,7 +46,6 @@ public class AdvancedSearchEngine {
 
     private final DomesticIndexService domesticIndexService;
     private final DomesticListedAssetService domesticListedAssetService;
-    private final IndexWeightDao indexWeightDao;
     private final SwIndustryMemberDao swIndustryMemberDao;
 
     private List<String> upstreamErrors;
@@ -219,22 +216,27 @@ public class AdvancedSearchEngine {
     }
 
     private List<DomesticIndexWeightItem> queryIndexComponentWeights(String indexCode, AdvancedSearchCondition condition) {
+        DomesticIndexWeightByTsCodeAndDateRangeResponse response =
+                domesticIndexService.getDomesticIndexWeightByTsCodeAndDateRange(
+                        DomesticIndexWeightByTsCodeAndDateRangeRequest.newBuilder()
+                                .setTsCode(indexCode)
+                                .setStartDate(yyyymmddToMillis(condition.effectiveStartDate()))
+                                .setEndDate(yyyymmddToMillis(condition.effectiveEndDate()))
+                                .build());
+        List<DomesticIndexWeightItem> items = response.getItemsList();
         if (condition.getStartDateValue() == null && condition.getEndDateValue() == null) {
-            Long maxTradeDate = indexWeightDao.getMaxTradeDateByTsCode(indexCode, MIN_DATE_MS, MAX_DATE_MS);
-            if (maxTradeDate == null) {
+            if (items.isEmpty()) {
                 return List.of();
             }
-            return indexWeightDao.getIndexWeightsByTsCodeAndTradeDate(indexCode, maxTradeDate)
-                    .stream()
+            // 无日期条件只取整个指数最新公告期，不能把已经移出的旧成分股合入当前快照。
+            long maxTradeDate = items.stream().mapToLong(DomesticIndexWeightItem::getTradeDate).max().orElseThrow();
+            return items.stream()
+                    .filter(item -> item.getTradeDate() == maxTradeDate)
                     .map(this::toItem)
                     .toList();
         }
-        long startMs = yyyymmddToMillis(condition.effectiveStartDate());
-        long endMs = yyyymmddToMillis(condition.effectiveEndDate());
-        return indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(indexCode, startMs, endMs)
-                .stream()
-                .map(this::toItem)
-                .toList();
+        // 日期范围保留区间内出现过的全部成分股；先选每股最后一条，随后调用方才筛选权重。
+        return latestWeights(items, false);
     }
 
     private Map<String, AdvancedSearchResult> executeHasStockForIndices(AdvancedSearchCondition condition,
@@ -287,10 +289,12 @@ public class AdvancedSearchEngine {
         for (String stockCode : stockCodes) {
             List<DomesticIndexWeightItem> items;
             try {
-                items = indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange(stockCode, startMs, endMs)
-                        .stream()
-                        .map(this::toItem)
-                        .toList();
+                DomesticIndexWeightByConCodeAndDateRangeResponse response =
+                        domesticIndexService.getDomesticIndexWeightByConCodeAndDateRange(
+                                DomesticIndexWeightByConCodeAndDateRangeRequest.newBuilder()
+                                        .setConCode(stockCode).setStartDate(startMs).setEndDate(endMs).build());
+                // 每只股票先按指数选最后一条，避免较早匹配权重的记录覆盖最新不匹配的事实。
+                items = latestWeights(response.getItemsList(), true);
             } catch (Exception e) {
                 recordUpstreamError("has_stock query failed for " + stockCode, e);
                 continue;
@@ -508,13 +512,21 @@ public class AdvancedSearchEngine {
         upstreamErrors.add(detail);
     }
 
-    private DomesticIndexWeightItem toItem(IndexWeight pojo) {
-        return DomesticIndexWeightItem.newBuilder()
-                .setIndexCode(pojo.getIndexCode())
-                .setConCode(pojo.getConCode())
-                .setTradeDate(millisToYyyymmdd(pojo.getTradeDate()))
-                .setWeight(pojo.getWeight())
-                .build();
+    /** RPC 返回历史毫秒日期；按查询对象取最新记录后，保留高级查询原有的 YYYYMMDD 结果。 */
+    private List<DomesticIndexWeightItem> latestWeights(List<DomesticIndexWeightItem> items, boolean byIndex) {
+        Map<String, DomesticIndexWeightItem> latest = new LinkedHashMap<>();
+        for (DomesticIndexWeightItem item : items) {
+            String key = byIndex ? item.getIndexCode() : item.getConCode();
+            DomesticIndexWeightItem previous = latest.get(key);
+            if (previous == null || item.getTradeDate() > previous.getTradeDate()) {
+                latest.put(key, item);
+            }
+        }
+        return latest.values().stream().map(this::toItem).toList();
+    }
+
+    private DomesticIndexWeightItem toItem(DomesticIndexWeightItem item) {
+        return item.toBuilder().setTradeDate(millisToYyyymmdd(item.getTradeDate())).build();
     }
 
     private static long yyyymmddToMillis(long yyyymmdd) {

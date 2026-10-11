@@ -12,6 +12,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -1442,5 +1445,202 @@ class ToolJobAnchorMapperIntegrationTest {
 
         ToolJobCheckpointService svc2 = newServiceChain();
         assertThat(svc2.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void workspaceRefusalRequiresPreparingIdentityAndReleasedProof() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-refused", "call", 1);
+        DataAnalysisReservation preparing = new DataAnalysisReservation(
+                identity.reservationId(), identity, DataAnalysisResourceClass.STANDARD,
+                1, DataAnalysisReservationState.PREPARING, null,
+                java.time.Instant.parse("2026-09-29T00:00:00Z"));
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setRequestFingerprint("sha256:original");
+        anchor.setAnchorState("PREPARING");
+        anchor.setReservationJson(om.writeValueAsString(preparing));
+        insertRun("run-refused", "EXECUTING", anchor.toJson());
+
+        assertThat(mapper.recordWorkspaceRefusal("run-refused", identity.operationId(),
+                "sha256:wrong", null, true, null, null, "WORKSPACE_DIRTY")).isZero();
+        assertThat(mapper.recordWorkspaceRefusal("run-refused", identity.operationId(),
+                "sha256:original", null, true, null, null, "WORKSPACE_DIRTY")).isEqualTo(1);
+        assertThat(mapper.recordWorkspaceRefusal("run-refused", identity.operationId(),
+                "sha256:original", null, true, null, null, "WORKSPACE_DIRTY")).isZero();
+        ToolJobAnchor refused = ToolJobAnchor.fromJson(
+                mapper.findById("run-refused").getToolJobAnchorJson());
+        assertThat(refused.getAnchorState()).isEqualTo("WORKSPACE_REFUSED");
+        assertThat(refused.getWorkspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(refused.getTaskId()).isNull();
+        assertThat(mapper.completeWorkspaceRefusal("run-refused", identity.operationId(),
+                "sha256:original", "WORKSPACE_DIRTY")).isZero();
+
+        DataAnalysisReservation released = new DataAnalysisReservation(
+                preparing.reservationId(), preparing.identity(), preparing.resourceClass(),
+                preparing.capacityUnits(), DataAnalysisReservationState.RELEASED, null,
+                preparing.acquiredAt());
+        assertThat(mapper.recordWorkspaceRefusalReleased("run-refused", identity.operationId(),
+                "sha256:original", "WORKSPACE_DIRTY", om.writeValueAsString(released)))
+                .isEqualTo(1);
+        assertThat(mapper.completeWorkspaceRefusal("run-refused", identity.operationId(),
+                "sha256:original", "WORKSPACE_DELETED")).isZero();
+        assertThat(mapper.completeWorkspaceRefusal("run-refused", identity.operationId(),
+                "sha256:original", "WORKSPACE_DIRTY")).isEqualTo(1);
+        AgentRun completed = mapper.findById("run-refused");
+        assertThat(completed.getStatus()).isEqualTo(AgentRunStatus.FAILED);
+        assertThat(completed.getLastError()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(completed.getToolJobAnchorJson()).isEqualTo("{}");
+    }
+
+    @Test
+    void workspaceRefusalCannotReplaceCancellationOrAnAttachedTask() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-refusal-race", "call", 1);
+        DataAnalysisReservation preparing = new DataAnalysisReservation(
+                identity.reservationId(), identity, DataAnalysisResourceClass.STANDARD,
+                1, DataAnalysisReservationState.PREPARING, null,
+                java.time.Instant.parse("2026-09-29T00:00:00Z"));
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setRequestFingerprint("sha256:race");
+        anchor.setAnchorState("PREPARING");
+        anchor.setReservationJson(om.writeValueAsString(preparing));
+        insertRun("run-refusal-race", "EXECUTING", anchor.toJson());
+
+        assertThat(mapper.persistCancelDisposition("run-refusal-race",
+                AgentRunStatus.EXECUTING, identity.operationId())).isEqualTo(1);
+        assertThat(mapper.recordWorkspaceRefusal("run-refusal-race", identity.operationId(),
+                "sha256:race", null, true, null, null, "WORKSPACE_DIRTY")).isZero();
+        ToolJobAnchor canceled = ToolJobAnchor.fromJson(
+                mapper.findById("run-refusal-race").getToolJobAnchorJson());
+        assertThat(canceled.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(canceled.getAnchorState()).isEqualTo("PREPARING");
+
+        ToolJobAnchor attached = new ToolJobAnchor();
+        attached.setOperationId("run-refusal-attached:call:1");
+        attached.setRequestFingerprint("sha256:race");
+        attached.setAnchorState("ATTACHED");
+        attached.setTaskId("task-1");
+        insertRun("run-refusal-attached", "EXECUTING", attached.toJson());
+        assertThat(mapper.recordWorkspaceRefusal("run-refusal-attached",
+                attached.getOperationId(), "sha256:race", null, true, null, null,
+                "WORKSPACE_DIRTY")).isZero();
+    }
+
+    @Test
+    void workspaceRefusalHonorsDagLeaseAndTerminalRunRemainsDiscoverable() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-refusal-dag", "call", 1);
+        DataAnalysisReservation preparing = new DataAnalysisReservation(
+                identity.reservationId(), identity, DataAnalysisResourceClass.STANDARD,
+                1, DataAnalysisReservationState.PREPARING, null,
+                java.time.Instant.parse("2026-09-29T00:00:00Z"));
+        java.time.Instant lease = java.time.Instant.parse("2099-01-01T00:00:00Z");
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setRequestFingerprint("sha256:dag");
+        anchor.setAnchorState("PREPARING");
+        anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+        anchor.setAutoResume(false);
+        anchor.setBlockingOwnerId("owner-a");
+        anchor.setBlockingLeaseUntil(lease);
+        anchor.setReservationJson(om.writeValueAsString(preparing));
+        insertRun("run-refusal-dag", "EXECUTING", anchor.toJson());
+
+        assertThat(mapper.recordWorkspaceRefusal("run-refusal-dag", identity.operationId(),
+                "sha256:dag", "DAG_BLOCKING_NO_RESUME", false, "owner-a", null,
+                "WORKSPACE_DIRTY")).isZero();
+        assertThat(mapper.recordWorkspaceRefusal("run-refusal-dag", identity.operationId(),
+                "sha256:dag", "DAG_BLOCKING_NO_RESUME", false, "owner-a",
+                "2099-01-02T00:00:00Z", "WORKSPACE_DIRTY")).isZero();
+        assertThat(mapper.recordWorkspaceRefusal("run-refusal-dag", identity.operationId(),
+                "sha256:dag", "DAG_BLOCKING_NO_RESUME", false, "owner-a",
+                lease.toString(), "WORKSPACE_DIRTY")).isEqualTo(1);
+
+        assertThat(mapper.casUpdateStatus("run-refusal-dag", AgentRunStatus.CANCELED,
+                AgentRunStatus.EXECUTING)).isEqualTo(1);
+        updateLastError("run-refusal-dag", "cancel already won");
+        assertThat(mapper.listActiveToolJobAnchorsForDeployment(
+                DEPLOYMENT_ID, GENERATION_ID, 100))
+                .extracting(AgentRun::getId).contains("run-refusal-dag");
+        DataAnalysisReservation released = new DataAnalysisReservation(
+                preparing.reservationId(), preparing.identity(), preparing.resourceClass(),
+                preparing.capacityUnits(), DataAnalysisReservationState.RELEASED, null,
+                preparing.acquiredAt());
+        assertThat(mapper.recordWorkspaceRefusalReleased("run-refusal-dag", identity.operationId(),
+                "sha256:dag", "WORKSPACE_DIRTY", om.writeValueAsString(released)))
+                .isEqualTo(1);
+        assertThat(mapper.completeWorkspaceRefusal("run-refusal-dag", identity.operationId(),
+                "sha256:dag", "WORKSPACE_DIRTY")).isEqualTo(1);
+        AgentRun completed = mapper.findById("run-refusal-dag");
+        assertThat(completed.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        assertThat(completed.getLastError()).isEqualTo("cancel already won");
+    }
+
+    @Test
+    void workspaceRefusalCompletesActiveCancellationWithoutReplacingItsSnapshot() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-refusal-cancel", "call", 1);
+        DataAnalysisReservation released = new DataAnalysisReservation(
+                identity.reservationId(), identity, DataAnalysisResourceClass.STANDARD,
+                1, DataAnalysisReservationState.RELEASED, null,
+                java.time.Instant.parse("2026-09-29T00:00:00Z"));
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setRequestFingerprint("sha256:cancel");
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        anchor.setWorkspaceRefusalCode("WORKSPACE_DIRTY");
+        anchor.setRunDisposition("CANCELED");
+        anchor.setAutoResume(false);
+        anchor.setReservationJson(om.writeValueAsString(released));
+        insertRun("run-refusal-cancel", "EXECUTING", anchor.toJson());
+        updateLastError("run-refusal-cancel", "prior error");
+        try (Connection conn = dataSource().getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE alphafrog_agent_run SET snapshot_json = CAST(? AS jsonb) WHERE id = ?")) {
+            ps.setString(1, "{\"cancel_snapshot\":true}");
+            ps.setString(2, "run-refusal-cancel");
+            ps.executeUpdate();
+        }
+
+        assertThat(mapper.completeWorkspaceRefusal("run-refusal-cancel", identity.operationId(),
+                "sha256:cancel", "WORKSPACE_DIRTY")).isEqualTo(1);
+        AgentRun completed = mapper.findById("run-refusal-cancel");
+        assertThat(completed.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+        assertThat(completed.getLastError()).isEqualTo("prior error");
+        assertThat(completed.getSnapshotJson()).contains("cancel_snapshot");
+        assertThat(completed.getCompletedAt()).isNotNull();
+        assertThat(completed.getToolJobAnchorJson()).isEqualTo("{}");
+    }
+
+    @Test
+    void workspaceRefusalClearsPausedRunWithoutTurningItIntoTerminalState() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-refusal-paused", "call", 1);
+        DataAnalysisReservation released = new DataAnalysisReservation(
+                identity.reservationId(), identity, DataAnalysisResourceClass.STANDARD,
+                1, DataAnalysisReservationState.RELEASED, null,
+                java.time.Instant.parse("2026-09-29T00:00:00Z"));
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setRequestFingerprint("sha256:paused");
+        anchor.setAnchorState("WORKSPACE_REFUSED");
+        anchor.setWorkspaceRefusalCode("WORKSPACE_DIRTY");
+        anchor.setReservationJson(om.writeValueAsString(released));
+        insertRun("run-refusal-paused", "WAITING", anchor.toJson());
+
+        assertThat(mapper.completeWorkspaceRefusal("run-refusal-paused", identity.operationId(),
+                "sha256:paused", "WORKSPACE_DIRTY")).isEqualTo(1);
+        AgentRun paused = mapper.findById("run-refusal-paused");
+        assertThat(paused.getStatus()).isEqualTo(AgentRunStatus.WAITING);
+        assertThat(paused.getLastError()).isEqualTo("WORKSPACE_DIRTY");
+        assertThat(paused.getCompletedAt()).isNull();
+        assertThat(paused.getToolJobAnchorJson()).isEqualTo("{}");
     }
 }

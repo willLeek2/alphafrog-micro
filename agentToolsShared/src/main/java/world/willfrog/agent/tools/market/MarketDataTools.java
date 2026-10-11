@@ -5,9 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.MessageOrBuilder;
 import com.google.protobuf.util.JsonFormat;
 import dev.langchain4j.agent.tool.Tool;
-import org.apache.dubbo.config.annotation.DubboReference;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
@@ -22,7 +22,6 @@ import world.willfrog.agent.tools.market.advanced.AdvancedSearchDatasetWriter;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchEngine;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchException;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
-import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
@@ -89,19 +88,23 @@ public class MarketDataTools {
     /**
      * Dubbo 引用的股票服务，提供股票基础信息、日线、财务数据查询。
      */
-    @DubboReference
+    @Autowired
+    @Qualifier("marketDomesticStockService")
     private DomesticStockService domesticStockService;
 
     /** 基金服务，提供场外基金搜索、净值序列、ETF 份额规模查询。 */
-    @DubboReference
+    @Autowired
+    @Qualifier("marketDomesticFundService")
     private DomesticFundService domesticFundService;
 
-    /** 指数服务，提供指数基础信息、日线数据查询。 */
-    @DubboReference
+    /** 指数服务，提供指数基础信息、日线和成分权重查询。 */
+    @Autowired
+    @Qualifier("marketDomesticIndexService")
     private DomesticIndexService domesticIndexService;
 
     /** 场内资产服务，提供 ETF/股票/指数的统一日线查询、搜索、复权因子查询（含 MeiliSearch 索引）。 */
-    @DubboReference
+    @Autowired
+    @Qualifier("marketDomesticListedAssetService")
     private DomesticListedAssetService domesticListedAssetService;
 
     /**
@@ -135,9 +138,6 @@ public class MarketDataTools {
     /** JSON 序列化器，用于工具返回值的 JSON 编码和批量结果解析。 */
     private final ObjectMapper objectMapper;
 
-    /** 指数成分权重 DAO，advanced 搜索使用本地查询以支持日期单位转换与最新快照。 */
-    private final IndexWeightDao indexWeightDao;
-
     /** 申万行业成分 DAO，用于新工具 getStockSwIndustryInfo 及 advanced 行业成分日线拉取。 */
     private final SwIndustryMemberDao swIndustryMemberDao;
 
@@ -147,17 +147,7 @@ public class MarketDataTools {
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper) {
-        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null, null);
-    }
-
-    public MarketDataTools(DatasetWriter datasetWriter,
-                           DatasetRegistry datasetRegistry,
-                           ManifestWriter manifestWriter,
-                           AgentLlmLocalConfigLoader localConfigLoader,
-                           AgentLlmProperties llmProperties,
-                           ObjectMapper objectMapper,
-                           IndexWeightDao indexWeightDao) {
-        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, indexWeightDao, null);
+        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null);
     }
 
     @Autowired
@@ -167,7 +157,6 @@ public class MarketDataTools {
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper,
-                           IndexWeightDao indexWeightDao,
                            SwIndustryMemberDao swIndustryMemberDao) {
         this.datasetWriter = datasetWriter;
         this.datasetRegistry = datasetRegistry;
@@ -175,7 +164,6 @@ public class MarketDataTools {
         this.localConfigLoader = localConfigLoader;
         this.llmProperties = llmProperties;
         this.objectMapper = objectMapper;
-        this.indexWeightDao = indexWeightDao;
         this.swIndustryMemberDao = swIndustryMemberDao;
     }
 
@@ -715,9 +703,6 @@ public class MarketDataTools {
             return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
                     Map.of("priceMode", nvl(priceMode)));
         }
-        if (indexWeightDao == null || swIndustryMemberDao == null) {
-            return serviceUnavailable("getExchangeAssetDaily", "Advanced daily fetch DAOs are not available");
-        }
         try {
             AdvancedSearchRequest request = AdvancedSearchRequest.from("getExchangeAssetDaily", advancedPayload, objectMapper);
             if (!"stock".equals(request.getAssetType())) {
@@ -734,10 +719,16 @@ public class MarketDataTools {
                     throw new AdvancedSearchException("INVALID_ARGUMENT",
                             "Unsupported daily-fetch condition type: " + condition.getType());
                 }
+                if ("index_component".equals(condition.getType()) && domesticIndexService == null) {
+                    return serviceUnavailable("getExchangeAssetDaily", "Index weight service is not available");
+                }
+                if (!"index_component".equals(condition.getType()) && swIndustryMemberDao == null) {
+                    return serviceUnavailable("getExchangeAssetDaily", "SW industry member DAO is not available");
+                }
             }
 
             AdvancedSearchEngine engine = new AdvancedSearchEngine(
-                    domesticIndexService, domesticListedAssetService, indexWeightDao, swIndustryMemberDao);
+                    domesticIndexService, domesticListedAssetService, swIndustryMemberDao);
             int maxCodes = resolveMaxParallelQueriesInAdvancedMode();
             List<String> stockCodes = engine.resolveStockCodes(request, maxCodes);
             List<String> upstreamErrors = engine.getUpstreamErrors();
@@ -1643,7 +1634,7 @@ public class MarketDataTools {
             if ("searchIndex".equals(toolName) && request.getAssetType() != null && !request.getAssetType().isBlank()) {
                 log.info("searchIndex advanced ignores unexpected asset_type={}", request.getAssetType());
             }
-            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, indexWeightDao, swIndustryMemberDao);
+            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, swIndustryMemberDao);
             Map<String, Object> dataset = engine.execute(request, resolveMaxParallelQueriesInAdvancedMode());
             String upstreamError = dataset.get("upstream_error") instanceof String s ? s : null;
             String emptyReason = dataset.get("empty_reason") instanceof String s ? s : null;
@@ -2481,7 +2472,7 @@ public class MarketDataTools {
      * 将 advanced 日线拉取结果写入 dataset 并注册到 registry，返回 dataset_id。
      *
      * <p>dataset kind 使用 {@code stock_daily_advanced}，与单股 {@code stock_daily} 区分。
-     * 内部使用稳定的 group identity（{@code group-<digest>}）作为 writer 的 tsCode 和
+     * 内部使用稳定的 group identity（{@code group_<digest>}）作为 writer 的 tsCode 和
      * registry 的查询 key，避免不同查询条件/成员集合意外共享同一路径。返回的
      * {@code dataset_id} 由 {@link DatasetWriter} 生成（格式含 runId 前缀和 UUID），
      * 与内部 group identity 是不同概念。</p>
@@ -2550,7 +2541,7 @@ public class MarketDataTools {
 
     /**
      * 对完整 canonicalQuery + 去重排序后的 stockCodes 做 SHA-256 digest，生成稳定 identity。
-     * 输出格式：{@code group-<前16位hex>}，长度受控，适合作为 writer tsCode 和 registry 查询 key。
+     * 输出格式：{@code group_<前16位hex>}，只使用写盘允许的字符，保证 writer 与 registry 的路径身份一致。
      *
      * <p>canonicalQuery 使用 ObjectMapper 递归确定性序列化（map 所有层级 key 排序、
      * list 保序、scalar 按 JSON 编码），确保嵌套结构的变化也能反映到 digest 中。</p>
@@ -2577,11 +2568,11 @@ public class MarketDataTools {
             for (int i = 0; i < Math.min(8, hashed.length); i++) {
                 sb.append(String.format("%02x", hashed[i]));
             }
-            return "group-" + sb;
+            return "group_" + sb;
         } catch (Exception e) {
-            // fallback: 条件摘要 + 代码数
+            // 摘要降级时也只使用写盘允许的字符，避免负号导致登记路径与产物不一致。
             String fallback = summarizeAdvancedQuery(canonicalQuery) + "-" + (stockCodes == null ? 0 : stockCodes.size());
-            return "group-" + fallback.hashCode();
+            return "group_" + Integer.toUnsignedString(fallback.hashCode(), 16);
         }
     }
 
