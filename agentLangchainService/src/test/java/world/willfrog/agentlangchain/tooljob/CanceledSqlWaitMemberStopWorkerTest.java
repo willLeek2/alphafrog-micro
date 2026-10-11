@@ -19,6 +19,7 @@ import world.willfrog.agent.tools.python.PythonSandboxJobRunnerAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
@@ -70,7 +71,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         PlatformTransactionManager transactions = mock(PlatformTransactionManager.class);
         when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
         worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox, settlement, json, transactions,
-                ownership, 2, 120, 5);
+                ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
         member = new WaitMember(); member.setId(41L); member.setGroupId(7L); member.setRunId(RUN);
         member.setMemberIdentity("query-member"); member.setToolCallId("raw-model-call");
         member.setToolName("executeQuery"); member.setExternalOperationId(operation.operationId()); member.setState("CANCELED");

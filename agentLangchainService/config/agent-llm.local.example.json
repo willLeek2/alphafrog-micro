@@ -192,6 +192,9 @@
       "memberReceiverBackoffMaxMs": 15000,
       "memberReceiverMaxBackoffStep": 6
     },
+    "observabilityEvents": {
+      "enabled": false
+    },
     "resume": {
       "interruptedTtlDays": 7
     },

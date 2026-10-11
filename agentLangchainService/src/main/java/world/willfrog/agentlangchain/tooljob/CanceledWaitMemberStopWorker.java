@@ -7,6 +7,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import world.willfrog.agent.platform.observability.ObservabilityEvents;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
@@ -15,6 +16,7 @@ import world.willfrog.agent.platform.wait.WaitMemberStopStore;
 import world.willfrog.agent.platform.wait.WaitMemberStopTask;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.dataanalysis.DurableSandboxTool;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
@@ -40,6 +42,8 @@ import java.util.UUID;
 public class CanceledWaitMemberStopWorker {
     private final WaitMemberStopStore stops;
     private final RunOwnershipGateway ownership;
+    /** 只用于事件里的根运行编号：已受理的 Run 内存里带着根树身份。 */
+    private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final WaitGroupStore groups;
     private final PythonSandboxService sandbox;
     private final WaitMemberSettlement settlement;
@@ -54,6 +58,7 @@ public class CanceledWaitMemberStopWorker {
                                         PythonSandboxService sandbox, WaitMemberSettlement settlement,
                                         ObjectMapper objectMapper, PlatformTransactionManager transactionManager,
                                         RunOwnershipGateway ownership,
+                                        DualPoolRunAdmissionRegistry admissionRegistry,
                                         @Value("${agent.langchain.wait-member.stop.batch-size:16}") int batchSize,
                                         @Value("${agent.langchain.wait-member.stop.lease-seconds:120}") long leaseSeconds,
                                         @Value("${agent.langchain.wait-member.stop.retry-seconds:5}") long retrySeconds) {
@@ -62,6 +67,7 @@ public class CanceledWaitMemberStopWorker {
         }
         this.stops = stops;
         this.ownership = ownership;
+        this.admissionRegistry = admissionRegistry;
         this.groups = groups;
         this.sandbox = sandbox;
         this.settlement = settlement;
@@ -229,7 +235,18 @@ public class CanceledWaitMemberStopWorker {
                 stop.getId(), stop.getClaimToken(), confirmedTaskId, confirmedStatus));
         if (!Boolean.TRUE.equals(confirmed)) {
             retry(stop, "terminal_evidence_not_committed");
+            return;
         }
+        // 合同里的停止确认事件：终态证据已经提交成功，这里报一次「外部停止已确认」。
+        // 逐次核对的结果不报——那是这条工作循环的热路径，报多了拖执行；关闭时是空操作。
+        ObservabilityEvents.externalStopChecked()
+                .rootRunId(admissionRegistry.rootRunIdIfAdmitted(stop.getRunId())
+                        .orElse(stop.getRunId()))
+                .operationId(stop.getOperationId())
+                .decision("confirmed")
+                .outcome("success")
+                .summary("外部停止已确认，终态证据已提交")
+                .emit();
     }
 
     private void retry(WaitMemberStopTask stop, String reason) {

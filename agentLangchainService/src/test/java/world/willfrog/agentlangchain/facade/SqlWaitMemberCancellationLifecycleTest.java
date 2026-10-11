@@ -29,6 +29,7 @@ import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
@@ -607,7 +608,7 @@ class SqlWaitMemberCancellationLifecycleTest {
             PlatformTransactionManager tx = mock(PlatformTransactionManager.class);
             when(tx.getTransaction(any())).thenAnswer(i -> new SimpleTransactionStatus());
             worker = new CanceledWaitMemberStopWorker(new MybatisWaitMemberStopStore(stopMapper), groups,
-                    sandbox, settlement, json, tx, ownership, 2, 120, 5);
+                    sandbox, settlement, json, tx, ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
             ToolJobFinalizer finalizer = new ToolJobFinalizer(anchors, cache, capacity,
                     resume, config, mock(FinanceRecordChannelProcessor.class),
                     mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
