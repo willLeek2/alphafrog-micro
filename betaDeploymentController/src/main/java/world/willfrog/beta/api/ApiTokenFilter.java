@@ -64,7 +64,8 @@ public class ApiTokenFilter extends OncePerRequestFilter {
         try {
             Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(tokenFile);
             if (permissions.stream().anyMatch(permission -> permission != PosixFilePermission.OWNER_READ
-                    && permission != PosixFilePermission.OWNER_WRITE)) return "";
+                    && permission != PosixFilePermission.OWNER_WRITE
+                    && permission != PosixFilePermission.GROUP_READ)) return "";
         } catch (UnsupportedOperationException ignored) { }
         String value = Files.readString(tokenFile);
         return value.length() >= 32 && value.equals(value.strip()) && value.chars().noneMatch(Character::isISOControl)

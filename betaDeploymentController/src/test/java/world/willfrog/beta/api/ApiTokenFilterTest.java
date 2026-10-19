@@ -44,6 +44,25 @@ class ApiTokenFilterTest {
     }
 
     @Test
+    void acceptsGroupReadTokenModeForStartupAndBearerRequests() throws Exception {
+        Path token = temporary.resolve("api-token");
+        String validToken = "t".repeat(48);
+        Files.writeString(token, validToken);
+        try { Files.setPosixFilePermissions(token, PosixFilePermissions.fromString("rw-r-----")); }
+        catch (UnsupportedOperationException ignored) { return; }
+        BetaControllerProperties properties = new BetaControllerProperties();
+        properties.setApiTokenFile(token);
+        ApiTokenFilter filter = new ApiTokenFilter(properties);
+        filter.verifyTokenAtStartup();
+
+        MockHttpServletRequest allowed = new MockHttpServletRequest("GET", "/internal/beta/routes/main/service");
+        allowed.addHeader("Authorization", "Bearer " + validToken);
+        MockHttpServletResponse allowedResponse = new MockHttpServletResponse();
+        filter.doFilter(allowed, allowedResponse, new MockFilterChain());
+        assertEquals(200, allowedResponse.getStatus());
+    }
+
+    @Test
     void runtimeTokenFailureNeverTurnsAnEmptyOrOldBearerIntoAuthorization() throws Exception {
         Path token = temporary.resolve("api-token");
         String validToken = "t".repeat(48);
