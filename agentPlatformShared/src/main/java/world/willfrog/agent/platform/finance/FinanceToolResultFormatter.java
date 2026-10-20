@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -165,6 +166,9 @@ public class FinanceToolResultFormatter {
         error.put("message", requiredText(failure.message(), "failure message"));
         error.put("retryable", failure.retryable());
         error.put("action", requiredText(failure.action(), "failure action"));
+        // 失败类别按码兜底解析（非故障结果族不写字段）；写在 failurePayload 内部，
+        // 使该字段与 stderr/stdout 一样参与 fitText/fits 的完整 JSON 长度控制。
+        ToolFailureCategory.putCategoryIfResolved(error, failure.code(), null);
 
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);

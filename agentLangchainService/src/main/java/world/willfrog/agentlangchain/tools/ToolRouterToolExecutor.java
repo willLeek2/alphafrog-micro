@@ -15,14 +15,18 @@ import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingExceptio
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
+import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 import world.willfrog.agentlangchain.execution.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -141,10 +145,13 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
 
             ToolThrottleResult throttleResult = toolThrottle.tryAcquire(request.name());
             if (!throttleResult.acquired() && throttleResult.failureReason() != null) {
-                // 限流等待超时或被打断时，只把错误文本返回给模型，不把整个 run 判为失败
+                // 限流等待超时或被打断时，返回带限流类别的标准失败信封（工具没有真正执行），
+                // 不把整个 run 判为失败
                 String reason = throttleResult.failureReason();
                 log.warn("Tool throttled: tool={} reason={}", request.name(), reason);
-                output = reason;
+                output = SandboxJobResponses.fail(objectMapper, request.name(),
+                        "TOOL_WEIGHT_LIMIT_EXCEEDED", reason, Map.of(),
+                        ToolFailureCategory.RATE_LIMITED_OR_CAPACITY);
                 success = false;
                 throttleRejected = true;
                 throttleLayer = "lc4j_semaphore";
@@ -177,8 +184,21 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
                     // 与上面同样是控制信号，不能变成工具失败文本，也不能写 TOOL_CALL_FINISHED；
                     // 事实由派发器写进成员行，终态结果由结果接收方按派发证明写入。
                     throw pending;
+                } catch (RunBudgetException budget) {
+                    // Run 级预算在派发前拒绝：工具没有执行，这不是工具故障。
+                    // 输出与 V2 成员渲染同款的结构化拒绝信封（dimension/used/limit 取自异常携带的
+                    // 捕获时事实），模型能区分「工具坏了」和「额度用完」。
+                    output = WaitMemberResultPayload.budgetRejectionText(budget.getDimension(),
+                            budget.getActual(), budget.getLimit(), objectMapper);
+                    success = false;
+                    log.warn("Tool invocation rejected by run budget: tool={} runId={} dimension={} {}/{}",
+                            request.name(), AgentContext.getRunId(), budget.getDimension(),
+                            budget.getActual(), budget.getLimit());
                 } catch (Exception e) {
-                    output = e.getMessage();
+                    // 其余异常收敛为带上游/系统故障类别的标准失败信封，不再退化为裸文本。
+                    output = SandboxJobResponses.fail(objectMapper, request.name(),
+                            "TOOL_INVOCATION_ERROR", e.getMessage(), Map.of(),
+                            ToolFailureCategory.UPSTREAM_OR_SYSTEM);
                     success = false;
                     log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
                 } finally {

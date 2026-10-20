@@ -7,6 +7,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.CanonicalSandboxCreateSpec;
 import world.willfrog.agent.platform.dataanalysis.CapacityAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
@@ -1043,9 +1044,17 @@ public final class SandboxToolJobLifecycle {
                 String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                         ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                         : "DATA_ANALYSIS_SERVER_BUSY";
+                // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因不猜类别，
+                // 走码默认兜底，原码与具体原因文案保留。
+                ToolFailureCategory capacityCategory =
+                        admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                                || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                                ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                                : null;
                 return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), code, admission.getMessage(),
                         Map.of("retryable",
-                                admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                                admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE),
+                        capacityCategory);
             }
         }
         // 完整请求必须先于外部 createTask 落库，恢复线程才能用同一身份重放。

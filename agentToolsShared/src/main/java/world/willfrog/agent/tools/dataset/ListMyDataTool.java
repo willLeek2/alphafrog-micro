@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
@@ -508,6 +509,7 @@ public class ListMyDataTool {
         err.put("code", nvl(code));
         err.put("message", nvl(message));
         err.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(err, code, null);
         payload.put("error", err);
         return writeJson(payload);
     }

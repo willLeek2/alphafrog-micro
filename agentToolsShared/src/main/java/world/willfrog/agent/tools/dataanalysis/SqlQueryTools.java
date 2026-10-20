@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
@@ -322,8 +323,15 @@ public class SqlQueryTools {
                 String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                         ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                         : "DATA_ANALYSIS_SERVER_BUSY";
+                // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因（恢复中、预留身份冲突、
+                // 非法恢复）不猜类别，走码默认兜底，原码与具体原因文案保留。
+                ToolFailureCategory capacityCategory =
+                        admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                                || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                                ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                                : null;
                 return fail(code, admission.getMessage(), Map.of("retryable",
-                        admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                        admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE), capacityCategory);
             }
 
             ExecuteRequest baseRequest = buildBaseRequest(
@@ -526,8 +534,15 @@ public class SqlQueryTools {
             String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                     ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                     : "DATA_ANALYSIS_SERVER_BUSY";
+            // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因（恢复中、预留身份冲突、
+            // 非法恢复）不猜类别，走码默认兜底，原码与具体原因文案保留。
+            ToolFailureCategory capacityCategory =
+                    admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                            || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                            ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                            : null;
             return fail(code, admission.getMessage(), Map.of("retryable",
-                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE), capacityCategory);
         }
         java.util.concurrent.atomic.AtomicReference<PreparedSqlMember> session =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -870,6 +885,12 @@ public class SqlQueryTools {
 
     private String fail(String code, String message, Map<String, Object> details) {
         return SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details);
+    }
+
+    /** 带失败类别的重载：构造点掌握具体原因（如容量准入的具体拒绝原因）时显式覆盖兜底映射。 */
+    private String fail(String code, String message, Map<String, Object> details,
+                        ToolFailureCategory category) {
+        return SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details, category);
     }
 
     /** 从 classpath 读入运行器脚本原文；资源缺失属打包错误，直接让类初始化失败。 */

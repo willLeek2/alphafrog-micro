@@ -6,6 +6,7 @@ import dev.langchain4j.agent.tool.Tool;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRequest;
@@ -68,13 +69,17 @@ public class SearchTools {
 
             // 如果 Dubbo 层返回 ok=false，则按错误处理
             if (!resp.getOk()) {
+                // 上游错误码里保留着 HTTP 状态事实（各后端统一把状态写成 HTTP_<code>）：
+                // 429 是限流，5xx 是上游故障；取值来自既有状态字段，不解析自由文本。上游码原样透传。
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("ok", false);
                 payload.put("tool", "searchWeb");
-                payload.put("error", Map.of(
-                        "code", nvl(resp.getErrorCode()),
-                        "message", nvl(resp.getErrorMessage())
-                ));
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("code", nvl(resp.getErrorCode()));
+                err.put("message", nvl(resp.getErrorMessage()));
+                ToolFailureCategory.putCategoryIfResolved(err, resp.getErrorCode(),
+                        upstreamFailureCategory(resp.getErrorCode()));
+                payload.put("error", err);
                 return objectMapper.writeValueAsString(payload);
             }
 
@@ -155,15 +160,35 @@ public class SearchTools {
             payload.put("data", data);
             return objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
+            // 本地异常包装行：RPC/序列化一类的上游或系统故障。
             return writeJson(Map.of(
                     "ok", false,
                     "tool", "searchWeb",
                     "error", Map.of(
                             "code", "TOOL_ERROR",
-                            "message", nvl(e.getMessage())
+                            "message", nvl(e.getMessage()),
+                            "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name()
                     )
             ));
         }
+    }
+
+    /** 上游失败码携带的 HTTP 状态事实（HTTP_429 一族）→类别；其余按码兜底（未知默认上游/系统故障）。 */
+    private static ToolFailureCategory upstreamFailureCategory(String errorCode) {
+        if (errorCode != null && errorCode.startsWith("HTTP_")) {
+            try {
+                int status = Integer.parseInt(errorCode.substring("HTTP_".length()).trim());
+                if (status == 429) {
+                    return ToolFailureCategory.RATE_LIMITED_OR_CAPACITY;
+                }
+                if (status >= 500 && status < 600) {
+                    return ToolFailureCategory.UPSTREAM_OR_SYSTEM;
+                }
+            } catch (NumberFormatException ignored) {
+                // 后缀不是数字：按未知码走兜底
+            }
+        }
+        return ToolFailureCategory.of(errorCode);
     }
 
     private String nvl(String s) {

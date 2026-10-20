@@ -5,6 +5,7 @@ import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -113,6 +114,7 @@ public class LoadToolGuideTool {
         err.put("code", nvl(code));
         err.put("message", nvl(message));
         err.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(err, code, null);
         payload.put("error", err);
         return writeJson(payload);
     }

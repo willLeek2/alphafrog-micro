@@ -73,6 +73,52 @@ public class RootTreeCallBudget {
         }
     }
 
+    /** 工具调用次数维度的模型可见额度快照。 */
+    public record ToolCallBudgetStatus(
+            String dimension,
+            boolean unlimited,
+            long used,
+            long limit,
+            long remaining,
+            String scopeNote) {
+    }
+
+    /**
+     * 读取当前运行的工具调用次数额度快照，供模型可见性注入（执行逐轮提示、规划阶段提示）使用。
+     *
+     * <p><b>选源规则</b>：计数源按该运行<b>冻结的调度版本</b>选择，调用方只传当前运行编号、
+     * 不自选计数源——是 V2（DUAL_POOL_V2）时沿用根解析把当前运行归到根运行，读根树共享计数
+     * （数据库表 {@code alphafrog_agent_run_tree_budget} 的快照）；否则（V1）读本运行观测统计的
+     * 工具次数累计（经 {@link AgentRunBudgetService#observedToolCalls(String)}），与该服务
+     * tool_calls 拒绝检查同一数据源，避免展示与判定出现两套数字。Run 行缺失或编号为空时按
+     * V1 口径降级（观测读不到即 0）。</p>
+     *
+     * <p><b>三条显示规则</b>：①上限 ≤0（配置为 0 或负，即不设次数上限）时 {@code unlimited=true}，
+     * 不返回巨大数字；②配置调小到低于已用次数时 {@code remaining=0}，{@code used} 保留真实值；
+     * ③这里只展示所选来源的额度快照，仅用于模型可见性——实际能否派发仍由现有准入决定，
+     * 不为此加锁、不预分额度。</p>
+     */
+    public ToolCallBudgetStatus toolCallBudgetStatus(String currentRunId) {
+        long limit = config.effectiveConfig().maxToolCalls();
+        boolean dualPoolV2 = false;
+        if (currentRunId != null && !currentRunId.isBlank()) {
+            AgentRun run = runs.findById(currentRunId);
+            dualPoolV2 = run != null && "DUAL_POOL_V2".equals(run.getSchedulerVersion());
+        }
+        long used;
+        String scopeNote;
+        if (dualPoolV2) {
+            used = store.snapshot(roots.rootRunId(currentRunId)).toolCalls();
+            scopeNote = "整棵运行树（含子运行）共享";
+        } else {
+            used = config.observedToolCalls(currentRunId);
+            scopeNote = "本运行";
+        }
+        boolean unlimited = limit <= 0;
+        long remaining = unlimited ? 0L : Math.max(0L, limit - used);
+        return new ToolCallBudgetStatus("tool_calls", unlimited, used, limit, remaining, scopeNote);
+    }
+
     private static String operationId(String kind, String first, String second) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");

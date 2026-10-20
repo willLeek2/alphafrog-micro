@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.execution;
 
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.service.AiServices;
@@ -829,7 +830,8 @@ public class LangchainTodoNodeExecutor {
      *       Todo 执行阶段正文由 User Message 单独注入；</li>
      *   <li><b>maxToolCallingRoundTrips</b>：单 todo 内模型↔工具的最大往返轮数，默认 30，受 {@link #resolveMaxToolRoundTrips} 约束；</li>
      *   <li><b>chatRequestTransformer</b>：每次发 LLM 请求前检查 run 是否被取消/暂停（{@link #ensureRunnable}），
-     *       防止用户已点 cancel 但请求仍发出；</li>
+     *       防止用户已点 cancel 但请求仍发出；同时逐回合注入工具调用额度现状（{@link #withToolBudgetStatus}）
+     *       与 90% last-mile 提示；</li>
      *   <li><b>beforeToolExecution</b>：工具执行前再次检查可运行性，防止在 tool loop 中间被中断后继续执行工具；</li>
      *   <li><b>toolExecutionErrorHandler</b>：工具执行异常处理器（{@link LangchainTerminalToolErrorHandler#handle}），
      *       决定某个工具失败时是整个 todo 失败还是继续尝试；</li>
@@ -860,7 +862,7 @@ public class LangchainTodoNodeExecutor {
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
+                    return maybeInjectLastMileHint(withToolBudgetStatus(chatRequest, request.getRunId()));
                 })
                 .beforeToolExecution(before -> {
                     ensureRunnable(request);
@@ -1022,6 +1024,39 @@ public class LangchainTodoNodeExecutor {
         List<ChatMessage> out = new ArrayList<>(original);
         out.add(UserMessage.from(hint));
         return out;
+    }
+
+    /**
+     * 每次模型请求前把工具调用次数额度现状作为一条 SystemMessage 插到稳定 System 之后（位置 1）。
+     *
+     * <p>额度快照统一来自 {@link RootTreeCallBudget#toolCallBudgetStatus(String)}——只传当前运行编号，
+     * 计数源（V2 根树共享 / V1 本运行观测统计）由该方法按该运行冻结的调度版本自选，本注入点不自选
+     * 计数源，避免 V1 的执行循环读到 V2 的根树计数。注入只改本次发出的请求副本，不进对话记忆、
+     * 不改写稳定 System。快照只读不预分，能否派发仍由既有预算检查决定；读不到额度（无预算组件、
+     * 无运行编号或快照为空）时原样返回。</p>
+     */
+    private ChatRequest withToolBudgetStatus(ChatRequest chatRequest, String runId) {
+        if (chatRequest == null || rootTreeCallBudget == null || runId == null || runId.isBlank()) {
+            return chatRequest;
+        }
+        RootTreeCallBudget.ToolCallBudgetStatus status = rootTreeCallBudget.toolCallBudgetStatus(runId);
+        if (status == null) {
+            return chatRequest;
+        }
+        List<ChatMessage> original = chatRequest.messages();
+        List<ChatMessage> rebuilt = new ArrayList<>(original == null ? List.of() : original);
+        rebuilt.add(Math.min(1, rebuilt.size()), SystemMessage.from(toolBudgetStatusText(status)));
+        return chatRequest.toBuilder().messages(rebuilt).build();
+    }
+
+    /** 额度现状注入文本；不设上限时如实写明，而不是给一个巨大数字。 */
+    private static String toolBudgetStatusText(RootTreeCallBudget.ToolCallBudgetStatus status) {
+        if (status.unlimited()) {
+            return "工具调用预算现状：" + status.scopeNote() + "不设工具调用次数上限。";
+        }
+        return "工具调用预算现状：" + status.scopeNote() + "累计工具调用已用" + status.used()
+                + "次、上限" + status.limit() + "次、剩余" + status.remaining()
+                + "次；预算耗尽时新调用会被拒绝，请据此安排调用。";
     }
 
     /**

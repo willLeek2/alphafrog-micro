@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
@@ -2135,11 +2136,19 @@ public class MarketDataTools {
     /**
      * 构造失败响应的 JSON 字符串。
      *
-     * <p>统一错误格式：{@code {ok: false, tool, data: {}, error: {code, message, details}}}。
+     * <p>统一错误格式：{@code {ok: false, tool, data: {}, error: {code, message, details[, category]}}}。
      * 错误码是结构化字符串（如 BATCH_LIMIT_EXCEEDED / INVALID_ARGUMENT / NO_DATA / TOOL_ERROR），
-     * 不是 HTTP 状态码，便于 FailureMapper 做分类和前端展示。</p>
+     * 不是 HTTP 状态码，便于 FailureMapper 做分类和前端展示。失败类别 {@code category} 按码兜底解析
+     * （构造点已知更细事实时经全参重载显式覆盖）；查询无记录类（NO_DATA 等）不属四类工具故障，
+     * 不写该字段。</p>
      */
     String fail(String tool, String code, String message, Map<String, Object> details) {
+        return fail(tool, code, message, details, null);
+    }
+
+    /** 带失败类别的失败响应构造；{@code category} 传 null 时按 {@link ToolFailureCategory#of(String)} 兜底。 */
+    String fail(String tool, String code, String message, Map<String, Object> details,
+                ToolFailureCategory category) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", tool);
@@ -2148,6 +2157,7 @@ public class MarketDataTools {
         err.put("code", nvl(code));
         err.put("message", nvl(message));
         err.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(err, code, category);
         payload.put("error", err);
         return writeJson(payload);
     }

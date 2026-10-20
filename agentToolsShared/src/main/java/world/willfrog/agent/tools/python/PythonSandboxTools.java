@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
@@ -1006,8 +1007,15 @@ public class PythonSandboxTools {
             String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                     ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                     : "DATA_ANALYSIS_SERVER_BUSY";
+            // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因不猜类别，
+            // 走码默认兜底，原码与具体原因文案保留。
+            ToolFailureCategory capacityCategory =
+                    admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                            || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                            ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                            : null;
             return fail("executePython", code, admission.getMessage(), Map.of("retryable",
-                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE), capacityCategory);
         }
 
         // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
@@ -1471,6 +1479,12 @@ public class PythonSandboxTools {
     /** 构造 {@code ok=false} 的标准 JSON 工具响应；{@code details} 供 LLM 或上层做结构化重试。 */
     private String fail(String tool, String code, String message, Map<String, Object> details) {
         return SandboxJobResponses.fail(objectMapper, tool, code, message, details);
+    }
+
+    /** 带失败类别的重载：构造点掌握具体原因（如容量准入的具体拒绝原因）时显式覆盖兜底映射。 */
+    private String fail(String tool, String code, String message, Map<String, Object> details,
+                        ToolFailureCategory category) {
+        return SandboxJobResponses.fail(objectMapper, tool, code, message, details, category);
     }
 
     /**
