@@ -119,6 +119,15 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
     }
 
     @Override
+    public List<RunCoordination> scanDueForDeployment(String deploymentId, String deploymentGenerationId,
+                                                      String laneTag, int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.scanDueForDeployment(deploymentId, deploymentGenerationId, laneTag, limit);
+    }
+
+    @Override
     public int refreshCoordinationMissedRounds(long roundNumber) {
         requireRoundNumber(roundNumber);
         return mapper.refreshCoordinationMissedRounds(roundNumber);

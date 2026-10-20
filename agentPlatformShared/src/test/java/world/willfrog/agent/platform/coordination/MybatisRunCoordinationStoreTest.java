@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -112,6 +113,21 @@ class MybatisRunCoordinationStoreTest {
                 .as("旧版本与两个双池版本排在同一份候选里，按记录自己的版本路由")
                 .containsExactly(legacy, v2);
         verify(mapper).scanDue(8);
+    }
+
+    @Test
+    void scanDueForDeploymentPassesTheDeploymentFenceAndRejectsNonPositiveLimit() {
+        RunCoordination due = row("run-v1", "DUAL_POOL_V1");
+        when(mapper.scanDueForDeployment(anyString(), anyString(), any(), anyInt()))
+                .thenReturn(List.of(due));
+
+        assertThat(store.scanDueForDeployment("stable", "gen-1", null, 8))
+                .containsExactly(due);
+        verify(mapper).scanDueForDeployment("stable", "gen-1", null, 8);
+
+        assertThatThrownBy(() -> store.scanDueForDeployment("stable", "gen-1", "lane-opt-01", 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        verify(mapper, never()).scanDueForDeployment(anyString(), anyString(), anyString(), eq(0));
     }
 
     @Test

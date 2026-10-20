@@ -207,6 +207,24 @@ public interface NodeWorkItemStore {
     /** 按 Run 的调度器版本统计未完成分段，与上面那条配套做「有没有读全」的核对。 */
     int countUnfinishedByRunSchedulerVersion(SchedulerVersion schedulerVersion);
 
+    /**
+     * 按「Run 的调度器版本」取未完成分段，再限定在本进程所属的部署身份与泳道。
+     *
+     * <p>未完成状态过滤与 {@link #listUnfinishedByRunSchedulerVersion} 相同。扫描条数必须为正数。</p>
+     */
+    List<NodeWorkItem> listUnfinishedByRunSchedulerVersionForDeployment(
+            SchedulerVersion schedulerVersion,
+            String deploymentId,
+            String deploymentGenerationId,
+            String laneTag,
+            int limit);
+
+    /** 按 Run 的调度器版本统计未完成分段，再限定在本进程所属的部署身份与泳道。 */
+    int countUnfinishedByRunSchedulerVersionForDeployment(SchedulerVersion schedulerVersion,
+                                                          String deploymentId,
+                                                          String deploymentGenerationId,
+                                                          String laneTag);
+
     /** 某个调度器版本是否有遗留记录——有就必须禁止该版本的执行扫描、暂停该版本的新建准入。 */
     default boolean hasResidueFor(SchedulerVersion schedulerVersion) {
         return countUnfinishedBySchedulerVersion(schedulerVersion) > 0;

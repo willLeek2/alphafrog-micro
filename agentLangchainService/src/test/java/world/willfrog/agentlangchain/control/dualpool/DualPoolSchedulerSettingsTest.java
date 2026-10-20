@@ -410,6 +410,44 @@ class DualPoolSchedulerSettingsTest {
         }
     }
 
+    /** 没有泳道环境变量：进程泳道标记是空。 */
+    @Test
+    void processLaneTagIsNullWhenTheScopeIdIsMissing() {
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly();
+
+        assertThat(settings.processLaneTag()).isNull();
+        assertThat(settings.laneProcess()).isFalse();
+    }
+
+    /** 泳道环境变量是空白：与没写一样，进程泳道标记是空。 */
+    @Test
+    void processLaneTagIsNullWhenTheScopeIdIsBlank() {
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "   ");
+
+        assertThat(settings.processLaneTag()).isNull();
+        assertThat(settings.laneProcess()).isFalse();
+    }
+
+    /** 部署写入了泳道环境变量：进程泳道标记就是那个值。 */
+    @Test
+    void processLaneTagReturnsTheConfiguredScopeId() {
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "lane-opt-01");
+
+        assertThat(settings.processLaneTag()).isEqualTo("lane-opt-01");
+        assertThat(settings.laneProcess()).isTrue();
+    }
+
+    /** 服务所有权有效期至少 1 秒：请求 0 或负数时抬到 1。 */
+    @Test
+    void serviceLeaseTtlIsAtLeastOneSecond() {
+        assertThat(DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(120L)).isEqualTo(120L);
+        assertThat(DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(1L)).isEqualTo(1L);
+        assertThat(DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(0L)).isEqualTo(1L);
+        assertThat(DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(-8L)).isEqualTo(1L);
+    }
+
     /** 从一段源码里挑出读双池参数的属性名（`@Value` 与定时任务的定时间隔都算）。 */
     private static Set<String> dualPoolPropertyKeys(String source) {
         Set<String> keys = new LinkedHashSet<>();

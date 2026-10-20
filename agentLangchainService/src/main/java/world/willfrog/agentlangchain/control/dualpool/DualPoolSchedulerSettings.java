@@ -199,12 +199,30 @@ public class DualPoolSchedulerSettings {
     }
 
     /**
+     * 当前进程的泳道标记：部署时会写入 {@link #LANE_TRAFFIC_SCOPE_ID}。
+     * 没有这个变量、或值为空白时返回 null。与 {@link #laneProcess()} 读的是同一个属性。
+     */
+    public String processLaneTag() {
+        String scopeId = environment.getProperty(LANE_TRAFFIC_SCOPE_ID);
+        if (scopeId == null || scopeId.isBlank()) {
+            return null;
+        }
+        return scopeId;
+    }
+
+    /**
      * 当前进程是不是泳道实例：部署时会写入 {@link #LANE_TRAFFIC_SCOPE_ID}。
      * 主 Beta 没有这个变量，新 Run 仍可用环境属性里的版本。
      */
     public boolean laneProcess() {
-        String scopeId = environment.getProperty(LANE_TRAFFIC_SCOPE_ID);
-        return scopeId != null && !scopeId.isBlank();
+        return processLaneTag() != null;
+    }
+
+    /**
+     * 服务所有权有效期的共用下限：至少 1 秒。
+     */
+    public static long normalizeServiceLeaseTtlSeconds(long requested) {
+        return Math.max(1L, requested);
     }
 
     /** 与上面同一个判断，只是复用调用方已经取好的那一份热配置快照（一次读数里只取一份）。 */

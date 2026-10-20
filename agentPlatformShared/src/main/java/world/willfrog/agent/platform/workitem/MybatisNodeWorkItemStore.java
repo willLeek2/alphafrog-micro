@@ -521,6 +521,31 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
         return mapper.countUnfinishedByRunSchedulerVersion(schedulerVersion.name());
     }
 
+    @Override
+    public List<NodeWorkItem> listUnfinishedByRunSchedulerVersionForDeployment(
+            SchedulerVersion schedulerVersion,
+            String deploymentId,
+            String deploymentGenerationId,
+            String laneTag,
+            int limit) {
+        requireVersion(schedulerVersion);
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        return mapper.listUnfinishedByRunSchedulerVersionForDeployment(
+                schedulerVersion.name(), deploymentId, deploymentGenerationId, laneTag, limit);
+    }
+
+    @Override
+    public int countUnfinishedByRunSchedulerVersionForDeployment(SchedulerVersion schedulerVersion,
+                                                                 String deploymentId,
+                                                                 String deploymentGenerationId,
+                                                                 String laneTag) {
+        requireVersion(schedulerVersion);
+        return mapper.countUnfinishedByRunSchedulerVersionForDeployment(
+                schedulerVersion.name(), deploymentId, deploymentGenerationId, laneTag);
+    }
+
     /**
      * 提交类语句被拒时，区分「这一行已经属于新的领取者」与其它条件不匹配。
      * 只有领取代际确实变了才算陈旧提交，这一个判断决定要不要上报

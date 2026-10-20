@@ -85,6 +85,14 @@ public interface RunCoordinationStore {
     List<RunCoordination> scanDue(int limit);
 
     /**
+     * 取这一轮可以被协调的 Run，限定在本进程所属的部署身份与泳道。
+     *
+     * <p>排序与存活状态与 {@link #scanDue} 相同。扫描条数必须为正数。</p>
+     */
+    List<RunCoordination> scanDueForDeployment(String deploymentId, String deploymentGenerationId,
+                                               String laneTag, int limit);
+
+    /**
      * 一轮结束时刷新连续未获协调的轮数，给公平性观测用：这一轮有资格却没被服务的各加一轮。
      *
      * <p>按轮递增而不是按轮次差补算，否则延期等待一段时间后重新可见，会把没竞争的轮数一次算进去。</p>

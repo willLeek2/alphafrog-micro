@@ -284,4 +284,24 @@ public interface NodeWorkItemMapper {
 
     /** 按 Run 的调度器版本统计未完成分段，与上面那条配套做「有没有读全」的核对。 */
     int countUnfinishedByRunSchedulerVersion(@Param("schedulerVersion") String schedulerVersion);
+
+    /**
+     * 按「Run 的调度器版本」取未完成分段，再限定在本进程所属的部署身份与泳道。
+     *
+     * <p>未完成状态过滤与 {@link #listUnfinishedByRunSchedulerVersion} 相同。泳道标记为空时
+     * 只取主表上 {@code lane_tag} 为空的行。</p>
+     */
+    List<NodeWorkItem> listUnfinishedByRunSchedulerVersionForDeployment(
+            @Param("schedulerVersion") String schedulerVersion,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("laneTag") String laneTag,
+            @Param("limit") int limit);
+
+    /** 按 Run 的调度器版本统计未完成分段，再限定在本进程所属的部署身份与泳道。 */
+    int countUnfinishedByRunSchedulerVersionForDeployment(
+            @Param("schedulerVersion") String schedulerVersion,
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("laneTag") String laneTag);
 }

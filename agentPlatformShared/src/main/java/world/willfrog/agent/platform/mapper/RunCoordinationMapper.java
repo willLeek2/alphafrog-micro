@@ -103,6 +103,17 @@ public interface RunCoordinationMapper {
     List<RunCoordination> scanDue(@Param("limit") int limit);
 
     /**
+     * 这一轮可以被协调的 Run，限定在本进程所属的部署身份与泳道。
+     *
+     * <p>存活状态、到期条件与排序与 {@link #scanDue} 相同；再按 Run 主表上的部署编号、
+     * 部署代际和泳道标记过滤。泳道标记为空时只取主表上 {@code lane_tag} 为空的行。</p>
+     */
+    List<RunCoordination> scanDueForDeployment(@Param("deploymentId") String deploymentId,
+                                               @Param("deploymentGenerationId") String deploymentGenerationId,
+                                               @Param("laneTag") String laneTag,
+                                               @Param("limit") int limit);
+
+    /**
      * 一轮结束时刷新连续未获协调的轮数：这一轮确实站着排队却没轮到的各加一轮。
      *
      * <p>按轮递增，不按全局轮次差补算：延期等待的那段时间它没在竞争，不该被算成没被服务。</p>
