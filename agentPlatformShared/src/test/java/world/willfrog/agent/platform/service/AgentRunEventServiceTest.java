@@ -8,6 +8,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -287,6 +288,50 @@ class AgentRunEventServiceTest {
         assertEquals("PLAN_READY", envelope.get("eventType"));
         assertTrue(String.valueOf(envelope.get("payloadJson")).contains("\"ok\":true"));
         assertTrue(String.valueOf(envelope.get("createdAt")).contains("T"));
+    }
+
+    @Test
+    void missingSeqKeyContinuesFromDatabaseMax() {
+        AgentRun run = run("r1", "u1");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(1L, 5L);
+        when(eventMapper.findMaxSeq("r1")).thenReturn(4);
+
+        service.append("r1", "u1", "RUN_EXPIRED", Map.of("previous_status", "EXECUTING"));
+
+        ArgumentCaptor<AgentRunEvent> inserted = ArgumentCaptor.forClass(AgentRunEvent.class);
+        verify(eventMapper).insert(inserted.capture());
+        assertEquals(5, inserted.getValue().getSeq());
+        verify(valueOperations).set(eq("agent:run:event_seq:r1"), eq("4"), any(Duration.class));
+    }
+
+    @Test
+    void seqConflictOutsideCreateTransactionRetriesFromDatabaseMax() {
+        AgentRun run = run("r1", "u1");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(2L, 5L);
+        when(eventMapper.findMaxSeq("r1")).thenReturn(4);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            AgentRunEvent event = invocation.getArgument(0);
+            if (event.getSeq() == 2) {
+                throw new DuplicateKeyException("Key (run_id, seq)=(r1, 2) already exists");
+            }
+            return null;
+        }).when(eventMapper).insert(any());
+        AgentRunEvent stored = new AgentRunEvent();
+        stored.setRunId("r1");
+        stored.setSeq(5);
+        stored.setEventType("RUN_EXPIRED");
+        stored.setPayloadJson("{\"previous_status\":\"EXECUTING\"}");
+        stored.setCreatedAt(OffsetDateTime.now());
+        when(eventMapper.findByRunIdAndSeq("r1", 5)).thenReturn(stored);
+
+        service.append("r1", "u1", "RUN_EXPIRED", Map.of("previous_status", "EXECUTING"));
+
+        verify(valueOperations).set(eq("agent:run:event_seq:r1"), eq("4"), any(Duration.class));
+        verify(eventRedisStore).append(stored);
     }
 
     @Test

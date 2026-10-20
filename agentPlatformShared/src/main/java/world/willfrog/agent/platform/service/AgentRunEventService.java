@@ -733,27 +733,39 @@ public class AgentRunEventService {
      * 一个号，不会在读者那边留下孤儿事件。</p>
      */
     private AgentRunEvent persistEvent(String runId, String eventType, Object payload) {
-        // 事件序号采用 Redis 原子递增，避免并发落库时 seq 冲突。
+        return persistEvent(runId, eventType, payload, true);
+    }
+
+    /**
+     * 事件序号用 Redis 原子递增。序号键过期后，自增会从 1 重新开始，和库里已有序号撞车。
+     * 键刚好被建成 1 时，若库里已经有事件，改按库里的最大序号续上再自增。
+     * 插入仍然撞上 (run_id, seq) 时，在创建事务外面按库里的最大序号重铺一次并再写一行。
+     * 创建事务里插入失败会把整段事务作废，那里不重试。
+     */
+    private AgentRunEvent persistEvent(String runId, String eventType, Object payload, boolean allowSeqRetry) {
         int nextSeq = nextSeq(runId);
         AgentRunEvent event = new AgentRunEvent();
         event.setRunId(runId);
         event.setSeq(nextSeq);
         event.setEventType(eventType);
-        // payload 已经是字符串则直接使用,否则序列化为 JSON
         String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
         event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
         event.setCreatedAt(OffsetDateTime.now());
-        // TRANSITIONAL: dual-write to PostgreSQL until all readers are Redis-only.
-        // This database insert will be removed in a near-term release.
         try {
             eventMapper.insert(event);
-        } catch (Exception e) {
+        } catch (RuntimeException failure) {
+            if (allowSeqRetry
+                    && isRunSeqConflict(failure)
+                    && !TransactionSynchronizationManager.isActualTransactionActive()) {
+                reseedEventSeqFromDatabase(runId);
+                return persistEvent(runId, eventType, payload, false);
+            }
             String msg = String.format(
                     "Append event failed (fail-fast): runId=%s, eventType=%s, seq=%d",
                     runId, eventType, nextSeq
             );
-            log.error(msg, e);
-            throw new IllegalStateException(msg, e);
+            log.error(msg, failure);
+            throw new IllegalStateException(msg, failure);
         }
         return canonicalEvent(runId, nextSeq, eventType);
     }
@@ -1572,24 +1584,58 @@ public class AgentRunEventService {
     private int nextSeq(String runId) {
         String key = eventSeqKey(runId);
         try {
-            // 第一次写入时初始化为 0,INCR 后即为 1
-            redisTemplate.opsForValue().setIfAbsent(key, "0", Duration.ofMinutes(ttlMinutes));
             Long next = redisTemplate.opsForValue().increment(key);
             if (next == null) {
                 throw new IllegalStateException("Redis INCR returned null");
             }
-            // 每次刷新 TTL,防止长 run 中途 key 过期
             redisTemplate.expire(key, Duration.ofMinutes(ttlMinutes));
-            // seq 是 INT 类型,溢出时抛错,理论上不该发生
+            if (next == 1L) {
+                int dbMax = databaseMaxSeq(runId);
+                if (dbMax >= 1) {
+                    redisTemplate.opsForValue().set(
+                            key, Integer.toString(dbMax), Duration.ofMinutes(ttlMinutes));
+                    next = redisTemplate.opsForValue().increment(key);
+                    if (next == null) {
+                        throw new IllegalStateException("Redis INCR returned null");
+                    }
+                    redisTemplate.expire(key, Duration.ofMinutes(ttlMinutes));
+                }
+            }
             if (next > Integer.MAX_VALUE) {
                 throw new IllegalStateException("Event seq overflow: " + next);
             }
             return next.intValue();
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             String msg = String.format("Next seq generation failed (Redis only): runId=%s", runId);
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
         }
+    }
+
+    private void reseedEventSeqFromDatabase(String runId) {
+        String key = eventSeqKey(runId);
+        redisTemplate.opsForValue().set(
+                key, Integer.toString(databaseMaxSeq(runId)), Duration.ofMinutes(ttlMinutes));
+    }
+
+    private int databaseMaxSeq(String runId) {
+        Integer max = eventMapper.findMaxSeq(runId);
+        return max == null ? 0 : max;
+    }
+
+    private static boolean isRunSeqConflict(RuntimeException failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof DuplicateKeyException) {
+                return true;
+            }
+            String message = current.getMessage();
+            if (message != null && message.contains("(run_id, seq)")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     /**
