@@ -21,16 +21,26 @@ public interface RunServiceLeaseStore {
      */
     Optional<RunServiceLease> acquire(String runId, String ownerInstanceId, Duration ttl);
 
-    /** 续期：只有还是这一位、这一代持有才续得上；返回是否续上。 */
-    boolean renew(String runId, String ownerInstanceId, long fencingToken, Duration ttl);
+    /**
+     * 创建时写下的到期时间已经过了，运行还停在已接收、规划中、执行中或总结中：
+     * 部署、代际、泳道与 {@code scope} 一致时，换持有人并把代际号加一。
+     *
+     * <p>别人的服务所有权还没到期也接得走。等待外部工具作业和正在取消不在此列。
+     * 对不上时返回空。条件在数据库语句里，不靠调用方先查一遍。</p>
+     */
+    Optional<RunServiceLease> acquirePastDeadline(String runId, String ownerInstanceId, Duration ttl,
+                                                  ServiceOwnershipScope scope);
+
+    /** 续期：还是这一位、这一代，并且运行的部署、代际、泳道与 scope 一致，才续得上。 */
+    boolean renew(String runId, String ownerInstanceId, long fencingToken, Duration ttl,
+                  ServiceOwnershipScope scope);
 
     /**
-     * 把这一位持有的、对应 Run 还在跑的租约续一遍，返回续上的行数。
+     * 把这一位持有的、对应运行还在进行、且部署代际泳道与 scope 一致的服务所有权续一遍，返回续上的行数。
      *
-     * <p>条数就是本进程正在服务或排队的 Run 数，与它自己的容量同量级，所以这是一条有界的批量写。
-     * 已经结束的 Run 不再续：它们的租约到期就到期，不用一直占着。</p>
+     * <p>已经结束的运行不再续。部署、代际或泳道对不上的也不续，避免一个进程一直握住别的部署的运行。</p>
      */
-    int renewOwned(String ownerInstanceId, Duration ttl);
+    int renewOwned(String ownerInstanceId, Duration ttl, ServiceOwnershipScope scope);
 
     /**
      * 这一位持有、且对应 Run 还在跑的租约，按取得时间升序取有界一页。

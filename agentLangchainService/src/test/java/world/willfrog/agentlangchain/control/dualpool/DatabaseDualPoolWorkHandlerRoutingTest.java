@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
@@ -706,6 +707,99 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         verify(workItemStore).cancel(any(), eq(0L), eq(1), eq("run_status_EXPIRED"));
         verify(admissionRegistry).releaseBusinessPermitIfCurrent(eq("run-residue"), eq(-1L), any());
         verify(admissionRegistry, never()).takeoverLegacyRun(anyString());
+    }
+
+    @Test
+    void foreignLiveOwnershipPastCreationDeadlineIsTakenAndExpired() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-foreign", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        ServiceOwnershipScope scope = new ServiceOwnershipScope(DEPLOYMENT_ID, GENERATION, null);
+        RunServiceLease taken = new RunServiceLease("run-foreign", TEST_INSTANCE, 3L,
+                OffsetDateTime.now().minusMinutes(5), OffsetDateTime.now(),
+                OffsetDateTime.now().plusMinutes(2));
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-foreign", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-foreign")).thenReturn(run);
+        when(leaseStore.find("run-foreign")).thenReturn(Optional.of(new RunServiceLease(
+                "run-foreign", "other-instance", 2L,
+                OffsetDateTime.now().minusMinutes(5), OffsetDateTime.now(),
+                OffsetDateTime.now().plusMinutes(2))));
+        when(events.shouldMarkExpired(run)).thenReturn(true);
+        when(leaseStore.acquirePastDeadline(eq("run-foreign"), eq(TEST_INSTANCE), any(Duration.class), eq(scope)))
+                .thenReturn(Optional.of(taken));
+        when(runMapper.updateStatus("run-foreign", "user-routing",
+                AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED)).thenReturn(1);
+        when(workItemStore.listUnfinishedByRun("run-foreign")).thenReturn(List.of());
+        when(workItemStore.countUnfinishedByRun("run-foreign")).thenReturn(0);
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+
+        verify(admissionRegistry).bindFence("run-foreign", new ServiceOwnershipFence(TEST_INSTANCE, 3L));
+        verify(runMapper).updateStatus("run-foreign", "user-routing",
+                AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED);
+        verify(events).append(eq("run-foreign"), eq("user-routing"), eq("RUN_EXPIRED"), any());
+        verify(admissionRegistry, never()).takeoverLegacyRun("run-foreign");
+        assertThat(handler.routingSnapshot())
+                .containsEntry("leaseNotAcquiredTotal", 0L);
+    }
+
+    @Test
+    void foreignLiveOwnershipBeforeDeadlineIsNotForceTaken() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-live-foreign", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(10));
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-live-foreign", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-live-foreign")).thenReturn(run);
+        when(leaseStore.find("run-live-foreign")).thenReturn(Optional.of(new RunServiceLease(
+                "run-live-foreign", "other-instance", 2L,
+                OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
+        when(events.shouldMarkExpired(run)).thenReturn(false);
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+
+        verify(leaseStore, never()).acquirePastDeadline(anyString(), anyString(), any(Duration.class), any());
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
+        assertThat(handler.routingSnapshot())
+                .containsEntry("leaseNotAcquiredTotal", 1L);
+    }
+
+    @Test
+    void waitingToolJobWithForeignLiveOwnershipIsNotForceTaken() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-tool", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.WAITING_TOOL_JOB);
+        run.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-tool", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-tool")).thenReturn(run);
+        when(leaseStore.find("run-tool")).thenReturn(Optional.of(new RunServiceLease(
+                "run-tool", "other-instance", 2L,
+                OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
+        when(events.shouldMarkExpired(run)).thenReturn(true);
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+
+        verify(leaseStore, never()).acquirePastDeadline(anyString(), anyString(), any(Duration.class), any());
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
     }
 
     @Test

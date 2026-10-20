@@ -15,6 +15,27 @@
     <sql id="liveRunStatuses">'RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'CANCELING'</sql>
 
     <!--
+      创建时到期后允许强制接手的状态。等待外部工具作业和正在取消不在这里：
+      前者要等工具自己结束，后者要等取消收尾。
+    -->
+    <sql id="deadlineTakeoverStatuses">'RECEIVED', 'PLANNING', 'EXECUTING', 'SUMMARIZING'</sql>
+
+    <!-- 运行主表上的部署、代际、泳道与本进程一致。泳道为空时只匹配 lane_tag 为空的行。 -->
+    <sql id="runMatchesScope">
+        r.deployment_id = #{scope.deploymentId}
+        AND r.deployment_generation_id = #{scope.deploymentGenerationId}
+        AND
+        <choose>
+            <when test="scope.laneTag == null">
+                r.lane_tag IS NULL
+            </when>
+            <otherwise>
+                r.lane_tag = #{scope.laneTag}
+            </otherwise>
+        </choose>
+    </sql>
+
+    <!--
       关掉自动映射。这份结果已经用构造器按列逐个取值。生产会话开了下划线转驼峰之后，
       自动映射会按驼峰名把同一批列再塞进构造器，Java record 参数个数对不上。
       fencing_token 写成装箱 Long：JDBC 把 BIGINT 读成 Long，MyBatis 按这个实参类型
@@ -62,6 +83,30 @@
         RETURNING run_id, owner_instance_id, fencing_token, acquired_at, renewed_at, expires_at
     </select>
 
+    <!--
+      创建时写下的到期时间已经过了，运行还停在已接收、规划中、执行中或总结中：
+      部署、代际、泳道一致时换持有人，代际号加一。别人的服务所有权还没到期也写得进去。
+      条件都在这条语句里。取得时间不改。
+    -->
+    <select id="acquirePastDeadline" resultMap="RunServiceLeaseResultMap">
+        UPDATE alphafrog_agent_run_service_lease SET
+            fencing_token = fencing_token + 1,
+            owner_instance_id = #{owner},
+            renewed_at = CURRENT_TIMESTAMP,
+            expires_at = CURRENT_TIMESTAMP + #{ttlMillis} * INTERVAL '1 millisecond'
+        WHERE run_id = #{runId}
+          AND owner_instance_id &lt;&gt; #{owner}
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run r
+              WHERE r.id = alphafrog_agent_run_service_lease.run_id
+                AND <include refid="runMatchesScope"/>
+                AND r.ttl_expires_at IS NOT NULL
+                AND r.ttl_expires_at &lt; CURRENT_TIMESTAMP
+                AND r.status IN (<include refid="deadlineTakeoverStatuses"/>)
+          )
+        RETURNING run_id, owner_instance_id, fencing_token, acquired_at, renewed_at, expires_at
+    </select>
+
     <update id="renew">
         UPDATE alphafrog_agent_run_service_lease SET
             renewed_at = CURRENT_TIMESTAMP,
@@ -69,6 +114,11 @@
         WHERE run_id = #{runId}
           AND owner_instance_id = #{owner}
           AND fencing_token = #{fencingToken}
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run r
+              WHERE r.id = alphafrog_agent_run_service_lease.run_id
+                AND <include refid="runMatchesScope"/>
+          )
     </update>
 
     <!--
@@ -78,13 +128,16 @@
       堆着永远不过期的行、并把「本进程还持有几条活租约」这个数越算越大。
     -->
     <update id="renewOwned">
-        UPDATE alphafrog_agent_run_service_lease l SET
+        UPDATE alphafrog_agent_run_service_lease SET
             renewed_at = CURRENT_TIMESTAMP,
             expires_at = CURRENT_TIMESTAMP + #{ttlMillis} * INTERVAL '1 millisecond'
-        WHERE l.owner_instance_id = #{owner}
-          AND EXISTS (SELECT 1 FROM alphafrog_agent_run r
-                      WHERE r.id = l.run_id
-                        AND r.status IN (<include refid="liveRunStatuses"/>))
+        WHERE owner_instance_id = #{owner}
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run r
+              WHERE r.id = alphafrog_agent_run_service_lease.run_id
+                AND r.status IN (<include refid="liveRunStatuses"/>)
+                AND <include refid="runMatchesScope"/>
+          )
     </update>
 
     <!--

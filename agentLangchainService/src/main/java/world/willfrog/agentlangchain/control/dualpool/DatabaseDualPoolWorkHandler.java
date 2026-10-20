@@ -23,6 +23,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.observability.ObservabilityEvents;
@@ -1363,7 +1364,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             if (existing != null
                     && !existing.expiredAt(OffsetDateTime.now())
                     && !processIdentity.value().equals(existing.ownerInstanceId())) {
-                // 别人正活着持有这条 Run：这一轮不碰它，也不改它的轮次位置。
+                // 别人还握着服务所有权。创建时的到期时间已经过了，并且部署、代际、泳道一致时，
+                // 强制接手后立刻收成过期。没到期、或状态不在可收口的几种里，这一轮仍不碰。
+                if (forceExpirePastDeadline(run)) {
+                    continue;
+                }
                 leaseMissThisRound++;
                 leaseNotAcquired.incrementAndGet();
                 continue;
@@ -1475,6 +1480,42 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
      * <p>读到或领到的这一代要写回准入组件：写入、撤销与协调都按状态里那份凭据比对，只更新数据库
      * 不更新这里，本进程会一直带着旧代际去写，条件语句全部落空，看起来像「什么都没发生」。</p>
      */
+    /**
+     * 别人还握着服务所有权，但这条运行已经过了创建时写下的到期时间：
+     * 数据库语句核对部署、代际、泳道和状态之后换持有人，再走现有的过期收口。
+     * 语句没写进行，返回 false，调用方按这一轮不碰处理。
+     */
+    private boolean forceExpirePastDeadline(AgentRun run) {
+        if (ownership == null || settings == null || run == null || !matchesThisProcess(run)) {
+            return false;
+        }
+        AgentRunStatus status = run.getStatus();
+        if (status != AgentRunStatus.RECEIVED
+                && status != AgentRunStatus.PLANNING
+                && status != AgentRunStatus.EXECUTING
+                && status != AgentRunStatus.SUMMARIZING) {
+            return false;
+        }
+        if (!eventService.shouldMarkExpired(run)) {
+            return false;
+        }
+        DeploymentIdentity identity = ownership.requireIdentity();
+        Optional<RunServiceLease> taken = leaseStore.acquirePastDeadline(
+                run.getId(),
+                processIdentity.value(),
+                serviceLeaseTtl,
+                new ServiceOwnershipScope(
+                        identity.deploymentId(), identity.generationId(), settings.processLaneTag()));
+        if (taken.isEmpty()) {
+            return false;
+        }
+        admissionRegistry.bindFence(run.getId(), fenceOf(taken.get()));
+        log.info("创建时到期时间已过，本进程强制接手并收成过期: runId={} fence={}",
+                run.getId(), taken.get().fencingToken());
+        expireTimedOutRun(run);
+        return true;
+    }
+
     private boolean holdsServiceOwnership(String runId) {
         AgentRun run = runMapper.findById(runId);
         if (!matchesThisProcess(run)) {

@@ -47,6 +47,7 @@ import world.willfrog.agent.platform.lease.MybatisRunServiceLeaseStore;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
 import world.willfrog.agent.platform.mapper.RunServiceLeaseMapper;
 import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
@@ -2124,13 +2125,13 @@ class Stage3WaitContractPostgresTest {
                 .isEqualTo(1L);
         assertThat(store.acquire("run-lease", "owner-b", ttl))
                 .as("别人正活着持有：领不到，也不该领到").isEmpty();
-        assertThat(store.renew("run-lease", "owner-b", 1L, ttl))
+        assertThat(store.renew("run-lease", "owner-b", 1L, ttl, testScope()))
                 .as("续期要核对主人").isFalse();
-        assertThat(store.renew("run-lease", "owner-a", 1L, ttl)).isTrue();
-        assertThat(store.renew("run-lease", "owner-a", 2L, ttl))
+        assertThat(store.renew("run-lease", "owner-a", 1L, ttl, testScope())).isTrue();
+        assertThat(store.renew("run-lease", "owner-a", 2L, ttl, testScope()))
                 .as("续期要核对代际：号对不上说明这条已经换了主人").isFalse();
-        assertThat(store.renewOwned("owner-a", ttl)).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
-        assertThat(store.renewOwned("owner-b", ttl)).as("别人的租约一条都不动").isZero();
+        assertThat(store.renewOwned("owner-a", ttl, testScope())).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
+        assertThat(store.renewOwned("owner-b", ttl, testScope())).as("别人的租约一条都不动").isZero();
 
         // 到期之后可以被接手：代际加一，旧主人手里那个号立刻写不动。
         execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP, "
@@ -2138,7 +2139,7 @@ class Stage3WaitContractPostgresTest {
         RunServiceLease takenOver = store.acquire("run-lease", "owner-b", ttl).orElseThrow();
         assertThat(takenOver.ownerInstanceId()).isEqualTo("owner-b");
         assertThat(takenOver.fencingToken()).as("接手要换代，旧主人的号从此作废").isEqualTo(2L);
-        assertThat(store.renew("run-lease", "owner-a", 1L, ttl))
+        assertThat(store.renew("run-lease", "owner-a", 1L, ttl, testScope()))
                 .as("旧主人迟到的续期写不动").isFalse();
         assertThat(store.release("run-lease", "owner-a", 1L))
                 .as("旧主人迟到的让出也写不动").isFalse();
@@ -2213,7 +2214,7 @@ class Stage3WaitContractPostgresTest {
                 .as("清点只看还在跑的：自己的两条里有一条已经结束了")
                 .extracting(RunServiceLease::runId)
                 .containsExactly("run-renew-mine");
-        assertThat(store.renewOwned("owner-renew", ttl))
+        assertThat(store.renewOwned("owner-renew", ttl, testScope()))
                 .as("续上的条数与清点的一致，才不会每轮报假的「被接手」")
                 .isEqualTo(1);
 
@@ -2221,7 +2222,7 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.find("run-renew-peer").orElseThrow().expiresAt())
                 .as("别人持有的那条一点都不动")
                 .isEqualTo(before);
-        assertThat(store.renewOwned("owner-other", ttl)).as("别人续自己的那条照常").isEqualTo(1);
+        assertThat(store.renewOwned("owner-other", ttl, testScope())).as("别人续自己的那条照常").isEqualTo(1);
     }
 
     /**
@@ -2240,16 +2241,83 @@ class Stage3WaitContractPostgresTest {
         RunServiceLease taken = store.acquire("run-renew-taken", "owner-second", ttl).orElseThrow();
         assertThat(taken.fencingToken()).isEqualTo(mine.fencingToken() + 1);
 
-        assertThat(store.renew("run-renew-taken", "owner-first", mine.fencingToken(), ttl))
+        assertThat(store.renew("run-renew-taken", "owner-first", mine.fencingToken(), ttl, testScope()))
                 .as("旧主人手里那个代际号续不动了")
                 .isFalse();
-        assertThat(store.renewOwned("owner-first", ttl))
+        assertThat(store.renewOwned("owner-first", ttl, testScope()))
                 .as("批量续期也一样：这条已经不归它")
                 .isZero();
         assertThat(store.listOwnedWithLiveRun("owner-first", 50))
                 .as("清点里也不再出现：旧主人这轮的「该续几条」自然对得上")
                 .isEmpty();
-        assertThat(store.renewOwned("owner-second", ttl)).isEqualTo(1);
+        assertThat(store.renewOwned("owner-second", ttl, testScope())).isEqualTo(1);
+    }
+
+    /**
+     * 别人的服务所有权还没到期，但运行已经过了创建时写下的到期时间：
+     * 部署、代际、泳道一致时换持有人并加代际号。没到期、等待工具、别的泳道都接不走。
+     * 换手之后旧持有人的续期写不进去。
+     */
+    @Test
+    void pastCreationDeadlineTakeoverRequiresMatchingScopeAndThenOldRenewFails() throws Exception {
+        createRun("run-force", 0, 0L);
+        createRun("run-not-due", 0, 0L);
+        createRun("run-tool-wait", 0, 0L);
+        createRun("run-other-lane", 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET ttl_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 minute' "
+                + "WHERE id IN ('run-force', 'run-tool-wait', 'run-other-lane')");
+        execute("UPDATE alphafrog_agent_run SET status = 'WAITING_TOOL_JOB' WHERE id = 'run-tool-wait'");
+        execute("UPDATE alphafrog_agent_run SET lane_tag = 'other-lane' WHERE id = 'run-other-lane'");
+        RunServiceLeaseStore store = leaseStore();
+        java.time.Duration ttl = java.time.Duration.ofMinutes(2);
+        RunServiceLease held = store.acquire("run-force", "owner-old", ttl).orElseThrow();
+        store.acquire("run-not-due", "owner-old", ttl).orElseThrow();
+        store.acquire("run-tool-wait", "owner-old", ttl).orElseThrow();
+        store.acquire("run-other-lane", "owner-old", ttl).orElseThrow();
+
+        assertThat(store.acquirePastDeadline("run-not-due", "owner-new", ttl, testScope()))
+                .as("创建时到期时间还没到，不能提前抢走").isEmpty();
+        assertThat(store.acquirePastDeadline("run-tool-wait", "owner-new", ttl, testScope()))
+                .as("等待外部工具作业不能被强制接手").isEmpty();
+        assertThat(store.acquirePastDeadline("run-other-lane", "owner-new", ttl, testScope()))
+                .as("泳道对不上不能强制接手").isEmpty();
+        ServiceOwnershipScope otherDeployment = new ServiceOwnershipScope(
+                "other-deploy", "gen-" + "a".repeat(64), null);
+        assertThat(store.acquirePastDeadline("run-force", "owner-new", ttl, otherDeployment))
+                .as("部署对不上不能强制接手").isEmpty();
+
+        RunServiceLease taken = store.acquirePastDeadline("run-force", "owner-new", ttl, testScope())
+                .orElseThrow();
+        assertThat(taken.ownerInstanceId()).isEqualTo("owner-new");
+        assertThat(taken.fencingToken()).isEqualTo(held.fencingToken() + 1);
+        assertThat(taken.acquiredAt()).as("取得时间保持第一次领取的时刻").isEqualTo(held.acquiredAt());
+        assertThat(store.renew("run-force", "owner-old", held.fencingToken(), ttl, testScope()))
+                .as("旧持有人按旧代际续期写不进去").isFalse();
+        assertThat(store.renewOwned("owner-old", ttl, testScope()))
+                .as("旧持有人只续得上部署和泳道仍匹配的那两条").isEqualTo(2);
+        assertThat(store.renew("run-force", "owner-new", taken.fencingToken(), ttl, testScope())).isTrue();
+    }
+
+    /** 批量续期不延长部署对不上的运行，即使持有人还是自己。 */
+    @Test
+    void renewOwnedSkipsARunWhoseDeploymentDoesNotMatch() throws Exception {
+        createRun("run-scope-mine", 0, 0L);
+        createRun("run-scope-other", 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET deployment_id = 'other-deploy' WHERE id = 'run-scope-other'");
+        RunServiceLeaseStore store = leaseStore();
+        java.time.Duration ttl = java.time.Duration.ofMinutes(2);
+        store.acquire("run-scope-mine", "owner-scope", ttl).orElseThrow();
+        store.acquire("run-scope-other", "owner-scope", ttl).orElseThrow();
+        java.time.OffsetDateTime otherExpires = store.find("run-scope-other").orElseThrow().expiresAt();
+
+        assertThat(store.renewOwned("owner-scope", ttl, testScope())).isEqualTo(1);
+        assertThat(store.find("run-scope-other").orElseThrow().expiresAt())
+                .isEqualTo(otherExpires);
+        assertThat(store.renew("run-scope-other", "owner-scope", 1L, ttl, testScope())).isFalse();
+    }
+
+    private static ServiceOwnershipScope testScope() {
+        return new ServiceOwnershipScope("stable", "gen-" + "a".repeat(64), null);
     }
 
     /**

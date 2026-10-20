@@ -2,6 +2,7 @@ package world.willfrog.agent.platform.mapper;
 
 import org.apache.ibatis.annotations.Param;
 import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -14,15 +15,26 @@ public interface RunServiceLeaseMapper {
                             @Param("owner") String owner,
                             @Param("ttlMillis") long ttlMillis);
 
-    /** 续期；返回影响行数。 */
+    /**
+     * 创建时到期时间已过，且部署、代际、泳道与本进程一致时，换持有人并把代际号加一。
+     * 别人的服务所有权还没到期也写得进去。拿不到时返回空。
+     */
+    RunServiceLease acquirePastDeadline(@Param("runId") String runId,
+                                        @Param("owner") String owner,
+                                        @Param("ttlMillis") long ttlMillis,
+                                        @Param("scope") ServiceOwnershipScope scope);
+
+    /** 续期；部署、代际、泳道也对不上时影响行数为 0。 */
     int renew(@Param("runId") String runId,
               @Param("owner") String owner,
               @Param("fencingToken") long fencingToken,
-              @Param("ttlMillis") long ttlMillis);
+              @Param("ttlMillis") long ttlMillis,
+              @Param("scope") ServiceOwnershipScope scope);
 
-    /** 这一位持有、且对应 Run 还在跑的租约一起续；返回影响行数。 */
+    /** 这一位持有、运行还在进行、且部署代际泳道一致的服务所有权一起续；返回影响行数。 */
     int renewOwned(@Param("owner") String owner,
-                   @Param("ttlMillis") long ttlMillis);
+                   @Param("ttlMillis") long ttlMillis,
+                   @Param("scope") ServiceOwnershipScope scope);
 
     /** 这一位持有、且对应 Run 还在跑的租约，按取得时间升序取有界一页。 */
     List<RunServiceLease> listOwnedWithLiveRun(@Param("owner") String owner,
