@@ -189,8 +189,8 @@ public class ToolJobFinalizer {
                 String stderr = resultResp.getStderr();
                 boolean python = anchor.getToolName() == null || anchor.getToolName().isBlank()
                         || ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(anchor.getToolName());
-                boolean hasFinanceData = python && (resultResp.hasFinanceRecordChannel()
-                        || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY)));
+                boolean hasFinanceData = python
+                        && FinanceRecordDecoder.hasFinancePayload(stdout, resultResp.hasFinanceRecordChannel());
                 FinanceRecordExtractionResult formatContext = null;
                 if (hasFinanceData) {
                     if (anchor.getFinanceRecordLimitsJson() == null || anchor.getFinanceRecordLimitsJson().isBlank()) {
@@ -209,6 +209,7 @@ public class ToolJobFinalizer {
                                 FinanceRecordProtoAdapter.executionEnvironment(resultResp),
                                 snapshot.targetEnvironment(), snapshot.limits()));
                         stdout = formatContext.ordinaryStdout();
+                        stderr = formatContext.ordinaryStderr();
                     } catch (RuntimeException e) {
                         String reason = "SUCCEEDED".equals(terminalStatus)
                                 ? "finance_processing_failed" : "finance_demarker_failed";
@@ -217,12 +218,9 @@ public class ToolJobFinalizer {
                         persistFinalizerAnchor(runId, anchor);
                         return FinalizerOutcome.incomplete(STEP_ENVELOPE, reason);
                     }
-                }
-                // 普通 Python 失败保留既有去标记行为，原始结果仍留作沙箱状态证明。
-                if (python && !"SUCCEEDED".equals(terminalStatus) && stderr != null
-                        && stderr.contains(FinanceRecordDecoder.MARKER_FAMILY)) {
-                    stderr = stderr.lines().filter(line -> !line.contains(FinanceRecordDecoder.MARKER_FAMILY))
-                            .collect(java.util.stream.Collectors.joining("\n"));
+                } else if (python) {
+                    // 无金融载荷时 stderr 仍按共用逻辑隔离（report 返回值被打印到 stderr 的形态），原始结果留作沙箱状态证明。
+                    stderr = FinanceRecordDecoder.stripMarkerLines(stderr);
                 }
                 SandboxTerminalResultView terminalView = new SandboxTerminalResultView(
                         terminalStatus, resultResp.getExitCode(), stdout, stderr, null, null,

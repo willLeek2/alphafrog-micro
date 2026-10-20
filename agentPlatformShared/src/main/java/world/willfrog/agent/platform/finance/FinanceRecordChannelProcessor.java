@@ -44,17 +44,19 @@ public class FinanceRecordChannelProcessor {
     public FinanceRecordExtractionResult process(FinanceRecordExtractionRequest request) {
         validateIdentity(request);
         FinanceRecordDecoder.DecodedBatch decoded = decoder.decode(request.stdout());
+        // stderr 只做标记行隔离（供模型可见出口统一取用），不参与提取与落库。
+        String ordinaryStderr = FinanceRecordDecoder.stripMarkerLines(request.stderr());
 
         if (!"SUCCEEDED".equals(request.terminalStatus()) || request.exitCode() != 0) {
             observability.processingFailure("terminal_rejected");
             return new FinanceRecordExtractionResult(
-                    null, List.of(), decoded.ordinaryStdout(), List.of(), false);
+                    null, List.of(), decoded.ordinaryStdout(), ordinaryStderr, List.of(), false);
         }
         if (!request.limits().enabled()) {
             List<FinanceRecordExtractionResult.ModelNotice> notices = decoded.records().isEmpty()
                     ? List.of() : List.of(rejectedNotice());
             return new FinanceRecordExtractionResult(
-                    null, List.of(), decoded.ordinaryStdout(), notices, false);
+                    null, List.of(), decoded.ordinaryStdout(), ordinaryStderr, notices, false);
         }
 
         List<String> batchErrors = validateTransport(request, decoded);
@@ -64,7 +66,7 @@ public class FinanceRecordChannelProcessor {
             List<FinanceRecordExtractionResult.ModelNotice> notices = shouldWarn(request, decoded)
                     ? List.of(rejectedNotice()) : List.of();
             return new FinanceRecordExtractionResult(
-                    batch, List.of(), decoded.ordinaryStdout(), notices, true);
+                    batch, List.of(), decoded.ordinaryStdout(), ordinaryStderr, notices, true);
         }
 
         List<RecordDraft> drafts = new ArrayList<>();
@@ -93,7 +95,7 @@ public class FinanceRecordChannelProcessor {
                 allRecordErrors, records);
         persist(batch, records, schemaValid ? "accepted" : "schema_rejected");
         return new FinanceRecordExtractionResult(
-                batch, records, decoded.ordinaryStdout(), notices, true);
+                batch, records, decoded.ordinaryStdout(), ordinaryStderr, notices, true);
     }
 
     private FinanceMetricRecord buildRecord(

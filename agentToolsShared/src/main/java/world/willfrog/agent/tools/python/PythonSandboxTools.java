@@ -1195,8 +1195,8 @@ public class PythonSandboxTools {
             if (result == null) {
                 return resultLostFailure();
             }
-            if (result.hasFinanceRecordChannel()
-                    || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+            // 共用的金融载荷判断：检测到载荷说明金融接线未就位，拒绝把带标记的输出交给模型。
+            if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                 return unavailableFinanceWiringFailure();
             }
             return formatResult(status, result, null);
@@ -1204,8 +1204,7 @@ public class PythonSandboxTools {
         if ("FAILED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
             if (result != null) {
-                if (result.hasFinanceRecordChannel()
-                        || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                     return unavailableFinanceWiringFailure();
                 }
                 return formatResult(status, result, null);
@@ -1221,8 +1220,7 @@ public class PythonSandboxTools {
         if ("CANCELED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
             if (result != null) {
-                if (result.hasFinanceRecordChannel()
-                        || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                     return unavailableFinanceWiringFailure();
                 }
                 return formatResult(status, result, null);
@@ -1350,7 +1348,8 @@ public class PythonSandboxTools {
             ToolJobAnchor anchor,
             String status,
             TaskResultResponse result) {
-        if (!hasFinancePayload(result)) {
+        if (result == null
+                || !FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
             return null;
         }
         if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
@@ -1387,7 +1386,8 @@ public class PythonSandboxTools {
             String toolCallId,
             String status,
             TaskResultResponse result) {
-        if (!hasFinancePayload(result)) {
+        if (result == null
+                || !FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
             return null;
         }
         if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
@@ -1441,15 +1441,6 @@ public class PythonSandboxTools {
                 FinanceRecordProtoAdapter.executionEnvironment(result),
                 frozen.targetEnvironment(),
                 frozen.limits()));
-    }
-
-    private static boolean hasFinancePayload(TaskResultResponse result) {
-        if (result == null) {
-            return false;
-        }
-        String stdout = result.getStdout();
-        return result.hasFinanceRecordChannel()
-                || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY));
     }
 
     private static String firstNonBlank(String preferred, String fallback) {

@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.python;
 
+import world.willfrog.agent.platform.finance.FinanceRecordDecoder;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionResult;
 import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
 import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
@@ -68,6 +69,12 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
         }
         String stdout = financeResult == null
                 ? nvl(result.stdout()) : financeResult.ordinaryStdout();
+        // stderr 的标记隔离单点：financeResult 非空时用 processor 的剥离结果；
+        // 为空时按标记族前缀静态剥离——report() 的返回值可能被用户代码再打印到 stderr，
+        // 那种形态标准输出干净、不会进入提取流程，这里只做隔离兜底，不做提取。
+        String stderr = financeResult != null
+                ? financeResult.ordinaryStderr()
+                : FinanceRecordDecoder.stripMarkerLines(result.stderr());
 
         if ("SUCCEEDED".equals(result.statusName())
                 && result.exitCode() != null && result.exitCode() == 0) {
@@ -99,7 +106,7 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
                 : "检查输入和资源限制；如问题持续，请联系管理员";
         return financeToolResultFormatter.formatFailure(
                 stdout,
-                nvl(result.stderr()),
+                stderr,
                 new FinanceToolResultFormatter.FailureDetail(errorCode,
                         guidance == null ? message : guidance.message(),
                         retryable, guidance == null ? action : guidance.action()));
