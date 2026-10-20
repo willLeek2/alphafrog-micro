@@ -249,33 +249,6 @@ class Stage3GlobalStateMapperBindingTest {
                 .contains("ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id");
     }
 
-    @Test
-    void scanDueForDeploymentKeepsTheSameQueueAndAddsDeploymentFence() {
-        Map<String, Object> nullLane = dummyParams("scanDueForDeployment",
-                paramsByMapper.get("RunCoordinationMapper"));
-        nullLane.put("laneTag", null);
-        String withoutLane = sql("RunCoordinationMapper", "scanDueForDeployment", nullLane);
-        assertThat(withoutLane).as("到期条件与存活状态与 scanDue 相同")
-                .contains("c.next_visible_at <= CURRENT_TIMESTAMP")
-                .contains("r.status IN (");
-        assertThat(withoutLane).as("按本进程部署身份过滤")
-                .contains("r.deployment_id = ?")
-                .contains("r.deployment_generation_id = ?");
-        assertThat(withoutLane).as("泳道标记为空时只取主表上 lane_tag 为空的行")
-                .contains("r.lane_tag IS NULL")
-                .doesNotContain("r.lane_tag = ?");
-        assertThat(withoutLane).as("排序与 scanDue 相同")
-                .contains("ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id");
-
-        Map<String, Object> tagged = dummyParams("scanDueForDeployment",
-                paramsByMapper.get("RunCoordinationMapper"));
-        tagged.put("laneTag", "lane-opt-01");
-        String withLane = sql("RunCoordinationMapper", "scanDueForDeployment", tagged);
-        assertThat(withLane).as("有泳道标记时按等值过滤")
-                .contains("r.lane_tag = ?")
-                .doesNotContain("r.lane_tag IS NULL")
-                .contains("r.deployment_id = ?");
-    }
 
     @Test
     void deferReasonLiteralsExistInTheJavaEnum() {

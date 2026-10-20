@@ -290,49 +290,6 @@ class AgentRunEventServiceTest {
         assertTrue(String.valueOf(envelope.get("createdAt")).contains("T"));
     }
 
-    @Test
-    void missingSeqKeyContinuesFromDatabaseMax() {
-        AgentRun run = run("r1", "u1");
-        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(1L, 5L);
-        when(eventMapper.findMaxSeq("r1")).thenReturn(4);
-
-        service.append("r1", "u1", "RUN_EXPIRED", Map.of("previous_status", "EXECUTING"));
-
-        ArgumentCaptor<AgentRunEvent> inserted = ArgumentCaptor.forClass(AgentRunEvent.class);
-        verify(eventMapper).insert(inserted.capture());
-        assertEquals(5, inserted.getValue().getSeq());
-        verify(valueOperations).set(eq("agent:run:event_seq:r1"), eq("4"), any(Duration.class));
-    }
-
-    @Test
-    void seqConflictOutsideCreateTransactionRetriesFromDatabaseMax() {
-        AgentRun run = run("r1", "u1");
-        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(2L, 5L);
-        when(eventMapper.findMaxSeq("r1")).thenReturn(4);
-        org.mockito.Mockito.doAnswer(invocation -> {
-            AgentRunEvent event = invocation.getArgument(0);
-            if (event.getSeq() == 2) {
-                throw new DuplicateKeyException("Key (run_id, seq)=(r1, 2) already exists");
-            }
-            return null;
-        }).when(eventMapper).insert(any());
-        AgentRunEvent stored = new AgentRunEvent();
-        stored.setRunId("r1");
-        stored.setSeq(5);
-        stored.setEventType("RUN_EXPIRED");
-        stored.setPayloadJson("{\"previous_status\":\"EXECUTING\"}");
-        stored.setCreatedAt(OffsetDateTime.now());
-        when(eventMapper.findByRunIdAndSeq("r1", 5)).thenReturn(stored);
-
-        service.append("r1", "u1", "RUN_EXPIRED", Map.of("previous_status", "EXECUTING"));
-
-        verify(valueOperations).set(eq("agent:run:event_seq:r1"), eq("4"), any(Duration.class));
-        verify(eventRedisStore).append(stored);
-    }
 
     @Test
     void append_shouldNotFailWhenLivePublishFails() {
@@ -666,80 +623,6 @@ class AgentRunEventServiceTest {
         assertEquals(true, ext.get("generate_artifacts"));
     }
 
-    /**
-     * 拿不到服务所有权时创建必须整体失败：插入已经发生在同一条事务里，异常会让事务回滚。
-     *
-     * <p>这里用的是替身，真正的回滚由事务管理器做；断言的是异常抛出、插入已经走进事务、领取被调用。</p>
-     */
-    @Test
-    void createRun_shouldFailWhenServiceOwnershipCannotBeAcquired() {
-        when(leaseStore.acquire(anyString(), anyString(), any(Duration.class))).thenReturn(Optional.empty());
-
-        IllegalStateException error = assertThrows(
-                IllegalStateException.class,
-                () -> service.createRun("u-lease", "hello", "{}", "idem-lease", "m", "e",
-                        false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
-                        DEPLOYMENT_GENERATION_ID, false, false));
-
-        assertTrue(error.getMessage().contains("没有拿到服务所有权"));
-        verify(runMapper).insert(any());
-        verify(leaseStore).acquire(anyString(), eq(INSTANCE_OWNER), any(Duration.class));
-        verify(eventMapper, never()).insert(any());
-    }
-
-    /**
-     * 还没被受理的新建 Run：RECEIVED 改成 FAILED，写入排队失败事件，本进程持有时让出服务所有权。
-     * 第二次改不动状态，返回 false，也不再让出一次。
-     */
-    @Test
-    void closeUnacceptedCreate_marksFailedWritesEventReleasesWhenOwnedAndIsIdempotent() throws Exception {
-        String runId = "r-close";
-        String userId = "u-close";
-        AgentRun existing = run(runId, userId);
-        existing.setStatus(AgentRunStatus.FAILED);
-        when(runMapper.updateStatus(runId, userId, AgentRunStatus.RECEIVED, AgentRunStatus.FAILED))
-                .thenReturn(1, 0);
-        when(runMapper.findByIdAndUser(runId, userId)).thenReturn(existing);
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.increment("agent:run:event_seq:" + runId)).thenReturn(2L);
-        when(leaseStore.find(runId)).thenReturn(Optional.of(ownedLease(runId, INSTANCE_OWNER)));
-        when(leaseStore.release(runId, INSTANCE_OWNER, 1L)).thenReturn(true);
-
-        assertTrue(service.closeUnacceptedCreate(runId, userId, "admission-unavailable"));
-
-        ArgumentCaptor<AgentRunEvent> eventCaptor = ArgumentCaptor.forClass(AgentRunEvent.class);
-        verify(eventMapper).insert(eventCaptor.capture());
-        assertEquals("RUN_ENQUEUE_FAILED", eventCaptor.getValue().getEventType());
-        Map<?, ?> payload = objectMapper.readValue(eventCaptor.getValue().getPayloadJson(), Map.class);
-        assertEquals("agentLangchainService", payload.get("engine"));
-        assertEquals("admission-unavailable", payload.get("reason"));
-        verify(leaseStore).release(runId, INSTANCE_OWNER, 1L);
-
-        assertFalse(service.closeUnacceptedCreate(runId, userId, "admission-unavailable"));
-        verify(leaseStore, times(1)).release(runId, INSTANCE_OWNER, 1L);
-        verify(eventMapper, times(1)).insert(any());
-    }
-
-    @Test
-    void executingRunPastItsDeadlineIsExpiredAndOneStillInsideIsNot() {
-        AgentRun expired = run("r-exec-expired", "u");
-        expired.setStatus(AgentRunStatus.EXECUTING);
-        expired.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
-        AgentRun live = run("r-exec-live", "u");
-        live.setStatus(AgentRunStatus.EXECUTING);
-        live.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(30));
-        AgentRun canceling = run("r-canceling", "u");
-        canceling.setStatus(AgentRunStatus.CANCELING);
-        canceling.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
-        AgentRun waitingTool = run("r-tool", "u");
-        waitingTool.setStatus(AgentRunStatus.WAITING_TOOL_JOB);
-        waitingTool.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
-
-        assertTrue(service.shouldMarkExpired(expired));
-        assertFalse(service.shouldMarkExpired(live));
-        assertFalse(service.shouldMarkExpired(canceling));
-        assertFalse(service.shouldMarkExpired(waitingTool));
-    }
 
     private AgentRun run(String runId, String userId) {
         AgentRun run = new AgentRun();

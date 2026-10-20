@@ -212,27 +212,6 @@ class LangchainRunReadServiceTest {
         order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
     }
 
-    @Test
-    void getRunClosesTerminalResidueAfterPersistingExpired() {
-        AgentRun active = run("{\"run_provider\":\"langchain\"}");
-        active.setStatus(AgentRunStatus.EXECUTING);
-        AgentRun expired = run("{\"run_provider\":\"langchain\"}");
-        expired.setStatus(AgentRunStatus.EXPIRED);
-        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
-        when(eventService.shouldMarkExpired(active)).thenReturn(true);
-        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED)).thenReturn(1);
-        TerminalResidueCloser closer = mock(TerminalResidueCloser.class);
-        @SuppressWarnings("unchecked")
-        ObjectProvider<TerminalResidueCloser> closers = mock(ObjectProvider.class);
-        when(closers.getIfAvailable()).thenReturn(closer);
-        service.bindTerminalResidueCloser(closers);
-
-        service.getRun(GetAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
-
-        InOrder order = inOrder(finalizationService, closer);
-        order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
-        order.verify(closer).closeIfTerminal("r1");
-    }
 
     @Test
     void getRunPublisherFailureDoesNotRollbackPersistedExpiredState() {

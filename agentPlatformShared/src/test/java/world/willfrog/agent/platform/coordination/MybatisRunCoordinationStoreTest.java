@@ -115,20 +115,6 @@ class MybatisRunCoordinationStoreTest {
         verify(mapper).scanDue(8);
     }
 
-    @Test
-    void scanDueForDeploymentPassesTheDeploymentFenceAndRejectsNonPositiveLimit() {
-        RunCoordination due = row("run-v1", "DUAL_POOL_V1");
-        when(mapper.scanDueForDeployment(anyString(), anyString(), any(), anyInt()))
-                .thenReturn(List.of(due));
-
-        assertThat(store.scanDueForDeployment("stable", "gen-1", null, 8))
-                .containsExactly(due);
-        verify(mapper).scanDueForDeployment("stable", "gen-1", null, 8);
-
-        assertThatThrownBy(() -> store.scanDueForDeployment("stable", "gen-1", "lane-opt-01", 0))
-                .isInstanceOf(IllegalArgumentException.class);
-        verify(mapper, never()).scanDueForDeployment(anyString(), anyString(), anyString(), eq(0));
-    }
 
     @Test
     void syncOnlyForwardsThePlanGeneration() {

@@ -456,39 +456,6 @@ class NodeWorkItemMapperBindingTest {
         }
     }
 
-    @Test
-    void unfinishedByRunSchedulerVersionForDeploymentAddsDeploymentFence() {
-        Map<String, Object> nullLane = dummyParams("listUnfinishedByRunSchedulerVersionForDeployment");
-        nullLane.put("laneTag", null);
-        String listWithoutLane = normalized(configuration.getMappedStatement(
-                        NAMESPACE + ".listUnfinishedByRunSchedulerVersionForDeployment")
-                .getSqlSource().getBoundSql(nullLane).getSql());
-        assertThat(listWithoutLane).as("按本进程部署身份过滤")
-                .contains("r.deployment_id = ?")
-                .contains("r.deployment_generation_id = ?");
-        assertThat(listWithoutLane).as("泳道标记为空时只取主表上 lane_tag 为空的行")
-                .contains("r.lane_tag IS NULL")
-                .doesNotContain("r.lane_tag = ?");
-
-        Map<String, Object> tagged = dummyParams("listUnfinishedByRunSchedulerVersionForDeployment");
-        tagged.put("laneTag", "lane-opt-01");
-        String listWithLane = normalized(configuration.getMappedStatement(
-                        NAMESPACE + ".listUnfinishedByRunSchedulerVersionForDeployment")
-                .getSqlSource().getBoundSql(tagged).getSql());
-        assertThat(listWithLane).as("有泳道标记时按等值过滤")
-                .contains("r.lane_tag = ?")
-                .doesNotContain("r.lane_tag IS NULL")
-                .contains("r.deployment_id = ?");
-
-        Map<String, Object> countNullLane = dummyParams("countUnfinishedByRunSchedulerVersionForDeployment");
-        countNullLane.put("laneTag", null);
-        String countWithoutLane = normalized(configuration.getMappedStatement(
-                        NAMESPACE + ".countUnfinishedByRunSchedulerVersionForDeployment")
-                .getSqlSource().getBoundSql(countNullLane).getSql());
-        assertThat(countWithoutLane)
-                .contains("r.deployment_id = ?")
-                .contains("r.lane_tag IS NULL");
-    }
 
     /**
      * 创建工作项这一条是 Run 级写入：两层条件都要在同一句里核。

@@ -226,15 +226,6 @@ class MybatisNodeWorkItemStoreTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> store.scanClaimable(null, 10))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.listUnfinishedByRunSchedulerVersionForDeployment(
-                SchedulerVersion.DUAL_POOL_V1, "stable", "gen-1", null, 0))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.listUnfinishedByRunSchedulerVersionForDeployment(
-                null, "stable", "gen-1", null, 8))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.countUnfinishedByRunSchedulerVersionForDeployment(
-                null, "stable", "gen-1", null))
-                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

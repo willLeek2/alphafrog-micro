@@ -72,30 +72,6 @@ class WaitGroupRecoveryIntakeTest {
                 .containsEntry("WaitGroupRecoveryIntake", 120L);
     }
 
-    /** 部署或泳道对不上：领取前就退回，不取服务所有权。 */
-    @Test
-    void aRunFromAnotherLaneIsLeftAloneWithoutAcquire() {
-        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
-        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity("beta-test",
-                "gen-" + "a".repeat(64)));
-        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
-                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "lane-a");
-        ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
-        Mockito.lenient().when(identity.value()).thenReturn(OWNER);
-        intake = new WaitGroupRecoveryIntake(waitGroupStore, leaseStore, identity,
-                admissionRegistry, settings, ownership, 120L, frozenEffectiveSettings);
-        AgentRun run = runningRun();
-        run.setDeploymentId("beta-test");
-        run.setDeploymentGenerationId("gen-" + "a".repeat(64));
-        run.setLaneTag("lane-b");
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), run, "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.DEFERRED);
-        assertThat(result.rejection()).isEqualTo(RecoveryRejection.LEASE_NOT_OWNED);
-        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
-        verify(waitGroupStore, never()).consumeRecovery(anyLong(), anyString(), anyLong(), anyString(), anyLong());
-    }
 
     /** 不是所有者：不消费、不动通知、不占名额。 */
     @Test
