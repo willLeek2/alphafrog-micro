@@ -1015,6 +1015,12 @@ async def health() -> dict:
         # The effective boolean only — no user file or code content is ever
         # reflected here.
         "persistent_workspace_enabled": config.persistent_workspace_enabled,
+        # Queue-wait governance read-back (014-opt-04): the effective frozen
+        # value plus its source ("env" | "default"). No execution logic reads
+        # these keys; they exist so the deployed value is observable without
+        # shell access to the container.
+        "queue_wait_timeout_seconds": config.queue_wait_timeout_seconds,
+        "queue_wait_timeout_source": config.queue_wait_timeout_source,
     }
     if pool is not None:
         try:

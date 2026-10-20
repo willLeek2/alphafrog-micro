@@ -764,6 +764,10 @@ services:
       AF_SANDBOX_POOL_ACQUIRE_TIMEOUT: ${AF_SANDBOX_POOL_ACQUIRE_TIMEOUT:-30}
       AF_SANDBOX_POOL_IDLE_TIMEOUT: ${AF_SANDBOX_POOL_IDLE_TIMEOUT:-300}
       AF_SANDBOX_POOL_MAX_CONTAINER_USES: ${AF_SANDBOX_POOL_MAX_CONTAINER_USES:-}
+      # 014-opt-04 排队期限：任务入队后等待调度的超时上限（秒），超时走 200-data
+      # 终态。启动时经 load_config 读一次固化（改后需重启，无热更新）；生效值与
+      # 来源从 python-sandbox /health 回读（queue_wait_timeout_seconds/_source）。
+      AF_SANDBOX_QUEUE_WAIT_TIMEOUT: ${AF_SANDBOX_QUEUE_WAIT_TIMEOUT:-30}
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
       AF_SANDBOX_TASK_STORE_PATH: /data/sandbox_tasks/state.json
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"

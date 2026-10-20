@@ -1757,15 +1757,33 @@ public class AgentRunEventService {
      * </ol>
      */
     private int resolveInterruptedTtlDays() {
+        return interruptedTtlDaysWithSource().value();
+    }
+
+    /** 中断 Run 存活期读数：生效值与来源层级（hot_config|property|default）。 */
+    public record InterruptedTtlDaysWithSource(int value, String source) { }
+
+    /**
+     * 中断 Run 存活期的生效值与来源，供回读端点展示；{@link #resolveInterruptedTtlDays()} 委托到这里，
+     * 解析路径只有一份。
+     *
+     * <p>来源层级与 {@link #resolveInterruptedTtlDays()} 的三级优先级一致：热配置 →
+     * {@code agent.run.interrupted-ttl-days} 属性 → 代码默认。上层给了不合法的值（≤0）时按既有
+     * 行为落到下一层，读数里报的就是实际生效的那一层。</p>
+     */
+    public InterruptedTtlDaysWithSource interruptedTtlDaysWithSource() {
         int local = llmLocalConfigLoader.current()
                 .map(AgentLlmProperties::getRuntime)
                 .map(AgentLlmProperties.Runtime::getResume)
                 .map(AgentLlmProperties.Resume::getInterruptedTtlDays)
                 .orElse(0);
         if (local > 0) {
-            return local;
+            return new InterruptedTtlDaysWithSource(local, "hot_config");
         }
-        return interruptedTtlDays > 0 ? interruptedTtlDays : 7;
+        if (interruptedTtlDays > 0) {
+            return new InterruptedTtlDaysWithSource(interruptedTtlDays, "property");
+        }
+        return new InterruptedTtlDaysWithSource(7, "default");
     }
 
     /**

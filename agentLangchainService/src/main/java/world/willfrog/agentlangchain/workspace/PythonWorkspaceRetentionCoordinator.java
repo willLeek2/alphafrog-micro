@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
@@ -37,6 +38,10 @@ public class PythonWorkspaceRetentionCoordinator {
     /** 网关接口升级前不启动清理；缺失接口绝不通过旧取得接口查盘。 */
     @Autowired(required = false)
     private PythonWorkspaceRetentionPort sandbox;
+
+    /** 清理扫描周期（毫秒）。@Scheduled 启动时读一次定死，改后需重启；此处绑定仅供回读展示。 */
+    @Value("${agent.python-workspace.cleanup-scan-ms:60000}")
+    private long cleanupScanMs;
 
     @Scheduled(fixedDelayString = "${agent.python-workspace.cleanup-scan-ms:60000}",
             initialDelayString = "${agent.python-workspace.cleanup-initial-delay-ms:60000}")
@@ -214,17 +219,46 @@ public class PythonWorkspaceRetentionCoordinator {
     }
 
     int retentionHours() {
+        return retentionHoursWithSource().value();
+    }
+
+    /** 保留时长读数：生效值、来源、是否被 24 小时下限钳过、原始配置值（没配就是 null）。 */
+    public record RetentionHoursWithSource(int value, String source, boolean clamped, Integer configuredValue) { }
+
+    /**
+     * 保留时长的生效值与来源，供回读端点展示；{@link #retentionHours()} 委托到这里，判定路径只有一份。
+     *
+     * <p>来源两级：热配置里读得到这个值（{@code agent.python-workspace.retention-hours}，含被
+     * 24 小时下限钳回的）是 {@code hot_config}；读不到（热配置没配）是 {@code default}。
+     * 是否被钳过与原始配置值一并带出：钳制发生时，配了多少、实际按多少执行都能在读数里看到。</p>
+     */
+    public RetentionHoursWithSource retentionHoursWithSource() {
         AgentLlmProperties config = configLoader.currentSnapshot().config();
         AgentLlmProperties.PythonWorkspace workspace = config == null || config.getAgent() == null
                 ? null : config.getAgent().getPythonWorkspace();
         Integer configured = workspace == null ? null : workspace.getRetentionHours();
         if (configured == null) {
-            return MIN_RETENTION_HOURS;
+            return new RetentionHoursWithSource(MIN_RETENTION_HOURS, "default", false, null);
         }
         if (configured < MIN_RETENTION_HOURS) {
             log.warn("Python 工作区保留时长低于 24 小时，按 24 小时处理: configured={}", configured);
-            return MIN_RETENTION_HOURS;
+            return new RetentionHoursWithSource(MIN_RETENTION_HOURS, "hot_config", true, configured);
         }
-        return configured;
+        return new RetentionHoursWithSource(configured, "hot_config", false, configured);
+    }
+
+    /** 回读展示用：清理端口组件是否在位。网关接口未升级时端口对象为空，扫描不启动。 */
+    public boolean retentionPortPresent() {
+        return sandbox != null;
+    }
+
+    /** 回读展示用：热配置是否已同步权威。与端口在位合取（见 {@link #scan()} 开头的判断）才是扫描实际在跑的条件。 */
+    public boolean hotConfigIsAuthoritative() {
+        return configLoader.hotConfigIsAuthoritative();
+    }
+
+    /** 回读展示用：启动时读一次定死的清理扫描周期（毫秒），改后需重启才生效。 */
+    public long cleanupScanMs() {
+        return cleanupScanMs;
     }
 }
