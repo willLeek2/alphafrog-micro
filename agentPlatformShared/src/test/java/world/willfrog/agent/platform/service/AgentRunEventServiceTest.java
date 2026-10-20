@@ -686,10 +686,14 @@ class AgentRunEventServiceTest {
         AgentRun canceling = run("r-canceling", "u");
         canceling.setStatus(AgentRunStatus.CANCELING);
         canceling.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        AgentRun waitingTool = run("r-tool", "u");
+        waitingTool.setStatus(AgentRunStatus.WAITING_TOOL_JOB);
+        waitingTool.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
 
         assertTrue(service.shouldMarkExpired(expired));
         assertFalse(service.shouldMarkExpired(live));
         assertFalse(service.shouldMarkExpired(canceling));
+        assertFalse(service.shouldMarkExpired(waitingTool));
     }
 
     private AgentRun run(String runId, String userId) {

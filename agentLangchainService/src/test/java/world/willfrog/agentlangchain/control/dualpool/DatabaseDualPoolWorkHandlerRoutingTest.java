@@ -17,7 +17,10 @@ import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
@@ -593,7 +596,48 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         verify(runMapper).updateStatus(
                 "run-timed-out", "user-routing", AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED);
         verify(events).append(eq("run-timed-out"), eq("user-routing"), eq("RUN_EXPIRED"), any());
+        verify(runStateStore).markRunStatus("run-timed-out", AgentRunStatus.EXPIRED.name());
+        verify(finalizationService).publishFinalizedEvent(
+                "run-timed-out", "user-routing", AgentRunStatus.EXPIRED.name());
         verify(workItemStore, never()).claim(any(), any(), anyString(), any(), any(), any());
+    }
+
+    @Test
+    void alreadyExpiredRunStillCancelsUnfinishedSegmentsBeforeRelease() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun live = run("run-raced", "DUAL_POOL_V2");
+        live.setStatus(AgentRunStatus.EXECUTING);
+        live.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        AgentRun closed = run("run-raced", "DUAL_POOL_V2");
+        closed.setStatus(AgentRunStatus.EXPIRED);
+        NodeWorkItem item = new NodeWorkItem();
+        item.setRunId("run-raced");
+        item.setPlanGeneration(0);
+        item.setNodeId("node");
+        item.setNodeAttempt(0);
+        item.setSegmentSequence(0);
+        item.setRunControlVersion(0L);
+        item.setClaimEpoch(0);
+        when(admissionRegistry.currentAdmissionEpoch("run-raced")).thenReturn(1L);
+        when(admissionRegistry.holdsOwnership("run-raced")).thenReturn(true);
+        when(runMapper.findById("run-raced")).thenReturn(live, closed, closed);
+        when(coordinationStore.find("run-raced")).thenReturn(Optional.of(candidate("run-raced", "DUAL_POOL_V2")));
+        when(events.shouldMarkExpired(live)).thenReturn(true);
+        when(runMapper.updateStatus("run-raced", "user-routing", AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED))
+                .thenReturn(0);
+        when(workItemStore.listUnfinishedByRun("run-raced")).thenReturn(List.of(item));
+        when(workItemStore.cancel(any(), anyLong(), anyInt(), eq("run_ttl_expired")))
+                .thenReturn(NodeWorkItemMutationResult.success());
+        when(workItemStore.countUnfinishedByRun("run-raced")).thenReturn(0);
+
+        handler.coordinateRun(new RunCoordinationHint("run-raced", RunCoordinationHint.Reason.SCAN_REDISCOVERED));
+
+        verify(events, never()).append(anyString(), anyString(), anyString(), any());
+        verify(workItemStore).cancel(any(), anyLong(), anyInt(), eq("run_ttl_expired"));
+        verify(admissionRegistry).releaseBusinessPermitIfCurrent(eq("run-raced"), eq(1L), any());
     }
 
     @Test
@@ -610,6 +654,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     }
 
     private ChildRunIntentStore childRunIntents;
+    private AgentRunStateStore runStateStore;
+    private AgentRunFinalizationService finalizationService;
 
     @SuppressWarnings("unchecked")
     private DatabaseDualPoolWorkHandler handlerWith(RunOwnershipGateway ownership,
@@ -619,6 +665,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         ObjectProvider<LegacyRunHandoff> handoffProvider = Mockito.mock(ObjectProvider.class);
         Mockito.lenient().when(identity.value()).thenReturn(TEST_INSTANCE);
         Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
+        runStateStore = Mockito.mock(AgentRunStateStore.class);
+        finalizationService = Mockito.mock(AgentRunFinalizationService.class);
         return new DatabaseDualPoolWorkHandler(
                 runMapper,
                 freshRunPipeline,
@@ -640,6 +688,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 settings,
                 ownership,
                 childRunIntents = Mockito.mock(ChildRunIntentStore.class),
+                runStateStore,
+                finalizationService,
                 300, 1000, 5000, 120, new FrozenEffectiveSettings());
     }
 

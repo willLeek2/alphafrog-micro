@@ -26,7 +26,9 @@ import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.observability.ObservabilityEvents;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.treebudget.RootTreeActivityLimitException;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkerProcessProof;
@@ -116,6 +118,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final ChildRunIntentStore childRunIntents;
     private volatile String claimant;
     private final RunServiceLeaseStore leaseStore;
+    private final AgentRunStateStore runStateStore;
+    private final AgentRunFinalizationService finalizationService;
     private final ProcessInstanceIdentity processIdentity;
     private final ObjectProvider<LegacyRunHandoff> legacyHandoff;
     private final Duration serviceLeaseTtl;
@@ -157,6 +161,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             DualPoolSchedulerSettings settings,
             RunOwnershipGateway ownership,
             ChildRunIntentStore childRunIntents,
+            AgentRunStateStore runStateStore,
+            AgentRunFinalizationService finalizationService,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
             @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
@@ -182,6 +188,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.settings = settings;
         this.ownership = ownership;
         this.childRunIntents = childRunIntents;
+        this.runStateStore = runStateStore;
+        this.finalizationService = finalizationService;
         this.leaseStore = leaseStore;
         this.processIdentity = processIdentity;
         this.legacyHandoff = legacyHandoff;
@@ -228,8 +236,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this(runMapper, freshRunPipeline, workItemStore, planAdapter, todoNodeExecutor, eventService,
                 objectMapper, dispatcher, admissionRegistry, schedulerVersionPolicy, toolJobCoordinator,
                 waitGroupNodeExecutor, coordinationStore, stateStore, leaseStore, processIdentity,
-                legacyHandoff, settings, null, childRunIntents, claimLeaseSeconds, coordinationDeferRetryMs,
-                hintQueueFullRetryMs, serviceLeaseTtlSeconds, frozenEffectiveSettings);
+                legacyHandoff, settings, null, childRunIntents, null, null, claimLeaseSeconds,
+                coordinationDeferRetryMs, hintQueueFullRetryMs, serviceLeaseTtlSeconds, frozenEffectiveSettings);
     }
 
     /**
@@ -726,15 +734,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     }
 
     /**
-     * 创建时写下的到期时间已经过了，运行还在进行：收成过期，取消还没做完的分段，放开本进程占用。
-     * 条件更新没改到行，说明状态已经被别人写过，这一轮不再补事件。
+     * 创建时写下的到期时间已经过了，运行还在进行：收成过期，刷新运行状态缓存，发布终态事件，
+     * 取消还没做完的分段，再放开本进程占用。刷新缓存或发布事件失败只记日志，过期状态保留。
+     * 条件更新没改到行时，这一轮不补过期事件；库里已经是终态时，仍取消未完成分段后再释放。
      */
     private void expireTimedOutRun(AgentRun run) {
         int updatedRows = runMapper.updateStatus(
                 run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.EXPIRED);
         if (updatedRows != 1) {
             if (terminalNow(run.getId())) {
-                releaseRun(run.getId());
+                finishExpiredRun(run.getId());
             }
             return;
         }
@@ -746,8 +755,29 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         } catch (RuntimeException failure) {
             log.error("运行到期后写过期事件失败: runId={}", run.getId(), failure);
         }
-        if (cancelUnfinished(run.getId(), "run_ttl_expired")) {
-            releaseRun(run.getId());
+        if (runStateStore != null) {
+            try {
+                runStateStore.markRunStatus(run.getId(), AgentRunStatus.EXPIRED.name());
+            } catch (RuntimeException failure) {
+                log.warn("运行到期后刷新状态缓存失败: runId={}", run.getId(), failure);
+            }
+        }
+        if (finalizationService != null) {
+            try {
+                finalizationService.publishFinalizedEvent(
+                        run.getId(), run.getUserId(), AgentRunStatus.EXPIRED.name());
+            } catch (RuntimeException failure) {
+                log.warn("运行到期后发布终态事件失败，已提交的过期状态保留: runId={} err={}",
+                        run.getId(), failure.getMessage(), failure);
+            }
+        }
+        finishExpiredRun(run.getId());
+    }
+
+    /** 过期之后取消还没做完的分段，分段都清掉再放开本进程占用。 */
+    private void finishExpiredRun(String runId) {
+        if (cancelUnfinished(runId, "run_ttl_expired")) {
+            releaseRun(runId);
         }
     }
 

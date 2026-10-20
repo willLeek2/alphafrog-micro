@@ -1523,8 +1523,8 @@ public class AgentRunEventService {
      * 判断这条运行是否到了该收成过期的时刻。
      *
      * <p>等待中、失败、已取消用的是进入这些状态时延长过的到期时间。已接收、规划中、执行中、
-     * 总结中、等待工具作业用的是创建时写下的到期时间：到点还没结束，就停掉，不再一直留在执行中。
-     * 正在取消的运行留给取消收尾，不在这里改状态。</p>
+     * 总结中用的是创建时写下的到期时间：到点还没结束，就停掉。等待外部工具作业不按这个时间停，
+     * 工具自己的完成或失败再决定运行怎么走。正在取消的运行留给取消收尾。</p>
      */
     public boolean shouldMarkExpired(AgentRun run) {
         if (run == null || run.getTtlExpiresAt() == null) {
@@ -1537,8 +1537,7 @@ public class AgentRunEventService {
                 && status != AgentRunStatus.RECEIVED
                 && status != AgentRunStatus.PLANNING
                 && status != AgentRunStatus.EXECUTING
-                && status != AgentRunStatus.SUMMARIZING
-                && status != AgentRunStatus.WAITING_TOOL_JOB) {
+                && status != AgentRunStatus.SUMMARIZING) {
             return false;
         }
         return OffsetDateTime.now().isAfter(run.getTtlExpiresAt());
