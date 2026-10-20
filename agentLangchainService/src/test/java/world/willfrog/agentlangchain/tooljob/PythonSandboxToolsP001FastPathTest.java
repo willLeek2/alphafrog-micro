@@ -383,7 +383,9 @@ class PythonSandboxToolsP001FastPathTest {
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
                 mock(org.springframework.transaction.PlatformTransactionManager.class),
-                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class),
+                mock(world.willfrog.agent.platform.lease.RunServiceLeaseStore.class),
+                mock(world.willfrog.agent.platform.lease.ProcessInstanceIdentity.class));
         injectEventServiceFields(realEventService);
         AgentRunEventService eventService = spy(realEventService);
 
@@ -496,7 +498,9 @@ class PythonSandboxToolsP001FastPathTest {
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
                 mock(org.springframework.transaction.PlatformTransactionManager.class),
-                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class),
+                mock(world.willfrog.agent.platform.lease.RunServiceLeaseStore.class),
+                mock(world.willfrog.agent.platform.lease.ProcessInstanceIdentity.class));
         injectEventServiceFields(realEventSvc);
         AgentRunEventService eventServiceSpy = spy(realEventSvc);
 
@@ -723,7 +727,9 @@ class PythonSandboxToolsP001FastPathTest {
                 newMapper(), newEventMapper(), eventRedis1, om, redisTemplate,
                 llmLoader1, mock(AgentMessageService.class), mock(AgentPromptService.class),
                 mock(org.springframework.transaction.PlatformTransactionManager.class),
-                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class),
+                mock(world.willfrog.agent.platform.lease.RunServiceLeaseStore.class),
+                mock(world.willfrog.agent.platform.lease.ProcessInstanceIdentity.class));
         injectEventServiceFields(eventSvc1);
         ToolJobEventHookImpl eventHook1 = new ToolJobEventHookImpl(newMapper(), eventSvc1);
 
@@ -931,7 +937,9 @@ class PythonSandboxToolsP001FastPathTest {
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class),
                 mock(org.springframework.transaction.PlatformTransactionManager.class),
-                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class));
+                mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class),
+                mock(world.willfrog.agent.platform.lease.RunServiceLeaseStore.class),
+                mock(world.willfrog.agent.platform.lease.ProcessInstanceIdentity.class));
         injectEventServiceFields(eventService);
 
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);

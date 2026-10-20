@@ -10,17 +10,22 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
-import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException;
 import world.willfrog.agent.platform.idempotency.RunRequestDigest;
 import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 
+import java.time.Duration;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -60,6 +65,10 @@ class AgentRunEventServiceIdempotencyTest {
     private AgentPromptService mockPromptService;
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
+    @Mock
+    private RunServiceLeaseStore leaseStore;
+    @Mock
+    private ProcessInstanceIdentity instanceIdentity;
 
     private world.willfrog.agent.platform.coordination.RunCoordinationStore coordinationStore;
     private AgentRunEventService service;
@@ -70,9 +79,17 @@ class AgentRunEventServiceIdempotencyTest {
         objectMapper = new ObjectMapper();
         coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
         org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
+        org.mockito.Mockito.lenient().when(instanceIdentity.value()).thenReturn("test-instance");
+        org.mockito.Mockito.lenient().when(leaseStore.acquire(anyString(), anyString(), any(Duration.class)))
+                .thenAnswer(invocation -> {
+                    OffsetDateTime now = OffsetDateTime.now();
+                    return Optional.of(new RunServiceLease(
+                            invocation.getArgument(0), invocation.getArgument(1), 1L,
+                            now, now, now.plusMinutes(2)));
+                });
         service = new AgentRunEventService(runMapper, eventMapper, eventRedisStore, objectMapper,
                 redisTemplate, llmLocalConfigLoader, messageService, mockPromptService, transactionManager,
-                coordinationStore);
+                coordinationStore, leaseStore, instanceIdentity);
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any())).thenReturn(new PromptRunSelection(
                 PromptRunSelection.SCHEMA_VERSION, "default-v1", "control", "bundle-digest",

@@ -44,6 +44,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.mapper.ChildRunIntentMapper;
 import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
 import world.willfrog.agent.platform.lease.MybatisRunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.RunServiceLeaseMapper;
@@ -2301,6 +2302,17 @@ class Stage3WaitContractPostgresTest {
                         java.time.LocalDate.of(2025, 2, 3)));
         Mockito.lenient().when(promptService.snapshotDataFreshness()).thenReturn(null);
 
+        RunServiceLeaseStore leaseStore = Mockito.mock(RunServiceLeaseStore.class);
+        ProcessInstanceIdentity instanceIdentity = Mockito.mock(ProcessInstanceIdentity.class);
+        Mockito.lenient().when(instanceIdentity.value()).thenReturn("test-instance");
+        Mockito.lenient().when(leaseStore.acquire(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenAnswer(invocation -> Optional.of(new RunServiceLease(
+                        invocation.getArgument(0, String.class),
+                        invocation.getArgument(1, String.class),
+                        1L,
+                        OffsetDateTime.now(),
+                        OffsetDateTime.now(),
+                        OffsetDateTime.now().plusMinutes(2))));
         AgentRunEventService service = new AgentRunEventService(
                 template.getMapper(AgentRunMapper.class),
                 template.getMapper(AgentRunEventMapper.class),
@@ -2312,12 +2324,15 @@ class Stage3WaitContractPostgresTest {
                 promptService,
                 new DataSourceTransactionManager(dataSource),
                 // 创建那条事务里会往共享候选里排队：用真的资格表，量的才是「Run 一出生就在候选里」。
-                coordinationStore());
+                coordinationStore(),
+                leaseStore,
+                instanceIdentity);
         // 这些值平时由配置注入，直接 new 出来是 0/空；显式给上，免得量的是个退化配置。
         ReflectionTestUtils.setField(service, "ttlMinutes", 60);
         ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
         ReflectionTestUtils.setField(service, "payloadMaxChars", 10000);
         ReflectionTestUtils.setField(service, "payloadPreviewChars", 4096);
+        ReflectionTestUtils.setField(service, "serviceLeaseTtlSeconds", 120L);
         return service;
     }
 

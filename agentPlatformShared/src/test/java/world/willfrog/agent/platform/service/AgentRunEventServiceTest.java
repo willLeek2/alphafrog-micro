@@ -17,12 +17,18 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 
+import java.time.Duration;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -38,6 +44,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -46,6 +53,7 @@ class AgentRunEventServiceTest {
 
     private static final String DEPLOYMENT_ID = "stable";
     private static final String DEPLOYMENT_GENERATION_ID = "gen-" + "a".repeat(64);
+    private static final String INSTANCE_OWNER = "test-instance";
 
     @Mock
     private AgentRunMapper runMapper;
@@ -65,6 +73,10 @@ class AgentRunEventServiceTest {
     private AgentPromptService mockPromptService;
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
+    @Mock
+    private RunServiceLeaseStore leaseStore;
+    @Mock
+    private ProcessInstanceIdentity instanceIdentity;
 
     private world.willfrog.agent.platform.coordination.RunCoordinationStore coordinationStore;
     private AgentRunEventService service;
@@ -77,6 +89,10 @@ class AgentRunEventServiceTest {
         org.mockito.Mockito.lenient().when(llmLocalConfigLoader.current()).thenReturn(Optional.empty());
         coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
         org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
+        org.mockito.Mockito.lenient().when(instanceIdentity.value()).thenReturn(INSTANCE_OWNER);
+        org.mockito.Mockito.lenient().when(leaseStore.acquire(anyString(), anyString(), any(Duration.class)))
+                .thenAnswer(invocation -> Optional.of(ownedLease(
+                        invocation.getArgument(0), invocation.getArgument(1))));
         service = new AgentRunEventService(
                 runMapper,
                 eventMapper,
@@ -87,8 +103,11 @@ class AgentRunEventServiceTest {
                 messageService,
                 mockPromptService,
                 transactionManager,
-                coordinationStore
+                coordinationStore,
+                leaseStore,
+                instanceIdentity
         );
+        ReflectionTestUtils.setField(service, "serviceLeaseTtlSeconds", 120L);
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
                         anyString(), anyString(), any()))
                 .thenReturn(new PromptRunSelection(
@@ -216,7 +235,9 @@ class AgentRunEventServiceTest {
                 messageService,
                 mockPromptService,
                 transactionManager,
-                coordinationStore
+                coordinationStore,
+                leaseStore,
+                instanceIdentity
         );
         AgentRunEvent pending = new AgentRunEvent();
         pending.setRunId("r1");
@@ -600,10 +621,69 @@ class AgentRunEventServiceTest {
         assertEquals(true, ext.get("generate_artifacts"));
     }
 
+    /**
+     * 拿不到服务所有权时创建必须整体失败：插入已经发生在同一条事务里，异常会让事务回滚。
+     *
+     * <p>这里用的是替身，真正的回滚由事务管理器做；断言的是异常抛出、插入已经走进事务、领取被调用。</p>
+     */
+    @Test
+    void createRun_shouldFailWhenServiceOwnershipCannotBeAcquired() {
+        when(leaseStore.acquire(anyString(), anyString(), any(Duration.class))).thenReturn(Optional.empty());
+
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> service.createRun("u-lease", "hello", "{}", "idem-lease", "m", "e",
+                        false, "openrouter", 2, false, "{}", DEPLOYMENT_ID,
+                        DEPLOYMENT_GENERATION_ID, false, false));
+
+        assertTrue(error.getMessage().contains("没有拿到服务所有权"));
+        verify(runMapper).insert(any());
+        verify(leaseStore).acquire(anyString(), eq(INSTANCE_OWNER), any(Duration.class));
+        verify(eventMapper, never()).insert(any());
+    }
+
+    /**
+     * 还没被受理的新建 Run：RECEIVED 改成 FAILED，写入排队失败事件，本进程持有时让出服务所有权。
+     * 第二次改不动状态，返回 false，也不再让出一次。
+     */
+    @Test
+    void closeUnacceptedCreate_marksFailedWritesEventReleasesWhenOwnedAndIsIdempotent() throws Exception {
+        String runId = "r-close";
+        String userId = "u-close";
+        AgentRun existing = run(runId, userId);
+        existing.setStatus(AgentRunStatus.FAILED);
+        when(runMapper.updateStatus(runId, userId, AgentRunStatus.RECEIVED, AgentRunStatus.FAILED))
+                .thenReturn(1, 0);
+        when(runMapper.findByIdAndUser(runId, userId)).thenReturn(existing);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:" + runId)).thenReturn(2L);
+        when(leaseStore.find(runId)).thenReturn(Optional.of(ownedLease(runId, INSTANCE_OWNER)));
+        when(leaseStore.release(runId, INSTANCE_OWNER, 1L)).thenReturn(true);
+
+        assertTrue(service.closeUnacceptedCreate(runId, userId, "admission-unavailable"));
+
+        ArgumentCaptor<AgentRunEvent> eventCaptor = ArgumentCaptor.forClass(AgentRunEvent.class);
+        verify(eventMapper).insert(eventCaptor.capture());
+        assertEquals("RUN_ENQUEUE_FAILED", eventCaptor.getValue().getEventType());
+        Map<?, ?> payload = objectMapper.readValue(eventCaptor.getValue().getPayloadJson(), Map.class);
+        assertEquals("agentLangchainService", payload.get("engine"));
+        assertEquals("admission-unavailable", payload.get("reason"));
+        verify(leaseStore).release(runId, INSTANCE_OWNER, 1L);
+
+        assertFalse(service.closeUnacceptedCreate(runId, userId, "admission-unavailable"));
+        verify(leaseStore, times(1)).release(runId, INSTANCE_OWNER, 1L);
+        verify(eventMapper, times(1)).insert(any());
+    }
+
     private AgentRun run(String runId, String userId) {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId(userId);
         return run;
+    }
+
+    private static RunServiceLease ownedLease(String runId, String owner) {
+        OffsetDateTime now = OffsetDateTime.now();
+        return new RunServiceLease(runId, owner, 1L, now, now, now.plusMinutes(2));
     }
 }

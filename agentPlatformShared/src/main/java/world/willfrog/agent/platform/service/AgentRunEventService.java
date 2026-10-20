@@ -24,6 +24,8 @@ import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException
 import world.willfrog.agent.platform.idempotency.RunRequestDigest;
 import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
@@ -40,6 +42,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 @Service
@@ -111,6 +114,10 @@ public class AgentRunEventService {
      * Run 主记录只有这一处插入点。</p>
      */
     private final RunCoordinationStore coordinationStore;
+    /** 新建 Run 时领取与让出服务所有权。 */
+    private final RunServiceLeaseStore leaseStore;
+    /** 本进程的持有者标识：领取与让出服务所有权都用它认人。 */
+    private final ProcessInstanceIdentity instanceIdentity;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -127,6 +134,10 @@ public class AgentRunEventService {
     /** 热配置缺省时的 Python 持久工作区开关；新 Run 创建时读取当下生效值。 */
     @Value("${agent.python-workspace.enabled:false}")
     private boolean pythonWorkspaceEnabled;
+
+    /** 新建 Run 领取服务所有权时的有效期（秒），使用时最短按 1 秒收成 Duration。 */
+    @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}")
+    private long serviceLeaseTtlSeconds;
 
     @PostConstruct
     void logPythonWorkspaceSetting() {
@@ -338,6 +349,11 @@ public class AgentRunEventService {
                 if (!coordinationStore.ensure(runId)) {
                     log.warn("这条 Run 建出来却没有排进共享候选，需要人看一眼: runId={}", runId);
                 }
+                // 领取服务所有权与创建同一条事务：拿不到就整次回滚，库里不留下无人认领的 Run。
+                if (leaseStore.acquire(runId, instanceIdentity.value(), serviceLeaseTtl()).isEmpty()) {
+                    throw new IllegalStateException(
+                            "创建 Run 时没有拿到服务所有权，整次创建回滚：runId=" + runId);
+                }
                 // 接收事实与 Run 主记录同一条事务：只落库，投射留到提交之后。
                 return persistEvent(runId, "RUN_RECEIVED", ext);
             });
@@ -386,6 +402,34 @@ public class AgentRunEventService {
      * 新建的那条才允许准入与启动：读回的 Run 已经在别处跑着，再启动一次会让同一次请求执行两遍。</p>
      */
     public record RunCreation(AgentRun run, boolean created) {
+    }
+
+    /**
+     * 把还没被受理的新建 Run 关掉：状态从 RECEIVED 改成 FAILED，并让出本进程持有的服务所有权。
+     *
+     * <p>已经不是 RECEIVED 的，这一步改不动，返回 false。这是幂等关闭：第二次进来不会再写事件、
+     * 也不会再让出一次所有权。</p>
+     *
+     * @return 这次把状态从 RECEIVED 改成了 FAILED 时为 true；本来就已经关掉则为 false
+     */
+    public boolean closeUnacceptedCreate(String runId, String userId, String reason) {
+        Objects.requireNonNull(runId, "runId");
+        Objects.requireNonNull(userId, "userId");
+        Objects.requireNonNull(reason, "reason");
+        int updated = runMapper.updateStatus(
+                runId, userId, AgentRunStatus.RECEIVED, AgentRunStatus.FAILED);
+        if (updated == 0) {
+            return false;
+        }
+        append(runId, userId, "RUN_ENQUEUE_FAILED", Map.of(
+                "engine", "agentLangchainService",
+                "reason", reason));
+        leaseStore.find(runId)
+                .filter(lease -> instanceIdentity.value().equals(lease.ownerInstanceId())
+                        && lease.fencingToken() > 0)
+                .ifPresent(lease -> leaseStore.release(
+                        runId, lease.ownerInstanceId(), lease.fencingToken()));
+        return true;
     }
 
     /**
@@ -476,6 +520,10 @@ public class AgentRunEventService {
         if (!coordinationStore.ensure(childRunId)) {
             throw new IllegalStateException("Child Run did not receive a coordination row: " + childRunId);
         }
+        if (leaseStore.acquire(childRunId, instanceIdentity.value(), serviceLeaseTtl()).isEmpty()) {
+            throw new IllegalStateException(
+                    "创建子 Run 时没有拿到服务所有权，整次创建回滚：runId=" + childRunId);
+        }
         AgentRunEvent received = persistEvent(childRunId, "RUN_RECEIVED", ext);
         messageService.createInitialMessage(childRunId, childGoal);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -560,6 +608,11 @@ public class AgentRunEventService {
     /** 事务模板按需构造：它只是配置的载体，每次调用新建一个比放进字段更省心。 */
     private TransactionTemplate transactionTemplate() {
         return new TransactionTemplate(transactionManager);
+    }
+
+    /** 领取服务所有权时的有效期：配置小于 1 秒时按 1 秒用。 */
+    private Duration serviceLeaseTtl() {
+        return Duration.ofSeconds(Math.max(1L, serviceLeaseTtlSeconds));
     }
 
     /** 空串与纯空白都按「没有带幂等键」处理：历史客户端会把空串传进来。 */
