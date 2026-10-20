@@ -75,7 +75,7 @@ class ToolJobFinalizerFinanceRecordTest {
         when(configLoader.parseFrozenSnapshot(FROZEN_SNAPSHOT)).thenReturn(snapshot);
 
         FinanceRecordExtractionResult extraction = new FinanceRecordExtractionResult(
-                null, List.of(), "rows=5\nTotal return=0.1247\n", List.of(), true);
+                null, List.of(), "rows=5\nTotal return=0.1247\n", "", List.of(), true);
         when(processor.process(any())).thenReturn(extraction);
 
         var modelResult = new FinanceToolResultFormatter.FinanceModelResult(
@@ -329,7 +329,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         when(configLoader.parseFrozenSnapshot(FROZEN_SNAPSHOT)).thenReturn(snapshot);
         FinanceRecordExtractionResult extraction = new FinanceRecordExtractionResult(
-                null, List.of(), "clean stdout", List.of(), false);
+                null, List.of(), "clean stdout", "", List.of(), false);
         when(processor.process(any())).thenReturn(extraction);
         when(formatter.formatFailure(eq("clean stdout"), eq(""), any())).thenReturn(FAILURE_JSON);
 
@@ -411,7 +411,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         when(configLoader.parseFrozenSnapshot(FROZEN_SNAPSHOT)).thenReturn(snapshot);
         FinanceRecordExtractionResult extraction = new FinanceRecordExtractionResult(
-                null, List.of(), "de-markered", List.of(), true);
+                null, List.of(), "de-markered", "", List.of(), true);
         when(processor.process(any())).thenReturn(extraction);
         when(formatter.formatSuccess(any(), any(), any())).thenReturn(SUCCESS_JSON);
 

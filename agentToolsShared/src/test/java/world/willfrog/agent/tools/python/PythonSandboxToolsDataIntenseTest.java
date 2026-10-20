@@ -570,7 +570,7 @@ class PythonSandboxToolsDataIntenseTest {
                 TaskStatusResponse.newBuilder().setStatus("FAILED").build());
         when(sandbox.getTaskResult(any())).thenReturn(financeFailedTerminalResult());
         when(processor.process(any())).thenReturn(new FinanceRecordExtractionResult(
-                null, List.of(), "rows-before-failure", List.of(), false));
+                null, List.of(), "rows-before-failure", "err: RuntimeError", List.of(), false));
 
         String output = tools.executePython(
                 "raise RuntimeError()", "1", null, null, 30);
@@ -1847,7 +1847,7 @@ class PythonSandboxToolsDataIntenseTest {
                 .renderable(true)
                 .build();
         return new FinanceRecordExtractionResult(
-                batch, List.of(record), "rows=5", List.of(), true);
+                batch, List.of(record), "rows=5", "", List.of(), true);
     }
 
     // ==================== 等待成员：用预计算身份建任务，不写 Run 级进度记录 ====================
