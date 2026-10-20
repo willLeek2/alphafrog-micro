@@ -1520,22 +1520,25 @@ public class AgentRunEventService {
     }
 
     /**
-     * 判断中断状态 run 是否到了应该被清理为 EXPIRED 的时刻。
+     * 判断这条运行是否到了该收成过期的时刻。
      *
-     * <p>仅 WAITING/FAILED/CANCELED 三种状态走 interrupted TTL 检查,
-     * 其他状态由其他流程管理生命周期。</p>
+     * <p>等待中、失败、已取消用的是进入这些状态时延长过的到期时间。已接收、规划中、执行中、
+     * 总结中、等待工具作业用的是创建时写下的到期时间：到点还没结束，就停掉，不再一直留在执行中。
+     * 正在取消的运行留给取消收尾，不在这里改状态。</p>
      */
     public boolean shouldMarkExpired(AgentRun run) {
-        if (run == null) {
+        if (run == null || run.getTtlExpiresAt() == null) {
             return false;
         }
         AgentRunStatus status = run.getStatus();
         if (status != AgentRunStatus.WAITING
                 && status != AgentRunStatus.FAILED
-                && status != AgentRunStatus.CANCELED) {
-            return false;
-        }
-        if (run.getTtlExpiresAt() == null) {
+                && status != AgentRunStatus.CANCELED
+                && status != AgentRunStatus.RECEIVED
+                && status != AgentRunStatus.PLANNING
+                && status != AgentRunStatus.EXECUTING
+                && status != AgentRunStatus.SUMMARIZING
+                && status != AgentRunStatus.WAITING_TOOL_JOB) {
             return false;
         }
         return OffsetDateTime.now().isAfter(run.getTtlExpiresAt());

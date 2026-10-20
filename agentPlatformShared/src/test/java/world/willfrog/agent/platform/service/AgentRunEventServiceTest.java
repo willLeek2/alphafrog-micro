@@ -675,6 +675,23 @@ class AgentRunEventServiceTest {
         verify(eventMapper, times(1)).insert(any());
     }
 
+    @Test
+    void executingRunPastItsDeadlineIsExpiredAndOneStillInsideIsNot() {
+        AgentRun expired = run("r-exec-expired", "u");
+        expired.setStatus(AgentRunStatus.EXECUTING);
+        expired.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        AgentRun live = run("r-exec-live", "u");
+        live.setStatus(AgentRunStatus.EXECUTING);
+        live.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(30));
+        AgentRun canceling = run("r-canceling", "u");
+        canceling.setStatus(AgentRunStatus.CANCELING);
+        canceling.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+
+        assertTrue(service.shouldMarkExpired(expired));
+        assertFalse(service.shouldMarkExpired(live));
+        assertFalse(service.shouldMarkExpired(canceling));
+    }
+
     private AgentRun run(String runId, String userId) {
         AgentRun run = new AgentRun();
         run.setId(runId);

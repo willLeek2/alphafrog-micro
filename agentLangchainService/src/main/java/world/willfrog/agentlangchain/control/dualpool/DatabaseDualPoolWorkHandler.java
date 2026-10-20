@@ -371,6 +371,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     }
 
     private void coordinateLocked(AgentRun run, CoordinationTurn turn) {
+        if (eventService.shouldMarkExpired(run)) {
+            expireTimedOutRun(run);
+            return;
+        }
         AgentRunStatus status = run.getStatus();
         if (status == AgentRunStatus.RECEIVED) {
             ensurePlanningWorkItem(run, turn);
@@ -721,6 +725,32 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         }
     }
 
+    /**
+     * 创建时写下的到期时间已经过了，运行还在进行：收成过期，取消还没做完的分段，放开本进程占用。
+     * 条件更新没改到行，说明状态已经被别人写过，这一轮不再补事件。
+     */
+    private void expireTimedOutRun(AgentRun run) {
+        int updatedRows = runMapper.updateStatus(
+                run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.EXPIRED);
+        if (updatedRows != 1) {
+            if (terminalNow(run.getId())) {
+                releaseRun(run.getId());
+            }
+            return;
+        }
+        try {
+            eventService.append(run.getId(), run.getUserId(), "RUN_EXPIRED", Map.of(
+                    "run_id", run.getId(),
+                    "expired_at", OffsetDateTime.now().toString(),
+                    "previous_status", run.getStatus() == null ? "" : run.getStatus().name()));
+        } catch (RuntimeException failure) {
+            log.error("运行到期后写过期事件失败: runId={}", run.getId(), failure);
+        }
+        if (cancelUnfinished(run.getId(), "run_ttl_expired")) {
+            releaseRun(run.getId());
+        }
+    }
+
     private void persistInfrastructureFailure(AgentRun run,
                                               LangchainTodoPlan plan,
                                               List<LangchainCompletedTodo> completed,
@@ -788,6 +818,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         // 写到一半再去读全局轮次会把拖久了的回合说成更晚才被服务。
         long dispatchTurnRound = stateStore.currentRound(SchedulerRoundScope.NODE_DISPATCH);
         AgentRun run = runMapper.findById(identity.runId());
+        if (run != null && eventService.shouldMarkExpired(run)) {
+            // 到期的运行由协调回合收成过期。这一段不再领取，避免到期之后还把模型调用做完。
+            return;
+        }
         boolean planning = PLANNING_NODE_ID.equals(identity.nodeId());
         if (run == null || !schedulerVersionPolicy.isDualPoolFamily(run)
                 || run.getPlanGeneration() == null

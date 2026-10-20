@@ -570,6 +570,33 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     }
 
     @Test
+    void executingRunPastItsDeadlineIsClosedAsExpiredInsteadOfAdvanced() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-timed-out", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        when(admissionRegistry.currentAdmissionEpoch("run-timed-out")).thenReturn(1L);
+        when(admissionRegistry.holdsOwnership("run-timed-out")).thenReturn(true);
+        when(runMapper.findById("run-timed-out")).thenReturn(run);
+        when(coordinationStore.find("run-timed-out")).thenReturn(Optional.of(candidate("run-timed-out", "DUAL_POOL_V2")));
+        when(events.shouldMarkExpired(run)).thenReturn(true);
+        when(runMapper.updateStatus("run-timed-out", "user-routing", AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED))
+                .thenReturn(1);
+        when(workItemStore.listUnfinishedByRun("run-timed-out")).thenReturn(List.of());
+        when(workItemStore.countUnfinishedByRun("run-timed-out")).thenReturn(0);
+
+        handler.coordinateRun(new RunCoordinationHint("run-timed-out", RunCoordinationHint.Reason.SCAN_REDISCOVERED));
+
+        verify(runMapper).updateStatus(
+                "run-timed-out", "user-routing", AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED);
+        verify(events).append(eq("run-timed-out"), eq("user-routing"), eq("RUN_EXPIRED"), any());
+        verify(workItemStore, never()).claim(any(), any(), anyString(), any(), any(), any());
+    }
+
+    @Test
     void aLocallyAdmittedRunWhoseFamilyChangedIsReleasedInsteadOfHinted() {
         when(coordinationStore.scanDue(10)).thenReturn(List.of());
         when(admissionRegistry.snapshotRunIds()).thenReturn(Set.of("run-replaced"));
