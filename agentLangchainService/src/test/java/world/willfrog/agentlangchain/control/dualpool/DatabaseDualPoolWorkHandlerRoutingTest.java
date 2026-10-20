@@ -5,6 +5,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.ObjectProvider;
+import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
+import world.willfrog.agent.platform.childrun.ChildRunIntentView;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
@@ -116,6 +118,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 handoffProvider,
                 // 上限与水位按默认值；这一份用例量的是路由，不是参数解析。
                 TestSchedulerSettings.propertyOnly(),
+                null,
                 300, 1000, 5000, 120, frozenEffectiveSettings);
     }
 
@@ -234,6 +237,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 Mockito.mock(ProcessInstanceIdentity.class),
                 Mockito.mock(ObjectProvider.class),
                 TestSchedulerSettings.propertyOnly(),
+                null,
                 300, 1000, 5000, 1, inUse);
 
         assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
@@ -518,6 +522,54 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     }
 
     @Test
+    void acceptedChildWithExpiredOwnershipIsNotClosedAsIncompleteCreate() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly();
+        handler = handlerWith(ownership, events, settings);
+        AgentRun run = run("run-accepted-child", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.RECEIVED);
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-accepted-child", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-accepted-child")).thenReturn(run);
+        when(leaseStore.find("run-accepted-child")).thenReturn(Optional.empty());
+        when(workItemStore.countUnfinishedByRun("run-accepted-child")).thenReturn(0);
+        when(childRunIntents.findByChildRunId("run-accepted-child")).thenReturn(Optional.of(
+                new ChildRunIntentView(9L, "root", "parent", "run-accepted-child",
+                        null, 0L, null, null, 0, 0, 0L,
+                        "ACCEPTED", "RECEIVED", null, OffsetDateTime.now(), null, null, null)));
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+        verify(events, never()).closeUnacceptedCreate(anyString(), anyString(), anyString());
+        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
+    }
+
+    @Test
+    void closeFailureDoesNotStopTheScanRound() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly();
+        handler = handlerWith(ownership, events, settings);
+        AgentRun run = run("run-close-fails", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.RECEIVED);
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-close-fails", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-close-fails")).thenReturn(run);
+        when(leaseStore.find("run-close-fails")).thenReturn(Optional.empty());
+        when(workItemStore.countUnfinishedByRun("run-close-fails")).thenReturn(0);
+        when(events.closeUnacceptedCreate("run-close-fails", "user-routing", "create_incomplete"))
+                .thenThrow(new IllegalStateException("event write failed"));
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+    }
+
+    @Test
     void aLocallyAdmittedRunWhoseFamilyChangedIsReleasedInsteadOfHinted() {
         when(coordinationStore.scanDue(10)).thenReturn(List.of());
         when(admissionRegistry.snapshotRunIds()).thenReturn(Set.of("run-replaced"));
@@ -529,6 +581,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         verify(admissionRegistry).releaseBusinessPermitIfCurrent(
                 Mockito.eq("run-replaced"), Mockito.anyLong(), Mockito.any());
     }
+
+    private ChildRunIntentStore childRunIntents;
 
     @SuppressWarnings("unchecked")
     private DatabaseDualPoolWorkHandler handlerWith(RunOwnershipGateway ownership,
@@ -558,6 +612,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 handoffProvider,
                 settings,
                 ownership,
+                childRunIntents = Mockito.mock(ChildRunIntentStore.class),
                 300, 1000, 5000, 120, new FrozenEffectiveSettings());
     }
 

@@ -4,11 +4,13 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
 import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
 import world.willfrog.agent.platform.capacity.SchedulerRoundScope;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
@@ -110,6 +112,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     /** 每个回合读一次的参数：上限与水位允许在运行期改，改完只影响之后新建的节点。 */
     private final DualPoolSchedulerSettings settings;
     private final RunOwnershipGateway ownership;
+    /** 已受理子运行意图：创建已经完成、只是还没启动。协调扫描不把这类记录收成创建失败。 */
+    private final ChildRunIntentStore childRunIntents;
     private volatile String claimant;
     private final RunServiceLeaseStore leaseStore;
     private final ProcessInstanceIdentity processIdentity;
@@ -131,6 +135,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     /** 固定条带锁不会按 runId 增长，也不会在旧协调回合仍等待时被删除并创建第二把锁。 */
     private final Object[] runLockStripes = createRunLockStripes();
 
+    @Autowired
     public DatabaseDualPoolWorkHandler(
             AgentRunMapper runMapper,
             FreshRunPipeline freshRunPipeline,
@@ -151,6 +156,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             ObjectProvider<LegacyRunHandoff> legacyHandoff,
             DualPoolSchedulerSettings settings,
             RunOwnershipGateway ownership,
+            ChildRunIntentStore childRunIntents,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
             @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
@@ -175,6 +181,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.hintQueueFullRetry = Duration.ofMillis(Math.max(1L, hintQueueFullRetryMs));
         this.settings = settings;
         this.ownership = ownership;
+        this.childRunIntents = childRunIntents;
         this.leaseStore = leaseStore;
         this.processIdentity = processIdentity;
         this.legacyHandoff = legacyHandoff;
@@ -212,6 +219,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             ProcessInstanceIdentity processIdentity,
             ObjectProvider<LegacyRunHandoff> legacyHandoff,
             DualPoolSchedulerSettings settings,
+            ChildRunIntentStore childRunIntents,
             long claimLeaseSeconds,
             long coordinationDeferRetryMs,
             long hintQueueFullRetryMs,
@@ -220,8 +228,22 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this(runMapper, freshRunPipeline, workItemStore, planAdapter, todoNodeExecutor, eventService,
                 objectMapper, dispatcher, admissionRegistry, schedulerVersionPolicy, toolJobCoordinator,
                 waitGroupNodeExecutor, coordinationStore, stateStore, leaseStore, processIdentity,
-                legacyHandoff, settings, null, claimLeaseSeconds, coordinationDeferRetryMs,
+                legacyHandoff, settings, null, childRunIntents, claimLeaseSeconds, coordinationDeferRetryMs,
                 hintQueueFullRetryMs, serviceLeaseTtlSeconds, frozenEffectiveSettings);
+    }
+
+    /**
+     * 子运行意图已经是已受理或已请求取消：创建完成了，只是还没启动或正在收取消。
+     * 服务所有权到期后由补投按这条意图重新取得，不收成创建失败。
+     */
+    private boolean acceptedChildWaitingToLaunch(String runId) {
+        if (childRunIntents == null || runId == null) {
+            return false;
+        }
+        return childRunIntents.findByChildRunId(runId)
+                .map(intent -> "ACCEPTED".equals(intent.intentState())
+                        || "CANCEL_REQUESTED".equals(intent.intentState()))
+                .orElse(false);
     }
 
     /** 读数与登记里用的组件名。 */
@@ -1220,7 +1242,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                     && run.getStatus() == AgentRunStatus.RECEIVED
                     && matchesThisProcess(run)
                     && workItemStore.countUnfinishedByRun(run.getId()) == 0) {
-                eventService.closeUnacceptedCreate(run.getId(), run.getUserId(), "create_incomplete");
+                if (acceptedChildWaitingToLaunch(run.getId())) {
+                    continue;
+                }
+                try {
+                    eventService.closeUnacceptedCreate(run.getId(), run.getUserId(), "create_incomplete");
+                } catch (RuntimeException failure) {
+                    log.error("关闭未受理创建失败，本轮继续扫描下一条: runId={}", run.getId(), failure);
+                }
                 continue;
             }
             if (existing != null

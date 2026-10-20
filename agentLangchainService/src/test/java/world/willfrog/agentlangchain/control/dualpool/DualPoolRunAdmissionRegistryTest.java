@@ -639,6 +639,33 @@ class DualPoolRunAdmissionRegistryTest {
     }
 
     @Test
+    void acceptedChildOwnershipIsAcquiredWhenTheRowIsMissing() {
+        Fixture fixture = new Fixture();
+
+        assertThat(fixture.registry.acquireAcceptedChildOwnership("child")).isTrue();
+
+        verify(fixture.leaseStore).acquire(eq("child"), eq("test-instance"), any());
+    }
+
+    @Test
+    void acceptedChildOwnershipRefusesAnotherLane() {
+        RunOwnershipGateway ownership = mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity("beta-test", GENERATION));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "lane-a");
+        Fixture fixture = new Fixture(ownership, settings);
+        AgentRun run = new AgentRun();
+        run.setId("child");
+        run.setDeploymentId("beta-test");
+        run.setDeploymentGenerationId(GENERATION);
+        run.setLaneTag("lane-b");
+        fixture.run(run);
+
+        assertThat(fixture.registry.acquireAcceptedChildOwnership("child")).isFalse();
+        verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
+    }
+
+    @Test
     void admitNewRunDoesNotReleaseOwnershipWhenPermitIsUnavailable() {
         Fixture fixture = new Fixture();
         fixture.permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);

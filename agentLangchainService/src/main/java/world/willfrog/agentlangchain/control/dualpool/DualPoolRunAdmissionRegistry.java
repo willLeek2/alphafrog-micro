@@ -807,6 +807,43 @@ public class DualPoolRunAdmissionRegistry {
      * <p>遗留 Run 的接管不走这里：普通扫描用的是 {@link #takeoverLegacyRun(String)}，
      * 那条路会把 Run 与它全部未完成分段读回来，按与启动恢复同一套证明重新判定。</p>
      */
+    /**
+     * 已受理子运行补投：按持久意图取得本进程的服务所有权。
+     *
+     * <p>业务名额由随后的 {@link #admitNewRun} 领取。名额不足时这里不让出服务所有权，
+     * 下一秒补投还能读到同一代。部署或泳道不一致时不取得。</p>
+     */
+    public boolean acquireAcceptedChildOwnership(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return false;
+        }
+        String isolation = isolatedRunReasons.get(runId);
+        if (isolation != null) {
+            log.warn("这条 Run 被隔离，已受理子运行这条路径不受理: runId={} reason={}", runId, isolation);
+            return false;
+        }
+        if (ownership != null && settings != null) {
+            AgentRun run = runMapper == null ? null : runMapper.findById(runId);
+            if (!matchesThisProcess(run)) {
+                log.warn("这条 Run 不属于本进程的部署或泳道，已受理子运行这条路径不受理: runId={}", runId);
+                return false;
+            }
+        }
+        if (leaseStore == null || instanceIdentity == null) {
+            log.error("没有服务所有权存储，已受理子运行补投做不了: runId={}", runId);
+            return false;
+        }
+        Optional<RunServiceLease> existing = leaseStore.find(runId);
+        if (existing.isPresent()
+                && instanceIdentity.value().equals(existing.get().ownerInstanceId())
+                && !existing.get().expiredAt(OffsetDateTime.now())) {
+            RunServiceLease lease = existing.get();
+            bindFence(runId, new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken()));
+            return true;
+        }
+        return acquireOwnership(runId).isPresent();
+    }
+
     public boolean restorePersistedToolJob(String runId) {
         if (runId == null || runId.isBlank()) {
             return false;
