@@ -641,6 +641,74 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     }
 
     @Test
+    void unadmittedExecutingRunPastDeadlineExpiresWithoutTakeover() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-unadmitted", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-unadmitted", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-unadmitted")).thenReturn(run);
+        ownedByThisProcess("run-unadmitted");
+        when(admissionRegistry.isAdmitted("run-unadmitted")).thenReturn(false);
+        when(events.shouldMarkExpired(run)).thenReturn(true);
+        when(runMapper.updateStatus("run-unadmitted", "user-routing",
+                AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED)).thenReturn(1);
+        when(workItemStore.listUnfinishedByRun("run-unadmitted")).thenReturn(List.of());
+        when(workItemStore.countUnfinishedByRun("run-unadmitted")).thenReturn(0);
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+
+        verify(runMapper).updateStatus("run-unadmitted", "user-routing",
+                AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED);
+        verify(events).append(eq("run-unadmitted"), eq("user-routing"), eq("RUN_EXPIRED"), any());
+        verify(admissionRegistry, never()).takeoverLegacyRun("run-unadmitted");
+    }
+
+    @Test
+    void sweepCancelsUnfinishedSegmentsOfAnAlreadyExpiredRun() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-residue", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.EXPIRED);
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        NodeWorkItem item = new NodeWorkItem();
+        item.setRunId("run-residue");
+        item.setPlanGeneration(0);
+        item.setNodeId("todo_1");
+        item.setNodeAttempt(0);
+        item.setSegmentSequence(3);
+        item.setRunControlVersion(0L);
+        item.setClaimEpoch(1);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of());
+        when(workItemStore.listTerminalRunIdsWithUnfinishedWork(
+                eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of("run-residue"));
+        when(runMapper.findById("run-residue")).thenReturn(run);
+        ownedByThisProcess("run-residue");
+        when(workItemStore.listUnfinishedByRun("run-residue")).thenReturn(List.of(item));
+        when(workItemStore.cancel(any(), anyLong(), anyInt(), eq("run_status_EXPIRED")))
+                .thenReturn(NodeWorkItemMutationResult.success());
+        when(workItemStore.countUnfinishedByRun("run-residue")).thenReturn(0);
+        when(admissionRegistry.currentAdmissionEpoch("run-residue")).thenReturn(-1L);
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+
+        verify(workItemStore).cancel(any(), eq(0L), eq(1), eq("run_status_EXPIRED"));
+        verify(admissionRegistry).releaseBusinessPermitIfCurrent(eq("run-residue"), eq(-1L), any());
+        verify(admissionRegistry, never()).takeoverLegacyRun(anyString());
+    }
+
+    @Test
     void aLocallyAdmittedRunWhoseFamilyChangedIsReleasedInsteadOfHinted() {
         when(coordinationStore.scanDue(10)).thenReturn(List.of());
         when(admissionRegistry.snapshotRunIds()).thenReturn(Set.of("run-replaced"));

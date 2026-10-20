@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
+import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
@@ -20,6 +21,7 @@ import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
+import world.willfrog.agentlangchain.control.dualpool.TerminalResidueCloser;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityContractFixtures;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
@@ -208,6 +210,28 @@ class LangchainRunReadServiceTest {
         order.verify(eventService).append(eq("r1"), eq("u1"), eq("RUN_EXPIRED"), anyMap());
         order.verify(stateStore).markRunStatus("r1", "EXPIRED");
         order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
+    }
+
+    @Test
+    void getRunClosesTerminalResidueAfterPersistingExpired() {
+        AgentRun active = run("{\"run_provider\":\"langchain\"}");
+        active.setStatus(AgentRunStatus.EXECUTING);
+        AgentRun expired = run("{\"run_provider\":\"langchain\"}");
+        expired.setStatus(AgentRunStatus.EXPIRED);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
+        when(eventService.shouldMarkExpired(active)).thenReturn(true);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED)).thenReturn(1);
+        TerminalResidueCloser closer = mock(TerminalResidueCloser.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<TerminalResidueCloser> closers = mock(ObjectProvider.class);
+        when(closers.getIfAvailable()).thenReturn(closer);
+        service.bindTerminalResidueCloser(closers);
+
+        service.getRun(GetAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        InOrder order = inOrder(finalizationService, closer);
+        order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
+        order.verify(closer).closeIfTerminal("r1");
     }
 
     @Test

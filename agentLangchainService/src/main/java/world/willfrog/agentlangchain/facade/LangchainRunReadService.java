@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -25,6 +27,7 @@ import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
+import world.willfrog.agentlangchain.control.dualpool.TerminalResidueCloser;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
 import world.willfrog.alphafrogmicro.agent.idl.AgentFeatureConfigMessage;
@@ -111,8 +114,8 @@ import java.util.Map;
  *
  * <h2>过期标记</h2>
  * 普通用户读取通过 {@link #markExpiredIfNeeded} 检查 run 是否已过期（超过 TTL），
- * 如果是则更新状态并写入 EXPIRED 事件。这种"读时触发写"的模式保证过期状态
- * 即使没有定时任务也能被及时感知；管理员诊断读取明确绕过这一写回路径。
+ * 如果是则更新状态并写入 EXPIRED 事件，再调用与协调扫描相同的终态收口取消未完成分段。
+ * 管理员诊断读取明确绕过这一写回路径。
  *
  * @see LangchainRunControlService 写/控制路径（pause/cancel/resume）
  * @see AgentLangchainRunService 写路径入口（createRun）
@@ -140,6 +143,13 @@ public class LangchainRunReadService {
     private final DataAnalysisObservabilityQuery dataAnalysisObservabilityQuery;
     private final DataAnalysisReadResponseSerializer dataAnalysisSerializer;
     private final AgentRunFinalizationService finalizationService;
+
+    private ObjectProvider<TerminalResidueCloser> terminalResidueClosers;
+
+    @Autowired
+    void bindTerminalResidueCloser(ObjectProvider<TerminalResidueCloser> terminalResidueClosers) {
+        this.terminalResidueClosers = terminalResidueClosers;
+    }
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -553,8 +563,25 @@ public class LangchainRunReadService {
                 "expired_at", OffsetDateTime.now().toString()));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.EXPIRED.name());
         publishFinalizedEventSafely(run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
+        closeTerminalResidue(run.getId());
         AgentRun refreshed = runMapper.findByIdAndUser(run.getId(), run.getUserId());
         return refreshed == null ? run : refreshed;
+    }
+
+    /** 过期状态已经写上之后，取消未完成分段。收口失败只记日志，下一轮协调扫描会再试。 */
+    private void closeTerminalResidue(String runId) {
+        if (terminalResidueClosers == null) {
+            return;
+        }
+        TerminalResidueCloser closer = terminalResidueClosers.getIfAvailable();
+        if (closer == null) {
+            return;
+        }
+        try {
+            closer.closeIfTerminal(runId);
+        } catch (RuntimeException failure) {
+            log.warn("读路径写成过期后，终态残留没有收口: runId={}", runId, failure);
+        }
     }
 
     /** 工作区归档事件发送失败时走数据库轮询备用路径，不能反向破坏已经提交的过期终态。 */

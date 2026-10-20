@@ -83,7 +83,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 @Component
 @Slf4j
-public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
+public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, TerminalResidueCloser {
 
     private static final String KIND_PLANNING = "PLANNING";
     private static final String KIND_TODO = "TODO";
@@ -774,6 +774,49 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         finishExpiredRun(run.getId());
     }
 
+    /**
+     * 每一轮协调开始时扫一次：本部署、本代际、本泳道里已经是终态、但还有未完成分段的运行。
+     *
+     * <p>部署身份还没注入时不扫。一条失败不影响后面的运行。</p>
+     */
+    private void sweepTerminalResidue(int limit) {
+        if (ownership == null || settings == null || limit <= 0) {
+            return;
+        }
+        DeploymentIdentity identity = ownership.requireIdentity();
+        List<String> runIds = workItemStore.listTerminalRunIdsWithUnfinishedWork(
+                identity.deploymentId(), identity.generationId(), settings.processLaneTag(), limit);
+        for (String runId : runIds) {
+            try {
+                closeIfTerminal(runId);
+            } catch (RuntimeException failure) {
+                log.error("终态残留收口失败，本轮继续下一条: runId={}", runId, failure);
+            }
+        }
+    }
+
+    /**
+     * 运行已经是终态时取消未完成分段。服务所有权不在本进程就不改分段。
+     * 分段都清掉之后再放开本进程占用的名额；本进程没有占名额时，放开是空操作。
+     */
+    @Override
+    public boolean closeIfTerminal(String runId) {
+        AgentRun run = runMapper.findById(runId);
+        if (run == null || !isTerminal(run.getStatus()) || !matchesThisProcess(run)) {
+            return false;
+        }
+        if (!holdsServiceOwnership(runId)) {
+            log.info("终态残留不收口，服务所有权不在本进程: runId={} status={}", runId, run.getStatus());
+            return false;
+        }
+        boolean cleared = cancelUnfinished(runId, "run_status_" + run.getStatus().name());
+        if (cleared) {
+            releaseRun(runId);
+            log.info("终态残留已收口: runId={} status={}", runId, run.getStatus());
+        }
+        return cleared;
+    }
+
     /** 过期之后取消还没做完的分段，分段都清掉再放开本进程占用。 */
     private void finishExpiredRun(String runId) {
         if (cancelUnfinished(runId, "run_ttl_expired")) {
@@ -1247,6 +1290,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         if (limit <= 0) {
             return List.of();
         }
+        sweepTerminalResidue(limit);
         refreshRoundCounters();
         long round = stateStore.currentRound(SchedulerRoundScope.RUN_COORDINATION);
         LinkedHashMap<String, AgentRun> candidates = new LinkedHashMap<>();
@@ -1351,11 +1395,22 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 releaseRun(runId);
                 continue;
             }
-            if (!admissionRegistry.isAdmitted(runId)
-                    && !admissionRegistry.takeoverLegacyRun(runId)) {
-                // 库里有资格记录但这个进程还没有受理它：接管要按与启动恢复同一套证明重新判定
-                // （证明不了就隔离），不在这里凭一次扫描就无条件受理。
-                continue;
+            if (!admissionRegistry.isAdmitted(runId)) {
+                // 还没受理的运行不接回来接着跑。到期的先收成过期；已经是终态的取消残留分段。
+                // 这两步都不走遗留接管：接管把终态判成不可恢复后只会隔离，不会取消分段。
+                if (eventService.shouldMarkExpired(run)) {
+                    expireTimedOutRun(run);
+                    continue;
+                }
+                if (isTerminal(run.getStatus())) {
+                    closeIfTerminal(runId);
+                    continue;
+                }
+                if (!admissionRegistry.takeoverLegacyRun(runId)) {
+                    // 库里有资格记录但这个进程还没有受理它：接管要按与启动恢复同一套证明重新判定
+                    // （证明不了就隔离），不在这里凭一次扫描就无条件受理。
+                    continue;
+                }
             }
             hints.add(new RunCoordinationHint(runId, RunCoordinationHint.Reason.SCAN_REDISCOVERED));
         }

@@ -304,4 +304,13 @@ public interface NodeWorkItemMapper {
             @Param("deploymentId") String deploymentId,
             @Param("deploymentGenerationId") String deploymentGenerationId,
             @Param("laneTag") String laneTag);
+
+    /**
+     * 本部署、本代际、本泳道里，运行已经是终态、但还有未完成分段的运行编号。同一条运行只返回一次。
+     */
+    List<String> listTerminalRunIdsWithUnfinishedWork(
+            @Param("deploymentId") String deploymentId,
+            @Param("deploymentGenerationId") String deploymentGenerationId,
+            @Param("laneTag") String laneTag,
+            @Param("limit") int limit);
 }

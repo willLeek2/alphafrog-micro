@@ -225,6 +225,16 @@ public interface NodeWorkItemStore {
                                                           String deploymentGenerationId,
                                                           String laneTag);
 
+    /**
+     * 本部署、本代际、本泳道里，运行已经是终态、但还有未完成分段的运行编号。
+     *
+     * <p>终态含完成、部分完成、失败、取消、过期。扫描条数必须为正数。同一条运行只出现一次。</p>
+     */
+    List<String> listTerminalRunIdsWithUnfinishedWork(String deploymentId,
+                                                      String deploymentGenerationId,
+                                                      String laneTag,
+                                                      int limit);
+
     /** 某个调度器版本是否有遗留记录——有就必须禁止该版本的执行扫描、暂停该版本的新建准入。 */
     default boolean hasResidueFor(SchedulerVersion schedulerVersion) {
         return countUnfinishedBySchedulerVersion(schedulerVersion) > 0;

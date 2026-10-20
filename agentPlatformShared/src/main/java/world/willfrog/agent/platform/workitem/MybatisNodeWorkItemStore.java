@@ -546,6 +546,22 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
                 schedulerVersion.name(), deploymentId, deploymentGenerationId, laneTag);
     }
 
+    @Override
+    public List<String> listTerminalRunIdsWithUnfinishedWork(String deploymentId,
+                                                            String deploymentGenerationId,
+                                                            String laneTag,
+                                                            int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("扫描条数必须为正数：" + limit);
+        }
+        if (deploymentId == null || deploymentId.isBlank()
+                || deploymentGenerationId == null || deploymentGenerationId.isBlank()) {
+            throw new IllegalArgumentException("部署身份不完整");
+        }
+        return mapper.listTerminalRunIdsWithUnfinishedWork(
+                deploymentId, deploymentGenerationId, laneTag, limit);
+    }
+
     /**
      * 提交类语句被拒时，区分「这一行已经属于新的领取者」与其它条件不匹配。
      * 只有领取代际确实变了才算陈旧提交，这一个判断决定要不要上报
