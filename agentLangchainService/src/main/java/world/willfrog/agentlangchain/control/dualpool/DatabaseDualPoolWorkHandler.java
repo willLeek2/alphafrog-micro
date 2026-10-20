@@ -1366,7 +1366,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                     && !processIdentity.value().equals(existing.ownerInstanceId())) {
                 // 别人还握着服务所有权。创建时的到期时间已经过了，并且部署、代际、泳道一致时，
                 // 强制接手后立刻收成过期。没到期、或状态不在可收口的几种里，这一轮仍不碰。
-                if (forceExpirePastDeadline(run)) {
+                if (forceExpirePastDeadline(run, existing)) {
                     continue;
                 }
                 leaseMissThisRound++;
@@ -1472,21 +1472,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
     }
 
     /**
-     * 本进程现在是不是这条 Run 的服务所有者。
-     *
-     * <p>先读一次：已经是自己的、还没过期就直接算持有，免得每一轮扫描都为同一批 Run 写一遍。
-     * 需要的时候才去领——没建立过、或者上一代已经过期，两种都靠领取语句按条件决定。</p>
-     *
-     * <p>读到或领到的这一代要写回准入组件：写入、撤销与协调都按状态里那份凭据比对，只更新数据库
-     * 不更新这里，本进程会一直带着旧代际去写，条件语句全部落空，看起来像「什么都没发生」。</p>
-     */
-    /**
      * 别人还握着服务所有权，但这条运行已经过了创建时写下的到期时间：
-     * 数据库语句核对部署、代际、泳道和状态之后换持有人，再走现有的过期收口。
-     * 语句没写进行，返回 false，调用方按这一轮不碰处理。
+     * 数据库语句核对部署、代际、泳道、状态，以及当前持有人仍是这一轮读到的那一位，
+     * 然后换持有人，再走现有的过期收口。语句没写进行，返回 false，调用方按这一轮不碰处理。
      */
-    private boolean forceExpirePastDeadline(AgentRun run) {
-        if (ownership == null || settings == null || run == null || !matchesThisProcess(run)) {
+    private boolean forceExpirePastDeadline(AgentRun run, RunServiceLease existing) {
+        if (ownership == null || settings == null || run == null || existing == null
+                || existing.ownerInstanceId() == null || existing.ownerInstanceId().isBlank()
+                || !matchesThisProcess(run)) {
             return false;
         }
         AgentRunStatus status = run.getStatus();
@@ -1505,7 +1498,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                 processIdentity.value(),
                 serviceLeaseTtl,
                 new ServiceOwnershipScope(
-                        identity.deploymentId(), identity.generationId(), settings.processLaneTag()));
+                        identity.deploymentId(), identity.generationId(), settings.processLaneTag()),
+                existing.ownerInstanceId());
         if (taken.isEmpty()) {
             return false;
         }
@@ -1516,6 +1510,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         return true;
     }
 
+    /**
+     * 本进程现在是不是这条 Run 的服务所有者。
+     *
+     * <p>先读一次：已经是自己的、还没过期就直接算持有，免得每一轮扫描都为同一批 Run 写一遍。
+     * 需要的时候才去领——没建立过、或者上一代已经过期，两种都靠领取语句按条件决定。</p>
+     *
+     * <p>读到或领到的这一代要写回准入组件：写入、撤销与协调都按状态里那份凭据比对，只更新数据库
+     * 不更新这里，本进程会一直带着旧代际去写，条件语句全部落空，看起来像「什么都没发生」。</p>
+     */
     private boolean holdsServiceOwnership(String runId) {
         AgentRun run = runMapper.findById(runId);
         if (!matchesThisProcess(run)) {

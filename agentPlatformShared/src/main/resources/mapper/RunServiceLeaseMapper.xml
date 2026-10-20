@@ -85,7 +85,8 @@
 
     <!--
       创建时写下的到期时间已经过了，运行还停在已接收、规划中、执行中或总结中：
-      部署、代际、泳道一致时换持有人，代际号加一。别人的服务所有权还没到期也写得进去。
+      部署、代际、泳道一致，并且当前持有人仍是调用方读到的那一位时，才换持有人，代际号加一。
+      别人的服务所有权还没到期也写得进去。两个进程同时看到同一位旧持有人时，只有先写上的那一次成功。
       条件都在这条语句里。取得时间不改。
     -->
     <select id="acquirePastDeadline" resultMap="RunServiceLeaseResultMap">
@@ -96,6 +97,7 @@
             expires_at = CURRENT_TIMESTAMP + #{ttlMillis} * INTERVAL '1 millisecond'
         WHERE run_id = #{runId}
           AND owner_instance_id &lt;&gt; #{owner}
+          AND owner_instance_id = #{expectedOwner}
           AND EXISTS (
               SELECT 1 FROM alphafrog_agent_run r
               WHERE r.id = alphafrog_agent_run_service_lease.run_id

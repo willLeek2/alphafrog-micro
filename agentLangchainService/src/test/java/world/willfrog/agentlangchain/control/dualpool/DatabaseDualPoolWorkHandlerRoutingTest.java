@@ -732,7 +732,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 OffsetDateTime.now().minusMinutes(5), OffsetDateTime.now(),
                 OffsetDateTime.now().plusMinutes(2))));
         when(events.shouldMarkExpired(run)).thenReturn(true);
-        when(leaseStore.acquirePastDeadline(eq("run-foreign"), eq(TEST_INSTANCE), any(Duration.class), eq(scope)))
+        when(leaseStore.acquirePastDeadline(eq("run-foreign"), eq(TEST_INSTANCE), any(Duration.class), eq(scope),
+                eq("other-instance")))
                 .thenReturn(Optional.of(taken));
         when(runMapper.updateStatus("run-foreign", "user-routing",
                 AgentRunStatus.EXECUTING, AgentRunStatus.EXPIRED)).thenReturn(1);
@@ -771,10 +772,40 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
 
         assertThat(handler.scanRunnableRuns(10)).isEmpty();
 
-        verify(leaseStore, never()).acquirePastDeadline(anyString(), anyString(), any(Duration.class), any());
+        verify(leaseStore, never()).acquirePastDeadline(anyString(), anyString(), any(Duration.class), any(), any());
         verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
         assertThat(handler.routingSnapshot())
                 .containsEntry("leaseNotAcquiredTotal", 1L);
+    }
+
+    @Test
+    void staleExpectedOwnerDoesNotExpireTheRun() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        handler = handlerWith(ownership, events, TestSchedulerSettings.propertyOnly());
+        AgentRun run = run("run-raced-owner", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setTtlExpiresAt(OffsetDateTime.now().minusMinutes(1));
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        ServiceOwnershipScope scope = new ServiceOwnershipScope(DEPLOYMENT_ID, GENERATION, null);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-raced-owner", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-raced-owner")).thenReturn(run);
+        when(leaseStore.find("run-raced-owner")).thenReturn(Optional.of(new RunServiceLease(
+                "run-raced-owner", "other-instance", 2L,
+                OffsetDateTime.now().minusMinutes(5), OffsetDateTime.now(),
+                OffsetDateTime.now().plusMinutes(2))));
+        when(events.shouldMarkExpired(run)).thenReturn(true);
+        when(leaseStore.acquirePastDeadline(eq("run-raced-owner"), eq(TEST_INSTANCE), any(Duration.class), eq(scope),
+                eq("other-instance"))).thenReturn(Optional.empty());
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
+        verify(events, never()).append(anyString(), anyString(), anyString(), any());
+        assertThat(handler.routingSnapshot()).containsEntry("leaseNotAcquiredTotal", 1L);
     }
 
     @Test
@@ -798,7 +829,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
 
         assertThat(handler.scanRunnableRuns(10)).isEmpty();
 
-        verify(leaseStore, never()).acquirePastDeadline(anyString(), anyString(), any(Duration.class), any());
+        verify(leaseStore, never()).acquirePastDeadline(anyString(), anyString(), any(Duration.class), any(), any());
         verify(runMapper, never()).updateStatus(anyString(), anyString(), any(), any());
     }
 

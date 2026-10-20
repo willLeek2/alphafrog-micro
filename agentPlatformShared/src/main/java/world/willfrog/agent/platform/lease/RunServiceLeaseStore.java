@@ -26,10 +26,11 @@ public interface RunServiceLeaseStore {
      * 部署、代际、泳道与 {@code scope} 一致时，换持有人并把代际号加一。
      *
      * <p>别人的服务所有权还没到期也接得走。等待外部工具作业和正在取消不在此列。
-     * 对不上时返回空。条件在数据库语句里，不靠调用方先查一遍。</p>
+     * {@code expectedOwner} 是调用方这一轮读到的持有人；语句要求当前持有人仍是这一位。
+     * 中间已经被别人接走时返回空。条件在数据库语句里。</p>
      */
     Optional<RunServiceLease> acquirePastDeadline(String runId, String ownerInstanceId, Duration ttl,
-                                                  ServiceOwnershipScope scope);
+                                                  ServiceOwnershipScope scope, String expectedOwner);
 
     /** 续期：还是这一位、这一代，并且运行的部署、代际、泳道与 scope 一致，才续得上。 */
     boolean renew(String runId, String ownerInstanceId, long fencingToken, Duration ttl,

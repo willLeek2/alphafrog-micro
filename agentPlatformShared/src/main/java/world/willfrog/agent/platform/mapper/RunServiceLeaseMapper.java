@@ -17,12 +17,13 @@ public interface RunServiceLeaseMapper {
 
     /**
      * 创建时到期时间已过，且部署、代际、泳道与本进程一致时，换持有人并把代际号加一。
-     * 别人的服务所有权还没到期也写得进去。拿不到时返回空。
+     * 别人的服务所有权还没到期也写得进去。当前持有人必须仍是 expectedOwner。拿不到时返回空。
      */
     RunServiceLease acquirePastDeadline(@Param("runId") String runId,
                                         @Param("owner") String owner,
                                         @Param("ttlMillis") long ttlMillis,
-                                        @Param("scope") ServiceOwnershipScope scope);
+                                        @Param("scope") ServiceOwnershipScope scope,
+                                        @Param("expectedOwner") String expectedOwner);
 
     /** 续期；部署、代际、泳道也对不上时影响行数为 0。 */
     int renew(@Param("runId") String runId,

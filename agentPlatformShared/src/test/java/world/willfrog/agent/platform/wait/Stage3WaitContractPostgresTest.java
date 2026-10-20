@@ -2275,18 +2275,20 @@ class Stage3WaitContractPostgresTest {
         store.acquire("run-tool-wait", "owner-old", ttl).orElseThrow();
         store.acquire("run-other-lane", "owner-old", ttl).orElseThrow();
 
-        assertThat(store.acquirePastDeadline("run-not-due", "owner-new", ttl, testScope()))
+        assertThat(store.acquirePastDeadline("run-not-due", "owner-new", ttl, testScope(), "owner-old"))
                 .as("创建时到期时间还没到，不能提前抢走").isEmpty();
-        assertThat(store.acquirePastDeadline("run-tool-wait", "owner-new", ttl, testScope()))
+        assertThat(store.acquirePastDeadline("run-tool-wait", "owner-new", ttl, testScope(), "owner-old"))
                 .as("等待外部工具作业不能被强制接手").isEmpty();
-        assertThat(store.acquirePastDeadline("run-other-lane", "owner-new", ttl, testScope()))
+        assertThat(store.acquirePastDeadline("run-other-lane", "owner-new", ttl, testScope(), "owner-old"))
                 .as("泳道对不上不能强制接手").isEmpty();
         ServiceOwnershipScope otherDeployment = new ServiceOwnershipScope(
                 "other-deploy", "gen-" + "a".repeat(64), null);
-        assertThat(store.acquirePastDeadline("run-force", "owner-new", ttl, otherDeployment))
+        assertThat(store.acquirePastDeadline("run-force", "owner-new", ttl, otherDeployment, "owner-old"))
                 .as("部署对不上不能强制接手").isEmpty();
+        assertThat(store.acquirePastDeadline("run-force", "owner-new", ttl, testScope(), "someone-else"))
+                .as("期望的旧持有人已经不是当前持有人时，这一轮退让").isEmpty();
 
-        RunServiceLease taken = store.acquirePastDeadline("run-force", "owner-new", ttl, testScope())
+        RunServiceLease taken = store.acquirePastDeadline("run-force", "owner-new", ttl, testScope(), "owner-old")
                 .orElseThrow();
         assertThat(taken.ownerInstanceId()).isEqualTo("owner-new");
         assertThat(taken.fencingToken()).isEqualTo(held.fencingToken() + 1);
@@ -2296,6 +2298,8 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.renewOwned("owner-old", ttl, testScope()))
                 .as("旧持有人只续得上部署和泳道仍匹配的那两条").isEqualTo(2);
         assertThat(store.renew("run-force", "owner-new", taken.fencingToken(), ttl, testScope())).isTrue();
+        assertThat(store.acquirePastDeadline("run-force", "owner-third", ttl, testScope(), "owner-old"))
+                .as("第一个进程已经接手后，仍拿旧持有人去抢的第二次写不进去").isEmpty();
     }
 
     /** 批量续期不延长部署对不上的运行，即使持有人还是自己。 */

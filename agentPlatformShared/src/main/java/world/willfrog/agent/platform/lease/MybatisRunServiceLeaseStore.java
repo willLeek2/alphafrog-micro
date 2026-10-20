@@ -33,12 +33,16 @@ public class MybatisRunServiceLeaseStore implements RunServiceLeaseStore {
 
     @Override
     public Optional<RunServiceLease> acquirePastDeadline(String runId, String ownerInstanceId, Duration ttl,
-                                                         ServiceOwnershipScope scope) {
+                                                         ServiceOwnershipScope scope, String expectedOwner) {
         requireRunId(runId);
         requireOwner(ownerInstanceId);
+        requireOwner(expectedOwner);
         requireScope(scope);
+        if (ownerInstanceId.equals(expectedOwner)) {
+            throw new IllegalArgumentException("强制接手时期望的旧持有人不能是自己");
+        }
         return Optional.ofNullable(mapper.acquirePastDeadline(
-                runId, ownerInstanceId, requireTtl(ttl), scope));
+                runId, ownerInstanceId, requireTtl(ttl), scope, expectedOwner));
     }
 
     @Override
