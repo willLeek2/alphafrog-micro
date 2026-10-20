@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.dataanalysis;
 
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
@@ -62,10 +63,14 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
         JsonNode envelope = findEnvelope(result.stdout());
         if (envelope == null) {
             boolean crashed = result.stderr() != null && !result.stderr().isBlank();
+            // 同一码两个分支的已知事实不同：运行器崩溃属沙箱/运行器侧故障；信封缺失且 stderr 干净
+            // 对应结果超限，属容量语义——显式覆盖，不靠码兜底。
             return failure("QUERY_RESULT_UNAVAILABLE",
                     crashed ? "Query runner crashed before producing the result envelope"
                             : "Query result exceeded the output size limit; narrow the query and retry",
-                    Map.of("stderr_preview", preview(result.stderr()), "retryable", !crashed));
+                    Map.of("stderr_preview", preview(result.stderr()), "retryable", !crashed),
+                    crashed ? ToolFailureCategory.UPSTREAM_OR_SYSTEM
+                            : ToolFailureCategory.RATE_LIMITED_OR_CAPACITY);
         }
         String status = envelope.path("status").asText("");
         if ("SUCCEEDED".equals(status)) {
@@ -91,7 +96,14 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
     }
 
     private ResolvedResult failure(String code, String message, Map<String, Object> details) {
-        return new ResolvedResult(SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details),
+        return failure(code, message, details, null);
+    }
+
+    /** 显式类别的失败构造；{@code category} 传 null 时由 SandboxJobResponses 按码兜底。 */
+    private ResolvedResult failure(String code, String message, Map<String, Object> details,
+                                   ToolFailureCategory category) {
+        return new ResolvedResult(
+                SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details, Map.of(), category),
                 false, code);
     }
 

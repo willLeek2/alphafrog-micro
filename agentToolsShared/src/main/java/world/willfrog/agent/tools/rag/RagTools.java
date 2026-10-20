@@ -13,7 +13,9 @@ import world.willfrog.alphafrogmicro.externalinfo.idl.RagSearchResultItem;
 import world.willfrog.agent.platform.artifact.RunRawRefStore;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -130,8 +132,8 @@ public class RagTools {
             payload.put("data", data);
             return objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"ragSearch\",\"error\":{\"code\":\"TOOL_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            return SandboxJobResponses.fail(objectMapper, "ragSearch", "TOOL_ERROR",
+                    nvl(e.getMessage()), Map.of());
         }
     }
 
@@ -139,10 +141,12 @@ public class RagTools {
     public String loadDocument(String ossUrl) {
         try {
             if (ossUrl == null || ossUrl.isBlank()) {
-                return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"INVALID_ARGUMENT\",\"message\":\"ossUrl is empty\"}}";
+                return SandboxJobResponses.fail(objectMapper, "loadDocument", "INVALID_ARGUMENT",
+                        "ossUrl is empty", Map.of());
             }
             if (ossUrl.startsWith("raw_ref_") || ossUrl.startsWith("raw-ref:")) {
-                return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"INVALID_ARGUMENT\",\"message\":\"rawRef must be passed to rereadToolResult, not loadDocument\"}}";
+                return SandboxJobResponses.fail(objectMapper, "loadDocument", "INVALID_ARGUMENT",
+                        "rawRef must be passed to rereadToolResult, not loadDocument", Map.of());
             }
             var httpClient = java.net.http.HttpClient.newHttpClient();
             var request = java.net.http.HttpRequest.newBuilder()
@@ -153,8 +157,13 @@ public class RagTools {
             var response = httpClient.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() != 200) {
-                return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"HTTP_ERROR\",\"message\":\"Status "
-                        + response.statusCode() + "\"}}";
+                // 同一码按状态码区分事实：429 系是上游限流，其余非 200（5xx 等）按上游或系统故障；
+                // 原 code 仍写 HTTP_ERROR，message 说明状态。
+                return SandboxJobResponses.fail(objectMapper, "loadDocument", "HTTP_ERROR",
+                        "Status " + response.statusCode(), Map.of(),
+                        response.statusCode() == 429
+                                ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                                : ToolFailureCategory.UPSTREAM_OR_SYSTEM);
             }
             Map<String, Object> data = new LinkedHashMap<>();
             String body = response.body();
@@ -179,8 +188,9 @@ public class RagTools {
             result.put("data", data);
             return objectMapper.writeValueAsString(result);
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"TOOL_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            // 文档读取走网络取回正文，异常基本都是网络/IO 一类的上游或系统故障，显式归类。
+            return SandboxJobResponses.fail(objectMapper, "loadDocument", "TOOL_ERROR",
+                    nvl(e.getMessage()), Map.of(), ToolFailureCategory.UPSTREAM_OR_SYSTEM);
         }
     }
 
@@ -380,13 +390,5 @@ public class RagTools {
     private int rereadRangeMinLimitWithoutKeyword() {
         Integer value = toolsConfig().getReread().getRangeMinLimitWithoutKeyword();
         return value != null && value > 0 ? value : 3000;
-    }
-
-    private String escapeJson(String text) {
-        return nvl(text)
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
     }
 }

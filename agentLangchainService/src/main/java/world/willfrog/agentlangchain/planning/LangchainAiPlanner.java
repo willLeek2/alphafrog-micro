@@ -188,6 +188,11 @@ public class LangchainAiPlanner {
                      */
                     strategyStage += "\n\n" + promptService.planningLinearConstraint();
                 }
+                String budgetNote = toolBudgetNote(request.getRunId());
+                if (!budgetNote.isBlank()) {
+                    // 规划是「决定本轮调多少工具」的时刻：把按当前运行口径读到的真实额度一并给模型。
+                    strategyStage += "\n\n" + budgetNote;
+                }
                 String strategyContent = dialogueContext.isBlank()
                         ? dynamicPrefix + "\n" + strategyStage + "\n\n用户需求：" + request.getUserGoal()
                         : dynamicPrefix + "\n" + strategyStage + "\n\n历史对话压缩内容：\n" + dialogueContext
@@ -333,6 +338,11 @@ public class LangchainAiPlanner {
                         + "\n\n历史对话压缩内容：\n" + dialogueCtx
                         + "\n\n当前轮次用户需求：" + request.getUserGoal();
             }
+            String singleStageBudgetNote = toolBudgetNote(request.getRunId());
+            if (!singleStageBudgetNote.isBlank()) {
+                // 单阶段路径没有 strategy 阶段，额度现状随 user message 一并给出。
+                userMessage += "\n\n" + singleStageBudgetNote;
+            }
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 // 每一次尝试单独建代理：模型要绑上这一轮的身份（夹具按调用身份发回合，身份里带尝试
                 // 序号），第二次尝试才会拿到脚本里为它声明的那一份回复，而不是重放第一份。
@@ -371,6 +381,30 @@ public class LangchainAiPlanner {
                     request.getRunId(), request.getPlanGeneration() == null ? 0 : request.getPlanGeneration(),
                     "__dual_pool_planning__", 0, 0), phase + ':' + attempt);
         }
+    }
+
+    /**
+     * 规划提示里的工具调用预算现状注入文本。
+     *
+     * <p>只调统一状态方法 {@link RootTreeCallBudget#toolCallBudgetStatus(String)} 传当前运行编号：
+     * 计数源（V2 根树共享 / V1 本运行观测统计）由该方法按该运行冻结的调度版本自选，规划器不自选
+     * 根树计数——模型在规划时无论走哪条路径、运行冻结在哪个版本，看到的都是该版本的真实计数。
+     * 读不到额度（无预算组件或快照为空）时返回空串，不附加任何额度文字。</p>
+     */
+    private String toolBudgetNote(String runId) {
+        if (rootTreeCallBudget == null) {
+            return "";
+        }
+        RootTreeCallBudget.ToolCallBudgetStatus status = rootTreeCallBudget.toolCallBudgetStatus(runId);
+        if (status == null) {
+            return "";
+        }
+        if (status.unlimited()) {
+            return "工具调用预算现状：" + status.scopeNote() + "不设工具调用次数上限。";
+        }
+        return "工具调用预算现状：" + status.scopeNote() + "累计工具调用已用" + status.used()
+                + "次、上限" + status.limit() + "次、剩余" + status.remaining()
+                + "次；规划 Todo 数量与每步的工具调用时请考虑该预算。";
     }
 
     private static ChatModel planningModel(LangchainPlanningRequest request, int attempt, String phase) {

@@ -10,6 +10,7 @@ import world.willfrog.agent.platform.artifact.ToolOutputReadResult;
 import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
 import java.util.LinkedHashMap;
@@ -139,15 +140,16 @@ public class RereadToolHandler {
     }
 
     private String fail(String code, String message, Map<String, Object> details) {
+        Map<String, Object> err = new LinkedHashMap<>();
+        err.put("code", code);
+        err.put("message", message);
+        err.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(err, code, null);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", "rereadToolResult");
         payload.put("data", Map.of());
-        payload.put("error", Map.of(
-                "code", code,
-                "message", message,
-                "details", details == null ? Map.of() : details
-        ));
+        payload.put("error", err);
         return writeJson(payload);
     }
 

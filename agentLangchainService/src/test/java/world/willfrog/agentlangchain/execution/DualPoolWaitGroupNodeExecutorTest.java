@@ -1100,7 +1100,7 @@ class DualPoolWaitGroupNodeExecutorTest {
                 .map(ToolExecutionResultMessage.class::cast)
                 .map(ToolExecutionResultMessage::text))
                 .anySatisfy(text -> assertThat(text)
-                        .contains("run_budget_exceeded", "请根据已有结果回答"));
+                        .contains("RUN_BUDGET_EXCEEDED", "rejected_before_dispatch", "请根据已有结果回答"));
     }
 
     // ==================== 测试脚手架 ====================

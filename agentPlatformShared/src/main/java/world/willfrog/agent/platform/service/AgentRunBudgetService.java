@@ -243,6 +243,20 @@ public class AgentRunBudgetService {
     }
 
     /**
+     * 只读读取当前 run 观测统计里的累计工具调用次数。
+     *
+     * <p>数据源与 {@code check(String)} 的 tool_calls 拒绝检查完全相同（observability
+     * summary.toolCalls），供展示类消费方取数，保证展示数字与拒绝判定不出现两套口径。
+     * 只读：不触发检查、不递增计数、不写事件。</p>
+     */
+    public long observedToolCalls(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return 0L;
+        }
+        return toLong(loadSummary(runId).get("toolCalls"));
+    }
+
+    /**
      * 构造预算超限异常，同时向事件总线写入 RUN_BUDGET_EXCEEDED 事件。
      * <p>异常消息格式：{@code RUN_BUDGET_EXCEEDED:<维度>:<实际值>/<上限>}，
      * 例如 {@code RUN_BUDGET_EXCEEDED:tool_calls:30/30}。</p>

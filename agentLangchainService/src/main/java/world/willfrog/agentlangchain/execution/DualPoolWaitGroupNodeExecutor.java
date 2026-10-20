@@ -295,7 +295,8 @@ public class DualPoolWaitGroupNodeExecutor {
         requestMessages.add(Math.min(1, requestMessages.size()), SystemMessage.from(
                 "本次模型回复最多包含" + maxMembers + "个工具调用，所有工具合计。"
                         + "这是整轮调用数量限制，与checkParallelLimits返回的单次批量参数数量不同。"
-                        + "超过整轮限制时全部调用都不会执行；请减少本轮调用数量，等结果返回后再继续余下批次。"));
+                        + "超过整轮限制时全部调用都不会执行；请减少本轮调用数量，等结果返回后再继续余下批次。"
+                        + toolCallBudgetNote(input.identity().runId())));
         ChatRequest chatRequest = ChatRequest.builder()
                 .messages(requestMessages)
                 .toolSpecifications(visibleToolSpecifications(input.identity().runId(),
@@ -318,6 +319,30 @@ public class DualPoolWaitGroupNodeExecutor {
             throw new IllegalStateException("模型没有返回回复，无法继续这个节点：" + input.identity().describe());
         }
         return reply;
+    }
+
+    /**
+     * 根树工具调用预算现状的注入文本（每模型回合一次快照读）。
+     *
+     * <p>只调统一状态方法 {@link RootTreeCallBudget#toolCallBudgetStatus(String)} 传当前运行编号，
+     * 计数源（V2 根树共享 / V1 本运行观测统计）由该方法按运行冻结的调度版本自选，本注入点不自选。
+     * 额度快照仅用于模型可见性，能否派发仍由既有准入决定。读不到额度（无预算组件或快照为空，
+     * 如旧测试桩）时返回空串，不附加任何额度文字。</p>
+     */
+    private String toolCallBudgetNote(String runId) {
+        if (rootTreeCallBudget == null) {
+            return "";
+        }
+        RootTreeCallBudget.ToolCallBudgetStatus status = rootTreeCallBudget.toolCallBudgetStatus(runId);
+        if (status == null) {
+            return "";
+        }
+        if (status.unlimited()) {
+            return "工具调用预算现状：" + status.scopeNote() + "不设工具调用次数上限。";
+        }
+        return "工具调用预算现状：" + status.scopeNote() + "累计工具调用已用" + status.used()
+                + "次、上限" + status.limit() + "次、剩余" + status.remaining()
+                + "次；预算耗尽时新调用会在派发前被拒绝，请据此安排调用。";
     }
 
     /** 给每个被拒绝的原调用配一个结果，保留完整对话配对关系，不派发任何工具。 */
@@ -518,10 +543,11 @@ public class DualPoolWaitGroupNodeExecutor {
                                 suspended.groupId(), member.getMemberIdentity());
                     }
                 } catch (RunBudgetException budget) {
+                    // 预留额度被拒：工具与子运行都没有执行，与派发路径同款的结构化拒绝载荷
+                    // （dimension/used/limit 从捕获处透传），恢复时渲染成拒绝信封而非「工具调用失败」。
                     String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
                             member.getToolCallId(), false, "",
-                            Map.of("errorCode", "run_budget_exceeded",
-                                    "errorDetail", "当前运行预算已用尽，无法继续调用工具。请根据已有结果回答；信息不足时说明无法完成。"),
+                            budgetFailure("run_budget_exceeded", budget),
                             maxMemberResultChars);
                     MemberCompletionResult completed = waitGroupStore.completeMember(new MemberCompletionRequest(
                             suspended.groupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
@@ -778,17 +804,20 @@ public class DualPoolWaitGroupNodeExecutor {
             // 将未派发成员写成明确失败，等整组齐备后下一分段直接让节点失败。
             notificationId = keepNotification(notificationId,
                     abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
-                            RISK_REPLAY_EVIDENCE_MISSING_CODE));
+                            RISK_REPLAY_EVIDENCE_MISSING_CODE, null));
             log.warn("Python 风险审查决定缺少可重放请求，等待组成员按失败收尾：groupId={} segment={}",
                     groupId, input.identity().describe(), missing);
         } catch (RunBudgetException budget) {
             // 额度耗尽：还没拿到结果的成员记成失败，让整组仍然能齐备；本段按挂起收场，
             // 下一段恢复后模型调用会再次撞上额度检查，由那一次给出节点失败结果。
+            // dimension/actual/limit 在捕获处最全，随成员载荷结构化透传，往后每跳只透传不重算，
+            // 恢复时由 WaitMemberResultPayload 渲染成拒绝信封而不是「工具调用失败」。
             notificationId = keepNotification(notificationId,
                     abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
-                            "run_budget_exceeded"));
-            log.warn("派发期间额度耗尽，未完成的成员按失败记：groupId={} segment={}",
-                    groupId, input.identity().describe());
+                            "run_budget_exceeded", budget));
+            log.warn("派发期间额度耗尽，未完成的成员按失败记：groupId={} segment={} dimension={} {}/{}",
+                    groupId, input.identity().describe(), budget.getDimension(),
+                    budget.getActual(), budget.getLimit());
         } catch (RuntimeException e) {
             if (!LangchainTerminalToolErrorHandler.isTerminalSignal(e)) {
                 throw e;
@@ -796,7 +825,7 @@ public class DualPoolWaitGroupNodeExecutor {
             // 取消、暂停这一类控制信号要求当前 Worker 松开调用栈。先把没拿到结果的成员记成失败，
             // 让等待链停在「组已齐备」而不是永远等不到人；随后原样抛出，交给上层收尾。
             abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
-                    "member_dispatch_aborted");
+                    "member_dispatch_aborted", null);
             throw e;
         }
         return notificationId;
@@ -808,21 +837,32 @@ public class DualPoolWaitGroupNodeExecutor {
                                        AcceptanceReleasePolicy policy,
                                        AcceptanceReleasePolicy.RuleMatches policyMatches,
                                        List<WaitMember> members,
-                                       String errorCode) {
+                                       String errorCode,
+                                       RunBudgetException budget) {
         Long notificationId = null;
         for (WaitMember member : members) {
             if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING
                     || awaitingPersistedSandboxDispatch(member)) {
                 continue;
             }
-            Map<String, Object> failure = "run_budget_exceeded".equals(errorCode)
-                    ? Map.of("errorCode", errorCode,
-                            "errorDetail", "当前运行预算已用尽，无法继续调用工具。请根据已有结果回答；信息不足时说明无法完成。")
+            Map<String, Object> failure = budget != null
+                    ? budgetFailure(errorCode, budget)
                     : Map.of("errorCode", errorCode);
             notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
                     policyMatches, member, false, "", failure, null));
         }
         return notificationId;
+    }
+
+    /** 预算拒绝的成员失败载荷：dimension/used/limit 从捕获处异常透传，恢复时渲染成结构化拒绝信封。 */
+    private static Map<String, Object> budgetFailure(String errorCode, RunBudgetException budget) {
+        Map<String, Object> failure = new LinkedHashMap<>();
+        failure.put("errorCode", errorCode);
+        failure.put("errorDetail", "当前运行预算已用尽，无法继续调用工具。请根据已有结果回答；信息不足时说明无法完成。");
+        failure.put("dimension", budget.getDimension());
+        failure.put("used", budget.getActual());
+        failure.put("limit", budget.getLimit());
+        return failure;
     }
 
     private static boolean awaitingPersistedSandboxDispatch(WaitMember member) {

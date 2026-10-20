@@ -14,6 +14,7 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.wait.WaitGroupMemberPendingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
@@ -493,7 +494,8 @@ public class ToolRouter {
                 "error", Map.of(
                         "code", nvl(precheck.getErrorCode()),
                         "message", nvl(precheck.getMessage()),
-                        "details", details
+                        "details", details,
+                        "category", ToolFailureCategory.INVALID_ARGUMENT.name()
                 )
         ));
     }
@@ -521,7 +523,8 @@ public class ToolRouter {
                         "error", Map.of(
                                 "code", "CAPABILITY_DISABLED",
                                 "message", "webSearch is disabled for this run",
-                                "details", Map.of()
+                                "details", Map.of(),
+                                "category", ToolFailureCategory.UNSUPPORTED.name()
                         )
                 ));
                 return ToolResultCacheService.ToolExecutionOutcome.builder()
@@ -628,7 +631,8 @@ public class ToolRouter {
                                 "error", Map.of(
                                         "code", "CAPABILITY_DISABLED",
                                         "message", "ETF adj factor is disabled (adjFactorEnabled=false)",
-                                        "details", Map.of("adjFactorEnabled", false)
+                                        "details", Map.of("adjFactorEnabled", false),
+                                        "category", ToolFailureCategory.UNSUPPORTED.name()
                                 )
                         ));
                     }
@@ -1034,7 +1038,8 @@ public class ToolRouter {
                 "error", Map.of(
                         "code", "UNSUPPORTED_TOOL",
                         "message", "Unsupported tool",
-                        "details", Map.of("tool", nvl(toolName))
+                        "details", Map.of("tool", nvl(toolName)),
+                        "category", ToolFailureCategory.UNSUPPORTED.name()
                 )
         ));
     }
@@ -1050,7 +1055,8 @@ public class ToolRouter {
                 "error", Map.of(
                         "code", "TOOL_INVOCATION_ERROR",
                         "message", nvl(message),
-                        "details", Map.of()
+                        "details", Map.of(),
+                        "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name()
                 )
         ));
     }
@@ -1066,7 +1072,8 @@ public class ToolRouter {
                         "details", Map.of(
                                 "effectiveWeight", Math.max(0, effectiveWeight),
                                 "tool", nvl(toolName)
-                        )
+                        ),
+                        "category", ToolFailureCategory.RATE_LIMITED_OR_CAPACITY.name()
                 )
         ));
     }

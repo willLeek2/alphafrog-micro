@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionSink;
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionSinkException;
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionSnapshot;
@@ -431,6 +432,7 @@ public class FinanceMethodTools {
         err.put("code", nvl(code));
         err.put("message", nvl(message));
         err.put("details", Map.of());
+        ToolFailureCategory.putCategoryIfResolved(err, code, null);
         payload.put("error", err);
         return writeJson(payload);
     }
