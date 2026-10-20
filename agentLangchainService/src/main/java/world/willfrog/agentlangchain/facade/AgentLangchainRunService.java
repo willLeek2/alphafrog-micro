@@ -6,7 +6,6 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
@@ -22,8 +21,6 @@ import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
-
-import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -173,12 +170,7 @@ public class AgentLangchainRunService {
 
     private void markEnqueueFailed(AgentRunEventService agentEventService, AgentRun run, RuntimeException error) {
         try {
-            agentEventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
-                    "engine", "agentLangchainService",
-                    "reason", describeFailure(error)
-            ));
-            runMapper.updateStatus(
-                    run.getId(), run.getUserId(), run.getStatus(), AgentRunStatus.FAILED);
+            agentEventService.closeUnacceptedCreate(run.getId(), run.getUserId(), describeFailure(error));
         } catch (Exception markError) {
             log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
                     run.getId(), markError.getMessage());

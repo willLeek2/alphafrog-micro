@@ -13,6 +13,8 @@ import world.willfrog.agent.platform.wait.RecoveryNotification;
 import world.willfrog.agent.platform.wait.RecoveryRejection;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -31,7 +33,7 @@ import static org.mockito.Mockito.when;
  * 恢复受理的顺序：先服务所有权、再业务名额、最后才取走那条不可逆的恢复资格。
  *
  * <p>这里量四件事：不是所有者时不消费也不动通知；名额拿不到时通知留在等待态（而不是先消费掉再要名额）；
- * 消费没成按语句给的原因分「推后」与「收口」两种；刚取得、还没接手的租约要按持有者与代际让出去，
+ * 消费没成按语句给的原因分「推后」与「收口」两种；刚取得、还没接手的服务所有权要按持有者与代际让出去，
  * 本来就是我持有的那条留着。</p>
  */
 class WaitGroupRecoveryIntakeTest {
@@ -63,11 +65,36 @@ class WaitGroupRecoveryIntakeTest {
                 .thenReturn(new DualPoolRunAdmissionRegistry.Admission(true, 11L));
     }
 
-    /** 这条路在读服务租约时长：登记之后读数里报的是它归一化之后在用的数。 */
+    /** 这条路在读服务所有权有效期：登记之后读数里报的是它归一化之后在用的数。 */
     @Test
     void theEffectiveLeaseTtlIsRegisteredForTheReading() {
         assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
                 .containsEntry("WaitGroupRecoveryIntake", 120L);
+    }
+
+    /** 部署或泳道对不上：领取前就退回，不取服务所有权。 */
+    @Test
+    void aRunFromAnotherLaneIsLeftAloneWithoutAcquire() {
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity("beta-test",
+                "gen-" + "a".repeat(64)));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "lane-a");
+        ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
+        Mockito.lenient().when(identity.value()).thenReturn(OWNER);
+        intake = new WaitGroupRecoveryIntake(waitGroupStore, leaseStore, identity,
+                admissionRegistry, settings, ownership, 120L, frozenEffectiveSettings);
+        AgentRun run = runningRun();
+        run.setDeploymentId("beta-test");
+        run.setDeploymentGenerationId("gen-" + "a".repeat(64));
+        run.setLaneTag("lane-b");
+
+        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), run, "test");
+
+        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.DEFERRED);
+        assertThat(result.rejection()).isEqualTo(RecoveryRejection.LEASE_NOT_OWNED);
+        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
+        verify(waitGroupStore, never()).consumeRecovery(anyLong(), anyString(), anyLong(), anyString(), anyLong());
     }
 
     /** 不是所有者：不消费、不动通知、不占名额。 */
@@ -85,7 +112,7 @@ class WaitGroupRecoveryIntakeTest {
         verify(admissionRegistry, never()).reserveForRecovery(anyString());
     }
 
-    /** 名额拿不到：先不消费，通知留在等待态，刚取得的租约让出去。 */
+    /** 名额拿不到：先不消费，通知留在等待态，刚取得的服务所有权让出去。 */
     @Test
     void withoutABusinessPermitTheEntitlementIsNotConsumed() {
         givenFreshlyTakenLease();
@@ -103,7 +130,7 @@ class WaitGroupRecoveryIntakeTest {
                 .containsEntry("recoveryIntakeLeaseReleasedTotal", 1L);
     }
 
-    /** 本来就归我持有的租约：名额拿不到时留着，因为这条 Run 确实归我服务。 */
+    /** 本来就归我持有的服务所有权：名额拿不到时留着，因为这条 Run 确实归我服务。 */
     @Test
     void aLeaseThatWasAlreadyMineIsKeptWhenTheAttemptDoesNotHandOff() {
         when(leaseStore.find(RUN_ID)).thenReturn(Optional.of(lease(TOKEN)));
@@ -148,7 +175,7 @@ class WaitGroupRecoveryIntakeTest {
         verify(admissionRegistry, never()).rollbackReservedAdmission(anyString(), any());
     }
 
-    /** 不会再被服务的原因：收口关闭并写明原因，同时把预留与租约还回去。 */
+    /** 不会再被服务的原因：收口关闭并写明原因，同时把预留与服务所有权还回去。 */
     @Test
     void aPermanentRejectionClosesTheNotification() {
         givenFreshlyTakenLease();
@@ -166,7 +193,7 @@ class WaitGroupRecoveryIntakeTest {
         assertThat(intake.snapshot()).containsEntry("recoveryIntakeClosedTotal", 1L);
     }
 
-    /** 暂时性的原因：退避重试，通知不动，刚取得的租约也让出去。 */
+    /** 暂时性的原因：退避重试，通知不动，刚取得的服务所有权也让出去。 */
     @Test
     void aTemporaryRejectionOnlyDefers() {
         givenFreshlyTakenLease();
@@ -248,7 +275,7 @@ class WaitGroupRecoveryIntakeTest {
 
     // ===== 造数据 =====
 
-    /** 这条 Run 本来没有租约：这一次是刚取得的，没接手就该让出去。 */
+    /** 这条 Run 本来没有服务所有权：这一次是刚取得的，没接手就该让出去。 */
     private void givenFreshlyTakenLease() {
         when(leaseStore.find(RUN_ID)).thenReturn(Optional.empty());
         when(leaseStore.acquire(eq(RUN_ID), eq(OWNER), any(Duration.class)))

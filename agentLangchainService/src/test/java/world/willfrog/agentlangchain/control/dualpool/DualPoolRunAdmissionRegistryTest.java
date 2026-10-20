@@ -20,6 +20,8 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -46,8 +48,9 @@ class DualPoolRunAdmissionRegistryTest {
 
     /** 替身里那条活着的服务所有权：持有人 test-instance、代际 1，与 {@code leaseAcquired()} 对应。 */
     private static final ServiceOwnershipFence FENCE = new ServiceOwnershipFence("test-instance", 1L);
+    private static final String GENERATION = "gen-" + "a".repeat(64);
 
-    /** 这条路在读服务租约时长：登记之后读数里报的是它归一化之后在用的数。 */
+    /** 这条路在读服务所有权有效期：登记之后读数里报的是它归一化之后在用的数。 */
     @Test
     void theEffectiveLeaseTtlIsRegisteredForTheReading() {
         FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
@@ -60,7 +63,7 @@ class DualPoolRunAdmissionRegistryTest {
     }
 
     /**
-     * 只量名额语义的替身：服务所有权交给一条「取一次就成功」的租约。受理这条路本来就要先拿到
+     * 只量名额语义的替身：服务所有权交给一条「取一次就成功」的服务所有权。受理这条路本来就要先拿到
      * 这条 Run 的服务所有权，拿不到的进程不该受理它，所以替身也必须把这一关摆出来。
      */
     private static DualPoolRunAdmissionRegistry registryThatCanOwnRuns(
@@ -75,12 +78,16 @@ class DualPoolRunAdmissionRegistryTest {
         ProcessInstanceIdentity identity = mock(ProcessInstanceIdentity.class);
         when(identity.value()).thenReturn("test-instance");
         when(leaseStore.acquire(anyString(), anyString(), any())).thenAnswer(invocation ->
-                Optional.of(new RunServiceLease(invocation.getArgument(0, String.class), "test-instance", 1L,
-                        OffsetDateTime.now(), OffsetDateTime.now(),
-                        OffsetDateTime.now().plusMinutes(2))));
-        when(leaseStore.find(anyString())).thenReturn(Optional.empty());
+                Optional.of(liveLease(invocation.getArgument(0, String.class))));
+        when(leaseStore.find(anyString())).thenAnswer(invocation ->
+                Optional.of(liveLease(invocation.getArgument(0, String.class))));
         return new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity, 120L,
                 new FrozenEffectiveSettings(), resolver);
+    }
+
+    private static RunServiceLease liveLease(String runId) {
+        return new RunServiceLease(runId, "test-instance", 1L,
+                OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2));
     }
 
     @Test
@@ -245,15 +252,16 @@ class DualPoolRunAdmissionRegistryTest {
     }
 
     /**
-     * 恢复预留没占上名额时，这一次刚取得的租约要让出去，本进程也不再以为这条 Run 归自己。
+     * 恢复预留没占上名额时，这一次刚取得的服务所有权要让出去，本进程也不再以为这条 Run 归自己。
      *
-     * <p>以前这里只把「本进程不认识这条 Run」记下来，凭据与库里的租约都留在手里：这条 Run 被本进程
-     * 锁着（续期循环还会一直替它续），却没有一个入口能推进它，直到租约过期。</p>
+     * <p>以前这里只把「本进程不认识这条 Run」记下来，凭据与库里的服务所有权都留在手里：这条 Run 被本进程
+     * 锁着（续期循环还会一直替它续），却没有一个入口能推进它，直到服务所有权过期。</p>
      */
     @Test
     void aRejectedRecoveryReservationGivesTheFreshlyTakenLeaseBack() {
         Fixture fixture = new Fixture();
         fixture.permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        fixture.thisProcessOwns("run-1");
         assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
 
         assertThat(fixture.registry.reserveForRecovery("run-2").admitted()).isFalse();
@@ -266,9 +274,9 @@ class DualPoolRunAdmissionRegistryTest {
     }
 
     /**
-     * 这条 Run 的租约本来就是我们的：这一轮接手失败（分段放不回去）不能把凭据清掉。
+     * 这条 Run 的服务所有权本来就是我们的：这一轮接手失败（分段放不回去）不能把凭据清掉。
      *
-     * <p>数据库里那条租约还是我们的，凭据清掉之后本进程会一直带着空凭据去写——每一次写入都被条件
+     * <p>数据库里那条服务所有权还是我们的，凭据清掉之后本进程会一直带着空凭据去写——每一次写入都被条件
      * 语句挡回来，看起来像「什么都没发生」。</p>
      */
     @Test
@@ -295,7 +303,7 @@ class DualPoolRunAdmissionRegistryTest {
 
         assertThat(fixture.isolationReasonOf("run-2")).isEqualTo("claim_requeue_left_claimed");
         assertThat(fixture.registry.holdsOwnership("run-2"))
-                .as("租约本来就在我们手上：这一轮不动它，凭据也留着").isTrue();
+                .as("服务所有权本来就在我们手上：这一轮不动它，凭据也留着").isTrue();
         verify(fixture.leaseStore, never()).release(eq("run-2"), anyString(), anyLong());
         assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
     }
@@ -309,6 +317,7 @@ class DualPoolRunAdmissionRegistryTest {
     @Test
     void aRevocationCarryingAStaleTokenLeavesTheStateWeTookBackAlone() {
         Fixture fixture = new Fixture();
+        fixture.thisProcessOwns("run-1");
         assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
         assertThat(fixture.registry.bindFence("run-1", new ServiceOwnershipFence("test-instance", 9L))).isTrue();
 
@@ -324,6 +333,7 @@ class DualPoolRunAdmissionRegistryTest {
     @Test
     void aRevocationCarryingTheCurrentTokenDropsTheOwnershipAndThePermit() {
         Fixture fixture = new Fixture();
+        fixture.thisProcessOwns("run-1");
         assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
         assertThat(fixture.registry.bindFence("run-1", new ServiceOwnershipFence("test-instance", 9L))).isTrue();
 
@@ -522,7 +532,7 @@ class DualPoolRunAdmissionRegistryTest {
      * 父 Run 已经进终态、收口又没能证明那些分段也已终结：隔离这一条，不许借恢复接回执行链。
      *
      * <p>终态 Run 没有执行权。收口失败时如果落进普通恢复流程，它会被当成「说得清的遗留」重新取得
-     * 租约与业务名额，接回来继续跑一张已经结束的图。</p>
+     * 服务所有权与业务名额，接回来继续跑一张已经结束的图。</p>
      */
     @Test
     void terminalResidueThatCannotBeClosedIsIsolatedInsteadOfRecovered() {
@@ -594,8 +604,70 @@ class DualPoolRunAdmissionRegistryTest {
         assertThat(fixture.registry.startupResidueBlockedFor(SchedulerVersion.DUAL_POOL_V2.name())).isTrue();
         assertThat(fixture.registry.startupResidueBlockedFor(SchedulerVersion.DUAL_POOL_V1.name())).isFalse();
         assertThat(fixture.registry.startupResidueBlocked()).isTrue();
+        fixture.thisProcessOwns("run-new-v1");
+        fixture.thisProcessOwns("run-new-v2");
         assertThat(fixture.registry.admitNewRun("run-new-v1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
         assertThat(fixture.registry.admitNewRun("run-new-v2", SchedulerVersion.DUAL_POOL_V2.name())).isFalse();
+    }
+
+    @Test
+    void otherDeploymentOrLaneResidueIsNotRecovered() {
+        RunOwnershipGateway ownership = mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity("beta-test", GENERATION));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "lane-a");
+        Fixture fixture = new Fixture(ownership, settings);
+        NodeWorkItem waiting = item("run-2", 3, "todo-1", 0, 0);
+        waiting.setState(NodeWorkItemState.WAITING.name());
+        waiting.setClaimEpoch(0);
+        waiting.setContextVersion(7L);
+        waiting.setRunControlVersion(2L);
+        waiting.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
+        fixture.residue(SchedulerVersion.DUAL_POOL_V2, List.of(waiting));
+        AgentRun run = waitGroupRun(AgentRunStatus.EXECUTING);
+        run.setDeploymentId("beta-test");
+        run.setDeploymentGenerationId(GENERATION);
+        run.setLaneTag("lane-b");
+        fixture.run(run);
+
+        fixture.registry.detectStartupResidue();
+
+        assertThat(fixture.isolationReasonOf("run-2")).isEqualTo("deployment_or_lane_mismatch");
+        assertThat(fixture.registry.isAdmitted("run-2")).isFalse();
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
+        verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
+    }
+
+    @Test
+    void admitNewRunDoesNotReleaseOwnershipWhenPermitIsUnavailable() {
+        Fixture fixture = new Fixture();
+        fixture.permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 1);
+        fixture.thisProcessOwns("run-1");
+        fixture.thisProcessOwns("run-2");
+        assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
+
+        assertThat(fixture.registry.admitNewRun("run-2", SchedulerVersion.DUAL_POOL_V1.name())).isFalse();
+
+        verify(fixture.leaseStore, never()).release(eq("run-2"), anyString(), anyLong());
+        verify(fixture.leaseStore, never()).acquire(anyString(), anyString(), any());
+        assertThat(fixture.registry.holdsOwnership("run-2")).as("名额没拿到也把凭据留着").isTrue();
+        assertThat(fixture.registry.isAdmitted("run-2")).isFalse();
+        assertThat(fixture.registry.isKnownInCurrentProcess("run-2")).isFalse();
+    }
+
+    @Test
+    void forgetFailedAdmissionReleasesBoundOwnership() {
+        Fixture fixture = new Fixture();
+        fixture.thisProcessOwns("run-1");
+        assertThat(fixture.registry.admitNewRun("run-1", SchedulerVersion.DUAL_POOL_V1.name())).isTrue();
+        when(fixture.leaseStore.release("run-1", "test-instance", 1L)).thenReturn(true);
+
+        fixture.registry.forgetFailedAdmission("run-1");
+
+        verify(fixture.leaseStore).release("run-1", "test-instance", 1L);
+        assertThat(fixture.registry.isAdmitted("run-1")).isFalse();
+        assertThat(fixture.registry.isKnownInCurrentProcess("run-1")).isFalse();
+        assertThat(fixture.permitLedger.usage(SchedulerPermitLayer.BUSINESS_ADMISSION).inUse()).isZero();
     }
 
     @Test
@@ -680,26 +752,47 @@ class DualPoolRunAdmissionRegistryTest {
         private final AgentRunMapper runs = mock(AgentRunMapper.class);
         private final RunServiceLeaseStore leaseStore = mock(RunServiceLeaseStore.class);
         private final ProcessInstanceIdentity identity = mock(ProcessInstanceIdentity.class);
+        private final RunOwnershipGateway ownership;
         private final DualPoolRunAdmissionRegistry registry;
 
         private Fixture() {
+            this(null, null);
+        }
+
+        private Fixture(RunOwnershipGateway ownership, DualPoolSchedulerSettings settings) {
+            this.ownership = ownership;
             permitLedger.setLimit(SchedulerPermitLayer.BUSINESS_ADMISSION, 4);
             when(identity.value()).thenReturn("test-instance");
-            when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V1)).thenReturn(0);
-            when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2)).thenReturn(0);
+            if (ownership == null) {
+                when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V1)).thenReturn(0);
+                when(workItems.countUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2)).thenReturn(0);
+            } else {
+                when(workItems.countUnfinishedByRunSchedulerVersionForDeployment(
+                        any(), any(), any(), any())).thenReturn(0);
+            }
             when(leaseStore.find(anyString())).thenReturn(Optional.empty());
             // 默认这条 Run 的服务所有权取得得到；「在别人手上」的用例再单独把这一条改掉。
             when(leaseStore.acquire(anyString(), anyString(), any())).thenAnswer(invocation ->
-                    Optional.of(new RunServiceLease(invocation.getArgument(0, String.class), "test-instance",
-                            1L, OffsetDateTime.now(), OffsetDateTime.now(),
-                            OffsetDateTime.now().plusMinutes(2))));
+                    Optional.of(liveLease(invocation.getArgument(0, String.class))));
             registry = new DualPoolRunAdmissionRegistry(permitLedger, workItems, runs, leaseStore, identity,
-                    120L, new FrozenEffectiveSettings());
+                    120L, new FrozenEffectiveSettings(), RootRunResolver.identityForTests(),
+                    ownership, settings);
         }
 
         private void residue(SchedulerVersion version, List<NodeWorkItem> items) {
-            when(workItems.countUnfinishedByRunSchedulerVersion(version)).thenReturn(items.size());
-            when(workItems.listUnfinishedByRunSchedulerVersion(eq(version), anyInt())).thenReturn(items);
+            if (ownership == null) {
+                when(workItems.countUnfinishedByRunSchedulerVersion(version)).thenReturn(items.size());
+                when(workItems.listUnfinishedByRunSchedulerVersion(eq(version), anyInt())).thenReturn(items);
+                return;
+            }
+            when(workItems.countUnfinishedByRunSchedulerVersionForDeployment(
+                    eq(version), any(), any(), any())).thenReturn(items.size());
+            when(workItems.listUnfinishedByRunSchedulerVersionForDeployment(
+                    eq(version), any(), any(), any(), anyInt())).thenReturn(items);
+        }
+
+        private void thisProcessOwns(String runId) {
+            when(leaseStore.find(runId)).thenReturn(Optional.of(liveLease(runId)));
         }
 
         private void run(AgentRun run) {

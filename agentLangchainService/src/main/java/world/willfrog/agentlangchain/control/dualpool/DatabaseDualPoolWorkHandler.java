@@ -50,6 +50,8 @@ import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.execution.WaitGroupSuspensionMarker;
 import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
 import java.time.Duration;
@@ -107,6 +109,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
     private final Duration hintQueueFullRetry;
     /** 每个回合读一次的参数：上限与水位允许在运行期改，改完只影响之后新建的节点。 */
     private final DualPoolSchedulerSettings settings;
+    private final RunOwnershipGateway ownership;
     private volatile String claimant;
     private final RunServiceLeaseStore leaseStore;
     private final ProcessInstanceIdentity processIdentity;
@@ -147,6 +150,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
             ProcessInstanceIdentity processIdentity,
             ObjectProvider<LegacyRunHandoff> legacyHandoff,
             DualPoolSchedulerSettings settings,
+            RunOwnershipGateway ownership,
             @Value("${agent.langchain.dual-pool.node-worker.claim-lease-seconds:300}") long claimLeaseSeconds,
             @Value("${agent.langchain.dual-pool.coordination-defer-retry-ms:1000}") long coordinationDeferRetryMs,
             @Value("${agent.langchain.dual-pool.hint-queue-full-retry-ms:5000}") long hintQueueFullRetryMs,
@@ -170,12 +174,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         this.coordinationDeferRetry = Duration.ofMillis(Math.max(1L, coordinationDeferRetryMs));
         this.hintQueueFullRetry = Duration.ofMillis(Math.max(1L, hintQueueFullRetryMs));
         this.settings = settings;
+        this.ownership = ownership;
         this.leaseStore = leaseStore;
         this.processIdentity = processIdentity;
         this.legacyHandoff = legacyHandoff;
-        this.serviceLeaseTtl = Duration.ofSeconds(Math.max(5L, serviceLeaseTtlSeconds));
-        // 登记归一化之后真正在用的值：领取租约、协调延期重试、提示队列满重试与服务租约时长这几项
-        // 读数里报的都是这里登记的数，不是属性请求值。
+        this.serviceLeaseTtl = Duration.ofSeconds(
+                DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(serviceLeaseTtlSeconds));
+        // 登记归一化之后真正在用的值：节点领取有效期、协调延期重试、提示队列满重试与服务所有权有效期
+        // 这几项读数里报的都是这里登记的数，不是属性请求值。
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_NODE_WORKER_CLAIM_LEASE_SECONDS,
                 COMPONENT, this.claimLease.toSeconds());
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_COORDINATION_DEFER_RETRY_MS,
@@ -184,6 +190,38 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                 COMPONENT, this.hintQueueFullRetry.toMillis());
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
                 COMPONENT, this.serviceLeaseTtl.toSeconds());
+    }
+
+    /** 窄测试入口：不注入部署归属时，扫描仍走未限定部署的候选。 */
+    DatabaseDualPoolWorkHandler(
+            AgentRunMapper runMapper,
+            FreshRunPipeline freshRunPipeline,
+            NodeWorkItemStore workItemStore,
+            NodeWorkPlanAdapter planAdapter,
+            LangchainTodoNodeExecutor todoNodeExecutor,
+            AgentRunEventService eventService,
+            ObjectMapper objectMapper,
+            DualPoolDispatcher dispatcher,
+            DualPoolRunAdmissionRegistry admissionRegistry,
+            SchedulerVersionPolicy schedulerVersionPolicy,
+            DualPoolToolJobCoordinator toolJobCoordinator,
+            DualPoolWaitGroupNodeExecutor waitGroupNodeExecutor,
+            RunCoordinationStore coordinationStore,
+            SchedulerStateStore stateStore,
+            RunServiceLeaseStore leaseStore,
+            ProcessInstanceIdentity processIdentity,
+            ObjectProvider<LegacyRunHandoff> legacyHandoff,
+            DualPoolSchedulerSettings settings,
+            long claimLeaseSeconds,
+            long coordinationDeferRetryMs,
+            long hintQueueFullRetryMs,
+            long serviceLeaseTtlSeconds,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
+        this(runMapper, freshRunPipeline, workItemStore, planAdapter, todoNodeExecutor, eventService,
+                objectMapper, dispatcher, admissionRegistry, schedulerVersionPolicy, toolJobCoordinator,
+                waitGroupNodeExecutor, coordinationStore, stateStore, leaseStore, processIdentity,
+                legacyHandoff, settings, null, claimLeaseSeconds, coordinationDeferRetryMs,
+                hintQueueFullRetryMs, serviceLeaseTtlSeconds, frozenEffectiveSettings);
     }
 
     /** 读数与登记里用的组件名。 */
@@ -1131,7 +1169,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         long isolatedThisRound = 0L;
         // 一次全局扫描：三个调度器版本排在同一份候选顺序里，选出来之后按每一行冻结的版本路由。
         // 候选是共享的，谁能被接手不共享：能不能动这条 Run，由它自己的服务所有权说了算。
-        for (RunCoordination due : coordinationStore.scanDue(limit)) {
+        for (RunCoordination due : scanDueCandidates(limit)) {
             AgentRun run = runMapper.findById(due.getRunId());
             if (run == null) {
                 // 资格行指向一条读不回来的 Run：不动它的状态，也不接手。
@@ -1174,6 +1212,23 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
                     log.error("协调候选里的版本不属于任何已知执行层，保持失败关闭: runId={} version={} 累计{}条",
                             due.getRunId(), run.getSchedulerVersion(), isolated);
                 }
+                continue;
+            }
+            RunServiceLease existing = leaseStore.find(run.getId()).orElse(null);
+            boolean missingOrExpired = existing == null || existing.expiredAt(OffsetDateTime.now());
+            if (missingOrExpired
+                    && run.getStatus() == AgentRunStatus.RECEIVED
+                    && matchesThisProcess(run)
+                    && workItemStore.countUnfinishedByRun(run.getId()) == 0) {
+                eventService.closeUnacceptedCreate(run.getId(), run.getUserId(), "create_incomplete");
+                continue;
+            }
+            if (existing != null
+                    && !existing.expiredAt(OffsetDateTime.now())
+                    && !processIdentity.value().equals(existing.ownerInstanceId())) {
+                // 别人正活着持有这条 Run：这一轮不碰它，也不改它的轮次位置。
+                leaseMissThisRound++;
+                leaseNotAcquired.incrementAndGet();
                 continue;
             }
             if (!holdsServiceOwnership(run.getId())) {
@@ -1273,6 +1328,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
      * 不更新这里，本进程会一直带着旧代际去写，条件语句全部落空，看起来像「什么都没发生」。</p>
      */
     private boolean holdsServiceOwnership(String runId) {
+        AgentRun run = runMapper.findById(runId);
+        if (!matchesThisProcess(run)) {
+            return false;
+        }
         String owner = processIdentity.value();
         RunServiceLease current = leaseStore.find(runId).orElse(null);
         if (current != null && owner.equals(current.ownerInstanceId())
@@ -1283,6 +1342,33 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler {
         Optional<RunServiceLease> acquired = leaseStore.acquire(runId, owner, serviceLeaseTtl);
         acquired.ifPresent(lease -> admissionRegistry.bindFence(runId, fenceOf(lease)));
         return acquired.isPresent();
+    }
+
+    private List<RunCoordination> scanDueCandidates(int limit) {
+        if (ownership == null) {
+            return coordinationStore.scanDue(limit);
+        }
+        DeploymentIdentity identity = ownership.requireIdentity();
+        return coordinationStore.scanDueForDeployment(
+                identity.deploymentId(), identity.generationId(), settings.processLaneTag(), limit);
+    }
+
+    /**
+     * 这条 Run 是不是本进程该服务的部署代际与泳道。
+     *
+     * <p>部署归属还没注入时（窄测试构造器）不做过滤。两边泳道都是空表示主 Beta，算匹配。</p>
+     */
+    private boolean matchesThisProcess(AgentRun run) {
+        if (run == null) {
+            return false;
+        }
+        if (ownership == null || settings == null) {
+            return true;
+        }
+        DeploymentIdentity identity = ownership.requireIdentity();
+        return Objects.equals(identity.deploymentId(), run.getDeploymentId())
+                && Objects.equals(identity.generationId(), run.getDeploymentGenerationId())
+                && Objects.equals(settings.processLaneTag(), run.getLaneTag());
     }
 
     private static ServiceOwnershipFence fenceOf(RunServiceLease lease) {

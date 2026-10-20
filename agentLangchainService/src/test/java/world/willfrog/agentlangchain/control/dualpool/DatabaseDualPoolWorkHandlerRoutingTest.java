@@ -26,6 +26,8 @@ import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -40,6 +42,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -56,6 +59,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
 
     private static final String TEST_INSTANCE = "agent@localhost@"
             + ProcessHandle.current().pid() + "@test-instance";
+    private static final String DEPLOYMENT_ID = "beta-test";
+    private static final String GENERATION = "gen-" + "a".repeat(64);
 
     private RunCoordinationStore coordinationStore;
     private SchedulerStateStore stateStore;
@@ -65,7 +70,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     private SchedulerVersionPolicy versionPolicy;
     private RunServiceLeaseStore leaseStore;
     private LegacyRunHandoff legacyHandoff;
-    /** 读数用的登记表：这一份用例顺带量「领取租约、两次重试与服务租约时长」有没有登记在用的值。 */
+    /** 读数用的登记表：这一份用例顺带量「节点领取有效期、两次重试与服务所有权有效期」有没有登记在用的值。 */
     private final FrozenEffectiveSettings frozenEffectiveSettings = new FrozenEffectiveSettings();
 
     private DatabaseDualPoolWorkHandler handler;
@@ -117,8 +122,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     /**
      * 四个启动冻结的值各自登记归一化之后真正在用的数。
      *
-     * <p>读数里这几项报的是这里登记的数，不是属性请求值；服务租约时长这一项要求至少 5 秒，所以请求
-     * 1 秒时登记的是 5 秒——报出 1 秒会让验收与排查以为真的只保 1 秒。</p>
+     * <p>读数里这几项报的是这里登记的数，不是属性请求值；服务所有权有效期至少 1 秒。</p>
      */
     @Test
     void preparingInterruptedExitRetriesOriginalClaimEpochAndRestoresInterrupt() {
@@ -207,7 +211,36 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 .containsEntry("DatabaseDualPoolWorkHandler", 120L);
     }
 
-    /** 本进程已经握着这条 Run 的租约：读一次就够，不必再写一遍。 */
+    @Test
+    @SuppressWarnings("unchecked")
+    void serviceOwnershipTtlFloorIsOneSecond() {
+        FrozenEffectiveSettings inUse = new FrozenEffectiveSettings();
+        new DatabaseDualPoolWorkHandler(
+                runMapper,
+                freshRunPipeline,
+                workItemStore,
+                Mockito.mock(NodeWorkPlanAdapter.class),
+                Mockito.mock(LangchainTodoNodeExecutor.class),
+                Mockito.mock(AgentRunEventService.class),
+                new ObjectMapper(),
+                Mockito.mock(DualPoolDispatcher.class),
+                admissionRegistry,
+                versionPolicy,
+                Mockito.mock(DualPoolToolJobCoordinator.class),
+                Mockito.mock(DualPoolWaitGroupNodeExecutor.class),
+                coordinationStore,
+                stateStore,
+                leaseStore,
+                Mockito.mock(ProcessInstanceIdentity.class),
+                Mockito.mock(ObjectProvider.class),
+                TestSchedulerSettings.propertyOnly(),
+                300, 1000, 5000, 1, inUse);
+
+        assertThat(inUse.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
+                .containsEntry("DatabaseDualPoolWorkHandler", 1L);
+    }
+
+    /** 本进程已经握着这条 Run 的服务所有权：读一次就够，不必再写一遍。 */
     private void ownedByThisProcess(String runId) {
         RunServiceLease lease = new RunServiceLease(runId, TEST_INSTANCE, 1L,
                 OffsetDateTime.now().minusMinutes(1), OffsetDateTime.now(),
@@ -435,6 +468,56 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
      * 受理在前、版本后来不是双池了，就不该继续当双池的活来推。</p>
      */
     @Test
+    void otherLaneReceivedRunDoesNotAcquireOwnership() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly(
+                DualPoolSchedulerSettings.LANE_TRAFFIC_SCOPE_ID, "lane-a");
+        handler = handlerWith(ownership, events, settings);
+        AgentRun run = run("run-other-lane", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.RECEIVED);
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        run.setLaneTag("lane-b");
+        when(coordinationStore.scanDueForDeployment(DEPLOYMENT_ID, GENERATION, "lane-a", 10))
+                .thenReturn(List.of(candidate("run-other-lane", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-other-lane")).thenReturn(run);
+        when(leaseStore.find("run-other-lane")).thenReturn(Optional.empty());
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
+        verify(events, never()).closeUnacceptedCreate(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void expiredOwnershipOnReceivedRunWithZeroItemsClosesUnacceptedCreate() {
+        AgentRunEventService events = Mockito.mock(AgentRunEventService.class);
+        RunOwnershipGateway ownership = Mockito.mock(RunOwnershipGateway.class);
+        when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        DualPoolSchedulerSettings settings = TestSchedulerSettings.propertyOnly();
+        handler = handlerWith(ownership, events, settings);
+        AgentRun run = run("run-incomplete", "DUAL_POOL_V2");
+        run.setStatus(AgentRunStatus.RECEIVED);
+        run.setDeploymentId(DEPLOYMENT_ID);
+        run.setDeploymentGenerationId(GENERATION);
+        run.setLaneTag(null);
+        when(coordinationStore.scanDueForDeployment(eq(DEPLOYMENT_ID), eq(GENERATION), isNull(), eq(10)))
+                .thenReturn(List.of(candidate("run-incomplete", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-incomplete")).thenReturn(run);
+        when(leaseStore.find("run-incomplete")).thenReturn(Optional.of(new RunServiceLease(
+                "run-incomplete", TEST_INSTANCE, 1L,
+                OffsetDateTime.now().minusMinutes(10), OffsetDateTime.now().minusMinutes(10),
+                OffsetDateTime.now().minusMinutes(1))));
+        when(workItemStore.countUnfinishedByRun("run-incomplete")).thenReturn(0);
+
+        assertThat(handler.scanRunnableRuns(10)).isEmpty();
+        verify(events).closeUnacceptedCreate("run-incomplete", "user-routing", "create_incomplete");
+        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
+        verify(admissionRegistry, never()).takeoverLegacyRun(anyString());
+    }
+
+    @Test
     void aLocallyAdmittedRunWhoseFamilyChangedIsReleasedInsteadOfHinted() {
         when(coordinationStore.scanDue(10)).thenReturn(List.of());
         when(admissionRegistry.snapshotRunIds()).thenReturn(Set.of("run-replaced"));
@@ -445,6 +528,37 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         assertThat(handler.scanRunnableRuns(10)).isEmpty();
         verify(admissionRegistry).releaseBusinessPermitIfCurrent(
                 Mockito.eq("run-replaced"), Mockito.anyLong(), Mockito.any());
+    }
+
+    @SuppressWarnings("unchecked")
+    private DatabaseDualPoolWorkHandler handlerWith(RunOwnershipGateway ownership,
+                                                    AgentRunEventService events,
+                                                    DualPoolSchedulerSettings settings) {
+        ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
+        ObjectProvider<LegacyRunHandoff> handoffProvider = Mockito.mock(ObjectProvider.class);
+        Mockito.lenient().when(identity.value()).thenReturn(TEST_INSTANCE);
+        Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
+        return new DatabaseDualPoolWorkHandler(
+                runMapper,
+                freshRunPipeline,
+                workItemStore,
+                Mockito.mock(NodeWorkPlanAdapter.class),
+                Mockito.mock(LangchainTodoNodeExecutor.class),
+                events,
+                new ObjectMapper(),
+                Mockito.mock(DualPoolDispatcher.class),
+                admissionRegistry,
+                versionPolicy,
+                Mockito.mock(DualPoolToolJobCoordinator.class),
+                Mockito.mock(DualPoolWaitGroupNodeExecutor.class),
+                coordinationStore,
+                stateStore,
+                leaseStore,
+                identity,
+                handoffProvider,
+                settings,
+                ownership,
+                300, 1000, 5000, 120, new FrozenEffectiveSettings());
     }
 
     private static RunCoordination candidate(String runId, String version) {
