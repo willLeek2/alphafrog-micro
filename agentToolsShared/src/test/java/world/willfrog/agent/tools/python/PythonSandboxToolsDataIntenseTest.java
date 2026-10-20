@@ -577,7 +577,7 @@ class PythonSandboxToolsDataIntenseTest {
 
         assertThat(output)
                 .contains("\"ok\":false", "\"code\":\"PYTHON_EXECUTION_FAILED\"")
-                .contains("\"stdout\":\"rows-before-failure\"", "\"stderr\":\"boom\"")
+                .contains("\"stdout\":\"rows-before-failure\"", "\"stderr\":\"err: RuntimeError\"")
                 .doesNotContain("__AF_FINANCE_RESULT_", "task-finance-failed", "results");
         verify(processor).process(argThat(request ->
                 "FAILED".equals(request.terminalStatus()) && request.exitCode() == 1));
