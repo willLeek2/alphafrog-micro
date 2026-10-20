@@ -536,7 +536,7 @@ class ToolJobFinalizerFinanceRecordTest {
     @Test
     void failedWithMarkersInStderr_shouldStripMarkers() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatFailure(eq("Traceback..."), eq("clean stderr"), any()))
+        when(formatter.formatFailure(eq("Traceback..."), eq("clean stderr\n"), any()))
                 .thenReturn(FAILURE_JSON);
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
@@ -566,8 +566,8 @@ class ToolJobFinalizerFinanceRecordTest {
 
         finalizer.handleTerminal("run-sm", anchor, "FAILED", resp, false);
 
-        // formatFailure must receive stderr WITHOUT the marker line
-        verify(formatter).formatFailure(eq("Traceback..."), eq("clean stderr"), any());
+        // formatFailure must receive stderr WITHOUT the marker line（新剥离逻辑保留原始行结构含尾换行）
+        verify(formatter).formatFailure(eq("Traceback..."), eq("clean stderr\n"), any());
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(FAILURE_JSON);
     }
 
