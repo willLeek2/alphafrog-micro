@@ -72,9 +72,10 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
         // stderr 的标记隔离单点：financeResult 非空时用 processor 的剥离结果；
         // 为空时按标记族前缀静态剥离——report() 的返回值可能被用户代码再打印到 stderr，
         // 那种形态标准输出干净、不会进入提取流程，这里只做隔离兜底，不做提取。
+        // 剥离方法 null 进 null 出，这里包 nvl 保持与旧口径一致（null 归一成空串）。
         String stderr = financeResult != null
                 ? financeResult.ordinaryStderr()
-                : FinanceRecordDecoder.stripMarkerLines(result.stderr());
+                : nvl(FinanceRecordDecoder.stripMarkerLines(result.stderr()));
 
         if ("SUCCEEDED".equals(result.statusName())
                 && result.exitCode() != null && result.exitCode() == 0) {

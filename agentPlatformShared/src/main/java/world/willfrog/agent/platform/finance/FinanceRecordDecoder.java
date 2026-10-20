@@ -33,10 +33,14 @@ public class FinanceRecordDecoder {
     /**
      * 按标记族前缀过滤行，供 stderr 隔离共用：report() 的返回值可能被用户代码再打印到 stderr，
      * 此时标准输出干净、载荷判断为假，不会进入提取流程——本方法只做隔离兜底，不做提取。
+     * null 输入原样返回 null；各出口按改动前的口径自行归一（适配器侧 nvl 成空串，收尾器侧保持 null）。
      */
     public static String stripMarkerLines(String stderr) {
-        if (stderr == null || !stderr.contains(MARKER_FAMILY)) {
-            return stderr == null ? "" : stderr;
+        if (stderr == null) {
+            return null;
+        }
+        if (!stderr.contains(MARKER_FAMILY)) {
+            return stderr;
         }
         StringBuilder kept = new StringBuilder();
         for (String line : stderr.split("\\n", -1)) {
