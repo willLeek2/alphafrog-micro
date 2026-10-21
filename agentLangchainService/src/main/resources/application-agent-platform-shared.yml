@@ -58,6 +58,8 @@ agent:
     ttl-seconds: ${AF_AGENT_CALL_RAW_CONTENT_TTL_SECONDS:7200}
   run:
     interrupted-ttl-days: ${AF_AGENT_RUN_INTERRUPTED_TTL_DAYS:7}
+    # 生命周期 TTL 预警软阈值（消耗比例）；启动期固定、改需重启，泳道不可热调
+    ttl-warning-ratio: ${AF_AGENT_RUN_TTL_WARNING_RATIO:0.9}
     checkpoint-version: ${AF_AGENT_RUN_CHECKPOINT_VERSION:v2}
     budget:
       max-wall-clock-ms: ${AF_AGENT_RUN_BUDGET_MAX_WALL_CLOCK_MS:600000}

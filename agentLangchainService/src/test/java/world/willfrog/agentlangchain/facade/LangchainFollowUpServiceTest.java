@@ -11,7 +11,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
@@ -32,7 +32,7 @@ class LangchainFollowUpServiceTest {
     private final AgentRunEventService eventService = mock(AgentRunEventService.class);
     private final AgentMessageService messageService = mock(AgentMessageService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
-    private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
+    private final AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
     private final DeploymentIdentityProvider identityProvider =
             () -> new DeploymentIdentity("stable", GENERATION);
     private final LangchainFollowUpService service = new LangchainFollowUpService(

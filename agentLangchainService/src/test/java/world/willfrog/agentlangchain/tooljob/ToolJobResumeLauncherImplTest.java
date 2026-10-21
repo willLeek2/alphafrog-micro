@@ -4,7 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -19,7 +19,7 @@ class ToolJobResumeLauncherImplTest {
     @Test
     void sameTokenAndVersionIsAcceptedOnlyOnceWhileActive() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
@@ -53,7 +53,7 @@ class ToolJobResumeLauncherImplTest {
     @Test
     void nondurablePipelineOutcomeRemovesActiveClaimButKeepsAnchor() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
@@ -78,7 +78,7 @@ class ToolJobResumeLauncherImplTest {
     @Test
     void heartbeatKeepsOnlyClaimsStillOwnedInDatabase() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
@@ -103,7 +103,7 @@ class ToolJobResumeLauncherImplTest {
     @Test
     void isActiveMatchesExactIdentityAcrossTokenVersionAndRunId() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);

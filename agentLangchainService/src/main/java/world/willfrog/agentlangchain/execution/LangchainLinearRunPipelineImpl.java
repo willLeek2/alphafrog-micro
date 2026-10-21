@@ -17,7 +17,6 @@ import world.willfrog.agent.platform.debug.DebugObservabilityRequest;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentCreditService;
@@ -31,11 +30,8 @@ import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
-import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
-import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
@@ -60,9 +56,9 @@ import java.time.OffsetDateTime;
  * <p>一次 AgentRun 从创建后到完成/失败落库的主线：
  * 先恢复 run 记录和运行上下文，再解析 planning（规划）、execution（执行）、
  * final answer（最终答案）三个阶段要用的模型，接着调用 {@link LangchainAiPlanner}
- * 生成 todo（任务项）计划，之后根据计划选择
- * {@link LangchainLinearWorkflowExecutor} 或 {@link LangchainDagWorkflowExecutor} 执行，
- * 最后把答案、事件、运行快照和可观测数据写回共享存储。</p>
+ * 生成 todo（任务项）计划；节点执行由双池协调循环驱动（本类只承载双池的准备、
+ * 收尾与事件合同方法，不再有自己的执行入口），最后把答案、事件、运行快照和
+ * 可观测数据写回共享存储。</p>
  * <p>这个类本身不直接和大模型对话，也不直接执行工具；它负责把“模型、prompt、工具目录、
  * 状态机、可观测性、取消/暂停控制”串成一个完整业务流程。具体规划逻辑在
  * {@link LangchainAiPlanner}，单个 todo 的工具循环在 {@link LangchainTodoNodeExecutor}。</p>
@@ -75,11 +71,9 @@ import java.time.OffsetDateTime;
  */
 @Service
 @Slf4j
-public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipeline {
+public class LangchainLinearRunPipelineImpl implements AgentRunPipeline {
 
     private final LangchainAiPlanner planner;
-    private final LangchainLinearWorkflowExecutor linearWorkflowExecutor;
-    private final LangchainDagWorkflowExecutor dagWorkflowExecutor;
     private final LangchainRunStageModelResolver stageModelResolver;
     private final AgentRunMapper runMapper;
     protected final AgentRunEventService eventService;
@@ -91,7 +85,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final LangchainFollowUpContextSupport followUpContextSupport;
     private final AgentMessageService messageService;
     private final LangchainRunExecutionGuard executionGuard;
-    private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentCreditService creditService;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final AgentRunFinalizationService finalizationService;
@@ -113,17 +106,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     @Autowired(required = false)
     protected WorkflowCheckpointService workflowCheckpointService;
 
-    @Autowired(required = false)
-    protected AgentRunDagNodeMapper dagNodeMapper;
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
 
-    private final RunOwnershipGateway ownershipGateway;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
-                                          LangchainLinearWorkflowExecutor linearWorkflowExecutor,
-                                          LangchainDagWorkflowExecutor dagWorkflowExecutor,
                                           LangchainRunStageModelResolver stageModelResolver,
                                           AgentRunMapper runMapper,
                                           AgentRunEventService eventService,
@@ -135,17 +123,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainFollowUpContextSupport followUpContextSupport,
                                           AgentMessageService messageService,
                                           LangchainRunExecutionGuard executionGuard,
-                                          LangchainRunConcurrencyScheduler runConcurrencyScheduler,
                                           AgentCreditService creditService,
                                           AgentRunCreditSettlementService creditSettlementService,
                                           AgentRunFinalizationService finalizationService,
                                           AgentPromptService promptService,
                                           ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider,
-                                          ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider,
-                                          RunOwnershipGateway ownershipGateway) {
+                                          ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider) {
         this.planner = planner;
-        this.linearWorkflowExecutor = linearWorkflowExecutor;
-        this.dagWorkflowExecutor = dagWorkflowExecutor;
         this.stageModelResolver = stageModelResolver;
         this.runMapper = runMapper;
         this.eventService = eventService;
@@ -157,176 +141,22 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.followUpContextSupport = followUpContextSupport;
         this.messageService = messageService;
         this.executionGuard = executionGuard;
-        this.runConcurrencyScheduler = runConcurrencyScheduler;
         this.creditService = creditService;
         this.creditSettlementService = creditSettlementService;
         this.finalizationService = finalizationService;
         this.promptService = promptService;
         this.agentRunDatasetRegistryProvider = agentRunDatasetRegistryProvider;
         this.debugObservabilityServiceProvider = debugObservabilityServiceProvider;
-        this.ownershipGateway = ownershipGateway;
     }
 
     @Override
     public void launchAsync(AgentRun run) {
-        launchAsync(run, null);
+        // LEGACY 调度主线已删除，这里只保留接口形状：双池 Run 的启动入口是
+        // DualPoolRunPipeline.launchAsync（协调提示入队），本类只作为双池准备/收尾方法的
+        // 载体被 DatabaseDualPoolWorkHandler 直接调用，不再有自己的执行入口。
+        throw new IllegalStateException("legacy_pipeline_removed");
     }
 
-    @Override
-    public void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
-        if (!belongsToLocalDeployment(run)) {
-            log.warn("拒绝把非当前部署代际的 Run 提交到执行队列: runId={}",
-                    run == null ? null : run.getId());
-            return;
-        }
-        // 入口层只把 run 交给并发调度器，不直接开线程。
-        // hard/current 并发闸门、排队顺序和队列容量都集中在 scheduler，pipeline 只负责拿到执行权后的业务流程。
-        runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
-    }
-
-    /**
-     * 把一次持久化恢复提交到普通 Run 共用的有界调度器。
-     *
-     * @param run 从数据库读取到的待恢复 Run，只使用稳定 id 定位最新状态
-     * @param context 由 anchor 解码出的 checkpoint、终态结果和恢复租约
-     * @param terminalConsumed 工作流接受终态结果后执行的持久化消费确认
-     * @param completion 恢复 Runnable 退出时回报“结果是否已经持久化”的回调
-     * @return 参数有效且成功进入调度器时返回 true；不会在这里调用 planner
-     */
-    @Override
-    public boolean launchResumedAsync(AgentRun run,
-                                      ToolJobResumeContext context,
-                                      BooleanSupplier terminalConsumed,
-                                      Consumer<Boolean> completion) {
-        // 缺少 Run 身份或恢复上下文时不允许创建一个无法 fencing 的排队任务。
-        if (run == null || context == null || isBlank(run.getId())) {
-            return false;
-        }
-        if (!belongsToLocalDeployment(run)) {
-            log.warn("拒绝把非当前部署代际的 Run 提交到恢复队列: runId={}", run.getId());
-            return false;
-        }
-        // reservation 传 null，让恢复任务重新经过普通 Run 的限流、排队和拒绝策略。
-        runConcurrencyScheduler.submit(null, run, () -> {
-            // durable 只表示恢复结果已经写入真相源，不等同于工作流一定成功。
-            boolean durable = false;
-            try {
-                // 新 worker 根据 checkpoint 重建线程上下文并继续原 plan。
-                durable = executeResumedRun(run, context, terminalConsumed);
-            } finally {
-                // launcher 用该回调决定是否可以把 LAUNCHING anchor 清理为 CONSUMED。
-                if (completion != null) {
-                    completion.accept(durable);
-                }
-            }
-        });
-        // 返回 true 仅说明调度器已接收；真正执行可能仍在有界队列中等待。
-        return true;
-    }
-
-    void executeRun(AgentRun initialRun) {
-        if (initialRun == null || isBlank(initialRun.getId())) {
-            return;
-        }
-        // 重新从数据库读取 run，而不是完全相信入口传入的对象。
-        // createRun 之后到异步线程真正执行之间，run 可能已经被取消、更新或存活时间（TTL）状态变化。
-        AgentRun run = findLocalRun(initialRun.getId());
-        if (run == null) {
-            log.warn("LangChain Run 不存在或不属于当前部署代际，停止执行: {}", initialRun.getId());
-            return;
-        }
-        if (run.getStatus() != AgentRunStatus.RECEIVED) {
-            log.warn("Run 当前状态不是可执行起点，停止迟到或重复执行: runId={} status={}",
-                    run.getId(), run.getStatus());
-            return;
-        }
-        String runId = run.getId();
-        String userId = run.getUserId();
-        String userGoal = "";
-        // 当前执行到的阶段名：意外异常被安全网接住时，把它带进失败事件，
-        // 让失败点不再被一个大 try 抹平。预期失败（额度不足、校验不过、执行结果失败）
-        // 不走异常通道，各自在阶段内用结果对象返回。
-        String stage = "prepare_run_context";
-        try {
-            if (!prepareRunContext(run)) {
-                return;
-            }
-            stage = "precheck_runnable";
-            if (!precheckRunnable(run)) {
-                return;
-            }
-            emitExecutionStarted(run);
-
-            stage = "resolve_stage_inputs";
-            StageInputs inputs = resolveStageInputs(run);
-            userGoal = inputs.userGoal();
-
-            stage = "resolve_plan";
-            PlanResolution resolution = resolvePlan(run, inputs);
-
-            stage = "execute_workflow";
-            LangchainWorkflowResult result = executeWorkflow(inputs, resolution);
-            if (result == null) {
-                return;
-            }
-
-            // cancel/pause 可能发生在 todo 执行和最终落库之间。
-            // 这里再次检查，避免用户已经取消后 pipeline 又把 run 覆盖成 COMPLETED/FAILED。
-            if (result.isInterrupted()
-                    || abortIfStopped(runId, userId, "before_persist")) {
-                log.info("LangChain run {} stopped before persist (interrupted={}, reason={})",
-                        runId, result.isInterrupted(), result.getFailureReason());
-                return;
-            }
-
-            updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, writeJson(result.getPlan()));
-            if (result.isSuccess()) {
-                persistCompletedOutcome(run, userGoal, inputs.stageModels(), result, null);
-            } else if (result.isPartial()) {
-                persistPartialOutcome(run, userGoal, inputs.stageModels(), result, null);
-            } else {
-                publishFailure(runId, userId, userGoal, result, null, "execute_workflow");
-                tryScheduleSettlement(runId, userId);
-            }
-        } catch (Exception e) {
-            log.error("LangChain run failed: runId={}", runId, e);
-            // 所有未被 workflow result（工作流结果）显式表达的异常都会收敛到统一失败出口，
-            // 由 LangchainFailureMapper 决定前端事件类型和 observability failure type（可观测失败类型）。
-            publishFailure(runId, userId, userGoal,
-                    LangchainWorkflowResult.builder()
-                            .success(false)
-                            .failureReason(e.getMessage())
-                            .toolCallsUsed(0)
-                            .build(),
-                    e, stage);
-            // 异常路径也触发结算
-            tryScheduleSettlement(runId, userId);
-        } finally {
-            try {
-                DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
-                if (debugObservabilityService != null) {
-                    debugObservabilityService.closeRunSession(runId);
-                }
-            } catch (Exception debugCloseEx) {
-                log.warn("Failed to close debug observability session for runId={}: {}",
-                        runId, debugCloseEx.getMessage());
-            }
-            // 清理当前 run 的 dataset/manifest 编号转译层状态。
-            // 长生命周期进程里若不清理，registry 会无限累积；run 终态后下一个 run 串到上一个 run 的编号 → 错位。
-            // ObjectProvider 在 bean 不存在时静默跳过（保持纯单元测试启动）。
-            try {
-                AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
-                if (registry != null) {
-                    registry.reset(runId);
-                }
-            } catch (Exception cleanupEx) {
-                log.warn("Failed to reset AgentRunDatasetRegistry for runId={}: {}",
-                        runId, cleanupEx.getMessage());
-            }
-            // 异步线程会被线程池复用，必须清理 ThreadLocal（线程本地变量），避免下一个 run 继承上一个 run 的 phase/todo/provider 信息。
-            AgentContext.clear();
-        }
-    }
 
     /**
      * 双池 Run 的首个协调回合：只完成运行前检查与规划，不执行任何 Todo 节点。
@@ -335,6 +165,20 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * 结果接入和下一轮协调都由后续独立回合完成。</p>
      */
     public DualPoolPlanPreparation prepareDualPoolRun(AgentRun initialRun) {
+        return prepareDualPoolRunInternal(initialRun, false);
+    }
+
+    /**
+     * 恢复带冻结计划的规划回合入口（节点级续跑）：计划解析走 {@link #resolvePlanFromFrozen}，
+     * 不调规划器——「已完成节点不重跑」由协调回合的跨代际承接种子兑现，本方法只读冻结计划、
+     * 裁出生效模式、校验检查点安全性；其余步骤（上下文准备、额度预检、RECEIVED→EXECUTING、
+     * 阶段输入解析）与全新规划回合完全一致。
+     */
+    public DualPoolPlanPreparation prepareDualPoolRunWithFrozenPlan(AgentRun initialRun) {
+        return prepareDualPoolRunInternal(initialRun, true);
+    }
+
+    private DualPoolPlanPreparation prepareDualPoolRunInternal(AgentRun initialRun, boolean resumeFromFrozenPlan) {
         if (initialRun == null || isBlank(initialRun.getId())) {
             return null;
         }
@@ -359,7 +203,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             StageInputs inputs = resolveStageInputs(run);
             userGoal = inputs.userGoal();
             stage = "resolve_plan";
-            PlanResolution resolution = resolvePlan(run, inputs);
+            PlanResolution resolution = resumeFromFrozenPlan
+                    ? resolvePlanFromFrozen(run, inputs)
+                    : resolvePlan(run, inputs);
             return new DualPoolPlanPreparation(
                     run,
                     resolution.plan(),
@@ -544,7 +390,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         return durable;
     }
 
-    /** 双池节点沿用旧 LINEAR 的事件字段和失败即忽略策略，避免再手抄一套观测合同。 */
+    /**
+     * 双池节点沿用旧 LINEAR 的事件字段和失败即忽略策略（TODO_NODE_* 事件合同随 LEGACY 执行器
+     * 删除一并迁到这里，字段一字不改）：前端 stepper 与观测报表按这批字段拼节点进度。
+     */
     public void emitDualPoolTodoNodeEvent(String runId,
                                           String userId,
                                           String eventType,
@@ -554,8 +403,58 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           Map<String, Object> failureMetadata,
                                           boolean recovered,
                                           String recoveryOutcome) {
-        linearWorkflowExecutor.emitDualPoolTodoNodeEvent(runId, userId, eventType, item, reason, durationMs,
-                failureMetadata, recovered, recoveryOutcome);
+        if (isBlank(runId) || isBlank(userId)) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("todo_id", item.getId());
+        payload.put("todo_sequence", item.getSequence());
+        String workflow = world.willfrog.agent.platform.context.AgentContext.getWorkflow();
+        payload.put("workflow", isBlank(workflow) ? "linear" : workflow);
+        payload.put("phase", "execution");
+        boolean isStarted = "TODO_NODE_STARTED".equals(eventType);
+        if (isStarted) {
+            payload.put("started_at", System.currentTimeMillis());
+        } else {
+            payload.put("duration_ms", durationMs);
+        }
+        if (!isBlank(reason)) {
+            if ("TODO_NODE_FAILED".equals(eventType)) {
+                payload.put("failure_reason", reason);
+                if (reason.startsWith("RUN_INTERRUPTED:CANCEL")) {
+                    payload.put("error_code", "RUN_CANCELED");
+                }
+            } else {
+                payload.put("reason", reason);
+            }
+        }
+        // recovery 成功标记：仅 TODO_NODE_COMPLETED 时填，TODO_NODE_FAILED 的 recovery 信息在 failureMetadata 里
+        if (!isStarted && recovered) {
+            payload.put("recovered", true);
+            if (!isBlank(recoveryOutcome)) {
+                payload.put("recovery_outcome", recoveryOutcome);
+            }
+        }
+        // failureMetadata 结构化观测：按语义路由到对应子字段（budget_failure / empty_output_observation / failure_metadata），
+        // 让压测报告 / dashboard 能直接消费，不必回 trace 翻。
+        // 额度失败的元数据不要写进 empty_output_observation，否则会被误判成「待办输出为空」。
+        if (failureMetadata != null && !failureMetadata.isEmpty()) {
+            if (failureMetadata.containsKey("todo_retry_attempts")) {
+                payload.put("todo_retry_attempts", failureMetadata.get("todo_retry_attempts"));
+                if (failureMetadata.get("todo_retry_outcome") != null) {
+                    payload.put("todo_retry_outcome", failureMetadata.get("todo_retry_outcome"));
+                }
+            }
+            String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
+            if (field != null && "TODO_NODE_FAILED".equals(eventType)) {
+                payload.put(field, failureMetadata);
+            }
+        }
+        try {
+            eventService.append(runId, userId, eventType, payload);
+        } catch (Exception e) {
+            // 事件失败不影响节点执行
+        }
     }
 
     /** 当前执行形态的标识，进 EXECUTION_STARTED 事件的 workflow 字段；子类按形态覆盖。 */
@@ -741,24 +640,52 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     /**
-     * 阶段六：执行工作流。LINEAR 重启（解析结果带检查点边界）从 checkpoint 继续；
-     * 其余情况按计划形态走步骤协调器。返回 null 表示 worker 已被释放（挂起转后台），调用方静默结束。
+     * 恢复场景的冻结计划解析（{@link #resolvePlan} 的兄弟方法，双池规划回合在
+     * resumeFromFrozenPlan 标记下改走这里）：只读数据库里的冻结 plan，绝不调规划器——
+     * 恢复后重新规划可能重复副作用，且已完成节点的成果已保留在旧代际工作项里。
+     * 三件套范本沿自已删除的 LEGACY 冻结重启路径（原 FrozenPlanRestartPipeline.resolvePlan，
+     * 随 LEGACY 调度删除退役）：读冻结 plan ＋ {@link ExecutionModeResolver#inspectFrozen} 只读裁模式 ＋
+     * {@link LangchainWorkflowRouting#validateFrozenPlan} 校验；检查点侧照范本走
+     * parse/validate、从不 initialize（「plan_json 有、检查点缺」的崩溃窗口行为继承范本
+     * 既有处理）。planOverride 在两条路径下都保持纯展示（resolvePlan 从不读它）。
      */
-    private LangchainWorkflowResult executeWorkflow(StageInputs inputs, PlanResolution resolution) {
-        if (abortIfStopped(inputs.runId(), inputs.userId(), "before_execution")) {
-            return null;
+    protected PlanResolution resolvePlanFromFrozen(AgentRun run, StageInputs inputs) throws Exception {
+        AgentContext.setPhase("planning");
+        String runId = inputs.runId();
+        String userId = inputs.userId();
+        if (isBlank(run.getPlanJson()) || "{}".equals(run.getPlanJson().trim())) {
+            throw new IllegalStateException("dual_pool_resume_plan_missing");
         }
-        if (resolution.restartCheckpoint() != null) {
-            return linearWorkflowExecutor.restartPlanned(
-                    inputs.workflowRequest(), resolution.plan(), resolution.restartCheckpoint());
+        LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+        LangchainWorkflowRouting.validateFrozenPlan(plan);
+        ExecutionModeResolver.Decision frozenDecision = ExecutionModeResolver.inspectFrozen(plan);
+        boolean useDag = frozenDecision.useDag();
+        PlanExecutionMode effectiveExecutionMode = frozenDecision.effective();
+        if (workflowCheckpointService != null) {
+            if (useDag) {
+                // 双池不复用 LEGACY DAG 的节点行，这里只继承范本的安全性校验：
+                // 确认崩溃/到期前没有启动过不安全重放的工具。
+                workflowCheckpointService.parseAndValidateDagRestart(run);
+            } else {
+                workflowCheckpointService.parseAndValidate(run, plan);
+            }
         }
-        LangchainWorkflowStepCoordinator.Outcome stepOutcome = stepCoordinator().execute(
-                inputs.runId(), inputs.userId(), inputs.workflowRequest(), resolution.plan(), resolution.useDag());
-        if (stepOutcome.workerReleased()) {
-            return null;
-        }
-        return stepOutcome.result();
+        eventService.append(runId, userId, "PLAN_READY", Map.of(
+                "execution_mode", effectiveExecutionMode.name(),
+                "requested_execution_mode", inputs.requestedExecutionMode().name(),
+                "planned_execution_mode", frozenDecision.planned() == null
+                        ? ""
+                        : frozenDecision.planned().name(),
+                "effective_execution_mode", effectiveExecutionMode.name(),
+                "workflow", useDag ? "dag" : "linear",
+                "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
+                "plan", plan,
+                "reason", frozenDecision.reason(),
+                "planner_skipped", true
+        ));
+        return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
     }
+
 
     /** 执行阶段的共享输入：三种形态共用同一份环境解析结果。 */
     protected record StageInputs(String runId,
@@ -793,159 +720,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                       LangchainWorkflowRequest workflowRequest) {
     }
 
-    boolean executeResumedRun(AgentRun initialRun,
-                              ToolJobResumeContext resumeContext,
-                              BooleanSupplier terminalConsumed) {
-        // 排队期间 Run 可能被取消或 checkpoint 被更新，因此必须重新读取数据库真相源。
-        AgentRun run = findLocalRun(initialRun.getId());
-        if (run == null) {
-            return false;
-        }
-        // 后续事件、快照和 CAS 都使用数据库中的稳定身份。
-        String runId = run.getId();
-        String userId = run.getUserId();
-        // 先给失败路径一个安全默认值，解析 follow-up 上下文后再覆盖。
-        String userGoal = "";
-        try {
-            // 新线程不会继承旧 worker 的 ThreadLocal，必须从持久化身份重新建立。
-            AgentContext.setRunId(runId);
-            AgentContext.setUserId(userId);
-            // durable resume 使用同一前置门；不能让 follow-up 摘要先于 digest 校验调用模型。
-            setPromptSelectionFromExt(run.getExt());
-            // 恢复排队期间若用户已暂停/取消，不能继续执行原 Todo。
-            if (!eventService.isRunnable(runId, userId)) {
-                // 只有停止状态已经持久化，才算这次 launcher 可以安全完成交接。
-                return hasDurableStopState(runId);
-            }
-            // plan 是恢复必需上下文；缺失时严禁重新规划，因为新 plan 可能重复副作用。
-            if (isBlank(run.getPlanJson())) {
-                throw new IllegalStateException("resume_plan_missing");
-            }
-            // 从 DB 还原挂起前冻结的原计划。
-            LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
-            // 当前 durable resume 只实现 LINEAR 顺序语义；DAG 不能降级成 LINEAR 猜测恢复。
-            if (ExecutionModeResolver.inspectFrozen(plan).useDag()) {
-                throw new IllegalStateException("resume_dag_not_supported");
-            }
-
-            // 模型配置也按当前 Run 的冻结配置重建，不沿用旧线程对象。
-            LangchainRunStageModelResolver.StageModels stageModels = stageModelResolver.resolve(run);
-            // follow-up 对话上下文从 Run 数据重新计算，保持与首次执行一致。
-            LangchainFollowUpContextSupport.ExecutionContext executionContext = followUpContextSupport.resolve(run);
-            userGoal = executionContext.userGoal();
-            // 工具开关、检索配置和数据新鲜度都从持久化 ext 恢复。
-            AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
-            AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
-            AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
-            setDataFreshnessFromExt(run.getExt());
-            // 用相同运行配置重建工具目录，但不会再次调用 planner。
-            List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
-            // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
-            LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
-                    runId, userId, run.getPlanGeneration(), userGoal, executionContext.dialogueContext(),
-                    stageModels, toolSpecifications, runConfig);
-
-            // token + leaseVersion 使重复 launcher 只能写出一条 WORKFLOW_RESUMED 事件。
-            String resumedDedupeKey = runId + ":" + resumeContext.getResumeToken()
-                    + ":" + resumeContext.getResumeLeaseVersion() + ":workflow_resumed";
-            eventService.appendOnce(runId, userId, "WORKFLOW_RESUMED", resumedDedupeKey, Map.of(
-                    "run_id", runId,
-                    "todo_id", nvl(resumeContext.getTodoId()),
-                    "resume_token", nvl(resumeContext.getResumeToken()),
-                    "resume_lease_version", resumeContext.getResumeLeaseVersion(),
-                    "planner_skipped", true
-            ));
-
-            // executor 按 checkpoint 跳过已完成 Todo，并把终态结果注入原挂起节点。
-            LangchainWorkflowResult result = linearWorkflowExecutor.resumePlanned(
-                    workflowRequest, plan, resumeContext, terminalConsumed);
-            // 只有结果成功写入 DB，launcher 才能完成消费确认并清理 anchor。
-            return persistResumedResult(run, userGoal, stageModels, result, resumeContext);
-        } catch (Exception e) {
-            // 恢复异常也要尝试持久化为可见失败，不能只依赖当前进程日志。
-            log.error("Resumed LangChain run failed: runId={}", runId, e);
-            try {
-                return publishResumedFailure(runId, userId, userGoal,
-                        LangchainWorkflowResult.builder()
-                                .success(false)
-                                .failureReason(e.getMessage())
-                                .toolCallsUsed(resumeContext.getToolCallsUsed())
-                                .build(), e, resumeContext, "resume_execute");
-            } catch (Exception persistEx) {
-                // 失败本身未持久化时返回 false，保留 LAUNCHING claim 供 reconciler 重入。
-                log.error("Resumed failure could not be persisted runId={}", runId, persistEx);
-                return false;
-            }
-        } finally {
-            // dataset registry 是进程内缓存；本轮恢复结束后必须按 runId 清理。
-            try {
-                AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
-                if (registry != null) {
-                    registry.reset(runId);
-                }
-            } catch (Exception cleanupEx) {
-                log.warn("Failed to reset resumed dataset registry runId={}: {}",
-                        runId, cleanupEx.getMessage());
-            }
-            // worker 会被线程池复用，清除新建的所有 AgentContext ThreadLocal。
-            AgentContext.clear();
-        }
-    }
-
-    private boolean persistResumedResult(AgentRun run,
-                                         String userGoal,
-                                         LangchainRunStageModelResolver.StageModels stageModels,
-                                         LangchainWorkflowResult result,
-                                         ToolJobResumeContext resumeContext) {
-        String runId = run.getId();
-        String userId = run.getUserId();
-        // 恢复过程中还可能再次遇到另一个长工具，因此允许二次挂起。
-        if (result.isSuspended()) {
-            // 二次挂起必须覆盖为新的完整 checkpoint，再释放这次恢复 worker。
-            LangchainToolJobCheckpointCoordinator.Attempt checkpoint = checkpointCoordinator().persist(runId, result);
-            // 写失败时仍使用同一 durable failure ownership 协议。
-            if (!checkpoint.persisted()
-                    && checkpointCoordinator().recordFailure(runId, userId, result, checkpoint.request())
-                    != ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
-                return false;
-            }
-            // 事件写在 checkpoint 之后，避免观察者先看到不可恢复的挂起。
-            eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", Map.of(
-                    "run_id", runId,
-                    "tool_call_id", nvl(result.getPendingToolCallId()),
-                    "attempt", result.getPendingAttempt(),
-                    "todo_id", nvl(result.getSuspendedTodoId()),
-                    "todo_sequence", result.getSuspendedTodoSequence() == null
-                            ? 0 : result.getSuspendedTodoSequence(),
-                    "workflow", "linear"
-            ));
-            // true 表示“新的挂起点已经持久化”，launcher 可以结束本轮旧 handoff。
-            return true;
-        }
-        // 恢复执行期间用户状态可能再次变化，终态覆盖前做最后一次停止检查。
-        if (result.isInterrupted()
-                || abortIfStopped(runId, userId, "resume_before_persist")) {
-            return hasDurableStopState(runId);
-        }
-        if (result.isSuccess()) {
-            return persistCompletedOutcome(run, userGoal, stageModels, result, resumeContext);
-        }
-        if (result.isPartial()) {
-            return persistPartialOutcome(run, userGoal, stageModels, result, resumeContext);
-        }
-        if ("resume_result_consume_failed".equals(result.getFailureReason())) {
-            // 终态结果已注入内存，但消费确认没有持久化。
-            // 保留 Run 与 LAUNCHING anchor，reconciler 会用同一 claim 重新进入，避免丢结果。
-            log.warn("Resume result consume failed for run={}, leaving claim for retry", runId);
-            return false;
-        }
-        boolean durable = publishResumedFailure(
-                runId, userId, userGoal, result, null, resumeContext, "resume_persist");
-        if (durable) {
-            tryScheduleSettlement(runId, userId);
-        }
-        return durable;
-    }
 
     /**
      * 组装执行器所需的运行环境参数。正常执行与恢复执行使用完全相同的字段集，
@@ -1165,13 +939,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 || latest.getStatus() == AgentRunStatus.PARTIAL;
     }
 
-    /**
-     * 归属判定收在 gateway：生产入口和真正执行前各检查一次，避免排队期间发生代际切换后
-     * 旧实例继续处理不属于自己的 Run。业务代码不感知自己的部署身份。
-     */
-    private boolean belongsToLocalDeployment(AgentRun run) {
-        return ownershipGateway.owns(run);
-    }
 
     private AgentRun findLocalRun(String runId) {
         return runMapper.findById(runId);
@@ -1228,23 +995,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 expectedResumeToken, expectedLeaseVersion, expectedLauncherOwnerId);
     }
 
-    private LangchainToolJobCheckpointCoordinator checkpointCoordinator() {
-        return new LangchainToolJobCheckpointCoordinator(
-                runMapper,
-                eventService,
-                objectMapper,
-                agentRunDatasetRegistryProvider,
-                toolJobCheckpointWriter,
-                checkpointFailureRecoveryService);
-    }
-
-    private LangchainWorkflowStepCoordinator stepCoordinator() {
-        return new LangchainWorkflowStepCoordinator(
-                linearWorkflowExecutor,
-                dagWorkflowExecutor,
-                eventService,
-                checkpointCoordinator());
-    }
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
@@ -1257,9 +1007,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
     }
 
-    protected void validateFrozenPlan(LangchainTodoPlan plan) {
-        LangchainWorkflowRouting.validateFrozenPlan(plan);
-    }
 
     private List<ToolSpecification> resolveToolSpecifications(AgentRunEventService.RunConfig runConfig, String userGoal) {
         ToolProvider provider = toolProviderProvider.getIfAvailable();
@@ -1465,15 +1212,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         publishFailureInternal(runId, userId, userGoal, result, throwable, null, stage);
     }
 
-    private boolean publishResumedFailure(String runId,
-                                          String userId,
-                                          String userGoal,
-                                          LangchainWorkflowResult result,
-                                          Throwable throwable,
-                                          ToolJobResumeContext resumeContext,
-                                          String stage) {
-        return publishFailureInternal(runId, userId, userGoal, result, throwable, resumeContext, stage);
-    }
 
     private boolean publishFailureInternal(String runId,
                                            String userId,

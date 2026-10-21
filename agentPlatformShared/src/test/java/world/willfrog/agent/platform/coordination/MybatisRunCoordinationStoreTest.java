@@ -173,19 +173,6 @@ class MybatisRunCoordinationStoreTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
-    @Test
-    void handoffBookkeepingDoesNotCarryOwnership() {
-        // 旧版本 Run 交给旧入口这一步由「派发决定」授权，不是所有权：它走单独的语句，不带凭据。
-        when(mapper.markHandoffServed(anyString(), anyLong(), anyInt())).thenReturn(1);
-        when(mapper.deferHandoff(anyString(), anyString(), any(), anyInt(), anyLong())).thenReturn(1);
-
-        assertThat(store.markHandoffServed("run-legacy", 5L, 2)).isTrue();
-        assertThat(store.deferHandoff("run-legacy", RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
-                OffsetDateTime.now(), 2, 5L)).isTrue();
-
-        verify(mapper).markHandoffServed("run-legacy", 5L, 2);
-    }
-
     private static RunCoordination row(String runId, String schedulerVersion) {
         RunCoordination row = new RunCoordination();
         row.setRunId(runId);

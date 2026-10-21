@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.execution;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
@@ -19,9 +20,10 @@ import java.util.function.Consumer;
  * <p>入口只补发一次协调提示，不在请求线程或旧 Run worker 中执行完整工作流。
  * 提示队列满时数据库扫描会重新发现该 Run，因此不能把提示丢失改写成 Run 失败。</p>
  */
+@Primary
 @Component
 @Slf4j
-public class DualPoolRunPipeline implements LangchainLinearRunPipeline {
+public class DualPoolRunPipeline implements AgentRunPipeline {
 
     private final DualPoolDispatcher dispatcher;
     private final DualPoolRunAdmissionRegistry admissionRegistry;

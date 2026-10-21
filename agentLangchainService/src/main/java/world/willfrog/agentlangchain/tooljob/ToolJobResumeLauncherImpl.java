@@ -7,7 +7,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,7 +29,7 @@ import java.util.concurrent.ConcurrentMap;
 public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
 
     private final AgentRunMapper runMapper;
-    private final LangchainLinearRunPipeline pipeline;
+    private final AgentRunPipeline pipeline;
     private final ObjectProvider<ToolJobResumeService> resumeServiceProvider;
     private final ConcurrentMap<ToolJobResumeClaimKey, Boolean> activeClaims = new ConcurrentHashMap<>();
     @Override
@@ -54,7 +54,7 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
             return false;
         }
         try {
-            // 普通启动和恢复启动共用同一个 LangchainRunConcurrencyScheduler。
+            // 长工具挂起后的恢复入口：V1 锚点链仍在调用；双池管线实现失败关闭（false＋warn）。
             boolean accepted = pipeline.launchResumedAsync(
                     run,
                     context,

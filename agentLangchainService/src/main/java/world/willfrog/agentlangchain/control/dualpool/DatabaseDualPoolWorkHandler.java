@@ -44,7 +44,6 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
 import org.springframework.beans.factory.ObjectProvider;
-import world.willfrog.agentlangchain.control.LegacyRunHandoff;
 import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.ExecutionModeResolver;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
@@ -122,13 +121,10 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
     private final AgentRunStateStore runStateStore;
     private final AgentRunFinalizationService finalizationService;
     private final ProcessInstanceIdentity processIdentity;
-    private final ObjectProvider<LegacyRunHandoff> legacyHandoff;
     private final Duration serviceLeaseTtl;
 
-    /** 交出去的旧版本 Run 累计条数（反复扫描同一行的重复命中也算，是「次数」不是「当前候选数」）。 */
-    private final AtomicLong legacyHandedOff = new AtomicLong();
-    /** 旧版本 Run 这一轮没接手、按所有权原因推后的累计次数。 */
-    private final AtomicLong legacyDeferred = new AtomicLong();
+    /** LEGACY 调度删除后被协调循环显式跳过的累计次数（收口责任在启动态收敛）。 */
+    private final AtomicLong legacySkipped = new AtomicLong();
     /** 服务所有权在别的进程手上、这一轮不接手的累计次数（双池那一路）。 */
     private final AtomicLong leaseNotAcquired = new AtomicLong();
     /** 版本读不出来、或不属于任何已知执行层的候选累计次数：只记账，不动这些 Run 的任何状态。 */
@@ -158,7 +154,6 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             SchedulerStateStore stateStore,
             RunServiceLeaseStore leaseStore,
             ProcessInstanceIdentity processIdentity,
-            ObjectProvider<LegacyRunHandoff> legacyHandoff,
             DualPoolSchedulerSettings settings,
             RunOwnershipGateway ownership,
             ChildRunIntentStore childRunIntents,
@@ -193,7 +188,6 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         this.finalizationService = finalizationService;
         this.leaseStore = leaseStore;
         this.processIdentity = processIdentity;
-        this.legacyHandoff = legacyHandoff;
         this.serviceLeaseTtl = Duration.ofSeconds(
                 DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(serviceLeaseTtlSeconds));
         // 登记归一化之后真正在用的值：节点领取有效期、协调延期重试、提示队列满重试与服务所有权有效期
@@ -226,7 +220,6 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             SchedulerStateStore stateStore,
             RunServiceLeaseStore leaseStore,
             ProcessInstanceIdentity processIdentity,
-            ObjectProvider<LegacyRunHandoff> legacyHandoff,
             DualPoolSchedulerSettings settings,
             ChildRunIntentStore childRunIntents,
             long claimLeaseSeconds,
@@ -237,7 +230,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         this(runMapper, freshRunPipeline, workItemStore, planAdapter, todoNodeExecutor, eventService,
                 objectMapper, dispatcher, admissionRegistry, schedulerVersionPolicy, toolJobCoordinator,
                 waitGroupNodeExecutor, coordinationStore, stateStore, leaseStore, processIdentity,
-                legacyHandoff, settings, null, childRunIntents, null, null, claimLeaseSeconds,
+                settings, null, childRunIntents, null, null, claimLeaseSeconds,
                 coordinationDeferRetryMs, hintQueueFullRetryMs, serviceLeaseTtlSeconds, frozenEffectiveSettings);
     }
 
@@ -460,6 +453,12 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("kind", KIND_PLANNING);
         payload.put("workflow", "PENDING_PLAN");
+        // 恢复带着冻结计划回来（resetForResume 不清 plan_json；追问落库时会把 plan_json 清成 '{}'）：
+        // 规划段走冻结分支不调规划器，节点级续跑的「已完成节点不重跑」由跨代际承接种子兑现。
+        if (run.getPlanJson() != null && !run.getPlanJson().isBlank()
+                && !"{}".equals(run.getPlanJson().trim())) {
+            payload.put("resumeFromFrozenPlan", true);
+        }
         createAndHint(identity, 0L, value(run.getRunControlVersion()), payload,
                 run.getSchedulerVersion(), turn);
     }
@@ -531,11 +530,16 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             failureMetadata = segmentFailureMetadata(row);
             break;
         }
-        completed.sort(Comparator.comparingInt(LangchainCompletedTodo::getSequence));
         if (failureReason != null) {
             persistInfrastructureFailure(run, plan, completed, failureReason, failureMetadata);
             return;
         }
+        // 承接只属于冻结计划续跑的代际：重规划代（追问、规划中到期）的节点编号会与旧计划重号
+        // （规划器提示词教的就是 todo_1 这种格式），误承接会把新计划里语义不同的同名节点静默标成已完成。
+        if (resumeFromFrozenPlan(planning)) {
+            seedCompletedFromEarlierGenerations(run, generation, plan, completed, completedIds, existingIds);
+        }
+        completed.sort(Comparator.comparingInt(LangchainCompletedTodo::getSequence));
         if (completedIds.size() == items.size()) {
             advanceFinalAnswer(run, plan, generation, completed, latestSegments, turn);
             return;
@@ -573,6 +577,60 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             byNode.put(item.getNodeId(), item);
         }
         return byNode;
+    }
+
+    /**
+     * 跨代际承接种子：把更早代际里已完成（分段结果已提交且成功）的节点播进本代际的 completed
+     * 集合——恢复开的恢复代际只跑没做完的节点（节点级续跑，不做节点内断点）。只在
+     * {@link #resumeFromFrozenPlan} 为真的代际调用：重规划代与旧计划节点编号重号，不承接。
+     *
+     *
+     * <p>两条边界：种子只认当前冻结计划里出现的 nodeId（历史代际计划变化时，不在当前计划的
+     * 旧节点自然忽略，防跨计划误承接）；本代际已有行的节点（含未完成行）不播——现代际优先，
+     * 「上一代完成、本代重跑未完成」的节点以本代际的未完成事实为准，不会被旧完成行覆盖。
+     * 承接节点的成果经 completed 链随协调回合快照进未完成节点与最终答案的 completedContext，
+     * 消费侧零改动。</p>
+     *
+     * <p>记账口径：resultToolCalls/totalCommittedToolCalls 只统计本代际，承接节点让这两个
+     * 展示读数偏小——不影响正确性，资源上限账在 observability 累计、不受代际影响。</p>
+     */
+    private void seedCompletedFromEarlierGenerations(AgentRun run, int generation, LangchainTodoPlan plan,
+                                                     List<LangchainCompletedTodo> completed,
+                                                     Set<String> completedIds, Set<String> existingIds) {
+        if (generation <= 0) {
+            return;
+        }
+        Map<String, NodeWorkItem> earlierLatest = new LinkedHashMap<>();
+        for (NodeWorkItem item : workItemStore.listLatestSegmentsBeforeGeneration(run.getId(), generation)) {
+            earlierLatest.put(item.getNodeId(), item);
+        }
+        if (earlierLatest.isEmpty()) {
+            return;
+        }
+        for (TodoItem item : plan.getItems() == null ? List.<TodoItem>of() : plan.getItems()) {
+            String nodeId = item.getId();
+            if (completedIds.contains(nodeId) || existingIds.contains(nodeId)) {
+                continue;
+            }
+            NodeWorkItem row = earlierLatest.get(nodeId);
+            if (row == null || row.stateEnum() != NodeWorkItemState.RESULT_COMMITTED
+                    || !segmentSuccess(row)) {
+                continue;
+            }
+            completedIds.add(nodeId);
+            completed.add(completedTodo(item, row));
+        }
+    }
+
+    /** 这一代是不是带着冻结计划回来的续跑：规划段载荷里的标记，只有 resetForResume 不清 plan_json 的恢复会写。 */
+    private boolean resumeFromFrozenPlan(NodeWorkItem planning) {
+        try {
+            return objectMapper.readTree(planning.getPayloadJson())
+                    .path("resumeFromFrozenPlan").asBoolean(false);
+        } catch (Exception e) {
+            // 载荷读不出来时不承接：宁可让已完成节点重跑，也不冒跨计划重号误承接的险。
+            return false;
+        }
     }
 
     /** 只把确实能领取的分段投进提醒队列：等待中的下一段不该占掉别人的派发机会。 */
@@ -1003,7 +1061,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                     resultPatch = todoExecution.resultPatch();
                 } else {
                     resultPatch = switch (kind) {
-                        case KIND_PLANNING -> executePlanning(identity.runId());
+                        case KIND_PLANNING -> executePlanning(identity.runId(),
+                                payload.path("resumeFromFrozenPlan").asBoolean(false));
                         case KIND_FINAL_ANSWER -> executeFinalAnswer(identity.runId(), payload);
                         default -> throw new IllegalArgumentException("unknown_dual_pool_work_kind:" + kind);
                     };
@@ -1110,10 +1169,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         }
     }
 
-    private Map<String, Object> executePlanning(String runId) {
+    private Map<String, Object> executePlanning(String runId, boolean resumeFromFrozenPlan) {
         AgentRun run = runMapper.findById(runId);
-        LangchainLinearRunPipelineImpl.DualPoolPlanPreparation preparation =
-                freshRunPipeline.prepareDualPoolRun(run);
+        LangchainLinearRunPipelineImpl.DualPoolPlanPreparation preparation = resumeFromFrozenPlan
+                ? freshRunPipeline.prepareDualPoolRunWithFrozenPlan(run)
+                : freshRunPipeline.prepareDualPoolRun(run);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("kind", KIND_PLANNING);
         result.put("success", preparation != null);
@@ -1332,8 +1392,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                         due.getRunId(), due.getSchedulerVersion(), run.getSchedulerVersion());
             }
             if (version == SchedulerVersion.LEGACY) {
+                // LEGACY 调度实现已删除，这条候选永远不会再有执行层接手：收口责任在启动态收敛
+                // （StartupRunStateConvergence 启动时把非终态 LEGACY 一次性关成 FAILED）。协调循环
+                // 这里只显式跳过并留有界日志，不推后——推后会让同一条死候选反复回到页首占位。
                 legacyThisRound++;
-                handOffLegacyRun(run, due, round);
+                long skipped = legacySkipped.incrementAndGet();
+                if (skipped == 1L || skipped % 1000L == 0L) {
+                    log.warn("LEGACY 调度已删除，协调候选显式跳过（收口见启动态收敛）: runId={} 累计{}条",
+                            run.getId(), skipped);
+                }
                 continue;
             }
             if (!version.isDualPoolFamily()) {
@@ -1420,55 +1487,6 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             hints.add(new RunCoordinationHint(runId, RunCoordinationHint.Reason.SCAN_REDISCOVERED));
         }
         return List.copyOf(hints);
-    }
-
-    /**
-     * 旧版本 Run 的处理：拿到服务所有权之后才交给旧入口，拿不到就按所有权原因推后。
-     *
-     * <p>三道都要过。第一道是所有权：候选是三个版本共用的，但「能不能动这条 Run」由它自己的
-     * 所有权决定——没有可跨进程核对、会过期、能原子转交的持久事实，凭一条候选就接手，会在滚动
-     * 部署新旧并存的窗口里对着旧进程正在跑的图再启动一次。第二道是旧入口在不在（它随配置开关）。
-     * 第三道是旧入口自己的领取条件（领取语句会核对状态与重试次数）。</p>
-     *
-     * <p>没接手的要推后：不推后它会一直停在候选页首，页数一满，排在它后面的双池 Run 永远看不见。</p>
-     */
-    private void handOffLegacyRun(AgentRun run, RunCoordination due, long round) {
-        String runId = run.getId();
-        if (!holdsServiceOwnership(runId)) {
-            deferLegacyRun(due, "所有权不在本进程");
-            return;
-        }
-        LegacyRunHandoff handoff = legacyHandoff.getIfAvailable();
-        if (handoff == null) {
-            deferLegacyRun(due, "旧入口没有启用");
-            return;
-        }
-        if (!handoff.handOff(runId)) {
-            deferLegacyRun(due, "旧入口没有接手");
-            return;
-        }
-        legacyHandedOff.incrementAndGet();
-        // 交出去了：记下这一轮服务过它，它从此排在别的候选后面。
-        boolean marked = coordinationStore.markHandoffServed(runId, round, planGeneration(due));
-        if (!marked) {
-            log.info("旧版本 Run 已经交给旧入口，但轮次位置没有写进去（可能刚换了计划代际）: runId={}", runId);
-        }
-    }
-
-    /** 按所有权原因推后一条旧版本候选，让它从页首让开。 */
-    private void deferLegacyRun(RunCoordination due, String why) {
-        legacyDeferred.incrementAndGet();
-        boolean deferred = coordinationStore.deferHandoff(due.getRunId(),
-                RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
-                OffsetDateTime.now().plus(coordinationDeferRetry),
-                planGeneration(due), servedRound(due));
-        if (!deferred) {
-            log.debug("旧版本 Run 的推后没有生效（轮次或代际已经变了）: runId={}", due.getRunId());
-        }
-        if (legacyDeferred.get() == 1L || legacyDeferred.get() % 1000L == 0L) {
-            log.info("旧版本 Run 这一轮不接手（{}），按所有权原因推后: runId={} 累计{}次",
-                    why, due.getRunId(), legacyDeferred.get());
-        }
     }
 
     /**
@@ -2033,8 +2051,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
     @Override
     public Map<String, Object> routingSnapshot() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
-        snapshot.put("legacyHandedOffTotal", legacyHandedOff.get());
-        snapshot.put("legacyDeferredTotal", legacyDeferred.get());
+        snapshot.put("legacySkippedTotal", legacySkipped.get());
         snapshot.put("leaseNotAcquiredTotal", leaseNotAcquired.get());
         snapshot.put("routingIsolatedTotal", routingIsolated.get());
         snapshot.put("legacyCandidatesLastRound", legacyCandidatesLastRound);

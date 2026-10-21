@@ -71,28 +71,6 @@ public class MybatisRunCoordinationStore implements RunCoordinationStore {
     }
 
     @Override
-    public boolean markHandoffServed(String runId, long roundNumber, int expectedPlanGeneration) {
-        requireRoundNumber(roundNumber);
-        requirePlanGeneration(expectedPlanGeneration);
-        return mapper.markHandoffServed(runId, roundNumber, expectedPlanGeneration) > 0;
-    }
-
-    @Override
-    public boolean deferHandoff(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt,
-                               int expectedPlanGeneration, long expectedCoordinationRound) {
-        if (reason == null) {
-            throw new IllegalArgumentException("延期必须给出原因，否则观测里看不出为什么没推进");
-        }
-        if (nextVisibleAt == null) {
-            throw new IllegalArgumentException("延期必须给出下次可见时间");
-        }
-        requirePlanGeneration(expectedPlanGeneration);
-        requireRoundNumber(expectedCoordinationRound);
-        return mapper.deferHandoff(runId, reason.name(), nextVisibleAt,
-                expectedPlanGeneration, expectedCoordinationRound) > 0;
-    }
-
-    @Override
     public boolean syncPlanGeneration(String runId, int planGeneration, ServiceOwnershipFence fence) {
         requirePlanGeneration(planGeneration);
         requireFence(fence);

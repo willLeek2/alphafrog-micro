@@ -2,7 +2,7 @@ package world.willfrog.agentlangchain.control;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -12,7 +12,7 @@ class AgentLangchainOrchestratorTest {
 
     @Test
     void orchestrationStatus_shouldReportDisabledBeforeInspectingPipeline() {
-        ObjectProvider<LangchainLinearRunPipeline> provider = mock(ObjectProvider.class);
+        ObjectProvider<AgentRunPipeline> provider = mock(ObjectProvider.class);
         AgentLangchainOrchestrator orchestrator = new AgentLangchainOrchestrator(provider);
 
         assertThat(orchestrator.orchestrationStatus(false))
@@ -21,8 +21,8 @@ class AgentLangchainOrchestratorTest {
 
     @Test
     void orchestrationStatus_shouldReportReadyWhenEnabledPipelineExists() {
-        ObjectProvider<LangchainLinearRunPipeline> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(mock(LangchainLinearRunPipeline.class));
+        ObjectProvider<AgentRunPipeline> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(mock(AgentRunPipeline.class));
         AgentLangchainOrchestrator orchestrator = new AgentLangchainOrchestrator(provider);
 
         assertThat(orchestrator.orchestrationStatus(true))
@@ -31,7 +31,7 @@ class AgentLangchainOrchestratorTest {
 
     @Test
     void orchestrationStatus_shouldReportUnavailableWhenEnabledPipelineMissing() {
-        ObjectProvider<LangchainLinearRunPipeline> provider = mock(ObjectProvider.class);
+        ObjectProvider<AgentRunPipeline> provider = mock(ObjectProvider.class);
         when(provider.getIfAvailable()).thenReturn(null);
         AgentLangchainOrchestrator orchestrator = new AgentLangchainOrchestrator(provider);
 

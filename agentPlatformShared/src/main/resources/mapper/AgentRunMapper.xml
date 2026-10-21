@@ -724,6 +724,22 @@
           AND status = #{expectedStatus}
     </update>
 
+    <!--
+      LEGACY 调度删除后的启动一次性收口：把仍停在非终态的 LEGACY Run 关成 FAILED。
+      条件里带 scheduler_version='LEGACY' 与非终态集合，天然幂等——重跑只会命中还没关掉的行。
+    -->
+    <update id="failLegacyStartupClosure">
+        UPDATE alphafrog_agent_run
+        SET status = 'FAILED',
+            last_error = #{lastError},
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND scheduler_version = 'LEGACY'
+          AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+    </update>
+
     <select id="listNonTerminalDeploymentGenerations" resultMap="DeploymentGenerationResultMap">
         SELECT DISTINCT deployment_id,
                         deployment_generation_id
@@ -887,7 +903,12 @@
           AND deletion_started_at IS NULL
           AND workspace_cleanup_started_at IS NULL
           AND workspace_expired_at IS NULL
-          AND status IN ('FAILED', 'CANCELED', 'WAITING')
+          <!-- EXPIRED 限定可恢复：completed_at 为空（从未完成过）的「执行中到期」放行进入恢复；
+               已完成过的 EXPIRED 不放开。既有 FAILED/CANCELED/WAITING 白名单语义不变。 -->
+          AND (
+                status IN ('FAILED', 'CANCELED', 'WAITING')
+                OR (status = 'EXPIRED' AND completed_at IS NULL)
+          )
           AND COALESCE(tool_job_anchor_json -&gt;&gt; 'anchorState', '')
                 NOT IN ('PREPARING', 'WORKSPACE_REFUSED')
           AND NOT (

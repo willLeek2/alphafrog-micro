@@ -121,8 +121,9 @@ public class LangchainTodoNodeResult {
      *   <li>其他 generic metadata → {@code failure_metadata}（保留通道，避免信息丢失）</li>
      * </ul>
      * <p>
-     * 调用方：{@code LangchainLinearRunPipelineImpl#publishFailure} / {@code LangchainLinearWorkflowExecutor#emitTodoNodeEvent} /
-     * {@code LangchainDagWorkflowExecutor#todoNodeResultPayload}，分别在 WORKFLOW_FAILED / TODO_NODE_FAILED event payload 中调用。
+     * 调用方：{@code LangchainLinearRunPipelineImpl#publishFailure} 与
+     * {@code LangchainLinearRunPipelineImpl#emitDualPoolTodoNodeEvent}，分别在 WORKFLOW_FAILED /
+     * TODO_NODE_FAILED event payload 中调用。
      * <p>
      * 返回的 key 名称是 event payload 字段 snake_case 命名。
      */

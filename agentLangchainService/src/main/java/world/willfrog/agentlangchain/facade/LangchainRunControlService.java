@@ -19,7 +19,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.wait.WaitGroup;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
@@ -63,7 +63,7 @@ import java.util.Map;
  *
  *
  * @see LangchainRunReadService 读路径，提供 requireWritableRun
- * @see LangchainLinearRunPipeline 异步执行入口
+ * @see AgentRunPipeline 异步执行入口
  * @see AgentRunObservabilityService observability 落盘
  */
 @Service
@@ -76,7 +76,7 @@ public class LangchainRunControlService {
     private final AgentRunEventService agentEventService;
     private final AgentRunStateStore stateStore;
     private final AgentRunObservabilityService agentObservabilityService;
-    private final LangchainLinearRunPipeline pipeline;
+    private final AgentRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
     private final AgentRunFinalizationService finalizationService;
@@ -96,6 +96,9 @@ public class LangchainRunControlService {
 
     @Autowired(required = false)
     private WaitGroupStore waitGroupStore;
+
+    @Autowired(required = false)
+    private world.willfrog.agent.platform.wait.WaitMemberStopStore waitMemberStopStore;
 
     @Autowired
     private AgentRunFamilyDeletionService familyDeletionService;
@@ -406,34 +409,39 @@ public class LangchainRunControlService {
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         rejectDirectChildControl(run);
-        if (run.getStatus() == AgentRunStatus.EXPIRED) {
+        if (run.getStatus() == AgentRunStatus.EXPIRED && run.getCompletedAt() != null) {
+            // 已完成过的 EXPIRED（完成后老化的收口语义）不可恢复；
+            // 执行中到期的 EXPIRED（completed_at 为空）放行进入下方恢复链，
+            // 由 resetForResume 的 SQL 白名单（EXPIRED 且 completed_at IS NULL）二次把关。
             throw new IllegalStateException("run expired");
         }
         if (run.getStatus() != AgentRunStatus.FAILED
                 && run.getStatus() != AgentRunStatus.CANCELED
-                && run.getStatus() != AgentRunStatus.WAITING) {
+                && run.getStatus() != AgentRunStatus.WAITING
+                && run.getStatus() != AgentRunStatus.EXPIRED) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
-        if (schedulerVersionPolicy != null && dualPoolRunAdmissionRegistry != null
-                && schedulerVersionPolicy.isDualPool(run)
-                && !dualPoolRunAdmissionRegistry.isKnownInCurrentProcess(run.getId())) {
-            throw new IllegalStateException(
-                    "双池 Run 来自本次进程启动之前，不能自动恢复；请新建 Run");
-        }
-        boolean dualPoolRun = schedulerVersionPolicy != null
+        // 受理在改 Run 状态或写消息之前：双池家族（V1＋V2）统一走登记组件的用户控制受理。
+        // V1 保持「本进程未知即拒绝」；V2 未知也在这里落库前受理（数据库租约→登记已知→预留），
+        // 不再先落库后补扫。拿不到所有权或名额按原因拒绝、原状态不动，用户稍后重试。
+        boolean dualPoolFamilyRun = schedulerVersionPolicy != null
                 && dualPoolRunAdmissionRegistry != null
-                && schedulerVersionPolicy.isDualPool(run);
-        DualPoolRunAdmissionRegistry.Admission dualPoolReservation = null;
-        if (dualPoolRun) {
-            dualPoolReservation = dualPoolRunAdmissionRegistry.admitExistingRunWithLease(run.getId());
+                && schedulerVersionPolicy.isDualPoolFamily(run);
+        DualPoolRunAdmissionRegistry.UserControlAdmission dualPoolReservation = null;
+        if (dualPoolFamilyRun) {
+            dualPoolReservation = dualPoolRunAdmissionRegistry.admitForUserControl(
+                    run.getId(), !schedulerVersionPolicy.isDualPool(run));
             if (!dualPoolReservation.admitted()) {
-                throw new IllegalStateException("双池业务准入名额已满，请稍后重试");
+                throw new IllegalStateException(
+                        dualPoolAdmissionRejectMessage(dualPoolReservation.rejectReason()));
             }
         }
         boolean durableReceived = false;
         try {
             rejectUnsettledCanceledSqlSessionBeforeResume(run);
             disposePausedAnchorBeforeResume(run);
+            cancelOpenWaitGroupsBeforeResume(run.getId());
+            rejectUnsettledStopTasksBeforeResume(run);
             if (request.getPlanOverrideJson() != null && !request.getPlanOverrideJson().isBlank()) {
                 stateStore.clearTasks(run.getId());
                 stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
@@ -443,13 +451,19 @@ public class LangchainRunControlService {
                 throw new IllegalStateException("Run 状态已变化，无法恢复到待执行");
             }
             if (dualPoolReservation != null && dualPoolReservation.admitted()
+                    && dualPoolReservation.admission().epoch() >= 0L
                     && !dualPoolRunAdmissionRegistry.activateReservedAdmission(
-                    run.getId(), dualPoolReservation)) {
+                    run.getId(), dualPoolReservation.admission())) {
                 throw new IllegalStateException("恢复已落库，但双池准入预留无法激活");
             }
             // 数据库状态已经进入 RECEIVED。后续辅助状态或提示投递即使失败，也不能释放
             // 双池业务名额；保留准入后，数据库扫描仍能把这条 Run 重新交给协调池。
             durableReceived = true;
+            // 恢复拿一个新的挂钟窗口：预算检查实际读取的 Redis 观测起点（summary.startedAtMillis）
+            // 在这里显式重写为恢复时刻，与上一段 ttl_expires_at 的「恢复即重置」同口径——
+            // 时间窗口给新、资源账（次数/tokens）累计保留。普通分段初始化仍是幂等不覆盖，
+            // 不会被这次重写影响。
+            agentObservabilityService.restartWallClockOnResume(run.getId());
             agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
                     "run_id", run.getId(),
                     "engine", "agentLangchainService"));
@@ -464,11 +478,80 @@ public class LangchainRunControlService {
             pipeline.launchAsync(refreshed);
             return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
         } catch (RuntimeException e) {
-            if (dualPoolReservation != null && dualPoolReservation.admitted() && !durableReceived) {
+            if (dualPoolReservation != null && dualPoolReservation.admitted()
+                    && dualPoolReservation.admission().epoch() >= 0L && !durableReceived) {
                 dualPoolRunAdmissionRegistry.rollbackReservedAdmission(
-                        run.getId(), dualPoolReservation);
+                        run.getId(), dualPoolReservation.admission());
             }
             throw e;
+        }
+    }
+
+    /** 受理拒绝的恢复提示按稳定原因区分：所有权在别人手上、名额满、启动隔离、V1 未知。 */
+    private static String dualPoolAdmissionRejectMessage(String reason) {
+        return switch (reason == null ? "permit_unavailable" : reason) {
+            case "unknown_run" -> "双池 Run 来自本次进程启动之前，不能自动恢复；请新建 Run";
+            case "startup_isolated" -> "这条运行被启动核验隔离，不能受理恢复";
+            case "ownership_unavailable" -> "这条运行的服务所有权在别的实例上，请稍后重试";
+            default -> "双池业务准入名额已满，请稍后重试";
+        };
+    }
+
+    /**
+     * 恢复前的旧等待组收口：把这条 Run 还开着的等待链标 CANCELED 并为已派发成员落停机任务
+     * （与显式取消共用的等待组段）。旧代际组是死行，取消副作用即使后续恢复步骤失败也已落库——
+     * 清理安全且该做；停机结算本身保持既有异步责任（停机工人 1 秒级领取）。
+     */
+    private void cancelOpenWaitGroupsBeforeResume(String runId) {
+        if (waitGroupStore == null) {
+            log.error("恢复前等待组存储不可用，旧等待组无法收口: runId={}", runId);
+            return;
+        }
+        long afterGroupId = 0;
+        while (true) {
+            java.util.List<WaitGroup> groups = waitGroupStore.listOpenGroupsByRun(runId, afterGroupId, 100);
+            if (groups.isEmpty()) {
+                break;
+            }
+            for (WaitGroup group : groups) {
+                waitGroupStore.cancelChain(group.getId());
+                afterGroupId = group.getId();
+            }
+        }
+    }
+
+    /**
+     * 恢复闸：旧成员的停机结算未结清时，恢复先给出可重试拒绝（旧 SQL 仍占用户查询会话，放行只会让
+     * 新代际的第一条 SQL 撞会话忙）。读口口径是 {@code state <> 'CONFIRMED'}，会把永远不会再推进的
+     * BLOCKED_PROOF 也带回来——这里只认 PENDING/CLAIMED；BLOCKED_PROOF 残留不拦恢复，但留下有界日志。
+     */
+    private void rejectUnsettledStopTasksBeforeResume(AgentRun run) {
+        if (waitMemberStopStore == null) {
+            return;
+        }
+        boolean unsettled = false;
+        boolean blockedProofResidue = false;
+        long afterStopId = 0;
+        while (true) {
+            java.util.List<world.willfrog.agent.platform.wait.WaitMemberStopTask> stops =
+                    waitMemberStopStore.listUnconfirmedByRun(run.getId(), afterStopId, 100);
+            if (stops.isEmpty()) {
+                break;
+            }
+            for (world.willfrog.agent.platform.wait.WaitMemberStopTask stop : stops) {
+                afterStopId = stop.getId();
+                if ("PENDING".equals(stop.getState()) || "CLAIMED".equals(stop.getState())) {
+                    unsettled = true;
+                } else if ("BLOCKED_PROOF".equals(stop.getState())) {
+                    blockedProofResidue = true;
+                }
+            }
+        }
+        if (blockedProofResidue) {
+            log.warn("恢复发现 BLOCKED_PROOF 停机残留，不阻塞恢复仅记录: runId={}", run.getId());
+        }
+        if (unsettled) {
+            throw new IllegalStateException("旧任务仍在停机结算，请稍后重试恢复");
         }
     }
 

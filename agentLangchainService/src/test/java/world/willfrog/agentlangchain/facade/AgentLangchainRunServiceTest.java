@@ -14,8 +14,7 @@ import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
-import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunRejectedException;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
@@ -37,13 +36,11 @@ class AgentLangchainRunServiceTest {
     @Mock
     private ObjectProvider<AgentRunEventService> eventServiceProvider;
     @Mock
-    private ObjectProvider<LangchainLinearRunPipeline> pipelineProvider;
+    private ObjectProvider<AgentRunPipeline> pipelineProvider;
     @Mock
     private AgentRunEventService eventService;
     @Mock
-    private LangchainLinearRunPipeline pipeline;
-    @Mock
-    private LangchainRunConcurrencyScheduler scheduler;
+    private AgentRunPipeline pipeline;
     @Mock
     private AgentRunMapper runMapper;
     @Mock
@@ -65,14 +62,14 @@ class AgentLangchainRunServiceTest {
 
     @BeforeEach
     void setUp() {
-        runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, scheduler, runMapper,
+        runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, runMapper,
                 creditService, userDao,
                 world.willfrog.agentlangchain.gateway.GatewayTestFixtures.
                         withIdentity(runMapper, "stable", GENERATION),
                 schedulerVersionPolicy, dualPoolRunAdmissionRegistry, acceptanceFixtureGate,
                 acceptanceControlGate);
         lenient().when(schedulerVersionPolicy.versionForNewRun())
-                .thenReturn(SchedulerVersionPolicy.LEGACY);
+                .thenReturn(SchedulerVersionPolicy.DUAL_POOL_V1);
         // 版本家族判断按版本名如实回答：假的策略不能把双池版本说成不是双池，否则这里测的就不是创建路径了。
         lenient().when(schedulerVersionPolicy.isDualPoolFamily(anyString()))
                 .thenAnswer(invocation -> {
@@ -86,12 +83,10 @@ class AgentLangchainRunServiceTest {
     }
 
     @Test
-    void createRunLaunchesLinearPipeline() {
+    void createRunLaunchesThePipelineWithTheFrozenVersion() {
         when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
         when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
-        LangchainRunConcurrencyScheduler.Reservation reservation =
-                mock(LangchainRunConcurrencyScheduler.Reservation.class);
-        when(scheduler.reserve()).thenReturn(reservation);
+        when(dualPoolRunAdmissionRegistry.admitNewRun(eq("run123"), anyString())).thenReturn(true);
 
         AgentRun run = new AgentRun();
         run.setId("run123");
@@ -115,12 +110,12 @@ class AgentLangchainRunServiceTest {
         assertEquals("run123", message.getId());
         verify(eventService).createRun(eq("u1"), eq("analyze stocks"), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq("stable"), eq(GENERATION), eq("lane-a"),
-                eq(SchedulerVersionPolicy.LEGACY), eq(true), anyBoolean());
-        verify(pipeline).launchAsync(run, reservation);
+                eq(SchedulerVersionPolicy.DUAL_POOL_V1), eq(true), anyBoolean());
+        verify(pipeline).launchAsync(run);
     }
 
     @Test
-    void dualPoolRunFreezesVersionWithoutReservingLegacyScheduler() {
+    void dualPoolRunFreezesVersionAndAdmitsThroughTheRegistry() {
         when(schedulerVersionPolicy.versionForNewRun())
                 .thenReturn(SchedulerVersionPolicy.DUAL_POOL_V1);
         when(dualPoolRunAdmissionRegistry.admitNewRun(eq("run-dual"), anyString())).thenReturn(true);
@@ -141,16 +136,16 @@ class AgentLangchainRunServiceTest {
                 .setMessage("dual pool")
                 .build());
 
-        verify(scheduler, never()).reserve();
         verify(dualPoolRunAdmissionRegistry).admitNewRun(eq("run-dual"), anyString());
-        verify(pipeline).launchAsync(run, null);
+        verify(pipeline).launchAsync(run);
     }
 
     @Test
     void createRunRejectedBeforeCreateRunDoesNotPersistRun() {
         when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
         when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
-        when(scheduler.reserve()).thenThrow(new LangchainRunRejectedException("agent_run_executor_queue_full"));
+        // 旧调度器的名额预留已随 LEGACY 删除；这里换一个同样发生在 createRun 之前的拒绝源。
+        when(dualPoolRunAdmissionRegistry.startupResidueBlockedFor(anyString())).thenReturn(true);
 
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
@@ -184,11 +179,10 @@ class AgentLangchainRunServiceTest {
                 .build();
 
         assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
-        verify(scheduler, never()).reserve();
         verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(), any(),
                 anyString(), anyBoolean(), anyBoolean());
-        verify(pipeline, never()).launchAsync(any(), any());
+        verify(pipeline, never()).launchAsync(any());
     }
 
     @Test
@@ -200,16 +194,13 @@ class AgentLangchainRunServiceTest {
     }
 
     /**
-     * 幂等键命中旧 Run 时：本次不启动 pipeline、不占用业务准入名额，为这次临时预留下的名额当场还回去。
+     * 幂等键命中旧 Run 时：本次不启动 pipeline、不占业务准入名额。
      * 同一次请求被重复提交，不应该让模型和工具再跑一遍。
      */
     @Test
     void idempotentReadBackNeverLaunchesThePipelineAgain() {
         when(eventServiceProvider.getIfAvailable()).thenReturn(eventService);
         when(pipelineProvider.getIfAvailable()).thenReturn(pipeline);
-        LangchainRunConcurrencyScheduler.Reservation reservation =
-                mock(LangchainRunConcurrencyScheduler.Reservation.class);
-        when(scheduler.reserve()).thenReturn(reservation);
         AgentRun existing = new AgentRun();
         existing.setId("run-original");
         existing.setUserId("u1");
@@ -224,9 +215,8 @@ class AgentLangchainRunServiceTest {
                 .build());
 
         assertEquals("run-original", message.getId());
-        verify(pipeline, never()).launchAsync(any(), any());
+        verify(pipeline, never()).launchAsync(any());
         verify(dualPoolRunAdmissionRegistry, never()).admitNewRun(anyString(), anyString());
-        verify(scheduler).release(reservation);
     }
 
     @Test
@@ -249,7 +239,7 @@ class AgentLangchainRunServiceTest {
         runService.createRun(request);
         verify(eventService).createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq("stable"), eq(GENERATION), isNull(),
-                eq(SchedulerVersionPolicy.LEGACY), anyBoolean(), anyBoolean());
+                eq(SchedulerVersionPolicy.DUAL_POOL_V1), anyBoolean(), anyBoolean());
     }
 
     @Test
@@ -292,6 +282,6 @@ class AgentLangchainRunServiceTest {
         order.verify(dualPoolRunAdmissionRegistry).forgetFailedAdmission("run-v2");
         order.verify(eventService).closeUnacceptedCreate(eq("run-v2"), eq("u1"), argThat(reason ->
                 String.valueOf(reason).contains("argument type mismatch")));
-        verify(pipeline, never()).launchAsync(any(), any());
+        verify(pipeline, never()).launchAsync(any());
     }
 }

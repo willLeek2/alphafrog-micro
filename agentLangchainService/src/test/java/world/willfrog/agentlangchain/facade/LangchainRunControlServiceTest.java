@@ -12,7 +12,7 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
@@ -43,7 +43,7 @@ class LangchainRunControlServiceTest {
     private final AgentRunEventService eventService = mock(AgentRunEventService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
     private final AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
-    private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
+    private final AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
     private final AgentRunCreditSettlementService creditSettlementService = mock(AgentRunCreditSettlementService.class);
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
     private final AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);

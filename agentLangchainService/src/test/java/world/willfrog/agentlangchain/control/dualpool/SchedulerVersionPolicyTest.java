@@ -35,8 +35,8 @@ class SchedulerVersionPolicyTest {
     }
 
     @Test
-    void unconfiguredFallsBackToLegacy() {
-        assertThat(policy(new MockEnvironment()).versionForNewRun()).isEqualTo("LEGACY");
+    void unconfiguredFallsBackToDualPoolV2() {
+        assertThat(policy(new MockEnvironment()).versionForNewRun()).isEqualTo("DUAL_POOL_V2");
     }
 
     @Test
@@ -54,13 +54,15 @@ class SchedulerVersionPolicyTest {
     }
 
     @Test
-    void haltSwitchDoesNotRewriteAnExplicitLegacy() {
+    void explicitLegacyIsRejectedEvenWhenTheHaltSwitchIsOn() {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty(HALT_KEY, "true")
                 .withProperty(VERSION_KEY, "LEGACY");
-        assertThat(policy(environment).versionForNewRun())
-                .as("显式写了 LEGACY 就是要在旧入口上跑：演练开关只改默认值，不改操作人写下的版本")
-                .isEqualTo("LEGACY");
+        assertThatThrownBy(() -> policy(environment).versionForNewRun())
+                .as("LEGACY 调度已删除：显式写下的 LEGACY 不得被演练开关悄悄改写成别的版本，"
+                        + "也不得原样发给新 Run，必须显式拒绝")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("LEGACY");
     }
 
     /**
@@ -75,7 +77,7 @@ class SchedulerVersionPolicyTest {
                 new DualPoolSchedulerSettings(null, environment).newRunSchedulerVersion();
 
         assertThat(version.textValue()).isEqualTo("DUAL_POOL_V1");
-        assertThat(version.requested()).as("请求值：一层都没配，用代码默认").isEqualTo("LEGACY");
+        assertThat(version.requested()).as("请求值：一层都没配，用代码默认").isEqualTo("DUAL_POOL_V2");
         assertThat(version.source()).isEqualTo(DualPoolSchedulerSettings.SOURCE_DEFAULT);
         assertThat(version.rejection()).contains("演练开关");
     }

@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.execution;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
-import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
@@ -17,9 +16,7 @@ import dev.langchain4j.service.tool.ToolProvider;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
-import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 
 /**
@@ -30,8 +27,6 @@ import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 public class FreshRunPipeline extends LangchainLinearRunPipelineImpl {
 
     public FreshRunPipeline(LangchainAiPlanner planner,
-                            LangchainLinearWorkflowExecutor linearWorkflowExecutor,
-                            LangchainDagWorkflowExecutor dagWorkflowExecutor,
                             LangchainRunStageModelResolver stageModelResolver,
                             AgentRunMapper runMapper,
                             AgentRunEventService eventService,
@@ -43,20 +38,18 @@ public class FreshRunPipeline extends LangchainLinearRunPipelineImpl {
                             LangchainFollowUpContextSupport followUpContextSupport,
                             AgentMessageService messageService,
                             LangchainRunExecutionGuard executionGuard,
-                            LangchainRunConcurrencyScheduler runConcurrencyScheduler,
                             AgentCreditService creditService,
                             AgentRunCreditSettlementService creditSettlementService,
                             AgentRunFinalizationService finalizationService,
                             AgentPromptService promptService,
                             ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider,
-                            ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider,
-                            RunOwnershipGateway ownershipGateway) {
-        super(planner, linearWorkflowExecutor, dagWorkflowExecutor, stageModelResolver, runMapper,
+                            ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider) {
+        super(planner, stageModelResolver, runMapper,
                 eventService, objectMapper, toolProviderProvider, stateStoreProvider,
                 observabilityServiceProvider, failureMapper, followUpContextSupport, messageService,
-                executionGuard, runConcurrencyScheduler, creditService, creditSettlementService,
+                executionGuard, creditService, creditSettlementService,
                 finalizationService, promptService, agentRunDatasetRegistryProvider,
-                debugObservabilityServiceProvider, ownershipGateway);
+                debugObservabilityServiceProvider);
     }
 
     @Override

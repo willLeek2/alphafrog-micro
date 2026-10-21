@@ -27,7 +27,7 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.agentlangchain.tooljob.ToolJobConfig;
 import world.willfrog.agentlangchain.tooljob.ToolJobEventHook;
@@ -144,7 +144,7 @@ class ToolJobReconcilerP005ReverseTest {
     private AgentRunEventService eventService;
     private AgentRunStateStore stateStore;
     private AgentRunObservabilityService observabilityService;
-    private LangchainLinearRunPipeline pipeline;
+    private AgentRunPipeline pipeline;
     private AgentRunCreditSettlementService creditSettlementService;
 
     // ---- Infrastructure lifecycle ----
@@ -219,7 +219,7 @@ class ToolJobReconcilerP005ReverseTest {
         eventService = mock(AgentRunEventService.class);
         stateStore = mock(AgentRunStateStore.class);
         observabilityService = mock(AgentRunObservabilityService.class);
-        pipeline = mock(LangchainLinearRunPipeline.class);
+        pipeline = mock(AgentRunPipeline.class);
         creditSettlementService = mock(AgentRunCreditSettlementService.class);
 
         // Configure mocks for cancelRun:

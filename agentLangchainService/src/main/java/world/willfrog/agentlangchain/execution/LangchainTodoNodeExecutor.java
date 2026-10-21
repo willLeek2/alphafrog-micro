@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>
  * 与上下游协作关系：
  * <ul>
- *   <li>上游调度：由 {@link LangchainDagWorkflowExecutor} 决定什么时候调用本类（依赖图就绪后并发调度）；</li>
+ *   <li>上游调度：由双池协调循环（{@link world.willfrog.agentlangchain.control.dualpool.DatabaseDualPoolWorkHandler}）按节点工作项决定什么时候调用本类；</li>
  *   <li>Prompt 来源：{@link AgentPromptService#reactSystemPrompt()} 只提供稳定时间与全局规则；Todo 与工具能力通过 User 阶段说明注入；</li>
  *   <li>消息拼装：{@link LangchainTodoUserMessageBuilder} 负责把 todo 描述、已完成 todo 列表、dataset refs 拼成 user message；</li>
  *   <li>预算/观测：{@link AtomicInteger} toolCalls 由上游传入，用于累加 run 级别的总工具调用次数；{@link AgentContext} 用于注入 tracing/observability 上下文。</li>
@@ -59,9 +59,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>讲解材料见
  * {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}</p>
  *
- * @see LangchainDagWorkflowExecutor DAG 调度层
  * @see AgentPromptService Prompt 装配层
- * @see LangchainLinearRunPipelineImpl Run 总控层
+ * @see LangchainLinearRunPipelineImpl 双池准备/收尾方法载体
  */
 @Component
 @RequiredArgsConstructor
@@ -651,7 +650,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
+                    return maybeInjectTtlWrapUpHint(maybeInjectLastMileHint(chatRequest));
                 })
                 .build();
     }
@@ -784,7 +783,7 @@ public class LangchainTodoNodeExecutor {
     /**
      * 生成面向用户的最终回答（final answer）。
      * <p>
-     * 触发时机：DAG 中所有 todo 执行完毕（或最后一个 todo 输出后），由 {@link LangchainDagWorkflowExecutor} 调用。
+     * 触发时机：所有 todo 执行完毕（或最后一个 todo 输出后），由双池协调循环调用。
      * 与 {@link #execute} 的区别：
      * <ul>
      *   <li>不再触发工具调用（no tool loop），纯文本生成；</li>
@@ -792,7 +791,7 @@ public class LangchainTodoNodeExecutor {
      *   <li>user message 由 {@link LangchainTodoUserMessageBuilder#buildFinalUserMessage} 拼装，包含用户原始目标 + 全部已完成 todo 的结果汇总。</li>
      * </ul>
      * <p>
-     * 若最终回答为空，{@link LangchainDagWorkflowExecutor} 会判定为失败（empty final answer failed）。
+     * 若最终回答为空，双池收尾链路会判定为失败（empty final answer failed）。
      *
      * @param request        当前 run 请求上下文
      * @param completedTodos 所有已完成 todo 的结果列表
@@ -862,7 +861,7 @@ public class LangchainTodoNodeExecutor {
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(withToolBudgetStatus(chatRequest, request.getRunId()));
+                    return maybeInjectTtlWrapUpHint(maybeInjectLastMileHint(withToolBudgetStatus(chatRequest, request.getRunId())));
                 })
                 .beforeToolExecution(before -> {
                     ensureRunnable(request);
@@ -914,7 +913,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
+                    return maybeInjectTtlWrapUpHint(maybeInjectLastMileHint(chatRequest));
                 })
                 .build();
     }
@@ -1027,6 +1026,39 @@ public class LangchainTodoNodeExecutor {
     }
 
     /**
+     * 把 {@link AgentContext#getTtlWrapUpHint()} 里待注入的 TTL 收尾约定合并到下一次 LLM 请求中。
+     * <p>
+     * 触发条件：{@link AgentRunBudgetService} 在生命周期 TTL 消耗比例首次跨过软阈值
+     * （agent.run.ttl-warning-ratio，默认 0.9）时把收尾约定写入
+     * {@link AgentContext#setTtlWrapUpHint(String)}（本 TTL 窗口一次性，原子 SADD gate 守门；
+     * 与信封 lastMileHint 是两条通道：生命周期 vs 资源预算）。
+     * <p>
+     * 注入位置与消费语义与 {@link #maybeInjectLastMileHint} 完全一致：作为新的
+     * {@link UserMessage} 追加到 ChatRequest.messages 末尾，稳定 System 不变；
+     * 注入后立即清空 ThreadLocal，一次性消费。
+     *
+     * @param chatRequest 本次 LLM 调用的原始请求对象
+     * @return 注入收尾约定后的新 ChatRequest；ThreadLocal 无提示时原样返回
+     */
+    static ChatRequest maybeInjectTtlWrapUpHint(ChatRequest chatRequest) {
+        if (chatRequest == null) {
+            return null;
+        }
+        String hint = AgentContext.getTtlWrapUpHint();
+        if (hint == null || hint.isBlank()) {
+            return chatRequest;
+        }
+        List<ChatMessage> original = chatRequest.messages();
+        List<ChatMessage> rebuilt = rebuildMessagesWithHint(
+                original == null ? List.of() : original,
+                hint);
+        AgentContext.clearTtlWrapUpHint();
+        return chatRequest.toBuilder()
+                .messages(rebuilt)
+                .build();
+    }
+
+    /**
      * 每次模型请求前把工具调用次数额度现状作为一条 SystemMessage 插到稳定 System 之后（位置 1）。
      *
      * <p>额度快照统一来自 {@link RootTreeCallBudget#toolCallBudgetStatus(String)}——只传当前运行编号，
@@ -1060,8 +1092,8 @@ public class LangchainTodoNodeExecutor {
     }
 
     /**
-     * 从 catch 的异常中提取额度超限结构化字段，供 LangchainLinearWorkflowExecutor /
-     * LangchainDagWorkflowExecutor 在「拼部分答案 / 立即失败」决策时识别。
+     * 从 catch 的异常中提取额度超限结构化字段，供双池收尾链路（部分答案拼装 / 立即失败
+     * 的决策方）识别。
      * <p>
      * 触发链路：{@link AgentRunBudgetService#checkBeforeLlmCall()} / {@link AgentRunBudgetService#checkBeforeToolCall()}
      * 在 budget 超限时抛 {@link RunBudgetException}（继承 {@link IllegalStateException}），消息格式

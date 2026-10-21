@@ -223,6 +223,21 @@
         ORDER BY node_id, node_attempt DESC, segment_sequence DESC, id DESC
     </select>
 
+    <!--
+      跨代际版：早于指定代际的每个逻辑节点最新分段。恢复开的恢复代际只跑没做完的节点，
+      「上一代做完了没有」就看这里——代际优先于尝试与分段序号：gen1 已完成、gen2 重跑
+      未完成时，本查询在 gen2 之前圈定的是 gen1 行（若把圈定代际设为 gen2 之后含 gen2，
+      则取到 gen2 行）。调用方只把它播进恢复代际的 completed 种子，现代际的事实仍以
+      listLatestSegments 为准。
+    -->
+    <select id="listLatestSegmentsBeforeGeneration" resultMap="NodeWorkItemResultMap">
+        SELECT DISTINCT ON (node_id) <include refid="workItemColumns"/>
+        FROM alphafrog_agent_run_work_item
+        WHERE run_id = #{runId}
+          AND plan_generation &lt; #{planGeneration}
+        ORDER BY node_id, plan_generation DESC, node_attempt DESC, segment_sequence DESC, id DESC
+    </select>
+
     <select id="listUnfinishedBySchedulerVersion" resultMap="NodeWorkItemResultMap">
         SELECT <include refid="workItemColumns"/>
         FROM alphafrog_agent_run_work_item

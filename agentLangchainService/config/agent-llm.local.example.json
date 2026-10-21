@@ -175,7 +175,7 @@
   },
   "runtime": {
     "scheduler": {
-      "newRunSchedulerVersion": "LEGACY",
+      "newRunSchedulerVersion": "DUAL_POOL_V2",
       "perTurnNewNodeLimit": 8,
       "perRunUnfinishedLimit": 256,
       "globalUnfinishedHighWatermark": 128,

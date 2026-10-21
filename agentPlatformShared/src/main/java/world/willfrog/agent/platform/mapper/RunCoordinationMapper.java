@@ -80,22 +80,6 @@ public interface RunCoordinationMapper {
                            @Param("fencingToken") long fencingToken);
 
     /**
-     * 旧版本 Run 交给旧入口这一步的记账：与上面两条同形，但不带服务所有权条件。
-     *
-     * <p>授权来源不同：这一笔由「本进程刚决定把这条旧 Run 交给旧入口」这个动作授权，
-     * 双池这一层对它从来没有所有权，所以没有 token 可核。</p>
-     */
-    int markHandoffServed(@Param("runId") String runId, @Param("roundNumber") long roundNumber,
-                          @Param("expectedPlanGeneration") int expectedPlanGeneration);
-
-    /** 旧版本候选按所有权原因推后一步的记账：同上，不带服务所有权条件。 */
-    int deferHandoff(@Param("runId") String runId,
-                     @Param("deferReason") String deferReason,
-                     @Param("nextVisibleAt") OffsetDateTime nextVisibleAt,
-                     @Param("expectedPlanGeneration") int expectedPlanGeneration,
-                     @Param("expectedServedRound") long expectedServedRound);
-
-    /**
      * 这一轮可以被协调的 Run：双池家族一份候选，按最近协调轮次升序，已结束与取消中的 Run 不参与。
      *
      * <p>候选里只有双池家族：旧版本的 Run 归旧引擎，混进来只会占满扫描条数。</p>

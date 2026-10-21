@@ -58,18 +58,6 @@ public interface RunCoordinationStore {
                                ServiceOwnershipFence fence);
 
     /**
-     * 旧版本 Run 交给旧入口这一步的记账：与 {@link #markCoordinationServed} 同形，但不带服务所有权凭据。
-     *
-     * <p>它写的是「本进程刚把这条旧 Run 交给旧入口」这件事，双池这一层对旧版本 Run 从来没有所有权，
-     * 拿不出凭据也不该被要求拿出凭据；语句在映射文件里单独一条，事项清楚。</p>
-     */
-    boolean markHandoffServed(String runId, long roundNumber, int expectedPlanGeneration);
-
-    /** 旧版本候选按所有权原因推后的记账：同上，不带服务所有权凭据。 */
-    boolean deferHandoff(String runId, RunCoordinationDeferReason reason, OffsetDateTime nextVisibleAt,
-                         int expectedPlanGeneration, long expectedCoordinationRound);
-
-    /**
      * 把计划代际同步到资格记录上，让提醒去重键与 Run 主记录保持一致。
      *
      * <p>只在前移时生效：调用方声明的这一代必须是 Run 主表上的当前一代，且必须比记录里的新；
