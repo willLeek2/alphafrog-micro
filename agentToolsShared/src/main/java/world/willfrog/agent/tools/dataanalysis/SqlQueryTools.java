@@ -777,6 +777,9 @@ public class SqlQueryTools {
             mount.put("format", metadata.format());
             mount.put("recordsPath", metadata.recordsPath());
             mount.put("columns", metadata.columns());
+            // 真实行数随规格下发，运行器门的估计口径统一靠它换算（014-opt-05）。
+            // planCapacity 已先拒绝元数据缺行数的数据集，这里不会见到空值。
+            mount.put("row_count", metadata.rowCount());
             mounts.add(mount);
         }
         spec.put("datasets", mounts);

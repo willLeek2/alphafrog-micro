@@ -112,9 +112,15 @@ except Exception:
     blocked_reopen = True
 check("lock blocks widening allowed_directories", blocked_reopen)
 
+# row_count/columns 即生产规格里 Java 侧元数据下发的字段（真实行数与列清单），
+# 门的估计口径统一靠它换算。归属按「投影列集合被唯一数据集列集合覆盖」判定：
+# t1 投影出的 {id,val} 只被 t1 覆盖（可归属）；t2 投影出的 {id} 同时被 t1、t2
+# 覆盖（非唯一，回落引擎估计——Parquet 引擎值本取脚注真实行数，回落不改结论）。
 spec_two = {**spec_base, "datasets": [
-    {"alias": "t1", "path": str(MOUNT / "_run_dataset_1" / "small.csv")},
-    {"alias": "t2", "path": str(MOUNT / "_run_dataset_2" / "big.parquet")},
+    {"alias": "t1", "path": str(MOUNT / "_run_dataset_1" / "small.csv"),
+     "row_count": 150, "columns": ["id", "val"]},
+    {"alias": "t2", "path": str(MOUNT / "_run_dataset_2" / "big.parquet"),
+     "row_count": 300000, "columns": ["id"]},
 ]}
 # 按生产路径形态摆数据：mount_dir 下的 _run_dataset_<n>/<filename>
 (MOUNT / "_run_dataset_1").mkdir(exist_ok=True)
@@ -211,12 +217,21 @@ check("gate rejects unbounded dump via top-output rule (300k>100)", ok, detail)
 # 顶层规则对过滤查询不拦（「无过滤全表扫描」的关键在「整表」）：大表过滤后放行——
 # Parquet 的过滤下推进扫描框（内嵌 Filters 键），CSV 的过滤是独立 FILTER 算子，两个信号都算数。
 ok, _report = runner.gate(con2, "SELECT * FROM t2 WHERE id < 100", "INTERACTIVE", spec_two)
-check("gate passes filtered big scan (parquet in-scan Filters)", ok)
+check("gate passes filtered big scan (parquet in-scan Filters)",
+      ok and _report.get("estimate_source") == "engine"
+      and _report["estimated_rows_max"] == 60000,
+      f"source={_report.get('estimate_source')} est={_report.get('estimated_rows_max')}")
 ok, _report = runner.gate(con2, "SELECT * FROM t1 WHERE id < 10", "INTERACTIVE", spec_two)
-check("gate passes filtered small scan (csv FILTER operator)", ok)
-# 顶层白名单：聚合顶层直接放行（count(*) 在 Parquet 上甚至是元数据扫描）。
+check("gate passes filtered small scan (csv FILTER operator)",
+      ok and _report.get("estimate_source") == "unified"
+      and _report["estimated_rows_max"] == 30,
+      f"source={_report.get('estimate_source')} est={_report.get('estimated_rows_max')}")
+# 顶层白名单：聚合顶层直接放行（count(*) 在 Parquet 上甚至是元数据扫描——
+# 计划里没有数据集扫描算子，估计来源记 engine 属预期边界）。
 ok, _report = runner.gate(con2, "SELECT count(*) FROM t2", "INTERACTIVE", spec_two)
-check("gate passes count(*) (aggregate top whitelisted)", ok)
+check("gate passes count(*) (aggregate top whitelisted)",
+      ok and _report.get("estimate_source") == "engine",
+      f"source={_report.get('estimate_source')}")
 # 顶层有界但扫描超估计行数档：BACKGROUND 档上限放宽到 600k 后放行。
 spec_two_bg = {**spec_two, "tier": "BACKGROUND", "limits": LIMITS_BG}
 ok_bg, report_bg = runner.gate(con2, "SELECT * FROM t2 LIMIT 5", "BACKGROUND", spec_two_bg)
@@ -243,10 +258,16 @@ check("gate falls back to legacy cap when estimated_row_cap absent (300k>200k)",
 mid_csv = MOUNT / "mid.csv"
 duckdb.execute(
     f"COPY (SELECT range AS id, range * 2 AS val FROM range(5000)) TO '{mid_csv}' (HEADER)")
+# 三个数据集的列集合互相覆盖：{id,val} 在 t1/t3 重复，{id} 被三者都覆盖。
+# 按归属规则本用例集全部扫描回落引擎估计——正好逐字压住「回落口径行为不变」
+# 这条回归线；统一口径的覆盖由上文 spec_two 的 t1 用例（{id,val} 唯一覆盖）承担。
 CASE_SPEC = {**spec_base, "datasets": [
-    {"alias": "t1", "path": str(MOUNT / "small.csv"), "format": "csv"},
-    {"alias": "t2", "path": str(MOUNT / "big.parquet"), "format": "parquet"},
-    {"alias": "t3", "path": str(MOUNT / "mid.csv"), "format": "csv"},
+    {"alias": "t1", "path": str(MOUNT / "small.csv"), "format": "csv",
+     "row_count": 150, "columns": ["id", "val"]},
+    {"alias": "t2", "path": str(MOUNT / "big.parquet"), "format": "parquet",
+     "row_count": 300000, "columns": ["id"]},
+    {"alias": "t3", "path": str(MOUNT / "mid.csv"), "format": "csv",
+     "row_count": 5000, "columns": ["id", "val"]},
 ]}
 # (名称, sql, INTERACTIVE/BACKGROUND, 应判, 应拒时的错误码, 在测哪条规则)
 CASE_SET = [
@@ -328,6 +349,8 @@ def run_e2e(name, spec, expect_status, extra_check=None):
     return env
 
 
+# 端到端规格刻意不带 row_count：旧锚点重放的正是这种旧规格，这层用例同时证明
+# 新版运行器对旧规格全程回落引擎估计、判定行为不变。
 ds_t1 = [{"alias": "t1", "path": str(MOUNT / "_run_dataset_1" / "small.csv"), "format": "csv"}]
 ds_typed = [{"alias": "t3", "path": str(MOUNT / "_run_dataset_3" / "typed.csv"), "format": "csv"}]
 (MOUNT / "_run_dataset_3").mkdir(exist_ok=True)

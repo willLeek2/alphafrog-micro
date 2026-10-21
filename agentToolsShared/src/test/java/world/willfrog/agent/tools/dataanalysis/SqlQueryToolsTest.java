@@ -262,6 +262,10 @@ class SqlQueryToolsTest {
         assertEquals("csv", mounts.get(0).path("format").asText());
         assertEquals("t2", mounts.get(1).path("alias").asText());
         assertEquals("parquet", mounts.get(1).path("format").asText());
+        // row_count 随规格下发供门统一估计口径；这两条构造条目没有真实元数据，
+        // 字段为 null，运行器对空值按旧规格回落引擎估计。
+        assertTrue(mounts.get(0).has("row_count"));
+        assertTrue(mounts.get(0).path("row_count").isNull());
     }
 
     @Test
@@ -279,6 +283,8 @@ class SqlQueryToolsTest {
         assertEquals("json", mount.path("format").asText());
         assertEquals("results", mount.path("recordsPath").asText());
         assertEquals("label", mount.path("columns").get(0).asText());
+        // 侧车元数据里的真实行数必须进规格（门估计口径统一的数据源）。
+        assertEquals(1, mount.path("row_count").asInt());
     }
 
     @Test

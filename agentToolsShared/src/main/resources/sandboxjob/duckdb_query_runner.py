@@ -5,9 +5,9 @@
 输出：stdout 最后一行打印 `__EXECUTE_QUERY_RESULT__` 前缀的 JSON 信封，Java 侧只认这一行。
 
 档位数值（语句超时、返回行数上限、估计行数上限）全部由 Java 侧经规格下发——
-容量阈值在 Java 侧是可配置项，双份硬编码必然漂移。唯一例外是估计行数上限的
-兼容回落：旧锚点重放的规格里没有该字段时按当时的固定值判定（见 gate），
-新渲染的规格永远带它。
+容量阈值在 Java 侧是可配置项，双份硬编码必然漂移。两处兼容回落只服务旧锚点
+重放的规格：没有估计行数上限时按当时的固定值判定（见 gate）；没有 row_count
+时门全程回落引擎估计（见 _dataset_row_counts）。新渲染的规格永远带这两类字段。
 """
 import base64
 import datetime
@@ -236,12 +236,79 @@ def _is_bounded_or_aggregate_top(name):
     return name in _BOUNDED_TOP_NAMES or "AGGREGATE" in name or "GROUP_BY" in name
 
 
+# 统一过滤选择性常数：与 DuckDB 1.5.6 引擎默认取值一致（本机实测两种格式分别为
+# 0.199999 与 0.200000）。统一的意义在基数可靠（改用规格下发的真实行数），
+# 不在改选择性常数本身。
+UNIFORM_FILTER_SELECTIVITY = 0.2
+
+# 数据集扫描算子（EXPLAIN JSON 的 name 与 extra_info.Function 同形）：
+# CSV 视图、Parquet 视图、JSON 数据集注册的 pandas 帧（PANDAS_SCAN）。
+_SCAN_NODE_NAMES = frozenset({"READ_CSV", "READ_CSV_AUTO", "READ_PARQUET", "PANDAS_SCAN"})
+
+
+def _is_dataset_scan(node):
+    return node.get("name") in _SCAN_NODE_NAMES or \
+        node.get("extra_info", {}).get("Function") in _SCAN_NODE_NAMES
+
+
+def _projection_columns(node):
+    """扫描算子 extra_info 的 Projections：多列是列表，单列是裸字符串，缺省按空集。"""
+    raw = node.get("extra_info", {}).get("Projections")
+    if raw is None:
+        return frozenset()
+    if isinstance(raw, str):
+        return frozenset({raw})
+    return frozenset(str(c) for c in raw)
+
+
+def _dataset_row_counts(spec):
+    """从规格读每个数据集的（列集合, 真实行数），供门统一估计口径。
+    必须 .get：现有规格字段是硬取键（见 mount_datasets），旧锚点重放的规格没有
+    row_count，硬取键会在门阶段 KeyError。规格无 row_count 时映射为空，门全程回落
+    引擎估计——这是存档旧请求可能打到新版运行器的防御性兼容，不是恢复必经路径
+    （旧锚点重放的是存档完整旧请求）。本函数是行数映射的唯一构建点：
+    挂载不需要该字段，门直接从规格取，不经 mount_datasets 的返回值。"""
+    stats = []
+    for entry in spec.get("datasets", []):
+        row_count = entry.get("row_count")
+        if row_count is None:
+            continue
+        try:
+            row_count = int(row_count)
+        except (TypeError, ValueError):
+            continue
+        stats.append((frozenset(entry.get("columns") or []), row_count))
+    return stats
+
+
+def _attribute_scan_rows(node, stats):
+    """把扫描算子归属到唯一数据集的真实行数：单数据集直接映射；多数据集要求
+    投影列集合只被一个数据集的列集合覆盖（投影是数据集合的子集也算覆盖；两个
+    数据集列集合重复、或投影同时被多个数据集覆盖，都属非唯一）。归属不上返回
+    None，由调用方回落引擎估计——保守方向，不多猜。
+    不能按「投影列集合等于数据集列集合」匹配：投影经常是数据集列的真子集
+    （如只 SELECT id），相等匹配会把这次扫描错配给列集合恰好等于该子集的另一
+    张表——本机实测 window/group_by 只取 id 的查询把 150 行小表的扫描错配成
+    30 万行大表，误拒放行用例。"""
+    if not stats:
+        return None
+    if len(stats) == 1:
+        return stats[0][1]
+    projections = _projection_columns(node)
+    if not projections:
+        return None
+    matches = [row_count for columns, row_count in stats if projections <= columns]
+    return matches[0] if len(matches) == 1 else None
+
+
 def gate(con, sql, tier, spec):
     """EXPLAIN 只出计划不执行主查询；任一检查不过即拒收。返回 (放行?, 报告)。
 
     检查顺序：文本禁令 -> 结构规则（笛卡尔积、无界全局排序）-> 规模规则（顶层输出
     规模、各算子估计行数对照档位上限）。结构规则先跑是为了让模型拿到可操作的专用
-    错误码——笛卡尔积该加连接条件，加 LIMIT 是错的补救方向。"""
+    错误码——笛卡尔积该加连接条件，加 LIMIT 是错的补救方向。
+    规模规则的估计口径：扫描与过滤算子按规格下发的真实行数统一换算（见
+    _dataset_row_counts），引擎估计只留给连接等中间算子与归属不上的数据集。"""
     limits = spec["limits"]
     report = {"estimated_rows_max": 0, "checks": []}
     preflight(sql, report)
@@ -251,9 +318,51 @@ def gate(con, sql, tier, spec):
     except Exception as exc:
         return False, {"stage": "explain", "error": str(exc)}
     nodes = [n for root in plan_tree for n in _walk(root)]
-    report["estimated_rows_max"] = max(
-        (e for e in (_node_estimated_rows(n) for n in nodes) if e is not None),
+
+    # 估计口径统一（014-opt-05）：扫描与过滤算子的基数改用规格下发的真实行数换算，
+    # 连接等中间算子保留引擎估计。机制（本机 DuckDB 1.5.6 实测并经独立复验）：
+    # Parquet 扫描基数取文件脚注真实行数，CSV 由引擎按文件字节数猜测、随每行字节数
+    # 漂移且方向不定；两种格式的过滤选择性常数同为 0.2，分歧全在基数来源。
+    # 单表场景的估计等于真实行数乘（有过滤取 0.2、无过滤取 1）；多表场景各表同规则
+    # 重算求和作输入规模上界，再与中间算子引擎估计取大。
+    stats = _dataset_row_counts(spec)
+    contributions = []
+    absorbed_filters = set()
+    attributed = 0
+    unattributed = 0
+    for root in plan_tree:
+        for node, ancestors in _walk_with_ancestors(root):
+            if not _is_dataset_scan(node):
+                continue
+            real_rows = _attribute_scan_rows(node, stats)
+            pushdown = "Filters" in node.get("extra_info", {})
+            filtered_above = bool(ancestors) and ancestors[-1].get("name") == "FILTER"
+            if real_rows is None:
+                unattributed += 1
+                contributions.append(_node_estimated_rows(node) or 0)
+                continue
+            attributed += 1
+            filtered = pushdown or filtered_above
+            contributions.append(
+                int(real_rows * UNIFORM_FILTER_SELECTIVITY) if filtered else real_rows)
+            if filtered_above:
+                # 独立 FILTER 节点的口径已折进该表贡献（真实行数乘 0.2），不再进
+                # 中间算子取大，避免引擎猜测的过滤值混进统一口径。
+                absorbed_filters.add(id(ancestors[-1]))
+    others_max = max(
+        (e for n in nodes
+         if not _is_dataset_scan(n) and id(n) not in absorbed_filters
+         for e in [_node_estimated_rows(n)] if e is not None),
         default=0)
+    report["estimated_rows_max"] = max(sum(contributions), others_max)
+    # 估计来源写进报告供验收检查：全部数据集扫描都归属到真实行数记 unified，
+    # 部分归属记 mixed，完全回落（含旧规格无 row_count）记 engine。
+    if attributed and not unattributed:
+        report["estimate_source"] = "unified"
+    elif attributed:
+        report["estimate_source"] = "mixed"
+    else:
+        report["estimate_source"] = "engine"
 
     # 结构规则一：笛卡尔积有独立算子名。
     if any(n.get("name") == "CROSS_PRODUCT" for n in nodes):
@@ -284,6 +393,13 @@ def gate(con, sql, tier, spec):
         if _is_bounded_or_aggregate_top(name):
             continue
         estimated = _node_estimated_rows(root)
+        # 顶层即数据集扫描时按统一口径覆盖为真实行数（本规则只在计划无过滤时拒，
+        # 无需再乘过滤系数）；多表的连接/投影顶层保留引擎估计（已知边界：
+        # PLAN_FULL_SCAN 多表场景根节点不作统一口径，避免验收误判）。
+        if _is_dataset_scan(root):
+            real_rows = _attribute_scan_rows(root, stats)
+            if real_rows is not None:
+                estimated = real_rows
         if (estimated is None or estimated > row_cap) and not plan_filtered:
             report["checks"].append("top_output_over_row_cap")
             plan_reject("PLAN_FULL_SCAN",
@@ -297,6 +413,9 @@ def gate(con, sql, tier, spec):
     # 保证老作业恢复后行为不变。两个回落值只服务兼容性，不再随版本调整。
     cap_raw = limits.get("estimated_row_cap")
     cap = int(cap_raw) if cap_raw is not None else (200_000 if tier == "INTERACTIVE" else 600_000)
+    # 适用阈值同样落报告：判定用哪条上限，验收可直接读。
+    report["row_cap"] = row_cap
+    report["estimated_row_cap"] = cap
     if report["estimated_rows_max"] > cap:
         report["checks"].append("estimated_rows_over_cap")
         plan_reject("PLAN_ESTIMATED_ROWS_OVER_CAP",
