@@ -11,7 +11,7 @@ import world.willfrog.alphafrogmicro.portfolioservice.dto.PageResult;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.PortfolioCreateRequest;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.PortfolioResponse;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.PortfolioUpdateRequest;
-import world.willfrog.alphafrogmicro.portfolioservice.exception.BizException;
+import world.willfrog.alphafrogmicro.common.exception.BizException;
 import world.willfrog.alphafrogmicro.portfolioservice.mapper.PortfolioMapper;
 import world.willfrog.alphafrogmicro.portfolioservice.service.PortfolioService;
 import world.willfrog.alphafrogmicro.portfolioservice.util.PortfolioConverter;

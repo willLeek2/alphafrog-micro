@@ -9,7 +9,7 @@ import world.willfrog.alphafrogmicro.portfolioservice.domain.PortfolioPo;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.HoldingResponse;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.HoldingUpsertItem;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.HoldingUpsertRequest;
-import world.willfrog.alphafrogmicro.portfolioservice.exception.BizException;
+import world.willfrog.alphafrogmicro.common.exception.BizException;
 import world.willfrog.alphafrogmicro.portfolioservice.mapper.HoldingMapper;
 import world.willfrog.alphafrogmicro.portfolioservice.mapper.PortfolioMapper;
 import world.willfrog.alphafrogmicro.portfolioservice.service.HoldingService;
