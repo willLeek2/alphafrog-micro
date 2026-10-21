@@ -1,1 +1,2 @@
 laneProviderEntry=world.willfrog.alphafrogmicro.common.lane.LaneProviderEntryFilter
+bizExceptionProvider=world.willfrog.alphafrogmicro.common.exception.BizExceptionProviderFilter

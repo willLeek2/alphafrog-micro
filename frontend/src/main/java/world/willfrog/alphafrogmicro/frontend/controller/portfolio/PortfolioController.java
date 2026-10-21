@@ -43,6 +43,7 @@ import world.willfrog.alphafrogmicro.portfolioservice.dto.TradeCreateItem;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.TradeCreateRequest;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.TradeResponse;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.ValuationResponse;
+import world.willfrog.alphafrogmicro.frontend.rpc.FrontendRpcFailureMapper;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 
 import java.math.BigDecimal;
@@ -125,10 +126,8 @@ public class PortfolioController {
                     .build();
             PortfolioMessage response = portfolioDubboService.getPortfolio(req);
             return ResponseWrapper.success(toPortfolioResponse(response));
-        } catch (RpcException e) {
-            return handleRpcError(e, "查询组合");
         } catch (Exception e) {
-            return handleError(e, "查询组合");
+            return FrontendRpcFailureMapper.toWrapper(e, "查询组合");
         }
     }
 
@@ -519,13 +518,11 @@ public class PortfolioController {
     }
 
     private <T> ResponseWrapper<T> handleRpcError(RpcException e, String action) {
-        log.error("{}失败: {}", action, e.getMessage());
-        return ResponseWrapper.error(ResponseCode.EXTERNAL_SERVICE_ERROR, action + "失败");
+        return FrontendRpcFailureMapper.toWrapper(e, action);
     }
 
     private <T> ResponseWrapper<T> handleError(Exception e, String action) {
-        log.error("{}失败", action, e);
-        return ResponseWrapper.error(ResponseCode.SYSTEM_ERROR, action + "失败");
+        return FrontendRpcFailureMapper.toWrapper(e, action);
     }
 
     private boolean isCompact(String format) {

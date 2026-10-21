@@ -12,6 +12,7 @@ import world.willfrog.alphafrogmicro.common.dto.compact.CompactApiResponse;
 import world.willfrog.alphafrogmicro.common.dto.compact.CompactMeta;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.common.utils.compact.CompactJsonConverter;
+import world.willfrog.alphafrogmicro.frontend.rpc.FrontendRpcFailureMapper;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.portfolio.idl.StrategyBacktestRunListRequest;
 import world.willfrog.alphafrogmicro.portfolio.idl.StrategyBacktestRunListResponse;
@@ -456,13 +457,11 @@ public class StrategyController {
     }
 
     private <T> ResponseWrapper<T> handleRpcError(RpcException e, String action) {
-        log.error("{}失败: {}", action, e.getMessage());
-        return ResponseWrapper.error(ResponseCode.EXTERNAL_SERVICE_ERROR, action + "失败");
+        return FrontendRpcFailureMapper.toWrapper(e, action);
     }
 
     private <T> ResponseWrapper<T> handleError(Exception e, String action) {
-        log.error("{}失败", action, e);
-        return ResponseWrapper.error(ResponseCode.SYSTEM_ERROR, action + "失败");
+        return FrontendRpcFailureMapper.toWrapper(e, action);
     }
 
     private boolean isCompact(String format) {

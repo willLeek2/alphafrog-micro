@@ -7,7 +7,7 @@ import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.portfolioservice.constants.PortfolioConstants;
 import world.willfrog.alphafrogmicro.portfolioservice.domain.*;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.*;
-import world.willfrog.alphafrogmicro.portfolioservice.exception.BizException;
+import world.willfrog.alphafrogmicro.common.exception.BizException;
 import world.willfrog.alphafrogmicro.portfolioservice.mapper.*;
 import world.willfrog.alphafrogmicro.portfolioservice.service.StrategyService;
 

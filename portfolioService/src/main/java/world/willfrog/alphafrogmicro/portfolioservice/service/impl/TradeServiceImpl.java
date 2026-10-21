@@ -11,7 +11,7 @@ import world.willfrog.alphafrogmicro.portfolioservice.dto.PageResult;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.TradeCreateItem;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.TradeCreateRequest;
 import world.willfrog.alphafrogmicro.portfolioservice.dto.TradeResponse;
-import world.willfrog.alphafrogmicro.portfolioservice.exception.BizException;
+import world.willfrog.alphafrogmicro.common.exception.BizException;
 import world.willfrog.alphafrogmicro.portfolioservice.mapper.PortfolioMapper;
 import world.willfrog.alphafrogmicro.portfolioservice.mapper.TradeMapper;
 import world.willfrog.alphafrogmicro.portfolioservice.service.TradeService;

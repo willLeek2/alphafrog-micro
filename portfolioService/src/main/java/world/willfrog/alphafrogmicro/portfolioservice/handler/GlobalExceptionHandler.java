@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
-import world.willfrog.alphafrogmicro.portfolioservice.exception.BizException;
+import world.willfrog.alphafrogmicro.common.exception.BizException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {

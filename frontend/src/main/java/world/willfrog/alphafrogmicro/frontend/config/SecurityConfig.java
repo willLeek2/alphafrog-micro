@@ -41,7 +41,7 @@ public class SecurityConfig {
             log.debug("Skip unauthorized entry point: response committed, uri={}", request.getRequestURI());
             return;
         }
-        response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Unauthorized");
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
     }
 
     /**
