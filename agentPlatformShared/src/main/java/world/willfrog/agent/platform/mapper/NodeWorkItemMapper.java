@@ -247,6 +247,14 @@ public interface NodeWorkItemMapper {
     List<NodeWorkItem> listLatestSegments(@Param("runId") String runId,
                                           @Param("planGeneration") int planGeneration);
 
+    /**
+     * 早于指定代际的每个逻辑节点最新分段（代际优先于尝试与分段序号）。
+     * 恢复代际只跑没做完的节点，「上一代做完了没有」用这一行判断；现代际事实仍以
+     * {@link #listLatestSegments} 为准。
+     */
+    List<NodeWorkItem> listLatestSegmentsBeforeGeneration(@Param("runId") String runId,
+                                                          @Param("planGeneration") int planGeneration);
+
     /** 某个 Run 上还没完成的工作项（清理准入与背压读数用）。 */
     List<NodeWorkItem> listUnfinishedByRun(@Param("runId") String runId);
 

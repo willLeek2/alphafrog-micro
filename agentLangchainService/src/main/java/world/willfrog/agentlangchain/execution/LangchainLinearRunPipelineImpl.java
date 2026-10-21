@@ -335,6 +335,20 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * 结果接入和下一轮协调都由后续独立回合完成。</p>
      */
     public DualPoolPlanPreparation prepareDualPoolRun(AgentRun initialRun) {
+        return prepareDualPoolRunInternal(initialRun, false);
+    }
+
+    /**
+     * 恢复带冻结计划的规划回合入口（节点级续跑）：计划解析走 {@link #resolvePlanFromFrozen}，
+     * 不调规划器——「已完成节点不重跑」由协调回合的跨代际承接种子兑现，本方法只读冻结计划、
+     * 裁出生效模式、校验检查点安全性；其余步骤（上下文准备、额度预检、RECEIVED→EXECUTING、
+     * 阶段输入解析）与全新规划回合完全一致。
+     */
+    public DualPoolPlanPreparation prepareDualPoolRunWithFrozenPlan(AgentRun initialRun) {
+        return prepareDualPoolRunInternal(initialRun, true);
+    }
+
+    private DualPoolPlanPreparation prepareDualPoolRunInternal(AgentRun initialRun, boolean resumeFromFrozenPlan) {
         if (initialRun == null || isBlank(initialRun.getId())) {
             return null;
         }
@@ -359,7 +373,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             StageInputs inputs = resolveStageInputs(run);
             userGoal = inputs.userGoal();
             stage = "resolve_plan";
-            PlanResolution resolution = resolvePlan(run, inputs);
+            PlanResolution resolution = resumeFromFrozenPlan
+                    ? resolvePlanFromFrozen(run, inputs)
+                    : resolvePlan(run, inputs);
             return new DualPoolPlanPreparation(
                     run,
                     resolution.plan(),
@@ -736,6 +752,53 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
                 "plan", plan,
                 "reason", modeDecision.reason()
+        ));
+        return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
+    }
+
+    /**
+     * 恢复场景的冻结计划解析（{@link #resolvePlan} 的兄弟方法，双池规划回合在
+     * resumeFromFrozenPlan 标记下改走这里）：只读数据库里的冻结 plan，绝不调规划器——
+     * 恢复后重新规划可能重复副作用，且已完成节点的成果已保留在旧代际工作项里。
+     * 三件套范本沿自 LEGACY 冻结重启（FrozenPlanRestartPipeline.resolvePlan，随 LEGACY
+     * 删除退役）：读冻结 plan ＋ {@link ExecutionModeResolver#inspectFrozen} 只读裁模式 ＋
+     * {@link LangchainWorkflowRouting#validateFrozenPlan} 校验；检查点侧照范本走
+     * parse/validate、从不 initialize（「plan_json 有、检查点缺」的崩溃窗口行为继承范本
+     * 既有处理）。planOverride 在两条路径下都保持纯展示（resolvePlan 从不读它）。
+     */
+    protected PlanResolution resolvePlanFromFrozen(AgentRun run, StageInputs inputs) throws Exception {
+        AgentContext.setPhase("planning");
+        String runId = inputs.runId();
+        String userId = inputs.userId();
+        if (isBlank(run.getPlanJson()) || "{}".equals(run.getPlanJson().trim())) {
+            throw new IllegalStateException("dual_pool_resume_plan_missing");
+        }
+        LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+        LangchainWorkflowRouting.validateFrozenPlan(plan);
+        ExecutionModeResolver.Decision frozenDecision = ExecutionModeResolver.inspectFrozen(plan);
+        boolean useDag = frozenDecision.useDag();
+        PlanExecutionMode effectiveExecutionMode = frozenDecision.effective();
+        if (workflowCheckpointService != null) {
+            if (useDag) {
+                // 双池不复用 LEGACY DAG 的节点行，这里只继承范本的安全性校验：
+                // 确认崩溃/到期前没有启动过不安全重放的工具。
+                workflowCheckpointService.parseAndValidateDagRestart(run);
+            } else {
+                workflowCheckpointService.parseAndValidate(run, plan);
+            }
+        }
+        eventService.append(runId, userId, "PLAN_READY", Map.of(
+                "execution_mode", effectiveExecutionMode.name(),
+                "requested_execution_mode", inputs.requestedExecutionMode().name(),
+                "planned_execution_mode", frozenDecision.planned() == null
+                        ? ""
+                        : frozenDecision.planned().name(),
+                "effective_execution_mode", effectiveExecutionMode.name(),
+                "workflow", useDag ? "dag" : "linear",
+                "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
+                "plan", plan,
+                "reason", frozenDecision.reason(),
+                "planner_skipped", true
         ));
         return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
     }

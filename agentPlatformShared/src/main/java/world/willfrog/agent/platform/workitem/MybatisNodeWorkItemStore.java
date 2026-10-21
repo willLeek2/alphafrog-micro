@@ -463,6 +463,11 @@ public class MybatisNodeWorkItemStore implements NodeWorkItemStore {
     }
 
     @Override
+    public List<NodeWorkItem> listLatestSegmentsBeforeGeneration(String runId, int planGeneration) {
+        return mapper.listLatestSegmentsBeforeGeneration(runId, planGeneration);
+    }
+
+    @Override
     public List<NodeWorkItem> listUnfinishedByRun(String runId) {
         return mapper.listUnfinishedByRun(runId);
     }

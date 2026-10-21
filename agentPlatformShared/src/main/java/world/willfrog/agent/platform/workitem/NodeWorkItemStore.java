@@ -175,6 +175,15 @@ public interface NodeWorkItemStore {
      */
     List<NodeWorkItem> listLatestSegments(String runId, int planGeneration);
 
+    /**
+     * 早于指定代际的每个逻辑节点最新分段（代际优先于尝试与分段序号）。
+     *
+     * <p>恢复开的恢复代际只跑没做完的节点，本查询给出「上一代做完了没有」的事实；
+     * 现代际的事实仍以 {@link #listLatestSegments} 为准——节点在现代际有行（含未完成行）
+     * 时以现代际为准，不用旧代际的完成行覆盖。</p>
+     */
+    List<NodeWorkItem> listLatestSegmentsBeforeGeneration(String runId, int planGeneration);
+
     List<NodeWorkItem> listUnfinishedByRun(String runId);
 
     /** 数据库里未完成的工作项总数：背压四个数之一。 */

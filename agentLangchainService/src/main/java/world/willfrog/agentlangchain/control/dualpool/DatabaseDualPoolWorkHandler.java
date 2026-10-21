@@ -460,6 +460,12 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("kind", KIND_PLANNING);
         payload.put("workflow", "PENDING_PLAN");
+        // 恢复带着冻结计划回来（resetForResume 不清 plan_json；追问落库时会把 plan_json 清成 '{}'）：
+        // 规划段走冻结分支不调规划器，节点级续跑的「已完成节点不重跑」由跨代际承接种子兑现。
+        if (run.getPlanJson() != null && !run.getPlanJson().isBlank()
+                && !"{}".equals(run.getPlanJson().trim())) {
+            payload.put("resumeFromFrozenPlan", true);
+        }
         createAndHint(identity, 0L, value(run.getRunControlVersion()), payload,
                 run.getSchedulerVersion(), turn);
     }
@@ -531,11 +537,12 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             failureMetadata = segmentFailureMetadata(row);
             break;
         }
-        completed.sort(Comparator.comparingInt(LangchainCompletedTodo::getSequence));
         if (failureReason != null) {
             persistInfrastructureFailure(run, plan, completed, failureReason, failureMetadata);
             return;
         }
+        seedCompletedFromEarlierGenerations(run, generation, plan, completed, completedIds, existingIds);
+        completed.sort(Comparator.comparingInt(LangchainCompletedTodo::getSequence));
         if (completedIds.size() == items.size()) {
             advanceFinalAnswer(run, plan, generation, completed, latestSegments, turn);
             return;
@@ -573,6 +580,47 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             byNode.put(item.getNodeId(), item);
         }
         return byNode;
+    }
+
+    /**
+     * 跨代际承接种子：把更早代际里已完成（分段结果已提交且成功）的节点播进本代际的 completed
+     * 集合——恢复开的恢复代际只跑没做完的节点（节点级续跑，不做节点内断点）。
+     *
+     * <p>两条边界：种子只认当前冻结计划里出现的 nodeId（历史代际计划变化时，不在当前计划的
+     * 旧节点自然忽略，防跨计划误承接）；本代际已有行的节点（含未完成行）不播——现代际优先，
+     * 「上一代完成、本代重跑未完成」的节点以本代际的未完成事实为准，不会被旧完成行覆盖。
+     * 承接节点的成果经 completed 链随协调回合快照进未完成节点与最终答案的 completedContext，
+     * 消费侧零改动。</p>
+     *
+     * <p>记账口径：resultToolCalls/totalCommittedToolCalls 只统计本代际，承接节点让这两个
+     * 展示读数偏小——不影响正确性，资源上限账在 observability 累计、不受代际影响。</p>
+     */
+    private void seedCompletedFromEarlierGenerations(AgentRun run, int generation, LangchainTodoPlan plan,
+                                                     List<LangchainCompletedTodo> completed,
+                                                     Set<String> completedIds, Set<String> existingIds) {
+        if (generation <= 0) {
+            return;
+        }
+        Map<String, NodeWorkItem> earlierLatest = new LinkedHashMap<>();
+        for (NodeWorkItem item : workItemStore.listLatestSegmentsBeforeGeneration(run.getId(), generation)) {
+            earlierLatest.put(item.getNodeId(), item);
+        }
+        if (earlierLatest.isEmpty()) {
+            return;
+        }
+        for (TodoItem item : plan.getItems() == null ? List.<TodoItem>of() : plan.getItems()) {
+            String nodeId = item.getId();
+            if (completedIds.contains(nodeId) || existingIds.contains(nodeId)) {
+                continue;
+            }
+            NodeWorkItem row = earlierLatest.get(nodeId);
+            if (row == null || row.stateEnum() != NodeWorkItemState.RESULT_COMMITTED
+                    || !segmentSuccess(row)) {
+                continue;
+            }
+            completedIds.add(nodeId);
+            completed.add(completedTodo(item, row));
+        }
     }
 
     /** 只把确实能领取的分段投进提醒队列：等待中的下一段不该占掉别人的派发机会。 */
@@ -1003,7 +1051,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                     resultPatch = todoExecution.resultPatch();
                 } else {
                     resultPatch = switch (kind) {
-                        case KIND_PLANNING -> executePlanning(identity.runId());
+                        case KIND_PLANNING -> executePlanning(identity.runId(),
+                                payload.path("resumeFromFrozenPlan").asBoolean(false));
                         case KIND_FINAL_ANSWER -> executeFinalAnswer(identity.runId(), payload);
                         default -> throw new IllegalArgumentException("unknown_dual_pool_work_kind:" + kind);
                     };
@@ -1110,10 +1159,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         }
     }
 
-    private Map<String, Object> executePlanning(String runId) {
+    private Map<String, Object> executePlanning(String runId, boolean resumeFromFrozenPlan) {
         AgentRun run = runMapper.findById(runId);
-        LangchainLinearRunPipelineImpl.DualPoolPlanPreparation preparation =
-                freshRunPipeline.prepareDualPoolRun(run);
+        LangchainLinearRunPipelineImpl.DualPoolPlanPreparation preparation = resumeFromFrozenPlan
+                ? freshRunPipeline.prepareDualPoolRunWithFrozenPlan(run)
+                : freshRunPipeline.prepareDualPoolRun(run);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("kind", KIND_PLANNING);
         result.put("success", preparation != null);
