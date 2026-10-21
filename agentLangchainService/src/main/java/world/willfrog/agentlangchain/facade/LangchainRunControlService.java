@@ -406,12 +406,16 @@ public class LangchainRunControlService {
         ownershipGateway.requireOwnedRunForUser(request.getId(), request.getUserId());
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         rejectDirectChildControl(run);
-        if (run.getStatus() == AgentRunStatus.EXPIRED) {
+        if (run.getStatus() == AgentRunStatus.EXPIRED && run.getCompletedAt() != null) {
+            // 已完成过的 EXPIRED（完成后老化的收口语义）不可恢复；
+            // 执行中到期的 EXPIRED（completed_at 为空）放行进入下方恢复链，
+            // 由 resetForResume 的 SQL 白名单（EXPIRED 且 completed_at IS NULL）二次把关。
             throw new IllegalStateException("run expired");
         }
         if (run.getStatus() != AgentRunStatus.FAILED
                 && run.getStatus() != AgentRunStatus.CANCELED
-                && run.getStatus() != AgentRunStatus.WAITING) {
+                && run.getStatus() != AgentRunStatus.WAITING
+                && run.getStatus() != AgentRunStatus.EXPIRED) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
         if (schedulerVersionPolicy != null && dualPoolRunAdmissionRegistry != null
@@ -450,6 +454,11 @@ public class LangchainRunControlService {
             // 数据库状态已经进入 RECEIVED。后续辅助状态或提示投递即使失败，也不能释放
             // 双池业务名额；保留准入后，数据库扫描仍能把这条 Run 重新交给协调池。
             durableReceived = true;
+            // 恢复拿一个新的挂钟窗口：预算检查实际读取的 Redis 观测起点（summary.startedAtMillis）
+            // 在这里显式重写为恢复时刻，与上一段 ttl_expires_at 的「恢复即重置」同口径——
+            // 时间窗口给新、资源账（次数/tokens）累计保留。普通分段初始化仍是幂等不覆盖，
+            // 不会被这次重写影响。
+            agentObservabilityService.restartWallClockOnResume(run.getId());
             agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
                     "run_id", run.getId(),
                     "engine", "agentLangchainService"));

@@ -104,6 +104,20 @@ public class AgentRunBudgetService {
     private int defaultMaxHttpAttemptsPerLogicalCall;
 
     /**
+     * 生命周期 TTL 预警软阈值（消耗比例），默认 0.9。
+     * 与 {@code agent.run.ttl-minutes} 同一键族：启动期注入、改需重启；泳道不可热调。
+     */
+    @Value("${agent.run.ttl-warning-ratio:0.9}")
+    private double ttlWarningRatio;
+
+    /**
+     * 生命周期 TTL 窗口长度（分钟）。读取与 {@code AgentRunEventService} 相同的键
+     * {@code agent.run.ttl-minutes}，本类只用它计算消耗比例（窗口总长），不参与 TTL 收口判定。
+     */
+    @Value("${agent.run.ttl-minutes:60}")
+    private int ttlMinutes;
+
+    /**
      * 在每次 LLM 调用前检查预算（由 {@code OpenRouterProviderRoutedChatModel} 调用）。
      * 此入口会检查 wallClock、llm_calls 和 tokens 三个维度；tool_calls 维度不会在这里触发。
      */
@@ -125,12 +139,18 @@ public class AgentRunBudgetService {
     }
 
     /**
-     * 当前 Run 剩余墙钟毫秒数。起点锁 {@code alphafrog_agent_run.started_at}，
-     * 上限取 {@link #effectiveConfig()} 的 maxWallClockMs。
+     * 当前 Run 剩余墙钟毫秒数。起算锚统一为 observability 的 {@code summary.startedAtMillis}
+     * （首次执行时刻；resume 时被显式重写为恢复时刻），与 {@link #check} 的挂钟口径一致；
+     * observability 读不到时回落到 {@code alphafrog_agent_run.started_at}（创建时刻），
+     * 无观测记录的 run 保持既有行为。上限取 {@link #effectiveConfig()} 的 maxWallClockMs。
      *
      * <p>墙钟上限未设（&lt;=0）时返回 {@link Long#MAX_VALUE}，表示不夹超时。
-     * 没有 runId、started_at 缺失、Run 不存在或 mapper 未接线时抛
-     * {@link RunStartedAtMissingException}，不回落到 observability JSON 里的 startedAtMillis。</p>
+     * 没有 runId、Run 不存在、started_at 缺失或 mapper 未接线时抛
+     * {@link RunStartedAtMissingException}。</p>
+     *
+     * <p>锚点统一前这里锁 DB started_at（创建时刻）：同一 run 内 SQL 夹取恒比执行检查多扣
+     * 「创建→首次执行」的排队间隙；且 resume 只重写 observability 锚的话，续跑 run 的
+     * SQL 夹取仍按创建时刻算剩余，生产 wallMs 下 executeQuery 会被全部拒绝。</p>
      */
     public long remainingWallClockMs() {
         String runId = AgentContext.getRunId();
@@ -148,7 +168,10 @@ public class AgentRunBudgetService {
         if (maxWallClockMs <= 0L) {
             return Long.MAX_VALUE;
         }
-        long startedAtMillis = run.getStartedAt().toInstant().toEpochMilli();
+        long observedStartedAt = toLong(loadSummary(runId).get("startedAtMillis"));
+        long startedAtMillis = observedStartedAt > 0
+                ? observedStartedAt
+                : run.getStartedAt().toInstant().toEpochMilli();
         long elapsed = Math.max(0L, System.currentTimeMillis() - startedAtMillis);
         return Math.max(0L, maxWallClockMs - elapsed);
     }
@@ -199,6 +222,9 @@ public class AgentRunBudgetService {
             return;
         }
         String userId = AgentContext.getUserId();
+        // 行读取复用：同一次 check 只查一次 run 行，供 V2 根树判定（persistentTreeCalls）
+        // 与 TTL 生命周期预警（warnTtlLastMileIfNeeded）共用，不加第二次查询
+        AgentRun run = runMapper == null ? null : runMapper.findById(runId);
         EffectiveRunBudget budget = effectiveConfig();
         Map<String, Object> summary = loadSummary(runId);
         // startedAtMillis 由 Pipeline 在 run 开始时写入 observability，用于计算挂钟时间
@@ -210,13 +236,18 @@ public class AgentRunBudgetService {
         // 0b. 90% last-mile 提示：跨过 90% 时写 BUDGET_LAST_MILE 事件 + 写入 AgentContext.lastMileHint，
         //     下一次 LLM 调用时 chatRequestTransformer 会读取并作为 UserMessage 注入，保持 System 稳定
         emitBudgetLastMileIfNeeded(runId, userId, summary, budget, elapsed);
+        // 0c. TTL 生命周期软阈值预警：消耗比例跨过 ttl-warning-ratio 时发 RUN_TTL_LAST_MILE 事件
+        //     + 写入 AgentContext.ttlWrapUpHint（与信封 lastMileHint 分开通道：生命周期 vs 资源预算）。
+        //     放在超限检查之前（与 0/0b 同理由）：若本轮随后信封超限抛出，TTL 预警也已产出。
+        //     预警是被动送达——本检查挂在调用边界，hint 随下一次 LLM 调用注入
+        warnTtlLastMileIfNeeded(runId, userId, run);
         // 1. 挂钟时间检查：从 run 启动到当前的毫秒数
         if (budget.maxWallClockMs() > 0 && elapsed > budget.maxWallClockMs()) {
             throw exceeded("wall_clock_ms", elapsed, budget.maxWallClockMs());
         }
         // 2. LLM 调用次数检查：仅 llm_call 入口触发，tool_call 入口跳过
         long llmCalls = toLong(summary.get("llmCalls"));
-        boolean persistentTreeCalls = isPersistentTreeCall(runId);
+        boolean persistentTreeCalls = run != null && "DUAL_POOL_V2".equals(run.getSchedulerVersion());
         if (!persistentTreeCalls && "llm_call".equals(operation)
                 && budget.maxLlmCalls() > 0 && llmCalls >= budget.maxLlmCalls()) {
             throw exceeded("llm_calls", llmCalls, budget.maxLlmCalls());
@@ -234,12 +265,70 @@ public class AgentRunBudgetService {
         }
     }
 
-    private boolean isPersistentTreeCall(String runId) {
-        if (runMapper == null) {
-            return false;
+    /**
+     * 生命周期 TTL 剩余毫秒（纯读）：{@code ttl_expires_at − now}，可能为负（已过期）。
+     */
+    private long remainingTtlMs(AgentRun run) {
+        return run.getTtlExpiresAt().toInstant().toEpochMilli() - System.currentTimeMillis();
+    }
+
+    /**
+     * TTL 生命周期软阈值预警——消耗比例首次跨过 {@link #ttlWarningRatio}（默认 0.9）时发一次
+     * {@code RUN_TTL_LAST_MILE} 事件＋把收尾约定写入 {@link AgentContext#setTtlWrapUpHint}。
+     *
+     * <p>触发条件：消耗比例 (total−remaining)/total ≥ ratio，等价 remaining ≤ (1−ratio)×total，
+     * 与信封 80%/90% 预警的 consumed 语义一致。去重基于
+     * {@link AgentRunStateStore#tryMarkTtlLastMileWarned} 的 Redis SADD 原子语义，
+     * 元素＝本窗口 ttl_expires_at 毫秒值——恢复重置 TTL 后键自然变化，新窗口自动重新具备
+     * 预警资格，不需要窗口代次字段。payload 字段对齐信封事件族口径：
+     * dimension="ttl"、remaining_ms、expires_at（毫秒）、ratio（消耗比例）。</p>
+     *
+     * <p>跳过条件：run 行缺失（mapper 未接线或查无此行）、ttl_expires_at 缺失、
+     * ttlMinutes/ttlWarningRatio 未配置或非法（&lt;=0 / &gt;=1，纯单测环境 @Value 不生效时为 0）、
+     * 已过期（remaining&lt;0，由 TTL 收口路径处理）、中断保留期（ttl_expires_at=终态+7 天，
+     * 剩余远大于窗口总长，消耗比例为负自然不触发）。</p>
+     */
+    private void warnTtlLastMileIfNeeded(String runId, String userId, AgentRun run) {
+        if (runId == null || userId == null || run == null || run.getTtlExpiresAt() == null) {
+            return;
         }
-        AgentRun run = runMapper.findById(runId);
-        return run != null && "DUAL_POOL_V2".equals(run.getSchedulerVersion());
+        if (ttlMinutes <= 0 || ttlWarningRatio <= 0.0 || ttlWarningRatio >= 1.0) {
+            return;
+        }
+        long totalMs = ttlMinutes * 60_000L;
+        long remainingMs = remainingTtlMs(run);
+        if (remainingMs < 0) {
+            return;
+        }
+        long consumedMs = totalMs - remainingMs;
+        double consumedRatio = (double) consumedMs / (double) totalMs;
+        if (consumedRatio < ttlWarningRatio) {
+            return;
+        }
+        long expiresAtMs = run.getTtlExpiresAt().toInstant().toEpochMilli();
+        if (!stateStore.tryMarkTtlLastMileWarned(runId, String.valueOf(expiresAtMs))) {
+            // 本窗口已被其它线程抢先标记 → 跳过，不再发事件
+            return;
+        }
+        AgentContext.setTtlWrapUpHint(buildTtlWrapUpHint(remainingMs));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("dimension", "ttl");
+        payload.put("remaining_ms", remainingMs);
+        payload.put("expires_at", expiresAtMs);
+        payload.put("ratio", consumedRatio);
+        eventService.append(runId, userId, "RUN_TTL_LAST_MILE", payload);
+    }
+
+    /**
+     * 拼装 TTL 收尾约定文本：告知剩余时间、请完成当前步骤到达 Todo 边界（检查点在 Todo
+     * 完成时自动保存）、整理当前结论与未完成项；到硬上限本次执行会被停止但可从检查点恢复继续。
+     */
+    private String buildTtlWrapUpHint(long remainingMs) {
+        long remainingMinutes = Math.max(0L, remainingMs / 60_000L);
+        return "[ttl_wrap_up_hint] 本运行的生命周期剩余时间约 " + remainingMinutes + " 分钟（"
+                + remainingMs + " 毫秒），即将到达硬上限。请开始收尾：完成当前步骤后到达 Todo 边界就停下"
+                + "（检查点会在每个 Todo 完成时自动保存），并把当前结论与未完成事项整理进回答；"
+                + "到达硬上限后本次执行会被停止，但可以从已保存的检查点恢复继续运行。";
     }
 
     /**

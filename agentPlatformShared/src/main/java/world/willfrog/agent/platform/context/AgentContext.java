@@ -165,6 +165,16 @@ public class AgentContext {
      */
     private static final ThreadLocal<String> LAST_MILE_HINT_HOLDER = new ThreadLocal<>();
 
+    /**
+     * TTL 收尾 hint：当本 run 的生命周期 TTL 消耗比例首次跨过软阈值（默认 0.9）时，
+     * {@code AgentRunBudgetService} 写入收尾约定文本到本 ThreadLocal；
+     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并追加为 UserMessage，
+     * 促使模型整理进度、在 Todo 边界保存恢复所需信息。
+     * <p>与 {@link #LAST_MILE_HINT_HOLDER} 分开存放：那是资源预算（信封层）的收尾提示，这是
+     * 生命周期（TTL 层）的收尾提示，两者可能同时存在、语义不同，不能共用一个通道。</p>
+     */
+    private static final ThreadLocal<String> TTL_WRAP_UP_HINT_HOLDER = new ThreadLocal<>();
+
     /** 设置当前线程的 Run ID。 */
     public static void setRunId(String runId) {
         RUN_ID_HOLDER.set(runId);
@@ -626,6 +636,32 @@ public class AgentContext {
         LAST_MILE_HINT_HOLDER.remove();
     }
 
+    /**
+     * 设置 TTL 收尾 hint 文本（由 {@code AgentRunBudgetService} 在生命周期消耗比例首次跨过软阈值时调用）。
+     * 空白值等价于清理,避免误把空字符串当成有效收尾约定。
+     */
+    public static void setTtlWrapUpHint(String hint) {
+        if (hint == null || hint.isBlank()) {
+            TTL_WRAP_UP_HINT_HOLDER.remove();
+            return;
+        }
+        TTL_WRAP_UP_HINT_HOLDER.set(hint);
+    }
+
+    /**
+     * 获取 TTL 收尾 hint,可能为 null(未设置或已清理)。
+     * 由 {@code LangchainTodoNodeExecutor#chatRequestTransformer} 读取,
+     * 读到非空字符串时追加为 UserMessage，促使模型在到达 TTL 硬上限前整理进度并保存恢复所需信息。
+     */
+    public static String getTtlWrapUpHint() {
+        return TTL_WRAP_UP_HINT_HOLDER.get();
+    }
+
+    /** 清理 TTL 收尾 hint(在 chatRequestTransformer 注入完成后立即清,避免下次 LLM 调用误注入)。 */
+    public static void clearTtlWrapUpHint() {
+        TTL_WRAP_UP_HINT_HOLDER.remove();
+    }
+
     /** 清理 phase。 */
     public static void clearPhase() {
         PHASE_HOLDER.remove();
@@ -776,6 +812,7 @@ public class AgentContext {
                 getDataFreshness(),
                 getPromptRunSelection(),
                 getLastMileHint(),
+                getTtlWrapUpHint(),
                 getDebugObservabilitySessionId(),
                 getToolJobResumeToken(),
                 getToolJobResumeLeaseVersion()
@@ -868,6 +905,12 @@ public class AgentContext {
         } else {
             setLastMileHint(snapshot.lastMileHint());
         }
+        // TTL 收尾 hint:与 last-mile hint 同理,V2 分段换线程后也要能被下一次 LLM 调用消费
+        if (snapshot.ttlWrapUpHint() == null) {
+            clearTtlWrapUpHint();
+        } else {
+            setTtlWrapUpHint(snapshot.ttlWrapUpHint());
+        }
         if (snapshot.debugObservabilitySessionId() == null) {
             clearDebugObservabilitySessionId();
         } else {
@@ -917,6 +960,7 @@ public class AgentContext {
         clearThinkingContent();
         clearStreamingProgress();
         clearLastMileHint();
+        clearTtlWrapUpHint();
         clearDebugObservabilitySessionId();
     }
 
@@ -975,6 +1019,7 @@ public class AgentContext {
             AgentLlmProperties.DataFreshness dataFreshness,
             PromptRunSelection promptRunSelection,
             String lastMileHint,
+            String ttlWrapUpHint,
             String debugObservabilitySessionId,
             String toolJobResumeToken,
             Long toolJobResumeLeaseVersion

@@ -887,7 +887,12 @@
           AND deletion_started_at IS NULL
           AND workspace_cleanup_started_at IS NULL
           AND workspace_expired_at IS NULL
-          AND status IN ('FAILED', 'CANCELED', 'WAITING')
+          <!-- EXPIRED 限定可恢复：completed_at 为空（从未完成过）的「执行中到期」放行进入恢复；
+               已完成过的 EXPIRED 不放开。既有 FAILED/CANCELED/WAITING 白名单语义不变。 -->
+          AND (
+                status IN ('FAILED', 'CANCELED', 'WAITING')
+                OR (status = 'EXPIRED' AND completed_at IS NULL)
+          )
           AND COALESCE(tool_job_anchor_json -&gt;&gt; 'anchorState', '')
                 NOT IN ('PREPARING', 'WORKSPACE_REFUSED')
           AND NOT (

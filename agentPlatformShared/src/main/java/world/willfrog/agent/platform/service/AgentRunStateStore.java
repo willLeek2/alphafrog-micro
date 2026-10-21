@@ -57,6 +57,13 @@ public class AgentRunStateStore {
      */
     private static final String BUDGET_LAST_MILE_WARNED_KEY = ":budget_last_mile_warned";
 
+    /**
+     * TTL 生命周期软阈值预警去重 key（Set 结构，元素为已发过预警的 {@code ttl_expires_at} 毫秒值）。
+     * 元素带 ttl_expires_at 值意味着：resume 重置 TTL 后 ttl_expires_at 变化，新窗口的元素不在 Set 里，
+     * 预警资格自动恢复——不需要额外的窗口代次字段。
+     */
+    private static final String TTL_LAST_MILE_WARNED_KEY = ":ttl_last_mile_warned";
+
     // legacy keys for read compatibility
     private static final String TASK_INDEX_KEY = ":tasks";
     private static final String TASK_KEY_PREFIX = ":task:";
@@ -497,6 +504,22 @@ public class AgentRunStateStore {
     }
 
     /**
+     * 原子地尝试标记本 TTL 窗口（由 {@code ttlExpiresAtEpochMs} 标识）已发过 {@code RUN_TTL_LAST_MILE} 预警。
+     * 与 {@link #tryMarkBudgetProgressWarned} 同语义（Redis SADD 返回值做 check-and-set），并发下只发一次。
+     * <p>元素是 ttl_expires_at 的毫秒值而非固定维度名：恢复重置 TTL 后新窗口自动重新具备预警资格。</p>
+     *
+     * @return true 表示本次新加入（应当次调用方发事件）；false 表示该窗口已发过（应跳过）
+     */
+    public boolean tryMarkTtlLastMileWarned(String runId, String ttlExpiresAtEpochMs) {
+        if (blank(runId) || blank(ttlExpiresAtEpochMs)) {
+            return false;
+        }
+        Long added = redisTemplate.opsForSet().add(ttlLastMileWarnedKey(runId), ttlExpiresAtEpochMs);
+        touch(ttlLastMileWarnedKey(runId));
+        return added != null && added > 0;
+    }
+
+    /**
      * 非破坏性查询某 dimension 是否已发过 80% 预算进度告警。
      * 不修改 Redis 状态，用于监控/测试的只读场景。
      * <p>注意：发事件路径请使用 {@link #tryMarkBudgetProgressWarned} 原子 gate，
@@ -588,6 +611,7 @@ public class AgentRunStateStore {
         redisTemplate.delete(patchedPlanKey(runId));
         redisTemplate.delete(budgetProgressWarnedKey(runId));
         redisTemplate.delete(budgetLastMileWarnedKey(runId));
+        redisTemplate.delete(ttlLastMileWarnedKey(runId));
     }
 
     public void clearTasks(String runId) {
@@ -826,6 +850,10 @@ public class AgentRunStateStore {
 
     private String budgetLastMileWarnedKey(String runId) {
         return PREFIX + runId + BUDGET_LAST_MILE_WARNED_KEY;
+    }
+
+    private String ttlLastMileWarnedKey(String runId) {
+        return PREFIX + runId + TTL_LAST_MILE_WARNED_KEY;
     }
 
     private String taskIndexKey(String runId) {

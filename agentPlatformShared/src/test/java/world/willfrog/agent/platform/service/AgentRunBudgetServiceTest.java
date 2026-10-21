@@ -300,20 +300,26 @@ class AgentRunBudgetServiceTest {
     }
 
     @Test
-    void remainingWallClockMs_readsStartedAtFromAgentRunNotObservability() {
+    void remainingWallClockMs_prefersObservabilityStartedAtWithAgentRunFallback() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         ReflectionTestUtils.setField(service, "runMapper", runMapper);
         AgentRun run = new AgentRun();
         run.setStartedAt(OffsetDateTime.now().minusSeconds(10));
         when(runMapper.findById("run-1")).thenReturn(run);
         when(localConfigLoader.current()).thenReturn(Optional.empty());
-        stubObservabilityWithStartedAtMillis(1L);
 
-        long remaining = service.remainingWallClockMs();
+        // 观测起点＝590 秒前（剩余约 10 秒），DB started_at＝10 秒前（剩余约 590 秒）：
+        // 锚点统一后应以观测起点为准
+        stubObservabilityWithStartedAtMillis(System.currentTimeMillis() - 590_000L);
+        long fromObservability = service.remainingWallClockMs();
+        assertTrue(fromObservability <= 60_000L, "观测起点 590 秒前，剩余应约 10 秒");
+        verify(stateStore).loadObservability("run-1");
 
-        assertTrue(remaining > 500_000L, "10 秒 elapsed 相对 600 秒上限，剩余应远大于 500 秒");
-        assertTrue(remaining <= 600_000L);
-        verify(stateStore, never()).loadObservability(any());
+        // 观测记录缺失（如尚未首次执行）时回落 DB started_at，无观测记录的 run 行为不变
+        when(stateStore.loadObservability("run-1")).thenReturn(Optional.empty());
+        long fromAgentRun = service.remainingWallClockMs();
+        assertTrue(fromAgentRun > 500_000L, "回落 DB started_at（10 秒前）时剩余应远大于 500 秒");
+        assertTrue(fromAgentRun <= 600_000L);
     }
 
     @Test

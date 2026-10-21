@@ -651,7 +651,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
+                    return maybeInjectTtlWrapUpHint(maybeInjectLastMileHint(chatRequest));
                 })
                 .build();
     }
@@ -862,7 +862,7 @@ public class LangchainTodoNodeExecutor {
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(withToolBudgetStatus(chatRequest, request.getRunId()));
+                    return maybeInjectTtlWrapUpHint(maybeInjectLastMileHint(withToolBudgetStatus(chatRequest, request.getRunId())));
                 })
                 .beforeToolExecution(before -> {
                     ensureRunnable(request);
@@ -914,7 +914,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
+                    return maybeInjectTtlWrapUpHint(maybeInjectLastMileHint(chatRequest));
                 })
                 .build();
     }
@@ -1024,6 +1024,39 @@ public class LangchainTodoNodeExecutor {
         List<ChatMessage> out = new ArrayList<>(original);
         out.add(UserMessage.from(hint));
         return out;
+    }
+
+    /**
+     * 把 {@link AgentContext#getTtlWrapUpHint()} 里待注入的 TTL 收尾约定合并到下一次 LLM 请求中。
+     * <p>
+     * 触发条件：{@link AgentRunBudgetService} 在生命周期 TTL 消耗比例首次跨过软阈值
+     * （agent.run.ttl-warning-ratio，默认 0.9）时把收尾约定写入
+     * {@link AgentContext#setTtlWrapUpHint(String)}（本 TTL 窗口一次性，原子 SADD gate 守门；
+     * 与信封 lastMileHint 是两条通道：生命周期 vs 资源预算）。
+     * <p>
+     * 注入位置与消费语义与 {@link #maybeInjectLastMileHint} 完全一致：作为新的
+     * {@link UserMessage} 追加到 ChatRequest.messages 末尾，稳定 System 不变；
+     * 注入后立即清空 ThreadLocal，一次性消费。
+     *
+     * @param chatRequest 本次 LLM 调用的原始请求对象
+     * @return 注入收尾约定后的新 ChatRequest；ThreadLocal 无提示时原样返回
+     */
+    static ChatRequest maybeInjectTtlWrapUpHint(ChatRequest chatRequest) {
+        if (chatRequest == null) {
+            return null;
+        }
+        String hint = AgentContext.getTtlWrapUpHint();
+        if (hint == null || hint.isBlank()) {
+            return chatRequest;
+        }
+        List<ChatMessage> original = chatRequest.messages();
+        List<ChatMessage> rebuilt = rebuildMessagesWithHint(
+                original == null ? List.of() : original,
+                hint);
+        AgentContext.clearTtlWrapUpHint();
+        return chatRequest.toBuilder()
+                .messages(rebuilt)
+                .build();
     }
 
     /**

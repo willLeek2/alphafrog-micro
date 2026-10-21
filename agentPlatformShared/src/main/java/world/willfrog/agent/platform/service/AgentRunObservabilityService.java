@@ -173,6 +173,26 @@ public class AgentRunObservabilityService {
     }
 
     /**
+     * 人工恢复（resume）时把观测挂钟起点显式重写为当前时刻。
+     *
+     * <p>与 {@link #initializeRun} 的「幂等不覆盖」相反：resume 需要一个新的挂钟窗口——
+     * 预算检查（AgentRunBudgetService.check / remainingWallClockMs）实际读取的就是本 Redis
+     * 观测 JSON 的 summary.startedAtMillis，不重写的话恢复后的 run 仍背着旧的起点，
+     * 信封挂钟在恢复晚于上限时立即超限。与 resetForResume 重置 ttl_expires_at 的口径对齐
+     * （时间窗口给新、资源账累计保留）。普通分段初始化仍走 {@link #initializeRun} 的幂等
+     * 语义，不会被本方法影响——本方法只在 resume 链路上被显式调用一次。</p>
+     *
+     * <p>由 {@code LangchainRunControlService#resumeRunWhileActive} 在 resetForResume 落库
+     * 成功后调用；观测条目缺失时 mutate 会创建新状态（等价于从恢复时刻起表）。</p>
+     */
+    public void restartWallClockOnResume(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        mutate(runId, state -> state.getSummary().setStartedAtMillis(System.currentTimeMillis()));
+    }
+
+    /**
      * 记录流式生成的实时进度快照（每个 chunk 接收时由流式 ChatModel 上报）。
      *
      * <p>用于前端展示"正在生成…"的实时字符数/速率等。
