@@ -541,7 +541,11 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             persistInfrastructureFailure(run, plan, completed, failureReason, failureMetadata);
             return;
         }
-        seedCompletedFromEarlierGenerations(run, generation, plan, completed, completedIds, existingIds);
+        // 承接只属于冻结计划续跑的代际：重规划代（追问、规划中到期）的节点编号会与旧计划重号
+        // （规划器提示词教的就是 todo_1 这种格式），误承接会把新计划里语义不同的同名节点静默标成已完成。
+        if (resumeFromFrozenPlan(planning)) {
+            seedCompletedFromEarlierGenerations(run, generation, plan, completed, completedIds, existingIds);
+        }
         completed.sort(Comparator.comparingInt(LangchainCompletedTodo::getSequence));
         if (completedIds.size() == items.size()) {
             advanceFinalAnswer(run, plan, generation, completed, latestSegments, turn);
@@ -584,7 +588,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
 
     /**
      * 跨代际承接种子：把更早代际里已完成（分段结果已提交且成功）的节点播进本代际的 completed
-     * 集合——恢复开的恢复代际只跑没做完的节点（节点级续跑，不做节点内断点）。
+     * 集合——恢复开的恢复代际只跑没做完的节点（节点级续跑，不做节点内断点）。只在
+     * {@link #resumeFromFrozenPlan} 为真的代际调用：重规划代与旧计划节点编号重号，不承接。
+     *
      *
      * <p>两条边界：种子只认当前冻结计划里出现的 nodeId（历史代际计划变化时，不在当前计划的
      * 旧节点自然忽略，防跨计划误承接）；本代际已有行的节点（含未完成行）不播——现代际优先，
@@ -620,6 +626,17 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
             }
             completedIds.add(nodeId);
             completed.add(completedTodo(item, row));
+        }
+    }
+
+    /** 这一代是不是带着冻结计划回来的续跑：规划段载荷里的标记，只有 resetForResume 不清 plan_json 的恢复会写。 */
+    private boolean resumeFromFrozenPlan(NodeWorkItem planning) {
+        try {
+            return objectMapper.readTree(planning.getPayloadJson())
+                    .path("resumeFromFrozenPlan").asBoolean(false);
+        } catch (Exception e) {
+            // 载荷读不出来时不承接：宁可让已完成节点重跑，也不冒跨计划重号误承接的险。
+            return false;
         }
     }
 
