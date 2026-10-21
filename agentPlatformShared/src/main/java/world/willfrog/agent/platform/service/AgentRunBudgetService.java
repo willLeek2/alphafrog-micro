@@ -321,14 +321,16 @@ public class AgentRunBudgetService {
 
     /**
      * 拼装 TTL 收尾约定文本：告知剩余时间、请完成当前步骤到达 Todo 边界（检查点在 Todo
-     * 完成时自动保存）、整理当前结论与未完成项；到硬上限本次执行会被停止但可从检查点恢复继续。
+     * 完成时自动保存）、整理当前结论与未完成项；到硬上限本次执行会被停止。恢复语义用机制
+     * 中立表述（成果保留、可通过恢复入口继续），不向模型承诺检查点粒度的续跑——现网调度的
+     * 恢复衔接粒度以任务进度页登记的方案为准。
      */
     private String buildTtlWrapUpHint(long remainingMs) {
         long remainingMinutes = Math.max(0L, remainingMs / 60_000L);
         return "[ttl_wrap_up_hint] 本运行的生命周期剩余时间约 " + remainingMinutes + " 分钟（"
                 + remainingMs + " 毫秒），即将到达硬上限。请开始收尾：完成当前步骤后到达 Todo 边界就停下"
                 + "（检查点会在每个 Todo 完成时自动保存），并把当前结论与未完成事项整理进回答；"
-                + "到达硬上限后本次执行会被停止，但可以从已保存的检查点恢复继续运行。";
+                + "到达硬上限后本次执行会被停止；已完成的成果会保留，之后可以通过恢复入口继续运行。";
     }
 
     /**
