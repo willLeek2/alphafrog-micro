@@ -73,6 +73,21 @@ public class DualPoolRunAdmissionRegistry {
     }
 
     /**
+     * 用户控制操作（追问、手动恢复）的统一受理结果：受理令牌，或没受理时的稳定原因编号
+     * （unknown_run／startup_isolated／ownership_unavailable／permit_unavailable）。
+     * 入口据此给用户可区分的提示，不合成笼统异常。
+     */
+    public record UserControlAdmission(Admission admission, String rejectReason) {
+        static UserControlAdmission rejected(String reason) {
+            return new UserControlAdmission(new Admission(false, -1L), reason);
+        }
+
+        public boolean admitted() {
+            return admission != null && admission.admitted();
+        }
+    }
+
+    /**
      * 一条 Run 在本进程里的全部状态：服务所有权凭据、准入生命周期令牌、还没落库的预留。
      *
      * <p>三样放在同一个对象里，是因为它们说的是同一件事——本进程此刻能不能推进这条 Run。分成两份映射
@@ -887,15 +902,20 @@ public class DualPoolRunAdmissionRegistry {
      * 激活，也不需要回滚。恢复消费是一锤子买卖，预留必须在这之前拿到手：拿不到就不消费。</p>
      */
     public Admission reserveForRecovery(String runId) {
+        return reserveForRecoveryInternal(runId).admission();
+    }
+
+    /** 与 {@link #reserveForRecovery(String)} 同一条判定链，但把每一步的拒绝原因带回来，供用户入口给可区分提示。 */
+    private UserControlAdmission reserveForRecoveryInternal(String runId) {
         if (runId == null || runId.isBlank()) {
-            return Admission.rejected();
+            return UserControlAdmission.rejected("unknown_run");
         }
         String isolation = isolatedRunReasons.get(runId);
         if (isolation != null) {
             // 启动扫描判定这条 Run 的恢复事实说不清：不许借着一次恢复受理把它接回执行链。
             log.warn("这条 Run 在启动时被隔离，恢复受理一律拒绝: runId={} reason={}", runId, isolation);
             reportAdmissionDecision(runId, false, "startup_isolated", "启动隔离中的运行不受理恢复");
-            return Admission.rejected();
+            return UserControlAdmission.rejected("startup_isolated");
         }
         // 没有凭据就按数据库取一次。这一句以前写成「已经有凭据就不再取，否则取一次」，受理不成时
         // 这次新取的服务所有权就留在手里了——握着服务所有权却不受理，这条 Run 会被锁到服务所有权过期为止，别的进程
@@ -907,15 +927,17 @@ public class DualPoolRunAdmissionRegistry {
             // 所有权在别人手上：这次恢复消费不该发生，也不该占预留。
             log.warn("这条 Run 的服务所有权在别人手上，恢复受理拒绝: runId={}", runId);
             reportAdmissionDecision(runId, false, "ownership_unavailable", "这条运行的服务所有权在别的实例上");
-            return Admission.rejected();
+            return UserControlAdmission.rejected("ownership_unavailable");
         }
         knownRunIds.add(runId);
         if (isAdmitted(runId)) {
-            return new Admission(true, -1L);
+            return new UserControlAdmission(new Admission(true, -1L), null);
         }
-        Admission admission = admitExistingRunWithLease(runId);
-        if (admission.admitted() || acquired.isEmpty()) {
-            return admission;
+        ExistingRunAdmission decision = decideExistingRunAdmission(runId);
+        reportAdmissionDecision(runId, decision.admission().admitted(), decision.reasonCode(),
+                decision.admission().admitted() ? "已建运行重新获得执行名额" : "已建运行的准入未通过");
+        if (decision.admission().admitted() || acquired.isEmpty()) {
+            return new UserControlAdmission(decision.admission(), decision.reasonCode());
         }
         // 刚取得凭据、受理却没成（业务名额拿不到）：这条 Run 这一轮不接手，把刚取得的让出去，
         // 本进程也不再当成认识它。
@@ -923,7 +945,33 @@ public class DualPoolRunAdmissionRegistry {
         releaseOwnershipIfFreshlyTaken(runId,
                 new ServiceOwnershipFence(acquired.get().ownerInstanceId(), acquired.get().fencingToken()),
                 false);
-        return Admission.rejected();
+        return UserControlAdmission.rejected(
+                decision.reasonCode() != null ? decision.reasonCode() : "permit_unavailable");
+    }
+
+    /**
+     * 追问与手动恢复两个用户入口的统一受理：在各自用户、部署、状态检查之后、改 Run 状态或写消息之前调用。
+     *
+     * <p>已知（本进程认识这条 Run）→ {@link #admitExistingRunWithLease} 的既有可回滚预留；
+     * 未知且 {@code unknownAdmissible}（V2）→ {@link #reserveForRecovery} 的取得数据库服务租约、
+     * 登记已知、再预留；未知且不可（V1）→ 保持「本进程未知即拒绝」的来源限制。这一摞判断集中在这里，
+     * 两个入口不再各自拼接——当初的缺口正是创建路径改成家族判定后这里没跟上。</p>
+     *
+     * <p>返回的 {@link Admission} 按既有合同消费：epoch&gt;=0 才需要落库成功后激活、失败时回滚；
+     * epoch=-1 表示本进程本来就已受理（reserveForRecovery 对已受理 Run 的返回），激活与回滚都不要再调。</p>
+     */
+    public UserControlAdmission admitForUserControl(String runId, boolean unknownAdmissible) {
+        if (runId != null && knownRunIds.contains(runId)) {
+            ExistingRunAdmission decision = decideExistingRunAdmission(runId);
+            reportAdmissionDecision(runId, decision.admission().admitted(), decision.reasonCode(),
+                    decision.admission().admitted() ? "用户操作重新获得执行名额" : "用户操作的准入未通过");
+            return new UserControlAdmission(decision.admission(), decision.reasonCode());
+        }
+        if (!unknownAdmissible) {
+            reportAdmissionDecision(runId, false, "unknown_run", "本进程不认识这条运行，用户操作受理拒绝");
+            return UserControlAdmission.rejected("unknown_run");
+        }
+        return reserveForRecoveryInternal(runId);
     }
 
     /** 同一进程内的追问或显式恢复可以重新占用业务名额；重启前未知的 Run 一律拒绝。 */

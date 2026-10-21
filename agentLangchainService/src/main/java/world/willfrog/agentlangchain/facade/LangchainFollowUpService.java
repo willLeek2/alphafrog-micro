@@ -76,13 +76,6 @@ public class LangchainFollowUpService {
                     .setRunStatus(run.getStatus().name())
                     .build();
         }
-        if (!dualPoolFollowUpAllowed(run)) {
-            return SendAgentMessageResponse.newBuilder()
-                    .setStatus("rejected")
-                    .setRejectReason("双池 Run 来自本次进程启动之前，不能自动接续；请新建 Run")
-                    .setRunStatus(run.getStatus().name())
-                    .build();
-        }
         if (agentEventService.shouldMarkExpired(run)) {
             runMapper.updateStatus(
                     runId, userId, AgentRunStatus.COMPLETED, AgentRunStatus.EXPIRED);
@@ -95,12 +88,13 @@ public class LangchainFollowUpService {
                     .setRunStatus(AgentRunStatus.EXPIRED.name())
                     .build();
         }
-        DualPoolRunAdmissionRegistry.Admission dualPoolReservation = reserveDualPoolRun(run);
-        if (schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPool(run)
-                && (dualPoolReservation == null || !dualPoolReservation.admitted())) {
+        // 受理在写追问消息、改 Run 状态之前：拿不到所有权或名额就按原因拒绝，原状态与消息不动，
+        // 用户稍后重试即可（经同一条统一受理重新申请）。
+        DualPoolRunAdmissionRegistry.UserControlAdmission dualPoolReservation = reserveDualPoolRun(run);
+        if (dualPoolReservation != null && !dualPoolReservation.admitted()) {
             return SendAgentMessageResponse.newBuilder()
                     .setStatus("rejected")
-                    .setRejectReason("双池业务准入名额已满，请稍后重试")
+                    .setRejectReason(dualPoolAdmissionRejectReason(dualPoolReservation.rejectReason()))
                     .setRunStatus(run.getStatus().name())
                     .build();
         }
@@ -121,8 +115,9 @@ public class LangchainFollowUpService {
                 return rejectedInactiveDeployment();
             }
             if (dualPoolReservation != null && dualPoolReservation.admitted()
+                    && dualPoolReservation.admission().epoch() >= 0L
                     && !dualPoolRunAdmissionRegistry.activateReservedAdmission(
-                    run.getId(), dualPoolReservation)) {
+                    run.getId(), dualPoolReservation.admission())) {
                 throw new IllegalStateException("追问已落库，但双池准入预留无法激活");
             }
             // 这里之后 Run 已经持久化为 RECEIVED。后续事件、缓存或提示投递失败时，
@@ -171,27 +166,34 @@ public class LangchainFollowUpService {
                 .build();
     }
 
-    private boolean dualPoolFollowUpAllowed(AgentRun run) {
-        if (schedulerVersionPolicy == null || dualPoolRunAdmissionRegistry == null) {
-            return true;
-        }
-        return !schedulerVersionPolicy.isDualPool(run)
-                || dualPoolRunAdmissionRegistry.isKnownInCurrentProcess(run.getId());
-    }
-
-    private DualPoolRunAdmissionRegistry.Admission reserveDualPoolRun(AgentRun run) {
+    /** 双池家族（V1＋V2）的追问受理；非双池返回 null，入口按无预留继续。 */
+    private DualPoolRunAdmissionRegistry.UserControlAdmission reserveDualPoolRun(AgentRun run) {
         if (schedulerVersionPolicy == null || dualPoolRunAdmissionRegistry == null
-                || !schedulerVersionPolicy.isDualPool(run)) {
+                || !schedulerVersionPolicy.isDualPoolFamily(run)) {
             return null;
         }
-        return dualPoolRunAdmissionRegistry.admitExistingRunWithLease(run.getId());
+        // V1 保持「本进程未知即拒绝」的来源限制；V2 未知走落库前受理（数据库租约→登记已知→预留），
+        // 不再先落库后补扫——那条路会在消息已提交后启动失败，用户看到失败但消息已在库。
+        return dualPoolRunAdmissionRegistry.admitForUserControl(
+                run.getId(), !schedulerVersionPolicy.isDualPool(run));
+    }
+
+    /** 受理拒绝的用户提示按稳定原因区分：所有权在别人手上、名额满、启动隔离、V1 未知。 */
+    private static String dualPoolAdmissionRejectReason(String reason) {
+        return switch (reason == null ? "permit_unavailable" : reason) {
+            case "unknown_run" -> "双池 Run 来自本次进程启动之前，不能自动接续；请新建 Run";
+            case "startup_isolated" -> "这条运行被启动核验隔离，不能接续";
+            case "ownership_unavailable" -> "这条运行的服务所有权在别的实例上，请稍后重试";
+            default -> "双池业务准入名额已满，请稍后重试";
+        };
     }
 
     private void releaseDualPoolReservation(
-            AgentRun run, DualPoolRunAdmissionRegistry.Admission reservation) {
+            AgentRun run, DualPoolRunAdmissionRegistry.UserControlAdmission reservation) {
         if (reservation != null && reservation.admitted()
-                && schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPool(run)) {
-            dualPoolRunAdmissionRegistry.rollbackReservedAdmission(run.getId(), reservation);
+                && reservation.admission().epoch() >= 0L
+                && schedulerVersionPolicy != null && schedulerVersionPolicy.isDualPoolFamily(run)) {
+            dualPoolRunAdmissionRegistry.rollbackReservedAdmission(run.getId(), reservation.admission());
         }
     }
 
