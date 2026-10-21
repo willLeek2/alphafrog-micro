@@ -848,15 +848,7 @@ public class DualPoolRunAdmissionRegistry {
             log.error("没有服务所有权存储，已受理子运行补投做不了: runId={}", runId);
             return false;
         }
-        Optional<RunServiceLease> existing = leaseStore.find(runId);
-        if (existing.isPresent()
-                && instanceIdentity.value().equals(existing.get().ownerInstanceId())
-                && !existing.get().expiredAt(OffsetDateTime.now())) {
-            RunServiceLease lease = existing.get();
-            bindFence(runId, new ServiceOwnershipFence(lease.ownerInstanceId(), lease.fencingToken()));
-            return true;
-        }
-        return acquireOwnership(runId).isPresent();
+        return ensureServiceOwnership(runId).valid();
     }
 
     public boolean restorePersistedToolJob(String runId) {
@@ -962,9 +954,31 @@ public class DualPoolRunAdmissionRegistry {
      */
     public UserControlAdmission admitForUserControl(String runId, boolean unknownAdmissible) {
         if (runId != null && knownRunIds.contains(runId)) {
+            // 已知 Run 的用户受理（恢复/追问）必须先把数据库服务租约锚住（含续期），再取业务名额：
+            // 调用方随后会把 Run 写回 RECEIVED，若此刻数据库租约缺失、已过期、或只剩零点几秒寿命，
+            // 协调补扫会先一步把它按「创建未完成」收口成 FAILED——受理成功也活不过下一拍扫描。放在
+            // decideExistingRunAdmission 之前还有一层：decide 的第二步是内存 holdsOwnership 检查，这里的
+            // 凭据绑定/数据库领取会重建内存条目，上一轮受理失败刚让出过凭据的 Run 也能从这里重新受进来。
+            ServiceOwnershipAssurance ownership = ensureServiceOwnership(runId);
+            if (!ownership.valid()) {
+                log.warn("用户受理时数据库服务所有权不可得（别的实例有效持有或存储不可用），按既有原因拒绝: runId={}", runId);
+                reportAdmissionDecision(runId, false, "ownership_unavailable", "用户操作时数据库服务所有权不可得");
+                return UserControlAdmission.rejected("ownership_unavailable");
+            }
             ExistingRunAdmission decision = decideExistingRunAdmission(runId);
             reportAdmissionDecision(runId, decision.admission().admitted(), decision.reasonCode(),
                     decision.admission().admitted() ? "用户操作重新获得执行名额" : "用户操作的准入未通过");
+            if (decision.admission().admitted() || ownership.freshlyAcquired().isEmpty()) {
+                return new UserControlAdmission(decision.admission(), decision.reasonCode());
+            }
+            // 业务名额没拿到、而服务租约是本次刚从数据库取的：按 reserveForRecoveryInternal 的既有
+            // 口径让出去（握着所有权却不受理，会把 Run 锁到租约过期为止）。找到既有有效租约的那一态
+            // 不让出——尤其 WAITING 中的 Run，租约正被续期循环持有，那是活着的执行面。已知分支
+            // 不动 knownRunIds：进入这里之前本进程就认识它。
+            releaseOwnershipIfFreshlyTaken(runId,
+                    new ServiceOwnershipFence(ownership.freshlyAcquired().get().ownerInstanceId(),
+                            ownership.freshlyAcquired().get().fencingToken()),
+                    false);
             return new UserControlAdmission(decision.admission(), decision.reasonCode());
         }
         if (!unknownAdmissible) {
@@ -1209,6 +1223,43 @@ public class DualPoolRunAdmissionRegistry {
         snapshot.put("leaseHeldElsewhereTotal", startupLeaseHeldElsewhere.get());
         snapshot.put("admissionUnavailableTotal", startupAdmissionUnavailable.get());
         return snapshot;
+    }
+
+    /** 用户受理前所有权核验的结果：valid＝本进程当前持有有效数据库租约；freshlyAcquired 非空＝租约是本次新取的。 */
+    private record ServiceOwnershipAssurance(boolean valid, Optional<RunServiceLease> freshlyAcquired) {
+        static final ServiceOwnershipAssurance UNAVAILABLE =
+                new ServiceOwnershipAssurance(false, Optional.empty());
+    }
+
+    /**
+     * 确认本进程当前持有这条 Run 的有效数据库服务租约，并区分「既有所有权续期」与「本次新取」。
+     *
+     * <p>不管此刻租约是否仍有效，都走一次数据库领取来锚定剩余寿命：本进程持有的租约 acquire 即续期
+     * （所有权编号不变）——只判「尚未到期」就直过的话，剩余 1 秒以内的租约会在受理后的下一拍补扫里
+     * 过期，再撞一次「创建未完成」收口；别的进程的租约只有在已过期时才会被接管（编号加一），仍有效时
+     * acquire 返回空、核验不通过。</p>
+     *
+     * <p>「本次调用了续期」不等于「此前没有有效所有权」：受理前就有效属于本进程的租约（例如 WAITING
+     * 中正被续期循环持有的），这次只是延了寿命，不算新取，业务名额失败时不得让出；此前没有有效所有权
+     * （缺失、已过期、在别人手上刚被接管）才算本次新取，失败时按
+     * {@link #releaseOwnershipIfFreshlyTaken} 的「只让刚取得的那一代」口径让出。</p>
+     */
+    private ServiceOwnershipAssurance ensureServiceOwnership(String runId) {
+        if (leaseStore == null || instanceIdentity == null) {
+            log.error("没有服务所有权存储，用户受理的所有权核验做不了: runId={}", runId);
+            return ServiceOwnershipAssurance.UNAVAILABLE;
+        }
+        Optional<RunServiceLease> existing = leaseStore.find(runId);
+        boolean hadValidOwnership = existing.isPresent()
+                && instanceIdentity.value().equals(existing.get().ownerInstanceId())
+                && !existing.get().expiredAt(OffsetDateTime.now());
+        Optional<RunServiceLease> acquired = acquireOwnership(runId);
+        if (acquired.isEmpty()) {
+            return ServiceOwnershipAssurance.UNAVAILABLE;
+        }
+        return hadValidOwnership
+                ? new ServiceOwnershipAssurance(true, Optional.empty())
+                : new ServiceOwnershipAssurance(true, acquired);
     }
 
     /**
