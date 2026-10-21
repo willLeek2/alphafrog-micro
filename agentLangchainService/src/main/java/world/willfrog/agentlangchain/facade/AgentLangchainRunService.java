@@ -11,7 +11,6 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
-import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
@@ -31,7 +30,6 @@ public class AgentLangchainRunService {
 
     private final ObjectProvider<AgentRunEventService> agentEventServiceProvider;
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
-    private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentRunMapper runMapper;
     private final AgentCreditService creditService;
     private final UserDao userDao;
@@ -71,19 +69,15 @@ public class AgentLangchainRunService {
                 request.getContextJson(), deploymentIdentity.deploymentId(), deploymentIdentity.generationId());
 
         LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
-        LangchainRunConcurrencyScheduler.Reservation reservation = null;
         AgentRun run = null;
         boolean createdNow = false;
-        // 版本在创建前选择并写进 Run。只有旧版本预占旧调度器名额；双池版本只在数据库
-        // 记录写稳后补发提示，提示丢失由扫描恢复。
+        // 版本在创建前选择并写进 Run。LEGACY 已不再发给新 Run（versionForNewRun 显式拒绝），
+        // 旧调度器名额预留随之退役：双池版本只在数据库记录写稳后补发提示，提示丢失由扫描恢复。
         String schedulerVersion = schedulerVersionPolicy.versionForNewRun();
         boolean dualPoolFamily = schedulerVersionPolicy.isDualPoolFamily(schedulerVersion);
         if (dualPoolFamily && dualPoolRunAdmissionRegistry.startupResidueBlockedFor(schedulerVersion)) {
             throw new world.willfrog.agentlangchain.control.LangchainRunRejectedException(
                     "dual_pool_startup_residue_blocked", "startup_residue_blocked");
-        }
-        if (pipeline != null && SchedulerVersionPolicy.LEGACY.equals(schedulerVersion)) {
-            reservation = runConcurrencyScheduler.reserve();
         }
         try {
             AgentRunEventService.RunCreation creation = agentEventService.createRun(
@@ -112,10 +106,6 @@ public class AgentLangchainRunService {
                 // 既不预留名额，也不启动 pipeline；本次为它临时占下的名额当场还回去。
                 log.info("幂等键命中，本次不启动 pipeline: runId={} schedulerVersion={}",
                         run.getId(), schedulerVersion);
-                if (reservation != null) {
-                    runConcurrencyScheduler.release(reservation);
-                    reservation = null;
-                }
                 return AgentLangchainRunMessageMapper.toRunMessage(run);
             }
 
@@ -133,8 +123,7 @@ public class AgentLangchainRunService {
                 }
                 log.info("Launching langchain pipeline for run {} with schedulerVersion={}",
                         run.getId(), schedulerVersion);
-                pipeline.launchAsync(run, reservation);
-                reservation = null;
+                pipeline.launchAsync(run);
             } else {
                 log.warn("Langchain run pipeline not registered; run {} created but not executed", run.getId());
             }
@@ -142,9 +131,6 @@ public class AgentLangchainRunService {
         } catch (RuntimeException e) {
             log.error("创建后启动失败: runId={} schedulerVersion={} createdNow={}",
                     run == null ? null : run.getId(), schedulerVersion, createdNow, e);
-            if (reservation != null) {
-                runConcurrencyScheduler.release(reservation);
-            }
             // 只有这次真的新建了 Run 才收尾：幂等读回的旧 Run 属于别人的执行流程，
             // 一次重复提交的失败不该把它改成失败态。
             if (run != null && createdNow) {

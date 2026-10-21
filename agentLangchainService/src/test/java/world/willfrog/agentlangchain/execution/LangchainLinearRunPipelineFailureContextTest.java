@@ -18,7 +18,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSupport.immediateScheduler;
 
 /**
  * 写终态失败时重建上下文：这条路不许碰模型解析。
@@ -103,8 +102,6 @@ class LangchainLinearRunPipelineFailureContextTest {
     private LangchainLinearRunPipelineImpl pipeline() {
         return new LangchainLinearRunPipelineImpl(
                 mock(world.willfrog.agentlangchain.planning.LangchainAiPlanner.class),
-                mock(LangchainLinearWorkflowExecutor.class),
-                mock(world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor.class),
                 stageModelResolver,
                 runMapper,
                 mock(AgentRunEventService.class),
@@ -116,14 +113,12 @@ class LangchainLinearRunPipelineFailureContextTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(world.willfrog.agentlangchain.control.LangchainRunExecutionGuard.class),
-                immediateScheduler(),
                 mock(AgentCreditService.class),
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
-                mock(ObjectProvider.class),
-                world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
+                mock(ObjectProvider.class));
     }
 
     private static AgentRun executingRun(String planJson) {

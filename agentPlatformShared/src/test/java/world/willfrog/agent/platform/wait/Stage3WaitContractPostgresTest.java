@@ -845,7 +845,9 @@ class Stage3WaitContractPostgresTest {
         store.markCoordinationServed("run-cold", 1, 0, fenceFor("run-cold"));
         store.markCoordinationServed("run-warm", 7, 0, fenceFor("run-warm"));
         store.markCoordinationServed("run-hot", 9, 0, fenceFor("run-hot"));
-        store.markHandoffServed("run-legacy", 10, 0);
+        // 旧入口的交接记账已随 LEGACY 调度删除；存储层对版本无感知，这里按同形的服务记账记账，
+        // 旧版本 Run 被收敛关闭成终态后，scanDue 按 Run 存活状态自然把它排出候选。
+        store.markCoordinationServed("run-legacy", 10, 0, fenceFor("run-legacy"));
         assertThat(dueRunIds(store, ROTATION_RUNS))
                 .as("按最近被服务的轮次升序：越久没被服务的越靠前，旧版本一样排在里面")
                 .containsExactly("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -1027,43 +1029,6 @@ class Stage3WaitContractPostgresTest {
         assertThat(dueRunIds(store, mine))
                 .as("两条走同一份排序：先比服务轮次，再比下次可见时间，最后比 Run 编号")
                 .containsExactly("run-legacy-scan", "run-v2-scan");
-    }
-
-    /**
-     * 页首的旧版本行被推后之后，只剩下一条名额的扫描能轮到后面的双池 Run。
-     *
-     * <p>三个版本共用候选之后，旧版本的行也会被选出来。它接不了手（所有权不在本进程）时如果就
-     * 停在页首，页数一满，后面的双池 Run 永远看不见。这条量的是推后确实能把它移出页首：
-     * 名额只有一条，取到的必须是双池那一条。</p>
-     */
-    @Test
-    void aDeferredLegacyRowStopsBlockingTheSingleCandidateSlot() throws Exception {
-        createRunFor("run-legacy-blocking", "user-blocking", SchedulerVersion.LEGACY, 0, 0L);
-        createRunFor("run-v2-behind", "user-blocking", SchedulerVersion.DUAL_POOL_V2, 0, 0L);
-        RunCoordinationStore store = coordinationStore();
-        assertThat(store.ensure("run-legacy-blocking")).isTrue();
-        assertThat(store.ensure("run-v2-behind")).isTrue();
-        // 整个用例类共用一个 schema：先把别的用例留下的候选推出一小时之外，这条只量本用例的两行。
-        execute("UPDATE alphafrog_agent_run_coordination SET next_visible_at = CURRENT_TIMESTAMP "
-                + "+ INTERVAL '1 hour' "
-                + "WHERE run_id NOT IN ('run-legacy-blocking', 'run-v2-behind')");
-        execute("UPDATE alphafrog_agent_run_coordination SET coordination_served_round = 0, "
-                + "next_visible_at = CURRENT_TIMESTAMP, defer_reason = NULL "
-                + "WHERE run_id IN ('run-legacy-blocking', 'run-v2-behind')");
-
-        // 旧版本排在前面（编号更小、轮次相同），名额只有一条时先取它。
-        assertThat(store.scanDue(1))
-                .extracting(RunCoordination::getRunId)
-                .containsExactly("run-legacy-blocking");
-
-        // 接不了手，按所有权原因推后：下一轮它让位，名额落到双池那条上。
-        assertThat(store.deferHandoff("run-legacy-blocking",
-                RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE,
-                OffsetDateTime.now().plusMinutes(1), 0, 0L)).isTrue();
-        assertThat(store.scanDue(1))
-                .as("推后之后一条名额也能轮到后面的双池 Run")
-                .extracting(RunCoordination::getRunId)
-                .containsExactly("run-v2-behind");
     }
 
     @Test

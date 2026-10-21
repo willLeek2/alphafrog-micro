@@ -47,9 +47,14 @@ public class SchedulerVersionPolicy {
                             + version.source() + " 值 " + version.textValue());
         }
         String effectiveVersion = requireKnown(version.textValue());
-        // 认不出的值在这里失败关闭（既不是旧路径，也不是任何一个双池版本），不悄悄回落到旧版本。
-        // 三个已知版本都可以给新 Run 用：完整 DAG 那一版的执行链已经接通（分段执行、等待组、
-        // 结果接收、恢复分发与启动恢复都在），但要不要用由配置决定——没配置时仍是旧路径。
+        // 认不出的值在这里失败关闭（不是任何一个双池版本），不悄悄回落。
+        if (LEGACY.equals(effectiveVersion)) {
+            // LEGACY 调度实现已删除：种子文件旧值、环境属性旧值或没来得及更新的热配置，都不能再
+            // 发给新 Run。显式拒绝并写明来源，提示操作人把配置改成双池版本。
+            throw new IllegalStateException(
+                    "LEGACY 调度已删除，新 Run 的调度器版本不能再是 LEGACY；请把配置改为 DUAL_POOL_V1/V2"
+                            + "（当前来源 " + version.source() + " 值 " + version.textValue() + "）");
+        }
         return effectiveVersion;
     }
 

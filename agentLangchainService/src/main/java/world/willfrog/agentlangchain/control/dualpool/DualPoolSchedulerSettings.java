@@ -182,9 +182,8 @@ public class DualPoolSchedulerSettings {
      * 看到的现象是「配了新版本，跑的还是旧版本」，那比明确报错更难查。所以生效值仍然是「配置了什么
      * 就是什么」，认不出时由版本解析那一处对新 Run 失败关闭；读数里会写明这个值不被认识。</p>
      *
-     * <p>进程终止演练开关只覆盖**代码默认值**：只有一层都没配、停在内置的 LEGACY 上时，它才把新 Run
-     * 推进双池 V1。热配置或环境属性里显式写下的版本（包括显式写 LEGACY）是操作人的选择，不被它改写——
-     * 否则泳道没法用配置切回旧入口，读数里显示的版本也对不上新 Run 真正落库的那个。</p>
+     * <p>进程终止演练开关只覆盖**代码默认值**：只有一层都没配、落在代码默认（现在是双池 V2）时，
+     * 它才把新 Run 推进双池 V1。热配置或环境属性里显式写下的版本是操作人的选择，不被它改写。</p>
      */
     public Setting newRunSchedulerVersion() {
         return newRunSchedulerVersion(resolver());
@@ -228,19 +227,20 @@ public class DualPoolSchedulerSettings {
     /** 与上面同一个判断，只是复用调用方已经取好的那一份热配置快照（一次读数里只取一份）。 */
     private Setting newRunSchedulerVersion(Resolver resolver) {
         Setting configured = resolver.text(KEY_NEW_RUN_SCHEDULER_VERSION,
-                AgentLlmProperties.Scheduler::getNewRunSchedulerVersion, SchedulerVersion.LEGACY.name());
+                AgentLlmProperties.Scheduler::getNewRunSchedulerVersion, SchedulerVersion.DUAL_POOL_V2.name());
         String raw = configured.textValue();
         if (!knownVersion(raw)) {
             return new Setting(raw, configured.source(), true,
                     "认不出的调度器版本，新 Run 会被拒绝：" + raw);
         }
-        if (!SchedulerVersion.LEGACY.name().equals(raw)
-                || !SOURCE_DEFAULT.equals(configured.source())
-                || !haltDrillOn()) {
+        // 演练开关只覆盖「一层都没配、落在代码默认」的情形。默认层改成 V2 后，这里不能再拿
+        // 「raw 是 LEGACY」当触发条件（DEFAULT 层解析出来就是 V2，那会变成永远不触发的死代码）；
+        // 否则演练泳道会静默拿到 V2，长工具演练路径失效。
+        if (!SOURCE_DEFAULT.equals(configured.source()) || !haltDrillOn()) {
             return configured;
         }
         return new Setting(SchedulerVersion.DUAL_POOL_V1.name(), configured.source(), true,
-                "没有配置新 Run 的调度器版本，进程终止演练开关把默认值改成了 "
+                "没有配置新 Run 的调度器版本（落在代码默认），进程终止演练开关把它改成了 "
                         + SchedulerVersion.DUAL_POOL_V1.name(),
                 raw, null);
     }

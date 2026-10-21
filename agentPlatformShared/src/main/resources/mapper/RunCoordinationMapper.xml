@@ -185,40 +185,6 @@
     </update>
 
     <!--
-      旧版本 Run 交给旧入口这一步的记账：与上面两条同形，但**不带服务所有权条件**。
-      授权来源不同——这一笔不是「我在服务这条 Run」，而是「本进程刚决定把这条旧 Run 交给旧入口」，
-      双池这一层对它从来没有所有权。两条语句分开写就是为了让这件事在 SQL 里看得见，
-      而不是给所有权条件加一个「可空」的开关。
-    -->
-    <update id="markHandoffServed">
-        UPDATE alphafrog_agent_run_coordination c SET
-            defer_reason = NULL,
-            next_visible_at = CURRENT_TIMESTAMP,
-            coordination_served_round = #{roundNumber},
-            coordination_missed_rounds = 0,
-            updated_at = CURRENT_TIMESTAMP
-        FROM alphafrog_agent_run r
-        WHERE c.run_id = #{runId}
-          AND r.id = c.run_id
-          AND c.plan_generation = #{expectedPlanGeneration}
-          AND r.plan_generation = #{expectedPlanGeneration}
-          AND c.coordination_served_round &lt; #{roundNumber}
-    </update>
-
-    <update id="deferHandoff">
-        UPDATE alphafrog_agent_run_coordination c SET
-            defer_reason = #{deferReason},
-            next_visible_at = #{nextVisibleAt},
-            updated_at = CURRENT_TIMESTAMP
-        FROM alphafrog_agent_run r
-        WHERE c.run_id = #{runId}
-          AND r.id = c.run_id
-          AND c.plan_generation = #{expectedPlanGeneration}
-          AND r.plan_generation = #{expectedPlanGeneration}
-          AND c.coordination_served_round = #{expectedServedRound}
-    </update>
-
-    <!--
       这一轮可以被协调的 Run，一次全局扫描：两个双池版本不各自分池，排在同一份候选里，
       调用方按每行记录的冻结版本路由。已结束的 Run 不再需要协调，取消中的 Run 交给取消路径推进。
 

@@ -4,12 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
-import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
 import world.willfrog.agent.platform.childrun.ChildRunIntentView;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.coordination.RunCoordination;
-import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
@@ -27,7 +25,6 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.workitem.ServiceOwnershipFence;
-import world.willfrog.agentlangchain.control.LegacyRunHandoff;
 import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
@@ -45,7 +42,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -55,11 +51,11 @@ import static org.mockito.Mockito.when;
 import world.willfrog.agentlangchain.control.dualpool.TestSchedulerSettings;
 
 /**
- * 共享候选按行路由：三个版本排在同一份候选里，选出来之后按每一行冻结的版本分别对待。
+ * 共享候选按行路由：候选里混着什么版本就按每一行冻结的版本分别对待。
  *
- * <p>候选共享、能不能接手不共享。旧版本的 Run 只有拿到服务所有权之后才进旧入口；所有权在别的
- * 进程手上时这一轮不接手，并按所有权原因把它推后——不推后它会一直停在候选页首，页数一满，
- * 排在它后面的双池 Run 永远看不见。版本按 Run 主表上冻结的那一个走，资格行上的只是镜像。</p>
+ * <p>LEGACY 调度实现删除后，资格行上冻结成 LEGACY 的候选不会再有执行层接手：协调循环显式跳过
+ * 并留有界日志，收口责任在启动态收敛（启动时把非终态 LEGACY Run 一次性关成 FAILED，终态 Run
+ * 自然退出候选）。版本按 Run 主表上冻结的那一个走，资格行上的只是镜像。</p>
  */
 class DatabaseDualPoolWorkHandlerRoutingTest {
 
@@ -75,7 +71,6 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     private DualPoolRunAdmissionRegistry admissionRegistry;
     private SchedulerVersionPolicy versionPolicy;
     private RunServiceLeaseStore leaseStore;
-    private LegacyRunHandoff legacyHandoff;
     /** 读数用的登记表：这一份用例顺带量「节点领取有效期、两次重试与服务所有权有效期」有没有登记在用的值。 */
     private final FrozenEffectiveSettings frozenEffectiveSettings = new FrozenEffectiveSettings();
 
@@ -92,13 +87,10 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         admissionRegistry = Mockito.mock(DualPoolRunAdmissionRegistry.class);
         versionPolicy = Mockito.mock(SchedulerVersionPolicy.class);
         leaseStore = Mockito.mock(RunServiceLeaseStore.class);
-        legacyHandoff = Mockito.mock(LegacyRunHandoff.class);
         ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
-        ObjectProvider<LegacyRunHandoff> handoffProvider = Mockito.mock(ObjectProvider.class);
         Mockito.lenient().when(admissionRegistry.snapshotRunIds()).thenReturn(Set.of());
         Mockito.lenient().when(stateStore.currentRound(any())).thenReturn(1L);
         Mockito.lenient().when(identity.value()).thenReturn(TEST_INSTANCE);
-        Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
         Mockito.lenient().when(versionPolicy.isDualPoolFamily(any(world.willfrog.agent.platform.entity.AgentRun.class)))
                 .thenReturn(true);
         freshRunPipeline = Mockito.mock(FreshRunPipeline.class);
@@ -119,7 +111,6 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 stateStore,
                 leaseStore,
                 identity,
-                handoffProvider,
                 // 上限与水位按默认值；这一份用例量的是路由，不是参数解析。
                 TestSchedulerSettings.propertyOnly(),
                 null,
@@ -228,55 +219,19 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     }
 
     @Test
-    void aLegacyRunIsHandedOffOnceOwnershipIsOurs() {
+    void aLegacyCandidateIsExplicitlySkippedByTheCoordinationLoop() {
         when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-legacy", "LEGACY")));
         when(runMapper.findById("run-legacy")).thenReturn(run("run-legacy", "LEGACY"));
         ownedByThisProcess("run-legacy");
-        when(legacyHandoff.handOff("run-legacy")).thenReturn(true);
 
         assertThat(handler.scanRunnableRuns(10))
-                .as("旧版本不交给双池那两个池")
+                .as("LEGACY 候选不交给任何执行层，也不占用服务所有权")
                 .isEmpty();
-        verify(legacyHandoff).handOff("run-legacy");
-        verify(coordinationStore).markHandoffServed(eq("run-legacy"), anyLong(), eq(0));
-        verify(coordinationStore, never()).deferHandoff(anyString(), any(), any(), anyInt(), anyLong());
+        verify(leaseStore, never()).find(anyString());
+        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
         assertThat(handler.routingSnapshot())
-                .containsEntry("legacyHandedOffTotal", 1L)
-                .containsEntry("legacyDeferredTotal", 0L)
+                .containsEntry("legacySkippedTotal", 1L)
                 .containsEntry("legacyCandidatesLastRound", 1L);
-    }
-
-    @Test
-    void aLegacyRunWhoseOwnershipIsElsewhereIsDeferredNotTaken() {
-        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-legacy-busy", "LEGACY")));
-        when(runMapper.findById("run-legacy-busy")).thenReturn(run("run-legacy-busy", "LEGACY"));
-        RunServiceLease peerLease = new RunServiceLease("run-legacy-busy", "other-instance", 3L,
-                OffsetDateTime.now().minusMinutes(1), OffsetDateTime.now(),
-                OffsetDateTime.now().plusMinutes(2));
-        when(leaseStore.find("run-legacy-busy")).thenReturn(Optional.of(peerLease));
-        when(leaseStore.acquire(eq("run-legacy-busy"), anyString(), any(Duration.class)))
-                .thenReturn(Optional.empty());
-
-        assertThat(handler.scanRunnableRuns(10)).isEmpty();
-        verify(legacyHandoff, never()).handOff(anyString());
-        verify(coordinationStore).deferHandoff(eq("run-legacy-busy"),
-                eq(RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE), any(), eq(0), eq(0L));
-        assertThat(handler.routingSnapshot()).containsEntry("legacyDeferredTotal", 1L);
-    }
-
-    @Test
-    void aLegacyRunTheOldEntryRefusesIsDeferredToo() {
-        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-legacy-stuck", "LEGACY")));
-        when(runMapper.findById("run-legacy-stuck")).thenReturn(run("run-legacy-stuck", "LEGACY"));
-        ownedByThisProcess("run-legacy-stuck");
-        when(legacyHandoff.handOff("run-legacy-stuck")).thenReturn(false);
-
-        handler.scanRunnableRuns(10);
-        verify(coordinationStore).deferHandoff(eq("run-legacy-stuck"),
-                eq(RunCoordinationDeferReason.SERVICE_OWNERSHIP_ELSEWHERE), any(), eq(0), eq(0L));
-        assertThat(handler.routingSnapshot())
-                .containsEntry("legacyHandedOffTotal", 0L)
-                .containsEntry("legacyDeferredTotal", 1L);
     }
 
     /**
@@ -285,22 +240,22 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
      */
     @Test
     void theOwnershipThisRoundActuallyHasIsWrittenBackToTheAdmissionRegistry() {
-        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-legacy", "LEGACY")));
-        when(runMapper.findById("run-legacy")).thenReturn(run("run-legacy", "LEGACY"));
-        ownedByThisProcess("run-legacy");
-        when(legacyHandoff.handOff("run-legacy")).thenReturn(true);
+        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-owned", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-owned")).thenReturn(run("run-owned", "DUAL_POOL_V2"));
+        when(admissionRegistry.isAdmitted("run-owned")).thenReturn(true);
+        ownedByThisProcess("run-owned");
 
         handler.scanRunnableRuns(10);
-        verify(admissionRegistry).bindFence("run-legacy", new ServiceOwnershipFence(TEST_INSTANCE, 1L));
+        verify(admissionRegistry).bindFence("run-owned", new ServiceOwnershipFence(TEST_INSTANCE, 1L));
 
         // 库里没有、这次现领一条：领到的代际（这里是 5）要写回，不能还留着上一轮的旧号。
-        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-fresh", "LEGACY")));
-        when(runMapper.findById("run-fresh")).thenReturn(run("run-fresh", "LEGACY"));
+        when(coordinationStore.scanDue(10)).thenReturn(List.of(candidate("run-fresh", "DUAL_POOL_V2")));
+        when(runMapper.findById("run-fresh")).thenReturn(run("run-fresh", "DUAL_POOL_V2"));
+        when(admissionRegistry.isAdmitted("run-fresh")).thenReturn(true);
         when(leaseStore.find("run-fresh")).thenReturn(Optional.empty());
         when(leaseStore.acquire(eq("run-fresh"), anyString(), any(Duration.class)))
                 .thenReturn(Optional.of(new RunServiceLease("run-fresh", TEST_INSTANCE, 5L,
                         OffsetDateTime.now(), OffsetDateTime.now(), OffsetDateTime.now().plusMinutes(2))));
-        when(legacyHandoff.handOff("run-fresh")).thenReturn(true);
 
         handler.scanRunnableRuns(10);
         verify(admissionRegistry).bindFence("run-fresh", new ServiceOwnershipFence(TEST_INSTANCE, 5L));
@@ -331,7 +286,6 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 .as("按主表路由：它走双池那一路")
                 .extracting(RunCoordinationHint::runId)
                 .containsExactly("run-mirror");
-        verify(legacyHandoff, never()).handOff(anyString());
     }
 
     @Test
@@ -463,9 +417,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                                                     AgentRunEventService events,
                                                     DualPoolSchedulerSettings settings) {
         ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
-        ObjectProvider<LegacyRunHandoff> handoffProvider = Mockito.mock(ObjectProvider.class);
         Mockito.lenient().when(identity.value()).thenReturn(TEST_INSTANCE);
-        Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
         runStateStore = Mockito.mock(AgentRunStateStore.class);
         finalizationService = Mockito.mock(AgentRunFinalizationService.class);
         return new DatabaseDualPoolWorkHandler(
@@ -485,7 +437,6 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 stateStore,
                 leaseStore,
                 identity,
-                handoffProvider,
                 settings,
                 ownership,
                 childRunIntents = Mockito.mock(ChildRunIntentStore.class),

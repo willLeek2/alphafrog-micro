@@ -166,6 +166,11 @@ public interface AgentRunMapper {
                             @Param("expectedStatus") AgentRunStatus expectedStatus,
                             @Param("lastError") String lastError);
 
+    /** LEGACY 调度删除后的启动一次性收口：非终态 LEGACY Run 条件写成 FAILED，天然幂等。 */
+    int failLegacyStartupClosure(@Param("id") String id,
+                                 @Param("userId") String userId,
+                                 @Param("lastError") String lastError);
+
     /** 查询仍有未结束旧版 Run 的部署代际；可恢复的 V2 Run 不因实例暂时缺席而失败。 */
     List<DeploymentGenerationRecord> listNonTerminalDeploymentGenerations(
             @Param("excludedDeploymentId") String excludedDeploymentId,
