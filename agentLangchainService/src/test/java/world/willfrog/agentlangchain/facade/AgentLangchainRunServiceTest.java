@@ -14,7 +14,7 @@ import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.control.LangchainRunRejectedException;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
@@ -36,11 +36,11 @@ class AgentLangchainRunServiceTest {
     @Mock
     private ObjectProvider<AgentRunEventService> eventServiceProvider;
     @Mock
-    private ObjectProvider<LangchainLinearRunPipeline> pipelineProvider;
+    private ObjectProvider<AgentRunPipeline> pipelineProvider;
     @Mock
     private AgentRunEventService eventService;
     @Mock
-    private LangchainLinearRunPipeline pipeline;
+    private AgentRunPipeline pipeline;
     @Mock
     private AgentRunMapper runMapper;
     @Mock

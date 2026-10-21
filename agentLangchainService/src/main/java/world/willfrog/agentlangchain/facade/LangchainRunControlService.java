@@ -19,7 +19,7 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agent.platform.wait.WaitGroup;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
@@ -63,7 +63,7 @@ import java.util.Map;
  *
  *
  * @see LangchainRunReadService 读路径，提供 requireWritableRun
- * @see LangchainLinearRunPipeline 异步执行入口
+ * @see AgentRunPipeline 异步执行入口
  * @see AgentRunObservabilityService observability 落盘
  */
 @Service
@@ -76,7 +76,7 @@ public class LangchainRunControlService {
     private final AgentRunEventService agentEventService;
     private final AgentRunStateStore stateStore;
     private final AgentRunObservabilityService agentObservabilityService;
-    private final LangchainLinearRunPipeline pipeline;
+    private final AgentRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
     private final AgentRunFinalizationService finalizationService;

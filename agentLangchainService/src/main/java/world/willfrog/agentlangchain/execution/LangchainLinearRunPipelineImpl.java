@@ -56,9 +56,9 @@ import java.time.OffsetDateTime;
  * <p>一次 AgentRun 从创建后到完成/失败落库的主线：
  * 先恢复 run 记录和运行上下文，再解析 planning（规划）、execution（执行）、
  * final answer（最终答案）三个阶段要用的模型，接着调用 {@link LangchainAiPlanner}
- * 生成 todo（任务项）计划，之后根据计划选择
- * {@link LangchainLinearWorkflowExecutor} 或 {@link LangchainDagWorkflowExecutor} 执行，
- * 最后把答案、事件、运行快照和可观测数据写回共享存储。</p>
+ * 生成 todo（任务项）计划；节点执行由双池协调循环驱动（本类只承载双池的准备、
+ * 收尾与事件合同方法，不再有自己的执行入口），最后把答案、事件、运行快照和
+ * 可观测数据写回共享存储。</p>
  * <p>这个类本身不直接和大模型对话，也不直接执行工具；它负责把“模型、prompt、工具目录、
  * 状态机、可观测性、取消/暂停控制”串成一个完整业务流程。具体规划逻辑在
  * {@link LangchainAiPlanner}，单个 todo 的工具循环在 {@link LangchainTodoNodeExecutor}。</p>
@@ -71,7 +71,7 @@ import java.time.OffsetDateTime;
  */
 @Service
 @Slf4j
-public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipeline {
+public class LangchainLinearRunPipelineImpl implements AgentRunPipeline {
 
     private final LangchainAiPlanner planner;
     private final LangchainRunStageModelResolver stageModelResolver;
@@ -643,8 +643,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * 恢复场景的冻结计划解析（{@link #resolvePlan} 的兄弟方法，双池规划回合在
      * resumeFromFrozenPlan 标记下改走这里）：只读数据库里的冻结 plan，绝不调规划器——
      * 恢复后重新规划可能重复副作用，且已完成节点的成果已保留在旧代际工作项里。
-     * 三件套范本沿自 LEGACY 冻结重启（FrozenPlanRestartPipeline.resolvePlan，随 LEGACY
-     * 删除退役）：读冻结 plan ＋ {@link ExecutionModeResolver#inspectFrozen} 只读裁模式 ＋
+     * 三件套范本沿自已删除的 LEGACY 冻结重启路径（原 FrozenPlanRestartPipeline.resolvePlan，
+     * 随 LEGACY 调度删除退役）：读冻结 plan ＋ {@link ExecutionModeResolver#inspectFrozen} 只读裁模式 ＋
      * {@link LangchainWorkflowRouting#validateFrozenPlan} 校验；检查点侧照范本走
      * parse/validate、从不 initialize（「plan_json 有、检查点缺」的崩溃窗口行为继承范本
      * 既有处理）。planOverride 在两条路径下都保持纯展示（resolvePlan 从不读它）。

@@ -10,7 +10,7 @@ import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.acceptance.AcceptanceControlGate;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureGate;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
@@ -29,7 +29,7 @@ public class AgentLangchainRunService {
     private static final int ADMIN_USER_TYPE = 1127;
 
     private final ObjectProvider<AgentRunEventService> agentEventServiceProvider;
-    private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
+    private final ObjectProvider<AgentRunPipeline> linearRunPipelineProvider;
     private final AgentRunMapper runMapper;
     private final AgentCreditService creditService;
     private final UserDao userDao;
@@ -68,7 +68,7 @@ public class AgentLangchainRunService {
         acceptanceControlGate.admitRequestContext(
                 request.getContextJson(), deploymentIdentity.deploymentId(), deploymentIdentity.generationId());
 
-        LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
+        AgentRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
         AgentRun run = null;
         boolean createdNow = false;
         // 版本在创建前选择并写进 Run。LEGACY 已不再发给新 Run（versionForNewRun 显式拒绝），

@@ -2,7 +2,7 @@ package world.willfrog.agentlangchain.control;
 
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 
 @Component
 public class AgentLangchainOrchestrator {
@@ -11,9 +11,9 @@ public class AgentLangchainOrchestrator {
     public static final String PROVIDER_DISABLED = "PROVIDER_DISABLED";
     public static final String LINEAR_PIPELINE_UNAVAILABLE = "LINEAR_PIPELINE_UNAVAILABLE";
 
-    private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
+    private final ObjectProvider<AgentRunPipeline> linearRunPipelineProvider;
 
-    public AgentLangchainOrchestrator(ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider) {
+    public AgentLangchainOrchestrator(ObjectProvider<AgentRunPipeline> linearRunPipelineProvider) {
         this.linearRunPipelineProvider = linearRunPipelineProvider;
     }
 

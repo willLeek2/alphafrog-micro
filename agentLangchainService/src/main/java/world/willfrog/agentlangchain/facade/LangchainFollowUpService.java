@@ -12,7 +12,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
@@ -31,7 +31,7 @@ public class LangchainFollowUpService {
     private final AgentRunEventService agentEventService;
     private final AgentMessageService messageService;
     private final AgentRunStateStore stateStore;
-    private final LangchainLinearRunPipeline pipeline;
+    private final AgentRunPipeline pipeline;
     private final RunOwnershipGateway ownershipGateway;
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)

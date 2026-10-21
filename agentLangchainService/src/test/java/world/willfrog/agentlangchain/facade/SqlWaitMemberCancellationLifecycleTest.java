@@ -32,7 +32,7 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
-import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.AgentRunPipeline;
 import world.willfrog.agentlangchain.facade.LangchainRunControlService;
 import world.willfrog.agentlangchain.facade.LangchainRunReadService;
 import world.willfrog.agentlangchain.gateway.GatewayTestFixtures;
@@ -489,7 +489,7 @@ class SqlWaitMemberCancellationLifecycleTest {
         final ReentrantLock runRowLock = new ReentrantLock();
         final ThreadLocal<Boolean> recoveryTransaction = ThreadLocal.withInitial(() -> false);
         boolean createNodeOnLaunch;
-        final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
+        final AgentRunPipeline pipeline = mock(AgentRunPipeline.class);
         final AgentRunEventService events = mock(AgentRunEventService.class);
         final AgentRunFinalizationService finalization = mock(AgentRunFinalizationService.class);
         final ToolJobResumeService resume = mock(ToolJobResumeService.class);

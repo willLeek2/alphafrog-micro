@@ -23,7 +23,7 @@ import java.util.function.Consumer;
 @Primary
 @Component
 @Slf4j
-public class DualPoolRunPipeline implements LangchainLinearRunPipeline {
+public class DualPoolRunPipeline implements AgentRunPipeline {
 
     private final DualPoolDispatcher dispatcher;
     private final DualPoolRunAdmissionRegistry admissionRegistry;

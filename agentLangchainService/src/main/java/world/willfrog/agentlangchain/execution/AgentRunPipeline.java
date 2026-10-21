@@ -4,9 +4,10 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 
 /**
- * P1 linear execution hook implemented by Codex B1 ({@code sequenceBuilder} path).
+ * AgentRun 的异步执行入口：现由双池管线（{@link DualPoolRunPipeline}）实现，
+ * 启动、冻结重启与长工具恢复的接口形状都定义在这里。
  */
-public interface LangchainLinearRunPipeline {
+public interface AgentRunPipeline {
 
     void launchAsync(AgentRun run);
 
