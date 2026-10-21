@@ -297,6 +297,10 @@ class SandboxConfig:
     standard_memory_limit_bytes: int = 512 * 1024 * 1024
     heavy_memory_limit_bytes: int = 1536 * 1024 * 1024
     queue_wait_timeout_seconds: float = 30.0
+    # Read-back metadata for GET /health only: "env" when
+    # AF_SANDBOX_QUEUE_WAIT_TIMEOUT was present at startup, "default"
+    # otherwise. Purely informational — no execution logic branches on it.
+    queue_wait_timeout_source: str = "default"
     usage_sampling_interval_millis: int = 200
     task_store_path: Path = Path("/data/sandbox_tasks/state.json")
     # D13 (26Q3): bounded acceptance queue. create rejects with HTTP 503
@@ -538,7 +542,13 @@ def load_config() -> SandboxConfig:
     compat_input_path_enabled = _parse_bool(os.getenv("AF_SANDBOX_COMPAT_INPUT_PATH"), default=True)
     standard_memory_limit_bytes = int(os.getenv("AF_SANDBOX_STANDARD_MEMORY_BYTES", str(512 * 1024 * 1024)))
     heavy_memory_limit_bytes = int(os.getenv("AF_SANDBOX_HEAVY_MEMORY_BYTES", str(1536 * 1024 * 1024)))
-    queue_wait_timeout_seconds = float(os.getenv("AF_SANDBOX_QUEUE_WAIT_TIMEOUT", "30"))
+    # The queue-wait timeout is frozen at startup either way; the source tag
+    # only records whether the env variable was present, for /health read-back.
+    queue_wait_timeout_env = os.getenv("AF_SANDBOX_QUEUE_WAIT_TIMEOUT")
+    queue_wait_timeout_seconds = (
+        float(queue_wait_timeout_env) if queue_wait_timeout_env is not None else 30.0
+    )
+    queue_wait_timeout_source = "env" if queue_wait_timeout_env is not None else "default"
     usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
     task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
     queue_max_size = int(os.getenv("AF_SANDBOX_QUEUE_MAX_SIZE", "128"))
@@ -710,6 +720,7 @@ def load_config() -> SandboxConfig:
         standard_memory_limit_bytes=standard_memory_limit_bytes,
         heavy_memory_limit_bytes=heavy_memory_limit_bytes,
         queue_wait_timeout_seconds=queue_wait_timeout_seconds,
+        queue_wait_timeout_source=queue_wait_timeout_source,
         usage_sampling_interval_millis=usage_sampling_interval_millis,
         task_store_path=task_store_path,
         queue_max_size=queue_max_size,
