@@ -14,7 +14,9 @@ import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.tooljob.WaitMemberResultReceiver;
+import world.willfrog.agentlangchain.workspace.PythonWorkspaceRetentionCoordinator;
 import world.willfrog.agent.platform.capacity.SchedulerBackpressureProbe;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 
 import java.util.Map;
 
@@ -65,6 +67,14 @@ class AgentLangchainHealthControllerTest {
 
     @MockBean
     private WaitMemberResultReceiver waitMemberResultReceiver;
+
+    // 控制器为 /sandbox-governance 回读端点新增了两个构造器入参
+    // （工作区保留协调器、运行事件服务），装配替身需一并对上。
+    @MockBean
+    private PythonWorkspaceRetentionCoordinator retentionCoordinator;
+
+    @MockBean
+    private AgentRunEventService runEventService;
 
     @Test
     void healthReportsProviderDisabledWithoutReadinessAlert() throws Exception {
