@@ -3,7 +3,7 @@
 运行方式（Maven 不会执行本文件）：
     conda run -n alphafrog python agentToolsShared/src/test/python/sandboxjob/test_duckdb_query_runner.py
 
-覆盖：估计行数解析、引擎锁定、只读白名单、数据集挂载（CSV/Parquet）、文本级禁令
+覆盖：估计行数解析、引擎锁定、只读白名单、数据集挂载（CSV/JSON；Parquet 本版本禁用、含挂载拒绝断言）、文本级禁令
 （多语句/ATTACH/字符串字面量里的分号不误伤）、EXPLAIN 准入（笛卡尔积/无界全局排序/
 估计行数超档；有界排序与小的混合排序放行）、语句超时中断与信封错误码、日期/小数/
 二进制类型的序列化、超大结果的体积守卫、端到端信封。
@@ -53,9 +53,16 @@ small_csv = MOUNT / "small.csv"
 duckdb.execute(
     f"COPY (SELECT range AS id, range * 2 AS val FROM range(150)) TO '{small_csv}' (HEADER)"
 ).fetchall()
-big_parquet = MOUNT / "big.parquet"
+big_csv = MOUNT / "big.csv"
 duckdb.execute(
-    f"COPY (SELECT range AS id FROM range(300000)) TO '{big_parquet}' (FORMAT PARQUET)"
+    f"COPY (SELECT range AS id FROM range(300000)) TO '{big_csv}' (HEADER)"
+).fetchall()
+# 真实有效的 Parquet 文件：旧版本能成功挂载它，禁用后对它必须明确拒绝——
+# 用 CSV 冒充 parquet 证明不了禁用生效（旧版本 read_parquet 读 CSV 内容同样失败），
+# 只有「本可挂载的有效输入被明确拒绝」才是禁用生效的证据。
+small_parquet = MOUNT / "small_real.parquet"
+duckdb.execute(
+    f"COPY (SELECT range AS id, range * 2 AS val FROM range(150)) TO '{small_parquet}' (FORMAT PARQUET)"
 ).fetchall()
 typed_csv = MOUNT / "typed.csv"
 duckdb.execute(
@@ -81,7 +88,7 @@ spec_base = {
 # ---------- 单元级 ----------
 # 估计行数来自 EXPLAIN (FORMAT JSON) 的 extra_info（字符串值；有界/聚合算子不给）
 plan_tree_sample = [{"name": "PROJECTION", "extra_info": {"Estimated Cardinality": "20000"},
-                     "children": [{"name": "READ_PARQUET",
+                     "children": [{"name": "READ_CSV",
                                    "extra_info": {"Estimated Cardinality": "1,234,567"}}]}]
 _max_est = max((e for e in (runner._node_estimated_rows(n)
                             for r in plan_tree_sample for n in runner._walk(r))
@@ -115,11 +122,11 @@ check("lock blocks widening allowed_directories", blocked_reopen)
 # row_count/columns 即生产规格里 Java 侧元数据下发的字段（真实行数与列清单），
 # 门的估计口径统一靠它换算。归属按「投影列集合被唯一数据集列集合覆盖」判定：
 # t1 投影出的 {id,val} 只被 t1 覆盖（可归属）；t2 投影出的 {id} 同时被 t1、t2
-# 覆盖（非唯一，回落引擎估计——Parquet 引擎值本取脚注真实行数，回落不改结论）。
+# 覆盖（非唯一，回落引擎估计——CSV 引擎值按文件字节数猜基数，与真实行数有偏差）。
 spec_two = {**spec_base, "datasets": [
     {"alias": "t1", "path": str(MOUNT / "_run_dataset_1" / "small.csv"),
      "row_count": 150, "columns": ["id", "val"]},
-    {"alias": "t2", "path": str(MOUNT / "_run_dataset_2" / "big.parquet"),
+    {"alias": "t2", "path": str(MOUNT / "_run_dataset_2" / "big.csv"),
      "row_count": 300000, "columns": ["id"]},
 ]}
 # 按生产路径形态摆数据：mount_dir 下的 _run_dataset_<n>/<filename>
@@ -127,14 +134,12 @@ spec_two = {**spec_base, "datasets": [
 (MOUNT / "_run_dataset_2").mkdir(exist_ok=True)
 import shutil  # noqa: E402
 shutil.copy(small_csv, MOUNT / "_run_dataset_1" / "small.csv")
-shutil.copy(big_parquet, MOUNT / "_run_dataset_2" / "big.parquet")
+shutil.copy(big_csv, MOUNT / "_run_dataset_2" / "big.csv")
 
 con2 = runner.configure_engine(spec_two)
 mounted = runner.mount_datasets(con2, spec_two)
 n = con2.execute("SELECT count(*) FROM t1").fetchone()[0]
 check("mount csv view t1 (external access off + whitelist)", n == 150, f"count={n}")
-n2 = con2.execute("SELECT count(*) FROM t2").fetchone()[0]
-check("mount parquet view t2 (external access off + whitelist)", n2 == 300000, f"count={n2}")
 
 # 内存外溢：临时目录在挂载目录之外且是 duckdb 自己写文件，不应被 external access 关闭影响。
 spill_spec = {**spec_base,
@@ -144,7 +149,7 @@ spill_ok = True
 spill_detail = ""
 try:
     con_spill.execute(
-        f"CREATE VIEW t2 AS SELECT * FROM read_parquet('{big_parquet}')")
+        f"CREATE VIEW t2 AS SELECT * FROM read_csv('{big_csv}', header=true, auto_detect=true)")
     got = con_spill.execute(
         "SELECT count(*) FROM (SELECT id, md5(id::VARCHAR) AS h FROM t2 ORDER BY h LIMIT 1000)"
     ).fetchone()[0]
@@ -214,11 +219,16 @@ check("gate rejects big inner sort via estimated-rows cap", ok, detail)
 # （比估计行数规则先触发，给出可操作的 PLAN_FULL_SCAN）。
 ok, detail = gate_expect_reject(con2, "SELECT * FROM t2", spec_two, "PLAN_FULL_SCAN")
 check("gate rejects unbounded dump via top-output rule (300k>100)", ok, detail)
-# 顶层规则对过滤查询不拦（「无过滤全表扫描」的关键在「整表」）：大表过滤后放行——
-# Parquet 的过滤下推进扫描框（内嵌 Filters 键），CSV 的过滤是独立 FILTER 算子，两个信号都算数。
-ok, _report = runner.gate(con2, "SELECT * FROM t2 WHERE id < 100", "INTERACTIVE", spec_two)
-check("gate passes filtered big scan (parquet in-scan Filters)",
-      ok and _report.get("estimate_source") == "engine"
+# 顶层规则对过滤查询不拦（「无过滤全表扫描」的关键在「整表」）：大表过滤后放行。
+# 本条在只挂 t2 的规格下跑：投影 {id} 唯一归属，断统一口径——独立 FILTER 形态下
+# 该表贡献折为真实行数乘 0.2（300000×0.2=60000），FILTER 节点不再进中间算子取大。
+# （原 Parquet 下推形态场景随禁用撤销；CSV 不产生扫描框内嵌 Filters 键。）
+spec_t2_only = {**spec_base, "datasets": [spec_two["datasets"][1]]}
+con2b = runner.configure_engine(spec_t2_only)
+runner.mount_datasets(con2b, spec_t2_only)
+ok, _report = runner.gate(con2b, "SELECT * FROM t2 WHERE id < 100", "INTERACTIVE", spec_t2_only)
+check("gate passes filtered big scan (csv FILTER operator, unified)",
+      ok and _report.get("estimate_source") == "unified"
       and _report["estimated_rows_max"] == 60000,
       f"source={_report.get('estimate_source')} est={_report.get('estimated_rows_max')}")
 ok, _report = runner.gate(con2, "SELECT * FROM t1 WHERE id < 10", "INTERACTIVE", spec_two)
@@ -226,12 +236,12 @@ check("gate passes filtered small scan (csv FILTER operator)",
       ok and _report.get("estimate_source") == "unified"
       and _report["estimated_rows_max"] == 30,
       f"source={_report.get('estimate_source')} est={_report.get('estimated_rows_max')}")
-# 顶层白名单：聚合顶层直接放行（count(*) 在 Parquet 上甚至是元数据扫描——
-# 计划里没有数据集扫描算子，估计来源记 engine 属预期边界）。
-ok, _report = runner.gate(con2, "SELECT count(*) FROM t2", "INTERACTIVE", spec_two)
-check("gate passes count(*) (aggregate top whitelisted)",
-      ok and _report.get("estimate_source") == "engine",
-      f"source={_report.get('estimate_source')}")
+# CSV 大表 count(*)：顶层聚合白名单不拦，但估计行数规则会拦——t2 归属不上回落引擎，
+# CSV 字节猜测基数约 39.8 万超 20 万档。Parquet 时代这条放行靠的是元数据扫描特性
+# （计划里没有数据集扫描算子），随禁用消失；白名单放行由小表用例（case csv_count）继续覆盖。
+ok, detail = gate_expect_reject(con2, "SELECT count(*) FROM t2", spec_two,
+                                "PLAN_ESTIMATED_ROWS_OVER_CAP")
+check("gate rejects big csv count(*) via estimated-rows cap (fallback engine guess)", ok, detail)
 # 顶层有界但扫描超估计行数档：BACKGROUND 档上限放宽到 600k 后放行。
 spec_two_bg = {**spec_two, "tier": "BACKGROUND", "limits": LIMITS_BG}
 ok_bg, report_bg = runner.gate(con2, "SELECT * FROM t2 LIMIT 5", "BACKGROUND", spec_two_bg)
@@ -253,7 +263,9 @@ check("gate falls back to legacy cap when estimated_row_cap absent (300k>200k)",
 # ---------- 固定用例集（错拒率统计：每次改动必跑，验收以此为准） ----------
 # 标签按最终口径：结构规则专用码优先（笛卡尔积、无界排序），规模规则在后
 # （顶层输出规模 PLAN_FULL_SCAN -> 各算子估计行数对照档位上限）。
-# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于基线 0/13，
+# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于 0/11
+# （Parquet 停用迁移后应放总数 13 减 2：csv_filtered_big_fallback 与 big_csv_count
+# 由放转拒。0/11 是迁移后样本口径，不代表原 0/13 基线得到改善）。
 # 漏放（应拒被放）必须为 0。基线数字见 C4 验收说明。
 mid_csv = MOUNT / "mid.csv"
 duckdb.execute(
@@ -264,7 +276,7 @@ duckdb.execute(
 CASE_SPEC = {**spec_base, "datasets": [
     {"alias": "t1", "path": str(MOUNT / "small.csv"), "format": "csv",
      "row_count": 150, "columns": ["id", "val"]},
-    {"alias": "t2", "path": str(MOUNT / "big.parquet"), "format": "parquet",
+    {"alias": "t2", "path": str(MOUNT / "big.csv"), "format": "csv",
      "row_count": 300000, "columns": ["id"]},
     {"alias": "t3", "path": str(MOUNT / "mid.csv"), "format": "csv",
      "row_count": 5000, "columns": ["id", "val"]},
@@ -273,7 +285,7 @@ CASE_SPEC = {**spec_base, "datasets": [
 CASE_SET = [
     ("csv_filtered_small", "SELECT * FROM t1 WHERE id < 10", "I", "放", None, "顶层 FILTER 估计 ≤ row_cap"),
     ("csv_limit_preview", "SELECT * FROM t1 LIMIT 100", "I", "放", None, "顶层 STREAMING_LIMIT 白名单"),
-    ("parquet_count", "SELECT count(*) FROM t2", "I", "放", None, "聚合顶层白名单（Parquet 元数据扫描）"),
+    ("big_csv_count", "SELECT count(*) FROM t2", "I", "拒", "PLAN_ESTIMATED_ROWS_OVER_CAP", "聚合顶层白名单不拦、估计规则拦：回落引擎字节猜测约 39.8 万 > 20 万档"),
     ("csv_count", "SELECT count(*) FROM t1", "I", "放", None, "聚合顶层白名单（CSV 真实全扫但顶层收敛）"),
     ("big_limit5_bg", "SELECT * FROM t2 LIMIT 5", "B", "放", None, "顶层有界 + 估计 300k ≤ 后台档 600k"),
     ("topn_bounded", "SELECT * FROM t1 ORDER BY id LIMIT 5", "I", "放", None, "ORDER_BY 有 TOP_N 祖先"),
@@ -283,8 +295,8 @@ CASE_SET = [
     ("literal_no_false_positive", "SELECT ';' AS s, 'ATTACH' AS k FROM t1 LIMIT 1", "I", "放", None, "文本禁令不误伤字面量"),
     ("recursive_cte", "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r WHERE x < 500) SELECT count(*) FROM r", "I", "放", None, "聚合顶层；慢归超时管不归准入管"),
     ("derived_small_inner_sort", "SELECT * FROM (SELECT * FROM t1 WHERE id < 50 ORDER BY id) sub ORDER BY id LIMIT 5", "I", "放", None, "TOP_N 祖先 + 小内层"),
-    ("big_unfiltered_dump", "SELECT * FROM t2", "I", "拒", "PLAN_FULL_SCAN", "顶层 READ_PARQUET 估计 300k > 100"),
-    ("parquet_filtered_big", "SELECT * FROM t2 WHERE id < 100", "I", "放", None, "计划级过滤信号（扫描框内嵌 Filters 键）；过滤查询顶层规则不拦"),
+    ("big_unfiltered_dump", "SELECT * FROM t2", "I", "拒", "PLAN_FULL_SCAN", "顶层 READ_CSV 估计（字节猜测）> 100"),
+    ("csv_filtered_big_fallback", "SELECT * FROM t2 WHERE id < 100", "I", "拒", "PLAN_ESTIMATED_ROWS_OVER_CAP", "三数据集列集合互覆盖使 t2 回落引擎；CSV 字节猜测基数（约 39.8 万）超 20 万档——回落路径的固有保守，统一口径的对照见上文 spec_t2_only 用例"),
     ("csv_unbounded_dump", "SELECT * FROM t1", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 ~103 > 100"),
     ("window_unbounded", "SELECT id, row_number() OVER (ORDER BY id) rn FROM t1", "I", "拒", "PLAN_FULL_SCAN", "顶层 PROJECTION 估计 ~104 > 100"),
     ("mid_unbounded_dump", "SELECT * FROM t3", "I", "拒", "PLAN_FULL_SCAN", "顶层估计 ~5k > 100（估计行数规则不拒，顶层规则独立价值）"),
@@ -313,7 +325,7 @@ for name, sql, tier, expect, expect_code, rule in CASE_SET:
         case_ok, detail = gate_expect_reject(case_con, sql, case_spec, expect_code)
         check(f"case {name} ({rule})", case_ok, detail)
         case_false_allow += 0 if case_ok else 1
-check("case-set false-reject rate at baseline (0/13)", case_false_reject == 0,
+check("case-set false-reject rate at baseline (0/11)", case_false_reject == 0,
       f"false_reject={case_false_reject}")
 check("case-set false-allow is zero", case_false_allow == 0, f"false_allow={case_false_allow}")
 case_con.close()
@@ -398,6 +410,20 @@ run_e2e("reject_attach", {
     "sql": "ATTACH ':memory:' AS x",
     "datasets": ds_t1,
 }, "PLAN_REJECTED", lambda e: (e["error"]["code"] == "PLAN_FORBIDDEN_STATEMENT", e["error"]["code"]))
+
+# Parquet 停用生效证据：有效 Parquet 输入（旧版本可成功挂载）在挂载阶段被明确
+# 拒绝，信封 stage=mount、错误码 DATASET_MOUNT_FAILED、原因写明格式已停用且点名别名。
+(MOUNT / "_run_dataset_4").mkdir(exist_ok=True)
+shutil.copy(small_parquet, MOUNT / "_run_dataset_4" / "real.parquet")
+run_e2e("reject_parquet_disabled", {
+    **spec_base,
+    "sql": "SELECT * FROM t9 WHERE id < 5",
+    "datasets": [{"alias": "t9", "path": str(MOUNT / "_run_dataset_4" / "real.parquet"),
+                  "format": "parquet", "row_count": 150, "columns": ["id", "val"]}],
+}, "FAILED", lambda e: (e.get("stage") == "mount"
+                        and e["error"]["code"] == "DATASET_MOUNT_FAILED"
+                        and "disabled" in e["error"]["message"] and "t9" in e["error"]["message"],
+                        f"stage={e.get('stage')} code={e['error']['code']} msg={e['error']['message'][:100]}"))
 
 run_e2e("bad_sql", {
     **spec_base,

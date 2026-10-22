@@ -261,7 +261,7 @@ class SqlQueryToolsTest {
         assertEquals("/sandbox/input/_run_dataset_1/daily.csv", mounts.get(0).path("path").asText());
         assertEquals("csv", mounts.get(0).path("format").asText());
         assertEquals("t2", mounts.get(1).path("alias").asText());
-        assertEquals("parquet", mounts.get(1).path("format").asText());
+        assertEquals("json", mounts.get(1).path("format").asText());
         // row_count 随规格下发供门统一估计口径；这两条构造条目没有真实元数据，
         // 字段为 null，运行器对空值按旧规格回落引擎估计。
         assertTrue(mounts.get(0).has("row_count"));
@@ -422,14 +422,14 @@ class SqlQueryToolsTest {
         return new SandboxTerminalResultView(status, exitCode, stdout, stderr, null, null, null, null, null, null);
     }
 
-    /** 构造两条 run 级数据集条目（1=CSV，2=Parquet）。 */
+    /** 构造两条 run 级数据集条目（1=CSV，2=JSON；Parquet 本版本禁用，见运行器挂载分支）。 */
     private static final class AgentRunDatasetEntryBuilder {
         List<world.willfrog.agent.workflow.AgentRunDatasetEntry> two() {
             return List.of(
                     world.willfrog.agent.workflow.AgentRunDatasetEntry.forDataset(
                             1, "ds-1", "/persisted/ds-1", "000001.SZ", "daily.csv"),
                     world.willfrog.agent.workflow.AgentRunDatasetEntry.forDataset(
-                            2, "ds-2", "/persisted/ds-2", "000002.SZ", "weekly.parquet"));
+                            2, "ds-2", "/persisted/ds-2", "000002.SZ", "weekly.json"));
         }
     }
 }
