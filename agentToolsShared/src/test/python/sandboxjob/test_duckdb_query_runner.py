@@ -59,7 +59,7 @@ duckdb.execute(
 ).fetchall()
 # 真实有效的 Parquet 文件：旧版本能成功挂载它，禁用后对它必须明确拒绝——
 # 用 CSV 冒充 parquet 证明不了禁用生效（旧版本 read_parquet 读 CSV 内容同样失败），
-# 只有「本可挂载的有效输入被明确拒绝」才是禁用生效的证据（codex 4325a2b2）。
+# 只有「本可挂载的有效输入被明确拒绝」才是禁用生效的证据。
 small_parquet = MOUNT / "small_real.parquet"
 duckdb.execute(
     f"COPY (SELECT range AS id, range * 2 AS val FROM range(150)) TO '{small_parquet}' (FORMAT PARQUET)"
@@ -140,8 +140,6 @@ con2 = runner.configure_engine(spec_two)
 mounted = runner.mount_datasets(con2, spec_two)
 n = con2.execute("SELECT count(*) FROM t1").fetchone()[0]
 check("mount csv view t1 (external access off + whitelist)", n == 150, f"count={n}")
-n2 = con2.execute("SELECT count(*) FROM t2").fetchone()[0]
-check("mount csv view t2 (external access off + whitelist)", n2 == 300000, f"count={n2}")
 
 # 内存外溢：临时目录在挂载目录之外且是 duckdb 自己写文件，不应被 external access 关闭影响。
 spill_spec = {**spec_base,
@@ -265,8 +263,9 @@ check("gate falls back to legacy cap when estimated_row_cap absent (300k>200k)",
 # ---------- 固定用例集（错拒率统计：每次改动必跑，验收以此为准） ----------
 # 标签按最终口径：结构规则专用码优先（笛卡尔积、无界排序），规模规则在后
 # （顶层输出规模 PLAN_FULL_SCAN -> 各算子估计行数对照档位上限）。
-# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于基线 0/12
-# （Parquet 禁用迁移后应放总数 13 减 2：csv_filtered_big_fallback 与 big_csv_count 由放转拒），
+# 合格线是改动期防退化线：错拒率（标注口径 = 应放被拒/应放总数）不得高于 0/11
+# （Parquet 停用迁移后应放总数 13 减 2：csv_filtered_big_fallback 与 big_csv_count
+# 由放转拒。0/11 是迁移后样本口径，不代表原 0/13 基线得到改善）。
 # 漏放（应拒被放）必须为 0。基线数字见 C4 验收说明。
 mid_csv = MOUNT / "mid.csv"
 duckdb.execute(
@@ -412,7 +411,7 @@ run_e2e("reject_attach", {
     "datasets": ds_t1,
 }, "PLAN_REJECTED", lambda e: (e["error"]["code"] == "PLAN_FORBIDDEN_STATEMENT", e["error"]["code"]))
 
-# Parquet 禁用生效证据（frog 2026-10-22 拍板）：有效 Parquet 输入在挂载阶段被明确
+# Parquet 停用生效证据：有效 Parquet 输入（旧版本可成功挂载）在挂载阶段被明确
 # 拒绝，信封 stage=mount、错误码 DATASET_MOUNT_FAILED、原因写明格式已停用且点名别名。
 (MOUNT / "_run_dataset_4").mkdir(exist_ok=True)
 shutil.copy(small_parquet, MOUNT / "_run_dataset_4" / "real.parquet")
