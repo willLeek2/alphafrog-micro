@@ -119,7 +119,12 @@ def mount_datasets(con, spec):
         path = resolved_path.replace("'", "''")
         fmt = str(entry.get("format") or os.path.splitext(resolved_path)[1].lstrip(".")).lower()
         if fmt == "parquet":
-            read = f"read_parquet('{path}')"
+            # Parquet 挂载本版本停用：全项目无生产者、当前版本亦无需求产出该格式（人类拍板）。
+            # 错误信息带别名、路径与格式，便于调用方把该数据集从 dataset_ids 去掉后重试。
+            # 恢复支持只需把本分支改回 read_parquet 挂载；gate 的双形态识别等下游代码保留为不可达。
+            raise ValueError(
+                f"dataset {alias!r} ({resolved_path}) is parquet, which is disabled in this version; "
+                "remove it from dataset_ids and retry with csv/json datasets")
         elif fmt == "json":
             from pathlib import Path
             from af_dataset_loader import read_dataset_file
