@@ -77,6 +77,17 @@ public final class StructuredPlanningSupport {
             if (dependsOnNode != null && !dependsOnNode.isArray()) {
                 return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_depends_on@" + index);
             }
+            JsonNode expectedToolsNode = itemNode.get("expectedTools");
+            if (expectedToolsNode != null) {
+                if (!expectedToolsNode.isArray()) {
+                    return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_expected_tools@" + index);
+                }
+                for (JsonNode toolName : expectedToolsNode) {
+                    if (!toolName.isTextual()) {
+                        return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_expected_tool@" + index);
+                    }
+                }
+            }
             JsonNode groupKeyNode = itemNode.get("groupKey");
             if (groupKeyNode != null && !groupKeyNode.isTextual()) {
                 return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_group_key@" + index);
@@ -214,6 +225,11 @@ public final class StructuredPlanningSupport {
                                                 "dependsOn", Map.of(
                                                         "type", "array",
                                                         "description", "依赖的todoId列表（DAG模式下可选）",
+                                                        "items", Map.of("type", "string")
+                                                ),
+                                                "expectedTools", Map.of(
+                                                        "type", "array",
+                                                        "description", "预计可能使用的工具名，可省略或为空；不限制执行选择",
                                                         "items", Map.of("type", "string")
                                                 ),
                                                 "groupKey", Map.of(

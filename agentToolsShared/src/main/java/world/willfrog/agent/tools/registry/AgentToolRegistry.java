@@ -62,6 +62,41 @@ public final class AgentToolRegistry {
         NONE, MARKET_ADVANCED, PARALLEL_LIMITS, MANUAL_FINANCE, MANUAL_SUB_AGENT
     }
 
+    /** 检查依据和实际引用目标；没有检查入口的类别明确保留未知。 */
+    public enum Dependency {
+        MARKET_STOCK("market.stock.reference", "股票服务引用", "DomesticStockService", "marketDomesticStockService"),
+        MARKET_FUND("market.fund.reference", "基金服务引用", "DomesticFundService", "marketDomesticFundService"),
+        MARKET_INDEX("market.index.reference", "指数服务引用", "DomesticIndexService", "marketDomesticIndexService"),
+        MARKET_LISTED("market.listed.reference", "场内资产服务引用", "DomesticListedAssetService", "marketDomesticListedAssetService"),
+        EXTERNAL_INFO("external-info.reference", "外部信息服务引用", "world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService", null),
+        SANDBOX_GATEWAY("sandbox.gateway.reference", "沙箱网关服务引用", "world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService", null),
+        MARKET_TARGET("market.target", "行情查询目标", null, null),
+        INDUSTRY_DATABASE("industry.database", "行业数据查询", null, null),
+        SEARCH_BACKEND("search.backend", "搜索或检索后端", null, null),
+        SANDBOX_EXECUTOR("sandbox.executor", "实际沙箱执行器", null, null),
+        DOCUMENT_TARGET("document.target", "文档地址", null, null),
+        ADJ_FACTOR_CONFIG("market.adj-factor.config", "ETF复权因子开关", null, null),
+        EXECUTION_MODEL("execution.model.config", "执行阶段模型配置", null, null);
+
+        private final String id;
+        private final String label;
+        private final String interfaceName;
+        private final String referenceBeanName;
+
+        Dependency(String id, String label, String interfaceName, String referenceBeanName) {
+            this.id = id;
+            this.label = label;
+            this.interfaceName = interfaceName != null && !interfaceName.contains(".")
+                    ? "world.willfrog.alphafrogmicro.domestic.idl." + interfaceName : interfaceName;
+            this.referenceBeanName = referenceBeanName;
+        }
+
+        public String id() { return id; }
+        public String label() { return label; }
+        public String interfaceName() { return interfaceName; }
+        public String referenceBeanName() { return referenceBeanName; }
+    }
+
     /**
      * 单条工具声明。{@code compressionExemptionReason} 仅当 compression=EXEMPT 时必填，
      * 其余取值必须为 null，防止「静默缺席」与「理由泛滥」两种漂移。
@@ -76,7 +111,8 @@ public final class AgentToolRegistry {
             Set<ParallelGroup> parallelGroups,
             BatchCountKeys batchCountKeys,
             CanonicalSpec canonicalSpec,
-            String beanClassName) {
+            String beanClassName,
+            Set<Dependency> dependencies) {
 
         public ToolDeclaration {
             if (name == null || name.isBlank()) {
@@ -90,84 +126,96 @@ public final class AgentToolRegistry {
                 throw new IllegalArgumentException("compressionExemptionReason only allowed for EXEMPT: " + name);
             }
             parallelGroups = parallelGroups == null ? Set.of() : Set.copyOf(parallelGroups);
+            dependencies = dependencies == null ? Set.of()
+                    : Collections.unmodifiableSet(new LinkedHashSet<>(dependencies));
+        }
+
+        /** 保留已有登记和消费者的十参数构造；未声明依赖不表示检查通过。 */
+        public ToolDeclaration(String name, Domain domain, CapabilityGate capabilityGate,
+                               Compression compression, String compressionExemptionReason,
+                               CacheFamily cacheFamily, Set<ParallelGroup> parallelGroups,
+                               BatchCountKeys batchCountKeys, CanonicalSpec canonicalSpec,
+                               String beanClassName) {
+            this(name, domain, capabilityGate, compression, compressionExemptionReason,
+                    cacheFamily, parallelGroups, batchCountKeys, canonicalSpec, beanClassName, Set.of());
         }
     }
 
     private static final List<ToolDeclaration> DECLARATIONS = List.of(
             new ToolDeclaration("getStockInfo", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.INFO,
-                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_STOCK)),
             new ToolDeclaration("getStockDaily", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
-                    Set.of(ParallelGroup.DAILY), BatchCountKeys.TS_CODE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.DAILY), BatchCountKeys.TS_CODE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_STOCK)),
             new ToolDeclaration("getStockSwIndustryInfo", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.EXEMPT, "已路由但历史未纳入压缩白名单（S3A-005 漂移样本）；D05 登记现状、行为不变，压缩资格评估留待后续",
-                    CacheFamily.NONE, Set.of(ParallelGroup.SEARCH), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    CacheFamily.NONE, Set.of(ParallelGroup.SEARCH), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.INDUSTRY_DATABASE)),
             new ToolDeclaration("searchStock", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.SEARCH,
-                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.QUERY, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.QUERY, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_STOCK)),
             new ToolDeclaration("searchFund", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.SEARCH,
-                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.QUERY, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.QUERY, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_FUND)),
             new ToolDeclaration("getIndexInfo", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.INFO,
-                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.SEARCH), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_INDEX)),
             new ToolDeclaration("getIndexDaily", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
-                    Set.of(ParallelGroup.DAILY), BatchCountKeys.TS_CODE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.DAILY), BatchCountKeys.TS_CODE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_INDEX)),
             new ToolDeclaration("searchIndex", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.SEARCH,
                     Set.of(ParallelGroup.SEARCH, ParallelGroup.ADVANCED), BatchCountKeys.QUERY,
-                    CanonicalSpec.MARKET_ADVANCED, "MarketDataTools"),
+                    CanonicalSpec.MARKET_ADVANCED, "MarketDataTools", Set.of(Dependency.MARKET_INDEX, Dependency.MARKET_TARGET)),
             new ToolDeclaration("searchAssetInfo", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.SEARCH,
                     Set.of(ParallelGroup.SEARCH, ParallelGroup.ADVANCED), BatchCountKeys.QUERY,
-                    CanonicalSpec.MARKET_ADVANCED, "MarketDataTools"),
+                    CanonicalSpec.MARKET_ADVANCED, "MarketDataTools", Set.of(Dependency.MARKET_TARGET)),
             new ToolDeclaration("checkParallelLimits", Domain.META, CapabilityGate.NONE,
                     Compression.EXEMPT, "元工具，响应体为限流说明且体量小，不进入压缩机制（现状如此）",
                     CacheFamily.NONE, Set.of(), BatchCountKeys.NONE, CanonicalSpec.PARALLEL_LIMITS, "MarketDataTools"),
             new ToolDeclaration("getTradingDaysSummary", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_INDEX)),
             new ToolDeclaration("isTradingDay", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.NONE,
-                    Set.of(ParallelGroup.CALENDAR), BatchCountKeys.DATES, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(ParallelGroup.CALENDAR), BatchCountKeys.DATES, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_INDEX)),
             new ToolDeclaration("getExchangeAssetDaily", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
                     Set.of(ParallelGroup.DAILY, ParallelGroup.ADVANCED), BatchCountKeys.TS_CODE,
-                    CanonicalSpec.MARKET_ADVANCED, "MarketDataTools"),
+                    CanonicalSpec.MARKET_ADVANCED, "MarketDataTools", Set.of(Dependency.MARKET_TARGET)),
             new ToolDeclaration("getOffExchangeAssetDaily", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_FUND)),
             new ToolDeclaration("getEtfAdj", Domain.MARKET_DATA, CapabilityGate.ADJ_FACTOR,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_LISTED, Dependency.ADJ_FACTOR_CONFIG)),
             new ToolDeclaration("getListedAssetShareSize", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_FUND)),
             new ToolDeclaration("getFinancialReport", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_STOCK)),
             new ToolDeclaration("getSpecialAssetDaily", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools", Set.of(Dependency.MARKET_STOCK)),
             new ToolDeclaration("ragSearch", Domain.RAG, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "RagTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "RagTools", Set.of(Dependency.EXTERNAL_INFO, Dependency.SEARCH_BACKEND)),
             new ToolDeclaration("loadDocument", Domain.RAG, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "RagTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "RagTools", Set.of(Dependency.DOCUMENT_TARGET)),
             new ToolDeclaration("searchWeb", Domain.WEB_SEARCH, CapabilityGate.WEB_SEARCH,
                     Compression.EXCLUDED, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "SearchTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "SearchTools", Set.of(Dependency.EXTERNAL_INFO, Dependency.SEARCH_BACKEND)),
             new ToolDeclaration("executePython", Domain.PYTHON_SANDBOX, CapabilityGate.CODE_INTERPRETER,
                     Compression.EXCLUDED, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "PythonSandboxTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "PythonSandboxTools", Set.of(Dependency.SANDBOX_GATEWAY, Dependency.SANDBOX_EXECUTOR)),
             // executeQuery 是沙箱内固定 DuckDB 运行器的 SQL 取数工具：SQL 取数不是代码执行，
             // 不跟随代码解释器开关（NONE 常开）；输出随档位可达千行，同 executePython 不参与压缩。
             new ToolDeclaration("executeQuery", Domain.SQL_SANDBOX, CapabilityGate.NONE,
                     Compression.EXCLUDED, null, CacheFamily.NONE,
-                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "SqlQueryTools"),
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "SqlQueryTools", Set.of(Dependency.SANDBOX_GATEWAY, Dependency.SANDBOX_EXECUTOR)),
             new ToolDeclaration("resolveFinanceMethods", Domain.FINANCE, CapabilityGate.NONE,
                     Compression.EXEMPT, "返回方法建议卡/结构化清单，体量小；现状未纳入压缩白名单",
                     CacheFamily.NONE, Set.of(), BatchCountKeys.NONE, CanonicalSpec.MANUAL_FINANCE, "FinanceMethodTools"),

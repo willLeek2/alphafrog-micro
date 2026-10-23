@@ -281,6 +281,8 @@ public class LangchainTodoNodeExecutor {
                 item.getDescription(),
                 request.getToolSpecifications(),
                 ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
+        base += "\n\n" + LangchainTodoUserMessageBuilder.dependencyCheckInstruction(
+                request.getDependencyCheck(), request.getPlanGeneration(), item.getId());
         String userMessage = base + "\n\n外部工具已在后台完成。下面是与原工具调用绑定的持久化结果。"
                 + "请使用该结果完成当前待办并给出完整回复；不要再次调用工具。\n\n"
                 + (toolResult == null ? "external tool completed" : toolResult);
@@ -324,6 +326,8 @@ public class LangchainTodoNodeExecutor {
                 item.getDescription(),
                 request.getToolSpecifications(),
                 ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
+        userMessage += "\n\n" + LangchainTodoUserMessageBuilder.dependencyCheckInstruction(
+                request.getDependencyCheck(), request.getPlanGeneration(), item.getId());
         if (retryContext != null) {
             userMessage += buildTodoRetryUserMessage(retryContext);
         }

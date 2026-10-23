@@ -293,6 +293,9 @@ public class DualPoolWaitGroupNodeExecutor {
                                int modelTurn, int maxMembers) {
         List<ChatMessage> requestMessages = new ArrayList<>(messages);
         requestMessages.add(Math.min(1, requestMessages.size()), SystemMessage.from(
+                LangchainTodoUserMessageBuilder.dependencyCheckInstruction(
+                        input.request().getDependencyCheck(), input.request().getPlanGeneration(), input.todo().getId())));
+        requestMessages.add(Math.min(1, requestMessages.size()), SystemMessage.from(
                 "本次模型回复最多包含" + maxMembers + "个工具调用，所有工具合计。"
                         + "这是整轮调用数量限制，与checkParallelLimits返回的单次批量参数数量不同。"
                         + "超过整轮限制时全部调用都不会执行；请减少本轮调用数量，等结果返回后再继续余下批次。"
