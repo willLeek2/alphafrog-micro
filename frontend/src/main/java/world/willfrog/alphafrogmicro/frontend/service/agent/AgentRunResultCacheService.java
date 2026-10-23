@@ -8,11 +8,15 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @Slf4j
 public class AgentRunResultCacheService {
+
+    private static final Set<String> TERMINAL_STATUSES =
+            Set.of("COMPLETED", "PARTIAL", "FAILED", "CANCELED", "EXPIRED");
 
     private final ConcurrentHashMap<String, CacheEntry> cache = new ConcurrentHashMap<>();
 
@@ -31,7 +35,8 @@ public class AgentRunResultCacheService {
         long now = System.currentTimeMillis();
         String key = cacheKey(userId, runId, isAdmin);
         CacheEntry hit = cache.get(key);
-        if (hit != null && hit.expiresAtMs() > now) {
+        // 非终态结果不参与缓存：取消后必须重新读取，不能继续返回取消前的执行中状态。
+        if (hit != null && hit.expiresAtMs() > now && isTerminal(hit.result().getStatus())) {
             return hit.result();
         }
         AgentRunResultMessage result = agentDubboService.getResult(
@@ -41,8 +46,25 @@ public class AgentRunResultCacheService {
                         .setIsAdmin(isAdmin)
                         .build()
         );
-        cache.put(key, new CacheEntry(result, now + ttlMs));
+        if (isTerminal(result.getStatus())) {
+            cache.put(key, new CacheEntry(result, now + ttlMs));
+        } else {
+            cache.remove(key);
+        }
         return result;
+    }
+
+    private static boolean isTerminal(String status) {
+        return status != null && TERMINAL_STATUSES.contains(status);
+    }
+
+    /** 取消成功后必须立刻读到取消结果，清掉该用户该运行的用户与管理两份缓存。 */
+    public void invalidate(String userId, String runId) {
+        if (userId == null || userId.isBlank() || runId == null || runId.isBlank()) {
+            return;
+        }
+        cache.remove(cacheKey(userId, runId, false));
+        cache.remove(cacheKey(userId, runId, true));
     }
 
     void clearForTest() {

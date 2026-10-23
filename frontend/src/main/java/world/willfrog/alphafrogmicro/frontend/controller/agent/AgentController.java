@@ -570,6 +570,8 @@ public class AgentController {
         }
         try {
             AgentRunMessage run = resolveService().cancelRun(CancelAgentRunRequest.newBuilder().setUserId(userId).setId(runId).build());
+            // 结果缓存可能还留着取消前的状态；取消成功后立即失效，刷新就能看到已取消。
+            runResultCacheService.invalidate(userId, runId);
             return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "取消 agent run");

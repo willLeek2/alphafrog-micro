@@ -164,6 +164,14 @@ public class CanceledSqlWaitMemberRecovery {
                 || !Set.of("CANCELED", "LATE", "PENDING", "RUNNING").contains(member.getState())) {
             return Inspection.invalid();
         }
+        WaitMemberStopTask stop = stops.findByWaitMemberId(member.getId()).orElse(null);
+        if (stop != null && "UNCONFIRMED".equals(stop.getState())
+                && Objects.equals(stop.getRunId(), runId)
+                && Objects.equals(stop.getGroupId(), member.getGroupId())
+                && Objects.equals(stop.getOperationId(), anchor.getOperationId())) {
+            // 未确认先于凭证校验：凭证可能正是因为不完整才被判无效，这条运行不能再回到自动收尾。
+            return new Inspection(Ownership.UNCONFIRMED, member, stop, null);
+        }
         try {
             WaitMemberDispatchProof proof = WaitMemberDispatchProof.fromJson(json,
                     member.getDispatchProofJson()).orElseThrow();
@@ -196,7 +204,6 @@ public class CanceledSqlWaitMemberRecovery {
                     || disagrees(proof.taskId(), anchor.getTaskId())
                     || disagrees(original.taskId(), anchor.getTaskId())
                     || disagrees(session.taskId(), anchor.getTaskId())) return Inspection.invalid();
-            WaitMemberStopTask stop = stops.findByWaitMemberId(member.getId()).orElse(null);
             if (stop != null && (!Objects.equals(stop.getWaitMemberId(), member.getId())
                     || !Objects.equals(stop.getGroupId(), member.getGroupId())
                     || !runId.equals(stop.getRunId()) || !proof.operationId().equals(stop.getOperationId())
@@ -235,10 +242,32 @@ public class CanceledSqlWaitMemberRecovery {
                 }
                 if (!matchingUsage) return Inspection.invalid();
             }
+            if (hasUnconfirmedSibling(runId, member.getId())) {
+                // 同一运行任一停机任务已未确认，最终写入永远不会成功；停止自动收尾，保留资源。
+                return new Inspection(Ownership.UNCONFIRMED, member, stop, null);
+            }
             return new Inspection(Ownership.MEMBER_OWNED, member, stop, terminalReservationJson);
         } catch (Exception invalid) {
             log.warn("取消SQL会话的成员证明不完整，保留原资源责任：run={}", runId);
             return Inspection.invalid();
+        }
+    }
+
+    /** 同运行其他成员是否已经有未确认的停机任务；分页读完，避免只看到第一页。 */
+    private boolean hasUnconfirmedSibling(String runId, long currentMemberId) {
+        long afterStopId = 0;
+        while (true) {
+            var page = stops.listUnconfirmedByRun(runId, afterStopId, 100);
+            if (page.isEmpty()) {
+                return false;
+            }
+            for (WaitMemberStopTask task : page) {
+                afterStopId = task.getId();
+                if (!Objects.equals(task.getWaitMemberId(), currentMemberId)
+                        && "UNCONFIRMED".equals(task.getState())) {
+                    return true;
+                }
+            }
         }
     }
 

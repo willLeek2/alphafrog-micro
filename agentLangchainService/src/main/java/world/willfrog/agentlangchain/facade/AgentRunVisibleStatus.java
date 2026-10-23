@@ -19,6 +19,10 @@ final class AgentRunVisibleStatus {
         if (run == null || baseStatus == null || isTerminal(baseStatus)) {
             return baseStatus;
         }
+        // 取消处置只属于双池 V2 的锚点；旧调度版本即使留有锚点也以数据库状态为准。
+        if (!"DUAL_POOL_V2".equals(run.getSchedulerVersion())) {
+            return baseStatus;
+        }
         String anchorJson = run.getToolJobAnchorJson();
         if (anchorJson == null || anchorJson.isBlank()) {
             return baseStatus;

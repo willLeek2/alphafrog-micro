@@ -473,6 +473,7 @@
         <if test="status != null">
             AND CASE
                     WHEN status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+                         AND scheduler_version = 'DUAL_POOL_V2'
                          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
                         THEN 'CANCELED'
                     ELSE status
@@ -494,6 +495,7 @@
         <if test="status != null">
             AND CASE
                     WHEN status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+                         AND scheduler_version = 'DUAL_POOL_V2'
                          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
                         THEN 'CANCELED'
                     ELSE status
@@ -1906,7 +1908,6 @@
                 SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
                  WHERE s.run_id = alphafrog_agent_run.id
                    AND s.state = 'UNCONFIRMED'
-                   AND s.operation_id = tool_job_anchor_json -&gt;&gt; 'operationId'
               )
           AND NOT (
                 status = 'EXECUTING'
