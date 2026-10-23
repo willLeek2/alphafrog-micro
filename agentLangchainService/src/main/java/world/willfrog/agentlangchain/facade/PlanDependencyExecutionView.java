@@ -104,7 +104,13 @@ final class PlanDependencyExecutionView {
             if (synchronous) {
                 raw.put("source", "synchronous");
                 raw.remove("business_success");
-                if (event.payload().get("success") instanceof Boolean success) {
+                // 旧后台事件的 success 只说明任务进程终态，业务结论由独立结果通知提供。
+                boolean legacyTask = raw.get("operation_id") != null
+                        || raw.get("task_id") != null || raw.get("status") != null;
+                if (legacyTask && raw.get("task_status") == null) {
+                    raw.put("task_status", raw.get("status"));
+                }
+                if (!legacyTask && event.payload().get("success") instanceof Boolean success) {
                     raw.put("business_success", success);
                 }
             }
