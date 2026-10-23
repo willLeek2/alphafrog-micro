@@ -67,7 +67,7 @@ class ToolRouterThrottleFinishedContractTest {
     }
 
     @Test
-    void lc4jRejection_executePython_emitsFinishedWithThrottleLayerLc4jSemaphore() {
+    void lc4jRejection_executePython_emitsFinishedWithThrottleLayerLc4jSemaphore() throws Exception {
         String failureReason = "TOOL_THROTTLE_TIMEOUT: tool=executePython waitMs=10 permits=0";
         when(toolThrottle.tryAcquire("executePython"))
                 .thenReturn(ToolThrottleResult.timeout("executePython", 10, 0));
@@ -80,7 +80,10 @@ class ToolRouterThrottleFinishedContractTest {
 
         String output = executor.execute(request, null);
 
-        assertEquals(failureReason, output);
+        var failure = objectMapper.readTree(output);
+        assertFalse(failure.path("ok").asBoolean(true));
+        assertEquals("TOOL_WEIGHT_LIMIT_EXCEEDED", failure.path("error").path("code").asText());
+        assertEquals(failureReason, failure.path("error").path("message").asText());
 
         ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
         verify(eventService).appendOnce(
