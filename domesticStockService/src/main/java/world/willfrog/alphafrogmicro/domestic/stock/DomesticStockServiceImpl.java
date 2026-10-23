@@ -35,6 +35,8 @@ import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockReportRc;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticStockServiceTriple.*;
+import world.willfrog.alphafrogmicro.domestic.stock.service.AssetSqlExecutor;
+import world.willfrog.alphafrogmicro.domestic.stock.service.AssetSqlGuard;
 
 import jakarta.annotation.PostConstruct;
 import java.util.HashMap;
@@ -66,6 +68,9 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
     private final CbDailyDao cbDailyDao;
     private final StkAhDao stkAhDao;
     private final Environment environment;
+    // 统一 SQL 资产取数工具：守卫（八步放行/拒绝）与执行器（只读事务＋超时＋截断＋并发限制）
+    private final AssetSqlGuard assetSqlGuard;
+    private final AssetSqlExecutor assetSqlExecutor;
     private volatile Client meiliClient;
     private volatile String meiliClientHost;
     private volatile String meiliClientApiKey;
@@ -84,7 +89,9 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                                     StockReportRcDao stockReportRcDao,
                                     CbDailyDao cbDailyDao,
                                     StkAhDao stkAhDao,
-                                    Environment environment) {
+                                    Environment environment,
+                                    AssetSqlGuard assetSqlGuard,
+                                    AssetSqlExecutor assetSqlExecutor) {
         this.stockInfoDao = stockInfoDao;
         this.stockQuoteDao = stockQuoteDao;
         this.stockIncomeDao = stockIncomeDao;
@@ -96,6 +103,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         this.cbDailyDao = cbDailyDao;
         this.stkAhDao = stkAhDao;
         this.environment = environment;
+        this.assetSqlGuard = assetSqlGuard;
+        this.assetSqlExecutor = assetSqlExecutor;
     }
 
     /**
@@ -842,6 +851,59 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
             responseBuilder.addItems(itemBuilder.build());
         }
         return responseBuilder.build();
+    }
+
+    /**
+     * 统一 SQL 资产取数工具新增：只读 SQL 资产查询（方案 D2——执行体放数据服务端，
+     * 经 Dubbo 调用；守卫八步见 {@link AssetSqlGuard}，执行约束见 {@link AssetSqlExecutor}）。
+     * 装配关系＝守卫放行后交执行器只读执行；守卫拒绝与执行拒绝一律经响应级 error 结构返回
+     * （稳定错误码，跨 RPC 可机读），不靠异常传递。truncated＝执行触顶截断，或外层 LIMIT
+     * 超硬上限被改写（方案 D3「改写到硬上限并 truncated 说明」）。
+     */
+    @Override
+    public ExecuteAssetSqlResponse executeAssetSql(ExecuteAssetSqlRequest request) {
+        long startNanos = System.nanoTime();
+        try {
+            AssetSqlGuard.GuardVerdict verdict = assetSqlGuard.inspect(request.getSql());
+            if (!verdict.isAccepted()) {
+                return errorResponse(verdict.getErrorCode(), verdict.getErrorMessage(),
+                        verdict.getErrorDetailsJson(), startNanos);
+            }
+            AssetSqlExecutor.ExecutionOutcome outcome = assetSqlExecutor.execute(verdict.getExecutableSql());
+            if (outcome.isRejected()) {
+                return errorResponse(outcome.getErrorCode(), outcome.getErrorMessage(),
+                        outcome.getErrorDetailsJson(), startNanos);
+            }
+            boolean truncated = outcome.isTruncated() || verdict.isLimitRewritten();
+            return ExecuteAssetSqlResponse.newBuilder()
+                    .addAllColumns(outcome.getColumns())
+                    .addAllRows(outcome.getRows())
+                    .setRowCount(outcome.getRows().size())
+                    .setTruncated(truncated)
+                    .setEnforcedLimit(verdict.getEnforcedLimit())
+                    .setElapsedMs(elapsedMs(startNanos))
+                    .build();
+        } catch (Exception e) {
+            // 兜底：任何未预期异常也转成结构化错误返回，不向调用方抛异常
+            log.error("executeAssetSql 服务内部错误", e);
+            return errorResponse(AssetSqlExecutor.CODE_QUERY_FAILED,
+                    "服务内部错误：" + e.getMessage(), "", startNanos);
+        }
+    }
+
+    private ExecuteAssetSqlResponse errorResponse(String code, String message, String detailsJson, long startNanos) {
+        return ExecuteAssetSqlResponse.newBuilder()
+                .setElapsedMs(elapsedMs(startNanos))
+                .setError(ExecuteAssetSqlError.newBuilder()
+                        .setCode(code)
+                        .setMessage(message == null ? "" : message)
+                        .setDetailsJson(detailsJson == null ? "" : detailsJson)
+                        .build())
+                .build();
+    }
+
+    private long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000;
     }
 
     private double orZero(Double v) { return v == null ? 0.0 : v; }

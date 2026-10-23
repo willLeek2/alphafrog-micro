@@ -55,3 +55,11 @@ tushare:
 advanced:
   meili-enabled: true
   meili-auto-sync: true
+
+# 统一 SQL 资产取数工具：守卫与执行参数（AssetSqlGuard / AssetSqlExecutor 读取；
+# 缺省值与代码内默认一致，可用环境变量覆盖）
+asset-sql:
+  max-rows: ${AF_ASSET_SQL_MAX_ROWS:200000}
+  max-bytes: ${AF_ASSET_SQL_MAX_BYTES:33554432}
+  query-timeout-seconds: ${AF_ASSET_SQL_QUERY_TIMEOUT_SECONDS:30}
+  max-concurrency: ${AF_ASSET_SQL_MAX_CONCURRENCY:4}
