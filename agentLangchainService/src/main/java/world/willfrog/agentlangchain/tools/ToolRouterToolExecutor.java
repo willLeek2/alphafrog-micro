@@ -391,6 +391,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
+        putSourceNodeIdentity(payload, runId);
         agentEventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
     }
 
@@ -445,6 +446,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
+        putSourceNodeIdentity(payload, runId);
         // 沙箱后台长工具的终态由 finalizer 按同一 dedupeKey 幂等写入，这里用 appendOnce 防重复。
         if (DurableSandboxTool.fromToolName(toolName).isPresent()) {
             String dedupeKey = runId + ":" + toolCallId + ":logical_terminal";
@@ -452,6 +454,20 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
         } else {
             agentEventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
         }
+    }
+
+    /** 使用本次工具执行时冻结的节点身份，避免恢复后的新代次被补到旧调用上。 */
+    private static void putSourceNodeIdentity(Map<String, Object> payload, String runId) {
+        var context = DualPoolToolJobExecutionContext.current();
+        if (context == null || context.identity() == null || !runId.equals(context.identity().runId())) {
+            return;
+        }
+        var identity = context.identity();
+        payload.put("plan_generation", identity.planGeneration());
+        payload.put("node_id", identity.nodeId());
+        payload.putIfAbsent("todo_id", identity.nodeId());
+        payload.put("node_attempt", identity.nodeAttempt());
+        payload.put("segment_sequence", identity.segmentSequence());
     }
 
     /** 同步完成的沙箱后台长工具要清掉派发凭证，防止恢复链把已完成调用当成待恢复任务。 */

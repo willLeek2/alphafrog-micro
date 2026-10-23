@@ -49,14 +49,31 @@ public final class AgentExternalObservabilityMapper {
     );
     private static final Set<String> COMPLETED_ITEM_KEYS = Set.of("todoid", "sequence", "description", "summary");
     private static final Set<String> PLAN_ROOT_KEYS = Set.of(
-            "items", "tasks", "steps", "extractedentities", "executionmode", "strategy"
+            "items", "tasks", "steps", "extractedentities", "executionmode", "strategy",
+            "dependencycheck", "dependencyexecution"
     );
     private static final Set<String> PLAN_ITEM_CONTAINER_KEYS = Set.of("items", "tasks", "steps");
     private static final Set<String> PLAN_ID_LIST_KEYS = Set.of("dependson", "dependencies");
     private static final Set<String> PLAN_ITEM_KEYS = Set.of(
             "id", "sequence", "type", "toolname", "tool", "description", "status",
-            "dependson", "dependencies", "groupkey", "parallelizable", "executionmode", "maxsteps"
+            "dependson", "dependencies", "groupkey", "parallelizable", "executionmode", "maxsteps",
+            "expectedtools"
     );
+    private static final Set<String> DEPENDENCY_REPORT_TEXT_KEYS = Set.of("checkedat");
+    private static final Set<String> DEPENDENCY_REPORT_NUMBER_KEYS = Set.of(
+            "version", "checkedplangeneration", "durationms", "checkeddependencycount", "omittedcount", "omittedtodocount");
+    private static final Set<String> DEPENDENCY_HINT_TEXT_KEYS = Set.of(
+            "todoid", "toolname", "dependencyid", "dependencylabel", "status", "basis", "reason");
+    private static final Set<String> DEPENDENCY_RESULT_TEXT_KEYS = Set.of(
+            "source", "todoid", "nodeid", "groupid", "memberid", "memberidentity", "toolname", "toolcallid",
+            "operationid", "memberstate", "taskstatus", "errorcode", "taskid");
+    private static final Set<String> DEPENDENCY_RESULT_NUMBER_KEYS = Set.of(
+            "plangeneration", "nodeattempt", "segmentsequence", "modelturn", "attempt", "eventseq",
+            "contextversion", "runcontrolversion");
+    private static final Set<String> DEPENDENCY_RESULT_BOOLEAN_KEYS = Set.of("businesssuccess", "executed");
+    private static final Set<String> DEPENDENCY_VIEW_NUMBER_KEYS = Set.of(
+            "plangeneration", "checkeventseq", "resumeeventseq", "omittedcount");
+    private static final Set<String> DEPENDENCY_VIEW_BOOLEAN_KEYS = Set.of("prepared", "frozenreuse");
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             "authorization", "proxyauthorization", "apikey", "xapikey", "secret", "clientsecret",
             "password", "passwd", "credential", "credentials", "cookie", "setcookie",
@@ -120,6 +137,18 @@ public final class AgentExternalObservabilityMapper {
         }
     }
 
+    /** 状态摘要和时间线与实时事件沿用同一套依赖提示字段过滤。 */
+    public static Object parseEvent(ObjectMapper objectMapper, String json, String eventType) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            return sanitizeDependencyEvent(objectMapper.readValue(json, Object.class), eventType);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     /** Recursively applies the selected outbound view to an already parsed value. */
     public static Object sanitize(Object value, View view) {
         if (view == View.PLAN) {
@@ -149,6 +178,10 @@ public final class AgentExternalObservabilityMapper {
                 sanitized = sanitizePlanItems(entry.getValue());
             } else if ("extractedentities".equals(normalized)) {
                 sanitized = sanitizePlanScalarList(entry.getValue());
+            } else if ("dependencycheck".equals(normalized)) {
+                sanitized = sanitizeDependencyReport(entry.getValue());
+            } else if ("dependencyexecution".equals(normalized)) {
+                sanitized = sanitizeDependencyExecution(entry.getValue());
             } else {
                 sanitized = sanitizePlanScalar(entry.getValue());
             }
@@ -175,9 +208,13 @@ public final class AgentExternalObservabilityMapper {
                 if (!PLAN_ITEM_KEYS.contains(normalized)) {
                     continue;
                 }
-                Object sanitized = PLAN_ID_LIST_KEYS.contains(normalized)
-                        ? sanitizePlanScalarList(entry.getValue())
-                        : sanitizePlanScalar(entry.getValue());
+                Object sanitized;
+                if ("expectedtools".equals(normalized)) {
+                    sanitized = sanitizeDisplayStringList(entry.getValue());
+                } else {
+                    sanitized = PLAN_ID_LIST_KEYS.contains(normalized)
+                            ? sanitizePlanScalarList(entry.getValue()) : sanitizePlanScalar(entry.getValue());
+                }
                 if (sanitized != null) {
                     sanitizedItem.put(key, sanitized);
                 }
@@ -209,6 +246,129 @@ public final class AgentExternalObservabilityMapper {
             return value;
         }
         return null;
+    }
+
+    /** 新增的依赖提示只接收固定显示字段，不让配置、参数或工具正文进入页面。 */
+    public static Object sanitizeDependencyEvent(Object value, String eventType) {
+        if ("DEPENDENCIES_CHECKED".equals(eventType)) {
+            Map<String, Object> out = sanitizeDisplayScalars(value, Set.of(), Set.of("plangeneration"),
+                    Set.of("frozenreuse", "reportmissing"));
+            if (out != null && value instanceof Map<?, ?> map) {
+                copyDependencyField(map, out, "report", AgentExternalObservabilityMapper::sanitizeDependencyReport);
+            }
+            return out;
+        }
+        if ("TOOL_RESULT_RECORDED".equals(eventType)) {
+            return sanitizeDependencyResult(value);
+        }
+        return sanitize(value, View.EVENT);
+    }
+
+    private static Object sanitizeDependencyReport(Object value) {
+        Map<String, Object> out = sanitizeDisplayScalars(value, DEPENDENCY_REPORT_TEXT_KEYS,
+                DEPENDENCY_REPORT_NUMBER_KEYS, Set.of("truncated"));
+        if (out != null && value instanceof Map<?, ?> map) {
+            copyDependencyField(map, out, "hints", item -> sanitizeDisplayObjectList(item,
+                    hint -> sanitizeDisplayScalars(hint, DEPENDENCY_HINT_TEXT_KEYS, Set.of(), Set.of())));
+            copyDependencyField(map, out, "omittedtodoids", AgentExternalObservabilityMapper::sanitizeDisplayStringList);
+        }
+        return out;
+    }
+
+    private static Object sanitizeDependencyExecution(Object value) {
+        Map<String, Object> out = sanitizeDisplayScalars(value, Set.of(), DEPENDENCY_VIEW_NUMBER_KEYS,
+                DEPENDENCY_VIEW_BOOLEAN_KEYS);
+        if (out != null && value instanceof Map<?, ?> map) {
+            copyDependencyField(map, out, "results", item -> sanitizeDisplayObjectList(item,
+                    AgentExternalObservabilityMapper::sanitizeDependencyResult));
+            copyDependencyField(map, out, "omittedtodoids", AgentExternalObservabilityMapper::sanitizeDisplayStringList);
+        }
+        return out;
+    }
+
+    private static Object sanitizeDependencyResult(Object value) {
+        return sanitizeDisplayScalars(value, DEPENDENCY_RESULT_TEXT_KEYS,
+                DEPENDENCY_RESULT_NUMBER_KEYS, DEPENDENCY_RESULT_BOOLEAN_KEYS);
+    }
+
+    private static Map<String, Object> sanitizeDisplayScalars(Object value, Set<String> strings,
+                                                              Set<String> numbers, Set<String> booleans) {
+        if (!(value instanceof Map<?, ?> map)) {
+            return null;
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        map.forEach((rawKey, item) -> {
+            String key = String.valueOf(rawKey);
+            String normalized = normalizeKey(key);
+            if (strings.contains(normalized) && item instanceof String text) {
+                String safe = boundedDisplayText(text);
+                if (safe != null) {
+                    out.put(key, safe);
+                }
+            } else if (numbers.contains(normalized) && item instanceof Number number
+                    && Double.isFinite(number.doubleValue()) && number.doubleValue() >= 0
+                    && number.doubleValue() == number.longValue()) {
+                out.put(key, number);
+            } else if (booleans.contains(normalized) && item instanceof Boolean) {
+                out.put(key, item);
+            }
+        });
+        return out;
+    }
+
+    private static Object sanitizeDisplayStringList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return null;
+        }
+        List<String> out = new ArrayList<>();
+        for (Object item : list) {
+            if (out.size() >= 32) {
+                break;
+            }
+            if (item instanceof String text) {
+                String safe = boundedDisplayText(text);
+                if (safe != null) {
+                    out.add(safe);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static Object sanitizeDisplayObjectList(Object value, java.util.function.Function<Object, Object> mapper) {
+        if (!(value instanceof List<?> list)) {
+            return null;
+        }
+        List<Object> out = new ArrayList<>();
+        for (Object item : list) {
+            if (out.size() >= 32) {
+                break;
+            }
+            Object mapped = mapper.apply(item);
+            if (mapped != null) {
+                out.add(mapped);
+            }
+        }
+        return out;
+    }
+
+    private static void copyDependencyField(Map<?, ?> source, Map<String, Object> destination,
+                                            String normalizedKey, java.util.function.Function<Object, Object> mapper) {
+        source.forEach((rawKey, value) -> {
+            String key = String.valueOf(rawKey);
+            if (normalizedKey.equals(normalizeKey(key))) {
+                Object mapped = mapper.apply(value);
+                if (mapped != null) {
+                    destination.put(key, mapped);
+                }
+            }
+        });
+    }
+
+    private static String boundedDisplayText(String value) {
+        String safe = scrubString(value);
+        // 调用和步骤身份也经过这里；超长时省略，不能截成可能相同的前缀。
+        return safe.length() <= 256 ? safe : null;
     }
 
     private static Object sanitize(Object value, View view, int depth, String parentKey) {
