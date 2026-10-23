@@ -31,7 +31,7 @@ SQL 写法规则：
 返回结果：
   - 50 行以内：columns（列名）、rows（数据行）、row_count、truncated 内联返回
   - 超过 50 行：自动写入当前 Run 的数据集，返回 dataset_id 与行数、字段、预览摘要；该数据集可继续被 executePython/executeQuery 挂载
-  - 结果上限 200000 行或 32MiB，触顶截断并标记 truncated=true；需要更少行数请加过滤或收窄条件
+  - 结果上限 200000 行或 4MiB，触顶截断并标记 truncated=true；需要更少行数请加过滤或收窄条件
   - 语句超时 30 秒（错误码 STATEMENT_TIMEOUT），超时不返回部分行；缩小日期范围、加过滤条件后重试；并发占满时返回 SERVER_BUSY，可直接重试
 
 注意事项：

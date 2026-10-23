@@ -57,9 +57,16 @@ advanced:
   meili-auto-sync: true
 
 # 统一 SQL 资产取数工具：守卫与执行参数（AssetSqlGuard / AssetSqlExecutor 读取；
-# 缺省值与代码内默认一致，可用环境变量覆盖）
+# 缺省值与代码内默认一致，可用环境变量覆盖）。
+# max-bytes 缺省 4MiB 是对齐 Dubbo3 Triple 传输默认响应缓冲 8MiB 的结果：该默认值是
+# Dubbo 3.3.2 TripleConfig.DEFAULT_MAX_RESPONSE_BODY_SIZE＝8388608，在提供方写响应侧生效
+# （NettyH2StreamChannel.newOutputMessage 用它构造 LimitedByteBufOutputStream），仓库内
+# 无运行时覆盖。结果集经 tri 协议一次性回传，缺省压在 8MiB 之下并留一倍余量，字节触顶时
+# 模型拿到的是 truncated 结果集而不是传输层失败的 RPC。若把 AF_ASSET_SQL_MAX_BYTES 上调
+# 超过 8388608，必须在提供方（本服务）同时调大响应缓冲，否则回到传输先炸的错位：
+#   dubbo.protocol.triple.max-response-body-size: <不低于 AF_ASSET_SQL_MAX_BYTES 的字节数>
 asset-sql:
   max-rows: ${AF_ASSET_SQL_MAX_ROWS:200000}
-  max-bytes: ${AF_ASSET_SQL_MAX_BYTES:33554432}
+  max-bytes: ${AF_ASSET_SQL_MAX_BYTES:4194304}
   query-timeout-seconds: ${AF_ASSET_SQL_QUERY_TIMEOUT_SECONDS:30}
   max-concurrency: ${AF_ASSET_SQL_MAX_CONCURRENCY:4}

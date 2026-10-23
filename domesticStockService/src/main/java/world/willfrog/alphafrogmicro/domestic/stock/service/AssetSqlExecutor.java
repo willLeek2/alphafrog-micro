@@ -30,7 +30,7 @@ import java.util.concurrent.Semaphore;
  *       兜住关键字黑名单外的写形态，例如 SELECT … INTO）；</li>
  *   <li>语句超时：JdbcTemplate queryTimeout＝30 秒（可配置），超时拒绝 STATEMENT_TIMEOUT，
  *       不给部分行；</li>
- *   <li>行/字节双硬上限：20 万行 / 32MiB（均可配置），逐行累计、超即停并标记 truncated，
+ *   <li>行/字节双硬上限：20 万行 / 4MiB（均可配置），逐行累计、超即停并标记 truncated，
  *       不包括越限那一行；</li>
  *   <li>实例级并发：Semaphore(4)（可配置）跨运行共限同一服务实例上的并发查询——权重限流
  *       只对登记了热配置条目的工具生效、且只管单轮调用预算（方案事实 7），跨运行并发必须
@@ -50,13 +50,15 @@ public class AssetSqlExecutor {
     public static final String CODE_STATEMENT_TIMEOUT = "STATEMENT_TIMEOUT";
     public static final String CODE_QUERY_FAILED = "QUERY_FAILED";
 
-    // ---- 配置键与默认值（方案 D3/D7；缺省 20 万行 / 32MiB / 30 秒 / 并发 4，可用配置覆盖） ----
+    // ---- 配置键与默认值（方案 D3/D7；缺省 20 万行 / 4MiB / 30 秒 / 并发 4，可用配置覆盖） ----
     static final String MAX_ROWS_PROP = "asset-sql.max-rows";
     static final String MAX_BYTES_PROP = "asset-sql.max-bytes";
     static final String QUERY_TIMEOUT_PROP = "asset-sql.query-timeout-seconds";
     static final String MAX_CONCURRENCY_PROP = "asset-sql.max-concurrency";
     private static final long DEFAULT_MAX_ROWS = 200_000L;
-    private static final long DEFAULT_MAX_BYTES = 32L * 1024 * 1024;
+    // 字节缺省压在 Dubbo Triple 传输默认响应缓冲 8MiB 之下（留一倍余量），保证触顶时
+    // 拿到的是 truncated 结果而不是传输层失败的 RPC；上调超过 8MiB 的注意事项见 application.yml。
+    private static final long DEFAULT_MAX_BYTES = 4L * 1024 * 1024;
     private static final int DEFAULT_QUERY_TIMEOUT_SECONDS = 30;
     private static final int DEFAULT_MAX_CONCURRENCY = 4;
     private static final int FETCH_SIZE = 1000;
