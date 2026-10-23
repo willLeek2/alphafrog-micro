@@ -460,6 +460,16 @@ public class AssetSqlGuard {
         int numberSkeletonEnd = -1;
         Matcher limitMatcher = LIMIT_CLAUSE.matcher(skeleton.text());
         while (limitMatcher.find()) {
+            // 科学计数法（CR 必改 2 同族收尾）：数字后紧邻的字符（不跳空白）是标识符字符
+            // （e/E 等，如 LIMIT 9e7）即拒。与下方「跳过空白后查算术运算符」分属两个检查位、
+            // 不能合并——LIMIT 5 OFFSET 10 跳空白后是 O（标识符字符），合并写会误杀正常分页。
+            int adjacent = limitMatcher.end(1);
+            if (adjacent < skeleton.length() && isIdentifierPart(skeleton.charAt(adjacent))) {
+                throw new Rejection(GuardVerdict.reject(CODE_MISSING_LIMIT,
+                        "LIMIT 只接受纯数字（不支持科学计数法、算术表达式或小数），请直接写一个不超过 "
+                                + maxRows + " 的整数",
+                        details("max_rows", maxRows, "reason", "limit_expression")));
+            }
             int afterNumber = skipWhitespace(skeleton, limitMatcher.end(1));
             if (afterNumber < skeleton.length()) {
                 char next = skeleton.charAt(afterNumber);
