@@ -57,6 +57,7 @@ final class LangchainRunStatusReadModel {
                 ? agentEventService.listByRunIdFromDatabase(run.getId())
                 : agentEventService.listByRunId(run.getId());
         int totalCredits = creditService.calculateRunTotalCredits(run, events, observabilitySummaryJson);
+        planJson = PlanDependencyExecutionView.enrich(planJson, run, events, objectMapper);
         Integer maxSeq = diagnosticNoTouch
                 ? agentEventService.findMaxSeqFromDatabase(run.getId())
                 : agentEventService.findMaxSeq(run.getId());

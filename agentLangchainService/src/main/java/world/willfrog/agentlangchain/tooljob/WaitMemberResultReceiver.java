@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -115,6 +116,7 @@ public class WaitMemberResultReceiver {
     private final WaitMemberSettlement settlement;
     private final DualPoolRecoveryDispatcher recoveryDispatcher;
     private final ObjectMapper objectMapper;
+    private final ToolResultRecordedEventPublisher resultEventPublisher;
     /** 每轮读一次的参数：批次、退避与最多翻几步都允许在运行期改，改完下一轮生效。 */
     private final DualPoolSchedulerSettings settings;
     /** 最近一次构造退避用的初值与上限；配置变了就按新值重建，不用重启。 */
@@ -164,13 +166,36 @@ public class WaitMemberResultReceiver {
             DualPoolRecoveryDispatcher recoveryDispatcher,
             ObjectMapper objectMapper,
             DualPoolSchedulerSettings settings,
+            int maxMemberResultChars,
+            long pollIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings,
+            AcceptanceRunPolicyRegistry acceptancePolicies,
+            AcceptanceReleasePointStore releasePoints,
+            FixtureRuleHitStore ruleHitStore) {
+        this(waitGroupStore, ownership, nodeWorkItemStore, sandboxService, pythonSandboxTools,
+                settlement, recoveryDispatcher, objectMapper, settings, maxMemberResultChars,
+                pollIntervalMs, frozenEffectiveSettings, acceptancePolicies, releasePoints, ruleHitStore, null);
+    }
+
+    @Autowired
+    public WaitMemberResultReceiver(
+            WaitGroupStore waitGroupStore,
+            RunOwnershipGateway ownership,
+            NodeWorkItemStore nodeWorkItemStore,
+            PythonSandboxService sandboxService,
+            PythonSandboxTools pythonSandboxTools,
+            WaitMemberSettlement settlement,
+            DualPoolRecoveryDispatcher recoveryDispatcher,
+            ObjectMapper objectMapper,
+            DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}")
             int maxMemberResultChars,
             @Value("${agent.langchain.wait-member.receiver.poll-interval-ms:1000}") long pollIntervalMs,
             FrozenEffectiveSettings frozenEffectiveSettings,
             AcceptanceRunPolicyRegistry acceptancePolicies,
             AcceptanceReleasePointStore releasePoints,
-            FixtureRuleHitStore ruleHitStore) {
+            FixtureRuleHitStore ruleHitStore,
+            ToolResultRecordedEventPublisher resultEventPublisher) {
         this.waitGroupStore = waitGroupStore;
         this.ownership = ownership;
         this.nodeWorkItemStore = nodeWorkItemStore;
@@ -179,6 +204,7 @@ public class WaitMemberResultReceiver {
         this.settlement = settlement;
         this.recoveryDispatcher = recoveryDispatcher;
         this.objectMapper = objectMapper;
+        this.resultEventPublisher = resultEventPublisher;
         this.settings = settings;
         this.acceptancePolicies = acceptancePolicies;
         this.releasePoints = releasePoints;
@@ -483,6 +509,7 @@ public class WaitMemberResultReceiver {
             duplicates.incrementAndGet();
             return;
         }
+        publishRecordedResult(member, run);
         completed.incrementAndGet();
         if (result.groupBecameReady()) {
             recoveryDispatcher.wake(result.notificationId());
@@ -837,6 +864,7 @@ public class WaitMemberResultReceiver {
                     member.getGroupId(), member.getMemberIdentity());
             return;
         }
+        publishRecordedResult(member, run);
         completed.incrementAndGet();
         // 策略定下的事到这里才真的发生过一次：决策处计数会把收尾失败后的重试也记成新的一次。
         if (refusal != null) {
@@ -859,6 +887,20 @@ public class WaitMemberResultReceiver {
             // 它自己的周期补扫与启动扫描会按数据库把这条通知重新发现。
             recoveryDispatcher.wake(result.notificationId());
             wakeups.incrementAndGet();
+        }
+    }
+
+    private void publishRecordedResult(WaitMember member, AgentRun run) {
+        if (resultEventPublisher == null) {
+            return;
+        }
+        try {
+            resultEventPublisher.publishMember(run.getId(), run.getUserId(),
+                    member.getGroupId(), member.getMemberIdentity());
+        } catch (Exception e) {
+            // 展示失败不改变已经提交的成员结果，也不妨碍原来的组齐备唤醒。
+            log.warn("成员展示通知失败: runId={} memberId={} exception={}",
+                    run.getId(), member.getId(), e.getClass().getSimpleName());
         }
     }
 

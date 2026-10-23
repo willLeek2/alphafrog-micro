@@ -1,7 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -13,12 +13,24 @@ import java.util.Map;
 
 /** 把后台工具终态转换为唯一一条 {@code TOOL_CALL_FINISHED} 事件。 */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class ToolJobEventHookImpl implements ToolJobEventHook {
 
     private final AgentRunMapper runMapper;
     private final AgentRunEventService agentEventService;
+    private final ToolResultRecordedEventPublisher resultEventPublisher;
+
+    public ToolJobEventHookImpl(AgentRunMapper runMapper, AgentRunEventService agentEventService) {
+        this(runMapper, agentEventService, null);
+    }
+
+    @Autowired
+    public ToolJobEventHookImpl(AgentRunMapper runMapper, AgentRunEventService agentEventService,
+                               ToolResultRecordedEventPublisher resultEventPublisher) {
+        this.runMapper = runMapper;
+        this.agentEventService = agentEventService;
+        this.resultEventPublisher = resultEventPublisher;
+    }
 
     @Override
     public boolean emitTerminalEvent(String runId, ToolJobAnchor anchor) {
@@ -51,12 +63,19 @@ public class ToolJobEventHookImpl implements ToolJobEventHook {
         try {
             // appendOnce 若发现同一 key 已存在仍是幂等成功，不阻塞 finalizer 后续恢复。
             agentEventService.appendOnce(runId, run.getUserId(), "TOOL_CALL_FINISHED", dedupeKey, payload);
-            return true;
         } catch (Exception e) {
             log.warn("Failed to append logical terminal event runId={} toolCallId={}: {}",
                     runId, anchor.getToolCallId(), e.getMessage());
             return false;
         }
+        try {
+            if (resultEventPublisher != null) {
+                resultEventPublisher.publishAnchor(runId, run.getUserId(), anchor);
+            }
+        } catch (Exception e) {
+            log.warn("锚点展示通知失败: runId={} exception={}", runId, e.getClass().getSimpleName());
+        }
+        return true;
     }
 
     private static void put(Map<String, Object> payload, String key, String value) {
