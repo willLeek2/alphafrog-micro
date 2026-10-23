@@ -440,6 +440,7 @@ public class LangchainRunControlService {
         try {
             rejectUnsettledCanceledSqlSessionBeforeResume(run);
             disposePausedAnchorBeforeResume(run);
+            disposeSettledCanceledAnchorBeforeResume(run);
             cancelOpenWaitGroupsBeforeResume(run.getId());
             rejectUnsettledStopTasksBeforeResume(run);
             if (request.getPlanOverrideJson() != null && !request.getPlanOverrideJson().isBlank()) {
@@ -608,7 +609,8 @@ public class LangchainRunControlService {
      * 清掉锚点再放行重新调度（重新调度后该 todo 会重新执行：暂停期间到达的
      * 工具结果不进手动恢复路径，这是本批的明确取舍）。清锚点失败（并发处置
      * 已改变状态）则整个恢复失败关闭。
-     * 其他处置标记（取消/DAG 系等）的遗留锚点不由这里处理，交给既有恢复机器。
+     * 其他处置标记（DAG 系等）的遗留锚点不由这里处理；已收尾的取消残留由
+     * {@link #disposeSettledCanceledAnchorBeforeResume} 沿同一套终态残留清理处理。
      */
     private void disposePausedAnchorBeforeResume(AgentRun run) {
         ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
@@ -639,6 +641,31 @@ public class LangchainRunControlService {
                     "resume_anchor_clear_failed: run state changed concurrently, retry");
         }
         log.info("Resume run={}: cleared finalized paused anchor operationId={}",
+                run.getId(), anchor.getOperationId());
+    }
+
+    /**
+     * 恢复受理前处理已收尾的取消残留锚点：运行已终态且收尾链已完成时，旧取消处置只是
+     * 历史记录，用现有的终态残留清理（SQL 再核终态、操作身份、autoResume=false 与步骤）
+     * 把它清掉，再让本次恢复进入新执行。未收尾的取消仍在进行，不清理、也不靠读取阶段
+     * 猜测恢复事实；读取投影继续显示已取消，收尾责任和资源都保留。
+     */
+    private void disposeSettledCanceledAnchorBeforeResume(AgentRun run) {
+        ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+        if (anchor == null || !"CANCELED".equals(anchor.getRunDisposition())
+                || anchor.getOperationId() == null || anchor.getOperationId().isBlank()) {
+            return;
+        }
+        if (!isTerminal(run.getStatus())
+                || anchor.getFinalizerStep() == null || anchor.getFinalizerStep().isBlank()
+                || !ToolJobFinalizer.isCleanupChainComplete(anchor)) {
+            return;
+        }
+        if (!anchorService.closeResidualCanceledAnchor(run.getId(), anchor.getOperationId())) {
+            throw new IllegalStateException(
+                    "resume_anchor_clear_failed: canceled anchor changed concurrently, retry");
+        }
+        log.info("Resume run={}: cleared finalized canceled anchor operationId={}",
                 run.getId(), anchor.getOperationId());
     }
 

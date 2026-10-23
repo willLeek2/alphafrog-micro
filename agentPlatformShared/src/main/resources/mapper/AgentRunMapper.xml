@@ -475,8 +475,6 @@
                     WHEN status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
                          AND status &lt;&gt; 'RECEIVED'
                          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
-                         AND COALESCE(tool_job_anchor_json -&gt;&gt; 'finalizerStep', '')
-                             NOT IN ('EVENT', 'CAS_STATUS', 'RESUME_READY', 'CANCELED')
                         THEN 'CANCELED'
                     ELSE status
                 END = #{status}
@@ -499,8 +497,6 @@
                     WHEN status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
                          AND status &lt;&gt; 'RECEIVED'
                          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
-                         AND COALESCE(tool_job_anchor_json -&gt;&gt; 'finalizerStep', '')
-                             NOT IN ('EVENT', 'CAS_STATUS', 'RESUME_READY', 'CANCELED')
                         THEN 'CANCELED'
                     ELSE status
                 END = #{status}
