@@ -79,8 +79,7 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
 
     @Test
     void writeFinalAnswer_shouldSendFinalPromptWithFinanceBlockIsolationInstruction() {
-        // codex e740f454 ①/③：final-stage prompt 必须带 §11 块外隔离约束——
-        // 服务端追加数值表 + 禁止模型复述后台身份/摘要；捕获实际 ChatRequest 钉死。
+        // 核对实际发送的最终回答提示，避免数值表与内部身份混入模型正文。
         FinanceResultComposer composer = mock(FinanceResultComposer.class);
         when(composer.appendFinanceResultBlock(any(), any(), any()))
                 .thenAnswer(invocation -> invocation.getArgument(2));
@@ -106,12 +105,12 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
         }
         String prompt = userText.toString();
         // 服务端追加契约
-        assertThat(prompt).contains("由服务端在你的回答之后自动追加");
+        assertThat(prompt).contains("由服务端在回答之后确定性追加");
         // 块外禁止复述：digest/版本/环境/镜像/包/证据/resolver/内部警告/各类 ID
-        assertThat(prompt).contains("禁止在回答中复述或拼接任何内部身份与后台信息");
-        assertThat(prompt).contains("sha256:");
+        assertThat(prompt).contains("不得复述或拼接内部身份与后台信息");
+        assertThat(prompt).contains("content digest");
         assertThat(prompt).contains("执行环境或镜像身份");
-        assertThat(prompt).contains("证据类型或等级");
+        assertThat(prompt).contains("证据类型/等级");
         assertThat(prompt).contains("resolver");
         assertThat(prompt).contains("内部警告");
         // prompt 自身不携带任何真实后台身份值（静态指令文本）
