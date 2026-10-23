@@ -1,0 +1,36 @@
+对平台已落库的资产数据表写一条只读 SQL，一次调用完成组合取数。SQL 由平台服务端在资产库上守卫执行，只读、限时、限量。
+
+适用场景：
+  - 固定参数工具做不到的组合取数：跨表 JOIN（如指数成分权重表连股票信息表取某年成分股清单）、多资产批量清单、不规则筛选
+  - 需要 JSONB 指标（估值、换手、财务指标）参与过滤或输出的取数
+  - 先取数、后用 Python 或 SQL 做分析的两段式任务的第一段
+
+与 executeQuery 的分工：
+  - 本工具是第一段取数：直接查平台资产库（股票 14 张、指数 10 张、ETF 3 张、场外基金 7 张、交易日历 1 张，共 35 张表）
+  - executeQuery 是第二段分析：对已落盘的数据集执行 SQL；本工具超过 50 行的结果自动落成数据集，正好作为它的输入
+  - 只需看数不需要分析时，小结果直接内联返回即可，不必再调 executeQuery
+
+可查表清单：
+  - 先调 listAssetTables 拿 35 张可查表的目录：表名、中文用途、唯一键、关键列、JSONB 键、日期与单位写法、覆盖说明
+  - 只允许查询目录内的表；查目录外的表（含平台业务表）或使用任何 schema 限定引用（public.、information_schema.、pg_catalog. 等前缀）会被拒 TABLE_NOT_ALLOWED
+
+SQL 写法规则：
+  - 只接受单条语句，且必须以 SELECT 或 WITH 开头；INSERT/UPDATE/DELETE/SET/CALL 等非查询语句与多语句直接拒绝
+  - 必须自带 LIMIT：没有 LIMIT 被拒 MISSING_LIMIT；LIMIT 超过 200000 会被改写到 200000 并在结果里说明
+  - OFFSET 原样保留；分页取数建议每页不超过 1000 行
+  - 日期列是 BIGINT 毫秒时间戳：写 af_date('2024-01-01') 由辅助函数自动转毫秒，不要手写毫秒数字。区间示例：trade_date >= af_date('2024-01-01') AND trade_date < af_date('2025-01-01')
+  - JSONB 列用 ->> 取键：valuation->>'pe' 返回文本，数值比较用 (valuation->>'pe')::double precision
+  - 管理类函数族（pg_*、lo_*、dblink、XML 类、set_config/current_setting、游标类等）默认拒绝，命中返回 FORBIDDEN_FUNCTION；普通分析函数用裸函数名调用即可
+
+参数说明：
+  sql - 一条 PostgreSQL 只读查询语句，必填
+
+返回结果：
+  - 50 行以内：columns（列名）、rows（数据行）、row_count、truncated 内联返回
+  - 超过 50 行：自动写入当前 Run 的数据集，返回 dataset_id 与行数、字段、预览摘要；该数据集可继续被 executePython/executeQuery 挂载
+  - 结果上限 200000 行或 32MiB，触顶截断并标记 truncated=true；需要更少行数请加过滤或收窄条件
+  - 语句超时 30 秒（错误码 STATEMENT_TIMEOUT），超时不返回部分行；缩小日期范围、加过滤条件后重试；并发占满时返回 SERVER_BUSY，可直接重试
+
+注意事项：
+  - 金额/份额等数值列是 TuShare 接口原始口径（万元、亿元、万份等，库层不统一换算），跨表比较前先核对 listAssetTables 里的单位说明
+  - 少数表没有写入线（如 alphafrog_index_weekly 恒为空），财务类表有报告期/公告日语义（end_date 报告期、ann_date 公告日），取数前先看 listAssetTables 的覆盖说明

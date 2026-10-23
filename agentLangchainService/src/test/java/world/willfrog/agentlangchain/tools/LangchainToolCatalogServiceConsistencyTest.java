@@ -14,6 +14,7 @@ import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -39,6 +40,7 @@ class LangchainToolCatalogServiceConsistencyTest {
 
     private LangchainToolCatalogService service;
     private MarketDataTools marketDataTools;
+    private AssetSqlTools assetSqlTools;
     private RagTools ragTools;
     private SearchTools searchTools;
     private PythonSandboxTools pythonSandboxTools;
@@ -57,6 +59,11 @@ class LangchainToolCatalogServiceConsistencyTest {
                 new AgentLlmProperties(),
                 objectMapper
         );
+        assetSqlTools = new AssetSqlTools(
+                mock(DatasetWriter.class),
+                mock(DatasetRegistry.class),
+                objectMapper
+        );
         ragTools = new RagTools(objectMapper);
         searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         pythonSandboxTools = new PythonSandboxTools(objectMapper);
@@ -67,6 +74,7 @@ class LangchainToolCatalogServiceConsistencyTest {
 
         service = new LangchainToolCatalogService(
                 marketDataTools,
+                assetSqlTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
@@ -86,6 +94,7 @@ class LangchainToolCatalogServiceConsistencyTest {
 
         Set<String> runtimeNames = ToolCatalogBuilder.buildSpecifications(
                 marketDataTools,
+                assetSqlTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
@@ -102,7 +111,7 @@ class LangchainToolCatalogServiceConsistencyTest {
         assertEquals(runtimeNames, apiNames,
                 "API 目录应与运行时 builder 在能力门控全开时的结果一致");
         assertEquals(AgentToolRegistry.declaredToolNames(), apiNames,
-                "API 全量视图应包含注册表全部 28 个声明");
+                "API 全量视图应包含注册表全部 31 个声明");
     }
 
     @Test

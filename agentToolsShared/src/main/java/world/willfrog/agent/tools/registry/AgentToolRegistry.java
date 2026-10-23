@@ -59,7 +59,7 @@ public final class AgentToolRegistry {
 
     /** canonical 规格覆盖来源。NONE=Bean 反射；其余为各 catalog helper 或手工构建。 */
     public enum CanonicalSpec {
-        NONE, MARKET_ADVANCED, PARALLEL_LIMITS, MANUAL_FINANCE, MANUAL_SUB_AGENT
+        NONE, MARKET_ADVANCED, PARALLEL_LIMITS, MANUAL_FINANCE, MANUAL_SUB_AGENT, ASSET_SQL
     }
 
     /**
@@ -151,6 +151,16 @@ public final class AgentToolRegistry {
             new ToolDeclaration("getSpecialAssetDaily", Domain.MARKET_DATA, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.DATASET,
                     Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "MarketDataTools"),
+            // 014-new-02：统一 SQL 资产取数两段分工——queryAssetData=平台资产库取数第一段（只读 SQL，
+            // 服务端守卫执行，>50 行落 kind=asset_sql 数据集）；executeQuery=数据集分析第二段（上方 SQL_SANDBOX）。
+            // queryAssetData 缓存族对齐 getStockDaily（结果落数据集，复用走 DatasetRegistry）；无批量语义故不进并行组。
+            new ToolDeclaration("queryAssetData", Domain.MARKET_DATA, CapabilityGate.NONE,
+                    Compression.ELIGIBLE, null, CacheFamily.DATASET,
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "AssetSqlTools"),
+            // listAssetTables：零参数元工具（先例 checkParallelLimits），只读静态目录渲染，无 IO 与数据面开销。
+            new ToolDeclaration("listAssetTables", Domain.MARKET_DATA, CapabilityGate.NONE,
+                    Compression.ELIGIBLE, null, CacheFamily.NONE,
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.ASSET_SQL, "AssetSqlTools"),
             new ToolDeclaration("ragSearch", Domain.RAG, CapabilityGate.NONE,
                     Compression.ELIGIBLE, null, CacheFamily.NONE,
                     Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "RagTools"),

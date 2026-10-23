@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tools;
 
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.tools.catalog.AssetSqlToolCatalog;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
@@ -23,6 +24,17 @@ class CatalogHelperForceCheckContractTest {
         assertEquals(registryNames, helperNames,
                 "MarketDataAdvancedToolCatalog 覆盖的名字必须与注册表 MARKET_ADVANCED canonical 声明一致");
         assertEquals(3, helperNames.size());
+    }
+
+    @Test
+    void assetSqlHelperCanonicalNameMatchesRegistryCanonicalSpec() {
+        String helperName = AssetSqlToolCatalog.canonicalToolName();
+        Set<String> registryNames = AgentToolRegistry.namesWithCanonicalSpec(
+                AgentToolRegistry.CanonicalSpec.ASSET_SQL);
+
+        assertEquals(registryNames, Set.of(helperName),
+                "AssetSqlToolCatalog 覆盖的名字必须与注册表 ASSET_SQL canonical 声明一致");
+        assertEquals("listAssetTables", helperName);
     }
 
     @Test

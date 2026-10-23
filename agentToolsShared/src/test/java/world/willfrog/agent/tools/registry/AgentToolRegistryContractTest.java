@@ -1,7 +1,12 @@
 package world.willfrog.agent.tools.registry;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -17,10 +22,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AgentToolRegistryContractTest {
 
     @Test
-    void declaredToolNames_hasExactly29UniqueNames() {
+    void declaredToolNames_hasExactly31UniqueNames() {
         Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertEquals(29, names.size(), "生产声明面应保持 29 个工具名");
-        assertEquals(29, names.stream().distinct().count(), "工具名必须唯一");
+        assertEquals(31, names.size(), "生产声明面应保持 31 个工具名");
+        assertEquals(31, names.stream().distinct().count(), "工具名必须唯一");
     }
 
     @Test
@@ -28,6 +33,8 @@ class AgentToolRegistryContractTest {
         Set<String> names = AgentToolRegistry.declaredToolNames();
         assertTrue(names.contains("spawnSubAgent"), "D06 必须登记 spawnSubAgent");
         assertTrue(names.contains("waitForSubAgent"), "D06 必须登记 waitForSubAgent");
+        assertTrue(names.contains("queryAssetData"), "014 资产 SQL 工具必须登记 queryAssetData");
+        assertTrue(names.contains("listAssetTables"), "014 资产 SQL 工具必须登记 listAssetTables");
     }
 
     @Test
@@ -60,6 +67,8 @@ class AgentToolRegistryContractTest {
                 "getListedAssetShareSize",
                 "getFinancialReport",
                 "getSpecialAssetDaily",
+                "queryAssetData",
+                "listAssetTables",
                 "ragSearch",
                 "loadDocument"
         );
@@ -103,7 +112,8 @@ class AgentToolRegistryContractTest {
                 "getOffExchangeAssetDaily",
                 "getListedAssetShareSize",
                 "getEtfAdj",
-                "getSpecialAssetDaily"
+                "getSpecialAssetDaily",
+                "queryAssetData"
         );
         Set<String> actual = AgentToolRegistry.namesInCacheFamily(AgentToolRegistry.CacheFamily.DATASET);
         assertEquals(expected, actual);
@@ -182,6 +192,55 @@ class AgentToolRegistryContractTest {
         Set<String> expected = Set.of("checkParallelLimits");
         Set<String> actual = AgentToolRegistry.namesWithCanonicalSpec(AgentToolRegistry.CanonicalSpec.PARALLEL_LIMITS);
         assertEquals(expected, actual);
+    }
+
+    @Test
+    void canonicalAssetSql_matchesFrozenGroundTruth() {
+        Set<String> expected = Set.of("listAssetTables");
+        Set<String> actual = AgentToolRegistry.namesWithCanonicalSpec(AgentToolRegistry.CanonicalSpec.ASSET_SQL);
+        assertEquals(expected, actual, "ASSET_SQL canonical 集合必须与注册表现状一致");
+    }
+
+    @Test
+    void assetTablesCatalog_resourceMatchesFrozen35Tables() throws Exception {
+        // 与服务端 AssetSqlAllowedTables 白名单同源的 35 表冻结清单：目录资源任何增删表都会在此报警。
+        Set<String> expected = Set.of(
+                "alphafrog_cb_daily", "alphafrog_domestic_etf", "alphafrog_domestic_etf_adj_factor",
+                "alphafrog_domestic_etf_daily", "alphafrog_fund_company", "alphafrog_fund_etf_share_size",
+                "alphafrog_fund_info", "alphafrog_fund_manager", "alphafrog_fund_nav", "alphafrog_fund_portfolio",
+                "alphafrog_fund_share", "alphafrog_index_ci_daily", "alphafrog_index_ci_member",
+                "alphafrog_index_daily", "alphafrog_index_daily_basic", "alphafrog_index_info",
+                "alphafrog_index_sw_classify", "alphafrog_index_sw_daily", "alphafrog_index_sw_member",
+                "alphafrog_index_weekly", "alphafrog_index_weight", "alphafrog_stk_ah",
+                "alphafrog_stock_balancesheet", "alphafrog_stock_cashflow", "alphafrog_stock_daily",
+                "alphafrog_stock_express", "alphafrog_stock_fina_indicator", "alphafrog_stock_forecast",
+                "alphafrog_stock_income", "alphafrog_stock_info", "alphafrog_stock_moneyflow",
+                "alphafrog_stock_report_rc", "alphafrog_stock_share_float", "alphafrog_stock_top10_holders",
+                "alphafrog_trade_calendar"
+        );
+        Set<String> actual = new LinkedHashSet<>();
+        String resource = "prompts/tools/asset_tables_catalog.json";
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream(resource)) {
+            assert in != null : "目录资源缺失: " + resource;
+            JsonNode root = new ObjectMapper().readTree(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            collectTableNames(root, actual);
+        }
+        assertEquals(expected, actual, "资产表目录必须与服务端白名单同源的 35 表冻结清单一致");
+    }
+
+    private static void collectTableNames(JsonNode node, Set<String> out) {
+        if (node == null) {
+            return;
+        }
+        if (node.isObject()) {
+            JsonNode table = node.get("table");
+            if (table != null && table.isTextual()) {
+                out.add(table.asText());
+            }
+            node.fields().forEachRemaining(entry -> collectTableNames(entry.getValue(), out));
+        } else if (node.isArray()) {
+            node.forEach(child -> collectTableNames(child, out));
+        }
     }
 
     @Test

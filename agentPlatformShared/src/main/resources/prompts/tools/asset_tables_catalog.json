@@ -1,0 +1,343 @@
+{
+  "catalog_version": 1,
+  "table_count": 35,
+  "purpose": "queryAssetData 可查询的 35 张平台资产表目录，与工具表白名单同源（表结构变更时两者必须同步修改）",
+  "date_column_note": "所有日期列均为 BIGINT 毫秒时间戳（上海当日零点），SQL 中写 af_date('2024-01-01') 自动转毫秒；区间写法示例：trade_date >= af_date('2024-01-01') AND trade_date < af_date('2025-01-01')",
+  "jsonb_note": "JSONB 列用 ->> 取键，如 valuation->>'pe'（返回 text）；需要数值比较时转 (valuation->>'pe')::double precision",
+  "units_note": "金额/份额/量纲类数值均为 TuShare 接口原始口径（万元、亿元、万份、元等依接口而异），库层不统一换算，跨表比较前按 TuShare 接口文档核对单位",
+  "domains": [
+    {
+      "domain": "stock",
+      "name": "股票（14 张）",
+      "tables": [
+        {"table": "alphafrog_stock_info", "name": "股票基本信息（代码-名称-行业-上市状态对照）", "keys": ["ts_code", "symbol"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码，交易所后缀，如 600519.SH"}, {"col": "symbol", "type": "VARCHAR", "desc": "6 位数字代码，如 600519"},
+            {"col": "name", "type": "VARCHAR", "desc": "股票简称"}, {"col": "industry", "type": "VARCHAR", "desc": "所属行业"}, {"col": "market", "type": "VARCHAR", "desc": "市场（主板/创业板/科创板等）"},
+            {"col": "list_status", "type": "VARCHAR", "desc": "上市状态：L 上市 / D 退市 / P 暂停上市"}, {"col": "list_date", "type": "BIGINT", "desc": "上市日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "delist_date", "type": "BIGINT", "desc": "退市日期，毫秒时间戳，写法用 af_date('2024-01-01')"}
+          ]
+        },
+        {"table": "alphafrog_stock_daily", "name": "股票日线行情（含复权因子、估值与换手 JSONB）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码，如 600519.SH"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "open,high,low,close", "type": "DOUBLE", "desc": "开/高/低/收盘价（元）"}, {"col": "pre_close,change,pct_chg", "type": "DOUBLE", "desc": "前收盘价/涨跌额/涨跌幅%"},
+            {"col": "vol,amount", "type": "DOUBLE", "desc": "成交量/成交额，TuShare 原始口径"}, {"col": "adj_factor", "type": "DOUBLE", "desc": "复权因子，后复权价=close×adj_factor"}
+          ],
+          "jsonb_columns": {
+            "valuation": "pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm（估值指标，亏损时市盈率为空）",
+            "share_turnover": "turnover_rate,turnover_rate_f,volume_ratio,total_share,float_share,free_share,total_mv,circ_mv,limit_status（换手率、股本、总市值/流通市值等，TuShare 原始口径）"
+          },
+          "coverage_note": "adj_factor/valuation/share_turnover 为后期追加列，早于加列日期的历史行这些列为空，需回填后才可用"
+        },
+        {"table": "alphafrog_stock_income", "name": "利润表（按报告期）", "keys": ["ts_code", "end_date", "report_type"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date,f_ann_date", "type": "BIGINT", "desc": "公告日期/实际公告日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "报告期（如 2024-06-30），毫秒时间戳，写法用 af_date('2024-06-30')"}, {"col": "report_type", "type": "VARCHAR", "desc": "报表类型（TuShare 口径，如 1=合并报表）"},
+            {"col": "basic_eps,diluted_eps", "type": "DOUBLE", "desc": "基本/稀释每股收益（元）"}, {"col": "total_revenue,revenue", "type": "DOUBLE", "desc": "营业总收入/营业收入，TuShare 原始口径"},
+            {"col": "operate_profit,total_profit", "type": "DOUBLE", "desc": "营业利润/利润总额"}, {"col": "n_income,n_income_attr_p", "type": "DOUBLE", "desc": "净利润/归母净利润"},
+            {"col": "ebit,ebitda,rd_exp", "type": "DOUBLE", "desc": "EBIT/EBITDA/研发费用"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"},
+          "coverage_note": "同一 (ts_code,end_date,report_type) 仅一行；end_date 是报告期、ann_date 是公告日，想清楚按哪个口径取"
+        },
+        {"table": "alphafrog_stock_balancesheet", "name": "资产负债表（按报告期）", "keys": ["ts_code", "end_date", "report_type"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date,f_ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "报告期，毫秒时间戳，写法用 af_date('2024-06-30')"}, {"col": "report_type", "type": "VARCHAR", "desc": "报表类型"},
+            {"col": "money_cap", "type": "DOUBLE", "desc": "货币资金，TuShare 原始口径"}, {"col": "total_cur_assets,total_nca", "type": "DOUBLE", "desc": "流动资产合计/非流动资产合计"},
+            {"col": "fix_assets,goodwill,intan_assets", "type": "DOUBLE", "desc": "固定资产/商誉/无形资产"}, {"col": "total_assets", "type": "DOUBLE", "desc": "资产总计"},
+            {"col": "total_cur_liab,total_ncl,total_liab", "type": "DOUBLE", "desc": "流动负债/非流动负债/负债合计"}, {"col": "total_hldr_eqy_exc_min_int", "type": "DOUBLE", "desc": "归母股东权益合计"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"},
+          "coverage_note": "同一 (ts_code,end_date,report_type) 仅一行；公告期语义同利润表"
+        },
+        {"table": "alphafrog_stock_cashflow", "name": "现金流量表（按报告期）", "keys": ["ts_code", "end_date", "report_type"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date,f_ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "报告期，毫秒时间戳，写法用 af_date('2024-06-30')"}, {"col": "report_type", "type": "VARCHAR", "desc": "报表类型"},
+            {"col": "c_fr_sale_sg", "type": "DOUBLE", "desc": "销售商品提供劳务收到的现金"}, {"col": "n_cashflow_act", "type": "DOUBLE", "desc": "经营活动现金流净额"},
+            {"col": "n_cashflow_inv_act", "type": "DOUBLE", "desc": "投资活动现金流净额"}, {"col": "n_cash_flows_fnc_act", "type": "DOUBLE", "desc": "筹资活动现金流净额"},
+            {"col": "free_cashflow", "type": "DOUBLE", "desc": "自由现金流"}, {"col": "c_cash_equ_end_period", "type": "DOUBLE", "desc": "期末现金及现金等价物余额"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"},
+          "coverage_note": "同一 (ts_code,end_date,report_type) 仅一行；公告期语义同利润表"
+        },
+        {"table": "alphafrog_stock_forecast", "name": "业绩预告（按公告）", "keys": ["ts_code", "ann_date", "end_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-01-31')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "对应报告期，毫秒时间戳，写法用 af_date('2024-06-30')"}, {"col": "type", "type": "VARCHAR", "desc": "预告类型（预盈/预亏/预增/预减等）"},
+            {"col": "p_change_min,p_change_max", "type": "DOUBLE", "desc": "预计业绩变动幅度下限/上限%"}, {"col": "net_profit_min,net_profit_max", "type": "DOUBLE", "desc": "预计净利润下限/上限，TuShare 原始口径"},
+            {"col": "last_parent_net", "type": "DOUBLE", "desc": "上年同期归母净利润"}, {"col": "summary,change_reason", "type": "TEXT", "desc": "业绩预告摘要/变动原因"}
+          ],
+          "coverage_note": "一条记录=一次公告，同一报告期可能多次预告，取最新按 ann_date 最大"
+        },
+        {"table": "alphafrog_stock_express", "name": "业绩快报（按公告）", "keys": ["ts_code", "ann_date", "end_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-02-28')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "对应报告期，毫秒时间戳，写法用 af_date('2024-06-30')"},
+            {"col": "revenue,operate_profit,n_income", "type": "DOUBLE", "desc": "营业收入/营业利润/净利润，TuShare 原始口径"},
+            {"col": "total_assets,total_hldr_eqy_exc_min_int", "type": "DOUBLE", "desc": "总资产/归母股东权益"}, {"col": "diluted_eps,diluted_roe,bps", "type": "DOUBLE", "desc": "稀释每股收益/稀释 ROE/每股净资产"},
+            {"col": "yoy_net_profit,yoy_sales,yoy_op,yoy_tp,yoy_dedu_np,yoy_eps,yoy_roe", "type": "DOUBLE", "desc": "净利润/营收/营业利润/利润总额/扣非/每股收益/ROE 同比%"}
+          ],
+          "coverage_note": "一条记录=一次公告；正式财报（利润表等）披露后快报会被替代"
+        },
+        {"table": "alphafrog_stock_report_rc", "name": "卖方盈利预测与评级（按研报）", "keys": ["ts_code", "report_date", "org_name", "quarter"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "report_date", "type": "BIGINT", "desc": "报告发布日期（不是报告期），毫秒时间戳，写法用 af_date('2024-05-10')"},
+            {"col": "report_title,report_type,classify", "type": "VARCHAR", "desc": "报告标题/类型/分类"}, {"col": "org_name,author_name", "type": "VARCHAR", "desc": "机构名称/分析师"},
+            {"col": "quarter", "type": "VARCHAR", "desc": "预测期（如 2024Q1、2024A）"}, {"col": "op_rt,op_pr,rating", "type": "VARCHAR", "desc": "评级调整方向/评级/评级描述"},
+            {"col": "tp,max_price,min_price", "type": "DOUBLE", "desc": "目标价/最高目标价/最低目标价（元）"},
+            {"col": "np,eps,pe,roe,ev_ebitda", "type": "DOUBLE", "desc": "预测净利润/预测每股收益/预测 PE/预测 ROE/预测 EV/EBITDA"}
+          ],
+          "coverage_note": "report_date 是报告发布日，按机构+预测期唯一"
+        },
+        {"table": "alphafrog_stock_fina_indicator", "name": "财务指标（按报告期，TuShare fina_indicator）", "keys": ["ts_code", "end_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-03-28')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "报告期，毫秒时间戳，写法用 af_date('2024-06-30')"}
+          ],
+          "jsonb_columns": {
+            "profitability": "盈利与回报类：roe/roa/roic 族、利润率、扣非相关（如 roe_dt、netprofit_margin）",
+            "per_share": "每股类：*_ps、eps、bps",
+            "capital_cash": "营运/偿债/现金流/资本结构类（如 assets_turn、assets_to_eqt）",
+            "growth": "增长类：yoy/qoq 同比环比、研发；单季 q_ 前缀字段按所属类别归入同类",
+            "extended": "未进四类的字段原样保存，键名沿用 TuShare 字段名"
+          },
+          "coverage_note": "同一 (ts_code,end_date) 后到的公告覆盖前值（写入方整行覆盖），取到的总是最新一次公告口径"
+        },
+        {"table": "alphafrog_stock_moneyflow", "name": "个股资金流向（按交易日）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "buy_sm_vol,buy_md_vol,buy_lg_vol,buy_elg_vol", "type": "BIGINT", "desc": "小/中/大/特大单买入量"},
+            {"col": "sell_sm_vol,sell_md_vol,sell_lg_vol,sell_elg_vol", "type": "BIGINT", "desc": "小/中/大/特大单卖出量"},
+            {"col": "buy_sm_amount 等 8 个 *_amount", "type": "DOUBLE", "desc": "对应买卖金额，TuShare 原始口径"}, {"col": "net_mf_vol,net_mf_amount", "type": "DOUBLE", "desc": "净流入量/净流入额"}
+          ]
+        },
+        {"table": "alphafrog_stock_top10_holders", "name": "前十大股东（按报告期披露）", "keys": ["ts_code", "end_date", "holder_name"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-04-27')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "报告期（股东持股截止日），毫秒时间戳，写法用 af_date('2024-03-31')"}, {"col": "holder_name,holder_type", "type": "VARCHAR", "desc": "股东名称/股东类型"},
+            {"col": "hold_amount", "type": "DOUBLE", "desc": "持股数量，TuShare 原始口径"}, {"col": "hold_ratio,hold_float_ratio", "type": "DOUBLE", "desc": "占总股本比例%/占流通股本比例%"},
+            {"col": "hold_change", "type": "DOUBLE", "desc": "持股变动"}
+          ]
+        },
+        {"table": "alphafrog_stock_share_float", "name": "限售股解禁（按解禁批次）", "keys": ["ts_code", "float_date", "holder_name", "share_type"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "股票代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-01-10')"},
+            {"col": "float_date", "type": "BIGINT", "desc": "解禁日期，毫秒时间戳，写法用 af_date('2024-06-30')"}, {"col": "holder_name,share_type", "type": "VARCHAR", "desc": "解禁股东/股份类型"},
+            {"col": "float_share", "type": "DOUBLE", "desc": "解禁数量，TuShare 原始口径"}, {"col": "float_ratio", "type": "DOUBLE", "desc": "占总流通股本比例%"}
+          ]
+        },
+        {"table": "alphafrog_cb_daily", "name": "可转债日线行情（含溢价 JSONB）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "转债代码，如 113050.SH"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "open,high,low,close", "type": "DOUBLE", "desc": "开/高/低/收盘价（元）"}, {"col": "pre_close,change,pct_chg", "type": "DOUBLE", "desc": "前收盘价/涨跌额/涨跌幅%"},
+            {"col": "vol,amount", "type": "DOUBLE", "desc": "成交量/成交额，TuShare 原始口径"}
+          ],
+          "jsonb_columns": {"premium": "bond_value 纯债价值、bond_over_rate 纯债溢价率%、cb_value 转股价值、cb_over_rate 转股溢价率%"}
+        },
+        {"table": "alphafrog_stk_ah", "name": "AH 比价（A/H 两地同时上市股票，按交易日）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "A 股代码"}, {"col": "hk_code", "type": "VARCHAR", "desc": "对应 H 股代码"},
+            {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"}, {"col": "close,hk_close", "type": "DOUBLE", "desc": "A 股/H 股收盘价（各按当地货币）"},
+            {"col": "pct_chg,hk_pct_chg", "type": "DOUBLE", "desc": "A 股/H 股涨跌幅%"}, {"col": "ah_comparison", "type": "DOUBLE", "desc": "比价（A/H）"},
+            {"col": "ah_premium", "type": "DOUBLE", "desc": "溢价率（A/H）%"}
+          ]
+        }
+      ]
+    },
+    {
+      "domain": "index",
+      "name": "指数（10 张）",
+      "tables": [
+        {"table": "alphafrog_index_info", "name": "指数基本信息", "keys": ["ts_code"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "指数代码，如 000300.SH"}, {"col": "name,fullname", "type": "VARCHAR", "desc": "指数简称/全称"},
+            {"col": "market,publisher", "type": "VARCHAR", "desc": "市场/发布机构"}, {"col": "index_type,category", "type": "VARCHAR", "desc": "指数类型/类别"},
+            {"col": "base_date", "type": "BIGINT", "desc": "基准日期，毫秒时间戳，写法用 af_date('2005-04-08')"}, {"col": "base_point", "type": "DOUBLE", "desc": "基点"},
+            {"col": "weight_rule", "type": "VARCHAR", "desc": "加权方式"}
+          ],
+          "coverage_note": "表内有列名 desc（指数描述）。desc 是 SQL 保留字，引用时必须写双引号 \"desc\""
+        },
+        {"table": "alphafrog_index_daily", "name": "指数日线行情", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "指数代码，如 000300.SH"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "open,high,low,close", "type": "DOUBLE", "desc": "开/高/低/收盘点位"}, {"col": "pre_close,change,pct_chg", "type": "DOUBLE", "desc": "前收盘/涨跌/涨跌幅%"},
+            {"col": "vol,amount", "type": "DOUBLE", "desc": "成交量/成交额，TuShare 原始口径"}
+          ]
+        },
+        {"table": "alphafrog_index_weekly", "name": "指数周线（僵尸表）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "指数代码"}, {"col": "trade_date", "type": "BIGINT", "desc": "周线日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "open,high,low,close,vol,amount", "type": "DOUBLE", "desc": "周开高低收/量额"}
+          ],
+          "coverage_note": "无写入线无数据：平台没有任何写入，查询恒返回 0 行；周线请从 alphafrog_index_daily 按周自行聚合"
+        },
+        {"table": "alphafrog_index_weight", "name": "指数成分与权重（快照）", "keys": ["index_code", "con_code", "trade_date"],
+          "columns": [
+            {"col": "index_code", "type": "VARCHAR", "desc": "指数代码，如 000300.SH"}, {"col": "con_code", "type": "VARCHAR", "desc": "成分股代码"},
+            {"col": "trade_date", "type": "BIGINT", "desc": "快照日期，毫秒时间戳，写法用 af_date('2024-01-31')"}, {"col": "weight", "type": "DOUBLE", "desc": "权重%"}
+          ],
+          "coverage_note": "按快照保存（非逐日）；取某时点成分时选不晚于该时点的最近一个快照日期"
+        },
+        {"table": "alphafrog_index_daily_basic", "name": "指数每日指标（估值/市值）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "指数代码"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "total_mv,float_mv", "type": "DOUBLE", "desc": "总市值/流通市值，TuShare 原始口径"}, {"col": "total_share,float_share,free_share", "type": "DOUBLE", "desc": "总股本/流通股本/自由流通股本"},
+            {"col": "turnover_rate,turnover_rate_f", "type": "DOUBLE", "desc": "换手率/自由流通换手率"}, {"col": "pe,pe_ttm,pb", "type": "DOUBLE", "desc": "市盈率/滚动市盈率/市净率"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_index_ci_member", "name": "中证行业成分股", "keys": ["ts_code", "l3_code", "in_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "成分股代码"}, {"col": "name", "type": "VARCHAR", "desc": "成分股名称"},
+            {"col": "l1_code,l1_name,l2_code,l2_name,l3_code,l3_name", "type": "VARCHAR", "desc": "一/二/三级行业代码与名称"},
+            {"col": "in_date,out_date", "type": "BIGINT", "desc": "纳入/剔除日期，毫秒时间戳，写法用 af_date('2024-01-01')"}, {"col": "is_new", "type": "VARCHAR", "desc": "是否当前版本"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_index_ci_daily", "name": "中信行业指数日线", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "中信行业指数代码"}, {"col": "name", "type": "VARCHAR", "desc": "行业名称"},
+            {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"}, {"col": "open,high,low,close,pre_close", "type": "DOUBLE", "desc": "开高低收/前收盘"},
+            {"col": "change_val,pct_change", "type": "DOUBLE", "desc": "涨跌额/涨跌幅%"}, {"col": "vol,amount", "type": "DOUBLE", "desc": "成交量/成交额，TuShare 原始口径"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_index_sw_classify", "name": "申万行业分类", "keys": ["index_code", "src"],
+          "columns": [
+            {"col": "index_code", "type": "VARCHAR", "desc": "行业代码，如 801010"}, {"col": "industry_name", "type": "VARCHAR", "desc": "行业名称"},
+            {"col": "parent_code", "type": "VARCHAR", "desc": "上级行业代码"}, {"col": "level", "type": "VARCHAR", "desc": "层级（L1/L2/L3）"},
+            {"col": "industry_code", "type": "VARCHAR", "desc": "行业编码"}, {"col": "is_pub", "type": "VARCHAR", "desc": "是否发布"}, {"col": "src", "type": "VARCHAR", "desc": "来源版本（如 2021 版）"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_index_sw_daily", "name": "申万行业指数日线（含估值市值）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "申万行业指数代码"}, {"col": "name", "type": "VARCHAR", "desc": "行业名称"},
+            {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"}, {"col": "open,high,low,close", "type": "DOUBLE", "desc": "开高低收"},
+            {"col": "change_val,pct_change", "type": "DOUBLE", "desc": "涨跌额/涨跌幅%"}, {"col": "vol,amount", "type": "DOUBLE", "desc": "成交量/成交额，TuShare 原始口径"},
+            {"col": "pe,pb", "type": "DOUBLE", "desc": "市盈率/市净率"}, {"col": "float_mv,total_mv", "type": "DOUBLE", "desc": "流通市值/总市值，TuShare 原始口径"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_index_sw_member", "name": "申万行业成分股", "keys": ["ts_code", "l3_code", "in_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "成分股代码"}, {"col": "name", "type": "VARCHAR", "desc": "成分股名称"},
+            {"col": "l1_code,l1_name,l2_code,l2_name,l3_code,l3_name", "type": "VARCHAR", "desc": "一/二/三级行业代码与名称"},
+            {"col": "in_date,out_date", "type": "BIGINT", "desc": "纳入/剔除日期，毫秒时间戳，写法用 af_date('2024-01-01')"}, {"col": "is_new", "type": "VARCHAR", "desc": "是否当前版本"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        }
+      ]
+    },
+    {
+      "domain": "etf",
+      "name": "ETF（3 张）",
+      "tables": [
+        {"table": "alphafrog_domestic_etf", "name": "ETF 基本信息", "keys": ["ts_code"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "ETF 代码，如 510300.SH"}, {"col": "name,full_name", "type": "VARCHAR", "desc": "简称/全称"},
+            {"col": "exchange", "type": "VARCHAR", "desc": "上市交易所"}, {"col": "mgr_name", "type": "VARCHAR", "desc": "管理人"}, {"col": "list_status", "type": "VARCHAR", "desc": "上市状态"},
+            {"col": "etf_type", "type": "VARCHAR", "desc": "ETF 类型"}, {"col": "index_code,index_name", "type": "VARCHAR", "desc": "跟踪指数代码/名称"},
+            {"col": "list_date,setup_date", "type": "BIGINT", "desc": "上市/成立日期，毫秒时间戳，写法用 af_date('2012-05-28')"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_domestic_etf_daily", "name": "ETF 日线行情", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "ETF 代码"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "open,high,low,close", "type": "DOUBLE", "desc": "开/高/低/收盘价（元）"}, {"col": "pre_close,change,pct_chg", "type": "DOUBLE", "desc": "前收盘价/涨跌额/涨跌幅%"},
+            {"col": "vol,amount", "type": "DOUBLE", "desc": "成交量/成交额，TuShare 原始口径"}
+          ]
+        },
+        {"table": "alphafrog_domestic_etf_adj_factor", "name": "ETF 复权因子", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "ETF 代码"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "adj_factor", "type": "DOUBLE", "desc": "复权因子，后复权价=close×adj_factor"}
+          ]
+        }
+      ]
+    },
+    {
+      "domain": "off_exchange_fund",
+      "name": "场外基金（7 张）",
+      "tables": [
+        {"table": "alphafrog_fund_info", "name": "场外公募基金基本信息（不用于场内 ETF）", "keys": ["ts_code"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "基金代码，如 000001.OF"}, {"col": "name", "type": "VARCHAR", "desc": "基金简称"},
+            {"col": "management,custodian", "type": "VARCHAR", "desc": "管理人/托管人"}, {"col": "fund_type,invest_type,market", "type": "VARCHAR", "desc": "基金类型/投资类型/市场"},
+            {"col": "found_date,due_date,list_date,delist_date", "type": "BIGINT", "desc": "成立/到期/上市/退市日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "issue_amount,duration_year,p_value", "type": "DOUBLE", "desc": "发行份额/存续期/面值，TuShare 原始口径"}, {"col": "m_fee,c_fee", "type": "DOUBLE", "desc": "管理费率/托管费率"},
+            {"col": "benchmark", "type": "VARCHAR", "desc": "业绩比较基准"}
+          ]
+        },
+        {"table": "alphafrog_fund_nav", "name": "场外基金净值（按净值日）", "keys": ["ts_code", "nav_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "基金代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-01-15')"},
+            {"col": "nav_date", "type": "BIGINT", "desc": "净值日期，毫秒时间戳，写法用 af_date('2024-01-12')"}, {"col": "unit_nav,accum_nav,adj_nav", "type": "DOUBLE", "desc": "单位净值/累计净值/复权净值"},
+            {"col": "accum_div", "type": "DOUBLE", "desc": "累计分红"}, {"col": "net_asset,total_net_asset", "type": "DOUBLE", "desc": "净资产/合计净资产，TuShare 原始口径"}
+          ]
+        },
+        {"table": "alphafrog_fund_portfolio", "name": "场外基金股票持仓（按公告）", "keys": ["ts_code", "symbol", "ann_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "基金代码"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-04-22')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "持仓截止报告期，毫秒时间戳，写法用 af_date('2024-03-31')"}, {"col": "symbol", "type": "VARCHAR", "desc": "持仓股票代码"},
+            {"col": "mkv", "type": "DOUBLE", "desc": "持仓市值，TuShare 原始口径"}, {"col": "amount", "type": "DOUBLE", "desc": "持股数量"},
+            {"col": "stk_mkv_ratio,stk_float_ratio", "type": "DOUBLE", "desc": "占基金股票市值比例%/占该股流通股本比例%"}
+          ],
+          "coverage_note": "按定期报告公告，一个 ann_date 对应一份持仓快照"
+        },
+        {"table": "alphafrog_fund_share", "name": "场外基金份额（按交易日）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "基金代码"}, {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"},
+            {"col": "fd_share", "type": "DOUBLE", "desc": "基金份额，TuShare 原始口径"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_fund_company", "name": "基金公司信息", "keys": ["credit_code"],
+          "columns": [
+            {"col": "name,shortname", "type": "VARCHAR", "desc": "公司全称/简称"}, {"col": "province,city", "type": "VARCHAR", "desc": "省份/城市"},
+            {"col": "chairman,manager", "type": "VARCHAR", "desc": "董事长/总经理"}, {"col": "reg_capital,employees", "type": "DOUBLE", "desc": "注册资本/员工人数，TuShare 原始口径"},
+            {"col": "setup_date,end_date", "type": "BIGINT", "desc": "成立/注销日期，毫秒时间戳，写法用 af_date('2024-01-01')"}, {"col": "main_business", "type": "TEXT", "desc": "主营业务"},
+            {"col": "org_code,credit_code", "type": "VARCHAR", "desc": "组织机构代码/统一社会信用代码"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_fund_manager", "name": "基金经理任职信息", "keys": ["ts_code", "name", "begin_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "所管理基金代码"}, {"col": "name", "type": "VARCHAR", "desc": "经理姓名"},
+            {"col": "gender,birth_year,edu,nationality", "type": "VARCHAR", "desc": "性别/出生年/学历/国籍"}, {"col": "ann_date", "type": "BIGINT", "desc": "公告日期，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "begin_date", "type": "BIGINT", "desc": "任职开始日期，毫秒时间戳，写法用 af_date('2018-03-01')"},
+            {"col": "end_date", "type": "BIGINT", "desc": "任职结束日期（空=在任），毫秒时间戳，写法用 af_date('2024-01-01')"}, {"col": "resume", "type": "TEXT", "desc": "简历"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"}
+        },
+        {"table": "alphafrog_fund_etf_share_size", "name": "ETF 份额规模时序（场内 ETF，TuShare etf_share_size）", "keys": ["ts_code", "trade_date"],
+          "columns": [
+            {"col": "ts_code", "type": "VARCHAR", "desc": "ETF 代码"}, {"col": "etf_name", "type": "VARCHAR", "desc": "ETF 名称"},
+            {"col": "trade_date", "type": "BIGINT", "desc": "交易日期，毫秒时间戳，写法用 af_date('2024-01-05')"}, {"col": "total_share", "type": "DOUBLE", "desc": "总份额，TuShare 原始口径"},
+            {"col": "total_size", "type": "DOUBLE", "desc": "总规模，TuShare 原始口径"}, {"col": "nav,close", "type": "DOUBLE", "desc": "单位净值/收盘价"},
+            {"col": "exchange", "type": "VARCHAR", "desc": "交易所"}
+          ],
+          "jsonb_columns": {"extended": "未建普通列的接口字段原样保存，键名沿用 TuShare 字段名，无固定清单"},
+          "coverage_note": "虽在场外基金域，覆盖对象是场内 ETF 的份额规模"
+        }
+      ]
+    },
+    {
+      "domain": "trade_calendar",
+      "name": "交易日历（1 张）",
+      "tables": [
+        {"table": "alphafrog_trade_calendar", "name": "交易日历（按交易所逐自然日）", "keys": ["exchange", "cal_date_timestamp"],
+          "columns": [
+            {"col": "exchange", "type": "VARCHAR", "desc": "交易所代码，如 SSE、SZSE"}, {"col": "cal_date_timestamp", "type": "BIGINT", "desc": "自然日，毫秒时间戳，写法用 af_date('2024-01-01')"},
+            {"col": "is_open", "type": "INTEGER", "desc": "0=休市，1=交易"}, {"col": "pre_trade_date_timestamp", "type": "BIGINT", "desc": "上一交易日，毫秒时间戳，写法用 af_date('2024-01-01')"}
+          ],
+          "coverage_note": "按自然日逐日记录（含周末节假日），判断交易日不能只看周一到周五"
+        }
+      ]
+    }
+  ]
+}

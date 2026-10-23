@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -72,6 +73,7 @@ public class ToolRouterToolProvider implements ToolProvider {
 
     private final ToolRouter toolRouter;
     private final MarketDataTools marketDataTools;
+    private final AssetSqlTools assetSqlTools;
     private final RagTools ragTools;
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
@@ -93,6 +95,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     /** 保留旧调度器现有的独立构造调用点；生产构造由配置类传入持久子代理桥接。 */
     public ToolRouterToolProvider(ToolRouter toolRouter,
                                   MarketDataTools marketDataTools,
+                                  AssetSqlTools assetSqlTools,
                                   RagTools ragTools,
                                   SearchTools searchTools,
                                   PythonSandboxTools pythonSandboxTools,
@@ -104,7 +107,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   AgentRunEventService agentEventService,
                                   LangchainToolConcurrencyThrottle toolThrottle,
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore) {
-        this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+        this(toolRouter, marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
                 listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
                 toolThrottle, pythonSandboxDispatchStore, null, null);
     }
@@ -135,6 +138,7 @@ public class ToolRouterToolProvider implements ToolProvider {
 
         List<ToolSpecification> specifications = ToolCatalogBuilder.buildSpecifications(
                 marketDataTools,
+                assetSqlTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,

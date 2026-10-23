@@ -22,6 +22,9 @@ public final class DatabaseFetchedPathStrategy {
     /** encoded_string 截取长度（16 字符 ≈ 80 bits） */
     private static final int ENCODED_LENGTH = 16;
 
+    /** asset_sql 身份摘要截取长度（8 字符 base32hex ≈ 40 bits） */
+    private static final int SQL_DIGEST_LENGTH = 8;
+
     private DatabaseFetchedPathStrategy() {}
 
     // ---- Topic Mapping ----
@@ -44,8 +47,30 @@ public final class DatabaseFetchedPathStrategy {
         if ("market_data_advanced_search".equals(toolType)) {
             return "advanced_search";
         }
+        // 014-new-02：queryAssetData 的 SQL 结果数据集必须显式登记自己的 topic。
+        // 若不登记，下方未知前缀回落会把它归进 domestic_listed_asset 目录，
+        // 与资产标的数据集混在一起（ccmax 审查提示的坑），这里 fail-显式而非静默回落。
+        if ("asset_sql".equals(toolType)) {
+            return "asset_sql";
+        }
         // Fallback for unknown toolTypes — keeps data accessible under a generic topic
         return "domestic_listed_asset";
+    }
+
+    // ---- SQL 数据集身份摘要 ----
+
+    /**
+     * asset_sql 数据集的身份摘要：归一化 SQL 文本的 SHA-256 base32hex 前 8 字符（40 bits）。
+     *
+     * <p>方案 D3：复用键＝归一化 SQL 文本（去首尾空白＋空白折叠＋去注释，见
+     * {@code AssetSqlTools.normalizeAssetSql}）；摘要写入数据集四层路径的 tsCode 位，
+     * 也作为 {@code DatasetRegistry} 精确复用查询的索引键。字母表与 encodedString
+     * 同源（base32hex，字符均在文件名安全集内）。LIMIT/OFFSET 属文本一部分，
+     * 不同 LIMIT/OFFSET 自然得到不同摘要、不同数据集。</p>
+     */
+    public static String sqlDigest(String normalizedSql) {
+        Objects.requireNonNull(normalizedSql, "normalizedSql 不能为 null");
+        return encodeBase32Hex(sha256(normalizedSql)).substring(0, SQL_DIGEST_LENGTH);
     }
 
     // ---- Encoded String ----

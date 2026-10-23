@@ -31,6 +31,25 @@ public class ToolWeightedLimitService {
     private static final int DEFAULT_MAX_WEIGHT = 12;
     private static final int DEFAULT_TOOL_WEIGHT = 2;
 
+    /**
+     * 014-new-02 D7：代码级默认权重条目。权重限流只认配置 {@code tools} 映射里的条目，
+     * 没有条目的工具直接拿空许可、不进权重信号量——新工具等热配置落地前等于无限流。
+     * {@code queryAssetData} 因此在这里给默认条目：与单批量市场工具同权
+     * （weight=2、maxBatchItems=1，即单次调用＝单批量计权，一条 SQL 一次调用）；
+     * 热配置（agent-llm.local.json / agent.llm.runtime.parallel.tool-weighted-limit.tools）
+     * 显式给出时仍以其为准。{@code listAssetTables} 不登记：只读静态目录渲染，
+     * 无 IO 与数据面开销，与 {@code checkParallelLimits} 元工具豁免同口径。
+     */
+    private static final Map<String, AgentLlmProperties.ToolWeightEntry> CODE_DEFAULT_TOOL_ENTRIES =
+            Map.of("queryAssetData", fixedEntry(2, 1));
+
+    private static AgentLlmProperties.ToolWeightEntry fixedEntry(int weight, int maxBatchItems) {
+        AgentLlmProperties.ToolWeightEntry entry = new AgentLlmProperties.ToolWeightEntry();
+        entry.setWeight(weight);
+        entry.setMaxBatchItems(maxBatchItems);
+        return entry;
+    }
+
     private final AgentLlmProperties llmProperties;
     private final ObjectMapper objectMapper;
 
@@ -49,7 +68,7 @@ public class ToolWeightedLimitService {
             return Optional.of(WeightLease.noop());
         }
 
-        AgentLlmProperties.ToolWeightEntry entry = config.getTools().get(nvl(toolName));
+        AgentLlmProperties.ToolWeightEntry entry = resolveToolEntry(config, toolName);
         if (entry == null) {
             return Optional.of(WeightLease.noop());
         }
@@ -77,7 +96,7 @@ public class ToolWeightedLimitService {
         if (!Boolean.TRUE.equals(config.getEnabled())) {
             return 0;
         }
-        AgentLlmProperties.ToolWeightEntry entry = config.getTools().get(nvl(toolName));
+        AgentLlmProperties.ToolWeightEntry entry = resolveToolEntry(config, toolName);
         if (entry == null) {
             return 0;
         }
@@ -85,6 +104,12 @@ public class ToolWeightedLimitService {
         int maxBatchItems = positiveOrDefault(entry.getMaxBatchItems(), 1);
         int batchItems = Math.max(1, countBatchItems(toolName, params));
         return unitWeight * Math.min(batchItems, maxBatchItems);
+    }
+
+    /** 配置 {@code tools} 映射优先；014-new-02 起新工具可带代码级默认条目兜底（见 {@link #CODE_DEFAULT_TOOL_ENTRIES}）。 */
+    private AgentLlmProperties.ToolWeightEntry resolveToolEntry(AgentLlmProperties.ToolWeightedLimit config, String toolName) {
+        AgentLlmProperties.ToolWeightEntry entry = config.getTools().get(nvl(toolName));
+        return entry != null ? entry : CODE_DEFAULT_TOOL_ENTRIES.get(nvl(toolName));
     }
 
     private AgentLlmProperties.ToolWeightedLimit resolveConfig() {

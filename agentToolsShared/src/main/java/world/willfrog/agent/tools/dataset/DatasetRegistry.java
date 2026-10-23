@@ -151,6 +151,53 @@ public class DatasetRegistry {
         return Optional.of(selected);
     }
 
+    /**
+     * 014-new-02 D3：asset_sql 数据集的精确复用查询。
+     *
+     * <p>SQL 数据集没有日期区间，也没有调用前可预知的列集（列集要执行后才知道），
+     * 因此不走 {@link #findReusable}（它的 queryKey 含列集与日期，且支持区间复用）。
+     * 本方法以归一化 SQL 摘要为唯一身份：同摘要（同归一化 SQL）即视为同一份数据，
+     * 精确匹配、不做区间复用；新鲜度沿用注册表既有语义（TTL 未过期＋数据文件在位），
+     * 命中后同样 touchMeta 并向当前 run 发布 {@code DatasetPersistedEvent}。</p>
+     *
+     * @param sqlDigest 归一化 SQL 的 SHA-256 base32hex 前 8 字符（见
+     *                  {@link DatabaseFetchedPathStrategy#sqlDigest}，即数据集登记时的 tsCode）
+     */
+    public Optional<DatasetMeta> findReusableAssetSql(String sqlDigest) {
+        if (!resolveEnabled() || sqlDigest == null || sqlDigest.isBlank()) {
+            return Optional.empty();
+        }
+        Set<String> queryKeys = redisTemplate.opsForSet().members(indexKey("asset_sql", sqlDigest));
+        if (queryKeys == null || queryKeys.isEmpty()) {
+            return Optional.empty();
+        }
+        DatasetMeta selected = null;
+        for (String candidateKey : queryKeys) {
+            Optional<DatasetMeta> candidate = loadMeta(candidateKey);
+            if (candidate.isEmpty()) {
+                continue;
+            }
+            DatasetMeta meta = candidate.get();
+            if (!"asset_sql".equals(meta.getType()) || !sqlDigest.equals(meta.getTsCode())) {
+                continue;
+            }
+            if (isExpired(meta) || !datasetFilesExist(meta)) {
+                cleanupMeta(meta);
+                continue;
+            }
+            // 同一 SQL 理论上只有一份列集；防御性取最新一份。
+            if (selected == null || meta.getCreatedAt() > selected.getCreatedAt()) {
+                selected = meta;
+            }
+        }
+        if (selected == null) {
+            return Optional.empty();
+        }
+        touchMeta(selected);
+        publishDatasetPersistedEvent(selected);
+        return Optional.of(selected);
+    }
+
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
                                 List<String> columns, String datasetId, int rowCount) {
         String safeTsCode = tsCode != null ? tsCode.replaceAll("[^a-zA-Z0-9.]", "_") : "data";

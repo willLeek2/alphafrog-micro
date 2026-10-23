@@ -14,6 +14,7 @@ import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -41,6 +42,7 @@ class ToolCatalogBuilderRegistryContractTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private MarketDataTools marketDataTools;
+    private AssetSqlTools assetSqlTools;
     private RagTools ragTools;
     private SearchTools searchTools;
     private PythonSandboxTools pythonSandboxTools;
@@ -59,6 +61,11 @@ class ToolCatalogBuilderRegistryContractTest {
                 new AgentLlmProperties(),
                 objectMapper
         );
+        assetSqlTools = new AssetSqlTools(
+                mock(DatasetWriter.class),
+                mock(DatasetRegistry.class),
+                objectMapper
+        );
         ragTools = new RagTools(objectMapper);
         searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         pythonSandboxTools = new PythonSandboxTools(objectMapper);
@@ -71,18 +78,18 @@ class ToolCatalogBuilderRegistryContractTest {
     @Test
     void withAllGatesOn_catalogEqualsDeclaredToolNames() {
         Set<String> built = names(ToolCatalogBuilder.buildSpecifications(
-                marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
+                marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
                 loadToolGuideTool, rereadToolHandler, true, true));
 
         assertEquals(AgentToolRegistry.declaredToolNames(), built,
                 "两个门控都开启时，构建出的目录应与注册表声明完全一致");
-        assertEquals(29, built.size(), "注册表声明面应保持 29 个工具");
+        assertEquals(31, built.size(), "注册表声明面应保持 31 个工具");
     }
 
     @Test
     void catalogDescriptionsMustMatchAuthorityFiles() {
         List<ToolSpecification> specs = ToolCatalogBuilder.buildSpecifications(
-                marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
+                marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
                 loadToolGuideTool, rereadToolHandler, true, true);
         for (ToolSpecification spec : specs) {
             assertEquals(ToolDescriptionTexts.require(spec.name()), spec.description(),
@@ -93,7 +100,7 @@ class ToolCatalogBuilderRegistryContractTest {
     @Test
     void withWebSearchOff_searchWebAbsentAndOthersPresent() {
         Set<String> built = names(ToolCatalogBuilder.buildSpecifications(
-                marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
+                marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
                 loadToolGuideTool, rereadToolHandler, false, true));
 
         assertFalse(built.contains("searchWeb"), "webSearch 关闭时应移除 searchWeb");
@@ -106,7 +113,7 @@ class ToolCatalogBuilderRegistryContractTest {
     @Test
     void withCodeInterpreterOff_executePythonAbsentAndOthersPresent() {
         Set<String> built = names(ToolCatalogBuilder.buildSpecifications(
-                marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
+                marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
                 loadToolGuideTool, rereadToolHandler, true, false));
 
         assertFalse(built.contains("executePython"), "codeInterpreter 关闭时应移除 executePython");
@@ -119,7 +126,7 @@ class ToolCatalogBuilderRegistryContractTest {
     @Test
     void withBothGatesOff_searchWebAndExecutePythonAbsentAndOthersPresent() {
         Set<String> built = names(ToolCatalogBuilder.buildSpecifications(
-                marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
+                marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
                 loadToolGuideTool, rereadToolHandler, false, false));
 
         assertFalse(built.contains("searchWeb"), "webSearch 关闭时应移除 searchWeb");
@@ -135,7 +142,7 @@ class ToolCatalogBuilderRegistryContractTest {
         for (boolean webSearch : List.of(true, false)) {
             for (boolean codeInterpreter : List.of(true, false)) {
                 Set<String> built = names(ToolCatalogBuilder.buildSpecifications(
-                        marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
+                        marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools, listMyDataTool,
                         loadToolGuideTool, rereadToolHandler, webSearch, codeInterpreter));
 
                 assertTrue(AgentToolRegistry.declaredToolNames().containsAll(built),

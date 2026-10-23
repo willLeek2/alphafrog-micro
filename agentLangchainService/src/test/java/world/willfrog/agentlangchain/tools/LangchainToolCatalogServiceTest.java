@@ -9,6 +9,7 @@ import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.alphafrogmicro.agent.idl.AgentToolMessage;
 
@@ -33,6 +34,7 @@ class LangchainToolCatalogServiceTest {
         );
         LangchainToolCatalogService service = new LangchainToolCatalogService(
                 marketDataTools,
+                new AssetSqlTools(mock(DatasetWriter.class), mock(DatasetRegistry.class), objectMapper),
                 null,
                 null,
                 null,
@@ -71,6 +73,7 @@ class LangchainToolCatalogServiceTest {
     void listToolMessages_shouldExposeListMyData() throws Exception {
         LangchainToolCatalogService service = new LangchainToolCatalogService(
                 null,
+                new AssetSqlTools(mock(DatasetWriter.class), mock(DatasetRegistry.class), objectMapper),
                 null,
                 null,
                 null,
@@ -96,6 +99,7 @@ class LangchainToolCatalogServiceTest {
     void listToolMessages_shouldExposeResolveFinanceMethodsAlways() throws Exception {
         LangchainToolCatalogService service = new LangchainToolCatalogService(
                 null,
+                new AssetSqlTools(mock(DatasetWriter.class), mock(DatasetRegistry.class), objectMapper),
                 null,
                 null,
                 null,

@@ -23,6 +23,9 @@ class PromptProjectionConsistencyTest {
     private static final Set<Path> CLASSPATH_ONLY = Set.of(
             Path.of("judge/dag_recovery_judge_system.txt"),
             Path.of("python/execute_python_tool_description.txt"),
+            // 35 表目录是 listAssetTables 工具运行时经 classpath 读取的结构化数据，
+            // 不是可热推覆盖的 prompt 文本，不进入外置投影。
+            Path.of("tools/asset_tables_catalog.json"),
             Path.of("todo/dag_react_system_default.txt")
     );
 

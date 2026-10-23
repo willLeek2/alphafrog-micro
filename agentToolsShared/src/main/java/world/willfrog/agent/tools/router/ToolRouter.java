@@ -180,6 +180,16 @@ public class ToolRouter {
     private SubAgentControlHandler subAgentControlHandler;
 
     /**
+     * 014-new-02：平台资产库统一只读 SQL 取数工具集（queryAssetData / listAssetTables）。
+     *
+     * <p>本类在仓内有多处按位置传参的直接构造测试（构造器加参会破坏它们的编译），
+     * 故沿用上方 budgetService / subAgentControlHandler 的可选字段注入先例；
+     * 生产环境由组件扫描必然注入，缺 Bean 时返回结构化不可用错误而非 UNSUPPORTED_TOOL。</p>
+     */
+    @Autowired(required = false)
+    private world.willfrog.agent.tools.market.AssetSqlTools assetSqlTools;
+
+    /**
      * 简化入口：仅返回工具输出文本，丢弃成功标志、耗时、缓存元数据等。
      *
      * <p>保留此入口主要用于向后兼容老的调用点，新调用方应优先使用
@@ -654,6 +664,16 @@ public class ToolRouter {
                         dateStr(params.get("startPeriod"), params.get("start_period"), params.get("start"), params.get("arg2")),
                         dateStr(params.get("endPeriod"), params.get("end_period"), params.get("end"), params.get("arg3"))
                 );
+                // 014-new-02：平台资产库只读 SQL 取数第一段（>50 行自动落数据集，衔接 executeQuery 第二段）。
+                case "queryAssetData" -> assetSqlTools == null
+                        ? assetSqlUnavailable(toolName)
+                        : assetSqlTools.queryAssetData(
+                        str(params.get("sql"), params.get("query"), params.get("arg0"))
+                );
+                // 014-new-02：35 张可查资产表目录元工具（零参数，先例 checkParallelLimits）。
+                case "listAssetTables" -> assetSqlTools == null
+                        ? assetSqlUnavailable(toolName)
+                        : assetSqlTools.listAssetTables();
                 case "ragSearch" -> ragTools.ragSearch(
                         str(params.get("queryText"), params.get("query_text"), params.get("query"), params.get("arg0")),
                         str(params.get("docType"), params.get("doc_type"), params.get("arg1")),
@@ -767,6 +787,19 @@ public class ToolRouter {
                         "code", "SUB_AGENT_UNAVAILABLE",
                         "message", "Sub-agent execution is unavailable in this runtime",
                         "details", Map.of())));
+    }
+
+    /** 014-new-02：AssetSqlTools Bean 缺失时的稳定不可用错误（直构测试场景；生产由组件扫描必然注入）。 */
+    private String assetSqlUnavailable(String toolName) {
+        return writeJson(Map.of(
+                "ok", false,
+                "tool", nvl(toolName),
+                "data", Map.of(),
+                "error", Map.of(
+                        "code", "SERVICE_UNAVAILABLE",
+                        "message", "Asset sql tools are unavailable in this runtime",
+                        "details", Map.of(),
+                        "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name())));
     }
 
     /**

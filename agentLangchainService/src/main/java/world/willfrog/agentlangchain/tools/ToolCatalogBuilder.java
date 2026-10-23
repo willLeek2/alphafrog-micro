@@ -8,10 +8,12 @@ import dev.langchain4j.model.chat.request.json.JsonIntegerSchema;
 import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
+import world.willfrog.agent.tools.catalog.AssetSqlToolCatalog;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -35,6 +37,7 @@ final class ToolCatalogBuilder {
     }
 
     static List<ToolSpecification> buildSpecifications(MarketDataTools marketDataTools,
+                                                       AssetSqlTools assetSqlTools,
                                                        RagTools ragTools,
                                                        SearchTools searchTools,
                                                        PythonSandboxTools pythonSandboxTools,
@@ -46,6 +49,7 @@ final class ToolCatalogBuilder {
                                                        boolean codeInterpreterEnabled) {
         List<ToolSpecification> specifications = new ArrayList<>();
         addSpecsIfPresent(specifications, marketDataTools);
+        addSpecsIfPresent(specifications, assetSqlTools);
         addSpecsIfPresent(specifications, ragTools);
         addSpecsIfPresent(specifications, searchTools);
         addSpecsIfPresent(specifications, pythonSandboxTools);
@@ -59,8 +63,8 @@ final class ToolCatalogBuilder {
                         webSearchEnabled, codeInterpreterEnabled))
                 .collect(Collectors.toCollection(ArrayList::new));
 
-        List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
-                ParallelLimitsToolCatalog.mergeCanonical(filtered));
+        List<ToolSpecification> merged = AssetSqlToolCatalog.mergeCanonical(MarketDataAdvancedToolCatalog.mergeCanonical(
+                ParallelLimitsToolCatalog.mergeCanonical(filtered)));
         List<ToolSpecification> result = addSubAgentControlToolsIfAbsent(
                 addResolveFinanceMethodsIfAbsent(merged));
         // 目录里的每个工具名都必须已在注册表登记，未登记就直接抛错，避免漏进未登记工具。
