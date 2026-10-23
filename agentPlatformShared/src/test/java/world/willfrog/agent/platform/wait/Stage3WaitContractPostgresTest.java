@@ -142,6 +142,8 @@ class Stage3WaitContractPostgresTest {
     private static final String TREE_BUDGET_SCRIPT = "019_agent_run_tree_budget.sql";
     private static final String WAIT_MEMBER_STOP_SCRIPT = "020_agent_run_wait_member_stop.sql";
     private static final String TREE_ACTIVITY_SCRIPT = "021_agent_run_tree_activity_gate.sql";
+    private static final String UNCONFIRMED_STOP_SCRIPT =
+            "026_agent_run_wait_member_stop_unconfirmed.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -2654,7 +2656,8 @@ class Stage3WaitContractPostgresTest {
                     REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
                     RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT,
                     FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT, CHILD_INTENT_SCRIPT,
-                    TREE_BUDGET_SCRIPT, WAIT_MEMBER_STOP_SCRIPT, TREE_ACTIVITY_SCRIPT)) {
+                    TREE_BUDGET_SCRIPT, WAIT_MEMBER_STOP_SCRIPT, TREE_ACTIVITY_SCRIPT,
+                    UNCONFIRMED_STOP_SCRIPT)) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
