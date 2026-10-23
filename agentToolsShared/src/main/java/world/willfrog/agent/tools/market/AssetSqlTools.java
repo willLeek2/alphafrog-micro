@@ -308,7 +308,8 @@ public class AssetSqlTools {
     /**
      * 服务端错误码→失败类别（方案 D7：统一走 ToolFailureCategory）。
      * 守卫参数类（MISSING_LIMIT/NOT_SELECT/FORBIDDEN_KEYWORD/TABLE_NOT_ALLOWED/
-     * FORBIDDEN_FUNCTION/MULTI_STATEMENT/INVALID_DATE_LITERAL）→INVALID_ARGUMENT；
+     * FORBIDDEN_FUNCTION/FORBIDDEN_SYNTAX/MULTI_STATEMENT/INVALID_DATE_LITERAL）
+     * →INVALID_ARGUMENT；
      * SERVER_BUSY→容量类；STATEMENT_TIMEOUT/QUERY_FAILED 与未知码→上游类。
      */
     private static ToolFailureCategory categoryForErrorCode(String code) {

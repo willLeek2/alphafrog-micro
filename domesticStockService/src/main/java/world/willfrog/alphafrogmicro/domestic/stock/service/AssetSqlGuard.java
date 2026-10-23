@@ -24,8 +24,9 @@ import java.util.regex.Pattern;
  *       骨架算法参照 agentToolsShared 的 duckdb_query_runner.py）。</li>
  *   <li>必须以 SELECT 或 WITH 开头（{@link #checkStartsSelect}）。</li>
  *   <li>关键字黑名单 INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|
- *       EXEC|EXECUTE|COPY|VACUUM|MERGE|SET|RESET|CALL|DO（{@link #checkKeywords}，
- *       在 remote_pg_query 黑名单上补 SET/RESET/CALL/DO）。</li>
+ *       EXEC|EXECUTE|COPY|VACUUM|MERGE|SET|RESET|CALL|DO|INTO（{@link #checkKeywords}，
+ *       在 remote_pg_query 黑名单上补 SET/RESET/CALL/DO；INTO 为 CR 补充——SELECT…INTO
+ *       写路径，合法分析 SQL 不会裸用）。</li>
  *   <li>FROM/JOIN 关系名逐一对照 35 表显式白名单（{@link #checkRelations}）；只认裸表名，
  *       任何 schema 限定（information_schema./pg_catalog./public. 等一切 {@code x.y} 形态）
  *       一律拒；WITH 定义的 CTE 名收集为本地关系放行（含嵌套子查询里的 WITH）。</li>
@@ -45,6 +46,11 @@ import java.util.regex.Pattern;
  * <p>已知取舍（与参考实现 duckdb_query_runner 一致）：骨架不识别 PG 的 dollar 引用字符串
  * （{@code $$...$$}），其内的分号/关键字会被当作代码检查——方向是误拒而不是漏放，
  * 模型面向的说明文件统一用单引号字面量，不构成可用性问题。</p>
+ *
+ * <p>双引号标识符一律拒（CR 必改 1）：把双引号标识符剥成空白会让关系扫描与函数检查
+ * 全部失明（{@code FROM "public"."alphafrog_user"}、{@code SELECT "pg_sleep"(1) LIMIT 5}
+ * 等形态穿透），而模型面向的常规分析 SQL 完全不需要双引号——骨架构建时检出即拒
+ * FORBIDDEN_SYNTAX，引导用裸表名/裸列名/裸函数名重写。</p>
  */
 @Component
 public class AssetSqlGuard {
@@ -55,14 +61,16 @@ public class AssetSqlGuard {
     public static final String CODE_FORBIDDEN_KEYWORD = "FORBIDDEN_KEYWORD";
     public static final String CODE_TABLE_NOT_ALLOWED = "TABLE_NOT_ALLOWED";
     public static final String CODE_FORBIDDEN_FUNCTION = "FORBIDDEN_FUNCTION";
+    public static final String CODE_FORBIDDEN_SYNTAX = "FORBIDDEN_SYNTAX";
     public static final String CODE_MISSING_LIMIT = "MISSING_LIMIT";
     public static final String CODE_INVALID_DATE_LITERAL = "INVALID_DATE_LITERAL";
 
-    // ---- 关键字黑名单（方案 D4 第 3 条；按方案列举顺序逐一检查，命中即拒） ----
+    // ---- 关键字黑名单（方案 D4 第 3 条的 18 词＋CR 补充 INTO——SELECT…INTO 写路径，
+    //      合法分析 SQL 不会裸用该词，readOnly 事务之外再加一道结构化拒绝） ----
     private static final List<String> FORBIDDEN_KEYWORDS = List.of(
             "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE",
             "GRANT", "REVOKE", "EXEC", "EXECUTE", "COPY", "VACUUM", "MERGE",
-            "SET", "RESET", "CALL", "DO");
+            "SET", "RESET", "CALL", "DO", "INTO");
 
     private static final int CASE_INSENSITIVE = Pattern.CASE_INSENSITIVE;
 
@@ -105,6 +113,7 @@ public class AssetSqlGuard {
         // 第一遍：第 1-5 条骨架校验（在原文骨架上做）
         Skeleton first = buildSkeleton(rawSql);
         try {
+            checkNoQuotedIdentifiers(first);
             checkSingleStatement(first);
             checkStartsSelect(first);
             checkKeywords(first);
@@ -123,6 +132,7 @@ public class AssetSqlGuard {
         // 第 7 条后半：替换后重走一遍第 1-5 条骨架校验
         Skeleton second = buildSkeleton(replacedSql);
         try {
+            checkNoQuotedIdentifiers(second);
             checkSingleStatement(second);
             checkStartsSelect(second);
             checkKeywords(second);
@@ -136,6 +146,23 @@ public class AssetSqlGuard {
             return resolveOuterLimit(replacedSql, second);
         } catch (Rejection rejection) {
             return rejection.verdict();
+        }
+    }
+
+    // ==================== 第 0 条：双引号标识符一律拒（CR 必改 1） ====================
+
+    /**
+     * 双引号标识符（{@code "name"}，含函数名/表名/列名的引号形态）一律拒：骨架会把它们
+     * 剥成空白，所有检查器随之失明——引号形态既能让任意表绕过白名单（含 schema 限定），
+     * 也能让函数族黑名单失效（PG 正常解析执行引号函数名）。常规分析 SQL 用裸名即可，
+     * 零可用性损失。字符串字面量内部的单引号场景不受影响（字面量先被剥成空白）。
+     */
+    private void checkNoQuotedIdentifiers(Skeleton skeleton) {
+        if (skeleton.hasQuotedIdentifier()) {
+            throw new Rejection(GuardVerdict.reject(CODE_FORBIDDEN_SYNTAX,
+                    "检测到双引号标识符：本工具只接受裸表名、裸列名与裸函数名，请去掉双引号重写"
+                            + "（引号形态会让白名单与函数族检查失效，一律拒绝）",
+                    details("reason", "double_quoted_identifier")));
         }
     }
 
@@ -197,8 +224,19 @@ public class AssetSqlGuard {
                 }
                 char c = skeleton.charAt(pos);
                 if (c == '(') {
-                    // 子查询 / LATERAL 括号体：跳过括号体本身，其内部的 FROM/JOIN 由本全文扫描另行命中
-                    pos = skipBalancedParentheses(skeleton, pos);
+                    // 子查询 / LATERAL 括号体：跳过括号体本身，其内部的 FROM/JOIN 由本全文扫描另行命中；
+                    // 括号体剥掉冗余括号后恰是单个裸标识符时（FROM (alphafrog_user) u 等形态），
+                    // PG 解析期才拒绝的结构化拒绝缺口在此补上：同样对照白名单（CR 建议①）。
+                    int closeEnd = skipBalancedParentheses(skeleton, pos);
+                    String bare = bareIdentifierInParens(skeleton, pos, closeEnd);
+                    if (bare != null
+                            && !AssetSqlAllowedTables.ALLOWED_TABLES.contains(bare)
+                            && !cteNames.contains(bare)) {
+                        throw new Rejection(GuardVerdict.reject(CODE_TABLE_NOT_ALLOWED,
+                                "关系 " + bare + " 不在资产表白名单内（白名单共 35 张资产表，可用 listAssetTables 查看全部表）",
+                                details("relation", bare, "reason", "paren_wrapped")));
+                    }
+                    pos = closeEnd;
                 } else if (isIdentifierStart(c)) {
                     int[] identRange = readIdentifier(skeleton, pos);
                     String name = skeleton.text().substring(identRange[0], identRange[1])
@@ -228,7 +266,8 @@ public class AssetSqlGuard {
                         pos = identRange[1];
                     }
                 } else {
-                    // 解析不出关系名（如被骨架剥成空白的带引号标识符）：跳过，交给后续检查与 PG 本身
+                    // 解析不出关系名（非法形态）：跳过，交给后续检查与 PG 本身（双引号标识符
+                    // 已在骨架期被 checkNoQuotedIdentifiers 拒掉，不再进入这里）
                     break;
                 }
                 // 跳过可选别名后看是否逗号续列表（FROM a x, b y / FROM (…) t, b）
@@ -409,6 +448,10 @@ public class AssetSqlGuard {
      * CTE 体与子查询内的 LIMIT 深度大于 0，不算外层）。无外层 LIMIT 拒 MISSING_LIMIT
      * 并引导看 listAssetTables 的写法示例；LIMIT 超硬上限改写为硬上限并标记 limitRewritten；
      * OFFSET 原样保留。非数字形态的 LIMIT（如 LIMIT ALL、LIMIT(5)）视同无外层 LIMIT 处理。
+     *
+     * <p>LIMIT 只接受纯数字（CR 必改 2）：数字后跟算术运算符或左括号（{@code LIMIT 2*200001}、
+     * {@code LIMIT 999999999+1}）一律拒——PG 会按表达式求值，守卫按首个数字解析会导致
+     * 「超上限改写」失效且 enforced_limit 错报；内层（CTE/子查询）LIMIT 同样适用。</p>
      */
     private GuardVerdict resolveOuterLimit(String sql, Skeleton skeleton) {
         int[] depthAt = parenDepths(skeleton);
@@ -417,6 +460,17 @@ public class AssetSqlGuard {
         int numberSkeletonEnd = -1;
         Matcher limitMatcher = LIMIT_CLAUSE.matcher(skeleton.text());
         while (limitMatcher.find()) {
+            int afterNumber = skipWhitespace(skeleton, limitMatcher.end(1));
+            if (afterNumber < skeleton.length()) {
+                char next = skeleton.charAt(afterNumber);
+                if (next == '+' || next == '-' || next == '*' || next == '/'
+                        || next == '%' || next == '(' || next == '.') {
+                    throw new Rejection(GuardVerdict.reject(CODE_MISSING_LIMIT,
+                            "LIMIT 只接受纯数字（不支持算术表达式或小数），请直接写一个不超过 "
+                                    + maxRows + " 的整数",
+                            details("max_rows", maxRows, "reason", "limit_expression")));
+                }
+            }
             if (depthAt[limitMatcher.start()] == 0) {
                 numberSkeletonStart = limitMatcher.start(1);
                 numberSkeletonEnd = limitMatcher.end(1);
@@ -451,10 +505,13 @@ public class AssetSqlGuard {
      * 后的代码骨架，同时保留「骨架下标 → 原文下标」的位置映射（af_date 替换与 LIMIT 改写
      * 都靠它在骨架命中位回写原文）。算法与 duckdb_query_runner._code_skeleton 一致，
      * 额外产出位置映射；被剥区域以一个空格占位。字符串与注释里的分号、关键字不会误伤。
+     * 检出双引号标识符时置 {@code hasQuotedIdentifier} 标记（代码位才会检出——字符串字面量
+     * 与注释先被各自分支消费），由 {@link #checkNoQuotedIdentifiers} 统一拒绝。
      */
     private static Skeleton buildSkeleton(String sql) {
         StringBuilder text = new StringBuilder();
         List<Integer> mapping = new ArrayList<>();
+        boolean quotedIdentifier = false;
         int i = 0;
         int n = sql.length();
         while (i < n) {
@@ -481,6 +538,7 @@ public class AssetSqlGuard {
                     i++;
                 }
                 i++;
+                quotedIdentifier = true;
                 blank(start, text, mapping);
             } else if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
                 int start = i;
@@ -506,7 +564,7 @@ public class AssetSqlGuard {
         for (int j = 0; j < map.length; j++) {
             map[j] = mapping.get(j);
         }
-        return new Skeleton(text.toString(), map);
+        return new Skeleton(text.toString(), map, quotedIdentifier);
     }
 
     /** 被剥区域以一个空格占位，位置映射指向区域起点（供骨架命中位回写原文用）。 */
@@ -577,6 +635,63 @@ public class AssetSqlGuard {
             i++;
         }
         return skeleton.length();
+    }
+
+    /**
+     * FROM/JOIN 关系位的括号体（骨架内容区间 [open+1, closeEnd-1)，闭开区间）剥掉两侧空白
+     * 与冗余外层括号后若恰是单个裸标识符，返回其小写名（{@code FROM (alphafrog_user) u}、
+     * {@code FROM ((alphafrog_stock_daily)) t} 等形态）；子查询、表达式等多内容形态返回 null。
+     */
+    private static String bareIdentifierInParens(Skeleton skeleton, int open, int closeEnd) {
+        int lo = open + 1;
+        int hi = closeEnd - 1; // 内容区间 [lo, hi)，闭合括号本身在 closeEnd-1=hi 处（不含入内容）
+        if (hi <= lo || closeEnd > skeleton.length() || skeleton.charAt(closeEnd - 1) != ')') {
+            return null; // 不闭合或空的括号体：按复杂形态跳过，交给后续检查与 PG
+        }
+        while (true) {
+            while (lo < hi && Character.isWhitespace(skeleton.charAt(lo))) {
+                lo++;
+            }
+            while (lo < hi && Character.isWhitespace(skeleton.charAt(hi - 1))) {
+                hi--;
+            }
+            if (lo >= hi) {
+                return null;
+            }
+            if (skeleton.charAt(lo) == '(' && skeleton.charAt(hi - 1) == ')'
+                    && parenClosesAt(skeleton, lo, hi - 1)) {
+                lo++;
+                hi--;
+                continue;
+            }
+            break;
+        }
+        if (!isIdentifierStart(skeleton.charAt(lo))) {
+            return null;
+        }
+        Matcher matcher = IDENTIFIER.matcher(skeleton.text());
+        matcher.region(lo, hi);
+        if (!matcher.matches()) {
+            return null; // 含标识符以外内容（子查询、表达式、逗号列表等）
+        }
+        return matcher.group().toLowerCase(Locale.ROOT);
+    }
+
+    /** open 处的 '(' 是否恰在 close 处闭合（区间内深度归零一次且就在 close）。 */
+    private static boolean parenClosesAt(Skeleton skeleton, int open, int close) {
+        int depth = 0;
+        for (int i = open; i <= close && i < skeleton.length(); i++) {
+            char c = skeleton.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth == 0) {
+                    return i == close;
+                }
+            }
+        }
+        return false;
     }
 
     /** pos 处是否是指定单词（大小写不敏感且后有词边界）。 */
@@ -670,8 +785,9 @@ public class AssetSqlGuard {
 
     // ==================== 内部载体 ====================
 
-    /** 骨架文本＋骨架下标到原文下标的位置映射（被剥区域映射到区域起点）。 */
-    private record Skeleton(String text, int[] map) {
+    /** 骨架文本＋骨架下标到原文下标的位置映射（被剥区域映射到区域起点）
+     * ＋是否检出双引号标识符（检出即拒，见 {@link #checkNoQuotedIdentifiers}）。 */
+    private record Skeleton(String text, int[] map, boolean hasQuotedIdentifier) {
 
         int length() {
             return text.length();

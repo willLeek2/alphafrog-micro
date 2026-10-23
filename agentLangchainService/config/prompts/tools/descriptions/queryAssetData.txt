@@ -15,9 +15,12 @@
   - 只允许查询目录内的表；查目录外的表（含平台业务表）或使用任何 schema 限定引用（public.、information_schema.、pg_catalog. 等前缀）会被拒 TABLE_NOT_ALLOWED
 
 SQL 写法规则：
-  - 只接受单条语句，且必须以 SELECT 或 WITH 开头；INSERT/UPDATE/DELETE/SET/CALL 等非查询语句与多语句直接拒绝
+  - 只接受单条语句，且必须以 SELECT 或 WITH 开头；INSERT/UPDATE/DELETE/SET/CALL/INTO 等非查询语句与多语句直接拒绝
+  - 表名、列名、函数名一律写裸名（不加双引号）；带双引号的标识符会被拒 FORBIDDEN_SYNTAX（引号形态会让白名单与函数检查失效）
   - 必须自带 LIMIT：没有 LIMIT 被拒 MISSING_LIMIT；LIMIT 超过 200000 会被改写到 200000 并在结果里说明
-  - OFFSET 原样保留；分页取数建议每页不超过 1000 行
+  - OFFSET 原样保留；分页取数建议每页不超过 1000 行；OFFSET 不接受负数（PG 会拒绝）
+  - LIMIT 只写纯数字：算术表达式（如 2*100000）或小数会被拒绝
+  - 语句末尾的分号可写可不写；注释支持 -- 与 /* */，但不要嵌套块注释
   - 日期列是 BIGINT 毫秒时间戳：写 af_date('2024-01-01') 由辅助函数自动转毫秒，不要手写毫秒数字。区间示例：trade_date >= af_date('2024-01-01') AND trade_date < af_date('2025-01-01')
   - JSONB 列用 ->> 取键：valuation->>'pe' 返回文本，数值比较用 (valuation->>'pe')::double precision
   - 管理类函数族（pg_*、lo_*、dblink、XML 类、set_config/current_setting、游标类等）默认拒绝，命中返回 FORBIDDEN_FUNCTION；普通分析函数用裸函数名调用即可

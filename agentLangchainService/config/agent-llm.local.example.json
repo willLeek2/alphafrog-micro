@@ -275,7 +275,7 @@
           "ragSearch": { "weight": 2, "maxBatchItems": 1 },
           "executePython": { "weight": 4, "maxBatchItems": 1 },
           "executeQuery": { "weight": 4, "maxBatchItems": 1 },
-      "queryAssetData": { "weight": 2, "maxBatchItems": 1 }
+          "queryAssetData": { "weight": 2, "maxBatchItems": 1 }
         }
       }
     },
