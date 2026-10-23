@@ -49,12 +49,12 @@ public class MybatisWaitMemberStopStore implements WaitMemberStopStore {
 
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
-    public boolean blockProof(long stopId, String claimToken, String reason) {
+    public boolean unconfirm(long stopId, String claimToken, String reason) {
         positive(stopId);
         required(claimToken, "领取令牌");
-        required(reason, "阻断原因");
-        if (reason.length() > 512) throw new IllegalArgumentException("阻断原因过长");
-        return mapper.blockProof(stopId, claimToken, reason) == 1;
+        required(reason, "未确认原因");
+        if (reason.length() > 512) throw new IllegalArgumentException("未确认原因过长");
+        return mapper.unconfirm(stopId, claimToken, reason) == 1;
     }
 
     @Override

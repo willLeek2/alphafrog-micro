@@ -560,13 +560,13 @@ class Stage3WaitContractPostgresTest {
                     "stable", "gen-" + "a".repeat(64), "worker-a", "token-a", OffsetDateTime.now(),
                     OffsetDateTime.now().plusMinutes(1)).orElseThrow());
             transaction.executeWithoutResult(ignored -> {
-                assertThat(stops.blockProof(claimed.getId(), "wrong-token", "identity_mismatch"))
+                assertThat(stops.unconfirm(claimed.getId(), "wrong-token", "identity_mismatch"))
                         .isFalse();
-                assertThat(stops.blockProof(claimed.getId(), "token-a", "identity_mismatch"))
+                assertThat(stops.unconfirm(claimed.getId(), "token-a", "identity_mismatch"))
                         .isTrue();
             });
             assertThat(stops.findByWaitMemberId(claimed.getWaitMemberId()).orElseThrow().getState())
-                    .isEqualTo("BLOCKED_PROOF");
+                    .isEqualTo("UNCONFIRMED");
             Optional<WaitMemberStopTask> reclaimed = transaction.execute(ignored -> stops.claimDue(
                     "stable", "gen-" + "a".repeat(64), "worker-b", "token-b", OffsetDateTime.now().plusMinutes(2),
                     OffsetDateTime.now().plusMinutes(3)));

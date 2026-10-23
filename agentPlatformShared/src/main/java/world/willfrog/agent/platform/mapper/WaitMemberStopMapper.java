@@ -21,8 +21,8 @@ public interface WaitMemberStopMapper {
     int retry(@Param("stopId") long stopId, @Param("claimToken") String claimToken,
               @Param("nextAttemptAt") OffsetDateTime nextAttemptAt, @Param("reason") String reason);
 
-    int blockProof(@Param("stopId") long stopId, @Param("claimToken") String claimToken,
-                   @Param("reason") String reason);
+    int unconfirm(@Param("stopId") long stopId, @Param("claimToken") String claimToken,
+                  @Param("reason") String reason);
 
     int confirmSandboxTerminal(@Param("stopId") long stopId, @Param("claimToken") String claimToken,
                                @Param("taskId") String taskId, @Param("terminalStatus") String terminalStatus);

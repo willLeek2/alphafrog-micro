@@ -322,7 +322,7 @@ class WaitGroupMapperBindingTest {
             known.add(state.name());
         }
         // cancelChain 同时插入外部停机任务；它的缺证明状态属于停机记录，不属于等待成员。
-        known.add("BLOCKED_PROOF");
+        known.add("UNCONFIRMED");
         for (AgentRunStatus status : AgentRunStatus.values()) {
             known.add(status.name());
         }

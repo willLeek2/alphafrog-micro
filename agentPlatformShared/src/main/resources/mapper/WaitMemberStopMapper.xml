@@ -65,9 +65,9 @@
            AND lease_until &gt; CURRENT_TIMESTAMP
     </update>
 
-    <update id="blockProof">
+    <update id="unconfirm">
         UPDATE alphafrog_agent_run_wait_member_stop
-           SET state = 'BLOCKED_PROOF', claimed_by = NULL, claim_token = NULL,
+           SET state = 'UNCONFIRMED', claimed_by = NULL, claim_token = NULL,
                lease_until = NULL, last_error = #{reason}, updated_at = CURRENT_TIMESTAMP
          WHERE id = #{stopId} AND state = 'CLAIMED' AND claim_token = #{claimToken}
            AND lease_until &gt; CURRENT_TIMESTAMP

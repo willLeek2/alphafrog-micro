@@ -69,7 +69,7 @@ class CanceledWaitMemberStopWorkerTest {
         when(transaction.getTransaction(any())).thenAnswer(ignored -> new SimpleTransactionStatus());
         worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox,
                 settlement, objectMapper, transaction, ownership,
-                mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+                mock(DualPoolRunAdmissionRegistry.class), 2, 120, 8, 5, 120);
         stop = new WaitMemberStopTask();
         stop.setId(9L);
         stop.setWaitMemberId(41L);
@@ -187,7 +187,7 @@ class CanceledWaitMemberStopWorkerTest {
 
         assertThat(worker.runBatch()).isEqualTo(1);
         verify(stops).confirmSandboxTerminal(9L, "claim-1", "task-1", "CANCELED");
-        verify(stops, never()).blockProof(anyLong(), any(), any());
+        verify(stops, never()).unconfirm(anyLong(), any(), any());
     }
 
     @Test
@@ -218,7 +218,7 @@ class CanceledWaitMemberStopWorkerTest {
         when(sandbox.getTaskByOperationId(any())).thenReturn(lookup("task-1", "sha256:" + "b".repeat(64)));
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).blockProof(9L, "claim-1", "sandbox_operation_identity_mismatch");
+        verify(stops).unconfirm(9L, "claim-1", "sandbox_operation_identity_mismatch");
         verify(sandbox, never()).cancelTask(any());
         verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
     }
@@ -244,7 +244,7 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("other-task").setStatus("CANCELED").build());
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).blockProof(9L, "claim-1", "sandbox_status_identity_mismatch");
+        verify(stops).unconfirm(9L, "claim-1", "sandbox_status_identity_mismatch");
         verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
     }
 
@@ -253,7 +253,7 @@ class CanceledWaitMemberStopWorkerTest {
         member.setToolName("spawnSubAgent");
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).blockProof(9L, "claim-1", "wait_member_identity_mismatch");
+        verify(stops).unconfirm(9L, "claim-1", "wait_member_identity_mismatch");
         verify(sandbox, never()).cancelTask(any());
     }
 

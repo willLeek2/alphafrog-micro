@@ -31,7 +31,13 @@ import java.util.Set;
 @Service
 @Slf4j
 public class CanceledSqlWaitMemberRecovery {
-    public enum Ownership { NOT_APPLICABLE, MEMBER_OWNED, INVALID_PROOF }
+    public enum Ownership {
+        NOT_APPLICABLE,
+        MEMBER_OWNED,
+        /** 外部作业停止已经放弃自动确认：保留会话锁与容量，不再自动收尾。 */
+        UNCONFIRMED,
+        INVALID_PROOF
+    }
 
     private final AgentRunMapper runs;
     private final WaitGroupStore groups;
@@ -198,6 +204,10 @@ public class CanceledSqlWaitMemberRecovery {
                     || disagrees(proof.taskId(), stop.getTaskId())
                     || disagrees(anchor.getTaskId(), stop.getTaskId()))) return Inspection.invalid();
             String terminalReservationJson = null;
+            if (stop != null && "UNCONFIRMED".equals(stop.getState())) {
+                // 未确认优先于终态残留判断：这条运行不再由自动收尾处理。
+                return new Inspection(Ownership.UNCONFIRMED, member, stop, null);
+            }
             if (alreadyClosed && (stop == null || !"CONFIRMED".equals(stop.getState()))) return Inspection.invalid();
             if (stop != null && "CONFIRMED".equals(stop.getState())) {
                 if (stop.getTerminalTaskId() == null || stop.getTerminalTaskId().isBlank()

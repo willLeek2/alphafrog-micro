@@ -894,11 +894,7 @@
                    NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', ''),
                    NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', ''),
                    'wait-member-' || m.id::text,
-                   CASE WHEN m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
-                             AND m.external_operation_id ~ '^[^:\s]+:[^:\s]+:[1-9][0-9]*$'
-                             AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
-                                 ~ '^sha256:[0-9a-f]{64}$'
-                        THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
+                   'PENDING'
               FROM siblings_canceled m
              WHERE m.tool_name IN ('executePython', 'executeQuery')
                AND m.external_operation_id IS NOT NULL
@@ -1157,11 +1153,7 @@
                    NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', ''),
                    NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', ''),
                    'wait-member-' || m.id::text,
-                   CASE WHEN m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
-                             AND m.external_operation_id ~ '^[^:\s]+:[^:\s]+:[1-9][0-9]*$'
-                             AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
-                                 ~ '^sha256:[0-9a-f]{64}$'
-                        THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
+                   'PENDING'
              FROM members_canceled m
              WHERE m.tool_name IN ('executePython', 'executeQuery')
                AND m.external_operation_id IS NOT NULL
@@ -1220,11 +1212,7 @@
                    NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', ''),
                    NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', ''),
                    'wait-member-' || m.id::text,
-                   CASE WHEN m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
-                             AND m.external_operation_id ~ '^[^:\s]+:[^:\s]+:[1-9][0-9]*$'
-                             AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
-                                 ~ '^sha256:[0-9a-f]{64}$'
-                        THEN 'PENDING' ELSE 'BLOCKED_PROOF' END
+                   'PENDING'
               FROM run_fence f
               JOIN alphafrog_agent_run_wait_member m ON m.group_id = f.group_id
              WHERE m.state = 'CANCELED'

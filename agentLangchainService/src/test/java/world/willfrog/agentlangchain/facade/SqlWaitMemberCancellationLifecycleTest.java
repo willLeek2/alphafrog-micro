@@ -608,7 +608,7 @@ class SqlWaitMemberCancellationLifecycleTest {
             PlatformTransactionManager tx = mock(PlatformTransactionManager.class);
             when(tx.getTransaction(any())).thenAnswer(i -> new SimpleTransactionStatus());
             worker = new CanceledWaitMemberStopWorker(new MybatisWaitMemberStopStore(stopMapper), groups,
-                    sandbox, settlement, json, tx, ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+                    sandbox, settlement, json, tx, ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 8, 5, 120);
             ToolJobFinalizer finalizer = new ToolJobFinalizer(anchors, cache, capacity,
                     resume, config, mock(FinanceRecordChannelProcessor.class),
                     mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),

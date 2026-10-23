@@ -71,7 +71,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         PlatformTransactionManager transactions = mock(PlatformTransactionManager.class);
         when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
         worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox, settlement, json, transactions,
-                ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+                ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 8, 5, 120);
         member = new WaitMember(); member.setId(41L); member.setGroupId(7L); member.setRunId(RUN);
         member.setMemberIdentity("query-member"); member.setToolCallId("raw-model-call");
         member.setToolName("executeQuery"); member.setExternalOperationId(operation.operationId()); member.setState("CANCELED");
@@ -162,7 +162,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         assertThat((Integer) ReflectionTestUtils.invokeMethod(capacity, "usedUnitsSnapshot")).isEqualTo(1);
         verify(capacity, times(2)).releaseReservation(argThat(request -> request.reservation().identity().equals(operation)));
         verify(capacity, never()).releaseReservation(argThat(request -> request.reservation().identity().equals(next.identity())));
-        verify(stops, never()).blockProof(anyLong(), any(), any());
+        verify(stops, never()).unconfirm(anyLong(), any(), any());
         verify(stops, never()).retry(anyLong(), any(), any(), any());
     }
 
@@ -272,7 +272,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         worker.runBatch(); assertCapacityHeld();
         verifyNoInteractions(sandbox, recorder);
         verify(capacity, never()).releaseReservation(any());
-        verify(stops).blockProof(eq(9L), eq("original-claim"), any());
+        verify(stops).unconfirm(eq(9L), eq("original-claim"), any());
         verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
     }
 }

@@ -120,6 +120,15 @@ public class ToolJobReconciler {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
+                if (canceledSqlWaitMemberRecovery != null
+                        && "CANCELED".equals(a.getRunDisposition())
+                        && canceledSqlWaitMemberRecovery.ownership(run.getId(), a)
+                        == CanceledSqlWaitMemberRecovery.Ownership.UNCONFIRMED) {
+                    // 已放弃自动确认的锚点不再重建到期项；容量占用仍由成员扫描保留。
+                    redisCache.removeDue(run.getId());
+                    redisCache.deletePendingCache(run.getId());
+                    continue;
+                }
                 if (waitGroupOwnsUnresolvedMember(run.getId(), a)) {
                     if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB
                             && dualPoolToolJobCoordinator != null
@@ -192,17 +201,23 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
-            if (canceledSqlWaitMemberRecovery != null
-                    && canceledSqlWaitMemberRecovery.ownership(runId, anchor)
-                    != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
-                if (canceledSqlWaitMemberRecovery.complete(runId, anchor)) {
-                    redisCache.removeDue(runId);
-                    redisCache.deletePendingCache(runId);
-                } else {
-                    anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
-                    redisCache.upsertDue(runId, anchor);
+            if (canceledSqlWaitMemberRecovery != null) {
+                var ownership = canceledSqlWaitMemberRecovery.ownership(runId, anchor);
+                if (ownership != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.UNCONFIRMED) {
+                        // 外部作业未确认：移除到期项，保留会话锁与容量，等人工处理。
+                        redisCache.removeDue(runId);
+                        redisCache.deletePendingCache(runId);
+                        log.warn("外部作业停止未确认，停止自动收尾并保留会话锁：runId={}", runId);
+                    } else if (canceledSqlWaitMemberRecovery.complete(runId, anchor)) {
+                        redisCache.removeDue(runId);
+                        redisCache.deletePendingCache(runId);
+                    } else {
+                        anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                        redisCache.upsertDue(runId, anchor);
+                    }
+                    return;
                 }
-                return;
             }
             if (waitGroupOwnsUnresolvedMember(runId, anchor)) {
                 if (dualPoolToolJobCoordinator != null

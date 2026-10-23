@@ -523,14 +523,14 @@ public class LangchainRunControlService {
     /**
      * 恢复闸：旧成员的停机结算未结清时，恢复先给出可重试拒绝（旧 SQL 仍占用户查询会话，放行只会让
      * 新代际的第一条 SQL 撞会话忙）。读口口径是 {@code state <> 'CONFIRMED'}，会把永远不会再推进的
-     * BLOCKED_PROOF 也带回来——这里只认 PENDING/CLAIMED；BLOCKED_PROOF 残留不拦恢复，但留下有界日志。
+     * UNCONFIRMED 也带回来——这里只认 PENDING/CLAIMED；UNCONFIRMED 残留不拦恢复，但留下有界日志。
      */
     private void rejectUnsettledStopTasksBeforeResume(AgentRun run) {
         if (waitMemberStopStore == null) {
             return;
         }
         boolean unsettled = false;
-        boolean blockedProofResidue = false;
+        boolean unconfirmedResidue = false;
         long afterStopId = 0;
         while (true) {
             java.util.List<world.willfrog.agent.platform.wait.WaitMemberStopTask> stops =
@@ -542,13 +542,13 @@ public class LangchainRunControlService {
                 afterStopId = stop.getId();
                 if ("PENDING".equals(stop.getState()) || "CLAIMED".equals(stop.getState())) {
                     unsettled = true;
-                } else if ("BLOCKED_PROOF".equals(stop.getState())) {
-                    blockedProofResidue = true;
+                } else if ("UNCONFIRMED".equals(stop.getState())) {
+                    unconfirmedResidue = true;
                 }
             }
         }
-        if (blockedProofResidue) {
-            log.warn("恢复发现 BLOCKED_PROOF 停机残留，不阻塞恢复仅记录: runId={}", run.getId());
+        if (unconfirmedResidue) {
+            log.warn("恢复发现 UNCONFIRMED 停机残留，不阻塞恢复仅记录: runId={}", run.getId());
         }
         if (unsettled) {
             throw new IllegalStateException("旧任务仍在停机结算，请稍后重试恢复");
