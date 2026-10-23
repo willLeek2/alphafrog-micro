@@ -20,13 +20,19 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /** 有效计划形成后，汇总当前进程可取得的有限检查事实。 */
 @Service
 public class PlanDependencyCheckService {
+    private static final Pattern IDENTIFIER = Pattern.compile("[\\p{L}\\p{N}._:@/\\-]{1,256}");
+    private static final Pattern CREDENTIAL = Pattern.compile(
+            "(?i)(?:sk|ak|pk|rk|ghp|xox[baprs]|ya29)[_-][A-Za-z0-9._-]{12,}|AKIA[0-9A-Z]{16}");
     private final ToolDependencyInspector inspector;
     private final ObjectMapper objectMapper;
 
@@ -62,10 +68,11 @@ public class PlanDependencyCheckService {
             if (todo == null) {
                 continue;
             }
-            String todoId = identifier(todo.getId());
+            collector.currentTodoId = todo.getId();
+            String todoId = safeIdentifier(todo.getId());
             List<String> expectedTools = todo.getExpectedTools() == null ? List.of() : todo.getExpectedTools();
             if (collector.full() || elapsedMs(started) >= PlanDependencyCheckReport.TRAVERSAL_BUDGET_MS) {
-                collector.omitUnexpanded(todoId, Math.max(1, expectedTools.size()));
+                collector.omitUnexpanded(todo.getId(), Math.max(1, expectedTools.size()));
                 continue;
             }
             if (expectedTools.isEmpty()) {
@@ -76,7 +83,7 @@ public class PlanDependencyCheckService {
             Set<String> seen = new HashSet<>();
             for (int toolIndex = 0; toolIndex < expectedTools.size(); toolIndex++) {
                 if (collector.full() || elapsedMs(started) >= PlanDependencyCheckReport.TRAVERSAL_BUDGET_MS) {
-                    collector.omitUnexpanded(todoId, expectedTools.size() - toolIndex);
+                    collector.omitUnexpanded(todo.getId(), expectedTools.size() - toolIndex);
                     break;
                 }
                 String expected = expectedTools.get(toolIndex);
@@ -84,7 +91,7 @@ public class PlanDependencyCheckService {
                 if (!seen.add(name)) {
                     continue;
                 }
-                String displayName = identifier(name);
+                String displayName = safeIdentifier(name);
                 boolean registered = AgentToolRegistry.find(name).isPresent();
                 if (!registered) {
                     collector.add(new Hint(todoId, displayName, "tool.unknown", "工具登记",
@@ -140,12 +147,10 @@ public class PlanDependencyCheckService {
         return Math.max(0, (System.nanoTime() - started) / 1_000_000);
     }
 
-    private static String identifier(String value) {
-        if (value == null || value.isBlank()) {
-            return "";
-        }
-        String trimmed = value.trim();
-        return trimmed.matches("[A-Za-z0-9_.:-]{1,80}") ? trimmed : "unrecognized";
+    /** 身份通过安全检查时完整保留原值；无法表示时留空，避免伪造相同身份。 */
+    public static String safeIdentifier(String value) {
+        return value != null && IDENTIFIER.matcher(value).matches() && !value.contains("://")
+                && !CREDENTIAL.matcher(value).matches() ? value : "";
     }
 
     private final class Collector {
@@ -153,6 +158,10 @@ public class PlanDependencyCheckService {
         private final Integer generation;
         private final List<Hint> hints = new ArrayList<>();
         private final Set<String> omittedTodos = new LinkedHashSet<>();
+        // 原身份只在内部用于计数；无法安全输出的不同步骤仍分别计入总影响数。
+        private final Map<Hint, String> originalTodoIds = new IdentityHashMap<>();
+        private String currentTodoId;
+        private int omittedTodoIdLimit = PlanDependencyCheckReport.MAX_HINTS;
         private int omittedCount;
         private int checkedDependencyCount;
         private long durationMs;
@@ -168,16 +177,21 @@ public class PlanDependencyCheckService {
 
         private void add(Hint hint) {
             if (full()) {
-                omit(hint);
+                recordOmission(currentTodoId);
             } else {
                 hints.add(hint);
+                originalTodoIds.put(hint, currentTodoId);
             }
         }
 
         private void omit(Hint hint) {
+            recordOmission(originalTodoIds.remove(hint));
+        }
+
+        private void recordOmission(String originalTodoId) {
             omittedCount++;
-            if (hint.todoId() != null && !hint.todoId().isBlank()) {
-                omittedTodos.add(hint.todoId());
+            if (originalTodoId != null && !originalTodoId.isBlank()) {
+                omittedTodos.add(originalTodoId);
             }
         }
 
@@ -199,7 +213,8 @@ public class PlanDependencyCheckService {
                     .checkedAt(checkedAt).checkedPlanGeneration(generation)
                     .durationMs(durationMs).checkedDependencyCount(checkedDependencyCount)
                     .hints(List.copyOf(visible)).omittedCount(omittedCount)
-                    .omittedTodoIds(omittedTodos.stream().limit(PlanDependencyCheckReport.MAX_HINTS).toList())
+                    .omittedTodoIds(omittedTodos.stream().map(PlanDependencyCheckService::safeIdentifier)
+                            .filter(id -> !id.isBlank()).limit(omittedTodoIdLimit).toList())
                     .omittedTodoCount(omittedTodos.size()).truncated(omittedCount > 0).build();
         }
 
@@ -210,6 +225,11 @@ public class PlanDependencyCheckService {
             PlanDependencyCheckReport result = report();
             while (!hints.isEmpty() && jsonLength(result) > PlanDependencyCheckReport.MAX_REPORT_CHARACTERS) {
                 omit(hints.remove(hints.size() - 1));
+                result = report();
+            }
+            while (!result.getOmittedTodoIds().isEmpty()
+                    && jsonLength(result) > PlanDependencyCheckReport.MAX_REPORT_CHARACTERS) {
+                omittedTodoIdLimit = result.getOmittedTodoIds().size() - 1;
                 result = report();
             }
             return result;

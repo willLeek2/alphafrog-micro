@@ -1067,11 +1067,12 @@ public class LangchainLinearRunPipelineImpl implements AgentRunPipeline {
             if (plan.getItems() != null) {
                 for (TodoItem item : plan.getItems()) {
                     if (item != null && item.getId() != null && !item.getId().isBlank()) {
-                        affected.add(item.getId().length() <= 80 ? item.getId() : item.getId().substring(0, 80));
+                        affected.add(item.getId());
                     }
                 }
             }
             List<String> visibleIds = new ArrayList<>(affected.stream()
+                    .map(PlanDependencyCheckService::safeIdentifier).filter(id -> !id.isBlank())
                     .limit(PlanDependencyCheckReport.MAX_HINTS).toList());
             PlanDependencyCheckReport summary = report.toBuilder()
                     .hints(List.of(new PlanDependencyCheckReport.Hint("", "", "report.omitted", "未覆盖部分",

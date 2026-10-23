@@ -85,11 +85,17 @@ final class LangchainTodoUserMessageBuilder {
         boolean matched = false;
         if (report.getHints() != null) {
             for (PlanDependencyCheckReport.Hint hint : report.getHints()) {
-                if (hint == null || (hint.todoId() != null && !hint.todoId().isBlank()
-                        && !hint.todoId().equals(todoId))) {
+                if (hint == null) {
                     continue;
                 }
-                matched = true;
+                boolean sameTodo = hint.todoId() != null && !hint.todoId().isBlank() && hint.todoId().equals(todoId);
+                boolean common = (hint.todoId() == null || hint.todoId().isBlank())
+                        && ("execution.model.config".equals(hint.dependencyId())
+                        || "report.omitted".equals(hint.dependencyId()));
+                if (!sameTodo && !common) {
+                    continue;
+                }
+                matched |= sameTodo;
                 if (note.length() > 1600) {
                     note.append("其余说明见保存报告，未显示的部分不能据此判断可用。\n");
                     break;
@@ -103,7 +109,7 @@ final class LangchainTodoUserMessageBuilder {
                     note.append(hint.toolName()).append("：");
                 }
                 note.append(hint.dependencyLabel() == null ? "依赖" : hint.dependencyLabel())
-                        .append("——").append(status).append("；")
+                        .append("：").append(status).append("；")
                         .append(hint.reason() == null ? "没有检查依据。" : hint.reason()).append('\n');
             }
         }
