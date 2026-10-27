@@ -143,6 +143,28 @@ public final class RunDriverMain {
             六步全部结束后，用不超过八行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与 paths_dataset.csv 里平台对象的对应；第三步给出代码输出（行数）；第四步给出 dataset_id、行数与实际覆盖区间；第五步给出编号；第六步给出新对象的 ds_ id（如成功）或如实转述错误内容。
             """;
 
+    /** c9 降级探测模板（--expect-degraded 用）：DataFrog 半边停机窗口内跑，五步，
+     * 每步的失败/降级本身就是断言对象（预期失败=继续下一步，全部转述原文）。
+     * 甲方案（拿六步模板进窗口）走不通：第二步 ds_ 挂载失败会触发「失败即停」规则，
+     * promote 永远不会被调到，第三条断言（TOOL_ERROR）测不到。 */
+    private static final String C9_PROMPT_TEMPLATE = """
+            你是一个降级窗口探测助手。当前平台数据对象服务（DataFrog）已停机。请严格按下面五步依次执行，只调用指定的四个工具（listMyData、executePython、getStockDaily、promoteDatasetToPlatform），不要调用任何其他工具。本任务里前两步与第五步预期返回失败或降级结果——失败不是异常，是本次要观测的事实：如实逐字转述每步的返回原文，转述完继续下一步，不要因为失败而停止或重试。
+
+            第一步：调用工具 listMyData，参数 query_type 传 "dataset"，其余参数留空。预期：调用成功返回，但「平台数据对象」区为空、并附带不可用说明（note）。把 note 原文逐字转述。
+
+            第二步：调用工具 executePython，code 参数传下面这段（原样）：
+            print("C9_PROBE_DONE")
+            dataset_ids 只传 "{{DS_ID}}"。预期：结构化失败，错误码形如 PLATFORM_OBJECT_UNAVAILABLE，且不会创建沙箱任务。把错误码与 message 原文逐字转述。
+
+            第三步：调用工具 getStockDaily，参数 ts_code="000001.SZ"、start_date="20260105"、end_date="20260109"、includeColumns 留空。预期：正常成功（取数不经 DataFrog）。记下 dataset_id、rows、start_date、end_date。
+
+            第四步：再调用一次工具 listMyData，参数 query_type 传 "dataset"。取数数据集会出现（fromTsCode="000001.SZ" 那条），记下它的 number（平台区此时仍为空+note，照常转述一次 note）。
+
+            第五步：调用工具 promoteDatasetToPlatform，参数：dataset_number 传第四步的 number；name 传 "{{NAME}}"；description 传 "{{DESCRIPTION}}"；semantic_refs 传 "{{SEMANTIC_REFS}}"；primary_key 传 "{{PRIMARY_KEY}}"；coverage_scope 传 "{{COVERAGE_SCOPE}}"；coverage_start 传第三步记下的 start_date（YYYYMMDD 转 YYYY-MM-DD）；coverage_end 传第三步记下的 end_date（同样转格式）；frequency 传 "daily"。预期：TOOL_ERROR（promoteDatasetToPlatform invocation error 之类的最外层包装错误），不产生新对象。把错误码与 message 原文逐字转述。
+
+            五步结束后用不超过六行总结：每步工具名、预期是否兑现、关键错误码/note 原文。
+            """;
+
     // ---------------------------------------------------------------------
     // 状态
     // ---------------------------------------------------------------------
@@ -217,6 +239,7 @@ public final class RunDriverMain {
         long timeoutSeconds = Long.parseLong(opts.getOrDefault("--timeout-seconds", "900"));
         long pollIntervalSeconds = Long.parseLong(opts.getOrDefault("--poll-interval-seconds", "5"));
         boolean captureLlm = "1".equals(opts.get("--capture-llm"));
+        boolean expectDegraded = "1".equals(opts.get("--expect-degraded"));
         boolean toolGate = !"1".equals(opts.get("--no-tool-gate"));
 
         boolean attachMode = !attachRunId.isBlank();
@@ -236,7 +259,7 @@ public final class RunDriverMain {
             message = Files.readString(Path.of(messageFile), StandardCharsets.UTF_8);
             System.out.println("提示词来自文件（不替换占位符）: " + messageFile);
         } else {
-            message = render(PROMPT_TEMPLATE, Map.ofEntries(
+            message = render(expectDegraded ? C9_PROMPT_TEMPLATE : PROMPT_TEMPLATE, Map.ofEntries(
                     Map.entry("{{DS_ID}}", dsId),
                     Map.entry("{{CODE_MOUNT}}", indentCodeBlock(codeMount)),
                     Map.entry("{{CODE_READ}}", indentCodeBlock(codeRead)),
@@ -364,7 +387,7 @@ public final class RunDriverMain {
                 pollLog.append(line).append(System.lineSeparator());
                 if (consecutiveErrors >= 5) {
                     System.err.println("连续 5 次轮询失败，中止。");
-                    writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus);
+                    writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded);
                     System.exit(2);
                     return;
                 }
@@ -379,7 +402,7 @@ public final class RunDriverMain {
         // -----------------------------------------------------------------
         // 终态后取证
         // -----------------------------------------------------------------
-        writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus);
+        writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded);
 
         boolean completed = "COMPLETED".equals(terminalStatus);
         check("status.terminal_completed", completed,
@@ -401,7 +424,8 @@ public final class RunDriverMain {
 
     /** 终态取证：run 详情、结果、事件全量、credit 明细（尽力而为）+ 工具调用核对。 */
     private void writeEvidence(Path outDir, String runId, String user, AgentDubboService svc,
-                               Long csvDataRows, String model, AgentRunStatusMessage lastStatus) {
+                               Long csvDataRows, String model, AgentRunStatusMessage lastStatus,
+                               boolean expectDegraded) {
         AgentRunMessage runMsg = null;
         try {
             laneTagAttachment();
@@ -473,10 +497,18 @@ public final class RunDriverMain {
                 .filter(ids -> ids != null && hasDsToken(ids) && !hasDigitToken(ids)).findFirst().orElse(null);
         check("tool.executePython.ds_only_step2", dsOnly != null,
                 dsOnly == null ? "没有仅 ds_ 的调用" : "dataset_ids=\"" + dsOnly + "\"");
-        String mixed = pyStarted.stream().map(RunDriverMain::extractDatasetIds)
-                .filter(ids -> ids != null && hasDigitToken(ids) && hasDsToken(ids)).findFirst().orElse(null);
-        check("tool.executePython.dataset_ids_mixed", mixed != null,
-                mixed == null ? "没有数字+ds_ 混合的调用" : "dataset_ids=\"" + mixed + "\"");
+        if (expectDegraded) {
+            // c9 降级核对门：预期失败即通过（executePython 拒绝码族 + promote 最外层 TOOL_ERROR）。
+            String pyFinished = toolFinishedPayload(events, "executePython");
+            check("c9.executePython.platform_object_unavailable",
+                    pyFinished != null && pyFinished.contains("PLATFORM_OBJECT_UNAVAILABLE"),
+                    pyFinished == null ? "无 FINISHED 事件" : shorten(pyFinished));
+        } else {
+            String mixed = pyStarted.stream().map(RunDriverMain::extractDatasetIds)
+                    .filter(ids -> ids != null && hasDigitToken(ids) && hasDsToken(ids)).findFirst().orElse(null);
+            check("tool.executePython.dataset_ids_mixed", mixed != null,
+                    mixed == null ? "没有数字+ds_ 混合的调用" : "dataset_ids=\"" + mixed + "\"");
+        }
         String startedFetch = toolStartedPayload(events, "getStockDaily");
         check("tool.getStockDaily.started", startedFetch != null,
                 startedFetch == null ? "未找到" : shorten(startedFetch));
@@ -484,13 +516,23 @@ public final class RunDriverMain {
         check("tool.promoteDatasetToPlatform.started", startedPromote != null,
                 startedPromote == null ? "未找到" : shorten(startedPromote));
         String finishedPromote = toolFinishedPayload(events, "promoteDatasetToPlatform");
-        boolean promoteOk = finishedPromote != null && SUCCESS_TRUE_PATTERN.matcher(finishedPromote).find();
-        check("tool.promoteDatasetToPlatform.finished_success", promoteOk,
-                finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
-        if (promoteOk && finishedPromote.contains("ds_")) {
-            info("promote 应答预览含 ds_ 新对象 id（c8-34 关键返回）: " + shorten(finishedPromote));
+        boolean promoteOk;
+        if (expectDegraded) {
+            promoteOk = false;
+            check("c9.promote.tool_error_wrapped",
+                    finishedPromote != null && finishedPromote.contains("TOOL_ERROR")
+                            && finishedPromote.toLowerCase().contains("invocation error"),
+                    finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
+            info("c9 降级模式：promote 预期 TOOL_ERROR（不产生新对象），ds_ 预览检查跳过");
         } else {
-            info("promote 成功但预览里没看到 ds_ id（result_preview 可能被截断，回查以 events.jsonl / result.txt 为准）");
+            promoteOk = finishedPromote != null && SUCCESS_TRUE_PATTERN.matcher(finishedPromote).find();
+            check("tool.promoteDatasetToPlatform.finished_success", promoteOk,
+                    finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
+            if (promoteOk && finishedPromote.contains("ds_")) {
+                info("promote 应答预览含 ds_ 新对象 id（c8-34 关键返回）: " + shorten(finishedPromote));
+            } else {
+                info("promote 成功但预览里没看到 ds_ id（result_preview 可能被截断，回查以 events.jsonl / result.txt 为准）");
+            }
         }
         if (csvDataRows != null) {
             boolean rowsSeen = events.stream().anyMatch(ev -> ev.getPayloadJson() != null
@@ -742,6 +784,9 @@ public final class RunDriverMain {
                   --out <dir>            evidence 输出根目录（默认 out-014data04）
                   --capture-llm          置 capture_llm_requests=true（默认关）
                   --no-tool-gate         关工具核对门（退出码只看终态，不要求三工具齐全）
+  --expect-degraded      c9 停机窗口模式：提示词换五步降级探测模板，核对门按
+                         「预期失败即 PASS」判（executePython=PLATFORM_OBJECT_UNAVAILABLE、
+                         promote=TOOL_ERROR；混传与 promote 成功两项不再检查）
 
                 提示词模板与 Python 代码在源码 RunDriverMain 顶部常量，交付评审时直接改。
 
