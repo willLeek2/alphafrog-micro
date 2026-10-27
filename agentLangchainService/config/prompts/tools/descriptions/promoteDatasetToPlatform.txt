@@ -1,0 +1,19 @@
+把当前 agent run 内的一个 dataset 提升为平台数据对象（DataFrog 私有对象，直接登记，不走审核）。
+
+用于：
+1. 用户明确要求把本次运行产出的数据保存为可长期复用的平台数据集
+2. 多步工作流中把中间结果沉淀为平台对象，供后续 run 通过 ds_ 标识复用
+
+参数：
+  dataset_number - 必填，listMyData 返回的 run 级 dataset 编号（entries[].number，纯数字）
+  name           - 必填，平台对象名称（保存后在 listMyData 的平台数据对象区以 ds_ id + 此名称展示）
+  description    - 可选，平台对象描述
+
+行为与边界：
+- 读取该 dataset 的已落盘 CSV 原文，原样上传为平台对象的首个版本内容
+- 登记属性固定：用户生成（source_type=USER）、Agent 产出（gen_method=AGENT）、
+  当前用户私有（visibility=PRIVATE）、无输入对象；不写连续完整日信息
+- 成功后返回平台对象 id（ds_ 前缀）；后续 run 可在 executePython 的 dataset_ids 里
+  直接传该 ds_ id 挂载使用
+- 平台对象挂载副本不能再次提升（内容已在平台上，直接引用原 ds_ id）
+- 仅在用户明确要求保存/沉淀数据时调用，不要在普通分析流程中主动调用
