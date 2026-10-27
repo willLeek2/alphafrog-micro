@@ -712,7 +712,8 @@ public class ToolRouter {
                                 str(params.get("primary_key"), params.get("primaryKey"), params.get("arg4")),
                                 str(params.get("coverage_scope"), params.get("coverageScope"), params.get("arg5")),
                                 str(params.get("coverage_start"), params.get("coverageStart"), params.get("arg6")),
-                                str(params.get("coverage_end"), params.get("coverageEnd"), params.get("arg7"))
+                                str(params.get("coverage_end"), params.get("coverageEnd"), params.get("arg7")),
+                                str(params.get("frequency"), params.get("arg8"))
                 );
                 case "rereadToolResult" -> rereadToolHandler.reread(
                         str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),

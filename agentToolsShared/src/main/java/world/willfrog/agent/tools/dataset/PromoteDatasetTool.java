@@ -13,6 +13,7 @@ import world.willfrog.agent.tools.datafrog.DataFrogObjectClient;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.datafrog.idl.DataObjectCard;
+import world.willfrog.datafrog.idl.Frequency;
 import world.willfrog.datafrog.idl.GenMethod;
 import world.willfrog.datafrog.idl.RegisterDataObjectRequest;
 import world.willfrog.datafrog.idl.RegisterDataObjectResponse;
@@ -108,7 +109,8 @@ public class PromoteDatasetTool {
             @P(value = "必填，逗号分隔的主键列名列表，如 \"trade_date,ts_code\"", required = true) String primary_key,
             @P(value = "必填，覆盖范围说明，如 \"A股股票日线\"", required = true) String coverage_scope,
             @P(value = "必填，数据覆盖起始日期，格式 YYYY-MM-DD", required = true) String coverage_start,
-            @P(value = "必填，数据覆盖结束日期，格式 YYYY-MM-DD", required = true) String coverage_end
+            @P(value = "必填，数据覆盖结束日期，格式 YYYY-MM-DD", required = true) String coverage_end,
+            @P(value = "必填，更新频率：daily（每日更新）或 single_period（一次性单期）", required = true) String frequency
     ) {
         try {
             String runId = AgentContext.getRunId();
@@ -162,6 +164,14 @@ public class PromoteDatasetTool {
                 return fail("INVALID_COVERAGE_DATE", "coverage_end must be a valid YYYY-MM-DD date",
                         Map.of("coverage_end", nvl(coverage_end)));
             }
+            // 261028 泳道实测修：frequency 是库侧 NOT NULL 声明字段，此前不传，服务端
+            // 按未声明炸成 INTERNAL+SQL 原文；现在工具侧必收、本地先校验词表。
+            Frequency parsedFrequency = parseFrequency(frequency);
+            if (parsedFrequency == null) {
+                return fail("INVALID_FREQUENCY",
+                        "frequency must be daily or single_period",
+                        Map.of("frequency", nvl(frequency)));
+            }
 
             // 持久化读取通道与取数 / 查看工具一致：registry 快照 → persistedPath → 文件字节。
             AgentRunDatasetEntry entry = agentRunDatasetRegistry
@@ -205,7 +215,8 @@ public class PromoteDatasetTool {
 
             // RegisterDataObject 直登（无审核分支）。方案 D4-4 固定字段 + 必填约定字段
             // （description / semantic_refs / primary_key / coverage_scope / coverage_start /
-            // coverage_end，bob d61398da：字段带齐，不放宽服务端 ConventionValidator）外
+            // coverage_end / frequency，bob d61398da：字段带齐，不放宽服务端 ConventionValidator；
+            // frequency 261028 补——库侧 NOT NULL，首态遗漏，属约定字段清单补齐）外
             // 其余声明字段不填；服务端约定校验如不通过，错误码与 message 原样透传给调用方。
             RegisterDataObjectRequest request = RegisterDataObjectRequest.newBuilder()
                     .setName(safeName)
@@ -214,6 +225,7 @@ public class PromoteDatasetTool {
                     .setOwner(userId)
                     .setVisibility(Visibility.PRIVATE)
                     .setGenMethod(GenMethod.AGENT)
+                    .setFrequency(parsedFrequency)
                     .addAllSemanticRefs(semanticRefs)
                     .setCoverageScope(safeCoverageScope)
                     .addAllPrimaryKey(primaryKeyColumns)
@@ -297,6 +309,18 @@ public class PromoteDatasetTool {
             names.add(name);
         }
         return names.isEmpty() ? null : names;
+    }
+
+    /** 词表校验：daily→DAILY、single_period→SINGLE_PERIOD（大小写不敏感），其余 null。 */
+    private static Frequency parseFrequency(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "daily" -> Frequency.DAILY;
+            case "single_period" -> Frequency.SINGLE_PERIOD;
+            default -> null;
+        };
     }
 
     /** 严格 YYYY-MM-DD 日期解析（LocalDate.parse 不接受 2026-1-1 这类非补零形态）；不合法返回 null。 */

@@ -15,6 +15,7 @@
   coverage_scope  - 覆盖范围说明，如 "A股股票日线"
   coverage_start  - 数据覆盖起始日期，格式 YYYY-MM-DD
   coverage_end    - 数据覆盖结束日期，格式 YYYY-MM-DD
+  frequency       - 更新频率：daily（每日更新）或 single_period（一次性单期）
 
 行为与边界：
 - 读取该 dataset 的已落盘 CSV 原文，原样上传为平台对象的首个版本内容
