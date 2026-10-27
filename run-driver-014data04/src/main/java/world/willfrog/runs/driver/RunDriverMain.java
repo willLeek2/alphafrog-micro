@@ -178,11 +178,11 @@ public final class RunDriverMain {
 
     /** 泳道标签：非空时给每次出站调用带上官方 dubbo.tag 附件。
      * 直连（不经 tag 路由）时提供方按附件恢复泳道上下文；缺了它 createRun 落库 lane_tag 为空，
-     * 租约续期与补扫都按进程泳道过滤、看不见这条 run（2026-10-28 接手事故根因）。 */
+     * 租约续期与补扫按进程泳道筛选，运行标签与进程不一致时无法续期或补扫。 */
     private String laneTag = "";
 
-    /** 每次远程调用前调用：把标签放进 RpcContext 客户端附件（本驱动类路径无共享 common 包，
-     * 不存在会清手工附件的 LaneConsumerHopFilter，附件原样上线）。 */
+    /** 每次远程调用前把泳道标签写入 RpcContext 客户端附件。
+     * 本独立驱动未引入共享 common 过滤器；引入后应通过 LaneContext 传递标签。 */
     private void laneTagAttachment() {
         if (laneTag != null && !laneTag.isBlank()) {
             RpcContext.getClientAttachment().setAttachment("dubbo.tag", laneTag);
