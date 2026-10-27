@@ -6,6 +6,31 @@ listMyData → executePython（仅 ds_）→ executePython（数字+ds_ 混传�
 提升的数据源）→ listMyData（给取数数据集分配编号）→ promoteDatasetToPlatform（提升该编号），
 轮询到终态后把全部应答原文落盘 evidence。
 
+## 014-data-05 phase 2 复用（分支 wang/run-driver-014data05）
+
+05 的修改任务 run 由受理端点（HTTP POST /api/data-platform/v1/modification-tasks）自行
+createRun，驱动器**不建 run、不发提示词**，从 e2e 程序拿到的 runId 进跟踪：
+
+```bash
+export LANG=C.UTF-8
+java -Ddubbo.application.serialize-check-status=DISABLE -jar run-driver-014data04/target/run-driver-014data04.jar \
+  --agent-url tri://<05 泳道 agent 直连地址> \
+  --lane-tag <05 泳道标签> \
+  --user <受理用户的 id（run 归属用户，getStatus 按 user+runId 查）> \
+  --run-id <e2e 受理后 GET /modification-tasks/{taskId} 里拿到的 runId> \
+  --mod-gate \
+  --out out-014data05 \
+  --timeout-seconds 900
+```
+
+- `--mod-gate` 核对门：① executePython 发生（附件由沙箱代码产出）；② 结构化负载
+  （事件 payload_json、result payload_json、structured_answer_json）里去重后的 csv 附件
+  标记恰一个——这是 run 侧旁证，**登记段的权威计数（contentType 含 csv/文件名 .csv
+  过滤后恰一）在 05 e2e 侧**。run 侧负载若不暴露附件信息，`--mod-csv-gate off` 降级为只记录。
+- run 终态词表仍是 COMPLETED；task 侧 SUCCEEDED、registeredVersion=base+1、守卫两拒、
+  幂等去重全部由 05 e2e（HTTP 侧）断言，不在驱动器。
+- 04 专属核对（listMyData/getStockDaily/promote 形态）在 mod 模式全部跳过。
+
 ## 构建（机器侧，JDK 17 + 机器 maven）
 
 ```bash

@@ -46,6 +46,12 @@ import java.util.regex.Pattern;
  * <p>只负责打穿与取证，不做数据库侧断言（那是 DataFrog 侧断言程序的事）。
  * 本地构建只需 maven + JDK17，不连泳道；真跑由泳道侧按验收顺序执行。
  *
+ * <p>014-data-05 phase 2 复用形态（--run-id + --mod-gate）：05 的 run 由修改任务
+ * 受理端点（HTTP）自行 createRun，驱动器跳过建 run，从 runId 进轮询+取证；
+ * 核对门换成 05 修改任务门（executePython 发生 + 结构化负载里 csv 附件标记恰一个）。
+ * 受理/查询/守卫编排与登记段权威计数都在 05 e2e 程序（HTTP 侧），两段以 runId 衔接；
+ * run 终态词表仍是 COMPLETED（task 侧 SUCCEEDED 由 e2e 查询断言，不在这判）。
+ *
  * <p>流程（详见 --help）：
  * createRun（或 --run-id 挂已有 run）→ 轮询 getStatus 到终态（超时可配）
  * → getRun + getResult + listEvents（翻页全量）+ getRunCredits（尽力而为）
@@ -240,6 +246,8 @@ public final class RunDriverMain {
         long pollIntervalSeconds = Long.parseLong(opts.getOrDefault("--poll-interval-seconds", "5"));
         boolean captureLlm = "1".equals(opts.get("--capture-llm"));
         boolean expectDegraded = "1".equals(opts.get("--expect-degraded"));
+        boolean modGate = "1".equals(opts.get("--mod-gate"));
+        String modCsvGate = opts.getOrDefault("--mod-csv-gate", "hard");
         boolean toolGate = !"1".equals(opts.get("--no-tool-gate"));
 
         boolean attachMode = !attachRunId.isBlank();
@@ -258,6 +266,9 @@ public final class RunDriverMain {
         if (!messageFile.isBlank()) {
             message = Files.readString(Path.of(messageFile), StandardCharsets.UTF_8);
             System.out.println("提示词来自文件（不替换占位符）: " + messageFile);
+        } else if (attachMode && modGate) {
+            // 05 复用形态：run 由受理端点创建，驱动器不发提示词，占位内容只进 params.txt 留档
+            message = "（attach+mod 模式：不发送提示词——run 由 014-data-05 修改任务受理端点创建，驱动器只跟踪与取证）";
         } else {
             message = render(expectDegraded ? C9_PROMPT_TEMPLATE : PROMPT_TEMPLATE, Map.ofEntries(
                     Map.entry("{{DS_ID}}", dsId),
@@ -387,7 +398,7 @@ public final class RunDriverMain {
                 pollLog.append(line).append(System.lineSeparator());
                 if (consecutiveErrors >= 5) {
                     System.err.println("连续 5 次轮询失败，中止。");
-                    writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded);
+                    writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded, modGate, modCsvGate);
                     System.exit(2);
                     return;
                 }
@@ -402,7 +413,7 @@ public final class RunDriverMain {
         // -----------------------------------------------------------------
         // 终态后取证
         // -----------------------------------------------------------------
-        writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded);
+        writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded, modGate, modCsvGate);
 
         boolean completed = "COMPLETED".equals(terminalStatus);
         check("status.terminal_completed", completed,
@@ -425,7 +436,7 @@ public final class RunDriverMain {
     /** 终态取证：run 详情、结果、事件全量、credit 明细（尽力而为）+ 工具调用核对。 */
     private void writeEvidence(Path outDir, String runId, String user, AgentDubboService svc,
                                Long csvDataRows, String model, AgentRunStatusMessage lastStatus,
-                               boolean expectDegraded) {
+                               boolean expectDegraded, boolean modGate, String modCsvGate) {
         AgentRunMessage runMsg = null;
         try {
             laneTagAttachment();
@@ -434,10 +445,15 @@ public final class RunDriverMain {
         } catch (Exception e) {
             info("getRun 失败（证据缺 run-message.txt）: " + e.getMessage());
         }
+        // 结构化结果面（csv 标记统计用）：payload_json / structured_answer_json 是服务端结构，answerMarkdown 是模型行文不算
+        String resultPayloadJson = null;
+        String resultStructuredJson = null;
         try {
             laneTagAttachment();
             AgentRunResultMessage result = svc.getResult(GetAgentRunResultRequest.newBuilder()
                     .setUserId(user).setId(runId).build());
+            resultPayloadJson = result.getPayloadJson();
+            resultStructuredJson = result.getStructuredAnswerJson();
             StringBuilder sb = new StringBuilder(protoText(result));
             sb.append(System.lineSeparator())
               .append("===== answer_markdown 原文 =====").append(System.lineSeparator())
@@ -488,50 +504,65 @@ public final class RunDriverMain {
         }
 
         // 工具调用核对（硬检查；payload 是服务端 Jackson 紧凑 JSON，用包含+正则取值）
-        String startedList = toolStartedPayload(events, "listMyData");
-        check("tool.listMyData.started", startedList != null, startedList == null ? "未找到" : shorten(startedList));
         List<String> pyStarted = allToolStartedPayloads(events, "executePython");
         check("tool.executePython.started", !pyStarted.isEmpty(), pyStarted.isEmpty() ? "未找到" : shorten(pyStarted.get(0)));
-        // 四步编排：第二步仅 ds_（挂载并产生数字编号）、第三步数字+ds_ 混合；核对任一次调用满足各自形态。
-        String dsOnly = pyStarted.stream().map(RunDriverMain::extractDatasetIds)
-                .filter(ids -> ids != null && hasDsToken(ids) && !hasDigitToken(ids)).findFirst().orElse(null);
-        check("tool.executePython.ds_only_step2", dsOnly != null,
-                dsOnly == null ? "没有仅 ds_ 的调用" : "dataset_ids=\"" + dsOnly + "\"");
-        if (expectDegraded) {
+        if (modGate) {
+            // 05 修改任务门：附件「恰一个 CSV」在 run 侧按结构化负载里的 csv 标记去重统计；
+            // 登记段的权威计数（contentType 含 csv / 文件名 .csv 过滤后恰一）在 05 e2e 侧，这里是对应的 run 侧旁证。
+            java.util.LinkedHashSet<String> csvMarkers = new java.util.LinkedHashSet<>();
+            collectCsvMarkers(resultPayloadJson, csvMarkers);
+            collectCsvMarkers(resultStructuredJson, csvMarkers);
+            for (AgentRunEventMessage ev : events) {
+                collectCsvMarkers(ev.getPayloadJson(), csvMarkers);
+            }
+            int csvCount = csvMarkers.size();
+            String detail = "去重 csv 标记=" + csvCount + (csvMarkers.isEmpty() ? "" : " " + csvMarkers)
+                    + "（登记段权威计数在 05 e2e 侧）";
+            if ("off".equals(modCsvGate)) {
+                info("mod.csv_attachment_single（门已关，仅记录）: " + detail);
+            } else {
+                check("mod.csv_attachment_single", csvCount == 1, detail);
+            }
+            info("mod 门：04 专属核对（listMyData/getStockDaily/promote 形态）跳过");
+        } else if (expectDegraded) {
             // c9 降级核对门：预期失败即通过（executePython 拒绝码族 + promote 最外层 TOOL_ERROR）。
             String pyFinished = toolFinishedPayload(events, "executePython");
             check("c9.executePython.platform_object_unavailable",
                     pyFinished != null && pyFinished.contains("PLATFORM_OBJECT_UNAVAILABLE"),
                     pyFinished == null ? "无 FINISHED 事件" : shorten(pyFinished));
-        } else {
+        } else if (!modGate) {
+            String startedList = toolStartedPayload(events, "listMyData");
+            check("tool.listMyData.started", startedList != null, startedList == null ? "未找到" : shorten(startedList));
             String mixed = pyStarted.stream().map(RunDriverMain::extractDatasetIds)
                     .filter(ids -> ids != null && hasDigitToken(ids) && hasDsToken(ids)).findFirst().orElse(null);
             check("tool.executePython.dataset_ids_mixed", mixed != null,
                     mixed == null ? "没有数字+ds_ 混合的调用" : "dataset_ids=\"" + mixed + "\"");
         }
-        String startedFetch = toolStartedPayload(events, "getStockDaily");
-        check("tool.getStockDaily.started", startedFetch != null,
-                startedFetch == null ? "未找到" : shorten(startedFetch));
-        String startedPromote = toolStartedPayload(events, "promoteDatasetToPlatform");
-        check("tool.promoteDatasetToPlatform.started", startedPromote != null,
-                startedPromote == null ? "未找到" : shorten(startedPromote));
-        String finishedPromote = toolFinishedPayload(events, "promoteDatasetToPlatform");
-        boolean promoteOk;
-        if (expectDegraded) {
-            promoteOk = false;
-            check("c9.promote.tool_error_wrapped",
-                    finishedPromote != null && finishedPromote.contains("TOOL_ERROR")
-                            && finishedPromote.toLowerCase().contains("invocation error"),
-                    finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
-            info("c9 降级模式：promote 预期 TOOL_ERROR（不产生新对象），ds_ 预览检查跳过");
-        } else {
-            promoteOk = finishedPromote != null && SUCCESS_TRUE_PATTERN.matcher(finishedPromote).find();
-            check("tool.promoteDatasetToPlatform.finished_success", promoteOk,
-                    finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
-            if (promoteOk && finishedPromote.contains("ds_")) {
-                info("promote 应答预览含 ds_ 新对象 id（c8-34 关键返回）: " + shorten(finishedPromote));
+        if (!modGate) {
+            String startedFetch = toolStartedPayload(events, "getStockDaily");
+            check("tool.getStockDaily.started", startedFetch != null,
+                    startedFetch == null ? "未找到" : shorten(startedFetch));
+            String startedPromote = toolStartedPayload(events, "promoteDatasetToPlatform");
+            check("tool.promoteDatasetToPlatform.started", startedPromote != null,
+                    startedPromote == null ? "未找到" : shorten(startedPromote));
+            String finishedPromote = toolFinishedPayload(events, "promoteDatasetToPlatform");
+            boolean promoteOk;
+            if (expectDegraded) {
+                promoteOk = false;
+                check("c9.promote.tool_error_wrapped",
+                        finishedPromote != null && finishedPromote.contains("TOOL_ERROR")
+                                && finishedPromote.toLowerCase().contains("invocation error"),
+                        finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
+                info("c9 降级模式：promote 预期 TOOL_ERROR（不产生新对象），ds_ 预览检查跳过");
             } else {
-                info("promote 成功但预览里没看到 ds_ id（result_preview 可能被截断，回查以 events.jsonl / result.txt 为准）");
+                promoteOk = finishedPromote != null && SUCCESS_TRUE_PATTERN.matcher(finishedPromote).find();
+                check("tool.promoteDatasetToPlatform.finished_success", promoteOk,
+                        finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
+                if (promoteOk && finishedPromote.contains("ds_")) {
+                    info("promote 应答预览含 ds_ 新对象 id（c8-34 关键返回）: " + shorten(finishedPromote));
+                } else {
+                    info("promote 成功但预览里没看到 ds_ id（result_preview 可能被截断，回查以 events.jsonl / result.txt 为准）");
+                }
             }
         }
         if (csvDataRows != null) {
@@ -629,6 +660,24 @@ public final class RunDriverMain {
             }
         }
         return false;
+    }
+
+    /** 附件/工件类键名的取值（filename、file_name、content_type、contentType、artifact_xxx 等）。 */
+    private static final Pattern ATTACHMENT_VALUE_PATTERN = Pattern.compile(
+            "\"[A-Za-z_]*(?:filename|file_name|content_type|contentType|artifact)[A-Za-z_]*\"\\s*:\\s*\"([^\"]*)\"");
+
+    /** 从一段结构化 JSON 里收集值含 csv 的附件标记（去重；大小写不敏感按小写归一）。 */
+    private static void collectCsvMarkers(String json, java.util.LinkedHashSet<String> out) {
+        if (json == null || json.isBlank()) {
+            return;
+        }
+        Matcher m = ATTACHMENT_VALUE_PATTERN.matcher(json);
+        while (m.find()) {
+            String value = m.group(1);
+            if (value.toLowerCase().contains("csv")) {
+                out.add(value);
+            }
+        }
     }
 
     private static String render(String template, Map<String, String> values) {
@@ -730,10 +779,10 @@ public final class RunDriverMain {
             "--coverage-scope", "--coverage-start", "--coverage-end",
             "--csv", "--out", "--run-id", "--message-file",
             "--timeout-seconds", "--poll-interval-seconds",
-            "--lane-tag");
+            "--lane-tag", "--mod-csv-gate");
 
     private static final List<String> FLAG_OPTS = List.of(
-            "--capture-llm", "--no-tool-gate", "--expect-degraded", "--help");
+            "--capture-llm", "--no-tool-gate", "--expect-degraded", "--mod-gate", "--help");
 
     private static Map<String, String> parseArgs(String[] args) {
         Map<String, String> opts = new LinkedHashMap<>();
@@ -787,6 +836,12 @@ public final class RunDriverMain {
   --expect-degraded      c9 停机窗口模式：提示词换五步降级探测模板，核对门按
                          「预期失败即 PASS」判（executePython=PLATFORM_OBJECT_UNAVAILABLE、
                          promote=TOOL_ERROR；混传与 promote 成功两项不再检查）
+  --mod-gate             014-data-05 phase 2 修改任务模式（配 --run-id 用）：run 由 05 受理端点
+                         创建，驱动器只跟踪+取证；核对门换成 05 门（executePython 发生 +
+                         结构化负载里去重 csv 附件标记恰一个）；04 专属核对全部跳过；
+                         run 终态词表仍是 COMPLETED（task 侧 SUCCEEDED 由 05 e2e 断言）
+  --mod-csv-gate <hard|off> 05 的 csv 附件门开关（默认 hard；off=只记录不断言，
+                         run 侧负载若不暴露附件信息时降级用，登记段权威计数在 05 e2e 侧）
 
                 提示词模板与 Python 代码在源码 RunDriverMain 顶部常量，交付评审时直接改。
 
