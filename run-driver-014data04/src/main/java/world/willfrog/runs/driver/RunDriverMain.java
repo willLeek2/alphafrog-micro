@@ -125,7 +125,7 @@ public final class RunDriverMain {
             目的：一次调用同时挂载 run 级编号与平台对象（两套标识并存），并按编号读到数据。
 
             第四步：调用工具 getStockDaily，参数原样传入：ts_code 传 "000001.SZ"，start_date 传 "20260105"，end_date 传 "20260109"，includeColumns 留空。
-            目的：取一小段股票日线行情，作为后续提升的数据源。把应答里的 dataset_id 与 rows 记下来。
+            目的：取一小段股票日线行情，作为后续提升的数据源。把应答里的 dataset_id、rows、start_date、end_date 都记下来（start_date/end_date 是数据的实际覆盖区间，缓存复用时可能比请求区间宽，提升时以它为准）。
 
             第五步：再调用一次工具 listMyData，参数 query_type 传 "dataset"，其余参数留空。run 数据集列表（entries）里会出现刚才取数产生的数据集（fromTsCode 是 "000001.SZ" 的那条；列表不含平台对象挂载条目）。把它的 number 记下来。
 
@@ -136,10 +136,11 @@ public final class RunDriverMain {
             - semantic_refs 传 "{{SEMANTIC_REFS}}"
             - primary_key 传 "{{PRIMARY_KEY}}"
             - coverage_scope 传 "{{COVERAGE_SCOPE}}"
-            - coverage_start 传 "{{COVERAGE_START}}"
-            - coverage_end 传 "{{COVERAGE_END}}"
+            - coverage_start 传第四步记下的 start_date（YYYYMMDD 转成 YYYY-MM-DD，用实际值）
+            - coverage_end 传第四步记下的 end_date（同样转格式，用实际值）
+            - frequency 传 "daily"
 
-            六步全部结束后，用不超过八行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与 paths_dataset.csv 里平台对象的对应；第三步给出代码输出（行数）；第四步给出 dataset_id 与行数；第五步给出编号；第六步给出新对象的 ds_ id（如成功）或如实转述错误内容。
+            六步全部结束后，用不超过八行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与 paths_dataset.csv 里平台对象的对应；第三步给出代码输出（行数）；第四步给出 dataset_id、行数与实际覆盖区间；第五步给出编号；第六步给出新对象的 ds_ id（如成功）或如实转述错误内容。
             """;
 
     // ---------------------------------------------------------------------
@@ -243,9 +244,7 @@ public final class RunDriverMain {
                     Map.entry("{{DESCRIPTION}}", description),
                     Map.entry("{{SEMANTIC_REFS}}", semanticRefs),
                     Map.entry("{{PRIMARY_KEY}}", primaryKey),
-                    Map.entry("{{COVERAGE_SCOPE}}", coverageScope),
-                    Map.entry("{{COVERAGE_START}}", coverageStart),
-                    Map.entry("{{COVERAGE_END}}", coverageEnd)));
+                    Map.entry("{{COVERAGE_SCOPE}}", coverageScope)));
         }
         // 三个阶段全量覆盖（planning 阶段 isValid 需要 endpoint+model 都非空才不回落执行模型）
         String stageConfigJson = "{\"execution\":{\"endpointName\":\"" + endpoint
@@ -729,8 +728,10 @@ public final class RunDriverMain {
                   --ds-id <id>           ds_ 平台对象 id（创建模式必填）
                   --dataset-number <n>   【已废弃】新模板里编号由模型按第二步结果自定；参数保留只为旧脚本不报错，传入被忽略
                   --promote-number <n>   【已废弃】同上
-                  --name/--description/--semantic-ref/--primary-key/--coverage-scope/--coverage-start/--coverage-end
-                                         promote 其余 7 个必填参数（semantic-ref 形如 name@version，默认 acc04_sem@1）
+                  --name/--description/--semantic-ref/--primary-key/--coverage-scope
+                                         promote 其余必填参数（semantic-ref 形如 name@version，须为 e2e phase 5 登记的定义）
+                  --coverage-start/--coverage-end
+                                         【已废弃】覆盖日期改由模型按第四步取数应答的实际值传入；参数保留只为旧脚本不报错
                   --csv <path>           可选，本地 CSV，用来预读期望数据行数做软核对
                   --message-file <path>  可选，整段提示词直接用文件内容（不替换占位符）
 

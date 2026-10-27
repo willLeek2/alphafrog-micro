@@ -28,8 +28,6 @@ java -Ddubbo.application.serialize-check-status=DISABLE -jar run-driver-014data0
   --semantic-ref "<e2e phase 5 打印的 SEMANTIC_REF，形如 acc04_sd20261028xxxxxx@1>" \
   --primary-key trade_date \
   --coverage-scope "e2e04-promoted-$STAMP" \
-  --coverage-start 2026-01-05 \
-  --coverage-end 2026-01-09 \
   --timeout-seconds 900
 echo "exit=$?"
 ```
@@ -48,7 +46,12 @@ echo "exit=$?"
   run d6f83cc9 实证挂载副本再提升被守卫拒（PLATFORM_OBJECT_SELF_PROMOTE，PromoteDatasetTool:179，
   bob 审过的定案行为，不改），提升源改取数工具产出的数据集；第五步 listMyData 给取数数据集
   分配编号（列表不含平台挂载条目，选 fromTsCode=000001.SZ 那条的 number）；第六步 promote 该编号。
-  `--dataset-number/--promote-number` 已废弃，传入被忽略。
+  `--dataset-number/--promote-number/--coverage-start/--coverage-end` 已废弃，传入被忽略。
+- **模板口径 v3.2（261028 frequency 缺口修复后）**：第六步 promote 补传 frequency="daily"
+  （库侧 NOT NULL 声明字段，此前工具不传、服务端炸 INTERNAL——双侧已修：工具补必填参数
+  =主仓库 9eda17a4，服务端未声明 fail-closed 拒绝=DataFrog 1e7675b，泳道两侧须按新头重拉重构建）；
+  coverage 起止改由模型按第四步取数应答的实际值传入（缓存复用会宽于请求区间，实测复用了
+  2026-01-01→06-24 的已有数据集，声明比内容窄就是假账，所以用实际值）。
 - **--semantic-ref 必须用 e2e phase 5 登记的定义**（既有 18 条定义全是指标类，没有能如实标注
   股票日线的；phase 5 会打印 SEMANTIC_REF=acc04_sd<时间戳>@1 并回写 def.SD 进 object-ids.properties）。
 - 断言解析为容忍空白的正则（服务端 Jackson 是 `"tool_name": "x"` 带空格式，不是紧凑式），
