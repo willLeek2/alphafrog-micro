@@ -4,15 +4,23 @@
 1. 用户明确要求把本次运行产出的数据保存为可长期复用的平台数据集
 2. 多步工作流中把中间结果沉淀为平台对象，供后续 run 通过 ds_ 标识复用
 
-参数：
-  dataset_number - 必填，listMyData 返回的 run 级 dataset 编号（entries[].number，纯数字）
-  name           - 必填，平台对象名称（保存后在 listMyData 的平台数据对象区以 ds_ id + 此名称展示）
-  description    - 可选，平台对象描述
+参数（全部必填，服务端约定校验不放宽，字段带不齐或值不合法登记会被拒绝）：
+  dataset_number  - listMyData 返回的 run 级 dataset 编号（entries[].number，纯数字）
+  name            - 平台对象名称（保存后在 listMyData 的平台数据对象区以 ds_ id + 此名称展示）
+  description     - 平台对象描述，非空
+  semantic_refs   - 逗号分隔的语义定义引用列表，每项 name@version，
+                    如 "price_daily@1,adj_factor@2"；引用的语义定义必须已在平台登记，
+                    给不出已登记的定义时登记失败（服务端错误原样返回）
+  primary_key     - 逗号分隔的主键列名，如 "trade_date,ts_code"（须是该 dataset 的真实列名）
+  coverage_scope  - 覆盖范围说明，如 "A股股票日线"
+  coverage_start  - 数据覆盖起始日期，格式 YYYY-MM-DD
+  coverage_end    - 数据覆盖结束日期，格式 YYYY-MM-DD
 
 行为与边界：
 - 读取该 dataset 的已落盘 CSV 原文，原样上传为平台对象的首个版本内容
 - 登记属性固定：用户生成（source_type=USER）、Agent 产出（gen_method=AGENT）、
   当前用户私有（visibility=PRIVATE）、无输入对象；不写连续完整日信息
+- 服务端约定校验失败时错误码与报文原样返回，按报文提示改参后重试
 - 成功后返回平台对象 id（ds_ 前缀）；后续 run 可在 executePython 的 dataset_ids 里
   直接传该 ds_ id 挂载使用
 - 平台对象挂载副本不能再次提升（内容已在平台上，直接引用原 ds_ id）
