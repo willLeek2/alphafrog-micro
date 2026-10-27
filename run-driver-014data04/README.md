@@ -19,7 +19,7 @@ JAVA_HOME="$(/usr/libexec/java_home -v 17)" mvn -q -f run-driver-014data04/pom.x
 ```bash
 STAMP=$(date +%Y%m%d%H%M%S)
 java -Ddubbo.application.serialize-check-status=DISABLE -jar run-driver-014data04/target/run-driver-014data04.jar \
-  --agent-url dubbo://172.27.49.47:53400 \
+  --agent-url tri://172.27.49.47:53400 \
   --ds-id ds_d036f04f \
   --name "acc04-b-$STAMP" \
   --description "014-data-04 节点d 提升回查对象B（run内提升产生，源=对象A挂载副本）" \
@@ -33,7 +33,7 @@ echo "exit=$?"
 ```
 
 要点：
-- **协议用 dubbo:// 不是 tri://**（该端口 tri 握手会被重置——开发机实测）。
+- **协议按机器网络实测定（首跑实证更正）**：服务端本身是 tri——Beta 机直连用 `tri://` 正常（01:15 首跑 createRun 即过）；`dubbo://` 只在服务端收到「Can not recognize protocol」拒绝。开发机之前 tri 握手被重置是本机透明代理的问题，不是服务端口径。**机器侧用 tri://，README 首版 dubbo:// 建议作废。**
 - **-Ddubbo.application.serialize-check-status=DISABLE 必须带**（消费端 STRICT 模式拦 protobuf 类，
   开发机实测被 SerializedForm allow list 拒）。
 - 退出码：0=COMPLETED 且工具核对全过；1=COMPLETED 但核对有 FAIL；2=连接/创建中断；3=非 COMPLETED 终态；4=超时。
