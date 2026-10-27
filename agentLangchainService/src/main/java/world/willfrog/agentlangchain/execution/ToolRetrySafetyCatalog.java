@@ -22,7 +22,7 @@ public class ToolRetrySafetyCatalog {
         for (String name : new String[]{
                 "getStockInfo", "getStockDaily", "getStockSwIndustryInfo", "searchStock", "searchFund",
                 "getIndexInfo", "getIndexDaily", "searchIndex", "searchAssetInfo", "checkParallelLimits",
-                "getTradingDaysSummary", "isTradingDay", "getExchangeAssetDaily", "getOffExchangeAssetDaily",
+                "getTradingDaysSummary", "isTradingDay", "getExchangeAssetDaily", "getOffExchangeAssetDaily", "getSpecialAssetDaily",
                 "getEtfAdj", "getListedAssetShareSize", "getFinancialReport", "ragSearch", "loadDocument",
                 "searchWeb", "resolveFinanceMethods", "loadToolGuide", "rereadToolResult", "listMyData",
                 "waitForSubAgent"
@@ -35,6 +35,8 @@ public class ToolRetrySafetyCatalog {
         safety.put("executeQuery", ToolRetrySafety.IDEMPOTENT);
         // 创建子 Agent 会启动新的执行单元，重复调用可能重复消耗资源，明确禁止自动重放。
         safety.put("spawnSubAgent", ToolRetrySafety.UNSAFE);
+        // promoteDatasetToPlatform 在平台登记新数据对象，重复调用会重复登记，禁止自动重试与重放。
+        safety.put("promoteDatasetToPlatform", ToolRetrySafety.UNSAFE);
         SAFETY_BY_TOOL = Map.copyOf(safety);
     }
 

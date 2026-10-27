@@ -10,6 +10,7 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
@@ -26,7 +27,7 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
  */
 @Configuration
 @ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class,
-        PythonSandboxTools.class, ListMyDataTool.class, LoadToolGuideTool.class,
+        PythonSandboxTools.class, ListMyDataTool.class, PromoteDatasetTool.class, LoadToolGuideTool.class,
         RereadToolHandler.class, AgentRunEventService.class, PythonSandboxDispatchStore.class})
 public class LangchainToolsConfiguration {
 
@@ -38,6 +39,7 @@ public class LangchainToolsConfiguration {
                                        PythonSandboxTools pythonSandboxTools,
                                        SqlQueryTools sqlQueryTools,
                                        ListMyDataTool listMyDataTool,
+                                       PromoteDatasetTool promoteDatasetTool,
                                        LoadToolGuideTool loadToolGuideTool,
                                        RereadToolHandler rereadToolHandler,
                                        ObjectMapper objectMapper,
@@ -54,6 +56,7 @@ public class LangchainToolsConfiguration {
                 pythonSandboxTools,
                 sqlQueryTools,
                 listMyDataTool,
+                promoteDatasetTool,
                 loadToolGuideTool,
                 rereadToolHandler,
                 objectMapper,

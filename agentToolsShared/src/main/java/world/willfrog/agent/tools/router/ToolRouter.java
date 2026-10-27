@@ -24,6 +24,7 @@ import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
@@ -178,6 +179,13 @@ public class ToolRouter {
      */
     @Autowired(required = false)
     private SubAgentControlHandler subAgentControlHandler;
+    /**
+     * 014-data-04 promoteDatasetToPlatform 工具实现。可选注入（@Autowired(required = false)），
+     * 与上面几个可选依赖同理：不改构造签名（既有 new ToolRouter 调用点不受影响）；Bean 不在
+     * （如纯单元测试上下文）时分发返回结构化 TOOL_UNAVAILABLE，不空指针。
+     */
+    @Autowired(required = false)
+    private PromoteDatasetTool promoteDatasetTool;
 
     /**
      * 简化入口：仅返回工具输出文本，丢弃成功标志、耗时、缓存元数据等。
@@ -694,6 +702,18 @@ public class ToolRouter {
                         toIntOrNull(params.get("limit"), params.get("arg6")),
                         str(params.get("related_dataset_ids"), params.get("arg7"))
                 );
+                case "promoteDatasetToPlatform" -> promoteDatasetTool == null
+                        ? promoteUnavailable(toolName)
+                        : promoteDatasetTool.promoteDatasetToPlatform(
+                                toIntOrNull(params.get("dataset_number"), params.get("datasetNumber"), params.get("arg0")),
+                                str(params.get("name"), params.get("arg1")),
+                                str(params.get("description"), params.get("arg2")),
+                                str(params.get("semantic_refs"), params.get("semanticRefs"), params.get("arg3")),
+                                str(params.get("primary_key"), params.get("primaryKey"), params.get("arg4")),
+                                str(params.get("coverage_scope"), params.get("coverageScope"), params.get("arg5")),
+                                str(params.get("coverage_start"), params.get("coverageStart"), params.get("arg6")),
+                                str(params.get("coverage_end"), params.get("coverageEnd"), params.get("arg7"))
+                );
                 case "rereadToolResult" -> rereadToolHandler.reread(
                         str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
                         str(params.get("keyword"), params.get("arg1")),
@@ -756,6 +776,22 @@ public class ToolRouter {
                 .durationMs(Math.max(0L, System.currentTimeMillis() - startedAt))
                 .success(isToolSuccess(result))
                 .build();
+    }
+
+    /**
+     * promoteDatasetToPlatform 的稳定不可用应答：PromoteDatasetTool Bean 不在时使用，
+     * 形态与 {@link #subAgentUnavailable(String)} 一致，错误码为 TOOL_UNAVAILABLE，
+     * 不空指针、不落 UNSUPPORTED_TOOL。
+     */
+    private String promoteUnavailable(String toolName) {
+        return writeJson(Map.of(
+                "ok", false,
+                "tool", nvl(toolName),
+                "data", Map.of(),
+                "error", Map.of(
+                        "code", "TOOL_UNAVAILABLE",
+                        "message", "promoteDatasetToPlatform is unavailable in this runtime",
+                        "details", Map.of())));
     }
 
     private String subAgentUnavailable(String toolName) {
