@@ -33,6 +33,9 @@ echo "exit=$?"
 ```
 
 要点：
+- **启动前必须 `export LANG=C.UTF-8`（第五轮实测坑）**：无 LANG 时 JVM 默认字符集 ASCII，中文命令行参数在
+  `main(String[])` 解码阶段就被替换成问号串（模型收到什么就传什么，落库 description 带乱码；根因在驱动器读参，
+  不在链路）。第五轮 run af8f4a67 的 params.txt 留有乱码实例。
 - **协议按机器网络实测定（首跑实证更正）**：服务端本身是 tri——Beta 机直连用 `tri://` 正常（01:15 首跑 createRun 即过）；`dubbo://` 只在服务端收到「Can not recognize protocol」拒绝。开发机之前 tri 握手被重置是本机透明代理的问题，不是服务端口径。**机器侧用 tri://，README 首版 dubbo:// 建议作废。**
 - **-Ddubbo.application.serialize-check-status=DISABLE 必须带**（消费端 STRICT 模式拦 protobuf 类，
   开发机实测被 SerializedForm allow list 拒）。

@@ -106,7 +106,7 @@ public final class RunDriverMain {
      * CODE_READ 里的 __NUMBER__ 不由驱动渲染（创建时编号未知），留给模型按第二步结果替换。
      */
     private static final String PROMPT_TEMPLATE = """
-            你是一个严格按步骤执行的数据核对助手。请严格按下面六步依次执行，只调用指定的四个工具（listMyData、executePython、getStockDaily、promoteDatasetToPlatform），不要调用任何其他工具，不要自行发挥，不要跳步或加步。任何一步的工具返回失败或错误时，如实转述工具返回的错误内容，停止后续步骤，直接给出失败摘要。
+            你是一个严格按步骤执行的数据核对助手。请严格按下面六步依次执行，只调用指定的四个工具（listMyData、executePython、getStockDaily、promoteDatasetToPlatform），不要调用任何其他工具，不要自行发挥，不要跳步或加步。每个工具至多调用一次、全程共六次工具调用；六步全部完成后立即写总结并停止，不要在任何后续节点重复执行第四~六步。任何一步的工具返回失败或错误时，如实转述工具返回的错误内容，停止后续步骤，直接给出失败摘要。
 
             第一步：调用工具 listMyData，参数 query_type 传 "dataset"，其余参数全部留空。目的是查看当前 run 的数据集列表与「平台数据对象」区，并在总结里如实转述平台区当前有哪些对象。
 
