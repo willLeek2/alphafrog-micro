@@ -97,7 +97,7 @@ public class PythonSandboxTools {
      * 纯数字 token 走原 run 级编号路径；两套标识互不混用。
      */
     private static final String PLATFORM_OBJECT_ID_PREFIX = "ds_";
-    /** 平台对象 CSV 副本的持久化登记 TTL（小时）：对齐 DatasetRegistry 兜底口径 12h。 */
+    /** 平台对象 CSV 副本的持久化登记 TTL（小时）：与 DatasetRegistry 既有口径一致，12h。 */
     private static final long PLATFORM_OBJECT_ARTIFACT_TTL_HOURS = 12L;
     /** 平台对象名做文件名的长度上限（防超长名打爆文件系统）。 */
     private static final int PLATFORM_OBJECT_NAME_MAX_CHARS = 64;
