@@ -37,8 +37,9 @@ import java.util.Locale;
  * （写法照 DataFrog 侧 AgentRunClient 消费主仓库 group=langchain 的先例；check=false，
  * DataFrog 未部署时启动不失败，调用期才报错）。封装四件事：
  * <ul>
- *   <li>{@link #listMyDataObjects(String)}：枚举当前用户自己的平台对象（01 契约没有 owner
- *       过滤参数，调用侧拿全量分页后在内存按 card.owner 过滤，这是既定边界）</li>
+ *   <li>{@link #listMyDataObjects(String)}：枚举当前用户自己的平台对象（014-data-04 起
+ *       ListDataObjects 带服务端 filter_owner 等值过滤，不再全量拉回内存过滤——bob 节点 c
+ *       裁定 d61398da）</li>
  *   <li>{@link #getDataObject(String)} / {@link #registerDataObject(RegisterDataObjectRequest)}：直封装</li>
  *   <li>{@link #readAllObjectData(String, int, Path)}：ReadObjectData 字节分页拉全量 part，
  *       按版本行 content_checksum 做 fail-closed 校验</li>
@@ -93,9 +94,11 @@ public class DataFrogObjectClient {
     /**
      * 枚举当前用户自己的平台数据对象。
      *
-     * <p>01 契约的 ListDataObjects 没有 owner 过滤参数（014-data-04 过滤组也不含 owner），
-     * 这里按纯分页拉全量后在内存按 card.owner == currentUser 过滤——既定边界：列表只查
-     * 当前用户自己的对象，且 owner 固定取当前登录用户，不接受外部传入任意 owner。
+     * <p>014-data-04 起 ListDataObjects 请求带服务端 filter_owner 等值过滤（rpc 新字段，
+     * 空=01 原全量分页行为；bob 节点 c 裁定 d61398da：不做「全量拉回进程内存过滤」）。
+     * 翻页循环与保护上限保留：同一过滤条件内接着翻页，next_page_token 为空即结束。
+     * 边界不变：列表只查当前用户自己的对象，owner 固定取当前登录用户（由调用方从
+     * AgentContext 取得传入），不接受外部传入任意 owner。
      */
     public List<DataObjectCard> listMyDataObjects(String currentUser) {
         if (currentUser == null || currentUser.isBlank()) {
@@ -105,17 +108,14 @@ public class DataFrogObjectClient {
         String pageToken = "";
         for (int page = 0; page < MAX_LIST_PAGES; page++) {
             ListDataObjectsRequest.Builder builder = ListDataObjectsRequest.newBuilder()
-                    .setPageSize(LIST_PAGE_SIZE);
+                    .setPageSize(LIST_PAGE_SIZE)
+                    .setFilterOwner(currentUser);
             if (!pageToken.isEmpty()) {
                 builder.setPageToken(pageToken);
             }
             ListDataObjectsResponse response = dataObjectService.listDataObjects(builder.build());
             requireOk(response.getResult(), "ListDataObjects");
-            for (DataObjectCard card : response.getCardsList()) {
-                if (currentUser.equals(card.getOwner())) {
-                    mine.add(card);
-                }
-            }
+            mine.addAll(response.getCardsList());
             pageToken = response.getNextPageToken();
             if (pageToken == null || pageToken.isEmpty()) {
                 return mine;

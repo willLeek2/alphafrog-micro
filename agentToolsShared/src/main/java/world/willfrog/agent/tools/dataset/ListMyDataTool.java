@@ -347,20 +347,25 @@ public class ListMyDataTool {
 
     /**
      * 014-data-04：组装「平台数据对象」区。数据源是 DataFrogObjectClient.listMyDataObjects
-     * （01 契约没有 owner 过滤参数，消费端内存按 owner 过滤是既定边界；owner 固定取当前登录
-     * 用户，不接受工具参数传入）。平台侧不可用时列表主流程不失败：run 级条目仍完整返回，
-     * 附带不可用说明。
+     * （014-data-04 起 ListDataObjects 带服务端 filter_owner 等值过滤，owner 固定取当前登录
+     * 用户，不接受工具参数传入；bob 节点 c 裁定 d61398da）。平台侧不可用时列表主流程不失败：
+     * run 级条目仍完整返回，且「空平台区 + 不可用说明」必须写进返回给模型的结果文本
+     * （platform_objects_note），不能只打日志。
      */
     private void attachPlatformObjects(Map<String, Object> data) {
         if (dataFrogObjectClient == null) {
             data.put("platform_objects", List.of());
             data.put("platform_object_count", 0);
+            data.put("platform_objects_note",
+                    "platform objects unavailable: DataFrog channel is not wired in this deployment");
             return;
         }
         String userId = AgentContext.getUserId();
         if (userId == null || userId.isBlank()) {
             data.put("platform_objects", List.of());
             data.put("platform_object_count", 0);
+            data.put("platform_objects_note",
+                    "platform objects unavailable: no current user context in this run");
             return;
         }
         try {
