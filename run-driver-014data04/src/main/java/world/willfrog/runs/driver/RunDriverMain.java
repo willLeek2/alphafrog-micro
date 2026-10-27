@@ -4,6 +4,7 @@ import com.google.protobuf.TextFormat;
 import org.apache.dubbo.config.ApplicationConfig;
 import org.apache.dubbo.config.ReferenceConfig;
 import org.apache.dubbo.config.bootstrap.DubboBootstrap;
+import org.apache.dubbo.rpc.RpcContext;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
@@ -160,9 +161,26 @@ public final class RunDriverMain {
         System.exit(0); // 不会到这（run 内部决定退出码），保险
     }
 
+    /** 泳道标签：非空时给每次出站调用带上官方 dubbo.tag 附件。
+     * 直连（不经 tag 路由）时提供方按附件恢复泳道上下文；缺了它 createRun 落库 lane_tag 为空，
+     * 租约续期与补扫都按进程泳道过滤、看不见这条 run（2026-10-28 接手事故根因）。 */
+    private String laneTag = "";
+
+    /** 每次远程调用前调用：把标签放进 RpcContext 客户端附件（本驱动类路径无共享 common 包，
+     * 不存在会清手工附件的 LaneConsumerHopFilter，附件原样上线）。 */
+    private void laneTagAttachment() {
+        if (laneTag != null && !laneTag.isBlank()) {
+            RpcContext.getClientAttachment().setAttachment("dubbo.tag", laneTag);
+        }
+    }
+
     private void run(Map<String, String> opts) throws Exception {
         String agentUrl = opts.getOrDefault("--agent-url", DEFAULT_AGENT_URL);
         String group = opts.getOrDefault("--group", DEFAULT_GROUP);
+        this.laneTag = opts.getOrDefault("--lane-tag", "");
+        if (!this.laneTag.isBlank()) {
+            info("泳道标签附件已启用: dubbo.tag=" + this.laneTag);
+        }
         String user = opts.getOrDefault("--user", DEFAULT_USER);
         String model = opts.getOrDefault("--model", DEFAULT_MODEL);
         String endpoint = opts.getOrDefault("--endpoint", DEFAULT_ENDPOINT);
@@ -264,6 +282,7 @@ public final class RunDriverMain {
 
         // credit 预检（尽力而为，失败不拦）
         try {
+            laneTagAttachment();
             GetAgentCreditsResponse credits = svc.getCredits(GetAgentCreditsRequest.newBuilder()
                     .setUserId(user).build());
             info("credit 预检: total=" + credits.getTotalCredits()
@@ -284,6 +303,7 @@ public final class RunDriverMain {
                     .setCaptureLlmRequests(captureLlm);
             AgentRunMessage created;
             try {
+                laneTagAttachment();
                 created = svc.createRun(req.build());
             } catch (Exception e) {
                 System.err.println("createRun 失败: " + e);
@@ -307,6 +327,7 @@ public final class RunDriverMain {
         int consecutiveErrors = 0;
         while (System.currentTimeMillis() < deadline) {
             try {
+                laneTagAttachment();
                 lastStatus = svc.getStatus(GetAgentRunStatusRequest.newBuilder()
                         .setUserId(user).setId(runId).build());
                 consecutiveErrors = 0;
@@ -368,12 +389,14 @@ public final class RunDriverMain {
                                Long csvDataRows, String model, AgentRunStatusMessage lastStatus) {
         AgentRunMessage runMsg = null;
         try {
+            laneTagAttachment();
             runMsg = svc.getRun(GetAgentRunRequest.newBuilder().setUserId(user).setId(runId).build());
             writeText(outDir.resolve("run-message.txt"), protoText(runMsg));
         } catch (Exception e) {
             info("getRun 失败（证据缺 run-message.txt）: " + e.getMessage());
         }
         try {
+            laneTagAttachment();
             AgentRunResultMessage result = svc.getResult(GetAgentRunResultRequest.newBuilder()
                     .setUserId(user).setId(runId).build());
             StringBuilder sb = new StringBuilder(protoText(result));
@@ -385,6 +408,7 @@ public final class RunDriverMain {
             info("getResult 失败（证据缺 result.txt）: " + e.getMessage());
         }
         try {
+            laneTagAttachment();
             GetAgentRunCreditsResponse credits = svc.getRunCredits(GetAgentRunCreditsRequest.newBuilder()
                     .setUserId(user).setId(runId).build());
             writeText(outDir.resolve("run-credits.txt"), protoText(credits));
@@ -402,6 +426,7 @@ public final class RunDriverMain {
         try {
             int afterSeq = 0;
             while (true) {
+                laneTagAttachment();
                 ListAgentRunEventsResponse page = svc.listEvents(ListAgentRunEventsRequest.newBuilder()
                         .setUserId(user).setId(runId).setAfterSeq(afterSeq).setLimit(200).build());
                 events.addAll(page.getItemsList());
@@ -637,7 +662,8 @@ public final class RunDriverMain {
             "--name", "--description", "--semantic-ref", "--primary-key",
             "--coverage-scope", "--coverage-start", "--coverage-end",
             "--csv", "--out", "--run-id", "--message-file",
-            "--timeout-seconds", "--poll-interval-seconds");
+            "--timeout-seconds", "--poll-interval-seconds",
+            "--lane-tag");
 
     private static final List<String> FLAG_OPTS = List.of(
             "--capture-llm", "--no-tool-gate", "--help");
@@ -666,6 +692,8 @@ public final class RunDriverMain {
 
                 连接与身份：
                   --agent-url <url>      泳道 agentLangchainService 直连地址（默认 tri://172.27.49.47:53400）
+                  --lane-tag <tag>       泳道标签：给每次出站调用带官方 dubbo.tag 附件，createRun 落库
+                                         lane_tag 用（直连必须带，缺了 run 行 lane_tag 为空、租约续不上）
                   --group <g>            Dubbo group（默认 langchain，agentLangchainService 固定值）
                   --user <id>            直通用户 id，直接进请求 user_id（默认 5）
                   --model <m>            模型名，写入 stage_config_json 覆盖服务端默认（默认 deepseek/deepseek-v4.1-flash）
