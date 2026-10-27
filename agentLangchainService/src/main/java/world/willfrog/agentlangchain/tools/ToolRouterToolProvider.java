@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
@@ -77,6 +78,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final PythonSandboxTools pythonSandboxTools;
     private final SqlQueryTools sqlQueryTools;
     private final ListMyDataTool listMyDataTool;
+    private final PromoteDatasetTool promoteDatasetTool;
     private final LoadToolGuideTool loadToolGuideTool;
     private final RereadToolHandler rereadToolHandler;
     private final ObjectMapper objectMapper;
@@ -98,6 +100,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   PythonSandboxTools pythonSandboxTools,
                                   SqlQueryTools sqlQueryTools,
                                   ListMyDataTool listMyDataTool,
+                                  PromoteDatasetTool promoteDatasetTool,
                                   LoadToolGuideTool loadToolGuideTool,
                                   RereadToolHandler rereadToolHandler,
                                   ObjectMapper objectMapper,
@@ -105,7 +108,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   LangchainToolConcurrencyThrottle toolThrottle,
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore) {
         this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
-                listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
+                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
                 toolThrottle, pythonSandboxDispatchStore, null, null);
     }
 
@@ -140,6 +143,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 pythonSandboxTools,
                 sqlQueryTools,
                 listMyDataTool,
+                promoteDatasetTool,
                 loadToolGuideTool,
                 rereadToolHandler,
                 webSearchEnabled,

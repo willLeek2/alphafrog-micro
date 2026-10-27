@@ -1,10 +1,11 @@
-列出当前 agent run 已落盘的 dataset / manifest，提供 raw file content grep 能力。
+列出当前 agent run 已落盘的 dataset / manifest，提供 raw file content grep 能力；dataset 模式同时列出当前用户的平台数据对象。
 
 用于：
 1. executePython 收到 ILLEGAL_RUN_LEVEL_IDS 错误时恢复（先 listMyData 查合法编号）
 2. 多步工作流中回顾前面步骤落下了什么数据
 3. 发现某个 manifest 包含哪些相关 dataset
 4. 在 dataset 原始文件里搜索某关键字（grep 模式）
+5. 查看当前用户在数据平台上已保存的平台数据对象（platform_objects 区，014-data-04）
 
 参数：
   query_type          - 必填，取值 "dataset" 或 "manifest"
@@ -18,4 +19,10 @@
   related_dataset_ids - 可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest
 
 返回（grep 模式）：{ ok, data: { query_type, run_id, matched_count, file_offset, file_limit, matches: [...] }, error }
-返回（非 grep 模式）：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...] }, error }
+返回（非 grep 模式）：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...], platform_objects: [...], platform_object_count }, error }
+
+平台数据对象（dataset 模式，014-data-04）：
+- platform_objects 每条含 id（ds_ 前缀）、name、description、coverageEnd、assertionStatus 文案
+- 平台对象只以 ds_ 标识展示，不占 run 级编号；executePython 的 dataset_ids 可直接传 ds_ id 挂载
+- 平台对象挂载进 run 后不在 entries 里重复出现（避免与 run 级数据集混淆）
+- 平台侧暂时不可用时 entries 照常返回，platform_objects 为空并附 platform_objects_note

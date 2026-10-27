@@ -86,7 +86,8 @@ public class AgentRunDatasetRegistry {
                 event.getFromTsCode(),
                 event.getSortKey(),
                 List.of(),
-                PersistedArtifactType.DATASET);
+                PersistedArtifactType.DATASET,
+                event.getDatasetSource());
         RawEntry prior = state.rawDatasets.putIfAbsent(datasetId, raw);
         if (prior != null) {
             log.debug("Dataset already ingested (raw), skip re-ingest: runId={} datasetId={} sortKey={}",
@@ -112,7 +113,8 @@ public class AgentRunDatasetRegistry {
                 event.getFromTsCode(),
                 event.getSortKey(),
                 related,
-                PersistedArtifactType.MANIFEST);
+                PersistedArtifactType.MANIFEST,
+                DatasetPersistedEvent.SOURCE_TOOL_OUTPUT);
         RawEntry prior = state.rawManifests.putIfAbsent(manifestId, raw);
         if (prior != null) {
             log.debug("Manifest already ingested (raw), skip re-ingest: runId={} manifestId={} sortKey={}",
@@ -191,9 +193,14 @@ public class AgentRunDatasetRegistry {
             List<AgentRunDatasetEntry> datasetEntries = new ArrayList<>(sortedDatasets.size());
             for (Integer n : sortedDatasetNumbers) {
                 RawEntry raw = datasetByNumber.get(n);
-                datasetEntries.add(AgentRunDatasetEntry.forDataset(
-                        n, raw.originalId(), raw.persistedPath(),
-                        raw.fromTsCode(), raw.sortKey()));
+                // 014-data-04：平台对象挂载副本带 platform_object 来源标记，供 listMyData 跳过展示。
+                datasetEntries.add(AgentRunDatasetEntry.SOURCE_PLATFORM_OBJECT.equals(raw.source())
+                        ? AgentRunDatasetEntry.forPlatformObject(
+                                n, raw.originalId(), raw.persistedPath(),
+                                raw.fromTsCode(), raw.sortKey())
+                        : AgentRunDatasetEntry.forDataset(
+                                n, raw.originalId(), raw.persistedPath(),
+                                raw.fromTsCode(), raw.sortKey()));
             }
 
             // MF2: manifest.relatedDatasetIds 用同 snapshot 的 dataset run-level 编号翻译。
@@ -275,7 +282,7 @@ public class AgentRunDatasetRegistry {
             putUnique(datasetNumbering, entry.originalId(), entry.number(), "dataset originalId");
             putUnique(datasets, entry.originalId(), new RawEntry(
                     entry.originalId(), entry.persistedPath(), entry.fromTsCode(), entry.sortKey(),
-                    List.of(), PersistedArtifactType.DATASET), "dataset originalId");
+                    List.of(), PersistedArtifactType.DATASET, entry.source()), "dataset originalId");
         }
 
         Map<String, RawEntry> manifests = new HashMap<>();
@@ -304,7 +311,8 @@ public class AgentRunDatasetRegistry {
             }
             putUnique(manifests, entry.originalId(), new RawEntry(
                     entry.originalId(), entry.persistedPath(), entry.fromTsCode(), entry.sortKey(),
-                    List.copyOf(relatedOriginalIds), PersistedArtifactType.MANIFEST), "manifest originalId");
+                    List.copyOf(relatedOriginalIds), PersistedArtifactType.MANIFEST,
+                    DatasetPersistedEvent.SOURCE_TOOL_OUTPUT), "manifest originalId");
         }
         return new RestoredState(datasets, manifests, datasetNumbering, manifestNumbering);
     }
@@ -461,7 +469,8 @@ public class AgentRunDatasetRegistry {
             String fromTsCode,
             String sortKey,
             List<String> relatedDatasetIds,
-            PersistedArtifactType artifactType
+            PersistedArtifactType artifactType,
+            String source
     ) {
     }
 }

@@ -70,6 +70,20 @@
             <artifactId>dubbo-spring-boot-starter</artifactId>
             <version>${dubbo.version}</version>
         </dependency>
+        <!-- 014-data-04：DataFrog 数据对象平台契约（DataObjectService 等 proto 消息与 triple stub）。
+             本地安装版本 world.willfrog:datafrog-api:0.1.0-SNAPSHOT，与 DataFrog 侧同源生成。 -->
+        <dependency>
+            <groupId>world.willfrog</groupId>
+            <artifactId>datafrog-api</artifactId>
+            <version>0.1.0-SNAPSHOT</version>
+        </dependency>
+        <!-- 014-data-04：DuckDB JDBC，读平台对象 parquet part 转 CSV。
+             与 DataFrog 写 parquet 的 ContentStorageService 同款同版本（1.3.1.0），转换口径一致。 -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+            <version>1.3.1.0</version>
+        </dependency>
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
