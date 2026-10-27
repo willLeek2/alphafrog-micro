@@ -75,13 +75,19 @@ public final class RunDriverMain {
     // 提示词模板（frog 交付评审时改这里；占位符 {{XXX}} 由驱动参数填入）
     // ---------------------------------------------------------------------
 
-    /**
-     * 沙箱内执行的 Python 代码：用官方加载器按编号/平台 id 各加载一次，
-     * 打印每个 key 的行数与总行数（TOTAL_ROWS 是给证据核对用的稳定标记）。
-     */
-    private static final String PYTHON_CODE_TEMPLATE = """
+    /** 第二步挂载专用：不寻址数据（沙箱内按编号寻址是平台约定），打印标记并原文输出 paths_dataset.csv（original_id 溯源证据）。 */
+    private static final String CODE_MOUNT_TEMPLATE = """
+            print("MOUNT_ONLY_STEP_DONE")
+            try:
+                print(open("/sandbox/paths_dataset.csv").read())
+            except Exception as e:
+                print("paths_dataset.csv read failed:", e)
+            """;
+
+    /** 第三步按编号读：__NUMBER__ 由模型按第二步结果里的数字编号替换（驱动渲染期编号未知）。 */
+    private static final String CODE_READ_TEMPLATE = """
             from af_dataset_loader import load_datasets
-            datasets = load_datasets("{{DS_ID}}")
+            datasets = load_datasets("__NUMBER__")
             total = 0
             for key in sorted(datasets):
                 df = datasets[key]
@@ -91,31 +97,33 @@ public final class RunDriverMain {
             """;
 
     /**
-     * 发给模型的中文指令：只执行不发挥，三步定序，失败如实转述后停止。
-     * 占位符：{{DS_ID}}、{{DATASET_NUMBER}}、{{PROMOTE_NUMBER}}、{{NAME}}、
-     * {{DESCRIPTION}}、{{SEMANTIC_REFS}}、{{PRIMARY_KEY}}、{{COVERAGE_SCOPE}}、
-     * {{COVERAGE_START}}、{{COVERAGE_END}}、{{CODE_BLOCK}}。
+     * 发给模型的中文指令：四步定序（listMyData→挂载专用 executePython→混传 executePython→
+     * promoteDatasetToPlatform），失败如实转述后停止。
+     * 占位符：{{DS_ID}}、{{CODE_MOUNT}}、{{CODE_READ}}、{{NAME}}、{{DESCRIPTION}}、
+     * {{SEMANTIC_REFS}}、{{PRIMARY_KEY}}、{{COVERAGE_SCOPE}}、{{COVERAGE_START}}、{{COVERAGE_END}}。
+     * CODE_READ 里的 __NUMBER__ 不由驱动渲染（创建时编号未知），留给模型按第二步结果替换。
      */
     private static final String PROMPT_TEMPLATE = """
             你是一个严格按步骤执行的数据核对助手。请严格按下面四步依次执行，只调用指定的三个工具（listMyData、executePython、promoteDatasetToPlatform），不要调用任何其他工具，不要自行发挥，不要跳步或加步。任何一步的工具返回失败或错误时，如实转述工具返回的错误内容，停止后续步骤，直接给出失败摘要。
 
             第一步：调用工具 listMyData，参数 query_type 传 "dataset"，其余参数全部留空。目的是查看当前 run 的数据集列表与「平台数据对象」区，并在总结里如实转述平台区当前有哪些对象。
 
-            第二步：调用工具 executePython：
+            第二步：调用工具 executePython 做一次挂载专用调用：
             - code 参数使用下面这段代码，原样传入，不要修改：
-            {{CODE_BLOCK}}
-            - dataset_ids 参数只传 "{{DS_ID}}"（仅平台对象，先不带任何数字编号）；
+            {{CODE_MOUNT}}
+            - dataset_ids 参数只传 "{{DS_ID}}"（仅平台对象；本步不读数据——沙箱内数据一律按 run 级编号寻址，这是平台约定）；
             - manifest_ids 留空；libraries 留空；timeout_seconds 传 120。
-            目的：挂载该平台对象并在本 run 里登记一个 run 级数据集。工具返回里会显示本次挂载登记的数字编号（run 级数据集编号），把它记下来。
+            目的：挂载该平台对象并登记为 run 级数据集。工具返回里会显示分配的数字编号，把它记下来；代码会打印 paths_dataset.csv 全文，把编号与平台对象 id 的对应关系一并转述。
 
-            第三步：再调用一次工具 executePython：
-            - code 参数用同一段代码，原样传入，不要修改；
-            - dataset_ids 参数传「第二步返回里显示的数字编号,{{DS_ID}}」（纯数字 run 级编号与 ds_ 平台对象 id 混合，一次调用、原样传入，不要拆成两次调用，不要改动数字）；
+            第三步：再调用一次工具 executePython 做混传调用：
+            - code 参数使用下面这段代码，并把其中 load_datasets("__NUMBER__") 里的 __NUMBER__ 替换为第二步结果里显示的数字编号，其余原样：
+            {{CODE_READ}}
+            - dataset_ids 参数传「第二步结果里显示的数字编号,{{DS_ID}}」（纯数字与 ds_ 混合，一次调用、原样传入，不要拆成两次调用，不要改动数字）；
             - 其余参数同第二步。
-            目的：一次调用同时挂载 run 级编号与平台对象（两套标识并存）。
+            目的：一次调用同时挂载 run 级编号与平台对象（两套标识并存），并按编号读到数据。
 
             第四步：调用工具 promoteDatasetToPlatform，参数原样传入：
-            - dataset_number 传第二步返回里显示的同一个数字编号；
+            - dataset_number 传第二步结果里显示的同一个数字编号；
             - name 传 "{{NAME}}"
             - description 传 "{{DESCRIPTION}}"
             - semantic_refs 传 "{{SEMANTIC_REFS}}"
@@ -124,7 +132,7 @@ public final class RunDriverMain {
             - coverage_start 传 "{{COVERAGE_START}}"
             - coverage_end 传 "{{COVERAGE_END}}"
 
-            四步全部结束后，用不超过六行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与代码输出；第三步确认混合挂载成功；第四步给出新对象的 ds_ id（如成功）或如实转述错误内容。
+            四步全部结束后，用不超过六行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与 paths_dataset.csv 里平台对象的对应；第三步给出代码输出（行数）；第四步给出新对象的 ds_ id（如成功）或如实转述错误内容。
             """;
 
     // ---------------------------------------------------------------------
@@ -213,8 +221,8 @@ public final class RunDriverMain {
         }
 
         // 提示词与模型配置（attach 模式不需要）
-        String pythonCode = render(PYTHON_CODE_TEMPLATE, Map.of(
-                "{{DS_ID}}", dsId));
+        String codeMount = CODE_MOUNT_TEMPLATE;
+        String codeRead = CODE_READ_TEMPLATE; // __NUMBER__ 留给模型按第二步结果替换
         String message;
         if (!messageFile.isBlank()) {
             message = Files.readString(Path.of(messageFile), StandardCharsets.UTF_8);
@@ -222,14 +230,15 @@ public final class RunDriverMain {
         } else {
             message = render(PROMPT_TEMPLATE, Map.ofEntries(
                     Map.entry("{{DS_ID}}", dsId),
+                    Map.entry("{{CODE_MOUNT}}", indentCodeBlock(codeMount)),
+                    Map.entry("{{CODE_READ}}", indentCodeBlock(codeRead)),
                     Map.entry("{{NAME}}", name),
                     Map.entry("{{DESCRIPTION}}", description),
                     Map.entry("{{SEMANTIC_REFS}}", semanticRefs),
                     Map.entry("{{PRIMARY_KEY}}", primaryKey),
                     Map.entry("{{COVERAGE_SCOPE}}", coverageScope),
                     Map.entry("{{COVERAGE_START}}", coverageStart),
-                    Map.entry("{{COVERAGE_END}}", coverageEnd),
-                    Map.entry("{{CODE_BLOCK}}", indentCodeBlock(pythonCode))));
+                    Map.entry("{{COVERAGE_END}}", coverageEnd)));
         }
         // 三个阶段全量覆盖（planning 阶段 isValid 需要 endpoint+model 都非空才不回落执行模型）
         String stageConfigJson = "{\"execution\":{\"endpointName\":\"" + endpoint
@@ -243,7 +252,7 @@ public final class RunDriverMain {
         String stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now());
         Path outDir = Path.of(outRoot, stamp + (attachMode ? "-attach" : ""));
         Files.createDirectories(outDir);
-        writeParams(outDir, opts, message, pythonCode, stageConfigJson);
+        writeParams(outDir, opts, message, codeMount + "\n===== code-read =====\n" + codeRead, stageConfigJson);
 
         // 本地 CSV 期望行数（软核对用）
         Long csvDataRows = null;
@@ -466,7 +475,7 @@ public final class RunDriverMain {
         check("tool.promoteDatasetToPlatform.started", startedPromote != null,
                 startedPromote == null ? "未找到" : shorten(startedPromote));
         String finishedPromote = toolFinishedPayload(events, "promoteDatasetToPlatform");
-        boolean promoteOk = finishedPromote != null && finishedPromote.contains("\"success\":true");
+        boolean promoteOk = finishedPromote != null && SUCCESS_TRUE_PATTERN.matcher(finishedPromote).find();
         check("tool.promoteDatasetToPlatform.finished_success", promoteOk,
                 finishedPromote == null ? "无 FINISHED 事件" : shorten(finishedPromote));
         if (promoteOk && finishedPromote.contains("ds_")) {
@@ -515,7 +524,7 @@ public final class RunDriverMain {
         return events.stream()
                 .filter(ev -> "TOOL_CALL_STARTED".equals(ev.getEventType()))
                 .map(AgentRunEventMessage::getPayloadJson)
-                .filter(p -> p != null && p.contains("\"tool_name\":\"" + tool + "\""))
+                .filter(p -> p != null && toolNamePattern(tool).matcher(p).find())
                 .findFirst().orElse(null);
     }
 
@@ -523,7 +532,7 @@ public final class RunDriverMain {
         return events.stream()
                 .filter(ev -> "TOOL_CALL_STARTED".equals(ev.getEventType()))
                 .map(AgentRunEventMessage::getPayloadJson)
-                .filter(p -> p != null && p.contains("\"tool_name\":\"" + tool + "\""))
+                .filter(p -> p != null && toolNamePattern(tool).matcher(p).find())
                 .toList();
     }
 
@@ -531,9 +540,16 @@ public final class RunDriverMain {
         return events.stream()
                 .filter(ev -> "TOOL_CALL_FINISHED".equals(ev.getEventType()))
                 .map(AgentRunEventMessage::getPayloadJson)
-                .filter(p -> p != null && p.contains("\"tool_name\":\"" + tool + "\""))
+                .filter(p -> p != null && toolNamePattern(tool).matcher(p).find())
                 .findFirst().orElse(null);
     }
+
+    /** 服务端事件负载是带空格的 Jackson JSON（"tool_name": "x"），工具名匹配必须容忍空白。 */
+    private static Pattern toolNamePattern(String tool) {
+        return Pattern.compile("\"tool_name\"\\s*:\\s*\"" + Pattern.quote(tool) + "\"");
+    }
+
+    private static final Pattern SUCCESS_TRUE_PATTERN = Pattern.compile("\"success\"\\s*:\\s*true");
 
     private static final Pattern DATASET_IDS_PATTERN =
             Pattern.compile("\"dataset_ids\"\\s*:\\s*\"([^\"]*)\"");
@@ -701,8 +717,8 @@ public final class RunDriverMain {
 
                 场景参数（填进提示词）：
                   --ds-id <id>           ds_ 平台对象 id（创建模式必填）
-                  --dataset-number <n>   executePython dataset_ids 混传里的纯数字 run 级编号（默认 1）
-                  --promote-number <n>   promoteDatasetToPlatform 的 dataset_number（默认同 --dataset-number）
+                  --dataset-number <n>   【已废弃】新模板里编号由模型按第二步结果自定；参数保留只为旧脚本不报错，传入被忽略
+                  --promote-number <n>   【已废弃】同上
                   --name/--description/--semantic-ref/--primary-key/--coverage-scope/--coverage-start/--coverage-end
                                          promote 其余 7 个必填参数（semantic-ref 形如 name@version，默认 acc04_sem@1）
                   --csv <path>           可选，本地 CSV，用来预读期望数据行数做软核对
