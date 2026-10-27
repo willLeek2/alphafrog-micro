@@ -733,7 +733,7 @@ public final class RunDriverMain {
             "--lane-tag");
 
     private static final List<String> FLAG_OPTS = List.of(
-            "--capture-llm", "--no-tool-gate", "--help");
+            "--capture-llm", "--no-tool-gate", "--expect-degraded", "--help");
 
     private static Map<String, String> parseArgs(String[] args) {
         Map<String, String> opts = new LinkedHashMap<>();
