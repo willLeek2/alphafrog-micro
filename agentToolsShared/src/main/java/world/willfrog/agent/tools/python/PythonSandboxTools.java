@@ -8,7 +8,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
@@ -40,6 +42,8 @@ import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.agent.workflow.DatasetPersistedEvent;
+import world.willfrog.agent.tools.datafrog.DataFrogObjectClient;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
@@ -47,7 +51,11 @@ import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import com.google.protobuf.util.JsonFormat;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -85,6 +93,16 @@ public class PythonSandboxTools {
     private static final int DATA_ANALYSIS_ATTEMPT = 1;
 
     /**
+     * 平台数据对象标识前缀（014-data-04）：dataset_ids 里 ds_ 前缀 token 走平台对象分支，
+     * 纯数字 token 走原 run 级编号路径；两套标识互不混用。
+     */
+    private static final String PLATFORM_OBJECT_ID_PREFIX = "ds_";
+    /** 平台对象 CSV 副本的持久化登记 TTL（小时）：对齐 DatasetRegistry 兜底口径 12h。 */
+    private static final long PLATFORM_OBJECT_ARTIFACT_TTL_HOURS = 12L;
+    /** 平台对象名做文件名的长度上限（防超长名打爆文件系统）。 */
+    private static final int PLATFORM_OBJECT_NAME_MAX_CHARS = 64;
+
+    /**
      * 写给模型的完整说明只维护在 classpath 权威文件里。
      * {@code @Tool} 不再放正文：LangChain4j 反射只要方法签名，目录构建时再覆盖成权威正文。
      * 文件缺失或为空时加载直接失败，不再在 Java 里放第二份说明。
@@ -104,6 +122,29 @@ public class PythonSandboxTools {
      */
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
+
+    /**
+     * 014-data-04：DataFrog 平台数据对象消费端（可选注入，纯单元测试不接 DataFrog 时为 null；
+     * dataset_ids 里出现 ds_ token 且本依赖缺失时按结构化错误失败，不创建沙箱任务）。
+     */
+    @Autowired(required = false)
+    private DataFrogObjectClient dataFrogObjectClient;
+
+    /** 014-data-04：平台对象 CSV 经 DatasetPersistedEvent 登记进当前 run（与取数工具同一入口）。 */
+    @Autowired(required = false)
+    private ApplicationEventPublisher eventPublisher;
+
+    /** 014-data-04：平台对象 CSV 目录的持久化登记（TTL 与 Run 删除清理），可选注入。 */
+    @Autowired(required = false)
+    private PersistentArtifactRegistry persistentArtifactRegistry;
+
+    /**
+     * 014-data-04：平台对象 CSV 落盘根。与取数工具 dataset 共用同一存储根
+     * （agent.tools.market-data.dataset.database-fetched-path），沙箱 runner 能直接按
+     * source_path cp，沙箱服务与 Dubbo 契约零改动。
+     */
+    @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
+    private String platformObjectStorageRoot;
 
     @Autowired
     private AgentRunMapper agentRunMapper;
@@ -318,6 +359,22 @@ public class PythonSandboxTools {
             // LLM 可能传入逗号分隔数字，也可能传入 JSON 数组形态（如 "[1, 3]"），统一经 parseDatasetIds 规范化。
             String[] parsedDatasetNumbers = parseDatasetIds(dataset_ids);
             String[] parsedManifestNumbers = parseDatasetIds(manifest_ids);
+            // 014-data-04 两套标识分流：ds_ 前缀 token 是 DataFrog 平台数据对象，走平台对象分支；
+            // 其余 token 维持原 run 级编号语义不动。混传（数字 + ds_）支持，任一 ds_ 解析/校验
+            // 失败则整个调用结构化失败，不创建沙箱任务。
+            String[] runLevelDatasetTokens = new String[parsedDatasetNumbers.length];
+            int runLevelTokenCount = 0;
+            List<String> platformObjectIds = new ArrayList<>();
+            for (String token : parsedDatasetNumbers) {
+                if (token != null && token.startsWith(PLATFORM_OBJECT_ID_PREFIX)) {
+                    if (!platformObjectIds.contains(token)) {
+                        platformObjectIds.add(token);
+                    }
+                } else {
+                    runLevelDatasetTokens[runLevelTokenCount++] = token;
+                }
+            }
+            String[] numericDatasetTokens = java.util.Arrays.copyOf(runLevelDatasetTokens, runLevelTokenCount);
 
             // --- 第二阶段：读取当前 agent 运行的 registry 快照 ---
             // dataset_ids 与 manifest_ids 均为当前 agent 运行内的局部编号（由 listMyData 分配），
@@ -368,7 +425,7 @@ public class PythonSandboxTools {
             List<Map<String, Object>> illegalDatasetRefs = new ArrayList<>();
             List<Map<String, Object>> illegalManifestRefs = new ArrayList<>();
 
-            resolveRunLevelNumbers(parsedDatasetNumbers, registry, runId, "dataset",
+            resolveRunLevelNumbers(numericDatasetTokens, registry, runId, "dataset",
                     resolvedDatasets, illegalDatasetRefs, false);
             resolveRunLevelNumbers(parsedManifestNumbers, registry, runId, "manifest",
                     resolvedManifests, illegalManifestRefs, true);
@@ -382,6 +439,22 @@ public class PythonSandboxTools {
                 return fail("executePython", "ILLEGAL_RUN_LEVEL_IDS",
                         "Some dataset_ids / manifest_ids are not valid run-level numbers; pass values from the legal lists below",
                         details);
+            }
+
+            // --- 第二阶段附加：ds_ 平台数据对象解析（014-data-04）---
+            // 拉全量 part 过 content_checksum 校验（fail-closed）→ parquet 转 CSV（对象名.csv）→
+            // 经 DatasetPersistedEvent 登记为本 run 条目（来源 platform_object）。此后与 run 级
+            // 数据集同链路：originalId 汇总进 originalIdsToMount、路径映射 CSV 加一行
+            // （沙箱内文件名 = 对象名.csv）。挂载顺序：数字 token 条目在前，ds_ 条目按入参顺序随后。
+            if (!platformObjectIds.isEmpty()) {
+                List<AgentRunDatasetEntry> platformDatasets;
+                try {
+                    platformDatasets = resolvePlatformObjects(runId, platformObjectIds);
+                } catch (PlatformObjectResolutionException resolutionFailure) {
+                    return fail("executePython", resolutionFailure.code(),
+                            resolutionFailure.getMessage(), resolutionFailure.details());
+                }
+                resolvedDatasets.addAll(platformDatasets);
             }
 
             // --- 第三阶段：根据 manifest 补全成员 dataset ---
@@ -1178,6 +1251,164 @@ public class PythonSandboxTools {
             boolean allowEmptyTokens) {
         // 解析归集语义与 executeQuery 共用 RunLevelIdResolver，这里只留委托。
         RunLevelIdResolver.resolveRunLevelNumbers(tokens, registry, runId, kind, resolved, illegal, allowEmptyTokens);
+    }
+
+    /**
+     * 「这次 ds_ 平台对象解析被拒绝」的内部异常（014-data-04）。
+     *
+     * <p>携带结构化失败的 code 与 details，由 executePythonInternal 转成 fail 响应；
+     * 任一 ds_ 对象解析/校验失败，整个调用失败，不创建沙箱任务。</p>
+     */
+    private static final class PlatformObjectResolutionException extends RuntimeException {
+        private final String code;
+        private final Map<String, Object> details;
+
+        PlatformObjectResolutionException(String code, String message, Map<String, Object> details) {
+            super(message);
+            this.code = code;
+            this.details = details == null ? Map.of() : details;
+        }
+
+        String code() {
+            return code;
+        }
+
+        Map<String, Object> details() {
+            return details;
+        }
+    }
+
+    /**
+     * 解析 dataset_ids 里的全部 ds_ 平台数据对象（014-data-04）。
+     *
+     * <p>每个对象：GetDataObject 拿卡（version 固定取当前 ACTIVE）→ readAllObjectData 拉全量
+     * part 并对拼接字节算 sha256 与版本行 content_checksum 比对（不一致即 fail-closed 拒绝，
+     * 宁可报错不挂错文件）→ 校验通过后 parquetToCsv 转成 CSV（文件名 = 对象名.csv，校验和只对
+     * parquet part 字节算、不算 CSV）→ 写 rowCount 伴随元数据（容量预估的行数来源）→ 经
+     * DatasetPersistedEvent 登记为本 run 条目（来源 platform_object，originalId 即 ds_ 对象 id，
+     * sortKey 即对象名.csv，沙箱内文件名由此而来）。part 临时文件转换后即删。</p>
+     *
+     * @return 每个对象对应的 run 级 dataset 条目（registry 已分配编号）
+     */
+    private List<AgentRunDatasetEntry> resolvePlatformObjects(String runId, List<String> platformObjectIds) {
+        if (dataFrogObjectClient == null || eventPublisher == null) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CHANNEL_UNAVAILABLE",
+                    "Platform object channel is not wired; ds_ ids cannot be mounted in this deployment",
+                    Map.of("platform_object_ids", platformObjectIds));
+        }
+        List<AgentRunDatasetEntry> resolved = new ArrayList<>(platformObjectIds.size());
+        for (String objectId : platformObjectIds) {
+            resolved.add(mountPlatformObject(runId, objectId));
+        }
+        return resolved;
+    }
+
+    /** 单个平台对象的「拉取 → 校验 → 转 CSV → 登记」全流程；任一步失败抛 PlatformObjectResolutionException。 */
+    private AgentRunDatasetEntry mountPlatformObject(String runId, String objectId) {
+        // part 临时目录按调用唯一：不同 run / 不同版本并发挂同一对象时互不踩踏。
+        Path partsDir = Paths.get(platformObjectStorageRoot, "platform_objects", objectId,
+                "parts-" + java.util.UUID.randomUUID());
+        DataFrogObjectClient.ObjectContent content;
+        try {
+            content = dataFrogObjectClient.readAllObjectData(objectId, 0, partsDir);
+        } catch (DataFrogObjectClient.ChecksumMismatchException mismatch) {
+            // fail-closed：拼接字节与登记卡 content_checksum 不一致，宁可报错不挂错文件。
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CHECKSUM_MISMATCH",
+                    "Platform object content checksum mismatch; refuse to mount corrupted data",
+                    Map.of("object_id", objectId,
+                            "expected_checksum", mismatch.expected(),
+                            "actual_checksum", mismatch.actual()));
+        } catch (RuntimeException readFailure) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_UNAVAILABLE",
+                    "Platform object is unavailable: " + readFailure.getMessage(),
+                    Map.of("object_id", objectId));
+        }
+
+        String csvBaseName = platformObjectFileName(content.card().getName(), objectId);
+        Path objectDir = Paths.get(platformObjectStorageRoot, "platform_objects", objectId,
+                "v" + content.version());
+        Path csvPath = objectDir.resolve(csvBaseName + ".csv");
+        try {
+            dataFrogObjectClient.parquetToCsv(content.partFiles(), csvPath);
+        } catch (RuntimeException convertFailure) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CONVERT_FAILED",
+                    "Failed to convert platform object parquet to CSV: " + convertFailure.getMessage(),
+                    Map.of("object_id", objectId));
+        } finally {
+            // part 临时文件转换完即删（尽力清理，失败不阻断主流程）。
+            for (Path partFile : content.partFiles()) {
+                try {
+                    Files.deleteIfExists(partFile);
+                } catch (IOException cleanupFailure) {
+                    log.warn("平台对象 part 临时文件清理失败: {}", partFile, cleanupFailure);
+                }
+            }
+            try {
+                Files.deleteIfExists(partsDir);
+            } catch (IOException dirCleanupFailure) {
+                log.warn("平台对象 part 临时目录清理失败: {}", partsDir, dirCleanupFailure);
+            }
+        }
+
+        // rowCount 伴随元数据：容量准入的行数来源（DatasetEntryMetadataReader 侧读 <stem>.meta.json）。
+        try {
+            Files.createDirectories(objectDir);
+            Path metaPath = objectDir.resolve(csvBaseName + ".meta.json");
+            Files.writeString(metaPath, "{\"rowCount\":" + content.card().getRowCount()
+                    + ",\"format\":\"csv\"}", StandardCharsets.UTF_8);
+        } catch (IOException metaFailure) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CONVERT_FAILED",
+                    "Failed to write platform object CSV metadata: " + metaFailure.getMessage(),
+                    Map.of("object_id", objectId));
+        }
+
+        // 与取数工具产出 dataset 同一登记入口：发布 DatasetPersistedEvent，registry 分配 run 级编号。
+        // 来源标记 platform_object：listMyData 的 run 数据集区跳过这类条目（平台条目区只以 ds_ 标识展示）。
+        String sortKey = csvBaseName + ".csv";
+        eventPublisher.publishEvent(new DatasetPersistedEvent(
+                this, runId, objectId, csvPath.toString(), null, sortKey,
+                DatasetPersistedEvent.SOURCE_PLATFORM_OBJECT));
+        registerPlatformObjectArtifact(objectId, objectDir);
+
+        AgentRunDatasetEntry entry = agentRunDatasetRegistry.snapshot(runId).datasets().stream()
+                .filter(e -> objectId.equals(e.originalId()))
+                .findFirst()
+                .orElse(null);
+        if (entry == null) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_REGISTER_FAILED",
+                    "Platform object CSV was not registered into the run registry",
+                    Map.of("object_id", objectId));
+        }
+        log.info("平台对象已登记为本 run 数据集: runId={} objectId={} number={} csv={}",
+                runId, objectId, entry.number(), csvPath);
+        return entry;
+    }
+
+    /** 平台对象 CSV 目录的持久化登记（TTL 与 Run 删除清理）；失败只 warn，不影响挂载。 */
+    private void registerPlatformObjectArtifact(String objectId, Path objectDir) {
+        if (persistentArtifactRegistry == null) {
+            return;
+        }
+        try {
+            persistentArtifactRegistry.registerExternal("dataset", objectId, "platform_object",
+                    objectDir.toAbsolutePath().normalize(), PLATFORM_OBJECT_ARTIFACT_TTL_HOURS, false);
+        } catch (Exception registrationFailure) {
+            log.warn("平台对象 CSV 目录持久化登记失败（不影响本次挂载）: objectId={} err={}",
+                    objectId, registrationFailure.getMessage());
+        }
+    }
+
+    /** 对象名做安全文件名：去路径分隔与非法字符、限长；空白名回退为对象 id。 */
+    private static String platformObjectFileName(String objectName, String objectId) {
+        String raw = objectName == null ? "" : objectName.trim();
+        if (raw.isEmpty()) {
+            raw = objectId;
+        }
+        String cleaned = raw.replaceAll("[/\\\\:*?\"<>|\\s]+", "_");
+        if (cleaned.length() > PLATFORM_OBJECT_NAME_MAX_CHARS) {
+            cleaned = cleaned.substring(0, PLATFORM_OBJECT_NAME_MAX_CHARS);
+        }
+        return cleaned;
     }
 
     /** 查询沙箱任务当前状态；每次 Dubbo 调用前都会尝试安装调试 attachment。 */

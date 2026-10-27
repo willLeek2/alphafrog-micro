@@ -7,9 +7,9 @@ REQUIRED parameters:
 - In the temporary sandbox mode, at least one of dataset_ids or manifest_ids must be non-empty. In a run with a persistent workspace, both may be empty when the code only uses files saved by an earlier call in this run.
 
 IDs are agent run-level numbers (NOT original datasetId strings):
-- dataset_ids: comma-separated run-level dataset numbers, e.g. "1" or "1,3". Get these from listMyData or from the legal_dataset_numbers list in an ILLEGAL_RUN_LEVEL_IDS error.
+- dataset_ids: comma-separated run-level dataset numbers, e.g. "1" or "1,3". Get these from listMyData or from the legal_dataset_numbers list in an ILLEGAL_RUN_LEVEL_IDS error. dataset_ids may also contain ds_-prefixed platform data object ids taken from listMyData's platform_objects section, e.g. "1,ds_0123abcd" (numbers and ds_ ids can be mixed).
 - manifest_ids: comma-separated run-level manifest numbers, e.g. "1" or "1,2". Prefer manifest_ids when the data you need is already grouped into a manifest. Dataset and manifest counters are independent; both start at 1 within the same run.
-- Pass numbers only. If you only have a raw dataset id string or a file path, call listMyData first to resolve it.
+- Pass numbers or ds_ platform object ids only. If you only have a raw dataset id string or a file path, call listMyData first to resolve it.
 - The tool arguments can use comma-separated numbers. In Python helper code, prefer loading one number at a time and merging results when you need multiple datasets/manifests.
 
 OPTIONAL parameters:
@@ -61,6 +61,7 @@ ERROR FEEDBACK AND RECOVERY:
 - MISSING_IDS: in temporary sandbox mode, dataset_ids and manifest_ids are both empty → provide at least one. In persistent workspace mode, both may be empty to use existing workspace files.
 - RUN_LEVEL_IDS_UNAVAILABLE: no active agent run / registry not wired → wait for run start.
 - ILLEGAL_RUN_LEVEL_IDS: a number is not in the run's legal set → response lists legal_dataset_numbers and legal_manifest_numbers; pass values from those lists. If you are unsure, call listMyData first.
+- PLATFORM_OBJECT_UNAVAILABLE / PLATFORM_OBJECT_CHECKSUM_MISMATCH: a ds_ platform object could not be read or its content failed the integrity check → do not retry blindly; call listMyData to confirm the object still exists and report the issue.
 - TASK_FAILED / NON_ZERO_EXIT: code raised → fix and retry. If you hit this twice due to IDs or paths, stop and call listMyData or switch strategy.
 
 from_ts_code may be UNCERTAIN in paths_dataset.csv; this only means the asset code could not be inferred from the tool arguments, NOT that the data is corrupted.
