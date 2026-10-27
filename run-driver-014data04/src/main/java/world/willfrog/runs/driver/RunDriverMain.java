@@ -97,14 +97,16 @@ public final class RunDriverMain {
             """;
 
     /**
-     * 发给模型的中文指令：四步定序（listMyData→挂载专用 executePython→混传 executePython→
-     * promoteDatasetToPlatform），失败如实转述后停止。
+     * 发给模型的中文指令：六步定序（listMyData→挂载专用 executePython→混传 executePython→
+     * getStockDaily 取数→listMyData 分配编号→promoteDatasetToPlatform），失败如实转述后停止。
+     * 第四~六步是 20261028 守卫裁定后改的：挂载副本不许再提升（PLATFORM_OBJECT_SELF_PROMOTE，
+     * 守卫是 bob 审过的定案行为），提升源改取数工具产出的数据集。
      * 占位符：{{DS_ID}}、{{CODE_MOUNT}}、{{CODE_READ}}、{{NAME}}、{{DESCRIPTION}}、
      * {{SEMANTIC_REFS}}、{{PRIMARY_KEY}}、{{COVERAGE_SCOPE}}、{{COVERAGE_START}}、{{COVERAGE_END}}。
      * CODE_READ 里的 __NUMBER__ 不由驱动渲染（创建时编号未知），留给模型按第二步结果替换。
      */
     private static final String PROMPT_TEMPLATE = """
-            你是一个严格按步骤执行的数据核对助手。请严格按下面四步依次执行，只调用指定的三个工具（listMyData、executePython、promoteDatasetToPlatform），不要调用任何其他工具，不要自行发挥，不要跳步或加步。任何一步的工具返回失败或错误时，如实转述工具返回的错误内容，停止后续步骤，直接给出失败摘要。
+            你是一个严格按步骤执行的数据核对助手。请严格按下面六步依次执行，只调用指定的四个工具（listMyData、executePython、getStockDaily、promoteDatasetToPlatform），不要调用任何其他工具，不要自行发挥，不要跳步或加步。任何一步的工具返回失败或错误时，如实转述工具返回的错误内容，停止后续步骤，直接给出失败摘要。
 
             第一步：调用工具 listMyData，参数 query_type 传 "dataset"，其余参数全部留空。目的是查看当前 run 的数据集列表与「平台数据对象」区，并在总结里如实转述平台区当前有哪些对象。
 
@@ -118,12 +120,17 @@ public final class RunDriverMain {
             第三步：再调用一次工具 executePython 做混传调用：
             - code 参数使用下面这段代码，并把其中 load_datasets("__NUMBER__") 里的 __NUMBER__ 替换为第二步结果里显示的数字编号，其余原样：
             {{CODE_READ}}
-            - dataset_ids 参数传「第二步结果里显示的数字编号,{{DS_ID}}」（纯数字与 ds_ 混合，一次调用、原样传入，不要拆成两次调用，不要改动数字）；
+            - dataset_ids 参数传「第二步结果里显示的数字编号,{{DS_ID}}"（纯数字与 ds_ 混合，一次调用、原样传入，不要拆成两次调用，不要改动数字）；
             - 其余参数同第二步。
             目的：一次调用同时挂载 run 级编号与平台对象（两套标识并存），并按编号读到数据。
 
-            第四步：调用工具 promoteDatasetToPlatform，参数原样传入：
-            - dataset_number 传第二步结果里显示的同一个数字编号；
+            第四步：调用工具 getStockDaily，参数原样传入：ts_code 传 "000001.SZ"，start_date 传 "20260105"，end_date 传 "20260109"，includeColumns 留空。
+            目的：取一小段股票日线行情，作为后续提升的数据源。把应答里的 dataset_id 与 rows 记下来。
+
+            第五步：再调用一次工具 listMyData，参数 query_type 传 "dataset"，其余参数留空。run 数据集列表（entries）里会出现刚才取数产生的数据集（fromTsCode 是 "000001.SZ" 的那条；列表不含平台对象挂载条目）。把它的 number 记下来。
+
+            第六步：调用工具 promoteDatasetToPlatform，参数原样传入：
+            - dataset_number 传第五步记下的 number（取数数据集的编号，不要用第二步平台挂载的编号）；
             - name 传 "{{NAME}}"
             - description 传 "{{DESCRIPTION}}"
             - semantic_refs 传 "{{SEMANTIC_REFS}}"
@@ -132,7 +139,7 @@ public final class RunDriverMain {
             - coverage_start 传 "{{COVERAGE_START}}"
             - coverage_end 传 "{{COVERAGE_END}}"
 
-            四步全部结束后，用不超过六行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与 paths_dataset.csv 里平台对象的对应；第三步给出代码输出（行数）；第四步给出新对象的 ds_ id（如成功）或如实转述错误内容。
+            六步全部结束后，用不超过八行文字总结：每一步调用的工具名、是否成功；第一步转述平台区对象概况；第二步给出数字编号与 paths_dataset.csv 里平台对象的对应；第三步给出代码输出（行数）；第四步给出 dataset_id 与行数；第五步给出编号；第六步给出新对象的 ds_ id（如成功）或如实转述错误内容。
             """;
 
     // ---------------------------------------------------------------------
@@ -471,6 +478,9 @@ public final class RunDriverMain {
                 .filter(ids -> ids != null && hasDigitToken(ids) && hasDsToken(ids)).findFirst().orElse(null);
         check("tool.executePython.dataset_ids_mixed", mixed != null,
                 mixed == null ? "没有数字+ds_ 混合的调用" : "dataset_ids=\"" + mixed + "\"");
+        String startedFetch = toolStartedPayload(events, "getStockDaily");
+        check("tool.getStockDaily.started", startedFetch != null,
+                startedFetch == null ? "未找到" : shorten(startedFetch));
         String startedPromote = toolStartedPayload(events, "promoteDatasetToPlatform");
         check("tool.promoteDatasetToPlatform.started", startedPromote != null,
                 startedPromote == null ? "未找到" : shorten(startedPromote));
