@@ -14,6 +14,8 @@ public record RacingFailure(String code, String reasonCode, Map<String, String> 
             "ownerscopeinstanceid", "ownernamespace", "ownerkind", "rootid", "currentrunid", "runid",
             "operationid", "promptid", "version", "promptversion", "promptsetid", "promptsetversion",
             "selectionid", "selectionkey", "experimentid", "configurationversion", "candidateid",
+            "modelinputid", "logicalcallid", "attemptuuid", "assignmentid",
+            "toolcallid", "ownerid", "referenceid",
             "objectid", "objecttype", "resourcetype", "field");
 
     public RacingFailure {
