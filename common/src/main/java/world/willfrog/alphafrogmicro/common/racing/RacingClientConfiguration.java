@@ -26,4 +26,10 @@ public class RacingClientConfiguration {
     public RacingTransport racingTransport(RacingClientSettings settings) {
         return new RacingTransport(service, settings);
     }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public RacingExperimentClient racingExperimentClient(RacingTransport transport) {
+        return new RacingExperimentClient(transport);
+    }
 }
