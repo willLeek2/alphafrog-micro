@@ -292,7 +292,10 @@ public class ToolRouter {
         }
 
         try {
+        Map<String, Object> originalParams = params == null ? Map.of() : new LinkedHashMap<>(params);
         Map<String, Object> actualParams = params;
+        SearchTools.PreparedSearchArguments preparedSearch = null;
+        RacingCallException preparationFailure = null;
         long preparationDurationMs = 0;
         ToolResultCacheService.CachedToolCallResult cached;
         if ("searchWeb".equals(toolName)) {
@@ -303,6 +306,7 @@ public class ToolRouter {
                 long preparationStarted = System.currentTimeMillis();
                 try {
                     SearchTools.PreparedSearchArguments prepared = prepareSearchArguments(params);
+                    preparedSearch = prepared;
                     preparationDurationMs = Math.max(0L, System.currentTimeMillis() - preparationStarted);
                     actualParams = prepared.parameters();
                     if (prepared.cacheDiscriminator().isEmpty()) {
@@ -314,6 +318,7 @@ public class ToolRouter {
                                 prepared.cacheDiscriminator(), () -> executePreparedSearch(prepared));
                     }
                 } catch (RacingCallException failure) {
+                    preparationFailure = failure;
                     preparationDurationMs = Math.max(0L, System.currentTimeMillis() - preparationStarted);
                     cached = withoutCache(ToolResultCacheService.ToolExecutionOutcome.builder()
                             .result(writeJson(Map.of("ok", false, "tool", "searchWeb", "data", Map.of(),
@@ -337,7 +342,21 @@ public class ToolRouter {
         // AgentRunObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
         // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计，也不提供展开详情。
         if (!"checkParallelLimits".equals(toolName)) {
-            recordObservability(toolName, actualParams, observabilityResult, durationMs, success, cacheMeta);
+            Map<String, Object> observed = actualParams;
+            if ("searchWeb".equals(toolName)) {
+                // 观测对象由服务端组装，不进入缓存参数或远端搜索请求。
+                observed = new LinkedHashMap<>(originalParams);
+                observed.put("requested_parameters", originalParams);
+                observed.put("actual_parameters", preparedSearch == null ? Map.of() : preparedSearch.parameters());
+                if (preparedSearch != null) observed.put("experiment", preparedSearch.experimentDetails());
+                if (preparationFailure != null) {
+                    Map<String, Object> source = new LinkedHashMap<>(preparationFailure.error().getObjectLocatorMap());
+                    source.putAll(preparationFailure.error().getDetailsMap());
+                    observed.put("experiment", source);
+                    observed.put("preparation_error_code", preparationFailure.error().getCode());
+                }
+            }
+            recordObservability(toolName, observed, observabilityResult, durationMs, success, cacheMeta);
         }
 
         // 按 toolName 分桶上报耗时指标
