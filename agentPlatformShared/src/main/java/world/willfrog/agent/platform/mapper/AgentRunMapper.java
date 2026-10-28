@@ -200,6 +200,12 @@ public interface AgentRunMapper {
                   @Param("userId") String userId,
                   @Param("ext") String ext);
 
+    /** 只保存相同根绑定下尚未确定或内容相同的提示词选择，保留其他运行扩展字段。 */
+    int confirmPromptSelection(@Param("id") String id,
+                               @Param("userId") String userId,
+                               @Param("bindingJson") String bindingJson,
+                               @Param("selectionJson") String selectionJson);
+
     int updateSnapshot(@Param("id") String id,
                        @Param("userId") String userId,
                        @Param("status") AgentRunStatus status,
