@@ -6,8 +6,12 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 /**
  * ReAct 累积式对话上下文管理器。
@@ -46,7 +50,7 @@ public class ReactConversationContext {
     /** 最少保留的非系统消息数，确保至少能容纳一组 user-assistant 交互。 */
     private static final int MIN_CONVERSATION_MESSAGES = 2;
 
-    private final List<ChatMessage> messages;
+    private final List<PromptMessage> messages;
     private final int maxMessages;
 
     /**
@@ -75,11 +79,18 @@ public class ReactConversationContext {
         if (systemPrompt == null || systemPrompt.isBlank()) {
             return;
         }
-        if (!messages.isEmpty() && messages.get(0) instanceof SystemMessage) {
-            messages.set(0, new SystemMessage(systemPrompt));
-        } else {
-            messages.add(0, new SystemMessage(systemPrompt));
-        }
+        setSystemEntry(PromptMessage.unknown(new SystemMessage(systemPrompt)));
+    }
+
+    /** 明确的应用正文；旧String入口仍保留未知来源。 */
+    public void setSystemPrompt(PromptText prompt) {
+        requirePrompt(prompt);
+        if (!prompt.text().isBlank()) setSystemEntry(PromptMessage.system(prompt));
+    }
+
+    private void setSystemEntry(PromptMessage message) {
+        if (!messages.isEmpty() && messages.get(0).message() instanceof SystemMessage) messages.set(0, message);
+        else messages.add(0, message);
     }
 
     /**
@@ -91,8 +102,17 @@ public class ReactConversationContext {
         if (content == null || content.isBlank()) {
             return;
         }
-        messages.add(new UserMessage(content));
+        messages.add(PromptMessage.unknown(new UserMessage(content)));
         trimIfNeeded();
+    }
+
+    public void addUserPrompt(PromptText prompt) {
+        requirePrompt(prompt);
+        if (!prompt.text().isBlank()) append(PromptMessage.user(prompt));
+    }
+
+    public void addRuntimeUserMessage(String content) {
+        if (content != null && !content.isBlank()) append(PromptMessage.runtimeData(UserMessage.from(content)));
     }
 
     /**
@@ -104,17 +124,40 @@ public class ReactConversationContext {
         if (content == null || content.isBlank()) {
             return;
         }
-        messages.add(AiMessage.from(content));
+        messages.add(PromptMessage.unknown(AiMessage.from(content)));
         trimIfNeeded();
     }
 
+    public void addRuntimeAssistantMessage(String content) {
+        if (content != null && !content.isBlank()) append(PromptMessage.runtimeData(AiMessage.from(content)));
+    }
+
+    /** 增删始终以整条消息为单位；系统消息统一替换首条。 */
+    public void append(PromptMessage entry) {
+        if (entry == null) throw missing();
+        if (entry.message() instanceof SystemMessage) setSystemEntry(entry);
+        else {
+            messages.add(entry);
+            trimIfNeeded();
+        }
+    }
+
     /**
-     * 获取当前完整的 messages 列表（不可变视图），用于传入 LLM 调用。
+     * 获取当前完整的消息快照；兼容旧消费者，但不丢弃内部来源。
      *
      * @return 不可变的消息列表
      */
     public List<ChatMessage> getMessages() {
-        return Collections.unmodifiableList(messages);
+        return messages.stream().map(PromptMessage::message).toList();
+    }
+
+    public List<PromptMessage> snapshot() {
+        return List.copyOf(messages);
+    }
+
+    /** 旧入口留下UNKNOWN时停止，调用方不能把旧消息直接标记为运行数据。 */
+    public ModelInputSources modelInputSources() {
+        return PromptMessage.toModelInputSources(snapshot());
     }
 
     /**
@@ -131,7 +174,7 @@ public class ReactConversationContext {
         if (messages.isEmpty()) {
             return 0;
         }
-        return messages.get(0) instanceof SystemMessage ? messages.size() - 1 : messages.size();
+        return messages.get(0).message() instanceof SystemMessage ? messages.size() - 1 : messages.size();
     }
 
     /**
@@ -160,11 +203,19 @@ public class ReactConversationContext {
      * 始终保留至少一条非系统消息，避免裁剪到只剩 System Message。
      */
     private void trimIfNeeded() {
-        int startIdx = (!messages.isEmpty() && messages.get(0) instanceof SystemMessage) ? 1 : 0;
+        int startIdx = (!messages.isEmpty() && messages.get(0).message() instanceof SystemMessage) ? 1 : 0;
         int conversationCount = messages.size() - startIdx;
         while (conversationCount > maxMessages && messages.size() > startIdx + 1) {
             messages.remove(startIdx);
             conversationCount--;
         }
+    }
+
+    private static void requirePrompt(PromptText prompt) {
+        if (prompt == null) throw missing();
+    }
+
+    private static ModelSendBlockedException missing() {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "会话消息缺少明确来源");
     }
 }

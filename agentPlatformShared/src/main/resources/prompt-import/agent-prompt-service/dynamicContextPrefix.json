@@ -1,0 +1,22 @@
+{
+  "fragment": "dynamicContextPrefix",
+  "purpose": "dynamicContextPrefix",
+  "bodyType": "TEMPLATE",
+  "body": "今天是{{date}}。",
+  "variables": [
+    {
+      "name": "date",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "c5778a188b66a17ea176c3f00b3e0a1c008e70fa767725babd6115b381119a34",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/service/AgentPromptService.java",
+    "method": "dynamicContextPrefix",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}
