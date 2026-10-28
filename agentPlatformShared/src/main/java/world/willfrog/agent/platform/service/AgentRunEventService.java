@@ -9,6 +9,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -31,11 +32,16 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.agent.platform.prompt.PromptSelectionCoordinator;
+import world.willfrog.agent.platform.experiment.ExperimentRunPreparation;
+import world.willfrog.agent.platform.experiment.ExperimentRunBindingStore;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
+import java.time.LocalDate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -105,6 +111,10 @@ public class AgentRunEventService {
     private final AgentMessageService messageService;
     /** 提示词服务：用于在 run 创建时快照当前 dataFreshness */
     private final AgentPromptService agentPromptService;
+    /** 创建、执行和恢复共同使用原根的实验绑定与真实提示词选择。 */
+    @Autowired
+    private ExperimentRunPreparation experimentRunPreparation;
+
     /** 事务管理器：Run 主记录与它的事件必须在同一条事务里落库 */
     private final PlatformTransactionManager transactionManager;
     /**
@@ -266,9 +276,8 @@ public class AgentRunEventService {
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
         ext.put("python_workspace_enabled", resolvePythonWorkspaceEnabled());
-        PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
-                runId, userId, contextJson);
-        ext.put("prompt_selection", promptSelection.toExtMap());
+        ext.put(PromptSelectionCoordinator.REFERENCE_DATE_FIELD, LocalDate.now().toString());
+        ext.put(ExperimentRunBindingStore.CONTEXT_FIELD, experimentRunPreparation.freezeContext(runId));
         // 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
         ext.put("generate_artifacts", generateArtifacts);
@@ -341,7 +350,7 @@ public class AgentRunEventService {
         // 「有 Run、没有接收事实」的半成品——那种记录会被幂等重试直接读回，缺失的事实再也没人补。
         AgentRunEvent received;
         try {
-            received = transactionTemplate().execute(status -> {
+            received = rootCreationTransactionTemplate().execute(status -> {
                 runMapper.insert(run);
                 // 排进共享候选与创建同一条事务：资格行缺了，这条 Run 在候选里就没有位置，
                 // 而候选是三个版本共用的唯一入口——旧版本的 Run 也没有第二条路会来补它。
@@ -386,6 +395,24 @@ public class AgentRunEventService {
             log.warn("Failed to create initial message for runId={}, but continuing: {}", runId, e.getMessage());
         }
 
+        // 原根先独立提交，平台才能使用真实根身份建立选择；本地选择确认前不返回可启动结果。
+        try {
+            prepareExperimentRunContext(runId);
+        } catch (RuntimeException failure) {
+            var blocked = ModelSendBlocks.find(failure);
+            String reason = blocked.map(value -> value.code()).orElse("PROMPT_UNREADABLE");
+            try {
+                closeUnacceptedCreate(runId, userId, reason);
+                if (blocked.isPresent()) {
+                    append(runId, userId, "EXPERIMENT_PREPARATION_FAILED",
+                            ModelSendBlocks.failureMetadata(blocked.get()));
+                }
+            } catch (RuntimeException persistenceFailure) {
+                log.error("新根提示词准备失败后未能确认关闭运行: runId={}", runId);
+            }
+            throw failure;
+        }
+
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
         AgentRun persisted = runMapper.findByIdAndUserForDeployment(
                 runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
@@ -393,6 +420,11 @@ public class AgentRunEventService {
             throw new IllegalStateException("Run 刚刚写入却读不回来：runId=" + runId);
         }
         return new RunCreation(persisted, true);
+    }
+
+    /** 执行和恢复在任何模型调用之前读取原根已提交的真实选择。 */
+    public PromptRunSelection prepareExperimentRunContext(String runId) {
+        return experimentRunPreparation.ensurePrepared(runId);
     }
 
     /**
@@ -603,6 +635,14 @@ public class AgentRunEventService {
                     run.getId(), e.getMessage());
         }
         return run;
+    }
+
+    /** 根记录必须先提交；后续远端准备和独立保存不能加入尚未提交的创建事务。 */
+    private TransactionTemplate rootCreationTransactionTemplate() {
+        TransactionTemplate template = transactionTemplate();
+        template.setPropagationBehavior(org.springframework.transaction.TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        template.setIsolationLevel(org.springframework.transaction.TransactionDefinition.ISOLATION_READ_COMMITTED);
+        return template;
     }
 
     /** 事务模板按需构造：它只是配置的载体，每次调用新建一个比放进字段更省心。 */
