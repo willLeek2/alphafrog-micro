@@ -93,7 +93,15 @@ public class ToolResultCacheService {
                                                  Map<String, Object> params,
                                                  String scope,
                                                  Supplier<ToolExecutionOutcome> loader) {
-        CachePlan plan = buildPlan(toolName, params, scope);
+        return executeWithCache(toolName, params, scope, "", loader);
+    }
+
+    public CachedToolCallResult executeWithCache(String toolName,
+                                                 Map<String, Object> params,
+                                                 String scope,
+                                                 String discriminator,
+                                                 Supplier<ToolExecutionOutcome> loader) {
+        CachePlan plan = buildPlan(toolName, params, scope, discriminator);
         debugLog("cache plan resolved: runId={}, tool={}, mode={}, key={}, ttlSeconds={}, scope={}",
                 AgentContext.getRunId(), nvl(toolName), plan.getMode(), plan.getKey(), plan.getTtlSeconds(), nvl(scope));
         long lookupStartedAt = System.currentTimeMillis();
@@ -233,6 +241,10 @@ public class ToolResultCacheService {
     }
 
     private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope) {
+        return buildPlan(toolName, params, scope, "");
+    }
+
+    private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope, String discriminator) {
         CacheMode mode = resolveMode(toolName, params);
         /*
          * D07 fail-closed（Risks 3.3.2）：blank scope（无 userId 且无 runId）不得
@@ -246,7 +258,7 @@ public class ToolResultCacheService {
                     .ttlSeconds(0)
                     .build();
         }
-        String key = buildCacheKey(toolName, params, scope);
+        String key = buildCacheKey(toolName, params, scope, discriminator);
         int ttlSeconds = resolveTtlSeconds(mode, toolName);
         return CachePlan.builder()
                 .mode(mode)
@@ -303,8 +315,18 @@ public class ToolResultCacheService {
     }
 
     private String buildCacheKey(String toolName, Map<String, Object> params, String scope) {
+        return buildCacheKey(toolName, params, scope, "");
+    }
+
+    private String buildCacheKey(String toolName, Map<String, Object> params, String scope, String discriminator) {
         Map<String, String> normalizedArgs = normalizeArgs(toolName, params);
         String argsJson = safeWrite(normalizedArgs);
+        if (!blank(discriminator)) {
+            Map<String, String> identity = new TreeMap<>();
+            identity.put("arguments_json", argsJson);
+            identity.put("experiment", discriminator);
+            argsJson = safeWrite(identity);
+        }
         String argsHash = sha256(argsJson);
         /*
          * D07：不再把 blank scope 默认写成 global。REDIS 模式的 blank scope 已在

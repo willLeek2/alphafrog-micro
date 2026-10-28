@@ -37,6 +37,7 @@ import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
+import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -291,23 +292,52 @@ public class ToolRouter {
         }
 
         try {
-        // 主调用路径：走缓存装饰，由 ToolResultCacheService 决定命中或回源到 executeDirect
-        ToolResultCacheService.CachedToolCallResult cached = toolResultCacheService.executeWithCache(
-                toolName,
-                params,
-                resolveScope(),
-                () -> executeDirect(toolName, params)
-        );
+        Map<String, Object> actualParams = params;
+        long preparationDurationMs = 0;
+        ToolResultCacheService.CachedToolCallResult cached;
+        if ("searchWeb".equals(toolName)) {
+            // 能力检查先于实验取值和缓存读取，关闭能力时不取得旧缓存结果。
+            if (!AgentContext.isWebSearchEnabled()) {
+                cached = withoutCache(executeDirect(toolName, params));
+            } else {
+                long preparationStarted = System.currentTimeMillis();
+                try {
+                    SearchTools.PreparedSearchArguments prepared = prepareSearchArguments(params);
+                    preparationDurationMs = Math.max(0L, System.currentTimeMillis() - preparationStarted);
+                    actualParams = prepared.parameters();
+                    if (prepared.cacheDiscriminator().isEmpty()) {
+                        // 未配置实验时保持原缓存键；执行仍使用已经固定的原参数解析结果。
+                        cached = toolResultCacheService.executeWithCache(toolName, params, resolveScope(),
+                                () -> executePreparedSearch(prepared));
+                    } else {
+                        cached = toolResultCacheService.executeWithCache(toolName, actualParams, resolveScope(),
+                                prepared.cacheDiscriminator(), () -> executePreparedSearch(prepared));
+                    }
+                } catch (RacingCallException failure) {
+                    preparationDurationMs = Math.max(0L, System.currentTimeMillis() - preparationStarted);
+                    cached = withoutCache(ToolResultCacheService.ToolExecutionOutcome.builder()
+                            .result(writeJson(Map.of("ok", false, "tool", "searchWeb", "data", Map.of(),
+                                    "error", Map.of("code", failure.error().getCode(),
+                                            "message", failure.error().getMessage(),
+                                            "object_locator", failure.error().getObjectLocatorMap(),
+                                            "details", failure.error().getDetailsMap()))))
+                            .success(false).durationMs(0).build());
+                }
+            }
+        } else {
+            cached = toolResultCacheService.executeWithCache(toolName, params, resolveScope(),
+                    () -> executeDirect(toolName, params));
+        }
         String result = nvl(cached.getResult());
         String observabilityResult = isBlank(cached.getObservabilityResult()) ? result : cached.getObservabilityResult();
         boolean success = cached.isSuccess();
-        long durationMs = Math.max(0L, cached.getDurationMs());
+        long durationMs = Math.max(0L, cached.getDurationMs()) + preparationDurationMs;
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
         // 记录观测 trace（参数、结果摘要、耗时、缓存命中信息）。
         // AgentRunObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
         // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计，也不提供展开详情。
         if (!"checkParallelLimits".equals(toolName)) {
-            recordObservability(toolName, params, observabilityResult, durationMs, success, cacheMeta);
+            recordObservability(toolName, actualParams, observabilityResult, durationMs, success, cacheMeta);
         }
 
         // 按 toolName 分桶上报耗时指标
@@ -329,6 +359,33 @@ public class ToolRouter {
         } finally {
             weightLease.ifPresent(ToolWeightedLimitService.WeightLease::release);
         }
+    }
+
+    private SearchTools.PreparedSearchArguments prepareSearchArguments(Map<String, Object> raw) {
+        Map<String, Object> params = raw == null ? Map.of() : raw;
+        return searchTools.prepareArguments(
+                str(params.get("query"), params.get("arg0")),
+                str(params.get("scene"), params.get("arg1")),
+                str(params.get("backend"), params.get("arg2")),
+                str(params.get("strength"), params.get("arg3")),
+                toBool(params.get("skipHotCache"), params.get("skip_hot_cache"), params.get("arg4")),
+                toBool(params.get("skipRagPrefetch"), params.get("skip_rag_prefetch"), params.get("arg5")),
+                str(params.get("timeRangeStart"), params.get("time_range_start"), params.get("arg6")),
+                str(params.get("timeRangeEnd"), params.get("time_range_end"), params.get("arg7")),
+                toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8")));
+    }
+
+    private ToolResultCacheService.ToolExecutionOutcome executePreparedSearch(SearchTools.PreparedSearchArguments prepared) {
+        long started = System.currentTimeMillis();
+        String output = searchTools.searchWebPrepared(prepared);
+        return ToolResultCacheService.ToolExecutionOutcome.builder().result(output)
+                .success(isToolSuccess(output)).durationMs(Math.max(0L, System.currentTimeMillis() - started)).build();
+    }
+
+    private static ToolResultCacheService.CachedToolCallResult withoutCache(ToolResultCacheService.ToolExecutionOutcome outcome) {
+        return ToolResultCacheService.CachedToolCallResult.builder().result(outcome.getResult())
+                .observabilityResult(outcome.getResult()).success(outcome.isSuccess())
+                .durationMs(outcome.getDurationMs()).build();
     }
 
     /**

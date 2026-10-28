@@ -25,6 +25,7 @@ import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
+import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRequest;
 
 import java.util.Map;
 import java.util.Set;
@@ -164,7 +165,11 @@ class ToolRouterRegistryConsistencyTest {
         when(ragTools.loadDocument(anyString())).thenReturn(okJson("loadDocument"));
 
         SearchTools searchTools = mock(SearchTools.class);
-        when(searchTools.searchWeb(anyString(), anyString(), anyString(), anyString(), anyBoolean(), anyBoolean(), anyString(), anyString(), anyInt())).thenReturn(okJson("searchWeb"));
+        when(searchTools.prepareArguments(anyString(), anyString(), anyString(), anyString(), anyBoolean(),
+                anyBoolean(), anyString(), anyString(), anyInt())).thenReturn(new SearchTools.PreparedSearchArguments(
+                WebSearchRequest.newBuilder().setQuery("q").setMaxResults(5).build(),
+                Map.of("query", "q", "maxResults", 5), "", Map.of()));
+        when(searchTools.searchWebPrepared(any())).thenReturn(okJson("searchWeb"));
 
         PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
         when(pythonSandboxTools.executePython(anyString(), anyString(), anyString(), anyString(), any())).thenReturn(okJson("executePython"));
