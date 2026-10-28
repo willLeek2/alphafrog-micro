@@ -3,6 +3,7 @@ package world.willfrog.agent.platform.experiment;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
+import java.util.Comparator;
 import java.util.Map;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -19,6 +20,11 @@ import world.willfrog.racing.idl.TargetIdentity;
 @Component
 public final class ExperimentRunBindingStore {
     public static final String CONTEXT_FIELD = "experiment_context";
+    // JSON数值按含义比较；Java整数宽度及小数表示不改变已保存的选择。
+    private static final Comparator<JsonNode> JSON_VALUES = (left, right) -> {
+        if (left.isNumber() && right.isNumber()) return left.decimalValue().compareTo(right.decimalValue());
+        return left.equals(right) ? 0 : 1;
+    };
     private final AgentRunMapper runs;
     private final ChildRunIntentStore children;
     private final ObjectMapper json;
@@ -71,7 +77,7 @@ public final class ExperimentRunBindingStore {
             Binding actual = transaction.execute(status -> read(confirmedContext.getRoot().getRootId()));
             if (actual == null) throw failure("PERSISTENCE_UNCONFIRMED", "根记录重读结果为空");
             requireSameBinding(actual.context(), confirmedContext);
-            if (selection.equals(actual.selection())) return;
+            if (selection.equals(JSON_VALUES, actual.selection())) return;
             if (actual.selection() != null) throw failure("REVISION_CONFLICT", "根运行已经保存另一份提示词选择");
         } catch (RacingCallException ex) {
             throw ex;
