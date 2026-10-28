@@ -785,8 +785,11 @@
     <update id="updateExt">
         UPDATE alphafrog_agent_run
         SET ext = CASE WHEN ext -&gt; 'experiment_context' IS NOT NULL
-                       THEN (CAST(#{ext} AS jsonb) - 'experiment_context' - 'prompt_selection')
+                       THEN (CAST(#{ext} AS jsonb) - 'experiment_context' - 'prompt_selection' - 'prompt_reference_date')
                             || jsonb_build_object('experiment_context', ext -&gt; 'experiment_context')
+                            || CASE WHEN ext -&gt; 'prompt_reference_date' IS NOT NULL
+                                    THEN jsonb_build_object('prompt_reference_date', ext -&gt; 'prompt_reference_date')
+                                    ELSE '{}'::jsonb END
                             || CASE WHEN ext -&gt; 'prompt_selection' IS NOT NULL
                                     THEN jsonb_build_object('prompt_selection', ext -&gt; 'prompt_selection')
                                     ELSE '{}'::jsonb END

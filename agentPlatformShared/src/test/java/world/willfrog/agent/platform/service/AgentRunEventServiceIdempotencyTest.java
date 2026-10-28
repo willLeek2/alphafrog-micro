@@ -90,10 +90,14 @@ class AgentRunEventServiceIdempotencyTest {
         service = new AgentRunEventService(runMapper, eventMapper, eventRedisStore, objectMapper,
                 redisTemplate, llmLocalConfigLoader, messageService, mockPromptService, transactionManager,
                 coordinationStore, leaseStore, instanceIdentity);
-        org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
-                        anyString(), anyString(), any())).thenReturn(new PromptRunSelection(
-                PromptRunSelection.SCHEMA_VERSION, "default-v1", "control", "bundle-digest",
-                "capability-digest", LocalDate.of(2025, 2, 3)));
+        var experimentPreparation = org.mockito.Mockito.mock(
+                world.willfrog.agent.platform.experiment.ExperimentRunPreparation.class);
+        org.springframework.test.util.ReflectionTestUtils.setField(service,
+                "experimentRunPreparation", experimentPreparation);
+        org.mockito.Mockito.lenient().when(experimentPreparation.freezeContext(anyString()))
+                .thenAnswer(invocation -> objectMapper.valueToTree(java.util.Map.of(
+                        "root", java.util.Map.of("root_id", invocation.getArgument(0)),
+                        "target", java.util.Map.of("target_scope_instance_id", "racing-main"))));
         org.mockito.Mockito.lenient().when(mockPromptService.snapshotDataFreshness()).thenReturn(null);
         stubCanonicalEventReadBack(eventMapper);
     }
