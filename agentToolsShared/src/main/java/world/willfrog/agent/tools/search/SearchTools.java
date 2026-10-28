@@ -22,6 +22,7 @@ import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRagPrefetch;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchAnswerMeta;
 import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
 import world.willfrog.racing.idl.EvaluationValue;
+import world.willfrog.racing.idl.RacingError;
 import world.willfrog.racing.idl.ValueSource;
 
 import java.math.BigDecimal;
@@ -87,14 +88,21 @@ public class SearchTools {
                     "source_revision", "run:" + nvl(AgentContext.getRunId()), "ordinary_value", limit));
             EvaluationValue evaluated = client.evaluate(AgentContext.getRunId(), experimentId,
                     Integer.toString(limit), ordinarySource);
+            ValueSource source = evaluated.getSource();
             try {
-                limit = new BigDecimal(evaluated.getValueJson()).intValueExact();
+                limit = new BigDecimal(evaluated.getValueJson().strip()).intValueExact();
                 if (limit <= 0) throw new ArithmeticException();
             } catch (NumberFormatException | ArithmeticException failure) {
-                throw RacingCallException.failure("INVALID_ARGUMENT", "搜索实验返回的最大结果条数必须是正整数");
+                RacingError.Builder error = RacingError.newBuilder().setCode("INVALID_ARGUMENT")
+                        .setMessage("搜索实验返回的最大结果条数必须是正整数")
+                        .putObjectLocator("experiment_id", experimentId)
+                        .putDetails("source_kind", source.getKind().name())
+                        .putDetails("configuration_scope_instance_id", source.getConfigurationScopeInstanceId());
+                if (!evaluated.getAssignmentId().isEmpty()) error.putObjectLocator("assignment_id", evaluated.getAssignmentId());
+                if (source.hasConfigurationVersion()) error.putDetails("configuration_version", Long.toString(source.getConfigurationVersion()));
+                throw new RacingCallException(error.build());
             }
             effectiveSkipHotCache = true;
-            ValueSource source = evaluated.getSource();
             details.put("experiment_id", experimentId);
             details.put("environment", evaluated.getActualTarget().getEnvironment());
             details.put("configuration_scope_instance_id", source.getConfigurationScopeInstanceId());
@@ -155,6 +163,7 @@ public class SearchTools {
                 ToolFailureCategory.putCategoryIfResolved(err, resp.getErrorCode(),
                         upstreamFailureCategory(resp.getErrorCode()));
                 payload.put("error", err);
+                payload.put("data", preparedDetails(prepared));
                 return objectMapper.writeValueAsString(payload);
             }
 
@@ -174,8 +183,8 @@ public class SearchTools {
 
             // 组装 citations
             List<Map<String, Object>> citations = new ArrayList<>();
-            for (WebSearchCitation citation : resp.getCitationsList().subList(0,
-                    Math.min(req.getMaxResults(), resp.getCitationsCount()))) {
+            // 原生回答可能引用任意原序号，保留全部引用才能继续定位其证据。
+            for (WebSearchCitation citation : resp.getCitationsList()) {
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("index", citation.getIndex());
                 row.put("url", citation.getUrl());
@@ -214,9 +223,7 @@ public class SearchTools {
                 answerMeta.put("model_used", am.getModelUsed());
             }
 
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("query", nvl(query));
-            data.put("scene", nvl(scene));
+            Map<String, Object> data = preparedDetails(prepared);
             data.put("hits", hits);
             data.put("answer", resp.getAnswer());
             data.put("citations", citations);
@@ -229,8 +236,6 @@ public class SearchTools {
             data.put("requested_entities", requestedEntities);
             data.put("relevanceJudged", judgeResult.relevanceJudged());
             data.put("relevanceJudgeError", judgeResult.relevanceJudgeError());
-            data.put("actual_arguments", prepared.parameters());
-            if (!prepared.experimentDetails().isEmpty()) data.put("experiment", prepared.experimentDetails());
 
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("ok", true);
@@ -242,6 +247,7 @@ public class SearchTools {
             return writeJson(Map.of(
                     "ok", false,
                     "tool", "searchWeb",
+                    "data", preparedDetails(prepared),
                     "error", Map.of(
                             "code", "TOOL_ERROR",
                             "message", nvl(e.getMessage()),
@@ -249,6 +255,15 @@ public class SearchTools {
                     )
             ));
         }
+    }
+
+    private Map<String, Object> preparedDetails(PreparedSearchArguments prepared) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("query", prepared.request().getQuery());
+        data.put("scene", prepared.request().getScene());
+        data.put("actual_arguments", prepared.parameters());
+        if (!prepared.experimentDetails().isEmpty()) data.put("experiment", prepared.experimentDetails());
+        return data;
     }
 
     /** 请求与来源均在执行之前固定；缓存命中也使用同一份实际参数。 */
