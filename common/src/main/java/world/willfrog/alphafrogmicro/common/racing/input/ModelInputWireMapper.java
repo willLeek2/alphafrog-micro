@@ -112,6 +112,9 @@ public final class ModelInputWireMapper {
         if (experiment) {
             if (!hasValueSource) throw blocked("实验指令缺少实际取值来源");
             ValueSource actualSource = valueSource(source.valueSourceJson());
+            if (actualSource.getConfigurationScopeInstanceId().isBlank()) {
+                throw blocked("实验指令缺少实际配置范围");
+            }
             boolean hasAssignment = hasText(source.experimentValueId());
             if (actualSource.getKind() == ValueSourceKind.ENDED_FIXED) {
                 if (hasAssignment) throw blocked("结束固定值不能携带虚构分配编号");
@@ -155,6 +158,9 @@ public final class ModelInputWireMapper {
         }
         if (source.hasCandidateId() && source.getCandidateId().isBlank()) {
             throw blocked("指令取值来源不能使用空候选编号");
+        }
+        if (source.getKind() != ValueSourceKind.EXPERIMENT && source.hasCandidateId()) {
+            throw blocked("普通默认或结束固定值不能携带候选编号");
         }
         if (source.getKind() == ValueSourceKind.EXPERIMENT || source.getKind() == ValueSourceKind.ENDED_FIXED) {
             if (source.getConfigurationScopeInstanceId().isBlank() || !source.hasConfigurationVersion()) {
