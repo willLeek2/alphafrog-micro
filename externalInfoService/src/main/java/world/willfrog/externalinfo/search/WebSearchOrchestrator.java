@@ -98,36 +98,39 @@ public class WebSearchOrchestrator {
                             .build())
                     .build();
 
-            // 8. 热点缓存写入（P2）
-            try {
-                hotKeywordCacheService.updateClusterStats(
-                        cacheKey, request.getRunId(), request.getUserId());
+            // 实验请求跳过热点缓存时，同时跳过聚类统计和写入。
+            if (!request.getSkipHotCache()) {
+                // 8. 热点缓存写入（P2）
+                try {
+                    hotKeywordCacheService.updateClusterStats(
+                            cacheKey, request.getRunId(), request.getUserId());
 
-                boolean shouldForm = hotKeywordCacheService.shouldFormHotCluster(
-                        cacheKey, request.getQuery(), request.getRunId(), request.getUserId());
-                if (shouldForm && response.getOk()) {
-                    long ttlSeconds = hotKeywordTtlStrategy.computeTtl(
-                            canonicalQuery, request.getScene(),
-                            new HotKeywordTtlStrategy.SlotResult(Map.of(
-                                    "assetCode", nvl(slots.assetCode()),
-                                    "assetName", nvl(slots.assetName()),
-                                    "timeRange", nvl(slots.timeRange()),
-                                    "marketScope", nvl(slots.marketScope())
-                            )));
-                    hotKeywordCacheService.writeCluster(
-                            cacheKey,
-                            canonicalQuery,
-                            canonicalQuery,
-                            request.getQuery(),
-                            request.getScene(),
-                            response,
-                            ttlSeconds
-                    );
-                    log.info("写入热点缓存: query={}, cacheKey={}, ttl={}s",
-                            canonicalQuery, cacheKey, ttlSeconds);
+                    boolean shouldForm = hotKeywordCacheService.shouldFormHotCluster(
+                            cacheKey, request.getQuery(), request.getRunId(), request.getUserId());
+                    if (shouldForm && response.getOk()) {
+                        long ttlSeconds = hotKeywordTtlStrategy.computeTtl(
+                                canonicalQuery, request.getScene(),
+                                new HotKeywordTtlStrategy.SlotResult(Map.of(
+                                        "assetCode", nvl(slots.assetCode()),
+                                        "assetName", nvl(slots.assetName()),
+                                        "timeRange", nvl(slots.timeRange()),
+                                        "marketScope", nvl(slots.marketScope())
+                                )));
+                        hotKeywordCacheService.writeCluster(
+                                cacheKey,
+                                canonicalQuery,
+                                canonicalQuery,
+                                request.getQuery(),
+                                request.getScene(),
+                                response,
+                                ttlSeconds
+                        );
+                        log.info("写入热点缓存: query={}, cacheKey={}, ttl={}s",
+                                canonicalQuery, cacheKey, ttlSeconds);
+                    }
+                } catch (Exception cacheEx) {
+                    log.warn("热点缓存写入失败，不影响主流程", cacheEx);
                 }
-            } catch (Exception cacheEx) {
-                log.warn("热点缓存写入失败，不影响主流程", cacheEx);
             }
 
             return response;

@@ -49,6 +49,7 @@ import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import com.google.protobuf.util.JsonFormat;
 import java.io.IOException;
@@ -749,6 +750,7 @@ public class PythonSandboxTools {
         } catch (PythonRiskReplayEvidenceMissingException missing) {
             throw missing;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Execute python tool error", e);
             emitSandboxToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));
