@@ -38,6 +38,7 @@ import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
 import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -842,7 +843,8 @@ public class ToolRouter {
             // 而库里已经有了一条「这个成员在执行中」的记录。
             throw pending;
         } catch (Exception e) {
-            // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息
+            ModelSendBlocks.rethrowIfBlocked(e);
+            // 普通工具异常转换为标准失败 JSON，避免对 LLM 暴露 Java 异常信息
             // 具体堆栈仍在服务日志中，模型只拿到可解释的 error.message。
             debugLog("tool invoke exception: runId={}, tool={}, error={}",
                     AgentContext.getRunId(), nvl(toolName), nvl(e.getMessage()));

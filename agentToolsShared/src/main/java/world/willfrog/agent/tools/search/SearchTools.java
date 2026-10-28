@@ -21,6 +21,9 @@ import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchBackendMeta;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRagPrefetch;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchAnswerMeta;
 import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+
 import world.willfrog.racing.idl.EvaluationValue;
 import world.willfrog.racing.idl.RacingError;
 import world.willfrog.racing.idl.ValueSource;
@@ -152,6 +155,10 @@ public class SearchTools {
 
             // 如果 Dubbo 层返回 ok=false，则按错误处理
             if (!resp.getOk()) {
+                // 外部模型调用明确停止时保留共同异常身份，不把它作为普通工具错误继续修复。
+                if (ModelSendBlocks.isBlockedCode(resp.getErrorCode())) {
+                    throw new ModelSendBlockedException(resp.getErrorCode(), "外部搜索的模型发送前检查未通过");
+                }
                 // 上游错误码里保留着 HTTP 状态事实（各后端统一把状态写成 HTTP_<code>）：
                 // 429 是限流，5xx 是上游故障；取值来自既有状态字段，不解析自由文本。上游码原样透传。
                 Map<String, Object> payload = new LinkedHashMap<>();
@@ -243,6 +250,7 @@ public class SearchTools {
             payload.put("data", data);
             return objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             // 本地异常包装行：RPC/序列化一类的上游或系统故障。
             return writeJson(Map.of(
                     "ok", false,
