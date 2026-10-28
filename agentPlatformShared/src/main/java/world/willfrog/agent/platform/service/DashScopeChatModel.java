@@ -1,5 +1,7 @@
 package world.willfrog.agent.platform.service;
 
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.model.openai.internal.chat.ChatCompletionRequest;
@@ -287,6 +289,7 @@ public class DashScopeChatModel implements ChatModel {
             throw new IllegalStateException(detail, e);
 
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             long durationMs = System.currentTimeMillis() - requestStartedAt;
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {

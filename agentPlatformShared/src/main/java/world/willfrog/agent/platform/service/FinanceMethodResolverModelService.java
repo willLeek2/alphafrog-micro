@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.net.SocketTimeoutException;
 import java.net.http.HttpTimeoutException;
@@ -171,6 +172,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                     lastError = rejection;
                     log.warn("Finance method resolver attempt {}/{} rejected response: {}", attempt, maxAttempts, rejection);
                 } catch (Exception e) {
+                    ModelSendBlocks.rethrowIfBlocked(e);
                     lastKind = isTimeout(e) ? ErrorKind.TIMEOUT : ErrorKind.CALL_FAILED;
                     lastError = nvl(e.getMessage());
                     log.warn("Finance method resolver attempt {}/{} failed: {}", attempt, maxAttempts, e.getMessage());
@@ -185,6 +187,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                             : (lastResponse.aiMessage() == null ? null : lastResponse.aiMessage().text()));
             return new TechnicalError(lastKind, lastError);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             log.warn("Finance method resolver failed: {}", e.getMessage());
             recordObservability(selected, durationMs, startedAtMillis, safeQuery, nvl(e.getMessage()), null, null);
@@ -256,6 +259,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                         resolved.modelName());
                 return new SelectionAndModel(cfg, candidate.source(), model, route);
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 log.warn("Init finance method resolver from {} failed: endpoint={}, model={}, err={}",
                         candidate.source(), cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
             }
