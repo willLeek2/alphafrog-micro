@@ -1,5 +1,8 @@
 package world.willfrog.agent.platform.service;
 
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.model.openai.internal.chat.ChatCompletionRequest;
@@ -20,6 +23,7 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.input.ArchivingChatModel;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -72,6 +76,14 @@ public class DashScopeChatModel implements ChatModel {
 
     @Setter
     private AgentRunBudgetService budgetService;
+
+    private volatile boolean inputArchivingEnabled;
+
+    /** 构建完成、交给调用方之前启用归档，并为每次模型调用建立独立逻辑编号。 */
+    public ChatModel withInputArchiving() {
+        inputArchivingEnabled = true;
+        return new ArchivingChatModel(this);
+    }
 
     @Override
     public ChatResponse doChat(ChatRequest chatRequest) {
@@ -152,7 +164,7 @@ public class DashScopeChatModel implements ChatModel {
             emitLlmCallStarted(llmTraceId, useStream);
             liveEventStarted = true;
             LlmRequestRetryPolicy retryPolicy = resolveRetryPolicy();
-            AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
+            AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, requestJson, shouldCapture, requestRecord, requestStartedAt,
                     retryPolicy, requestTimeout);
             attempts = attemptResult.attempts();
             HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
@@ -287,6 +299,7 @@ public class DashScopeChatModel implements ChatModel {
             throw new IllegalStateException(detail, e);
 
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             long durationMs = System.currentTimeMillis() - requestStartedAt;
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
@@ -335,6 +348,7 @@ public class DashScopeChatModel implements ChatModel {
     }
 
     private AttemptResult sendWithRetry(HttpRequest.Builder httpRequestBuilder,
+                                        String requestJson,
                                         boolean shouldCapture,
                                         RawHttpLogger.HttpRequestRecord requestRecord,
                                         long logicalStartedAt,
@@ -355,8 +369,12 @@ public class DashScopeChatModel implements ChatModel {
             }
             long attemptStarted = System.currentTimeMillis();
             try {
+                HttpRequest httpRequest = httpRequestBuilder.build();
+                if (inputArchivingEnabled) {
+                    ModelInputScope.currentRequired().beforeSend(requestJson);
+                }
                 HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
-                        httpRequestBuilder.build(),
+                        httpRequest,
                         HttpResponse.BodyHandlers.ofInputStream()
                 );
                 int status = httpResponse.statusCode();
@@ -390,6 +408,7 @@ public class DashScopeChatModel implements ChatModel {
                     return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
                 }
             } catch (IOException e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 long attemptDuration = System.currentTimeMillis() - attemptStarted;
                 Map<String, Object> attemptMeta = new LinkedHashMap<>();
                 attemptMeta.put("attempt", attempt);

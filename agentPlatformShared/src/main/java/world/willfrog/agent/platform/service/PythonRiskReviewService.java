@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.dataanalysis.PythonRiskDecisionRow;
 import world.willfrog.agent.platform.mapper.PythonRiskDecisionMapper;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -93,6 +94,7 @@ public class PythonRiskReviewService {
         } catch (Unavailable e) {
             throw e;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             throw new Unavailable("Python 审查暂不可用", e);
         }
     }

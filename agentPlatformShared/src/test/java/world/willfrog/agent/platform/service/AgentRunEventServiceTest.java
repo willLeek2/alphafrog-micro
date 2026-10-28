@@ -109,12 +109,14 @@ class AgentRunEventServiceTest {
                 instanceIdentity
         );
         ReflectionTestUtils.setField(service, "serviceLeaseTtlSeconds", 120L);
-        org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
-                        anyString(), anyString(), any()))
-                .thenReturn(new PromptRunSelection(
-                        PromptRunSelection.SCHEMA_VERSION,
-                        "default-v1", "control", "bundle-digest", "capability-digest",
-                        LocalDate.of(2025, 2, 3)));
+        var experimentPreparation = org.mockito.Mockito.mock(
+                world.willfrog.agent.platform.experiment.ExperimentRunPreparation.class);
+        org.springframework.test.util.ReflectionTestUtils.setField(service,
+                "experimentRunPreparation", experimentPreparation);
+        org.mockito.Mockito.lenient().when(experimentPreparation.freezeContext(anyString()))
+                .thenAnswer(invocation -> objectMapper.valueToTree(java.util.Map.of(
+                        "root", java.util.Map.of("root_id", invocation.getArgument(0)),
+                        "target", java.util.Map.of("target_scope_instance_id", "racing-main"))));
         stubCanonicalEventReadBack(eventMapper);
     }
 
@@ -483,12 +485,10 @@ class AgentRunEventServiceTest {
         Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
         assertEquals("DAG", ext.get("execution_mode"));
         assertEquals(false, ext.get("generate_artifacts"));
-        Map<?, ?> promptSelection = (Map<?, ?>) ext.get("prompt_selection");
-        assertEquals("default-v1", promptSelection.get("bundle_version"));
-        assertEquals("control", promptSelection.get("variant"));
-        assertEquals("bundle-digest", promptSelection.get("bundle_digest"));
-        assertEquals("capability-digest", promptSelection.get("capability_catalog_digest"));
-        assertEquals("2025-02-03", promptSelection.get("reference_date"));
+        assertFalse(ext.containsKey("prompt_selection"));
+        assertEquals(LocalDate.now().toString(), ext.get("prompt_reference_date"));
+        Map<?, ?> binding = (Map<?, ?>) ext.get("experiment_context");
+        assertEquals(captured.getId(), ((Map<?, ?>) binding.get("root")).get("root_id"));
         Map<?, ?> df = (Map<?, ?>) ext.get("data_freshness");
         assertEquals("2020-01-01", df.get("start_date"));
         assertEquals("2026-06-24", df.get("end_date"));

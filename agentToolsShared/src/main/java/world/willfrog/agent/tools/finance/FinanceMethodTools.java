@@ -14,6 +14,7 @@ import world.willfrog.agent.platform.finance.FinanceMethodResolutionSinkExceptio
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionSnapshot;
 import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
 import world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ResolverResult;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -91,6 +92,7 @@ public class FinanceMethodTools {
         try {
             return resolveFinanceMethodsInternal(query, context);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("resolveFinanceMethods failed", e);
             return fail("TOOL_ERROR", "Failed to resolve finance methods: " + nvl(e.getMessage()));
         }

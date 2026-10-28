@@ -38,6 +38,10 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
@@ -222,6 +226,23 @@ public class DualPoolWaitGroupNodeExecutor {
 
     /** 跑完一个分段。抛出的是控制信号与基础设施异常，业务失败都走 {@link Outcome}。 */
     public Outcome executeSegment(SegmentExecution input) {
+        try {
+            return executePreparedSegment(input);
+        } catch (RuntimeException exception) {
+            ModelSendBlocked blocked = ModelSendBlocks.find(exception).orElse(null);
+            if (blocked == null) {
+                throw exception;
+            }
+            NodeSegmentCheckpoint checkpoint = NodeSegmentCheckpoint.read(input.payload());
+            if (checkpoint == null) {
+                checkpoint = new NodeSegmentCheckpoint(0, null, List.of(), 0);
+            }
+            return new Outcome.Completed(failurePatch(input, checkpoint,
+                    blocked.code(), ModelSendBlocks.failureMetadata(blocked)));
+        }
+    }
+
+    private Outcome executePreparedSegment(SegmentExecution input) {
         NodeSegmentCheckpoint stored = NodeSegmentCheckpoint.read(input.payload());
         List<ChatMessage> messages = new ArrayList<>();
         NodeSegmentCheckpoint checkpoint;
@@ -400,10 +421,19 @@ public class DualPoolWaitGroupNodeExecutor {
             throw new IllegalStateException("等待组里没有成员：" + group.getId());
         }
         boolean riskReplayEvidenceMissing = false;
+        ModelSendBlockedException sendBlocked = null;
         for (WaitMember member : members) {
             if (!member.terminal()) {
                 throw new IllegalStateException("等待组还没齐备，这一段不该被领取：group=" + group.getId()
                         + " member=" + member.getMemberIdentity() + " state=" + member.getState());
+            }
+            ModelSendBlockedException blocked = blockedMemberResult(member.getResultRefJson());
+            if (blocked != null) {
+                // 仍核对整组已结束；已在执行的其他成员继续遵守原有等待责任。
+                if (sendBlocked == null) {
+                    sendBlocked = blocked;
+                }
+                continue;
             }
             messages.add(ToolExecutionResultMessage.from(
                     messageToolCallId(member),
@@ -412,7 +442,33 @@ public class DualPoolWaitGroupNodeExecutor {
             riskReplayEvidenceMissing |= RISK_REPLAY_EVIDENCE_MISSING_CODE.equals(
                     WaitMemberResultPayload.errorCode(member.getResultRefJson(), objectMapper));
         }
+        if (sendBlocked != null) {
+            // 派发阶段已持久保存这一原因。恢复直接结束节点，不把它交给模型重试。
+            throw sendBlocked;
+        }
         return riskReplayEvidenceMissing;
+    }
+
+    private ModelSendBlockedException blockedMemberResult(String resultRefJson) {
+        String code = WaitMemberResultPayload.errorCode(resultRefJson, objectMapper);
+        if (!ModelSendBlocks.isBlockedCode(code)) {
+            return null;
+        }
+        try {
+            JsonNode result = objectMapper.readTree(resultRefJson);
+            Map<String, String> locator = new LinkedHashMap<>();
+            JsonNode savedLocator = result.path("model_send_block_racing_locator");
+            if (savedLocator.isObject()) {
+                savedLocator.fields().forEachRemaining(field -> {
+                    if (field.getValue().isTextual()) locator.put(field.getKey(), field.getValue().textValue());
+                });
+            }
+            RacingFailure failure = new RacingFailure(result.path("model_send_block_racing_code").asText(""),
+                    result.path("model_send_block_racing_reason_code").asText(""), locator);
+            return new ModelSendBlockedException(code, result.path("errorDetail").asText(""), failure);
+        } catch (Exception exception) {
+            throw new IllegalStateException("等待成员的发送阻止原因无法读取", exception);
+        }
     }
 
     private static NodeWorkItemIdentity previousSegmentIdentity(NodeWorkItemIdentity identity) {
@@ -819,6 +875,13 @@ public class DualPoolWaitGroupNodeExecutor {
                     groupId, input.identity().describe(), budget.getDimension(),
                     budget.getActual(), budget.getLimit());
         } catch (RuntimeException e) {
+            ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
+            if (blocked != null) {
+                // 当前分段已挂起，原栈上的异常不能代替持久结果。保留原因供下一分段先于模型识别。
+                return keepNotification(notificationId,
+                        abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
+                                modelSendBlockPayload(blocked)));
+            }
             if (!LangchainTerminalToolErrorHandler.isTerminalSignal(e)) {
                 throw e;
             }
@@ -839,19 +902,37 @@ public class DualPoolWaitGroupNodeExecutor {
                                        List<WaitMember> members,
                                        String errorCode,
                                        RunBudgetException budget) {
+        Map<String, Object> failure = budget != null
+                ? budgetFailure(errorCode, budget)
+                : Map.of("errorCode", errorCode);
+        return abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members, failure);
+    }
+
+    private Long abortRemainingMembers(long groupId,
+                                       SegmentExecution input,
+                                       int modelTurn,
+                                       AcceptanceReleasePolicy policy,
+                                       AcceptanceReleasePolicy.RuleMatches policyMatches,
+                                       List<WaitMember> members,
+                                       Map<String, Object> failure) {
         Long notificationId = null;
         for (WaitMember member : members) {
             if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING
                     || awaitingPersistedSandboxDispatch(member)) {
                 continue;
             }
-            Map<String, Object> failure = budget != null
-                    ? budgetFailure(errorCode, budget)
-                    : Map.of("errorCode", errorCode);
             notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
                     policyMatches, member, false, "", failure, null));
         }
         return notificationId;
+    }
+
+    private static Map<String, Object> modelSendBlockPayload(ModelSendBlocked blocked) {
+        ModelSendBlocked safe = new ModelSendBlockedException(blocked.code(), blocked.reason(), blocked.racingFailure());
+        Map<String, Object> payload = new LinkedHashMap<>(ModelSendBlocks.failureMetadata(safe));
+        payload.put("errorCode", safe.code());
+        payload.put("errorDetail", safe.reason());
+        return payload;
     }
 
     /** 预算拒绝的成员失败载荷：dimension/used/limit 从捕获处异常透传，恢复时渲染成结构化拒绝信封。 */
@@ -952,8 +1033,13 @@ public class DualPoolWaitGroupNodeExecutor {
         } catch (RuntimeException e) {
             log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity(), e);
-            String compact = WaitMemberResultPayload.compactPersistFailure(
-                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+            ModelSendBlocked blocked = blockedMemberResult(request.resultRefJson());
+            // 短载荷重写也必须保留发送阻止身份，否则写入恢复后会被当成普通工具失败。
+            String compact = blocked == null
+                    ? WaitMemberResultPayload.compactPersistFailure(
+                            objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage())
+                    : WaitMemberResultPayload.encode(objectMapper, member.getToolName(), member.getToolCallId(),
+                            false, "", modelSendBlockPayload(blocked), Integer.MAX_VALUE);
             MemberCompletionRequest fallback = new MemberCompletionRequest(
                     request.groupId(),
                     request.memberIdentity(),

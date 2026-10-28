@@ -13,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -81,6 +82,7 @@ public class SearchEvidenceJudgeService {
                     parseItems(root.path("citations"), safeCitations.size(), "")
             );
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             log.warn("Search evidence judge failed: {}", e.getMessage());
             recordJudgeObservability(selected, durationMs, startedAtMillis, safeHits.size(), safeCitations.size(),
@@ -107,6 +109,7 @@ public class SearchEvidenceJudgeService {
                         resolvedStage.get().source(),
                         model);
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 log.warn("Init search evidence judge from stage config failed: endpoint={}, model={}, err={}",
                         cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
             }
@@ -128,6 +131,7 @@ public class SearchEvidenceJudgeService {
                         SearchEvidenceJudgeModelResolver.ModelSource.ROUTE_FALLBACK,
                         model);
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 log.warn("Init search evidence judge model failed: endpoint={}, model={}, err={}",
                         candidate.getEndpointName(), candidate.getModelName(), e.getMessage());
             }

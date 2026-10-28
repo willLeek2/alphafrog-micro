@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -366,6 +367,7 @@ public class AgentContextCompressor {
             String summary = response == null || response.aiMessage() == null ? "" : nvl(response.aiMessage().text());
             return trimToMaxChars(summary, config.summaryMaxChars());
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to summarize history, fallback to sliding window: {}", e.getMessage());
             return "";
         }
@@ -380,6 +382,7 @@ public class AgentContextCompressor {
             }
             return aiServiceFactory.buildChatModelWithTemperature(resolved, temperature);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to build summary model: {}", e.getMessage());
             return null;
         }

@@ -4,6 +4,7 @@ import dev.langchain4j.service.tool.ToolErrorContext;
 import dev.langchain4j.service.tool.ToolErrorHandlerResult;
 import world.willfrog.agent.platform.exception.AgentRunControlSignal;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 /**
  * LangChain4j 工具错误处理器中的“控制信号逃逸口”。
@@ -11,6 +12,8 @@ import world.willfrog.agent.platform.exception.RunBudgetException;
  * <p>普通工具异常会转成文本交给模型自我修复；{@link AgentRunControlSignal} 不是工具失败，
  * 而是“当前 worker 应退出”的栈展开信号。额度超限同样要绕开模型修复，但走资源类型，不进这个家族。
  * 如果这里把信号转成文本，模型会在旧 worker 上继续推理，pipeline 收不到挂起或中断结果。</p>
+ *
+ * <p>正文或发送前输入检查阻止模型请求时，同样保留其异常身份，不能由工具修复再发起模型请求。</p>
  */
 final class LangchainTerminalToolErrorHandler {
 
@@ -18,7 +21,7 @@ final class LangchainTerminalToolErrorHandler {
     }
 
     static ToolErrorHandlerResult handle(Throwable throwable, ToolErrorContext context) {
-        // 先识别不能被模型消费的 Run 控制信号；它们必须沿 Java 调用栈回到 todo/pipeline 边界。
+        // 控制、预算及发送阻止原因必须沿 Java 调用栈回到 todo/pipeline 边界，不能交给模型修复。
         if (isTerminalSignal(throwable)) {
             // 保留原 RuntimeException 身份，pending 异常中的 run/toolCall/attempt 才不会丢失。
             throw asRuntimeException(throwable);
@@ -30,6 +33,9 @@ final class LangchainTerminalToolErrorHandler {
     }
 
     static boolean isTerminalSignal(Throwable throwable) {
+        if (ModelSendBlocks.isBlocked(throwable)) {
+            return true;
+        }
         // 框架反射层可能把真实异常包在多层 RuntimeException 中，因此逐层检查 cause。
         Throwable current = throwable;
         while (current != null) {
