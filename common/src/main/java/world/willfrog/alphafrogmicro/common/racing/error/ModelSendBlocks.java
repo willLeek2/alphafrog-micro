@@ -2,6 +2,7 @@ package world.willfrog.alphafrogmicro.common.racing.error;
 
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -36,15 +37,26 @@ public final class ModelSendBlocks {
         }
         ModelSendBlocked blocked = find(failure).orElse(null);
         if (blocked != null) {
-            throw new ModelSendBlockedException(blocked.code(), blocked.reason());
+            throw new ModelSendBlockedException(blocked.code(), blocked.reason(), blocked.racingFailure());
         }
     }
 
     /** 节点与工作流使用相同字段保存发送被阻止的事实。 */
     public static Map<String, Object> failureMetadata(ModelSendBlocked blocked) {
-        ModelSendBlocked safe = new ModelSendBlockedException(blocked.code(), blocked.reason());
-        return Map.of("model_send_blocked", true,
-                "model_send_block_code", safe.code(), "model_send_block_reason", safe.reason());
+        ModelSendBlocked safe = new ModelSendBlockedException(blocked.code(), blocked.reason(), blocked.racingFailure());
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("model_send_blocked", true);
+        metadata.put("model_send_block_code", safe.code());
+        metadata.put("model_send_block_reason", safe.reason());
+        RacingFailure diagnostic = safe.racingFailure();
+        if (!diagnostic.code().isEmpty()) metadata.put("model_send_block_racing_code", diagnostic.code());
+        if (!diagnostic.reasonCode().isEmpty()) {
+            metadata.put("model_send_block_racing_reason_code", diagnostic.reasonCode());
+        }
+        if (!diagnostic.objectLocator().isEmpty()) {
+            metadata.put("model_send_block_racing_locator", diagnostic.objectLocator());
+        }
+        return Collections.unmodifiableMap(metadata);
     }
 
     /** 持久结果使用同一组稳定码，恢复时不把普通工具错误当成发送阻止。 */

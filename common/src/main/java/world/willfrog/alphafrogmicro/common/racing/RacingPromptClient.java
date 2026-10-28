@@ -2,7 +2,10 @@ package world.willfrog.alphafrogmicro.common.racing;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.util.JsonFormat;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptBodyType;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptSetVersionSource;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVariableDeclaration;
@@ -219,9 +222,14 @@ public final class RacingPromptClient {
                        Function<T, RuntimeIdentity> identityReader) {
         try {
             return transport.call(context, invocation, identityReader);
-        } catch (ModelSendBlockedException blocked) {
-            throw blocked;
         } catch (RuntimeException failure) {
+            ModelSendBlocked marker = ModelSendBlocks.find(failure).orElse(null);
+            if (marker != null) {
+                throw new ModelSendBlockedException(marker.code(), marker.reason(), marker.racingFailure());
+            }
+            if (failure instanceof RacingCallException racing) {
+                throw unreadable("平台提示词调用未确认", RacingFailure.from(racing.error()));
+            }
             // 远端错误文字、正文和凭据均不进入发送阻止异常。
             throw unreadable("平台提示词调用未确认");
         }
@@ -229,21 +237,21 @@ public final class RacingPromptClient {
 
     private static RuntimeIdentity readVersionsIdentity(ReadPromptVersionsReply reply) {
         require(reply != null, "平台没有返回提示词读取结果");
-        require(!reply.hasError(), "平台拒绝提示词读取");
+        if (reply.hasError()) throw unreadable("平台拒绝提示词读取", RacingFailure.from(reply.getError()));
         require(reply.hasVersions() && reply.hasActualTarget(), "提示词读取回复不完整");
         return reply.getActualTarget();
     }
 
     private static RuntimeIdentity readSetIdentity(PromptSetVersionReply reply) {
         require(reply != null, "平台没有返回集合读取结果");
-        require(!reply.hasError(), "平台拒绝集合读取");
+        if (reply.hasError()) throw unreadable("平台拒绝集合读取", RacingFailure.from(reply.getError()));
         require(reply.hasVersion() && reply.hasActualTarget(), "集合读取回复不完整");
         return reply.getActualTarget();
     }
 
     private static RuntimeIdentity selectionIdentity(PromptSelectionReply reply) {
         require(reply != null, "平台没有返回根选择结果");
-        require(!reply.hasError(), "平台拒绝根选择请求");
+        if (reply.hasError()) throw unreadable("平台拒绝根选择请求", RacingFailure.from(reply.getError()));
         require(reply.hasSelection() && reply.hasActualTarget(), "根选择回复不完整");
         return reply.getActualTarget();
     }
@@ -386,5 +394,9 @@ public final class RacingPromptClient {
 
     private static ModelSendBlockedException unreadable(String reason) {
         return new ModelSendBlockedException(PROMPT_UNREADABLE, reason);
+    }
+
+    private static ModelSendBlockedException unreadable(String reason, RacingFailure failure) {
+        return new ModelSendBlockedException(PROMPT_UNREADABLE, reason, failure);
     }
 }

@@ -21,6 +21,8 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
@@ -270,6 +272,23 @@ public class LangchainTodoNodeExecutor {
             List<LangchainCompletedTodo> completedTodos,
             Map<String, String> datasetRefs,
             String toolResult) {
+        try {
+            return executePreparedResumedToolResult(request, item, completedTodos, datasetRefs, toolResult);
+        } catch (RuntimeException exception) {
+            LangchainTodoNodeResult blocked = modelSendBlockedResult(exception);
+            if (blocked != null) {
+                return blocked;
+            }
+            throw exception;
+        }
+    }
+
+    private LangchainTodoNodeResult executePreparedResumedToolResult(
+            LangchainWorkflowRequest request,
+            TodoItem item,
+            List<LangchainCompletedTodo> completedTodos,
+            Map<String, String> datasetRefs,
+            String toolResult) {
         if (item == null) {
             return LangchainTodoNodeResult.failure("todo_item_required");
         }
@@ -298,6 +317,10 @@ public class LangchainTodoNodeExecutor {
         } catch (RunBudgetException e) {
             throw e;
         } catch (Exception e) {
+            LangchainTodoNodeResult blocked = modelSendBlockedResult(e);
+            if (blocked != null) {
+                return blocked;
+            }
             log.error("长工具恢复后的模型续跑失败: runId={} todoId={}",
                     request == null ? null : request.getRunId(), item.getId(), e);
             return LangchainTodoNodeResult.failure("resumed_todo_model_failed:" + item.getId());
@@ -311,6 +334,26 @@ public class LangchainTodoNodeExecutor {
                                                     AtomicInteger toolCalls,
                                                     ToolJobResumeContext repairContext,
                                                     TodoRetryContext retryContext) {
+        try {
+            return runPreparedAttempt(request, item, completedTodos, datasetRefs, toolCalls,
+                    repairContext, retryContext);
+        } catch (RuntimeException exception) {
+            // 消息渲染在工具循环之前，也可能因正文或变量不可用而停止本次发送。
+            LangchainTodoNodeResult blocked = modelSendBlockedResult(exception);
+            if (blocked != null) {
+                return blocked;
+            }
+            throw exception;
+        }
+    }
+
+    private LangchainTodoNodeResult runPreparedAttempt(LangchainWorkflowRequest request,
+                                                       TodoItem item,
+                                                       List<LangchainCompletedTodo> completedTodos,
+                                                       Map<String, String> datasetRefs,
+                                                       AtomicInteger toolCalls,
+                                                       ToolJobResumeContext repairContext,
+                                                       TodoRetryContext retryContext) {
         if (item == null) {
             return LangchainTodoNodeResult.failure("todo_item_required");
         }
@@ -413,6 +456,10 @@ public class LangchainTodoNodeExecutor {
                 // 信号在这里转换成正常挂起结果，异常传播到此为止。
                 return LangchainTodoNodeResult.suspended(pending);
             }
+            LangchainTodoNodeResult blocked = modelSendBlockedResult(e);
+            if (blocked != null) {
+                return blocked;
+            }
             TodoToolExecutionException toolFailure = findTodoToolFailure(e);
             if (toolFailure != null && todoRetryPolicy != null) {
                 TodoRetryPolicy.Decision decision = todoRetryPolicy.evaluate(item.getId(), toolFailure);
@@ -454,6 +501,12 @@ public class LangchainTodoNodeExecutor {
             AgentContext.clearPythonRepairContext();
             AgentContext.clearTodoContext();
         }
+    }
+
+    private static LangchainTodoNodeResult modelSendBlockedResult(Throwable failure) {
+        ModelSendBlocked blocked = ModelSendBlocks.find(failure).orElse(null);
+        return blocked == null ? null : LangchainTodoNodeResult.failure(
+                blocked.code(), ModelSendBlocks.failureMetadata(blocked));
     }
 
     private String buildTodoRetryUserMessage(TodoRetryContext context) {

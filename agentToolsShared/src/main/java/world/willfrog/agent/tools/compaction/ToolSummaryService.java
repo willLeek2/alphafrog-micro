@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 /**
  * 工具结果摘要 LLM，独立 plain ChatModel，phase=tool_result_summary。
@@ -39,6 +40,7 @@ public class ToolSummaryService {
             try {
                 return invokeSummary(toolName, rawOutput, todoGoal);
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 lastError = e;
                 log.warn("tool summary attempt {}/{} failed: tool={}, err={}", i + 1, attempts, toolName, e.getMessage());
             }
@@ -78,6 +80,7 @@ public class ToolSummaryService {
             AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(route.endpoint(), route.model());
             return aiServiceFactory.buildChatModelWithTemperature(resolved, DEFAULT_TEMPERATURE);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("build summary model failed: {}", e.getMessage());
             return null;
         }

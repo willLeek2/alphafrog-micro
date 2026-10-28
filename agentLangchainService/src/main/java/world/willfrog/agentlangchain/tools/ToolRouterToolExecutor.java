@@ -27,6 +27,7 @@ import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -195,6 +196,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
                             request.name(), AgentContext.getRunId(), budget.getDimension(),
                             budget.getActual(), budget.getLimit());
                 } catch (Exception e) {
+                    ModelSendBlocks.rethrowIfBlocked(e);
                     // 其余异常收敛为带上游/系统故障类别的标准失败信封，不再退化为裸文本。
                     output = SandboxJobResponses.fail(objectMapper, request.name(),
                             "TOOL_INVOCATION_ERROR", e.getMessage(), Map.of(),

@@ -34,7 +34,7 @@ public record ModelInputInvocation(UUID logicalCallId, String endpointName,
         } catch (RuntimeException failure) {
             ModelSendBlocked original = ModelSendBlocks.find(failure).orElse(null);
             if (original != null) {
-                throw new ModelSendBlockedException(original.code(), original.reason());
+                throw new ModelSendBlockedException(original.code(), original.reason(), original.racingFailure());
             }
             // 不把远程异常及正文带入模型库的自动重试和异常映射。
             throw unconfirmed();

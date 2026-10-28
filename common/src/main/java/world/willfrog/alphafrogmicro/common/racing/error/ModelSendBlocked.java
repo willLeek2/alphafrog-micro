@@ -13,4 +13,9 @@ public interface ModelSendBlocked {
 
     /** 安全的业务说明，不含模型正文、凭据或模板变量值。 */
     String reason();
+
+    /** 平台原始拒绝的稳定码及安全定位；本地阻止没有平台诊断。 */
+    default RacingFailure racingFailure() {
+        return RacingFailure.none();
+    }
 }

@@ -22,6 +22,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.ProviderChatException;
 import world.willfrog.agent.platform.exception.ProviderFailureCategory;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -429,6 +430,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             throw new IllegalStateException(detail, e);
             
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             // SSE live event: LLM call finished (error)
             long durationMs = System.currentTimeMillis() - requestStartedAt;
             String errorType = e.getClass().getSimpleName();

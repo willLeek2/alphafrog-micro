@@ -5,6 +5,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -101,9 +103,11 @@ public class LangchainLinearWorkflowExecutor {
             return executePlanned(request, plan, toolCalls, null, null, null);
         } catch (Exception e) {
             log.error("Linear execution failed before result publish: runId={}", request.getRunId(), e);
+            ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
             return LangchainWorkflowResult.builder()
                     .success(false)
-                    .failureReason(e.getMessage())
+                    .failureReason(blocked == null ? e.getMessage() : blocked.code())
+                    .failureMetadata(blocked == null ? null : ModelSendBlocks.failureMetadata(blocked))
                     .plan(plan)
                     .toolCallsUsed(toolCalls.get())
                     .build();
@@ -142,9 +146,11 @@ public class LangchainLinearWorkflowExecutor {
             // 把恢复异常转换为普通 workflow result，由 pipeline 统一持久化。
             // 失败结果可能因状态栅栏而写不进库，日志是这条异常唯一的可见出口。
             log.error("Linear resume failed before result publish: runId={}", request.getRunId(), e);
+            ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
             return LangchainWorkflowResult.builder()
                     .success(false)
-                    .failureReason(e.getMessage())
+                    .failureReason(blocked == null ? e.getMessage() : blocked.code())
+                    .failureMetadata(blocked == null ? null : ModelSendBlocks.failureMetadata(blocked))
                     .plan(plan)
                     .toolCallsUsed(toolCalls.get())
                     .build();
@@ -170,9 +176,11 @@ public class LangchainLinearWorkflowExecutor {
             applyRunContext(request);
             return executePlanned(request, plan, toolCalls, null, null, checkpoint);
         } catch (Exception e) {
+            ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
             return LangchainWorkflowResult.builder()
                     .success(false)
-                    .failureReason(e.getMessage())
+                    .failureReason(blocked == null ? e.getMessage() : blocked.code())
+                    .failureMetadata(blocked == null ? null : ModelSendBlocks.failureMetadata(blocked))
                     .plan(plan)
                     .toolCallsUsed(toolCalls.get())
                     .build();

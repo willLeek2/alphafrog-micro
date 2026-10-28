@@ -4,6 +4,7 @@ import java.util.Objects;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
 import world.willfrog.alphafrogmicro.common.racing.input.ModelInputAttempt;
 import world.willfrog.alphafrogmicro.common.racing.input.ModelInputStore;
 import world.willfrog.alphafrogmicro.common.racing.input.ModelInputWireMapper;
@@ -50,8 +51,12 @@ public final class RacingInputClient {
                     receipt.getSha256(), receipt.getUtf8Length());
         } catch (RuntimeException failure) {
             ModelSendBlocked marker = ModelSendBlocks.find(failure).orElse(null);
-            if (marker != null) throw new ModelSendBlockedException(marker.code(), marker.reason());
-            if (failure instanceof RacingCallException racing) throw blocked(racing.error().getCode());
+            if (marker != null) {
+                throw new ModelSendBlockedException(marker.code(), marker.reason(), marker.racingFailure());
+            }
+            if (failure instanceof RacingCallException racing) {
+                throw blocked(racing.error().getCode(), RacingFailure.from(racing.error()));
+            }
             // 不保留远程消息、HTTP异常或cause，避免正文与变量值进入异常日志。
             throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);
         }
@@ -60,7 +65,7 @@ public final class RacingInputClient {
     private static RuntimeIdentity actualTarget(StoreModelInputReply reply) {
         if (reply == null) throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);
         // 业务阻止原因优先于身份核对，错误回复不伪装成保存成功。
-        if (reply.hasError()) throw blocked(reply.getError().getCode());
+        if (reply.hasError()) throw blocked(reply.getError().getCode(), RacingFailure.from(reply.getError()));
         if (!reply.hasStored() || !reply.hasActualTarget()) {
             throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);
         }
@@ -68,6 +73,10 @@ public final class RacingInputClient {
     }
 
     private static ModelSendBlockedException blocked(String code) {
+        return blocked(code, RacingFailure.none());
+    }
+
+    private static ModelSendBlockedException blocked(String code, RacingFailure failure) {
         String stableCode = ModelSendBlocks.isBlockedCode(code) ? code : ModelSendBlocked.MODEL_INPUT_UNCONFIRMED;
         String reason = switch (stableCode) {
             case ModelSendBlocked.PROMPT_UNREADABLE -> "本次输入使用的正文版本不可读取";
@@ -75,6 +84,6 @@ public final class RacingInputClient {
             case ModelSendBlocked.PROMPT_SOURCE_MISSING -> "本次输入的指令来源缺失或无效";
             default -> "完整模型输入保存尚未确认";
         };
-        return new ModelSendBlockedException(stableCode, reason);
+        return new ModelSendBlockedException(stableCode, reason, failure);
     }
 }
