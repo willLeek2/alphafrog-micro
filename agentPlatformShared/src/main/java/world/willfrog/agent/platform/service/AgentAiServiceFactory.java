@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.langchain4j.http.client.HttpClientBuilderLoader;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import lombok.RequiredArgsConstructor;
@@ -9,6 +10,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.input.ArchivingChatModel;
+import world.willfrog.agent.platform.input.ArchivingHttpClientBuilder;
 
 import java.util.HashMap;
 import java.util.List;
@@ -67,6 +70,12 @@ public class AgentAiServiceFactory {
         return buildChatModelWithTemperature(resolved, temperatureOverride, null);
     }
 
+    /** 托管输入入口：每次实际HTTP发送先取得保存确认，旧入口仍沿用原行为。 */
+    public ChatModel buildArchivedChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
+                                                           Double temperatureOverride) {
+        return buildChatModelWithTemperature(resolved, temperatureOverride, null, true);
+    }
+
     /** 风险评分脚本只交给不持久捕获请求正文的 OpenAI 兼容客户端。 */
     public ChatModel buildPythonRiskReviewModel(AgentLlmResolver.ResolvedLlm resolved) {
         if (resolved == null || isDashScopeEndpoint(resolved)) {
@@ -78,6 +87,13 @@ public class AgentAiServiceFactory {
     public ChatModel buildChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
                                                  Double temperatureOverride,
                                                  Integer maxTokensOverride) {
+        return buildChatModelWithTemperature(resolved, temperatureOverride, maxTokensOverride, false);
+    }
+
+    private ChatModel buildChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
+                                                  Double temperatureOverride,
+                                                  Integer maxTokensOverride,
+                                                  boolean archiveInput) {
         String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
         if (isBlank(apiKey)) {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
@@ -85,7 +101,8 @@ public class AgentAiServiceFactory {
         double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
         int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         if (isDashScopeEndpoint(resolved)) {
-            return buildDashScopeChatModel(resolved, apiKey, finalTemperature, effectiveMaxTokens);
+            DashScopeChatModel model = buildDashScopeChatModel(resolved, apiKey, finalTemperature, effectiveMaxTokens);
+            return archiveInput ? model.withInputArchiving() : model;
         }
         OpenAiChatModel.OpenAiChatModelBuilder builder = OpenAiChatModel.builder()
                 .apiKey(apiKey)
@@ -96,12 +113,16 @@ public class AgentAiServiceFactory {
                 // LC4j 内置 logRequests/logResponses 会打全量 HTTP body；langchain 压测时保持关闭
                 .logRequests(false)
                 .logResponses(false);
+        if (archiveInput) {
+            builder.httpClientBuilder(new ArchivingHttpClientBuilder(HttpClientBuilderLoader.loadHttpClientBuilder()));
+        }
 
         Map<String, String> headers = buildCustomHeaders(resolved);
         if (!headers.isEmpty()) {
             builder.customHeaders(headers);
         }
-        return builder.build();
+        ChatModel model = builder.build();
+        return archiveInput ? new ArchivingChatModel(model) : model;
     }
 
     public ChatModel buildChatModelWithProviderOrderAndTemperature(AgentLlmResolver.ResolvedLlm resolved,
@@ -295,7 +316,7 @@ public class AgentAiServiceFactory {
         return value == null || value.trim().isEmpty();
     }
 
-    private ChatModel buildDashScopeChatModel(AgentLlmResolver.ResolvedLlm resolved,
+    private DashScopeChatModel buildDashScopeChatModel(AgentLlmResolver.ResolvedLlm resolved,
                                                       String apiKey,
                                                       double finalTemperature,
                                                       int effectiveMaxTokens) {
