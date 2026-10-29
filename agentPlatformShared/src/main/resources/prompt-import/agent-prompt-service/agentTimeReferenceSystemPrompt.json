@@ -1,0 +1,58 @@
+{
+  "fragment": "agentTimeReferenceSystemPrompt",
+  "purpose": "agentTimeReferenceSystemPrompt",
+  "bodyType": "TEMPLATE",
+  "body": "当前时间：{{date}}（{{weekday}}，{{thisYear}}年{{month}}月{{day}}日）。所有涉及日期、时间、年份的推理必须以当前时间为基准。例如：用户说{{thisYear}}年，指{{thisYear}}年；说去年，指{{lastYear}}年；说今年，指{{thisYear}}年；说上一年，指{{lastYear}}年；说再上一年，指{{yearBeforeLast}}年。所有输出内容须标明具体公历年份，禁止使用仅含「去年」「明年」「上一年」「再上一年」等未标明具体年份的表述。",
+  "variables": [
+    {
+      "name": "date",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "weekday",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "thisYear",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "month",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "day",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "lastYear",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "yearBeforeLast",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "f013ad28ab9aa70644e7cbb5cf708205a0c499e4af1202cd80d395317b1412d9",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/service/AgentPromptService.java",
+    "method": "composeSystemPrompt",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -2,91 +2,114 @@ package world.willfrog.agentlangchain.execution;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.ChatMessageDeserializer;
-import dev.langchain4j.data.message.ChatMessageSerializer;
-
 import java.util.List;
+import java.util.Objects;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
 
-/**
- * 一个逻辑节点在两次领取之间的检查点：下一位 Worker 靠它把模型会话接回原样继续跑。
- *
- * <p>它随下一段的载荷一起写入，本身不单独建表。里面有四样东西：本段是第几次模型回复（从 0 起）、
- * 本段要接回哪一次模型回合产生的等待组（首段为空）、到目前为止的完整消息序列、以及本节点已经用掉的
- * 工具调用次数。</p>
- *
- * <p>接回等待组只记模型回合，不记等待组编号：本段的分段序号减一就是产生那一组的段落，
- * 与模型回合合起来唯一确定一个等待组（两者本来就在等待组身份里）。这样挂起语句在写下一段载荷时
- * 不需要先知道等待组编号——那时编号还没生成。</p>
- *
- * <p>消息序列包含系统消息与全部往返。存整段而不是存差量，是因为恢复时它要原样交给模型：
- * 少一条助手消息或顺序错位，模型看到的历史就和没中断时不一样，「最终上下文与不中断执行时等价」
- * 这句话就没法证明。</p>
- */
-public record NodeSegmentCheckpoint(int modelTurn,
-                                    Integer resumeGroupTurn,
-                                    List<ChatMessage> messages,
-                                    int toolCallsUsed) {
-
-    /** 载荷里的字段名：分段载荷与工作项检查点都用它。 */
+/** 一次节点分段的完整消息及来源；恢复时两者一起读取，不重新猜测旧消息来源。 */
+public final class NodeSegmentCheckpoint {
     public static final String FIELD = "nodeLoopCheckpoint";
 
-    public NodeSegmentCheckpoint {
-        if (modelTurn < 0) {
-            throw new IllegalArgumentException("模型回合不能是负数：" + modelTurn);
-        }
-        if (resumeGroupTurn != null && resumeGroupTurn < 0) {
-            throw new IllegalArgumentException("要接回的模型回合不能是负数：" + resumeGroupTurn);
-        }
-        if (toolCallsUsed < 0) {
-            throw new IllegalArgumentException("工具调用次数不能是负数：" + toolCallsUsed);
-        }
-        messages = messages == null ? List.of() : List.copyOf(messages);
+    private final int modelTurn;
+    private final Integer resumeGroupTurn;
+    private final List<PromptMessage> promptMessages;
+    private final int toolCallsUsed;
+
+    /** 兼容旧构造入口，旧消息全部保留UNKNOWN，直至调用方提供真实来源。 */
+    public NodeSegmentCheckpoint(int modelTurn, Integer resumeGroupTurn, List<ChatMessage> messages, int toolCallsUsed) {
+        this(modelTurn, resumeGroupTurn, toolCallsUsed, messages == null ? List.of()
+                : messages.stream().map(PromptMessage::unknown).toList());
     }
 
-    /** 从分段载荷里读出检查点；没有这个字段说明这一段还没进过模型，返回空。 */
+    private NodeSegmentCheckpoint(int modelTurn, Integer resumeGroupTurn, int toolCallsUsed,
+                                  List<PromptMessage> promptMessages) {
+        if (modelTurn < 0 || (resumeGroupTurn != null && resumeGroupTurn < 0) || toolCallsUsed < 0
+                || promptMessages == null || promptMessages.stream().anyMatch(Objects::isNull)) throw invalid();
+        this.modelTurn = modelTurn;
+        this.resumeGroupTurn = resumeGroupTurn;
+        this.toolCallsUsed = toolCallsUsed;
+        this.promptMessages = List.copyOf(promptMessages);
+    }
+
+    public static NodeSegmentCheckpoint withPromptMessages(int modelTurn, Integer resumeGroupTurn,
+            List<PromptMessage> messages, int toolCallsUsed) {
+        return new NodeSegmentCheckpoint(modelTurn, resumeGroupTurn, toolCallsUsed, messages);
+    }
+
+    public int modelTurn() { return modelTurn; }
+    public Integer resumeGroupTurn() { return resumeGroupTurn; }
+    public int toolCallsUsed() { return toolCallsUsed; }
+
+    /** 保留旧消费接口，返回与来源快照相同次序的不可变消息列表。 */
+    public List<ChatMessage> messages() {
+        return promptMessages.stream().map(PromptMessage::message).toList();
+    }
+
+    public List<PromptMessage> snapshot() {
+        return promptMessages;
+    }
+
+    public ModelInputSources modelInputSources() {
+        return PromptMessage.toModelInputSources(promptMessages);
+    }
+
+    /** 只有完全不存在字段才表示首段；已存在但损坏的检查点必须停止。 */
     public static NodeSegmentCheckpoint read(JsonNode payload) {
-        if (payload == null || !payload.path(FIELD).isObject()) {
-            return null;
-        }
-        JsonNode node = payload.path(FIELD);
-        Integer resumeGroupTurn = node.path("resumeGroupTurn").isNumber()
-                ? node.path("resumeGroupTurn").asInt() : null;
-        JsonNode messagesNode = node.path("messages");
-        List<ChatMessage> messages = messagesNode.isArray()
-                ? ChatMessageDeserializer.messagesFromJson(messagesNode.toString())
-                : List.of();
-        return new NodeSegmentCheckpoint(
-                Math.max(0, node.path("modelTurn").asInt(0)),
-                resumeGroupTurn,
-                messages,
-                Math.max(0, node.path("toolCallsUsed").asInt(0)));
+        if (payload == null) return null;
+        if (!payload.isObject()) throw invalid();
+        if (!payload.has(FIELD)) return null;
+        JsonNode node = payload.get(FIELD);
+        if (!node.isObject()) throw invalid();
+        Integer resume = node.get("resumeGroupTurn") == null || node.get("resumeGroupTurn").isNull()
+                ? null : count(node.get("resumeGroupTurn"));
+        return withPromptMessages(count(node.get("modelTurn")), resume,
+                PromptMessageCodec.read(node.get("messages")), count(node.get("toolCallsUsed")));
     }
 
-    /** 写进分段载荷的形式：消息序列直接嵌成数组，不在外面再套一层转义。 */
+    /** SDK原消息字段与promptSource在同一数组项中写入，无第二个可变来源列表。 */
     public ObjectNode toJson(ObjectMapper objectMapper) {
+        if (objectMapper == null) throw invalid();
         ObjectNode node = objectMapper.createObjectNode();
         node.put("modelTurn", modelTurn);
-        if (resumeGroupTurn == null) {
-            node.putNull("resumeGroupTurn");
-        } else {
-            node.put("resumeGroupTurn", resumeGroupTurn);
-        }
+        if (resumeGroupTurn == null) node.putNull("resumeGroupTurn");
+        else node.put("resumeGroupTurn", resumeGroupTurn);
         node.put("toolCallsUsed", toolCallsUsed);
-        ArrayNode messagesNode = node.putArray("messages");
-        if (!messages.isEmpty()) {
-            JsonNode parsed;
-            try {
-                parsed = objectMapper.readTree(ChatMessageSerializer.messagesToJson(messages));
-            } catch (Exception e) {
-                throw new IllegalStateException("节点检查点的消息序列无法编码", e);
-            }
-            if (parsed.isArray()) {
-                messagesNode.addAll((ArrayNode) parsed);
-            }
-        }
+        node.set("messages", PromptMessageCodec.write(promptMessages));
         return node;
+    }
+
+    private static int count(JsonNode value) {
+        if (value == null || !value.isIntegralNumber() || !value.canConvertToInt() || value.intValue() < 0) {
+            throw invalid();
+        }
+        return value.intValue();
+    }
+
+    private static ModelSendBlockedException invalid() {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "节点消息检查点结构或计数无效");
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        return other instanceof NodeSegmentCheckpoint checkpoint && modelTurn == checkpoint.modelTurn
+                && toolCallsUsed == checkpoint.toolCallsUsed && Objects.equals(resumeGroupTurn, checkpoint.resumeGroupTurn)
+                && promptMessages.equals(checkpoint.promptMessages);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(modelTurn, resumeGroupTurn, promptMessages, toolCallsUsed);
+    }
+
+    @Override
+    public String toString() {
+        return "NodeSegmentCheckpoint[modelTurn=" + modelTurn + ", resumeGroupTurn=" + resumeGroupTurn
+                + ", messageCount=" + promptMessages.size() + ", toolCallsUsed=" + toolCallsUsed + "]";
     }
 }
