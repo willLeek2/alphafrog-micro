@@ -1,6 +1,9 @@
 package world.willfrog.externalinfo.service;
 
 import lombok.RequiredArgsConstructor;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchModelSendBlock;
 import org.apache.dubbo.config.annotation.DubboService;
 import world.willfrog.alphafrogmicro.externalinfo.idl.DubboExternalInfoDubboServiceTriple;
 import world.willfrog.alphafrogmicro.externalinfo.idl.GetTodayMarketNewsRequest;
@@ -63,6 +66,17 @@ public class ExternalInfoDubboServiceImpl extends DubboExternalInfoDubboServiceT
 
     @Override
     public WebSearchResponse webSearch(WebSearchRequest request) {
-        return webSearchOrchestrator.search(request);
+        try {
+            return webSearchOrchestrator.search(request);
+        } catch (RuntimeException failure) {
+            ModelSendBlocked blocked = ModelSendBlocks.find(failure).orElse(null);
+            if (blocked == null) throw failure;
+            return WebSearchResponse.newBuilder().setOk(false).setErrorCode(blocked.code())
+                    .setErrorMessage(blocked.reason()).setModelSendBlock(WebSearchModelSendBlock.newBuilder()
+                            .setCode(blocked.code()).setReason(blocked.reason())
+                            .setRacingCode(blocked.racingFailure().code())
+                            .setRacingReasonCode(blocked.racingFailure().reasonCode())
+                            .putAllObjectLocator(blocked.racingFailure().objectLocator())).build();
+        }
     }
 }

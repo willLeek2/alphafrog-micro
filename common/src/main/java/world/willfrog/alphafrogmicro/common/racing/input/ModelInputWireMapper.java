@@ -55,7 +55,10 @@ public final class ModelInputWireMapper {
         String pointer = source.jsonPointer();
         ModelInputSourceBinding.Builder binding = ModelInputSourceBinding.newBuilder();
         String messagePrefix = body.has("messages") ? "/messages/" : "/input/messages/";
-        if (pointer.startsWith(messagePrefix)) {
+        if (pointer.equals("/query")) {
+            // 单查询搜索协议复用消息位置，序号固定为零，原始JSON不增加虚构messages。
+            binding.setMessage(ModelInputMessageLocation.newBuilder().setMessageIndex(0).setFieldPath(pointer));
+        } else if (pointer.startsWith(messagePrefix)) {
             int index = arrayIndex(pointer, messagePrefix);
             JsonNode message = body.at(messagePrefix.substring(0, messagePrefix.length() - 1)).get(index);
             if ("tool".equals(message.path("role").asText())) {
@@ -72,7 +75,8 @@ public final class ModelInputWireMapper {
             JsonNode name = tool.has("function") ? tool.path("function").get("name") : tool.get("name");
             binding.setToolDefinition(ModelInputToolLocation.newBuilder().setFieldPath(pointer)
                     .setToolName(requiredText(name, "工具定义缺少实际工具名称")));
-        } else if (pointer.equals("/response_format") || pointer.startsWith("/response_format/")) {
+        } else if (pointer.equals("/response_format") || pointer.startsWith("/response_format/")
+                || pointer.equals("/outputSchema") || pointer.startsWith("/outputSchema/")) {
             binding.setOutputStructure(ModelInputStructureLocation.newBuilder().setFieldPath(pointer));
         } else {
             throw blocked("输入来源不能转换为平台位置");

@@ -1,0 +1,14 @@
+{
+  "fragment": "webSearchProfileHeader",
+  "purpose": "webSearchProfileHeader",
+  "bodyType": "FIXED",
+  "body": "用户画像：",
+  "variables": [],
+  "utf8Sha256": "ce2b8c7e01c04528822a6d51514f3cb3ddf9dcf7fbac72a65a323738b2f1152a",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "externalInfoService/src/main/java/world/willfrog/externalinfo/search/profile/GlobalUserProfileInjector.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

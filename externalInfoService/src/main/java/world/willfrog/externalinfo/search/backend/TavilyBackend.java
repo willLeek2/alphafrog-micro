@@ -1,6 +1,10 @@
 package world.willfrog.externalinfo.search.backend;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.externalinfo.search.SearchPromptPreparation;
+import world.willfrog.externalinfo.search.SearchPromptPreparation.RequestBody;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -92,7 +96,8 @@ public class TavilyBackend implements SearchBackend {
             strength = "standard";
         }
 
-        Map<String, Object> body = buildRequestBody(context, strength);
+        RequestBody prepared = buildRequestBody(context, strength);
+        Map<String, Object> body = prepared.body();
         String rawQuery = context.request().getQuery();
 
         try {
@@ -108,7 +113,9 @@ public class TavilyBackend implements SearchBackend {
 
             HttpClient client = httpClientFactory.newClient(
                     Duration.ofSeconds(resolveConnectTimeout(config)));
-            RetryResult result = retry.sendWithRetry(client, requestBuilder.build(), name());
+            RetryResult result = retry.sendWithRetry(client, requestBuilder.build(), name(), requestBody,
+                    SearchPromptPreparation.requireBinding(context).invocation(
+                            "web-search/" + name(), prepared.sources()));
 
             if (!result.ok()) {
                 if (result.isHttpFailure()) {
@@ -128,6 +135,7 @@ public class TavilyBackend implements SearchBackend {
             return parseResponse(response.body(), strength, rawQuery,
                     System.currentTimeMillis() - startMs, result.attempts());
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Tavily 搜索请求异常", e);
             return BackendSearchResult.error(name(), "REQUEST_EXCEPTION", e.getMessage());
         }
@@ -136,11 +144,13 @@ public class TavilyBackend implements SearchBackend {
     /**
      * 构建 Tavily /search 请求体
      */
-    private Map<String, Object> buildRequestBody(WebSearchExecutionContext context, String strength) {
+    private RequestBody buildRequestBody(WebSearchExecutionContext context, String strength) {
         var request = context.request();
         Map<String, Object> body = new LinkedHashMap<>();
         // 将全局画像注入到 query 中
-        String injectedQuery = globalUserProfileInjector.injectIntoQuery(request.getQuery(), profileContext.getGlobalProfile());
+        PromptText injected = globalUserProfileInjector.queryPrompt(PromptText.runtimeData(request.getQuery()),
+                profileContext.getGlobalProfile(), SearchPromptPreparation.requireBinding(context));
+        String injectedQuery = injected.text();
         body.put("query", injectedQuery);
         body.put("search_depth", resolveSearchDepth(strength));
         body.put("topic", resolveTopic(context.scene()));
@@ -174,7 +184,7 @@ public class TavilyBackend implements SearchBackend {
             }
         }
 
-        return body;
+        return RequestBody.of(body, Map.of("/query", injected));
     }
 
     /**

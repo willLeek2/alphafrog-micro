@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
+import world.willfrog.externalinfo.search.WebSearchPromptTestFixture;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRequest;
 import world.willfrog.externalinfo.config.SearchLlmProperties;
 import world.willfrog.externalinfo.search.SearchLlmConfigResolver;
@@ -51,6 +52,7 @@ class PerplexityBackendTest {
             properties.getFeatures().getWebSearch().setProxy(proxy);
             SearchHttpClientFactory httpClientFactory = new SearchHttpClientFactory(properties);
             SearchBackendRetry retry = new SearchBackendRetry(properties);
+            WebSearchPromptTestFixture promptFixture = new WebSearchPromptTestFixture(mapper);
             PerplexityBackend backend = new PerplexityBackend(
                     mapper, new GlobalUserProfileInjector(), new ProfileContext(), httpClientFactory, retry);
             BackendSearchResult result = backend.search(new WebSearchExecutionContext(
@@ -74,7 +76,8 @@ class PerplexityBackendTest {
                             "Bearer ",
                             Map.of(),
                             2,
-                            5)
+                            5),
+                    promptFixture.preparation.bind(promptFixture.request("q"))
             ));
 
             JsonNode sent = mapper.readTree(body.get());

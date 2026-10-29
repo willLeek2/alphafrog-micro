@@ -2,6 +2,10 @@ package world.willfrog.externalinfo.search.backend;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.JsonNode;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.externalinfo.search.SearchPromptPreparation;
+import world.willfrog.externalinfo.search.SearchPromptPreparation.RequestBody;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -93,7 +97,8 @@ public class PerplexityBackend implements SearchBackend {
             strength = "standard";
         }
 
-        Map<String, Object> body = buildRequestBody(context, strength);
+        RequestBody prepared = buildRequestBody(context, strength);
+        Map<String, Object> body = prepared.body();
         String rawQuery = context.request().getQuery();
 
         try {
@@ -109,7 +114,9 @@ public class PerplexityBackend implements SearchBackend {
 
             HttpClient client = httpClientFactory.newClient(
                     Duration.ofSeconds(resolveConnectTimeout(config)));
-            RetryResult result = retry.sendWithRetry(client, requestBuilder.build(), name());
+            RetryResult result = retry.sendWithRetry(client, requestBuilder.build(), name(), requestBody,
+                    SearchPromptPreparation.requireBinding(context).invocation(
+                            "web-search/" + name(), prepared.sources()));
 
             if (!result.ok()) {
                 if (result.isHttpFailure()) {
@@ -130,6 +137,7 @@ public class PerplexityBackend implements SearchBackend {
             return parseResponse(response.body(), strength, rawQuery,
                     System.currentTimeMillis() - startMs, result.attempts());
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Perplexity 搜索请求异常", e);
             return BackendSearchResult.error(name(), "REQUEST_EXCEPTION", e.getMessage());
         }
@@ -138,7 +146,7 @@ public class PerplexityBackend implements SearchBackend {
     /**
      * 构建 Perplexity Chat Completions 请求体
      */
-    private Map<String, Object> buildRequestBody(WebSearchExecutionContext context, String strength) {
+    private RequestBody buildRequestBody(WebSearchExecutionContext context, String strength) {
         var request = context.request();
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", resolveModel(strength));
@@ -146,17 +154,22 @@ public class PerplexityBackend implements SearchBackend {
         List<Map<String, String>> messages = new ArrayList<>();
 
         // 注入全局画像到 system prompt
-        String systemPrompt = globalUserProfileInjector.injectIntoSystemPrompt("", profileContext.getGlobalProfile());
+        PromptText system = globalUserProfileInjector.systemPrompt(PromptText.runtimeData(""),
+                profileContext.getGlobalProfile(), SearchPromptPreparation.requireBinding(context));
+        String systemPrompt = system.text();
+        Map<String, PromptText> sources = new LinkedHashMap<>();
         if (hasText(systemPrompt)) {
             Map<String, String> systemMessage = new LinkedHashMap<>();
             systemMessage.put("role", "system");
             systemMessage.put("content", systemPrompt);
             messages.add(systemMessage);
+            sources.put("/messages/0", system);
         }
 
         Map<String, String> userMessage = new LinkedHashMap<>();
         userMessage.put("role", "user");
         userMessage.put("content", request.getQuery());
+        sources.put("/messages/" + messages.size(), PromptText.runtimeData(request.getQuery()));
         messages.add(userMessage);
         body.put("messages", messages);
         if (context.maxResults() > 0) {
@@ -188,7 +201,7 @@ public class PerplexityBackend implements SearchBackend {
                 body.put("search_recency_filter", recencyFilter);
             }
         }
-        return body;
+        return RequestBody.of(body, sources);
     }
 
     /**

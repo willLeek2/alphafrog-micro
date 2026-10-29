@@ -53,6 +53,24 @@ public record ModelInputSources(List<ModelInputSource> parts) {
         // OpenAI兼容接口与DashScope均在这两个已知位置保存消息。
         String prefix = body.has("messages") ? "/messages" : "/input/messages";
         JsonNode messages = body.at(prefix);
+        boolean queryInput = !body.has("messages") && !body.has("input") && body.has("query");
+        if (queryInput) {
+            if (!body.path("query").isTextual() || body.path("query").asText().isBlank()) {
+                throw blocked("搜索输入需要非空查询正文");
+            }
+            Set<String> allowedQuery = new LinkedHashSet<>();
+            allowedQuery.add("/query");
+            require(locations, "/query", false);
+            JsonNode schema = body.get("outputSchema");
+            if (schema != null && !schema.isNull()) {
+                validateStructure(locations, allowedQuery, "/outputSchema", schema);
+            }
+            if (body.has("tools") || body.has("response_format")
+                    || !allowedQuery.containsAll(locations.keySet())) {
+                throw blocked("搜索输入来源必须对应查询或输出结构");
+            }
+            return;
+        }
         if (!messages.isArray() || messages.isEmpty()) {
             throw blocked("模型输入缺少消息列表");
         }
