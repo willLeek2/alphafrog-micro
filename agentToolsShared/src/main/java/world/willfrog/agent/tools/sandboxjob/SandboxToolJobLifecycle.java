@@ -779,6 +779,8 @@ public final class SandboxToolJobLifecycle {
         deps.observability().emitToolTotal(toolStartMs,
                 "DAG_BLOCKING_TIMEOUT".equals(errorCode) ? "TIMEOUT" : "ERROR",
                 errorCode);
+        var terminalBlock = world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.read(anchor);
+        if (terminalBlock != null) throw terminalBlock;
         return factFailure(deps.objectMapper(), anchor.getToolName(),
                 errorCode, message, details);
     }
@@ -907,21 +909,29 @@ public final class SandboxToolJobLifecycle {
         if (deps.capacityService().restoreReservation(confirmed) == DataAnalysisRestoreOutcome.CONFLICT) {
             return null;
         }
-        Object formatContext = req.terminalSideEffect() == null
-                ? null
-                : req.terminalSideEffect().onTerminal(runId, identity, anchor, result);
-        // Build the public allowlist before persisting ENVELOPE. A projection/serialization
-        // failure must never leave a durable success preview behind.
-        SandboxJobResultAdapter.ResolvedPromptResult resolved = sourced
-                ? req.resultAdapter().resolveTerminalText(result, formatContext) : null;
-        if (sourced && (resolved == null || resolved.output() == null)) {
-            throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
-                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
-                    "sandbox-terminal-result");
+        var terminalBlock = world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.read(anchor);
+        SandboxJobResultAdapter.ResolvedPromptResult resolved = null;
+        PromptText output = null;
+        if (terminalBlock == null) {
+            try {
+                Object formatContext = req.terminalSideEffect() == null ? null
+                        : req.terminalSideEffect().onTerminal(runId, identity, anchor, result);
+                resolved = sourced ? req.resultAdapter().resolveTerminalText(result, formatContext) : null;
+                if (sourced && (resolved == null || resolved.output() == null)) {
+                    throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                            world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                            "sandbox-terminal-result");
+                }
+                output = sourced ? resolved.output()
+                        : PromptText.runtimeData(req.resultAdapter().formatTerminalResult(result, formatContext));
+            } catch (Exception failure) {
+                var blocked = ModelSendBlocks.find(failure).orElse(null);
+                if (blocked == null) throw failure;
+                world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.record(anchor, blocked);
+                terminalBlock = world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.read(anchor);
+            }
         }
-        PromptText output = sourced ? resolved.output()
-                : PromptText.runtimeData(req.resultAdapter().formatTerminalResult(result, formatContext));
-        String preview = output.text();
+        String preview = output == null ? null : output.text();
         String rawRef = SandboxJobResponses.blankToNull(result.rawRef());
         /*
          * 业务成败以工具的结果适配器为准：沙箱 SUCCEEDED 只代表运行器正常跑完
@@ -929,21 +939,22 @@ public final class SandboxToolJobLifecycle {
          * 语句超时都装在运行器信封里，沙箱状态全是 SUCCEEDED；executePython 的业务
          * 判据（SUCCEEDED 且退出码 0）与旧沙箱判据完全等价，行为不变。
          */
-        boolean businessSuccess = sourced ? resolved.success() : req.resultAdapter().isSuccess(result);
-        String errorCode = SandboxJobResponses.blankToNull(result.errorDetail());
+        boolean businessSuccess = terminalBlock == null && (sourced ? resolved.success() : req.resultAdapter().isSuccess(result));
+        String errorCode = terminalBlock == null ? SandboxJobResponses.blankToNull(result.errorDetail()) : terminalBlock.code();
         if (errorCode == null && !businessSuccess) {
             errorCode = sourced ? resolved.errorCode() : req.resultAdapter().errorCodeOf(result);
         }
         if (!"SUCCEEDED".equals(status) && errorCode == null) {
             errorCode = status;
         }
-        Instant terminalAt = Instant.now();
+        Instant terminalAt = terminalBlock != null && anchor.getTerminalAt() != null
+                ? anchor.getTerminalAt() : Instant.now();
         anchor.setAnchorState("TERMINAL");
         anchor.setTerminalStatus(status);
         anchor.setSandboxTerminalStatus(status);
         anchor.setTerminalBusinessSuccess(businessSuccess);
         anchor.setTerminalResultPreview(preview);
-        anchor.setTerminalPromptSourcesJson(sourced ? (String) PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
+        anchor.setTerminalPromptSourcesJson(sourced && output != null ? (String) PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
                         ? world.willfrog.agent.platform.input.PromptMessage.Origin.RUNTIME_DATA
                         : world.willfrog.agent.platform.input.PromptMessage.Origin.APPLICATION_INSTRUCTION,
                         output.sources()).get(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY) : null);
@@ -965,7 +976,7 @@ public final class SandboxToolJobLifecycle {
                 attached.taskId(), status, businessSuccess, preview, rawRef,
                 errorCode, businessSuccess ? null : terminalFailureMessage(status, errorCode),
                 result.retryable(), req.estimate(), confirmed, usage, terminalAt, false,
-                sourced ? (String) PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
+                sourced && output != null ? (String) PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
                         ? world.willfrog.agent.platform.input.PromptMessage.Origin.RUNTIME_DATA
                         : world.willfrog.agent.platform.input.PromptMessage.Origin.APPLICATION_INSTRUCTION,
                         output.sources()).get(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY) : null);
@@ -995,6 +1006,7 @@ public final class SandboxToolJobLifecycle {
         if (!deps.dispatchStore().persistAttached(runId, anchor)) {
             return null;
         }
+        if (terminalBlock != null) throw terminalBlock;
         return output;
     }
 

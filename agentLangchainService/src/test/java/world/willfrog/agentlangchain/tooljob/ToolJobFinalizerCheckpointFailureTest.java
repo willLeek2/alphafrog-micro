@@ -30,10 +30,10 @@ class ToolJobFinalizerCheckpointFailureTest {
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
         when(usageHook.upsertUsage(eq("run-1"), any())).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-1"), any())).thenReturn(true);
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, mock(ToolJobRedisCache.class),
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();

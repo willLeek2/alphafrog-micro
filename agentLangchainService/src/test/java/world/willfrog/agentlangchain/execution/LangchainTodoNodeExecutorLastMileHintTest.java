@@ -62,7 +62,7 @@ class LangchainTodoNodeExecutorLastMileHintTest {
     @Test
     void hintWithExistingSystemMessageShouldAppendNewUserMessage() {
         String hint = "[last_mile_hint] 9/10 tool_calls (90%)";
-        AgentContext.setLastMileHint(hint);
+        AgentContext.setLastMileHintPrompt(world.willfrog.agentlangchain.support.LangchainTestFixtures.versionedTestHint(hint));
         ChatRequest request = ChatRequest.builder()
                 .messages(List.of(
                         SystemMessage.from("原始系统提示"),
@@ -87,7 +87,7 @@ class LangchainTodoNodeExecutorLastMileHintTest {
     @Test
     void hintWithoutSystemMessageShouldAppendNewUserMessage() {
         String hint = "[last_mile_hint] 90% tokens";
-        AgentContext.setLastMileHint(hint);
+        AgentContext.setLastMileHintPrompt(world.willfrog.agentlangchain.support.LangchainTestFixtures.versionedTestHint(hint));
         ChatRequest request = ChatRequest.builder()
                 .messages(List.of(
                         UserMessage.from("user1"),
@@ -111,7 +111,7 @@ class LangchainTodoNodeExecutorLastMileHintTest {
 
     @Test
     void rebuildShouldPreserveTemperatureAndToolSpecifications() {
-        AgentContext.setLastMileHint("[last_mile_hint] hint");
+        AgentContext.setLastMileHintPrompt(world.willfrog.agentlangchain.support.LangchainTestFixtures.versionedTestHint("[last_mile_hint] hint"));
         ToolSpecification tool = ToolSpecification.builder()
                 .name("t1")
                 .description("d1")
@@ -134,7 +134,7 @@ class LangchainTodoNodeExecutorLastMileHintTest {
 
     @Test
     void hintShouldBeConsumedExactlyOnceEvenIfTransformedAgain() {
-        AgentContext.setLastMileHint("[last_mile_hint] 1");
+        AgentContext.setLastMileHintPrompt(world.willfrog.agentlangchain.support.LangchainTestFixtures.versionedTestHint("[last_mile_hint] 1"));
         ChatRequest request = sampleRequest();
 
         ChatRequest first = LangchainTodoNodeExecutor.maybeInjectLastMileHint(request);
@@ -146,7 +146,7 @@ class LangchainTodoNodeExecutorLastMileHintTest {
 
     @Test
     void nullChatRequestShouldReturnNull() {
-        AgentContext.setLastMileHint("[last_mile_hint] hint");
+        AgentContext.setLastMileHintPrompt(world.willfrog.agentlangchain.support.LangchainTestFixtures.versionedTestHint("[last_mile_hint] hint"));
         assertNull(LangchainTodoNodeExecutor.maybeInjectLastMileHint(null));
     }
 

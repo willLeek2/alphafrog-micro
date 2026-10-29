@@ -91,6 +91,22 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
     private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
     private final AgentPromptService promptService;
+    private final ToolExecutorPromptPreparation promptPreparation;
+
+    /** 旧装配未提供正文准备组件，新托管执行入口会明确停止。 */
+    public ToolRouterToolProvider(ToolRouter toolRouter, MarketDataTools marketDataTools, RagTools ragTools,
+                                  SearchTools searchTools, PythonSandboxTools pythonSandboxTools, SqlQueryTools sqlQueryTools,
+                                  ListMyDataTool listMyDataTool, PromoteDatasetTool promoteDatasetTool,
+                                  LoadToolGuideTool loadToolGuideTool, RereadToolHandler rereadToolHandler,
+                                  ObjectMapper objectMapper, AgentRunEventService agentEventService,
+                                  LangchainToolConcurrencyThrottle toolThrottle,
+                                  PythonSandboxDispatchStore pythonSandboxDispatchStore,
+                                  ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
+                                  AgentPromptService promptService) {
+        this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper,
+                agentEventService, toolThrottle, pythonSandboxDispatchStore, subAgentBridge, promptService, null);
+    }
 
     /** 保留旧调度器现有的独立构造调用点；生产构造由配置类传入持久子代理桥接。 */
     public ToolRouterToolProvider(ToolRouter toolRouter,
@@ -164,7 +180,7 @@ public class ToolRouterToolProvider implements ToolProvider {
         }
 
         ToolExecutor executor = new ToolRouterToolExecutor(
-                toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore);
+                toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore, promptPreparation);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);

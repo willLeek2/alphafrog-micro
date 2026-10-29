@@ -56,6 +56,7 @@ class LangchainLinearWorkflowResumeTest {
         prior.setSequence(1);
         prior.setDescription("todo-1-description");
         prior.setOutput("prior-output");
+        prior.setOutputSourceJson(LangchainCompletedTodo.modelOutputSourceJson());
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
         context.setTodoId("todo-2");
@@ -65,6 +66,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setToolCallsUsed(5);
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview("terminal-preview");
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("terminal-preview")));
         context.setTerminalRawRef("artifact://result-1");
         AtomicInteger consumed = new AtomicInteger();
 
@@ -112,6 +115,7 @@ class LangchainLinearWorkflowResumeTest {
         prior.setSequence(1);
         prior.setDescription("todo-1-description");
         prior.setOutput("prior-output");
+        prior.setOutputSourceJson(LangchainCompletedTodo.modelOutputSourceJson());
         // Meaningful leading/trailing whitespace and trailing newline — must survive byte-for-byte.
         String exactPreview = "  {\"ok\":true,\"data\":{\"stdout\":\"rows=5\\n\"}}  \n";
         ToolJobResumeContext context = new ToolJobResumeContext();
@@ -123,6 +127,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setToolCallsUsed(5);
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview(exactPreview);
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(exactPreview)));
         context.setTerminalRawRef("artifact://result-1");
 
         LangchainWorkflowResult result = executor.resumePlanned(
@@ -152,6 +158,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setToolCallsUsed(5);
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview("terminal-preview");
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("terminal-preview")));
 
         LangchainWorkflowResult result = executor.resumePlanned(request(), plan, context, () -> false);
 
@@ -181,6 +189,8 @@ class LangchainLinearWorkflowResumeTest {
         first.setTodoId("todo-2");
         first.setTerminalSuccess(true);
         first.setTerminalResultPreview("terminal-preview");
+        first.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("terminal-preview")));
 
         LangchainWorkflowResult crashed = executor.resumePlanned(
                 request(), plan, first, () -> false);
@@ -239,6 +249,7 @@ class LangchainLinearWorkflowResumeTest {
         prior.setSequence(1);
         prior.setDescription("todo-1-description");
         prior.setOutput("prior-output");
+        prior.setOutputSourceJson(LangchainCompletedTodo.modelOutputSourceJson());
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
         context.setTodoId("todo-2");
@@ -249,6 +260,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setToolCallsUsed(5);
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview("first-python-result");
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("first-python-result")));
         AtomicInteger accepted = new AtomicInteger();
 
         LangchainWorkflowResult result = executor.resumePlanned(
@@ -535,6 +548,7 @@ class LangchainLinearWorkflowResumeTest {
         prior.setSequence(1);
         prior.setDescription("todo-1-description");
         prior.setOutput("prior-output");
+        prior.setOutputSourceJson(LangchainCompletedTodo.modelOutputSourceJson());
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
         context.setTodoId("todo-2");
@@ -544,6 +558,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setToolCallsUsed(5);
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview("terminal-preview");
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("terminal-preview")));
         AtomicInteger consumed = new AtomicInteger();
 
         LangchainWorkflowResult result = executor.resumePlanned(
@@ -586,6 +602,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setToolCallsUsed(5);
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview("terminal-preview");
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("terminal-preview")));
         AtomicInteger consumed = new AtomicInteger();
 
         LangchainWorkflowResult result = executor.resumePlanned(
@@ -616,6 +634,8 @@ class LangchainLinearWorkflowResumeTest {
         context.setTerminalErrorCode("execution_failed");
         context.setTerminalExitReason("NON_ZERO_EXIT");
         context.setTerminalResultPreview("loaded five datasets");
+        context.setTerminalPromptSourcesJson(world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.encode(
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("loaded five datasets")));
         context.setTerminalStderrPreview("Traceback: bad date");
         context.setPythonFailedCodePreview("print('broken date parser')");
         context.setPythonRepairAttempt(repairAttempt);

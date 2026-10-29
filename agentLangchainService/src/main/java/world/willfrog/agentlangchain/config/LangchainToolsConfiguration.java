@@ -19,6 +19,7 @@ import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
+import world.willfrog.agentlangchain.tools.ToolExecutorPromptPreparation;
 import world.willfrog.agentlangchain.execution.PersistentSubAgentToolBridge;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 
@@ -47,7 +48,8 @@ public class LangchainToolsConfiguration {
                                        LangchainToolConcurrencyThrottle toolThrottle,
                                        PythonSandboxDispatchStore pythonSandboxDispatchStore,
                                        ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
-                                       AgentPromptService promptService) {
+                                       AgentPromptService promptService,
+                                       ToolExecutorPromptPreparation promptPreparation) {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
@@ -64,7 +66,8 @@ public class LangchainToolsConfiguration {
                 toolThrottle,
                 pythonSandboxDispatchStore,
                 subAgentBridge,
-                promptService
+                promptService,
+                promptPreparation
         );
     }
 }

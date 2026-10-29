@@ -1,5 +1,8 @@
 package world.willfrog.agentlangchain.execution;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -201,6 +204,15 @@ public class PersistentChildRunResultReceiver {
                 results.add(Map.of("subAgentId", childId,
                         "status", expired ? "WAIT_TIMEOUT" : "ACCEPTED"));
             } else if (terminal(child.getStatus())) {
+                Map<?, ?> metadata = childFailureMetadata(child);
+                var blocked = ModelSendBlocks.fromFailureMetadata(metadata);
+                if (blocked.isPresent()) {
+                    Map<String, Object> extra = new LinkedHashMap<>(ModelSendBlocks.failureMetadata(blocked.get()));
+                    extra.put("errorCode", blocked.get().code());
+                    extra.put("errorDetail", blocked.get().reason());
+                    finishWithMetadata(member, proof, false, "", extra);
+                    return;
+                }
                 Map<String, Object> state = new LinkedHashMap<>();
                 state.put("subAgentId", childId);
                 state.put("status", childStatus(child.getStatus()));
@@ -223,8 +235,14 @@ public class PersistentChildRunResultReceiver {
 
     private void finish(WaitMember member, JsonNode proof, boolean success,
                         String output, String errorCode) {
-        String payload = WaitMemberResultPayload.encode(json, member.getToolName(), member.getToolCallId(),
-                success, output, errorCode == null ? Map.of() : Map.of("errorCode", errorCode), maxResultChars);
+        finishWithMetadata(member, proof, success, output, errorCode == null ? Map.of() : Map.of("errorCode", errorCode));
+    }
+
+    private void finishWithMetadata(WaitMember member, JsonNode proof, boolean success,
+                        String output, Map<String, Object> extra) {
+        // 此处只组合持久子运行的状态、模型回答和诊断事实。
+        String payload = WaitMemberResultPayload.encodePrompt(json, member.getToolName(), member.getToolCallId(),
+                success, PromptText.runtimeData(output), extra, maxResultChars);
         MemberCompletionResult completed = waitGroups.completeMember(new MemberCompletionRequest(
                 member.getGroupId(), member.getMemberIdentity(),
                 success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
@@ -272,6 +290,17 @@ public class PersistentChildRunResultReceiver {
         } catch (Exception failure) {
             throw new IllegalStateException("child tool response could not be serialized", failure);
         }
+    }
+
+    private Map<?, ?> childFailureMetadata(AgentRun child) {
+        JsonNode snapshot;
+        try {
+            snapshot = json.readTree(child.getSnapshotJson());
+        } catch (Exception malformed) {
+            return Map.of();
+        }
+        JsonNode metadata = snapshot == null ? null : snapshot.get("failure_metadata");
+        return metadata != null && metadata.isObject() ? json.convertValue(metadata, Map.class) : Map.of();
     }
 
     private String answer(AgentRun child) {

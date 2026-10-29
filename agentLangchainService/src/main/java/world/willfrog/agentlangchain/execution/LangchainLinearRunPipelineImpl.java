@@ -44,6 +44,8 @@ import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -433,7 +435,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         String userGoal = "";
         try {
-            userGoal = followUpContextSupport.resolve(run).userGoal();
+            userGoal = followUpContextSupport.userGoal(run);
         } catch (Exception e) {
             log.warn("写终态失败时用户目标读不回来，按空目标写: runId={} reason={}", runId, e.getMessage());
         }
@@ -669,7 +671,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
         List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
         LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
-                runId, userId, run.getPlanGeneration(), userGoal, dialogueContext, stageModels,
+                runId, userId, run.getPlanGeneration(), userGoal, dialogueContext,
+                executionContext.dialogueContextPrompt(), stageModels,
                 toolSpecifications, runConfig);
         /*
          * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
@@ -678,7 +681,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
          */
         PlanExecutionMode requestedExecutionMode = AgentRunEventService.parseExecutionMode(
                 eventService.extractExecutionMode(run.getExt()));
-        return new StageInputs(runId, userId, userGoal, dialogueContext, stageModels,
+        return new StageInputs(runId, userId, userGoal, dialogueContext,
+                executionContext.dialogueContextPrompt(), stageModels,
                 toolSpecifications, workflowRequest, requestedExecutionMode);
     }
 
@@ -696,6 +700,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .planGeneration(run.getPlanGeneration())
                 .userGoal(inputs.userGoal())
                 .dialogueContext(inputs.dialogueContext())
+                .dialogueContextPrompt(inputs.dialogueContextPrompt())
                 .model(inputs.stageModels().planningModel())
                 .planningEndpointName(inputs.stageModels().planningEndpointName())
                 .planningModelName(inputs.stageModels().planningModelName())
@@ -762,6 +767,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                  String userId,
                                  String userGoal,
                                  String dialogueContext,
+                                 PromptText dialogueContextPrompt,
                                  LangchainRunStageModelResolver.StageModels stageModels,
                                  List<ToolSpecification> toolSpecifications,
                                  LangchainWorkflowRequest workflowRequest,
@@ -807,6 +813,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 新线程不会继承旧 worker 的 ThreadLocal，必须从持久化身份重新建立。
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
+            // 已持久的发送阻止先于原根读取、历史压缩和模型构建，走原失败保存出口。
+            ModelSendBlocks.fromFailureMetadata(resumeContext.getTerminalModelSendBlock())
+                    .ifPresent(blocked -> { throw blocked; });
             // 恢复也重新确认原根范围及选择，不使用子运行扩展字段中的摘要代替。
             AgentContext.setPromptRunSelection(eventService.prepareExperimentRunContext(runId));
             // 恢复排队期间若用户已暂停/取消，不能继续执行原 Todo。
@@ -840,6 +849,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
             LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
                     runId, userId, run.getPlanGeneration(), userGoal, executionContext.dialogueContext(),
+                    executionContext.dialogueContextPrompt(),
                     stageModels, toolSpecifications, runConfig);
 
             // token + leaseVersion 使重复 launcher 只能写出一条 WORKFLOW_RESUMED 事件。
@@ -866,6 +876,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                         LangchainWorkflowResult.builder()
                                 .success(false)
                                 .failureReason(e.getMessage())
+                                .failureMetadata(ModelSendBlocks.find(e).map(ModelSendBlocks::failureMetadata).orElse(null))
                                 .toolCallsUsed(resumeContext.getToolCallsUsed())
                                 .build(), e, resumeContext, "resume_execute");
             } catch (Exception persistEx) {
@@ -954,6 +965,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                                                  Integer planGeneration,
                                                                  String userGoal,
                                                                  String dialogueContext,
+                                                                 PromptText dialogueContextPrompt,
                                                                  LangchainRunStageModelResolver.StageModels stageModels,
                                                                  List<ToolSpecification> toolSpecifications,
                                                                  AgentRunEventService.RunConfig runConfig) {
@@ -963,11 +975,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .planGeneration(planGeneration)
                 .userGoal(userGoal)
                 .dialogueContext(dialogueContext)
+                .dialogueContextPrompt(dialogueContextPrompt)
                 .model(stageModels.executionModel())
                 .planningModel(stageModels.planningModel())
                 .executionModel(stageModels.executionModel())
                 .finalAnswerModel(stageModels.finalAnswerModel())
                 .planningEndpointName(stageModels.planningEndpointName())
+                .executionEndpointName(stageModels.executionEndpointName())
+                .finalAnswerEndpointName(stageModels.finalAnswerEndpointName())
                 .planningModelName(stageModels.planningModelName())
                 .planningProviderOrder(stageModels.planningProviderOrder())
                 .acceptanceReleasePolicy(stageModels.acceptanceReleasePolicy())
@@ -1298,6 +1313,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         snapshot.put("answer_markdown", nvl(result.getFinalAnswer()));
         snapshot.put("status", status.name());
         snapshot.put("failure_reason", nvl(result.getFailureReason()));
+        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks
+                .fromFailureMetadata(result.getFailureMetadata())
+                .ifPresent(blocked -> snapshot.put("failure_metadata",
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.failureMetadata(blocked)));
         snapshot.put("tool_calls_used", result.getToolCallsUsed());
         snapshot.put("engine", "agentLangchainService");
         return writeJson(snapshot);
@@ -1313,6 +1332,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         snapshot.put("answer_markdown", nvl(result.getFinalAnswer()));
         snapshot.put("status", AgentRunStatus.PARTIAL.name());
         snapshot.put("failure_reason", nvl(result.getFailureReason()));
+        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks
+                .fromFailureMetadata(result.getFailureMetadata())
+                .ifPresent(blocked -> snapshot.put("failure_metadata",
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.failureMetadata(blocked)));
         snapshot.put("tool_calls_used", result.getToolCallsUsed());
         snapshot.put("engine", "agentLangchainService");
         snapshot.put("partial", true);

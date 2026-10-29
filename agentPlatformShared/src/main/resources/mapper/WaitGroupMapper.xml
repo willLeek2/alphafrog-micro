@@ -732,6 +732,10 @@
               AND ((m.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
                    OR m.external_operation_id = #{externalOperationId}::varchar)
               AND m.state IN ('PENDING', 'RUNNING')
+              -- 同项已保存发送阻止时，持旧快照的普通完成不得把它覆盖。
+              AND (NOT (jsonb_exists(COALESCE(m.dispatch_proof_json, '{}'::jsonb), 'terminalModelSendBlock'))
+                   OR (#{memberState}::varchar = 'FAILED'
+                       AND CAST(#{resultRefJson} AS jsonb) @&gt; (m.dispatch_proof_json -&gt; 'terminalModelSendBlock')))
               -- 沙箱创建请求已落库但尚未转 RUNNING 时，旧/重跑线程不能把它写成普通
               -- 工具终态；只有原请求恢复并转 RUNNING 后才允许结果接收器结算。
               AND NOT (m.state = 'PENDING' AND m.tool_name IN ('executePython', 'executeQuery')
@@ -1360,6 +1364,25 @@
       成员还在执行中时推后它的下次查询时间并累加轮询次数。已经落终态的成员不会被改，
       所以「某个操作被查了第几次」永远只增一次。
     -->
+    <!-- 仅保存原成员已确认的终态事实；暂停后的控制版本变化不阻止清理，取消先完成则返回0。 -->
+    <update id="recordMemberTerminalBlock">
+        UPDATE alphafrog_agent_run_wait_member m SET
+            dispatch_proof_json = CAST(#{blockedProofJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE m.group_id = #{groupId}
+          AND m.member_identity = #{memberIdentity}
+          AND m.state = 'RUNNING'
+          AND m.external_operation_id = #{operationId}
+          AND m.dispatch_proof_json = CAST(#{expectedProofJson} AS jsonb)
+          AND NOT (jsonb_exists(m.dispatch_proof_json, 'terminalModelSendBlock'))
+          AND CAST(#{blockedProofJson} AS jsonb) - 'terminalModelSendBlock' - 'terminalCleanup'
+              = m.dispatch_proof_json
+          AND CAST(#{blockedProofJson} AS jsonb) #>> '{terminalModelSendBlock,model_send_blocked}' = 'true'
+          AND jsonb_typeof(CAST(#{blockedProofJson} AS jsonb) -&gt; 'terminalCleanup') = 'object'
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_group g
+                      WHERE g.id = m.group_id AND g.run_id = m.run_id)
+    </update>
+
     <update id="rescheduleMember">
         UPDATE alphafrog_agent_run_wait_member SET
             next_poll_at = #{nextPollAt},

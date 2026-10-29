@@ -25,6 +25,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class LangchainTodoNodeExecutorPythonRepairTest {
+    @org.junit.jupiter.api.BeforeEach
+    void prepareVersionedRunContext() {
+        world.willfrog.agent.platform.context.AgentContext.setRunId("fixture-current-run");
+    }
+
 
     private static final ToolSpecification EXECUTE_PYTHON = ToolSpecification.builder()
             .name("executePython")
@@ -157,13 +162,15 @@ class LangchainTodoNodeExecutorPythonRepairTest {
 
     private static LangchainTodoNodeResult executeRepair(
             ChatModel model, ToolProvider provider, AtomicInteger toolCalls) {
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor(
-                Optional.ofNullable(provider));
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor(
+                Optional.ofNullable(provider).map(LangchainTestFixtures::runtimeDataTools));
         LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-repair")
                 .userId("user-repair")
                 .userGoal("fix the failed Python analysis")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .toolSpecifications(List.of(EXECUTE_PYTHON))
                 .maxToolRoundTrips(4)
                 .build();

@@ -1,0 +1,27 @@
+{
+  "fragment": "nodeToolAdmissionRefusal",
+  "purpose": "nodeToolAdmissionRefusal",
+  "bodyType": "TEMPLATE",
+  "body": "本轮{{requested}}个工具调用超过上限{{maxMembers}}；本轮没有执行任何工具。请减少本轮调用数量，余下调用等本轮结果返回后再继续。",
+  "variables": [
+    {
+      "name": "requested",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "maxMembers",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "41d44f2eef415d9238944dc4343a8eb7dcd2eb4eff92bea53913232146029544",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/execution/DualPoolWaitGroupNodeExecutor.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

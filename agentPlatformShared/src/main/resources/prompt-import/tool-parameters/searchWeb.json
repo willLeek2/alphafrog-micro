@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.searchWeb",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/backend/description\":\"后端或 preset 覆盖：perplexity、tavily、exa 或 preset 名，可选\",\"/properties/maxResults/description\":\"最大返回结果数，可选，默认 5\",\"/properties/query/description\":\"搜索查询文本，必填\",\"/properties/scene/description\":\"搜索场景：general、finance 或 news，可选\",\"/properties/skipHotCache/description\":\"是否跳过热点缓存，可选，默认 false\",\"/properties/skipRagPrefetch/description\":\"是否跳过 RAG 预检，可选，默认 false\",\"/properties/strength/description\":\"搜索强度档位，可选\",\"/properties/timeRangeEnd/description\":\"时间范围结束 ISO 8601，可选\",\"/properties/timeRangeStart/description\":\"时间范围起始 ISO 8601，可选\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "339718b27f2537f8422d5186818b8dc9bc8425013daec834727ea1b29fe4fe53",
+  "source" : {
+    "toolName" : "searchWeb",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

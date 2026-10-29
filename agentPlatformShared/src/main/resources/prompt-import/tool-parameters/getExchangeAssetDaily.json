@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.getExchangeAssetDaily",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/advancedQuery/description\":\"advanced 查询对象。asset_type 对 searchAssetInfo / getExchangeAssetDaily advanced 必填；name 可选；conditions 之间为 AND，单个 condition 中 code 使用 | 分隔多个代码，代表 OR 条件。\",\"/properties/advancedQuery/properties/asset_type/description\":\"advanced 模式资产类型：stock / etf / index；searchAssetInfo / getExchangeAssetDaily advanced 必填，searchIndex advanced 忽略。\",\"/properties/advancedQuery/properties/conditions/description\":\"advanced 条件数组。支持 index_component / sw_industry_l2_component / sw_industry_l3_component；conditions 之间为 AND 关系。\",\"/properties/advancedQuery/properties/conditions/items/properties/end_date/description\":\"日期边界，传 YYYYMMDD 格式的日期字符串；NONE 表示未指定。对 index_component 的 NONE/NONE 默认取最新公告期完整快照，单边 NONE 表示不限制该侧边界。\",\"/properties/advancedQuery/properties/conditions/items/properties/index_code/description\":\"index_component 使用，可用 | 分隔多个指数代码，代表 OR 条件。\",\"/properties/advancedQuery/properties/conditions/items/properties/industry_code/description\":\"sw_industry_l2_component / sw_industry_l3_component 使用，可用 | 分隔多个行业代码，代表 OR 条件。\",\"/properties/advancedQuery/properties/conditions/items/properties/max_weight/description\":\"可选最大权重，取值范围 0.00-1.00。\",\"/properties/advancedQuery/properties/conditions/items/properties/min_weight/description\":\"可选最小权重，取值范围 0.00-1.00。\",\"/properties/advancedQuery/properties/conditions/items/properties/start_date/description\":\"日期边界，传 YYYYMMDD 格式的日期字符串；NONE 表示未指定。对 index_component 的 NONE/NONE 默认取最新公告期完整快照，单边 NONE 表示不限制该侧边界。\",\"/properties/advancedQuery/properties/conditions/items/properties/stock_code/description\":\"has_stock 使用，可用 | 分隔多个股票代码，代表 OR 条件。\",\"/properties/advancedQuery/properties/conditions/items/properties/type/description\":\"index_component / sw_industry_l2_component / sw_industry_l3_component / has_stock。\",\"/properties/advancedQuery/properties/name/description\":\"可选名称关键词，先走 simple 搜索候选。\",\"/properties/assetType/description\":\"simple 模式必填 stock|etf|index。advanced 模式忽略，asset_type 放在 advancedQuery 里。\",\"/properties/endDate/description\":\"日线日期范围终点，YYYYMMDD。\",\"/properties/mode/description\":\"可选：advanced。省略时为 simple。\",\"/properties/priceMode/description\":\"目前仅支持 raw_ohlc。\",\"/properties/startDate/description\":\"日线日期范围起点，YYYYMMDD。\",\"/properties/tsCode/description\":\"simple 模式场内资产代码，支持 | 批量；advanced 模式忽略。\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "cd6607c78bc5adeed48392fd70c318ce41c82afc5c1fa8e6860b2a164aae807f",
+  "source" : {
+    "toolName" : "getExchangeAssetDaily",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}
