@@ -206,4 +206,8 @@ public class LangchainPlanningStructuredOutputSettings {
     public Map<String, Object> todoPlanningJsonSchema() {
         return StructuredPlanningSupport.todoPlanningJsonSchema();
     }
+
+    public Map<String, Object> todoPlanningJsonSchema(Map<String, String> descriptions) {
+        return StructuredPlanningSupport.todoPlanningJsonSchema(descriptions);
+    }
 }

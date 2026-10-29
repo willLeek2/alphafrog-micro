@@ -4,12 +4,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.input.ManagedPromptAiServices;
+import world.willfrog.agent.platform.input.PromptMessage;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.ReactConversationContext;
@@ -20,7 +23,14 @@ import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import world.willfrog.agentlangchain.execution.RootTreeCallBudget;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -43,12 +53,9 @@ import java.util.stream.Collectors;
  * </ol>
  *
  * <h2>Structured Output 的 ThreadLocal 机制</h2>
- * LLM 调用的实际 HTTP 请求由 {@code OpenRouterProviderRoutedChatModel} 发出。
- * 它<strong>不读取</strong> LangChain4j 的 {@code ChatRequest.responseFormat()}，
- * 而是从 {@link AgentContext} 的 ThreadLocal 中读取
- * {@link AgentContext.StructuredOutputSpec}。因此本类在每次 LLM 调用前通过
- * {@link #applyStructuredSpec} 设置 ThreadLocal，调用结束后在 finally 块中恢复/清理，
- * 避免污染后续执行阶段（execution）的 LLM 调用。
+ * 自有模型从 {@link AgentContext} 的线程上下文读取结构要求，SDK模型通过
+ * 本次请求的参数接收同一份结构。每次调用同时登记实际消息和结构说明的来源，
+ * 发送器确认保存最终请求后才发送。调用结束后恢复原有结构、阶段和输入作用域。
  *
  * <h2>与共享规划组件的关系</h2>
  * 本类的两阶段路径直接复用了 {@link StructuredPlanningSupport} 做 schema
@@ -80,6 +87,8 @@ public class LangchainAiPlanner {
     private final ObjectMapper objectMapper;
     @Autowired
     private RootTreeCallBudget rootTreeCallBudget;
+    @Autowired
+    private PlanningPromptPreparation promptPreparation;
 
     /**
      * 执行一次完整的 agent 规划，返回 Todo 计划。
@@ -111,20 +120,23 @@ public class LangchainAiPlanner {
                 ? PlanExecutionMode.LINEAR
                 : request.getExecutionMode();
         String toolList = buildToolList(request.getToolSpecifications());
+        PromptText history = preparation().history(request.getDialogueContext(), request.getDialogueContextPrompt());
 
+        String previousPhase = AgentContext.getPhase();
         AgentContext.setPhase(AgentRunObservabilityService.PHASE_PLANNING);
         String previousStage = AgentContext.getStage();
         AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         try {
             if (structuredOutputSettings.strategyStageEnabled()) {
-                return planTwoStageStructured(request, mode, maxTodos, toolList);
+                return planTwoStageStructured(request, mode, maxTodos, toolList, history);
             }
             log.warn("[LangchainAiPlanner] runId={} legacy_single_stage_planning_enabled",
                     nvl(request.getRunId()));
-            return planSingleStageLegacyTemplate(request, mode, maxTodos, toolList);
+            return planSingleStageLegacyTemplate(request, mode, maxTodos, toolList, history);
         } finally {
             restoreStructuredOutputSpec(previousSpec);
             restoreStage(previousStage);
+            restorePhase(previousPhase);
         }
     }
 
@@ -163,52 +175,51 @@ public class LangchainAiPlanner {
     private LangchainTodoPlan planTwoStageStructured(LangchainPlanningRequest request,
                                                      PlanExecutionMode mode,
                                                      int maxTodos,
-                                                     String toolList) {
+                                                     String toolList,
+                                                     PromptText history) {
         int maxAttempts = resolvePlanningMaxAttempts();
         int maxDetailLength = structuredOutputSettings.strategyMaxDetailLength();
         boolean structuredEnabled = structuredOutputSettings.structuredEnabled();
-        String dialogueContext = nvl(request.getDialogueContext());
-        String reactSystem = promptService.reactSystemPrompt();
-        String dynamicPrefix = promptService.dynamicContextPrefix();
+        PromptText reactSystem = promptService.reactSystemPromptText();
+        PromptText dynamicPrefix = promptService.dynamicContextPrefixText();
         StructuredPlanningSupport.StructuredPlanningException lastError = null;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             ReactConversationContext ctx = new ReactConversationContext();
-            ctx.setSystemMessage(reactSystem);
+            ctx.setSystemPrompt(reactSystem);
             try {
-                String strategyStage = promptService.planningStrategyStageInstruction(
+                PromptText strategyStage = promptService.planningStrategyStageInstructionText(
                         toolList,
                         maxTodos,
                         maxDetailLength,
-                        ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
+                        ToolCapabilityPromptRenderer.renderText(promptService, request.getToolSpecifications()));
                 if (mode == PlanExecutionMode.LINEAR) {
                     /*
                      * 本 Run 明确请求 LINEAR 时，strategy 阶段的 LLM 也必须先按 LINEAR
                      * 思考；否则第二阶段可能根据一个 DAG strategy 生成分支/汇合依赖。
                      */
-                    strategyStage += "\n\n" + promptService.planningLinearConstraint();
+                    strategyStage = PromptText.concat(strategyStage, PromptText.runtimeData("\n\n"),
+                            promptService.planningLinearConstraintText());
                 }
-                String budgetNote = toolBudgetNote(request.getRunId());
-                if (!budgetNote.isBlank()) {
+                PromptText budgetNote = toolBudgetNote(request.getRunId());
+                if (!budgetNote.text().isBlank()) {
                     // 规划是「决定本轮调多少工具」的时刻：把按当前运行口径读到的真实额度一并给模型。
-                    strategyStage += "\n\n" + budgetNote;
+                    strategyStage = PromptText.concat(strategyStage, PromptText.runtimeData("\n\n"), budgetNote);
                 }
-                String strategyContent = dialogueContext.isBlank()
-                        ? dynamicPrefix + "\n" + strategyStage + "\n\n用户需求：" + request.getUserGoal()
-                        : dynamicPrefix + "\n" + strategyStage + "\n\n历史对话压缩内容：\n" + dialogueContext
-                        + "\n\n当前轮次用户需求：" + request.getUserGoal();
-                ctx.addUserMessage(strategyContent);
+                ctx.addUserPrompt(preparation().userMessage(dynamicPrefix, strategyStage, request.getUserGoal(), history));
 
                 AgentContext.setStage("planning_strategy");
+                var strategyDescriptions = structuredEnabled ? preparation().descriptions() : null;
                 applyStructuredSpec(
                         structuredEnabled,
                         STRATEGY_SCHEMA_NAME,
                         structuredOutputSettings.structuredStrict(),
-                        StructuredPlanningSupport.strategyStageJsonSchema(maxDetailLength),
+                        structuredEnabled ? StructuredPlanningSupport.strategyStageJsonSchema(maxDetailLength,
+                                strategyDescriptions.values()) : java.util.Map.of(),
+                        structuredEnabled ? strategyDescriptions.sources() : List.of(),
                         request
                 );
-                beforePlanningModelCall(request, attempt, "strategy");
-                ChatResponse strategyResponse = planningModel(request, attempt, "strategy").chat(ctx.getMessages());
+                ChatResponse strategyResponse = chat(request, attempt, "strategy", ctx.snapshot());
                 String strategyRaw = strategyResponse.aiMessage() == null ? "" : nvl(strategyResponse.aiMessage().text());
                 JsonNode strategyRoot = StructuredPlanningSupport.parseStructuredJson(objectMapper, strategyRaw);
                 StructuredPlanningSupport.ValidationResultWithData<StructuredPlanningSupport.OverallPlan> strategyValidation =
@@ -230,25 +241,26 @@ public class LangchainAiPlanner {
                     var normalizedOverallPlan = normalizedStrategy.putObject("overallPlan");
                     normalizedOverallPlan.put("mode", effectiveStrategyMode.name());
                     normalizedOverallPlan.put("detail", nvl(overallPlan.detail()));
-                    ctx.addAssistantMessage(normalizedStrategy.toString());
+                    ctx.addRuntimeAssistantMessage(normalizedStrategy.toString());
                 } else {
-                    ctx.addAssistantMessage(strategyRaw);
+                    ctx.addRuntimeAssistantMessage(strategyRaw);
                 }
 
-                String todosStage = promptService.planningTodosStageInstruction(
+                PromptText todosStage = promptService.planningTodosStageInstructionText(
                         effectiveStrategyMode.name(), overallPlan.detail(), toolList, maxTodos);
-                ctx.addUserMessage(todosStage);
+                ctx.addUserPrompt(todosStage);
 
                 AgentContext.setStage("planning_todos");
+                var todoDescriptions = structuredEnabled ? preparation().descriptions() : null;
                 applyStructuredSpec(
                         structuredEnabled,
                         TODO_PLAN_SCHEMA_NAME,
                         structuredOutputSettings.structuredStrict(),
-                        structuredOutputSettings.todoPlanningJsonSchema(),
+                        structuredEnabled ? structuredOutputSettings.todoPlanningJsonSchema(todoDescriptions.values()) : java.util.Map.of(),
+                        structuredEnabled ? todoDescriptions.sources() : List.of(),
                         request
                 );
-                beforePlanningModelCall(request, attempt, "todos");
-                ChatResponse todosResponse = planningModel(request, attempt, "todos").chat(ctx.getMessages());
+                ChatResponse todosResponse = chat(request, attempt, "todos", ctx.snapshot());
                 String todosRaw = todosResponse.aiMessage() == null ? "" : nvl(todosResponse.aiMessage().text());
                 LangchainTodoPlan plan = parseValidateTodoPlan(
                         todosRaw, effectiveStrategyMode, maxTodos);
@@ -268,6 +280,7 @@ public class LangchainAiPlanner {
                 );
                 return plan;
             } catch (StructuredPlanningSupport.StructuredPlanningException e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 lastError = e;
                 log.warn(
                         "[LangchainAiPlanner] runId={} planning attempt {} failed: {} {}",
@@ -298,12 +311,9 @@ public class LangchainAiPlanner {
      * {@link AgentContext.StructuredOutputSpec}。因此单阶段即使返回原始 JSON，
      * 也必须显式设置与两阶段 Todo 相同的 schema。
      *
-     * <h3>systemMessageProvider 的作用</h3>
-     * {@code systemMessageProvider(ignored -> promptService.reactSystemPrompt())}
-     * 让 LC4j 在每次调用时动态生成 system prompt，而不是在构建时固化。
-     * 这确保了日期等动态系统提示内容每次都是最新的。
-     * （工具列表在 user message 的 planning stage instruction 中单独注入，
-     * 不走 systemMessageProvider。）
+     * <h3>系统正文装配</h3>
+     * 系统正文已经按原根冻结的版本和日期渲染，装配辅助类跳过SDK的再次模板解析。
+     * 工具能力摘要放在本次用户消息中；规划阶段不会发送可执行工具定义。
      *
      * @see LangchainPlannerAiService 规划专用的 LC4j AI Service 接口
      * @see StructuredPlanningSupport 共享 JSON 解析与结构校验
@@ -311,53 +321,44 @@ public class LangchainAiPlanner {
     private LangchainTodoPlan planSingleStageLegacyTemplate(LangchainPlanningRequest request,
                                                             PlanExecutionMode mode,
                                                             int maxTodos,
-                                                            String toolList) {
+                                                            String toolList,
+                                                            PromptText history) {
         AgentContext.setStage("planning_todos");
         boolean structuredEnabled = structuredOutputSettings.structuredEnabled();
         int maxAttempts = resolvePlanningMaxAttempts();
         StructuredPlanningSupport.StructuredPlanningException lastError = null;
         try {
-            if (structuredEnabled) {
-                AgentContext.setStructuredOutputSpec(new AgentContext.StructuredOutputSpec(
-                        TODO_PLAN_SCHEMA_NAME,
-                        structuredOutputSettings.structuredStrict(),
-                        structuredOutputSettings.todoPlanningJsonSchema(),
-                        structuredOutputSettings.requireProviderParameters(request.getPlanningEndpointName()),
-                        structuredOutputSettings.allowProviderFallbacks()
-                ));
-            }
-            String dialogueCtx = nvl(request.getDialogueContext());
-            String userMessage;
-            if (dialogueCtx.isBlank()) {
-                userMessage = promptService.dynamicContextPrefix() + "\n"
-                        + promptService.planningTodosStageInstruction(mode.name(), "", toolList, maxTodos)
-                        + "\n\n用户需求：" + request.getUserGoal();
-            } else {
-                userMessage = promptService.dynamicContextPrefix() + "\n"
-                        + promptService.planningTodosStageInstruction(mode.name(), "", toolList, maxTodos)
-                        + "\n\n历史对话压缩内容：\n" + dialogueCtx
-                        + "\n\n当前轮次用户需求：" + request.getUserGoal();
-            }
-            String singleStageBudgetNote = toolBudgetNote(request.getRunId());
-            if (!singleStageBudgetNote.isBlank()) {
+            var descriptions = structuredEnabled ? preparation().descriptions() : null;
+            applyStructuredSpec(structuredEnabled, TODO_PLAN_SCHEMA_NAME, structuredOutputSettings.structuredStrict(),
+                    structuredEnabled ? structuredOutputSettings.todoPlanningJsonSchema(descriptions.values()) : java.util.Map.of(),
+                    structuredEnabled ? descriptions.sources() : List.of(), request);
+            PromptText system = promptService.reactSystemPromptText();
+            PromptText userMessage = preparation().userMessage(promptService.dynamicContextPrefixText(),
+                    promptService.planningTodosStageInstructionText(mode.name(), "", toolList, maxTodos),
+                    request.getUserGoal(), history);
+            PromptText singleStageBudgetNote = toolBudgetNote(request.getRunId());
+            if (!singleStageBudgetNote.text().isBlank()) {
                 // 单阶段路径没有 strategy 阶段，额度现状随 user message 一并给出。
-                userMessage += "\n\n" + singleStageBudgetNote;
+                userMessage = PromptText.concat(userMessage, PromptText.runtimeData("\n\n"), singleStageBudgetNote);
             }
+            List<PromptMessage> snapshot = List.of(PromptMessage.system(system), PromptMessage.user(userMessage));
+            AgentContext.StructuredOutputSpec spec = AgentContext.getStructuredOutputSpec();
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 // 每一次尝试单独建代理：模型要绑上这一轮的身份（夹具按调用身份发回合，身份里带尝试
                 // 序号），第二次尝试才会拿到脚本里为它声明的那一份回复，而不是重放第一份。
                 LangchainPlannerAiService service =
-                        dev.langchain4j.service.AiServices.builder(LangchainPlannerAiService.class)
+                        ManagedPromptAiServices.withSystemMessage(
+                                dev.langchain4j.service.AiServices.builder(LangchainPlannerAiService.class)
                                 .chatModel(planningModel(request, attempt, "single"))
-                                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
-                                .build();
-                try {
+                                .chatRequestTransformer(actual -> preparation().request(actual, snapshot, spec)), system).build();
+                try (ModelInputScope ignored = preparation().open(request.getPlanningEndpointName(), snapshot, spec)) {
                     beforePlanningModelCall(request, attempt, "single");
-                    LangchainTodoPlan plan = parseValidateTodoPlan(service.plan(userMessage), mode, maxTodos);
+                    LangchainTodoPlan plan = parseValidateTodoPlan(service.plan(userMessage.text()), mode, maxTodos);
                     log.info("[LangchainAiPlanner] runId={} legacy_single_stage_planning ok attempt={} todos={}",
                             nvl(request.getRunId()), attempt, plan.getItems().size());
                     return plan;
                 } catch (StructuredPlanningSupport.StructuredPlanningException e) {
+                    ModelSendBlocks.rethrowIfBlocked(e);
                     lastError = e;
                     log.warn("[LangchainAiPlanner] runId={} legacy planning attempt {} failed: {} {}",
                             nvl(request.getRunId()), attempt, e.category(), e.getMessage());
@@ -391,20 +392,31 @@ public class LangchainAiPlanner {
      * 根树计数——模型在规划时无论走哪条路径、运行冻结在哪个版本，看到的都是该版本的真实计数。
      * 读不到额度（无预算组件或快照为空）时返回空串，不附加任何额度文字。</p>
      */
-    private String toolBudgetNote(String runId) {
+    private PromptText toolBudgetNote(String runId) {
         if (rootTreeCallBudget == null) {
-            return "";
+            return PromptText.runtimeData("");
         }
         RootTreeCallBudget.ToolCallBudgetStatus status = rootTreeCallBudget.toolCallBudgetStatus(runId);
         if (status == null) {
-            return "";
+            return PromptText.runtimeData("");
         }
-        if (status.unlimited()) {
-            return "工具调用预算现状：" + status.scopeNote() + "不设工具调用次数上限。";
+        return preparation().budgetNote(status);
+    }
+
+    private ChatResponse chat(LangchainPlanningRequest request, int attempt, String phase, List<PromptMessage> snapshot) {
+        AgentContext.StructuredOutputSpec spec = AgentContext.getStructuredOutputSpec();
+        ChatRequest actual = preparation().request(ChatRequest.builder()
+                .messages(snapshot.stream().map(PromptMessage::message).toList()).build(), snapshot, spec);
+        try (ModelInputScope ignored = preparation().open(request.getPlanningEndpointName(), snapshot, spec)) {
+            beforePlanningModelCall(request, attempt, phase);
+            return planningModel(request, attempt, phase).chat(actual);
         }
-        return "工具调用预算现状：" + status.scopeNote() + "累计工具调用已用" + status.used()
-                + "次、上限" + status.limit() + "次、剩余" + status.remaining()
-                + "次；规划 Todo 数量与每步的工具调用时请考虑该预算。";
+    }
+
+    private PlanningPromptPreparation preparation() {
+        if (promptPreparation == null) throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "规划正文准备组件未配置");
+        return promptPreparation;
     }
 
     private static ChatModel planningModel(LangchainPlanningRequest request, int attempt, String phase) {
@@ -445,6 +457,7 @@ public class LangchainAiPlanner {
                                      String schemaName,
                                      boolean strict,
                                      java.util.Map<String, Object> schema,
+                                     List<PromptVersionSource> sources,
                                      LangchainPlanningRequest request) {
         if (!structuredEnabled) {
             AgentContext.clearStructuredOutputSpec();
@@ -455,7 +468,8 @@ public class LangchainAiPlanner {
                 strict,
                 schema,
                 structuredOutputSettings.requireProviderParameters(request.getPlanningEndpointName()),
-                structuredOutputSettings.allowProviderFallbacks()
+                structuredOutputSettings.allowProviderFallbacks(),
+                sources
         ));
     }
 
@@ -558,5 +572,10 @@ public class LangchainAiPlanner {
         } else {
             AgentContext.setStage(previousStage);
         }
+    }
+
+    private void restorePhase(String previousPhase) {
+        if (previousPhase == null || previousPhase.isBlank()) AgentContext.clearPhase();
+        else AgentContext.setPhase(previousPhase);
     }
 }
