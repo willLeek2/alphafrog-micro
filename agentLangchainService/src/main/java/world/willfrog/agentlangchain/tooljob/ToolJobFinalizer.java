@@ -1,6 +1,9 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import com.google.protobuf.util.JsonFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,6 +61,9 @@ public class ToolJobFinalizer {
     private final ToolJobConfig config;
     private final FinanceRecordChannelProcessor financeProcessor;
     private final FinanceRecordChannelConfigLoader configLoader;
+    @Autowired
+    private TerminalResultPromptTexts terminalPromptTexts;
+
     private final FinanceToolResultFormatter formatter;
     private final FinanceResultModelAdapter adapter;
     private final AgentRunMapper agentRunMapper;
@@ -130,11 +136,11 @@ public class ToolJobFinalizer {
         String toolName = anchor.getToolName();
         if (toolName == null || toolName.isBlank()) {
             // 旧版持久锚点没有工具名，原合同只支持 executePython。
-            return new PythonSandboxJobResultAdapter(formatter, adapter);
+            return new PythonSandboxJobResultAdapter(formatter, adapter, terminalPromptTexts);
         }
         return SandboxJobAdapterRegistry.find(toolName).map(bundle -> bundle.result())
                 .orElseGet(() -> ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(toolName)
-                        ? new PythonSandboxJobResultAdapter(formatter, adapter) : null);
+                        ? new PythonSandboxJobResultAdapter(formatter, adapter, terminalPromptTexts) : null);
     }
 
     // ========== public entry points ==========
@@ -166,6 +172,44 @@ public class ToolJobFinalizer {
             log.warn("拒绝由非所属部署代际处理工具终态: runId={}", runId);
             return FinalizerOutcome.incomplete("DEPLOYMENT_IDENTITY", "deployment_generation_inactive");
         }
+        if (isStepDone(anchor, STEP_ENVELOPE)) {
+            return handleTerminalPrepared(runId, anchor, terminalStatus, resultResp, autoResume);
+        }
+        var run = agentRunMapper == null ? null : agentRunMapper.findById(runId);
+        try (var context = BackgroundPromptContext.open(run, anchor.getTodoId(), anchor.getSequence(), anchor.getToolCallId())) {
+            if (run != null && !runId.equals(run.getId())) {
+                throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "background-run-context");
+            }
+            return handleTerminalPrepared(runId, anchor, terminalStatus, resultResp, autoResume);
+        } catch (RuntimeException failure) {
+            var blocked = ModelSendBlocks.find(failure).orElse(null);
+            if (blocked == null) throw failure;
+            // 模型正文不可交付，但已核验的沙箱终态仍须先落库再释放容量。
+            anchor.setAnchorState("TERMINAL");
+            anchor.setTerminalStatus(terminalStatus);
+            anchor.setSandboxTerminalStatus(terminalStatus);
+            if (anchor.getTerminalAt() == null) anchor.setTerminalAt(Instant.now());
+            if (resultResp != null) {
+                anchor.setTerminalRetryable(resultResp.hasRetryable() ? resultResp.getRetryable() : null);
+                anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
+                try {
+                    anchor.setTerminalUsageJson(JsonFormat.printer().omittingInsignificantWhitespace().print(resultResp.getResourceUsage()));
+                } catch (Exception encoding) {
+                    throw new IllegalStateException("terminal usage cannot be persisted", encoding);
+                }
+            }
+            world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.record(anchor, blocked);
+            anchor.setFinalizerStep(STEP_ENVELOPE);
+            if (!persistFinalizerAnchor(runId, anchor)) return FinalizerOutcome.incomplete(STEP_ENVELOPE, "cas_failed");
+            return handleTerminalPrepared(runId, anchor, terminalStatus, resultResp, autoResume);
+        }
+    }
+
+    private FinalizerOutcome handleTerminalPrepared(String runId, ToolJobAnchor anchor,
+                                                     String terminalStatus, TaskResultResponse resultResp,
+                                                     boolean autoResume) {
         // 同一轮收尾统一使用一个时间点，避免各字段在重入时产生互相矛盾的时间。
         Instant now = Instant.now();
         // 第一步：把 Sandbox 终态和有界结果摘要写入真相源。
@@ -211,6 +255,7 @@ public class ToolJobFinalizer {
                         stdout = formatContext.ordinaryStdout();
                         stderr = formatContext.ordinaryStderr();
                     } catch (RuntimeException e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
                         String reason = "SUCCEEDED".equals(terminalStatus)
                                 ? "finance_processing_failed" : "finance_demarker_failed";
                         log.warn("Finance terminal processing failed for run={} — will retry", runId, e);
@@ -229,25 +274,29 @@ public class ToolJobFinalizer {
                 boolean workspaceDirty = python && PythonSandboxJobResultAdapter.isWorkspaceDirty(
                         terminalStatus, resultResp);
                 Object resultContext = formatContext;
-                if (python && !resultAdapter.isSuccess(terminalView) && !workspaceDirty
+                if (python && !("SUCCEEDED".equals(terminalStatus) && resultResp.getExitCode() == 0) && !workspaceDirty
                         && !"RESULT_LOST".equals(terminalStatus)) {
                     // 普通脚本失败和取消保留原有提示；失败分类仍由共用结果适配器给出。
                     boolean retryable = resultResp.hasRetryable() && resultResp.getRetryable();
-                    resultContext = new FinanceToolResultFormatter.FailureDetail(
-                            resultAdapter.errorCodeOf(terminalView), "Sandbox " + terminalStatus, retryable,
-                            retryable ? "检查代码后重试" : "检查代码或联系管理员");
+                    if (terminalPromptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                            world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                            "background-terminal-policy");
+                    resultContext = FinanceToolResultFormatter.FailureDetail.withPrompts("", PromptText.runtimeData("Sandbox " + terminalStatus), retryable,
+                            terminalPromptTexts.instruction(retryable ? "backgroundRetryableFailureAction" : "backgroundNonRetryableFailureAction"));
                 }
-                SandboxJobResultAdapter.ResolvedResult resolved;
+                SandboxJobResultAdapter.ResolvedPromptResult resolved;
                 try {
-                    resolved = resultAdapter.resolveTerminal(terminalView, resultContext);
+                    resolved = resultAdapter.resolveTerminalText(terminalView, resultContext);
                 } catch (RuntimeException e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
                     // 格式化或金融投影失败不能留下已完成 ENVELOPE，后续仍以同一身份重试。
                     String reason = hasFinanceData ? "finance_processing_failed" : "result_formatting_failed";
                     anchor.setFinalizerError(reason);
                     persistFinalizerAnchor(runId, anchor);
                     return FinalizerOutcome.incomplete(STEP_ENVELOPE, reason);
                 }
-                String previewJson = resolved.output();
+                String previewJson = resolved.output().text();
+                anchor.setTerminalPromptSourcesJson(BackgroundPromptResults.encode(resolved.output()));
                 boolean success = resolved.success();
                 anchor.setTerminalBusinessSuccess(success);
                 anchor.setTerminalResultPreview(previewJson);
@@ -262,6 +311,7 @@ public class ToolJobFinalizer {
                     anchor.setTerminalUsageJson(JsonFormat.printer().omittingInsignificantWhitespace()
                             .print(resultResp.getResourceUsage()));
                 } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
                     log.warn("Failed to serialize resourceUsage for run={}", runId, e);
                 }
                 if (workspaceDirty || "RESULT_LOST".equals(terminalStatus)) {
@@ -276,12 +326,13 @@ public class ToolJobFinalizer {
                     persistFinalizerAnchor(runId, anchor);
                     return FinalizerOutcome.incomplete(STEP_ENVELOPE, "result_adapter_unavailable");
                 }
-                var lost = resultAdapter.resolveTerminal(new SandboxTerminalResultView(
+                var lost = resultAdapter.resolveTerminalText(new SandboxTerminalResultView(
                         terminalStatus, null, "", "", null, null, null, false, null, null), null);
                 anchor.setTerminalBusinessSuccess(false);
                 anchor.setTerminalRetryable(false);
                 anchor.setTerminalErrorCode(lost.errorCode());
-                anchor.setTerminalResultPreview(lost.output());
+                anchor.setTerminalResultPreview(lost.output().text());
+                anchor.setTerminalPromptSourcesJson(BackgroundPromptResults.encode(lost.output()));
             }
             // 先标记步骤，再连同 envelope 一起 CAS 写入，避免半步状态。
             anchor.setFinalizerStep(STEP_ENVELOPE);
@@ -304,7 +355,7 @@ public class ToolJobFinalizer {
         }
 
         // 兼容终态先落 ENVELOPE、稍后重新拉取才拿到 retryable 的协议情况。
-        if (anchor.getTerminalRetryable() == null && isStepDone(anchor, STEP_ENVELOPE)) {
+        if (anchor.getTerminalModelSendBlock() == null && anchor.getTerminalRetryable() == null && isStepDone(anchor, STEP_ENVELOPE)) {
             boolean backfilled = false;
             if (resultResp != null && resultResp.hasRetryable()) {
                 anchor.setTerminalRetryable(resultResp.getRetryable());
@@ -324,7 +375,7 @@ public class ToolJobFinalizer {
         }
 
         // 释放容量前必须有明确 retryable 分类；未知状态不能继续推进恢复。
-        if (anchor.getTerminalRetryable() == null) {
+        if (anchor.getTerminalModelSendBlock() == null && anchor.getTerminalRetryable() == null) {
             log.warn("terminalRetryable missing for run={}, fail-closed before RELEASE", runId);
             anchor.setFinalizerError("terminal_retryability_missing");
             persistFinalizerAnchor(runId, anchor);
@@ -380,12 +431,14 @@ public class ToolJobFinalizer {
         if (!autoResume) {
             if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                 // 原 DAG worker 已随旧进程消失；工具终态只用于收尾，不能生成 READY 或重跑 DAG。
-                anchor.setFinalizerError(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+                var sourceBlock = world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.read(anchor);
+                String failureCode = sourceBlock == null ? ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST : sourceBlock.code();
+                anchor.setFinalizerError(failureCode);
                 boolean failedAndCleared = anchorService.completeDagCleanupAndClear(
                         runId,
                         anchor.getOperationId(),
                         anchor.getBlockingOwnerId(),
-                        ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+                        failureCode);
                 if (!failedAndCleared) {
                     log.warn("DAG cleanup-only fail+clear CAS failed for run={}, operationId={}",
                             runId, anchor.getOperationId());
@@ -578,6 +631,7 @@ public class ToolJobFinalizer {
             finalizationService.publishFinalizedEvent(
                     runId, run.getUserId(), AgentRunStatus.CANCELED.name());
         } catch (RuntimeException e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Workspace finalization event failed after terminal CAS; polling will retry: "
                     + "runId={} status={} err={}",
                     runId, AgentRunStatus.CANCELED, e.getMessage(), e);
@@ -698,6 +752,7 @@ public class ToolJobFinalizer {
             // 把 RELEASED 写回数据库里的 anchor；否则重启恢复会从旧 PENDING/CONFIRMED 快照重新占用容量。
             return writeReleasedReservation(anchor, confirmed);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("releaseCapacity failed for reservation", e);
             return false;
         }
@@ -743,7 +798,8 @@ public class ToolJobFinalizer {
             if (estimate == null) return null;
             // success 只接受明确 SUCCEEDED，其他终态都按失败 envelope 处理。
             String status = anchor.getTerminalStatus();
-            boolean success = "SUCCEEDED".equals(status);
+            boolean success = anchor.getTerminalBusinessSuccess() != null
+                    ? anchor.getTerminalBusinessSuccess() : "SUCCEEDED".equals(status);
             String rawRef = anchor.getTerminalRawRef();
             String preview = boundedPreview(anchor.getTerminalResultPreview());
             String errorCode = anchor.getTerminalErrorCode();
@@ -761,10 +817,11 @@ public class ToolJobFinalizer {
                     reservation.identity().runId(), reservation.identity().toolCallId(),
                     reservation.identity().attempt(), reservation.operationId(), reservation.taskId(),
                     status, success, preview, rawRef, errorCode,
-                    success ? null : "sandbox " + status,
+                    success ? null : "SUCCEEDED".equals(status) ? "business failure: " + errorCode : "sandbox " + status,
                     Boolean.TRUE.equals(anchor.getTerminalRetryable()),
-                    estimate, reservation, usage, anchor.getTerminalAt(), true);
+                    estimate, reservation, usage, anchor.getTerminalAt(), true, anchor.getTerminalPromptSourcesJson());
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("buildEnvelope failed for reservationId={}, status={}",
                     reservation.reservationId(), anchor.getTerminalStatus(), e);
             return null;
@@ -784,6 +841,7 @@ public class ToolJobFinalizer {
         try {
             return objectMapper.readValue(estimateJson, DataAnalysisEstimate.class);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Failed to parse estimateJson", e);
             return null;
         }
@@ -832,6 +890,7 @@ public class ToolJobFinalizer {
         try {
             anchor.setEstimateJson(objectMapper.writeValueAsString(corrected));
         } catch (Exception serializationFailure) {
+            ModelSendBlocks.rethrowIfBlocked(serializationFailure);
             log.error("Failed to persist normalized legacy estimate for reservationId={}",
                     reservation.reservationId(), serializationFailure);
             return null;

@@ -105,7 +105,9 @@ class DualPoolWaitGroupNodeExecutorTest {
     private static final int GENERATION = 3;
     private static final String CLAIMANT = "worker-1";
 
-    private final AgentPromptService promptService = mock(AgentPromptService.class);
+    private final world.willfrog.agentlangchain.support.LangchainTestFixtures.VersionedNodeInputs promptFixture =
+            new world.willfrog.agentlangchain.support.LangchainTestFixtures.VersionedNodeInputs();
+    private final AgentPromptService promptService = promptFixture.prompts();
     private final LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
     private final FixtureRuleHitStore ruleHits = mock(FixtureRuleHitStore.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -118,20 +120,21 @@ class DualPoolWaitGroupNodeExecutorTest {
 
     @BeforeEach
     void setUp() {
+        AgentContext.setRunId(RUN_ID);
+        AgentContext.setUserId("user-1");
         store = new InMemoryWaitGroupStore();
         model = new ScriptedModel();
         dispatcher = new ScriptedDispatcher();
         publisher = new RecordingPublisher(store);
-        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher, publisher,
+        executor = promptFixture.configureDualPool(new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher, publisher,
                 objectMapper, TestSchedulerSettings.propertyOnly(
                         "agent.langchain.dual-pool.wait-group.max-members", "16"),
-                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits));
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        when(promptService.reactSystemPrompt()).thenReturn("系统提示");
-        when(promptService.dagReactStageInstruction(any())).thenReturn("阶段说明");
-        when(promptService.dynamicContextPrefix()).thenReturn("上下文");
-        when(promptService.renderToolCapabilities(any())).thenReturn("工具能力");
     }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearContext() { AgentContext.clear(); }
 
     // ==================== 完成与失败 ====================
 
@@ -141,6 +144,8 @@ class DualPoolWaitGroupNodeExecutorTest {
     void immediatePythonRefusalKeepsItsFullFailureThroughTheRealDispatchChain(String errorCode) throws Exception {
         // 真工具生成拒绝正文，真路由器判定 ok=false；只替换数据库、风险评估与远端 RPC 边界。
         PythonSandboxTools pythonTools = spy(new PythonSandboxTools(objectMapper));
+        ReflectionTestUtils.setField(pythonTools, "promptTexts", new world.willfrog.agent.tools.prompt.ProducerPromptTexts(promptFixture.reader()));
+        ReflectionTestUtils.setField(pythonTools, "terminalPromptTexts", new world.willfrog.agent.platform.prompt.TerminalResultPromptTexts(promptFixture.reader()));
         PythonSandboxService sandbox = mock(PythonSandboxService.class);
         AgentRunMapper runs = mock(AgentRunMapper.class);
         AgentRun run = new AgentRun();
@@ -165,10 +170,11 @@ class DualPoolWaitGroupNodeExecutorTest {
         }
         AtomicReference<String> originalOutput = new AtomicReference<>();
         doAnswer(invocation -> {
-            String output = (String) invocation.callRealMethod();
-            originalOutput.set(output);
+            world.willfrog.alphafrogmicro.common.racing.prompt.PromptText output =
+                    (world.willfrog.alphafrogmicro.common.racing.prompt.PromptText) invocation.callRealMethod();
+            originalOutput.set(output.text());
             return output;
-        }).when(pythonTools).executePython(any(), any(), any(), any(), any());
+        }).when(pythonTools).executePythonPrompt(any(), any(), any(), any(), any());
 
         AgentLlmLocalConfigLoader config = mock(AgentLlmLocalConfigLoader.class);
         when(config.current()).thenReturn(Optional.empty());
@@ -182,18 +188,21 @@ class DualPoolWaitGroupNodeExecutorTest {
         ToolRouter router = new ToolRouter(null, null, null, pythonTools, null, null, null, null,
                 null, properties, cache, null, mock(AgentRunObservabilityService.class),
                 objectMapper, meters, new StressTestProperties());
+        ReflectionTestUtils.setField(router, "promptPreparation",
+                new world.willfrog.agent.tools.router.ToolRouterPromptPreparation(promptFixture.reader(), objectMapper));
         ToolRouterToolExecutor toolExecutor = new ToolRouterToolExecutor(router, objectMapper,
                 mock(AgentRunEventService.class), new LangchainToolConcurrencyThrottle(false, 20, 60),
-                mock(PythonSandboxDispatchStore.class));
+                mock(PythonSandboxDispatchStore.class),
+                new world.willfrog.agentlangchain.tools.ToolExecutorPromptPreparation(promptFixture.reader(), objectMapper));
         ToolSpecification spec = ToolSpecification.builder().name("executePython").build();
         ToolProvider provider = request -> new ToolProviderResult(Map.of(spec, toolExecutor));
         ObjectProvider<ToolProvider> providers = mock(ObjectProvider.class);
         when(providers.getIfAvailable()).thenReturn(provider);
         LangchainNodeToolDispatcher actualDispatcher = new LangchainNodeToolDispatcher(providers, objectMapper);
-        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, actualDispatcher, publisher,
+        executor = promptFixture.configureDualPool(new DualPoolWaitGroupNodeExecutor(promptService, guard, store, actualDispatcher, publisher,
                 objectMapper, TestSchedulerSettings.propertyOnly(
                         "agent.langchain.dual-pool.wait-group.max-members", "16"),
-                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits));
         model.enqueue(AiMessage.from(List.of(toolCall("python-refusal", "executePython",
                 "{\"code\":\"print(1)\"}"))));
 
@@ -1040,10 +1049,10 @@ class DualPoolWaitGroupNodeExecutorTest {
         when(bridge.availableForRun(RUN_ID)).thenReturn(true);
         when(bridge.reserveSpawn(any())).thenReturn(PersistentSubAgentToolBridge.ReservationOutcome.RESERVED);
         when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
-        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher,
+        executor = promptFixture.configureDualPool(new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher,
                 bridgeProvider, transactions, publisher, objectMapper, TestSchedulerSettings.propertyOnly(
                 "agent.langchain.dual-pool.wait-group.max-members", "16"),
-                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits));
         dispatcher.subAgentOperationId = true;
         dispatcher.beforeDispatch = () -> verify(bridge).reserveSpawn(any());
         model.enqueue(AiMessage.from(List.of(toolCall("call-child", "spawnSubAgent",
@@ -1069,10 +1078,10 @@ class DualPoolWaitGroupNodeExecutorTest {
         when(bridgeProvider.getIfAvailable()).thenReturn(bridge);
         when(bridge.availableForRun(RUN_ID)).thenReturn(true);
         when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
-        executor = new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher,
+        executor = promptFixture.configureDualPool(new DualPoolWaitGroupNodeExecutor(promptService, guard, store, dispatcher,
                 bridgeProvider, transactions, publisher, objectMapper, TestSchedulerSettings.propertyOnly(
                 "agent.langchain.dual-pool.wait-group.max-members", "16"),
-                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits);
+                1024 * 1024, 2000L, new FrozenEffectiveSettings(), ruleHits));
         ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
         doThrow(new RunBudgetException("tool_calls", 1, 1, false))
                 .when(budget).beforeToolCall(eq(RUN_ID), anyLong(), any());
@@ -1136,7 +1145,8 @@ class DualPoolWaitGroupNodeExecutorTest {
 
     private Long completeMember(long groupId, String toolCallId, String output) {
         String resultJson = WaitMemberResultPayload.encode(objectMapper, toolCallId, toolCallId, true,
-                output, Map.of(), 1024 * 1024);
+                output, world.willfrog.agent.platform.input.PromptMessageCodec.sourceAttributes(
+                        world.willfrog.agent.platform.input.PromptMessage.Origin.RUNTIME_DATA, List.of()), 1024 * 1024);
         return store.completeMember(new MemberCompletionRequest(groupId, toolCallId,
                 WaitMemberState.SUCCEEDED, resultJson, null, GENERATION, 0L, 0L)).notificationId();
     }
@@ -1258,6 +1268,7 @@ class DualPoolWaitGroupNodeExecutorTest {
                         .userId("user-1")
                         .userGoal("把这件事做完")
                         .executionModel(segmentModel)
+                        .executionEndpointName(world.willfrog.agentlangchain.support.LangchainTestFixtures.NODE_ENDPOINT)
                         .acceptanceReleasePolicy(releasePolicy)
                         .toolSpecifications(new ArrayList<>(specifications))
                         .build(),
@@ -1280,7 +1291,8 @@ class DualPoolWaitGroupNodeExecutorTest {
                         .runId(RUN_ID)
                         .userId("user-1")
                         .userGoal("把这件事做完")
-                        .executionModel(model)
+                        .executionModel(world.willfrog.agentlangchain.support.LangchainTestFixtures.archivedNodeModel(model))
+                        .executionEndpointName(world.willfrog.agentlangchain.support.LangchainTestFixtures.NODE_ENDPOINT)
                         .acceptanceReleasePolicy(releasePolicy)
                         .toolSpecifications(new ArrayList<>(specifications))
                         .build(),
@@ -1355,8 +1367,9 @@ class DualPoolWaitGroupNodeExecutorTest {
             if (outcome != null) {
                 return outcome;
             }
-            return new DispatchOutcome.Completed(
-                    outputs.getOrDefault(request.toolName(), "结果:" + request.toolName()));
+            String output = outputs.getOrDefault(request.toolName(), "结果:" + request.toolName());
+            return new DispatchOutcome.Completed(output,
+                    world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(output));
         }
 
         @Override

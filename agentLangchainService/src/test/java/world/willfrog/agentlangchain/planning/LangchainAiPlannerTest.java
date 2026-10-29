@@ -23,8 +23,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class LangchainAiPlannerTest {
+    @org.junit.jupiter.api.AfterEach
+    void clearVersionedRunContext() { world.willfrog.agent.platform.context.AgentContext.clear(); }
 
-    private final LangchainAiPlanner planner = LangchainTestFixtures.planner();
+    @org.junit.jupiter.api.BeforeEach
+    void prepareVersionedRunContext() {
+        world.willfrog.agent.platform.context.AgentContext.setRunId("fixture-current-run");
+    }
+
+
+    private final LangchainAiPlanner planner = LangchainTestFixtures.versionedPlanner();
 
     @Test
     void plan_shouldSetStructuredOutputSpecWhileCallingModel() {
@@ -40,10 +48,11 @@ class LangchainAiPlannerTest {
                 }
                 """);
 
-        LangchainTestFixtures.planner().plan(LangchainPlanningRequest.builder()
+        LangchainTestFixtures.versionedPlanner().plan(LangchainPlanningRequest.builder()
                 .runId("run-structured")
                 .userGoal("分析沪深300")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build());
 
         assertThat(model.structuredOutputSeen).containsExactly(true, true);
@@ -73,13 +82,15 @@ class LangchainAiPlannerTest {
                 }
                 """);
 
-        LangchainTodoPlan plan = LangchainTestFixtures.legacySingleStagePlanner().plan(
+        LangchainTodoPlan plan = LangchainTestFixtures.versionedPlanner(LangchainTestFixtures.legacySingleStageLlmProperties()).plan(
                 LangchainPlanningRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析沪深300近一年走势")
                 .dialogueContext("无")
-                .model(model)
+                .dialogueContextPrompt(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("无"))
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .toolSpecifications(ToolSpecifications.toolSpecificationsFrom(new DemoTools()))
                 .executionMode(PlanExecutionMode.DAG)
                 .maxTodos(5)
@@ -117,7 +128,8 @@ class LangchainAiPlannerTest {
         LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                 .runId("run-forced-linear")
                 .userGoal("分析数据")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .executionMode(PlanExecutionMode.LINEAR)
                 .maxTodos(5)
                 .build());
@@ -145,7 +157,8 @@ class LangchainAiPlannerTest {
         planner.plan(LangchainPlanningRequest.builder()
                 .runId("run-no-tools")
                 .userGoal("整理现有信息")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .toolSpecifications(List.of())
                 .executionMode(PlanExecutionMode.LINEAR)
                 .maxTodos(3)
@@ -179,7 +192,8 @@ class LangchainAiPlannerTest {
         LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                 .runId("run-linear-dag-shape")
                 .userGoal("分析数据")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .executionMode(PlanExecutionMode.LINEAR)
                 .maxTodos(5)
                 .build());
@@ -206,10 +220,11 @@ class LangchainAiPlannerTest {
                 {"analysis":"empty","items":[],"extractedEntities":[]}
                 """);
 
-        assertThatThrownBy(() -> LangchainTestFixtures.legacySingleStagePlanner().plan(
+        assertThatThrownBy(() -> LangchainTestFixtures.versionedPlanner(LangchainTestFixtures.legacySingleStageLlmProperties()).plan(
                 LangchainPlanningRequest.builder()
                 .userGoal("hello")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("planning_retry_exhausted")
@@ -228,7 +243,8 @@ class LangchainAiPlannerTest {
         assertThatThrownBy(() -> planner(properties).plan(LangchainPlanningRequest.builder()
                 .runId("run-retry-config")
                 .userGoal("分析数据")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("planning_retry_exhausted");
@@ -287,12 +303,7 @@ class LangchainAiPlannerTest {
     }
 
     private static LangchainAiPlanner planner(AgentLlmProperties properties) {
-        ObjectMapper objectMapper = new ObjectMapper();
-        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(objectMapper);
-        return new LangchainAiPlanner(
-                new AgentPromptService(properties, loader),
-                new LangchainPlanningStructuredOutputSettings(properties, loader),
-                objectMapper);
+        return LangchainTestFixtures.versionedPlanner(properties);
     }
 
     static class DemoTools {

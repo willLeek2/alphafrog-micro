@@ -1,0 +1,14 @@
+{
+  "fragment": "marketCbNoDailyDataAdvice",
+  "purpose": "marketCbNoDailyDataAdvice",
+  "bodyType": "FIXED",
+  "body": "该可转债在指定日期范围内无日线记录，请检查代码或调整起止日期。",
+  "variables": [],
+  "utf8Sha256": "05df386864e16ce3b4730fee725977be354ca4f04242e6749f1f768c70553892",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataSpecialAssetTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

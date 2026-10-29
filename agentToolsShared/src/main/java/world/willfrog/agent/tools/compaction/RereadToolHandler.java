@@ -12,8 +12,13 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.tools.docs.DocumentToolPromptPreparation;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Objects;
 import java.util.Map;
 import java.util.Optional;
 
@@ -30,6 +35,8 @@ public class RereadToolHandler {
     private final ObjectMapper objectMapper;
     private final Optional<AgentLlmLocalConfigLoader> localConfigLoader;
     private final Optional<RunRawRefStore> runRawRefStore;
+    @Autowired
+    private DocumentToolPromptPreparation promptPreparation;
 
     public RereadToolHandler(ToolOutputRefService toolOutputRefService, ObjectMapper objectMapper) {
         this(toolOutputRefService, objectMapper, Optional.empty(), Optional.empty());
@@ -59,12 +66,16 @@ public class RereadToolHandler {
             @P(value = "可选读取偏移，默认 0", required = false) Integer offset,
             @P(value = "可选读取长度，0 表示使用服务默认", required = false) Integer limit
     ) {
-        return reread(rawRef, keyword, offset, limit);
+        return rereadToolResultPrompt(rawRef, keyword, offset, limit).text();
     }
 
     public String reread(String rawRef, String keyword, Integer offset, Integer limit) {
+        return rereadToolResultPrompt(rawRef, keyword, offset, limit).text();
+    }
+
+    public PromptText rereadToolResultPrompt(String rawRef, String keyword, Integer offset, Integer limit) {
         if (rawRef == null || rawRef.isBlank()) {
-            return fail("INVALID_ARGUMENT", "rawRef is required", Map.of());
+            return fail("INVALID_ARGUMENT", "rawRef is required", Map.of(), List.of());
         }
         int safeOffset = offset == null ? 0 : Math.max(0, offset);
         int safeLimit = limit == null ? 0 : Math.max(0, limit);
@@ -73,37 +84,33 @@ public class RereadToolHandler {
             int maxRangeLimit = effectiveRangeMaxLimit();
             int effectiveLimit = safeLimit <= 0 ? effectiveRereadMaxLimit() : safeLimit;
             if (effectiveLimit < minUsefulLimit) {
-                return fail("LIMIT_TOO_SMALL_WITHOUT_KEYWORD",
-                        "rereadToolResult without keyword must use configured minimum range limit, or provide keyword for filtered reread",
-                        Map.of(
-                                "requestedLimit", safeLimit,
-                                "effectiveLimit", effectiveLimit,
-                                "minimumInclusive", minUsefulLimit,
-                                "hint", "Set keyword for grep-style filtering, or set limit >= " + minUsefulLimit
-                        ));
+                PromptText message = policy("rereadRangeTooSmallMessage", Map.of());
+                PromptText hint = policy("rereadRangeTooSmallHint", Map.of("minimumInclusive", String.valueOf(minUsefulLimit)));
+                return fail("LIMIT_TOO_SMALL_WITHOUT_KEYWORD", message.text(),
+                        Map.of("requestedLimit", safeLimit, "effectiveLimit", effectiveLimit,
+                                "minimumInclusive", minUsefulLimit, "hint", hint.text()),
+                        PromptText.concat(message, hint).sources());
             }
             if (effectiveLimit > maxRangeLimit) {
-                return fail("LIMIT_TOO_LARGE_WITHOUT_KEYWORD",
-                        "rereadToolResult without keyword must not exceed configured range max limit",
-                        Map.of(
-                                "requestedLimit", effectiveLimit,
-                                "maximumInclusive", maxRangeLimit
-                        ));
+                PromptText message = policy("rereadRangeTooLargeMessage", Map.of());
+                return fail("LIMIT_TOO_LARGE_WITHOUT_KEYWORD", message.text(),
+                        Map.of("requestedLimit", effectiveLimit, "maximumInclusive", maxRangeLimit), message.sources());
             }
         } else {
             int kwMax = effectiveKeywordMaxLimit();
             int effectiveLimit = safeLimit <= 0 ? kwMax : safeLimit;
             if (effectiveLimit > kwMax) {
-                return fail("LIMIT_TOO_LARGE_WITH_KEYWORD",
-                        "rereadToolResult keyword mode limit must not exceed configured keyword max limit",
-                        Map.of(
-                                "requestedLimit", safeLimit,
-                                "maximumInclusive", kwMax
-                        ));
+                PromptText message = policy("rereadKeywordTooLargeMessage", Map.of());
+                return fail("LIMIT_TOO_LARGE_WITH_KEYWORD", message.text(),
+                        Map.of("requestedLimit", safeLimit, "maximumInclusive", kwMax), message.sources());
             }
             safeLimit = effectiveLimit;
         }
         ToolOutputReadResult read = readRawRef(rawRef, safeOffset, safeLimit, keyword);
+        if (read == null || read.getContentPrompt() == null
+                || !Objects.equals(read.getContent(), read.getContentPrompt().text())) {
+            throw DocumentToolPromptPreparation.missing("工具旧输出缺少与本次片段一致的原指令来源");
+        }
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("rawRef", rawRef);
         data.put("content", read.getContent());
@@ -113,7 +120,7 @@ public class RereadToolHandler {
         if (keyword != null && !keyword.isBlank()) {
             data.put("keyword", keyword);
         }
-        return ok(data);
+        return ok(data, read.getContentPrompt().sources());
     }
 
     private ToolOutputReadResult readRawRef(String rawRef, int offset, int limit, String keyword) {
@@ -124,22 +131,29 @@ public class RereadToolHandler {
             // 空白或不匹配的 userId 会在 registry.readContentStrict 处 fail-closed 拒绝。
             return runRawRefStore.get().read(runId, AgentContext.getUserId(), rawRef, offset, limit, keyword);
         }
-        return toolOutputRefService.read(rawRef, offset, limit, keyword);
+        return toolOutputRefService.read(runId, AgentContext.getUserId(), rawRef, offset, limit, keyword);
     }
 
     private boolean isShortRawRef(String rawRef) {
         return rawRef != null && rawRef.matches("raw_ref_\\d{3}");
     }
 
-    private String ok(Map<String, Object> data) {
+    private PromptText policy(String fragment, Map<String, String> values) {
+        if (promptPreparation == null) {
+            throw DocumentToolPromptPreparation.missing("工具重读建议缺少原根正文读取组件");
+        }
+        return promptPreparation.policy(fragment, values);
+    }
+
+    private PromptText ok(Map<String, Object> data, List<PromptVersionSource> sources) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
         payload.put("tool", "rereadToolResult");
         payload.put("data", data);
-        return writeJson(payload);
+        return DocumentToolPromptPreparation.envelope(objectMapper, payload, sources);
     }
 
-    private String fail(String code, String message, Map<String, Object> details) {
+    private PromptText fail(String code, String message, Map<String, Object> details, List<PromptVersionSource> sources) {
         Map<String, Object> err = new LinkedHashMap<>();
         err.put("code", code);
         err.put("message", message);
@@ -150,15 +164,7 @@ public class RereadToolHandler {
         payload.put("tool", "rereadToolResult");
         payload.put("data", Map.of());
         payload.put("error", err);
-        return writeJson(payload);
-    }
-
-    private String writeJson(Map<String, Object> payload) {
-        try {
-            return objectMapper.writeValueAsString(payload);
-        } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"rereadToolResult\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\"serialize failed\"}}";
-        }
+        return DocumentToolPromptPreparation.envelope(objectMapper, payload, sources);
     }
 
     private int effectiveResultMaxStringLength() {

@@ -86,10 +86,10 @@ class ToolJobFinalizerFinanceRecordTest {
                 List.<FinanceToolResultFormatter.FinanceModelResult>of(modelResult),
                 List.<FinanceRecordExtractionResult.ModelNotice>of(notice));
         when(adapter.project(extraction)).thenReturn(projectedBatch);
-        when(formatter.formatSuccess(eq("rows=5\nTotal return=0.1247\n"),
+        when(formatter.formatSuccessText(eq("rows=5\nTotal return=0.1247\n"),
                 eq(List.<FinanceToolResultFormatter.FinanceModelResult>of(modelResult)),
                 eq(List.<FinanceRecordExtractionResult.ModelNotice>of(notice))))
-                .thenReturn(SUCCESS_JSON);
+                .thenReturn(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(SUCCESS_JSON));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -119,7 +119,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         verify(processor).process(any());
         verify(adapter).project(extraction);
-        verify(formatter).formatSuccess(eq("rows=5\nTotal return=0.1247\n"),
+        verify(formatter).formatSuccessText(eq("rows=5\nTotal return=0.1247\n"),
                 eq(List.<FinanceToolResultFormatter.FinanceModelResult>of(modelResult)),
                 eq(List.<FinanceRecordExtractionResult.ModelNotice>of(notice)));
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(SUCCESS_JSON);
@@ -147,10 +147,10 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchor(eq("run-pe"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
-                processor, configLoader, formatter, mock(FinanceResultModelAdapter.class));
+                processor, configLoader, formatter, mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
 
@@ -176,15 +176,15 @@ class ToolJobFinalizerFinanceRecordTest {
         // Must NOT call updateAnchorAndStatus (ENVELOPE not advanced)
         verify(anchorService, never()).updateAnchorAndStatus(any(), any(), any(), any());
         // Formatter must not be called
-        verify(formatter, never()).formatSuccess(any(), any(), any());
+        verify(formatter, never()).formatSuccessText(any(), any(), any());
     }
 
     /** SUCCEEDED no finance → formatSuccess with raw stdout, no processor call. */
     @Test
     void succeededNoFinance_shouldUseFormatterDirectly() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatSuccess(eq("rows=5\n"), eq(List.of()), eq(List.of())))
-                .thenReturn(SUCCESS_JSON);
+        when(formatter.formatSuccessText(eq("rows=5\n"), eq(List.of()), eq(List.of())))
+                .thenReturn(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(SUCCESS_JSON));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-2"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -192,11 +192,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchorAndStatus(eq("run-2"), any(),
                 eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
         inject(finalizer, "formatter", formatter);
@@ -212,7 +212,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         finalizer.handleTerminal("run-2", anchor, "SUCCEEDED", resp, false);
 
-        verify(formatter).formatSuccess(eq("rows=5\n"), eq(List.of()), eq(List.of()));
+        verify(formatter).formatSuccessText(eq("rows=5\n"), eq(List.of()), eq(List.of()));
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(SUCCESS_JSON);
     }
 
@@ -220,7 +220,7 @@ class ToolJobFinalizerFinanceRecordTest {
     @Test
     void failedNoFinance_shouldUseFailureFormatter() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatFailure(eq("Traceback..."), eq(""), any())).thenReturn(FAILURE_JSON);
+        when(formatter.formatFailureText(eq("Traceback..."), eq(""), any())).thenAnswer(call -> ToolJobPromptTestFixture.instructionResult(FAILURE_JSON, "backgroundRetryableFailureAction"));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-3"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -228,11 +228,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchorAndStatus(eq("run-3"), any(),
                 eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
         inject(finalizer, "formatter", formatter);
@@ -248,7 +248,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         finalizer.handleTerminal("run-3", anchor, "FAILED", resp, false);
 
-        verify(formatter).formatFailure(eq("Traceback..."), eq(""), argThat(f ->
+        verify(formatter).formatFailureText(eq("Traceback..."), eq(""), argThat(f ->
                 "PYTHON_EXECUTION_FAILED".equals(f.code()) && f.retryable()));
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(FAILURE_JSON);
     }
@@ -257,7 +257,7 @@ class ToolJobFinalizerFinanceRecordTest {
     @Test
     void canceledNoFinance_shouldUseCanceledFailureCode() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatFailure(eq(""), eq(""), any())).thenReturn(FAILURE_JSON);
+        when(formatter.formatFailureText(eq(""), eq(""), any())).thenAnswer(call -> ToolJobPromptTestFixture.instructionResult(FAILURE_JSON, "backgroundRetryableFailureAction"));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-c"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -265,11 +265,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchorAndStatus(eq("run-c"), any(),
                 eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
         inject(finalizer, "formatter", formatter);
@@ -285,7 +285,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         finalizer.handleTerminal("run-c", anchor, "CANCELED", resp, false);
 
-        verify(formatter).formatFailure(eq(""), eq(""), argThat(f ->
+        verify(formatter).formatFailureText(eq(""), eq(""), argThat(f ->
                 "PYTHON_EXECUTION_CANCELED".equals(f.code()) && !f.retryable()));
     }
 
@@ -293,25 +293,25 @@ class ToolJobFinalizerFinanceRecordTest {
     @Test
     void resultLost_shouldUseLostFailureFormatter() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatFailure(eq(""), eq(""), argThat(f ->
-                "PYTHON_RESULT_LOST".equals(f.code())))).thenReturn(RESULT_LOST_JSON);
+        when(formatter.formatFailureText(eq(""), eq(""), argThat(f ->
+                "PYTHON_RESULT_LOST".equals(f.code())))).thenAnswer(call -> ToolJobPromptTestFixture.instructionResult(RESULT_LOST_JSON, "pythonResultLostAction"));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-rl"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "formatter", formatter);
 
         ToolJobAnchor anchor = basicAnchor("run-rl", "tc-rl", 1, "task-rl", false);
 
         finalizer.handleTerminal("run-rl", anchor, "RESULT_LOST", null, false);
 
-        verify(formatter).formatFailure(eq(""), eq(""), argThat(f ->
+        verify(formatter).formatFailureText(eq(""), eq(""), argThat(f ->
                 "PYTHON_RESULT_LOST".equals(f.code()) && !f.retryable()
                 && "重新提交计算任务".equals(f.action())));
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(RESULT_LOST_JSON);
@@ -331,7 +331,7 @@ class ToolJobFinalizerFinanceRecordTest {
         FinanceRecordExtractionResult extraction = new FinanceRecordExtractionResult(
                 null, List.of(), "clean stdout", "", List.of(), false);
         when(processor.process(any())).thenReturn(extraction);
-        when(formatter.formatFailure(eq("clean stdout"), eq(""), any())).thenReturn(FAILURE_JSON);
+        when(formatter.formatFailureText(eq("clean stdout"), eq(""), any())).thenAnswer(call -> ToolJobPromptTestFixture.instructionResult(FAILURE_JSON, "backgroundRetryableFailureAction"));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-fm"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -356,7 +356,7 @@ class ToolJobFinalizerFinanceRecordTest {
         finalizer.handleTerminal("run-fm", anchor, "FAILED", resp, false);
 
         verify(processor).process(any());
-        verify(formatter).formatFailure(eq("clean stdout"), eq(""), any());
+        verify(formatter).formatFailureText(eq("clean stdout"), eq(""), any());
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(FAILURE_JSON);
     }
 
@@ -370,11 +370,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchor(eq("run-fc"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 processor, mock(FinanceRecordChannelConfigLoader.class),
-                formatter, mock(FinanceResultModelAdapter.class));
+                formatter, mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
 
@@ -396,7 +396,7 @@ class ToolJobFinalizerFinanceRecordTest {
                 "finance_snapshot_missing".equals(a.getFinalizerError())),
                 eq(AgentRunStatus.WAITING_TOOL_JOB));
         verify(processor, never()).process(any());
-        verify(formatter, never()).formatSuccess(any(), any(), any());
+        verify(formatter, never()).formatSuccessText(any(), any(), any());
     }
 
     /** ENVELOPE reentry → processor + formatter called twice (idempotent). */
@@ -413,7 +413,7 @@ class ToolJobFinalizerFinanceRecordTest {
         FinanceRecordExtractionResult extraction = new FinanceRecordExtractionResult(
                 null, List.of(), "de-markered", "", List.of(), true);
         when(processor.process(any())).thenReturn(extraction);
-        when(formatter.formatSuccess(any(), any(), any())).thenReturn(SUCCESS_JSON);
+        when(formatter.formatSuccessText(any(), any(), any())).thenReturn(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(SUCCESS_JSON));
 
         FinanceResultModelAdapter reAdapter = mock(FinanceResultModelAdapter.class);
         when(reAdapter.project(any())).thenReturn(
@@ -446,13 +446,13 @@ class ToolJobFinalizerFinanceRecordTest {
         // First: CAS fails
         finalizer.handleTerminal("run-re", anchor, "SUCCEEDED", resp, false);
         verify(processor, times(1)).process(any());
-        verify(formatter, times(1)).formatSuccess(any(), any(), any());
+        verify(formatter, times(1)).formatSuccessText(any(), any(), any());
 
         // Second: fresh anchor reload → succeeds
         anchor.setFinalizerStep(null);
         finalizer.handleTerminal("run-re", anchor, "SUCCEEDED", resp, false);
         verify(processor, times(2)).process(any());
-        verify(formatter, times(2)).formatSuccess(any(), any(), any());
+        verify(formatter, times(2)).formatSuccessText(any(), any(), any());
         verify(anchorService).cancelFromStatuses(eq("run-re"), any(),
                 eq(AgentRunStatus.CANCELED));
     }
@@ -461,8 +461,8 @@ class ToolJobFinalizerFinanceRecordTest {
     @Test
     void succeededNoFinance_shouldCallFormatSuccessWithRawStdout() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatSuccess(eq("plain output\n"), eq(List.of()), eq(List.of())))
-                .thenReturn(SUCCESS_JSON);
+        when(formatter.formatSuccessText(eq("plain output\n"), eq(List.of()), eq(List.of())))
+                .thenReturn(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(SUCCESS_JSON));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-nf"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -470,11 +470,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchorAndStatus(eq("run-nf"), any(),
                 eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                formatter, mock(FinanceResultModelAdapter.class));
+                formatter, mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
 
@@ -489,7 +489,7 @@ class ToolJobFinalizerFinanceRecordTest {
 
         finalizer.handleTerminal("run-nf", anchor, "SUCCEEDED", resp, false);
 
-        verify(formatter).formatSuccess(eq("plain output\n"), eq(List.of()), eq(List.of()));
+        verify(formatter).formatSuccessText(eq("plain output\n"), eq(List.of()), eq(List.of()));
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(SUCCESS_JSON);
     }
 
@@ -502,11 +502,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchor(eq("run-fs"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                formatter, mock(FinanceResultModelAdapter.class));
+                formatter, mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
 
@@ -529,15 +529,15 @@ class ToolJobFinalizerFinanceRecordTest {
         verify(anchorService).updateAnchor(eq("run-fs"), argThat(a ->
                 "finance_snapshot_missing".equals(a.getFinalizerError())),
                 eq(AgentRunStatus.WAITING_TOOL_JOB));
-        verify(formatter, never()).formatFailure(any(), any(), any());
+        verify(formatter, never()).formatFailureText(any(), any(), any());
     }
 
     /** FAILED with stderr containing markers → markers stripped before formatFailure. */
     @Test
     void failedWithMarkersInStderr_shouldStripMarkers() throws Exception {
         FinanceToolResultFormatter formatter = mock(FinanceToolResultFormatter.class);
-        when(formatter.formatFailure(eq("Traceback..."), eq("clean stderr\n"), any()))
-                .thenReturn(FAILURE_JSON);
+        when(formatter.formatFailureText(eq("Traceback..."), eq("clean stderr\n"), any()))
+                .thenAnswer(call -> ToolJobPromptTestFixture.instructionResult(FAILURE_JSON, "backgroundRetryableFailureAction"));
 
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-sm"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
@@ -545,11 +545,11 @@ class ToolJobFinalizerFinanceRecordTest {
         when(anchorService.updateAnchorAndStatus(eq("run-sm"), any(),
                 eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
                 mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class),
-                formatter, mock(FinanceResultModelAdapter.class));
+                formatter, mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook());
         inject(finalizer, "eventHook", eventHook());
 
@@ -567,7 +567,7 @@ class ToolJobFinalizerFinanceRecordTest {
         finalizer.handleTerminal("run-sm", anchor, "FAILED", resp, false);
 
         // formatFailure must receive stderr WITHOUT the marker line（新剥离逻辑保留原始行结构含尾换行）
-        verify(formatter).formatFailure(eq("Traceback..."), eq("clean stderr\n"), any());
+        verify(formatter).formatFailureText(eq("Traceback..."), eq("clean stderr\n"), any());
         assertThat(anchor.getTerminalResultPreview()).isEqualTo(FAILURE_JSON);
     }
 
@@ -579,10 +579,10 @@ class ToolJobFinalizerFinanceRecordTest {
             FinanceRecordChannelConfigLoader configLoader,
             FinanceToolResultFormatter formatter,
             FinanceResultModelAdapter adapter) throws Exception {
-        ToolJobFinalizer f = new ToolJobFinalizer(anchorService,
+        ToolJobFinalizer f = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService,
                 mock(ToolJobRedisCache.class), mock(DataAnalysisCapacityService.class),
                 mock(ToolJobResumeService.class), mock(ToolJobConfig.class),
-                processor, configLoader, formatter, adapter);
+                processor, configLoader, formatter, adapter));
         inject(f, "usageHook", usageHook());
         inject(f, "eventHook", eventHook());
         return f;

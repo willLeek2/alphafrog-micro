@@ -35,6 +35,12 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
     }
 
     @Override
+    public String registerPrompt(String runId, String userId, String displayName,
+                                 world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content, long ttlSeconds) {
+        return localStore.registerPrompt(runId, userId, displayName, content, ttlSeconds, true);
+    }
+
+    @Override
     public String read(String runId, String userId, String shortId) {
         return localStore.read(runId, userId, shortId);
     }
@@ -42,7 +48,8 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
     @Override
     public ToolOutputReadResult read(String runId, String userId, String shortId,
                                      int offset, int limit, String keyword) {
-        String content = localStore.read(runId, userId, shortId);
+        ToolOutputReadResult original = localStore.readWithSources(runId, userId, shortId);
+        String content = original.getContent();
         String source = filterByKeyword(content, keyword);
         int total = source.length();
         int safeOffset = Math.max(0, Math.min(offset, total));
@@ -50,6 +57,9 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
         int end = Math.min(total, safeOffset + capped);
         return ToolOutputReadResult.builder()
                 .content(source.substring(safeOffset, end))
+                .contentPrompt(original.getContentPrompt() == null ? null
+                        : new world.willfrog.alphafrogmicro.common.racing.prompt.PromptText(
+                                source.substring(safeOffset, end), original.getContentPrompt().sources()))
                 .hasMore(end < total)
                 .nextOffset(end)
                 .totalLength(total)

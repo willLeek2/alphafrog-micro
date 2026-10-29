@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.prompt;
 
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.UUID;
 import org.springframework.context.annotation.Import;
@@ -50,6 +51,16 @@ public final class ToolSummaryPromptPreparation {
     }
 
     public Prepared prepare(String toolName, String rawOutput, String todoGoal, String experimentId) {
+        return prepare(toolName, rawOutput, null, todoGoal, experimentId);
+    }
+
+    public Prepared preparePrompt(String toolName, PromptText rawPrompt, String todoGoal, String experimentId) {
+        if (rawPrompt == null) throw sourceMissing();
+        return prepare(toolName, rawPrompt.text(), rawPrompt, todoGoal, experimentId);
+    }
+
+    private Prepared prepare(String toolName, String rawOutput, PromptText rawPrompt,
+                             String todoGoal, String experimentId) {
         try {
             String runId = AgentContext.getRunId();
             if (runId == null || runId.isBlank()) {
@@ -63,6 +74,12 @@ public final class ToolSummaryPromptPreparation {
             PromptText system = PromptTemplateRenderer.render(fragments.get(SYSTEM_FRAGMENT), Map.of());
             PromptText user = PromptTemplateRenderer.render(userBody, Map.of(
                     "toolName", nvl(toolName), "rawOutput", nvl(rawOutput), "todoGoal", nvl(todoGoal)));
+            if (userBody.variables().stream().anyMatch(variable -> "rawOutput".equals(variable.name()))) {
+                if (rawPrompt == null) throw sourceMissing();
+                var sources = new ArrayList<>(user.sources());
+                sources.addAll(rawPrompt.sources());
+                user = new PromptText(user.text(), sources);
+            }
             return new Prepared(context, system, user, inputs.boundTo(context));
         } catch (RuntimeException failure) {
             ModelSendBlocks.rethrowIfBlocked(failure);
@@ -80,6 +97,11 @@ public final class ToolSummaryPromptPreparation {
 
     private static ModelSendBlockedException blocked(String reason) {
         return new ModelSendBlockedException(ModelSendBlocked.PROMPT_UNREADABLE, reason);
+    }
+
+    private static ModelSendBlockedException sourceMissing() {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "工具总结使用的原始结果尚未明确保存来源");
     }
 
     public record Prepared(RuntimeCallContext context, PromptText system, PromptText user, ModelInputStore store) {

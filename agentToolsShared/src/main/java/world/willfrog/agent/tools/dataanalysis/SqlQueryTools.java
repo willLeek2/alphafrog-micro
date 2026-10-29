@@ -1,6 +1,10 @@
 package world.willfrog.agent.tools.dataanalysis;
 
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import dev.langchain4j.agent.tool.Tool;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -118,6 +122,12 @@ public class SqlQueryTools {
     private PythonSandboxService pythonSandboxService;
 
     private final ObjectMapper objectMapper;
+
+    @Autowired
+    private ProducerPromptTexts promptTexts;
+
+    @Autowired
+    private TerminalResultPromptTexts terminalPromptTexts;
     private final DatasetEntryMetadataReader metadataReader;
 
     /** 订阅数据集持久化事件，并在单次 agent 运行内维护「局部编号 → 条目」映射。 */
@@ -174,10 +184,14 @@ public class SqlQueryTools {
      */
     @Tool
     public String executeQuery(String sql, String dataset_ids, String product_tier) {
+        return executeQueryPrompt(sql, dataset_ids, product_tier).text();
+    }
+
+    public PromptText executeQueryPrompt(String sql, String dataset_ids, String product_tier) {
         return executeQueryInternal(sql, dataset_ids, product_tier);
     }
 
-    private String executeQueryInternal(String sql, String datasetIds, String productTier) {
+    private PromptText executeQueryInternal(String sql, String datasetIds, String productTier) {
         long toolStartMs = System.currentTimeMillis();
         try {
             // --- 档位解析： blank 默认 INTERACTIVE；未知档位直接拒，带上合法名单。 ---
@@ -186,7 +200,7 @@ public class SqlQueryTools {
                     : productTier.trim().toUpperCase(Locale.ROOT);
             ProductTier tierLimits = PRODUCT_TIERS.get(tier);
             if (tierLimits == null) {
-                return fail("UNKNOWN_TIER", "Unknown product_tier; use INTERACTIVE or BACKGROUND",
+                return fail("UNKNOWN_TIER", policy("sqlUnknownTierAdvice"),
                         Map.of("legal_tiers", List.of("INTERACTIVE", "BACKGROUND"), "retryable", true));
             }
             if (sql == null || sql.isBlank()) {
@@ -216,7 +230,7 @@ public class SqlQueryTools {
                 details.put("legal_dataset_numbers", registry.listDatasetNumbers(runId));
                 details.put("retryable", true);
                 return fail("ILLEGAL_RUN_LEVEL_IDS",
-                        "Some dataset_ids are not valid run-level numbers; pass values from the legal list below",
+                        policy("sqlIllegalRunIdsAdvice"),
                         details);
             }
 
@@ -395,7 +409,9 @@ public class SqlQueryTools {
                                 reservation, estimate, anchor,
                                 waitPolicy.durableSuspend(), toolStartMs));
                 if (attachOutcome instanceof SandboxToolJobLifecycle.AttachOutcome.FailureText failureText) {
-                    return failureText.text();
+                    if (failureText.prompt() == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "sandbox-attach");
+                return failureText.prompt();
                 }
                 SandboxToolJobLifecycle.AttachOutcome.Attached attached =
                         (SandboxToolJobLifecycle.AttachOutcome.Attached) attachOutcome;
@@ -403,15 +419,16 @@ public class SqlQueryTools {
                 reservation = attached.reservation();
 
                 // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
-                return SandboxToolJobLifecycle.pollFastPath(
+                return SandboxToolJobLifecycle.pollFastPathText(
                         deps,
                         new SandboxToolJobLifecycle.PollRequest(
                                 runId, identity, estimate, reservation, anchor, taskId,
                                 waitPolicy.durableSuspend(), toolStartMs,
                                 runnerAdapter(), resultAdapter(), meteringAdapter(), null));
             } catch (Exception lifecycleFailure) {
+                ModelSendBlocks.rethrowIfBlocked(lifecycleFailure);
                 if (!waitPolicy.durableSuspend()) {
-                    return SandboxToolJobLifecycle.promoteDagBlockingFailure(
+                    return SandboxToolJobLifecycle.promoteDagBlockingFailureText(
                             deps,
                             runId,
                             anchor,
@@ -435,6 +452,7 @@ public class SqlQueryTools {
             // 挂起信号：后台任务、名额与 Run 状态均已落库，原样上抛由上层释放线程。
             throw pending;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Execute query tool error", e);
             observability().emitToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("TOOL_ERROR", "Query sandbox invocation error",
@@ -450,7 +468,7 @@ public class SqlQueryTools {
      * 先占 PREPARING 名额，完整请求组装后在原用户锁事务中一起写Run会话锚点和成员证明，
      * 两项全部提交才创建沙箱任务。成员路径不读 DAG 阻塞轮询。</p>
      */
-    private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
+    private PromptText submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       String sql,
                                       String tier,
                                       ProductTier tierLimits,
@@ -548,7 +566,7 @@ public class SqlQueryTools {
                 new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.atomic.AtomicBoolean preparingInvoked = new java.util.concurrent.atomic.AtomicBoolean();
         try {
-            String dispatched = SandboxToolJobLifecycle.dispatchWaitGroupMember(
+            PromptText dispatched = SandboxToolJobLifecycle.dispatchWaitGroupMemberText(
                     deps,
                     new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                             member, identity, spec, plan.estimate(), baseRequest,
@@ -592,6 +610,7 @@ public class SqlQueryTools {
         } catch (ToolJobInjectedInterruption interruption) {
             throw interruption;
         } catch (RuntimeException dispatchFailure) {
+            ModelSendBlocks.rethrowIfBlocked(dispatchFailure);
             if (!preparingInvoked.get()) {
                 SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
             }
@@ -784,6 +803,7 @@ public class SqlQueryTools {
         try {
             specJson = objectMapper.writeValueAsString(spec);
         } catch (Exception serializeFailure) {
+            ModelSendBlocks.rethrowIfBlocked(serializeFailure);
             throw new IllegalStateException("query runner spec could not be serialized");
         }
         String encoded = Base64.getEncoder().encodeToString(specJson.getBytes(StandardCharsets.UTF_8));
@@ -839,7 +859,7 @@ public class SqlQueryTools {
                     local = new SandboxJobAdapters(
                             new SqlQueryJobRequestAdapter(),
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
-                            new SqlQueryJobResultAdapter(objectMapper),
+                            new SqlQueryJobResultAdapter(objectMapper, terminalPromptTexts),
                             new PythonSandboxJobMeteringAdapter(objectMapper));
                     sandboxJobAdapters = local;
                 }
@@ -883,14 +903,14 @@ public class SqlQueryTools {
         }
     }
 
-    private String fail(String code, String message, Map<String, Object> details) {
-        return SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details);
+    private PromptText fail(String code, Object message, Map<String, Object> details) {
+        return ProducerPromptTexts.failure(objectMapper, "executeQuery", code, message, details, Map.of(), null);
     }
 
     /** 带失败类别的重载：构造点掌握具体原因（如容量准入的具体拒绝原因）时显式覆盖兜底映射。 */
-    private String fail(String code, String message, Map<String, Object> details,
+    private PromptText fail(String code, Object message, Map<String, Object> details,
                         ToolFailureCategory category) {
-        return SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details, category);
+        return ProducerPromptTexts.failure(objectMapper, "executeQuery", code, message, details, Map.of(), category);
     }
 
     /** 从 classpath 读入运行器脚本原文；资源缺失属打包错误，直接让类初始化失败。 */
@@ -916,7 +936,14 @@ public class SqlQueryTools {
             }
             return hex.toString();
         } catch (Exception digestFailure) {
+            ModelSendBlocks.rethrowIfBlocked(digestFailure);
             throw new IllegalStateException("SHA-256 unavailable", digestFailure);
         }
     }
+    private PromptText policy(String fragment) {
+        if (promptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "producer-policy");
+        return promptTexts.policy(fragment);
+    }
+
 }

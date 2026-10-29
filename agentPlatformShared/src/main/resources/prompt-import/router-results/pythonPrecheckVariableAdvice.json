@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonPrecheckVariableAdvice",
+  "purpose": "pythonPrecheckVariableAdvice",
+  "bodyType": "FIXED",
+  "body": "代码引用了 dataset_id 变量但未定义，请先赋值后再使用",
+  "variables": [],
+  "utf8Sha256": "e1ce52dfc5e0b6e089f5be19b8e9ef2975eda247c9b3caeae617233e220b166c",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/router/PythonStaticPrecheckService.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

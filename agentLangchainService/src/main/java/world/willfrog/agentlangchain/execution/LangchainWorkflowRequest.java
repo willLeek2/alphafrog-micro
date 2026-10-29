@@ -5,6 +5,7 @@ import dev.langchain4j.model.chat.ChatModel;
 import lombok.Builder;
 import lombok.Data;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -28,6 +29,8 @@ public class LangchainWorkflowRequest {
     private Integer planGeneration;
     private String userGoal;
     private String dialogueContext;
+    /** 历史正文及其中的应用指令版本，随工作流和子线程请求一起传递。 */
+    private PromptText dialogueContextPrompt;
     private ChatModel model;
     private ChatModel planningModel;
     private ChatModel executionModel;
@@ -39,6 +42,8 @@ public class LangchainWorkflowRequest {
     private Boolean webSearchEnabled;
     private Boolean codeInterpreterEnabled;
     private String planningEndpointName;
+    private String executionEndpointName;
+    private String finalAnswerEndpointName;
     private String planningModelName;
     private List<String> planningProviderOrder;
     /**

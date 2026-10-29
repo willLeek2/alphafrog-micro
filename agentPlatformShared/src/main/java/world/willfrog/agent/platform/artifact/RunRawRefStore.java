@@ -18,6 +18,13 @@ public interface RunRawRefStore {
     /** Register content and return a run-scoped short ID (e.g. {@code raw_ref_001}). */
     String register(String runId, String userId, String displayName, String content, long ttlSeconds);
 
+    default String registerPrompt(String runId, String userId, String displayName,
+                                  world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content, long ttlSeconds) {
+        throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "原始产物存储尚未提供正文来源保存");
+    }
+
     /**
      * Read full content by short ID. 严格归属校验：runId 与 userId 均须与制品 meta
      * 严格相等（空白或不一致一律拒绝）。

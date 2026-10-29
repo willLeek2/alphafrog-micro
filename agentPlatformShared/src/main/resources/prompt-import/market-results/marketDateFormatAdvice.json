@@ -1,0 +1,14 @@
+{
+  "fragment": "marketDateFormatAdvice",
+  "purpose": "marketDateFormatAdvice",
+  "bodyType": "FIXED",
+  "body": "Invalid date range, please use YYYYMMDD format (Asia/Shanghai).",
+  "variables": [],
+  "utf8Sha256": "c703d7bd31068738e10bdee73e823aab9e130052e2f59da635d695f5534a0895",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -1140,6 +1140,15 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                                                                   NodeWorkItemVersions versions,
                                                                   NodeWorkItemClaim claim,
                                                                   JsonNode payload) throws Exception {
+        var terminalBlock = waitGroupNodeExecutor.resumeSendBlock(identity, payload);
+        if (terminalBlock != null) {
+            var failure = LangchainTodoNodeResult.failure(terminalBlock.code(),
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.failureMetadata(terminalBlock));
+            var checkpoint = world.willfrog.agentlangchain.execution.NodeSegmentCheckpoint.read(payload);
+            failure.setToolCallsUsed(checkpoint == null ? 0 : checkpoint.toolCallsUsed());
+            return Optional.of(nodeResultPatch(KIND_TODO, failure,
+                    payload.path("toolCallsUsed").asInt(0) + failure.getToolCallsUsed()));
+        }
         LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
                 freshRunPipeline.rebuildDualPoolNodeContext(identity.runId());
         if (context == null) {
@@ -1202,6 +1211,14 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
     }
 
     private TodoExecution executeTodo(String runId, JsonNode payload) throws Exception {
+        if (toolJobCoordinator.isResumePayload(payload)) {
+            var terminal = toolJobCoordinator.resumeResult(payload);
+            if (terminal.getFailureMetadata() != null
+                    && Boolean.TRUE.equals(terminal.getFailureMetadata().get("model_send_blocked"))) {
+                int calls = toolJobCoordinator.resumeTotalToolCalls(payload);
+                return new TodoExecution(nodeResultPatch(KIND_TODO, terminal, calls), terminal, calls);
+            }
+        }
         LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
                 freshRunPipeline.rebuildDualPoolNodeContext(runId);
         if (context == null) {
@@ -1224,9 +1241,9 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         if (resumingToolJob) {
             LangchainTodoNodeResult terminal = toolJobCoordinator.resumeResult(payload);
             if (toolJobCoordinator.resumeTerminalSuccess(payload)) {
-                nodeResult = todoNodeExecutor.executeResumedToolResult(
+                nodeResult = todoNodeExecutor.executeResumedToolResultPrompt(
                         context.workflowRequest(), todo, completed, datasetRefs,
-                        toolJobCoordinator.resumeToolOutput(payload));
+                        toolJobCoordinator.resumeToolOutputPrompt(payload));
                 toolJobCoordinator.afterModelCompleted(runId);
             } else {
                 nodeResult = terminal;
@@ -1708,6 +1725,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                 .sequence(item.getSequence())
                 .description(item.getDescription())
                 .output(output)
+                .outputSourceJson(result.path("outputSourceJson").asText(null))
                 .modelOutput(output)
                 .summary(result.path("summary").asText(output))
                 .build();
@@ -1725,6 +1743,7 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
                     .description(node.path("description").asText(""))
                     .modelOutput(node.path("modelOutput").asText(""))
                     .output(node.path("output").asText(""))
+                    .outputSourceJson(node.path("outputSourceJson").asText(null))
                     .summary(node.path("summary").asText(""))
                     .build());
         }
@@ -1765,6 +1784,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         patch.put("kind", kind);
         patch.put("success", result.isSuccess());
         patch.put("output", result.getOutput() == null ? "" : result.getOutput());
+        // 此处成功结果仅来自节点模型执行（含原有长工具恢复续轮）。
+        if (result.isSuccess()) patch.put("outputSourceJson", LangchainCompletedTodo.modelOutputSourceJson());
         patch.put("summary", result.getSummary() == null ? "" : result.getSummary());
         patch.put("failureReason", result.getFailureReason() == null ? "" : result.getFailureReason());
         patch.put("failureMetadata", result.getFailureMetadata() == null ? Map.of() : result.getFailureMetadata());

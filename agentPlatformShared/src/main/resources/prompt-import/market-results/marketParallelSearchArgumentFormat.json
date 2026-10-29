@@ -1,0 +1,14 @@
+{
+  "fragment": "marketParallelSearchArgumentFormat",
+  "purpose": "marketParallelSearchArgumentFormat",
+  "bodyType": "FIXED",
+  "body": "Use | separated values or JSON arrays. Do not use comma-separated values.",
+  "variables": [],
+  "utf8Sha256": "30b6a8a20ded64be1caf4b91bdf4fac896a6e1f68af248d4be7ec1552b229f76",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

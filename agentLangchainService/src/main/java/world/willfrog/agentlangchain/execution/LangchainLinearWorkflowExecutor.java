@@ -1,6 +1,8 @@
 package world.willfrog.agentlangchain.execution;
 
 import lombok.extern.slf4j.Slf4j;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.agentlangchain.tooljob.BackgroundPromptResults;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
@@ -140,6 +142,8 @@ public class LangchainLinearWorkflowExecutor {
         try {
             // 新 worker 需要重新建立 AgentContext，旧线程已经在 finally 中清理。
             applyRunContext(request);
+            // 清理后的来源阻止优先于任何恢复渲染、修复或模型调用。
+            ModelSendBlocks.fromFailureMetadata(context.getTerminalModelSendBlock()).ifPresent(blocked -> { throw blocked; });
             // 传入原计划与恢复上下文，执行器会跳过已完成前缀。
             return executePlanned(request, plan, toolCalls, context, terminalConsumed, null);
         } catch (Exception e) {
@@ -246,7 +250,8 @@ public class LangchainLinearWorkflowExecutor {
                 // 注入不调用 LLM/tool，仍记录本节点恢复耗时与节点事件。
                 long nodeStartMs = System.currentTimeMillis();
                 // preview/rawRef 被整理成与普通工具输出兼容的文本。
-                String injectedOutput = resumeTerminalOutput(resumeContext);
+                PromptText injectedPrompt = resumeTerminalOutput(resumeContext);
+                String injectedOutput = injectedPrompt.text();
                 // 失败终态先发节点失败，再推进/持久化消费位置，保证重入幂等。
                 if (!resumeContext.isTerminalSuccess()) {
                     java.util.Optional<ToolRepairHandler> repairHandler =
@@ -296,7 +301,7 @@ public class LangchainLinearWorkflowExecutor {
                     repairExecutionContext = resumeContext;
                 }
                 if (resumeContext.isTerminalSuccess()) {
-                    // 成功输出可能包含 dataset ref，必须在后续 Todo 执行前重新注册。
+                    // 沿用原有成功恢复语义：直接完成节点，不增加一次模型调用。
                     DatasetRefRegistry.registerFromJson(injectedOutput, datasetRefs);
                     // 把挂起 Todo 追加为已完成，但不增加 toolCalls：那次调用在挂起前已经计数。
                     completedTodos.add(LangchainCompletedTodo.builder()
@@ -305,6 +310,7 @@ public class LangchainLinearWorkflowExecutor {
                             .description(item.getDescription())
                             .modelOutput(injectedOutput)
                             .output(injectedOutput)
+                            .outputSourceJson(LangchainCompletedTodo.sourceJson(injectedPrompt))
                             .summary("external_tool_result")
                             .build());
                     persistWorkflowCheckpoint(request, plan, completedTodos, toolCalls.get());
@@ -392,6 +398,7 @@ public class LangchainLinearWorkflowExecutor {
                     .sequence(item.getSequence())
                     .description(item.getDescription())
                     .output(trimmed)
+                    .outputSourceJson(LangchainCompletedTodo.modelOutputSourceJson())
                     .summary(nodeResult.getSummary())
                     .build());
             // checkpoint 写成功后才进入下一 Todo；写失败会被外层转换为明确 workflow failure。
@@ -445,6 +452,7 @@ public class LangchainLinearWorkflowExecutor {
             record.setModelOutput(todo.getModelOutput());
             record.setOutput(todo.getOutput());
             record.setSummary(todo.getSummary());
+            record.setOutputSourceJson(todo.getOutputSourceJson());
             // map 返回的新对象会被序列化进下一版 checkpoint。
             return record;
         }).toList();
@@ -480,6 +488,7 @@ public class LangchainLinearWorkflowExecutor {
             record.setModelOutput(todo.getModelOutput());
             record.setOutput(todo.getOutput());
             record.setSummary(todo.getSummary());
+            record.setOutputSourceJson(todo.getOutputSourceJson());
             return record;
         }).toList();
         context.setCompletedTodos(records);
@@ -513,15 +522,8 @@ public class LangchainLinearWorkflowExecutor {
                 .orElse(null);
     }
 
-    private String resumeTerminalOutput(ToolJobResumeContext context) {
-        // preview 是 formatter 产出的完整有界 JSON；rawRef 仅用于内部引用，
-        // 不泄露给模型上下文。返回 exact bytes，不 trim/重写。
-        String preview = context.getTerminalResultPreview();
-        if (!isBlank(preview)) {
-            return preview;
-        }
-        // 终态缺少可见正文时给确定性占位，避免 null 破坏后续 prompt 构建。
-        return context.isTerminalSuccess() ? "external tool completed" : "external tool failed";
+    private PromptText resumeTerminalOutput(ToolJobResumeContext context) {
+        return BackgroundPromptResults.decode(context.getTerminalResultPreview(), context.getTerminalPromptSourcesJson());
     }
 
     private LangchainWorkflowResult failure(LangchainTodoPlan plan,

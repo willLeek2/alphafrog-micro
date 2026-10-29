@@ -43,7 +43,10 @@ public class ToolJobEventHookImpl implements ToolJobEventHook {
         put(payload, "operation_id", anchor.getOperationId());
         put(payload, "task_id", anchor.getTaskId());
         put(payload, "status", anchor.getTerminalStatus());
-        payload.put("success", "SUCCEEDED".equals(anchor.getTerminalStatus()));
+        payload.put("success", anchor.getTerminalModelSendBlock() == null
+                && (anchor.getTerminalBusinessSuccess() != null ? anchor.getTerminalBusinessSuccess()
+                    : "SUCCEEDED".equals(anchor.getTerminalStatus())));
+        if (anchor.getTerminalModelSendBlock() != null) payload.putAll(anchor.getTerminalModelSendBlock());
         put(payload, "result_preview", anchor.getTerminalResultPreview());
         put(payload, "raw_ref", anchor.getTerminalRawRef());
         put(payload, "error_code", anchor.getTerminalErrorCode());

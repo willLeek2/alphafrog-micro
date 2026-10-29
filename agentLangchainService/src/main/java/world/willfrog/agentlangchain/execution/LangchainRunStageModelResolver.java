@@ -108,27 +108,28 @@ public class LangchainRunStageModelResolver {
                 firstNonBlank(execStageCfg.getModelName(), requestedModelName));
         var providerOrder = mergeProviderOrder(
                 resolveStageProviderOrder(execStageCfg, userProviderOrder), resolvedLlm.validProviders());
-        ChatModel executionModel = aiServiceFactory.buildChatModelWithProviderOrder(
+        ChatModel executionModel = aiServiceFactory.buildArchivedChatModelWithProviderOrder(
                 resolvedLlm, providerOrder, execStageCfg.getMaxTokens());
 
         StageLlmConfig planningStageCfg = chooseEffectiveStageConfig(
                 requestedEndpointName, requestedModelName, stageConfig.getPlanning(), run.getExt(), "planning");
         ChatModel planningModel = executionModel;
-        String planningEndpointName = firstNonBlank(execStageCfg.getEndpointName(), requestedEndpointName);
-        String planningModelName = firstNonBlank(execStageCfg.getModelName(), requestedModelName);
+        String planningEndpointName = resolvedLlm.endpointName();
+        String planningModelName = resolvedLlm.modelName();
         List<String> planningProviderOrder = providerOrder;
         if (planningStageCfg != null && planningStageCfg.isValid()) {
             AgentLlmResolver.ResolvedLlm planningResolved = aiServiceFactory.resolveLlm(
                     planningStageCfg.getEndpointName(), planningStageCfg.getModelName());
             planningProviderOrder = mergeProviderOrder(
                     resolveStageProviderOrder(planningStageCfg, userProviderOrder), planningResolved.validProviders());
-            planningModel = aiServiceFactory.buildChatModelWithProviderOrder(
+            planningModel = aiServiceFactory.buildArchivedChatModelWithProviderOrder(
                     planningResolved, planningProviderOrder, planningStageCfg.getMaxTokens());
-            planningEndpointName = firstNonBlank(planningStageCfg.getEndpointName(), requestedEndpointName);
-            planningModelName = firstNonBlank(planningStageCfg.getModelName(), requestedModelName);
+            planningEndpointName = planningResolved.endpointName();
+            planningModelName = planningResolved.modelName();
         }
 
         ChatModel finalAnswerModel = executionModel;
+        String finalAnswerEndpointName = resolvedLlm.endpointName();
         StageLlmConfig finalAnswerStageCfg = chooseEffectiveStageConfig(
                 requestedEndpointName, requestedModelName, stageConfig.getFinalAnswer(), run.getExt(), "final_answer");
         if (hasAnyStageField(stageConfig.getFinalAnswer()) && finalAnswerStageCfg != null && finalAnswerStageCfg.isValid()) {
@@ -136,8 +137,9 @@ public class LangchainRunStageModelResolver {
                     finalAnswerStageCfg.getEndpointName(), finalAnswerStageCfg.getModelName());
             var finalProviderOrder = mergeProviderOrder(
                     resolveStageProviderOrder(finalAnswerStageCfg, userProviderOrder), finalResolved.validProviders());
-            finalAnswerModel = aiServiceFactory.buildChatModelWithProviderOrder(
+            finalAnswerModel = aiServiceFactory.buildArchivedChatModelWithProviderOrder(
                     finalResolved, finalProviderOrder, finalAnswerStageCfg.getMaxTokens());
+            finalAnswerEndpointName = finalResolved.endpointName();
         }
 
         return new StageModels(
@@ -147,7 +149,9 @@ public class LangchainRunStageModelResolver {
                 planningEndpointName,
                 planningModelName,
                 planningProviderOrder,
-                null);
+                null,
+                resolvedLlm.endpointName(),
+                finalAnswerEndpointName);
     }
 
     /**
@@ -182,7 +186,9 @@ public class LangchainRunStageModelResolver {
                 AcceptanceFixtureModelRegistry.ScriptedStage.ENDPOINT_NAME,
                 stage.modelName(),
                 List.of(),
-                releasePolicy);
+                releasePolicy,
+                AcceptanceFixtureModelRegistry.ScriptedStage.ENDPOINT_NAME,
+                AcceptanceFixtureModelRegistry.ScriptedStage.ENDPOINT_NAME);
     }
 
     /** 夹具 Run 上的真实客户端：第一次未声明调用才解析，失败记住，避免并行两次各建一次。 */
@@ -233,7 +239,17 @@ public class LangchainRunStageModelResolver {
             String planningEndpointName,
             String planningModelName,
             List<String> planningProviderOrder,
-            AcceptanceReleasePolicy acceptanceReleasePolicy) {
+            AcceptanceReleasePolicy acceptanceReleasePolicy,
+            String executionEndpointName,
+            String finalAnswerEndpointName) {
+
+        /** 旧构造未提供端点证明；实际归档入口会拒绝缺失的端点。 */
+        public StageModels(ChatModel planningModel, ChatModel executionModel, ChatModel finalAnswerModel,
+                           String planningEndpointName, String planningModelName, List<String> planningProviderOrder,
+                           AcceptanceReleasePolicy acceptanceReleasePolicy) {
+            this(planningModel, executionModel, finalAnswerModel, planningEndpointName, planningModelName,
+                    planningProviderOrder, acceptanceReleasePolicy, null, null);
+        }
 
         /**
          * 不带放行策略的那一版：普通 Run 用这个形状就够了，调用方不必写一个用不到的 null。

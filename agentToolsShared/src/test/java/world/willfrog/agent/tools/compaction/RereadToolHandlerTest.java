@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.compaction;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -42,7 +43,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setMaxLimit(4000);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw-ref:1", "", 0, 1000),
@@ -63,7 +64,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setMaxLimit(4000);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw-ref:1", "中证消费", 0, 80),
@@ -85,7 +86,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setMaxLimit(1200);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw-ref:1", null, 0, 0),
@@ -99,12 +100,12 @@ class RereadToolHandlerTest {
     void rereadShouldResolveRunScopedShortRawRef() throws Exception {
         AgentContext.setRunId("run-1");
         AgentContext.setUserId("user-1");
-        RereadToolHandler handler = new RereadToolHandler(
+        RereadToolHandler handler = configure(new RereadToolHandler(
                 new StubToolOutputRefService(),
                 objectMapper,
                 Optional.empty(),
                 Optional.of(new StubRunRawRefStore())
-        );
+        ));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw_ref_001", "现金流", 0, 80),
@@ -121,12 +122,12 @@ class RereadToolHandlerTest {
     void rereadShouldNotRouteMalformedShortRawRefToRunStore() throws Exception {
         AgentContext.setRunId("run-1");
         RunRawRefStore rawRefStore = mock(RunRawRefStore.class);
-        RereadToolHandler handler = new RereadToolHandler(
+        RereadToolHandler handler = configure(new RereadToolHandler(
                 new StubToolOutputRefService(),
                 objectMapper,
                 Optional.empty(),
                 Optional.of(rawRefStore)
-        );
+        ));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw_ref_xyz", "现金流", 0, 80),
@@ -146,7 +147,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setKeywordCharLimit(1500);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw-ref:1", "现金流", 0, 3000),
@@ -167,7 +168,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setKeywordCharLimit(1200);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         // limit=0 → normalized to keywordCharLimit=1200, should pass
         Map<String, Object> response = objectMapper.readValue(
@@ -186,7 +187,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setRangeMinLimitWithoutKeyword(3000);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw-ref:1", null, 0, 2000),
@@ -215,10 +216,12 @@ class RereadToolHandlerTest {
         for (int i = 0; i < 6000; i++) sb.append("x");
         when(largeStore.read(eq("run-range"), eq("user-range"), eq("raw_ref_001"), eq(0), eq(6000), isNull()))
                 .thenReturn(ToolOutputReadResult.builder()
-                        .content(sb.toString()).hasMore(false).nextOffset(6000).totalLength(6000).build());
+                        .content(sb.toString())
+                        .contentPrompt(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(sb.toString()))
+                        .hasMore(false).nextOffset(6000).totalLength(6000).build());
 
-        RereadToolHandler handler = new RereadToolHandler(
-                new StubToolOutputRefService(), objectMapper, Optional.of(loader), Optional.of(largeStore));
+        RereadToolHandler handler = configure(new RereadToolHandler(
+                new StubToolOutputRefService(), objectMapper, Optional.of(loader), Optional.of(largeStore)));
 
         Map<String, Object> response = objectMapper.readValue(
                 handler.reread("raw_ref_001", null, 0, 6000),
@@ -240,7 +243,7 @@ class RereadToolHandlerTest {
         // keywordCharLimit is null → should fallback to maxLimit=3000
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         // limit=3500 > maxLimit=3000 → rejected
         Map<String, Object> response = objectMapper.readValue(
@@ -262,7 +265,7 @@ class RereadToolHandlerTest {
         cfg.getTools().getReread().setMaxLimit(4000);
         when(loader.current()).thenReturn(Optional.of(cfg));
 
-        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+        RereadToolHandler handler = configure(new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader)));
 
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
                 () -> handler.reread("raw-ref-contextless", null, 0, 2000));
@@ -275,12 +278,12 @@ class RereadToolHandlerTest {
         // 在严格归属校验处 fail-closed——工具层原样抛出，不吞异常、不降级返回内容。
         AgentContext.setRunId("run-1");
         AgentContext.setUserId("user-evil");
-        RereadToolHandler handler = new RereadToolHandler(
+        RereadToolHandler handler = configure(new RereadToolHandler(
                 new StubToolOutputRefService(),
                 objectMapper,
                 Optional.empty(),
                 Optional.of(new StubRunRawRefStore())
-        );
+        ));
 
         assertThrows(IllegalArgumentException.class,
                 () -> handler.reread("raw_ref_001", "现金流", 0, 80));
@@ -291,12 +294,12 @@ class RereadToolHandlerTest {
         // 第三轮 MUST-FIX ② 反测：线程态只有 runId、没有 userId（空白）时，短格式读取
         // 同样被拒——不存在只凭 runId 放行的读取路径。
         AgentContext.setRunId("run-1");
-        RereadToolHandler handler = new RereadToolHandler(
+        RereadToolHandler handler = configure(new RereadToolHandler(
                 new StubToolOutputRefService(),
                 objectMapper,
                 Optional.empty(),
                 Optional.of(new StubRunRawRefStore())
-        );
+        ));
 
         assertThrows(IllegalArgumentException.class,
                 () -> handler.reread("raw_ref_001", "现金流", 0, 80));
@@ -328,6 +331,7 @@ class RereadToolHandlerTest {
             }
             return ToolOutputReadResult.builder()
                     .content("content")
+                    .contentPrompt(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("content"))
                     .hasMore(false)
                     .nextOffset(7)
                     .totalLength(7)
@@ -374,6 +378,7 @@ class RereadToolHandlerTest {
             requireOwner(runId, userId);
             return ToolOutputReadResult.builder()
                     .content("short-content")
+                    .contentPrompt(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("short-content"))
                     .hasMore(false)
                     .nextOffset(13)
                     .totalLength(13)

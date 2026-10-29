@@ -34,6 +34,18 @@ public final class LangchainRepeatedToolCallGuard {
     }
 
     static Decision beforeInvoke(String toolName, Map<String, Object> arguments, ObjectMapper objectMapper) {
+        Decision facts = beforeInvokeFacts(toolName, arguments, objectMapper);
+        if (facts.blocked()) {
+            return Decision.blocked(toolName, facts.count(), repeatedToolCallError(toolName, facts.count(), objectMapper));
+        }
+        if (facts.repeated()) {
+            return Decision.repeated(toolName, facts.count(), repeatedHint(toolName, facts.count()));
+        }
+        return facts;
+    }
+
+    /** 托管调用只取实际分支与次数；操作建议在当前原根版本下渲染。 */
+    static Decision beforeInvokeFacts(String toolName, Map<String, Object> arguments, ObjectMapper objectMapper) {
         if (!isGuardedDatabaseTool(toolName)) {
             return Decision.allowed(toolName, 1);
         }
@@ -42,10 +54,10 @@ public final class LangchainRepeatedToolCallGuard {
                 canonicalArguments(arguments, objectMapper));
         int count = LangchainRepeatedToolCallContext.currentOrCreate().increment(signature);
         if (count > DEFAULT_MAX_IDENTICAL_CALLS) {
-            return Decision.blocked(toolName, count, repeatedToolCallError(toolName, count, objectMapper));
+            return Decision.blocked(toolName, count, "");
         }
         if (count > 1) {
-            return Decision.repeated(toolName, count, repeatedHint(toolName, count));
+            return Decision.repeated(toolName, count, "");
         }
         return Decision.allowed(toolName, count);
     }

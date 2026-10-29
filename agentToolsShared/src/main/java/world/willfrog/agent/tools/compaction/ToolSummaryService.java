@@ -16,6 +16,9 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 /**
  * 工具结果摘要 LLM，独立 plain ChatModel，phase=tool_result_summary。
@@ -34,12 +37,24 @@ public class ToolSummaryService {
     private final ToolSummaryPromptPreparation promptPreparation;
 
     public String summarize(String toolName, String rawOutput, String todoGoal) {
+        return summarize(toolName, rawOutput, null, todoGoal);
+    }
+
+    public PromptText summarizePrompt(String toolName, PromptText rawPrompt, String todoGoal) {
+        if (rawPrompt == null) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "工具总结缺少已经分类的原始结果");
+        }
+        return PromptText.runtimeData(summarize(toolName, rawPrompt.text(), rawPrompt, todoGoal));
+    }
+
+    private String summarize(String toolName, String rawOutput, PromptText rawPrompt, String todoGoal) {
         String experimentId = resolvePromptExperimentId();
         int attempts = Math.max(0, resolveSummaryMaxRetries()) + 1;
         Exception lastError = null;
         for (int i = 0; i < attempts; i++) {
             try {
-                return invokeSummary(toolName, rawOutput, todoGoal, experimentId);
+                return invokeSummary(toolName, rawOutput, rawPrompt, todoGoal, experimentId);
             } catch (Exception e) {
                 ModelSendBlocks.rethrowIfBlocked(e);
                 lastError = e;
@@ -52,8 +67,10 @@ public class ToolSummaryService {
         return "";
     }
 
-    private String invokeSummary(String toolName, String rawOutput, String todoGoal, String experimentId) {
-        var prepared = promptPreparation.prepare(toolName, rawOutput, todoGoal, experimentId);
+    private String invokeSummary(String toolName, String rawOutput, PromptText rawPrompt,
+                                 String todoGoal, String experimentId) {
+        var prepared = rawPrompt == null ? promptPreparation.prepare(toolName, rawOutput, todoGoal, experimentId)
+                : promptPreparation.preparePrompt(toolName, rawPrompt, todoGoal, experimentId);
         SummaryRoute route = resolveSummaryRoute();
         ChatModel model = buildSummaryModel(route);
         if (model == null) {
