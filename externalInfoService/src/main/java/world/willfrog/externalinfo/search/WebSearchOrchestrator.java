@@ -1,6 +1,8 @@
 package world.willfrog.externalinfo.search;
 
 import lombok.RequiredArgsConstructor;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchResultOrigin;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRequest;
@@ -41,9 +43,11 @@ public class WebSearchOrchestrator {
     private final RagPrefetcher ragPrefetcher;
     private final HotKeywordCacheService hotKeywordCacheService;
     private final HotKeywordTtlStrategy hotKeywordTtlStrategy;
+    private final SearchPromptPreparation promptPreparation;
 
     public WebSearchResponse search(WebSearchRequest request) {
         try {
+            SearchPromptPreparation.Binding promptBinding = promptPreparation.bind(request);
             // 1. Query 规范化：提取槽位并生成意图模板
             SlotExtractor.SlotResult slots = slotExtractor.extract(request.getQuery());
             String canonicalQuery = queryCanonicalizer.canonicalize(request.getQuery(), slots);
@@ -54,7 +58,9 @@ public class WebSearchOrchestrator {
             if (!request.getSkipHotCache()) {
                 HotKeywordCacheService.HotKeywordCacheResult cached =
                         hotKeywordCacheService.findCluster(cacheKey, request.getQuery());
-                if (cached != null && cached.hit()) {
+                if (cached != null && cached.hit() && cached.response() != null
+                        && cached.response().getResultOrigin() == WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA
+                        && !cached.response().hasModelSendBlock()) {
                     log.info("热点缓存命中: query={}, cacheKey={}", request.getQuery(), cacheKey);
                     return cached.response();
                 }
@@ -79,7 +85,7 @@ public class WebSearchOrchestrator {
             // 4. Backend 选择与参数映射
             BackendRouter.ResolvedBackend resolved = backendRouter.resolve(effectiveRequest);
             SearchBackend backend = resolved.backend();
-            WebSearchExecutionContext context = resolved.context();
+            WebSearchExecutionContext context = resolved.context().withPromptBinding(promptBinding);
 
             // 5. 调用具体 Backend
             BackendSearchResult rawResult = backend.search(context);
@@ -89,6 +95,7 @@ public class WebSearchOrchestrator {
 
             // 7. 回填 P0 预埋字段
             response = response.toBuilder()
+                    .setResultOrigin(WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA)
                     .setCanonicalQuery(canonicalQuery)
                     .setSlotSignature(slotSignature)
                     .setRagPrefetch(WebSearchRagPrefetch.newBuilder()
@@ -135,11 +142,13 @@ public class WebSearchOrchestrator {
 
             return response;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("WebSearch 编排失败", e);
             return WebSearchResponse.newBuilder()
                     .setOk(false)
                     .setErrorCode("ORCHESTRATION_ERROR")
-                    .setErrorMessage(e.getMessage())
+                    .setErrorMessage(nvl(e.getMessage()))
+                    .setResultOrigin(WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA)
                     .build();
         }
     }
