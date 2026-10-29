@@ -11,10 +11,12 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.agentlangchain.tooljob.BackgroundPromptResults;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
+import java.util.ArrayList;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -98,13 +100,18 @@ public class PythonSandboxRepairHandler implements ToolRepairHandler {
             throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
                     "代码修复缺少正文组件或持久执行事实");
         }
-        return PromptText.concat(PromptText.runtimeData("\n\n"), promptService.pythonRepairStageInstructionText(),
+        PromptText terminal = BackgroundPromptResults.decode(
+                context.getTerminalResultPreview(), context.getTerminalPromptSourcesJson());
+        PromptText instruction = PromptText.concat(PromptText.runtimeData("\n\n"), promptService.pythonRepairStageInstructionText(),
                 promptService.pythonRepairContextInstructionText(
                         String.valueOf(context.getPythonRepairAttempt()),
                         safeRepairValue(context.getTerminalStatus()), safeRepairValue(context.getTerminalExitReason()),
                         safeRepairValue(context.getTerminalErrorCode()), String.valueOf(context.getTerminalRetryable()),
-                        safeRepairBlock(context.getTerminalResultPreview()), safeRepairBlock(context.getTerminalStderrPreview()),
+                        safeRepairBlock(terminal.text()), safeRepairBlock(context.getTerminalStderrPreview()),
                         safeRepairBlock(context.getPythonFailedCodePreview())));
+        var sources = new ArrayList<>(instruction.sources());
+        sources.addAll(terminal.sources());
+        return new PromptText(instruction.text(), sources);
     }
 
     String buildRepairUserMessage(ToolJobResumeContext context) {

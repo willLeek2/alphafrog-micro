@@ -15,6 +15,8 @@ import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingExceptio
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.agentlangchain.tooljob.BackgroundPromptResults;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -190,6 +192,9 @@ class LangchainTodoNodeExecutorPythonRepairTest {
         context.setTerminalRetryable(false);
         context.setTerminalExitReason("NON_ZERO_EXIT");
         context.setTerminalStderrPreview("bad date parser");
+        PromptText terminal = PromptText.runtimeData("bad date parser");
+        context.setTerminalResultPreview(terminal.text());
+        context.setTerminalPromptSourcesJson(BackgroundPromptResults.encode(terminal));
         context.setPythonFailedCodePreview("print('same broken code')");
         context.setPythonRepairAttempt(1);
         context.setPythonRepairPending(true);
