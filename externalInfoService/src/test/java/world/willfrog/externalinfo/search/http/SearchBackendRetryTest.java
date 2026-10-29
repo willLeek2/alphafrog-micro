@@ -1,6 +1,11 @@
 package world.willfrog.externalinfo.search.http;
 
 import com.sun.net.httpserver.HttpServer;
+import java.util.List;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputInvocation;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSource;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -23,6 +28,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SearchBackendRetryTest {
+
+    private static final String INPUT = "{\"query\":\"test\"}";
+
+    private ModelInputInvocation invocation() {
+        return ModelInputInvocation.start("search-test", new ModelInputSources(List.of(
+                new ModelInputSource("/query", ModelInputSource.Origin.RUNTIME_DATA, List.of()))),
+                attempt -> new ModelInputStore.Confirmation("saved", attempt.attemptId(), attempt.sha256(), attempt.utf8Length()));
+    }
 
     private HttpServer server;
     private int port;
@@ -56,11 +69,11 @@ class SearchBackendRetryTest {
                 .build();
     }
 
-    private HttpRequest newGetRequest() {
+    private HttpRequest newPostRequest() {
         return HttpRequest.newBuilder()
                 .uri(java.net.URI.create("http://127.0.0.1:" + port + "/probe"))
                 .timeout(java.time.Duration.ofSeconds(2))
-                .GET()
+                .POST(HttpRequest.BodyPublishers.ofString(INPUT, StandardCharsets.UTF_8))
                 .build();
     }
 
@@ -93,7 +106,7 @@ class SearchBackendRetryTest {
         });
         SearchBackendRetry retry = newRetry(2, 0L, Set.of(500, 502, 503, 504));
 
-        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newGetRequest(), "test");
+        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newPostRequest(), "test", INPUT, invocation());
 
         assertTrue(result.ok());
         assertEquals(200, result.response().statusCode());
@@ -117,7 +130,7 @@ class SearchBackendRetryTest {
         });
         SearchBackendRetry retry = newRetry(2, 0L, Set.of(500, 502, 503, 504));
 
-        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newGetRequest(), "test");
+        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newPostRequest(), "test", INPUT, invocation());
 
         assertTrue(result.ok());
         assertEquals(2, result.attempts());
@@ -135,7 +148,7 @@ class SearchBackendRetryTest {
         });
         SearchBackendRetry retry = newRetry(3, 0L, Set.of(500, 502, 503, 504));
 
-        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newGetRequest(), "test");
+        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newPostRequest(), "test", INPUT, invocation());
 
         assertFalse(result.ok());
         assertTrue(result.isHttpFailure());
@@ -155,7 +168,7 @@ class SearchBackendRetryTest {
         });
         SearchBackendRetry retry = newRetry(2, 0L, Set.of(500, 502, 503, 504));
 
-        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newGetRequest(), "test");
+        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newPostRequest(), "test", INPUT, invocation());
 
         assertTrue(result.isHttpFailure());
         assertEquals(503, result.response().statusCode());
@@ -170,7 +183,7 @@ class SearchBackendRetryTest {
         port = 1; // privileged port with no listener
         SearchBackendRetry retry = newRetry(2, 0L, Set.of(500, 502, 503, 504));
 
-        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newGetRequest(), "test");
+        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newPostRequest(), "test", INPUT, invocation());
 
         assertTrue(result.isException());
         assertNotNull(result.error());
@@ -210,7 +223,7 @@ class SearchBackendRetryTest {
         });
         SearchBackendRetry retry = newRetry(3, 0L, Set.of(408, 425, 429, 500, 502, 503, 504));
 
-        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newGetRequest(), "test");
+        SearchBackendRetry.RetryResult result = retry.sendWithRetry(newClient(), newPostRequest(), "test", INPUT, invocation());
 
         assertTrue(result.isHttpFailure());
         assertEquals(404, result.response().statusCode());
