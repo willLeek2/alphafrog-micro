@@ -132,6 +132,21 @@ public class RunRawRefLocalStore {
      */
     public String register(String runId, String userId, String displayName,
                            String content, long ttlSeconds, boolean shortIdStyle) {
+        return register(runId, userId, displayName, content, ttlSeconds, shortIdStyle, null);
+    }
+
+    public String registerPrompt(String runId, String userId, String displayName,
+                                 world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content,
+                                 long ttlSeconds, boolean shortIdStyle) {
+        String source = (String) world.willfrog.agent.platform.input.PromptMessageCodec.sourceAttributes(
+                content.sources().isEmpty() ? world.willfrog.agent.platform.input.PromptMessage.Origin.RUNTIME_DATA
+                        : world.willfrog.agent.platform.input.PromptMessage.Origin.APPLICATION_INSTRUCTION,
+                content.sources()).get(world.willfrog.agent.platform.input.PromptMessageCodec.SOURCE_ATTRIBUTE_KEY);
+        return register(runId, userId, displayName, content.text(), ttlSeconds, shortIdStyle, source);
+    }
+
+    private String register(String runId, String userId, String displayName,
+                            String content, long ttlSeconds, boolean shortIdStyle, String sourceJson) {
         requireSafeSegment(runId, "runId");
         requireText(userId, "userId");
         if (content == null) {
@@ -164,7 +179,7 @@ public class RunRawRefLocalStore {
         Path filePath = runDir.resolve(ref + ".txt");
 
         Entry candidate = new Entry(ref, runId, userId, nvl(displayName),
-                filePath, bytes.length, System.currentTimeMillis(), ttlSeconds, runDir);
+                filePath, bytes.length, System.currentTimeMillis(), ttlSeconds, runDir, sourceJson);
         synchronized (this) {
             long runCount = entries.values().stream()
                     .filter(e -> runId.equals(e.runId())).count();
@@ -196,6 +211,23 @@ public class RunRawRefLocalStore {
     public String read(String runId, String userId, String ref) {
         Entry entry = requireOwnedEntry(runId, userId, ref);
         return readContentOf(entry);
+    }
+
+    /** 内容和来源由同一索引条目读取；旧条目明确保留未知来源。 */
+    public ToolOutputReadResult readWithSources(String runId, String userId, String ref) {
+        Entry entry = requireOwnedEntry(runId, userId, ref);
+        String content = readContentOf(entry);
+        world.willfrog.alphafrogmicro.common.racing.prompt.PromptText prompt = null;
+        if (entry.sourceJson() != null) {
+            var attributed = world.willfrog.agent.platform.input.PromptMessageCodec.fromSourceAttributes(
+                    dev.langchain4j.data.message.UserMessage.from(content), java.util.Map.of(
+                            world.willfrog.agent.platform.input.PromptMessageCodec.SOURCE_ATTRIBUTE_KEY, entry.sourceJson()));
+            if (attributed.origin() != world.willfrog.agent.platform.input.PromptMessage.Origin.UNKNOWN) {
+                prompt = new world.willfrog.alphafrogmicro.common.racing.prompt.PromptText(content, attributed.sources());
+            }
+        }
+        return ToolOutputReadResult.builder().content(content).contentPrompt(prompt)
+                .hasMore(false).nextOffset(content.length()).totalLength(content.length()).build();
     }
 
     /** Ownership-checked existence. */
@@ -388,7 +420,7 @@ public class RunRawRefLocalStore {
         Files.createDirectories(rootDir);
         List<IndexEntry> index = entries.values().stream()
                 .map(e -> new IndexEntry(e.ref(), e.runId(), e.userId(), e.displayName(),
-                        e.path().toString(), e.bytes(), e.createdAtMillis(), e.ttlSeconds()))
+                        e.path().toString(), e.bytes(), e.createdAtMillis(), e.ttlSeconds(), e.sourceJson()))
                 .toList();
         Path tmp = rootDir.resolve(INDEX_FILE_NAME + ".tmp-" + UUID.randomUUID());
         Files.write(tmp, MAPPER.writeValueAsBytes(index));
@@ -435,7 +467,7 @@ public class RunRawRefLocalStore {
                     Entry entry = new Entry(indexEntry.ref(), indexEntry.runId(), indexEntry.userId(),
                             indexEntry.displayName(), derived, indexEntry.bytes(),
                             indexEntry.createdAtMillis(), indexEntry.ttlSeconds(),
-                            derived.getParent());
+                            derived.getParent(), indexEntry.sourceJson());
                     if (isExpired(entry, now)) {
                         deleteQuietly(entry.path());
                         continue;
@@ -494,7 +526,11 @@ public class RunRawRefLocalStore {
 
     record Entry(String ref, String runId, String userId, String displayName,
                  Path path, long bytes, long createdAtMillis, long ttlSeconds,
-                 Path runDir) {
+                 Path runDir, String sourceJson) {
+        Entry(String ref, String runId, String userId, String displayName, Path path, long bytes,
+              long createdAtMillis, long ttlSeconds, Path runDir) {
+            this(ref, runId, userId, displayName, path, bytes, createdAtMillis, ttlSeconds, runDir, null);
+        }
         int seq() {
             if (ref != null && ref.startsWith("raw_ref_")) {
                 try {
@@ -510,6 +546,6 @@ public class RunRawRefLocalStore {
     /** Jackson-serializable index form (paths as strings). 加载时不再信任 path
      * 字段本身，一律按 root/runId/ref.txt 重新推导（见 ensureIndexLoaded）。 */
     record IndexEntry(String ref, String runId, String userId, String displayName,
-                      String path, long bytes, long createdAtMillis, long ttlSeconds) {
+                      String path, long bytes, long createdAtMillis, long ttlSeconds, String sourceJson) {
     }
 }
