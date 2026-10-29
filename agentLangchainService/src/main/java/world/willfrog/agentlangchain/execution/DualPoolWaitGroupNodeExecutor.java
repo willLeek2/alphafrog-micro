@@ -226,24 +226,23 @@ public class DualPoolWaitGroupNodeExecutor {
 
     /** 跑完一个分段。抛出的是控制信号与基础设施异常，业务失败都走 {@link Outcome}。 */
     public Outcome executeSegment(SegmentExecution input) {
+        NodeSegmentCheckpoint stored = null;
         try {
-            return executePreparedSegment(input);
+            stored = NodeSegmentCheckpoint.read(input.payload());
+            return executePreparedSegment(input, stored);
         } catch (RuntimeException exception) {
             ModelSendBlocked blocked = ModelSendBlocks.find(exception).orElse(null);
             if (blocked == null) {
                 throw exception;
             }
-            NodeSegmentCheckpoint checkpoint = NodeSegmentCheckpoint.read(input.payload());
-            if (checkpoint == null) {
-                checkpoint = new NodeSegmentCheckpoint(0, null, List.of(), 0);
-            }
+            NodeSegmentCheckpoint checkpoint = stored == null
+                    ? new NodeSegmentCheckpoint(0, null, List.of(), 0) : stored;
             return new Outcome.Completed(failurePatch(input, checkpoint,
                     blocked.code(), ModelSendBlocks.failureMetadata(blocked)));
         }
     }
 
-    private Outcome executePreparedSegment(SegmentExecution input) {
-        NodeSegmentCheckpoint stored = NodeSegmentCheckpoint.read(input.payload());
+    private Outcome executePreparedSegment(SegmentExecution input, NodeSegmentCheckpoint stored) {
         List<ChatMessage> messages = new ArrayList<>();
         NodeSegmentCheckpoint checkpoint;
         boolean riskReplayEvidenceMissing = false;

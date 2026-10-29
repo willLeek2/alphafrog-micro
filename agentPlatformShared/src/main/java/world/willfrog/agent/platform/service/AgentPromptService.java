@@ -11,6 +11,12 @@ import world.willfrog.agent.platform.prompt.DefaultPromptVariantSelector;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.prompt.PromptSelectionContext;
 import world.willfrog.agent.platform.prompt.PromptVariantSelector;
+import world.willfrog.agent.platform.prompt.AgentPromptTextReader;
+import world.willfrog.agent.platform.prompt.AgentPromptTextReader.RootPrompts;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionBody;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -33,7 +39,8 @@ import java.util.Locale;
  *
  * <h2>Prompt 的三层结构</h2>
  * <ol>
- *   <li><b>时间基准前缀</b>（harness，由 {@link #composeSystemPrompt(String)} 动态注入）：
+ *   <li><b>时间基准前缀</b>（托管正文由 {@link #reactSystemPromptText()} 读取版本并填入日期，
+ *       兼容路径由 {@link #composeSystemPrompt(String)} 注入）：
  *       Run 内根据建 Run 时冻结的 reference date 计算当前年月日 + 相对年份映射规则；
  *       非 Run 的轻量调用才使用 {@code LocalDate.now()}。
  *       例如 "当前时间：2026年05月25日（星期一，2026年5月25日）...说去年，指2025年"。
@@ -47,7 +54,10 @@ import java.util.Locale;
  *       放在 User Message 的设计意图是保持 System Prompt 稳定以提升缓存命中率。</li>
  * </ol>
  *
- * <h2>Prompt 权威源与投影</h2>
+ * <h2>正文读取与来源</h2>
+ * <p>schema2根运行使用返回PromptText的方法，按持久根集合读取正文、日期和数据时效，
+ * 并把实际版本来源交给调用方。旧String出口在schema2或运行选择缺失时停止，避免丢失来源。</p>
+ * <p>以下投影规则仅适用于尚未切换的schema1与非Run兼容路径：</p>
  * <ol>
  *   <li><b>唯一权威正文</b>：{@code agentPlatformShared} classpath {@code prompts/}。</li>
  *   <li><b>Nacos / 外置文件</b>：仍可热加载，但只作为权威正文的部署投影；内容不一致时拒绝刷新。</li>
@@ -91,10 +101,18 @@ public class AgentPromptService {
     private final AgentLlmLocalConfigLoader localConfigLoader;
     private final PromptAuthority promptAuthority;
     private final PromptVariantSelector promptVariantSelector;
+    private final AgentPromptTextReader promptTexts;
     private static final ObjectMapper CATALOG_MAPPER = new ObjectMapper();
     private volatile Map<String, String> toolCapabilityCatalog;
 
     @Autowired
+    public AgentPromptService(AgentLlmProperties properties,
+                              AgentLlmLocalConfigLoader localConfigLoader,
+                              PromptVariantSelector promptVariantSelector,
+                              AgentPromptTextReader promptTexts) {
+        this(properties, localConfigLoader, PromptAuthority.shared(), promptVariantSelector, promptTexts);
+    }
+
     public AgentPromptService(AgentLlmProperties properties,
                               AgentLlmLocalConfigLoader localConfigLoader,
                               PromptVariantSelector promptVariantSelector) {
@@ -116,13 +134,22 @@ public class AgentPromptService {
                        AgentLlmLocalConfigLoader localConfigLoader,
                        PromptAuthority promptAuthority,
                        PromptVariantSelector promptVariantSelector) {
+        this(properties, localConfigLoader, promptAuthority, promptVariantSelector, null);
+    }
+
+    private AgentPromptService(AgentLlmProperties properties,
+                       AgentLlmLocalConfigLoader localConfigLoader,
+                       PromptAuthority promptAuthority,
+                       PromptVariantSelector promptVariantSelector,
+                       AgentPromptTextReader promptTexts) {
         this.properties = properties;
         this.localConfigLoader = localConfigLoader;
         this.promptAuthority = promptAuthority;
         this.promptVariantSelector = promptVariantSelector;
+        this.promptTexts = promptTexts;
     }
 
-    /** Run 创建时唯一允许调用的版本选择入口。 */
+    /** 仅为兼容路径生成旧摘要；托管根的真实集合由PromptSelectionCoordinator确认并保存。 */
     public PromptRunSelection snapshotPromptSelection(String runId, String userId, String experimentContext) {
         PromptVariantSelector.SelectedVariant selected = promptVariantSelector.select(
                 new PromptSelectionContext(runId, userId, experimentContext));
@@ -142,12 +169,16 @@ public class AgentPromptService {
     }
 
     /**
-     * 在消费正文前校验持久化选择仍对应当前生效版本或近期留存版本。
-     * 运行时覆盖推送会更换生效指纹；在途 Run 冻结的旧指纹只要还在留存窗口内就放行，
-     * 避免一次覆盖推送把正在执行的 Run 打成配置错误。
+     * schema2在此核对选择结构，实际正文仍须由typed入口核对持久根、用途及授权。
+     * schema1兼容路径继续校验当前或近期留存摘要；旧摘要不代表可以还原历史正文。
      */
     public void validatePromptSelection(PromptRunSelection selection) {
         if (selection == null) {
+            return;
+        }
+        if (selection.schemaVersion() == PromptRunSelection.RACING_SCHEMA_VERSION) {
+            // 实际正文由typed入口继续核对持久根、用途与当前授权，不查旧Authority摘要。
+            selection.racingSelection();
             return;
         }
         boolean current = DefaultPromptVariantSelector.BUNDLE_VERSION.equals(selection.bundleVersion())
@@ -168,6 +199,267 @@ public class AgentPromptService {
                 "Run 冻结的 Prompt 版本或摘要与当前权威资源不一致");
     }
 
+    /** 原根日期政策、数据时效政策和全局正文；不加入历史specific参数。 */
+    public PromptText reactSystemPromptText() {
+        RootPrompts root = textReader().current();
+        String freshness = freshnessClauses(root.freshness());
+        Map<String, String> expected = new LinkedHashMap<>();
+        expected.put("agentTimeReferenceSystemPrompt", "agentTimeReferenceSystemPrompt");
+        expected.put("agentRunSystemPrompt", "agentRunSystemPrompt");
+        if (!freshness.isEmpty()) expected.put("dataFreshnessInstruction", "dataFreshnessInstruction");
+        Map<String, PromptVersionBody> bodies = textReader().read(root, expected);
+        LocalDate date = root.referenceDate();
+        List<PromptText> parts = new ArrayList<>();
+        parts.add(textReader().render(bodies.get("agentTimeReferenceSystemPrompt"), data(
+                "date", date.format(CN_DATE_FORMATTER),
+                "weekday", date.getDayOfWeek().getDisplayName(TextStyle.FULL, Locale.CHINESE),
+                "thisYear", String.valueOf(date.getYear()), "month", String.valueOf(date.getMonthValue()),
+                "day", String.valueOf(date.getDayOfMonth()), "lastYear", String.valueOf(date.getYear() - 1),
+                "yearBeforeLast", String.valueOf(date.getYear() - 2)), Map.of()));
+        if (!freshness.isEmpty()) {
+            parts.add(textReader().render(bodies.get("dataFreshnessInstruction"), data("clauses", freshness), Map.of()));
+        }
+        parts.add(textReader().render(bodies.get("agentRunSystemPrompt"), Map.of(), Map.of()));
+        return joinTexts(parts, "\n");
+    }
+
+    public PromptText dynamicContextPrefixText() {
+        RootPrompts root = textReader().current();
+        return renderText(root, "dynamicContextPrefix", data("date", root.referenceDate().format(CN_DATE_FORMATTER)), Map.of());
+    }
+
+    @Deprecated
+    public PromptText planningAnalysisStageInstructionText(String toolWhitelist, int maxTodos) {
+        return renderText("planningAnalysisStage", data("toolWhitelist", toolWhitelist, "maxTodos", String.valueOf(maxTodos)));
+    }
+
+    public PromptText planningStrategyStageInstructionText(String toolWhitelist, int maxTodos, int maxDetailLength) {
+        RootPrompts root = textReader().current();
+        PromptVersionBody body = readBody(root, "planningStrategyStage");
+        PromptText capabilities = usesVariable(body, "toolCapabilities")
+                ? renderToolCapabilities(root, splitToolNames(toolWhitelist)) : PromptText.runtimeData("");
+        return renderStrategy(body, toolWhitelist, maxTodos, maxDetailLength, capabilities);
+    }
+
+    public PromptText planningStrategyStageInstructionText(String toolWhitelist, int maxTodos, int maxDetailLength,
+                                                           PromptText capabilities) {
+        RootPrompts root = textReader().current();
+        return renderStrategy(readBody(root, "planningStrategyStage"), toolWhitelist, maxTodos, maxDetailLength, capabilities);
+    }
+
+    private PromptText renderStrategy(PromptVersionBody body, String toolWhitelist, int maxTodos, int maxDetailLength,
+                                       PromptText capabilities) {
+        return textReader().render(body, data("toolWhitelist", toolWhitelist, "maxTodos", String.valueOf(maxTodos),
+                "strategyMaxDetailLength", String.valueOf(maxDetailLength)), instructions("toolCapabilities", capabilities));
+    }
+
+    public PromptText renderToolCapabilitiesText(Collection<String> toolNames) {
+        if (toolNames == null || toolNames.isEmpty()) return PromptText.runtimeData("");
+        return renderToolCapabilities(textReader().current(), toolNames);
+    }
+
+    private PromptText renderToolCapabilities(RootPrompts root, Collection<String> toolNames) {
+        List<String> ordered = new ArrayList<>();
+        if (toolNames.contains("checkParallelLimits")) ordered.add("checkParallelLimits");
+        toolNames.stream().filter(name -> name != null && !name.isBlank() && !"checkParallelLimits".equals(name))
+                .distinct().sorted().forEach(ordered::add);
+        if (ordered.isEmpty()) return PromptText.runtimeData("");
+        Map<String, String> expected = new LinkedHashMap<>();
+        ordered.forEach(name -> expected.put("tool.capability." + name, "TOOL_CAPABILITY"));
+        Map<String, PromptVersionBody> bodies = textReader().read(root, expected);
+        List<PromptText> lines = new ArrayList<>();
+        for (String name : ordered) {
+            lines.add(PromptText.concat(PromptText.runtimeData("- " + name + ": "),
+                    textReader().render(bodies.get("tool.capability." + name), Map.of(), Map.of())));
+        }
+        return joinTexts(lines, "\n");
+    }
+
+    public PromptText planningTodosStageInstructionText(String mode, String detail, String toolWhitelist, int maxTodos) {
+        RootPrompts root = textReader().current();
+        PromptVersionBody body = readBody(root, "planningTodosStage");
+        PromptText guidance = usesVariable(body, "modeGuidance") ? renderText(root,
+                "DAG".equalsIgnoreCase(mode) ? "planningDagModeGuidance" : "planningLinearModeGuidance",
+                Map.of(), Map.of()) : PromptText.runtimeData("");
+        return textReader().render(body, data("mode", mode, "detail", detail, "toolWhitelist", toolWhitelist,
+                "maxTodos", String.valueOf(maxTodos)), instructions("modeGuidance", guidance));
+    }
+
+    public PromptText dagReactStageInstructionText(PromptText capabilities) {
+        RootPrompts root = textReader().current();
+        Map<String, PromptVersionBody> bodies = textReader().read(root, Map.of(
+                "dagReactSystemPrompt", "dagReactSystemPrompt",
+                "dagReactToolCapabilitiesSection", "dagReactToolCapabilitiesSection"));
+        return PromptText.concat(textReader().render(bodies.get("dagReactSystemPrompt"), Map.of(), Map.of()),
+                textReader().render(bodies.get("dagReactToolCapabilitiesSection"), Map.of(),
+                        instructions("toolCapabilities", capabilities)));
+    }
+
+    // 历史System出口都保持稳定层；阶段专用正文由带来源的阶段接口提供。
+    public PromptText agentRunSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText todoPlannerSystemPromptText(String toolWhitelist, int maxTodos) { return reactSystemPromptText(); }
+    public PromptText workflowFinalSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText workflowTodoRecoverySystemPromptText() { return reactSystemPromptText(); }
+    public PromptText parallelPlannerSystemPromptText(String toolWhitelist, int maxTasks, int maxSubSteps,
+            int maxParallelTasks, int maxSubAgents) { return reactSystemPromptText(); }
+    public PromptText parallelPlannerSystemPromptText(String toolWhitelist, int maxTasks, int maxSubSteps,
+            int maxParallelTasks, int maxSubAgents, int candidateIndex, int candidateCount) { return reactSystemPromptText(); }
+    public PromptText parallelFinalSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText parallelPatchPlannerSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText planJudgeSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText planJudgeRuntimeSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText semanticJudgeSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText subAgentPlannerSystemPromptText(String tools, int maxSteps) { return reactSystemPromptText(); }
+    public PromptText subAgentSummarySystemPromptText() { return reactSystemPromptText(); }
+    public PromptText pythonRefineSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText orchestratorPlanningSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText orchestratorSummarySystemPromptText() { return reactSystemPromptText(); }
+    public PromptText dagReactSystemPromptText() { return reactSystemPromptText(); }
+    public PromptText dagRecoveryJudgeSystemPromptText() { return reactSystemPromptText(); }
+
+    public List<PromptText> pythonRefineRequirementsTexts() {
+        return requirementTexts(textReader().current());
+    }
+
+    private List<PromptText> requirementTexts(RootPrompts root) {
+        return textReader().requirements(root).stream()
+                .map(body -> textReader().render(body, Map.of(), Map.of())).toList();
+    }
+
+    public PromptText pythonRefineOutputInstructionText() {
+        return renderText("pythonRefineOutputInstruction", Map.of());
+    }
+
+    public PromptText financeMethodResolverSystemPromptText(String resolverCatalog) {
+        return renderText("financeMethodResolverSystemPrompt", data("RESOLVER_CATALOG", resolverCatalog));
+    }
+
+    /** 返回真实版本用于模板摘要和单次渲染，未渲染模板不作为已完成的PromptText返回。 */
+    public PromptVersionBody financeMethodResolverSystemPromptVersion() {
+        return readBody(textReader().current(), "financeMethodResolverSystemPrompt");
+    }
+
+    /** 字段规格及展示标签是结构事实；调用方明确提供本次使用的数据。 */
+    public PromptText pythonRefineDatasetFieldGuideText(List<AgentLlmProperties.DatasetFieldSpec> facts) {
+        return PromptText.runtimeData(datasetFieldFacts(facts));
+    }
+
+    public PromptText dagModeGuidancePromptText() { return renderText("dagModeGuidancePrompt", Map.of()); }
+    public PromptText dagRecoveryJudgeStageInstructionText() { return renderText("dagRecoveryJudgeSystemPromptTemplate", Map.of()); }
+    public PromptText planningStructuredStageInstructionText() { return renderText("planningStructuredStage", Map.of()); }
+    public PromptText planningLinearConstraintText() { return renderText("planningLinearConstraint", Map.of()); }
+
+    public PromptText pythonRepairStageInstructionText() {
+        RootPrompts root = textReader().current();
+        PromptVersionBody body = readBody(root, "pythonRepairStageInstruction");
+        List<PromptText> requirements = new ArrayList<>();
+        if (usesVariable(body, "requirements")) {
+            for (PromptText item : requirementTexts(root)) {
+                requirements.add(PromptText.concat(PromptText.runtimeData("- "), item));
+            }
+        }
+        return textReader().render(body, Map.of(), instructions("requirements", joinTexts(requirements, "\n")));
+    }
+
+    public PromptText todoRetryContextInstructionText(String toolName, String toolSafety, String failureCategory,
+                                                       String failureSummary, String previousArguments) {
+        return renderText("todoRetryContextInstruction", data("toolName", toolName, "toolSafety", toolSafety,
+                "failureCategory", failureCategory, "failureSummary", failureSummary, "previousArguments", previousArguments));
+    }
+
+    public PromptText pythonRepairContextInstructionText(String repairAttempt, String terminalStatus, String exitReason,
+            String errorCode, String retryable, String stdoutPreview, String stderrPreview, String failedCodePreview) {
+        return renderText("pythonRepairContextInstruction", data("repairAttempt", repairAttempt,
+                "terminalStatus", terminalStatus, "exitReason", exitReason, "errorCode", errorCode,
+                "retryable", retryable, "stdoutPreview", stdoutPreview, "stderrPreview", stderrPreview,
+                "failedCodePreview", failedCodePreview));
+    }
+
+    public PromptText toolSummarySystemPromptText() { return renderText("toolSummarySystemPrompt", Map.of()); }
+
+    /** 普通集合正文；实验版选择由工具总结的专用准备组件提供。 */
+    public PromptText toolSummaryUserPromptText(String todoGoal, String toolName, String rawOutput) {
+        return renderText("toolSummaryUserPromptTemplate", data("todoGoal", todoGoal, "toolName", toolName, "rawOutput", rawOutput));
+    }
+
+    public PromptText emptyOutputRecoveryStageInstructionText() { return renderText("emptyOutputRecoveryStageInstruction", Map.of()); }
+
+    public PromptText budgetLastMileStageInstructionText(String dimension, long actual, long limit, long ratioPct) {
+        return renderText("budgetLastMileStageInstruction", data("dimension", dimension, "actual", String.valueOf(actual),
+                "limit", String.valueOf(limit), "ratioPct", String.valueOf(ratioPct)));
+    }
+
+    public PromptText recoveryStageInstructionText() { return renderText("workflowTodoRecoverySystemPrompt", Map.of()); }
+    public PromptText finalAnswerStageInstructionText() { return renderText("workflowFinalSystemPrompt", Map.of()); }
+    public PromptText planJudgeStageInstructionText() { return renderText("planJudgeRuntimeSystemPromptTemplate", Map.of()); }
+    public PromptText patchPlannerStageInstructionText() { return renderText("parallelPatchPlannerSystemPromptTemplate", Map.of()); }
+
+    private AgentPromptTextReader textReader() {
+        if (promptTexts == null) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_UNREADABLE, "托管正文读取组件未配置");
+        }
+        return promptTexts;
+    }
+
+    private PromptVersionBody readBody(RootPrompts root, String fragment) {
+        return textReader().read(root, Map.of(fragment, fragment)).get(fragment);
+    }
+
+    private PromptText renderText(String fragment, Map<String, String> values) {
+        return renderText(textReader().current(), fragment, values, Map.of());
+    }
+
+    private PromptText renderText(RootPrompts root, String fragment, Map<String, String> values,
+                                    Map<String, PromptText> instructionValues) {
+        return textReader().render(readBody(root, fragment), values, instructionValues);
+    }
+
+    private static boolean usesVariable(PromptVersionBody body, String name) {
+        return body.variables().stream().anyMatch(variable -> variable.name().equals(name));
+    }
+
+    private static Map<String, String> data(String... pairs) {
+        Map<String, String> values = new LinkedHashMap<>();
+        for (int i = 0; i < pairs.length; i += 2) values.put(pairs[i], pairs[i + 1]);
+        return values;
+    }
+
+    private static Map<String, PromptText> instructions(String name, PromptText value) {
+        Map<String, PromptText> values = new LinkedHashMap<>();
+        values.put(name, value);
+        return values;
+    }
+
+    private static PromptText joinTexts(List<PromptText> parts, String separator) {
+        List<PromptText> joined = new ArrayList<>();
+        for (PromptText part : parts) {
+            if (!joined.isEmpty()) joined.add(PromptText.runtimeData(separator));
+            joined.add(part);
+        }
+        return PromptText.concat(joined);
+    }
+
+    private String freshnessClauses(AgentPromptTextReader.DataFreshnessFacts freshness) {
+        if (freshness == null) return "";
+        String start = firstNonBlank(freshness.startDate()), end = firstNonBlank(freshness.endDate());
+        String asOf = firstNonBlank(freshness.asOfDate()), description = firstNonBlank(freshness.description());
+        List<String> clauses = new ArrayList<>();
+        if (!start.isEmpty() || !end.isEmpty()) clauses.add("范围：" + firstNonBlank(start, "未指定") + " 至 " + firstNonBlank(end, "未指定"));
+        if (!asOf.isEmpty()) clauses.add("as-of 日期：" + asOf);
+        if (!description.isEmpty()) clauses.add("说明：" + description);
+        return String.join("；", clauses);
+    }
+
+    private void requireLegacyTextPath() {
+        PromptRunSelection selection = AgentContext.getPromptRunSelection();
+        String runId = AgentContext.getRunId();
+        if ((selection != null && selection.schemaVersion() == PromptRunSelection.RACING_SCHEMA_VERSION)
+                || (runId != null && !runId.isBlank() && selection == null)) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "当前运行必须使用带版本来源的正文接口");
+        }
+    }
+
     /**
      * 返回 Agent Run 入口的完整 System Prompt（含时间基准 + 全局指令）。
      * 主要供完整 Agent Run 入口使用；DAG 节点执行倾向使用 {@link #reactSystemPrompt()}
@@ -176,6 +468,7 @@ public class AgentPromptService {
      * @return 时间基准 + agent_run_system.txt 全局指令的拼接结果
      */
     public String agentRunSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getAgentRunSystemPrompt(), ""));
     }
 
@@ -192,6 +485,7 @@ public class AgentPromptService {
      * @return 仅含时间基准、数据时效和全局指令的稳定 System Prompt
      */
     public String todoPlannerSystemPrompt(String toolWhitelist, int maxTodos) {
+        requireLegacyTextPath();
         String template = currentPrompts().getTodoPlannerSystemPromptTemplate();
         String specific = render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
@@ -218,6 +512,7 @@ public class AgentPromptService {
      * @return "今天是yyyy年MM月dd日。" 格式的日期字符串
      */
     public String dynamicContextPrefix() {
+        requireLegacyTextPath();
         PromptRunSelection selection = AgentContext.getPromptRunSelection();
         validatePromptSelection(selection);
         LocalDate date = selection == null ? LocalDate.now() : selection.referenceDate();
@@ -231,6 +526,7 @@ public class AgentPromptService {
      * @return 含时间基准的 final answer 阶段 System Prompt
      */
     public String workflowFinalSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(
                 currentPrompts().getWorkflowFinalSystemPrompt(),
                 currentPrompts().getParallelFinalSystemPrompt(),
@@ -245,6 +541,7 @@ public class AgentPromptService {
      * @return 含时间基准的 recovery 阶段 System Prompt
      */
     public String workflowTodoRecoverySystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(
                 currentPrompts().getWorkflowTodoRecoverySystemPrompt(),
                 ""
@@ -267,6 +564,7 @@ public class AgentPromptService {
                                               int maxSubSteps,
                                               int maxParallelTasks,
                                               int maxSubAgents) {
+        requireLegacyTextPath();
         return parallelPlannerSystemPrompt(toolWhitelist, maxTasks, maxSubSteps, maxParallelTasks, maxSubAgents, 1, 1);
     }
 
@@ -292,6 +590,7 @@ public class AgentPromptService {
                                               int maxSubAgents,
                                               int candidateIndex,
                                               int candidateCount) {
+        requireLegacyTextPath();
         String template = firstNonBlank(currentPrompts().getParallelPlannerSystemPromptTemplate(),
                 "");
         String specific = render(template, Map.of(
@@ -314,17 +613,20 @@ public class AgentPromptService {
      * 比较各方案结果并输出最终答案。</p>
      */
     public String parallelFinalSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getParallelFinalSystemPrompt(), ""));
     }
 
     /** 并行 Plan 补丁（patch）阶段的 System Prompt，用于对已有 Plan 做增量修正。 */
     public String parallelPatchPlannerSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getParallelPatchPlannerSystemPromptTemplate(), ""));
     }
 
     /** Plan Judge（计划判定器，静态版本）的 System Prompt。
      *  用于让 LLM 判断一个 Plan 是否可执行或需要修正。 */
     public String planJudgeSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getPlanJudgeSystemPromptTemplate(), ""));
     }
 
@@ -337,6 +639,7 @@ public class AgentPromptService {
      * @return 运行时或静态 Plan Judge System Prompt
      */
     public String planJudgeRuntimeSystemPrompt() {
+        requireLegacyTextPath();
         String runtimePrompt = firstNonBlank(currentPrompts().getPlanJudgeRuntimeSystemPromptTemplate(), "");
         if (!runtimePrompt.isEmpty()) {
             return composeSystemPrompt(runtimePrompt);
@@ -347,6 +650,7 @@ public class AgentPromptService {
     /** 语义判断器（SemanticJudge）的 System Prompt。
      *  用于让 LLM 对执行结果做语义级别的是否满足用户意图判定。 */
     public String semanticJudgeSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getSemanticJudgeSystemPromptTemplate(), ""));
     }
 
@@ -359,6 +663,7 @@ public class AgentPromptService {
      * @return 含时间基准的 Sub-Agent Planner System Prompt
      */
     public String subAgentPlannerSystemPrompt(String tools, int maxSteps) {
+        requireLegacyTextPath();
         String template = firstNonBlank(currentPrompts().getSubAgentPlannerSystemPromptTemplate(),
                 "");
         String specific = render(template, Map.of(
@@ -370,6 +675,7 @@ public class AgentPromptService {
 
     /** Sub-Agent 完成任务后的内容总结 System Prompt。 */
     public String subAgentSummarySystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getSubAgentSummarySystemPrompt(), ""));
     }
 
@@ -380,6 +686,7 @@ public class AgentPromptService {
      * 用此 prompt 引导 LLM 基于错误信息和原始代码生成修正版本。</p>
      */
     public String pythonRefineSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getPythonRefineSystemPrompt(), ""));
     }
 
@@ -390,6 +697,7 @@ public class AgentPromptService {
      * @return 不可变的需求列表（配置为空时返回空列表）
      */
     public List<String> pythonRefineRequirements() {
+        requireLegacyTextPath();
         List<String> requirements = currentPrompts().getPythonRefineRequirements();
         if (requirements == null || requirements.isEmpty()) {
             return List.of();
@@ -405,6 +713,7 @@ public class AgentPromptService {
 
     /** Python refine 阶段的输出格式指令（如"输出 markdown 表格"等）。 */
     public String pythonRefineOutputInstruction() {
+        requireLegacyTextPath();
         return firstNonBlank(currentPrompts().getPythonRefineOutputInstruction());
     }
 
@@ -418,6 +727,7 @@ public class AgentPromptService {
      * @return 替换占位符后的完整 system prompt
      */
     public String financeMethodResolverSystemPrompt(String resolverCatalog) {
+        requireLegacyTextPath();
         return render(financeMethodResolverSystemPromptTemplate(), Map.of("RESOLVER_CATALOG", safe(resolverCatalog)));
     }
 
@@ -431,6 +741,7 @@ public class AgentPromptService {
      * 路径本身不会再被当作模型指令。</p>
      */
     public String financeMethodResolverSystemPromptTemplate() {
+        requireLegacyTextPath();
         return currentPrompts().getFinanceMethodResolverSystemPrompt();
     }
 
@@ -444,7 +755,11 @@ public class AgentPromptService {
      * @return 多行字段说明文本，无配置时返回空串
      */
     public String pythonRefineDatasetFieldGuide() {
-        List<AgentLlmProperties.DatasetFieldSpec> fields = currentPrompts().getDatasetFieldSpecs();
+        requireLegacyTextPath();
+        return datasetFieldFacts(currentPrompts().getDatasetFieldSpecs());
+    }
+
+    private String datasetFieldFacts(List<AgentLlmProperties.DatasetFieldSpec> fields) {
         if (fields == null || fields.isEmpty()) {
             return "";
         }
@@ -469,11 +784,13 @@ public class AgentPromptService {
     /** Orchestrator（任务编排器）规划阶段的 System Prompt。
      *  用于多 Agent 协作场景下主控 Agent 的规划。 */
     public String orchestratorPlanningSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getOrchestratorPlanningSystemPrompt(), ""));
     }
 
     /** Orchestrator 总结阶段的 System Prompt。 */
     public String orchestratorSummarySystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getOrchestratorSummarySystemPrompt(), ""));
     }
 
@@ -498,11 +815,13 @@ public class AgentPromptService {
      * @see #reactSystemPrompt() planning 阶段的 System Prompt
      */
     public String dagReactSystemPrompt() {
+        requireLegacyTextPath();
         return reactSystemPrompt();
     }
 
     /** DAG/Todo 执行阶段正文，只能进入 User Message。 */
     public String dagReactStageInstruction(String renderedToolCapabilities) {
+        requireLegacyTextPath();
         return currentPrompts().getDagReactSystemPrompt()
                 + "\n\n## 本次 Run 实际开放的工具\n"
                 + safe(renderedToolCapabilities);
@@ -515,6 +834,7 @@ public class AgentPromptService {
      * <p>正文来自 shared classpath 权威文件，运行时投影必须逐字一致。</p>
      */
     public String dagModeGuidancePrompt() {
+        requireLegacyTextPath();
         return currentPrompts().getDagModeGuidancePrompt();
     }
 
@@ -527,11 +847,13 @@ public class AgentPromptService {
      * <p>通过 {@link #composeSystemPrompt(String)} 注入时间基准前缀与全局 agent_run 指令。</p>
      */
     public String dagRecoveryJudgeSystemPrompt() {
+        requireLegacyTextPath();
         return reactSystemPrompt();
     }
 
     /** DAG recovery judge 阶段正文，只能进入 User Message。 */
     public String dagRecoveryJudgeStageInstruction() {
+        requireLegacyTextPath();
         return currentPrompts().getDagRecoveryJudgeSystemPromptTemplate();
     }
 
@@ -651,6 +973,7 @@ public class AgentPromptService {
      * @see #dagReactSystemPrompt() DAG 节点执行的 System Prompt
      */
     public String reactSystemPrompt() {
+        requireLegacyTextPath();
         return composeSystemPrompt(firstNonBlank(currentPrompts().getAgentRunSystemPrompt(), ""));
     }
 
@@ -664,6 +987,7 @@ public class AgentPromptService {
      */
     @Deprecated
     public String planningAnalysisStageInstruction(String toolWhitelist, int maxTodos) {
+        requireLegacyTextPath();
         String template = currentPrompts().getPlanningAnalysisStage();
         return render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
@@ -691,6 +1015,7 @@ public class AgentPromptService {
      * @return 含工具能力清单的 strategy 阶段 User Message 指令
      */
     public String planningStrategyStageInstruction(String toolWhitelist, int maxTodos, int maxDetailLength) {
+        requireLegacyTextPath();
         return planningStrategyStageInstruction(
                 toolWhitelist, maxTodos, maxDetailLength,
                 renderToolCapabilities(splitToolNames(toolWhitelist)));
@@ -700,6 +1025,7 @@ public class AgentPromptService {
                                                    int maxTodos,
                                                    int maxDetailLength,
                                                    String renderedToolCapabilities) {
+        requireLegacyTextPath();
         String template = currentPrompts().getPlanningStrategyStage();
         return render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
@@ -728,6 +1054,7 @@ public class AgentPromptService {
      * @return 以换行分隔的工具能力说明文本，直接注入到 strategy stage instruction 中
      */
     public String renderToolCapabilities(Collection<String> toolNames) {
+        requireLegacyTextPath();
         if (toolNames == null || toolNames.isEmpty()) {
             return "";
         }
@@ -778,6 +1105,7 @@ public class AgentPromptService {
      */
     public String planningTodosStageInstruction(String mode, String detail,
                                                   String toolWhitelist, int maxTodos) {
+        requireLegacyTextPath();
         String template = currentPrompts().getPlanningTodosStage();
         String modeGuidance = "DAG".equalsIgnoreCase(mode)
                 ? currentPrompts().getPlanningDagModeGuidance()
@@ -802,14 +1130,17 @@ public class AgentPromptService {
      * @return 含 JSON 格式示例和注意事项的 structured 阶段指令
      */
     public String planningStructuredStageInstruction() {
+        requireLegacyTextPath();
         return currentPrompts().getPlanningStructuredStage();
     }
 
     public String planningLinearConstraint() {
+        requireLegacyTextPath();
         return currentPrompts().getPlanningLinearConstraint();
     }
 
     public String pythonRepairStageInstruction() {
+        requireLegacyTextPath();
         List<String> requirements = pythonRefineRequirements();
         String renderedRequirements = requirements == null ? "" : requirements.stream()
                 .map(item -> "- " + item)
@@ -824,6 +1155,7 @@ public class AgentPromptService {
                                               String failureCategory,
                                               String failureSummary,
                                               String previousArguments) {
+        requireLegacyTextPath();
         return render(currentPrompts().getTodoRetryContextInstruction(), Map.of(
                 "toolName", safe(toolName),
                 "toolSafety", safe(toolSafety),
@@ -840,6 +1172,7 @@ public class AgentPromptService {
                                                  String stdoutPreview,
                                                  String stderrPreview,
                                                  String failedCodePreview) {
+        requireLegacyTextPath();
         return render(currentPrompts().getPythonRepairContextInstruction(), Map.of(
                 "repairAttempt", safe(repairAttempt),
                 "terminalStatus", safe(terminalStatus),
@@ -852,10 +1185,12 @@ public class AgentPromptService {
     }
 
     public String toolSummarySystemPrompt() {
+        requireLegacyTextPath();
         return currentPrompts().getToolSummarySystemPrompt();
     }
 
     public String toolSummaryUserPrompt(String todoGoal, String toolName, String rawOutput) {
+        requireLegacyTextPath();
         return render(currentPrompts().getToolSummaryUserPromptTemplate(), Map.of(
                 "todoGoal", safe(todoGoal),
                 "toolName", safe(toolName),
@@ -863,6 +1198,7 @@ public class AgentPromptService {
     }
 
     public String emptyOutputRecoveryStageInstruction() {
+        requireLegacyTextPath();
         return currentPrompts().getEmptyOutputRecoveryStageInstruction();
     }
 
@@ -870,6 +1206,7 @@ public class AgentPromptService {
                                                   long actual,
                                                   long limit,
                                                   long ratioPct) {
+        requireLegacyTextPath();
         return render(currentPrompts().getBudgetLastMileStageInstruction(), Map.of(
                 "dimension", safe(dimension),
                 "actual", String.valueOf(actual),
@@ -886,6 +1223,7 @@ public class AgentPromptService {
      * @return 带 [Stage: TODO_RECOVERY] 标记的 recovery 指令
      */
     public String recoveryStageInstruction() {
+        requireLegacyTextPath();
         return firstNonBlank(
                 currentPrompts().getWorkflowTodoRecoverySystemPrompt(),
                 ""
@@ -899,6 +1237,7 @@ public class AgentPromptService {
      * @return 带 [Stage: FINAL_ANSWER] 标记的 final answer 指令
      */
     public String finalAnswerStageInstruction() {
+        requireLegacyTextPath();
         return firstNonBlank(
                 currentPrompts().getWorkflowFinalSystemPrompt(),
                 currentPrompts().getParallelFinalSystemPrompt(),
@@ -916,6 +1255,7 @@ public class AgentPromptService {
      * @return 带 [Stage: PLAN_JUDGE] 标记的 judge 指令
      */
     public String planJudgeStageInstruction() {
+        requireLegacyTextPath();
         return firstNonBlank(
                 currentPrompts().getPlanJudgeRuntimeSystemPromptTemplate(),
                 currentPrompts().getPlanJudgeSystemPromptTemplate(),
@@ -932,6 +1272,7 @@ public class AgentPromptService {
      * @return 带 [Stage: PATCH_PLAN] 标记的 patch 指令
      */
     public String patchPlannerStageInstruction() {
+        requireLegacyTextPath();
         return firstNonBlank(
                 currentPrompts().getParallelPatchPlannerSystemPromptTemplate(),
                 ""
@@ -939,9 +1280,9 @@ public class AgentPromptService {
     }
 
     /**
-     * 组装完整的 System Prompt：<b>时间基准 + 全局 agent 指令 + 可选的阶段专属 prompt</b>。
+     * 为未切换的兼容路径组装 System Prompt：<b>时间基准 + 数据时效 + 全局指令</b>。
      *
-     * <p>这是整个 agent 系统最重要的 prompt 组装方法，所有 System Prompt 最终都经过这里。</p>
+     * <p>schema2不能进入此方法；托管系统正文使用reactSystemPromptText读取原根集合。</p>
      *
      * <h3>三段式结构</h3>
      * <ol>
@@ -969,6 +1310,7 @@ public class AgentPromptService {
      * @return 稳定时间基准、数据时效与全局指令组成的 System Prompt
      */
     private String composeSystemPrompt(String ignoredSpecificPrompt) {
+        requireLegacyTextPath();
         String global = firstNonBlank(currentPrompts().getAgentRunSystemPrompt(), "");
 
         List<String> parts = new ArrayList<>();
@@ -1012,6 +1354,7 @@ public class AgentPromptService {
     }
 
     private Map<String, String> toolCapabilityCatalog() {
+        requireLegacyTextPath();
         Map<String, String> current = toolCapabilityCatalog;
         if (current != null) {
             return current;
@@ -1046,6 +1389,7 @@ public class AgentPromptService {
      * 入口从 ext 解析回 ThreadLocal。快照为 null 时 fallback 到 {@link #currentDataFreshness()}。</p>
      */
     private String dataFreshnessPrompt() {
+        requireLegacyTextPath();
         // 优先使用 run 启动时冻结的快照（AgentContext），保证同一 run 内 dataFreshness 语义一致
         AgentLlmProperties.DataFreshness freshness = AgentContext.getDataFreshness();
         if (freshness == null) {
@@ -1087,6 +1431,7 @@ public class AgentPromptService {
      * @return 权威 Prompt 的防御性副本（永不为 null）
      */
     private AgentLlmProperties.Prompts currentPrompts() {
+        requireLegacyTextPath();
         promptAuthority.validateProjection(properties.getPrompts(), "Spring prompt projection");
         AgentLlmLocalConfigLoader.LocalConfigSnapshot localSnapshot = localConfigLoader.currentSnapshot();
         if (localSnapshot != null
@@ -1246,6 +1591,7 @@ public class AgentPromptService {
      * @return 替换后的文本
      */
     private String render(String template, Map<String, String> vars) {
+        requireLegacyTextPath();
         String out = safe(template);
         for (Map.Entry<String, String> entry : vars.entrySet()) {
             out = out.replace("{{" + entry.getKey() + "}}", safe(entry.getValue()));
