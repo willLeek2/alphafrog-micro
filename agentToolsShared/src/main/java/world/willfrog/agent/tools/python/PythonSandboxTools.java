@@ -1,6 +1,9 @@
 package world.willfrog.agent.tools.python;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import com.fasterxml.jackson.databind.JsonNode;
 import dev.langchain4j.agent.tool.Tool;
 import jakarta.annotation.PostConstruct;
@@ -117,6 +120,12 @@ public class PythonSandboxTools {
 
     private final ObjectMapper objectMapper;
 
+    @Autowired
+    private ProducerPromptTexts promptTexts;
+
+    @Autowired
+    private TerminalResultPromptTexts terminalPromptTexts;
+
     /**
      * 订阅数据集持久化事件，并在单次 agent 运行内维护「局部编号 → 条目」映射。
      * 标记为可选注入（{@code required=false}），便于单元测试在不启动完整 Spring 上下文时运行。
@@ -211,6 +220,15 @@ public class PythonSandboxTools {
         this.financeToolResultFormatter = new FinanceToolResultFormatter(objectMapper);
     }
 
+    @Autowired
+    public PythonSandboxTools(ObjectMapper objectMapper, FinanceToolResultFormatter formatter,
+                              TerminalResultPromptTexts terminalPromptTexts) {
+        this.objectMapper = objectMapper;
+        this.metadataReader = new DatasetEntryMetadataReader(objectMapper);
+        this.financeToolResultFormatter = formatter;
+        this.terminalPromptTexts = terminalPromptTexts;
+    }
+
     // ==================== 适配器装配（生命周期框架的四个出口） ====================
 
     private volatile SandboxJobObservability observability;
@@ -236,7 +254,7 @@ public class PythonSandboxTools {
                     current = new SandboxJobAdapters(
                             new PythonSandboxJobRequestAdapter(),
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
-                            new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter),
+                            new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter, terminalPromptTexts),
                             new PythonSandboxJobMeteringAdapter(objectMapper),
                             (context, terminal) -> extractFinanceIfPresent(
                                     context.runId(), context.userId(), context.todoId(), context.toolCallId(),
@@ -326,7 +344,7 @@ public class PythonSandboxTools {
      */
     @Tool
     public String executePython(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
-        return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
+        return executePythonPrompt(code, dataset_ids, manifest_ids, libraries, timeout_seconds).text();
     }
 
     /**
@@ -335,7 +353,7 @@ public class PythonSandboxTools {
      * 分别在各自编号空间中解析，不会再按旧逻辑串行混查。
      */
     public String executePython(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
-        return executePythonInternal(code, dataset_ids, null, libraries, timeout_seconds);
+        return executePythonPrompt(code, dataset_ids, null, libraries, timeout_seconds).text();
     }
 
     /**
@@ -351,7 +369,15 @@ public class PythonSandboxTools {
      * 返回值始终是 JSON 字符串：{@code ok=true} 时 {@code data} 含 stdout/stderr 等字段；
      * {@code ok=false} 时 {@code error.code} 标识失败类型，{@code error.details} 附带结构化上下文。
      */
-    private String executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
+    public PromptText executePythonPrompt(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
+        return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
+    }
+
+    public PromptText executePythonPrompt(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
+        return executePythonPrompt(code, dataset_ids, null, libraries, timeout_seconds);
+    }
+
+    private PromptText executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
         long toolStartMs = System.currentTimeMillis();
         try {
             long prepareStartMs = System.currentTimeMillis();
@@ -438,7 +464,7 @@ public class PythonSandboxTools {
                 details.put("legal_dataset_numbers", legalDatasetNumbers);
                 details.put("legal_manifest_numbers", legalManifestNumbers);
                 return fail("executePython", "ILLEGAL_RUN_LEVEL_IDS",
-                        "Some dataset_ids / manifest_ids are not valid run-level numbers; pass values from the legal lists below",
+                        policy("pythonIllegalRunIdsAdvice"),
                         details);
             }
 
@@ -561,7 +587,7 @@ public class PythonSandboxTools {
                     primaryOriginalId, originalIdsToMount.size(), resolvedDatasets.size(), resolvedManifests.size(), relatedDatasets.size());
 
             // 持久操作号先于工作区取得确定；拒绝的脚本不能创建工作区或沙箱任务。
-            String riskRefusal = reviewPythonBeforeWorkspace(runId, code);
+            PromptText riskRefusal = reviewPythonBeforeWorkspace(runId, code);
             if (riskRefusal != null) {
                 return riskRefusal;
             }
@@ -577,6 +603,7 @@ public class PythonSandboxTools {
                     acquired = pythonSandboxService.acquireWorkspace(
                             AcquireWorkspaceRequest.newBuilder().setRunId(runId).build());
                 } catch (Exception acquireFailure) {
+                    ModelSendBlocks.rethrowIfBlocked(acquireFailure);
                     log.warn("当前 Run 暂不能取得 Python 工作区: run={}", runId, acquireFailure);
                     return fail("executePython", "WORKSPACE_ACQUIRE_UNAVAILABLE",
                             "Python workspace acquisition is temporarily unavailable", Map.of());
@@ -666,11 +693,7 @@ public class PythonSandboxTools {
                 return fail(
                         "executePython",
                         "SANDBOX_CAPACITY_WIRING_INCOMPLETE",
-                        "Python sandbox production wiring incomplete; "
-                                + "refuses Legacy create without capacity reservation "
-                                + "and operationId. Non-production fixtures must enable "
-                                + "the documented Legacy compatibility switches as a group "
-                                + "(no global capacity admission / no idempotent recovery).",
+                        policy("pythonLegacyWiringAdvice"),
                         Map.of());
             }
             log.warn("sandbox.create.legacyWithoutCapacity: allow-legacy-without-capacity=true "
@@ -722,7 +745,7 @@ public class PythonSandboxTools {
                 lastRemoteStatus = remoteStatus;
                 pollIndex++;
                 // terminalOutput 对终态返回 JSON 字符串，对 RUNNING 等中间态返回 null，继续轮询。
-                String terminal = terminalOutput(taskId, statusResp);
+                PromptText terminal = terminalOutput(taskId, statusResp);
                 if (terminal != null) {
                     emitSandboxToolTotal(toolStartMs, "OK", "");
                     return terminal;
@@ -757,7 +780,7 @@ public class PythonSandboxTools {
         }
     }
 
-    private String reviewPythonBeforeWorkspace(String runId, String code) {
+    private PromptText reviewPythonBeforeWorkspace(String runId, String code) {
         if (pythonRiskReviewService == null) {
             return fail("executePython", "PYTHON_RISK_REVIEW_UNAVAILABLE",
                     "Python review service is unavailable", Map.of());
@@ -839,6 +862,7 @@ public class PythonSandboxTools {
             JsonFormat.parser().merge(requestJson, original);
             return operationId.equals(original.getOperationId()) && code.equals(original.getCode());
         } catch (Exception malformed) {
+            ModelSendBlocks.rethrowIfBlocked(malformed);
             log.warn("原 Python 完整请求无法确认：run={} operation={}", runId, operationId, malformed);
             return false;
         }
@@ -875,10 +899,12 @@ public class PythonSandboxTools {
     private static final class DataIntenseRefusal extends RuntimeException {
 
         private final String code;
+        private final Object promptMessage;
         private final Map<String, Object> details;
 
-        DataIntenseRefusal(String code, String message, Map<String, Object> details) {
-            super(message);
+        DataIntenseRefusal(String code, Object message, Map<String, Object> details) {
+            super(message instanceof PromptText text ? text.text() : String.valueOf(message));
+            this.promptMessage = message;
             this.code = code;
             this.details = details == null ? Map.of() : details;
         }
@@ -971,8 +997,7 @@ public class PythonSandboxTools {
         PythonRepairContext repairContext = AgentContext.getPythonRepairContext();
         if (repairContext != null && repairContext.hasFailed(pythonRequestFingerprint)) {
             throw new DataIntenseRefusal("REPEATED_FAILED_PYTHON_ATTEMPT",
-                    "The same Python code and effective parameters already failed in this Todo; "
-                            + "change the code or meaningful parameters before retrying",
+                    policy("pythonRepeatedFailureAdvice"),
                     Map.of("python_repair_attempt", repairContext.repairAttempt(),
                             "request_fingerprint", pythonRequestFingerprint));
         }
@@ -988,7 +1013,7 @@ public class PythonSandboxTools {
      * {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}；这里只保留工具自有的
      * 接线检查、成员身份比对与容量事实冻结（planCapacity）。</p>
      */
-    private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
+    private PromptText submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       AgentRunDatasetSnapshot datasetSnapshot,
                                       List<AgentRunDatasetEntry> datasets,
                                       List<AgentRunDatasetEntry> manifests,
@@ -1021,9 +1046,9 @@ public class PythonSandboxTools {
             plan = planCapacity(identity.operationId(), datasetSnapshot, datasets, manifests,
                     baseRequest, timeoutSeconds);
         } catch (DataIntenseRefusal refusal) {
-            return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
+            return fail("executePython", refusal.code(), refusal.promptMessage, refusal.details());
         }
-        return SandboxToolJobLifecycle.dispatchWaitGroupMember(
+        return SandboxToolJobLifecycle.dispatchWaitGroupMemberText(
                 lifecycleDeps(),
                 new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                         member, identity, plan.spec(), plan.estimate(), baseRequest,
@@ -1031,7 +1056,7 @@ public class PythonSandboxTools {
                         ToolJobAnchor.EXECUTE_PYTHON_TOOL, toolStartMs, null));
     }
 
-    private String executeDataIntense(
+    private PromptText executeDataIntense(
             String runId,
             AgentRunDatasetSnapshot datasetSnapshot,
             List<AgentRunDatasetEntry> datasets,
@@ -1066,7 +1091,7 @@ public class PythonSandboxTools {
             plan = planCapacity(identity.operationId(), datasetSnapshot, datasets, manifests,
                     baseRequest, timeoutSeconds);
         } catch (DataIntenseRefusal refusal) {
-            return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
+            return fail("executePython", refusal.code(), refusal.promptMessage, refusal.details());
         }
         DataAnalysisEstimate estimate = plan.estimate();
         CanonicalSandboxCreateSpec spec = plan.spec();
@@ -1169,7 +1194,9 @@ public class PythonSandboxTools {
                             reservation, estimate, anchor,
                             waitPolicy.durableSuspend(), toolStartMs));
             if (attachOutcome instanceof SandboxToolJobLifecycle.AttachOutcome.FailureText failureText) {
-                return failureText.text();
+                if (failureText.prompt() == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "sandbox-attach");
+                return failureText.prompt();
             }
             SandboxToolJobLifecycle.AttachOutcome.Attached attached =
                     (SandboxToolJobLifecycle.AttachOutcome.Attached) attachOutcome;
@@ -1177,15 +1204,16 @@ public class PythonSandboxTools {
             reservation = attached.reservation();
 
             // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
-            return SandboxToolJobLifecycle.pollFastPath(
+            return SandboxToolJobLifecycle.pollFastPathText(
                     deps,
                     new SandboxToolJobLifecycle.PollRequest(
                             runId, identity, estimate, reservation, anchor, taskId,
                             waitPolicy.durableSuspend(), toolStartMs,
                             runnerAdapter(), resultAdapter(), meteringAdapter(), terminalSideEffect()));
         } catch (Exception lifecycleFailure) {
+            ModelSendBlocks.rethrowIfBlocked(lifecycleFailure);
             if (!waitPolicy.durableSuspend()) {
-                return SandboxToolJobLifecycle.promoteDagBlockingFailure(
+                return SandboxToolJobLifecycle.promoteDagBlockingFailureText(
                         deps,
                         runId,
                         anchor,
@@ -1212,6 +1240,7 @@ public class PythonSandboxTools {
                     .digest((value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
             return "sha256:" + java.util.HexFormat.of().formatHex(digest);
         } catch (Exception impossible) {
+            ModelSendBlocks.rethrowIfBlocked(impossible);
             throw new IllegalStateException("SHA-256 unavailable", impossible);
         }
     }
@@ -1395,6 +1424,7 @@ public class PythonSandboxTools {
             persistentArtifactRegistry.registerExternal("dataset", objectId, "platform_object",
                     objectDir.toAbsolutePath().normalize(), PLATFORM_OBJECT_ARTIFACT_TTL_HOURS, false);
         } catch (Exception registrationFailure) {
+            ModelSendBlocks.rethrowIfBlocked(registrationFailure);
             log.warn("平台对象 CSV 目录持久化登记失败（不影响本次挂载）: objectId={} err={}",
                     objectId, registrationFailure.getMessage());
         }
@@ -1429,7 +1459,7 @@ public class PythonSandboxTools {
      *   <li>其余状态（如 RUNNING）：返回 {@code null}，由轮询循环继续等待</li>
      * </ul>
      */
-    private String terminalOutput(String taskId, TaskStatusResponse statusResp) {
+    private PromptText terminalOutput(String taskId, TaskStatusResponse statusResp) {
         String status = statusResp.getStatus();
         if ("SUCCEEDED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
@@ -1440,7 +1470,7 @@ public class PythonSandboxTools {
             if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                 return unavailableFinanceWiringFailure();
             }
-            return formatResult(status, result, null);
+            return formatResultText(status, result, null);
         }
         if ("FAILED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
@@ -1448,15 +1478,11 @@ public class PythonSandboxTools {
                 if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                     return unavailableFinanceWiringFailure();
                 }
-                return formatResult(status, result, null);
+                return formatResultText(status, result, null);
             }
-            return formatter().formatFailure(
+            return formatter().formatFailureText(
                     "", nvl(statusResp.getError()),
-                    new FinanceToolResultFormatter.FailureDetail(
-                            "PYTHON_EXECUTION_FAILED",
-                            "Python 执行失败",
-                            true,
-                            "根据错误信息修正代码或输入后重试"));
+                    FinanceToolResultFormatter.FailureDetail.withPrompts("PYTHON_EXECUTION_FAILED", PromptText.runtimeData("Python 执行失败"), true, terminalPolicies().instruction("pythonStatusFailureAction")));
         }
         if ("CANCELED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
@@ -1464,15 +1490,11 @@ public class PythonSandboxTools {
                 if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                     return unavailableFinanceWiringFailure();
                 }
-                return formatResult(status, result, null);
+                return formatResultText(status, result, null);
             }
-            return formatter().formatFailure(
+            return formatter().formatFailureText(
                     "", "",
-                    new FinanceToolResultFormatter.FailureDetail(
-                            "PYTHON_EXECUTION_CANCELED",
-                            "Python 执行已取消",
-                            false,
-                            "确认仍需计算后重新提交任务"));
+                    FinanceToolResultFormatter.FailureDetail.withPrompts("PYTHON_EXECUTION_CANCELED", PromptText.runtimeData("Python 执行已取消"), false, terminalPolicies().instruction("pythonCanceledAction")));
         }
         if ("NOT_FOUND".equals(status)) {
             return resultLostFailure();
@@ -1501,6 +1523,7 @@ public class PythonSandboxTools {
             }
             return result;
         } catch (Exception exception) {
+            ModelSendBlocks.rethrowIfBlocked(exception);
             fetchStatus = "ERROR";
             log.warn("Unable to fetch terminal sandbox result: taskId={}, error={}",
                     taskId, exception.getMessage());
@@ -1517,24 +1540,12 @@ public class PythonSandboxTools {
         }
     }
 
-    private String unavailableFinanceWiringFailure() {
-        return formatter().formatFailure(
-                "", "",
-                new FinanceToolResultFormatter.FailureDetail(
-                        "FINANCE_RECORD_DURABLE_WIRING_UNAVAILABLE",
-                        "结构化金融结果暂时无法安全保存",
-                        false,
-                        "稍后重试，或改为普通文本输出"));
+    private PromptText unavailableFinanceWiringFailure() {
+        return formatter().formatFailureText("", "", FinanceToolResultFormatter.FailureDetail.withPrompts("FINANCE_RECORD_DURABLE_WIRING_UNAVAILABLE", PromptText.runtimeData("结构化金融结果暂时无法安全保存"), false, terminalPolicies().instruction("pythonFinanceWiringAction")));
     }
 
-    private String resultLostFailure() {
-        return formatter().formatFailure(
-                "", "",
-                new FinanceToolResultFormatter.FailureDetail(
-                        "PYTHON_RESULT_LOST",
-                        "Python 执行结果已丢失",
-                        false,
-                        "重新提交计算任务"));
+    private PromptText resultLostFailure() {
+        return formatter().formatFailureText("", "", FinanceToolResultFormatter.FailureDetail.withPrompts("PYTHON_RESULT_LOST", PromptText.runtimeData("Python 执行结果已丢失"), false, terminalPolicies().instruction("pythonResultLostAction")));
     }
 
     /**
@@ -1581,6 +1592,17 @@ public class PythonSandboxTools {
             FinanceRecordExtractionResult financeResult) {
         return resultAdapter().formatTerminalResult(
                 runnerAdapter().toTerminalView(result, status), financeResult);
+    }
+
+    public PromptText formatTerminalResultText(String status, TaskResultResponse result,
+                                               String runId, String userId, String todoId, String toolCallId) {
+        FinanceRecordExtractionResult finance = extractFinanceIfPresent(runId, userId, todoId, toolCallId, status, result);
+        return formatResultText(status, result, finance);
+    }
+
+    private PromptText formatResultText(String status, TaskResultResponse result,
+                                       FinanceRecordExtractionResult financeResult) {
+        return resultAdapter().resolveTerminalText(runnerAdapter().toTerminalView(result, status), financeResult).output();
     }
 
     private FinanceRecordExtractionResult processFinanceResult(
@@ -1701,26 +1723,26 @@ public class PythonSandboxTools {
     }
 
     /** 构造 {@code ok=false} 的标准 JSON 工具响应；{@code details} 供 LLM 或上层做结构化重试。 */
-    private String fail(String tool, String code, String message, Map<String, Object> details) {
-        return SandboxJobResponses.fail(objectMapper, tool, code, message, details);
+    private PromptText fail(String tool, String code, Object message, Map<String, Object> details) {
+        return ProducerPromptTexts.failure(objectMapper, tool, code, message, details, Map.of(), null);
     }
 
     /** 带失败类别的重载：构造点掌握具体原因（如容量准入的具体拒绝原因）时显式覆盖兜底映射。 */
-    private String fail(String tool, String code, String message, Map<String, Object> details,
+    private PromptText fail(String tool, String code, Object message, Map<String, Object> details,
                         ToolFailureCategory category) {
-        return SandboxJobResponses.fail(objectMapper, tool, code, message, details, category);
+        return ProducerPromptTexts.failure(objectMapper, tool, code, message, details, Map.of(), category);
     }
 
     /**
      * 构造 {@code ok=false} 的 JSON 工具响应，可在失败时仍附带部分 {@code data}
      *（例如 exit code 非零但 stdout 有内容的场景）。
      */
-    private String fail(String tool,
+    private PromptText fail(String tool,
                         String code,
-                        String message,
+                        Object message,
                         Map<String, Object> details,
                         Map<String, Object> data) {
-        return SandboxJobResponses.fail(objectMapper, tool, code, message, details, data);
+        return ProducerPromptTexts.failure(objectMapper, tool, code, message, details, data, null);
     }
 
     private String nvl(String text) {
@@ -1733,4 +1755,16 @@ public class PythonSandboxTools {
     void setAgentRunDatasetRegistry(AgentRunDatasetRegistry registry) {
         this.agentRunDatasetRegistry = registry;
     }
+    private TerminalResultPromptTexts terminalPolicies() {
+        if (terminalPromptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "python-terminal-policy");
+        return terminalPromptTexts;
+    }
+
+    private PromptText policy(String fragment) {
+        if (promptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "producer-policy");
+        return promptTexts.policy(fragment);
+    }
+
 }

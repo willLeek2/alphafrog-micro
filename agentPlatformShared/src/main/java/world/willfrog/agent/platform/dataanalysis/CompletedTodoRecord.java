@@ -24,6 +24,8 @@ public class CompletedTodoRecord {
     private String modelOutput;
     // output 保存最终结构化输出，dataset ref 也从这里重新注册。
     private String output;
+    // 输出及摘要的规范来源 JSON，与正文一同保存、恢复。
+    private String outputSourceJson;
     // toolCalls 记录该 Todo 的调用量；run 级计数另存在 anchor.toolCallsUsed。
     private int toolCalls;
 
@@ -46,6 +48,9 @@ public class CompletedTodoRecord {
 
     public String getOutput() { return output; }
     public void setOutput(String output) { this.output = output; }
+
+    public String getOutputSourceJson() { return outputSourceJson; }
+    public void setOutputSourceJson(String value) { outputSourceJson = value; }
 
     public int getToolCalls() { return toolCalls; }
     public void setToolCalls(int toolCalls) { this.toolCalls = toolCalls; }

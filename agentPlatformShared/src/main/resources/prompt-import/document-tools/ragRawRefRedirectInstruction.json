@@ -1,0 +1,14 @@
+{
+  "fragment": "ragRawRefRedirectInstruction",
+  "purpose": "ragRawRefRedirectInstruction",
+  "bodyType": "FIXED",
+  "body": "rawRef must be passed to rereadToolResult, not loadDocument",
+  "variables": [],
+  "utf8Sha256": "95f4fb3ca526d74efd438c47969254e3baf463d8d380971261637beea739e31e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/rag/RagTools.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

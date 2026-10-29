@@ -59,6 +59,32 @@ public final class ModelSendBlocks {
         return Collections.unmodifiableMap(metadata);
     }
 
+    /** 只恢复显式持久标记；普通错误文字不会升级为控制信号。 */
+    public static Optional<ModelSendBlockedException> fromFailureMetadata(Map<?, ?> metadata) {
+        if (metadata == null || !Boolean.TRUE.equals(metadata.get("model_send_blocked"))) {
+            return Optional.empty();
+        }
+        String code = stringValue(metadata.get("model_send_block_code"));
+        if (!isBlockedCode(code)) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "持久模型发送阻止原因损坏");
+        }
+        Map<String, String> locator = new LinkedHashMap<>();
+        if (metadata.get("model_send_block_racing_locator") instanceof Map<?, ?> saved) {
+            saved.forEach((key, value) -> {
+                if (key instanceof String name && value instanceof String text) locator.put(name, text);
+            });
+        }
+        return Optional.of(new ModelSendBlockedException(code,
+                stringValue(metadata.get("model_send_block_reason")),
+                new RacingFailure(stringValue(metadata.get("model_send_block_racing_code")),
+                        stringValue(metadata.get("model_send_block_racing_reason_code")), locator)));
+    }
+
+    private static String stringValue(Object value) {
+        return value instanceof String text ? text : "";
+    }
+
     /** 持久结果使用同一组稳定码，恢复时不把普通工具错误当成发送阻止。 */
     public static boolean isBlockedCode(String code) {
         if (code == null) {

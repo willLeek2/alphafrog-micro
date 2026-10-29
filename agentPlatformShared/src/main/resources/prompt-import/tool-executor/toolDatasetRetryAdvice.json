@@ -1,0 +1,33 @@
+{
+  "fragment": "toolDatasetRetryAdvice",
+  "purpose": "toolDatasetRetryAdvice",
+  "bodyType": "TEMPLATE",
+  "body": "{{toolName}} failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. {{toolName}} expects current run-level integer {{expectedIds}}, not raw {{rawIdKinds}} strings, paths, or scope hashes. Call listMyData first (query_type=dataset or query_type=manifest) to resolve the integer ids for this run before retrying. ",
+  "variables": [
+    {
+      "name": "toolName",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "expectedIds",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "rawIdKinds",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "4c8b348ba67610159fa24a689e0b53f059120ce1635ee1b9c3d45f31b5b3e14c",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tools/ToolRouterToolExecutor.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

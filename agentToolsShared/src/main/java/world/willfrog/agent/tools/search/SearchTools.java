@@ -9,6 +9,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.prompt.AgentPromptTextReader;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
+import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchResultOrigin;
 import world.willfrog.agent.platform.experiment.AgentExperimentClient;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
@@ -39,6 +44,9 @@ public class SearchTools {
 
     @DubboReference(timeout = 60000, retries = 0)
     private ExternalInfoDubboService externalInfoDubboService;
+
+    @Autowired(required = false)
+    private AgentPromptTextReader promptReader;
 
     private final ObjectMapper objectMapper;
     private final SearchEvidenceJudgeService searchEvidenceJudgeService;
@@ -146,19 +154,52 @@ public class SearchTools {
         return new PreparedSearchArguments(req, actual, discriminator, details);
     }
 
+    public PromptText searchWebPrompt(String query, String scene, String backend, String strength,
+            boolean skipHotCache, boolean skipRagPrefetch, String timeRangeStart, String timeRangeEnd, int maxResults) {
+        return searchWebPreparedPrompt(prepareArguments(query, scene, backend, strength, skipHotCache,
+                skipRagPrefetch, timeRangeStart, timeRangeEnd, maxResults));
+    }
+
     public String searchWebPrepared(PreparedSearchArguments prepared) {
+        return searchWebPreparedPrompt(prepared).text();
+    }
+
+    public PromptText searchWebPreparedPrompt(PreparedSearchArguments prepared) {
         WebSearchRequest req = prepared.request();
+        {
+            if (promptReader == null) throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "网页搜索缺少原根正文读取组件");
+            var root = promptReader.current();
+            if (!req.getRunId().equals(root.context().getCurrentRunId())) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_UNREADABLE,
+                        "网页搜索参数与当前原根运行不一致");
+            }
+            req = req.toBuilder().setRuntimeCallContext(root.context().toByteString())
+                    .setPromptSelection(root.selection().racingSelection().toByteString()).build();
+        }
         String query = req.getQuery();
         String scene = req.getScene();
         try {
             WebSearchResponse resp = externalInfoDubboService.webSearch(req);
+            if (resp.hasModelSendBlock()) {
+                var block = resp.getModelSendBlock();
+                if (!ModelSendBlocks.isBlockedCode(block.getCode())) {
+                    throw new ModelSendBlockedException(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED,
+                            "外部搜索返回的发送阻止原因无效");
+                }
+                throw new ModelSendBlockedException(block.getCode(), block.getReason(),
+                        new RacingFailure(block.getRacingCode(), block.getRacingReasonCode(), block.getObjectLocatorMap()));
+            }
+            if (!resp.getOk() && ModelSendBlocks.isBlockedCode(resp.getErrorCode())) {
+                throw new ModelSendBlockedException(resp.getErrorCode(), "外部搜索的模型发送前检查未通过");
+            }
+            if (resp.getResultOrigin() != WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "外部搜索结果缺少明确来源，不能用于模型续轮");
+            }
 
             // 如果 Dubbo 层返回 ok=false，则按错误处理
             if (!resp.getOk()) {
-                // 外部模型调用明确停止时保留共同异常身份，不把它作为普通工具错误继续修复。
-                if (ModelSendBlocks.isBlockedCode(resp.getErrorCode())) {
-                    throw new ModelSendBlockedException(resp.getErrorCode(), "外部搜索的模型发送前检查未通过");
-                }
                 // 上游错误码里保留着 HTTP 状态事实（各后端统一把状态写成 HTTP_<code>）：
                 // 429 是限流，5xx 是上游故障；取值来自既有状态字段，不解析自由文本。上游码原样透传。
                 Map<String, Object> payload = new LinkedHashMap<>();
@@ -171,7 +212,7 @@ public class SearchTools {
                         upstreamFailureCategory(resp.getErrorCode()));
                 payload.put("error", err);
                 payload.put("data", preparedDetails(prepared));
-                return objectMapper.writeValueAsString(payload);
+                return PromptText.runtimeData(objectMapper.writeValueAsString(payload));
             }
 
             // 组装 hits
@@ -248,11 +289,11 @@ public class SearchTools {
             payload.put("ok", true);
             payload.put("tool", "searchWeb");
             payload.put("data", data);
-            return objectMapper.writeValueAsString(payload);
+            return PromptText.runtimeData(objectMapper.writeValueAsString(payload));
         } catch (Exception e) {
             ModelSendBlocks.rethrowIfBlocked(e);
             // 本地异常包装行：RPC/序列化一类的上游或系统故障。
-            return writeJson(Map.of(
+            return PromptText.runtimeData(writeJson(Map.of(
                     "ok", false,
                     "tool", "searchWeb",
                     "data", preparedDetails(prepared),
@@ -261,7 +302,7 @@ public class SearchTools {
                             "message", nvl(e.getMessage()),
                             "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name()
                     )
-            ));
+            )));
         }
     }
 

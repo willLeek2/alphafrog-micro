@@ -1,7 +1,6 @@
 package world.willfrog.agentlangchain.execution;
 
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.service.AiServices;
@@ -12,6 +11,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.ManagedPromptAiServices;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.agent.platform.prompt.AgentPromptTextReader;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.ToolJobInjectedInterruption;
 import world.willfrog.agent.platform.exception.RunBudgetException;
@@ -22,7 +26,9 @@ import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
@@ -202,6 +208,13 @@ public class LangchainTodoNodeExecutor {
     @Autowired(required = false)
     private TodoRetryPolicy todoRetryPolicy;
 
+    @Autowired
+    private AgentModelInputs modelInputs;
+    @Autowired
+    private AgentPromptTextReader promptReader;
+    @Autowired
+    private ToolPromptCatalog toolPrompts;
+
 
     /**
      * 执行单个 DAG todo 节点：构建 user message → 启动 LC4j tool loop → 收集结果。
@@ -272,6 +285,15 @@ public class LangchainTodoNodeExecutor {
             List<LangchainCompletedTodo> completedTodos,
             Map<String, String> datasetRefs,
             String toolResult) {
+        // 旧持久结果只有裸正文，不能据内容猜测其中是否包含应用建议。
+        return LangchainTodoNodeResult.failure(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                ModelSendBlocks.failureMetadata(new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "恢复工具结果尚未保存来源，必须使用带来源的恢复入口")));
+    }
+
+    public LangchainTodoNodeResult executeResumedToolResultPrompt(
+            LangchainWorkflowRequest request, TodoItem item, List<LangchainCompletedTodo> completedTodos,
+            Map<String, String> datasetRefs, PromptText toolResult) {
         try {
             return executePreparedResumedToolResult(request, item, completedTodos, datasetRefs, toolResult);
         } catch (RuntimeException exception) {
@@ -280,6 +302,8 @@ public class LangchainTodoNodeExecutor {
                 return blocked;
             }
             throw exception;
+        } finally {
+            AgentContext.clearTodoContext();
         }
     }
 
@@ -288,30 +312,30 @@ public class LangchainTodoNodeExecutor {
             TodoItem item,
             List<LangchainCompletedTodo> completedTodos,
             Map<String, String> datasetRefs,
-            String toolResult) {
+            PromptText toolResult) {
         if (item == null) {
             return LangchainTodoNodeResult.failure("todo_item_required");
         }
         AgentContext.setTodoContext(item.getId(), item.getSequence());
-        String base = LangchainTodoUserMessageBuilder.buildTodoUserMessage(
+        PromptText base = LangchainTodoUserMessageBuilder.buildTodoUserPrompt(
                 promptService,
                 request.getUserGoal(),
                 completedTodos,
                 datasetRefs,
                 item.getDescription(),
                 request.getToolSpecifications(),
-                ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
-        String userMessage = base + "\n\n外部工具已在后台完成。下面是与原工具调用绑定的持久化结果。"
-                + "请使用该结果完成当前待办并给出完整回复；不要再次调用工具。\n\n"
-                + (toolResult == null ? "external tool completed" : toolResult);
+                ToolCapabilityPromptRenderer.renderText(promptService, request.getToolSpecifications()));
+        if (toolResult == null) throw sourceMissing("恢复工具结果缺少明确来源归类");
+        PromptText userMessage = PromptText.concat(base, PromptText.runtimeData("\n\n"),
+                instruction("todoResumedToolInstruction"), PromptText.runtimeData("\n\n"), toolResult);
         try {
             ensureRunnable(request);
-            String output = buildRecoveryAiService(request).execute(userMessage);
+            String output = buildRecoveryAiService(request, userMessage).execute(userMessage.text());
             if (isBlank(output)) {
                 return LangchainTodoNodeResult.failure("empty_resumed_todo_output:" + item.getId());
             }
             String trimmed = output.trim();
-            DatasetRefRegistry.registerFromJson(toolResult, datasetRefs);
+            DatasetRefRegistry.registerFromJson(toolResult.text(), datasetRefs);
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             return LangchainTodoNodeResult.success(trimmed, 0);
         } catch (RunBudgetException e) {
@@ -344,6 +368,12 @@ public class LangchainTodoNodeExecutor {
                 return blocked;
             }
             throw exception;
+        } finally {
+            LangchainRepeatedToolCallContext.clear();
+            LangchainDatasetRefContext.clear();
+            AgentContext.clearPythonRefineAttempt();
+            AgentContext.clearPythonRepairContext();
+            AgentContext.clearTodoContext();
         }
     }
 
@@ -360,16 +390,16 @@ public class LangchainTodoNodeExecutor {
         // 设置当前 todo 的上下文，供下游 observability / ToolRouter / event 服务在 trace 中标记当前 todo
         AgentContext.setTodoContext(item.getId(), item.getSequence());
         // 拼装 user message：包含用户目标、已完成 todo、dataset refs（数据引用）、当前 todo 描述和工具规格
-        String userMessage = LangchainTodoUserMessageBuilder.buildTodoUserMessage(
+        PromptText userMessage = LangchainTodoUserMessageBuilder.buildTodoUserPrompt(
                 promptService,
                 request.getUserGoal(),
                 completedTodos,
                 datasetRefs,
                 item.getDescription(),
                 request.getToolSpecifications(),
-                ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
+                ToolCapabilityPromptRenderer.renderText(promptService, request.getToolSpecifications()));
         if (retryContext != null) {
-            userMessage += buildTodoRetryUserMessage(retryContext);
+            userMessage = PromptText.concat(userMessage, buildTodoRetryUserMessage(retryContext));
         }
         boolean repairRound = false;
         ToolRepairHandler repairHandler = catalog().handlerForRepairRound(repairContext).orElse(null);
@@ -380,7 +410,7 @@ public class LangchainTodoNodeExecutor {
         AtomicBoolean currentAttemptToolStarted = new AtomicBoolean(false);
         if (repairHandler != null) {
             repairRound = true;
-            userMessage += repairHandler.buildRepairInstruction(repairContext);
+            userMessage = PromptText.concat(userMessage, repairHandler.buildRepairInstructionText(repairContext));
             repairHandler.activateRuntime(repairContext);
         } else if (retryContext != null) {
             catalog().handlerForTool(retryContext.toolName())
@@ -414,7 +444,7 @@ public class LangchainTodoNodeExecutor {
                             return out == null ? 0L : out.length();
                         })
                         .sum();
-        int currentPromptBudget = userMessage.length();
+        int currentPromptBudget = userMessage.text().length();
         String lastNonEmptyTodoId = lastNonEmptyTodoId(completedTodos);
 
         try (LangchainSubAgentExecutionContext.Scope ignored =
@@ -423,8 +453,8 @@ public class LangchainTodoNodeExecutor {
             ensureRunnable(request);
             String output = buildTodoAiService(
                     request, toolCalls, datasetRefs, repairHandler, acceptedRepairExecution,
-                    currentAttemptToolStarted)
-                    .execute(userMessage);
+                    currentAttemptToolStarted, userMessage)
+                    .execute(userMessage.text());
             // 极端情况：LLM 返回了空字符串（例如被安全过滤或模型异常），视为失败
             if (isBlank(output)) {
                 return handleEmptyOutput(
@@ -493,13 +523,6 @@ public class LangchainTodoNodeExecutor {
             // 统一转为失败结果；上层 DagWorkflowExecutor 根据 isSuccess() 决定是否 skip 下游节点
             Map<String, Object> budgetMetadata = extractBudgetFailureMetadata(e);
             return LangchainTodoNodeResult.failure(e.getMessage(), budgetMetadata);
-        } finally {
-            // 清理 ThreadLocal，防止线程池复用时上下文串扰到下一个 run
-            LangchainRepeatedToolCallContext.clear();
-            LangchainDatasetRefContext.clear();
-            AgentContext.clearPythonRefineAttempt();
-            AgentContext.clearPythonRepairContext();
-            AgentContext.clearTodoContext();
         }
     }
 
@@ -509,8 +532,8 @@ public class LangchainTodoNodeExecutor {
                 blocked.code(), ModelSendBlocks.failureMetadata(blocked));
     }
 
-    private String buildTodoRetryUserMessage(TodoRetryContext context) {
-        return promptService.todoRetryContextInstruction(
+    private PromptText buildTodoRetryUserMessage(TodoRetryContext context) {
+        return promptService.todoRetryContextInstructionText(
                 safeRetryText(context.toolName(), 256),
                 context.safety().name(),
                 safeRetryText(context.failureCategory(), 256),
@@ -600,7 +623,7 @@ public class LangchainTodoNodeExecutor {
                                                        AtomicInteger toolCalls,
                                                        int callsBefore,
                                                        String firstOutput,
-                                                       String userMessage,
+                                                       PromptText userMessage,
                                                        String capturedStage,
                                                        String capturedModel,
                                                        String capturedProvider,
@@ -631,8 +654,9 @@ public class LangchainTodoNodeExecutor {
         String recoveredOutput;
         String recoveryOutcome;
         try {
-            recoveredOutput = buildRecoveryAiService(request).execute(
-                    userMessage + "\n\n" + promptService.emptyOutputRecoveryStageInstruction());
+            PromptText recoveryPrompt = PromptText.concat(userMessage, PromptText.runtimeData("\n\n"),
+                    promptService.emptyOutputRecoveryStageInstructionText());
+            recoveredOutput = buildRecoveryAiService(request, recoveryPrompt).execute(recoveryPrompt.text());
         } catch (Exception recEx) {
             // 取消/挂起/预算终止等控制信号必须原样向上传播，不能被改写成 recovery 失败文本。
             if (LangchainTerminalToolErrorHandler.isTerminalSignal(recEx)) {
@@ -698,15 +722,32 @@ public class LangchainTodoNodeExecutor {
      *   <li>仅保留 {@code chatRequestTransformer -> ensureRunnable(request)}，防止用户在 recovery 中途点 cancel。</li>
      * </ul>
      */
-    private LangchainTodoExecutionAiService buildRecoveryAiService(LangchainWorkflowRequest request) {
-        return AiServices.builder(LangchainTodoExecutionAiService.class)
-                .chatModel(request.executionModelOrDefault())
-                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
-                .chatRequestTransformer(chatRequest -> {
-                    ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
-                })
+    private LangchainTodoExecutionAiService buildRecoveryAiService(LangchainWorkflowRequest request, PromptText user) {
+        PromptText system = promptService.reactSystemPromptText();
+        return ManagedPromptAiServices.withSystemMessage(AiServices.builder(LangchainTodoExecutionAiService.class)
+                .chatModel(promptModel(request, system, user, false, false)), system)
                 .build();
+    }
+
+    private PromptText instruction(String fragment) {
+        if (promptReader == null) throw sourceMissing("节点指令缺少正文读取组件");
+        var root = promptReader.current();
+        return promptReader.render(promptReader.read(root, Map.of(fragment, fragment)).get(fragment), Map.of(), Map.of());
+    }
+
+    private LangchainTodoPromptModel promptModel(LangchainWorkflowRequest request, PromptText system,
+                                                 PromptText user, boolean finalAnswer, boolean tools) {
+        var model = finalAnswer ? AcceptanceFixtureModelRegistry.forCall(request.finalAnswerModelOrDefault(),
+                () -> FixtureCallIdentity.answer(request.getRunId(), request.planGenerationOrDefault()))
+                : request.executionModelOrDefault();
+        return new LangchainTodoPromptModel(model, system, user,
+                finalAnswer ? request.getFinalAnswerEndpointName() : request.getExecutionEndpointName(),
+                modelInputs, toolPrompts, promptReader, rootTreeCallBudget, tools, request.getRunId(),
+                () -> ensureRunnable(request));
+    }
+
+    private static ModelSendBlockedException sourceMissing(String reason) {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, reason);
     }
 
     /**
@@ -855,7 +896,9 @@ public class LangchainTodoNodeExecutor {
                                    List<LangchainCompletedTodo> completedTodos) {
         // 生成最终答案前也要检查 run 是否已被取消——避免用户在最后一步点了 cancel 但请求仍发出
         ensureRunnable(request);
-        LangchainFinalAnswerAiService answerService = buildFinalAnswerAiService(request);
+        PromptText userPrompt = LangchainTodoUserMessageBuilder.buildFinalUserPrompt(
+                promptService, request.getUserGoal(), completedTodos);
+        LangchainFinalAnswerAiService answerService = buildFinalAnswerAiService(request, userPrompt);
         if (rootTreeCallBudget != null) {
             rootTreeCallBudget.beforeModelCall(new NodeWorkItemIdentity(
                     request.getRunId(), request.planGenerationOrDefault(),
@@ -863,10 +906,7 @@ public class LangchainTodoNodeExecutor {
         }
         // buildFinalAnswerAiService 不注入 toolProvider → 纯文本生成，不会触发工具调用
         String modelText = answerService
-                .answer(LangchainTodoUserMessageBuilder.buildFinalUserMessage(
-                        promptService,
-                        request.getUserGoal(),
-                        completedTodos));
+                .answer(userPrompt.text());
         // Spec §11：模型块外说明之后，服务端按 runId 查询可投影金融记录并追加确定性三列结果块；
         // 无记录或组合失败时 composer 原样返回模型文本，普通任务仍成功。
         return financeResultComposer.appendFinanceResultBlock(
@@ -883,7 +923,7 @@ public class LangchainTodoNodeExecutor {
      *       Todo 执行阶段正文由 User Message 单独注入；</li>
      *   <li><b>maxToolCallingRoundTrips</b>：单 todo 内模型↔工具的最大往返轮数，默认 30，受 {@link #resolveMaxToolRoundTrips} 约束；</li>
      *   <li><b>chatRequestTransformer</b>：每次发 LLM 请求前检查 run 是否被取消/暂停（{@link #ensureRunnable}），
-     *       防止用户已点 cancel 但请求仍发出；同时逐回合注入工具调用额度现状（{@link #withToolBudgetStatus}）
+     *       防止用户已点 cancel 但请求仍发出；同时逐回合注入带来源的工具调用额度现状
      *       与 90% last-mile 提示；</li>
      *   <li><b>beforeToolExecution</b>：工具执行前再次检查可运行性，防止在 tool loop 中间被中断后继续执行工具；</li>
      *   <li><b>toolExecutionErrorHandler</b>：工具执行异常处理器（{@link LangchainTerminalToolErrorHandler#handle}），
@@ -907,16 +947,13 @@ public class LangchainTodoNodeExecutor {
                                                                Map<String, String> datasetRefs,
                                                                ToolRepairHandler repairHandler,
                                                                AtomicBoolean acceptedRepairExecution,
-                                                               AtomicBoolean currentAttemptToolStarted) {
-        AiServices<LangchainTodoExecutionAiService> builder = AiServices
+                                                               AtomicBoolean currentAttemptToolStarted,
+                                                               PromptText userPrompt) {
+        PromptText system = promptService.reactSystemPromptText();
+        AiServices<LangchainTodoExecutionAiService> builder = ManagedPromptAiServices.withSystemMessage(AiServices
                 .builder(LangchainTodoExecutionAiService.class)
-                .chatModel(request.executionModelOrDefault())
-                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
+                .chatModel(promptModel(request, system, userPrompt, false, true)), system)
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
-                .chatRequestTransformer(chatRequest -> {
-                    ensureRunnable(request);
-                    return maybeInjectLastMileHint(withToolBudgetStatus(chatRequest, request.getRunId()));
-                })
                 .beforeToolExecution(before -> {
                     ensureRunnable(request);
                     if (workflowCheckpointService != null && before != null && before.request() != null) {
@@ -957,18 +994,12 @@ public class LangchainTodoNodeExecutor {
      * @param request 当前 run 请求上下文
      * @return 配置完成的 final answer AiServices 代理实例
      */
-    private LangchainFinalAnswerAiService buildFinalAnswerAiService(LangchainWorkflowRequest request) {
+    private LangchainFinalAnswerAiService buildFinalAnswerAiService(LangchainWorkflowRequest request, PromptText userPrompt) {
         // 写答案这一次的调用身份：哪条 Run、哪一代计划。夹具按身份发脚本回合，同一条 Run 重做这一次
         // （进程重启后接着写）也拿回同一份回复；不带夹具编号的 Run 这一步原样返回真实模型。
-        return AiServices.builder(LangchainFinalAnswerAiService.class)
-                .chatModel(AcceptanceFixtureModelRegistry.forCall(
-                        request.finalAnswerModelOrDefault(),
-                        () -> FixtureCallIdentity.answer(request.getRunId(), request.planGenerationOrDefault())))
-                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
-                .chatRequestTransformer(chatRequest -> {
-                    ensureRunnable(request);
-                    return maybeInjectLastMileHint(chatRequest);
-                })
+        PromptText system = promptService.reactSystemPromptText();
+        return ManagedPromptAiServices.withSystemMessage(AiServices.builder(LangchainFinalAnswerAiService.class)
+                .chatModel(promptModel(request, system, userPrompt, true, false)), system)
                 .build();
     }
 
@@ -1062,10 +1093,12 @@ public class LangchainTodoNodeExecutor {
         if (hint == null || hint.isBlank()) {
             return chatRequest;
         }
+        PromptText attributed = AgentContext.getLastMileHintPrompt();
+        if (attributed == null || attributed.sources().isEmpty()) throw sourceMissing("预算最后提示尚未登记正文版本");
         List<ChatMessage> original = chatRequest.messages();
         List<ChatMessage> rebuilt = rebuildMessagesWithHint(
                 original == null ? List.of() : original,
-                hint);
+                attributed);
         AgentContext.clearLastMileHint();
         return chatRequest.toBuilder()
                 .messages(rebuilt)
@@ -1073,43 +1106,12 @@ public class LangchainTodoNodeExecutor {
     }
 
     /** 把 last-mile 阶段说明作为新的 UserMessage 追加，绝不改写稳定 System。 */
-    private static List<ChatMessage> rebuildMessagesWithHint(List<ChatMessage> original, String hint) {
+    private static List<ChatMessage> rebuildMessagesWithHint(List<ChatMessage> original, PromptText hint) {
         List<ChatMessage> out = new ArrayList<>(original);
-        out.add(UserMessage.from(hint));
+        PromptMessage entry = PromptMessage.user(hint);
+        out.add(UserMessage.builder().contents(List.of(dev.langchain4j.data.message.TextContent.from(hint.text())))
+                .attributes(PromptMessageCodec.sourceAttributes(entry.origin(), entry.sources())).build());
         return out;
-    }
-
-    /**
-     * 每次模型请求前把工具调用次数额度现状作为一条 SystemMessage 插到稳定 System 之后（位置 1）。
-     *
-     * <p>额度快照统一来自 {@link RootTreeCallBudget#toolCallBudgetStatus(String)}——只传当前运行编号，
-     * 计数源（V2 根树共享 / V1 本运行观测统计）由该方法按该运行冻结的调度版本自选，本注入点不自选
-     * 计数源，避免 V1 的执行循环读到 V2 的根树计数。注入只改本次发出的请求副本，不进对话记忆、
-     * 不改写稳定 System。快照只读不预分，能否派发仍由既有预算检查决定；读不到额度（无预算组件、
-     * 无运行编号或快照为空）时原样返回。</p>
-     */
-    private ChatRequest withToolBudgetStatus(ChatRequest chatRequest, String runId) {
-        if (chatRequest == null || rootTreeCallBudget == null || runId == null || runId.isBlank()) {
-            return chatRequest;
-        }
-        RootTreeCallBudget.ToolCallBudgetStatus status = rootTreeCallBudget.toolCallBudgetStatus(runId);
-        if (status == null) {
-            return chatRequest;
-        }
-        List<ChatMessage> original = chatRequest.messages();
-        List<ChatMessage> rebuilt = new ArrayList<>(original == null ? List.of() : original);
-        rebuilt.add(Math.min(1, rebuilt.size()), SystemMessage.from(toolBudgetStatusText(status)));
-        return chatRequest.toBuilder().messages(rebuilt).build();
-    }
-
-    /** 额度现状注入文本；不设上限时如实写明，而不是给一个巨大数字。 */
-    private static String toolBudgetStatusText(RootTreeCallBudget.ToolCallBudgetStatus status) {
-        if (status.unlimited()) {
-            return "工具调用预算现状：" + status.scopeNote() + "不设工具调用次数上限。";
-        }
-        return "工具调用预算现状：" + status.scopeNote() + "累计工具调用已用" + status.used()
-                + "次、上限" + status.limit() + "次、剩余" + status.remaining()
-                + "次；预算耗尽时新调用会被拒绝，请据此安排调用。";
     }
 
     /**

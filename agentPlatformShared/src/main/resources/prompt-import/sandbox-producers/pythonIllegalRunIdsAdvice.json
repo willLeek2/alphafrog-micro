@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonIllegalRunIdsAdvice",
+  "purpose": "pythonIllegalRunIdsAdvice",
+  "bodyType": "FIXED",
+  "body": "Some dataset_ids / manifest_ids are not valid run-level numbers; pass values from the legal lists below",
+  "variables": [],
+  "utf8Sha256": "dc6a9ca2974a2d16ac11924ed38ee9f7fec9cf856ead4b3e61006c437d4bf639",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

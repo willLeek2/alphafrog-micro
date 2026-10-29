@@ -1,0 +1,14 @@
+{
+  "fragment": "marketParallelCalendarArgumentFormat",
+  "purpose": "marketParallelCalendarArgumentFormat",
+  "bodyType": "FIXED",
+  "body": "Use | separated YYYYMMDD values or JSON arrays. Do not use comma-separated values.",
+  "variables": [],
+  "utf8Sha256": "5f8762571255e0b5685098a2cd2a0a399bc1444bcca99327452cfa3532228eab",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

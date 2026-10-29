@@ -1,12 +1,15 @@
 package world.willfrog.agent.tools.finance;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.finance.FinanceMetricRecord;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionResult;
 import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -33,12 +36,20 @@ public class FinanceResultModelAdapter {
 
     private final ObjectMapper objectMapper;
     private final FinanceResultModelProjector projector;
+    private final TerminalResultPromptTexts promptTexts;
 
     public FinanceResultModelAdapter(
             ObjectMapper objectMapper,
             FinanceResultModelProjector projector) {
+        this(objectMapper, projector, null);
+    }
+
+    @Autowired
+    public FinanceResultModelAdapter(ObjectMapper objectMapper, FinanceResultModelProjector projector,
+                                     TerminalResultPromptTexts promptTexts) {
         this.objectMapper = objectMapper;
         this.projector = projector;
+        this.promptTexts = promptTexts;
     }
 
     /**
@@ -72,7 +83,9 @@ public class FinanceResultModelAdapter {
             results.clear();
             if (notices.stream()
                     .noneMatch(notice -> REJECTED_NOTICE_CODE.equals(notice.code()))) {
-                notices.add(REJECTED_NOTICE);
+                notices.add(promptTexts == null ? REJECTED_NOTICE
+                        : FinanceRecordExtractionResult.ModelNotice.withPrompts(REJECTED_NOTICE.code(), PromptText.runtimeData(REJECTED_NOTICE.message()),
+                                promptTexts.instruction("financeProjectionRejectedAction")));
             }
         }
         return new ProjectionBatch(results, notices);

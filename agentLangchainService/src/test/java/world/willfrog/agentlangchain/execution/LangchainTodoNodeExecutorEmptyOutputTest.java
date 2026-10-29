@@ -42,6 +42,11 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
  * </ul>
  */
 class LangchainTodoNodeExecutorEmptyOutputTest {
+    @org.junit.jupiter.api.BeforeEach
+    void prepareVersionedRunContext() {
+        world.willfrog.agent.platform.context.AgentContext.setRunId("fixture-current-run");
+    }
+
 
     private final AgentRunBudgetService budgetService = mock(AgentRunBudgetService.class);
     private final world.willfrog.agent.platform.service.AgentRunStateStore stateStore =
@@ -58,7 +63,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     void execute_shouldRecoverAndSucceedWhenFirstResponseIsBlankButSecondIsNot() {
         // 第一次返回空白（"   "），第二次（recovery）返回真实答案
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_1", 1, "分析指数");
@@ -78,7 +83,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     @Test
     void execute_shouldFailWithStillBlankWhenRecoveryAlsoReturnsBlank() {
         QueueChatModel model = new QueueChatModel("   ", "   ");
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_2", 1, "分析指数");
@@ -99,7 +104,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     void execute_shouldFailWithExceptionWhenRecoveryThrows() {
         // 第一次返回空白，第二次（recovery）抛 RuntimeException
         QueueChatModel model = new QueueChatModel("   ", new RuntimeException("LLM down"));
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_3", 1, "分析指数");
@@ -121,13 +126,15 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         // D10 fix: 工具规范非空但当前 attempt 无实际工具执行 → 仍应走 recovery。
         // 旧语义是"有 toolSpec 就不恢复"，生产默认总有工具，导致 recovery 永远不可达。
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析指数")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .toolSpecifications(List.of(
                         dev.langchain4j.agent.tool.ToolSpecification.builder()
                                 .name("getIndexDaily")
@@ -173,14 +180,16 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
             }
         };
 
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor(
-                java.util.Optional.of(toolProvider));
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor(
+                java.util.Optional.of(LangchainTestFixtures.runtimeDataTools(toolProvider)));
 
         LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析指数")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .toolSpecifications(List.of(
                         dev.langchain4j.agent.tool.ToolSpecification.builder()
                                 .name("getIndexDaily")
@@ -220,7 +229,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 return super.doChat(request);
             }
         };
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_parallel", 1, "分析");
@@ -251,9 +260,9 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 // 第三次 check（recovery 的 chatRequestTransformer）→ 已取消
                 .thenReturn(java.util.Optional.of("CANCEL_REQUESTED"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
-        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedNode(new LangchainTodoNodeExecutor(
                 LangchainTestFixtures.promptService(), provider, guard, budgetService, stateStore,
-                LangchainTestFixtures.noopFinanceResultComposer());
+                LangchainTestFixtures.noopFinanceResultComposer()));
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainWorkflowRequest request = baseRequest(model);
@@ -280,9 +289,9 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
                 "{\"summary\":{\"llmCalls\":8,\"toolCalls\":0,\"totalTokens\":100,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
-        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedNode(new LangchainTodoNodeExecutor(
                 LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
-                LangchainTestFixtures.noopFinanceResultComposer());
+                LangchainTestFixtures.noopFinanceResultComposer()));
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainWorkflowRequest request = baseRequest(model);
@@ -311,9 +320,9 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
                 "{\"summary\":{\"llmCalls\":2,\"toolCalls\":0,\"totalTokens\":100,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
-        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedNode(new LangchainTodoNodeExecutor(
                 LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
-                LangchainTestFixtures.noopFinanceResultComposer());
+                LangchainTestFixtures.noopFinanceResultComposer()));
 
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED");
         LangchainWorkflowRequest request = baseRequest(model);
@@ -341,9 +350,9 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
                 "{\"summary\":{\"llmCalls\":40,\"toolCalls\":0,\"totalTokens\":240000,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
-        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedNode(new LangchainTodoNodeExecutor(
                 LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
-                LangchainTestFixtures.noopFinanceResultComposer());
+                LangchainTestFixtures.noopFinanceResultComposer()));
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainWorkflowRequest request = baseRequest(model);
@@ -372,9 +381,9 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
                 "{\"summary\":{\"llmCalls\":0,\"toolCalls\":30,\"totalTokens\":0,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
-        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedNode(new LangchainTodoNodeExecutor(
                 LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
-                LangchainTestFixtures.noopFinanceResultComposer());
+                LangchainTestFixtures.noopFinanceResultComposer()));
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainWorkflowRequest request = baseRequest(model);
@@ -397,7 +406,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         // 当 LLM 返回 AiMessage(text=null) 时，LC4j AiMessage.from() 抛 IllegalArgumentException("text cannot be null")
         // → executor 走 catch → failure 无 metadata。Recovery 设计上只针对 "trim 后空"，不针对 null text 异常。
         QueueChatModel model = new QueueChatModel((String) null);
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_6", 1, "分析");
@@ -416,7 +425,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     void execute_shouldMarkFinishReasonBlankAfterTrimWhenFirstOutputIsWhitespace() {
         // "   \n\t  " = 3 spaces + \n + \t + 2 spaces = 7 chars
         QueueChatModel model = new QueueChatModel("   \n\t  ");
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_7", 1, "分析");
@@ -437,14 +446,14 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     @Test
     void execute_shouldRecordLastNonEmptyTodoIdFromCompletedTodos() {
         QueueChatModel model = new QueueChatModel("   ");
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor();
 
         // 上游已有两个完成 todo：t0 空、t1 非空
         List<LangchainCompletedTodo> completed = new ArrayList<>();
         completed.add(LangchainCompletedTodo.builder()
-                .todoId("t0").sequence(0).description("").output("").summary("").build());
+                .todoId("t0").sequence(0).description("").output("").outputSourceJson(LangchainCompletedTodo.modelOutputSourceJson()).summary("").build());
         completed.add(LangchainCompletedTodo.builder()
-                .todoId("t1").sequence(1).description("").output("REAL_DATA_12345").summary("").build());
+                .todoId("t1").sequence(1).description("").output("REAL_DATA_12345").outputSourceJson(LangchainCompletedTodo.modelOutputSourceJson()).summary("").build());
 
         LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_8", 2, "下一步");
@@ -466,7 +475,9 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析指数")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build();
     }
 

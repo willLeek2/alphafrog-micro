@@ -443,6 +443,8 @@ public class ToolJobResumeService {
                 : "SUCCEEDED".equals(anchor.getTerminalStatus()));
         ctx.setTerminalStatus(anchor.getTerminalStatus());
         ctx.setTerminalResultPreview(anchor.getTerminalResultPreview());
+        ctx.setTerminalPromptSourcesJson(anchor.getTerminalPromptSourcesJson());
+        ctx.setTerminalModelSendBlock(anchor.getTerminalModelSendBlock());
         ctx.setTerminalRawRef(anchor.getTerminalRawRef());
         ctx.setTerminalStderrPreview(anchor.getTerminalStderrPreview());
         ctx.setTerminalErrorCode(anchor.getTerminalErrorCode());

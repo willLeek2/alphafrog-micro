@@ -28,6 +28,14 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 class LangchainTodoNodeExecutorRetryTest {
+    @org.junit.jupiter.api.AfterEach
+    void clearVersionedRunContext() { world.willfrog.agent.platform.context.AgentContext.clear(); }
+
+    @org.junit.jupiter.api.BeforeEach
+    void prepareVersionedRunContext() {
+        world.willfrog.agent.platform.context.AgentContext.setRunId("fixture-current-run");
+    }
+
 
     @Test
     void readOnlyToolGetsExactlyOneCorrectiveTodoRetry() {
@@ -84,7 +92,7 @@ class LangchainTodoNodeExecutorRetryTest {
     }
 
     private LangchainTodoNodeExecutor configuredExecutor(ToolProvider tools) {
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor(Optional.of(tools));
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor(Optional.of(LangchainTestFixtures.runtimeDataTools(tools)));
         @SuppressWarnings("unchecked")
         ObjectProvider<MeterRegistry> meterProvider = mock(ObjectProvider.class);
         ReflectionTestUtils.setField(executor, "todoRetryPolicy", new TodoRetryPolicy(
@@ -100,7 +108,9 @@ class LangchainTodoNodeExecutorRetryTest {
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("goal")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .toolSpecifications(List.of(ToolSpecification.builder().name(toolName).build()))
                 .maxToolRoundTrips(3)
                 .build();

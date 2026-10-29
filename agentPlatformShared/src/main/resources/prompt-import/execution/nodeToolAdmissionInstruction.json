@@ -1,0 +1,21 @@
+{
+  "fragment": "nodeToolAdmissionInstruction",
+  "purpose": "nodeToolAdmissionInstruction",
+  "bodyType": "TEMPLATE",
+  "body": "本次模型回复最多包含{{maxMembers}}个工具调用，所有工具合计。这是整轮调用数量限制，与checkParallelLimits返回的单次批量参数数量不同。超过整轮限制时全部调用都不会执行；请减少本轮调用数量，等结果返回后再继续余下批次。",
+  "variables": [
+    {
+      "name": "maxMembers",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "eca229d75aac40e07aee3590c457045abd97598de87e8717610745e6dac3aa3c",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/execution/DualPoolWaitGroupNodeExecutor.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -3,6 +3,8 @@ package world.willfrog.agent.platform.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import world.willfrog.agent.platform.context.AgentContext;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
@@ -26,6 +28,9 @@ class AgentLlmLocalConfigLoaderTest {
 
     @TempDir
     Path tempDir;
+
+    @AfterEach
+    void clearModelContext() { AgentContext.clear(); }
 
     @Test
     void realLocalExample_shouldResolveEveryConfiguredPromptProjection() throws Exception {
@@ -499,7 +504,7 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
-    void localProjection_shouldKeepResolverPromptVersionEqualToClasspathAuthority() throws Exception {
+    void localProjection_shouldKeepResolverPromptVersionEqualToSelectedVersion() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("finance");
         Files.createDirectories(promptsDir);
         Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
@@ -519,7 +524,9 @@ class AgentLlmLocalConfigLoaderTest {
         ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
         loader.load();
 
-        AgentPromptService promptService = new AgentPromptService(new AgentLlmProperties(), loader);
+        VersionedModelTestFixture versioned = new VersionedModelTestFixture();
+        versioned.put("financeMethodResolverSystemPrompt", localTemplate, "RESOLVER_CATALOG");
+        AgentPromptService promptService = versioned.promptService(new AgentLlmProperties(), loader);
 
         AgentAiServiceFactory aiServiceFactory = org.mockito.Mockito.mock(AgentAiServiceFactory.class);
         FinanceMethodResolverModelResolver modelResolver = org.mockito.Mockito.mock(FinanceMethodResolverModelResolver.class);
@@ -536,10 +543,10 @@ class AgentLlmLocalConfigLoaderTest {
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
                 "e2e-endpoint", "https://e2e.example.com/v1", "e2e-model", "key", "", java.util.List.of(), null);
         org.mockito.Mockito.when(aiServiceFactory.resolveLlm("e2e-endpoint", "e2e-model")).thenReturn(resolved);
-        org.mockito.Mockito.when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+        org.mockito.Mockito.when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                 org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyList(),
                 org.mockito.ArgumentMatchers.anyDouble(), org.mockito.ArgumentMatchers.anyInt()))
-                .thenReturn(chatModel);
+                .thenReturn(versioned.archived(chatModel, "e2e-endpoint"));
         org.mockito.Mockito.when(chatModel.chat(org.mockito.ArgumentMatchers.anyList())).thenReturn(
                 dev.langchain4j.model.chat.response.ChatResponse.builder()
                         .aiMessage(new dev.langchain4j.data.message.AiMessage("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"))
@@ -547,6 +554,7 @@ class AgentLlmLocalConfigLoaderTest {
 
         FinanceMethodResolverModelService service = new FinanceMethodResolverModelService(
                 new ObjectMapper(), aiServiceFactory, modelResolver, promptService, observability);
+        versioned.inject(service);
 
         var result = service.resolve("query", null, "E2E-CATALOG");
 
@@ -556,6 +564,7 @@ class AgentLlmLocalConfigLoaderTest {
                 java.security.MessageDigest.getInstance("SHA-256")
                         .digest(localTemplate.getBytes(StandardCharsets.UTF_8)));
         assertEquals(expectedDigest, ok.resolverPromptVersion());
+        assertEquals(localTemplate, promptService.financeMethodResolverSystemPromptVersion().body());
 
         byte[] classpathBytes;
         try (java.io.InputStream is = getClass().getResourceAsStream(
@@ -565,7 +574,7 @@ class AgentLlmLocalConfigLoaderTest {
         String classpathDigest = java.util.HexFormat.of().formatHex(
                 java.security.MessageDigest.getInstance("SHA-256").digest(classpathBytes));
         assertEquals(classpathDigest, ok.resolverPromptVersion(),
-                "外置投影不能产生不同于 classpath 权威正文的 promptVersion");
+                "本测试明确选用导入投影的同一正文版本，运行时摘要必须对应该版本");
 
         org.mockito.ArgumentCaptor<java.util.List<dev.langchain4j.data.message.ChatMessage>> captor =
                 org.mockito.ArgumentCaptor.forClass(java.util.List.class);
@@ -1180,7 +1189,7 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     /**
-     * 真实 loader + 真实 resolver + 真实 ModelService（仅 mock 路由构建/ChatModel/prompt/observability）
+     * 真实 loader、resolver、ModelService、版本渲染及输入作用域；版本读取、路由构建、模型响应和输入保存使用边界替身
      * 的 financeMethodResolver 消费链夹具。
      */
     private record RealResolverChain(
@@ -1199,26 +1208,27 @@ class AgentLlmLocalConfigLoaderTest {
                 new FinanceMethodResolverModelResolver(staticProperties, loader);
 
         AgentAiServiceFactory aiServiceFactory = org.mockito.Mockito.mock(AgentAiServiceFactory.class);
-        AgentPromptService promptService = org.mockito.Mockito.mock(AgentPromptService.class);
+        VersionedModelTestFixture versioned = new VersionedModelTestFixture();
+        versioned.put("financeMethodResolverSystemPrompt", "resolver template {{RESOLVER_CATALOG}}", "RESOLVER_CATALOG");
+        AgentPromptService promptService = versioned.promptService(staticProperties, loader);
         AgentRunObservabilityService observability = org.mockito.Mockito.mock(AgentRunObservabilityService.class);
         dev.langchain4j.model.chat.ChatModel chatModel = org.mockito.Mockito.mock(dev.langchain4j.model.chat.ChatModel.class);
-        org.mockito.Mockito.when(promptService.financeMethodResolverSystemPromptTemplate())
-                .thenReturn("resolver template {{RESOLVER_CATALOG}}");
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
                 "local-endpoint", "https://local.example.com/v1", "local-model", "key", "", java.util.List.of(), null);
-        org.mockito.Mockito.lenient().when(aiServiceFactory.resolveLlm(
+        org.mockito.Mockito.when(aiServiceFactory.resolveLlm(
                 org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(resolved);
-        org.mockito.Mockito.lenient().when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+        org.mockito.Mockito.when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                 org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyList(),
                 org.mockito.ArgumentMatchers.anyDouble(), org.mockito.ArgumentMatchers.anyInt()))
-                .thenReturn(chatModel);
-        org.mockito.Mockito.lenient().when(chatModel.chat(org.mockito.ArgumentMatchers.anyList())).thenReturn(
+                .thenReturn(versioned.archived(chatModel, "local-endpoint"));
+        org.mockito.Mockito.when(chatModel.chat(org.mockito.ArgumentMatchers.anyList())).thenReturn(
                 dev.langchain4j.model.chat.response.ChatResponse.builder()
                         .aiMessage(new dev.langchain4j.data.message.AiMessage("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"))
                         .build());
 
         FinanceMethodResolverModelService service = new FinanceMethodResolverModelService(
                 new ObjectMapper(), aiServiceFactory, modelResolver, promptService, observability);
+        versioned.inject(service);
         return new RealResolverChain(loader, modelResolver, service, chatModel);
     }
 

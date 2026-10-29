@@ -1,6 +1,11 @@
 package world.willfrog.agentlangchain.execution;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.invocation.InvocationContext;
@@ -78,14 +83,14 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
         if (SUB_AGENT_TOOL_NAMES.contains(request.toolName())) {
             PersistentSubAgentToolBridge bridge = subAgentBridge == null ? null : subAgentBridge.getIfAvailable();
             if (bridge == null || !bridge.availableForRun(request.runId())) {
-                return new DispatchOutcome.Failed("sub_agent_tool_not_available:" + request.toolName());
+                return failureData("sub_agent_tool_not_available:" + request.toolName());
             }
             countToolCall(request);
             return bridge.dispatch(request);
         }
         ToolExecutor executor = executorFor(request.toolName());
         if (executor == null) {
-            return new DispatchOutcome.Failed("unknown_tool:" + request.toolName());
+            return failureData("unknown_tool:" + request.toolName());
         }
         ToolExecutionRequest executionRequest = ToolExecutionRequest.builder()
                 .id(request.toolCallId() == null || request.toolCallId().isBlank()
@@ -98,24 +103,29 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
         Optional<WaitGroupMemberExecutionContext.Snapshot> waitGroup = waitGroupContext(request);
         if (isAsyncTool(request.toolName()) && waitGroup.isEmpty()) {
             // 会转后台的工具必须有预先算好的外部作业身份，否则工具层建出来的作业没人认得回来。
-            return new DispatchOutcome.Failed("wait_group_member_without_operation_id:" + request.toolName());
+            return failureData("wait_group_member_without_operation_id:" + request.toolName());
         }
         countToolCall(request);
         try (WaitGroupMemberExecutionContext.Scope ignored = waitGroup
                 .map(WaitGroupMemberExecutionContext::install).orElse(null)) {
             if (executor instanceof ToolRouterToolExecutor routerExecutor) {
                 ToolRouterToolExecutor.InvocationResult result =
-                        routerExecutor.executeWithResult(executionRequest, null);
+                        routerExecutor.executeWithPromptResult(executionRequest, null);
                 String output = result.output() == null ? "" : result.output();
                 // 业务拒绝无需创建沙箱任务；原失败正文进入成员结果，不能因同步返回而改成成功。
-                return result.success() ? new DispatchOutcome.Completed(output)
-                        : new DispatchOutcome.Failed(output);
+                return result.success() ? new DispatchOutcome.Completed(output, result.outputPrompt())
+                        : new DispatchOutcome.Failed(output, result.outputPrompt());
             }
-            String output = executor.execute(executionRequest, null);
-            return new DispatchOutcome.Completed(output == null ? "" : output);
+            var result = executor.executeWithContext(executionRequest, null);
+            String output = result.resultText() == null ? "" : result.resultText();
+            var source = PromptMessageCodec.fromSourceAttributes(
+                    ToolExecutionResultMessage.from(executionRequest, output), result.attributes());
+            return new DispatchOutcome.Completed(output, source.origin() == PromptMessage.Origin.UNKNOWN
+                    ? null : new PromptText(output, source.sources()));
         } catch (WaitGroupMemberPendingException pending) {
             return toPending(request, pending);
         } catch (RuntimeException e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             if (e instanceof PythonRiskReplayEvidenceMissingException) {
                 throw e;
             }
@@ -127,9 +137,14 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             log.warn("新版本节点执行期间工具失败：tool={} member={} segment={}",
                     request.toolName(), request.memberSeq(), request.segment().describe(), e);
             String message = e.getMessage();
-            return new DispatchOutcome.Failed(message == null || message.isBlank()
+            return failureData(message == null || message.isBlank()
                     ? e.getClass().getSimpleName() : message);
         }
+    }
+
+    /** 在实际拒绝与异常捕获处生成的状态事实，不包含应用指令。 */
+    private static DispatchOutcome.Failed failureData(String reason) {
+        return new DispatchOutcome.Failed(reason, PromptText.runtimeData(reason));
     }
 
     private void countToolCall(DispatchRequest request) {
@@ -151,7 +166,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
             log.error("等待成员的外部作业身份与成员行上的值不一致，这条后台作业按失败处理："
                             + "member={} 期望={} 实际={}",
                     request.memberIdentity(), expected.orElse("<没有>"), proof.operationId());
-            return new DispatchOutcome.Failed("wait_group_member_operation_identity_mismatch");
+            return failureData("wait_group_member_operation_identity_mismatch");
         }
         return new DispatchOutcome.Pending(proof.operationId(), proof.taskId(), proof.toJson(objectMapper));
     }

@@ -44,8 +44,8 @@ class LangchainLinearRunPipelineFailureContextTest {
         when(runMapper.findById("run-1")).thenReturn(executingRun(PLAN_JSON));
         when(stageModelResolver.resolve(any())).thenThrow(new IllegalStateException(
                 "夹具在跑的中途被停用了"));
-        when(followUpContextSupport.resolve(any()))
-                .thenReturn(new LangchainFollowUpContextSupport.ExecutionContext("把这件事做完", ""));
+        when(followUpContextSupport.userGoal(any()))
+                .thenReturn("把这件事做完");
 
         LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
                 pipeline().rebuildDualPoolNodeContextForFailure("run-1");

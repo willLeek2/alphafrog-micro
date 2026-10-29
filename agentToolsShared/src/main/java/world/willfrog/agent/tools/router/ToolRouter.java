@@ -40,6 +40,10 @@ import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
 import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import java.util.function.Supplier;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
@@ -189,6 +193,9 @@ public class ToolRouter {
     @Autowired(required = false)
     private PromoteDatasetTool promoteDatasetTool;
 
+    @Autowired(required = false)
+    private ToolRouterPromptPreparation promptPreparation;
+
     /**
      * 简化入口：仅返回工具输出文本，丢弃成功标志、耗时、缓存元数据等。
      *
@@ -222,6 +229,10 @@ public class ToolRouter {
      * @return 包含输出文本、成功标志、耗时、缓存元数据的封装对象
      */
     public ToolInvocationResult invokeWithMeta(String toolName, Map<String, Object> params) {
+        return invokeWithMeta(toolName, params, false);
+    }
+
+    private ToolInvocationResult invokeWithMeta(String toolName, Map<String, Object> params, boolean classified) {
         /*
          * checkParallelLimits 是让模型查询工具并行限制的元工具。它应该暴露给模型，
          * 但不能消耗 run 的 toolCalls 预算，也不能写入业务 tool trace；否则模型每次
@@ -252,6 +263,7 @@ public class ToolRouter {
             getOrCreateToolCallTimer(nvl(toolName)).record(0, TimeUnit.MILLISECONDS);
             return ToolInvocationResult.builder()
                     .output(errorResult)
+                    .outputPrompt(classified ? PromptText.runtimeData(errorResult) : null)
                     .success(false)
                     .durationMs(0)
                     .cacheMeta(null)
@@ -271,7 +283,9 @@ public class ToolRouter {
             Optional<ToolWeightedLimitService.WeightLease> acquired = toolWeightedLimitService.tryAcquire(toolName, params);
             if (acquired.isEmpty()) {
                 int effectiveWeight = toolWeightedLimitService.previewEffectiveWeight(toolName, params);
-                String errorResult = weightLimitExceeded(toolName, effectiveWeight);
+                PromptText rejection = classified ? prompts().weightLimit(toolName, effectiveWeight)
+                        : PromptText.runtimeData(weightLimitExceeded(toolName, effectiveWeight));
+                String errorResult = rejection.text();
                 /*
                  * D07 口径：限流拒绝 ≠ 已执行工具调用。不调用 recordObservability——
                  * 拒绝不得抬高 observability summary.toolCalls、不得消耗 maxToolCalls
@@ -283,6 +297,7 @@ public class ToolRouter {
                 getOrCreateThrottleRejectionCounter(nvl(toolName), "weight_limit").increment();
                 return ToolInvocationResult.builder()
                         .output(errorResult)
+                        .outputPrompt(classified ? rejection : null)
                         .success(false)
                         .durationMs(0)
                         .cacheMeta(null)
@@ -302,7 +317,7 @@ public class ToolRouter {
         if ("searchWeb".equals(toolName)) {
             // 能力检查先于实验取值和缓存读取，关闭能力时不取得旧缓存结果。
             if (!AgentContext.isWebSearchEnabled()) {
-                cached = withoutCache(executeDirect(toolName, params));
+                cached = withoutCache(executeDirect(toolName, params, classified));
             } else {
                 long preparationStarted = System.currentTimeMillis();
                 try {
@@ -310,29 +325,26 @@ public class ToolRouter {
                     preparedSearch = prepared;
                     preparationDurationMs = Math.max(0L, System.currentTimeMillis() - preparationStarted);
                     actualParams = prepared.parameters();
-                    if (prepared.cacheDiscriminator().isEmpty()) {
-                        // 未配置实验时保持原缓存键；执行仍使用已经固定的原参数解析结果。
-                        cached = toolResultCacheService.executeWithCache(toolName, params, resolveScope(),
-                                () -> executePreparedSearch(prepared));
-                    } else {
-                        cached = toolResultCacheService.executeWithCache(toolName, actualParams, resolveScope(),
-                                prepared.cacheDiscriminator(), () -> executePreparedSearch(prepared));
-                    }
+                    // searchWeb 的共享缓存策略为 NONE；参数与实验来源仍完整参与观测。
+                    cached = executeCached(classified, toolName, actualParams,
+                            () -> executePreparedSearch(prepared, classified));
                 } catch (RacingCallException failure) {
+                    ModelSendBlocks.rethrowIfBlocked(failure);
                     preparationFailure = failure;
                     preparationDurationMs = Math.max(0L, System.currentTimeMillis() - preparationStarted);
+                    String failureBody = writeJson(Map.of("ok", false, "tool", "searchWeb", "data", Map.of(),
+                            "error", Map.of("code", failure.error().getCode(),
+                                    "message", failure.error().getMessage(),
+                                    "object_locator", failure.error().getObjectLocatorMap(),
+                                    "details", failure.error().getDetailsMap())));
                     cached = withoutCache(ToolResultCacheService.ToolExecutionOutcome.builder()
-                            .result(writeJson(Map.of("ok", false, "tool", "searchWeb", "data", Map.of(),
-                                    "error", Map.of("code", failure.error().getCode(),
-                                            "message", failure.error().getMessage(),
-                                            "object_locator", failure.error().getObjectLocatorMap(),
-                                            "details", failure.error().getDetailsMap()))))
+                            .result(failureBody).resultPrompt(classified ? PromptText.runtimeData(failureBody) : null)
                             .success(false).durationMs(0).build());
                 }
             }
         } else {
-            cached = toolResultCacheService.executeWithCache(toolName, params, resolveScope(),
-                    () -> executeDirect(toolName, params));
+            cached = executeCached(classified, toolName, params,
+                    () -> executeDirect(toolName, params, classified));
         }
         String result = nvl(cached.getResult());
         String observabilityResult = isBlank(cached.getObservabilityResult()) ? result : cached.getObservabilityResult();
@@ -372,6 +384,7 @@ public class ToolRouter {
                 preview(result));
         return ToolInvocationResult.builder()
                 .output(result)
+                .outputPrompt(classified ? cached.getResultPrompt() : null)
                 .success(success)
                 .durationMs(durationMs)
                 .cacheMeta(cacheMeta)
@@ -379,6 +392,38 @@ public class ToolRouter {
         } finally {
             weightLease.ifPresent(ToolWeightedLimitService.WeightLease::release);
         }
+    }
+
+    /** 托管模型只接受正文和来源已经共同确认的工具结果。 */
+    public ToolInvocationResult invokeWithPromptMeta(String toolName, Map<String, Object> params) {
+        ToolInvocationResult result = invokeWithMeta(toolName, params, true);
+        if (result == null || result.getOutputPrompt() == null
+                || !nvl(result.getOutput()).equals(result.getOutputPrompt().text())) {
+            throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "工具结果缺少与正文一致的来源记录");
+        }
+        return result;
+    }
+
+    private ToolResultCacheService.CachedToolCallResult executeCached(boolean classified, String toolName,
+            Map<String, Object> params, Supplier<ToolResultCacheService.ToolExecutionOutcome> loader) {
+        return classified ? toolResultCacheService.executeWithPromptCache(toolName, params, resolveScope(), loader)
+                : toolResultCacheService.executeWithCache(toolName, params, resolveScope(), loader);
+    }
+
+    private PromptText selectOutput(boolean classified, Supplier<String> legacy, Supplier<PromptText> typed) {
+        if (!classified) return PromptText.runtimeData(nvl(legacy.get()));
+        PromptText output = typed.get();
+        if (output == null) throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "工具产生端未提供正文来源");
+        return output;
+    }
+
+    private ToolRouterPromptPreparation prompts() {
+        if (promptPreparation == null) throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "工具路由建议的正文读取组件不可用");
+        return promptPreparation;
     }
 
     private SearchTools.PreparedSearchArguments prepareSearchArguments(Map<String, Object> raw) {
@@ -395,15 +440,17 @@ public class ToolRouter {
                 toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8")));
     }
 
-    private ToolResultCacheService.ToolExecutionOutcome executePreparedSearch(SearchTools.PreparedSearchArguments prepared) {
+    private ToolResultCacheService.ToolExecutionOutcome executePreparedSearch(SearchTools.PreparedSearchArguments prepared, boolean classified) {
         long started = System.currentTimeMillis();
-        String output = searchTools.searchWebPrepared(prepared);
-        return ToolResultCacheService.ToolExecutionOutcome.builder().result(output)
-                .success(isToolSuccess(output)).durationMs(Math.max(0L, System.currentTimeMillis() - started)).build();
+        PromptText output = selectOutput(classified, () -> searchTools.searchWebPrepared(prepared),
+                () -> searchTools.searchWebPreparedPrompt(prepared));
+        return ToolResultCacheService.ToolExecutionOutcome.builder().result(output.text())
+                .resultPrompt(classified ? output : null).success(isToolSuccess(output.text())).durationMs(Math.max(0L, System.currentTimeMillis() - started)).build();
     }
 
     private static ToolResultCacheService.CachedToolCallResult withoutCache(ToolResultCacheService.ToolExecutionOutcome outcome) {
         return ToolResultCacheService.CachedToolCallResult.builder().result(outcome.getResult())
+                .resultPrompt(outcome.getResultPrompt()).observabilityPrompt(outcome.getResultPrompt())
                 .observabilityResult(outcome.getResult()).success(outcome.isSuccess())
                 .durationMs(outcome.getDurationMs()).build();
     }
@@ -486,7 +533,7 @@ public class ToolRouter {
      * @param params   原始参数 Map
      * @return 工具执行结果（含结果文本、耗时、成功标志）
      */
-    private String invokeExecutePython(Map<String, Object> params) {
+    private PromptText invokeExecutePython(Map<String, Object> params, boolean classified) {
         /*
          * executePython 是最容易把上游数据、模型生成代码和沙箱执行耦合在一起的工具。
          * 260623-harness-optimization-02: dataset_ids / manifest_ids 是两个独立编号空间，
@@ -502,28 +549,41 @@ public class ToolRouter {
             PythonStaticPrecheckService.Result precheck =
                     pythonStaticPrecheckService.check(code, datasetIds, manifestIds, params);
             if (!precheck.isPassed()) {
-                return precheckFailure("executePython", precheck);
+                return classified ? prompts().precheck("executePython", precheck)
+                        : PromptText.runtimeData(precheckFailure("executePython", precheck));
             }
         }
-        return pythonSandboxTools.executePython(
+        return selectOutput(classified, () -> pythonSandboxTools.executePython(
                 code,
                 datasetIds,
                 manifestIds,
                 str(params.get("libraries"), params.get("arg3")),
                 toNullableInt(params.get("timeout_seconds"), params.get("timeoutSeconds"), params.get("arg4"))
-        );
+        ),
+                () -> pythonSandboxTools.executePythonPrompt(
+                code,
+                datasetIds,
+                manifestIds,
+                str(params.get("libraries"), params.get("arg3")),
+                toNullableInt(params.get("timeout_seconds"), params.get("timeoutSeconds"), params.get("arg4"))
+        ));
     }
 
     /**
      * executeQuery 的参数归集：sql / dataset_ids / product_tier 三个参数，
      * 别名兼容（argN 与驼峰）与 executePython 保持同一层处理。
      */
-    private String invokeExecuteQuery(Map<String, Object> params) {
-        return sqlQueryTools.executeQuery(
+    private PromptText invokeExecuteQuery(Map<String, Object> params, boolean classified) {
+        return selectOutput(classified, () -> sqlQueryTools.executeQuery(
                 str(params.get("sql"), params.get("arg0")),
                 str(params.get("dataset_ids"), params.get("datasetIds"), params.get("arg1")),
                 str(params.get("product_tier"), params.get("productTier"), params.get("arg2"))
-        );
+        ),
+                () -> sqlQueryTools.executeQueryPrompt(
+                str(params.get("sql"), params.get("arg0")),
+                str(params.get("dataset_ids"), params.get("datasetIds"), params.get("arg1")),
+                str(params.get("product_tier"), params.get("productTier"), params.get("arg2"))
+        ));
     }
 
     private boolean isStaticPrecheckEnabled() {
@@ -586,6 +646,10 @@ public class ToolRouter {
     }
 
     private ToolResultCacheService.ToolExecutionOutcome executeDirect(String toolName, Map<String, Object> params) {
+        return executeDirect(toolName, params, false);
+    }
+
+    private ToolResultCacheService.ToolExecutionOutcome executeDirect(String toolName, Map<String, Object> params, boolean classified) {
         /*
          * executeDirect 是「去掉装饰层后的真实工具路由」：
          * invokeWithMeta 已经处理预算、压测、限流、缓存和观测；
@@ -595,13 +659,13 @@ public class ToolRouter {
          * 也方便后续新增别名时只改一个地方。
          */
         long startedAt = System.currentTimeMillis();
-        String result;
+        PromptText result;
         try {
             // 能力校验：searchWeb 必须显式开启 webSearch 能力，否则返回不可用响应
             if ("searchWeb".equals(toolName) && !AgentContext.isWebSearchEnabled()) {
                 // webSearch 是按 run 配置开放的能力，不是全局默认工具。
                 // 这里返回结构化不可用结果，让模型知道不能继续依赖搜索，而不是抛异常中断整个 run。
-                result = writeJson(Map.of(
+                result = PromptText.runtimeData(writeJson(Map.of(
                         "ok", false,
                         "tool", "searchWeb",
                         "data", Map.of(),
@@ -611,9 +675,9 @@ public class ToolRouter {
                                 "details", Map.of(),
                                 "category", ToolFailureCategory.UNSUPPORTED.name()
                         )
-                ));
+                )));
                 return ToolResultCacheService.ToolExecutionOutcome.builder()
-                        .result(result)
+                        .result(result.text()).resultPrompt(classified ? result : null)
                         .durationMs(Math.max(0L, System.currentTimeMillis() - startedAt))
                         .success(false)
                         .build();
@@ -622,69 +686,128 @@ public class ToolRouter {
             result = switch (toolName) {
                 // checkParallelLimits 是“给模型看的工具目录说明”，只读配置，不访问业务数据。
                 // 它必须和其它工具走同一个路由入口，模型才能通过 tool-calling 正常调用。
-                case "checkParallelLimits" -> marketDataTools.checkParallelLimits();
-                case "getStockInfo" -> marketDataTools.getStockInfo(
+                case "checkParallelLimits" -> selectOutput(classified, () -> marketDataTools.checkParallelLimits(),
+                        () -> marketDataTools.checkParallelLimitsPrompt());
+                case "getStockInfo" -> selectOutput(classified, () -> marketDataTools.getStockInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
-                );
-                case "getStockDaily" -> marketDataTools.getStockDaily(
+                ),
+                        () -> marketDataTools.getStockInfoPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
+                ));
+                case "getStockDaily" -> selectOutput(classified, () -> marketDataTools.getStockDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
                         str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
-                );
-                case "getStockSwIndustryInfo" -> marketDataTools.getStockSwIndustryInfo(
+                ),
+                        () -> marketDataTools.getStockDailyPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
+                        dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
+                ));
+                case "getStockSwIndustryInfo" -> selectOutput(classified, () -> marketDataTools.getStockSwIndustryInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
-                );
-                case "searchStock" -> marketDataTools.searchStock(
+                ),
+                        () -> marketDataTools.getStockSwIndustryInfoPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
+                ));
+                case "searchStock" -> selectOutput(classified, () -> marketDataTools.searchStock(
                         str(params.get("keyword"), params.get("query"), params.get("arg0"))
-                );
-                case "searchFund" -> marketDataTools.searchFund(
+                ),
+                        () -> marketDataTools.searchStockPrompt(
                         str(params.get("keyword"), params.get("query"), params.get("arg0"))
-                );
-                case "getIndexInfo" -> marketDataTools.getIndexInfo(
+                ));
+                case "searchFund" -> selectOutput(classified, () -> marketDataTools.searchFund(
+                        str(params.get("keyword"), params.get("query"), params.get("arg0"))
+                ),
+                        () -> marketDataTools.searchFundPrompt(
+                        str(params.get("keyword"), params.get("query"), params.get("arg0"))
+                ));
+                case "getIndexInfo" -> selectOutput(classified, () -> marketDataTools.getIndexInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("index_code"), params.get("arg0"))
-                );
-                case "getIndexDaily" -> marketDataTools.getIndexDaily(
+                ),
+                        () -> marketDataTools.getIndexInfoPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("index_code"), params.get("arg0"))
+                ));
+                case "getIndexDaily" -> selectOutput(classified, () -> marketDataTools.getIndexDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("index_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
                         str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
-                );
+                ),
+                        () -> marketDataTools.getIndexDailyPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("index_code"), params.get("arg0")),
+                        dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
+                        dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeColumns"), params.get("include_columns"), params.get("arg3"))
+                ));
                 case "searchIndex" -> AdvancedSearchRequest.isAdvancedMap(params)
-                        ? marketDataTools.searchIndexAdvanced(params)
-                        : marketDataTools.searchIndex(
+                        ? selectOutput(classified, () -> marketDataTools.searchIndexAdvanced(params),
+                        () -> marketDataTools.searchIndexAdvancedPrompt(params))
+                        : selectOutput(classified, () -> marketDataTools.searchIndex(
                         str(params.get("keyword"), params.get("query"), params.get("arg0")),
                         null,
                         null
-                );
+                ),
+                        () -> marketDataTools.searchIndexPrompt(
+                        str(params.get("keyword"), params.get("query"), params.get("arg0")),
+                        null,
+                        null
+                ));
                 case "searchAssetInfo" -> AdvancedSearchRequest.isAdvancedMap(params)
-                        ? marketDataTools.searchAssetInfoAdvanced(params)
-                        : marketDataTools.searchAssetInfo(
+                        ? selectOutput(classified, () -> marketDataTools.searchAssetInfoAdvanced(params),
+                        () -> marketDataTools.searchAssetInfoAdvancedPrompt(params))
+                        : selectOutput(classified, () -> marketDataTools.searchAssetInfo(
                         str(params.get("query"), params.get("keyword"), params.get("arg0")),
                         str(params.get("assetTypes"), params.get("asset_types"), params.get("arg1")),
                         str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic"),
                         null,
                         null
-                );
-                case "getTradingDaysSummary" -> marketDataTools.getTradingDaysSummary(
+                ),
+                        () -> marketDataTools.searchAssetInfoPrompt(
+                        str(params.get("query"), params.get("keyword"), params.get("arg0")),
+                        str(params.get("assetTypes"), params.get("asset_types"), params.get("arg1")),
+                        str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic"),
+                        null,
+                        null
+                ));
+                case "getTradingDaysSummary" -> selectOutput(classified, () -> marketDataTools.getTradingDaysSummary(
                         dateStr(params.get("startDate"), params.get("start_date"), params.get("startDateStr"), params.get("arg0")),
                         dateStr(params.get("endDate"), params.get("end_date"), params.get("endDateStr"), params.get("arg1")),
                         str(params.get("exchange"), params.get("arg2"), "SSE")
-                );
-                case "isTradingDay" -> marketDataTools.isTradingDay(
+                ),
+                        () -> marketDataTools.getTradingDaysSummaryPrompt(
+                        dateStr(params.get("startDate"), params.get("start_date"), params.get("startDateStr"), params.get("arg0")),
+                        dateStr(params.get("endDate"), params.get("end_date"), params.get("endDateStr"), params.get("arg1")),
+                        str(params.get("exchange"), params.get("arg2"), "SSE")
+                ));
+                case "isTradingDay" -> selectOutput(classified, () -> marketDataTools.isTradingDay(
                         dateStr(params.get("date"), params.get("dates"), params.get("tradeDate"), params.get("tradeDates"),
                                 params.get("trade_date"), params.get("trade_dates"), params.get("arg0")),
                         str(params.get("exchange"), params.get("arg1"), "SSE")
-                );
+                ),
+                        () -> marketDataTools.isTradingDayPrompt(
+                        dateStr(params.get("date"), params.get("dates"), params.get("tradeDate"), params.get("tradeDates"),
+                                params.get("trade_date"), params.get("trade_dates"), params.get("arg0")),
+                        str(params.get("exchange"), params.get("arg1"), "SSE")
+                ));
                 case "getExchangeAssetDaily" -> AdvancedSearchRequest.isAdvancedMap(params)
-                        ? marketDataTools.getExchangeAssetDailyAdvanced(
+                        ? selectOutput(classified, () -> marketDataTools.getExchangeAssetDailyAdvanced(
                         params,
                         str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
                         dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3")),
                         str(params.get("priceMode"), params.get("price_mode"), params.get("arg4"), "raw_ohlc")
-                        )
-                        : marketDataTools.getExchangeAssetDaily(
+                        ),
+                        () -> marketDataTools.getExchangeAssetDailyAdvancedPrompt(
+                        params,
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3")),
+                        str(params.get("priceMode"), params.get("price_mode"), params.get("arg4"), "raw_ohlc")
+                        ))
+                        : selectOutput(classified, () -> marketDataTools.getExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                         str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
@@ -692,24 +815,45 @@ public class ToolRouter {
                         str(params.get("priceMode"), params.get("price_mode"), params.get("arg4"), "raw_ohlc"),
                         null,
                         null
-                );
-                case "getOffExchangeAssetDaily" -> marketDataTools.getOffExchangeAssetDaily(
+                ),
+                        () -> marketDataTools.getExchangeAssetDailyPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3")),
+                        str(params.get("priceMode"), params.get("price_mode"), params.get("arg4"), "raw_ohlc"),
+                        null,
+                        null
+                ));
+                case "getOffExchangeAssetDaily" -> selectOutput(classified, () -> marketDataTools.getOffExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
                         str(params.get("includeDataset"), params.get("include_dataset"), params.get("arg3"))
-                );
-                case "getSpecialAssetDaily" -> marketDataTools.getSpecialAssetDaily(
+                ),
+                        () -> marketDataTools.getOffExchangeAssetDailyPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("includeDataset"), params.get("include_dataset"), params.get("arg3"))
+                ));
+                case "getSpecialAssetDaily" -> selectOutput(classified, () -> marketDataTools.getSpecialAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                         str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
                         dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3"))
-                );
+                ),
+                        () -> marketDataTools.getSpecialAssetDailyPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        str(params.get("assetType"), params.get("asset_type"), params.get("arg1")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg2")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg3"))
+                ));
                 case "getEtfAdj" -> {
                     if (!isAdjFactorEnabled()) {
                         // ETF 复权因子是可灰度关闭的功能。禁用时返回标准 JSON，
                         // 保证前端和 LLM 都能读到明确的 CAPABILITY_DISABLED，而不是把它当作服务异常。
-                        yield writeJson(Map.of(
+                        yield PromptText.runtimeData(writeJson(Map.of(
                                 "ok", false,
                                 "tool", "getEtfAdj",
                                 "data", Map.of(),
@@ -719,37 +863,64 @@ public class ToolRouter {
                                         "details", Map.of("adjFactorEnabled", false),
                                         "category", ToolFailureCategory.UNSUPPORTED.name()
                                 )
-                        ));
+                        )));
                     }
-                    yield marketDataTools.getEtfAdj(
+                    yield selectOutput(classified, () -> marketDataTools.getEtfAdj(
                             str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                             dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
                             dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2"))
-                    );
+                    ),
+                        () -> marketDataTools.getEtfAdjPrompt(
+                            str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                            dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
+                            dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2"))
+                    ));
                 }
-                case "getListedAssetShareSize" -> marketDataTools.getListedAssetShareSize(
+                case "getListedAssetShareSize" -> selectOutput(classified, () -> marketDataTools.getListedAssetShareSize(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
                         dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
                         str(params.get("exchange"), params.get("arg3"))
-                );
-                case "getFinancialReport" -> marketDataTools.getFinancialReport(
+                ),
+                        () -> marketDataTools.getListedAssetShareSizePrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
+                        dateStr(params.get("startDate"), params.get("startDateStr"), params.get("start_date"), params.get("arg1")),
+                        dateStr(params.get("endDate"), params.get("endDateStr"), params.get("end_date"), params.get("arg2")),
+                        str(params.get("exchange"), params.get("arg3"))
+                ));
+                case "getFinancialReport" -> selectOutput(classified, () -> marketDataTools.getFinancialReport(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("ts code"), params.get("arg0")),
                         str(params.get("reportType"), params.get("report_type"), params.get("type"), params.get("report type"), params.get("arg1")),
                         dateStr(params.get("startPeriod"), params.get("start_period"), params.get("start"), params.get("arg2")),
                         dateStr(params.get("endPeriod"), params.get("end_period"), params.get("end"), params.get("arg3"))
-                );
-                case "ragSearch" -> ragTools.ragSearch(
+                ),
+                        () -> marketDataTools.getFinancialReportPrompt(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("ts code"), params.get("arg0")),
+                        str(params.get("reportType"), params.get("report_type"), params.get("type"), params.get("report type"), params.get("arg1")),
+                        dateStr(params.get("startPeriod"), params.get("start_period"), params.get("start"), params.get("arg2")),
+                        dateStr(params.get("endPeriod"), params.get("end_period"), params.get("end"), params.get("arg3"))
+                ));
+                case "ragSearch" -> selectOutput(classified, () -> ragTools.ragSearch(
                         str(params.get("queryText"), params.get("query_text"), params.get("query"), params.get("arg0")),
                         str(params.get("docType"), params.get("doc_type"), params.get("arg1")),
                         str(params.get("tsCode"), params.get("ts_code"), params.get("arg2")),
                         str(params.get("indName"), params.get("ind_name"), params.get("arg3")),
                         toIntWithDefault(5, params.get("topK"), params.get("top_k"), params.get("arg4"))
-                );
-                case "loadDocument" -> ragTools.loadDocument(
+                ),
+                        () -> ragTools.ragSearchPrompt(
+                        str(params.get("queryText"), params.get("query_text"), params.get("query"), params.get("arg0")),
+                        str(params.get("docType"), params.get("doc_type"), params.get("arg1")),
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("arg2")),
+                        str(params.get("indName"), params.get("ind_name"), params.get("arg3")),
+                        toIntWithDefault(5, params.get("topK"), params.get("top_k"), params.get("arg4"))
+                ));
+                case "loadDocument" -> selectOutput(classified, () -> ragTools.loadDocument(
                         str(params.get("ossUrl"), params.get("oss_url"), params.get("url"), params.get("arg0"))
-                );
-                case "searchWeb" -> searchTools.searchWeb(
+                ),
+                        () -> ragTools.loadDocumentPrompt(
+                        str(params.get("ossUrl"), params.get("oss_url"), params.get("url"), params.get("arg0"))
+                ));
+                case "searchWeb" -> selectOutput(classified, () -> searchTools.searchWeb(
                         str(params.get("query"), params.get("arg0")),
                         str(params.get("scene"), params.get("arg1")),
                         str(params.get("backend"), params.get("arg2")),
@@ -759,17 +930,35 @@ public class ToolRouter {
                         str(params.get("timeRangeStart"), params.get("time_range_start"), params.get("arg6")),
                         str(params.get("timeRangeEnd"), params.get("time_range_end"), params.get("arg7")),
                         toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8"))
-                );
-                case "resolveFinanceMethods" -> financeMethodTools.resolveFinanceMethods(
+                ),
+                        () -> searchTools.searchWebPrompt(
+                        str(params.get("query"), params.get("arg0")),
+                        str(params.get("scene"), params.get("arg1")),
+                        str(params.get("backend"), params.get("arg2")),
+                        str(params.get("strength"), params.get("arg3")),
+                        toBool(params.get("skipHotCache"), params.get("skip_hot_cache"), params.get("arg4")),
+                        toBool(params.get("skipRagPrefetch"), params.get("skip_rag_prefetch"), params.get("arg5")),
+                        str(params.get("timeRangeStart"), params.get("time_range_start"), params.get("arg6")),
+                        str(params.get("timeRangeEnd"), params.get("time_range_end"), params.get("arg7")),
+                        toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8"))
+                ));
+                case "resolveFinanceMethods" -> selectOutput(classified, () -> financeMethodTools.resolveFinanceMethods(
                         str(params.get("query"), params.get("arg0")),
                         str(params.get("context"), params.get("arg1"))
-                );
-                case "executePython" -> invokeExecutePython(params);
-                case "executeQuery" -> invokeExecuteQuery(params);
-                case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
+                ),
+                        () -> financeMethodTools.resolveFinanceMethodsPrompt(
+                        str(params.get("query"), params.get("arg0")),
+                        str(params.get("context"), params.get("arg1"))
+                ));
+                case "executePython" -> invokeExecutePython(params, classified);
+                case "executeQuery" -> invokeExecuteQuery(params, classified);
+                case "loadToolGuide" -> selectOutput(classified, () -> loadToolGuideTool.loadToolGuide(
                         str(params.get("topic"), params.get("arg0"))
-                );
-                case "listMyData" -> listMyDataTool.listMyData(
+                ),
+                        () -> loadToolGuideTool.loadToolGuidePrompt(
+                        str(params.get("topic"), params.get("arg0"))
+                ));
+                case "listMyData" -> selectOutput(classified, () -> listMyDataTool.listMyData(
                         str(params.get("query_type"), params.get("arg0")),
                         str(params.get("from_ts_code"), params.get("arg1")),
                         str(params.get("grep"), params.get("arg2")),
@@ -778,10 +967,20 @@ public class ToolRouter {
                         toIntOrNull(params.get("offset"), params.get("arg5")),
                         toIntOrNull(params.get("limit"), params.get("arg6")),
                         str(params.get("related_dataset_ids"), params.get("arg7"))
-                );
+                ),
+                        () -> listMyDataTool.listMyDataPrompt(
+                        str(params.get("query_type"), params.get("arg0")),
+                        str(params.get("from_ts_code"), params.get("arg1")),
+                        str(params.get("grep"), params.get("arg2")),
+                        toIntOrNull(params.get("file_offset"), params.get("arg3")),
+                        toIntOrNull(params.get("file_limit"), params.get("arg4")),
+                        toIntOrNull(params.get("offset"), params.get("arg5")),
+                        toIntOrNull(params.get("limit"), params.get("arg6")),
+                        str(params.get("related_dataset_ids"), params.get("arg7"))
+                ));
                 case "promoteDatasetToPlatform" -> promoteDatasetTool == null
-                        ? promoteUnavailable(toolName)
-                        : promoteDatasetTool.promoteDatasetToPlatform(
+                        ? PromptText.runtimeData(promoteUnavailable(toolName))
+                        : selectOutput(classified, () -> promoteDatasetTool.promoteDatasetToPlatform(
                                 toIntOrNull(params.get("dataset_number"), params.get("datasetNumber"), params.get("arg0")),
                                 str(params.get("name"), params.get("arg1")),
                                 str(params.get("description"), params.get("arg2")),
@@ -791,20 +990,39 @@ public class ToolRouter {
                                 str(params.get("coverage_start"), params.get("coverageStart"), params.get("arg6")),
                                 str(params.get("coverage_end"), params.get("coverageEnd"), params.get("arg7")),
                                 str(params.get("frequency"), params.get("arg8"))
-                );
-                case "rereadToolResult" -> rereadToolHandler.reread(
+                ),
+                        () -> promoteDatasetTool.promoteDatasetToPlatformPrompt(
+                                toIntOrNull(params.get("dataset_number"), params.get("datasetNumber"), params.get("arg0")),
+                                str(params.get("name"), params.get("arg1")),
+                                str(params.get("description"), params.get("arg2")),
+                                str(params.get("semantic_refs"), params.get("semanticRefs"), params.get("arg3")),
+                                str(params.get("primary_key"), params.get("primaryKey"), params.get("arg4")),
+                                str(params.get("coverage_scope"), params.get("coverageScope"), params.get("arg5")),
+                                str(params.get("coverage_start"), params.get("coverageStart"), params.get("arg6")),
+                                str(params.get("coverage_end"), params.get("coverageEnd"), params.get("arg7")),
+                                str(params.get("frequency"), params.get("arg8"))
+                ));
+                case "rereadToolResult" -> selectOutput(classified, () -> rereadToolHandler.reread(
                         str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
                         str(params.get("keyword"), params.get("arg1")),
                         toIntOrNull(params.get("offset"), params.get("arg2")),
                         toIntOrNull(params.get("limit"), params.get("arg3"))
-                );
+                ),
+                        () -> rereadToolHandler.rereadToolResultPrompt(
+                        str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
+                        str(params.get("keyword"), params.get("arg1")),
+                        toIntOrNull(params.get("offset"), params.get("arg2")),
+                        toIntOrNull(params.get("limit"), params.get("arg3"))
+                ));
                 case "spawnSubAgent" -> subAgentControlHandler == null
-                        ? subAgentUnavailable(toolName)
-                        : subAgentControlHandler.spawn(params);
+                        ? PromptText.runtimeData(subAgentUnavailable(toolName))
+                        : selectOutput(classified, () -> subAgentControlHandler.spawn(params),
+                        () -> subAgentControlHandler.spawnPrompt(params));
                 case "waitForSubAgent" -> subAgentControlHandler == null
-                        ? subAgentUnavailable(toolName)
-                        : subAgentControlHandler.waitFor(params);
-                default -> unsupported(toolName);
+                        ? PromptText.runtimeData(subAgentUnavailable(toolName))
+                        : selectOutput(classified, () -> subAgentControlHandler.waitFor(params),
+                        () -> subAgentControlHandler.waitForPrompt(params));
+                default -> PromptText.runtimeData(unsupported(toolName));
             };
         } catch (PythonRiskReplayEvidenceMissingException missing) {
             throw missing;
@@ -848,12 +1066,12 @@ public class ToolRouter {
             // 具体堆栈仍在服务日志中，模型只拿到可解释的 error.message。
             debugLog("tool invoke exception: runId={}, tool={}, error={}",
                     AgentContext.getRunId(), nvl(toolName), nvl(e.getMessage()));
-            result = invocationError(toolName, e.getMessage());
+            result = PromptText.runtimeData(invocationError(toolName, e.getMessage()));
         }
         return ToolResultCacheService.ToolExecutionOutcome.builder()
-                .result(result)
+                .result(result.text()).resultPrompt(classified ? result : null)
                 .durationMs(Math.max(0L, System.currentTimeMillis() - startedAt))
-                .success(isToolSuccess(result))
+                .success(isToolSuccess(result.text()))
                 .build();
     }
 
@@ -1289,6 +1507,8 @@ public class ToolRouter {
     public static class ToolInvocationResult {
         /** 工具输出的标准响应 JSON 字符串 */
         private String output;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private world.willfrog.alphafrogmicro.common.racing.prompt.PromptText outputPrompt;
         /** 是否成功（根据响应顶层 ok 字段判定） */
         private boolean success;
         /** 本次调用耗时（含缓存判断和实际执行） */

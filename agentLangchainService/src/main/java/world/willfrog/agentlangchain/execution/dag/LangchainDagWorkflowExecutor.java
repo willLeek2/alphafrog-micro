@@ -16,6 +16,10 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.AgentRunFailureClass;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoStatus;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
@@ -103,6 +107,8 @@ public class LangchainDagWorkflowExecutor {
     private final AgentRunEventService eventService;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentPromptService promptService;
+    @Autowired
+    private AgentModelInputs modelInputs;
     private final ObjectMapper objectMapper;
     private final ObjectProvider<world.willfrog.agent.platform.service.AgentRunStateStore> stateStoreProvider;
 
@@ -559,6 +565,7 @@ public class LangchainDagWorkflowExecutor {
                         .sequence(item.getSequence())
                         .description(item.getDescription())
                         .output(record.getOutput())
+                        .outputSourceJson(LangchainCompletedTodo.modelOutputSourceJson())
                         .summary(record.getSummary())
                         .build());
                 long durationMs = System.currentTimeMillis() - nodeStartMs;
@@ -690,10 +697,16 @@ public class LangchainDagWorkflowExecutor {
         String previousStage = AgentContext.getStage();
         try {
             // 1. 构建恢复判定器的 system prompt + user message（user message 里包含所有 todo 的状态摘要和已完成节点的产出）
-            String systemPrompt = promptService.reactSystemPrompt();
-            String userMessage = promptService.dagRecoveryJudgeStageInstruction()
-                    + "\n\n"
-                    + buildRecoveryJudgeUserMessage(items, graph, results, sharedContext, request);
+            PromptText systemPrompt = promptService.reactSystemPromptText();
+            List<PromptText> judgeParts = new ArrayList<>();
+            judgeParts.add(promptService.dagRecoveryJudgeStageInstructionText());
+            judgeParts.add(PromptText.runtimeData("\n\n" + buildRecoveryJudgeUserMessage(
+                    items, graph, results, sharedContext, request)));
+            // 已完成结果的摘要沿用同项来源，恢复出来的旧未知结果不能重新标成运行数据。
+            for (LangchainCompletedTodo completed : sharedContext.completedTodosSnapshot()) {
+                judgeParts.add(completed.attributedText(""));
+            }
+            PromptText userMessage = PromptText.concat(judgeParts);
 
             // 2. 设置 judge 专用的 phase/stage，让 ChatModel 产生的 trace 归属到 dag_recovery_judge，方便在 observability 中过滤
             AgentContext.setPhase("dag_recovery_judge");
@@ -701,14 +714,21 @@ public class LangchainDagWorkflowExecutor {
 
             // 3. 调用 execution 阶段模型做判定（复用请求中的 execution model）
             ChatModel judgeModel = request.executionModelOrDefault();
-            ChatRequest chatRequest = ChatRequest.builder()
-                    .messages(List.of(
-                            SystemMessage.from(systemPrompt),
-                            UserMessage.from(userMessage)
-                    ))
-                    .build();
-
-            ChatResponse response = judgeModel.doChat(chatRequest);
+            List<PromptMessage> messages = List.of(PromptMessage.system(systemPrompt), PromptMessage.user(userMessage));
+            ChatRequest chatRequest = ChatRequest.builder().messages(messages.stream().map(PromptMessage::message).toList()).build();
+            if (modelInputs == null) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "恢复判定的输入保存组件未配置");
+            }
+            var parentSpec = AgentContext.getStructuredOutputSpec();
+            AgentContext.clearStructuredOutputSpec();
+            ChatResponse response;
+            try (var ignored = modelInputs.open(request.getExecutionEndpointName(), PromptMessage.toModelInputSources(messages))) {
+                response = judgeModel.doChat(chatRequest);
+            } finally {
+                if (parentSpec == null) AgentContext.clearStructuredOutputSpec();
+                else AgentContext.setStructuredOutputSpec(parentSpec);
+            }
             AiMessage aiMessage = response.aiMessage();
             String responseText = aiMessage.text();
 

@@ -21,6 +21,13 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -28,6 +35,9 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Objects;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -93,135 +103,167 @@ public class ToolResultCacheService {
                                                  Map<String, Object> params,
                                                  String scope,
                                                  Supplier<ToolExecutionOutcome> loader) {
-        return executeWithCache(toolName, params, scope, "", loader);
+        return execute(toolName, params, scope, loader, false);
     }
 
-    public CachedToolCallResult executeWithCache(String toolName,
-                                                 Map<String, Object> params,
-                                                 String scope,
-                                                 String discriminator,
-                                                 Supplier<ToolExecutionOutcome> loader) {
-        CachePlan plan = buildPlan(toolName, params, scope, discriminator);
+    public CachedToolCallResult executeWithPromptCache(String toolName, Map<String, Object> params,
+                                                       String scope, Supplier<ToolExecutionOutcome> loader) {
+        return execute(toolName, params, scope, loader, true);
+    }
+
+    private CachedToolCallResult execute(String toolName, Map<String, Object> params, String scope,
+                                          Supplier<ToolExecutionOutcome> loader, boolean classified) {
+        CachePlan plan = buildPlan(toolName, params, scope);
+        String rootSelectionDigest = classified ? currentRootSelectionDigest() : null;
+        String rootKey = blank(plan.getKey()) || rootSelectionDigest == null ? null
+                : plan.getKey() + ":prompt-root:" + rootSelectionDigest;
         debugLog("cache plan resolved: runId={}, tool={}, mode={}, key={}, ttlSeconds={}, scope={}",
                 AgentContext.getRunId(), nvl(toolName), plan.getMode(), plan.getKey(), plan.getTtlSeconds(), nvl(scope));
         long lookupStartedAt = System.currentTimeMillis();
 
         if (plan.getMode() == CacheMode.REDIS && plan.getTtlSeconds() > 0) {
-            CachePayload cached = readCache(plan.getKey());
-            if (cached != null && cached.getResult() != null) {
-                if (!isStructuredToolResult(cached.getResult())) {
-                    redisTemplate.delete(plan.getKey());
-                    log.info("Ignore legacy tool cache payload, key={}", plan.getKey());
-                } else {
-                    long durationMs = Math.max(0L, System.currentTimeMillis() - lookupStartedAt);
-                    long ttlRemainingMs = ttlRemainingMs(plan.getKey());
-                    long savedDurationMs = Math.max(0L, cached.getOriginalDurationMs() - durationMs);
-                    CacheMeta meta = CacheMeta.builder()
-                            .eligible(true)
-                            .hit(true)
-                            .key(plan.getKey())
-                            .ttlRemainingMs(ttlRemainingMs)
-                            .source(SOURCE_REDIS)
-                            .estimatedSavedDurationMs(savedDurationMs)
-                            .build();
-                    debugLog("cache hit: runId={}, tool={}, key={}, ttlRemainingMs={}, savedMs={}",
-                            AgentContext.getRunId(), nvl(toolName), plan.getKey(), ttlRemainingMs, savedDurationMs);
-                    cacheHitCounter.increment();
-                    cacheLookupTimer.record(durationMs, TimeUnit.MILLISECONDS);
-                    String result = cached.getResult();
-                    if (cached.isCompactionApplied() && cached.getRawLocator() != null) {
-                        try {
-                            result = toolOutputCompactionService.rebindForCacheHit(result, cached.getRawLocator());
-                        } catch (IllegalArgumentException e) {
-                            // 260814 scheduler-03 review fix：rebind 只允许读当前
-                            // AgentContext 拥有的 ref。缓存里的 locator 不属于当前
-                            // Run（跨 Run 命中）或来源 Run 已终态清理时，此缓存视为
-                            // 失效——删除并回源真实工具调用，绝不跨 Run 复制 raw
-                            // 内容，也不让 cache hit 以异常中断工具调用链。
-                            redisTemplate.delete(plan.getKey());
-                            log.info("Tool cache rawRef no longer owned by current run, "
-                                    + "invalidating cache and falling back to loader, key={}", plan.getKey());
-                            result = null;
-                        }
+            List<String> keys = new ArrayList<>();
+            if (classified && rootKey != null) keys.add(rootKey);
+            keys.add(plan.getKey());
+            for (String key : keys) {
+                CachePayload cached = readCache(key);
+                if (cached == null || cached.getResult() == null) continue;
+                PromptText cachedPrompt = classified ? cachedPrompt(cached, key.equals(rootKey), rootSelectionDigest) : null;
+                if (!isStructuredToolResult(cached.getResult()) || classified && cachedPrompt == null) {
+                    redisTemplate.delete(key);
+                    log.info("Ignore tool cache without a usable structured result and its provenance, key={}", key);
+                    continue;
+                }
+                long durationMs = Math.max(0L, System.currentTimeMillis() - lookupStartedAt);
+                long ttlRemainingMs = ttlRemainingMs(key);
+                CacheMeta meta = CacheMeta.builder().eligible(true).hit(true).key(key)
+                        .ttlRemainingMs(ttlRemainingMs).source(SOURCE_REDIS)
+                        .estimatedSavedDurationMs(Math.max(0L, cached.getOriginalDurationMs() - durationMs)).build();
+                cacheHitCounter.increment();
+                cacheLookupTimer.record(durationMs, TimeUnit.MILLISECONDS);
+                String result = cached.getResult();
+                if (cached.isCompactionApplied() && cached.getRawLocator() != null) {
+                    try {
+                        if (classified) {
+                            cachedPrompt = toolOutputCompactionService.rebindPromptForCacheHit(cachedPrompt, cached.getRawLocator());
+                            result = cachedPrompt.text();
+                        } else result = toolOutputCompactionService.rebindForCacheHit(result, cached.getRawLocator());
+                    } catch (IllegalArgumentException e) {
+                        redisTemplate.delete(key);
+                        log.info("Tool cache rawRef no longer owned by current run, invalidating cache, key={}", key);
+                        result = null;
                     }
-                    if (result != null) {
-                        return CachedToolCallResult.builder()
-                                .result(result)
-                                .observabilityResult(result)
-                                .durationMs(durationMs)
-                                .success(true)
-                                .cacheMeta(meta)
-                                .build();
-                    }
-                    // result == null：缓存失效，落到下方 loader 路径按 miss 处理
+                }
+                if (result != null) {
+                    if (classified) requirePrompt(result, cachedPrompt);
+                    return CachedToolCallResult.builder().result(result).resultPrompt(cachedPrompt)
+                            .observabilityResult(result).observabilityPrompt(cachedPrompt)
+                            .durationMs(durationMs).success(true).cacheMeta(meta).build();
                 }
             }
         }
 
-        // 未命中缓存时才执行真实工具调用（loader）。
         cacheMissCounter.increment();
         ToolExecutionOutcome loaded = loader.get();
         cacheLookupTimer.record(System.currentTimeMillis() - lookupStartedAt, TimeUnit.MILLISECONDS);
         if (loaded == null) {
-            loaded = ToolExecutionOutcome.builder()
-                    .result(fallbackToolErrorJson(toolName, "EMPTY_LOADER_RESULT", "Tool invocation error: empty loader result"))
-                    .durationMs(0L)
-                    .success(false)
-                    .build();
+            String error = fallbackToolErrorJson(toolName, "EMPTY_LOADER_RESULT", "Tool invocation error: empty loader result");
+            loaded = ToolExecutionOutcome.builder().result(error)
+                    .resultPrompt(classified ? PromptText.runtimeData(error) : null)
+                    .durationMs(0L).success(false).build();
         }
-
-        CacheMeta meta;
-        ToolOutputCompactionService.CompactionResult compaction = toolOutputCompactionService.compact(
-                toolName,
-                loaded.getResult(),
-                resolveTodoGoal());
+        PromptText rawPrompt = classified ? requirePrompt(loaded.getResult(), loaded.getResultPrompt()) : null;
+        if (classified && loaded.getObservabilityPrompt() != null
+                && !rawPrompt.equals(loaded.getObservabilityPrompt())) {
+            throw missingSource("工具原始结果与观测来源不一致");
+        }
+        ToolOutputCompactionService.CompactionResult compaction = classified
+                ? toolOutputCompactionService.compactPrompt(toolName, rawPrompt, resolveTodoGoal())
+                : toolOutputCompactionService.compact(toolName, loaded.getResult(), resolveTodoGoal());
         String modelOutput = compaction.getModelOutput();
         String cacheValue = compaction.isCompactionApplied() ? compaction.getCacheTemplate() : modelOutput;
         RawPayloadLocator rawLocator = compaction.isCompactionApplied() ? compaction.getRawLocator() : null;
-        boolean compactionApplied = compaction.isCompactionApplied();
-
+        PromptText modelPrompt = classified ? requirePrompt(modelOutput, compaction.getModelPrompt()) : null;
+        PromptText cachePrompt = classified ? requirePrompt(cacheValue, compaction.isCompactionApplied()
+                ? compaction.getCacheTemplatePrompt() : compaction.getModelPrompt()) : null;
+        PromptText observabilityPrompt = classified
+                ? requirePrompt(compaction.getObservabilityOutput(), compaction.getObservabilityPrompt()) : null;
+        boolean applicationSources = classified && (!rawPrompt.sources().isEmpty()
+                || !modelPrompt.sources().isEmpty() || !cachePrompt.sources().isEmpty()
+                || !observabilityPrompt.sources().isEmpty());
+        String cacheKey = plan.getKey();
+        if (applicationSources && rootKey != null) cacheKey = rootKey;
+        CacheMeta meta;
         if (plan.getMode() == CacheMode.NONE) {
-            meta = CacheMeta.builder()
-                    .eligible(false)
-                    .hit(false)
-                    .key("")
-                    .ttlRemainingMs(-1L)
-                    .source(SOURCE_NONE)
-                    .estimatedSavedDurationMs(0L)
-                    .build();
+            meta = CacheMeta.builder().eligible(false).hit(false).key("").ttlRemainingMs(-1L)
+                    .source(SOURCE_NONE).estimatedSavedDurationMs(0L).build();
         } else if (plan.getMode() == CacheMode.REDIS) {
             if (loaded.isSuccess() && plan.getTtlSeconds() > 0 && isStructuredToolResult(cacheValue)) {
-                writeCache(plan.getKey(), cacheValue, loaded.getDurationMs(), plan.getTtlSeconds(), rawLocator, compactionApplied);
-                debugLog("cache write: runId={}, tool={}, key={}, ttlSeconds={}, durationMs={}, compaction={}",
-                        AgentContext.getRunId(), nvl(toolName), plan.getKey(), plan.getTtlSeconds(), loaded.getDurationMs(), compactionApplied);
+                if (applicationSources && rootSelectionDigest == null) {
+                    throw missingSource("应用指令缓存缺少完整原根选择");
+                }
+                writeCache(cacheKey, cacheValue, loaded.getDurationMs(), plan.getTtlSeconds(), rawLocator,
+                        compaction.isCompactionApplied(), cachePrompt, observabilityPrompt,
+                        rawLocator == null ? null : rawPrompt, applicationSources ? rootSelectionDigest : null);
             }
-            meta = CacheMeta.builder()
-                    .eligible(true)
-                    .hit(false)
-                    .key(plan.getKey())
+            meta = CacheMeta.builder().eligible(true).hit(false).key(cacheKey)
                     .ttlRemainingMs(plan.getTtlSeconds() > 0 ? plan.getTtlSeconds() * 1000L : -1L)
-                    .source(SOURCE_REDIS)
-                    .estimatedSavedDurationMs(0L)
-                    .build();
+                    .source(SOURCE_REDIS).estimatedSavedDurationMs(0L).build();
         } else {
-            boolean hit = isDatasetReuseResult(loaded.getResult());
-            meta = CacheMeta.builder()
-                    .eligible(true)
-                    .hit(hit)
-                    .key(plan.getKey())
+            meta = CacheMeta.builder().eligible(true).hit(isDatasetReuseResult(loaded.getResult())).key(plan.getKey())
                     .ttlRemainingMs(plan.getTtlSeconds() > 0 ? plan.getTtlSeconds() * 1000L : -1L)
-                    .source(SOURCE_DATASET_REGISTRY)
-                    .estimatedSavedDurationMs(0L)
-                    .build();
+                    .source(SOURCE_DATASET_REGISTRY).estimatedSavedDurationMs(0L).build();
         }
+        return CachedToolCallResult.builder().result(modelOutput).resultPrompt(modelPrompt)
+                .observabilityResult(compaction.getObservabilityOutput()).observabilityPrompt(observabilityPrompt)
+                .durationMs(Math.max(0L, loaded.getDurationMs())).success(loaded.isSuccess()).cacheMeta(meta).build();
+    }
 
-        return CachedToolCallResult.builder()
-                .result(modelOutput)
-                .observabilityResult(compaction.getObservabilityOutput())
-                .durationMs(Math.max(0L, loaded.getDurationMs()))
-                .success(loaded.isSuccess())
-                .cacheMeta(meta)
-                .build();
+    private PromptText cachedPrompt(CachePayload payload, boolean rootBoundKey, String rootSelectionDigest) {
+        try {
+            PromptMessage result = decodeSource(payload.getResult(), payload.getResultSourceJson());
+            PromptMessage observed = decodeSource("cached-observability-source", payload.getObservabilitySourceJson());
+            PromptMessage raw = payload.getRawLocator() == null ? null
+                    : decodeSource("cached-artifact-source", payload.getRawSourceJson());
+            if (result.origin() == PromptMessage.Origin.UNKNOWN || observed.origin() == PromptMessage.Origin.UNKNOWN
+                    || raw != null && raw.origin() == PromptMessage.Origin.UNKNOWN) return null;
+            boolean application = !result.sources().isEmpty() || !observed.sources().isEmpty()
+                    || raw != null && !raw.sources().isEmpty();
+            if (application) {
+                if (!rootBoundKey || rootSelectionDigest == null
+                        || !rootSelectionDigest.equals(payload.getRootSelectionDigest())) return null;
+            } else if (rootBoundKey || !blank(payload.getRootSelectionDigest())) return null;
+            return new PromptText(payload.getResult(), result.sources());
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+    }
+
+    /** 来源属性只解码版本与分类，不把辅助值或来源元数据写进用户结果JSON。 */
+    private PromptMessage decodeSource(String body, String sourceJson) {
+        if (sourceJson == null) throw missingSource("缓存缺少结果来源");
+        return PromptMessageCodec.fromSourceAttributes(dev.langchain4j.data.message.UserMessage.from(body),
+                Map.of(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY, sourceJson));
+    }
+
+    private PromptText requirePrompt(String body, PromptText prompt) {
+        if (prompt == null || !Objects.equals(body, prompt.text())) throw missingSource("工具结果与已分类正文不一致");
+        return prompt;
+    }
+
+    private String currentRootSelectionDigest() {
+        PromptRunSelection selection = AgentContext.getPromptRunSelection();
+        if (selection == null || selection.schemaVersion() != PromptRunSelection.RACING_SCHEMA_VERSION) return null;
+        try {
+            return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(selection.racingSelection().toByteArray()));
+        } catch (Exception failure) {
+            throw missingSource("缓存无法确认完整原根选择");
+        }
+    }
+
+    private static ModelSendBlockedException missingSource(String reason) {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, reason);
     }
 
     private String resolveTodoGoal() {
@@ -241,10 +283,6 @@ public class ToolResultCacheService {
     }
 
     private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope) {
-        return buildPlan(toolName, params, scope, "");
-    }
-
-    private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope, String discriminator) {
         CacheMode mode = resolveMode(toolName, params);
         /*
          * D07 fail-closed（Risks 3.3.2）：blank scope（无 userId 且无 runId）不得
@@ -258,7 +296,7 @@ public class ToolResultCacheService {
                     .ttlSeconds(0)
                     .build();
         }
-        String key = buildCacheKey(toolName, params, scope, discriminator);
+        String key = buildCacheKey(toolName, params, scope);
         int ttlSeconds = resolveTtlSeconds(mode, toolName);
         return CachePlan.builder()
                 .mode(mode)
@@ -315,18 +353,8 @@ public class ToolResultCacheService {
     }
 
     private String buildCacheKey(String toolName, Map<String, Object> params, String scope) {
-        return buildCacheKey(toolName, params, scope, "");
-    }
-
-    private String buildCacheKey(String toolName, Map<String, Object> params, String scope, String discriminator) {
         Map<String, String> normalizedArgs = normalizeArgs(toolName, params);
         String argsJson = safeWrite(normalizedArgs);
-        if (!blank(discriminator)) {
-            Map<String, String> identity = new TreeMap<>();
-            identity.put("arguments_json", argsJson);
-            identity.put("experiment", discriminator);
-            argsJson = safeWrite(identity);
-        }
         String argsHash = sha256(argsJson);
         /*
          * D07：不再把 blank scope 默认写成 global。REDIS 模式的 blank scope 已在
@@ -558,7 +586,8 @@ public class ToolResultCacheService {
     }
 
     private void writeCache(String key, String result, long originalDurationMs, int ttlSeconds,
-                            RawPayloadLocator rawLocator, boolean compactionApplied) {
+                            RawPayloadLocator rawLocator, boolean compactionApplied, PromptText resultPrompt,
+                            PromptText observabilityPrompt, PromptText rawPrompt, String rootSelectionDigest) {
         if (blank(key) || blank(result) || ttlSeconds <= 0) {
             return;
         }
@@ -569,10 +598,24 @@ public class ToolResultCacheService {
             payload.setCachedAtMillis(System.currentTimeMillis());
             payload.setRawLocator(rawLocator);
             payload.setCompactionApplied(compactionApplied);
+            if (resultPrompt != null) {
+                payload.setResultSourceJson(sourceJson(resultPrompt));
+                payload.setObservabilitySourceJson(sourceJson(observabilityPrompt));
+                payload.setRawSourceJson(rawPrompt == null ? null : sourceJson(rawPrompt));
+                payload.setRootSelectionDigest(rootSelectionDigest);
+            }
             redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(payload), ttlSeconds, TimeUnit.SECONDS);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Write tool cache failed, key={}", key, e);
         }
+    }
+
+    private String sourceJson(PromptText prompt) {
+        if (prompt == null) throw missingSource("缓存缺少正文来源");
+        return (String) PromptMessageCodec.sourceAttributes(prompt.sources().isEmpty()
+                ? PromptMessage.Origin.RUNTIME_DATA : PromptMessage.Origin.APPLICATION_INSTRUCTION,
+                prompt.sources()).get(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY);
     }
 
     private boolean isDatasetReuseResult(String result) {
@@ -709,12 +752,20 @@ public class ToolResultCacheService {
         private long cachedAtMillis;
         private RawPayloadLocator rawLocator;
         private boolean compactionApplied;
+        private String resultSourceJson;
+        private String observabilitySourceJson;
+        private String rawSourceJson;
+        private String rootSelectionDigest;
     }
 
     @Data
     @Builder
     public static class ToolExecutionOutcome {
         private String result;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText resultPrompt;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText observabilityPrompt;
         private long durationMs;
         private boolean success;
     }
@@ -734,7 +785,11 @@ public class ToolResultCacheService {
     @Builder
     public static class CachedToolCallResult {
         private String result;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText resultPrompt;
         private String observabilityResult;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText observabilityPrompt;
         private long durationMs;
         private boolean success;
         private CacheMeta cacheMeta;

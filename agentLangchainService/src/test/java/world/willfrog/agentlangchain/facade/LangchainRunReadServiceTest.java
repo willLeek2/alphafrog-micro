@@ -623,6 +623,7 @@ class LangchainRunReadServiceTest {
         // 开关开启时：空产物 → false；非空产物 → true。
         AgentRun empty = run("{\"generate_artifacts\": true}");
         AgentRun withArtifact = run("{\"generate_artifacts\": true}");
+        withArtifact.setId("r2");
         when(runMapper.listByUser(any(), any(), any(), anyInt(), anyInt()))
                 .thenReturn(List.of(empty, withArtifact));
         when(runMapper.countByUser(any(), any(), any())).thenReturn(2);

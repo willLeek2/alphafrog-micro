@@ -19,7 +19,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -39,6 +38,7 @@ class SearchEvidenceJudgeServiceTest {
     private final JudgeModelSelectorService selectorService = mock(JudgeModelSelectorService.class);
     private final AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
     private final ChatModel model = mock(ChatModel.class);
+    private final VersionedModelTestFixture versioned = new VersionedModelTestFixture();
 
     @AfterEach
     void tearDown() {
@@ -57,8 +57,8 @@ class SearchEvidenceJudgeServiceTest {
         var resolved = new AgentLlmResolver.ResolvedLlm(
                 "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of(), null);
         when(aiServiceFactory.resolveLlm("cheap-judge", "small-model")).thenReturn(resolved);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS))
-                .thenReturn(model);
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS))
+                .thenReturn(versioned.archived(model, "cheap-judge"));
         when(model.chat(any(List.class))).thenReturn(ChatResponse.builder()
                 .aiMessage(new AiMessage("""
                         {"hits":[{"position":0,"entityMatch":false,"matchedEntities":["实体A"],"outOfScopeEntities":["实体C"],"relevanceWarning":"偏离问题"}],"citations":[{"position":0,"entityMatch":true,"matchedEntities":["实体A"],"outOfScopeEntities":[],"relevanceWarning":""}]}
@@ -77,7 +77,7 @@ class SearchEvidenceJudgeServiceTest {
         assertFalse(result.hits().get(0).entityMatch());
         assertEquals("实体C", result.hits().get(0).outOfScopeEntities().get(0));
         assertTrue(result.citations().get(0).entityMatch());
-        verify(aiServiceFactory).buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS);
+        verify(aiServiceFactory).buildArchivedChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS);
 
         ArgumentCaptor<List<ChatMessage>> captor = ArgumentCaptor.forClass(List.class);
         verify(model).chat(captor.capture());
@@ -100,7 +100,7 @@ class SearchEvidenceJudgeServiceTest {
         assertTrue(result.hits().get(0).entityMatch());
         assertFalse(result.hits().get(0).relevanceJudged());
         assertTrue(result.hits().get(0).relevanceWarning().contains("judge 未完成"));
-        verify(aiServiceFactory, never()).buildChatModelWithProviderOrderAndTemperature(any(), any(), any(), any());
+        verify(aiServiceFactory, never()).buildArchivedChatModelWithProviderOrderAndTemperature(any(), any(), any(), any());
     }
 
     @Test
@@ -196,14 +196,17 @@ class SearchEvidenceJudgeServiceTest {
         var resolved = new AgentLlmResolver.ResolvedLlm(
                 "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of(), null);
         when(aiServiceFactory.resolveLlm("cheap-judge", "small-model")).thenReturn(resolved);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS))
-                .thenReturn(model);
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS))
+                .thenReturn(versioned.archived(model, "cheap-judge"));
         return service;
     }
 
     private SearchEvidenceJudgeService newService() {
-        return new SearchEvidenceJudgeService(
+        versioned.putImported("searchEvidenceJudgeSystemPrompt");
+        var service = new SearchEvidenceJudgeService(
                 objectMapper, aiServiceFactory, judgeModelResolver, selectorService, observabilityService);
+        versioned.inject(service);
+        return service;
     }
 
     private Map<String, Object> hit(String title, String snippet, String url) {

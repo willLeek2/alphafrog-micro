@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.spawnSubAgent",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/context/description\":\"Optional bounded context that helps complete the goal.\",\"/properties/goal/description\":\"Concrete child-agent goal. Required and non-blank.\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "24d7cbd465d6042876d4d60724a6b6d8ef3074c0a2707846f98a92855d3c91b5",
+  "source" : {
+    "toolName" : "spawnSubAgent",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

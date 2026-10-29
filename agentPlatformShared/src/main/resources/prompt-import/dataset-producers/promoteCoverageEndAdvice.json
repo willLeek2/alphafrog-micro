@@ -1,0 +1,14 @@
+{
+  "fragment": "promoteCoverageEndAdvice",
+  "purpose": "promoteCoverageEndAdvice",
+  "bodyType": "FIXED",
+  "body": "coverage_end must be a valid YYYY-MM-DD date",
+  "variables": [],
+  "utf8Sha256": "11ca48e5a8f87431f0715076737e8fa4a0565cc1e0e2efd12c073cb57b037514",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataset/PromoteDatasetTool.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

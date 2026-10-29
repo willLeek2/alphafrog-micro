@@ -1,0 +1,14 @@
+{
+  "fragment": "sqlFullScanAdvice",
+  "purpose": "sqlFullScanAdvice",
+  "bodyType": "FIXED",
+  "body": "请加 LIMIT、加过滤条件或改用聚合",
+  "variables": [],
+  "utf8Sha256": "28a98a9fea745e90fe3036695a213d926612cdee0515878fe74f4e52e7ef8e2b",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/resources/sandboxjob/duckdb_query_runner.py",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

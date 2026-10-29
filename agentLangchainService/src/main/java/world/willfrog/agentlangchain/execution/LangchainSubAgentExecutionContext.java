@@ -52,6 +52,7 @@ public final class LangchainSubAgentExecutionContext {
                 .userId(source.getUserId())
                 .userGoal(source.getUserGoal())
                 .dialogueContext(source.getDialogueContext())
+                .dialogueContextPrompt(source.getDialogueContextPrompt())
                 .model(source.getModel())
                 .planningModel(source.getPlanningModel())
                 .executionModel(source.getExecutionModel())
@@ -62,6 +63,8 @@ public final class LangchainSubAgentExecutionContext {
                 .webSearchEnabled(source.getWebSearchEnabled())
                 .codeInterpreterEnabled(source.getCodeInterpreterEnabled())
                 .planningEndpointName(source.getPlanningEndpointName())
+                .executionEndpointName(source.getExecutionEndpointName())
+                .finalAnswerEndpointName(source.getFinalAnswerEndpointName())
                 .planningModelName(source.getPlanningModelName())
                 .planningProviderOrder(source.getPlanningProviderOrder() == null
                         ? null : List.copyOf(source.getPlanningProviderOrder()))

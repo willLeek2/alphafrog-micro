@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.python;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -82,25 +83,25 @@ class PythonRiskPreflightTest {
         PythonSandboxTools tools = toolsWith(review);
         AgentContext.setToolCallId("durable-tool");
 
-        String result = ReflectionTestUtils.invokeMethod(tools,
+        world.willfrog.alphafrogmicro.common.racing.prompt.PromptText result = ReflectionTestUtils.invokeMethod(tools,
                 "reviewPythonBeforeWorkspace", "run", "print(1)");
         assertNotNull(result);
-        assertTrue(result.contains("PYTHON_RISK_REJECTED"));
+        assertTrue(result.text().contains("PYTHON_RISK_REJECTED"));
     }
 
     @Test
     void absentReviewServiceCannotSilentlyDispatch() {
-        PythonSandboxTools tools = new PythonSandboxTools(new ObjectMapper());
+        PythonSandboxTools tools = configure(new PythonSandboxTools(new ObjectMapper()));
         AgentContext.setToolCallId("durable-tool");
 
-        String result = ReflectionTestUtils.invokeMethod(tools,
+        world.willfrog.alphafrogmicro.common.racing.prompt.PromptText result = ReflectionTestUtils.invokeMethod(tools,
                 "reviewPythonBeforeWorkspace", "run", "print(1)");
         assertNotNull(result);
-        assertTrue(result.contains("PYTHON_RISK_REVIEW_UNAVAILABLE"));
+        assertTrue(result.text().contains("PYTHON_RISK_REVIEW_UNAVAILABLE"));
     }
 
     private PythonSandboxTools toolsWith(PythonRiskReviewService review) {
-        PythonSandboxTools tools = new PythonSandboxTools(new ObjectMapper());
+        PythonSandboxTools tools = configure(new PythonSandboxTools(new ObjectMapper()));
         ReflectionTestUtils.setField(tools, "pythonRiskReviewService", review);
         return tools;
     }

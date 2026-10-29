@@ -1,0 +1,14 @@
+{
+  "fragment": "sqlIllegalRunIdsAdvice",
+  "purpose": "sqlIllegalRunIdsAdvice",
+  "bodyType": "FIXED",
+  "body": "Some dataset_ids are not valid run-level numbers; pass values from the legal list below",
+  "variables": [],
+  "utf8Sha256": "5cfe66db368ada7482e85c675f4d01aaccd91cf0ff739932e6b6b124787e87a1",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataanalysis/SqlQueryTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}
