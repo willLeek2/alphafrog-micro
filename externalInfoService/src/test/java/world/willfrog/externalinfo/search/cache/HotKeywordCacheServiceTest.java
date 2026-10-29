@@ -59,6 +59,7 @@ class HotKeywordCacheServiceTest {
                 "茅台去年新闻",
                 "news",
                 WebSearchResponse.newBuilder()
+                        .setResultOrigin(world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA)
                         .setOk(true)
                         .addHits(WebSearchHit.newBuilder().setTitle("t").setUrl("https://example.com").setSnippet("s").build())
                         .addCitations(WebSearchCitation.newBuilder().setIndex(1).setUrl("https://example.com").setTitle("t").build())

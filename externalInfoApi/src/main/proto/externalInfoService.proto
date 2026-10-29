@@ -72,6 +72,10 @@ message WebSearchRequest {
   // --- P0 预埋：P2 热点缓存所需的字段 ---
   string run_id = 10;                  // agent run ID，用于热点统计去重
   string user_id = 11;                 // 用户 ID，用于热点统计去重
+
+  // 原运行确认的Racing协议消息；不携带服务凭据。
+  bytes runtime_call_context = 12;
+  bytes prompt_selection = 13;
 }
 
 message WebSearchHit {
@@ -107,6 +111,19 @@ message WebSearchAnswerMeta {
   string model_used = 2;               // 生成答案的模型（如适用）
 }
 
+enum WebSearchResultOrigin {
+  WEB_SEARCH_RESULT_UNKNOWN = 0;
+  WEB_SEARCH_RESULT_RUNTIME_DATA = 1;
+}
+
+message WebSearchModelSendBlock {
+  string code = 1;
+  string reason = 2;
+  string racing_code = 3;
+  string racing_reason_code = 4;
+  map<string, string> object_locator = 5;
+}
+
 message WebSearchResponse {
   // --- 标准化检索结果层（必返） ---
   repeated WebSearchHit hits = 1;
@@ -128,6 +145,8 @@ message WebSearchResponse {
   bool ok = 10;
   string error_code = 11;
   string error_message = 12;
+  WebSearchResultOrigin result_origin = 13;
+  WebSearchModelSendBlock model_send_block = 14;
 }
 
 service ExternalInfoDubboService {

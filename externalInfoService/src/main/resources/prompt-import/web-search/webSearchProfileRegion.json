@@ -1,0 +1,21 @@
+{
+  "fragment": "webSearchProfileRegion",
+  "purpose": "webSearchProfileRegion",
+  "bodyType": "TEMPLATE",
+  "body": "地区 {{value}}",
+  "variables": [
+    {
+      "name": "value",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "3a7f9538f3473ac9c15df3160cf39cf6978a65221f908430757cc71f3b19715f",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "externalInfoService/src/main/java/world/willfrog/externalinfo/search/profile/GlobalUserProfileInjector.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}
