@@ -4,6 +4,10 @@ import world.willfrog.agent.platform.finance.FinanceRecordDecoder;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionResult;
 import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
 import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
@@ -22,12 +26,20 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
 
     private final FinanceToolResultFormatter financeToolResultFormatter;
     private final FinanceResultModelAdapter financeResultModelAdapter;
+    private final TerminalResultPromptTexts promptTexts;
 
     public PythonSandboxJobResultAdapter(
             FinanceToolResultFormatter financeToolResultFormatter,
             FinanceResultModelAdapter financeResultModelAdapter) {
+        this(financeToolResultFormatter, financeResultModelAdapter, null);
+    }
+
+    public PythonSandboxJobResultAdapter(FinanceToolResultFormatter financeToolResultFormatter,
+                                         FinanceResultModelAdapter financeResultModelAdapter,
+                                         TerminalResultPromptTexts promptTexts) {
         this.financeToolResultFormatter = financeToolResultFormatter;
         this.financeResultModelAdapter = financeResultModelAdapter;
+        this.promptTexts = promptTexts;
     }
 
     /** 业务成功判定：SUCCEEDED 且退出码为 0（与结果接收侧的既有口径一致）。 */
@@ -59,6 +71,18 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
 
     @Override
     public String formatTerminalResult(SandboxTerminalResultView result, Object formatContext) {
+        return formatTerminalResult(result, formatContext, false,
+                financeToolResultFormatter::formatSuccess, financeToolResultFormatter::formatFailure);
+    }
+
+    @Override
+    public PromptText formatTerminalResultText(SandboxTerminalResultView result, Object formatContext) {
+        return formatTerminalResult(result, formatContext, true,
+                financeToolResultFormatter::formatSuccessText, financeToolResultFormatter::formatFailureText);
+    }
+
+    private <T> T formatTerminalResult(SandboxTerminalResultView result, Object formatContext, boolean withSources,
+                                        SuccessFormat<T> successFormat, FailureFormat<T> failureFormat) {
         // 普通收尾保留既有失败提示；分类始终由本适配器决定，提示不能覆盖错误码。
         FinanceRecordExtractionResult financeResult = formatContext instanceof FinanceRecordExtractionResult extraction
                 ? extraction : null;
@@ -80,7 +104,7 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
         if ("SUCCEEDED".equals(result.statusName())
                 && result.exitCode() != null && result.exitCode() == 0) {
             if (financeResult == null) {
-                return financeToolResultFormatter.formatSuccess(stdout, List.of(), List.of());
+                return successFormat.format(stdout, List.of(), List.of());
             }
             if (financeResultModelAdapter == null) {
                 throw new FinanceRecordProcessingException(
@@ -89,8 +113,7 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
             }
             FinanceResultModelAdapter.ProjectionBatch projection =
                     financeResultModelAdapter.project(financeResult);
-            return financeToolResultFormatter.formatSuccess(
-                    stdout, projection.results(), projection.notices());
+            return successFormat.format(stdout, projection.results(), projection.notices());
         }
 
         boolean dirty = isWorkspaceDirty(result.statusName(), result.nativePayload());
@@ -105,12 +128,34 @@ public final class PythonSandboxJobResultAdapter implements SandboxJobResultAdap
                 : dirty ? "检查前一个任务的失败原因后，使用新的 Run 重新执行"
                 : retryable ? "根据 stderr 修正代码或输入后重试"
                 : "检查输入和资源限制；如问题持续，请联系管理员";
-        return financeToolResultFormatter.formatFailure(
-                stdout,
-                stderr,
-                new FinanceToolResultFormatter.FailureDetail(errorCode,
-                        guidance == null ? message : guidance.message(),
-                        retryable, guidance == null ? action : guidance.action()));
+        FinanceToolResultFormatter.FailureDetail detail;
+        if (guidance != null) {
+            detail = new FinanceToolResultFormatter.FailureDetail(errorCode, guidance.message(), retryable,
+                    guidance.action(), guidance.messagePrompt(), guidance.actionPrompt());
+        } else if (withSources) {
+            if (promptTexts == null) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "Python终态操作建议未配置正文来源");
+            }
+            String fragment = resultLost ? "pythonResultLostAction" : dirty ? "pythonWorkspaceDirtyAction"
+                    : retryable ? "pythonRetryableFailureAction" : "pythonNonRetryableFailureAction";
+            detail = FinanceToolResultFormatter.FailureDetail.withPrompts(errorCode, PromptText.runtimeData(message),
+                    retryable, promptTexts.instruction(fragment));
+        } else {
+            detail = new FinanceToolResultFormatter.FailureDetail(errorCode, message, retryable, action);
+        }
+        return failureFormat.format(stdout, stderr, detail);
+    }
+
+    @FunctionalInterface
+    private interface SuccessFormat<T> {
+        T format(String stdout, List<FinanceToolResultFormatter.FinanceModelResult> results,
+                 List<FinanceRecordExtractionResult.ModelNotice> notices);
+    }
+
+    @FunctionalInterface
+    private interface FailureFormat<T> {
+        T format(String stdout, String stderr, FinanceToolResultFormatter.FailureDetail failure);
     }
 
     private static String nvl(String text) {

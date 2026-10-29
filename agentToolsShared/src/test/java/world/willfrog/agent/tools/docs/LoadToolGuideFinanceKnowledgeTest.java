@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.docs;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
@@ -16,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class LoadToolGuideFinanceKnowledgeTest {
 
-    private final LoadToolGuideTool tool = new LoadToolGuideTool(new ObjectMapper());
+    private final LoadToolGuideTool tool = configure(new LoadToolGuideTool(new ObjectMapper()));
 
     @Test
     void shouldLoadFinanceMethodKnowledgeTopic() {

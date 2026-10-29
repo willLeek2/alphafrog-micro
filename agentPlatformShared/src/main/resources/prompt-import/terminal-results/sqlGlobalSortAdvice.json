@@ -1,0 +1,14 @@
+{
+  "fragment": "sqlGlobalSortAdvice",
+  "purpose": "sqlGlobalSortAdvice",
+  "bodyType": "FIXED",
+  "body": "请加 LIMIT 做 Top-N",
+  "variables": [],
+  "utf8Sha256": "76e7d829ff01401c3b8de63e9d4142a9205ed0d0c80a16da3fa6947a396fba16",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/resources/sandboxjob/duckdb_query_runner.py",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

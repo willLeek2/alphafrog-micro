@@ -4,8 +4,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import org.apache.dubbo.config.annotation.DubboReference;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.prompt.AgentPromptTextReader;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
+import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchResultOrigin;
+import world.willfrog.agent.platform.experiment.AgentExperimentClient;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService;
@@ -16,7 +25,15 @@ import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchCitation;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchBackendMeta;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRagPrefetch;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchAnswerMeta;
+import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
+import world.willfrog.racing.idl.EvaluationValue;
+import world.willfrog.racing.idl.RacingError;
+import world.willfrog.racing.idl.ValueSource;
+
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -28,12 +45,26 @@ public class SearchTools {
     @DubboReference(timeout = 60000, retries = 0)
     private ExternalInfoDubboService externalInfoDubboService;
 
+    @Autowired(required = false)
+    private AgentPromptTextReader promptReader;
+
     private final ObjectMapper objectMapper;
     private final SearchEvidenceJudgeService searchEvidenceJudgeService;
+    private final ObjectProvider<AgentExperimentClient> experiments;
+
+    @Value("${RACING_SEARCH_MAX_RESULTS_EXPERIMENT_ID:}")
+    private String maxResultsExperimentId = "";
 
     public SearchTools(ObjectMapper objectMapper, SearchEvidenceJudgeService searchEvidenceJudgeService) {
+        this(objectMapper, searchEvidenceJudgeService, null);
+    }
+
+    @Autowired
+    public SearchTools(ObjectMapper objectMapper, SearchEvidenceJudgeService searchEvidenceJudgeService,
+                       ObjectProvider<AgentExperimentClient> experiments) {
         this.objectMapper = objectMapper;
         this.searchEvidenceJudgeService = searchEvidenceJudgeService;
+        this.experiments = experiments;
     }
 
     @Tool
@@ -46,26 +77,126 @@ public class SearchTools {
                             @P(value = "时间范围起始 ISO 8601，可选", required = false) String timeRangeStart,
                             @P(value = "时间范围结束 ISO 8601，可选", required = false) String timeRangeEnd,
                             @P(value = "最大返回结果数，可选，默认 5", required = false) int maxResults) {
-        try {
-            AgentContext.WebSearchConfig runConfig = AgentContext.getWebSearchConfig();
-            int limit = resolveMaxResults(runConfig.maxResults(), maxResults);
-            boolean effectiveSkipHotCache = runConfig.skipHotCache() != null ? runConfig.skipHotCache() : skipHotCache;
-            boolean effectiveSkipRagPrefetch = runConfig.skipRagPrefetch() != null ? runConfig.skipRagPrefetch() : skipRagPrefetch;
-            WebSearchRequest req = WebSearchRequest.newBuilder()
-                    .setQuery(nvl(query))
-                    .setScene(nvl(scene))
-                    .setBackend(firstText(runConfig.backend(), backend))
-                    .setStrength(firstText(runConfig.strength(), strength))
-                    .setSkipHotCache(effectiveSkipHotCache)
-                    .setSkipRagPrefetch(effectiveSkipRagPrefetch)
-                    .setTimeRangeStart(nvl(timeRangeStart))
-                    .setTimeRangeEnd(nvl(timeRangeEnd))
-                    .setMaxResults(limit)
-                    .setRunId(nvl(AgentContext.getRunId()))
-                    .setUserId(nvl(AgentContext.getUserId()))
-                    .build();
+        return searchWebPrepared(prepareArguments(query, scene, backend, strength, skipHotCache,
+                skipRagPrefetch, timeRangeStart, timeRangeEnd, maxResults));
+    }
 
+    /** 缓存读取之前固定实际参数，后续执行不再读取运行配置或重新取值。 */
+    public PreparedSearchArguments prepareArguments(String query, String scene, String backend, String strength,
+            boolean skipHotCache, boolean skipRagPrefetch, String timeRangeStart, String timeRangeEnd, int maxResults) {
+        AgentContext.WebSearchConfig runConfig = AgentContext.getWebSearchConfig();
+        int limit = resolveMaxResults(runConfig.maxResults(), maxResults);
+        boolean effectiveSkipHotCache = runConfig.skipHotCache() != null ? runConfig.skipHotCache() : skipHotCache;
+        boolean effectiveSkipRagPrefetch = runConfig.skipRagPrefetch() != null ? runConfig.skipRagPrefetch() : skipRagPrefetch;
+        Map<String, Object> details = new LinkedHashMap<>();
+        String experimentId = maxResultsExperimentId == null ? "" : maxResultsExperimentId.strip();
+        if (!experimentId.isEmpty()) {
+            AgentExperimentClient client = experiments == null ? null : experiments.getIfAvailable();
+            if (client == null) throw RacingCallException.failure("SCOPE_UNAVAILABLE", "搜索实验调用组件不可用");
+            String ordinarySource = writeJson(Map.of("business_position", "searchWeb.maxResults",
+                    "source", runConfig.maxResults() != null && runConfig.maxResults() > 0
+                            ? "run_config" : maxResults > 0 ? "tool_argument" : "built_in_default",
+                    "source_revision", "run:" + nvl(AgentContext.getRunId()), "ordinary_value", limit));
+            EvaluationValue evaluated = client.evaluate(AgentContext.getRunId(), experimentId,
+                    Integer.toString(limit), ordinarySource);
+            ValueSource source = evaluated.getSource();
+            try {
+                limit = new BigDecimal(evaluated.getValueJson().strip()).intValueExact();
+                if (limit <= 0) throw new ArithmeticException();
+            } catch (NumberFormatException | ArithmeticException failure) {
+                RacingError.Builder error = RacingError.newBuilder().setCode("INVALID_ARGUMENT")
+                        .setMessage("搜索实验返回的最大结果条数必须是正整数")
+                        .putObjectLocator("experiment_id", experimentId)
+                        .putDetails("source_kind", source.getKind().name())
+                        .putDetails("configuration_scope_instance_id", source.getConfigurationScopeInstanceId());
+                if (!evaluated.getAssignmentId().isEmpty()) error.putObjectLocator("assignment_id", evaluated.getAssignmentId());
+                if (source.hasConfigurationVersion()) error.putDetails("configuration_version", Long.toString(source.getConfigurationVersion()));
+                throw new RacingCallException(error.build());
+            }
+            effectiveSkipHotCache = true;
+            details.put("experiment_id", experimentId);
+            details.put("environment", evaluated.getActualTarget().getEnvironment());
+            details.put("configuration_scope_instance_id", source.getConfigurationScopeInstanceId());
+            details.put("source_kind", source.getKind().name());
+            details.put("value_json", evaluated.getValueJson());
+            details.put("run_id", nvl(AgentContext.getRunId()));
+            if (!evaluated.getAssignmentId().isEmpty()) details.put("assignment_id", evaluated.getAssignmentId());
+            if (source.hasConfigurationVersion()) details.put("configuration_version", source.getConfigurationVersion());
+            if (source.hasCandidateId()) details.put("candidate_id", source.getCandidateId());
+            if (!source.getBusinessDefaultSourceJson().isEmpty()) {
+                details.put("ordinary_default_source_json", source.getBusinessDefaultSourceJson());
+            }
+        }
+        WebSearchRequest req = WebSearchRequest.newBuilder()
+                .setQuery(nvl(query))
+                .setScene(nvl(scene))
+                .setBackend(firstText(runConfig.backend(), backend))
+                .setStrength(firstText(runConfig.strength(), strength))
+                .setSkipHotCache(effectiveSkipHotCache)
+                .setSkipRagPrefetch(effectiveSkipRagPrefetch)
+                .setTimeRangeStart(nvl(timeRangeStart))
+                .setTimeRangeEnd(nvl(timeRangeEnd))
+                .setMaxResults(limit)
+                .setRunId(nvl(AgentContext.getRunId()))
+                .setUserId(nvl(AgentContext.getUserId()))
+                .build();
+        Map<String, Object> actual = Map.of("query", req.getQuery(), "scene", req.getScene(),
+                "backend", req.getBackend(), "strength", req.getStrength(),
+                "skipHotCache", req.getSkipHotCache(), "skipRagPrefetch", req.getSkipRagPrefetch(),
+                "timeRangeStart", req.getTimeRangeStart(), "timeRangeEnd", req.getTimeRangeEnd(),
+                "maxResults", req.getMaxResults());
+        String discriminator;
+        try {
+            discriminator = details.isEmpty() ? "" : objectMapper.writeValueAsString(details);
+        } catch (Exception failure) {
+            throw RacingCallException.failure("INVALID_ARGUMENT", "搜索实验来源无法生成缓存标识");
+        }
+        return new PreparedSearchArguments(req, actual, discriminator, details);
+    }
+
+    public PromptText searchWebPrompt(String query, String scene, String backend, String strength,
+            boolean skipHotCache, boolean skipRagPrefetch, String timeRangeStart, String timeRangeEnd, int maxResults) {
+        return searchWebPreparedPrompt(prepareArguments(query, scene, backend, strength, skipHotCache,
+                skipRagPrefetch, timeRangeStart, timeRangeEnd, maxResults));
+    }
+
+    public String searchWebPrepared(PreparedSearchArguments prepared) {
+        return searchWebPreparedPrompt(prepared).text();
+    }
+
+    public PromptText searchWebPreparedPrompt(PreparedSearchArguments prepared) {
+        WebSearchRequest req = prepared.request();
+        {
+            if (promptReader == null) throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "网页搜索缺少原根正文读取组件");
+            var root = promptReader.current();
+            if (!req.getRunId().equals(root.context().getCurrentRunId())) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_UNREADABLE,
+                        "网页搜索参数与当前原根运行不一致");
+            }
+            req = req.toBuilder().setRuntimeCallContext(root.context().toByteString())
+                    .setPromptSelection(root.selection().racingSelection().toByteString()).build();
+        }
+        String query = req.getQuery();
+        String scene = req.getScene();
+        try {
             WebSearchResponse resp = externalInfoDubboService.webSearch(req);
+            if (resp.hasModelSendBlock()) {
+                var block = resp.getModelSendBlock();
+                if (!ModelSendBlocks.isBlockedCode(block.getCode())) {
+                    throw new ModelSendBlockedException(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED,
+                            "外部搜索返回的发送阻止原因无效");
+                }
+                throw new ModelSendBlockedException(block.getCode(), block.getReason(),
+                        new RacingFailure(block.getRacingCode(), block.getRacingReasonCode(), block.getObjectLocatorMap()));
+            }
+            if (!resp.getOk() && ModelSendBlocks.isBlockedCode(resp.getErrorCode())) {
+                throw new ModelSendBlockedException(resp.getErrorCode(), "外部搜索的模型发送前检查未通过");
+            }
+            if (resp.getResultOrigin() != WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "外部搜索结果缺少明确来源，不能用于模型续轮");
+            }
 
             // 如果 Dubbo 层返回 ok=false，则按错误处理
             if (!resp.getOk()) {
@@ -80,13 +211,14 @@ public class SearchTools {
                 ToolFailureCategory.putCategoryIfResolved(err, resp.getErrorCode(),
                         upstreamFailureCategory(resp.getErrorCode()));
                 payload.put("error", err);
-                return objectMapper.writeValueAsString(payload);
+                payload.put("data", preparedDetails(prepared));
+                return PromptText.runtimeData(objectMapper.writeValueAsString(payload));
             }
 
             // 组装 hits
             List<Map<String, Object>> hits = new ArrayList<>();
             List<String> requestedEntities = AgentContext.getExtractedEntities();
-            for (WebSearchHit hit : resp.getHitsList()) {
+            for (WebSearchHit hit : resp.getHitsList().subList(0, Math.min(req.getMaxResults(), resp.getHitsCount()))) {
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("title", hit.getTitle());
                 row.put("url", hit.getUrl());
@@ -99,6 +231,7 @@ public class SearchTools {
 
             // 组装 citations
             List<Map<String, Object>> citations = new ArrayList<>();
+            // 原生回答可能引用任意原序号，保留全部引用才能继续定位其证据。
             for (WebSearchCitation citation : resp.getCitationsList()) {
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("index", citation.getIndex());
@@ -138,9 +271,7 @@ public class SearchTools {
                 answerMeta.put("model_used", am.getModelUsed());
             }
 
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("query", nvl(query));
-            data.put("scene", nvl(scene));
+            Map<String, Object> data = preparedDetails(prepared);
             data.put("hits", hits);
             data.put("answer", resp.getAnswer());
             data.put("citations", citations);
@@ -158,18 +289,38 @@ public class SearchTools {
             payload.put("ok", true);
             payload.put("tool", "searchWeb");
             payload.put("data", data);
-            return objectMapper.writeValueAsString(payload);
+            return PromptText.runtimeData(objectMapper.writeValueAsString(payload));
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             // 本地异常包装行：RPC/序列化一类的上游或系统故障。
-            return writeJson(Map.of(
+            return PromptText.runtimeData(writeJson(Map.of(
                     "ok", false,
                     "tool", "searchWeb",
+                    "data", preparedDetails(prepared),
                     "error", Map.of(
                             "code", "TOOL_ERROR",
                             "message", nvl(e.getMessage()),
                             "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name()
                     )
-            ));
+            )));
+        }
+    }
+
+    private Map<String, Object> preparedDetails(PreparedSearchArguments prepared) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("query", prepared.request().getQuery());
+        data.put("scene", prepared.request().getScene());
+        data.put("actual_arguments", prepared.parameters());
+        if (!prepared.experimentDetails().isEmpty()) data.put("experiment", prepared.experimentDetails());
+        return data;
+    }
+
+    /** 请求与来源均在执行之前固定；缓存命中也使用同一份实际参数。 */
+    public record PreparedSearchArguments(WebSearchRequest request, Map<String, Object> parameters,
+            String cacheDiscriminator, Map<String, Object> experimentDetails) {
+        public PreparedSearchArguments {
+            parameters = Map.copyOf(parameters);
+            experimentDetails = Map.copyOf(experimentDetails);
         }
     }
 

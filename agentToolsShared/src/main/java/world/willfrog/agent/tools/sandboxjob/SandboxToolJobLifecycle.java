@@ -1,6 +1,9 @@
 package world.willfrog.agent.tools.sandboxjob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -226,7 +229,17 @@ public final class SandboxToolJobLifecycle {
         /** taskId 与 canonical 指纹同时确认，锚点已持久化 ATTACHED。 */
         record Attached(String taskId, DataAnalysisReservation reservation) implements AttachOutcome {}
         /** 失败文本（如 DAG 租约丢失），调用方原样返回给模型。 */
-        record FailureText(String text) implements AttachOutcome {}
+        record FailureText(String text, PromptText prompt) implements AttachOutcome {
+            public FailureText {
+                if (prompt != null && !prompt.text().equals(text)) {
+                    throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                            world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                            "sandbox-attach-result");
+                }
+            }
+            public FailureText(String text) { this(text, null); }
+            public FailureText(PromptText prompt) { this(prompt.text(), prompt); }
+        }
     }
 
     /**
@@ -255,6 +268,7 @@ public final class SandboxToolJobLifecycle {
             // Sandbox 必须按 operationId/requestFingerprint 幂等创建。
             createResp = runner.createTask(req.request());
         } catch (Exception createFailure) {
+            ModelSendBlocks.rethrowIfBlocked(createFailure);
             try {
                 // RPC 异常不代表服务端未创建；先按 operationId 查找，禁止立即重建第二任务。
                 L lookup = runner.lookupRaw(identity.operationId());
@@ -266,7 +280,7 @@ public final class SandboxToolJobLifecycle {
                 } else if (verdict instanceof SandboxCreateVerdict.Absent) {
                     if (!req.durableSuspend()) {
                         if (!renewDagBlockingLease(deps, runId, anchor, true)) {
-                            return new AttachOutcome.FailureText(dagBlockingLeaseLost(
+                            return new AttachOutcome.FailureText(dagBlockingLeaseLostText(
                                     deps, anchor.getToolName(), null, req.toolStartMs(),
                                     "DAG worker lost its lease before canceling an uncertain create"));
                         }
@@ -285,6 +299,7 @@ public final class SandboxToolJobLifecycle {
                             "createTask outcome is ambiguous; PREPARING anchor retained", createFailure);
                 }
             } catch (Exception lookupFailure) {
+                ModelSendBlocks.rethrowIfBlocked(lookupFailure);
                 // 回查块里任何失败（含墓碑与「结果不确定」标记异常）都归并到原始创建异常上抛出：
                 // 原始异常带回了创建现场的真实原因，分支异常只作 suppressed 诊断。
                 if (lookupFailure != createFailure) {
@@ -314,7 +329,7 @@ public final class SandboxToolJobLifecycle {
                 || runner.taskIdOf(createResp) == null || runner.taskIdOf(createResp).isBlank()) {
             if (!req.durableSuspend()) {
                 if (!renewDagBlockingLease(deps, runId, anchor, true)) {
-                    return new AttachOutcome.FailureText(dagBlockingLeaseLost(
+                    return new AttachOutcome.FailureText(dagBlockingLeaseLostText(
                             deps, anchor.getToolName(), null, req.toolStartMs(),
                             "DAG worker lost its lease before canceling an uncertain create"));
                 }
@@ -342,6 +357,7 @@ public final class SandboxToolJobLifecycle {
                                 lookup, spec.requestFingerprint()) instanceof SandboxCreateVerdict.Confirmed confirmed
                         && taskId.equals(confirmed.taskId());
             } catch (Exception lookupFailure) {
+                ModelSendBlocks.rethrowIfBlocked(lookupFailure);
                 log.error("Sandbox create identity lookup failed for run={}, operationId={}, taskId={}",
                         runId, identity.operationId(), taskId, lookupFailure);
             }
@@ -368,6 +384,7 @@ public final class SandboxToolJobLifecycle {
         try {
             attachedReservationJson = deps.objectMapper().writeValueAsString(attached);
         } catch (Exception serializationFailure) {
+            ModelSendBlocks.rethrowIfBlocked(serializationFailure);
             throw new IllegalStateException("attached reservation could not be serialized", serializationFailure);
         }
         anchor.setTaskId(taskId);
@@ -380,7 +397,7 @@ public final class SandboxToolJobLifecycle {
         // taskId、ATTACHED 和名额状态一起写进数据库进度记录。
         if (!deps.dispatchStore().persistAttached(runId, anchor)) {
             if (!req.durableSuspend()) {
-                return new AttachOutcome.FailureText(dagBlockingLeaseLost(
+                return new AttachOutcome.FailureText(dagBlockingLeaseLostText(
                         deps, anchor.getToolName(), taskId, req.toolStartMs(),
                         "attach CAS rejected the live DAG owner"));
             }
@@ -394,7 +411,7 @@ public final class SandboxToolJobLifecycle {
         ToolJobAnchor anchor = req.anchor();
         String runId = req.runId();
         if (!req.durableSuspend() && !renewDagBlockingLease(deps, runId, anchor, true)) {
-            return new AttachOutcome.FailureText(dagBlockingLeaseLost(
+            return new AttachOutcome.FailureText(dagBlockingLeaseLostText(
                     deps, anchor.getToolName(), null, req.toolStartMs(),
                     "DAG worker lost its lease before recording workspace refusal"));
         }
@@ -405,12 +422,13 @@ public final class SandboxToolJobLifecycle {
         try {
             recorded = deps.dispatchStore().recordWorkspaceRefusal(runId, anchor, expectedLeaseUntil);
         } catch (Exception persistenceFailure) {
+            ModelSendBlocks.rethrowIfBlocked(persistenceFailure);
             log.warn("workspace refusal could not be recorded: run={} operation={}",
                     runId, anchor.getOperationId(), persistenceFailure);
             recorded = false;
         }
         if (!recorded) {
-            return new AttachOutcome.FailureText(SandboxJobResponses.fail(
+            return new AttachOutcome.FailureText(factFailure(
                     deps.objectMapper(), anchor.getToolName(), "WORKSPACE_REFUSAL_RECORD_PENDING",
                     "Python workspace refusal is awaiting durable settlement",
                     Map.of("operation_id", anchor.getOperationId(), "retryable", false)));
@@ -423,6 +441,7 @@ public final class SandboxToolJobLifecycle {
                     new DataAnalysisReleaseProof.WorkspaceRefusal(preparing.identity(), code),
                     DataAnalysisReleaseReason.WORKSPACE_CREATE_REFUSED));
         } catch (Exception releaseFailure) {
+            ModelSendBlocks.rethrowIfBlocked(releaseFailure);
             log.warn("workspace refusal capacity release deferred: run={} operation={}",
                     runId, anchor.getOperationId(), releaseFailure);
             released = DataAnalysisReleaseOutcome.CONFLICT;
@@ -438,12 +457,13 @@ public final class SandboxToolJobLifecycle {
                             anchor.getRequestFingerprint(), code);
                 }
             } catch (Exception completionFailure) {
+                ModelSendBlocks.rethrowIfBlocked(completionFailure);
                 log.warn("workspace refusal finalization deferred: run={} operation={}",
                         runId, anchor.getOperationId(), completionFailure);
             }
         }
         deps.observability().emitToolTotal(req.toolStartMs(), "ERROR", code);
-        return new AttachOutcome.FailureText(SandboxJobResponses.fail(
+        return new AttachOutcome.FailureText(factFailure(
                 deps.objectMapper(), anchor.getToolName(), code,
                 released == DataAnalysisReleaseOutcome.RELEASED
                         || released == DataAnalysisReleaseOutcome.ALREADY_RELEASED
@@ -496,6 +516,15 @@ public final class SandboxToolJobLifecycle {
      * 返回 null 表示 fast-path 耗尽且本方法已分流；非 null 是终态或失败文本。
      */
     public static String pollFastPath(LifecycleDeps deps, PollRequest req) throws Exception {
+        PromptText result = pollFastPathCore(deps, req, false);
+        return result == null ? null : result.text();
+    }
+
+    public static PromptText pollFastPathText(LifecycleDeps deps, PollRequest req) throws Exception {
+        return pollFastPathCore(deps, req, true);
+    }
+
+    private static PromptText pollFastPathCore(LifecycleDeps deps, PollRequest req, boolean sourced) throws Exception {
         String runId = req.runId();
         ToolJobAnchor anchor = req.anchor();
         String taskId = req.taskId();
@@ -506,14 +535,15 @@ public final class SandboxToolJobLifecycle {
             try {
                 if (!req.durableSuspend()
                         && !renewDagBlockingLease(deps, runId, anchor, false)) {
-                    return dagBlockingLeaseLost(
+                    return dagBlockingLeaseLostCore(
                             deps, anchor.getToolName(), taskId, req.toolStartMs(),
-                            "lease renewal was rejected before fast-path poll");
+                            "lease renewal was rejected before fast-path poll", sourced);
                 }
                 statusView = req.runner().statusOf(taskId);
             } catch (Exception pollFailure) {
+                ModelSendBlocks.rethrowIfBlocked(pollFailure);
                 if (!req.durableSuspend()) {
-                    return promoteDagBlockingFailure(
+                    return promoteDagBlockingFailureCore(
                             deps,
                             runId,
                             anchor,
@@ -521,18 +551,18 @@ public final class SandboxToolJobLifecycle {
                             "DAG Sandbox status polling failed",
                             req.toolStartMs(),
                             Map.of("task_id", taskId,
-                                    "message", SandboxJobResponses.nvl(pollFailure.getMessage())));
+                                    "message", SandboxJobResponses.nvl(pollFailure.getMessage())), sourced);
                 }
                 throw pollFailure;
             }
             String status = statusView == null ? "" : SandboxJobResponses.nvl(statusView.statusName());
             if (isTerminal(status)) {
-                return finishTerminalByWaitPolicy(deps, req, status);
+                return finishTerminalByWaitPolicyCore(deps, req, status, sourced);
             }
             if (!req.durableSuspend()
                     && statusView != null
                     && !SandboxJobResponses.nvl(statusView.error()).isBlank()) {
-                return promoteDagBlockingFailure(
+                return promoteDagBlockingFailureCore(
                         deps,
                         runId,
                         anchor,
@@ -540,7 +570,7 @@ public final class SandboxToolJobLifecycle {
                         "DAG Sandbox status polling failed",
                         req.toolStartMs(),
                         Map.of("task_id", taskId,
-                                "message", SandboxJobResponses.nvl(statusView.error())));
+                                "message", SandboxJobResponses.nvl(statusView.error())), sourced);
             }
             // 每次最多睡 100ms，并且不越过 fastDeadline。
             try {
@@ -549,23 +579,23 @@ public final class SandboxToolJobLifecycle {
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 if (!req.durableSuspend()) {
-                    return promoteDagBlockingFailure(
+                    return promoteDagBlockingFailureCore(
                             deps,
                             runId,
                             anchor,
                             "DAG_BLOCKING_INTERRUPTED",
                             "DAG Sandbox task polling was interrupted",
                             req.toolStartMs(),
-                            Map.of("task_id", taskId));
+                            Map.of("task_id", taskId), sourced);
                 }
                 throw interrupted;
             }
         }
         // 线性模式在快路径后转后台等待；DAG 留在当前线程，禁止生成 WAITING_TOOL_JOB。
         if (req.durableSuspend()) {
-            return suspend(deps, runId, anchor, req.reservation(), taskId);
+            return suspendCore(deps, runId, anchor, req.reservation(), taskId, sourced);
         }
-        return pollDagBlocking(deps, req);
+        return pollDagBlockingCore(deps, req, sourced);
     }
 
     /**
@@ -573,6 +603,15 @@ public final class SandboxToolJobLifecycle {
      * 本方法从不调用 transferToPending，也不抛 ExternalToolJobPendingException。
      */
     public static String pollDagBlocking(LifecycleDeps deps, PollRequest req) throws Exception {
+        PromptText result = pollDagBlockingCore(deps, req, false);
+        return result == null ? null : result.text();
+    }
+
+    public static PromptText pollDagBlockingText(LifecycleDeps deps, PollRequest req) throws Exception {
+        return pollDagBlockingCore(deps, req, true);
+    }
+
+    private static PromptText pollDagBlockingCore(LifecycleDeps deps, PollRequest req, boolean sourced) throws Exception {
         String runId = req.runId();
         ToolJobAnchor anchor = req.anchor();
         String taskId = req.taskId();
@@ -583,15 +622,16 @@ public final class SandboxToolJobLifecycle {
             SandboxJobStatusView statusView;
             try {
                 if (!renewDagBlockingLease(deps, runId, anchor, false)) {
-                    return dagBlockingLeaseLost(
+                    return dagBlockingLeaseLostCore(
                             deps, anchor.getToolName(), taskId, req.toolStartMs(),
-                            "lease renewal was rejected before blocking poll");
+                            "lease renewal was rejected before blocking poll", sourced);
                 }
                 statusView = req.runner().statusOf(taskId);
             } catch (Exception pollFailure) {
+                ModelSendBlocks.rethrowIfBlocked(pollFailure);
                 log.warn("DAG blocking poll failed: run={}, taskId={}, error={}",
                         runId, taskId, pollFailure.getMessage());
-                return promoteDagBlockingFailure(
+                return promoteDagBlockingFailureCore(
                         deps,
                         runId,
                         anchor,
@@ -599,7 +639,7 @@ public final class SandboxToolJobLifecycle {
                         "DAG Sandbox status polling failed",
                         req.toolStartMs(),
                         Map.of("task_id", taskId, "message",
-                                SandboxJobResponses.nvl(pollFailure.getMessage())));
+                                SandboxJobResponses.nvl(pollFailure.getMessage())), sourced);
             }
             String status = statusView == null ? "" : SandboxJobResponses.nvl(statusView.statusName());
             if (pollIndex == 0 || !status.equals(lastRemoteStatus) || pollIndex % 5 == 0) {
@@ -613,10 +653,10 @@ public final class SandboxToolJobLifecycle {
             lastRemoteStatus = status;
             pollIndex++;
             if (isTerminal(status)) {
-                return finishTerminalByWaitPolicy(deps, req, status);
+                return finishTerminalByWaitPolicyCore(deps, req, status, sourced);
             }
             if (statusView != null && !SandboxJobResponses.nvl(statusView.error()).isBlank()) {
-                return promoteDagBlockingFailure(
+                return promoteDagBlockingFailureCore(
                         deps,
                         runId,
                         anchor,
@@ -624,33 +664,33 @@ public final class SandboxToolJobLifecycle {
                         "DAG Sandbox status polling failed",
                         req.toolStartMs(),
                         Map.of("task_id", taskId,
-                                "message", SandboxJobResponses.nvl(statusView.error())));
+                                "message", SandboxJobResponses.nvl(statusView.error())), sourced);
             }
 
             long remainingMillis = timeoutAt == null ? deps.pollIntervalMs()
                     : timeoutAt.toEpochMilli() - System.currentTimeMillis();
             if (timeoutAt != null && remainingMillis <= 0L) {
-                return promoteDagBlockingFailure(
+                return promoteDagBlockingFailureCore(
                         deps,
                         runId,
                         anchor,
                         "DAG_BLOCKING_TIMEOUT",
                         "DAG Sandbox task did not reach terminal state before the frozen timeout",
                         req.toolStartMs(),
-                        Map.of("task_id", taskId, "timeout_at", timeoutAt.toString()));
+                        Map.of("task_id", taskId, "timeout_at", timeoutAt.toString()), sourced);
             }
             try {
                 TimeUnit.MILLISECONDS.sleep(Math.min(deps.pollIntervalMs(), remainingMillis));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                return promoteDagBlockingFailure(
+                return promoteDagBlockingFailureCore(
                         deps,
                         runId,
                         anchor,
                         "DAG_BLOCKING_INTERRUPTED",
                         "DAG Sandbox task polling was interrupted",
                         req.toolStartMs(),
-                        Map.of("task_id", taskId));
+                        Map.of("task_id", taskId), sourced);
             }
         }
     }
@@ -683,6 +723,7 @@ public final class SandboxToolJobLifecycle {
             renewed = deps.dispatchStore().renewDagBlockingLease(
                     runId, anchor, expectedLeaseUntil);
         } catch (Exception renewalFailure) {
+            ModelSendBlocks.rethrowIfBlocked(renewalFailure);
             log.warn("DAG blocking lease renewal failed: run={}, taskId={}, owner={}, error={}",
                     runId, anchor.getTaskId(), anchor.getBlockingOwnerId(),
                     renewalFailure.getMessage());
@@ -696,14 +737,23 @@ public final class SandboxToolJobLifecycle {
     }
 
     /** DAG worker 无法继续负责时的失败移交：把清理所有权转给恢复流程，再给模型失败文本。 */
-    public static String promoteDagBlockingFailure(
+    public static String promoteDagBlockingFailure(LifecycleDeps deps, String runId, ToolJobAnchor anchor, String errorCode, String message, long toolStartMs, Map<String, Object> details) {
+        PromptText result = promoteDagBlockingFailureCore(deps, runId, anchor, errorCode, message, toolStartMs, details, false);
+        return result == null ? null : result.text();
+    }
+
+    public static PromptText promoteDagBlockingFailureText(LifecycleDeps deps, String runId, ToolJobAnchor anchor, String errorCode, String message, long toolStartMs, Map<String, Object> details) {
+        return promoteDagBlockingFailureCore(deps, runId, anchor, errorCode, message, toolStartMs, details, true);
+    }
+
+    private static PromptText promoteDagBlockingFailureCore(
             LifecycleDeps deps,
             String runId,
             ToolJobAnchor anchor,
             String errorCode,
             String message,
             long toolStartMs,
-            Map<String, Object> details) {
+            Map<String, Object> details, boolean sourced) {
         Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
         anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         anchor.setAutoResume(false);
@@ -714,6 +764,7 @@ public final class SandboxToolJobLifecycle {
             promoted = deps.dispatchStore().promoteDagBlockingWorkerLost(
                     runId, anchor, expectedLeaseUntil);
         } catch (Exception promotionFailure) {
+            ModelSendBlocks.rethrowIfBlocked(promotionFailure);
             log.warn("DAG blocking cleanup ownership transfer failed: run={}, taskId={}, "
                             + "owner={}, error={}",
                     runId, anchor.getTaskId(), anchor.getBlockingOwnerId(),
@@ -721,22 +772,31 @@ public final class SandboxToolJobLifecycle {
             promoted = false;
         }
         if (!promoted) {
-            return dagBlockingLeaseLost(
+            return dagBlockingLeaseLostCore(
                     deps, anchor.getToolName(), anchor.getTaskId(), toolStartMs,
-                    "live-to-cleanup ownership CAS was rejected");
+                    "live-to-cleanup ownership CAS was rejected", sourced);
         }
         deps.observability().emitToolTotal(toolStartMs,
                 "DAG_BLOCKING_TIMEOUT".equals(errorCode) ? "TIMEOUT" : "ERROR",
                 errorCode);
-        return SandboxJobResponses.fail(deps.objectMapper(), anchor.getToolName(),
+        return factFailure(deps.objectMapper(), anchor.getToolName(),
                 errorCode, message, details);
     }
 
     /** DAG 租约丢失的统一失败文本。 */
-    public static String dagBlockingLeaseLost(
-            LifecycleDeps deps, String toolName, String taskId, long toolStartMs, String reason) {
+    public static String dagBlockingLeaseLost(LifecycleDeps deps, String toolName, String taskId, long toolStartMs, String reason) {
+        PromptText result = dagBlockingLeaseLostCore(deps, toolName, taskId, toolStartMs, reason, false);
+        return result == null ? null : result.text();
+    }
+
+    public static PromptText dagBlockingLeaseLostText(LifecycleDeps deps, String toolName, String taskId, long toolStartMs, String reason) {
+        return dagBlockingLeaseLostCore(deps, toolName, taskId, toolStartMs, reason, true);
+    }
+
+    private static PromptText dagBlockingLeaseLostCore(
+            LifecycleDeps deps, String toolName, String taskId, long toolStartMs, String reason, boolean sourced) {
         deps.observability().emitToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_LEASE_LOST");
-        return SandboxJobResponses.fail(deps.objectMapper(), toolName, "DAG_BLOCKING_LEASE_LOST",
+        return factFailure(deps.objectMapper(), toolName, "DAG_BLOCKING_LEASE_LOST",
                 "DAG Sandbox worker lost its durable blocking lease",
                 Map.of("task_id", SandboxJobResponses.nvl(taskId), "reason", SandboxJobResponses.nvl(reason)));
     }
@@ -747,24 +807,34 @@ public final class SandboxToolJobLifecycle {
      * 处理已经观察到的沙箱终态。线性模式如果同步走完终态流程失败，就把任务转成后台等待；
      * DAG 模式只能正常返回显式失败、保留数据库里的进度记录，交给恢复流程按「执行线程丢失」处理。
      */
-    public static String finishTerminalByWaitPolicy(
-            LifecycleDeps deps, PollRequest req, String status) throws Exception {
+    public static String finishTerminalByWaitPolicy(LifecycleDeps deps, PollRequest req, String status) throws Exception {
+        PromptText result = finishTerminalByWaitPolicyCore(deps, req, status, false);
+        return result == null ? null : result.text();
+    }
+
+    public static PromptText finishTerminalByWaitPolicyText(LifecycleDeps deps, PollRequest req, String status) throws Exception {
+        return finishTerminalByWaitPolicyCore(deps, req, status, true);
+    }
+
+    private static PromptText finishTerminalByWaitPolicyCore(
+            LifecycleDeps deps, PollRequest req, String status, boolean sourced) throws Exception {
         String runId = req.runId();
         ToolJobAnchor anchor = req.anchor();
         String taskId = anchor.getTaskId();
         // 终态结果必须同时证明 taskId、status、payload 完整性与 retryable 字段存在。
         if (!req.durableSuspend()
                 && !renewDagBlockingLease(deps, runId, anchor, true)) {
-            return dagBlockingLeaseLost(
+            return dagBlockingLeaseLostCore(
                     deps, anchor.getToolName(), taskId, req.toolStartMs(),
-                    "lease renewal was rejected before terminal result fetch");
+                    "lease renewal was rejected before terminal result fetch", sourced);
         }
         SandboxTerminalResultView result;
         try {
             result = req.runner().fetchResult(runId, taskId, status);
         } catch (Exception resultFailure) {
+            ModelSendBlocks.rethrowIfBlocked(resultFailure);
             if (!req.durableSuspend()) {
-                return promoteDagBlockingFailure(
+                return promoteDagBlockingFailureCore(
                         deps,
                         runId,
                         anchor,
@@ -773,24 +843,25 @@ public final class SandboxToolJobLifecycle {
                         req.toolStartMs(),
                         Map.of("task_id", taskId,
                                 "status", status,
-                                "message", SandboxJobResponses.nvl(resultFailure.getMessage())));
+                                "message", SandboxJobResponses.nvl(resultFailure.getMessage())), sourced);
             }
             throw resultFailure;
         }
         if (!req.durableSuspend()
                 && !renewDagBlockingLease(deps, runId, anchor, true)) {
-            return dagBlockingLeaseLost(
+            return dagBlockingLeaseLostCore(
                     deps, anchor.getToolName(), taskId, req.toolStartMs(),
-                    "lease renewal was rejected after terminal result fetch");
+                    "lease renewal was rejected after terminal result fetch", sourced);
         }
         if (result != null && result.retryable() != null) {
             try {
-                String completed = completeSynchronously(deps, req, status, result);
+                PromptText completed = completeSynchronouslyCore(deps, req, status, result, sourced);
                 if (completed != null) {
                     deps.observability().emitToolTotal(req.toolStartMs(), "OK", "");
                     return completed;
                 }
             } catch (Exception terminalFailure) {
+                ModelSendBlocks.rethrowIfBlocked(terminalFailure);
                 log.warn("Synchronous terminal finalization incomplete: run={}, taskId={}, "
                                 + "waitPolicy={}, error={}",
                         runId, taskId,
@@ -799,25 +870,34 @@ public final class SandboxToolJobLifecycle {
             }
         }
         if (req.durableSuspend()) {
-            return suspend(deps, runId, anchor, req.reservation(), taskId);
+            return suspendCore(deps, runId, anchor, req.reservation(), taskId, sourced);
         }
-        return promoteDagBlockingFailure(
+        return promoteDagBlockingFailureCore(
                 deps,
                 runId,
                 anchor,
                 "DAG_BLOCKING_TERMINAL_INCOMPLETE",
                 "DAG Sandbox task reached terminal state but durable finalization proof is incomplete",
                 req.toolStartMs(),
-                Map.of("task_id", taskId, "status", status));
+                Map.of("task_id", taskId, "status", status), sourced);
     }
 
     /**
      * 同步终态的三段持久：先 ENVELOPE（终态快照进锚点）、再 RELEASE（容量释放）、
      * 最后 USAGE（终态信封进用量账）。任何一段失败都返回 null，由调用方按策略转后台或移交。
      */
-    public static String completeSynchronously(
+    public static String completeSynchronously(LifecycleDeps deps, PollRequest req, String status, SandboxTerminalResultView result) throws Exception {
+        PromptText output = completeSynchronouslyCore(deps, req, status, result, false);
+        return output == null ? null : output.text();
+    }
+
+    public static PromptText completeSynchronouslyText(LifecycleDeps deps, PollRequest req, String status, SandboxTerminalResultView result) throws Exception {
+        return completeSynchronouslyCore(deps, req, status, result, true);
+    }
+
+    private static PromptText completeSynchronouslyCore(
             LifecycleDeps deps, PollRequest req, String status,
-            SandboxTerminalResultView result) throws Exception {
+            SandboxTerminalResultView result, boolean sourced) throws Exception {
         String runId = req.runId();
         ToolJobAnchor anchor = req.anchor();
         DataAnalysisOperationIdentity identity = req.identity();
@@ -832,8 +912,16 @@ public final class SandboxToolJobLifecycle {
                 : req.terminalSideEffect().onTerminal(runId, identity, anchor, result);
         // Build the public allowlist before persisting ENVELOPE. A projection/serialization
         // failure must never leave a durable success preview behind.
-        String output = req.resultAdapter().formatTerminalResult(result, formatContext);
-        String preview = output;
+        SandboxJobResultAdapter.ResolvedPromptResult resolved = sourced
+                ? req.resultAdapter().resolveTerminalText(result, formatContext) : null;
+        if (sourced && (resolved == null || resolved.output() == null)) {
+            throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "sandbox-terminal-result");
+        }
+        PromptText output = sourced ? resolved.output()
+                : PromptText.runtimeData(req.resultAdapter().formatTerminalResult(result, formatContext));
+        String preview = output.text();
         String rawRef = SandboxJobResponses.blankToNull(result.rawRef());
         /*
          * 业务成败以工具的结果适配器为准：沙箱 SUCCEEDED 只代表运行器正常跑完
@@ -841,10 +929,10 @@ public final class SandboxToolJobLifecycle {
          * 语句超时都装在运行器信封里，沙箱状态全是 SUCCEEDED；executePython 的业务
          * 判据（SUCCEEDED 且退出码 0）与旧沙箱判据完全等价，行为不变。
          */
-        boolean businessSuccess = req.resultAdapter().isSuccess(result);
+        boolean businessSuccess = sourced ? resolved.success() : req.resultAdapter().isSuccess(result);
         String errorCode = SandboxJobResponses.blankToNull(result.errorDetail());
         if (errorCode == null && !businessSuccess) {
-            errorCode = req.resultAdapter().errorCodeOf(result);
+            errorCode = sourced ? resolved.errorCode() : req.resultAdapter().errorCodeOf(result);
         }
         if (!"SUCCEEDED".equals(status) && errorCode == null) {
             errorCode = status;
@@ -855,6 +943,10 @@ public final class SandboxToolJobLifecycle {
         anchor.setSandboxTerminalStatus(status);
         anchor.setTerminalBusinessSuccess(businessSuccess);
         anchor.setTerminalResultPreview(preview);
+        anchor.setTerminalPromptSourcesJson(sourced ? (String) PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
+                        ? world.willfrog.agent.platform.input.PromptMessage.Origin.RUNTIME_DATA
+                        : world.willfrog.agent.platform.input.PromptMessage.Origin.APPLICATION_INSTRUCTION,
+                        output.sources()).get(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY) : null);
         anchor.setTerminalRawRef(rawRef);
         anchor.setTerminalErrorCode(errorCode);
         anchor.setTerminalRetryable(result.retryable());
@@ -872,7 +964,11 @@ public final class SandboxToolJobLifecycle {
                 runId, identity.toolCallId(), identity.attempt(), identity.operationId(),
                 attached.taskId(), status, businessSuccess, preview, rawRef,
                 errorCode, businessSuccess ? null : terminalFailureMessage(status, errorCode),
-                result.retryable(), req.estimate(), confirmed, usage, terminalAt, false);
+                result.retryable(), req.estimate(), confirmed, usage, terminalAt, false,
+                sourced ? (String) PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
+                        ? world.willfrog.agent.platform.input.PromptMessage.Origin.RUNTIME_DATA
+                        : world.willfrog.agent.platform.input.PromptMessage.Origin.APPLICATION_INSTRUCTION,
+                        output.sources()).get(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY) : null);
 
         DataAnalysisReleaseOutcome released = deps.capacityService().releaseReservation(
                 new DataAnalysisReleaseRequest(confirmed,
@@ -919,12 +1015,21 @@ public final class SandboxToolJobLifecycle {
      * 名额就没人管了），再把任务凭证和 Run 状态一起写进数据库，最后抛出挂起信号通知
      * 上层释放线程。
      */
-    public static String suspend(
+    public static String suspend(LifecycleDeps deps, String runId, ToolJobAnchor anchor, DataAnalysisReservation current, String taskId) throws Exception {
+        PromptText result = suspendCore(deps, runId, anchor, current, taskId, false);
+        return result == null ? null : result.text();
+    }
+
+    public static PromptText suspendText(LifecycleDeps deps, String runId, ToolJobAnchor anchor, DataAnalysisReservation current, String taskId) throws Exception {
+        return suspendCore(deps, runId, anchor, current, taskId, true);
+    }
+
+    private static PromptText suspendCore(
             LifecycleDeps deps,
             String runId,
             ToolJobAnchor anchor,
             DataAnalysisReservation current,
-            String taskId) throws Exception {
+            String taskId, boolean sourced) throws Exception {
         // 先看数据库进度记录里有没有最新的资源占用信息，有就用它，防止拿调用栈里的旧数据覆盖新状态。
         if (anchor.getReservationJson() != null && !anchor.getReservationJson().isBlank()) {
             current = deps.objectMapper().readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
@@ -1026,10 +1131,20 @@ public final class SandboxToolJobLifecycle {
 
     public static <REQ> String dispatchWaitGroupMember(
             LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req, MemberPreparingWriter writer) {
+        return dispatchWaitGroupMemberTyped(deps, req, req.runner(), writer).text();
+    }
+
+    public static <REQ> PromptText dispatchWaitGroupMemberText(
+            LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req) {
+        return dispatchWaitGroupMemberText(deps, req, null);
+    }
+
+    public static <REQ> PromptText dispatchWaitGroupMemberText(
+            LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req, MemberPreparingWriter writer) {
         return dispatchWaitGroupMemberTyped(deps, req, req.runner(), writer);
     }
 
-    private static <REQ, RESP, L> String dispatchWaitGroupMemberTyped(
+    private static <REQ, RESP, L> PromptText dispatchWaitGroupMemberTyped(
             LifecycleDeps deps, WaitGroupDispatchRequest<REQ> req,
             SandboxJobRunnerAdapter<REQ, RESP, L> runner, MemberPreparingWriter writer) {
         WaitGroupMemberExecutionContext.Snapshot member = req.member();
@@ -1051,7 +1166,7 @@ public final class SandboxToolJobLifecycle {
                                 || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
                                 ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
                                 : null;
-                return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), code, admission.getMessage(),
+                return factFailure(deps.objectMapper(), req.toolName(), code, admission.getMessage(),
                         Map.of("retryable",
                                 admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE),
                         capacityCategory);
@@ -1066,12 +1181,12 @@ public final class SandboxToolJobLifecycle {
             createRequestJson = req.requestAdapter().durableCreateRequestJson(request);
         } catch (RuntimeException requestFailure) {
             if (!releasePreDispatch(deps, reservation)) {
-                return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(),
+                return factFailure(deps.objectMapper(), req.toolName(),
                         "WAIT_GROUP_PREPARING_RELEASE_FAILED",
                         "Sandbox request could not be assembled and local capacity could not be released",
                         Map.of());
             }
-            return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(),
+            return factFailure(deps.objectMapper(), req.toolName(),
                     "WAIT_GROUP_REQUEST_INVALID",
                     "Sandbox request could not be assembled before dispatch", Map.of());
         }
@@ -1101,11 +1216,11 @@ public final class SandboxToolJobLifecycle {
             if (!releasePreDispatch(deps, reservation)) {
                 log.error("成员创建证明未落库，且本地预留归还失败：{} reservation={}",
                         member.describe(), reservation.reservationId());
-                return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_RELEASE_FAILED",
+                return factFailure(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_RELEASE_FAILED",
                         "Sandbox request identity could not be saved and local capacity could not be released",
                         Map.of());
             }
-            return SandboxJobResponses.fail(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_NOT_RECORDED",
+            return factFailure(deps.objectMapper(), req.toolName(), "WAIT_GROUP_PREPARING_NOT_RECORDED",
                     "Sandbox request identity could not be saved before dispatch", Map.of());
         }
         if (writer != null && Thread.currentThread().isInterrupted()) {
@@ -1131,6 +1246,7 @@ public final class SandboxToolJobLifecycle {
                 verdict = runner.verdictOf(response, request);
             }
         } catch (Exception createFailure) {
+            ModelSendBlocks.rethrowIfBlocked(createFailure);
             verdict = runner.verdictOfFailure(createFailure, request);
         }
         if (workspaceRefusalCode != null && verdict instanceof SandboxCreateVerdict.Absent) {
@@ -1228,8 +1344,20 @@ public final class SandboxToolJobLifecycle {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             throw new IllegalStateException(what + "写不成 JSON", e);
         }
+    }
+
+    /** 此处只编码本流程构造的协议、所有权与容量拒绝事实，不接收操作建议正文。 */
+    private static PromptText factFailure(ObjectMapper mapper, String tool, String code,
+                                          String message, Map<String, Object> details) {
+        return PromptText.runtimeData(SandboxJobResponses.fail(mapper, tool, code, message, details));
+    }
+
+    private static PromptText factFailure(ObjectMapper mapper, String tool, String code,
+                                          String message, Map<String, Object> details, ToolFailureCategory category) {
+        return PromptText.runtimeData(SandboxJobResponses.fail(mapper, tool, code, message, details, category));
     }
 
     /** 命中验收故障点；未注入故障器时静默跳过。 */

@@ -1,8 +1,11 @@
 package world.willfrog.agent.platform.finance;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
@@ -23,6 +26,7 @@ public class FinanceRecordChannelProcessor {
     private final FinanceRecordPersister persister;
     private final FinanceRecordChannelObservability observability;
     private final ObjectMapper objectMapper;
+    private final TerminalResultPromptTexts promptTexts;
 
     public FinanceRecordChannelProcessor(
             FinanceRecordDecoder decoder,
@@ -32,6 +36,16 @@ public class FinanceRecordChannelProcessor {
             FinanceRecordPersister persister,
             FinanceRecordChannelObservability observability,
             ObjectMapper objectMapper) {
+        this(decoder, schemaValidator, environmentVerifier, resolutionQuery, persister,
+                observability, objectMapper, null);
+    }
+
+    @Autowired
+    public FinanceRecordChannelProcessor(
+            FinanceRecordDecoder decoder, FinanceRecordSchemaValidator schemaValidator,
+            FinanceEnvironmentVerifier environmentVerifier, FinanceMethodResolutionQuery resolutionQuery,
+            FinanceRecordPersister persister, FinanceRecordChannelObservability observability,
+            ObjectMapper objectMapper, TerminalResultPromptTexts promptTexts) {
         this.decoder = decoder;
         this.schemaValidator = schemaValidator;
         this.environmentVerifier = environmentVerifier;
@@ -39,6 +53,7 @@ public class FinanceRecordChannelProcessor {
         this.persister = persister;
         this.observability = observability;
         this.objectMapper = objectMapper;
+        this.promptTexts = promptTexts;
     }
 
     public FinanceRecordExtractionResult process(FinanceRecordExtractionRequest request) {
@@ -391,7 +406,11 @@ public class FinanceRecordChannelProcessor {
                 || !request.channelMetadata().recordSetComplete()));
     }
 
-    private static FinanceRecordExtractionResult.ModelNotice rejectedNotice() {
+    private FinanceRecordExtractionResult.ModelNotice rejectedNotice() {
+        if (promptTexts != null) {
+            return FinanceRecordExtractionResult.ModelNotice.withPrompts("FINANCE_RESULT_REJECTED",
+                    PromptText.runtimeData("本次结构化金融结果没有被接收"), promptTexts.instruction("financeRecordRejectedAction"));
+        }
         return new FinanceRecordExtractionResult.ModelNotice(
                 "FINANCE_RESULT_REJECTED",
                 "本次结构化金融结果没有被接收",

@@ -1,0 +1,14 @@
+{
+  "fragment": "promoteMountedObjectAdvice",
+  "purpose": "promoteMountedObjectAdvice",
+  "bodyType": "FIXED",
+  "body": "this dataset is already a platform object mount; reference its ds_ id directly",
+  "variables": [],
+  "utf8Sha256": "a9a1970c84d45764ea63b2f8953404197342bb5a756faa620ecf515a77fd7f1a",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataset/PromoteDatasetTool.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

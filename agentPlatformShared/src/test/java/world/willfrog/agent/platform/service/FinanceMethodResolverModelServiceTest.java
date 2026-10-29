@@ -62,7 +62,7 @@ class FinanceMethodResolverModelServiceTest {
     @Mock
     private FinanceMethodResolverModelResolver resolverModelResolver;
 
-    @Mock
+    private final VersionedModelTestFixture versioned = new VersionedModelTestFixture();
     private AgentPromptService promptService;
 
     @Mock
@@ -77,6 +77,8 @@ class FinanceMethodResolverModelServiceTest {
     void setUp() {
         llmProperties = new AgentLlmProperties();
         AgentContext.clear();
+        versioned.put("financeMethodResolverSystemPrompt", TEMPLATE, "RESOLVER_CATALOG");
+        promptService = versioned.promptService();
     }
 
     @AfterEach
@@ -237,10 +239,10 @@ class FinanceMethodResolverModelServiceTest {
     void resolve_shouldComputePromptVersionFromActualTemplate() {
         FinanceMethodResolverModelService service = serviceWithModel();
         when(model.chat(anyList())).thenReturn(jsonResponse("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"));
-        when(promptService.financeMethodResolverSystemPromptTemplate())
-                .thenReturn("TEMPLATE_A {{RESOLVER_CATALOG}}", "TEMPLATE_B {{RESOLVER_CATALOG}}");
+        versioned.put("financeMethodResolverSystemPrompt", "TEMPLATE_A {{RESOLVER_CATALOG}}", "RESOLVER_CATALOG");
 
         ResolverResult first = service.resolve("query", null, "catalog-text");
+        versioned.put("financeMethodResolverSystemPrompt", "TEMPLATE_B {{RESOLVER_CATALOG}}", "RESOLVER_CATALOG");
         ResolverResult second = service.resolve("query", null, "catalog-text");
 
         assertEquals(sha256Hex("TEMPLATE_A {{RESOLVER_CATALOG}}"),
@@ -274,10 +276,10 @@ class FinanceMethodResolverModelServiceTest {
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
                 "dashscope", null, "qwen-lite", "key", "cn", List.of(), null);
         when(aiServiceFactory.resolveLlm("dashscope", "qwen-lite")).thenReturn(resolved);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
-                any(), anyList(), anyDouble(), anyInt())).thenReturn(model);
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
+                any(), anyList(), anyDouble(), anyInt())).thenAnswer(call -> versioned.archived(model,
+                        call.getArgument(0, AgentLlmResolver.ResolvedLlm.class).endpointName()));
         when(model.chat(anyList())).thenReturn(jsonResponse("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"));
-        when(promptService.financeMethodResolverSystemPromptTemplate()).thenReturn(TEMPLATE);
         FinanceMethodResolverModelService service = newService();
 
         ResolverResult result = service.resolve("query", null, "catalog-text");
@@ -392,14 +394,14 @@ class FinanceMethodResolverModelServiceTest {
                 "default-endpoint", "https://openrouter.ai/api/v1", "default-model", "key", "", List.of(), null);
         when(aiServiceFactory.resolveLlm("broken-endpoint", "broken-model")).thenReturn(broken);
         when(aiServiceFactory.resolveLlm("default-endpoint", "default-model")).thenReturn(fallback);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                 org.mockito.ArgumentMatchers.eq(broken), anyList(), anyDouble(), anyInt()))
                 .thenThrow(new IllegalStateException("stage route misconfigured"));
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                 org.mockito.ArgumentMatchers.eq(fallback), anyList(), anyDouble(), anyInt()))
-                .thenReturn(model);
+                .thenAnswer(call -> versioned.archived(model,
+                        call.getArgument(0, AgentLlmResolver.ResolvedLlm.class).endpointName()));
         when(model.chat(anyList())).thenReturn(jsonResponse("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"));
-        when(promptService.financeMethodResolverSystemPromptTemplate()).thenReturn(TEMPLATE);
         FinanceMethodResolverModelService service = newService();
 
         ResolverResult result = service.resolve("query", null, "catalog-text");
@@ -440,8 +442,6 @@ class FinanceMethodResolverModelServiceTest {
         AgentLlmResolver.ResolvedLlm blankBaseUrl = new AgentLlmResolver.ResolvedLlm(
                 "custom-endpoint", null, "custom-model", "key", "", List.of(), null);
         when(aiServiceFactory.resolveLlm("custom-endpoint", "custom-model")).thenReturn(blankBaseUrl);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
-                any(), anyList(), anyDouble(), anyInt())).thenReturn(model);
         FinanceMethodResolverModelService service = newService();
 
         ResolverResult result = service.resolve("query", null, "catalog-text");
@@ -454,27 +454,28 @@ class FinanceMethodResolverModelServiceTest {
     @Test
     void resolve_shouldFailClosedWhenTemplateMissingPlaceholder() {
         FinanceMethodResolverModelService service = serviceWithModel();
-        when(promptService.financeMethodResolverSystemPromptTemplate()).thenReturn("template without placeholder");
+        versioned.put("financeMethodResolverSystemPrompt", "template without placeholder");
 
-        ResolverResult result = service.resolve("query", null, "catalog-text");
-
-        TechnicalError error = assertInstanceOf(TechnicalError.class, result);
-        assertEquals(ErrorKind.CALL_FAILED, error.kind());
-        assertTrue(error.message().contains("exactly one"));
+        var failure = org.junit.jupiter.api.Assertions.assertThrows(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException.class,
+                () -> service.resolve("query", null, "catalog-text"));
+        assertEquals(world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_VARIABLE_INVALID,
+                failure.code());
+        assertEquals("RESOLVER_CATALOG", failure.reason());
         verify(model, never()).chat(anyList());
     }
 
     @Test
     void resolve_shouldFailClosedWhenTemplateHasDuplicatePlaceholders() {
         FinanceMethodResolverModelService service = serviceWithModel();
-        when(promptService.financeMethodResolverSystemPromptTemplate())
-                .thenReturn("A {{RESOLVER_CATALOG}} B {{RESOLVER_CATALOG}}");
+        versioned.put("financeMethodResolverSystemPrompt", "A {{RESOLVER_CATALOG}} B {{RESOLVER_CATALOG}}", "RESOLVER_CATALOG");
 
-        ResolverResult result = service.resolve("query", null, "catalog-text");
-
-        TechnicalError error = assertInstanceOf(TechnicalError.class, result);
-        assertEquals(ErrorKind.CALL_FAILED, error.kind());
-        assertTrue(error.message().contains("exactly one"));
+        var failure = org.junit.jupiter.api.Assertions.assertThrows(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException.class,
+                () -> service.resolve("query", null, "catalog-text"));
+        assertEquals(world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_VARIABLE_INVALID,
+                failure.code());
+        assertEquals("RESOLVER_CATALOG", failure.reason());
         verify(model, never()).chat(anyList());
     }
 
@@ -521,7 +522,7 @@ class FinanceMethodResolverModelServiceTest {
         FinanceMethodResolverModelService service = serviceWithModel();
         String marker = "OVERSIZED-TEMPLATE-MARKER";
         String hugeTemplate = marker + "x".repeat(20000) + " {{RESOLVER_CATALOG}}";
-        when(promptService.financeMethodResolverSystemPromptTemplate()).thenReturn(hugeTemplate);
+        versioned.put("financeMethodResolverSystemPrompt", hugeTemplate, "RESOLVER_CATALOG");
 
         ResolverResult result = service.resolve("query", null, "catalog-text");
 
@@ -603,9 +604,9 @@ class FinanceMethodResolverModelServiceTest {
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
                 "resolver-endpoint", "https://example.com/v1", "resolver-model", "key", "", List.of(), null);
         when(aiServiceFactory.resolveLlm("resolver-endpoint", "resolver-model")).thenReturn(resolved);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
-                any(), anyList(), anyDouble(), anyInt())).thenReturn(model);
-        lenient().when(promptService.financeMethodResolverSystemPromptTemplate()).thenReturn(TEMPLATE);
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
+                any(), anyList(), anyDouble(), anyInt())).thenAnswer(call -> versioned.archived(model,
+                        call.getArgument(0, AgentLlmResolver.ResolvedLlm.class).endpointName()));
         return newService();
     }
 
@@ -613,7 +614,9 @@ class FinanceMethodResolverModelServiceTest {
         // 边界读取与生产同口径：effective config 来自 resolver；测试默认映射到静态 llmProperties。
         lenient().when(resolverModelResolver.effectiveResolverConfig())
                 .thenAnswer(invocation -> llmProperties.getFinanceMethodResolver());
-        return new FinanceMethodResolverModelService(
+        var service = new FinanceMethodResolverModelService(
                 objectMapper, aiServiceFactory, resolverModelResolver, promptService, observabilityService);
+        versioned.inject(service);
+        return service;
     }
 }

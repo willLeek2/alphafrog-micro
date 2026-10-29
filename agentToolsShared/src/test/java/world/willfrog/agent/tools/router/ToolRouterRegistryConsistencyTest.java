@@ -40,6 +40,8 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.when;
 
 /**
@@ -163,8 +165,8 @@ class ToolRouterRegistryConsistencyTest {
         when(ragTools.ragSearch(anyString(), anyString(), anyString(), anyString(), anyInt())).thenReturn(okJson("ragSearch"));
         when(ragTools.loadDocument(anyString())).thenReturn(okJson("loadDocument"));
 
-        SearchTools searchTools = mock(SearchTools.class);
-        when(searchTools.searchWeb(anyString(), anyString(), anyString(), anyString(), anyBoolean(), anyBoolean(), anyString(), anyString(), anyInt())).thenReturn(okJson("searchWeb"));
+        SearchTools searchTools = spy(new SearchTools(new ObjectMapper(), null));
+        doReturn(okJson("searchWeb")).when(searchTools).searchWebPrepared(any());
 
         PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
         when(pythonSandboxTools.executePython(anyString(), anyString(), anyString(), anyString(), any())).thenReturn(okJson("executePython"));

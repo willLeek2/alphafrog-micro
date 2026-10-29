@@ -873,6 +873,11 @@ public class MarketDataTools {
                 .getOffExchangeAssetDaily(tsCode, startDate, endDate, includeDataset);
     }
 
+    public PromptText getOffExchangeAssetDailyPrompt(String tsCode, String startDate, String endDate, String includeDataset) {
+        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
+                .getOffExchangeAssetDailyPrompt(tsCode, startDate, endDate, includeDataset);
+    }
+
     /**
      * A 股资产特色数据查询（可转债日线 / AH 比价）。
      *
@@ -886,16 +891,31 @@ public class MarketDataTools {
                 .getSpecialAssetDaily(tsCode, assetType, startDate, endDate);
     }
 
+    public PromptText getSpecialAssetDailyPrompt(String tsCode, String assetType, String startDate, String endDate) {
+        return new MarketDataSpecialAssetTools(domesticStockService, datasetWriter, datasetRegistry, this)
+                .getSpecialAssetDailyPrompt(tsCode, assetType, startDate, endDate);
+    }
+
     @Tool
     public String getEtfAdj(String tsCode, String startDate, String endDate) {
         return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
                 .getEtfAdj(tsCode, startDate, endDate);
     }
 
+    public PromptText getEtfAdjPrompt(String tsCode, String startDate, String endDate) {
+        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
+                .getEtfAdjPrompt(tsCode, startDate, endDate);
+    }
+
     @Tool
     public String getListedAssetShareSize(String tsCode, String startDate, String endDate, String exchange) {
         return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
                 .getListedAssetShareSize(tsCode, startDate, endDate, exchange);
+    }
+
+    public PromptText getListedAssetShareSizePrompt(String tsCode, String startDate, String endDate, String exchange) {
+        return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, datasetWriter, datasetRegistry, this)
+                .getListedAssetShareSizePrompt(tsCode, startDate, endDate, exchange);
     }
 
     @Tool
@@ -979,6 +999,11 @@ public class MarketDataTools {
                 .getTradingDaysSummary(startDate, endDate, exchange);
     }
 
+    public PromptText getTradingDaysSummaryPrompt(String startDate, String endDate, String exchange) {
+        return new MarketDataCalendarTools(domesticIndexService, this)
+                .getTradingDaysSummaryPrompt(startDate, endDate, exchange);
+    }
+
     /**
      * 判断单个或多个日期是否为A股交易日。
      *
@@ -989,6 +1014,11 @@ public class MarketDataTools {
     @Tool
     public String isTradingDay(String date, String exchange) {
         return new MarketDataCalendarTools(domesticIndexService, this).isTradingDay(date, exchange);
+    }
+
+    public PromptText isTradingDayPrompt(String date, String exchange) {
+        return new MarketDataCalendarTools(domesticIndexService, this)
+                .isTradingDayPrompt(date, exchange);
     }
 
     /**
@@ -2503,6 +2533,11 @@ public class MarketDataTools {
     public String getFinancialReport(String tsCode, String reportType, String startPeriod, String endPeriod) {
         return new MarketDataFinancialTools(domesticStockService, datasetWriter, datasetRegistry, this)
                 .getFinancialReport(tsCode, reportType, startPeriod, endPeriod);
+    }
+
+    public PromptText getFinancialReportPrompt(String tsCode, String reportType, String startPeriod, String endPeriod) {
+        return new MarketDataFinancialTools(domesticStockService, datasetWriter, datasetRegistry, this)
+                .getFinancialReportPrompt(tsCode, reportType, startPeriod, endPeriod);
     }
 
     private void putReadableProtoItem(Map<String, Object> data, MessageOrBuilder item) {

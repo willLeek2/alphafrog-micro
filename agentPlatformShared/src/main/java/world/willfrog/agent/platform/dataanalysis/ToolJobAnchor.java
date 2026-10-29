@@ -120,6 +120,8 @@ public class ToolJobAnchor {
     private String terminalStatus;
     // terminalResultPreview 是限定大小的可读摘要，供恢复节点直接注入。
     private String terminalResultPreview;
+    // 与终态正文同项保存的来源属性；旧锚点缺失时保持未知。
+    private String terminalPromptSourcesJson;
     // terminalRawRef 指向完整结果产物，避免大对象进入 anchor。
     private String terminalRawRef;
     // terminalStderrPreview 保存可注入修复 prompt 的有界 stderr，完整结果仍由 Sandbox 保管。
@@ -414,6 +416,8 @@ public class ToolJobAnchor {
 
     public String getTerminalResultPreview() { return terminalResultPreview; }
     public void setTerminalResultPreview(String terminalResultPreview) { this.terminalResultPreview = terminalResultPreview; }
+    public String getTerminalPromptSourcesJson() { return terminalPromptSourcesJson; }
+    public void setTerminalPromptSourcesJson(String terminalPromptSourcesJson) { this.terminalPromptSourcesJson = terminalPromptSourcesJson; }
 
     public String getTerminalRawRef() { return terminalRawRef; }
     public void setTerminalRawRef(String terminalRawRef) { this.terminalRawRef = terminalRawRef; }

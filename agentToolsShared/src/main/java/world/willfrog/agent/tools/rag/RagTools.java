@@ -16,6 +16,9 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
+import world.willfrog.agent.tools.docs.DocumentToolPromptPreparation;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -41,6 +44,8 @@ public class RagTools {
     private final ObjectMapper objectMapper;
     private final Optional<RunRawRefStore> runRawRefStore;
     private final Optional<AgentLlmLocalConfigLoader> localConfigLoader;
+    @Autowired
+    private DocumentToolPromptPreparation promptPreparation;
 
     public RagTools(ObjectMapper objectMapper) {
         this(objectMapper, Optional.empty(), Optional.empty());
@@ -57,6 +62,10 @@ public class RagTools {
 
     @Tool
     public String ragSearch(String queryText, String docType, String tsCode, String indName, int topK) {
+        return ragSearchPrompt(queryText, docType, tsCode, indName, topK).text();
+    }
+
+    public PromptText ragSearchPrompt(String queryText, String docType, String tsCode, String indName, int topK) {
         try {
             int k = (topK <= 0 || topK > MAX_TOP_K) ? 5 : topK;
             RagSearchRequest req = RagSearchRequest.newBuilder()
@@ -130,23 +139,32 @@ public class RagTools {
             payload.put("ok", true);
             payload.put("tool", "ragSearch");
             payload.put("data", data);
-            return objectMapper.writeValueAsString(payload);
+            return DocumentToolPromptPreparation.envelope(objectMapper, payload, List.of());
         } catch (Exception e) {
-            return SandboxJobResponses.fail(objectMapper, "ragSearch", "TOOL_ERROR",
-                    nvl(e.getMessage()), Map.of());
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "ragSearch", "TOOL_ERROR",
+                    nvl(e.getMessage()), Map.of()));
         }
     }
 
     @Tool
     public String loadDocument(String ossUrl) {
+        return loadDocumentPrompt(ossUrl).text();
+    }
+
+    public PromptText loadDocumentPrompt(String ossUrl) {
         try {
             if (ossUrl == null || ossUrl.isBlank()) {
-                return SandboxJobResponses.fail(objectMapper, "loadDocument", "INVALID_ARGUMENT",
-                        "ossUrl is empty", Map.of());
+                return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "loadDocument", "INVALID_ARGUMENT",
+                        "ossUrl is empty", Map.of()));
             }
             if (ossUrl.startsWith("raw_ref_") || ossUrl.startsWith("raw-ref:")) {
-                return SandboxJobResponses.fail(objectMapper, "loadDocument", "INVALID_ARGUMENT",
-                        "rawRef must be passed to rereadToolResult, not loadDocument", Map.of());
+                if (promptPreparation == null) {
+                    throw DocumentToolPromptPreparation.missing("文档重定向建议缺少原根正文读取组件");
+                }
+                PromptText message = promptPreparation.policy("ragRawRefRedirectInstruction", Map.of());
+                return DocumentToolPromptPreparation.failure(objectMapper, "loadDocument", "INVALID_ARGUMENT",
+                        message, Map.of());
             }
             var httpClient = java.net.http.HttpClient.newHttpClient();
             var request = java.net.http.HttpRequest.newBuilder()
@@ -159,11 +177,11 @@ public class RagTools {
             if (response.statusCode() != 200) {
                 // 同一码按状态码区分事实：429 系是上游限流，其余非 200（5xx 等）按上游或系统故障；
                 // 原 code 仍写 HTTP_ERROR，message 说明状态。
-                return SandboxJobResponses.fail(objectMapper, "loadDocument", "HTTP_ERROR",
+                return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "loadDocument", "HTTP_ERROR",
                         "Status " + response.statusCode(), Map.of(),
                         response.statusCode() == 429
                                 ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
-                                : ToolFailureCategory.UPSTREAM_OR_SYSTEM);
+                                : ToolFailureCategory.UPSTREAM_OR_SYSTEM));
             }
             Map<String, Object> data = new LinkedHashMap<>();
             String body = response.body();
@@ -186,11 +204,12 @@ public class RagTools {
             result.put("ok", true);
             result.put("tool", "loadDocument");
             result.put("data", data);
-            return objectMapper.writeValueAsString(result);
+            return DocumentToolPromptPreparation.envelope(objectMapper, result, List.of());
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             // 文档读取走网络取回正文，异常基本都是网络/IO 一类的上游或系统故障，显式归类。
-            return SandboxJobResponses.fail(objectMapper, "loadDocument", "TOOL_ERROR",
-                    nvl(e.getMessage()), Map.of(), ToolFailureCategory.UPSTREAM_OR_SYSTEM);
+            return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "loadDocument", "TOOL_ERROR",
+                    nvl(e.getMessage()), Map.of(), ToolFailureCategory.UPSTREAM_OR_SYSTEM));
         }
     }
 
@@ -213,13 +232,15 @@ public class RagTools {
         }
         try {
             String rawContent = objectMapper.writeValueAsString(data);
-            String rawRef = runRawRefStore.get().register(runId, nvl(userId), displayName, rawContent, rawRefTtlSeconds());
+            String rawRef = runRawRefStore.get().registerPrompt(runId, nvl(userId), displayName,
+                    PromptText.runtimeData(rawContent), rawRefTtlSeconds());
             data.remove("needs_raw_ref");
             data.remove("raw_refs");
             data.remove("content");
             data.put("rawRef", rawRef);
             data.put("read_hints", readHints(rawRef));
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to register rawRef for {}", displayName, e);
             data.put("rawRef_error", "RAW_REF_REGISTER_FAILED");
         }

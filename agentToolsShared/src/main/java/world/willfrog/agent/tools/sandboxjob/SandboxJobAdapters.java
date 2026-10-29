@@ -36,6 +36,13 @@ public record SandboxJobAdapters(
         return result.resolveTerminal(terminal, formatContext);
     }
 
+    public SandboxJobResultAdapter.ResolvedPromptResult resolveTerminalText(
+            TerminalContext context, SandboxTerminalResultView terminal) {
+        Object formatContext = terminalFormatContextFactory == null ? null
+                : terminalFormatContextFactory.prepare(context, terminal);
+        return result.resolveTerminalText(terminal, formatContext);
+    }
+
     public String toolName() {
         return request.toolName();
     }

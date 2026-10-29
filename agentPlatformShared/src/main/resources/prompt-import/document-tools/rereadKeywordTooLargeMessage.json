@@ -1,0 +1,14 @@
+{
+  "fragment": "rereadKeywordTooLargeMessage",
+  "purpose": "rereadKeywordTooLargeMessage",
+  "bodyType": "FIXED",
+  "body": "rereadToolResult keyword mode limit must not exceed configured keyword max limit",
+  "variables": [],
+  "utf8Sha256": "5e6749129ee218da3ca723347ab06b464bb42e22ada83d93c2ff9541882cd066",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/compaction/RereadToolHandler.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

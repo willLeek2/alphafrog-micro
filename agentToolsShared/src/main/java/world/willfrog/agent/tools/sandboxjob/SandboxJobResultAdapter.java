@@ -11,6 +11,23 @@ public interface SandboxJobResultAdapter {
     /** 同一份工具结果解释同时提供正文、业务状态和失败分类。 */
     record ResolvedResult(String output, boolean success, String errorCode) {}
 
+    record ResolvedPromptResult(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText output,
+                                boolean success, String errorCode) {}
+
+    default ResolvedPromptResult resolveTerminalText(SandboxTerminalResultView result, Object formatContext) {
+        var output = formatTerminalResultText(result, formatContext);
+        boolean success = isSuccess(result);
+        return new ResolvedPromptResult(output, success, success ? null : errorCodeOf(result));
+    }
+
+    /** 未迁移的适配器不能把裸结果当作已确认来源。 */
+    default world.willfrog.alphafrogmicro.common.racing.prompt.PromptText formatTerminalResultText(
+            SandboxTerminalResultView result, Object formatContext) {
+        throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "沙箱终态结果尚未提供明确正文来源");
+    }
+
     default ResolvedResult resolveTerminal(SandboxTerminalResultView result, Object formatContext) {
         String output = formatTerminalResult(result, formatContext);
         boolean success = isSuccess(result);

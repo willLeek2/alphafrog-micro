@@ -1,6 +1,9 @@
 package world.willfrog.agent.tools.dataset;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import com.google.protobuf.ByteString;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
@@ -59,6 +62,9 @@ public class PromoteDatasetTool {
 
     private final ObjectMapper objectMapper;
 
+    @Autowired
+    private ProducerPromptTexts promptTexts;
+
     /** 可选注入（required=false），便于纯单元测试启动。 */
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
@@ -112,6 +118,10 @@ public class PromoteDatasetTool {
             @P(value = "必填，数据覆盖结束日期，格式 YYYY-MM-DD", required = true) String coverage_end,
             @P(value = "必填，更新频率：daily（每日更新）或 single_period（一次性单期）", required = true) String frequency
     ) {
+        return promoteDatasetToPlatformPrompt(dataset_number, name, description, semantic_refs, primary_key, coverage_scope, coverage_start, coverage_end, frequency).text();
+    }
+
+    public PromptText promoteDatasetToPlatformPrompt(Integer dataset_number, String name, String description, String semantic_refs, String primary_key, String coverage_scope, String coverage_start, String coverage_end, String frequency) {
         try {
             String runId = AgentContext.getRunId();
             String userId = AgentContext.getUserId();
@@ -127,7 +137,7 @@ public class PromoteDatasetTool {
             }
             if (dataset_number == null || dataset_number <= 0) {
                 return fail("INVALID_DATASET_NUMBER",
-                        "dataset_number must be a positive run-level number from listMyData",
+                        policy("promoteDatasetNumberAdvice"),
                         Map.of("dataset_number", dataset_number == null ? "" : dataset_number.toString()));
             }
             String safeName = name == null ? "" : name.trim();
@@ -141,15 +151,13 @@ public class PromoteDatasetTool {
             List<SemanticRef> semanticRefs = parseSemanticRefs(semantic_refs);
             if (semanticRefs == null) {
                 return fail("INVALID_SEMANTIC_REFS",
-                        "semantic_refs must be comma-separated name@version entries, "
-                                + "e.g. price_daily@1,adj_factor@2",
+                        policy("promoteSemanticRefsAdvice"),
                         Map.of("semantic_refs", nvl(semantic_refs)));
             }
             List<String> primaryKeyColumns = splitCsvNames(primary_key);
             if (primaryKeyColumns == null) {
                 return fail("INVALID_PRIMARY_KEY",
-                        "primary_key must be a non-empty comma-separated column name list, "
-                                + "e.g. trade_date,ts_code",
+                        policy("promotePrimaryKeyAdvice"),
                         Map.of("primary_key", nvl(primary_key)));
             }
             String safeCoverageScope = coverage_scope == null ? "" : coverage_scope.trim();
@@ -157,11 +165,11 @@ public class PromoteDatasetTool {
                 return fail("INVALID_COVERAGE_SCOPE", "coverage_scope must not be blank", Map.of());
             }
             if (parseIsoDate(coverage_start) == null) {
-                return fail("INVALID_COVERAGE_DATE", "coverage_start must be a valid YYYY-MM-DD date",
+                return fail("INVALID_COVERAGE_DATE", policy("promoteCoverageStartAdvice"),
                         Map.of("coverage_start", nvl(coverage_start)));
             }
             if (parseIsoDate(coverage_end) == null) {
-                return fail("INVALID_COVERAGE_DATE", "coverage_end must be a valid YYYY-MM-DD date",
+                return fail("INVALID_COVERAGE_DATE", policy("promoteCoverageEndAdvice"),
                         Map.of("coverage_end", nvl(coverage_end)));
             }
             // 261028 泳道实测修：frequency 是库侧 NOT NULL 声明字段，此前不传，服务端
@@ -169,7 +177,7 @@ public class PromoteDatasetTool {
             Frequency parsedFrequency = parseFrequency(frequency);
             if (parsedFrequency == null) {
                 return fail("INVALID_FREQUENCY",
-                        "frequency must be daily or single_period",
+                        policy("promoteFrequencyAdvice"),
                         Map.of("frequency", nvl(frequency)));
             }
 
@@ -180,14 +188,14 @@ public class PromoteDatasetTool {
             if (entry == null) {
                 List<Integer> legalNumbers = agentRunDatasetRegistry.listDatasetNumbers(runId);
                 return fail("INVALID_DATASET_NUMBER",
-                        "dataset_number is not a valid run-level dataset number; use listMyData first",
+                        policy("promoteDatasetLookupAdvice"),
                         Map.of("dataset_number", dataset_number.toString(),
                                 "legal_dataset_numbers", legalNumbers));
             }
             if (entry.isPlatformObject()) {
                 // 平台对象挂载副本再提升回平台没有意义（内容已在平台上），拒绝并提示直接用原对象。
                 return fail("PLATFORM_OBJECT_SELF_PROMOTE",
-                        "this dataset is already a platform object mount; reference its ds_ id directly",
+                        policy("promoteMountedObjectAdvice"),
                         Map.of("dataset_number", dataset_number.toString(),
                                 "platform_object_id", entry.originalId()));
             }
@@ -254,6 +262,7 @@ public class PromoteDatasetTool {
             data.put("note", "对象已登记为当前用户私有平台对象（不走审核）；listMyData 的平台数据对象区可见");
             return ok(data);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("promoteDatasetToPlatform failed", e);
             return fail("TOOL_ERROR", "promoteDatasetToPlatform invocation error",
                     Map.of("message", nvl(e.getMessage())));
@@ -335,7 +344,7 @@ public class PromoteDatasetTool {
         }
     }
 
-    private String ok(Map<String, Object> data) {
+    private PromptText ok(Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
         payload.put("tool", "promoteDatasetToPlatform");
@@ -344,25 +353,26 @@ public class PromoteDatasetTool {
         return writeJson(payload);
     }
 
-    private String fail(String code, String message, Map<String, Object> details) {
+    private PromptText fail(String code, Object message, Map<String, Object> details) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", "promoteDatasetToPlatform");
         payload.put("data", Map.of());
         Map<String, Object> err = new LinkedHashMap<>();
         err.put("code", nvl(code));
-        err.put("message", nvl(message));
+        err.put("message", message == null ? "" : message);
         err.put("details", details == null ? Map.of() : details);
         payload.put("error", err);
         return writeJson(payload);
     }
 
-    private String writeJson(Object payload) {
+    private PromptText writeJson(Object payload) {
         try {
-            return objectMapper.writeValueAsString(payload);
+            return ProducerPromptTexts.json(objectMapper, payload);
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"promoteDatasetToPlatform\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return PromptText.runtimeData("{\"ok\":false,\"tool\":\"promoteDatasetToPlatform\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
+                    + escapeJson(nvl(e.getMessage())) + "\"}}");
         }
     }
 
@@ -377,4 +387,10 @@ public class PromoteDatasetTool {
                 .replace("\n", "\\n")
                 .replace("\r", "\\r");
     }
+    private PromptText policy(String fragment) {
+        if (promptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "producer-policy");
+        return promptTexts.policy(fragment);
+    }
+
 }
