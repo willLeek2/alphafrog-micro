@@ -1,0 +1,14 @@
+{
+  "fragment": "marketStockOptionalColumnsAdvice",
+  "purpose": "marketStockOptionalColumnsAdvice",
+  "bodyType": "FIXED",
+  "body": "includeColumns 只接受 adj_factor / valuation / share_turnover，多个用逗号分隔；留空则只返回基础行情列。",
+  "variables": [],
+  "utf8Sha256": "e4a2a4ebb391db286a078fa249a3bd8e6ff0daff95040bd0c619b7c025ee603e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

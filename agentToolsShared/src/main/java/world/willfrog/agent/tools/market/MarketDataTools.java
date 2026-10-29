@@ -12,6 +12,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetManifest;
@@ -139,6 +144,9 @@ public class MarketDataTools {
     /** JSON 序列化器，用于工具返回值的 JSON 编码和批量结果解析。 */
     private final ObjectMapper objectMapper;
 
+    @Autowired
+    private MarketDataPromptPolicy promptPolicy;
+
     /** 申万行业成分 DAO，用于新工具 getStockSwIndustryInfo 及 advanced 行业成分日线拉取。 */
     private final SwIndustryMemberDao swIndustryMemberDao;
 
@@ -170,9 +178,13 @@ public class MarketDataTools {
 
     @Tool
     public String getStockInfo(String tsCode) {
+        return getStockInfoPrompt(tsCode).text();
+    }
+
+    public PromptText getStockInfoPrompt(String tsCode) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
-        String limitError = batchLimitFailureIfExceeded("getStockInfo", "tsCode", tsCodes, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("getStockInfo", "tsCode", tsCodes, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -183,35 +195,40 @@ public class MarketDataTools {
         return getStockInfoSingle(single);
     }
 
-    private String getStockInfoSingle(String tsCode) {
+    private PromptText getStockInfoSingle(String tsCode) {
         try {
             DomesticStockInfoByTsCodeRequest request = DomesticStockInfoByTsCodeRequest.newBuilder()
                     .setTsCode(nvl(tsCode))
                     .build();
             DomesticStockInfoByTsCodeResponse response = domesticStockService.getStockInfoByTsCode(request);
             if (!response.hasItem()) {
-                return fail("getStockInfo", "ASSET_NOT_FOUND",
-                        "资产 " + nvl(tsCode) + " 不存在，请检查代码是否正确或更换查询标的。",
+                return failPrompt("getStockInfo", "ASSET_NOT_FOUND",
+                        policy("marketAssetNotFound", Map.of("tsCode", nvl(tsCode))),
                         Map.of("ts_code", nvl(tsCode)));
             }
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("ts_code", nvl(tsCode));
             putReadableProtoItem(data, response.getItem());
-            return ok("getStockInfo", data);
+            return okPrompt("getStockInfo", data);
         } catch (Exception e) {
-            return fail("getStockInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getStockInfo", "TOOL_ERROR", policy("marketQueryFailure"),
                     Map.of("message", nvl(e.getMessage())));
         }
     }
 
     @Tool
     public String getStockSwIndustryInfo(String tsCode) {
+        return getStockSwIndustryInfoPrompt(tsCode).text();
+    }
+
+    public PromptText getStockSwIndustryInfoPrompt(String tsCode) {
         if (swIndustryMemberDao == null) {
             return serviceUnavailable("getStockSwIndustryInfo", "SwIndustryMemberDao is not available");
         }
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
-        String limitError = batchLimitFailureIfExceeded("getStockSwIndustryInfo", "tsCode", tsCodes, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("getStockSwIndustryInfo", "tsCode", tsCodes, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -222,7 +239,7 @@ public class MarketDataTools {
         return getStockSwIndustryInfoSingle(single);
     }
 
-    private String getStockSwIndustryInfoSingle(String tsCode) {
+    private PromptText getStockSwIndustryInfoSingle(String tsCode) {
         String normalizedTsCode = nvl(tsCode).trim();
         try {
             List<SwIndustryMember> members = swIndustryMemberDao.getByTsCode(normalizedTsCode);
@@ -240,13 +257,14 @@ public class MarketDataTools {
                 row.put("is_new", member.getIsNew());
                 items.add(row);
             }
-            return ok("getStockSwIndustryInfo", Map.of(
+            return okPrompt("getStockSwIndustryInfo", Map.of(
                     "ts_code", normalizedTsCode,
                     "count", items.size(),
                     "items", items
             ));
         } catch (Exception e) {
-            return fail("getStockSwIndustryInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getStockSwIndustryInfo", "TOOL_ERROR", policy("marketIndustryQueryFailure"),
                     Map.of("ts_code", normalizedTsCode, "message", nvl(e.getMessage())));
         }
     }
@@ -260,16 +278,20 @@ public class MarketDataTools {
      */
     @Tool
     public String getStockDaily(String tsCode, String startDateStr, String endDateStr, String includeColumns) {
+        return getStockDailyPrompt(tsCode, startDateStr, endDateStr, includeColumns).text();
+    }
+
+    public PromptText getStockDailyPrompt(String tsCode, String startDateStr, String endDateStr, String includeColumns) {
         int maxItems = resolveMaxParallelDailyQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
-        String limitError = batchLimitFailureIfExceeded("getStockDaily", "tsCode", tsCodes, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("getStockDaily", "tsCode", tsCodes, maxItems);
         if (limitError != null) {
             return limitError;
         }
         List<String> optionalColumns = parseOptionalColumns(includeColumns, STOCK_DAILY_OPTIONAL_COLUMNS);
         if (optionalColumns == null) {
-            return fail("getStockDaily", "INVALID_ARGUMENT",
-                    "includeColumns 只接受 adj_factor / valuation / share_turnover，多个用逗号分隔；留空则只返回基础行情列。",
+            return failPrompt("getStockDaily", "INVALID_ARGUMENT",
+                    policy("marketStockOptionalColumnsAdvice"),
                     Map.of("includeColumns", nvl(includeColumns), "allowed", STOCK_DAILY_OPTIONAL_COLUMNS));
         }
         if (tsCodes.size() > 1) {
@@ -296,14 +318,14 @@ public class MarketDataTools {
         return allowed.stream().filter(requested::contains).toList();
     }
 
-    private String getStockDailySingle(String tsCode, String startDateStr, String endDateStr, List<String> optionalColumns) {
+    private PromptText getStockDailySingle(String tsCode, String startDateStr, String endDateStr, List<String> optionalColumns) {
         String normalizedTsCode = nvl(tsCode).trim();
         String normalizedStart = compactDate(startDateStr);
         String normalizedEnd = compactDate(endDateStr);
         long startDate = convertToMsTimestamp(normalizedStart);
         long endDate = convertToMsTimestamp(normalizedEnd);
         if (startDate <= 0 || endDate <= 0) {
-            return fail("getStockDaily", "INVALID_ARGUMENT", "Invalid date range, please use YYYYMMDD format (Asia/Shanghai).", Map.of(
+            return failPrompt("getStockDaily", "INVALID_ARGUMENT", policy("marketDateFormatAdvice"), Map.of(
                     "ts_code", normalizedTsCode,
                     "start_date", normalizedStart,
                     "end_date", normalizedEnd
@@ -315,22 +337,27 @@ public class MarketDataTools {
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable("stock_daily", normalizedTsCode, normalizedStart, normalizedEnd, headers)
-                        .map(meta -> ok("getStockDaily", datasetDataFromMeta(
+                        .map(meta -> okPrompt("getStockDaily", datasetDataFromMeta(
                                 normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
                         .orElseGet(() -> fetchStockDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers, optionalColumns));
             }
             return fetchStockDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers, optionalColumns);
         } catch (Exception e) {
-            return fail("getStockDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getStockDaily", "TOOL_ERROR", policy("marketQueryFailure"),
                     Map.of("message", nvl(e.getMessage())));
         }
     }
 
     @Tool
     public String searchStock(String keyword) {
+        return searchStockPrompt(keyword).text();
+    }
+
+    public PromptText searchStockPrompt(String keyword) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
-        String limitError = batchLimitFailureIfExceeded("searchStock", "keyword", queries, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("searchStock", "keyword", queries, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -341,14 +368,14 @@ public class MarketDataTools {
         return searchStockSingle(single);
     }
 
-    private String searchStockSingle(String keyword) {
+    private PromptText searchStockSingle(String keyword) {
         try {
             DomesticStockSearchRequest request = DomesticStockSearchRequest.newBuilder()
                     .setQuery(nvl(keyword))
                     .build();
             DomesticStockSearchResponse response = domesticStockService.searchStock(request);
             if (response.getItemsCount() <= 0) {
-                return fail("searchStock", "NO_DATA", "No stocks found for keyword", Map.of("keyword", nvl(keyword)));
+                return failPrompt("searchStock", "NO_DATA", "No stocks found for keyword", Map.of("keyword", nvl(keyword)));
             }
             List<Map<String, Object>> items = new ArrayList<>();
             response.getItemsList().stream().limit(20).forEach(item -> {
@@ -358,21 +385,26 @@ public class MarketDataTools {
                 row.put("industry", item.getIndustry());
                 items.add(row);
             });
-            return ok("searchStock", Map.of(
+            return okPrompt("searchStock", Map.of(
                     "query", nvl(keyword),
                     "count", response.getItemsCount(),
                     "items", items
             ));
         } catch (Exception e) {
-            return fail("searchStock", "TOOL_ERROR", "Error searching stock", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("searchStock", "TOOL_ERROR", "Error searching stock", Map.of("message", nvl(e.getMessage())));
         }
     }
 
     @Tool
     public String searchFund(String keyword) {
+        return searchFundPrompt(keyword).text();
+    }
+
+    public PromptText searchFundPrompt(String keyword) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
-        String limitError = batchLimitFailureIfExceeded("searchFund", "keyword", queries, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("searchFund", "keyword", queries, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -383,14 +415,14 @@ public class MarketDataTools {
         return searchFundSingle(single);
     }
 
-    private String searchFundSingle(String keyword) {
+    private PromptText searchFundSingle(String keyword) {
         try {
             DomesticFundSearchRequest request = DomesticFundSearchRequest.newBuilder()
                     .setQuery(nvl(keyword))
                     .build();
             DomesticFundSearchResponse response = domesticFundService.searchDomesticFundInfo(request);
             if (response.getItemsCount() <= 0) {
-                return fail("searchFund", "NO_DATA", "No funds found for keyword", Map.of("keyword", nvl(keyword)));
+                return failPrompt("searchFund", "NO_DATA", "No funds found for keyword", Map.of("keyword", nvl(keyword)));
             }
             List<Map<String, Object>> items = new ArrayList<>();
             response.getItemsList().stream().limit(20).forEach(item -> {
@@ -399,21 +431,26 @@ public class MarketDataTools {
                 row.put("name", item.getName());
                 items.add(row);
             });
-            return ok("searchFund", Map.of(
+            return okPrompt("searchFund", Map.of(
                     "query", nvl(keyword),
                     "count", response.getItemsCount(),
                     "items", items
             ));
         } catch (Exception e) {
-            return fail("searchFund", "TOOL_ERROR", "Error searching fund", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("searchFund", "TOOL_ERROR", "Error searching fund", Map.of("message", nvl(e.getMessage())));
         }
     }
 
     @Tool
     public String getIndexInfo(String tsCode) {
+        return getIndexInfoPrompt(tsCode).text();
+    }
+
+    public PromptText getIndexInfoPrompt(String tsCode) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
-        String limitError = batchLimitFailureIfExceeded("getIndexInfo", "tsCode", tsCodes, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("getIndexInfo", "tsCode", tsCodes, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -424,23 +461,24 @@ public class MarketDataTools {
         return getIndexInfoSingle(single);
     }
 
-    private String getIndexInfoSingle(String tsCode) {
+    private PromptText getIndexInfoSingle(String tsCode) {
         try {
             DomesticIndexInfoByTsCodeRequest request = DomesticIndexInfoByTsCodeRequest.newBuilder()
                     .setTsCode(nvl(tsCode))
                     .build();
             DomesticIndexInfoByTsCodeResponse response = domesticIndexService.getDomesticIndexInfoByTsCode(request);
             if (!response.hasItem()) {
-                return fail("getIndexInfo", "ASSET_NOT_FOUND",
-                        "资产 " + nvl(tsCode) + " 不存在，请检查代码是否正确或更换查询标的。",
+                return failPrompt("getIndexInfo", "ASSET_NOT_FOUND",
+                        policy("marketAssetNotFound", Map.of("tsCode", nvl(tsCode))),
                         Map.of("ts_code", nvl(tsCode)));
             }
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("ts_code", nvl(tsCode));
             putReadableProtoItem(data, response.getItem());
-            return ok("getIndexInfo", data);
+            return okPrompt("getIndexInfo", data);
         } catch (Exception e) {
-            return fail("getIndexInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getIndexInfo", "TOOL_ERROR", policy("marketQueryFailure"),
                     Map.of("message", nvl(e.getMessage())));
         }
     }
@@ -453,16 +491,20 @@ public class MarketDataTools {
      */
     @Tool
     public String getIndexDaily(String tsCode, String startDateStr, String endDateStr, String includeColumns) {
+        return getIndexDailyPrompt(tsCode, startDateStr, endDateStr, includeColumns).text();
+    }
+
+    public PromptText getIndexDailyPrompt(String tsCode, String startDateStr, String endDateStr, String includeColumns) {
         int maxItems = resolveMaxParallelDailyQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
-        String limitError = batchLimitFailureIfExceeded("getIndexDaily", "tsCode", tsCodes, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("getIndexDaily", "tsCode", tsCodes, maxItems);
         if (limitError != null) {
             return limitError;
         }
         List<String> optionalColumns = parseOptionalColumns(includeColumns, INDEX_DAILY_OPTIONAL_COLUMNS);
         if (optionalColumns == null) {
-            return fail("getIndexDaily", "INVALID_ARGUMENT",
-                    "includeColumns 只接受 pe_ttm / pb，多个用逗号分隔；留空则只返回基础行情列。",
+            return failPrompt("getIndexDaily", "INVALID_ARGUMENT",
+                    policy("marketIndexOptionalColumnsAdvice"),
                     Map.of("includeColumns", nvl(includeColumns), "allowed", INDEX_DAILY_OPTIONAL_COLUMNS));
         }
         if (tsCodes.size() > 1) {
@@ -472,14 +514,14 @@ public class MarketDataTools {
         return getIndexDailySingle(singleTsCode, startDateStr, endDateStr, optionalColumns);
     }
 
-    private String getIndexDailySingle(String tsCode, String startDateStr, String endDateStr, List<String> optionalColumns) {
+    private PromptText getIndexDailySingle(String tsCode, String startDateStr, String endDateStr, List<String> optionalColumns) {
         String normalizedTsCode = nvl(tsCode).trim();
         String normalizedStart = compactDate(startDateStr);
         String normalizedEnd = compactDate(endDateStr);
         long startDate = convertToMsTimestamp(normalizedStart);
         long endDate = convertToMsTimestamp(normalizedEnd);
         if (startDate <= 0 || endDate <= 0) {
-            return fail("getIndexDaily", "INVALID_ARGUMENT", "Invalid date range, please use YYYYMMDD format (Asia/Shanghai).", Map.of(
+            return failPrompt("getIndexDaily", "INVALID_ARGUMENT", policy("marketDateFormatAdvice"), Map.of(
                     "ts_code", normalizedTsCode,
                     "start_date", normalizedStart,
                     "end_date", normalizedEnd
@@ -491,25 +533,30 @@ public class MarketDataTools {
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable("index_daily", normalizedTsCode, normalizedStart, normalizedEnd, headers)
-                        .map(meta -> ok("getIndexDaily", datasetDataFromMeta(
+                        .map(meta -> okPrompt("getIndexDaily", datasetDataFromMeta(
                                 normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
                         .orElseGet(() -> fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers, optionalColumns));
             }
             return fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers, optionalColumns);
         } catch (Exception e) {
-            return fail("getIndexDaily", "TOOL_ERROR", "Error fetching index daily data", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getIndexDaily", "TOOL_ERROR", "Error fetching index daily data", Map.of("message", nvl(e.getMessage())));
         }
     }
 
     @Tool
     public String searchIndex(String keyword, String mode, String advancedQuery) {
+        return searchIndexPrompt(keyword, mode, advancedQuery).text();
+    }
+
+    public PromptText searchIndexPrompt(String keyword, String mode, String advancedQuery) {
         if (isAdvancedMode(mode)) {
             Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
-            return searchIndexAdvanced(params);
+            return searchIndexAdvancedPrompt(params);
         }
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
-        String limitError = batchLimitFailureIfExceeded("searchIndex", "keyword", queries, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("searchIndex", "keyword", queries, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -520,14 +567,14 @@ public class MarketDataTools {
         return searchIndexSingle(single);
     }
 
-    private String searchIndexSingle(String keyword) {
+    private PromptText searchIndexSingle(String keyword) {
         try {
             DomesticIndexSearchRequest request = DomesticIndexSearchRequest.newBuilder()
                     .setQuery(nvl(keyword))
                     .build();
             DomesticIndexSearchResponse response = domesticIndexService.searchDomesticIndex(request);
             if (response.getItemsCount() <= 0) {
-                return fail("searchIndex", "NO_DATA", "No index found for keyword", Map.of("keyword", nvl(keyword)));
+                return failPrompt("searchIndex", "NO_DATA", "No index found for keyword", Map.of("keyword", nvl(keyword)));
             }
             List<Map<String, Object>> items = new ArrayList<>();
             response.getItemsList().stream().limit(20).forEach(item -> {
@@ -539,18 +586,23 @@ public class MarketDataTools {
                 row.put("has_daily", item.getHasDaily());
                 items.add(row);
             });
-            return ok("searchIndex", Map.of(
+            return okPrompt("searchIndex", Map.of(
                     "query", nvl(keyword),
                     "count", response.getItemsCount(),
                     "returned", items.size(),
                     "items", items
             ));
         } catch (Exception e) {
-            return fail("searchIndex", "TOOL_ERROR", "Error searching index", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("searchIndex", "TOOL_ERROR", "Error searching index", Map.of("message", nvl(e.getMessage())));
         }
     }
 
     public String searchIndexAdvanced(Map<String, Object> params) {
+        return searchIndexAdvancedPrompt(params).text();
+    }
+
+    public PromptText searchIndexAdvancedPrompt(Map<String, Object> params) {
         return executeAdvancedSearch("searchIndex", params);
     }
 
@@ -562,19 +614,23 @@ public class MarketDataTools {
      */
     @Tool
     public String searchAssetInfo(String query, String assetTypes, String marketScope, String mode, String advancedQuery) {
+        return searchAssetInfoPrompt(query, assetTypes, marketScope, mode, advancedQuery).text();
+    }
+
+    public PromptText searchAssetInfoPrompt(String query, String assetTypes, String marketScope, String mode, String advancedQuery) {
         if (isAdvancedMode(mode)) {
             Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
-            return searchAssetInfoAdvanced(params);
+            return searchAssetInfoAdvancedPrompt(params);
         }
         String scope = nvl(marketScope).trim();
         if (!scope.isBlank() && !"domestic".equalsIgnoreCase(scope)) {
-            return fail("searchAssetInfo", "INVALID_ARGUMENT", "Only marketScope=domestic is supported in v1",
+            return failPrompt("searchAssetInfo", "INVALID_ARGUMENT", "Only marketScope=domestic is supported in v1",
                     Map.of("marketScope", scope));
         }
         LinkedHashSet<String> types = parseAssetTypes(assetTypes);
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(query);
-        String limitError = batchLimitFailureIfExceeded("searchAssetInfo", "query", queries, maxItems);
+        PromptText limitError = batchLimitFailureIfExceededPrompt("searchAssetInfo", "query", queries, maxItems);
         if (limitError != null) {
             return limitError;
         }
@@ -586,18 +642,23 @@ public class MarketDataTools {
     }
 
     public String searchAssetInfoAdvanced(Map<String, Object> params) {
+        return searchAssetInfoAdvancedPrompt(params).text();
+    }
+
+    public PromptText searchAssetInfoAdvancedPrompt(Map<String, Object> params) {
         return executeAdvancedSearch("searchAssetInfo", params);
     }
 
-    private String searchAssetInfoSingle(String query, LinkedHashSet<String> types) {
+    private PromptText searchAssetInfoSingle(String query, LinkedHashSet<String> types) {
         List<Map<String, Object>> items = new ArrayList<>();
         List<Map<String, Object>> partialErrors = new ArrayList<>();
+        List<PromptVersionSource> retainedSources = new ArrayList<>();
         for (String type : types) {
             switch (type) {
-                case "stock" -> mergeSearchItems(items, partialErrors, query, "stock", searchStockSingle(query));
-                case "index" -> mergeSearchItems(items, partialErrors, query, "index", searchIndexSingle(query));
-                case "off_exchange_fund" -> mergeSearchItems(items, partialErrors, query, "off_exchange_fund", searchFundSingle(query));
-                case "etf" -> mergeSearchItems(items, partialErrors, query, "etf", searchListedAssetEtfSingle(query));
+                case "stock" -> mergeSearchItems(items, partialErrors, retainedSources, query, "stock", searchStockSingle(query));
+                case "index" -> mergeSearchItems(items, partialErrors, retainedSources, query, "index", searchIndexSingle(query));
+                case "off_exchange_fund" -> mergeSearchItems(items, partialErrors, retainedSources, query, "off_exchange_fund", searchFundSingle(query));
+                case "etf" -> mergeSearchItems(items, partialErrors, retainedSources, query, "etf", searchListedAssetEtfSingle(query));
                 default -> partialErrors.add(Map.of(
                         "asset_type", type,
                         "code", "INVALID_ARGUMENT",
@@ -613,7 +674,7 @@ public class MarketDataTools {
             }
         }
         if (items.isEmpty()) {
-            return fail("searchAssetInfo", "NO_DATA", "No assets found for query", Map.of(
+            return failPrompt("searchAssetInfo", "NO_DATA", "No assets found for query", Map.of(
                     "query", nvl(query),
                     "asset_types", new ArrayList<>(types)
             ));
@@ -627,7 +688,10 @@ public class MarketDataTools {
         if (!partialErrors.isEmpty()) {
             data.put("partial_errors", partialErrors);
         }
-        return ok("searchAssetInfo", data);
+        PromptText result = okPrompt("searchAssetInfo", data);
+        List<PromptVersionSource> sources = new ArrayList<>(result.sources());
+        sources.addAll(retainedSources);
+        return new PromptText(result.text(), List.copyOf(new LinkedHashSet<>(sources)));
     }
 
     @Tool
@@ -642,24 +706,28 @@ public class MarketDataTools {
      * </ul>
      */
     public String getExchangeAssetDaily(String tsCode, String assetType, String startDate, String endDate, String priceMode, String mode, String advancedQuery) {
+        return getExchangeAssetDailyPrompt(tsCode, assetType, startDate, endDate, priceMode, mode, advancedQuery).text();
+    }
+
+    public PromptText getExchangeAssetDailyPrompt(String tsCode, String assetType, String startDate, String endDate, String priceMode, String mode, String advancedQuery) {
         if (isAdvancedMode(mode)) {
             Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
-            return getExchangeAssetDailyAdvanced(params, assetType, startDate, endDate, priceMode);
+            return getExchangeAssetDailyAdvancedPrompt(params, assetType, startDate, endDate, priceMode);
         }
         String type = normalizeAssetType(assetType);
         if (type.isBlank()) {
-            return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "assetType is required: stock|etf|index",
+            return failPrompt("getExchangeAssetDaily", "INVALID_ARGUMENT", "assetType is required: stock|etf|index",
                     Map.of("assetType", nvl(assetType)));
         }
         String priceModeValue = nvl(priceMode).trim().toLowerCase();
         if (!priceModeValue.isBlank() && !"raw_ohlc".equals(priceModeValue)) {
-            return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
+            return failPrompt("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
                     Map.of("priceMode", nvl(priceMode)));
         }
         if ("etf".equals(type)) {
             int maxItems = resolveMaxParallelDailyQueries();
             List<String> tsCodes = parseBatchValues(tsCode);
-            String limitError = batchLimitFailureIfExceeded("getExchangeAssetDaily", "tsCode", tsCodes, maxItems);
+            PromptText limitError = batchLimitFailureIfExceededPrompt("getExchangeAssetDaily", "tsCode", tsCodes, maxItems);
             if (limitError != null) {
                 return limitError;
             }
@@ -670,12 +738,12 @@ public class MarketDataTools {
             return fetchListedAssetDailySingle(singleTsCode, startDate, endDate, "etf", "getExchangeAssetDaily");
         }
         if ("stock".equals(type)) {
-            return getStockDaily(tsCode, startDate, endDate, null);
+            return getStockDailyPrompt(tsCode, startDate, endDate, null);
         }
         if ("index".equals(type)) {
-            return getIndexDaily(tsCode, startDate, endDate, null);
+            return getIndexDailyPrompt(tsCode, startDate, endDate, null);
         }
-        return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Unsupported assetType: " + type,
+        return failPrompt("getExchangeAssetDaily", "INVALID_ARGUMENT", "Unsupported assetType: " + type,
                 Map.of("assetType", type));
     }
 
@@ -699,9 +767,17 @@ public class MarketDataTools {
                                                  String startDate,
                                                  String endDate,
                                                  String priceMode) {
+        return getExchangeAssetDailyAdvancedPrompt(advancedPayload, assetType, startDate, endDate, priceMode).text();
+    }
+
+    public PromptText getExchangeAssetDailyAdvancedPrompt(Map<String, Object> advancedPayload,
+                                                 String assetType,
+                                                 String startDate,
+                                                 String endDate,
+                                                 String priceMode) {
         String mode = nvl(priceMode).trim().toLowerCase();
         if (!mode.isBlank() && !"raw_ohlc".equals(mode)) {
-            return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
+            return failPrompt("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
                     Map.of("priceMode", nvl(priceMode)));
         }
         try {
@@ -734,15 +810,15 @@ public class MarketDataTools {
             List<String> stockCodes = engine.resolveStockCodes(request, maxCodes);
             List<String> upstreamErrors = engine.getUpstreamErrors();
             if (!upstreamErrors.isEmpty()) {
-                return fail("getExchangeAssetDaily", "UPSTREAM_ERROR", String.join("; ", upstreamErrors), Map.of());
+                return failPrompt("getExchangeAssetDaily", "UPSTREAM_ERROR", String.join("; ", upstreamErrors), Map.of());
             }
             if (stockCodes.isEmpty()) {
-                return fail("getExchangeAssetDaily", "NO_DATA", "No constituent stocks matched the advanced conditions",
+                return failPrompt("getExchangeAssetDaily", "NO_DATA", "No constituent stocks matched the advanced conditions",
                         Map.of("conditions", request.getCanonicalQuery().get("conditions")));
             }
             int maxConstituents = resolveMaxAdvancedDailyConstituentStocks();
             if (stockCodes.size() > maxConstituents) {
-                return fail("getExchangeAssetDaily", "BATCH_LIMIT_EXCEEDED",
+                return failPrompt("getExchangeAssetDaily", "BATCH_LIMIT_EXCEEDED",
                         "Matched constituent stock count exceeds advanced daily limit: " + maxConstituents,
                         Map.of("matched_stock_count", stockCodes.size(), "limit", maxConstituents));
             }
@@ -750,19 +826,19 @@ public class MarketDataTools {
             String normalizedStart = compactDate(startDate);
             String normalizedEnd = compactDate(endDate);
             if (convertToMsTimestamp(normalizedStart) <= 0 || convertToMsTimestamp(normalizedEnd) <= 0) {
-                return fail("getExchangeAssetDaily", "INVALID_ARGUMENT",
-                        "Invalid daily date range, please use YYYYMMDD format (Asia/Shanghai).",
+                return failPrompt("getExchangeAssetDaily", "INVALID_ARGUMENT",
+                        policy("marketAdvancedDateFormatAdvice"),
                         Map.of("start_date", normalizedStart, "end_date", normalizedEnd));
             }
 
             AdvancedDailyFetchResult fetchResult = fetchStockDailyForCodes(
                     stockCodes, normalizedStart, normalizedEnd);
             if (!fetchResult.errors().isEmpty()) {
-                return fail("getExchangeAssetDaily", "UPSTREAM_ERROR",
+                return failPrompt("getExchangeAssetDaily", "UPSTREAM_ERROR",
                         String.join("; ", fetchResult.errors()), Map.of("matched_stocks", stockCodes));
             }
             if (fetchResult.items().isEmpty()) {
-                return fail("getExchangeAssetDaily", "NO_DATA",
+                return failPrompt("getExchangeAssetDaily", "NO_DATA",
                         "No daily data returned for matched constituent stocks",
                         Map.of("matched_stocks", stockCodes));
             }
@@ -781,11 +857,12 @@ public class MarketDataTools {
             data.put("start_date", normalizedStart);
             data.put("end_date", normalizedEnd);
             data.put("conditions_meta", request.getCanonicalQuery().get("conditions"));
-            return ok("getExchangeAssetDaily", data);
+            return okPrompt("getExchangeAssetDaily", data);
         } catch (AdvancedSearchException e) {
-            return fail("getExchangeAssetDaily", e.getCode(), e.getMessage(), Map.of());
+            return failPrompt("getExchangeAssetDaily", e.getCode(), e.getMessage(), Map.of());
         } catch (Exception e) {
-            return fail("getExchangeAssetDaily", "TOOL_ERROR", "Error executing advanced daily fetch",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getExchangeAssetDaily", "TOOL_ERROR", "Error executing advanced daily fetch",
                     Map.of("message", nvl(e.getMessage())));
         }
     }
@@ -836,6 +913,10 @@ public class MarketDataTools {
      * 若本工具不可用，LLM 应当退化为单条查询（one item at a time）。</p>
      */
     public String checkParallelLimits() {
+        return checkParallelLimitsPrompt().text();
+    }
+
+    public PromptText checkParallelLimitsPrompt() {
         Map<String, Object> search = new LinkedHashMap<>();
         search.put("maxItems", resolveMaxParallelSearchQueries());
         search.put("tools", List.of(
@@ -847,7 +928,7 @@ public class MarketDataTools {
                 "getIndexInfo",
                 "getStockSwIndustryInfo"
         ));
-        search.put("argumentFormat", "Use | separated values or JSON arrays. Do not use comma-separated values.");
+        search.put("argumentFormat", policy("marketParallelSearchArgumentFormat"));
 
         Map<String, Object> daily = new LinkedHashMap<>();
         daily.put("maxItems", resolveMaxParallelDailyQueries());
@@ -856,14 +937,14 @@ public class MarketDataTools {
                 "getStockDaily",
                 "getIndexDaily"
         ));
-        daily.put("argumentFormat", "Use | separated tsCode values or JSON arrays. Do not use comma-separated values.");
+        daily.put("argumentFormat", policy("marketParallelDailyArgumentFormat"));
 
         Map<String, Object> calendar = new LinkedHashMap<>();
         calendar.put("maxItems", resolveMaxParallelCalendarQueries());
         calendar.put("tools", List.of(
                 "isTradingDay"
         ));
-        calendar.put("argumentFormat", "Use | separated YYYYMMDD values or JSON arrays. Do not use comma-separated values.");
+        calendar.put("argumentFormat", policy("marketParallelCalendarArgumentFormat"));
 
         Map<String, Object> advanced = new LinkedHashMap<>();
         advanced.put("maxItems", resolveMaxParallelQueriesInAdvancedMode());
@@ -873,16 +954,16 @@ public class MarketDataTools {
                 "searchAssetInfo(mode=advanced)",
                 "getExchangeAssetDaily(mode=advanced)"
         ));
-        advanced.put("argumentFormat", "conditions use | separated index_code/stock_code/industry_code values. Dates must be YYYYMMDD or NONE. getExchangeAssetDaily advanced only supports stock asset_type.");
+        advanced.put("argumentFormat", policy("marketParallelAdvancedArgumentFormat"));
 
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("search", search);
         data.put("daily", daily);
         data.put("calendar", calendar);
         data.put("advanced", advanced);
-        data.put("fallbackRule", "If checkParallelLimits is unavailable, assume batch/parallel querying is disabled and call tools with one item at a time.");
+        data.put("fallbackRule", policy("marketParallelFallbackRule"));
         data.put("source", "agent.llm.runtime.parallel from hot-loaded local config first, then application properties");
-        return ok("checkParallelLimits", data);
+        return okPrompt("checkParallelLimits", data);
     }
 
     /**
@@ -916,7 +997,7 @@ public class MarketDataTools {
      * <p>被 {@link #searchAssetInfoSingle} 在 assetTypes 包含 etf 时调用，
      * 与 searchStock / searchIndex 等单条搜索方法保持相同返回结构。</p>
      */
-    private String searchListedAssetEtfSingle(String query) {
+    private PromptText searchListedAssetEtfSingle(String query) {
         try {
             ListedAssetSearchRequest request = ListedAssetSearchRequest.newBuilder()
                     .setQuery(nvl(query))
@@ -926,18 +1007,19 @@ public class MarketDataTools {
                     .build();
             ListedAssetSearchResponse response = domesticListedAssetService.searchListedAssets(request);
             if (response.getItemsCount() <= 0) {
-                return fail("searchAssetInfo", "NO_DATA", "No ETF found for keyword", Map.of("keyword", nvl(query)));
+                return failPrompt("searchAssetInfo", "NO_DATA", "No ETF found for keyword", Map.of("keyword", nvl(query)));
             }
             List<Map<String, Object>> items = new ArrayList<>();
             response.getItemsList().stream().limit(20).forEach(item -> items.add(listedAssetInfoToRow(item)));
-            return ok("searchAssetInfo", Map.of(
+            return okPrompt("searchAssetInfo", Map.of(
                     "query", nvl(query),
                     "count", response.getItemsCount(),
                     "returned", items.size(),
                     "items", items
             ));
         } catch (Exception e) {
-            return fail("searchAssetInfo", "TOOL_ERROR", "Error searching ETF via DomesticListedAssetService",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("searchAssetInfo", "TOOL_ERROR", "Error searching ETF via DomesticListedAssetService",
                     Map.of("message", nvl(e.getMessage())));
         }
     }
@@ -952,24 +1034,25 @@ public class MarketDataTools {
      * batchGetDaily 针对股票/指数，走 domesticStockService / domesticIndexService；
      * 而 ETF 属于「场内资产」，走 domesticListedAssetService，统一入口为 {@link #fetchListedAssetDailySingle}。</p>
      */
-    private String batchGetListedAssetDaily(String toolName,
+    private PromptText batchGetListedAssetDaily(String toolName,
                                             List<String> tsCodes,
                                             String startDateStr,
                                             String endDateStr) {
-        List<CompletableFuture<Map<String, Object>>> futures = tsCodes.stream()
+        List<CompletableFuture<ResultRow>> futures = tsCodes.stream()
                 .map(code -> supplyAsyncWithAgentContext(() -> {
-                    String response = fetchListedAssetDailySingle(code, startDateStr, endDateStr, "etf", toolName);
+                    PromptText response = fetchListedAssetDailySingle(code, startDateStr, endDateStr, "etf", toolName);
                     Map<String, Object> payload = readJsonMap(response);
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("ts_code", code);
                     row.put("ok", Boolean.TRUE.equals(payload.get("ok")));
                     row.put("data", readNestedMap(payload.get("data")));
                     row.put("error", readNestedMap(payload.get("error")));
-                    return row;
+                    return new ResultRow(row, response.sources());
                 }))
                 .toList();
 
-        List<Map<String, Object>> results = futures.stream().map(CompletableFuture::join).toList();
+        List<ResultRow> completed = futures.stream().map(CompletableFuture::join).toList();
+        List<Map<String, Object>> results = completed.stream().map(ResultRow::row).toList();
         long successCount = results.stream().filter(it -> Boolean.TRUE.equals(it.get("ok"))).count();
         String normalizedStart = compactDate(startDateStr);
         String normalizedEnd = compactDate(endDateStr);
@@ -984,10 +1067,10 @@ public class MarketDataTools {
         data.put("success_count", successCount);
         data.put("failure_count", Math.max(0, results.size() - successCount));
         attachManifestIfEnabled("etf_daily", normalizedStart, normalizedEnd, tsCodes, DAILY_DATASET_HEADERS, results, data);
-        return ok(toolName, data);
+        return withRowSources(okPrompt(toolName, data), completed);
     }
 
-    private String fetchListedAssetDailySingle(String tsCode,
+    private PromptText fetchListedAssetDailySingle(String tsCode,
                                                String startDateStr,
                                                String endDateStr,
                                                String assetType,
@@ -998,7 +1081,7 @@ public class MarketDataTools {
         long startDate = convertToMsTimestamp(normalizedStart);
         long endDate = convertToMsTimestamp(normalizedEnd);
         if (startDate <= 0 || endDate <= 0) {
-            return fail(toolName, "INVALID_ARGUMENT", "Invalid date range, please use YYYYMMDD format (Asia/Shanghai).", Map.of(
+            return failPrompt(toolName, "INVALID_ARGUMENT", policy("marketDateFormatAdvice"), Map.of(
                     "ts_code", normalizedTsCode,
                     "start_date", normalizedStart,
                     "end_date", normalizedEnd
@@ -1010,7 +1093,7 @@ public class MarketDataTools {
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable(datasetKind, normalizedTsCode, normalizedStart, normalizedEnd, headers)
-                        .map(meta -> ok(toolName, datasetDataFromMeta(
+                        .map(meta -> okPrompt(toolName, datasetDataFromMeta(
                                 normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
                         .orElseGet(() -> fetchListedAssetDailyFromService(
                                 normalizedTsCode, normalizedStart, normalizedEnd, assetType, toolName, headers, datasetKind));
@@ -1018,11 +1101,12 @@ public class MarketDataTools {
             return fetchListedAssetDailyFromService(
                     normalizedTsCode, normalizedStart, normalizedEnd, assetType, toolName, headers, datasetKind);
         } catch (Exception e) {
-            return fail(toolName, "TOOL_ERROR", "Error fetching listed asset daily data", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt(toolName, "TOOL_ERROR", "Error fetching listed asset daily data", Map.of("message", nvl(e.getMessage())));
         }
     }
 
-    private String fetchListedAssetDailyFromService(String tsCode,
+    private PromptText fetchListedAssetDailyFromService(String tsCode,
                                                     String startDateStr,
                                                     String endDateStr,
                                                     String assetType,
@@ -1039,7 +1123,7 @@ public class MarketDataTools {
                     .build();
             ListedAssetDailyResponse response = domesticListedAssetService.getListedAssetDaily(request);
             if (response.getItemsCount() <= 0) {
-                return fail(toolName, "NO_DATA", "No daily listed asset data found", Map.of(
+                return failPrompt(toolName, "NO_DATA", "No daily listed asset data found", Map.of(
                         "ts_code", tsCode,
                         "asset_type", assetType,
                         "start_date", startDateStr,
@@ -1059,6 +1143,7 @@ public class MarketDataTools {
                     ListedAssetAdjFactorResponse adjResponse = domesticListedAssetService.getListedAssetAdjFactors(adjRequest);
                     adjResponse.getItemsList().forEach(item -> adjFactorMap.put(item.getTradeDate(), item.getAdjFactor()));
                 } catch (Exception e) {
+                    ModelSendBlocks.rethrowIfBlocked(e);
                     log.warn("Adj factor fetch failed for {}, continuing without: {}", tsCode, e.getMessage());
                 }
             }
@@ -1089,7 +1174,7 @@ public class MarketDataTools {
                 if (datasetRegistry.isEnabled()) {
                     datasetRegistry.registerDataset(datasetKind, tsCode, startDateStr, endDateStr, effectiveHeaders, datasetId, response.getItemsCount());
                 }
-                return ok(toolName, datasetData(
+                return okPrompt(toolName, datasetData(
                         tsCode,
                         startDateStr,
                         endDateStr,
@@ -1124,9 +1209,10 @@ public class MarketDataTools {
                     previewRows
             );
             data.put("asset_type", assetType);
-            return ok(toolName, data);
+            return okPrompt(toolName, data);
         } catch (Exception e) {
-            return fail(toolName, "TOOL_ERROR", "Error fetching listed asset daily data", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt(toolName, "TOOL_ERROR", "Error fetching listed asset daily data", Map.of("message", nvl(e.getMessage())));
         }
     }
 
@@ -1164,30 +1250,31 @@ public class MarketDataTools {
      * @param singleCall 单条查询的函数引用（如 {@code this::searchStockSingle}）
      * @return 批量结果的 JSON 字符串
      */
-    private String batchSearch(String toolName, List<String> queries, Function<String, String> singleCall) {
-        List<CompletableFuture<Map<String, Object>>> futures = queries.stream()
+    private PromptText batchSearch(String toolName, List<String> queries, Function<String, PromptText> singleCall) {
+        List<CompletableFuture<ResultRow>> futures = queries.stream()
                 .map(query -> supplyAsyncWithAgentContext(() -> {
-                    String response = singleCall.apply(query);
+                    PromptText response = singleCall.apply(query);
                     Map<String, Object> payload = readJsonMap(response);
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("query", query);
                     row.put("ok", Boolean.TRUE.equals(payload.get("ok")));
                     row.put("data", readNestedMap(payload.get("data")));
                     row.put("error", readNestedMap(payload.get("error")));
-                    return row;
+                    return new ResultRow(row, response.sources());
                 }))
                 .toList();
 
-        List<Map<String, Object>> results = futures.stream().map(CompletableFuture::join).toList();
+        List<ResultRow> completed = futures.stream().map(CompletableFuture::join).toList();
+        List<Map<String, Object>> results = completed.stream().map(ResultRow::row).toList();
         long successCount = results.stream().filter(it -> Boolean.TRUE.equals(it.get("ok"))).count();
 
-        return ok(toolName, Map.of(
+        return withRowSources(okPrompt(toolName, Map.of(
                 "mode", "batch",
                 "queries", queries,
                 "results", results,
                 "success_count", successCount,
                 "failure_count", Math.max(0, results.size() - successCount)
-        ));
+        )), completed);
     }
 
     /**
@@ -1195,15 +1282,15 @@ public class MarketDataTools {
      *
      * <p>与 {@link #batchSearch} 的区别：日报查询需要额外的日期范围参数，且按 ts_code 聚合而非 query。</p>
      */
-    private String batchGetDaily(String toolName,
+    private PromptText batchGetDaily(String toolName,
                                  List<String> tsCodes,
                                  String startDateStr,
                                  String endDateStr,
                                  boolean stock,
                                  List<String> optionalColumns) {
-        List<CompletableFuture<Map<String, Object>>> futures = tsCodes.stream()
+        List<CompletableFuture<ResultRow>> futures = tsCodes.stream()
                 .map(code -> supplyAsyncWithAgentContext(() -> {
-                    String response = stock
+                    PromptText response = stock
                             ? getStockDailySingle(code, startDateStr, endDateStr, optionalColumns)
                             : getIndexDailySingle(code, startDateStr, endDateStr, optionalColumns);
                     Map<String, Object> payload = readJsonMap(response);
@@ -1212,11 +1299,12 @@ public class MarketDataTools {
                     row.put("ok", Boolean.TRUE.equals(payload.get("ok")));
                     row.put("data", readNestedMap(payload.get("data")));
                     row.put("error", readNestedMap(payload.get("error")));
-                    return row;
+                    return new ResultRow(row, response.sources());
                 }))
                 .toList();
 
-        List<Map<String, Object>> results = futures.stream().map(CompletableFuture::join).toList();
+        List<ResultRow> completed = futures.stream().map(CompletableFuture::join).toList();
+        List<Map<String, Object>> results = completed.stream().map(ResultRow::row).toList();
         long successCount = results.stream().filter(it -> Boolean.TRUE.equals(it.get("ok"))).count();
         String normalizedStart = compactDate(startDateStr);
         String normalizedEnd = compactDate(endDateStr);
@@ -1233,7 +1321,7 @@ public class MarketDataTools {
         data.put("success_count", successCount);
         data.put("failure_count", Math.max(0, results.size() - successCount));
         attachManifestIfEnabled(dataType, normalizedStart, normalizedEnd, tsCodes, columns, results, data);
-        return ok(toolName, data);
+        return withRowSources(okPrompt(toolName, data), completed);
     }
 
     /**
@@ -1450,6 +1538,11 @@ public class MarketDataTools {
      * @return 若未超限返回 null；若超限返回 JSON 格式的错误响应字符串
      */
     String batchLimitFailureIfExceeded(String toolName, String argumentName, List<String> values, int maxItems) {
+        PromptText result = batchLimitFailureIfExceededPrompt(toolName, argumentName, values, maxItems);
+        return result == null ? null : result.text();
+    }
+
+    PromptText batchLimitFailureIfExceededPrompt(String toolName, String argumentName, List<String> values, int maxItems) {
         if (values == null || values.size() <= Math.max(1, maxItems)) {
             return null;
         }
@@ -1458,8 +1551,8 @@ public class MarketDataTools {
         details.put("actual_items", values.size());
         details.put("max_items", Math.max(1, maxItems));
         details.put("requested_values", values);
-        details.put("hint", "Call checkParallelLimits before batching, then split the request into batches no larger than max_items.");
-        return fail(toolName, "BATCH_LIMIT_EXCEEDED", "Batch size exceeds the current parallel limit.", details);
+        details.put("hint", policy("marketBatchLimitAdvice"));
+        return failPrompt(toolName, "BATCH_LIMIT_EXCEEDED", "Batch size exceeds the current parallel limit.", details);
     }
 
     /**
@@ -1629,7 +1722,7 @@ public class MarketDataTools {
         return Math.max(min, Math.min(max, value));
     }
 
-    private String executeAdvancedSearch(String toolName, Map<String, Object> params) {
+    private PromptText executeAdvancedSearch(String toolName, Map<String, Object> params) {
         try {
             AdvancedSearchRequest request = AdvancedSearchRequest.from(toolName, params, objectMapper);
             if ("searchIndex".equals(toolName) && request.getAssetType() != null && !request.getAssetType().isBlank()) {
@@ -1642,7 +1735,7 @@ public class MarketDataTools {
             if (upstreamError != null) {
                 Map<String, Object> details = new LinkedHashMap<>();
                 details.put("empty_reason", emptyReason == null ? "" : emptyReason);
-                return fail(toolName, "UPSTREAM_ERROR", upstreamError, details);
+                return failPrompt(toolName, "UPSTREAM_ERROR", upstreamError, details);
             }
             AdvancedSearchDatasetWriter writer = new AdvancedSearchDatasetWriter(datasetWriter, datasetRegistry, objectMapper);
             AdvancedSearchDatasetWriter.WriteResult writeResult = writer.writeOrReuse(
@@ -1668,11 +1761,12 @@ public class MarketDataTools {
             if (writeResult.getDatasetId() == null || writeResult.getDatasetId().isBlank()) {
                 data.put("dataset", dataset);
             }
-            return ok(toolName, data);
+            return okPrompt(toolName, data);
         } catch (AdvancedSearchException e) {
-            return fail(toolName, e.getCode(), e.getMessage(), Map.of());
+            return failPrompt(toolName, e.getCode(), e.getMessage(), Map.of());
         } catch (Exception e) {
-            return fail(toolName, "TOOL_ERROR", "Error executing advanced search", Map.of("message", nvl(e.getMessage())));
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt(toolName, "TOOL_ERROR", "Error executing advanced search", Map.of("message", nvl(e.getMessage())));
         }
     }
 
@@ -1690,6 +1784,7 @@ public class MarketDataTools {
                 Map<String, Object> queryMap = objectMapper.readValue(raw, new TypeReference<Map<String, Object>>() {});
                 params.put("advancedQuery", queryMap);
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 throw new AdvancedSearchException("INVALID_ARGUMENT", "advancedQuery JSON is invalid.");
             }
         } else if (!raw.isBlank()) {
@@ -1727,6 +1822,7 @@ public class MarketDataTools {
         try {
             return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             return Map.of();
         }
     }
@@ -1737,7 +1833,7 @@ public class MarketDataTools {
      * <p>先尝试 {@link DatasetRegistry} 复用已写入的 dataset，未命中再调用
      * domesticStockService。返回统一 {@code {ok,tool,data,error}} 结构。</p>
      */
-    private String fetchStockDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers, List<String> optionalColumns) {
+    private PromptText fetchStockDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers, List<String> optionalColumns) {
         try {
             long startDate = convertToMsTimestamp(startDateStr);
             long endDate = convertToMsTimestamp(endDateStr);
@@ -1750,12 +1846,12 @@ public class MarketDataTools {
             DomesticStockDailyByTsCodeAndDateRangeResponse response = domesticStockService.getStockDailyByTsCodeAndDateRange(request);
             if (response.getItemsCount() <= 0) {
                 if (!stockExists(tsCode)) {
-                    return fail("getStockDaily", "ASSET_NOT_FOUND",
-                            "资产 " + tsCode + " 不存在，请检查代码是否正确或更换查询标的。",
+                    return failPrompt("getStockDaily", "ASSET_NOT_FOUND",
+                            policy("marketAssetNotFound", Map.of("tsCode", nvl(tsCode))),
                             Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
                 }
-                return fail("getStockDaily", "TIME_SERIES_EMPTY",
-                        "该资产在指定日期范围内无日线记录，请考虑调整起止日期或更换资产。",
+                return failPrompt("getStockDaily", "TIME_SERIES_EMPTY",
+                        policy("marketNoDailyData"),
                         Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
             }
 
@@ -1773,7 +1869,7 @@ public class MarketDataTools {
                 if (datasetRegistry.isEnabled()) {
                     datasetRegistry.registerDataset("stock_daily", tsCode, startDateStr, endDateStr, headers, datasetId, response.getItemsCount());
                 }
-                return ok("getStockDaily", datasetData(
+                return okPrompt("getStockDaily", datasetData(
                         tsCode,
                         startDateStr,
                         endDateStr,
@@ -1801,7 +1897,7 @@ public class MarketDataTools {
                 }
                 previewRows.add(row);
             });
-            return ok("getStockDaily", datasetData(
+            return okPrompt("getStockDaily", datasetData(
                     tsCode,
                     startDateStr,
                     endDateStr,
@@ -1813,7 +1909,8 @@ public class MarketDataTools {
                     previewRows
             ));
         } catch (Exception e) {
-            return fail("getStockDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getStockDaily", "TOOL_ERROR", policy("marketQueryFailure"),
                     Map.of("message", nvl(e.getMessage())));
         }
     }
@@ -1841,7 +1938,7 @@ public class MarketDataTools {
      * <p>逻辑与 {@link #fetchStockDaily} 对称，只是底层 Dubbo 服务换为
      * domesticIndexService，dataset kind 为 {@code "index_daily"}。</p>
      */
-    private String fetchIndexDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers, List<String> optionalColumns) {
+    private PromptText fetchIndexDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers, List<String> optionalColumns) {
         try {
             long startDate = convertToMsTimestamp(startDateStr);
             long endDate = convertToMsTimestamp(endDateStr);
@@ -1854,12 +1951,12 @@ public class MarketDataTools {
             DomesticIndexDailyByTsCodeAndDateRangeResponse response = domesticIndexService.getDomesticIndexDailyByTsCodeAndDateRange(request);
             if (response.getItemsCount() <= 0) {
                 if (!indexExists(tsCode)) {
-                    return fail("getIndexDaily", "ASSET_NOT_FOUND",
-                            "资产 " + tsCode + " 不存在，请检查代码是否正确或更换查询标的。",
+                    return failPrompt("getIndexDaily", "ASSET_NOT_FOUND",
+                            policy("marketAssetNotFound", Map.of("tsCode", nvl(tsCode))),
                             Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
                 }
-                return fail("getIndexDaily", "TIME_SERIES_EMPTY",
-                        "该资产在指定日期范围内无日线记录，请考虑调整起止日期或更换资产。",
+                return failPrompt("getIndexDaily", "TIME_SERIES_EMPTY",
+                        policy("marketNoDailyData"),
                         Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
             }
 
@@ -1898,7 +1995,7 @@ public class MarketDataTools {
                         List.of()
                 );
                 attachIndexDailyMissingSummary(data, response.getItemsList());
-                return ok("getIndexDaily", data);
+                return okPrompt("getIndexDaily", data);
             }
 
             List<Map<String, Object>> previewRows = new ArrayList<>();
@@ -1927,9 +2024,10 @@ public class MarketDataTools {
                     previewRows
             );
             attachIndexDailyMissingSummary(data, response.getItemsList());
-            return ok("getIndexDaily", data);
+            return okPrompt("getIndexDaily", data);
         } catch (Exception e) {
-            return fail("getIndexDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return failPrompt("getIndexDaily", "TOOL_ERROR", policy("marketQueryFailure"),
                     Map.of("message", nvl(e.getMessage())));
         }
     }
@@ -1967,7 +2065,7 @@ public class MarketDataTools {
         if (hasMissing) {
             data.put("missing_fields_summary", missingCounts);
             data.put("data_quality_note",
-                    "本次工具调用落盘的数据存在部分字段缺失；Python 分析时请按缺失值处理，不要把空值当成 0。");
+                    policy("marketMissingValueAdvice"));
         }
     }
 
@@ -1978,6 +2076,7 @@ public class MarketDataTools {
                     .build();
             return domesticStockService.getStockInfoByTsCode(request).hasItem();
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             return false;
         }
     }
@@ -1989,6 +2088,7 @@ public class MarketDataTools {
                     .build();
             return domesticIndexService.getDomesticIndexInfoByTsCode(request).hasItem();
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             return false;
         }
     }
@@ -2119,11 +2219,82 @@ public class MarketDataTools {
     }
 
     /**
-     * 构造成功响应的 JSON 字符串。
+     * 构造成功响应的 JSON 正文，并保留其中实际政策的版本来源。
      *
      * <p>统一响应格式：{@code {ok: true, tool, data, error: null}}。
      * 所有工具方法无论成功或失败都返回同一结构，便于 LangchainTodoNodeExecutor 统一解析。</p>
      */
+    PromptText okPrompt(String tool, Map<String, Object> data) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", true);
+        payload.put("tool", tool);
+        payload.put("data", data == null ? Map.of() : data);
+        payload.put("error", null);
+        return writePromptJson(payload);
+    }
+
+    PromptText failPrompt(String tool, String code, String message, Map<String, Object> details) {
+        return failPromptValue(tool, code, nvl(message), details, null);
+    }
+
+    PromptText failPrompt(String tool, String code, PromptText message, Map<String, Object> details) {
+        return failPromptValue(tool, code, message, details, null);
+    }
+
+    PromptText failPrompt(String tool, String code, String message, Map<String, Object> details, ToolFailureCategory category) {
+        return failPromptValue(tool, code, nvl(message), details, category);
+    }
+
+    PromptText failPrompt(String tool, String code, PromptText message, Map<String, Object> details, ToolFailureCategory category) {
+        return failPromptValue(tool, code, message, details, category);
+    }
+
+    private PromptText failPromptValue(String tool, String code, Object message, Map<String, Object> details,
+                                      ToolFailureCategory category) {
+        Map<String, Object> error = new LinkedHashMap<>();
+        error.put("code", nvl(code));
+        error.put("message", message);
+        error.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(error, code, category);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", false);
+        payload.put("tool", tool);
+        payload.put("data", Map.of());
+        payload.put("error", error);
+        return writePromptJson(payload);
+    }
+
+    private PromptText writePromptJson(Object payload) {
+        var actual = MarketDataPromptPolicy.materialize(payload);
+        try {
+            return new PromptText(objectMapper.writeValueAsString(actual.value()), actual.sources());
+        } catch (Exception failure) {
+            ModelSendBlocks.rethrowIfBlocked(failure);
+            return PromptText.runtimeData("{\"ok\":false,\"tool\":\"unknown\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
+                    + escapeJson(nvl(failure.getMessage())) + "\"}}");
+        }
+    }
+
+    PromptText policy(String fragment) { return policy(fragment, Map.of()); }
+
+    PromptText policy(String fragment, Map<String, String> facts) {
+        if (promptPolicy == null) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "市场工具结果缺少原根政策读取组件");
+        }
+        return promptPolicy.read(fragment, facts);
+    }
+
+    private record ResultRow(Map<String, Object> row, List<PromptVersionSource> sources) { }
+
+    private PromptText withRowSources(PromptText result, List<ResultRow> rows) {
+        List<PromptVersionSource> sources = new ArrayList<>(result.sources());
+        rows.forEach(row -> sources.addAll(row.sources()));
+        return new PromptText(result.text(), List.copyOf(new LinkedHashSet<>(sources)));
+    }
+
+    private Map<String, Object> readJsonMap(PromptText result) { return readJsonMap(result.text()); }
+
     String ok(String tool, Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
@@ -2172,6 +2343,7 @@ public class MarketDataTools {
         try {
             return objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             return "{\"ok\":false,\"tool\":\"unknown\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\"" + escapeJson(nvl(e.getMessage())) + "\"}}";
         }
     }
@@ -2259,9 +2431,10 @@ public class MarketDataTools {
      */
     private void mergeSearchItems(List<Map<String, Object>> items,
                                   List<Map<String, Object>> partialErrors,
+                                  List<PromptVersionSource> retainedSources,
                                   String query,
                                   String assetType,
-                                  String responseJson) {
+                                  PromptText responseJson) {
         Map<String, Object> payload = readJsonMap(responseJson);
         if (Boolean.TRUE.equals(payload.get("ok"))) {
             Map<String, Object> data = readNestedMap(payload.get("data"));
@@ -2281,6 +2454,7 @@ public class MarketDataTools {
             return;
         }
         Map<String, Object> error = readNestedMap(payload.get("error"));
+        retainedSources.addAll(responseJson.sources());
         partialErrors.add(Map.of(
                 "asset_type", assetType,
                 "query", nvl(query),
@@ -2290,8 +2464,8 @@ public class MarketDataTools {
     }
 
     /** 构造服务不可用错误响应，当底层 Dubbo 服务未部署或不可用时使用。 */
-    private String serviceUnavailable(String tool, String message) {
-        return fail(tool, "SERVICE_UNAVAILABLE", message, Map.of());
+    private PromptText serviceUnavailable(String tool, String message) {
+        return failPrompt(tool, "SERVICE_UNAVAILABLE", message, Map.of());
     }
 
     /**
@@ -2347,6 +2521,7 @@ public class MarketDataTools {
             data.put("item", itemMap);
             data.put("item_text", objectMapper.writeValueAsString(itemMap));
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             data.put("item_text", decodeProtoText(item.toString()));
         }
     }
@@ -2447,6 +2622,7 @@ public class MarketDataTools {
                             errors.add(code + ": interrupted");
                             return new AdvancedDailyFetchResult(List.of(), errors);
                         } catch (Exception e) {
+                            ModelSendBlocks.rethrowIfBlocked(e);
                             errors.add(code + ": " + nvl(e.getMessage()));
                             return new AdvancedDailyFetchResult(List.of(), errors);
                         } finally {
@@ -2580,6 +2756,7 @@ public class MarketDataTools {
             }
             return "group_" + sb;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             // 摘要降级时也只使用写盘允许的字符，避免负号导致登记路径与产物不一致。
             String fallback = summarizeAdvancedQuery(canonicalQuery) + "-" + (stockCodes == null ? 0 : stockCodes.size());
             return "group_" + Integer.toUnsignedString(fallback.hashCode(), 16);

@@ -1,0 +1,14 @@
+{
+  "fragment": "marketAdvancedDateFormatAdvice",
+  "purpose": "marketAdvancedDateFormatAdvice",
+  "bodyType": "FIXED",
+  "body": "Invalid daily date range, please use YYYYMMDD format (Asia/Shanghai).",
+  "variables": [],
+  "utf8Sha256": "4857b0363b0fa19d53f9d4ec8e4d4399df46aa0aeaff63f172d8f372a4fa9834",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}
