@@ -120,7 +120,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     /** 构建完成、交给调用方之前启用归档，HTTP重试复用本次逻辑调用编号。 */
     public ChatModel withInputArchiving() {
         inputArchivingEnabled = true;
-        return new ArchivingChatModel(this);
+        return new ArchivingChatModel(this, endpointName);
     }
 
     @Override

@@ -2,6 +2,11 @@ package world.willfrog.agent.platform.service;
 
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputInvocation;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSource;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -82,7 +87,7 @@ public class DashScopeChatModel implements ChatModel {
     /** 构建完成、交给调用方之前启用归档，并为每次模型调用建立独立逻辑编号。 */
     public ChatModel withInputArchiving() {
         inputArchivingEnabled = true;
-        return new ArchivingChatModel(this);
+        return new ArchivingChatModel(this, endpointName);
     }
 
     @Override
@@ -371,7 +376,7 @@ public class DashScopeChatModel implements ChatModel {
             try {
                 HttpRequest httpRequest = httpRequestBuilder.build();
                 if (inputArchivingEnabled) {
-                    ModelInputScope.currentRequired().beforeSend(requestJson);
+                    inputForActualFormat(requestJson).beforeSend(requestJson);
                 }
                 HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
                         httpRequest,
@@ -552,6 +557,28 @@ public class DashScopeChatModel implements ChatModel {
                 curlCommand,
                 llmCallId
         );
+    }
+
+    /** json_object没有发送schema说明，只登记实际存在的协议字段。 */
+    private ModelInputInvocation inputForActualFormat(String requestJson) {
+        ModelInputInvocation input = ModelInputScope.currentRequired();
+        try {
+            var format = objectMapper.readTree(requestJson).path("response_format");
+            if (!format.isObject() || format.size() != 1
+                    || !"json_object".equals(format.path("type").asText())) return input;
+            List<ModelInputSource> sources = new ArrayList<>();
+            for (ModelInputSource source : input.sources().parts()) {
+                if (!source.jsonPointer().equals("/response_format")
+                        && !source.jsonPointer().startsWith("/response_format/")) sources.add(source);
+            }
+            sources.add(new ModelInputSource("/response_format", ModelInputSource.Origin.RUNTIME_DATA, List.of()));
+            return new ModelInputInvocation(input.logicalCallId(), input.endpointName(),
+                    new ModelInputSources(sources), input.store());
+        } catch (Exception failure) {
+            ModelSendBlocks.rethrowIfBlocked(failure);
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "实际结构化输出字段无法确认");
+        }
     }
 
     /**

@@ -2,17 +2,24 @@ package world.willfrog.agent.platform.service;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.prompt.LightweightPromptPreparation;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -43,6 +50,10 @@ public class AgentContextCompressor {
     private final AgentAiServiceFactory aiServiceFactory;
     private final AgentLlmLocalConfigLoader localConfigLoader;
     private final AgentLlmProperties llmProperties;
+    @Autowired
+    private LightweightPromptPreparation promptPreparation;
+    @Autowired
+    private AgentModelInputs modelInputs;
 
     /**
      * 最大历史消息数（轮数 * 2，因为每轮包含 user + assistant 两条消息）。
@@ -81,8 +92,13 @@ public class AgentContextCompressor {
      */
     public record ContextBuildResult(
             String text,
-            CompressionResult compression
+            CompressionResult compression,
+            PromptText dialogueContextPrompt
     ) {
+        /** 旧构造未提供来源，不能由非空String推断为运行事实。 */
+        public ContextBuildResult(String text, CompressionResult compression) {
+            this(text, compression, null);
+        }
     }
 
     /**
@@ -119,18 +135,19 @@ public class AgentContextCompressor {
      */
     public ContextBuildResult buildCompressedContext(List<AgentRunMessage> messages, String currentUserGoal) {
         if (messages == null || messages.isEmpty()) {
-            return new ContextBuildResult("", new CompressionResult(0, 0, "none", List.of()));
+            return new ContextBuildResult("", new CompressionResult(0, 0, "none", List.of()), PromptText.runtimeData(""));
         }
         List<AgentRunMessage> history = filterHistoryMessages(messages, currentUserGoal);
         if (history.isEmpty()) {
-            return new ContextBuildResult("", new CompressionResult(0, 0, "none", List.of()));
+            return new ContextBuildResult("", new CompressionResult(0, 0, "none", List.of()), PromptText.runtimeData(""));
         }
 
         CompressionConfig config = resolveCompressionConfig();
         if (history.size() < config.minMessagesForCompression()) {
+            PromptText dialogue = formatAsDialogueText(history);
             return new ContextBuildResult(
-                    formatAsDialogue(history),
-                    new CompressionResult(history.size(), history.size(), "none", List.of())
+                    dialogue.text(),
+                    new CompressionResult(history.size(), history.size(), "none", List.of()), dialogue
             );
         }
         if (shouldUseSummary(config, history.size())) {
@@ -139,14 +156,15 @@ public class AgentContextCompressor {
                 String trimmed = trimToMaxChars(summary, config.summaryMaxChars());
                 return new ContextBuildResult(
                         trimmed,
-                        new CompressionResult(history.size(), 1, "llm_summary", List.of())
+                        new CompressionResult(history.size(), 1, "llm_summary", List.of()), PromptText.runtimeData(trimmed)
                 );
             }
         }
 
         List<AgentRunMessage> compressed = compress(history);
         CompressionResult result = buildCompressionResult(history, compressed, "sliding_window");
-        return new ContextBuildResult(formatAsDialogue(compressed), result);
+        PromptText dialogue = formatAsDialogueText(compressed);
+        return new ContextBuildResult(dialogue.text(), result, dialogue);
     }
 
     /**
@@ -250,24 +268,14 @@ public class AgentContextCompressor {
      * @return 格式化的对话文本
      */
     public String formatAsDialogue(List<AgentRunMessage> messages) {
+        return formatAsDialogueText(messages).text();
+    }
+
+    public PromptText formatAsDialogueText(List<AgentRunMessage> messages) {
         if (messages == null || messages.isEmpty()) {
-            return "";
+            return PromptText.runtimeData("");
         }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("以下是用户与助手的历史对话：\n\n");
-
-        for (AgentRunMessage msg : messages) {
-            String roleLabel = switch (msg.getRole()) {
-                case AgentRunMessage.ROLE_USER -> "用户";
-                case AgentRunMessage.ROLE_ASSISTANT -> "助手";
-                case AgentRunMessage.ROLE_SYSTEM -> "系统";
-                default -> msg.getRole();
-            };
-            sb.append(roleLabel).append("：").append(msg.getContent()).append("\n\n");
-        }
-
-        return sb.toString();
+        return preparation().dialogue(messages);
     }
 
     private CompressionResult buildCompressionResult(List<AgentRunMessage> original,
@@ -345,42 +353,47 @@ public class AgentContextCompressor {
             log.warn("Summary compression enabled but summary model not configured");
             return "";
         }
+        AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         try {
+            AgentContext.clearStructuredOutputSpec();
             List<AgentRunMessage> limited = applyLengthLimit(messages);
             limited = applySummaryMessageLimit(limited, config.summaryMaxMessages());
             if (limited.isEmpty()) {
                 return "";
             }
-            String dialogue = formatAsDialogue(limited);
-            if (dialogue.isBlank()) {
+            var prepared = preparation().summary(limited, config.summaryMaxChars());
+            SummaryModel selected = buildSummaryModel(config);
+            if (selected == null) {
                 return "";
             }
-            ChatModel model = buildSummaryModel(config);
-            if (model == null) {
-                return "";
+            List<PromptMessage> messagesWithSources = List.of(PromptMessage.system(prepared.system()), PromptMessage.user(prepared.user()));
+            List<ChatMessage> chatMessages = messagesWithSources.stream().map(PromptMessage::message).toList();
+            ChatResponse response;
+            if (modelInputs == null) throw missingInputs();
+            try (ModelInputScope ignored = modelInputs.open(selected.endpointName(), PromptMessage.toModelInputSources(messagesWithSources))) {
+                response = selected.model().chat(chatMessages);
             }
-            List<ChatMessage> chatMessages = List.of(
-                    new SystemMessage(buildSummarySystemPrompt(config.summaryMaxChars())),
-                    new UserMessage(dialogue)
-            );
-            ChatResponse response = model.chat(chatMessages);
             String summary = response == null || response.aiMessage() == null ? "" : nvl(response.aiMessage().text());
             return trimToMaxChars(summary, config.summaryMaxChars());
         } catch (Exception e) {
             ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to summarize history, fallback to sliding window: {}", e.getMessage());
             return "";
+        } finally {
+            if (previousSpec == null) AgentContext.clearStructuredOutputSpec();
+            else AgentContext.setStructuredOutputSpec(previousSpec);
         }
     }
 
-    private ChatModel buildSummaryModel(CompressionConfig config) {
+    private SummaryModel buildSummaryModel(CompressionConfig config) {
         try {
             AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(config.summaryEndpoint(), config.summaryModel());
             Double temperature = config.summaryTemperature() <= 0 ? DEFAULT_SUMMARY_TEMPERATURE : config.summaryTemperature();
             if (config.summaryProviderOrder() != null && !config.summaryProviderOrder().isEmpty()) {
-                return aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, config.summaryProviderOrder(), temperature);
+                return new SummaryModel(aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
+                        resolved, config.summaryProviderOrder(), temperature), resolved.endpointName());
             }
-            return aiServiceFactory.buildChatModelWithTemperature(resolved, temperature);
+            return new SummaryModel(aiServiceFactory.buildArchivedChatModelWithTemperature(resolved, temperature), resolved.endpointName());
         } catch (Exception e) {
             ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to build summary model: {}", e.getMessage());
@@ -388,20 +401,16 @@ public class AgentContextCompressor {
         }
     }
 
-    private String buildSummarySystemPrompt(int maxChars) {
-        int limit = maxChars > 0 ? maxChars : DEFAULT_SUMMARY_MAX_CHARS;
-        String template = PromptAuthority.shared().expectedText("followUpSummarySystemPrompt");
-        if (!template.contains("{{maxChars}}")) {
-            throw new PromptConfigurationException(
-                    "authority_template_invalid", "follow-up 摘要 Prompt 缺少 {{maxChars}} 占位符");
-        }
-        String rendered = template.replace("{{maxChars}}", Integer.toString(limit));
-        if (rendered.contains("{{maxChars}}")) {
-            throw new PromptConfigurationException(
-                    "authority_template_unresolved", "follow-up 摘要 Prompt 的 {{maxChars}} 未完成渲染");
-        }
-        return rendered;
+    private LightweightPromptPreparation preparation() {
+        if (promptPreparation == null) throw missingInputs();
+        return promptPreparation;
     }
+
+    private static ModelSendBlockedException missingInputs() {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "历史摘要缺少原根正文或输入保存组件");
+    }
+
+    private record SummaryModel(ChatModel model, String endpointName) { }
 
     private List<AgentRunMessage> applySummaryMessageLimit(List<AgentRunMessage> messages, int maxMessages) {
         if (messages == null || messages.isEmpty()) {

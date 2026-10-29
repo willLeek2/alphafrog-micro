@@ -1,0 +1,40 @@
+{
+  "fragment": "planningToolBudgetLimited",
+  "purpose": "planningToolBudgetLimited",
+  "bodyType": "TEMPLATE",
+  "body": "工具调用预算现状：{{scopeNote}}累计工具调用已用{{used}}次、上限{{limit}}次、剩余{{remaining}}次；规划 Todo 数量与每步的工具调用时请考虑该预算。",
+  "variables": [
+    {
+      "name": "scopeNote",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    },
+    {
+      "name": "used",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "limit",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "remaining",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "4f718963e8b307ebcbcdb71cd1fd4f7e5a2f5543e1e06b396f26a29bd67770ad",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/planning/LangchainAiPlanner.java",
+    "method": "toolBudgetNote",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

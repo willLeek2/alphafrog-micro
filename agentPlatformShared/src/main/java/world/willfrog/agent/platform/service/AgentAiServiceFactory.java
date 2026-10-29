@@ -76,12 +76,21 @@ public class AgentAiServiceFactory {
         return buildChatModelWithTemperature(resolved, temperatureOverride, null, true);
     }
 
-    /** 风险评分脚本只交给不持久捕获请求正文的 OpenAI 兼容客户端。 */
+    /** 风险评分固定使用SDK客户端，关闭HTTP诊断正文；托管入口另行保存受限输入。 */
     public ChatModel buildPythonRiskReviewModel(AgentLlmResolver.ResolvedLlm resolved) {
+        return buildPythonRiskReviewModel(resolved, false);
+    }
+
+    /** 风险审查复用原SDK约束和固定参数，每次发送前必须确认输入保存。 */
+    public ChatModel buildArchivedPythonRiskReviewModel(AgentLlmResolver.ResolvedLlm resolved) {
+        return buildPythonRiskReviewModel(resolved, true);
+    }
+
+    private ChatModel buildPythonRiskReviewModel(AgentLlmResolver.ResolvedLlm resolved, boolean archiveInput) {
         if (resolved == null || isDashScopeEndpoint(resolved)) {
-            throw new IllegalArgumentException("Python 风险评分端点必须使用不捕获请求正文的 OpenAI 兼容客户端");
+            throw new IllegalArgumentException("Python 风险评分端点必须使用固定的 OpenAI 兼容客户端");
         }
-        return buildChatModelWithTemperature(resolved, 0.0D, 256);
+        return buildChatModelWithTemperature(resolved, 0.0D, 256, archiveInput);
     }
 
     public ChatModel buildChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
@@ -122,7 +131,7 @@ public class AgentAiServiceFactory {
             builder.customHeaders(headers);
         }
         ChatModel model = builder.build();
-        return archiveInput ? new ArchivingChatModel(model) : model;
+        return archiveInput ? new ArchivingChatModel(model, resolved.endpointName()) : model;
     }
 
     public ChatModel buildChatModelWithProviderOrderAndTemperature(AgentLlmResolver.ResolvedLlm resolved,
@@ -135,6 +144,30 @@ public class AgentAiServiceFactory {
                                                                            List<String> providerOrder,
                                                                            Double temperatureOverride,
                                                                            Integer maxTokensOverride) {
+        return buildChatModelWithProviderOrderAndTemperature(resolved, providerOrder, temperatureOverride,
+                maxTokensOverride, false);
+    }
+
+    public ChatModel buildArchivedChatModelWithProviderOrderAndTemperature(AgentLlmResolver.ResolvedLlm resolved,
+                                                                         List<String> providerOrder,
+                                                                         Double temperatureOverride) {
+        return buildArchivedChatModelWithProviderOrderAndTemperature(resolved, providerOrder, temperatureOverride, null);
+    }
+
+    /** 显式托管入口与原入口共用端点选择、供应商顺序和参数处理。 */
+    public ChatModel buildArchivedChatModelWithProviderOrderAndTemperature(AgentLlmResolver.ResolvedLlm resolved,
+                                                                         List<String> providerOrder,
+                                                                         Double temperatureOverride,
+                                                                         Integer maxTokensOverride) {
+        return buildChatModelWithProviderOrderAndTemperature(resolved, providerOrder, temperatureOverride,
+                maxTokensOverride, true);
+    }
+
+    private ChatModel buildChatModelWithProviderOrderAndTemperature(AgentLlmResolver.ResolvedLlm resolved,
+                                                                   List<String> providerOrder,
+                                                                   Double temperatureOverride,
+                                                                   Integer maxTokensOverride,
+                                                                   boolean archiveInput) {
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
         int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         // ALP-25: 对所有端点使用 OpenRouterProviderRoutedChatModel 以支持 HTTP 捕获
@@ -144,7 +177,8 @@ public class AgentAiServiceFactory {
                 throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
             }
             double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
-            return buildDashScopeChatModel(resolved, apiKey, finalTemperature, effectiveMaxTokens);
+            DashScopeChatModel model = buildDashScopeChatModel(resolved, apiKey, finalTemperature, effectiveMaxTokens);
+            return archiveInput ? model.withInputArchiving() : model;
         }
         if (shouldUseProviderRoutedModel(resolved)) {
             String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
@@ -171,9 +205,9 @@ public class AgentAiServiceFactory {
                     latencyWindow
             );
             model.setBudgetService(budgetService);
-            return model;
+            return archiveInput ? model.withInputArchiving() : model;
         }
-        return buildChatModelWithTemperature(resolved, temperatureOverride, maxTokensOverride);
+        return buildChatModelWithTemperature(resolved, temperatureOverride, maxTokensOverride, archiveInput);
     }
 
     public ChatModel buildChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved, List<String> providerOrder) {
@@ -183,6 +217,25 @@ public class AgentAiServiceFactory {
     public ChatModel buildChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
                                                      List<String> providerOrder,
                                                      Integer maxTokensOverride) {
+        return buildChatModelWithProviderOrder(resolved, providerOrder, maxTokensOverride, false);
+    }
+
+    public ChatModel buildArchivedChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
+                                                             List<String> providerOrder) {
+        return buildArchivedChatModelWithProviderOrder(resolved, providerOrder, null);
+    }
+
+    /** 每次发送必须先保存完整输入，构建时不读取当前线程的输入作用域。 */
+    public ChatModel buildArchivedChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
+                                                             List<String> providerOrder,
+                                                             Integer maxTokensOverride) {
+        return buildChatModelWithProviderOrder(resolved, providerOrder, maxTokensOverride, true);
+    }
+
+    private ChatModel buildChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
+                                                      List<String> providerOrder,
+                                                      Integer maxTokensOverride,
+                                                      boolean archiveInput) {
         String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
         if (isBlank(apiKey)) {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
@@ -191,7 +244,8 @@ public class AgentAiServiceFactory {
         int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         // ALP-25: 对所有端点使用 OpenRouterProviderRoutedChatModel 以支持 HTTP 捕获
         if (isDashScopeEndpoint(resolved)) {
-            return buildDashScopeChatModel(resolved, apiKey, temperature, effectiveMaxTokens);
+            DashScopeChatModel model = buildDashScopeChatModel(resolved, apiKey, temperature, effectiveMaxTokens);
+            return archiveInput ? model.withInputArchiving() : model;
         }
         if (shouldUseProviderRoutedModel(resolved)) {
             Map<String, String> headers = buildCustomHeaders(resolved);
@@ -213,7 +267,7 @@ public class AgentAiServiceFactory {
                     latencyWindow
             );
             model.setBudgetService(budgetService);
-            return model;
+            return archiveInput ? model.withInputArchiving() : model;
         }
 
         OpenAiChatModel.OpenAiChatModelBuilder builder = OpenAiChatModel.builder()
@@ -224,12 +278,16 @@ public class AgentAiServiceFactory {
                 .temperature(temperature)
                 .logRequests(false)
                 .logResponses(false);
+        if (archiveInput) {
+            builder.httpClientBuilder(new ArchivingHttpClientBuilder(HttpClientBuilderLoader.loadHttpClientBuilder()));
+        }
 
         Map<String, String> headers = buildCustomHeaders(resolved);
         if (!headers.isEmpty()) {
             builder.customHeaders(headers);
         }
-        return builder.build();
+        ChatModel model = builder.build();
+        return archiveInput ? new ArchivingChatModel(model, resolved.endpointName()) : model;
     }
 
     private Map<String, String> buildCustomHeaders(AgentLlmResolver.ResolvedLlm resolved) {
