@@ -1,0 +1,22 @@
+{
+  "fragment": "followUpSummaryDialogue",
+  "purpose": "followUpSummaryDialogue",
+  "bodyType": "TEMPLATE",
+  "body": "以下是用户与助手的历史对话：\n\n{{dialogue}}",
+  "variables": [
+    {
+      "name": "dialogue",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "9ccb1b3da7a1a8d5c288fa299c4abd41a1e98d652c92ec1e46860a32e2b67261",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/service/AgentContextCompressor.java",
+    "method": "formatAsDialogue",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}
