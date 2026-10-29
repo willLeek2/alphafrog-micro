@@ -359,7 +359,8 @@ public class AgentRunBudgetService {
             return;
         }
         long ratioPct = (long) Math.floor(ratio * 100);
-        AgentContext.setLastMileHint(buildLastMileHint(dimension, actual, limit, ratioPct));
+        AgentContext.setLastMileHintPrompt(promptService.budgetLastMileStageInstructionText(
+                dimension, actual, limit, ratioPct));
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("dimension", dimension);
         payload.put("actual", actual);
@@ -367,16 +368,6 @@ public class AgentRunBudgetService {
         payload.put("ratio", ratio);
         payload.put("ratioPct", ratioPct);
         eventService.append(runId, userId, "BUDGET_LAST_MILE", payload);
-    }
-
-    /**
-     * 拼装 90% last-mile hint 中文文本。
-     * 模板：{@code [last_mile_hint] 本 run 已使用 <pct>% <dim> 预算（<act>/<limit>），<advice>}
-     * advice 按维度区分：tokens 提示精简输出；tool_calls 提示精简工具调用；llm_calls 提示本轮直接给结论；wall_clock_ms 提示尽快完成。
-     */
-    private String buildLastMileHint(String dimension, long actual, long limit, long ratioPct) {
-        return promptService.budgetLastMileStageInstruction(
-                dimension, actual, limit, ratioPct);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */
