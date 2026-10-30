@@ -20,6 +20,7 @@ import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobCoordinator
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
 import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
+import world.willfrog.agent.tools.python.RunOutputArtifactHarvester;
 import world.willfrog.agent.tools.sandboxjob.SandboxTerminalResultView;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
@@ -63,6 +64,9 @@ public class ToolJobFinalizer {
     private final FinanceRecordChannelConfigLoader configLoader;
     @Autowired
     private TerminalResultPromptTexts terminalPromptTexts;
+    /** 014-new-03：挂起恢复路径的收割产物落盘与登记（与前台两处回调共用同一实现）。 */
+    @Autowired(required = false)
+    private RunOutputArtifactHarvester runOutputArtifactHarvester;
 
     private final FinanceToolResultFormatter formatter;
     private final FinanceResultModelAdapter adapter;
@@ -233,6 +237,11 @@ public class ToolJobFinalizer {
                 String stderr = resultResp.getStderr();
                 boolean python = anchor.getToolName() == null || anchor.getToolName().isBlank()
                         || ToolJobAnchor.EXECUTE_PYTHON_TOOL.equals(anchor.getToolName());
+                if (python && runOutputArtifactHarvester != null) {
+                    // 014-new-03：挂起恢复路径的产物收割，与 finance 同位处理（finance 在下方
+                    // 自行处理，不走前台回调）。收割幂等，finalizer 重入零重写；失败只 warn。
+                    runOutputArtifactHarvester.harvest(runId, null, resultResp);
+                }
                 boolean hasFinanceData = python
                         && FinanceRecordDecoder.hasFinancePayload(stdout, resultResp.hasFinanceRecordChannel());
                 FinanceRecordExtractionResult formatContext = null;

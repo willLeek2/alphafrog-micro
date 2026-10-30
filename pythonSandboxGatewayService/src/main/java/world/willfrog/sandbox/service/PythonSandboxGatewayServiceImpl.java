@@ -1,6 +1,8 @@
 package world.willfrog.sandbox.service;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.ByteString;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
@@ -263,6 +265,15 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 httpRequest.setRun_id(runId);
                 httpRequest.setWorkspace_id(workspaceId);
                 httpRequest.setWorkspace_generation(workspaceGeneration);
+            }
+            // 014-new-03: 任务产物收割标志只在 true 时下发（proto3 布尔无 presence，
+            // 缺省 false 不写键，旧 Python 端行为不变）；单文件上限随开关一起传，
+            // 上限 <=0 视为未携带，由 Python 侧配置兜底。
+            if (request.getCollectArtifacts()) {
+                httpRequest.setCollect_artifacts(true);
+                if (request.getCollectArtifactMaxBytes() > 0) {
+                    httpRequest.setCollect_artifact_max_bytes(request.getCollectArtifactMaxBytes());
+                }
             }
 
             String endpoint = sandboxUrl + "/tasks";
@@ -1915,6 +1926,16 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     if (executionEnvironment != null) {
                         builder.setExecutionEnvironment(executionEnvironment);
                     }
+                    // 014-new-03: 收割产物与跳过清单（旧 Python 端不回传时 HTTP 字段为 null，
+                    // 映射为 proto 空 repeated，消费方按无产物处理）。
+                    if (res.getCollected_artifacts() != null) {
+                        builder.addAllCollectedArtifacts(
+                                toProtoCollectedArtifacts(res.getCollected_artifacts()));
+                    }
+                    if (res.getSkipped_artifacts() != null) {
+                        builder.addAllSkippedArtifacts(
+                                toProtoSkippedArtifacts(res.getSkipped_artifacts()));
+                    }
                     emitSandboxHttp("GET", endpoint, downstreamStatus, resultDurationMs, "OK", null);
                     return builder.build();
                 }
@@ -2157,6 +2178,60 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         return builder.build();
     }
 
+    // 014-new-03: 收割产物列表映射（TaskResultResponse 字段 13）。逐项 null/坏 base64
+    // 容忍跳过并 warn（单条坏数据不应让整个终态结果连同 stdout 一起丢失）；
+    // gzip_data 在这里从 base64 字符串解回字节进 proto bytes 字段。
+    static List<CollectedArtifactFile> toProtoCollectedArtifacts(List<HttpCollectedArtifact> collected) {
+        List<CollectedArtifactFile> mapped = new java.util.ArrayList<>(collected.size());
+        for (HttpCollectedArtifact item : collected) {
+            if (item == null) {
+                continue;
+            }
+            try {
+                CollectedArtifactFile.Builder itemBuilder = CollectedArtifactFile.newBuilder();
+                if (item.getFilename() != null) {
+                    itemBuilder.setFilename(item.getFilename());
+                }
+                if (item.getSha256() != null) {
+                    itemBuilder.setSha256(item.getSha256());
+                }
+                if (item.getGzip_data() != null && !item.getGzip_data().isBlank()) {
+                    // 本仓库的 protobuf 版本 ByteString 无 fromBase64，用 JDK Base64 解码后拷入。
+                    itemBuilder.setGzipData(ByteString.copyFrom(
+                            java.util.Base64.getDecoder().decode(item.getGzip_data())));
+                }
+                if (item.getSize_bytes() != null) {
+                    itemBuilder.setSizeBytes(item.getSize_bytes());
+                }
+                mapped.add(itemBuilder.build());
+            } catch (RuntimeException malformed) {
+                log.warn("sandbox.getTaskResult.collectedArtifactMalformed: filename={}, err={}",
+                        item.getFilename(), malformed.getMessage());
+            }
+        }
+        return mapped;
+    }
+
+    // 014-new-03: 跳过清单映射（TaskResultResponse 字段 14）。逐项 null 容忍，
+    // 与 toProtoCollectedArtifacts 同款降级。
+    static List<SkippedArtifactFile> toProtoSkippedArtifacts(List<HttpSkippedArtifact> skipped) {
+        List<SkippedArtifactFile> mapped = new java.util.ArrayList<>(skipped.size());
+        for (HttpSkippedArtifact item : skipped) {
+            if (item == null) {
+                continue;
+            }
+            SkippedArtifactFile.Builder itemBuilder = SkippedArtifactFile.newBuilder();
+            if (item.getFilename() != null) {
+                itemBuilder.setFilename(item.getFilename());
+            }
+            if (item.getReason() != null) {
+                itemBuilder.setReason(item.getReason());
+            }
+            mapped.add(itemBuilder.build());
+        }
+        return mapped;
+    }
+
     private void emitSandboxResultTiming(String taskId, HttpExecuteResult result, long durationMs) {
         Map<String, Object> timingFields = extractTimingFields(result);
         if (timingFields.isEmpty()) {
@@ -2308,6 +2383,16 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String run_id;
         private String workspace_id;
         private String workspace_generation;
+        // 014-new-03: 任务产物收割开关与单文件上限；仅在开关为 true 时随请求下发
+        // （对齐 proto 侧 collectArtifacts/collectArtifactMaxBytes 的缺省语义）。
+        // 泳道实测 b3 修复：这两个字段是包装类型，开关关闭时为 null；若不加
+        // NON_NULL，Jackson 会把 null 序列化成 "collect_artifacts": null 发给
+        // 沙箱服务，而 Python 模型 collect_artifacts 是严格 bool，422 拒绝后
+        // agent 无限重试卡死 run。加注解后 null 时整个键省略，与注释本意一致。
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Boolean collect_artifacts;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Long collect_artifact_max_bytes;
     }
 
     @Data
@@ -2465,6 +2550,28 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         // on the proto side, not on these fields.
         private HttpFinanceRecordChannel finance_record_channel;
         private HttpExecutionEnvironment execution_environment;
+        // 014-new-03: 沙箱收割产物与跳过清单。null 表示旧 Python 端未实现收割
+        // （映射为 proto 空 repeated）；空列表表示收割了但没有任何产出。
+        private List<HttpCollectedArtifact> collected_artifacts;
+        private List<HttpSkippedArtifact> skipped_artifacts;
+    }
+
+    // 014-new-03: CollectedArtifactFile（TaskResultResponse 字段 13）的 HTTP 侧镜像。
+    // Jackson 绑定沙箱 Python 侧的 snake_case JSON；gzip_data 是 gzip 压缩后字节的
+    // base64 字符串，由 toProtoCollectedArtifacts 解回 bytes。字段顺序与 proto 一致。
+    @Data
+    static class HttpCollectedArtifact {
+        private String filename;
+        private String sha256;
+        private String gzip_data;
+        private Long size_bytes;
+    }
+
+    // 014-new-03: SkippedArtifactFile（TaskResultResponse 字段 14）的 HTTP 侧镜像。
+    @Data
+    static class HttpSkippedArtifact {
+        private String filename;
+        private String reason;
     }
 
     @Data

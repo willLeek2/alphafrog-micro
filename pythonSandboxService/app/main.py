@@ -624,6 +624,17 @@ async def _process_task_inner(task: Task, worker_id: int):
         if task.effective_output_limits is not None
         else None
     )
+    # 014-new-03: 产物收割请求开关。只在开启时以关键字参数透传给 runner
+    # （条件展开，同下面 workspace_mount 的先例）——缺省 false 时不传，
+    # 老调用方/测试桩的函数签名完全不受影响。
+    collect_kwargs = (
+        {
+            "collect_artifacts": True,
+            "collect_artifact_max_bytes": task.request.collect_artifact_max_bytes,
+        }
+        if task.request.collect_artifacts
+        else {}
+    )
     try:
         # Run synchronous sandbox runner in thread pool.  Workspace tasks
         # NEVER ride the warm pool: a pooled container is reused across
@@ -651,6 +662,7 @@ async def _process_task_inner(task: Task, worker_id: int):
                 task.request.path_manifest_csv,
                 task.request.resource_class,
                 effective_output_limits=frozen_limits,
+                **collect_kwargs,
             )
         else:
             # Workspace tasks: persist the container identity tuple BEFORE
@@ -691,6 +703,7 @@ async def _process_task_inner(task: Task, worker_id: int):
                     if workspace_mount is not None
                     else {}
                 ),
+                **collect_kwargs,
             )
             if workspace_mount is not None:
                 task_store.record_container_id(
@@ -729,6 +742,10 @@ async def _process_task_inner(task: Task, worker_id: int):
             execution_environment=_safe_parse_execution_environment(
                 result_dict.get("execution_environment"),
             ),
+            # 014-new-03: 收割结果只在收割实际运行时非 None（presence-aware）；
+            # 上面的异常路径不构造这两个字段（默认 None）。
+            collected_artifacts=result_dict.get("collected_artifacts"),
+            skipped_artifacts=result_dict.get("skipped_artifacts"),
         )
         # §5.1: attach the validated channel from the §7.1 write path (the
         # attach is merge-safe: it no-ops until D's frozen DTO field lands).

@@ -44,6 +44,18 @@ message ExecuteRequest {
   string runId = 24;
   string workspaceId = 25;
   string workspaceGeneration = 26;
+  // 014-new-03: 任务产物收割标志。true 时 Python 侧在任务成功收尾窗口
+  // （结果上报前、产物目录清理前）读取 AF_TASK_ARTIFACT_DIR 内的顶层文件，
+  // gzip 压缩后随结果响应回传。proto3 标量无 presence：false 即缺省，
+  // 旧调用方与旧 Python 端行为完全不变。
+  bool collectArtifacts = 27;
+  // 014-new-03: 单文件收割上限（字节），工具层与下载侧上限
+  // agent.artifact.download.max-bytes 同值注入。超限文件跳过并记入
+  // skippedArtifacts（带原因），不静默截断。成对约束：Java 侧只在
+  // collectArtifacts=true 且本值 >0 时同时设置两者；Python 契约校验
+  // collect=true 必须携带正上限——两侧都没有「0 或缺省也能收割」的兜底
+  // 配置，上限缺失即拒绝，避免「配 0 表达不限量」把工具整体打挂。
+  int64 collectArtifactMaxBytes = 28;
 }
 
 message ExecuteResponse {
@@ -106,6 +118,31 @@ message TaskResultResponse {
   // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
   // Tag 12 chosen because 260808 additive fields already occupy 9/10/11.
   SandboxErrorDetail errorDetail = 12;
+  // 014-new-03: 沙箱收割的任务产物文件（详见 CollectedArtifactFile）。repeated
+  // 字段无 presence 语义：空列表 = 本次任务没有收割产物（请求未带收割标志、
+  // 任务非成功、产物目录为空或全部跳过均归此类），消费方按无产物处理即可。
+  repeated CollectedArtifactFile collectedArtifacts = 13;
+  // 014-new-03: 收割时跳过的文件及原因（如单文件超上限）。仅日志/诊断用途，
+  // 不影响任务成败判定。
+  repeated SkippedArtifactFile skippedArtifacts = 14;
+}
+
+// 014-new-03: 单个收割产物文件。filename 是沙箱产物目录内的顶层文件名
+// （纯 basename，不含路径）；gzipData 是文件原始字节的 gzip 压缩（HTTP 侧
+// 为 base64 字符串，网关解码为 bytes 回填）；sha256 是解压后原始字节的
+// SHA-256 十六进制串，sizeBytes 是原始（解压后）大小，两者供注册前一致性
+// 校验使用。字段缺失语义按 proto3 缺省值处理（sizeBytes=0 表示未上报）。
+message CollectedArtifactFile {
+  string filename = 1;
+  string sha256 = 2;
+  bytes gzipData = 3;
+  int64 sizeBytes = 4;
+}
+
+// 014-new-03: 收割时跳过的文件与原因（机器可读分类文本，如 file_too_large）。
+message SkippedArtifactFile {
+  string filename = 1;
+  string reason = 2;
 }
 
 message SandboxResourceUsage {
