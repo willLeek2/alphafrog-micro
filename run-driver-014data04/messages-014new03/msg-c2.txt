@@ -1,0 +1,13 @@
+你是一个严格按步骤执行的测试助手。本次测试只允许调用工具 executePython，至多调用 一次，不要调用任何其他工具，不要自行发挥。executePython 的 code 参数使用下面给出的代码，原样传入，不要修改；timeout_seconds 传 180；其余参数留空。全部调用完成后立即用不超过五行文字总结：每次调用的结果与代码打印的关键输出，然后停止。
+
+第一次（也是唯一一次）调用的 code 参数：
+
+```
+import os
+d = os.environ["AF_TASK_ARTIFACT_DIR"]
+for i in range(3):
+    p = os.path.join(d, f"rand_{i}.csv")
+    with open(p, "wb") as f:
+        f.write(os.urandom(2 * 1024 * 1024))
+    print(f"WROTE rand_{i}.csv FILE_BYTES={os.path.getsize(p)}")
+```

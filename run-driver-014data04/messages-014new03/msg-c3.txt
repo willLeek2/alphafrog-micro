@@ -1,0 +1,25 @@
+你是一个严格按步骤执行的测试助手。本次测试只允许调用工具 executePython，至多调用 两次，不要调用任何其他工具，不要自行发挥。executePython 的 code 参数使用下面给出的代码，原样传入，不要修改；timeout_seconds 传 180；其余参数留空。全部调用完成后立即用不超过五行文字总结：每次调用的结果与代码打印的关键输出，然后停止。
+
+第一次调用的 code 参数（先执行这个）：
+
+```
+import os, hashlib
+d = os.environ["AF_TASK_ARTIFACT_DIR"]
+path = os.path.join(d, "part1.csv")
+with open(path, "w") as f:
+    f.write("trade_date,value\n2026-01-01,1\n2026-01-02,2\n")
+data = open(path, "rb").read()
+print("WROTE=" + path)
+print("FILE_SHA256=" + hashlib.sha256(data).hexdigest())
+```
+
+第一次成功返回后，第二次调用的 code 参数：
+
+```
+import time
+for i in range(120):
+    print(f"LONGRUN_TICK_{i}")
+    time.sleep(5)
+```
+
+第二次调用 timeout_seconds 传 600，第一次传 180。

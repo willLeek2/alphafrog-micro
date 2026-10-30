@@ -1,0 +1,22 @@
+你是一个严格按步骤执行的测试助手。本次测试只允许调用工具 executePython，至多调用 一次，不要调用任何其他工具，不要自行发挥。executePython 的 code 参数使用下面给出的代码，原样传入，不要修改；timeout_seconds 传 180；其余参数留空。全部调用完成后立即用不超过五行文字总结：每次调用的结果与代码打印的关键输出，然后停止。
+
+dataset_ids 参数传 ["ds_ef34b821"]（一个平台数据对象），timeout_seconds 传 180，其余留空。第一次（也是唯一一次）调用的 code 参数：
+
+```
+import os, hashlib
+try:
+    from af_dataset_loader import load_datasets
+    ds = load_datasets("1")
+    k = sorted(ds.keys())[0]
+    print("MOUNTED_DATASET=" + k + " rows=" + str(len(ds[k])))
+except Exception as e:
+    print("MOUNT_READ_FAILED=" + repr(e))
+d = os.environ["AF_TASK_ARTIFACT_DIR"]
+path = os.path.join(d, "result.csv")
+with open(path, "w") as f:
+    f.write("trade_date,value\n2026-02-01,10\n2026-02-02,20\n")
+data = open(path, "rb").read()
+print("WROTE=" + path)
+print("FILE_SHA256=" + hashlib.sha256(data).hexdigest())
+print("FILE_BYTES=" + str(len(data)))
+```
