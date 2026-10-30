@@ -5,12 +5,16 @@ import org.apache.dubbo.config.ApplicationConfig;
 import org.apache.dubbo.config.ReferenceConfig;
 import org.apache.dubbo.config.bootstrap.DubboBootstrap;
 import org.apache.dubbo.rpc.RpcContext;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
+import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
+import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
@@ -18,6 +22,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
 
@@ -51,6 +57,14 @@ import java.util.regex.Pattern;
  * 核对门换成 05 修改任务门（executePython 发生 + 结构化负载里 csv 附件标记恰一个）。
  * 受理/查询/守卫编排与登记段权威计数都在 05 e2e 程序（HTTP 侧），两段以 runId 衔接；
  * run 终态词表仍是 COMPLETED（task 侧 SUCCEEDED 由 e2e 查询断言，不在这判）。
+ *
+ * <p>014-new-03 产物通道模式（--generate-artifacts + --artifacts-probe）：创建 run 时置
+ * generate_artifacts=true，executePython 收割的交付文件注册为正式产物（type=run_output）；
+ * run 终态取证后跑探针——listArtifacts 清单全文落盘 artifacts-list.txt，run_output 逐个
+ * downloadArtifact 下载到 artifacts/ 并记 SHA-256 账（artifacts-sha256.txt），非 run_output
+ * 只记清单不下载；探针整体尽力而为，失败不改退出码。C3 取消路径另配
+ * --cancel-after-seconds：轮询超过该秒数仍未终态时发一次 cancelRun，随后照常轮询到终态
+ * （终态 CANCELED 与第一个任务产物保留的断言在泳道侧判）。
  *
  * <p>流程（详见 --help）：
  * createRun（或 --run-id 挂已有 run）→ 轮询 getStatus 到终态（超时可配）
@@ -244,6 +258,8 @@ public final class RunDriverMain {
         String messageFile = opts.getOrDefault("--message-file", "");
         long timeoutSeconds = Long.parseLong(opts.getOrDefault("--timeout-seconds", "900"));
         long pollIntervalSeconds = Long.parseLong(opts.getOrDefault("--poll-interval-seconds", "5"));
+        // C3 取消路径：轮询超过该秒数仍未终态时发一次 cancelRun（0=关，默认关）
+        long cancelAfterSeconds = Long.parseLong(opts.getOrDefault("--cancel-after-seconds", "0"));
         boolean captureLlm = "1".equals(opts.get("--capture-llm"));
         boolean expectDegraded = "1".equals(opts.get("--expect-degraded"));
         boolean modGate = "1".equals(opts.get("--mod-gate"));
@@ -349,7 +365,8 @@ public final class RunDriverMain {
                     .setUserId(user)
                     .setMessage(message)
                     .setStageConfigJson(stageConfigJson)
-                    .setCaptureLlmRequests(captureLlm);
+                    .setCaptureLlmRequests(captureLlm)
+                    .setGenerateArtifacts(opts.containsKey("--generate-artifacts"));
             AgentRunMessage created;
             try {
                 laneTagAttachment();
@@ -371,9 +388,11 @@ public final class RunDriverMain {
         // -----------------------------------------------------------------
         // 轮询到终态
         // -----------------------------------------------------------------
-        long deadline = System.currentTimeMillis() + timeoutSeconds * 1000;
+        long pollStartMs = System.currentTimeMillis();
+        long deadline = pollStartMs + timeoutSeconds * 1000;
         AgentRunStatusMessage lastStatus = null;
         int consecutiveErrors = 0;
+        boolean cancelSent = false; // cancelRun 只发一次（失败也算发过，防重发）
         while (System.currentTimeMillis() < deadline) {
             try {
                 laneTagAttachment();
@@ -403,6 +422,21 @@ public final class RunDriverMain {
                     return;
                 }
             }
+            // C3 取消路径（--cancel-after-seconds）：本轮未到终态且轮询已超阈值 → 发一次 cancelRun；
+            // 发过（含失败）不再重发，照常轮询到终态（CANCELED 与产物保留的断言在泳道侧判）。
+            if (cancelAfterSeconds > 0 && !cancelSent
+                    && System.currentTimeMillis() - pollStartMs > cancelAfterSeconds * 1000) {
+                cancelSent = true;
+                try {
+                    laneTagAttachment();
+                    svc.cancelRun(CancelAgentRunRequest.newBuilder()
+                            .setUserId(user).setId(runId).build());
+                    System.out.println("CANCEL_SENT status="
+                            + (lastStatus == null ? "UNKNOWN" : lastStatus.getStatus()));
+                } catch (Exception e) {
+                    System.out.println("CANCEL_FAILED: " + e);
+                }
+            }
             sleep(pollIntervalSeconds);
         }
         if (terminalStatus == null) {
@@ -414,6 +448,12 @@ public final class RunDriverMain {
         // 终态后取证
         // -----------------------------------------------------------------
         writeEvidence(outDir, runId, user, svc, csvDataRows, model, lastStatus, expectDegraded, modGate, modCsvGate);
+
+        // 014-new-03 产物探针（--artifacts-probe）：终态取证后跑，尽力而为不改退出码；
+        // 超时未到终态时 run 未定稿，跳过探针（产物清单大概率不全，以真终态那次为准）。
+        if (opts.containsKey("--artifacts-probe") && !timedOut) {
+            probeArtifacts(outDir, runId, user, svc);
+        }
 
         boolean completed = "COMPLETED".equals(terminalStatus);
         check("status.terminal_completed", completed,
@@ -599,6 +639,84 @@ public final class RunDriverMain {
     }
 
     // ---------------------------------------------------------------------
+    // 014-new-03 产物通道探针（--artifacts-probe）
+    // ---------------------------------------------------------------------
+
+    /**
+     * run 终态后的产物通道探针（014-new-03）。listArtifacts 拉产物清单，全文（含每项
+     * type/name/content_type/meta_json）落盘 artifacts-list.txt；type=run_output 的每一项
+     * downloadArtifact 下载到 {@code artifacts/<artifactId>__<filename>}（filename 里路径
+     * 分隔符换下划线），内容 SHA-256 逐行记 artifacts-sha256.txt；非 run_output 只进清单
+     * 不下载。整体一个 try/catch：任何失败打印 PROBE failed 并把原文追加到 artifacts-list.txt
+     * 尾部，不加 check、不改退出码，主流程照常走完。
+     */
+    private void probeArtifacts(Path outDir, String runId, String user, AgentDubboService svc) {
+        Path listPath = outDir.resolve("artifacts-list.txt");
+        try {
+            laneTagAttachment();
+            ListAgentArtifactsResponse list = svc.listArtifacts(ListAgentArtifactsRequest.newBuilder()
+                    .setUserId(user).setId(runId).build());
+            // 清单先落盘再逐个下载：中途失败时清单证据已在，失败原文追加在其尾部
+            writeText(listPath, "==== ListArtifacts runId=" + runId + " ====" + System.lineSeparator()
+                    + protoText(list));
+            info("产物探针: 清单项数=" + list.getItemsCount());
+            for (AgentArtifactMessage item : list.getItemsList()) {
+                String artifactId = item.getArtifactId();
+                if (!"run_output".equals(item.getType())) {
+                    System.out.println("PROBE artifact id=" + artifactId + " type=" + item.getType()
+                            + " skipped-download");
+                    continue;
+                }
+                laneTagAttachment();
+                DownloadAgentArtifactResponse dl = svc.downloadArtifact(DownloadAgentArtifactRequest.newBuilder()
+                        .setUserId(user).setArtifactId(artifactId).build());
+                // 记账文件名与落盘文件名同款净化名，账和盘上文件一一对应
+                String diskName = artifactId + "__" + sanitizeFilename(dl.getFilename());
+                Path artifactPath = outDir.resolve("artifacts").resolve(diskName);
+                Files.createDirectories(artifactPath.getParent());
+                byte[] content = dl.getContent().toByteArray();
+                Files.write(artifactPath, content);
+                String sha256 = sha256Hex(content);
+                appendText(outDir.resolve("artifacts-sha256.txt"), sha256 + "  " + diskName
+                        + "  bytes=" + content.length
+                        + "  contentType=" + (dl.getContentType().isBlank() ? item.getContentType() : dl.getContentType())
+                        + System.lineSeparator());
+                System.out.println("PROBE artifact id=" + artifactId + " type=run_output sha256=" + sha256
+                        + " bytes=" + content.length);
+            }
+        } catch (Exception e) {
+            System.out.println("PROBE failed: " + e);
+            appendText(listPath, "PROBE failed: " + e + System.lineSeparator());
+        }
+    }
+
+    /** 产物落盘文件名净化：路径分隔符替换成下划线（filename 可能带 a/b.csv 之类相对路径），空名兜底 unnamed。 */
+    private static String sanitizeFilename(String filename) {
+        String safe = (filename == null ? "" : filename).replace("/", "_").replace("\\", "_");
+        return safe.isBlank() ? "unnamed" : safe;
+    }
+
+    /** 内容 SHA-256 十六进制（小写），探针下载账用。 */
+    private static String sha256Hex(byte[] content) throws java.security.NoSuchAlgorithmException {
+        byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(content);
+        StringBuilder hex = new StringBuilder(digest.length * 2);
+        for (byte b : digest) {
+            hex.append(Character.forDigit((b >> 4) & 0xf, 16)).append(Character.forDigit(b & 0xf, 16));
+        }
+        return hex.toString();
+    }
+
+    /** 逐行追加写（探针记账/失败记录用；文件不存在则新建，写失败只报不打断）。 */
+    private static void appendText(Path path, String text) {
+        try {
+            Files.writeString(path, text, StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (Exception e) {
+            System.err.println("追加证据文件失败 " + path + ": " + e);
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // 小工具
     // ---------------------------------------------------------------------
 
@@ -778,11 +896,12 @@ public final class RunDriverMain {
             "--name", "--description", "--semantic-ref", "--primary-key",
             "--coverage-scope", "--coverage-start", "--coverage-end",
             "--csv", "--out", "--run-id", "--message-file",
-            "--timeout-seconds", "--poll-interval-seconds",
+            "--timeout-seconds", "--poll-interval-seconds", "--cancel-after-seconds",
             "--lane-tag", "--mod-csv-gate");
 
     private static final List<String> FLAG_OPTS = List.of(
-            "--capture-llm", "--no-tool-gate", "--expect-degraded", "--mod-gate", "--help");
+            "--capture-llm", "--no-tool-gate", "--expect-degraded", "--mod-gate",
+            "--generate-artifacts", "--artifacts-probe", "--help");
 
     private static Map<String, String> parseArgs(String[] args) {
         Map<String, String> opts = new LinkedHashMap<>();
@@ -833,6 +952,12 @@ public final class RunDriverMain {
                   --out <dir>            evidence 输出根目录（默认 out-014data04）
                   --capture-llm          置 capture_llm_requests=true（默认关）
                   --no-tool-gate         关工具核对门（退出码只看终态，不要求三工具齐全）
+                  --cancel-after-seconds <n> C3 取消路径：轮询超 n 秒仍未终态时发一次 cancelRun
+                                         （打 CANCEL_SENT，失败打 CANCEL_FAILED 且不重发），随后照常轮询到终态（默认 0=关）
+                  --generate-artifacts   创建 run 时置 generate_artifacts=true（014-new-03 产物通道开关，默认关）
+                  --artifacts-probe      run 终态后产物探针（014-new-03）：清单全文落 artifacts-list.txt，
+                                         run_output 逐个下载到 artifacts/ 并记 SHA-256 到 artifacts-sha256.txt，
+                                         非 run_output 只记清单不下载；探针尽力而为，失败不改退出码
   --expect-degraded      c9 停机窗口模式：提示词换五步降级探测模板，核对门按
                          「预期失败即 PASS」判（executePython=PLATFORM_OBJECT_UNAVAILABLE、
                          promote=TOOL_ERROR；混传与 promote 成功两项不再检查）
@@ -850,7 +975,9 @@ public final class RunDriverMain {
 
                 evidence（out/<时间戳>/ 目录）：params.txt（参数+完整提示词+模型配置原文）、
                 create-response.txt、poll.log、events.jsonl（事件全量原文）、result.txt（应答+markdown 原文）、
-                run-message.txt（run 详情，ext 含 stage_config_json）、run-credits.txt、evidence-summary.txt。
+                run-message.txt（run 详情，ext 含 stage_config_json）、run-credits.txt、evidence-summary.txt；
+                --artifacts-probe 时另有 artifacts-list.txt（产物清单全文+探针失败原文）、
+                artifacts-sha256.txt（下载账）与 artifacts/（run_output 产物原件）。
                 """);
     }
 }
