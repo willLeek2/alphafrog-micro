@@ -1706,19 +1706,22 @@ def _harvest_task_artifacts(
     不让整个收割失败。collected 每项含 filename/sha256/size_bytes/gzip_data
     （gzip 默认压缩级别，再 base64）。
 
-    累计预算（CR B3）：所有已收文件的 gzip 字节总量不得超过
-    AF_SANDBOX_HARVEST_TOTAL_BUDGET_BYTES（默认 6MB——Dubbo 默认报文上限
-    8MB 扣除 base64 的 4/3 膨胀后的安全值），否则该文件记
+    累计预算（CR B3；二轮复核后默认值 6MB 改 4MB）：所有已收文件的 gzip
+    字节总量不得超过 AF_SANDBOX_HARVEST_TOTAL_BUDGET_BYTES（默认
+    4194304=4MB——Dubbo 默认报文上限 8MB 扣除 base64 的 4/3 膨胀（4MB
+    gzip 经 base64 约 5.6MB）与 stdout/stderr/record 三项硬上限（合计约
+    1.5MB）后的余量，最坏组合总报文约 7.2MB），否则该文件记
     skipped(total_budget_exceeded)。预算约束的是回传通道：多文件组合
     超限的结果是 getTaskResult 整个调用失败（通道级故障，非文件级），
-    所以在收割侧截住。
+    所以在收割侧截住。泳道阶段调高 Dubbo payload 上限后，可用该环境
+    变量调大预算。
     """
     try:
-        total_budget = int(os.environ.get("AF_SANDBOX_HARVEST_TOTAL_BUDGET_BYTES", "6291456"))
+        total_budget = int(os.environ.get("AF_SANDBOX_HARVEST_TOTAL_BUDGET_BYTES", "4194304"))
     except ValueError:
-        total_budget = 6291456
+        total_budget = 4194304
     if total_budget <= 0:
-        total_budget = 6291456
+        total_budget = 4194304
     collected: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     gzip_bytes_used = 0
