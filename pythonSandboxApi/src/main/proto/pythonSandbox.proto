@@ -51,8 +51,10 @@ message ExecuteRequest {
   bool collectArtifacts = 27;
   // 014-new-03: 单文件收割上限（字节），工具层与下载侧上限
   // agent.artifact.download.max-bytes 同值注入。超限文件跳过并记入
-  // skippedArtifacts（带原因），不静默截断；仅在 collectArtifacts=true
-  // 时有意义，<=0 视为未携带（由 Python 侧配置兜底）。
+  // skippedArtifacts（带原因），不静默截断。成对约束：Java 侧只在
+  // collectArtifacts=true 且本值 >0 时同时设置两者；Python 契约校验
+  // collect=true 必须携带正上限——两侧都没有「0 或缺省也能收割」的兜底
+  // 配置，上限缺失即拒绝，避免「配 0 表达不限量」把工具整体打挂。
   int64 collectArtifactMaxBytes = 28;
 }
 

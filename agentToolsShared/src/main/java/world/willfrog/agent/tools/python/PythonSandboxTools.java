@@ -228,6 +228,10 @@ public class PythonSandboxTools {
     @Value("${agent.artifact.download.max-bytes:10485760}")
     private long collectArtifactMaxBytes = 10485760L;
 
+    /** 014-new-03 CR B2：max-bytes ≤0 时的「warn 一次」开关，避免每次调用刷日志。 */
+    private final java.util.concurrent.atomic.AtomicBoolean collectMaxBytesZeroWarned =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private final DatasetEntryMetadataReader metadataReader;
 
     public PythonSandboxTools(ObjectMapper objectMapper) {
@@ -716,9 +720,17 @@ public class PythonSandboxTools {
 
             // 014-new-03：Run 冻结的 generate_artifacts 开关为 true 时，向沙箱请求收割
             // 任务产物目录的顶层文件；单文件上限与下载侧同一配置（收割进来的必然下载得动）。
+            // 上限必须大于 0 才开启收割：Python 契约校验 collect=true 必须携带上限，
+            // 而下载侧把 max-bytes 配成 0 表达「不限量」——不设此条件会把开关打开的
+            // run 里每个请求都变成契约拒绝（工具完全不可用），故降级为不收割并 warn 一次。
             if (generateArtifactsEnabledForRun(runId)) {
-                requestBuilder.setCollectArtifacts(true)
-                        .setCollectArtifactMaxBytes(collectArtifactMaxBytes);
+                if (collectArtifactMaxBytes > 0) {
+                    requestBuilder.setCollectArtifacts(true)
+                            .setCollectArtifactMaxBytes(collectArtifactMaxBytes);
+                } else if (collectMaxBytesZeroWarned.compareAndSet(false, true)) {
+                    log.warn("agent.artifact.download.max-bytes 配置为 {}（≤0），收割不开启、交付文件不回传；"
+                            + "如需收割请把该配置设为正数", collectArtifactMaxBytes);
+                }
             }
 
             for (String oid : originalIdsToMount) {

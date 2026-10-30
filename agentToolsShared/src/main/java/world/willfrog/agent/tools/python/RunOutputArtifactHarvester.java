@@ -57,6 +57,14 @@ public class RunOutputArtifactHarvester {
     private int artifactAdminRetentionDays;
 
     /**
+     * CR 建议：解压读取上界（与单文件收割上限同键同默认）。诚实流程里 sizeBytes
+     * 与 gzip 出自同一份 payload，本界不触发；被攻陷的沙箱构造小体积、解压后极大
+     * 的报文时会在此截住，防止解压耗尽内存。读到上界再加 1 字节即判超限拒绝。
+     */
+    @Value("${agent.artifact.download.max-bytes:10485760}")
+    private long gunzipMaxBytes = 10485760L;
+
+    /**
      * 收割入口。响应里没有收割字段（开关未开、失败路径、旧版本沙箱）时零动作。
      *
      * @param runId   产物归属的 run
@@ -195,11 +203,24 @@ public class RunOutputArtifactHarvester {
                 && !".".equals(filename) && !"..".equals(filename);
     }
 
-    /** 解 gzip 得到原始字节；坏输入（非 gzip 流/截断）抛 IOException 由调用方降级。 */
-    private static byte[] gunzip(byte[] gzipBytes) throws IOException {
+    /** 解 gzip 得到原始字节；坏输入（非 gzip 流/截断/解压超过上界）抛 IOException 由调用方降级。 */
+    private byte[] gunzip(byte[] gzipBytes) throws IOException {
+        long bound = gunzipMaxBytes > 0 ? gunzipMaxBytes : 10485760L;
         try (ByteArrayInputStream byteIn = new ByteArrayInputStream(gzipBytes);
-             GZIPInputStream gzipIn = new GZIPInputStream(byteIn)) {
-            return gzipIn.readAllBytes();
+             GZIPInputStream gzipIn = new GZIPInputStream(byteIn);
+             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            long total = 0;
+            int read;
+            while ((read = gzipIn.read(buffer)) != -1) {
+                total += read;
+                if (total > bound) {
+                    // 多读 1 字节即判超限：宁可拒绝该文件，不给解压炸弹留内存。
+                    throw new IOException("decompressed size exceeds bound " + bound);
+                }
+                out.write(buffer, 0, read);
+            }
+            return out.toByteArray();
         }
     }
 

@@ -1698,16 +1698,30 @@ def _harvest_task_artifacts(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """收割产物目录顶层文件，返回 (collected, skipped) 两个 snake_case 列表。
 
-    014-new-03：在 run_in_open_session 的 finally 窗口（读产物大小之后、
+    014-new-03：在 run_in_open_session 的 finally 窗口（OOM 覆写判定之后、
     rm -rf 之前）调用，此刻任务已成功、文件还在容器里、session 仍可用。
     规则：只收顶层常规文件；子目录记 skipped(subdirectory_ignored)；其他
     类型（符号链接等）记 skipped(not_regular_file)；超过单文件上限记
     skipped(exceeds_max_bytes)；单个文件读取失败记 skipped(read_failed)，
     不让整个收割失败。collected 每项含 filename/sha256/size_bytes/gzip_data
     （gzip 默认压缩级别，再 base64）。
+
+    累计预算（CR B3）：所有已收文件的 gzip 字节总量不得超过
+    AF_SANDBOX_HARVEST_TOTAL_BUDGET_BYTES（默认 6MB——Dubbo 默认报文上限
+    8MB 扣除 base64 的 4/3 膨胀后的安全值），否则该文件记
+    skipped(total_budget_exceeded)。预算约束的是回传通道：多文件组合
+    超限的结果是 getTaskResult 整个调用失败（通道级故障，非文件级），
+    所以在收割侧截住。
     """
+    try:
+        total_budget = int(os.environ.get("AF_SANDBOX_HARVEST_TOTAL_BUDGET_BYTES", "6291456"))
+    except ValueError:
+        total_budget = 6291456
+    if total_budget <= 0:
+        total_budget = 6291456
     collected: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    gzip_bytes_used = 0
     for entry_type, size_bytes, filename in _list_artifact_dir_entries(
         session, artifact_dir
     ):
@@ -1731,12 +1745,22 @@ def _harvest_task_artifacts(
             )
             skipped.append({"filename": filename, "reason": "read_failed"})
             continue
+        gzip_payload = gzip.compress(payload)
+        if gzip_bytes_used + len(gzip_payload) > total_budget:
+            logger.info(
+                "ARTIFACT_HARVEST_BUDGET_EXCEEDED task=%s file=%s "
+                "used=%d fileGzipBytes=%d budget=%d",
+                task_id, filename, gzip_bytes_used, len(gzip_payload), total_budget,
+            )
+            skipped.append({"filename": filename, "reason": "total_budget_exceeded"})
+            continue
+        gzip_bytes_used += len(gzip_payload)
         collected.append(
             {
                 "filename": filename,
                 "sha256": hashlib.sha256(payload).hexdigest(),
                 "size_bytes": len(payload),
-                "gzip_data": base64.b64encode(gzip.compress(payload)).decode("ascii"),
+                "gzip_data": base64.b64encode(gzip_payload).decode("ascii"),
             }
         )
     return collected, skipped
@@ -2662,12 +2686,19 @@ def run_in_open_session(
         )
         artifact_bytes_written = _read_runtime_size(session, task_workspace + "/artifacts")
         temporary_bytes_written = _read_task_temporary_bytes(session, task_workspace)
-        # 014-new-03 收割窗口：此刻任务已成功（exit_reason 仍为 SUCCEEDED，
-        # 即 exit_code==0 且未取消、未超时）、产物文件还在容器里、session
-        # 仍可用，且位于 _cleanup_task_workspace 的 rm -rf 之前 —— 这是全
-        # 链路唯一满足三个条件的窗口（目录清理早于结果上报，Java 侧没有
-        # 收割机会）。收割整体 try/except 兜底：任何异常只记日志、两个字
-        # 段保持 None，绝不让任务结果变失败。
+        oom_killed = _container_oom_killed(actual_container_id)
+        # D11 (task #108): an OBSERVED cancel keeps the CANCELED exit reason
+        # even if the container also shows an OOM mark — the cancellation is
+        # the evidenced terminal cause (the OOM mark may be stale/container-
+        # wide).  Without cancel evidence the pre-D11 OOM override stands.
+        if oom_killed and exit_reason != "CANCELED":
+            exit_reason = "OOM_KILLED"
+        # 014-new-03 收割窗口：此刻 exit_reason 为 SUCCEEDED——判定在 OOM 覆写
+        # 之后，exit 0 但容器带 OOM 标记的任务已被改判 OOM_KILLED、不进本分支，
+        # 守住「FAILED 不收割」不变量。此刻产物文件还在容器里、session 仍可用，
+        # 且位于 _cleanup_task_workspace 的 rm -rf 之前——全链路唯一满足条件的
+        # 窗口（目录清理早于结果上报，Java 侧没有收割机会）。收割整体
+        # try/except 兜底：任何异常只记日志、两个字段保持 None，绝不让任务结果变失败。
         if collect_artifacts and result is not None and exit_reason == "SUCCEEDED":
             t_harvest_start = time.monotonic()
             try:
@@ -2696,13 +2727,6 @@ def run_in_open_session(
                     "ARTIFACT_HARVEST_FAILED task=%s error=%s",
                     task_id, harvest_error,
                 )
-        oom_killed = _container_oom_killed(actual_container_id)
-        # D11 (task #108): an OBSERVED cancel keeps the CANCELED exit reason
-        # even if the container also shows an OOM mark — the cancellation is
-        # the evidenced terminal cause (the OOM mark may be stale/container-
-        # wide).  Without cancel evidence the pre-D11 OOM override stands.
-        if oom_killed and exit_reason != "CANCELED":
-            exit_reason = "OOM_KILLED"
         t_cleanup_start = time.monotonic()
         cleanup_ok = True
         control_cleanup_ok = True
