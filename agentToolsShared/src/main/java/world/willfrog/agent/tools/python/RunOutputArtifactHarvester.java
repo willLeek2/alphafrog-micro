@@ -65,19 +65,26 @@ public class RunOutputArtifactHarvester {
     private long gunzipMaxBytes = 10485760L;
 
     /**
-     * 收割入口。响应里没有收割字段（开关未开、失败路径、旧版本沙箱）时零动作。
+     * 收割入口。响应里没有收割字段（开关未开、失败路径、旧版本沙箱）时零动作；
+     * 有跳过文件时无论是否收集到文件，都先打印逐文件跳过原因（全部被跳过的场景
+     * 也不能没有观测线索）。
      *
      * @param runId   产物归属的 run
      * @param userId 调用方已知的归属用户；为空时查 Run 记录补齐
      * @param result  沙箱终态结果响应
      */
     public void harvest(String runId, String userId, TaskResultResponse result) {
-        if (result == null || result.getCollectedArtifactsCount() == 0) {
+        if (result == null) {
             return;
         }
+        // 跳过原因必须先于「已收集数为 0」的早退打印：全部文件都被跳过时（如单文件超限），
+        // 早退会吞掉跳过原因，agent 侧就没有任何可观测线索（c1 泳道实测教训）。
         for (SkippedArtifactFile skipped : result.getSkippedArtifactsList()) {
             log.info("沙箱收割跳过一个产物文件: runId={} taskId={} filename={} reason={}",
                     runId, result.getTaskId(), skipped.getFilename(), skipped.getReason());
+        }
+        if (result.getCollectedArtifactsCount() == 0) {
+            return;
         }
         if (persistentArtifactRegistry == null || agentStoragePaths == null) {
             log.warn("收割产物登记接线缺失，本次产物不落盘: runId={} taskId={} registryReady={} storagePathsReady={}",
