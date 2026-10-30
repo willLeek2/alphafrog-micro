@@ -1,5 +1,6 @@
 package world.willfrog.sandbox.service;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.ByteString;
 import lombok.Data;
@@ -2384,7 +2385,13 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String workspace_generation;
         // 014-new-03: 任务产物收割开关与单文件上限；仅在开关为 true 时随请求下发
         // （对齐 proto 侧 collectArtifacts/collectArtifactMaxBytes 的缺省语义）。
+        // 泳道实测 b3 修复：这两个字段是包装类型，开关关闭时为 null；若不加
+        // NON_NULL，Jackson 会把 null 序列化成 "collect_artifacts": null 发给
+        // 沙箱服务，而 Python 模型 collect_artifacts 是严格 bool，422 拒绝后
+        // agent 无限重试卡死 run。加注解后 null 时整个键省略，与注释本意一致。
+        @JsonInclude(JsonInclude.Include.NON_NULL)
         private Boolean collect_artifacts;
+        @JsonInclude(JsonInclude.Include.NON_NULL)
         private Long collect_artifact_max_bytes;
     }
 
