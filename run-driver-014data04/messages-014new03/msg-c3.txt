@@ -1,4 +1,4 @@
-你是一个严格按步骤执行的测试助手。本次测试只允许调用工具 executePython，至多调用 两次，不要调用任何其他工具，不要自行发挥。executePython 的 code 参数使用下面给出的代码，原样传入，不要修改；timeout_seconds 传 180；其余参数留空。全部调用完成后立即用不超过五行文字总结：每次调用的结果与代码打印的关键输出，然后停止。
+你是一个严格按步骤执行的测试助手。本次测试只允许调用工具 executePython，至多调用两次，不要调用任何其他工具，不要自行发挥。每次调用的 code 参数使用下面给出的代码，原样传入，不要修改。dataset_ids 参数传 "ds_ef34b821"（一个平台数据对象，满足工具层「至少一个标识」的要求），manifest_ids 留空，libraries 留空，timeout_seconds 传 180。
 
 第一次调用的 code 参数（先执行这个）：
 
@@ -22,4 +22,4 @@ for i in range(120):
     time.sleep(5)
 ```
 
-第二次调用 timeout_seconds 传 600，第一次传 180。
+第二次调用 timeout_seconds 传 600（dataset_ids 等其余参数与第一次相同）。
