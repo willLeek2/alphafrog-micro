@@ -10,6 +10,8 @@ import java.util.Map;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.racing.idl.PromptScope;
 import world.willfrog.racing.idl.PromptSelection;
+import world.willfrog.racing.idl.PromptSetDefault;
+import world.willfrog.racing.idl.ValueSource;
 import world.willfrog.racing.idl.ValueSourceKind;
 
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_UNREADABLE;
@@ -198,16 +200,69 @@ public record PromptRunSelection(
         check(set.getVersion() > 0, "真实集合版本必须为正数");
         check(selection.hasOrigin() && selection.getOrigin().hasSourceScope(), "真实集合选择缺少实际来源");
         checkScope(selection.getOrigin().getSourceScope());
+        check(selection.getOrigin().getSourceScope().equals(set.getScope()), "真实集合选择的实际来源范围不一致");
         checkText(selection.getOrigin().getBusinessName());
-        check(selection.getOrigin().getDefaultRevision() > 0, "真实集合选择缺少默认修订");
-        check(selection.getOrigin().hasValueSource()
-                && selection.getOrigin().getValueSource().getKind() == ValueSourceKind.ORDINARY_DEFAULT,
-                "真实集合选择缺少普通默认来源");
-        var source = selection.getOrigin().getValueSource();
+        if (selection.getOrigin().hasValueSource()) {
+            check(selection.getOrigin().getDefaultRevision() > 0, "真实集合选择缺少默认修订");
+            var source = selection.getOrigin().getValueSource();
+            check(source.getKind() == ValueSourceKind.ORDINARY_DEFAULT, "真实集合选择缺少普通默认来源");
+            validateValueSource(source);
+            return;
+        }
+        check(selection.getOrigin().hasExperiment(), "真实集合选择缺少来源种类");
+        var experiment = selection.getOrigin().getExperiment();
+        checkText(experiment.getExperimentId());
+        check(experiment.hasValueSource(), "整组提示词实验缺少实际取值来源");
+        ValueSource source = experiment.getValueSource();
+        validateValueSource(source);
+        check(source.getConfigurationScopeInstanceId().equals(selection.getTarget().getTargetScopeInstanceId()),
+                "整组提示词实验的配置范围与根目标不一致");
+        switch (source.getKind()) {
+            case EXPERIMENT -> {
+                check(experiment.hasAssignmentId(), "整组提示词实验缺少分配编号");
+                checkText(experiment.getAssignmentId());
+                check(source.hasConfigurationVersion() && source.hasCandidateId(), "整组提示词实验缺少配置版本或候选");
+                check(selection.getOrigin().getDefaultRevision() == 0, "实验候选不能使用普通默认修订");
+            }
+            case ENDED_FIXED -> {
+                check(!experiment.hasAssignmentId(), "结束固定集合不能携带分配编号");
+                check(source.hasConfigurationVersion(), "结束固定集合缺少配置版本");
+                check(selection.getOrigin().getDefaultRevision() == 0, "结束固定集合不能使用普通默认修订");
+            }
+            case ORDINARY_DEFAULT -> {
+                check(experiment.hasAssignmentId(), "实验普通默认缺少分配编号");
+                checkText(experiment.getAssignmentId());
+                validateExperimentDefault(selection, source);
+            }
+            default -> throw blocked("整组提示词实验的实际来源种类无效");
+        }
+    }
+
+    private static void validateValueSource(ValueSource source) {
         if (source.hasConfigurationVersion()) {
             check(source.getConfigurationVersion() > 0, "真实集合选择包含无效配置版本");
         }
         if (source.hasCandidateId()) checkText(source.getCandidateId());
+    }
+
+    private static void validateExperimentDefault(PromptSelection selection, ValueSource source) {
+        try {
+            String saved = source.getBusinessDefaultSourceJson();
+            check(!saved.isBlank() && JSON.readTree(saved).isObject(), "实验普通默认缺少原默认集合来源");
+            PromptSetDefault.Builder builder = PromptSetDefault.newBuilder();
+            JsonFormat.parser().merge(saved, builder);
+            PromptSetDefault original = builder.build();
+            check(original.hasScope() && original.getScope().getEnvironment().equals(selection.getTarget().getEnvironment())
+                            && original.getScope().getScopeInstanceId().equals(selection.getTarget().getTargetScopeInstanceId())
+                            && original.getBusinessName().equals(selection.getOrigin().getBusinessName())
+                            && original.hasVersion() && original.getVersion().equals(selection.getSelectedTarget().getPromptSetVersion())
+                            && original.getRevision() > 0 && original.getRevision() == selection.getOrigin().getDefaultRevision(),
+                    "实验普通默认与原集合版本或修订不一致");
+        } catch (ModelSendBlockedException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw blocked("实验普通默认来源无法解析");
+        }
     }
 
     private static void checkScope(PromptScope scope) {

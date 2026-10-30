@@ -49,12 +49,11 @@ public class ToolSummaryService {
     }
 
     private String summarize(String toolName, String rawOutput, PromptText rawPrompt, String todoGoal) {
-        String experimentId = resolvePromptExperimentId();
         int attempts = Math.max(0, resolveSummaryMaxRetries()) + 1;
         Exception lastError = null;
         for (int i = 0; i < attempts; i++) {
             try {
-                return invokeSummary(toolName, rawOutput, rawPrompt, todoGoal, experimentId);
+                return invokeSummary(toolName, rawOutput, rawPrompt, todoGoal);
             } catch (Exception e) {
                 ModelSendBlocks.rethrowIfBlocked(e);
                 lastError = e;
@@ -68,9 +67,9 @@ public class ToolSummaryService {
     }
 
     private String invokeSummary(String toolName, String rawOutput, PromptText rawPrompt,
-                                 String todoGoal, String experimentId) {
-        var prepared = rawPrompt == null ? promptPreparation.prepare(toolName, rawOutput, todoGoal, experimentId)
-                : promptPreparation.preparePrompt(toolName, rawPrompt, todoGoal, experimentId);
+                                 String todoGoal) {
+        var prepared = rawPrompt == null ? promptPreparation.prepare(toolName, rawOutput, todoGoal)
+                : promptPreparation.preparePrompt(toolName, rawPrompt, todoGoal);
         SummaryRoute route = resolveSummaryRoute();
         ChatModel model = buildSummaryModel(route);
         if (model == null) {
@@ -138,12 +137,6 @@ public class ToolSummaryService {
                 .map(AgentLlmProperties.ToolSummary::getMaxRetries)
                 .filter(v -> v != null && v >= 0)
                 .orElse(1);
-    }
-
-    private String resolvePromptExperimentId() {
-        return localConfigLoader.current().map(AgentLlmProperties::getTools)
-                .map(AgentLlmProperties.Tools::getSummary)
-                .map(AgentLlmProperties.ToolSummary::getPromptExperimentId).orElse(null);
     }
 
     private void recordObservability(ChatResponse response, long durationMs, String errorMessage, SummaryRoute route) {

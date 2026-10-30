@@ -145,6 +145,10 @@ public class AgentRunEventService {
     @Value("${agent.python-workspace.enabled:false}")
     private boolean pythonWorkspaceEnabled;
 
+    /** 新根运行采用的整组提示词实验，创建时冻结到根记录。 */
+    @Value("${agent.llm.prompt-set-experiment-id:}")
+    private String promptSetExperimentId;
+
     /** 新建 Run 领取服务所有权时的有效期（秒），使用时最短按 1 秒收成 Duration。 */
     @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}")
     private long serviceLeaseTtlSeconds;
@@ -277,6 +281,7 @@ public class AgentRunEventService {
         ext.put("checkpoint_version", resolveCheckpointVersion());
         ext.put("python_workspace_enabled", resolvePythonWorkspaceEnabled());
         ext.put(PromptSelectionCoordinator.REFERENCE_DATE_FIELD, LocalDate.now().toString());
+        ext.put(PromptSelectionCoordinator.EXPERIMENT_ID_FIELD, resolvePromptSetExperimentId());
         ext.put(ExperimentRunBindingStore.CONTEXT_FIELD, experimentRunPreparation.freezeContext(runId));
         // 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
@@ -1784,6 +1789,14 @@ public class AgentRunEventService {
                 .map(AgentLlmProperties.Agent::getPythonWorkspace)
                 .map(AgentLlmProperties.PythonWorkspace::getEnabled)
                 .orElse(pythonWorkspaceEnabled);
+    }
+
+    private String resolvePromptSetExperimentId() {
+        String configured = Optional.ofNullable(llmLocalConfigLoader.current())
+                .flatMap(value -> value)
+                .map(AgentLlmProperties::getPromptSetExperimentId)
+                .orElse(promptSetExperimentId);
+        return configured == null ? "" : configured.trim();
     }
 
     /**

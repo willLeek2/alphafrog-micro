@@ -16,6 +16,7 @@ import world.willfrog.racing.idl.PromptInstructionSource;
 import world.willfrog.racing.idl.PromptSelection;
 import world.willfrog.racing.idl.PromptSelectionReply;
 import world.willfrog.racing.idl.PromptSetMember;
+import world.willfrog.racing.idl.PromptSetDefault;
 import world.willfrog.racing.idl.PromptSetVersion;
 import world.willfrog.racing.idl.PromptSetVersionRef;
 import world.willfrog.racing.idl.PromptSetVersionReply;
@@ -268,14 +269,58 @@ public final class RacingPromptClient {
             case PROMPT_SET_VERSION -> requireSetRef(selection.getSelectedTarget().getPromptSetVersion());
             default -> throw unreadable("根选择没有明确正文或集合版本");
         }
-        require(selection.hasOrigin() && selection.getOrigin().hasSourceScope(), "根选择缺少实际默认来源");
-        requireScope(selection.getOrigin().getSourceScope());
-        require(selection.getOrigin().getDefaultRevision() > 0, "根选择缺少真实默认修订");
-        require(selection.getOrigin().hasValueSource(), "根选择缺少默认来源种类");
-        requireValueSource(selection.getOrigin().getValueSource());
-        require(selection.getOrigin().getValueSource().getKind() == ValueSourceKind.ORDINARY_DEFAULT,
-                "普通根选择的来源种类不一致");
+        requireSelectionOrigin(selection, context);
         return selection;
+    }
+
+    private static void requireSelectionOrigin(PromptSelection selection, RuntimeCallContext context) {
+        require(selection.hasOrigin() && selection.getOrigin().hasSourceScope(), "根选择缺少实际来源");
+        var origin = selection.getOrigin();
+        requireScope(origin.getSourceScope());
+        requireText(origin.getBusinessName(), "根选择缺少业务名称");
+        var selectedScope = selection.getSelectedTarget().hasPromptSetVersion()
+                ? selection.getSelectedTarget().getPromptSetVersion().getScope()
+                : selection.getSelectedTarget().getPromptVersion().getScope();
+        require(origin.getSourceScope().equals(selectedScope), "根选择来源范围与实际集合不一致");
+        if (origin.hasValueSource()) {
+            require(origin.getDefaultRevision() > 0, "根选择缺少真实默认修订");
+            requireValueSource(origin.getValueSource());
+            require(origin.getValueSource().getKind() == ValueSourceKind.ORDINARY_DEFAULT,
+                    "普通根选择的来源种类不一致");
+            return;
+        }
+        require(origin.hasExperiment() && selection.getSelectedTarget().hasPromptSetVersion(),
+                "根选择缺少普通默认或集合实验来源");
+        var experiment = origin.getExperiment();
+        requireText(experiment.getExperimentId(), "集合实验缺少实验编号");
+        require(experiment.hasValueSource(), "集合实验缺少取值来源");
+        var source = experiment.getValueSource();
+        requireValueSource(source);
+        require(source.getConfigurationScopeInstanceId().equals(context.getTarget().getTargetScopeInstanceId()),
+                "集合实验来源不属于当前目标范围");
+        if (source.getKind() == ValueSourceKind.ENDED_FIXED) {
+            require(!experiment.hasAssignmentId(), "结束固定集合不能伪造分配编号");
+        } else {
+            require(experiment.hasAssignmentId(), "集合实验缺少已保存分配");
+            requireText(experiment.getAssignmentId(), "集合实验分配编号为空");
+        }
+        if (source.getKind() == ValueSourceKind.ORDINARY_DEFAULT) {
+            try {
+                var saved = PromptSetDefault.newBuilder();
+                JsonFormat.parser().merge(source.getBusinessDefaultSourceJson(), saved);
+                var ordinary = saved.build();
+                require(ordinary.getVersion().equals(selection.getSelectedTarget().getPromptSetVersion())
+                                && ordinary.getBusinessName().equals(origin.getBusinessName())
+                                && ordinary.getRevision() > 0 && ordinary.getRevision() == origin.getDefaultRevision(),
+                        "实验普通默认与原分配保存的集合或修订不一致");
+            } catch (InvalidProtocolBufferException failure) {
+                throw unreadable("实验普通默认来源无法读取");
+            }
+        } else {
+            require(source.getKind() == ValueSourceKind.EXPERIMENT || source.getKind() == ValueSourceKind.ENDED_FIXED,
+                    "集合实验来源种类不一致");
+            require(origin.getDefaultRevision() == 0, "实验候选不能伪造默认修订");
+        }
     }
 
     private static void requireContext(RuntimeCallContext context, boolean requireRoot) {

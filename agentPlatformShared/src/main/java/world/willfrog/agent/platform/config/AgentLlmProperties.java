@@ -13,6 +13,8 @@ public class AgentLlmProperties {
 
     private String defaultEndpoint;
     private String defaultModel;
+    @JsonAlias({"prompt-set-experiment-id", "prompt_set_experiment_id"})
+    private String promptSetExperimentId;
     private Map<String, Endpoint> endpoints = new HashMap<>();
     private List<String> models = new ArrayList<>();
     private Runtime runtime = new Runtime();
@@ -41,6 +43,15 @@ public class AgentLlmProperties {
 
     public void setDefaultModel(String defaultModel) {
         this.defaultModel = defaultModel;
+    }
+
+    /** 新根运行使用的整组提示词实验；运行创建后使用根记录冻结的编号。 */
+    public String getPromptSetExperimentId() {
+        return promptSetExperimentId;
+    }
+
+    public void setPromptSetExperimentId(String promptSetExperimentId) {
+        this.promptSetExperimentId = promptSetExperimentId;
     }
 
     public Map<String, Endpoint> getEndpoints() {
@@ -412,8 +423,6 @@ public class AgentLlmProperties {
     public static class ToolSummary {
         @JsonAlias({"max-retries", "max_retries"})
         private Integer maxRetries;
-        @JsonAlias({"prompt-experiment-id", "prompt_experiment_id"})
-        private String promptExperimentId;
 
         public Integer getMaxRetries() {
             return maxRetries;
@@ -421,14 +430,6 @@ public class AgentLlmProperties {
 
         public void setMaxRetries(Integer maxRetries) {
             this.maxRetries = maxRetries;
-        }
-
-        public String getPromptExperimentId() {
-            return promptExperimentId;
-        }
-
-        public void setPromptExperimentId(String promptExperimentId) {
-            this.promptExperimentId = promptExperimentId;
         }
     }
 

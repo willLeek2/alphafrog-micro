@@ -33,6 +33,7 @@ public final class PromptSelectionCoordinator {
     public static final String SELECTION_KEY = "agent.default_prompt_set";
     public static final String BUSINESS_NAME = "alphafrog.agent";
     public static final String REFERENCE_DATE_FIELD = "prompt_reference_date";
+    public static final String EXPERIMENT_ID_FIELD = "prompt_set_experiment_id";
     private final RacingPromptClient prompts;
     private final ExperimentRunBindingStore bindings;
     private final AgentRunMapper runs;
@@ -54,7 +55,8 @@ public final class PromptSelectionCoordinator {
             check(!rootId.isBlank(), "提示词准备缺少根编号");
             RuntimeCallContext savedBinding = bindings.saved(rootId);
             requireBinding(savedBinding, confirmedContext);
-            LocalDate referenceDate = referenceDate(rootId);
+            RootPromptSettings settings = rootSettings(rootId);
+            LocalDate referenceDate = settings.referenceDate();
             JsonNode saved = bindings.savedPromptSelection(rootId);
             PromptRunSelection result;
             if (saved != null) {
@@ -64,10 +66,10 @@ public final class PromptSelectionCoordinator {
                 PromptRunSelection local = PromptRunSelection.fromExt(saved);
                 check(referenceDate.equals(local.referenceDate()), "根运行固定日期与已保存选择不一致");
                 PromptSelection original = local.racingSelection();
-                requireSelection(original, confirmedContext);
+                requireSelection(original, confirmedContext, settings.experimentId());
                 PromptSelection actual = prompts.getSelection(GetPromptSelectionRequest.newBuilder()
                         .setContext(confirmedContext).setSelectionId(original.getSelectionId()).build());
-                requireSelection(actual, confirmedContext);
+                requireSelection(actual, confirmedContext, settings.experimentId());
                 // 普通发布可刷新预期代际，原根选择及其来源、记录时间仍保持。
                 check(original.toBuilder().clearTarget().clearConfirmedAt().build()
                                 .equals(actual.toBuilder().clearTarget().clearConfirmedAt().build()),
@@ -77,11 +79,12 @@ public final class PromptSelectionCoordinator {
                 TargetIdentity target = confirmedContext.getTarget();
                 PromptSelection actual = prompts.resolveSelection(ResolvePromptSelectionRequest.newBuilder()
                         .setContext(confirmedContext).setSelectionKey(SELECTION_KEY)
+                        .setExperimentId(settings.experimentId())
                         .setPromptSetDefault(PromptSetDefaultChoice.newBuilder().setBusinessName(BUSINESS_NAME)
                                 .setScope(PromptScope.newBuilder().setEnvironment(target.getEnvironment())
                                         .setScopeInstanceId(target.getTargetScopeInstanceId())))
                         .build());
-                requireSelection(actual, confirmedContext);
+                requireSelection(actual, confirmedContext, settings.experimentId());
                 result = PromptRunSelection.fromRacing(actual, referenceDate);
             }
             // 公共存储提交并重读后才成功返回，外层公共准备不再重复写相同字段。
@@ -100,22 +103,26 @@ public final class PromptSelectionCoordinator {
         }
     }
 
-    private LocalDate referenceDate(String rootId) {
+    private RootPromptSettings rootSettings(String rootId) {
         try {
             AgentRun root = runs.findById(rootId);
             check(root != null && rootId.equals(root.getId()), "根运行记录不可读取");
             JsonNode ext = json.readTree(root.getExt());
             JsonNode date = ext == null ? null : ext.get(REFERENCE_DATE_FIELD);
             check(date != null && date.isTextual() && !date.textValue().isBlank(), "根运行缺少固定提示词日期");
-            return LocalDate.parse(date.textValue());
+            JsonNode experiment = ext.get(EXPERIMENT_ID_FIELD);
+            check(experiment == null || experiment.isTextual(), "根运行的提示词实验编号无效");
+            String experimentId = experiment == null ? "" : experiment.textValue();
+            check(experimentId.isEmpty() || !experimentId.isBlank(), "根运行的提示词实验编号无效");
+            return new RootPromptSettings(LocalDate.parse(date.textValue()), experimentId);
         } catch (ModelSendBlockedException failure) {
             throw failure;
         } catch (Exception failure) {
-            throw blocked("根运行固定提示词日期无法读取");
+            throw blocked("根运行固定提示词日期或实验编号无法读取");
         }
     }
 
-    private static void requireSelection(PromptSelection selection, RuntimeCallContext context) {
+    private static void requireSelection(PromptSelection selection, RuntimeCallContext context, String experimentId) {
         check(selection.hasRoot() && selection.getRoot().equals(context.getRoot()), "平台根选择归属不一致");
         check(selection.hasTarget() && sameLogicalTarget(selection.getTarget(), context.getTarget()),
                 "平台根选择逻辑目标不一致");
@@ -124,7 +131,16 @@ public final class PromptSelectionCoordinator {
                 "根运行提示词准备只接受明确集合");
         check(selection.hasOrigin() && BUSINESS_NAME.equals(selection.getOrigin().getBusinessName()),
                 "平台根选择的业务默认来源不一致");
+        if (experimentId.isEmpty()) {
+            check(selection.getOrigin().hasValueSource(), "普通根选择不能使用未配置的提示词实验");
+        } else {
+            check(selection.getOrigin().hasExperiment()
+                            && experimentId.equals(selection.getOrigin().getExperiment().getExperimentId()),
+                    "平台根选择与原根冻结的提示词实验不一致");
+        }
     }
+
+    private record RootPromptSettings(LocalDate referenceDate, String experimentId) { }
 
     private static void requireBinding(RuntimeCallContext saved, RuntimeCallContext confirmed) {
         check(saved != null && saved.hasRoot() && saved.hasTarget()

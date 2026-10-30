@@ -65,8 +65,12 @@ public final class RacingPromptSetReader {
             PromptSetMember member = requiredMembers.get(i);
             PromptInstructionSource source = PromptInstructionSource.newBuilder().setVersion(member.getVersion())
                     .setSelectionId(saved.getSelectionId()).setSelectionKey(saved.getSelectionKey())
-                    .setPromptSetVersion(set.getReference()).setFragmentName(member.getFragmentName())
-                    .setOrdinaryDefaultSource(saved.getOrigin().getValueSource()).build();
+                    .setPromptSetVersion(set.getReference()).setFragmentName(member.getFragmentName()).build();
+            if (saved.getOrigin().hasExperiment()) {
+                source = source.toBuilder().setExperiment(saved.getOrigin().getExperiment()).build();
+            } else {
+                source = source.toBuilder().setOrdinaryDefaultSource(saved.getOrigin().getValueSource()).build();
+            }
             result.put(member.getFragmentName(), RacingPromptClient.toVersionBody(versions.get(i), source));
         }
         return Collections.unmodifiableMap(result);
