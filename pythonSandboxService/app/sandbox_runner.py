@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import csv
+import gzip
+import hashlib
 import io
 import json
 import logging
@@ -1638,6 +1640,108 @@ def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> 
         return 0
 
 
+def _list_artifact_dir_entries(
+    session: SandboxSession, artifact_dir: str
+) -> List[Tuple[str, int, str]]:
+    """列出容器内产物目录的顶层条目，返回 (类型, 大小, 文件名) 列表。
+
+    014-new-03 收割用。只看顶层（-mindepth 1 -maxdepth 1），GNU find 的
+    ``-printf '%y\\t%s\\t%f'`` 输出类型（f=常规文件，d=目录，l=符号链接
+    等）、字节大小和 basename。目录不存在返回空列表；单行解析失败（如
+    文件名本身带换行的极端情况）只记日志跳过，不让整个收割失败。
+    """
+    script = (
+        f"if [ -d {shlex.quote(artifact_dir)} ]; then "
+        f"find {shlex.quote(artifact_dir)} -mindepth 1 -maxdepth 1 "
+        "-printf '%y\\t%s\\t%f\\n' 2>/dev/null; fi"
+    )
+    text = _read_runtime_text(session, _sh_script(script))
+    entries: List[Tuple[str, int, str]] = []
+    for line in text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or not parts[0] or not parts[2]:
+            if line.strip():
+                logger.warning("ARTIFACT_LIST_UNPARSEABLE_LINE line=%r", line)
+            continue
+        try:
+            entries.append((parts[0], int(parts[1]), parts[2]))
+        except ValueError:
+            logger.warning("ARTIFACT_LIST_UNPARSEABLE_LINE line=%r", line)
+    return entries
+
+
+def _read_artifact_file_bytes(session: SandboxSession, artifact_path: str) -> bytes:
+    """读回容器内单个产物文件的原始字节（容器内 base64，二进制安全）。
+
+    与既有 stat/find 读取一样走 ``sh -lc``；base64 输出是纯 ASCII，不存在
+    stdout 按 UTF-8 解码破坏二进制的问题。命令失败（文件消失、权限等）
+    抛 RuntimeError，由收割侧按单文件 read_failed 兜底。
+    """
+    output = session.execute_command(
+        _sh_script(f"base64 -w 0 < {shlex.quote(artifact_path)}")
+    )
+    if output.exit_code != 0:
+        raise RuntimeError(
+            f"artifact base64 readback failed: exit_code={output.exit_code} "
+            f"stderr={(output.stderr or '')[:256]!r}"
+        )
+    # b64decode 默认 validate=False 会先丢弃换行等非字母表字符（-w 0 已
+    # 尽量避免换行，这里双保险）；stdout 含非 ASCII 时编码直接抛错。
+    return base64.b64decode((output.stdout or "").encode("ascii"))
+
+
+def _harvest_task_artifacts(
+    session: SandboxSession,
+    task_id: str,
+    artifact_dir: str,
+    max_bytes: int | None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """收割产物目录顶层文件，返回 (collected, skipped) 两个 snake_case 列表。
+
+    014-new-03：在 run_in_open_session 的 finally 窗口（读产物大小之后、
+    rm -rf 之前）调用，此刻任务已成功、文件还在容器里、session 仍可用。
+    规则：只收顶层常规文件；子目录记 skipped(subdirectory_ignored)；其他
+    类型（符号链接等）记 skipped(not_regular_file)；超过单文件上限记
+    skipped(exceeds_max_bytes)；单个文件读取失败记 skipped(read_failed)，
+    不让整个收割失败。collected 每项含 filename/sha256/size_bytes/gzip_data
+    （gzip 默认压缩级别，再 base64）。
+    """
+    collected: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for entry_type, size_bytes, filename in _list_artifact_dir_entries(
+        session, artifact_dir
+    ):
+        if entry_type == "d":
+            skipped.append({"filename": filename, "reason": "subdirectory_ignored"})
+            continue
+        if entry_type != "f":
+            skipped.append({"filename": filename, "reason": "not_regular_file"})
+            continue
+        if max_bytes is not None and size_bytes > max_bytes:
+            skipped.append({"filename": filename, "reason": "exceeds_max_bytes"})
+            continue
+        try:
+            payload = _read_artifact_file_bytes(
+                session, f"{artifact_dir}/{filename}"
+            )
+        except Exception as read_error:
+            logger.warning(
+                "ARTIFACT_HARVEST_READ_FAILED task=%s file=%s error=%s",
+                task_id, filename, read_error,
+            )
+            skipped.append({"filename": filename, "reason": "read_failed"})
+            continue
+        collected.append(
+            {
+                "filename": filename,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+                "gzip_data": base64.b64encode(gzip.compress(payload)).decode("ascii"),
+            }
+        )
+    return collected, skipped
+
+
 def _container_oom_killed(container_id: str) -> bool:
     if not container_id or container_id == "unknown":
         return False
@@ -2269,6 +2373,8 @@ def run_in_open_session(
     effective_output_limits: Dict[str, Any] | None = None,
     execution_environment: ExecutionEnvironment | None = None,
     persistent_workspace: str | None = None,
+    collect_artifacts: bool = False,
+    collect_artifact_max_bytes: int | None = None,
 ) -> dict:
     """Run one task inside an already-open session.
 
@@ -2328,6 +2434,11 @@ def run_in_open_session(
     post_install_environment: ExecutionEnvironment | None = None
 
     finance_record_channel: Dict[str, Any] | None = None
+    # 014-new-03: 收割结果。None = 未启用收割 / 任务不满足收割条件 /
+    # 收割整体异常；非 None（含空列表）= 收割已运行。只有 finally 窗口
+    # 里实际收割过才赋值。
+    collected_artifacts: List[Dict[str, Any]] | None = None
+    skipped_artifacts: List[Dict[str, Any]] | None = None
     task_workspace = f"{config.workspace_root}/{task_id}"
     # P0-5: the floor keys off the SELECTED path (frozen limits present), so
     # a task that fails mid-preparation is recycled exactly like a task that
@@ -2551,6 +2662,40 @@ def run_in_open_session(
         )
         artifact_bytes_written = _read_runtime_size(session, task_workspace + "/artifacts")
         temporary_bytes_written = _read_task_temporary_bytes(session, task_workspace)
+        # 014-new-03 收割窗口：此刻任务已成功（exit_reason 仍为 SUCCEEDED，
+        # 即 exit_code==0 且未取消、未超时）、产物文件还在容器里、session
+        # 仍可用，且位于 _cleanup_task_workspace 的 rm -rf 之前 —— 这是全
+        # 链路唯一满足三个条件的窗口（目录清理早于结果上报，Java 侧没有
+        # 收割机会）。收割整体 try/except 兜底：任何异常只记日志、两个字
+        # 段保持 None，绝不让任务结果变失败。
+        if collect_artifacts and result is not None and exit_reason == "SUCCEEDED":
+            t_harvest_start = time.monotonic()
+            try:
+                collected_artifacts, skipped_artifacts = _harvest_task_artifacts(
+                    session,
+                    task_id,
+                    task_workspace + "/artifacts",
+                    collect_artifact_max_bytes,
+                )
+                timings["artifact_harvest_ms"] = int(
+                    (time.monotonic() - t_harvest_start) * 1000
+                )
+                logger.info(
+                    "ARTIFACT_HARVEST task=%s collected=%d skipped=%d "
+                    "max_bytes=%s elapsed_ms=%s",
+                    task_id,
+                    len(collected_artifacts),
+                    len(skipped_artifacts),
+                    collect_artifact_max_bytes,
+                    timings["artifact_harvest_ms"],
+                )
+            except Exception as harvest_error:
+                collected_artifacts = None
+                skipped_artifacts = None
+                logger.error(
+                    "ARTIFACT_HARVEST_FAILED task=%s error=%s",
+                    task_id, harvest_error,
+                )
         oom_killed = _container_oom_killed(actual_container_id)
         # D11 (task #108): an OBSERVED cancel keeps the CANCELED exit reason
         # even if the container also shows an OOM mark — the cancellation is
@@ -2667,6 +2812,11 @@ def run_in_open_session(
         # rule 2).  False on the legacy path and every error path; the store
         # turns MARKER_OBSERVED into the CANCELED terminal state.
         "cancel_observed": cancel_observed,
+        # 014-new-03: 收割回传。只在 collect_artifacts=true 且任务成功时由
+        # finally 窗口填充；其余情况保持 None（presence-aware，请求缺省时
+        # 零开销），main.py 成功路径原样挂到 ExecuteResult 对应字段。
+        "collected_artifacts": collected_artifacts,
+        "skipped_artifacts": skipped_artifacts,
         # 260808-finance-methodspec-v5 work package D: caller-supplied
         # ExecutionEnvironment instance is surfaced here on the HTTP
         # ExecuteResult; gateway presence-aware mapping then sets the proto
@@ -2702,6 +2852,8 @@ def run_in_sandbox(
     memory_limit_bytes: int | None = None,
     effective_output_limits: Dict[str, Any] | None = None,
     workspace_mount: WorkspaceMount | None = None,
+    collect_artifacts: bool = False,
+    collect_artifact_max_bytes: int | None = None,
 ) -> dict:
     timeout = timeout_seconds or config.execution_timeout_seconds
     t0 = time.monotonic()
@@ -2769,6 +2921,8 @@ def run_in_sandbox(
             persistent_workspace=(
                 workspace_mount.container_path if workspace_mount else None
             ),
+            collect_artifacts=collect_artifacts,
+            collect_artifact_max_bytes=collect_artifact_max_bytes,
         )
         timings = result.setdefault("timings", {})
         timings["container_create_ms"] = container_create_ms

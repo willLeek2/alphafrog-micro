@@ -149,6 +149,14 @@ public class PythonSandboxTools {
     private PersistentArtifactRegistry persistentArtifactRegistry;
 
     /**
+     * 014-new-03：收割产物落盘与幂等登记的公共实现。三个终态出口共用：
+     * 本类的 terminalSideEffect 回调、TerminalFormatContextFactory、
+     * ToolJobFinalizer 挂起恢复路径；可选注入，纯单元测试未接 Spring 时为 null。
+     */
+    @Autowired(required = false)
+    private RunOutputArtifactHarvester runOutputArtifactHarvester;
+
+    /**
      * 014-data-04：平台对象 CSV 落盘根。与取数工具 dataset 共用同一存储根
      * （agent.tools.market-data.dataset.database-fetched-path），沙箱 runner 能直接按
      * source_path cp，沙箱服务与 Dubbo 契约零改动。
@@ -212,6 +220,14 @@ public class PythonSandboxTools {
     @Value("${sandbox.create.allow-legacy-without-capacity:false}")
     private boolean allowLegacyWithoutCapacity = false;
 
+    /**
+     * 014-new-03：收割开关开启时的单文件收割上限（字节）。与下载侧上限同一配置键、
+     * 同一默认 10MB（AgentArtifactService.downloadMaxBytes 同源），保证「收割进来的
+     * 文件必然下载得动」。字段初始化值对齐 @Value 默认，纯单元测试不接 Spring 时行为一致。
+     */
+    @Value("${agent.artifact.download.max-bytes:10485760}")
+    private long collectArtifactMaxBytes = 10485760L;
+
     private final DatasetEntryMetadataReader metadataReader;
 
     public PythonSandboxTools(ObjectMapper objectMapper) {
@@ -256,9 +272,18 @@ public class PythonSandboxTools {
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
                             new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter, terminalPromptTexts),
                             new PythonSandboxJobMeteringAdapter(objectMapper),
-                            (context, terminal) -> extractFinanceIfPresent(
-                                    context.runId(), context.userId(), context.todoId(), context.toolCallId(),
-                                    terminal.statusName(), (TaskResultResponse) terminal.nativePayload()));
+                            (context, terminal) -> {
+                                // 014-new-03：等待组成员接回路径（WaitMemberResultReceiver 拉到
+                                // 终态结果之后）在这里收割产物；成员身份由持久上下文显式传入。
+                                // 收割先于 finance：finance 失败会抛出阻断格式化，产物落袋不受它影响。
+                                if (runOutputArtifactHarvester != null) {
+                                    runOutputArtifactHarvester.harvest(context.runId(), context.userId(),
+                                            (TaskResultResponse) terminal.nativePayload());
+                                }
+                                return extractFinanceIfPresent(
+                                        context.runId(), context.userId(), context.todoId(), context.toolCallId(),
+                                        terminal.statusName(), (TaskResultResponse) terminal.nativePayload());
+                            });
                     sandboxJobAdapters = current;
                 }
             }
@@ -296,10 +321,21 @@ public class PythonSandboxTools {
                 POLL_INTERVAL_MS, DAG_LEASE_RENEW_AHEAD_MILLIS, fastPathMs);
     }
 
-    /** finance 记录通道是 executePython 的自有终态副作用；框架在结果格式化前回调这里。 */
+    /**
+     * finance 记录通道是 executePython 的自有终态副作用；框架在结果格式化前回调这里。
+     * 014-new-03：同一回调里先做收割产物落袋（生产同步/DAG 阻塞路径的收割挂钩点），
+     * 再处理 finance——收割失败只记 warn 不抛出，finance 的失败语义保持原样；
+     * 反过来把收割放 finance 之后，会让 finance 异常连带丢掉本可落袋的产物。
+     */
     private SandboxToolJobLifecycle.TerminalSideEffect terminalSideEffect() {
-        return (runId, identity, anchor, view) -> processFinanceResult(
-                runId, identity, anchor, view.statusName(), (TaskResultResponse) view.nativePayload());
+        return (runId, identity, anchor, view) -> {
+            if (runOutputArtifactHarvester != null) {
+                runOutputArtifactHarvester.harvest(runId, AgentContext.getUserId(),
+                        (TaskResultResponse) view.nativePayload());
+            }
+            return processFinanceResult(
+                    runId, identity, anchor, view.statusName(), (TaskResultResponse) view.nativePayload());
+        };
     }
 
     /** 每次工具调用都按当前 Run 的持久快照读取，避免热配置改变旧 Run 的磁盘语义。 */
@@ -335,6 +371,37 @@ public class PythonSandboxTools {
             return enabled.booleanValue();
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             throw new IllegalStateException("Run 的 Python 工作区开关快照无法读取", e);
+        }
+    }
+
+    /**
+     * 014-new-03：读取 Run 创建时冻结进 ext JSON 的 generate_artifacts 开关，决定本次
+     * 沙箱任务是否请求收割任务产物。语义对齐查询侧判定（LangchainArtifactFacadeService.
+     * generateArtifactsRequested）：缺失 / 非 JSON / 解析失败一律按 false——开关缺失只是
+     * 「用户没要产物」，不值得像工作区开关那样 fail-closed 拒绝执行；该 helper 是
+     * agentLangchainService 包内方法，工具层用不了，只能自读。
+     */
+    boolean generateArtifactsEnabledForRun(String runId) {
+        // 直接构造本工具的旧单元测试没有 Spring 接线，按关闭路径运行。
+        if (runId == null || runId.isBlank() || agentRunMapper == null || deploymentIdentityProvider == null) {
+            return false;
+        }
+        try {
+            DeploymentIdentity identity = deploymentIdentityProvider.current();
+            AgentRun run = agentRunMapper.findByIdForDeployment(
+                    runId, identity.deploymentId(), identity.generationId());
+            if (run == null || run.getExt() == null || run.getExt().isBlank()) {
+                return false;
+            }
+            JsonNode ext = objectMapper.readTree(run.getExt());
+            if (ext == null || !ext.isObject()) {
+                return false;
+            }
+            return ext.path("generate_artifacts").asBoolean(false);
+        } catch (Exception readFailure) {
+            ModelSendBlocks.rethrowIfBlocked(readFailure);
+            log.warn("读取 Run 的产物开关失败，按未开启处理: runId={} err={}", runId, readFailure.getMessage());
+            return false;
         }
     }
 
@@ -645,6 +712,13 @@ public class PythonSandboxTools {
                 requestBuilder.setRunId(runId)
                         .setWorkspaceId(workspace.getWorkspaceId())
                         .setWorkspaceGeneration(workspace.getWorkspaceGeneration());
+            }
+
+            // 014-new-03：Run 冻结的 generate_artifacts 开关为 true 时，向沙箱请求收割
+            // 任务产物目录的顶层文件；单文件上限与下载侧同一配置（收割进来的必然下载得动）。
+            if (generateArtifactsEnabledForRun(runId)) {
+                requestBuilder.setCollectArtifacts(true)
+                        .setCollectArtifactMaxBytes(collectArtifactMaxBytes);
             }
 
             for (String oid : originalIdsToMount) {
@@ -1442,6 +1516,7 @@ public class PythonSandboxTools {
         }
         return cleaned;
     }
+
 
     /** 查询沙箱任务当前状态；每次 Dubbo 调用前都会尝试安装调试 attachment。 */
     private TaskStatusResponse getTaskStatus(String taskId) {
