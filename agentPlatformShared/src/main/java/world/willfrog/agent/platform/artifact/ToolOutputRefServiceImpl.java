@@ -51,6 +51,15 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
     }
 
     @Override
+    public PersistentArtifactRegistration registerRawPrompt(String runId, String userId, String logicalId,
+            String displayName, world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content) {
+        String ref = localStore.registerPrompt(runId, userId, displayName, content,
+                resolveRawRefTtlHours() * 3600L, false);
+        return PersistentArtifactRegistration.builder().artifactId(ref)
+                .locator(RawPayloadLocator.builder().path(ref).build()).build();
+    }
+
+    @Override
     public PersistentArtifactRegistration rebindFromLocator(String logicalId, String displayName, RawPayloadLocator locator) {
         // 260814 scheduler-03 review fix：cache-hit rebind 必须保持 Run 隔离——
         // 只允许读当前 AgentContext 的 runId+userId 所拥有的 ref（同 Run 重启
@@ -58,8 +67,9 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
         // assertVisible 抛 IllegalArgumentException，由上层缓存服务视为缓存
         // 失效（删缓存回源），绝不跨 Run 复制 raw 内容。
         assertVisible(AgentContext.getRunId(), AgentContext.getUserId(), locator.getPath());
-        String content = localStore.read(AgentContext.getRunId(), AgentContext.getUserId(), locator.getPath());
-        return registerRawOutput(logicalId, displayName, content);
+        ToolOutputReadResult original = localStore.readWithSources(AgentContext.getRunId(), AgentContext.getUserId(), locator.getPath());
+        return original.getContentPrompt() == null ? registerRawOutput(logicalId, displayName, original.getContent())
+                : registerRawPrompt(logicalId, displayName, original.getContentPrompt());
     }
 
     @Override
@@ -87,7 +97,8 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
     private ToolOutputReadResult doRead(String runId, String userId, String rawRef,
                                         int offset, int limit, String keyword) {
         assertVisible(runId, userId, rawRef);
-        String content = localStore.read(runId, userId, rawRef);
+        ToolOutputReadResult original = localStore.readWithSources(runId, userId, rawRef);
+        String content = original.getContent();
         String source = filterByKeyword(content, keyword);
         int total = source.length();
         int safeOffset = Math.max(0, Math.min(offset, total));
@@ -95,6 +106,9 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
         int end = Math.min(total, safeOffset + cappedLimit);
         return ToolOutputReadResult.builder()
                 .content(source.substring(safeOffset, end))
+                .contentPrompt(original.getContentPrompt() == null ? null
+                        : new world.willfrog.alphafrogmicro.common.racing.prompt.PromptText(
+                                source.substring(safeOffset, end), original.getContentPrompt().sources()))
                 .hasMore(end < total)
                 .nextOffset(end)
                 .totalLength(total)

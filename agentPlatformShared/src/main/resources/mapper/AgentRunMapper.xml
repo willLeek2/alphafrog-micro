@@ -784,10 +784,30 @@
 
     <update id="updateExt">
         UPDATE alphafrog_agent_run
-        SET ext = CAST(#{ext} AS jsonb),
+        SET ext = CASE WHEN ext -&gt; 'experiment_context' IS NOT NULL
+                       THEN (CAST(#{ext} AS jsonb) - 'experiment_context' - 'prompt_selection' - 'prompt_reference_date')
+                            || jsonb_build_object('experiment_context', ext -&gt; 'experiment_context')
+                            || CASE WHEN ext -&gt; 'prompt_reference_date' IS NOT NULL
+                                    THEN jsonb_build_object('prompt_reference_date', ext -&gt; 'prompt_reference_date')
+                                    ELSE '{}'::jsonb END
+                            || CASE WHEN ext -&gt; 'prompt_selection' IS NOT NULL
+                                    THEN jsonb_build_object('prompt_selection', ext -&gt; 'prompt_selection')
+                                    ELSE '{}'::jsonb END
+                       ELSE CAST(#{ext} AS jsonb) END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
+    </update>
+
+    <update id="confirmPromptSelection">
+        UPDATE alphafrog_agent_run
+        SET ext = jsonb_set(ext, '{prompt_selection}', CAST(#{selectionJson} AS jsonb), true),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND ext -&gt; 'experiment_context' = CAST(#{bindingJson} AS jsonb)
+          AND (ext -&gt; 'prompt_selection' IS NULL
+               OR ext -&gt; 'prompt_selection' = CAST(#{selectionJson} AS jsonb))
     </update>
 
     <update id="updateSnapshot">

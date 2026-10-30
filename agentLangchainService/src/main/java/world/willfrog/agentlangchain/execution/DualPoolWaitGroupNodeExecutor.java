@@ -24,6 +24,14 @@ import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.dataanalysis.PythonRiskReplayEvidenceMissingException;
 import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.agent.platform.prompt.AgentPromptTextReader;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSource;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
 import world.willfrog.agent.platform.wait.MemberCompletionRequest;
 import world.willfrog.agent.platform.wait.MemberCompletionResult;
 import world.willfrog.agent.platform.wait.WaitGroup;
@@ -38,6 +46,10 @@ import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemVersions;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
 import world.willfrog.agentlangchain.acceptance.AcceptanceFixtureModelRegistry;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
@@ -92,6 +104,12 @@ public class DualPoolWaitGroupNodeExecutor {
     private static final String RISK_REPLAY_EVIDENCE_MISSING_CODE = "python_risk_replay_evidence_missing";
 
     private final AgentPromptService promptService;
+    @Autowired
+    private AgentModelInputs modelInputs;
+    @Autowired
+    private AgentPromptTextReader promptTexts;
+    @Autowired
+    private ToolPromptCatalog toolPrompts;
     @Autowired
     private RootTreeCallBudget rootTreeCallBudget;
     private final LangchainRunExecutionGuard executionGuard;
@@ -220,17 +238,49 @@ public class DualPoolWaitGroupNodeExecutor {
         }
     }
 
+    /** 上层重建历史上下文前先读取已齐备成员的明确阻止，避免失败收口再发模型。 */
+    public ModelSendBlockedException resumeSendBlock(NodeWorkItemIdentity identity, JsonNode payload) {
+        NodeSegmentCheckpoint checkpoint = NodeSegmentCheckpoint.read(payload);
+        if (checkpoint == null || checkpoint.resumeGroupTurn() == null) return null;
+        WaitGroup group = waitGroupStore.findGroup(new WaitGroupIdentity(
+                previousSegmentIdentity(identity), checkpoint.resumeGroupTurn())).orElse(null);
+        if (group == null) return null;
+        List<WaitMember> members = waitGroupStore.listMembers(group.getId());
+        if (members.isEmpty() || members.stream().anyMatch(member -> !member.terminal())) return null;
+        for (WaitMember member : members) {
+            var blocked = blockedMemberResult(member.getResultRefJson());
+            if (blocked != null) return blocked;
+        }
+        return null;
+    }
+
     /** 跑完一个分段。抛出的是控制信号与基础设施异常，业务失败都走 {@link Outcome}。 */
     public Outcome executeSegment(SegmentExecution input) {
-        NodeSegmentCheckpoint stored = NodeSegmentCheckpoint.read(input.payload());
-        List<ChatMessage> messages = new ArrayList<>();
+        NodeSegmentCheckpoint stored = null;
+        try {
+            stored = NodeSegmentCheckpoint.read(input.payload());
+            return executePreparedSegment(input, stored);
+        } catch (RuntimeException exception) {
+            ModelSendBlocked blocked = ModelSendBlocks.find(exception).orElse(null);
+            if (blocked == null) {
+                throw exception;
+            }
+            NodeSegmentCheckpoint checkpoint = stored == null
+                    ? new NodeSegmentCheckpoint(0, null, List.of(), 0) : stored;
+            return new Outcome.Completed(failurePatch(input, checkpoint,
+                    blocked.code(), ModelSendBlocks.failureMetadata(blocked)));
+        }
+    }
+
+    private Outcome executePreparedSegment(SegmentExecution input, NodeSegmentCheckpoint stored) {
+        List<PromptMessage> messages = new ArrayList<>();
         NodeSegmentCheckpoint checkpoint;
         boolean riskReplayEvidenceMissing = false;
         if (stored == null) {
             messages.addAll(initialMessages(input));
-            checkpoint = new NodeSegmentCheckpoint(0, null, messages, 0);
+            checkpoint = NodeSegmentCheckpoint.withPromptMessages(0, null, messages, 0);
         } else {
-            messages.addAll(stored.messages());
+            messages.addAll(stored.snapshot());
             if (stored.resumeGroupTurn() != null) {
                 riskReplayEvidenceMissing = appendMemberResults(messages, input, stored.resumeGroupTurn());
             }
@@ -266,59 +316,75 @@ public class DualPoolWaitGroupNodeExecutor {
             }
             appendAdmissionRefusals(messages, reply, calls, maxMembers);
             // 拒绝的调用没有执行，不计工具次数；模型修正仍使用新的回合身份和预算。
-            checkpoint = new NodeSegmentCheckpoint(checkpoint.modelTurn() + 1, null,
+            checkpoint = NodeSegmentCheckpoint.withPromptMessages(checkpoint.modelTurn() + 1, null,
                     messages, checkpoint.toolCallsUsed());
         }
     }
 
     // ==================== 一次模型回合 ====================
 
-    private List<ChatMessage> initialMessages(SegmentExecution input) {
-        List<ChatMessage> messages = new ArrayList<>();
-        messages.add(SystemMessage.from(promptService.reactSystemPrompt()));
+    private List<PromptMessage> initialMessages(SegmentExecution input) {
         List<ToolSpecification> visible = visibleToolSpecifications(input.identity().runId(),
                 input.request().getToolSpecifications());
-        messages.add(UserMessage.from(LangchainTodoUserMessageBuilder.buildTodoUserMessage(
-                promptService,
-                input.request().getUserGoal(),
-                input.completedTodos(),
-                input.datasetRefs(),
-                input.todo().getDescription(),
-                visible,
-                ToolCapabilityPromptRenderer.render(promptService, visible))));
-        return messages;
+        return List.of(PromptMessage.system(promptService.reactSystemPromptText()),
+                PromptMessage.user(LangchainTodoUserMessageBuilder.buildTodoUserPrompt(
+                        promptService, input.request().getUserGoal(), input.completedTodos(),
+                        input.datasetRefs(), input.todo().getDescription(), visible,
+                        ToolCapabilityPromptRenderer.renderText(promptService, visible))));
     }
 
-    private AiMessage chatOnce(SegmentExecution input, List<ChatMessage> messages,
+    private AiMessage chatOnce(SegmentExecution input, List<PromptMessage> messages,
                                int modelTurn, int maxMembers) {
-        List<ChatMessage> requestMessages = new ArrayList<>(messages);
-        requestMessages.add(Math.min(1, requestMessages.size()), SystemMessage.from(
-                "本次模型回复最多包含" + maxMembers + "个工具调用，所有工具合计。"
-                        + "这是整轮调用数量限制，与checkParallelLimits返回的单次批量参数数量不同。"
-                        + "超过整轮限制时全部调用都不会执行；请减少本轮调用数量，等结果返回后再继续余下批次。"
-                        + toolCallBudgetNote(input.identity().runId())));
-        ChatRequest chatRequest = ChatRequest.builder()
-                .messages(requestMessages)
-                .toolSpecifications(visibleToolSpecifications(input.identity().runId(),
-                        input.request().getToolSpecifications()))
-                .build();
-        // 这次调用的身份：哪条 Run、哪个计划代际、哪个节点、第几次尝试、哪一段、段内第几次模型回合。
-        // 夹具按这个身份发脚本回合，所以并行跑的几个节点各拿各的回复，重启后重做同一段也拿回同一份。
-        // 不带夹具编号的 Run 走的是真实模型，这一步原样返回，不影响它。
-        NodeWorkItemIdentity identity = input.identity();
-        if (rootTreeCallBudget != null) {
-            rootTreeCallBudget.beforeModelCall(identity, Integer.toString(modelTurn));
+        if (modelInputs == null || promptTexts == null || toolPrompts == null) {
+            throw sourceMissing("节点输入保存和正文准备组件未配置");
         }
-        ChatModel model = AcceptanceFixtureModelRegistry.forCall(
-                input.request().executionModelOrDefault(),
+        List<PromptMessage> actualMessages = new ArrayList<>(messages);
+        PromptText admission = renderPolicy("nodeToolAdmissionInstruction", Map.of("maxMembers", String.valueOf(maxMembers)));
+        PromptText budget = toolCallBudgetNote(input.identity().runId());
+        PromptText policies = PromptText.concat(admission, budget);
+        actualMessages.add(Math.min(1, actualMessages.size()), PromptMessage.system(policies));
+        NodeWorkItemIdentity identity = input.identity();
+        if (rootTreeCallBudget != null) rootTreeCallBudget.beforeModelCall(identity, Integer.toString(modelTurn));
+        String pendingHint = AgentContext.getLastMileHint();
+        if (pendingHint != null && !pendingHint.isBlank()) {
+            PromptText hint = AgentContext.getLastMileHintPrompt();
+            if (hint == null || !pendingHint.equals(hint.text())) throw sourceMissing("预算建议缺少原指令来源");
+            actualMessages.add(PromptMessage.user(hint));
+            AgentContext.clearLastMileHint();
+        }
+        var tools = toolPrompts.prepare(visibleToolSpecifications(identity.runId(), input.request().getToolSpecifications()));
+        List<ModelInputSource> sources = new ArrayList<>(PromptMessage.toModelInputSources(actualMessages).parts());
+        sources.addAll(tools.sources().parts());
+        ChatRequest chatRequest = ChatRequest.builder()
+                .messages(actualMessages.stream().map(PromptMessage::message).toList())
+                .toolSpecifications(tools.specifications()).build();
+        ChatModel model = AcceptanceFixtureModelRegistry.forCall(input.request().executionModelOrDefault(),
                 () -> FixtureCallIdentity.nodeSegment(identity.runId(), identity.planGeneration(),
                         identity.nodeId(), identity.nodeAttempt(), identity.segmentSequence(), modelTurn));
-        ChatResponse response = model.chat(LangchainTodoNodeExecutor.maybeInjectLastMileHint(chatRequest));
+        var parentSpec = AgentContext.getStructuredOutputSpec();
+        AgentContext.clearStructuredOutputSpec();
+        ChatResponse response;
+        try (var ignored = modelInputs.open(input.request().getExecutionEndpointName(), new ModelInputSources(sources))) {
+            response = model.chat(chatRequest);
+        } finally {
+            if (parentSpec == null) AgentContext.clearStructuredOutputSpec();
+            else AgentContext.setStructuredOutputSpec(parentSpec);
+        }
         AiMessage reply = response == null ? null : response.aiMessage();
         if (reply == null) {
-            throw new IllegalStateException("模型没有返回回复，无法继续这个节点：" + input.identity().describe());
+            throw new IllegalStateException("模型没有返回回复，无法继续这个节点：" + identity.describe());
         }
         return reply;
+    }
+
+    private PromptText renderPolicy(String fragment, Map<String, String> values) {
+        if (promptTexts == null) throw sourceMissing("节点正文读取组件未配置");
+        var body = promptTexts.read(promptTexts.current(), Map.of(fragment, fragment)).get(fragment);
+        return promptTexts.render(body, values, Map.of());
+    }
+
+    private static ModelSendBlockedException sourceMissing(String reason) {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, reason);
     }
 
     /**
@@ -329,36 +395,26 @@ public class DualPoolWaitGroupNodeExecutor {
      * 额度快照仅用于模型可见性，能否派发仍由既有准入决定。读不到额度（无预算组件或快照为空，
      * 如旧测试桩）时返回空串，不附加任何额度文字。</p>
      */
-    private String toolCallBudgetNote(String runId) {
-        if (rootTreeCallBudget == null) {
-            return "";
-        }
-        RootTreeCallBudget.ToolCallBudgetStatus status = rootTreeCallBudget.toolCallBudgetStatus(runId);
-        if (status == null) {
-            return "";
-        }
-        if (status.unlimited()) {
-            return "工具调用预算现状：" + status.scopeNote() + "不设工具调用次数上限。";
-        }
-        return "工具调用预算现状：" + status.scopeNote() + "累计工具调用已用" + status.used()
-                + "次、上限" + status.limit() + "次、剩余" + status.remaining()
-                + "次；预算耗尽时新调用会在派发前被拒绝，请据此安排调用。";
+    private PromptText toolCallBudgetNote(String runId) {
+        return rootTreeCallBudget == null ? PromptText.runtimeData("")
+                : ToolBudgetPromptRenderer.render(promptTexts, rootTreeCallBudget.toolCallBudgetStatus(runId));
     }
 
     /** 给每个被拒绝的原调用配一个结果，保留完整对话配对关系，不派发任何工具。 */
-    private void appendAdmissionRefusals(List<ChatMessage> messages, AiMessage reply,
+    private void appendAdmissionRefusals(List<PromptMessage> messages, AiMessage reply,
                                          List<ToolExecutionRequest> calls, int maxMembers) {
-        messages.add(withSyntheticCallIds(reply, calls));
+        messages.add(PromptMessage.runtimeData(withSyntheticCallIds(reply, calls)));
+        PromptText refusal = renderPolicy("nodeToolAdmissionRefusal",
+                Map.of("requested", String.valueOf(calls.size()), "maxMembers", String.valueOf(maxMembers)));
         String output = json(Map.of("ok", false, "error", Map.of(
                 "code", "WAIT_GROUP_MEMBER_LIMIT_EXCEEDED", "retryable", true,
                 "requested", calls.size(), "maxToolCallsPerTurn", maxMembers,
-                "message", "本轮" + calls.size() + "个工具调用超过上限" + maxMembers
-                        + "；本轮没有执行任何工具。请减少本轮调用数量，余下调用等本轮结果返回后再继续。")));
+                "message", refusal.text())));
         for (int index = 0; index < calls.size(); index++) {
             ToolExecutionRequest call = calls.get(index);
             String callId = call.id() == null || call.id().isBlank()
                     ? SYNTHETIC_CALL_ID_PREFIX + index : call.id();
-            messages.add(ToolExecutionResultMessage.from(callId, call.name(), output));
+            messages.add(PromptMessage.toolResult(callId, call.name(), new PromptText(output, refusal.sources())));
         }
     }
 
@@ -389,7 +445,7 @@ public class DualPoolWaitGroupNodeExecutor {
 
     // ==================== 接回上一次的成员结果 ====================
 
-    private boolean appendMemberResults(List<ChatMessage> messages, SegmentExecution input, int groupTurn) {
+    private boolean appendMemberResults(List<PromptMessage> messages, SegmentExecution input, int groupTurn) {
         WaitGroupIdentity groupIdentity = new WaitGroupIdentity(
                 previousSegmentIdentity(input.identity()), groupTurn);
         WaitGroup group = waitGroupStore.findGroup(groupIdentity)
@@ -400,19 +456,66 @@ public class DualPoolWaitGroupNodeExecutor {
             throw new IllegalStateException("等待组里没有成员：" + group.getId());
         }
         boolean riskReplayEvidenceMissing = false;
+        ModelSendBlockedException sendBlocked = null;
         for (WaitMember member : members) {
             if (!member.terminal()) {
                 throw new IllegalStateException("等待组还没齐备，这一段不该被领取：group=" + group.getId()
                         + " member=" + member.getMemberIdentity() + " state=" + member.getState());
             }
-            messages.add(ToolExecutionResultMessage.from(
-                    messageToolCallId(member),
-                    member.getToolName(),
-                    WaitMemberResultPayload.modelText(member.getResultRefJson(), objectMapper)));
+            ModelSendBlockedException blocked = blockedMemberResult(member.getResultRefJson());
+            if (blocked != null) {
+                // 仍核对整组已结束；已在执行的其他成员继续遵守原有等待责任。
+                if (sendBlocked == null) {
+                    sendBlocked = blocked;
+                }
+                continue;
+            }
+            messages.add(memberResultMessage(member));
             riskReplayEvidenceMissing |= RISK_REPLAY_EVIDENCE_MISSING_CODE.equals(
                     WaitMemberResultPayload.errorCode(member.getResultRefJson(), objectMapper));
         }
+        if (sendBlocked != null) {
+            // 派发阶段已持久保存这一原因。恢复直接结束节点，不把它交给模型重试。
+            throw sendBlocked;
+        }
         return riskReplayEvidenceMissing;
+    }
+
+    private PromptMessage memberResultMessage(WaitMember member) {
+        var message = ToolExecutionResultMessage.from(messageToolCallId(member), member.getToolName(),
+                WaitMemberResultPayload.modelText(member.getResultRefJson(), objectMapper));
+        try {
+            JsonNode payload = objectMapper.readTree(member.getResultRefJson());
+            JsonNode source = payload == null ? null : payload.get(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY);
+            if (source == null) return PromptMessage.unknown(message);
+            if (!source.isTextual()) throw sourceMissing("等待成员来源属性损坏");
+            return PromptMessageCodec.fromSourceAttributes(message, Map.of(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY, source.textValue()));
+        } catch (Exception failure) {
+            ModelSendBlocks.rethrowIfBlocked(failure);
+            throw sourceMissing("等待成员结果来源无法读取");
+        }
+    }
+
+    private ModelSendBlockedException blockedMemberResult(String resultRefJson) {
+        String code = WaitMemberResultPayload.errorCode(resultRefJson, objectMapper);
+        if (!ModelSendBlocks.isBlockedCode(code)) {
+            return null;
+        }
+        try {
+            JsonNode result = objectMapper.readTree(resultRefJson);
+            Map<String, String> locator = new LinkedHashMap<>();
+            JsonNode savedLocator = result.path("model_send_block_racing_locator");
+            if (savedLocator.isObject()) {
+                savedLocator.fields().forEachRemaining(field -> {
+                    if (field.getValue().isTextual()) locator.put(field.getKey(), field.getValue().textValue());
+                });
+            }
+            RacingFailure failure = new RacingFailure(result.path("model_send_block_racing_code").asText(""),
+                    result.path("model_send_block_racing_reason_code").asText(""), locator);
+            return new ModelSendBlockedException(code, result.path("errorDetail").asText(""), failure);
+        } catch (Exception exception) {
+            throw new IllegalStateException("等待成员的发送阻止原因无法读取", exception);
+        }
     }
 
     private static NodeWorkItemIdentity previousSegmentIdentity(NodeWorkItemIdentity identity) {
@@ -436,7 +539,7 @@ public class DualPoolWaitGroupNodeExecutor {
 
     private Outcome suspendForToolCalls(SegmentExecution input,
                                         NodeSegmentCheckpoint checkpoint,
-                                        List<ChatMessage> messages,
+                                        List<PromptMessage> messages,
                                         AiMessage reply,
                                         List<ToolExecutionRequest> calls) {
         List<WaitMemberDraft> drafts = new ArrayList<>();
@@ -463,10 +566,10 @@ public class DualPoolWaitGroupNodeExecutor {
         }
         int nextSegmentSequence = input.identity().segmentSequence() + 1;
         int nodeToolCalls = checkpoint.toolCallsUsed() + drafts.size();
-        List<ChatMessage> history = new ArrayList<>(messages);
-        history.add(withSyntheticCallIds(reply, calls));
+        List<PromptMessage> history = new ArrayList<>(messages);
+        history.add(PromptMessage.runtimeData(withSyntheticCallIds(reply, calls)));
 
-        NodeSegmentCheckpoint nextCheckpoint = new NodeSegmentCheckpoint(
+        NodeSegmentCheckpoint nextCheckpoint = NodeSegmentCheckpoint.withPromptMessages(
                 checkpoint.modelTurn() + 1, checkpoint.modelTurn(), history, nodeToolCalls);
         String suspensionPayloadJson = json(Map.of(WaitGroupSuspensionMarker.FIELD,
                 new WaitGroupSuspensionMarker(checkpoint.modelTurn(), nextSegmentSequence, drafts.size())
@@ -545,8 +648,9 @@ public class DualPoolWaitGroupNodeExecutor {
                 } catch (RunBudgetException budget) {
                     // 预留额度被拒：工具与子运行都没有执行，与派发路径同款的结构化拒绝载荷
                     // （dimension/used/limit 从捕获处透传），恢复时渲染成拒绝信封而非「工具调用失败」。
-                    String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
-                            member.getToolCallId(), false, "",
+                    String resultJson = WaitMemberResultPayload.encodePrompt(objectMapper, member.getToolName(),
+                            member.getToolCallId(), false, ToolBudgetPromptRenderer.rejection(promptTexts,
+                                    budget.getDimension(), budget.getActual(), budget.getLimit(), objectMapper),
                             budgetFailure("run_budget_exceeded", budget),
                             maxMemberResultChars);
                     MemberCompletionResult completed = waitGroupStore.completeMember(new MemberCompletionRequest(
@@ -574,8 +678,8 @@ public class DualPoolWaitGroupNodeExecutor {
                         case NOT_FOUND -> "sub_agent_not_found";
                         case RESERVED -> throw new IllegalStateException("已预留不能写失败结果");
                     };
-                    String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
-                            member.getToolCallId(), false, "", Map.of("errorCode", errorCode),
+                    String resultJson = WaitMemberResultPayload.encodePrompt(objectMapper, member.getToolName(),
+                            member.getToolCallId(), false, PromptText.runtimeData(""), Map.of("errorCode", errorCode),
                             maxMemberResultChars);
                     MemberCompletionResult completed = waitGroupStore.completeMember(new MemberCompletionRequest(
                             suspended.groupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
@@ -770,7 +874,7 @@ public class DualPoolWaitGroupNodeExecutor {
                 if (call == null) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
                             policyMatches, member, false, "",
-                            Map.of("errorCode", "wait_group_member_request_missing"), null));
+                            frameworkFailure("wait_group_member_request_missing"), null));
                     continue;
                 }
                 NodeToolDispatcher.DispatchOutcome outcome = toolDispatcher.dispatch(
@@ -780,10 +884,10 @@ public class DualPoolWaitGroupNodeExecutor {
                                 call.arguments()));
                 if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Completed completed) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                            policyMatches, member, true, completed.output(), Map.of(), call.arguments()));
+                            policyMatches, member, true, completed.output(), resultSources(completed.outputPrompt()), call.arguments()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Failed failed) {
                     notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                            policyMatches, member, false, failed.reason(), Map.of(), call.arguments()));
+                            policyMatches, member, false, failed.reason(), resultSources(failed.reasonPrompt()), call.arguments()));
                 } else if (outcome instanceof NodeToolDispatcher.DispatchOutcome.Pending pending) {
                     // 后台作业已经建出来了。成员从「待派发」进入「执行中」，并把派发证明与下次查询
                     // 时间写上：证明留给结果接收方收尾，查询时间让接收方能找到这个成员。
@@ -819,6 +923,13 @@ public class DualPoolWaitGroupNodeExecutor {
                     groupId, input.identity().describe(), budget.getDimension(),
                     budget.getActual(), budget.getLimit());
         } catch (RuntimeException e) {
+            ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
+            if (blocked != null) {
+                // 当前分段已挂起，原栈上的异常不能代替持久结果。保留原因供下一分段先于模型识别。
+                return keepNotification(notificationId,
+                        abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
+                                modelSendBlockPayload(blocked)));
+            }
             if (!LangchainTerminalToolErrorHandler.isTerminalSignal(e)) {
                 throw e;
             }
@@ -839,26 +950,52 @@ public class DualPoolWaitGroupNodeExecutor {
                                        List<WaitMember> members,
                                        String errorCode,
                                        RunBudgetException budget) {
+        Map<String, Object> failure = budget != null
+                ? budgetFailure(errorCode, budget)
+                : Map.of("errorCode", errorCode);
+        return abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members, failure);
+    }
+
+    private Long abortRemainingMembers(long groupId,
+                                       SegmentExecution input,
+                                       int modelTurn,
+                                       AcceptanceReleasePolicy policy,
+                                       AcceptanceReleasePolicy.RuleMatches policyMatches,
+                                       List<WaitMember> members,
+                                       Map<String, Object> failure) {
+        Map<String, Object> attributedFailure = new LinkedHashMap<>(failure);
+        attributedFailure.putAll(resultSources(PromptText.runtimeData("")));
         Long notificationId = null;
         for (WaitMember member : members) {
             if (member.terminal() || member.stateEnum() == WaitMemberState.RUNNING
                     || awaitingPersistedSandboxDispatch(member)) {
                 continue;
             }
-            Map<String, Object> failure = budget != null
-                    ? budgetFailure(errorCode, budget)
-                    : Map.of("errorCode", errorCode);
             notificationId = keepNotification(notificationId, completeMember(input, modelTurn, policy,
-                    policyMatches, member, false, "", failure, null));
+                    policyMatches, member, false, "", attributedFailure, null));
         }
         return notificationId;
+    }
+
+    private static Map<String, Object> frameworkFailure(String errorCode) {
+        Map<String, Object> extra = new LinkedHashMap<>(resultSources(PromptText.runtimeData("")));
+        extra.put("errorCode", errorCode);
+        return extra;
+    }
+
+    private static Map<String, Object> modelSendBlockPayload(ModelSendBlocked blocked) {
+        ModelSendBlocked safe = new ModelSendBlockedException(blocked.code(), blocked.reason(), blocked.racingFailure());
+        Map<String, Object> payload = new LinkedHashMap<>(ModelSendBlocks.failureMetadata(safe));
+        payload.put("errorCode", safe.code());
+        payload.put("errorDetail", safe.reason());
+        return payload;
     }
 
     /** 预算拒绝的成员失败载荷：dimension/used/limit 从捕获处异常透传，恢复时渲染成结构化拒绝信封。 */
     private static Map<String, Object> budgetFailure(String errorCode, RunBudgetException budget) {
         Map<String, Object> failure = new LinkedHashMap<>();
         failure.put("errorCode", errorCode);
-        failure.put("errorDetail", "当前运行预算已用尽，无法继续调用工具。请根据已有结果回答；信息不足时说明无法完成。");
+        failure.put("errorDetail", "当前运行预算已用尽，无法继续调用工具。");
         failure.put("dimension", budget.getDimension());
         failure.put("used", budget.getActual());
         failure.put("limit", budget.getLimit());
@@ -923,8 +1060,24 @@ public class DualPoolWaitGroupNodeExecutor {
                 extra.put("ruleActionNotApplied", detail);
             }
         }
-        String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
-                member.getToolCallId(), success, output, extra, maxMemberResultChars);
+        String resultJson;
+        if ("run_budget_exceeded".equals(extra.get("errorCode")) && (output == null || output.isBlank())
+                && extra.get("used") instanceof Number used && extra.get("limit") instanceof Number limit) {
+            PromptText rejection = ToolBudgetPromptRenderer.rejection(promptTexts,
+                    String.valueOf(extra.get("dimension")), used.longValue(), limit.longValue(), objectMapper);
+            resultJson = WaitMemberResultPayload.encodePrompt(objectMapper, member.getToolName(),
+                    member.getToolCallId(), success, rejection, extra, maxMemberResultChars);
+        } else if (extra.containsKey(PromptMessageCodec.SOURCE_ATTRIBUTE_KEY)) {
+            var attributed = PromptMessageCodec.fromSourceAttributes(ToolExecutionResultMessage.from(
+                    messageToolCallId(member), member.getToolName(), output == null ? "" : output), extra);
+            if (attributed.origin() == PromptMessage.Origin.UNKNOWN) throw sourceMissing("工具结果仍缺少明确来源");
+            resultJson = WaitMemberResultPayload.encodePrompt(objectMapper, member.getToolName(),
+                    member.getToolCallId(), success, new PromptText(output == null ? "" : output, attributed.sources()),
+                    extra, maxMemberResultChars);
+        } else {
+            resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
+                    member.getToolCallId(), success, output, extra, maxMemberResultChars);
+        }
         MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
                 member.getGroupId(),
                 member.getMemberIdentity(),
@@ -943,6 +1096,11 @@ public class DualPoolWaitGroupNodeExecutor {
         return result.notificationId();
     }
 
+    private static Map<String, Object> resultSources(PromptText prompt) {
+        return prompt == null ? Map.of() : PromptMessageCodec.sourceAttributes(prompt.sources().isEmpty()
+                ? PromptMessage.Origin.RUNTIME_DATA : PromptMessage.Origin.APPLICATION_INSTRUCTION, prompt.sources());
+    }
+
     /**
      * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
      */
@@ -952,8 +1110,13 @@ public class DualPoolWaitGroupNodeExecutor {
         } catch (RuntimeException e) {
             log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity(), e);
-            String compact = WaitMemberResultPayload.compactPersistFailure(
-                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage());
+            ModelSendBlocked blocked = blockedMemberResult(request.resultRefJson());
+            // 短载荷重写也必须保留发送阻止身份，否则写入恢复后会被当成普通工具失败。
+            String compact = blocked == null
+                    ? WaitMemberResultPayload.compactPersistFailurePrompt(
+                            objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage(), null)
+                    : WaitMemberResultPayload.encode(objectMapper, member.getToolName(), member.getToolCallId(),
+                            false, "", modelSendBlockPayload(blocked), Integer.MAX_VALUE);
             MemberCompletionRequest fallback = new MemberCompletionRequest(
                     request.groupId(),
                     request.memberIdentity(),
@@ -1089,6 +1252,8 @@ public class DualPoolWaitGroupNodeExecutor {
         patch.put("kind", KIND_TODO);
         patch.put("success", success);
         patch.put("output", output);
+        // 成功分支仅由本段模型最终回复进入，工具结果仍留在带来源的消息中。
+        if (success) patch.put("outputSourceJson", LangchainCompletedTodo.modelOutputSourceJson());
         patch.put("summary", summary);
         patch.put("failureReason", failureReason);
         patch.put("failureMetadata", failureMetadata);

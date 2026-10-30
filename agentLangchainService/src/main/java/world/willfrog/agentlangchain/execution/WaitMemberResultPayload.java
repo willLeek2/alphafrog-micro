@@ -3,6 +3,9 @@ package world.willfrog.agentlangchain.execution;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -91,6 +94,18 @@ public final class WaitMemberResultPayload {
         }
     }
 
+    /** 来源随已分类正文一起保存；旧encode入口不会为裸字符串补造来源。 */
+    public static String encodePrompt(ObjectMapper objectMapper, String toolName, String toolCallId,
+                                      boolean success, PromptText output, Map<String, Object> extra, int maxChars) {
+        Map<String, Object> attributes = new LinkedHashMap<>(extra == null ? Map.of() : extra);
+        boolean removed = tooLarge(stripJsonbUnsafe(output.text()), maxChars);
+        var sources = removed ? java.util.List.<world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource>of()
+                : output.sources();
+        attributes.putAll(PromptMessageCodec.sourceAttributes(sources.isEmpty()
+                ? PromptMessage.Origin.RUNTIME_DATA : PromptMessage.Origin.APPLICATION_INSTRUCTION, sources));
+        return encode(objectMapper, toolName, toolCallId, success, output.text(), attributes, maxChars);
+    }
+
     /**
      * 第一次写入失败后改用的短失败载荷：不含工具原文，避免同一条非法字符或超大 JSON 再次把语句打爆。
      */
@@ -117,6 +132,18 @@ public final class WaitMemberResultPayload {
         extra.put("errorDetail", detail);
         if (taskId != null && !taskId.isBlank()) extra.put("taskId", taskId);
         return encode(objectMapper, toolName, toolCallId, false, "", extra, Integer.MAX_VALUE);
+    }
+
+    /** 新产生的持久化失败是框架事实；旧 compact 入口继续不推断来源。 */
+    public static String compactPersistFailurePrompt(ObjectMapper objectMapper, String toolName,
+                                                     String toolCallId, String errorDetail, String taskId) {
+        String detail = errorDetail == null || errorDetail.isBlank() ? "成员结果无法写入等待组" : errorDetail;
+        if (detail.length() > 240) detail = detail.substring(0, 240);
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("errorCode", PERSIST_FAILED); extra.put("errorDetail", detail);
+        if (taskId != null && !taskId.isBlank()) extra.put("taskId", taskId);
+        return encodePrompt(objectMapper, toolName, toolCallId, false, PromptText.runtimeData(""),
+                extra, Integer.MAX_VALUE);
     }
 
     /**
@@ -190,6 +217,21 @@ public final class WaitMemberResultPayload {
      */
     public static String budgetRejectionText(String dimension, long used, long limit,
                                              ObjectMapper objectMapper) {
+        return budgetRejectionText(dimension, used, limit, budgetRejectionMessage(dimension), objectMapper, false);
+    }
+
+    public static PromptText budgetRejectionPrompt(String dimension, long used, long limit,
+                                                   PromptText message, ObjectMapper objectMapper) {
+        if (message == null || message.sources().isEmpty()) {
+            throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "预算拒绝建议缺少真实指令版本");
+        }
+        return new PromptText(budgetRejectionText(dimension, used, limit, message.text(), objectMapper, true), message.sources());
+    }
+
+    private static String budgetRejectionText(String dimension, long used, long limit, String message,
+                                              ObjectMapper objectMapper, boolean requireInstruction) {
         Map<String, Object> error = new LinkedHashMap<>();
         error.put("code", "RUN_BUDGET_EXCEEDED");
         error.put("dimension", dimension == null ? "" : dimension);
@@ -197,13 +239,18 @@ public final class WaitMemberResultPayload {
         error.put("limit", limit);
         error.put("retryable", false);
         error.put("rejected_before_dispatch", true);
-        error.put("message", budgetRejectionMessage(dimension));
+        error.put("message", message);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("error", error);
         try {
             return objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
+            if (requireInstruction) {
+                throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "预算拒绝的指令正文无法编码");
+            }
             // 序列化兜底：退回与 RunBudgetException 异常消息同款的可识别文本。
             return "RUN_BUDGET_EXCEEDED:" + (dimension == null ? "" : dimension) + ":" + used + "/" + limit;
         }

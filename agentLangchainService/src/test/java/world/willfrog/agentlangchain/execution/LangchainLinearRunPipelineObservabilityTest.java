@@ -41,7 +41,7 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 class LangchainLinearRunPipelineObservabilityTest {
 
     @Test
-    void executeRun_shouldInitializeObservabilityWithCaptureFlagFromExt() {
+    void executeRun_shouldInitializeObservabilityWithCaptureFlagFromExt() throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRunEventService eventService = mock(AgentRunEventService.class);
         AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
@@ -58,6 +58,9 @@ class LangchainLinearRunPipelineObservabilityTest {
                 "reference_date":"2025-02-03"}}
                 """);
         when(runMapper.findById("run-obs-1")).thenReturn(run);
+        when(eventService.prepareExperimentRunContext("run-obs-1")).thenReturn(
+                world.willfrog.agent.platform.prompt.PromptRunSelection.fromExt(
+                        new ObjectMapper().readTree(run.getExt()).get("prompt_selection")));
         when(runMapper.updateStatus("run-obs-1", "user-1",
                 world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED,
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
@@ -133,8 +136,8 @@ class LangchainLinearRunPipelineObservabilityTest {
                 eq("kimi-k2.5"),
                 eq(true));
         InOrder promptBoundaryOrder = inOrder(
-                promptService, stageModelResolver, observabilityService, followUpContextSupport);
-        promptBoundaryOrder.verify(promptService).validatePromptSelection(any());
+                eventService, stageModelResolver, observabilityService, followUpContextSupport);
+        promptBoundaryOrder.verify(eventService).prepareExperimentRunContext("run-obs-1");
         promptBoundaryOrder.verify(stageModelResolver).resolve(run);
         promptBoundaryOrder.verify(observabilityService).initializeRun(
                 eq("run-obs-1"), eq("openrouter-plan"), eq("kimi-k2.5"), eq(true));
@@ -163,7 +166,7 @@ class LangchainLinearRunPipelineObservabilityTest {
                 """);
         when(runMapper.findById("run-prompt-mismatch")).thenReturn(run);
         org.mockito.Mockito.doThrow(new IllegalStateException("prompt_selection_mismatch"))
-                .when(promptService).validatePromptSelection(any());
+                .when(eventService).prepareExperimentRunContext("run-prompt-mismatch");
 
         @SuppressWarnings("unchecked")
         ObjectProvider<AgentRunObservabilityService> observabilityProvider = mock(ObjectProvider.class);
@@ -196,7 +199,7 @@ class LangchainLinearRunPipelineObservabilityTest {
 
         pipeline.executeRun(run);
 
-        verify(promptService).validatePromptSelection(any());
+        verify(eventService).prepareExperimentRunContext("run-prompt-mismatch");
         verifyNoInteractions(stageModelResolver, followUpContextSupport, planner, linearWorkflowExecutor);
         verify(observabilityService, never()).initializeRun(any(), any(), any(), anyBoolean());
     }

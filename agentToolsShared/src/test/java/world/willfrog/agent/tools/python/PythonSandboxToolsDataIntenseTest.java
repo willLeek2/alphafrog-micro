@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.python;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -61,7 +62,7 @@ class PythonSandboxToolsDataIntenseTest {
     @BeforeEach
     void setUp() throws Exception {
         ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
-        tools = new PythonSandboxTools(objectMapper);
+        tools = configure(new PythonSandboxTools(objectMapper));
         world.willfrog.agent.platform.service.PythonRiskReviewService review =
                 mock(world.willfrog.agent.platform.service.PythonRiskReviewService.class);
         inject("pythonRiskReviewService", review);

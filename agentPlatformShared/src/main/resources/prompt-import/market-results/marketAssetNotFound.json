@@ -1,0 +1,21 @@
+{
+  "fragment": "marketAssetNotFound",
+  "purpose": "marketAssetNotFound",
+  "bodyType": "TEMPLATE",
+  "body": "资产 {{tsCode}} 不存在，请检查代码是否正确或更换查询标的。",
+  "variables": [
+    {
+      "name": "tsCode",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "cb5c4f0a1c46a9aa0c312b0daf2329648d08995449dfa3db1efd8efa43d2a16d",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

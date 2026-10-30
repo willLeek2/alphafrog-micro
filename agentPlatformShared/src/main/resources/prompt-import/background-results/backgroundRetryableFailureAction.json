@@ -1,0 +1,14 @@
+{
+  "fragment": "backgroundRetryableFailureAction",
+  "purpose": "backgroundRetryableFailureAction",
+  "bodyType": "FIXED",
+  "body": "检查代码后重试",
+  "variables": [],
+  "utf8Sha256": "6cb1098167dab15ada36c6a69916fd1af462ebcc519ab20ccdd890de174a9b6c",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tooljob/ToolJobFinalizer.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

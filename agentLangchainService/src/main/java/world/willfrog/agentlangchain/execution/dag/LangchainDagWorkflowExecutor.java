@@ -16,8 +16,14 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.AgentRunFailureClass;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoStatus;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.agentlangchain.execution.LangchainCompletedTodo;
 import world.willfrog.agentlangchain.execution.LangchainWorkflowRequest;
 import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
@@ -101,6 +107,8 @@ public class LangchainDagWorkflowExecutor {
     private final AgentRunEventService eventService;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentPromptService promptService;
+    @Autowired
+    private AgentModelInputs modelInputs;
     private final ObjectMapper objectMapper;
     private final ObjectProvider<world.willfrog.agent.platform.service.AgentRunStateStore> stateStoreProvider;
 
@@ -178,6 +186,15 @@ public class LangchainDagWorkflowExecutor {
                 return interrupted(plan, completedTodos, stopBeforeAnswer.get(), toolCalls.get());
             }
 
+            LangchainWorkflowResult blocked = modelSendBlockedFailure(
+                    plan, completedTodos, parallelRun.results(), toolCalls.get());
+            if (blocked != null) {
+                emitEventBestEffort(runId, userId, "DAG_EXECUTION_COMPLETED", Map.of(
+                        "success", false, "failure_reason", blocked.getFailureReason(),
+                        "total_tool_calls_used", toolCalls.get()));
+                return blocked;
+            }
+
             // 开关开启且存在失败节点时，用模型判定能否跳过部分失败节点、用已完成节点生成部分答案。
             // 额度已超限时绕过该判定：再问模型会立刻再次触发 RunBudgetException。
             // 直接走 handleBudgetExhaustion（有已完成节点则拼部分答案，否则立即失败）。
@@ -240,9 +257,11 @@ public class LangchainDagWorkflowExecutor {
                     .build();
         } catch (Exception e) {
             log.error("LangChain DAG workflow failed", e);
+            ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
             return LangchainWorkflowResult.builder()
                     .success(false)
-                    .failureReason(e.getMessage())
+                    .failureReason(blocked == null ? e.getMessage() : blocked.code())
+                    .failureMetadata(blocked == null ? null : ModelSendBlocks.failureMetadata(blocked))
                     .plan(plan)
                     .toolCallsUsed(toolCalls.get())
                     .build();
@@ -546,6 +565,7 @@ public class LangchainDagWorkflowExecutor {
                         .sequence(item.getSequence())
                         .description(item.getDescription())
                         .output(record.getOutput())
+                        .outputSourceJson(LangchainCompletedTodo.modelOutputSourceJson())
                         .summary(record.getSummary())
                         .build());
                 long durationMs = System.currentTimeMillis() - nodeStartMs;
@@ -582,9 +602,12 @@ public class LangchainDagWorkflowExecutor {
                 log.error("Failed to execute DAG node {}", item.getId(), t);
             }
             long catchDurationMs = nodeStartMs > 0 ? System.currentTimeMillis() - nodeStartMs : 0;
-            Map<String, Object> catchMetadata = unknownDefect ? unknownDefectMetadata(t) : null;
+            ModelSendBlocked blocked = unknownDefect ? null : ModelSendBlocks.find(t).orElse(null);
+            Map<String, Object> catchMetadata = blocked != null ? ModelSendBlocks.failureMetadata(blocked)
+                    : unknownDefect ? unknownDefectMetadata(t) : null;
             LangchainTodoNodeResult failed = LangchainTodoNodeResult.failure(
-                    "DAG execution failed: " + nvl(t.getMessage()), catchMetadata);
+                    blocked == null ? "DAG execution failed: " + nvl(t.getMessage()) : blocked.code(),
+                    catchMetadata);
             results.put(item.getId(), failed);
             nodeSuccess.put(item.getId(), false);
             stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
@@ -658,6 +681,11 @@ public class LangchainDagWorkflowExecutor {
             String runId,
             String userId) {
 
+        LangchainWorkflowResult blocked = modelSendBlockedFailure(plan, completedTodos, results, toolCalls.get());
+        if (blocked != null) {
+            return blocked;
+        }
+
         if (!isBlank(runId) && !isBlank(userId)) {
             eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_STARTED", Map.of(
                     "run_id", runId
@@ -669,10 +697,16 @@ public class LangchainDagWorkflowExecutor {
         String previousStage = AgentContext.getStage();
         try {
             // 1. 构建恢复判定器的 system prompt + user message（user message 里包含所有 todo 的状态摘要和已完成节点的产出）
-            String systemPrompt = promptService.reactSystemPrompt();
-            String userMessage = promptService.dagRecoveryJudgeStageInstruction()
-                    + "\n\n"
-                    + buildRecoveryJudgeUserMessage(items, graph, results, sharedContext, request);
+            PromptText systemPrompt = promptService.reactSystemPromptText();
+            List<PromptText> judgeParts = new ArrayList<>();
+            judgeParts.add(promptService.dagRecoveryJudgeStageInstructionText());
+            judgeParts.add(PromptText.runtimeData("\n\n" + buildRecoveryJudgeUserMessage(
+                    items, graph, results, sharedContext, request)));
+            // 已完成结果的摘要沿用同项来源，恢复出来的旧未知结果不能重新标成运行数据。
+            for (LangchainCompletedTodo completed : sharedContext.completedTodosSnapshot()) {
+                judgeParts.add(completed.attributedText(""));
+            }
+            PromptText userMessage = PromptText.concat(judgeParts);
 
             // 2. 设置 judge 专用的 phase/stage，让 ChatModel 产生的 trace 归属到 dag_recovery_judge，方便在 observability 中过滤
             AgentContext.setPhase("dag_recovery_judge");
@@ -680,14 +714,21 @@ public class LangchainDagWorkflowExecutor {
 
             // 3. 调用 execution 阶段模型做判定（复用请求中的 execution model）
             ChatModel judgeModel = request.executionModelOrDefault();
-            ChatRequest chatRequest = ChatRequest.builder()
-                    .messages(List.of(
-                            SystemMessage.from(systemPrompt),
-                            UserMessage.from(userMessage)
-                    ))
-                    .build();
-
-            ChatResponse response = judgeModel.doChat(chatRequest);
+            List<PromptMessage> messages = List.of(PromptMessage.system(systemPrompt), PromptMessage.user(userMessage));
+            ChatRequest chatRequest = ChatRequest.builder().messages(messages.stream().map(PromptMessage::message).toList()).build();
+            if (modelInputs == null) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "恢复判定的输入保存组件未配置");
+            }
+            var parentSpec = AgentContext.getStructuredOutputSpec();
+            AgentContext.clearStructuredOutputSpec();
+            ChatResponse response;
+            try (var ignored = modelInputs.open(request.getExecutionEndpointName(), PromptMessage.toModelInputSources(messages))) {
+                response = judgeModel.doChat(chatRequest);
+            } finally {
+                if (parentSpec == null) AgentContext.clearStructuredOutputSpec();
+                else AgentContext.setStructuredOutputSpec(parentSpec);
+            }
             AiMessage aiMessage = response.aiMessage();
             String responseText = aiMessage.text();
 
@@ -800,6 +841,15 @@ public class LangchainDagWorkflowExecutor {
             Map<String, LangchainTodoNodeResult> mergedResults = new LinkedHashMap<>(results);
             secondRun.results().forEach((k, v) -> mergedResults.put(k, v));
 
+            LangchainWorkflowResult secondRunBlocked = modelSendBlockedFailure(
+                    plan, new ArrayList<>(sharedContext.completedTodosSnapshot()), mergedResults, toolCalls.get());
+            if (secondRunBlocked != null) {
+                emitEventBestEffort(runId, userId, "DAG_EXECUTION_COMPLETED", Map.of(
+                        "success", false, "failure_reason", secondRunBlocked.getFailureReason(),
+                        "total_tool_calls_used", toolCalls.get()));
+                return secondRunBlocked;
+            }
+
             // 检查第二遍后是否仍有失败（skipSet 中的 recovered 节点不算失败）
             for (TodoItem item : items) {
                 if (skipSet.contains(item.getId())) continue;
@@ -832,6 +882,13 @@ public class LangchainDagWorkflowExecutor {
                     .build();
 
         } catch (Exception e) {
+            ModelSendBlocked sendBlocked = ModelSendBlocks.find(e).orElse(null);
+            if (sendBlocked != null) {
+                emitEventBestEffort(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
+                        "decision", "ERROR", "error", sendBlocked.code(),
+                        "error_type", e.getClass().getSimpleName()));
+            }
+            ModelSendBlocks.rethrowIfBlocked(e);
             // judge 调用本身异常（如 LLM 超时、JSON 解析失败）→ 打 warn 日志 + 事件，
             // 返回 null 让 executePlanned 继续走原有失败路径，不阻塞 DAG 的失败处理
             log.warn("DAG recovery judge failed, falling back to normal failure path: {}", e.getMessage());
@@ -1018,6 +1075,22 @@ public class LangchainDagWorkflowExecutor {
             Map<String, Object> meta = r.getFailureMetadata();
             if (meta != null && Boolean.TRUE.equals(meta.get("budget_exceeded"))) {
                 return meta;
+            }
+        }
+        return null;
+    }
+
+    private LangchainWorkflowResult modelSendBlockedFailure(
+            LangchainTodoPlan plan,
+            List<LangchainCompletedTodo> completedTodos,
+            Map<String, LangchainTodoNodeResult> results,
+            int toolCallsUsed) {
+        for (LangchainTodoNodeResult result : results.values()) {
+            Map<String, Object> metadata = result == null ? null : result.getFailureMetadata();
+            if (metadata != null && Boolean.TRUE.equals(metadata.get("model_send_blocked"))) {
+                String code = metadata.get("model_send_block_code") instanceof String value
+                        ? value : "MODEL_SEND_BLOCKED";
+                return failure(plan, completedTodos, code, toolCallsUsed, metadata);
             }
         }
         return null;

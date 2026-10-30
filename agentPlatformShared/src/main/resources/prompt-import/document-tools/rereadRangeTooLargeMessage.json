@@ -1,0 +1,14 @@
+{
+  "fragment": "rereadRangeTooLargeMessage",
+  "purpose": "rereadRangeTooLargeMessage",
+  "bodyType": "FIXED",
+  "body": "rereadToolResult without keyword must not exceed configured range max limit",
+  "variables": [],
+  "utf8Sha256": "dde654ae8e3412670921ba91255f3690146e5a16e7edd3d4aa49a3eaf422e833",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/compaction/RereadToolHandler.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

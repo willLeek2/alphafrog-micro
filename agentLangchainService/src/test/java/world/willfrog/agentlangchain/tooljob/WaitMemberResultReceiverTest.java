@@ -130,7 +130,7 @@ class WaitMemberResultReceiverTest {
                         "agent.langchain.wait-member.receiver.backoff-max-ms", "15000",
                         "agent.langchain.wait-member.receiver.max-backoff-step", "6"),
                 4096, 1000L, new FrozenEffectiveSettings(), acceptancePolicies, releasePoints, ruleHits);
-        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any(), any()))
+        Mockito.lenient().when(settlement.settlePrompt(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
 
         Mockito.lenient().when(waitGroupStore.rescheduleMember(anyLong(), anyString(), any(), anyInt()))
@@ -143,6 +143,12 @@ class WaitMemberResultReceiverTest {
         SandboxJobResultAdapter textStub = new SandboxJobResultAdapter() {
             public boolean isSuccess(SandboxTerminalResultView terminal) { return classifier.isSuccess(terminal); }
             public String errorCodeOf(SandboxTerminalResultView terminal) { return classifier.errorCodeOf(terminal); }
+            public world.willfrog.alphafrogmicro.common.racing.prompt.PromptText formatTerminalResultText(
+                    SandboxTerminalResultView terminal, Object ignored) {
+                // 本接收器测试替身明确产生普通 stdout 事实，真实建议分支另用真实适配器。
+                return world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(
+                        formatTerminalResult(terminal, ignored));
+            }
             public String formatTerminalResult(SandboxTerminalResultView terminal, Object ignored) {
                 return pythonSandboxTools.formatTerminalResult(terminal.statusName(),
                         (TaskResultResponse) terminal.nativePayload(), RUN_ID, null, "node-1", "tc-1");
@@ -159,10 +165,10 @@ class WaitMemberResultReceiverTest {
 
     private PythonSandboxTools installRealAdapters() {
         SandboxJobAdapterRegistry.clearForTests();
-        PythonSandboxTools python = new PythonSandboxTools(objectMapper);
+        PythonSandboxTools python = ToolJobPromptTestFixture.configureTool(new PythonSandboxTools(objectMapper));
         ReflectionTestUtils.setField(python, "pythonSandboxService", sandboxService);
         ReflectionTestUtils.invokeMethod(python, "registerSandboxJobAdapters");
-        SqlQueryTools query = new SqlQueryTools(objectMapper);
+        SqlQueryTools query = ToolJobPromptTestFixture.configureTool(new SqlQueryTools(objectMapper));
         ReflectionTestUtils.setField(query, "pythonSandboxService", sandboxService);
         ReflectionTestUtils.invokeMethod(query, "registerSandboxJobAdapters");
         return python;
@@ -189,7 +195,8 @@ class WaitMemberResultReceiverTest {
         assertThat(output.path("error").path("code").asText()).isEqualTo("PLAN_GLOBAL_SORT");
         assertThat(output.path("error").path("details").path("retryable").asBoolean()).isTrue();
         verify(pythonSandboxTools, never()).formatTerminalResult(any(), any(), any(), any(), any(), any());
-        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), eq(saved.path("output").asText()), any());
+        verify(settlement).settlePrompt(any(), any(), eq("SUCCEEDED"), any(),
+                Mockito.argThat(resolved -> resolved.output().text().equals(saved.path("output").asText())), any());
     }
 
     @ParameterizedTest
@@ -285,7 +292,8 @@ class WaitMemberResultReceiverTest {
         FinanceRecordChannelProcessor processor = new FinanceRecordChannelProcessor(
                 new FinanceRecordDecoder(objectMapper), new FinanceRecordSchemaValidator(),
                 new FinanceEnvironmentVerifier(), Mockito.mock(FinanceMethodResolutionQuery.class),
-                persister, Mockito.mock(FinanceRecordChannelObservability.class), objectMapper);
+                persister, Mockito.mock(FinanceRecordChannelObservability.class), objectMapper,
+                ToolJobPromptTestFixture.policies());
         ReflectionTestUtils.setField(python, "financeRecordChannelProcessor", processor);
         FinanceRecordChannelProperties properties = new FinanceRecordChannelProperties();
         properties.setEnabled(true);
@@ -311,7 +319,7 @@ class WaitMemberResultReceiverTest {
 
         receiver.round();
         verify(waitGroupStore, never()).completeMember(any());
-        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement, never()).settlePrompt(any(), any(), any(), any(), any(), any());
         receiver.round();
         receiver.round();
 
@@ -421,8 +429,8 @@ class WaitMemberResultReceiverTest {
         assertThat(request.externalOperationId()).isEqualTo("op-1");
         assertThat(request.resultRefJson())
                 .as("载荷与同步执行那条路用同一个写入方：同样的入参得到同样的 JSON")
-                .isEqualTo(WaitMemberResultPayload.encode(objectMapper, "executePython", "tc-1",
-                        true, "{\"ok\":true,\"stdout\":\"done\"}",
+                .isEqualTo(WaitMemberResultPayload.encodePrompt(objectMapper, "executePython", "tc-1",
+                        true, world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("{\"ok\":true,\"stdout\":\"done\"}"),
                         java.util.Map.of("taskId", "task-1"), 4096));
 
         verify(recoveryDispatcher).wake(99L);
@@ -447,7 +455,7 @@ class WaitMemberResultReceiverTest {
         receiver.round();
 
         verify(waitGroupStore, never()).completeMember(any());
-        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement, never()).settlePrompt(any(), any(), any(), any(), any(), any());
         assertThat(receiver.snapshot())
                 .containsEntry("waitMemberReceiverDeferredTotal", 1L)
                 .containsEntry("waitMemberReceiverFailuresTotal", 1L);
@@ -764,7 +772,7 @@ class WaitMemberResultReceiverTest {
         receiver.round();
 
         verify(waitGroupStore, never()).completeMember(any());
-        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement, never()).settlePrompt(any(), any(), any(), any(), any(), any());
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 1L);
     }
 
@@ -782,7 +790,7 @@ class WaitMemberResultReceiverTest {
 
         receiver.round();
 
-        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement, never()).settlePrompt(any(), any(), any(), any(), any(), any());
         verify(waitGroupStore, never()).completeMember(any());
     }
 
@@ -816,7 +824,7 @@ class WaitMemberResultReceiverTest {
 
         receiver.round();
 
-        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement, never()).settlePrompt(any(), any(), any(), any(), any(), any());
         verify(waitGroupStore, never()).completeMember(any());
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDeferredTotal", 1L);
     }
@@ -831,7 +839,7 @@ class WaitMemberResultReceiverTest {
 
         receiver.round();
 
-        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement, never()).settlePrompt(any(), any(), any(), any(), any(), any());
         verify(waitGroupStore, never()).completeMember(any());
     }
 
@@ -953,7 +961,7 @@ class WaitMemberResultReceiverTest {
         givenDueMember();
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
-        Mockito.lenient().when(settlement.settle(any(), any(), any(), any(), any(), any()))
+        Mockito.lenient().when(settlement.settlePrompt(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(false, "release:NOT_FOUND"));
 
         receiver.round();
@@ -977,10 +985,11 @@ class WaitMemberResultReceiverTest {
         receiver.round();
 
         ArgumentCaptor<String> statusName = ArgumentCaptor.forClass(String.class);
-        ArgumentCaptor<String> preview = ArgumentCaptor.forClass(String.class);
-        verify(settlement).settle(any(), any(), statusName.capture(), any(), preview.capture(), any());
+        ArgumentCaptor<SandboxJobResultAdapter.ResolvedPromptResult> preview =
+                ArgumentCaptor.forClass(SandboxJobResultAdapter.ResolvedPromptResult.class);
+        verify(settlement).settlePrompt(any(), any(), statusName.capture(), any(), preview.capture(), any());
         assertThat(statusName.getValue()).isEqualTo("SUCCEEDED");
-        assertThat(preview.getValue())
+        assertThat(preview.getValue().output().text())
                 .as("交给收尾的正文与写进成员结果的是同一份")
                 .isEqualTo("{\"ok\":true,\"stdout\":\"done\"}");
     }
@@ -1075,7 +1084,7 @@ class WaitMemberResultReceiverTest {
                 .contains("这个场景要造一条失败成员")
                 .contains("done");
         // 名额与用量照常收尾：被点名按失败收尾不等于这次调用没发生过。
-        verify(settlement).settle(any(), any(), any(), any(), any(), any());
+        verify(settlement).settlePrompt(any(), any(), any(), any(), any(), any());
         assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverDesignatedFailuresTotal", 1L);
     }
 
@@ -1100,7 +1109,7 @@ class WaitMemberResultReceiverTest {
                 .contains("acceptance_fixture_policy_peer_unknown")
                 .contains("tc-missing");
         ArgumentCaptor<String> settledStatus = ArgumentCaptor.forClass(String.class);
-        verify(settlement).settle(any(), any(), settledStatus.capture(), any(), any(), any());
+        verify(settlement).settlePrompt(any(), any(), settledStatus.capture(), any(), any(), any());
         assertThat(settledStatus.getValue())
                 .as("按沙箱自己的终态结算，名额与用量照实记")
                 .isEqualTo("SUCCEEDED");
@@ -1130,7 +1139,7 @@ class WaitMemberResultReceiverTest {
         assertThat(capturedRequest().resultRefJson())
                 .contains("acceptance_fixture_policy_unreadable")
                 .contains("acceptance_fixture_identity_changed");
-        verify(settlement).settle(any(), any(), eq("SUCCEEDED"), any(), any(), any());
+        verify(settlement).settlePrompt(any(), any(), eq("SUCCEEDED"), any(), any(), any());
         verify(waitGroupStore, never()).rescheduleMember(anyLong(), anyString(), any(), anyInt());
         assertThat(receiver.snapshot())
                 .containsEntry("waitMemberReceiverCompletedTotal", 1L)
@@ -1144,7 +1153,7 @@ class WaitMemberResultReceiverTest {
         policyOf(peerRule("tc-missing"));
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
-        when(settlement.settle(any(), any(), any(), any(), any(), any()))
+        when(settlement.settlePrompt(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(false, "reservation_busy"));
 
         receiver.round();
@@ -1155,7 +1164,7 @@ class WaitMemberResultReceiverTest {
                 .containsEntry("waitMemberReceiverPolicyRefusalsTotal", 0L)
                 .containsEntry("waitMemberReceiverDeferredTotal", 1L);
 
-        when(settlement.settle(any(), any(), any(), any(), any(), any()))
+        when(settlement.settlePrompt(any(), any(), any(), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
         completion(true, WaitMemberState.FAILED, null);
         receiver.round();
@@ -1431,6 +1440,7 @@ class WaitMemberResultReceiverTest {
     private static AgentRun run(AgentRunStatus status) {
         AgentRun run = new AgentRun();
         run.setId(RUN_ID);
+        run.setUserId("receiver-fixture-user");
         run.setStatus(status);
         run.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
         run.setPlanGeneration(2);

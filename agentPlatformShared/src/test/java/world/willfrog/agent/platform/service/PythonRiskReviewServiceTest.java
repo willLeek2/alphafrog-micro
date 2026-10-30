@@ -5,6 +5,8 @@ import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.dataanalysis.PythonRiskDecisionRow;
 import world.willfrog.agent.platform.mapper.PythonRiskDecisionMapper;
@@ -24,12 +26,20 @@ class PythonRiskReviewServiceTest {
     private final AgentAiServiceFactory factory = mock(AgentAiServiceFactory.class);
     private final PythonRiskDecisionMapper mapper = mock(PythonRiskDecisionMapper.class);
     private final ObjectMapper json = new ObjectMapper();
+    private final VersionedModelTestFixture versioned = new VersionedModelTestFixture();
+
+    @AfterEach
+    void clearContext() { AgentContext.clear(); }
 
     private PythonRiskReviewService subject(AgentLlmProperties snapshot) {
         when(loader.hotConfigIsAuthoritative()).thenReturn(true);
         when(loader.currentSnapshot()).thenReturn(
                 new AgentLlmLocalConfigLoader.LocalConfigSnapshot(snapshot, Set.of("agent")));
-        return new PythonRiskReviewService(base, loader, resolver, factory, mapper, json);
+        AgentContext.setRunId("run");
+        versioned.putImported("pythonRiskReviewSystemPrompt");
+        var service = new PythonRiskReviewService(base, loader, resolver, factory, mapper, json);
+        versioned.inject(service);
+        return service;
     }
 
     @Test
@@ -59,8 +69,8 @@ class PythonRiskReviewServiceTest {
         ChatModel model = mock(ChatModel.class);
         when(resolver.resolveFromSnapshot(eq("cheap"), eq("small-model"), same(snapshot)))
                 .thenReturn(route());
-        when(factory.buildPythonRiskReviewModel(any()))
-                .thenReturn(model);
+        when(factory.buildArchivedPythonRiskReviewModel(any()))
+                .thenReturn(versioned.archived(model, "cheap"));
         when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":51}"));
         AtomicReference<PythonRiskDecisionRow> stored = storeInsertedDecision();
 
@@ -83,8 +93,8 @@ class PythonRiskReviewServiceTest {
         ChatModel model = mock(ChatModel.class);
         when(resolver.resolveFromSnapshot(anyString(), anyString(), same(snapshot)))
                 .thenReturn(route());
-        when(factory.buildPythonRiskReviewModel(any()))
-                .thenReturn(model);
+        when(factory.buildArchivedPythonRiskReviewModel(any()))
+                .thenReturn(versioned.archived(model, "cheap"));
         when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":50}"));
         storeInsertedDecision();
         assertTrue(subject(snapshot).evaluate("run:ok:1", "run", "pass").allowed());
@@ -105,7 +115,7 @@ class PythonRiskReviewServiceTest {
         ChatModel model = mock(ChatModel.class);
         when(resolver.resolveFromSnapshot(anyString(), anyString(), same(snapshot)))
                 .thenReturn(route());
-        when(factory.buildPythonRiskReviewModel(any())).thenReturn(model);
+        when(factory.buildArchivedPythonRiskReviewModel(any())).thenReturn(versioned.archived(model, "cheap"));
         when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":100,\"riskScore\":0}"));
 
         assertThrows(PythonRiskReviewService.Unavailable.class,
@@ -119,8 +129,8 @@ class PythonRiskReviewServiceTest {
         ChatModel model = mock(ChatModel.class);
         when(resolver.resolveFromSnapshot(anyString(), anyString(), same(snapshot)))
                 .thenReturn(route());
-        when(factory.buildPythonRiskReviewModel(any()))
-                .thenReturn(model);
+        when(factory.buildArchivedPythonRiskReviewModel(any()))
+                .thenReturn(versioned.archived(model, "cheap"));
         when(model.chat(any(List.class))).thenThrow(new RuntimeException("timeout"));
         assertThrows(PythonRiskReviewService.Unavailable.class,
                 () -> subject(snapshot).evaluate("run:timeout:1", "run", "pass"));

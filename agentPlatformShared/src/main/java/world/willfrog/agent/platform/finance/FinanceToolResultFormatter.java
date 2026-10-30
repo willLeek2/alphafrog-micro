@@ -1,8 +1,10 @@
 package world.willfrog.agent.platform.finance;
 
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Autowired;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope;
 import world.willfrog.agent.platform.failure.ToolFailureCategory;
 
@@ -11,6 +13,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 
 /**
  * Serializes the byte-identical model-facing {@code executePython} result used by sync and async
@@ -33,9 +37,16 @@ public class FinanceToolResultFormatter {
                     "缩小计算范围或分批执行后重试");
 
     private final ObjectMapper objectMapper;
+    private final TerminalResultPromptTexts promptTexts;
 
     public FinanceToolResultFormatter(ObjectMapper objectMapper) {
+        this(objectMapper, null);
+    }
+
+    @Autowired
+    public FinanceToolResultFormatter(ObjectMapper objectMapper, TerminalResultPromptTexts promptTexts) {
         this.objectMapper = objectMapper;
+        this.promptTexts = promptTexts;
     }
 
     /**
@@ -45,6 +56,17 @@ public class FinanceToolResultFormatter {
             String ordinaryStdout,
             List<FinanceModelResult> results,
             List<FinanceRecordExtractionResult.ModelNotice> notices) {
+        return formatSuccessValue(ordinaryStdout, results, notices, false).output();
+    }
+
+    public PromptText formatSuccessText(String ordinaryStdout, List<FinanceModelResult> results,
+                                        List<FinanceRecordExtractionResult.ModelNotice> notices) {
+        var formatted = formatSuccessValue(ordinaryStdout, results, notices, true);
+        return new PromptText(formatted.output(), formatted.sources());
+    }
+
+    private FormattedSuccess formatSuccessValue(String ordinaryStdout, List<FinanceModelResult> results,
+                                          List<FinanceRecordExtractionResult.ModelNotice> notices, boolean withSources) {
         rejectMarkerFamily(ordinaryStdout, "ordinary stdout");
         List<FinanceModelResult> includedResults = new ArrayList<>();
         List<FinanceRecordExtractionResult.ModelNotice> includedNotices = new ArrayList<>();
@@ -80,14 +102,23 @@ public class FinanceToolResultFormatter {
         }
 
         if (omittedStructuredContent) {
-            makeRoomForTruncationNotice(includedResults, includedNotices);
-            includedNotices.add(SUMMARY_TRUNCATED_NOTICE);
+            var truncation = withSources ? truncationNotice() : SUMMARY_TRUNCATED_NOTICE;
+            makeRoomForTruncationNotice(includedResults, includedNotices, truncation);
+            includedNotices.add(truncation);
         }
 
         String fittedStdout = fitText(
                 ordinaryStdout,
                 value -> successPayload(value, includedResults, includedNotices));
-        return writeBounded(successPayload(fittedStdout, includedResults, includedNotices));
+        List<PromptVersionSource> sources = new ArrayList<>();
+        if (withSources) {
+            for (var notice : includedNotices) {
+                sources.addAll(TerminalResultPromptTexts.sources(notice.message(), notice.action(),
+                        notice.messagePrompt(), notice.actionPrompt()));
+            }
+        }
+        return new FormattedSuccess(writeBounded(successPayload(fittedStdout, includedResults, includedNotices)),
+                sources.stream().distinct().toList());
     }
 
     /**
@@ -113,11 +144,25 @@ public class FinanceToolResultFormatter {
         return writeBounded(failurePayload(fittedStdout, fittedStderr, failure));
     }
 
+    public PromptText formatFailureText(String ordinaryStdout, String stderr, FailureDetail failure) {
+        if (failure == null) throw TerminalResultPromptTexts.missing("终态失败缺少明确说明");
+        var sources = TerminalResultPromptTexts.sources(failure.message(), failure.action(),
+                failure.messagePrompt(), failure.actionPrompt());
+        return new PromptText(formatFailure(ordinaryStdout, stderr, failure), sources);
+    }
+
+    private FinanceRecordExtractionResult.ModelNotice truncationNotice() {
+        if (promptTexts == null) throw TerminalResultPromptTexts.missing("金融结果截断建议未配置正文来源");
+        return FinanceRecordExtractionResult.ModelNotice.withPrompts(SUMMARY_TRUNCATED_NOTICE.code(),
+                PromptText.runtimeData(SUMMARY_TRUNCATED_NOTICE.message()), promptTexts.instruction("financeSummaryTruncatedAction"));
+    }
+
     private void makeRoomForTruncationNotice(
             List<FinanceModelResult> results,
-            List<FinanceRecordExtractionResult.ModelNotice> notices) {
+            List<FinanceRecordExtractionResult.ModelNotice> notices,
+            FinanceRecordExtractionResult.ModelNotice truncation) {
         List<FinanceRecordExtractionResult.ModelNotice> withTruncation =
-                appended(notices, SUMMARY_TRUNCATED_NOTICE);
+                appended(notices, truncation);
         while (!fits(successPayload(null, results, withTruncation))) {
             if (!results.isEmpty()) {
                 results.remove(results.size() - 1);
@@ -125,7 +170,7 @@ public class FinanceToolResultFormatter {
             }
             if (!notices.isEmpty()) {
                 notices.remove(notices.size() - 1);
-                withTruncation = appended(notices, SUMMARY_TRUNCATED_NOTICE);
+                withTruncation = appended(notices, truncation);
                 continue;
             }
             throw new IllegalStateException("minimal finance truncation notice exceeds preview limit");
@@ -276,6 +321,8 @@ public class FinanceToolResultFormatter {
         Map<String, Object> create(String value);
     }
 
+    private record FormattedSuccess(String output, List<PromptVersionSource> sources) { }
+
     /** Model-safe projection produced by the canonical MethodSpec projector. */
     public record FinanceModelResult(
             String method,
@@ -289,6 +336,19 @@ public class FinanceToolResultFormatter {
             String code,
             String message,
             boolean retryable,
-            String action) {
+            String action,
+            PromptText messagePrompt,
+            PromptText actionPrompt) {
+        /** 旧构造不补造说明与操作建议的来源。 */
+        public FailureDetail(String code, String message, boolean retryable, String action) {
+            this(code, message, retryable, action, null, null);
+        }
+
+        public static FailureDetail withPrompts(String code, PromptText message, boolean retryable, PromptText action) {
+            if (message == null || action == null) {
+                throw TerminalResultPromptTexts.missing("终态失败缺少明确正文来源");
+            }
+            return new FailureDetail(code, message.text(), retryable, action.text(), message, action);
+        }
     }
 }

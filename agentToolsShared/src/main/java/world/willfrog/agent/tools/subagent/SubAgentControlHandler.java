@@ -1,6 +1,9 @@
 package world.willfrog.agent.tools.subagent;
 
 import java.util.Map;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
 /**
  * 子代理控制工具的跨模块执行接口。
@@ -16,4 +19,12 @@ public interface SubAgentControlHandler {
 
     /** 等待一个或多个子代理并返回结构化 JSON。 */
     String waitFor(Map<String, Object> params);
+    /** 实现方在结果产生处携带来源；旧实现没有来源时停止发送。 */
+    default PromptText spawnPrompt(Map<String, Object> params) {
+        throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "子代理创建结果缺少来源");
+    }
+
+    default PromptText waitForPrompt(Map<String, Object> params) {
+        throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "子代理等待结果缺少来源");
+    }
 }

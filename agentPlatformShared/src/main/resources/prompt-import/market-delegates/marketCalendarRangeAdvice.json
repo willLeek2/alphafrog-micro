@@ -1,0 +1,14 @@
+{
+  "fragment": "marketCalendarRangeAdvice",
+  "purpose": "marketCalendarRangeAdvice",
+  "bodyType": "FIXED",
+  "body": "Invalid date range, please use YYYYMMDD and ensure startDate <= endDate.",
+  "variables": [],
+  "utf8Sha256": "8923bee59cc53cbe8304887482b8f1fa3e7d341df891fefe563602642486864e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataCalendarTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

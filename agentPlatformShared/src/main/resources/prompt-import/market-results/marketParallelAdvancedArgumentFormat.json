@@ -1,0 +1,14 @@
+{
+  "fragment": "marketParallelAdvancedArgumentFormat",
+  "purpose": "marketParallelAdvancedArgumentFormat",
+  "bodyType": "FIXED",
+  "body": "conditions use | separated index_code/stock_code/industry_code values. Dates must be YYYYMMDD or NONE. getExchangeAssetDaily advanced only supports stock asset_type.",
+  "variables": [],
+  "utf8Sha256": "5e5c5950d5630eae94d7ff067515ae7b8d551b6ae7b99294a52e893ef559f4dd",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

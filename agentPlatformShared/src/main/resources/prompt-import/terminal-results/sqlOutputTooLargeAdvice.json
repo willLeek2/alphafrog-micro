@@ -1,0 +1,14 @@
+{
+  "fragment": "sqlOutputTooLargeAdvice",
+  "purpose": "sqlOutputTooLargeAdvice",
+  "bodyType": "FIXED",
+  "body": "请收窄查询（加过滤、减少列或降低行数）后重试",
+  "variables": [],
+  "utf8Sha256": "688b51891d71951f83dd40d42f89fd55fcf01ca7f887428e8aae59e02c50526d",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/resources/sandboxjob/duckdb_query_runner.py",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

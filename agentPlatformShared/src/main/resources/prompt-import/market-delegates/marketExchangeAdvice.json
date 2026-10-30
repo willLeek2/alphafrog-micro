@@ -1,0 +1,14 @@
+{
+  "fragment": "marketExchangeAdvice",
+  "purpose": "marketExchangeAdvice",
+  "bodyType": "FIXED",
+  "body": "exchange must be SSE, SZSE, or BSE",
+  "variables": [],
+  "utf8Sha256": "3c9d4ed133859c0e78bf075e8692c782e50199cc919c3a5bba327e8cf3b98ba5",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataFundEtfTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

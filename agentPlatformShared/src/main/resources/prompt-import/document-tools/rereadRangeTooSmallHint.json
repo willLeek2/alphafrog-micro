@@ -1,0 +1,21 @@
+{
+  "fragment": "rereadRangeTooSmallHint",
+  "purpose": "rereadRangeTooSmallHint",
+  "bodyType": "TEMPLATE",
+  "body": "Set keyword for grep-style filtering, or set limit >= {{minimumInclusive}}",
+  "variables": [
+    {
+      "name": "minimumInclusive",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "76687da377b409bbae84d2d0adbce01897ad3b2272bebfbd1e1bc7449be70e6f",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/compaction/RereadToolHandler.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

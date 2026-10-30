@@ -20,7 +20,17 @@ public record DataAnalysisTerminalEnvelope(
         DataAnalysisReservation reservation,
         DataAnalysisResourceUsage resourceUsage,
         Instant terminalAt,
-        boolean background) {
+        boolean background,
+        String resultPromptSourcesJson) {
+
+    public DataAnalysisTerminalEnvelope(String runId, String toolCallId, int attempt, String operationId,
+            String taskId, String terminalStatus, boolean success, String resultPreview, String rawRef,
+            String errorCode, String errorMessage, boolean retryable, DataAnalysisEstimate estimate,
+            DataAnalysisReservation reservation, DataAnalysisResourceUsage resourceUsage, Instant terminalAt,
+            boolean background) {
+        this(runId, toolCallId, attempt, operationId, taskId, terminalStatus, success, resultPreview, rawRef,
+                errorCode, errorMessage, retryable, estimate, reservation, resourceUsage, terminalAt, background, null);
+    }
 
     public static final int MAX_RESULT_PREVIEW_BYTES = 16 * 1024;
 

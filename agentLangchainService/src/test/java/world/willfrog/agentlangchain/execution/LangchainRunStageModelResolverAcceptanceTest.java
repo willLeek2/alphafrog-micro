@@ -95,7 +95,7 @@ class LangchainRunStageModelResolverAcceptanceTest {
                 return ChatResponse.builder().aiMessage(AiMessage.from("真")).build();
             }
         };
-        when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any(), any())).thenReturn(real);
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrder(any(), any(), any())).thenReturn(real);
 
         LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());
         verifyNoInteractions(aiServiceFactory);
@@ -106,7 +106,7 @@ class LangchainRunStageModelResolverAcceptanceTest {
                 .chat(ChatRequest.builder().messages(List.of(UserMessage.from("继续"))).build());
 
         assertThat(response.aiMessage().text()).isEqualTo("真");
-        verify(aiServiceFactory).buildChatModelWithProviderOrder(any(), any(), any());
+        verify(aiServiceFactory).buildArchivedChatModelWithProviderOrder(any(), any(), any());
     }
 
     @Test
@@ -117,7 +117,7 @@ class LangchainRunStageModelResolverAcceptanceTest {
                 .thenReturn(new AgentLlmResolver.ResolvedLlm(
                         "openrouter", "https://example.test", "some-model", "k", null, List.of(), 4096));
         ChatModel realModel = mock(ChatModel.class);
-        when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any(), any())).thenReturn(realModel);
+        when(aiServiceFactory.buildArchivedChatModelWithProviderOrder(any(), any(), any())).thenReturn(realModel);
 
         LangchainRunStageModelResolver.StageModels models = resolver.resolve(run());
 

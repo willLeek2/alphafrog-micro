@@ -1,0 +1,14 @@
+{
+  "fragment": "marketAssetDateFormatAdvice",
+  "purpose": "marketAssetDateFormatAdvice",
+  "bodyType": "FIXED",
+  "body": "Invalid tsCode or date range, use YYYYMMDD",
+  "variables": [],
+  "utf8Sha256": "e943f6496b145410bc8efa53716484d506c0835cb138b23b9ad952875a0b4213",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataFundEtfTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

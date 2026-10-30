@@ -1,5 +1,7 @@
 package world.willfrog.agentlangchain.execution;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -112,6 +114,17 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
         this.objectMapper = objectMapper;
         this.executor = executor;
         this.timeoutScheduler = timeoutScheduler;
+    }
+
+    /** 这些响应只包含本次执行状态、参数校验事实和子模型输出，没有应用指导正文。 */
+    @Override
+    public PromptText spawnPrompt(Map<String, Object> params) {
+        return PromptText.runtimeData(spawn(params));
+    }
+
+    @Override
+    public PromptText waitForPrompt(Map<String, Object> params) {
+        return PromptText.runtimeData(waitFor(params));
     }
 
     @Override
@@ -312,10 +325,13 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                     .userId(handle.userId)
                     .userGoal(childGoal)
                     .dialogueContext(context)
+                    .dialogueContextPrompt(world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(context))
                     .model(environment.parentRequest().getModel())
                     .planningModel(environment.parentRequest().getPlanningModel())
                     .executionModel(environment.parentRequest().getExecutionModel())
                     .finalAnswerModel(environment.parentRequest().getFinalAnswerModel())
+                    .executionEndpointName(environment.parentRequest().getExecutionEndpointName())
+                    .finalAnswerEndpointName(environment.parentRequest().getFinalAnswerEndpointName())
                     .toolSpecifications(childTools)
                     .maxTodos(1)
                     .maxToolRoundTrips(maxToolRoundTrips)
@@ -352,11 +368,13 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                     && result.getFailureReason().startsWith("RUN_INTERRUPTED:")) {
                 completeTerminal(handle, Status.CANCELED, "", result.getFailureReason(), childToolCalls);
             } else {
-                completeTerminal(handle, Status.FAILED, "", trim(result.getFailureReason()), childToolCalls);
+                completeTerminal(handle, Status.FAILED, "", trim(result.getFailureReason()), childToolCalls,
+                        result.getFailureMetadata());
             }
         } catch (Throwable failure) {
             Status status = Thread.currentThread().isInterrupted() ? Status.CANCELED : Status.FAILED;
-            completeTerminal(handle, status, "", trim(failure.getMessage()), 0);
+            completeTerminal(handle, status, "", trim(failure.getMessage()), 0,
+                    ModelSendBlocks.find(failure).map(ModelSendBlocks::failureMetadata).orElse(Map.of()));
         } finally {
             AgentContext.clear();
         }
@@ -403,6 +421,13 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                                   String result,
                                   String error,
                                   int toolCallsUsed) {
+        completeTerminal(handle, status, result, error, toolCallsUsed, Map.of());
+    }
+
+    private void completeTerminal(LiveHandle handle, Status status, String result, String error,
+                                  int toolCallsUsed, Map<String, Object> failureMetadata) {
+        Map<String, Object> blockedMetadata = ModelSendBlocks.fromFailureMetadata(failureMetadata)
+                .map(ModelSendBlocks::failureMetadata).orElse(Map.of());
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("subAgentId", handle.subAgentId);
         payload.put("status", status.name());
@@ -411,8 +436,9 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
         payload.put("toolCallsUsed", Math.max(0, toolCallsUsed));
         payload.put("ownerInstanceId", ownerInstanceId);
         payload.put("finishedAt", Instant.now().toString());
+        if (!blockedMetadata.isEmpty()) payload.put("failureMetadata", blockedMetadata);
         TerminalState fallback = new TerminalState(
-                status, bounded(result, resultMaxChars), bounded(error, 1000), toolCallsUsed);
+                status, bounded(result, resultMaxChars), bounded(error, 1000), toolCallsUsed, blockedMetadata);
         TerminalState durable;
         try {
             eventService.appendOnce(handle.runId, handle.userId, TERMINAL_EVENT,
@@ -430,7 +456,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                     Status.FAILED,
                     "",
                     "SUB_AGENT_TERMINAL_PERSISTENCE_FAILED",
-                    Math.max(0, toolCallsUsed));
+                    Math.max(0, toolCallsUsed), blockedMetadata);
             rememberTransientTerminal(handle, durable);
         }
         handle.terminal.complete(durable);
@@ -665,13 +691,18 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                     status,
                     trim(payload.get("result")),
                     trim(payload.get("error")),
-                    toInt(payload.get("toolCallsUsed")));
+                    toInt(payload.get("toolCallsUsed")),
+                    payload.get("failureMetadata") instanceof Map<?, ?> metadata
+                            ? ModelSendBlocks.fromFailureMetadata(metadata).map(ModelSendBlocks::failureMetadata).orElse(Map.of())
+                            : Map.of());
         } catch (Exception malformed) {
+            ModelSendBlocks.rethrowIfBlocked(malformed);
             return new TerminalState(Status.FAILED, "", "SUB_AGENT_TERMINAL_EVENT_MALFORMED", 0);
         }
     }
 
     private Map<String, Object> stateMap(String id, TerminalState state) {
+        ModelSendBlocks.fromFailureMetadata(state.failureMetadata).ifPresent(blocked -> { throw blocked; });
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("subAgentId", id);
         out.put("status", state.status.name());
@@ -780,7 +811,13 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
 
     enum Status { ACCEPTED, RUNNING, SUCCEEDED, FAILED, CANCELED, TIMEOUT }
 
-    private record TerminalState(Status status, String result, String error, int toolCallsUsed) { }
+    private record TerminalState(Status status, String result, String error, int toolCallsUsed,
+                                 Map<String, Object> failureMetadata) {
+        TerminalState(Status status, String result, String error, int toolCallsUsed) {
+            this(status, result, error, toolCallsUsed, Map.of());
+        }
+        TerminalState { failureMetadata = Map.copyOf(failureMetadata); }
+    }
 
     private static final class LiveHandle {
         private final String runId;

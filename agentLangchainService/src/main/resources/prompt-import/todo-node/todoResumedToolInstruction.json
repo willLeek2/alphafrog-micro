@@ -1,0 +1,15 @@
+{
+  "fragment": "todoResumedToolInstruction",
+  "purpose": "todoResumedToolInstruction",
+  "bodyType": "FIXED",
+  "body": "外部工具已在后台完成。下面是与原工具调用绑定的持久化结果。请使用该结果完成当前待办并给出完整回复；不要再次调用工具。",
+  "variables": [],
+  "utf8Sha256": "999eb7857c825290bb5541cb668215e6d576c1a159fe8f962f6f0db14c907dd5",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/execution/LangchainTodoNodeExecutor.java",
+    "method": "executePreparedResumedToolResult",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

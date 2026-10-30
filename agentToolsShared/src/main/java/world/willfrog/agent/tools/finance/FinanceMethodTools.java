@@ -2,6 +2,8 @@ package world.willfrog.agent.tools.finance;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
@@ -14,6 +16,7 @@ import world.willfrog.agent.platform.finance.FinanceMethodResolutionSinkExceptio
 import world.willfrog.agent.platform.finance.FinanceMethodResolutionSnapshot;
 import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
 import world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ResolverResult;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -88,15 +91,20 @@ public class FinanceMethodTools {
     public String resolveFinanceMethods(
             @P(value = "用户自然语言问题，必填", required = true) String query,
             @P(value = "可选自然语言上下文") String context) {
+        return resolveFinanceMethodsPrompt(query, context).text();
+    }
+
+    public PromptText resolveFinanceMethodsPrompt(String query, String context) {
         try {
             return resolveFinanceMethodsInternal(query, context);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("resolveFinanceMethods failed", e);
             return fail("TOOL_ERROR", "Failed to resolve finance methods: " + nvl(e.getMessage()));
         }
     }
 
-    private String resolveFinanceMethodsInternal(String query, String context) {
+    private PromptText resolveFinanceMethodsInternal(String query, String context) {
         if (query == null || query.isBlank()) {
             return fail("INVALID_INPUT", "query is required");
         }
@@ -204,6 +212,7 @@ public class FinanceMethodTools {
         try {
             return objectMapper.readTree(rawJson);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to parse resolver model JSON: {}", rawJson, e);
             return null;
         }
@@ -251,6 +260,7 @@ public class FinanceMethodTools {
         try {
             return Optional.of(objectMapper.valueToTree(fallback));
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             return Optional.empty();
         }
     }
@@ -262,7 +272,7 @@ public class FinanceMethodTools {
         return text.trim().toLowerCase().replace('　', ' ');
     }
 
-    private String technicalError(FinanceMethodResolverClient.ErrorKind kind) {
+    private PromptText technicalError(FinanceMethodResolverClient.ErrorKind kind) {
         String code = switch (kind) {
             case NO_ROUTE -> "RESOLVER_UNAVAILABLE";
             case TIMEOUT -> "RESOLVER_UNAVAILABLE";
@@ -410,11 +420,12 @@ public class FinanceMethodTools {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             return "\"serialization_failed\"";
         }
     }
 
-    private String ok(Map<String, Object> data) {
+    private PromptText ok(Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
         payload.put("tool", "resolveFinanceMethods");
@@ -423,26 +434,27 @@ public class FinanceMethodTools {
         return writeJson(payload);
     }
 
-    private String fail(String code, String message) {
+    private PromptText fail(String code, String message) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", "resolveFinanceMethods");
         payload.put("data", Map.of());
         Map<String, Object> err = new LinkedHashMap<>();
         err.put("code", nvl(code));
-        err.put("message", nvl(message));
+        err.put("message", message == null ? "" : message);
         err.put("details", Map.of());
         ToolFailureCategory.putCategoryIfResolved(err, code, null);
         payload.put("error", err);
         return writeJson(payload);
     }
 
-    private String writeJson(Object payload) {
+    private PromptText writeJson(Object payload) {
         try {
-            return objectMapper.writeValueAsString(payload);
+            return ProducerPromptTexts.json(objectMapper, payload);
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"resolveFinanceMethods\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return PromptText.runtimeData("{\"ok\":false,\"tool\":\"resolveFinanceMethods\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
+                    + escapeJson(nvl(e.getMessage())) + "\"}}");
         }
     }
 
@@ -451,6 +463,7 @@ public class FinanceMethodTools {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return "sha256:" + java.util.HexFormat.of().formatHex(digest.digest(bytes));
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             throw new IllegalStateException("SHA-256 unavailable", e);
         }
     }

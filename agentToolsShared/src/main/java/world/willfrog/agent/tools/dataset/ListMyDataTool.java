@@ -1,6 +1,9 @@
 package world.willfrog.agent.tools.dataset;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
@@ -135,6 +138,10 @@ public class ListMyDataTool {
             @P(value = "可选，单页返回上限（默认 50，上限 200）", required = false) Integer limit,
             @P(value = "可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest", required = false) String related_dataset_ids
     ) {
+        return listMyDataPrompt(query_type, from_ts_code, grep, file_offset, file_limit, offset, limit, related_dataset_ids).text();
+    }
+
+    public PromptText listMyDataPrompt(String query_type, String from_ts_code, String grep, Integer file_offset, Integer file_limit, Integer offset, Integer limit, String related_dataset_ids) {
         return executeCore(query_type, from_ts_code, grep, file_offset, file_limit,
                 offset, limit, related_dataset_ids);
     }
@@ -161,14 +168,14 @@ public class ListMyDataTool {
             Integer limit,
             String related_dataset_ids
     ) {
-        return executeLegacy6Core(query_type, from_ts_code, grep, offset, limit, related_dataset_ids);
+        return executeLegacy6Core(query_type, from_ts_code, grep, offset, limit, related_dataset_ids).text();
     }
 
     /**
      * 8 形参版的核心实现：合并「非 grep 列表」和「grep raw file content」两种语义。
      * 同时被 {@code @Tool} 公开方法和 ToolRouter 路由调用，确保两种入口行为一致。
      */
-    private String executeCore(String queryType,
+    private PromptText executeCore(String queryType,
                                String fromTsCode,
                                String grep,
                                Integer fileOffset,
@@ -247,6 +254,7 @@ public class ListMyDataTool {
             }
             return ok(data);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("listMyData failed", e);
             return fail("TOOL_ERROR", "listMyData invocation error",
                     Map.of("message", nvl(e.getMessage())));
@@ -257,7 +265,7 @@ public class ListMyDataTool {
      * 6 形参版的核心实现：保留旧 ToolRouter 入口的 originalId grep 语义，避免破坏既有 routing 逻辑。
      * 行为与原始 commit ec2b31e 完全一致：grep 对 originalId 做大小写不敏感子串匹配。
      */
-    private String executeLegacy6Core(String queryType,
+    private PromptText executeLegacy6Core(String queryType,
                                       String fromTsCode,
                                       String grep,
                                       Integer offset,
@@ -318,6 +326,7 @@ public class ListMyDataTool {
             }
             return ok(data);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("listMyData failed", e);
             return fail("TOOL_ERROR", "listMyData invocation error",
                     Map.of("message", nvl(e.getMessage())));
@@ -376,6 +385,7 @@ public class ListMyDataTool {
             data.put("platform_objects", platformObjects);
             data.put("platform_object_count", platformObjects.size());
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("listMyData 平台对象区查询失败: {}", e.getMessage());
             data.put("platform_objects", List.of());
             data.put("platform_object_count", 0);
@@ -594,7 +604,7 @@ public class ListMyDataTool {
         return out;
     }
 
-    private String ok(Map<String, Object> data) {
+    private PromptText ok(Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
         payload.put("tool", "listMyData");
@@ -603,26 +613,27 @@ public class ListMyDataTool {
         return writeJson(payload);
     }
 
-    private String fail(String code, String message, Map<String, Object> details) {
+    private PromptText fail(String code, Object message, Map<String, Object> details) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", "listMyData");
         payload.put("data", Map.of());
         Map<String, Object> err = new LinkedHashMap<>();
         err.put("code", nvl(code));
-        err.put("message", nvl(message));
+        err.put("message", message == null ? "" : message);
         err.put("details", details == null ? Map.of() : details);
         ToolFailureCategory.putCategoryIfResolved(err, code, null);
         payload.put("error", err);
         return writeJson(payload);
     }
 
-    private String writeJson(Object payload) {
+    private PromptText writeJson(Object payload) {
         try {
-            return objectMapper.writeValueAsString(payload);
+            return ProducerPromptTexts.json(objectMapper, payload);
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"listMyData\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return PromptText.runtimeData("{\"ok\":false,\"tool\":\"listMyData\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
+                    + escapeJson(nvl(e.getMessage())) + "\"}}");
         }
     }
 

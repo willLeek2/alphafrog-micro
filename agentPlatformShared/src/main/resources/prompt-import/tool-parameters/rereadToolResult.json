@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.rereadToolResult",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/keyword/description\":\"可选关键词；非空时只返回匹配片段\",\"/properties/limit/description\":\"可选读取长度，0 表示使用服务默认\",\"/properties/offset/description\":\"可选读取偏移，默认 0\",\"/properties/rawRef/description\":\"工具结果 data.rawRef 字段，形如 raw_ref_001 或 raw-ref:...\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "f75b3c584894e5726695e989275de05385954e6e882749a4ea80ea6287b61d5f",
+  "source" : {
+    "toolName" : "rereadToolResult",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

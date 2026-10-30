@@ -76,6 +76,9 @@ class LangchainLinearRunPipelineResumeTest {
                 """);
         run.setPlanJson(objectMapper.writeValueAsString(plan));
         when(runMapper.findById("run-1")).thenReturn(run);
+        when(events.prepareExperimentRunContext("run-1")).thenReturn(
+                world.willfrog.agent.platform.prompt.PromptRunSelection.fromExt(
+                        objectMapper.readTree(run.getExt()).get("prompt_selection")));
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
                 any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
@@ -126,10 +129,9 @@ class LangchainLinearRunPipelineResumeTest {
         assertThat(restoredSelection.get().bundleVersion()).isEqualTo("default-v1");
         assertThat(restoredSelection.get().variant()).isEqualTo("control");
         assertThat(restoredSelection.get().referenceDate().toString()).isEqualTo("2025-02-03");
-        verify(promptService).validatePromptSelection(argThat(selection ->
-                selection != null && "default-v1".equals(selection.bundleVersion())));
-        InOrder promptBoundaryOrder = inOrder(promptService, stageModels, followUp);
-        promptBoundaryOrder.verify(promptService).validatePromptSelection(any());
+        verify(events).prepareExperimentRunContext("run-1");
+        InOrder promptBoundaryOrder = inOrder(events, stageModels, followUp);
+        promptBoundaryOrder.verify(events).prepareExperimentRunContext("run-1");
         promptBoundaryOrder.verify(stageModels).resolve(run);
         promptBoundaryOrder.verify(followUp).resolve(run);
         assertThat(AgentContext.getPromptRunSelection()).isNull();

@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResultAdapter;
 import com.google.protobuf.util.JsonFormat;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -99,6 +100,31 @@ public class WaitMemberSettlement {
                           TaskResultResponse result,
                           String preview,
                           String finishedAt) {
+        return settleCore(member, proof, statusName, result, preview, finishedAt, null, null);
+    }
+
+    public Outcome settlePrompt(WaitMember member, WaitMemberDispatchProof proof, String statusName,
+                                TaskResultResponse result, SandboxJobResultAdapter.ResolvedPromptResult resolved,
+                                String finishedAt) {
+        if (resolved == null || resolved.output() == null) {
+            throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "wait-member-terminal-result");
+        }
+        return settleCore(member, proof, statusName, result, resolved.output().text(), finishedAt, resolved, null);
+    }
+
+    public Outcome settleBlocked(WaitMember member, WaitMemberDispatchProof proof, String statusName,
+                                 TaskResultResponse result, String finishedAt,
+                                 world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked blocked) {
+        if (blocked == null) throw new IllegalArgumentException("terminal block required");
+        return settleCore(member, proof, statusName, result, null, finishedAt, null, blocked);
+    }
+
+    private Outcome settleCore(WaitMember member, WaitMemberDispatchProof proof, String statusName,
+                                TaskResultResponse result, String preview, String finishedAt,
+                                SandboxJobResultAdapter.ResolvedPromptResult resolved,
+                                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked blocked) {
         DataAnalysisReservation stored;
         DataAnalysisEstimate estimate;
         try {
@@ -118,7 +144,7 @@ public class WaitMemberSettlement {
         if (statusName == null || result == null) {
             return Outcome.blocked("terminal_result_missing");
         }
-        return releaseWithUsage(member, stored, estimate, statusName, result, preview, finishedAt);
+        return releaseWithUsage(member, stored, estimate, statusName, result, preview, finishedAt, resolved, blocked);
     }
 
     /** 沙箱明确拒绝创建、原操作号权威无任务时，没有任务终态与资源用量可记录。 */
@@ -168,7 +194,8 @@ public class WaitMemberSettlement {
                                      String statusName,
                                      TaskResultResponse result,
                                      String preview,
-                                     String finishedAt) {
+                                     String finishedAt, SandboxJobResultAdapter.ResolvedPromptResult resolved,
+                                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked blocked) {
         String taskId = result.getTaskId();
         if (taskId == null || taskId.isBlank()) {
             return Outcome.blocked("terminal_without_task_id");
@@ -182,7 +209,7 @@ public class WaitMemberSettlement {
         // 信封要求名额处在「终态已确认」——还完名额之后再拿「已释放」去组织会被它自己拒掉，
         // 所以两份用途共用同一个对象，顺序上先当凭证、后当记录。
         DataAnalysisTerminalEnvelope envelope = envelope(member, confirmed, estimate,
-                statusName, result, preview, finishedAt);
+                statusName, result, preview, finishedAt, resolved, blocked);
         if (envelope == null) {
             return Outcome.blocked("envelope_unbuildable");
         }
@@ -291,13 +318,15 @@ public class WaitMemberSettlement {
                                                   String statusName,
                                                   TaskResultResponse result,
                                                   String preview,
-                                                  String finishedAt) {
+                                                  String finishedAt, SandboxJobResultAdapter.ResolvedPromptResult resolved,
+                                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked blocked) {
         try {
             Instant terminalAt = parseSandboxFinishedAt(finishedAt);
             DataAnalysisResourceUsage usage = usageOf(reservation, result);
-            boolean success = "SUCCEEDED".equals(statusName) && result.getExitCode() == 0;
+            boolean success = blocked == null && (resolved == null
+                    ? "SUCCEEDED".equals(statusName) && result.getExitCode() == 0 : resolved.success());
             String rawRef = blankToNull(result.getDatasetDir());
-            String errorCode = blankToNull(result.getError());
+            String errorCode = blocked != null ? blocked.code() : resolved == null ? blankToNull(result.getError()) : resolved.errorCode();
             if (!success && errorCode == null) {
                 errorCode = statusName;
             }
@@ -316,13 +345,14 @@ public class WaitMemberSettlement {
                     trimmedPreview,
                     rawRef,
                     errorCode,
-                    success ? null : "sandbox " + statusName,
+                    success ? null : "SUCCEEDED".equals(statusName) ? "business failure: " + errorCode : "sandbox " + statusName,
                     result.getRetryable(),
                     estimate,
                     reservation,
                     usage,
                     terminalAt,
-                    true);
+                    true, resolved != null && java.util.Objects.equals(trimmedPreview, preview)
+                            ? BackgroundPromptResults.encode(resolved.output()) : null);
         } catch (Exception e) {
             log.warn("成员的终态信封组织不出来：member={} reason={}", member.getMemberIdentity(), e.getMessage());
             return null;

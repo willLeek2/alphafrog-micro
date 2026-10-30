@@ -27,6 +27,10 @@ import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 import world.willfrog.agentlangchain.execution.WaitMemberResultPayload;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -40,7 +44,7 @@ import java.util.UUID;
  * legacy {@link ToolRouter}，并处理 langchain 路径特有的防护与提示。
  *
  * <p>与 {@link ToolRouterToolProvider} 的配合：Provider 负责「有哪些工具」；本类负责
- * 「选中某个工具后怎么跑」。所有工具名最终都进入 {@link ToolRouter#invokeWithMeta(String, Map)}，
+ * 「选中某个工具后怎么跑」。托管入口使用带正文来源的路由，旧String入口保留原路由，
  * 因此预算检查、observability trace、结果缓存、统一 JSON 响应格式都由 ToolRouter
  * 统一完成。</p>
  *
@@ -83,6 +87,15 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
     private final AgentRunEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
+    private final ToolExecutorPromptPreparation promptPreparation;
+
+    /** 旧构造只支持未登记来源的String业务入口。 */
+    public ToolRouterToolExecutor(ToolRouter toolRouter, ObjectMapper objectMapper,
+                                  AgentRunEventService agentEventService,
+                                  LangchainToolConcurrencyThrottle toolThrottle,
+                                  PythonSandboxDispatchStore pythonSandboxDispatchStore) {
+        this(toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore, null);
+    }
 
     /**
      * 执行一次 LC4j tool call 并把结果返回给模型。
@@ -107,20 +120,42 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
     }
 
     /** 同步工具的正文与已判定的业务状态，供等待成员持久化；挂起控制信号仍原样抛出。 */
-    public record InvocationResult(String output, boolean success) { }
+    public record InvocationResult(String output, boolean success, PromptText outputPrompt) {
+        public InvocationResult(String output, boolean success) { this(output, success, null); }
+        public InvocationResult {
+            if (outputPrompt != null && !outputPrompt.text().equals(output)) {
+                throw ToolExecutorPromptPreparation.missing("执行器工具正文与来源载体不一致");
+            }
+        }
+    }
 
     /** 保留路由器的业务状态，避免返回失败正文后被等待成员当作成功。 */
     public InvocationResult executeWithResult(ToolExecutionRequest request, Object memoryId) {
+        return executeResult(request, memoryId, false);
+    }
+
+    /** 托管模型使用明确来源的结果；旧裸字符串入口不在此补造来源。 */
+    public InvocationResult executeWithPromptResult(ToolExecutionRequest request, Object memoryId) {
+        if (promptPreparation == null) {
+            throw ToolExecutorPromptPreparation.missing("工具执行器未配置正文来源准备组件");
+        }
+        return executeResult(request, memoryId, true);
+    }
+
+    private InvocationResult executeResult(ToolExecutionRequest request, Object memoryId, boolean withSources) {
         String toolCallId = durableToolCallId(request.name(), resolveToolCallId(request));
         AgentContext.setToolCallId(toolCallId);
         try {
             Map<String, Object> params = parseArguments(request.arguments());
             LangchainRepeatedToolCallGuard.Decision repeatDecision =
-                    LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
+                    withSources ? LangchainRepeatedToolCallGuard.beforeInvokeFacts(request.name(), params, objectMapper)
+                            : LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
             if (repeatDecision.blocked()) {
                 // 重复调用被拦截时也发射 FINISHED 事件，避免前端 UI card 一直转圈
-                emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
-                return new InvocationResult(repeatDecision.outputOrHint(), false);
+                PromptText repeated = withSources ? promptPreparation.repeatedError(repeatDecision) : null;
+                String output = withSources ? repeated.text() : repeatDecision.outputOrHint();
+                emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
+                return new InvocationResult(output, false, repeated);
             }
 
             // emit STARTED
@@ -132,11 +167,12 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
                 String output = "DURABLE_TOOL_JOB_CONTEXT_UNAVAILABLE: " + request.name() + " requires a "
                         + "persisted node identity before creating a Sandbox task";
                 emitToolCallFinished(toolCallId, request.name(), params, false, output, 0L);
-                return new InvocationResult(output, false);
+                return new InvocationResult(output, false, withSources ? PromptText.runtimeData(output) : null);
             }
 
             Instant start = Instant.now();
             String output = null;
+            PromptText outputPrompt = null;
             boolean success = true;
             // 限流拒绝（本层 LC4j Semaphore 或下游权重限流）时工具没有真正执行，
             // FINISHED 事件只用于前端展示收尾，必须带 creditsConsumed=0 和可区分的拒绝标记
@@ -152,6 +188,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
                 output = SandboxJobResponses.fail(objectMapper, request.name(),
                         "TOOL_WEIGHT_LIMIT_EXCEEDED", reason, Map.of(),
                         ToolFailureCategory.RATE_LIMITED_OR_CAPACITY);
+                outputPrompt = withSources ? PromptText.runtimeData(output) : null;
                 success = false;
                 throttleRejected = true;
                 throttleLayer = "lc4j_semaphore";
@@ -159,9 +196,15 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
                 try {
                     // invokeWithMeta 可能直接返回结果；后台任务超时未完成时，会抛出专门的
                     // 挂起信号异常，通知上层任务已转后台、可以释放线程。
-                    ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+                    ToolRouter.ToolInvocationResult result = withSources
+                            ? toolRouter.invokeWithPromptMeta(request.name(), params)
+                            : toolRouter.invokeWithMeta(request.name(), params);
+                    if (withSources && result == null) {
+                        throw ToolExecutorPromptPreparation.missing("工具路由没有返回带来源的结果");
+                    }
                     // 只有真正的终态结果才走普通的 output/success 收尾流程。
                     output = result.getOutput();
+                    outputPrompt = withSources ? promptPreparation.requireOutput(output, result.getOutputPrompt()) : null;
                     success = result.isSuccess();
                     if (result.isThrottleRejected()) {
                         throttleRejected = true;
@@ -188,17 +231,24 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
                     // Run 级预算在派发前拒绝：工具没有执行，这不是工具故障。
                     // 输出与 V2 成员渲染同款的结构化拒绝信封（dimension/used/limit 取自异常携带的
                     // 捕获时事实），模型能区分「工具坏了」和「额度用完」。
-                    output = WaitMemberResultPayload.budgetRejectionText(budget.getDimension(),
-                            budget.getActual(), budget.getLimit(), objectMapper);
+                    if (withSources) {
+                        outputPrompt = promptPreparation.budgetRejection(budget);
+                        output = outputPrompt.text();
+                    } else {
+                        output = WaitMemberResultPayload.budgetRejectionText(budget.getDimension(),
+                                budget.getActual(), budget.getLimit(), objectMapper);
+                    }
                     success = false;
                     log.warn("Tool invocation rejected by run budget: tool={} runId={} dimension={} {}/{}",
                             request.name(), AgentContext.getRunId(), budget.getDimension(),
                             budget.getActual(), budget.getLimit());
                 } catch (Exception e) {
+                    ModelSendBlocks.rethrowIfBlocked(e);
                     // 其余异常收敛为带上游/系统故障类别的标准失败信封，不再退化为裸文本。
                     output = SandboxJobResponses.fail(objectMapper, request.name(),
                             "TOOL_INVOCATION_ERROR", e.getMessage(), Map.of(),
                             ToolFailureCategory.UPSTREAM_OR_SYSTEM);
+                    outputPrompt = withSources ? PromptText.runtimeData(output) : null;
                     success = false;
                     log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
                 } finally {
@@ -221,9 +271,16 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
             LangchainDatasetRefContext.set(datasetRefs);
             // 成功结果也可能包含 dataset_ids 和 error 字段；纠正提示只用于已判定失败的调用。
-            if (!success) {
-                output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
+            if (withSources) {
+                outputPrompt = promptPreparation.requireOutput(output, outputPrompt);
+                if (!success && needsDatasetRetryHint(output)) {
+                    outputPrompt = promptPreparation.appendDatasetAdvice(outputPrompt, request.name(),
+                            output.toLowerCase().contains("run_level_ids_unavailable"), datasetRefs);
+                }
+                outputPrompt = promptPreparation.appendRepeatedAdvice(outputPrompt, repeatDecision);
+                return new InvocationResult(outputPrompt.text(), success, outputPrompt);
             }
+            if (!success) output = appendDatasetRetryHintIfNeeded(request.name(), output, datasetRefs);
             return new InvocationResult(appendRepeatedToolCallHintIfNeeded(output, repeatDecision), success);
         } finally {
             AgentContext.clearToolCallId();
@@ -232,16 +289,19 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
 
     /**
      * LC4j 带上下文执行：先把 {@link InvocationContext#invocationParameters()} 灌进
-     * {@link world.willfrog.agent.platform.context.AgentContext}（经 {@link LangchainRunContextBridge}），再调用 {@link #execute}。
+     * {@link world.willfrog.agent.platform.context.AgentContext}（经 {@link LangchainRunContextBridge}），再调用带正文来源的 {@link #executeWithPromptResult}。
      */
     @Override
     public ToolExecutionResult executeWithContext(ToolExecutionRequest request, InvocationContext context) {
         if (context != null) {
             LangchainRunContextBridge.apply(context.invocationParameters());
         }
-        String output = execute(request, context == null ? null : context.chatMemoryId());
+        InvocationResult result = executeWithPromptResult(request, context == null ? null : context.chatMemoryId());
+        PromptText output = result.outputPrompt();
         return ToolExecutionResult.builder()
-                .resultText(output)
+                .resultText(output.text())
+                .attributes(PromptMessageCodec.sourceAttributes(output.sources().isEmpty()
+                        ? PromptMessage.Origin.RUNTIME_DATA : PromptMessage.Origin.APPLICATION_INSTRUCTION, output.sources()))
                 .build();
     }
 
@@ -302,24 +362,8 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
      * 引导模型先用 listMyData 解析 run-level 整数 ID，避免继续重试 raw id / path / placeholder。
      */
     private String appendDatasetRetryHintIfNeeded(String toolName, String output, Map<String, String> datasetRefs) {
-        if (output == null || output.isBlank()) {
-            return output;
-        }
+        if (!needsDatasetRetryHint(output)) return output;
         String lower = output.toLowerCase();
-        boolean datasetError = lower.contains("missing_dataset_ids")
-                || lower.contains("missing dataset_ids")
-                || lower.contains("invalid dataset_ids")
-                || lower.contains("missing_manifest_ids")
-                || lower.contains("missing manifest_ids")
-                || lower.contains("invalid_manifest_ids")
-                || lower.contains("invalid manifest_ids")
-                || lower.contains("run_level_ids_unavailable")
-                || lower.contains("dataset_id directory not found")
-                || (lower.contains("dataset_ids") && containsFailureWord(lower))
-                || (lower.contains("manifest_ids") && containsFailureWord(lower));
-        if (!datasetError) {
-            return output;
-        }
         StringBuilder hint = new StringBuilder(output);
         // 提示按实际工具名生成：executePython 与 executeQuery 共用这套 run 级编号约定。
         hint.append("\n\n_retry_hint_: ").append(toolName).append(" failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
@@ -340,6 +384,18 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
             hint.append("If listMyData has no data, call a market data tool first, then listMyData, and do not use placeholders such as placeholder/data/test or hand-code market data.");
         }
         return hint.toString();
+    }
+
+    private boolean needsDatasetRetryHint(String output) {
+        if (output == null || output.isBlank()) return false;
+        String lower = output.toLowerCase();
+        return lower.contains("missing_dataset_ids") || lower.contains("missing dataset_ids")
+                || lower.contains("invalid dataset_ids") || lower.contains("missing_manifest_ids")
+                || lower.contains("missing manifest_ids") || lower.contains("invalid_manifest_ids")
+                || lower.contains("invalid manifest_ids") || lower.contains("run_level_ids_unavailable")
+                || lower.contains("dataset_id directory not found")
+                || (lower.contains("dataset_ids") && containsFailureWord(lower))
+                || (lower.contains("manifest_ids") && containsFailureWord(lower));
     }
 
     private boolean containsFailureWord(String lowerOutput) {

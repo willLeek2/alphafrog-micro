@@ -96,6 +96,22 @@ final class PromptAuthority {
         return SHARED;
     }
 
+    /** 一次捕获生效正文；辅助资源原文单列为classpath材料，不改变读取或覆盖状态。 */
+    PromptBootstrapExporter.CapturedAuthority captureForExport() {
+        AuthoritySnapshot effective = snapshot();
+        AuthoritySnapshot baseline = baseSnapshot();
+        return new PromptBootstrapExporter.CapturedAuthority(
+                TEXT_FIELDS, effective.texts(), effective.toolDescriptions(),
+                baseline.texts(), baseline.toolDescriptions(),
+                Map.of(REQUIREMENTS_RESOURCE, requireResource(REQUIREMENTS_RESOURCE),
+                        DATASET_SPECS_RESOURCE, requireResource(DATASET_SPECS_RESOURCE),
+                        TOOL_DESCRIPTION_INDEX, requireResource(TOOL_DESCRIPTION_INDEX)),
+                List.copyOf(effective.prompts().getPythonRefineRequirements()),
+                List.copyOf(baseline.prompts().getPythonRefineRequirements()),
+                objectMapper.valueToTree(effective.prompts().getDatasetFieldSpecs()).toString(),
+                objectMapper.valueToTree(baseline.prompts().getDatasetFieldSpecs()).toString());
+    }
+
     /** 仅供同包测试注入受控 classpath 读取行为。 */
     static PromptAuthority forTesting(Function<String, String> resourceLoader) {
         return new PromptAuthority(resourceLoader, new ObjectMapper());

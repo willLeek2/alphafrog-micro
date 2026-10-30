@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.resolveFinanceMethods",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/context/description\":\"Optional natural-language context, e.g. already-fetched data or missing boundary hints.\",\"/properties/query/description\":\"The user's raw natural-language financial question (required).\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "63e708e66c4df6082b44adff98bf8c6dabb44036519b2494a76c0a4c3533a894",
+  "source" : {
+    "toolName" : "resolveFinanceMethods",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.loadToolGuide",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/topic/description\":\"指南主题，必填：python_sandbox|dataset_manifest|advanced_market_data|execute_python_tips|finance_method_knowledge\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "dec7d79de47b5a07912452ca545e89b1ad3abc1b1c61965a4d570952e58f3f6c",
+  "source" : {
+    "toolName" : "loadToolGuide",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

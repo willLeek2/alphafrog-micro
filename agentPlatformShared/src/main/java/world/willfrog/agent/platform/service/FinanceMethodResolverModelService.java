@@ -3,24 +3,38 @@ package world.willfrog.agent.platform.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.ModelProvider;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.output.TokenUsage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSource;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptBodyType;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptTemplateRenderer;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionBody;
 
 import java.net.SocketTimeoutException;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeoutException;
@@ -31,8 +45,8 @@ import java.util.concurrent.TimeoutException;
  *
  * <p>Builds a dedicated ChatModel via {@link AgentAiServiceFactory} with
  * {@code phase/stage=finance_method_resolver} and temperature 0, assembles the final
- * system prompt from the actual AgentPromptService template (local file takes precedence
- * over classpath) plus the caller-supplied compact catalog fragment, and returns the raw
+ * system prompt from one saved root-set version plus the caller-supplied compact catalog
+ * fragment, and returns the raw
  * model JSON untouched. It performs only fail-closed technical pre-checks (request/response
  * byte bounds, candidate-count bound, strict single-JSON shape) and never silently truncates;
  * per-item semantic validation is the canonical tools-side validator's job.</p>
@@ -58,6 +72,8 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
     private final FinanceMethodResolverModelResolver resolverModelResolver;
     private final AgentPromptService promptService;
     private final AgentRunObservabilityService observabilityService;
+    @Autowired
+    private AgentModelInputs modelInputs;
 
     @Override
     public ResolverResult resolve(String query, String context, String catalogFragment) {
@@ -100,24 +116,21 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
 
         // 实际模板只解析一次：同一文本既用于摘要也用于最终 prompt，避免热加载竞态导致两者不一致。
         // 模板必须 fail-closed 地恰含 1 个 {{RESOLVER_CATALOG}}：0 个会静默不注入目录，多个会重复注入。
-        String template = nvl(promptService.financeMethodResolverSystemPromptTemplate());
-        if (template.isBlank()) {
-            return new TechnicalError(ErrorKind.CALL_FAILED, "resolver system prompt template is blank");
-        }
+        PromptVersionBody version = promptService.financeMethodResolverSystemPromptVersion();
+        String template = version.body();
         int placeholderCount = countOccurrences(template, CATALOG_PLACEHOLDER);
-        if (placeholderCount != 1) {
-            return new TechnicalError(ErrorKind.CALL_FAILED,
-                    "resolver system prompt template must contain exactly one " + CATALOG_PLACEHOLDER
-                            + " placeholder, found " + placeholderCount);
+        if (version.type() != PromptBodyType.TEMPLATE || placeholderCount != 1) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_VARIABLE_INVALID, "RESOLVER_CATALOG");
         }
         // 裸 hex 不带 "sha256:" 前缀：落库列 resolver_prompt_version 是 VARCHAR(64)，
         // 带前缀共 71 字符必然溢出（261005 泳道实测 value too long）；同表 resolution_content_digest 同为裸 hex。
         String resolverPromptVersion = sha256Hex(template.getBytes(StandardCharsets.UTF_8));
-        String systemPrompt = template.replace(CATALOG_PLACEHOLDER, safeCatalog);
+        PromptText systemPrompt = PromptTemplateRenderer.render(version, "financeMethodResolverSystemPrompt",
+                Map.of("RESOLVER_CATALOG", safeCatalog));
 
         // 请求字节上限钉实际送给 ChatModel 的两个 message content（render 后 systemPrompt + 序列化 user JSON）
         // 的 UTF-8 bytes 总和：catalog 有独立预算，但 local template 本身也可能异常巨大。只报 size/cap，不回显内容。
-        int requestBytes = systemPrompt.getBytes(StandardCharsets.UTF_8).length
+        int requestBytes = systemPrompt.text().getBytes(StandardCharsets.UTF_8).length
                 + userPayload.getBytes(StandardCharsets.UTF_8).length;
         if (requestBytes > requestMaxBytes) {
             return new TechnicalError(ErrorKind.REQUEST_TOO_LARGE,
@@ -150,15 +163,26 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
             AgentContext.setProviderLlmTraceId(null);
             AgentContext.setLlmCallRequestMeta(buildRequestMeta(selected, safeQuery));
 
-            List<ChatMessage> messages = List.of(
-                    new SystemMessage(systemPrompt),
-                    new UserMessage(userPayload)
-            );
+            List<PromptMessage> messagesWithSources = List.of(PromptMessage.system(systemPrompt),
+                    PromptMessage.runtimeData(new UserMessage(userPayload)));
+            List<ChatMessage> messages = messagesWithSources.stream().map(PromptMessage::message).toList();
+            List<ModelInputSource> sourceParts = new ArrayList<>(PromptMessage.toModelInputSources(messagesWithSources).parts());
+            // 当前工厂的SDK实现返回OPEN_AI且不读取AgentContext结构；两个自有实现返回OTHER并发送该字段。
+            // 本schema只有协议字段，DashScope实际发送的json_object也属于结构数据。
+            if (selected.model().provider() == ModelProvider.OTHER) {
+                sourceParts.add(new ModelInputSource("/response_format", ModelInputSource.Origin.RUNTIME_DATA, List.of()));
+            }
+            ModelInputSources sources = new ModelInputSources(sourceParts);
             int maxAttempts = resolveMaxAttempts(bounds);
 
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
-                    lastResponse = selected.model().chat(messages);
+                    if (modelInputs == null) {
+                        throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "金融解析缺少输入保存组件");
+                    }
+                    try (ModelInputScope ignored = modelInputs.open(selected.endpointName(), sources)) {
+                        lastResponse = selected.model().chat(messages);
+                    }
                     String text = lastResponse.aiMessage() == null ? "" : nvl(lastResponse.aiMessage().text());
                     String rejection = checkResponse(text, responseMaxBytes, maxCandidates);
                     if (rejection == null) {
@@ -171,6 +195,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                     lastError = rejection;
                     log.warn("Finance method resolver attempt {}/{} rejected response: {}", attempt, maxAttempts, rejection);
                 } catch (Exception e) {
+                    ModelSendBlocks.rethrowIfBlocked(e);
                     lastKind = isTimeout(e) ? ErrorKind.TIMEOUT : ErrorKind.CALL_FAILED;
                     lastError = nvl(e.getMessage());
                     log.warn("Finance method resolver attempt {}/{} failed: {}", attempt, maxAttempts, e.getMessage());
@@ -185,6 +210,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                             : (lastResponse.aiMessage() == null ? null : lastResponse.aiMessage().text()));
             return new TechnicalError(lastKind, lastError);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             log.warn("Finance method resolver failed: {}", e.getMessage());
             recordObservability(selected, durationMs, startedAtMillis, safeQuery, nvl(e.getMessage()), null, null);
@@ -248,14 +274,15 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                 int maxTokens = cfg.getMaxTokens() != null && cfg.getMaxTokens() > 0
                         ? cfg.getMaxTokens()
                         : DEFAULT_MAX_TOKENS;
-                ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+                ChatModel model = aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                         resolved, providerOrder, 0.0D, maxTokens);
                 RouteInfo route = new RouteInfo(
                         resolveProviderType(resolved),
                         resolveEffectiveEndpoint(resolved),
                         resolved.modelName());
-                return new SelectionAndModel(cfg, candidate.source(), model, route);
+                return new SelectionAndModel(cfg, candidate.source(), model, route, resolved.endpointName());
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 log.warn("Init finance method resolver from {} failed: endpoint={}, model={}, err={}",
                         candidate.source(), cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
             }
@@ -350,7 +377,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
         schema.put("additionalProperties", false);
 
         return new AgentContext.StructuredOutputSpec(
-                "finance_method_resolver_output", false, schema, false, true);
+                "finance_method_resolver_output", false, schema, false, true, List.of());
     }
 
     private void recordObservability(SelectionAndModel selected,
@@ -488,6 +515,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
             StageLlmConfig config,
             FinanceMethodResolverModelResolver.ModelSource source,
             ChatModel model,
-            RouteInfo route) {
+            RouteInfo route,
+            String endpointName) {
     }
 }

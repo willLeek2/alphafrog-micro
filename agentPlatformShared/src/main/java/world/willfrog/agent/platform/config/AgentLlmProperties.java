@@ -412,6 +412,8 @@ public class AgentLlmProperties {
     public static class ToolSummary {
         @JsonAlias({"max-retries", "max_retries"})
         private Integer maxRetries;
+        @JsonAlias({"prompt-experiment-id", "prompt_experiment_id"})
+        private String promptExperimentId;
 
         public Integer getMaxRetries() {
             return maxRetries;
@@ -419,6 +421,14 @@ public class AgentLlmProperties {
 
         public void setMaxRetries(Integer maxRetries) {
             this.maxRetries = maxRetries;
+        }
+
+        public String getPromptExperimentId() {
+            return promptExperimentId;
+        }
+
+        public void setPromptExperimentId(String promptExperimentId) {
+            this.promptExperimentId = promptExperimentId;
         }
     }
 

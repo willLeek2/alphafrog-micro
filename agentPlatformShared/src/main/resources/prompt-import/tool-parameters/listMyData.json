@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.listMyData",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/file_limit/description\":\"可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）\",\"/properties/file_offset/description\":\"可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）\",\"/properties/from_ts_code/description\":\"可选，过滤 from_ts_code 包含该子串的条目\",\"/properties/grep/description\":\"可选（仅 dataset 模式），对 dataset 原始文件全文做大小写不敏感子串搜索\",\"/properties/limit/description\":\"可选，单页返回上限（默认 50，上限 200）\",\"/properties/offset/description\":\"可选，分页起始（默认 0）\",\"/properties/query_type/description\":\"查询类型：dataset | manifest\",\"/properties/related_dataset_ids/description\":\"可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "6137b669325ea3901ff7d3e57cf9909875f4ff18ff711b3616ffefac7a633cd8",
+  "source" : {
+    "toolName" : "listMyData",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

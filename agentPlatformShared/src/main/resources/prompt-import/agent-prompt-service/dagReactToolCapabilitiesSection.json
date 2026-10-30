@@ -1,0 +1,22 @@
+{
+  "fragment": "dagReactToolCapabilitiesSection",
+  "purpose": "dagReactToolCapabilitiesSection",
+  "bodyType": "TEMPLATE",
+  "body": "\n\n## 本次 Run 实际开放的工具\n{{toolCapabilities}}",
+  "variables": [
+    {
+      "name": "toolCapabilities",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "6801c62b4bb0254f35ff46c47c35423fe4c7107a534fcdeb1fe741a739d69d22",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/service/AgentPromptService.java",
+    "method": "dagReactStageInstruction",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

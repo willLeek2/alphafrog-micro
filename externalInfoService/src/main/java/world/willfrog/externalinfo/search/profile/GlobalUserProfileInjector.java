@@ -1,6 +1,12 @@
 package world.willfrog.externalinfo.search.profile;
 
 import lombok.RequiredArgsConstructor;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.externalinfo.search.SearchPromptPreparation.Binding;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import world.willfrog.externalinfo.search.profile.ProfileContext.GlobalUserProfile;
@@ -128,6 +134,51 @@ public class GlobalUserProfileInjector {
         sb.append("请使用").append(langDesc).append("进行相关性判定。");
 
         return sb.toString();
+    }
+
+    /** 实际搜索发送使用同项正文来源，画像语言和风格指令从原集合读取。 */
+    public PromptText systemPrompt(PromptText original, GlobalUserProfile profile, Binding binding) {
+        if (profile == null) return original;
+        Map<String, Map<String, String>> values = new LinkedHashMap<>();
+        values.put("webSearchProfileHeader", Map.of());
+        if (hasText(profile.timezone())) values.put("webSearchProfileTimezone", Map.of("value", profile.timezone()));
+        if (hasText(profile.region())) values.put("webSearchProfileRegion", Map.of("value", profile.region()));
+        if (hasText(profile.language())) values.put("webSearchProfileLanguage", Map.of("value", mapLanguageToDescription(profile.language())));
+        if (hasText(profile.answerStyle())) values.put("webSearchProfileStyle", Map.of("value", profile.answerStyle()));
+        Map<String, PromptText> rendered = binding.render(values);
+        List<PromptText> parts = new ArrayList<>();
+        parts.add(original);
+        if (!original.text().isEmpty()) parts.add(PromptText.runtimeData("\n\n"));
+        parts.add(rendered.get("webSearchProfileHeader"));
+        boolean first = true;
+        for (String key : values.keySet()) {
+            if (key.equals("webSearchProfileHeader")) continue;
+            if (!first) parts.add(PromptText.runtimeData("，"));
+            parts.add(rendered.get(key));
+            first = false;
+        }
+        parts.add(PromptText.runtimeData("。"));
+        return PromptText.concat(parts);
+    }
+
+    public PromptText queryPrompt(PromptText original, GlobalUserProfile profile, Binding binding) {
+        if (!hasText(original.text()) || profile == null) return original;
+        Map<String, Map<String, String>> values = new LinkedHashMap<>();
+        if (hasText(profile.region())) values.put("webSearchQueryRegion", Map.of("value", mapRegionToDescription(profile.region())));
+        if (hasText(profile.language())) values.put("webSearchQueryLanguage", Map.of("value", mapLanguageToDescription(profile.language())));
+        if (hasText(profile.timezone())) values.put("webSearchProfileTimezone", Map.of("value", mapTimezoneToDescription(profile.timezone())));
+        Map<String, PromptText> rendered = values.isEmpty() ? Map.of() : binding.render(values);
+        List<PromptText> parts = new ArrayList<>();
+        parts.add(PromptText.runtimeData("["));
+        boolean first = true;
+        for (String key : values.keySet()) {
+            if (!first) parts.add(PromptText.runtimeData("，"));
+            parts.add(rendered.get(key));
+            first = false;
+        }
+        parts.add(PromptText.runtimeData("] "));
+        parts.add(original);
+        return PromptText.concat(parts);
     }
 
     // ==================== 辅助方法 ====================

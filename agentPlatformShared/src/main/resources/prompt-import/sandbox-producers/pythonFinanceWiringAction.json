@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonFinanceWiringAction",
+  "purpose": "pythonFinanceWiringAction",
+  "bodyType": "FIXED",
+  "body": "稍后重试，或改为普通文本输出",
+  "variables": [],
+  "utf8Sha256": "4f16ad5aa1ea5f88ceb05df62ff7dddf8dacd2b73b30873c63ac07f0d42338cf",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

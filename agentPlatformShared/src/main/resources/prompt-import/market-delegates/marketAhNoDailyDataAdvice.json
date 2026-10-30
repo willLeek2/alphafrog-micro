@@ -1,0 +1,14 @@
+{
+  "fragment": "marketAhNoDailyDataAdvice",
+  "purpose": "marketAhNoDailyDataAdvice",
+  "bodyType": "FIXED",
+  "body": "该股票在指定日期范围内无 AH 比价记录（仅同时登录 A/H 两地的股票有此数据），请检查代码或调整起止日期。",
+  "variables": [],
+  "utf8Sha256": "adc2ce288b0ff415037b0f9a1addcfe6e7966fd9c5cc886b40b3836c6f66c2a8",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataSpecialAssetTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -1,0 +1,14 @@
+{
+  "fragment": "financeProjectionRejectedAction",
+  "purpose": "financeProjectionRejectedAction",
+  "bodyType": "FIXED",
+  "body": "检查 report_custom() 的必填字段，减少单批记录数量后重试",
+  "variables": [],
+  "utf8Sha256": "1c403a501d5e3eb89049eef3828fd2900214a2a4137889b83f2e4a3f3bf87fd3",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/finance/FinanceResultModelAdapter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

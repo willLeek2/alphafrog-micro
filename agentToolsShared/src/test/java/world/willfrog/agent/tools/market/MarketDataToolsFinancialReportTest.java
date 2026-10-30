@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.market;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -58,8 +59,8 @@ class MarketDataToolsFinancialReportTest {
         when(localConfigLoader.current()).thenReturn(Optional.empty());
         when(datasetWriter.isEnabled()).thenReturn(false);
         when(datasetRegistry.isEnabled()).thenReturn(false);
-        tools = new MarketDataTools(datasetWriter, datasetRegistry, null, localConfigLoader,
-                new AgentLlmProperties(), objectMapper);
+        tools = configure(new MarketDataTools(datasetWriter, datasetRegistry, null, localConfigLoader,
+                new AgentLlmProperties(), objectMapper));
         ReflectionTestUtils.setField(tools, "domesticStockService", stockService);
     }
 

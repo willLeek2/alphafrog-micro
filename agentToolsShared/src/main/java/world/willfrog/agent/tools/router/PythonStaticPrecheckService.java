@@ -19,6 +19,7 @@ public class PythonStaticPrecheckService {
 
     public Result check(String code, String datasetIds, String manifestIds, Map<String, Object> runArgs) {
         List<String> issues = new ArrayList<>();
+        List<String> issueCodes = new ArrayList<>();
         Map<String, Object> report = new LinkedHashMap<>();
         String normalizedCode = code == null ? "" : code;
         String normalizedDatasetIds = datasetIds == null ? "" : datasetIds.trim();
@@ -28,26 +29,31 @@ public class PythonStaticPrecheckService {
 
         if (normalizedCode.isBlank()) {
             issues.add("code 不能为空");
+            issueCodes.add("CODE_EMPTY");
         }
         // 空编号是否允许取决于工具最终取得的完整工作区身份；静态预检没有这份事实。
         // 临时盘模式的 MISSING_IDS 仍由 PythonSandboxTools 在派任务前返回。
         if (!parsedDatasetIds.isEmpty()
                 && parsedDatasetIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
             issues.add("dataset_id 格式非法，仅允许字母数字._-");
+            issueCodes.add("DATASET_ID_FORMAT");
         }
         if (!parsedManifestIds.isEmpty()
                 && parsedManifestIds.stream().anyMatch(id -> !DATASET_ID_PATTERN.matcher(id).matches())) {
             issues.add("manifest_id 格式非法，仅允许字母数字._-");
+            issueCodes.add("MANIFEST_ID_FORMAT");
         }
 
         if (!normalizedCode.isBlank() && FORBIDDEN_DATASETS_PATH_PATTERN.matcher(normalizedCode).find()) {
             issues.add("禁止在代码中使用 /datasets 路径，请改用 /sandbox/input/<dataset_id>/... 或 /tmp 输出");
+            issueCodes.add("DATASET_PATH_FORBIDDEN");
         }
 
         if (!normalizedCode.isBlank()
                 && DATASET_ID_PLACEHOLDER_IN_CODE.matcher(normalizedCode).find()
                 && !DATASET_ID_DEFINE_PATTERN.matcher(normalizedCode).find()) {
             issues.add("代码引用了 dataset_id 变量但未定义，请先赋值后再使用");
+            issueCodes.add("DATASET_VARIABLE_UNDEFINED");
         }
 
         report.put("code_length", normalizedCode.length());
@@ -65,6 +71,7 @@ public class PythonStaticPrecheckService {
                     .errorCode("STATIC_PRECHECK_FAILED")
                     .message(String.join("; ", issues))
                     .report(report)
+                    .issueCodes(List.copyOf(issueCodes))
                     .build();
         }
 
@@ -74,6 +81,7 @@ public class PythonStaticPrecheckService {
                 .errorCode("")
                 .message("")
                 .report(report)
+                .issueCodes(List.of())
                 .build();
     }
 
@@ -106,5 +114,7 @@ public class PythonStaticPrecheckService {
         private String errorCode;
         private String message;
         private Map<String, Object> report;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private List<String> issueCodes;
     }
 }

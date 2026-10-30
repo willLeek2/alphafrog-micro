@@ -126,6 +126,7 @@ public class WorkflowCheckpointService {
             record.setSequence(todo.getSequence());
             record.setDescription(todo.getDescription());
             record.setSummary(emptyToNull(summary));
+            record.setOutputSourceJson(todo.getOutputSourceJson());
             record.setModelOutput(emptyToNull(modelOutput));
             // 避免同一字符串在 JSONB 中存两份；恢复时 displayOutput 会回退到 modelOutput。
             record.setOutput(modelOutput.equals(output) ? null : emptyToNull(output));
@@ -214,6 +215,7 @@ public class WorkflowCheckpointService {
                         .description(record.getDescription())
                         .summary(record.getSummary())
                         .modelOutput(record.getModelOutput())
+                        .outputSourceJson(record.getOutputSourceJson())
                         .output(record.getOutput())
                         .build())
                 .toList();

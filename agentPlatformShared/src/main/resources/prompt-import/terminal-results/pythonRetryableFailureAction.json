@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonRetryableFailureAction",
+  "purpose": "pythonRetryableFailureAction",
+  "bodyType": "FIXED",
+  "body": "根据 stderr 修正代码或输入后重试",
+  "variables": [],
+  "utf8Sha256": "ff0cf6ba3bbb50c01d89558f141e039d885aff4612645525b8e0fcb272250151",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxJobResultAdapter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

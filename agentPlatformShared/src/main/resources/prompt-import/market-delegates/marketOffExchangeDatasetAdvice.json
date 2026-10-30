@@ -1,0 +1,14 @@
+{
+  "fragment": "marketOffExchangeDatasetAdvice",
+  "purpose": "marketOffExchangeDatasetAdvice",
+  "bodyType": "FIXED",
+  "body": "includeDataset 只接受 true/false：true 时把整段净值序列写入数据集并返回 dataset_id；不传或 false 保持 20 行预览。",
+  "variables": [],
+  "utf8Sha256": "3e40f279576c1bc48e1b9e1057dbe3178bef1065a5d332fc269e8ed365316a93",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataFundEtfTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

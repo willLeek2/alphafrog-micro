@@ -1,0 +1,21 @@
+{
+  "fragment": "toolBudgetRejection",
+  "purpose": "toolBudgetRejection",
+  "bodyType": "TEMPLATE",
+  "body": "{{dimensionLabel}}预算已用尽。请根据已有结果回答；信息不足时说明无法完成。",
+  "variables": [
+    {
+      "name": "dimensionLabel",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "d82d2733ce2c4c164b1d50a3bc3ba5905c3b78183fbc6a58b665fae2ec560fb7",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/execution/WaitMemberResultPayload.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

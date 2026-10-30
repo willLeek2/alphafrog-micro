@@ -12,6 +12,7 @@ import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchCitation;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchHit;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRagPrefetch;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchResponse;
+import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchResultOrigin;
 import world.willfrog.externalinfo.retrieval.EmbeddingApiClient;
 import world.willfrog.externalinfo.search.backend.BackendCitation;
 import world.willfrog.externalinfo.search.backend.BackendSearchResult;
@@ -59,7 +60,8 @@ public class HotKeywordCacheService {
                 return null;
             }
             ClusterData cluster = objectMapper.readValue(payload, ClusterData.class);
-            if (cluster == null || cluster.getResponse() == null || cluster.getQueryEmbedding() == null) {
+            if (cluster == null || cluster.getResponse() == null || cluster.getQueryEmbedding() == null
+                    || cluster.getResponse().getResultOrigin() != WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA_VALUE) {
                 return null;
             }
             List<Float> queryEmbedding = embedForCache(query);
@@ -106,7 +108,9 @@ public class HotKeywordCacheService {
                              String scene,
                              WebSearchResponse response,
                              long ttlSeconds) {
-        if (response == null || ttlSeconds <= 0) {
+        if (response == null || ttlSeconds <= 0
+                || response.getResultOrigin() != WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA
+                || response.hasModelSendBlock()) {
             return;
         }
         List<Float> embedding = embedForCache(query);
@@ -126,7 +130,9 @@ public class HotKeywordCacheService {
             ClusterData cluster = payload == null || payload.isBlank()
                     ? new ClusterData()
                     : objectMapper.readValue(payload, ClusterData.class);
-            if (cluster == null) {
+            if (cluster == null || cluster.getResponse() == null
+                    || cluster.getResponse().getResultOrigin() != WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA_VALUE) {
+                // 旧缓存的答案没有同项来源，不能在加入新答案后补成已知数据。
                 cluster = new ClusterData();
             }
             if (cluster.getCreatedAt() == null) {
@@ -322,11 +328,13 @@ public class HotKeywordCacheService {
         cached.setCanonicalQuery(response.getCanonicalQuery());
         cached.setSlotSignature(response.getSlotSignature());
         cached.setResultHash(response.getResultHash());
+        cached.setResultOrigin(response.getResultOriginValue());
         return cached;
     }
 
     private WebSearchResponse toResponse(CachedResponse cached) {
-        WebSearchResponse.Builder builder = WebSearchResponse.newBuilder().setOk(true);
+        WebSearchResponse.Builder builder = WebSearchResponse.newBuilder().setOk(true)
+                .setResultOriginValue(cached.getResultOrigin());
         if (cached.getHits() != null) {
             for (CachedHit hit : cached.getHits()) {
                 builder.addHits(WebSearchHit.newBuilder()
@@ -444,6 +452,7 @@ public class HotKeywordCacheService {
         private String canonicalQuery;
         private String slotSignature;
         private String resultHash;
+        private int resultOrigin;
     }
 
     private record CachedHit(String title, String url, String snippet, String source, String publishedDate, float score) {
