@@ -267,8 +267,9 @@ public final class RunDriverMain {
         boolean toolGate = !"1".equals(opts.get("--no-tool-gate"));
 
         boolean attachMode = !attachRunId.isBlank();
-        if (!attachMode && dsId.isBlank()) {
-            System.err.println("创建模式必须给 --ds-id（ds_ 平台对象 id）。看 --help。");
+        // 014-new-03：--message-file 模式整段提示词逐字使用、不渲染模板占位符，ds-id 不再必填。
+        if (!attachMode && dsId.isBlank() && opts.getOrDefault("--message-file", "").isBlank()) {
+            System.err.println("创建模式必须给 --ds-id（ds_ 平台对象 id），或改用 --message-file 提供整段提示词。看 --help。");
             System.exit(2);
         }
         if (dsId.startsWith("ds_") == false && !dsId.isBlank()) {
