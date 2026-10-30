@@ -10,9 +10,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.experiment.ExperimentRunBindingStore;
 import world.willfrog.agent.platform.experiment.ExperimentRunContextFactory;
 import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
-import world.willfrog.alphafrogmicro.common.racing.RacingExperimentClient;
 import world.willfrog.alphafrogmicro.common.racing.RacingInputClient;
-import world.willfrog.alphafrogmicro.common.racing.RacingPromptClient;
 import world.willfrog.alphafrogmicro.common.racing.RacingPromptClientConfiguration;
 import world.willfrog.alphafrogmicro.common.racing.RacingPromptSetReader;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
@@ -37,30 +35,27 @@ public final class ToolSummaryPromptPreparation {
     private final ExperimentRunContextFactory contexts;
     private final ExperimentRunBindingStore bindings;
     private final RacingPromptSetReader reader;
-    private final PromptChoiceAdapter choices;
     private final RacingInputClient inputs;
 
     public ToolSummaryPromptPreparation(ExperimentRunContextFactory contexts, ExperimentRunBindingStore bindings,
-            RacingPromptSetReader reader, RacingExperimentClient experiments, RacingPromptClient prompts,
-            RacingInputClient inputs) {
+            RacingPromptSetReader reader, RacingInputClient inputs) {
         this.contexts = contexts;
         this.bindings = bindings;
         this.reader = reader;
-        this.choices = new PromptChoiceAdapter(experiments, prompts);
         this.inputs = inputs;
     }
 
-    public Prepared prepare(String toolName, String rawOutput, String todoGoal, String experimentId) {
-        return prepare(toolName, rawOutput, null, todoGoal, experimentId);
+    public Prepared prepare(String toolName, String rawOutput, String todoGoal) {
+        return prepare(toolName, rawOutput, null, todoGoal);
     }
 
-    public Prepared preparePrompt(String toolName, PromptText rawPrompt, String todoGoal, String experimentId) {
+    public Prepared preparePrompt(String toolName, PromptText rawPrompt, String todoGoal) {
         if (rawPrompt == null) throw sourceMissing();
-        return prepare(toolName, rawPrompt.text(), rawPrompt, todoGoal, experimentId);
+        return prepare(toolName, rawPrompt.text(), rawPrompt, todoGoal);
     }
 
     private Prepared prepare(String toolName, String rawOutput, PromptText rawPrompt,
-                             String todoGoal, String experimentId) {
+                             String todoGoal) {
         try {
             String runId = AgentContext.getRunId();
             if (runId == null || runId.isBlank()) {
@@ -70,7 +65,7 @@ public final class ToolSummaryPromptPreparation {
             PromptRunSelection saved = PromptRunSelection.fromExt(bindings.savedPromptSelection(runId));
             var fragments = reader.readFragments(context, saved.racingSelection(), Map.of(
                     SYSTEM_FRAGMENT, SYSTEM_FRAGMENT, USER_FRAGMENT, USER_FRAGMENT));
-            var userBody = choices.resolve(context, experimentId, fragments.get(USER_FRAGMENT), USER_FRAGMENT);
+            var userBody = fragments.get(USER_FRAGMENT);
             PromptText system = PromptTemplateRenderer.render(fragments.get(SYSTEM_FRAGMENT), Map.of());
             PromptText user = PromptTemplateRenderer.render(userBody, Map.of(
                     "toolName", nvl(toolName), "rawOutput", nvl(rawOutput), "todoGoal", nvl(todoGoal)));
