@@ -33,11 +33,17 @@ import world.willfrog.racing.idl.EvaluationValue;
 import world.willfrog.racing.idl.RacingError;
 import world.willfrog.racing.idl.ValueSource;
 
+import world.willfrog.racing.idl.ExperimentUsageReceipt;
+import world.willfrog.racing.idl.RecordExperimentUsageRequest;
+
 import java.math.BigDecimal;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 @Component
 public class SearchTools {
@@ -179,8 +185,13 @@ public class SearchTools {
         }
         String query = req.getQuery();
         String scene = req.getScene();
+        ExperimentUsageReport usage = freezeUsage(prepared);
+        Map<String, Object> usageStatus = new LinkedHashMap<>();
+        boolean searchInvoked = false;
         try {
+            searchInvoked = true;
             WebSearchResponse resp = externalInfoDubboService.webSearch(req);
+            usageStatus = reportUsage(usage, usageResult(resp));
             if (resp.hasModelSendBlock()) {
                 var block = resp.getModelSendBlock();
                 if (!ModelSendBlocks.isBlockedCode(block.getCode())) {
@@ -212,6 +223,7 @@ public class SearchTools {
                         upstreamFailureCategory(resp.getErrorCode()));
                 payload.put("error", err);
                 payload.put("data", preparedDetails(prepared));
+                payload.putAll(usageStatus);
                 return PromptText.runtimeData(objectMapper.writeValueAsString(payload));
             }
 
@@ -289,20 +301,25 @@ public class SearchTools {
             payload.put("ok", true);
             payload.put("tool", "searchWeb");
             payload.put("data", data);
+            payload.putAll(usageStatus);
             return PromptText.runtimeData(objectMapper.writeValueAsString(payload));
         } catch (Exception e) {
+            if (searchInvoked && usage != null && !usageStatus.containsKey("usage_attempt_id")) {
+                usageStatus = reportUsage(usage, usageResult(e));
+            }
             ModelSendBlocks.rethrowIfBlocked(e);
-            // 本地异常包装行：RPC/序列化一类的上游或系统故障。
-            return PromptText.runtimeData(writeJson(Map.of(
-                    "ok", false,
-                    "tool", "searchWeb",
-                    "data", preparedDetails(prepared),
-                    "error", Map.of(
-                            "code", "TOOL_ERROR",
-                            "message", nvl(e.getMessage()),
-                            "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name()
-                    )
-            )));
+            // 本地异常包装行：RPC/序列化一类的上游或系统故障。搜索已经发起时保留原失败，不再次搜索。
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("ok", false);
+            payload.put("tool", "searchWeb");
+            payload.put("data", preparedDetails(prepared));
+            payload.put("error", Map.of(
+                    "code", "TOOL_ERROR",
+                    "message", nvl(e.getMessage()),
+                    "category", ToolFailureCategory.UPSTREAM_OR_SYSTEM.name()
+            ));
+            payload.putAll(usageStatus);
+            return PromptText.runtimeData(writeJson(payload));
         }
     }
 
@@ -375,6 +392,98 @@ public class SearchTools {
             row.put("relevanceJudged", judgement.relevanceJudged());
             row.put("relevanceJudgeError", judgement.relevanceJudgeError());
         }
+    }
+
+    /** 调用外部搜索之前固定的一次上报。重传只重复这个对象，不重新搜索。 */
+    private record ExperimentUsageReport(String attemptId, String experimentId, String assignmentId,
+            String adoptedValueJson, String toolCallId, String occurredAt) {
+    }
+
+    private ExperimentUsageReport freezeUsage(PreparedSearchArguments prepared) {
+        Object experimentId = prepared.experimentDetails().get("experiment_id");
+        Object adopted = prepared.experimentDetails().get("value_json");
+        if (!(experimentId instanceof String id) || id.isBlank()
+                || !(adopted instanceof String value) || value.isBlank()) {
+            return null;
+        }
+        Object assignment = prepared.experimentDetails().get("assignment_id");
+        String toolCallId = AgentContext.getToolCallId();
+        return new ExperimentUsageReport(UUID.randomUUID().toString(), id,
+                assignment instanceof String text ? text : "", value,
+                toolCallId == null ? "" : toolCallId.strip(),
+                OffsetDateTime.now(ZoneOffset.UTC).toString());
+    }
+
+    private String usageResult(WebSearchResponse response) {
+        boolean blocked = response.hasModelSendBlock();
+        String code = blocked ? response.getModelSendBlock().getCode() : response.getErrorCode();
+        return usageResult(response.getOk() && !blocked, code, response.getHitsCount());
+    }
+
+    private String usageResult(Exception failure) {
+        String code = "TOOL_ERROR";
+        if (failure instanceof ModelSendBlockedException blocked) {
+            code = blocked.code();
+        } else if (failure instanceof RacingCallException racing) {
+            code = racing.error().getCode();
+        }
+        return usageResult(false, code, 0);
+    }
+
+    private String usageResult(boolean ok, String errorCode, int hitCount) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ok", ok);
+        body.put("error_code", nvl(errorCode));
+        body.put("hit_count", hitCount);
+        return writeJson(body);
+    }
+
+    private Map<String, Object> reportUsage(ExperimentUsageReport usage, String resultJson) {
+        Map<String, Object> status = new LinkedHashMap<>();
+        if (usage == null) {
+            return status;
+        }
+        status.put("usage_attempt_id", usage.attemptId());
+        if (usage.toolCallId().isBlank()) {
+            status.put("experiment_usage_status", "UNCONFIRMED");
+            return status;
+        }
+        AgentExperimentClient client = experiments == null ? null : experiments.getIfAvailable();
+        if (client == null) {
+            status.put("experiment_usage_status", "UNCONFIRMED");
+            return status;
+        }
+        RecordExperimentUsageRequest request = RecordExperimentUsageRequest.newBuilder()
+                .setExperimentId(usage.experimentId())
+                .setUsageAttemptId(usage.attemptId())
+                .setAssignmentId(usage.assignmentId())
+                .setAdoptedValueJson(usage.adoptedValueJson())
+                .setResultJson(resultJson)
+                .setOccurredAt(usage.occurredAt())
+                .build();
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                ExperimentUsageReceipt receipt = client.recordUsage(nvl(AgentContext.getRunId()),
+                        usage.toolCallId(), request);
+                status.put("experiment_usage_status", "RECORDED");
+                status.put("usage_id", receipt.getUsageId());
+                if (!receipt.getFeedbackId().isEmpty()) {
+                    status.put("feedback_id", receipt.getFeedbackId());
+                }
+                return status;
+            } catch (RacingCallException failure) {
+                String code = failure.error().getCode();
+                if (!"PERSISTENCE_UNCONFIRMED".equals(code) && !"UNAVAILABLE".equals(code)
+                        && !"DEADLINE_EXCEEDED".equals(code)) {
+                    status.put("experiment_usage_status", code);
+                    return status;
+                }
+            } catch (RuntimeException ignored) {
+                // 传输没有给出业务结论时，只重传同一个上报对象。
+            }
+        }
+        status.put("experiment_usage_status", "UNCONFIRMED");
+        return status;
     }
 
     private String writeJson(Object payload) {
