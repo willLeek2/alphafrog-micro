@@ -529,7 +529,8 @@ public class AgentController {
             String minEventTime = null;
             String maxEventTime = null;
             for (var e : resp.getItemsList()) {
-                Object payload = parseOutboundJson(e.getPayloadJson(), AgentExternalObservabilityMapper.View.EVENT);
+                Object payload = AgentExternalObservabilityMapper.parseEvent(
+                        objectMapper, e.getPayloadJson(), e.getEventType());
                 String eventTime = safeTimelineString(e.getCreatedAt(), 128);
                 String eventType = safeTimelineString(e.getEventType(), 200);
                 if (minEventTime == null || eventTime.compareTo(minEventTime) < 0) {
@@ -771,7 +772,8 @@ public class AgentController {
                     emptyToNull(status.getCurrentTool()),
                     emptyToNull(status.getLastEventType()),
                     emptyToNull(status.getLastEventAt()),
-                    parseOutboundJson(status.getLastEventPayloadJson(), AgentExternalObservabilityMapper.View.EVENT),
+                    AgentExternalObservabilityMapper.parseEvent(
+                            objectMapper, status.getLastEventPayloadJson(), status.getLastEventType()),
                     parseOutboundJson(status.getPlanJson(), admin
                             ? AgentExternalObservabilityMapper.View.ADMIN
                             : AgentExternalObservabilityMapper.View.PLAN),
