@@ -4,7 +4,7 @@
 # shared-infra；否则 Nacos 里会出现 frontend 无法访问的 provider IP。
 # 这里用到 Nacos 的路由源地址来选网卡，比“取第一个 172.* 地址”稳定。
 NACOS_HOST="${NACOS_ADDRESS:-nacos}"
-NACOS_IP=$(getent hosts "$NACOS_HOST" | awk '{print $1; exit}')
+NACOS_IP=$(getent ahostsv4 "$NACOS_HOST" | awk '{print $1; exit}')
 
 if [ -n "$NACOS_IP" ]; then
     DUBBO_IP=$(ip route get "$NACOS_IP" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
