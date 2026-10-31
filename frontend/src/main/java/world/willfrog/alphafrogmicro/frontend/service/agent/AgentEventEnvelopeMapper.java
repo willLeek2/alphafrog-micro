@@ -39,7 +39,7 @@ public final class AgentEventEnvelopeMapper {
                 event.getRunId(),
                 event.getSeq(),
                 event.getEventType(),
-                payloadFromJson(objectMapper, event.getPayloadJson()),
+                payloadFromJson(objectMapper, event.getPayloadJson(), event.getEventType()),
                 createdAt,
                 createdAtEpochMs(createdAt),
                 true
@@ -60,16 +60,17 @@ public final class AgentEventEnvelopeMapper {
         int seq = durable ? sourceSeq : 0;
         Long id = durable ? longValue(envelope.get("id")) : null;
         String createdAt = emptyToNull(stringValue(envelope.get("createdAt")));
+        String eventType = stringValue(envelope.get("eventType"));
         Map<String, Object> payload = envelope.containsKey("payload")
-                ? payloadFromValue(envelope.get("payload"))
-                : payloadFromJson(objectMapper, stringValue(envelope.get("payloadJson")));
+                ? payloadFromValue(envelope.get("payload"), eventType)
+                : payloadFromJson(objectMapper, stringValue(envelope.get("payloadJson")), eventType);
         return new AgentRunEventResponse(
                 SCHEMA_VERSION,
                 EVENT_TYPE,
                 id != null && id > 0 ? id : null,
                 stringValue(envelope.get("runId")),
                 seq,
-                stringValue(envelope.get("eventType")),
+                eventType,
                 payload,
                 createdAt,
                 createdAtEpochMs(createdAt),
@@ -78,11 +79,15 @@ public final class AgentEventEnvelopeMapper {
     }
 
     public static Map<String, Object> payloadFromJson(ObjectMapper objectMapper, String json) {
+        return payloadFromJson(objectMapper, json, null);
+    }
+
+    private static Map<String, Object> payloadFromJson(ObjectMapper objectMapper, String json, String eventType) {
         if (json == null || json.isBlank()) {
             return new LinkedHashMap<>();
         }
         try {
-            return payloadFromValue(objectMapper.readValue(json, Object.class));
+            return payloadFromValue(objectMapper.readValue(json, Object.class), eventType);
         } catch (Exception ignored) {
             Map<String, Object> invalid = new LinkedHashMap<>();
             invalid.put("value", INVALID_JSON_VALUE);
@@ -90,13 +95,15 @@ public final class AgentEventEnvelopeMapper {
         }
     }
 
-    @SuppressWarnings("unchecked")
     public static Map<String, Object> payloadFromValue(Object value) {
+        return payloadFromValue(value, null);
+    }
+
+    private static Map<String, Object> payloadFromValue(Object value, String eventType) {
         if (value == null) {
             return new LinkedHashMap<>();
         }
-        Object safe = AgentExternalObservabilityMapper.sanitize(
-                value, AgentExternalObservabilityMapper.View.EVENT);
+        Object safe = AgentExternalObservabilityMapper.sanitizeDependencyEvent(value, eventType);
         if (safe instanceof Map<?, ?> map) {
             Map<String, Object> result = new LinkedHashMap<>();
             map.forEach((key, item) -> result.put(String.valueOf(key), item));
