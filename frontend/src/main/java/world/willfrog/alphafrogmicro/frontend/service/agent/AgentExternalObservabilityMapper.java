@@ -73,7 +73,7 @@ public final class AgentExternalObservabilityMapper {
     private static final Set<String> DEPENDENCY_RESULT_BOOLEAN_KEYS = Set.of("businesssuccess", "executed");
     private static final Set<String> DEPENDENCY_VIEW_NUMBER_KEYS = Set.of(
             "plangeneration", "checkeventseq", "resumeeventseq", "resultafterseq", "omittedcount");
-    private static final Set<String> DEPENDENCY_VIEW_BOOLEAN_KEYS = Set.of("prepared", "frozenreuse");
+    private static final Set<String> DEPENDENCY_VIEW_BOOLEAN_KEYS = Set.of("prepared", "frozenreuse", "requiresstartproof");
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             "authorization", "proxyauthorization", "apikey", "xapikey", "secret", "clientsecret",
             "password", "passwd", "credential", "credentials", "cookie", "setcookie",
