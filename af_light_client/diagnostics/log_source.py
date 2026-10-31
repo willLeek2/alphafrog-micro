@@ -66,14 +66,17 @@ def attach_log_result(
             continue
         count = result.get("count")
         got = result.get("rows") or []
-        if status == "success" and (count == 0 or got == []):
+        truncation = result.get("truncation") if isinstance(result.get("truncation"), dict) else {}
+        reason = truncation.get("reason")
+        zero_rows = count == 0 or got == []
+        if status == "empty" or (
+            status == "success" and zero_rows and reason not in {"row_limit", "byte_limit", "timeout"}
+        ):
             gaps.append({"item": "集中日志", "reason": f"trace {trace_id} 的查询为空结果"})
             continue
         for row in got:
             if isinstance(row, dict):
                 rows.append(_project_row(row))
-        truncation = result.get("truncation") or {}
-        reason = truncation.get("reason")
         if reason in {"row_limit", "byte_limit", "timeout"}:
             gaps.append({"item": "集中日志", "reason": f"trace {trace_id} 截断，原因是 {reason}"})
         if result.get("countsComplete") is False:
