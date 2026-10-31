@@ -39,8 +39,7 @@ def finalize_package(
     log_query: Callable[[str], dict[str, Any]] | None = None,
     deployment_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    traces = _load_json(output_dir / "traces.json")
-    log_attached = attach_log_result(traces=traces, query=log_query)
+    log_attached = attach_log_result(correspondence=None, query=log_query)
     deployment_attached = attach_deployment(deployment_payload)
     gaps = list(log_attached["gaps"]) + list(deployment_attached["gaps"])
     for error in summary.get("errors") or []:

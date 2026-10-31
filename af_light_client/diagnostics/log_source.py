@@ -43,27 +43,34 @@ def _project_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def attach_log_result(
     *,
-    traces: Any,
+    correspondence: list[dict[str, Any]] | None,
     query: Callable[[str], dict[str, Any]] | None,
 ) -> dict[str, Any]:
-    """query 为 None 表示集中日志入口尚未提供。"""
+    """没有来源证明的日志轨迹编号时，不查询，也不写入日志。"""
 
+    proven: list[str] = []
+    for item in correspondence or []:
+        raw = str(item.get("logTraceId") or "").strip()
+        evidence = str(item.get("evidence") or "").strip()
+        if TRACE_ID_32.fullmatch(raw) and evidence:
+            lowered = raw.lower()
+            if lowered not in proven:
+                proven.append(lowered)
+    if not proven:
+        return {
+            "association": "unassociated",
+            "rows": [],
+            "gaps": [{"item": "集中日志", "reason": "无法关联。业务调用编号不能当作日志轨迹编号"}],
+        }
     if query is None:
         return {
             "association": "source-missing",
             "rows": [],
             "gaps": [{"item": "集中日志", "reason": "入口尚未提供"}],
         }
-    trace_ids = trace_ids_from_traces(traces)
-    if not trace_ids:
-        return {
-            "association": "time-proximity-search",
-            "rows": [],
-            "gaps": [{"item": "集中日志", "reason": "没有可送入的 32 位十六进制 trace 标识，时间接近的搜索不写入这次运行的诊断文件"}],
-        }
     rows: list[dict[str, Any]] = []
     gaps: list[dict[str, str]] = []
-    for trace_id in trace_ids:
+    for trace_id in proven:
         result = query(trace_id)
         status = str(result.get("status") or "")
         if status == "rejected":
