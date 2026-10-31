@@ -7,6 +7,9 @@ import java.util.Objects;
 import world.willfrog.racing.idl.EvaluateReply;
 import world.willfrog.racing.idl.EvaluateRequest;
 import world.willfrog.racing.idl.EvaluationValue;
+import world.willfrog.racing.idl.ExperimentUsageReceipt;
+import world.willfrog.racing.idl.RecordExperimentUsageReply;
+import world.willfrog.racing.idl.RecordExperimentUsageRequest;
 import world.willfrog.racing.idl.RuntimeCallContext;
 import world.willfrog.racing.idl.RuntimeIdentity;
 import world.willfrog.racing.idl.ValueSource;
@@ -67,12 +70,33 @@ public final class RacingExperimentClient {
         return value;
     }
 
+    /** 业务错误原样抛出；成功时由传输层核对实际处理实例和代际。 */
+    public ExperimentUsageReceipt recordUsage(RuntimeCallContext context, RecordExperimentUsageRequest request) {
+        if (context == null || !context.hasRoot() || !context.hasTarget() || request == null
+                || request.getExperimentId().isBlank() || request.getUsageAttemptId().isBlank()
+                || request.getAdoptedValueJson().isBlank() || request.getOccurredAt().isBlank()) {
+            throw failure("INVALID_ARGUMENT", "使用上报缺少根上下文、实验编号、尝试编号、采用值或发生时间");
+        }
+        RecordExperimentUsageReply reply = transport.call(context,
+                (service, current) -> service.recordExperimentUsage(request.toBuilder().setContext(current).build()),
+                RacingExperimentClient::usageIdentity);
+        return reply.getReceipt();
+    }
+
     private static RuntimeIdentity actualIdentity(EvaluateReply reply) {
         if (reply.hasError()) throw new RacingCallException(reply.getError());
         if (!reply.hasValue() || !reply.getValue().hasActualTarget()) {
             throw failure("PERSISTENCE_UNCONFIRMED", "实验取值回复没有确认值或实际实例身份");
         }
         return reply.getValue().getActualTarget();
+    }
+
+    private static RuntimeIdentity usageIdentity(RecordExperimentUsageReply reply) {
+        if (reply.hasError()) throw new RacingCallException(reply.getError());
+        if (!reply.hasReceipt() || reply.getReceipt().getUsageId().isBlank() || !reply.hasActualTarget()) {
+            throw failure("PERSISTENCE_UNCONFIRMED", "使用上报回复没有确认回执或实际实例身份");
+        }
+        return reply.getActualTarget();
     }
 
     private static void requireValue(String value, String code) {

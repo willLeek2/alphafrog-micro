@@ -4,7 +4,7 @@
 # shared-infra；否则 Nacos 里会出现 frontend 无法访问的 provider IP。
 # 这里用到 Nacos 的路由源地址来选网卡，比“取第一个 172.* 地址”稳定。
 NACOS_HOST="${NACOS_ADDRESS:-nacos}"
-NACOS_IP=$(getent hosts "$NACOS_HOST" | awk '{print $1; exit}')
+NACOS_IP=$(getent ahostsv4 "$NACOS_HOST" | awk '{print $1; exit}')
 
 if [ -n "$NACOS_IP" ]; then
     DUBBO_IP=$(ip route get "$NACOS_IP" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
@@ -21,11 +21,19 @@ fi
 
 echo "[alphafrog] Detected DUBBO_IP: $DUBBO_IP"
 
-# Triple 协议需要使用 TRI_DUBBO_IP_TO_BIND 环境变量。
-# 绑定地址始终用自动检测的容器 IP；注册地址若已被外部预设（compose 注入的
-# DUBBO_IP_TO_REGISTRY，或外部预设的 TRI_DUBBO_IP_TO_REGISTRY），则不再写容器 IP，
-# 避免带协议前缀的值覆盖宿主机可路由地址。
-export TRI_DUBBO_IP_TO_BIND="$DUBBO_IP"
+# Triple 协议的 TRI_DUBBO_IP_TO_BIND：未设置或空值时使用自动检测的容器 IP；
+# 值为 none 时不向 Java 传入这个绑定覆盖；其他具体地址保持原样。
+# 注册地址若已被外部预设（compose 注入的 DUBBO_IP_TO_REGISTRY，
+# 或外部预设的 TRI_DUBBO_IP_TO_REGISTRY），则不再写容器 IP，
+# 避免带协议前缀的值覆盖宿主机可路由地址。绑定预设不会写入注册地址。
+case "${TRI_DUBBO_IP_TO_BIND:-}" in
+    none)
+        unset TRI_DUBBO_IP_TO_BIND
+        ;;
+    "")
+        export TRI_DUBBO_IP_TO_BIND="$DUBBO_IP"
+        ;;
+esac
 if [ -z "${DUBBO_IP_TO_REGISTRY:-}" ] && [ -z "${TRI_DUBBO_IP_TO_REGISTRY:-}" ]; then
     export TRI_DUBBO_IP_TO_REGISTRY="$DUBBO_IP"
 fi
