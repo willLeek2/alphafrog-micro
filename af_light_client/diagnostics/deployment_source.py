@@ -29,19 +29,28 @@ def attach_deployment(
     for record in records:
         if not isinstance(record, dict):
             continue
-        if task_id and record.get("taskId") == task_id:
+        if task_id and record.get("taskId") == task_id and record.get("containerKind") != "DEPLOYMENT_SERVICE":
             normalized.append(_normalize(record))
             continue
-        if record.get("deploymentId"):
-            if generation_id and str(record.get("generationId") or "") == str(generation_id):
-                normalized.append(_normalize(record))
-            else:
+        if record.get("deploymentId") or record.get("containerKind") == "DEPLOYMENT_SERVICE":
+            sources = record.get("missingSources") or []
+            generation = str(record.get("generationId") or "")
+            if "generationId" in sources or not generation_id or generation != str(generation_id):
                 dropped += 1
+            else:
+                normalized.append(_normalize(record))
     if dropped:
         gaps.append({
             "item": "部署与生命周期",
-            "reason": f"{dropped} 条部署容器记录因代际不一致或缺少代际而未写入",
+            "reason": f"{dropped} 条部署容器记录因代际不一致、缺少代际或 missingSources 含 generationId 而未写入",
         })
+    missing_count = payload.get("generationMissingCount")
+    if isinstance(missing_count, int) and missing_count > 0:
+        if payload.get("truncated"):
+            reason = f"generationMissingCount 是 {missing_count}，同时结果被截断，这个计数是下界"
+        else:
+            reason = f"generationMissingCount 是 {missing_count}，这些记录因代际为空被排除"
+        gaps.append({"item": "部署与生命周期", "reason": reason})
     if not records and not gaps:
         gaps.append({"item": "部署与生命周期", "reason": "没有读到记录。缺记录不解释为未发生"})
     return {"records": normalized, "gaps": gaps}
