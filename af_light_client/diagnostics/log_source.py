@@ -19,21 +19,6 @@ ROW_KEYS = (
 )
 
 
-def trace_ids_from_traces(traces: Any) -> list[str]:
-    rows = traces
-    if isinstance(traces, dict):
-        data = traces.get("data", traces)
-        rows = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else []
-    found: list[str] = []
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        raw = str(row.get("traceId") or row.get("trace_id") or "").replace("-", "")
-        if TRACE_ID_32.fullmatch(raw) and raw.lower() not in {item.lower() for item in found}:
-            found.append(raw.lower())
-    return found
-
-
 def _project_row(row: dict[str, Any]) -> dict[str, Any]:
     projected = {key: row.get(key) for key in ROW_KEYS}
     projected["message"] = None
