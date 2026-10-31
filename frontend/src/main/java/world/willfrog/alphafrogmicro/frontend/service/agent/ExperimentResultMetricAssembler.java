@@ -2,6 +2,9 @@ package world.willfrog.alphafrogmicro.frontend.service.agent;
 
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
 import org.springframework.security.core.Authentication;
@@ -13,7 +16,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 
 /**
- * 按根运行读取已有运行接口。每个根运行调用一次。实验开发者授权不能代替业务用户登录。
+ * 按根运行读取已有运行接口。每个不同的根运行调用一次。
+ * 公开的单根读取自行解析登录。批量读取使用调用方已经解析的登录上下文，自己不再解析。
  * 没有评分字段时分数固定为未评分。缺失的耗时和费用保持空，不填 0。
  */
 @Service
@@ -37,6 +41,29 @@ public class ExperimentResultMetricAssembler {
         if (rootRunId == null || rootRunId.isBlank()) {
             return RootRunMetrics.unavailable();
         }
+        return readOne(caller, rootRunId);
+    }
+
+    /**
+     * 使用已经解析的登录上下文，按根运行编号去重后读取。空白编号不进入结果。
+     * 同一个编号只保留第一次出现的位置，并且只读取一次。
+     */
+    public Map<String, RootRunMetrics> loadByRoots(AgentAuthSupport.AgentAuthContext caller, List<String> rootRunIds) {
+        Map<String, RootRunMetrics> metrics = new LinkedHashMap<>();
+        if (rootRunIds == null) {
+            return metrics;
+        }
+        boolean signedIn = caller != null && caller.userId() != null;
+        for (String rootRunId : rootRunIds) {
+            if (rootRunId == null || rootRunId.isBlank() || metrics.containsKey(rootRunId)) {
+                continue;
+            }
+            metrics.put(rootRunId, signedIn ? readOne(caller, rootRunId) : RootRunMetrics.unsigned());
+        }
+        return metrics;
+    }
+
+    private RootRunMetrics readOne(AgentAuthSupport.AgentAuthContext caller, String rootRunId) {
         AgentRunMessage run;
         try {
             run = runs.getRun(GetAgentRunRequest.newBuilder()

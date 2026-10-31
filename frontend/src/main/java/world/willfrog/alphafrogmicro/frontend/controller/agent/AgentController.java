@@ -57,6 +57,7 @@ import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
+import world.willfrog.alphafrogmicro.frontend.model.agent.ExperimentResultMetricsRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactPartsMetaResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentExportRequest;
@@ -84,6 +85,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceSpanItem;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
+import world.willfrog.alphafrogmicro.frontend.service.agent.ExperimentResultMetricAssembler;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentEventEnvelopeMapper;
@@ -129,6 +131,7 @@ public class AgentController {
     private final AgentCallDetailBlobReader callDetailBlobReader;
     private final AgentTracePartsService tracePartsService;
     private final AgentTimelineMergeService timelineMergeService;
+    private final ExperimentResultMetricAssembler experimentResultMetricAssembler;
 
     private AgentDubboService resolveService() {
         return agentDubboServiceLangchain;
@@ -677,6 +680,22 @@ public class AgentController {
         } catch (Exception e) {
             return handleError(e, "查询 agent run cost");
         }
+    }
+
+    /**
+     * 按一组根运行编号读取指标。登录在这里解析一次；用户编号为空时返回未登录，不读取运行。
+     * 有效上下文交给批量读取，由它按根运行编号去重。
+     */
+    @PostMapping("/api/agent/experiment-results/metrics")
+    public ResponseWrapper<Map<String, ExperimentResultMetricAssembler.RootRunMetrics>> experimentResultMetrics(
+            Authentication authentication,
+            @RequestBody ExperimentResultMetricsRequest request) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (caller.userId() == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        List<String> rootRunIds = request == null ? null : request.rootRunIds();
+        return ResponseWrapper.success(experimentResultMetricAssembler.loadByRoots(caller, rootRunIds));
     }
 
     @GetMapping(AGENT_RUNS + "/{runId}/credits")
