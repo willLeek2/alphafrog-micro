@@ -6,6 +6,7 @@ import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,6 +23,7 @@ public final class StructuredPlanningSupport {
 
     public static final String CATEGORY_JSON_PARSE_ERROR = "JSON_PARSE_ERROR";
     public static final String CATEGORY_SCHEMA_VALIDATION_ERROR = "SCHEMA_VALIDATION_ERROR";
+    public static final String EXPECTED_TOOLS_DESCRIPTION = "todos.expectedTools";
 
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([A-Za-z0-9_-]+)\\.output(?:\\.([A-Za-z0-9_.-]+))?}");
     private static final Map<String, String> LEGACY_DESCRIPTIONS = Map.of(
@@ -49,6 +51,11 @@ public final class StructuredPlanningSupport {
     }
 
     public static ValidationResult validateTodoPlan(JsonNode root, int maxTodos) {
+        return validateTodoPlan(root, maxTodos, false);
+    }
+
+    /** 返回校验采用本次所选说明字典支持的字段，不借用另一版本的约定。 */
+    public static ValidationResult validateTodoPlan(JsonNode root, int maxTodos, boolean expectedToolsEnabled) {
         if (root == null || !root.isObject()) {
             return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_plan_not_object");
         }
@@ -86,6 +93,20 @@ public final class StructuredPlanningSupport {
             JsonNode dependsOnNode = itemNode.get("dependsOn");
             if (dependsOnNode != null && !dependsOnNode.isArray()) {
                 return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_depends_on@" + index);
+            }
+            JsonNode expectedToolsNode = itemNode.get("expectedTools");
+            if (expectedToolsNode != null) {
+                if (!expectedToolsEnabled) {
+                    return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_unexpected_expected_tools@" + index);
+                }
+                if (!expectedToolsNode.isArray()) {
+                    return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_expected_tools@" + index);
+                }
+                for (JsonNode toolName : expectedToolsNode) {
+                    if (!toolName.isTextual()) {
+                        return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_expected_tool@" + index);
+                    }
+                }
             }
             JsonNode groupKeyNode = itemNode.get("groupKey");
             if (groupKeyNode != null && !groupKeyNode.isTextual()) {
@@ -201,6 +222,18 @@ public final class StructuredPlanningSupport {
 
     /** 协议结构继续由Java生成，说明只从业务已经核对的版本字典取值。 */
     public static Map<String, Object> todoPlanningJsonSchema(Map<String, String> descriptions) {
+        Map<String, Object> itemProperties = new LinkedHashMap<>();
+        itemProperties.put("id", Map.of("type", "string"));
+        itemProperties.put("sequence", Map.of("type", "integer"));
+        itemProperties.put("description", Map.of("type", "string", "description", description(descriptions, "todos.description")));
+        itemProperties.put("dependsOn", Map.of("type", "array", "description", description(descriptions, "todos.dependsOn"),
+                "items", Map.of("type", "string")));
+        itemProperties.put("groupKey", Map.of("type", "string", "description", description(descriptions, "todos.groupKey")));
+        itemProperties.put("parallelizable", Map.of("type", "boolean", "description", description(descriptions, "todos.parallelizable")));
+        if (descriptions != null && descriptions.containsKey(EXPECTED_TOOLS_DESCRIPTION)) {
+            itemProperties.put("expectedTools", Map.of("type", "array", "description", description(descriptions, EXPECTED_TOOLS_DESCRIPTION),
+                    "items", Map.of("type", "string")));
+        }
         return Map.of(
                 "type", "object",
                 "additionalProperties", false,
@@ -219,27 +252,7 @@ public final class StructuredPlanningSupport {
                                         "type", "object",
                                         "additionalProperties", false,
                                         "required", List.of("id", "sequence", "description"),
-                                        "properties", Map.of(
-                                                "id", Map.of("type", "string"),
-                                                "sequence", Map.of("type", "integer"),
-                                                "description", Map.of(
-                                                        "type", "string",
-                                                        "description", description(descriptions, "todos.description")
-                                                ),
-                                                "dependsOn", Map.of(
-                                                        "type", "array",
-                                                        "description", description(descriptions, "todos.dependsOn"),
-                                                        "items", Map.of("type", "string")
-                                                ),
-                                                "groupKey", Map.of(
-                                                        "type", "string",
-                                                        "description", description(descriptions, "todos.groupKey")
-                                                ),
-                                                "parallelizable", Map.of(
-                                                        "type", "boolean",
-                                                        "description", description(descriptions, "todos.parallelizable")
-                                                )
-                                        )
+                                        "properties", itemProperties
                                 )
                         )
                 )
@@ -339,6 +352,13 @@ public final class StructuredPlanningSupport {
 
     public static Set<String> planningDescriptionKeys() {
         return LEGACY_DESCRIPTIONS.keySet();
+    }
+
+    /** 已发布七键字典及增加预计工具说明的八键字典是两种明确的协议。 */
+    public static boolean acceptsPlanningDescriptionKeys(Set<String> keys) {
+        Set<String> legacy = planningDescriptionKeys();
+        return legacy.equals(keys) || keys != null && keys.size() == legacy.size() + 1
+                && keys.containsAll(legacy) && keys.contains(EXPECTED_TOOLS_DESCRIPTION);
     }
 
     private static String description(Map<String, String> descriptions, String key) {

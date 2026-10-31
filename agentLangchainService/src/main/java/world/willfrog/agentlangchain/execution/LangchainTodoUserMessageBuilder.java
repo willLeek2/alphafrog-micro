@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.execution;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
 import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.workflow.PlanDependencyCheckReport;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.LinkedHashMap;
@@ -51,6 +52,62 @@ final class LangchainTodoUserMessageBuilder {
         }
         parts.add(PromptText.runtimeData(facts.toString()));
         return PromptText.concat(parts);
+    }
+
+    /** 只呈现保存报告中的检查事实；执行规则由原根的阶段正文提供。 */
+    static PromptText dependencyCheckFacts(PlanDependencyCheckReport report,
+                                          Integer currentPlanGeneration, String todoId) {
+        if (report == null) {
+            return PromptText.runtimeData("依赖检查：本计划没有可核实的检查报告；服务、实际业务调用和数据覆盖均未检查。");
+        }
+        StringBuilder facts = new StringBuilder("依赖检查事实：原检查时间 ")
+                .append(report.getCheckedAt() == null ? "未知" : report.getCheckedAt()).append("。\n");
+        Integer checkedGeneration = report.getCheckedPlanGeneration();
+        if (checkedGeneration == null || currentPlanGeneration == null) {
+            facts.append("原检查代次或当前执行代次未知；没有本轮重新检查的事实。\n");
+        } else if (!checkedGeneration.equals(currentPlanGeneration)) {
+            facts.append("沿用旧检查、恢复后未重查：检查代次 ").append(checkedGeneration)
+                    .append("，当前执行代次 ").append(currentPlanGeneration).append("。\n");
+        }
+        boolean matched = false;
+        if (report.getHints() != null) {
+            for (PlanDependencyCheckReport.Hint hint : report.getHints()) {
+                if (hint == null) continue;
+                boolean sameTodo = hint.todoId() != null && !hint.todoId().isBlank() && hint.todoId().equals(todoId);
+                boolean common = (hint.todoId() == null || hint.todoId().isBlank())
+                        && ("execution.model.config".equals(hint.dependencyId())
+                        || "report.omitted".equals(hint.dependencyId()));
+                if (!sameTodo && !common) continue;
+                matched |= sameTodo;
+                if (facts.length() > 1600) {
+                    facts.append("当前展示已省略后续检查事实；完整内容保存在原报告中。\n");
+                    break;
+                }
+                String status = hint.status() == null ? "未检查" : switch (hint.status()) {
+                    case AVAILABLE -> "可用";
+                    case UNAVAILABLE -> "不可用";
+                    case UNCHECKED -> "未检查";
+                };
+                if (hint.toolName() != null && !hint.toolName().isBlank()) facts.append(hint.toolName()).append("：");
+                facts.append(hint.dependencyLabel() == null ? "依赖" : hint.dependencyLabel())
+                        .append("：").append(status).append("；")
+                        .append(dependencyBasisFact(hint.basis())).append('\n');
+            }
+        }
+        if (!matched) facts.append("本报告未覆盖当前步骤；其工具依赖未检查。\n");
+        if (report.getOmittedCount() > 0) facts.append("原报告省略提示数：").append(report.getOmittedCount()).append("。\n");
+        return PromptText.runtimeData(facts.toString());
+    }
+
+    /** 旧报告原因可能含应用规则，模型投影只读取结构化依据，原报告保持不变。 */
+    private static String dependencyBasisFact(PlanDependencyCheckReport.Basis basis) {
+        if (basis == null) return "报告没有记录检查依据。";
+        return switch (basis) {
+            case REFERENCE_STATE -> "检查依据为已有服务引用的本地状态；实际业务调用未检查。";
+            case CONFIG_PRESENT -> "检查依据为本地配置对象；实际模型请求未检查。";
+            case TOOL_AVAILABILITY -> "检查依据为本运行实际开放的工具集合。";
+            case NONE -> "报告没有记录已检查的依据。";
+        };
     }
 
     static PromptText buildFinalUserPrompt(AgentPromptService promptService,

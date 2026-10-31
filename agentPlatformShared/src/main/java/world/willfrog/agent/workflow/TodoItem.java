@@ -51,6 +51,10 @@ public class TodoItem {
     @Builder.Default
     private List<String> dependsOn = new ArrayList<>();
 
+    /** 预计可能使用的工具名，仅用于检查依赖，不限制执行时的工具选择。 */
+    @Builder.Default
+    private List<String> expectedTools = new ArrayList<>();
+
     /** 分组键（同组任务可并行） */
     private String groupKey;
 

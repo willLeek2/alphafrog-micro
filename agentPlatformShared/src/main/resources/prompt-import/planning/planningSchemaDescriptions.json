@@ -2,9 +2,9 @@
   "fragment": "planningSchemaDescriptions",
   "purpose": "planningSchemaDescriptions",
   "bodyType": "FIXED",
-  "body": "{\n  \"todos.extractedEntities\": \"用户明确提到的金融实体、指数、基金或股票名称。\",\n  \"todos.description\": \"1-3句话描述该Todo要完成的任务\",\n  \"todos.dependsOn\": \"依赖的todoId列表（DAG模式下可选）\",\n  \"todos.groupKey\": \"可选：并行分组键\",\n  \"todos.parallelizable\": \"可选：该节点是否可并行\",\n  \"strategy.mode\": \"执行模式：LINEAR串行(1段描述)或DAG并行(2-3段描述)\",\n  \"strategy.detail\": \"LINEAR模式用1个完整自然段，DAG模式用2-3个完整自然段，描述整体思路。严禁展开具体工作内容、代码、参数。\"\n}",
+  "body": "{\n  \"todos.extractedEntities\": \"用户明确提到的金融实体、指数、基金或股票名称。\",\n  \"todos.description\": \"1-3句话描述该Todo要完成的任务\",\n  \"todos.dependsOn\": \"依赖的todoId列表（DAG模式下可选）\",\n  \"todos.groupKey\": \"可选：并行分组键\",\n  \"todos.parallelizable\": \"可选：该节点是否可并行\",\n  \"strategy.mode\": \"执行模式：LINEAR串行(1段描述)或DAG并行(2-3段描述)\",\n  \"strategy.detail\": \"LINEAR模式用1个完整自然段，DAG模式用2-3个完整自然段，描述整体思路。严禁展开具体工作内容、代码、参数。\",\n  \"todos.expectedTools\": \"预计可能使用的工具名，可省略或为空；仅供依赖检查，不限制执行选择。\"\n}",
   "variables": [],
-  "utf8Sha256": "56637d18a6e05dd829cc24a30b1ee9609cd41ad1c5020ca836fabf852d5581e1",
+  "utf8Sha256": "5879a78c301df7ea533ee91c5b27ecc9401c73c8ec73e2c91ddbee43c53ed68f",
   "source": {
     "repository": "alphafrog-micro",
     "file": "agentPlatformShared/src/main/java/world/willfrog/agent/workflow/StructuredPlanningSupport.java",

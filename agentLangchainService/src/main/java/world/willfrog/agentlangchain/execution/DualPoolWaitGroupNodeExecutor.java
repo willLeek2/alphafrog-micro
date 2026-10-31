@@ -55,6 +55,7 @@ import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
 import world.willfrog.agentlangchain.acceptance.FixtureCallIdentity;
 import world.willfrog.agentlangchain.acceptance.FixtureRuleHitStore;
 import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
+import world.willfrog.agentlangchain.tooljob.ToolResultRecordedEventPublisher;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
@@ -112,6 +113,8 @@ public class DualPoolWaitGroupNodeExecutor {
     private ToolPromptCatalog toolPrompts;
     @Autowired
     private RootTreeCallBudget rootTreeCallBudget;
+    @Autowired
+    private ToolResultRecordedEventPublisher resultEvents;
     private final LangchainRunExecutionGuard executionGuard;
     private final WaitGroupStore waitGroupStore;
     private final NodeToolDispatcher toolDispatcher;
@@ -343,6 +346,10 @@ public class DualPoolWaitGroupNodeExecutor {
         PromptText budget = toolCallBudgetNote(input.identity().runId());
         PromptText policies = PromptText.concat(admission, budget);
         actualMessages.add(Math.min(1, actualMessages.size()), PromptMessage.system(policies));
+        PromptText dependencyFacts = LangchainTodoUserMessageBuilder.dependencyCheckFacts(
+                input.request().getDependencyCheck(), input.request().getPlanGeneration(), input.todo().getId());
+        actualMessages.add(Math.min(2, actualMessages.size()),
+                PromptMessage.runtimeData(UserMessage.from(dependencyFacts.text())));
         NodeWorkItemIdentity identity = input.identity();
         if (rootTreeCallBudget != null) rootTreeCallBudget.beforeModelCall(identity, Integer.toString(modelTurn));
         String pendingHint = AgentContext.getLastMileHint();
@@ -657,6 +664,7 @@ public class DualPoolWaitGroupNodeExecutor {
                             suspended.groupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
                             resultJson, member.getExternalOperationId(), input.identity().planGeneration(),
                             input.versions().contextVersion(), input.versions().runControlVersion()));
+                    publishMemberCompletion(input, member, completed);
                     notificationId = keepNotification(notificationId, completed.notificationId());
                     continue;
                 }
@@ -685,6 +693,7 @@ public class DualPoolWaitGroupNodeExecutor {
                             suspended.groupId(), member.getMemberIdentity(), WaitMemberState.FAILED,
                             resultJson, member.getExternalOperationId(), input.identity().planGeneration(),
                             input.versions().contextVersion(), input.versions().runControlVersion()));
+                    publishMemberCompletion(input, member, completed);
                     notificationId = keepNotification(notificationId, completed.notificationId());
                 }
             }
@@ -1092,6 +1101,7 @@ public class DualPoolWaitGroupNodeExecutor {
                     member.getGroupId(), member.getMemberIdentity());
             return result.notificationId();
         }
+        publishMemberCompletion(input, member, result);
         recordMemberAction(input, member, designated.isPresent() ? namedBy : null, actionNotApplied);
         return result.notificationId();
     }
@@ -1099,6 +1109,19 @@ public class DualPoolWaitGroupNodeExecutor {
     private static Map<String, Object> resultSources(PromptText prompt) {
         return prompt == null ? Map.of() : PromptMessageCodec.sourceAttributes(prompt.sources().isEmpty()
                 ? PromptMessage.Origin.RUNTIME_DATA : PromptMessage.Origin.APPLICATION_INSTRUCTION, prompt.sources());
+    }
+
+    /** 通知只引用最终保存结果；活动事务交给发布器在提交后读取，回滚不发送。 */
+    private void publishMemberCompletion(SegmentExecution input, WaitMember member, MemberCompletionResult result) {
+        if (!result.applied() || resultEvents == null) return;
+        try {
+            resultEvents.publishMemberAfterCommit(input.identity().runId(), input.request().getUserId(),
+                    member.getGroupId(), member.getMemberIdentity());
+        } catch (RuntimeException failure) {
+            // 展示通知失败不改变成员终态，也不进入结果载荷降级重写。
+            log.warn("成员终态已保存，结果通知未发送：group={} member={}",
+                    member.getGroupId(), member.getMemberIdentity(), failure);
+        }
     }
 
     /**

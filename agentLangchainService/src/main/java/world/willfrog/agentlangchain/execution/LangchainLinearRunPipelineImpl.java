@@ -1,6 +1,8 @@
 package world.willfrog.agentlangchain.execution;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.invocation.InvocationContext;
@@ -10,6 +12,7 @@ import dev.langchain4j.service.tool.ToolProviderRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -29,6 +32,7 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
+import world.willfrog.agent.workflow.PlanDependencyCheckReport;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
@@ -38,6 +42,7 @@ import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.agentlangchain.planning.PlanDependencyCheckService;
 import world.willfrog.agentlangchain.failure.LangchainFailureDecision;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
@@ -47,9 +52,12 @@ import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoverySer
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.BooleanSupplier;
 import java.time.OffsetDateTime;
@@ -118,6 +126,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
+
+    @Autowired(required = false)
+    private PlanDependencyCheckService planDependencyCheckService;
+
+    @Value("${agent.event.payload.max-chars:10000}")
+    private int dependencyEventMaxChars = 10000;
 
     private final RunOwnershipGateway ownershipGateway;
 
@@ -264,6 +278,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             stage = "resolve_plan";
             PlanResolution resolution = resolvePlan(run, inputs);
 
+            if (resolution == null) {
+                return;
+            }
+
             stage = "execute_workflow";
             LangchainWorkflowResult result = executeWorkflow(inputs, resolution);
             if (result == null) {
@@ -360,6 +378,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             userGoal = inputs.userGoal();
             stage = "resolve_plan";
             PlanResolution resolution = resolvePlan(run, inputs);
+            if (resolution == null) {
+                return null;
+            }
             return new DualPoolPlanPreparation(
                     run,
                     resolution.plan(),
@@ -398,6 +419,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         StageInputs inputs = resolveStageInputs(run);
         LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+        inputs.workflowRequest().setDependencyCheck(plan.getDependencyCheck());
         return new DualPoolNodeContext(
                 run,
                 plan,
@@ -718,8 +740,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
                     inputs.runId(), inputs.requestedExecutionMode(), planned.getExecutionMode(), effectiveExecutionMode);
         }
-        // PLAN_READY 前先把冻结 Plan 和 LINEAR 初始 checkpoint 写稳。
-        persistPlan(inputs.runId(), inputs.userId(), plan);
+        PlanDependencyCheckService checker = planDependencyCheckService == null
+                ? new PlanDependencyCheckService(null, objectMapper) : planDependencyCheckService;
+        plan.setDependencyCheck(checker.check(plan, inputs.workflowRequest()));
+        inputs.workflowRequest().setDependencyCheck(plan.getDependencyCheck());
+        // 计划保存成功后再建立检查点和发送事件，状态已变化时停止准备。
+        if (!persistPlan(inputs.runId(), inputs.userId(), plan)) {
+            return null;
+        }
         if (workflowCheckpointService != null) {
             if (useDag) {
                 workflowCheckpointService.initializeDag(inputs.runId(), inputs.userId());
@@ -736,9 +764,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 "effective_execution_mode", effectiveExecutionMode.name(),
                 "workflow", useDag ? "dag" : "linear",
                 "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
-                "plan", plan,
+                "plan", planReadyEventPlan(plan),
                 "reason", modeDecision.reason()
         ));
+        appendDependencyCheckEvent(inputs.runId(), inputs.userId(), run.getPlanGeneration(), plan, false, null);
         return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
     }
 
@@ -851,6 +880,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     runId, userId, run.getPlanGeneration(), userGoal, executionContext.dialogueContext(),
                     executionContext.dialogueContextPrompt(),
                     stageModels, toolSpecifications, runConfig);
+            workflowRequest.setDependencyCheck(plan.getDependencyCheck());
 
             // token + leaseVersion 使重复 launcher 只能写出一条 WORKFLOW_RESUMED 事件。
             String resumedDedupeKey = runId + ":" + resumeContext.getResumeToken()
@@ -862,6 +892,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     "resume_lease_version", resumeContext.getResumeLeaseVersion(),
                     "planner_skipped", true
             ));
+            appendDependencyCheckEvent(runId, userId, run.getPlanGeneration(), plan, true,
+                    resumedDedupeKey + ":dependency_check");
 
             // executor 按 checkpoint 跳过已完成 Todo，并把终态结果注入原挂起节点。
             LangchainWorkflowResult result = linearWorkflowExecutor.resumePlanned(
@@ -1258,15 +1290,62 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 checkpointCoordinator());
     }
 
-    private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
+    private boolean persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
-        updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, planJson);
+        if (updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, planJson) <= 0) {
+            return false;
+        }
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
             // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史的权威副本。
             // valid=true 说明这是 planner 生成并被 pipeline 接受的计划，不是 HITL 修改中的临时草稿。
             stateStore.recordPlan(runId, planJson, true);
         }
+        return true;
+    }
+
+    /** 普通计划事件维持原字段，检查报告通过独立事件和计划快照读取。 */
+    private ObjectNode planReadyEventPlan(LangchainTodoPlan plan) {
+        ObjectNode copy = objectMapper.valueToTree(plan);
+        copy.remove("dependencyCheck");
+        for (JsonNode item : copy.path("items")) {
+            if (item instanceof ObjectNode object) object.remove("expectedTools");
+        }
+        return copy;
+    }
+
+    /** 恢复只公布原报告的复用事实，不重新检查或改写原检查时间。 */
+    protected void appendDependencyCheckEvent(String runId, String userId, Integer generation,
+                                             LangchainTodoPlan plan, boolean frozenReuse, String dedupeKey) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        PlanDependencyCheckReport report = plan.getDependencyCheck();
+        payload.put("report", report);
+        payload.put("plan_generation", generation);
+        payload.put("frozen_reuse", frozenReuse);
+        if (report == null) payload.put("report_missing", true);
+        int limit = dependencyEventMaxChars <= 0 ? PlanDependencyCheckReport.MAX_REPORT_CHARACTERS
+                : Math.min(dependencyEventMaxChars, PlanDependencyCheckReport.MAX_REPORT_CHARACTERS);
+        if (writeJson(payload).length() > limit && report != null) {
+            Set<String> affected = new LinkedHashSet<>();
+            if (plan.getItems() != null) {
+                for (TodoItem item : plan.getItems()) {
+                    if (item != null && item.getId() != null && !item.getId().isBlank()) affected.add(item.getId());
+                }
+            }
+            List<String> visibleIds = new ArrayList<>(affected.stream()
+                    .map(PlanDependencyCheckService::safeIdentifier).filter(id -> !id.isBlank())
+                    .limit(PlanDependencyCheckReport.MAX_HINTS).toList());
+            PlanDependencyCheckReport summary = report.toBuilder()
+                    .hints(List.of(new PlanDependencyCheckReport.Hint("", "", "report.omitted", "未覆盖部分",
+                            PlanDependencyCheckReport.Status.UNCHECKED, PlanDependencyCheckReport.Basis.NONE,
+                            "事件报告已缩减；业务调用和数据覆盖未检查，完整事实保存在计划快照中。")))
+                    .omittedCount(report.getOmittedCount() + (report.getHints() == null ? 0 : report.getHints().size()))
+                    .omittedTodoIds(visibleIds).omittedTodoCount(affected.size()).truncated(true).build();
+            payload.put("report", summary);
+            while (!visibleIds.isEmpty() && writeJson(payload).length() > limit) visibleIds.remove(visibleIds.size() - 1);
+        }
+        if (dedupeKey == null) eventService.append(runId, userId, "DEPENDENCIES_CHECKED", payload);
+        else eventService.appendOnce(runId, userId, "DEPENDENCIES_CHECKED", dedupeKey, payload);
     }
 
     protected void validateFrozenPlan(LangchainTodoPlan plan) {

@@ -85,6 +85,7 @@ public class FrozenPlanRestartPipeline extends LangchainLinearRunPipelineImpl {
         }
         LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
         validateFrozenPlan(plan);
+        inputs.workflowRequest().setDependencyCheck(plan.getDependencyCheck());
         // 冻结 Plan 的生效模式同样交给 ExecutionModeResolver 一次裁完（只读裁决，不调规划器）。
         ExecutionModeResolver.Decision frozenDecision = ExecutionModeResolver.inspectFrozen(plan);
         boolean useDag = frozenDecision.useDag();
@@ -117,6 +118,8 @@ public class FrozenPlanRestartPipeline extends LangchainLinearRunPipelineImpl {
                         "workflow", useDag ? "dag" : "linear",
                         "restart_from", useDag ? "graph_start" : restartCheckpoint.getNextTodoId()
                 ));
+        appendDependencyCheckEvent(runId, userId, run.getPlanGeneration(), plan, true,
+                runId + ":restart:" + restartAttempt + ":dependency_check");
         return new PlanResolution(plan, useDag, effectiveExecutionMode, restartCheckpoint);
     }
 }
