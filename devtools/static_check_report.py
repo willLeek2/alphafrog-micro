@@ -2,9 +2,11 @@
 """按明确清单读取已有检查报告，保留覆盖缺口及版本比较依据。"""
 
 import argparse
+import ast
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -27,7 +29,9 @@ def nonempty_string(value):
 
 
 def match_key(item):
-    return tuple(item.get(k) for k in ("report_module", "report_class", "report_case"))
+    if item.get("format") == "pass_fail_text_v1":
+        return ("pass_fail_text_v1", item.get("report_module"), item.get("report_name"))
+    return ("junit_xml",) + tuple(item.get(k) for k in ("report_module", "report_class", "report_case"))
 
 
 def load_manifest(path):
@@ -46,10 +50,17 @@ def load_manifest(path):
             raise ValueError("清单检查编号重复: " + identity)
         ids.add(identity)
         source = check.get("source")
-        if not isinstance(source, dict) or not all(
-                nonempty_string(source.get(k)) for k in ("file", "class", "method")):
-            raise ValueError(identity + ": source 需要 file、class、method 三个字符串")
-        definition = (check["repo"], check["module"], source["class"], source["method"])
+        if not isinstance(source, dict) or not nonempty_string(source.get("file")):
+            raise ValueError(identity + ": source 需要 file 字符串")
+        named = "check_name" in source
+        if named:
+            if not nonempty_string(source["check_name"]) or any(k in source for k in ("class", "method")):
+                raise ValueError(identity + ": 具名定义需要 check_name，不填写 class/method")
+            definition = (check["repo"], check["module"], "named", source["file"], source["check_name"])
+        else:
+            if not all(nonempty_string(source.get(k)) for k in ("class", "method")):
+                raise ValueError(identity + ": XML源定义需要 class/method 字符串")
+            definition = (check["repo"], check["module"], "junit_xml", source["class"], source["method"])
         if definition in definitions:
             raise ValueError(identity + ": 相同源定义重复，请合并到同一条 report_matches")
         definitions.add(definition)
@@ -63,8 +74,19 @@ def load_manifest(path):
         if not isinstance(report_matches, list) or not report_matches:
             raise ValueError(identity + ": 需要非空 report_matches 数组")
         for item in report_matches:
-            if not isinstance(item, dict) or not all(nonempty_string(x) for x in match_key(item)):
-                raise ValueError(identity + ": 每项报告对应关系需要模块、类、用例字符串")
+            if not isinstance(item, dict):
+                raise ValueError(identity + ": 报告对应项必须是对象")
+            report_format = item.get("format", "junit_xml")
+            if report_format not in ("junit_xml", "pass_fail_text_v1"):
+                raise ValueError(identity + ": 不支持的报告格式")
+            if (report_format == "pass_fail_text_v1") != named:
+                raise ValueError(identity + ": 具名源定义与文本报告格式必须对应")
+            forbidden = ("report_class", "report_case") if named else ("report_name",)
+            if any(k in item for k in forbidden):
+                raise ValueError(identity + ": 报告对应项混用了两种格式的身份字段")
+            if not all(nonempty_string(x) for x in match_key(item)):
+                required = "report_module/report_name" if named else "模块、类、用例"
+                raise ValueError(identity + ": 每项报告对应关系需要 " + required + " 字符串")
             if item["report_module"] != check["module"]:
                 raise ValueError(identity + ": 清单模块与报告对应模块不一致")
             key = (check["repo"],) + match_key(item)
@@ -133,16 +155,77 @@ def local_tag(element):
     return element.tag.rsplit("}", 1)[-1]
 
 
-def read_junit_reports(executions):
+def read_pass_fail_text(raw, repo, module, path, digest):
+    """只按明确的逐行记录取值；辅助输出不补齐检查状态。"""
+    records, issues, auxiliary, summaries = [], [], [], []
+    issue = {"repo": repo, "report": str(path)}
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        return [], [dict(issue, reason="文本报告不是有效UTF-8: " + str(error))], []
+    for line_number, line in enumerate(lines, 1):
+        original = {"line_number": line_number, "raw_line": line}
+        if line.startswith(("PASS ", "FAIL ")):
+            name, delimiter, detail = line[5:].partition(" | ")
+            if not nonempty_string(name) or name.startswith(" "):
+                issues.append(dict(issue, **original, reason="文本记录缺少原名或前缀后不止一个空格"))
+                continue
+            failed = line.startswith("FAIL ")
+            records.append({
+                "repo": repo, "format": "pass_fail_text_v1", "report_module": module,
+                "report_name": name, "status": "failed" if failed else "passed",
+                "report": str(path), "report_sha256": digest, **original,
+                "detail": detail if delimiter else None, "input_issues": [],
+                "failure_originals": [{"kind": "FAIL", **original,
+                                       "detail": detail if delimiter else None}] if failed else [],
+            })
+            continue
+        summary = re.fullmatch(r"== ([0-9]+) passed, ([0-9]+) failed ==", line)
+        valid_auxiliary = not line.strip() or summary is not None
+        if summary:
+            summaries.append((int(summary[1]), int(summary[2]), original))
+        if line.startswith("__EXECUTE_QUERY_RESULT__"):
+            try:
+                valid_auxiliary = isinstance(json.loads(line[len("__EXECUTE_QUERY_RESULT__"):]), dict)
+            except ValueError:
+                valid_auxiliary = False
+        if line.startswith("FAILED: "):
+            try:
+                value = ast.literal_eval(line[len("FAILED: "):])
+                valid_auxiliary = isinstance(value, list) and all(isinstance(x, str) for x in value)
+            except (ValueError, SyntaxError):
+                valid_auxiliary = False
+        if valid_auxiliary:
+            auxiliary.append(original)
+        else:
+            issues.append(dict(issue, **original, reason="无法识别的文本报告行"))
+    actual = (sum(r["status"] == "passed" for r in records),
+              sum(r["status"] == "failed" for r in records))
+    for passed, failed, original in summaries:
+        if (passed, failed) != actual:
+            issues.append(dict(issue, **original, reason="文本汇总与逐行记录数量不一致"))
+    return records, issues, auxiliary
+
+
+def read_reports(executions):
     records, issues, files = [], [], []
     for repo, execution in executions.items():
         seen_paths = set()
         for supplied in execution["reports"]:
             issue = {"repo": repo, "report": supplied}
-            if not nonempty_string(supplied):
+            text_report = isinstance(supplied, dict)
+            if text_report:
+                if supplied.get("format") != "pass_fail_text_v1" or not all(
+                        nonempty_string(supplied.get(k)) for k in ("path", "module")):
+                    issues.append(dict(issue, reason="文本报告需要明确的 format、path、module"))
+                    continue
+                supplied_path = supplied["path"]
+            else:
+                supplied_path = supplied
+            if not nonempty_string(supplied_path):
                 issues.append(dict(issue, reason="报告路径必须是字符串"))
                 continue
-            path = Path(supplied)
+            path = Path(supplied_path)
             if not path.is_absolute():
                 if execution["root"] is None:
                     issues.append(dict(issue, reason="相对报告路径缺少 root"))
@@ -153,14 +236,31 @@ def read_junit_reports(executions):
                 issues.append(dict(issue, reason="同一报告路径重复提供"))
                 continue
             seen_paths.add(path)
-            module = module_for_report(path, execution["root"])
+            if text_report:
+                if execution["root"] is None or not path.is_relative_to(Path(execution["root"])):
+                    issues.append(dict(issue, reason="文本报告必须位于声明的 root 内"))
+                    continue
+                module = supplied["module"]
+            else:
+                module = module_for_report(path, execution["root"])
             try:
                 raw = path.read_bytes()
-                root = ET.fromstring(raw)
-            except (OSError, ET.ParseError) as error:
+            except OSError as error:
                 issues.append(dict(issue, reason="报告无法读取或解析: " + str(error)))
                 continue
             digest = hashlib.sha256(raw).hexdigest()
+            if text_report:
+                text_records, text_issues, auxiliary = read_pass_fail_text(raw, repo, module, path, digest)
+                records.extend(text_records)
+                issues.extend(text_issues)
+                files.append({"repo": repo, "path": str(path), "sha256": digest, "bytes": len(raw),
+                              "format": "pass_fail_text_v1", "module": module, "auxiliary_lines": auxiliary})
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as error:
+                issues.append(dict(issue, reason="报告无法读取或解析: " + str(error)))
+                continue
             files.append({"repo": repo, "path": str(path), "sha256": digest, "bytes": len(raw)})
             if local_tag(root) not in ("testsuite", "testsuites"):
                 issues.append(dict(issue, reason="不支持的 XML 根元素: " + local_tag(root)))
@@ -229,6 +329,7 @@ def summarize_coverage(manifest, executions, reports, side):
     for check in manifest["checks"]:
         repo = check["repo"]
         records, missing, issues = [], [], []
+        duplicate_text = False
         for match in check["report_matches"]:
             key = (repo,) + match_key(match)
             found = index.get(key, [])
@@ -236,6 +337,7 @@ def summarize_coverage(manifest, executions, reports, side):
                 missing.append(dict(match))
             if len(found) > 1:
                 issues.append("同一报告对应项出现重复记录: " + repr(match_key(match)))
+                duplicate_text = duplicate_text or match.get("format") == "pass_fail_text_v1"
             records.extend(found)
             mapped.add(key)
         for record in records:
@@ -245,7 +347,9 @@ def summarize_coverage(manifest, executions, reports, side):
             issues.append("清单声明定义不存在，但报告含对应记录")
         # 报告无法解析或重复时，不能确定它是否另含相同检查。
         issues.extend(x["reason"] for x in reports["issues"] if x["repo"] == repo)
-        if any(x["status"] == "failed" for x in records):
+        if duplicate_text:
+            status = "not_executed"
+        elif any(x["status"] == "failed" for x in records):
             status = "failed"
         elif any(x["status"] == "skipped" for x in records):
             status = "skipped"
@@ -331,7 +435,7 @@ def build_report(manifest, executions, reports):
     return {"schema_version": 1, "manifest": manifest, "checks": checks, "summary": summary,
             "executions": executions, "report_files": {s: reports[s]["files"] for s in reports},
             "unmapped_records": unmapped, "input_issues": {s: reports[s]["issues"] for s in reports},
-            "evidence_boundary": "未执行表示未取得对应执行记录；执行来源由维护者声明，XML本身不能证明提交或实际业务可用性。"}
+            "evidence_boundary": "未执行表示未取得完整可信的对应记录；执行来源由维护者声明，报告本身不能证明提交或实际业务可用性。"}
 
 
 def markdown_report(report):
@@ -355,12 +459,13 @@ def markdown_report(report):
         for side in ("baseline", "candidate"):
             for record in item[side]["records"]:
                 for failure in record["failure_originals"]:
-                    raw = failure["xml"]
+                    raw = failure["raw_line"] if record.get("format") == "pass_fail_text_v1" else failure["xml"]
+                    language = "text" if record.get("format") == "pass_fail_text_v1" else "xml"
                     fence = "```"
                     while fence in raw:
                         fence += "`"
                     lines.extend([item["check_id"] + " / " + side + " / " + record["report"],
-                                  "", fence + "xml", raw, fence, ""])
+                                  "", fence + language, raw, fence, ""])
     for side in ("baseline", "candidate"):
         lines.append(side + "：未对应记录" + str(len(report["unmapped_records"][side])) + "。")
         for issue in report["input_issues"][side]:
@@ -380,7 +485,7 @@ def main(argv=None):
     try:
         manifest = load_manifest(args.manifest)
         executions = {s: load_execution_record(getattr(args, s)) for s in ("baseline", "candidate")}
-        reports = {s: read_junit_reports(e) for s, e in executions.items()}
+        reports = {s: read_reports(e) for s, e in executions.items()}
         report = build_report(manifest, executions, reports)
         payload = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         if args.json_output:
