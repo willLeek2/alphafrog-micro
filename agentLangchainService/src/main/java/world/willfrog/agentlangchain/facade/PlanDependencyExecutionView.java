@@ -82,6 +82,7 @@ final class PlanDependencyExecutionView {
         }
         // 报告通知可在同次调用恢复后更新；只有重新执行及其首次检查推进结果下界。
         view.put("result_after_seq", resultAfterSeq);
+        view.put("requires_start_proof", restartSeq > 0);
         view.put("prepared", check != null);
         view.put("frozen_reuse", check != null && Boolean.TRUE.equals(check.payload().get("frozen_reuse")));
         if (check == null) {
