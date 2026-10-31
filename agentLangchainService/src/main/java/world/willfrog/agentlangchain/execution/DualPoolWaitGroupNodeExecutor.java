@@ -1090,7 +1090,9 @@ public class DualPoolWaitGroupNodeExecutor {
         MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
                 member.getGroupId(),
                 member.getMemberIdentity(),
-                success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
+                // 编码器可能将超长结果改写为失败，成员终态沿用最终载荷的业务判定。
+                WaitMemberResultPayload.succeeded(resultJson, objectMapper)
+                        ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
                 resultJson,
                 member.getExternalOperationId(),
                 input.identity().planGeneration(),
