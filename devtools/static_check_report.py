@@ -273,6 +273,11 @@ def comparable_value(check, field):
 
 
 def compare_checks(check, baseline, candidate, executions):
+    conflicts = [side + " 清单声明定义不存在，但报告含对应记录"
+                 for side, result in (("baseline", baseline), ("candidate", candidate))
+                 if not check["exists_in_" + side] and result["records"]]
+    if conflicts:
+        return {"kind": "incomparable", "reasons": conflicts}
     if not check["exists_in_baseline"] and check["exists_in_candidate"]:
         return {"kind": "candidate_only", "reasons": ["候选新增定义，不属于同一检查的失败变化"]}
     reasons = []
