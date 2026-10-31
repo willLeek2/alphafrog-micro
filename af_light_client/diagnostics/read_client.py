@@ -31,7 +31,6 @@ import uuid
 import requests
 
 
-DEFAULT_BASE_URL = "http://101.200.12.101:8090"
 DEFAULT_REPO_ROOT = Path.home() / "workspace" / "alphafrog" / "alphafrog-micro"
 DIAGNOSTIC_READ_CAPABILITIES_PATH = "/api/agent/diagnostics/read-capabilities"
 REQUIRED_DIAGNOSTIC_READ_CAPABILITIES = (
@@ -1181,7 +1180,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("ALPHAFROG_BASE_URL", DEFAULT_BASE_URL),
+        default=os.environ.get("ALPHAFROG_BASE_URL", ""),
         help="Frontend 服务地址；也可用 ALPHAFROG_BASE_URL",
     )
     parser.add_argument(
