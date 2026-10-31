@@ -697,14 +697,14 @@ class DualPoolWaitGroupNodeExecutorTest {
                     assertThat(completed.resultPatch()).containsEntry("cumulativeToolCallsUsed", 5);
                 });
         List<ChatMessage> messages = model.lastRequest();
-        assertThat(messages).as("系统 + 本轮限制 + 用户 + 助手 + 三条工具结果").hasSize(7);
-        assertThat(messages.subList(4, 7)).allSatisfy(message ->
+        assertThat(messages).as("系统 + 本轮限制 + 依赖事实 + 用户 + 助手 + 三条工具结果").hasSize(8);
+        assertThat(messages.subList(5, 8)).allSatisfy(message ->
                 assertThat(message).isInstanceOf(ToolExecutionResultMessage.class));
-        assertThat(messages.subList(4, 7)).extracting(message ->
+        assertThat(messages.subList(5, 8)).extracting(message ->
                         ((ToolExecutionResultMessage) message).id())
                 .as("按成员原始序号接回，与完成先后无关")
                 .containsExactly("call-a", "call-b", "call-c");
-        assertThat(messages.subList(4, 7)).extracting(message ->
+        assertThat(messages.subList(5, 8)).extracting(message ->
                         ((ToolExecutionResultMessage) message).text())
                 .containsExactly("第一个结果", "第二个结果", "第三个结果");
     }
