@@ -327,6 +327,9 @@ public class LangchainTodoNodeExecutor {
                 ToolCapabilityPromptRenderer.renderText(promptService, request.getToolSpecifications()));
         if (toolResult == null) throw sourceMissing("恢复工具结果缺少明确来源归类");
         PromptText userMessage = PromptText.concat(base, PromptText.runtimeData("\n\n"),
+                LangchainTodoUserMessageBuilder.dependencyCheckFacts(
+                        request.getDependencyCheck(), request.getPlanGeneration(), item.getId()),
+                PromptText.runtimeData("\n\n"),
                 instruction("todoResumedToolInstruction"), PromptText.runtimeData("\n\n"), toolResult);
         try {
             ensureRunnable(request);
@@ -398,6 +401,9 @@ public class LangchainTodoNodeExecutor {
                 item.getDescription(),
                 request.getToolSpecifications(),
                 ToolCapabilityPromptRenderer.renderText(promptService, request.getToolSpecifications()));
+        userMessage = PromptText.concat(userMessage, PromptText.runtimeData("\n\n"),
+                LangchainTodoUserMessageBuilder.dependencyCheckFacts(
+                        request.getDependencyCheck(), request.getPlanGeneration(), item.getId()));
         if (retryContext != null) {
             userMessage = PromptText.concat(userMessage, buildTodoRetryUserMessage(retryContext));
         }

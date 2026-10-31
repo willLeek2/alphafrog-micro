@@ -121,6 +121,8 @@ public class LangchainAiPlanner {
                 : request.getExecutionMode();
         String toolList = buildToolList(request.getToolSpecifications());
         PromptText history = preparation().history(request.getDialogueContext(), request.getDialogueContextPrompt());
+        // 即使不发送JSON结构，解析也采用本次原根字典；同一次规划及其重试只选择一次。
+        PlanningPromptPreparation.SchemaDescriptions descriptions = preparation().descriptions();
 
         String previousPhase = AgentContext.getPhase();
         AgentContext.setPhase(AgentRunObservabilityService.PHASE_PLANNING);
@@ -128,11 +130,11 @@ public class LangchainAiPlanner {
         AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         try {
             if (structuredOutputSettings.strategyStageEnabled()) {
-                return planTwoStageStructured(request, mode, maxTodos, toolList, history);
+                return planTwoStageStructured(request, mode, maxTodos, toolList, history, descriptions);
             }
             log.warn("[LangchainAiPlanner] runId={} legacy_single_stage_planning_enabled",
                     nvl(request.getRunId()));
-            return planSingleStageLegacyTemplate(request, mode, maxTodos, toolList, history);
+            return planSingleStageLegacyTemplate(request, mode, maxTodos, toolList, history, descriptions);
         } finally {
             restoreStructuredOutputSpec(previousSpec);
             restoreStage(previousStage);
@@ -176,7 +178,8 @@ public class LangchainAiPlanner {
                                                      PlanExecutionMode mode,
                                                      int maxTodos,
                                                      String toolList,
-                                                     PromptText history) {
+                                                     PromptText history,
+                                                     PlanningPromptPreparation.SchemaDescriptions descriptions) {
         int maxAttempts = resolvePlanningMaxAttempts();
         int maxDetailLength = structuredOutputSettings.strategyMaxDetailLength();
         boolean structuredEnabled = structuredOutputSettings.structuredEnabled();
@@ -209,14 +212,13 @@ public class LangchainAiPlanner {
                 ctx.addUserPrompt(preparation().userMessage(dynamicPrefix, strategyStage, request.getUserGoal(), history));
 
                 AgentContext.setStage("planning_strategy");
-                var strategyDescriptions = structuredEnabled ? preparation().descriptions() : null;
                 applyStructuredSpec(
                         structuredEnabled,
                         STRATEGY_SCHEMA_NAME,
                         structuredOutputSettings.structuredStrict(),
                         structuredEnabled ? StructuredPlanningSupport.strategyStageJsonSchema(maxDetailLength,
-                                strategyDescriptions.values()) : java.util.Map.of(),
-                        structuredEnabled ? strategyDescriptions.sources() : List.of(),
+                                descriptions.values()) : java.util.Map.of(),
+                        structuredEnabled ? descriptions.sources() : List.of(),
                         request
                 );
                 ChatResponse strategyResponse = chat(request, attempt, "strategy", ctx.snapshot());
@@ -251,19 +253,18 @@ public class LangchainAiPlanner {
                 ctx.addUserPrompt(todosStage);
 
                 AgentContext.setStage("planning_todos");
-                var todoDescriptions = structuredEnabled ? preparation().descriptions() : null;
                 applyStructuredSpec(
                         structuredEnabled,
                         TODO_PLAN_SCHEMA_NAME,
                         structuredOutputSettings.structuredStrict(),
-                        structuredEnabled ? structuredOutputSettings.todoPlanningJsonSchema(todoDescriptions.values()) : java.util.Map.of(),
-                        structuredEnabled ? todoDescriptions.sources() : List.of(),
+                        structuredEnabled ? structuredOutputSettings.todoPlanningJsonSchema(descriptions.values()) : java.util.Map.of(),
+                        structuredEnabled ? descriptions.sources() : List.of(),
                         request
                 );
                 ChatResponse todosResponse = chat(request, attempt, "todos", ctx.snapshot());
                 String todosRaw = todosResponse.aiMessage() == null ? "" : nvl(todosResponse.aiMessage().text());
                 LangchainTodoPlan plan = parseValidateTodoPlan(
-                        todosRaw, effectiveStrategyMode, maxTodos);
+                        todosRaw, effectiveStrategyMode, maxTodos, descriptions.expectedToolsEnabled());
                 if (overallPlan.detail() != null && !overallPlan.detail().isBlank()) {
                     plan = LangchainTodoPlan.builder()
                             .analysis(overallPlan.detail())
@@ -322,13 +323,13 @@ public class LangchainAiPlanner {
                                                             PlanExecutionMode mode,
                                                             int maxTodos,
                                                             String toolList,
-                                                            PromptText history) {
+                                                            PromptText history,
+                                                            PlanningPromptPreparation.SchemaDescriptions descriptions) {
         AgentContext.setStage("planning_todos");
         boolean structuredEnabled = structuredOutputSettings.structuredEnabled();
         int maxAttempts = resolvePlanningMaxAttempts();
         StructuredPlanningSupport.StructuredPlanningException lastError = null;
         try {
-            var descriptions = structuredEnabled ? preparation().descriptions() : null;
             applyStructuredSpec(structuredEnabled, TODO_PLAN_SCHEMA_NAME, structuredOutputSettings.structuredStrict(),
                     structuredEnabled ? structuredOutputSettings.todoPlanningJsonSchema(descriptions.values()) : java.util.Map.of(),
                     structuredEnabled ? descriptions.sources() : List.of(), request);
@@ -353,7 +354,8 @@ public class LangchainAiPlanner {
                                 .chatRequestTransformer(actual -> preparation().request(actual, snapshot, spec)), system).build();
                 try (ModelInputScope ignored = preparation().open(request.getPlanningEndpointName(), snapshot, spec)) {
                     beforePlanningModelCall(request, attempt, "single");
-                    LangchainTodoPlan plan = parseValidateTodoPlan(service.plan(userMessage.text()), mode, maxTodos);
+                    LangchainTodoPlan plan = parseValidateTodoPlan(service.plan(userMessage.text()), mode, maxTodos,
+                            descriptions.expectedToolsEnabled());
                     log.info("[LangchainAiPlanner] runId={} legacy_single_stage_planning ok attempt={} todos={}",
                             nvl(request.getRunId()), attempt, plan.getItems().size());
                     return plan;
@@ -428,10 +430,11 @@ public class LangchainAiPlanner {
 
     private LangchainTodoPlan parseValidateTodoPlan(String raw,
                                                     PlanExecutionMode mode,
-                                                    int maxTodos) {
+                                                    int maxTodos,
+                                                    boolean expectedToolsEnabled) {
         JsonNode root = StructuredPlanningSupport.parseStructuredJson(objectMapper, raw);
         StructuredPlanningSupport.ValidationResult validation =
-                StructuredPlanningSupport.validateTodoPlan(root, maxTodos);
+                StructuredPlanningSupport.validateTodoPlan(root, maxTodos, expectedToolsEnabled);
         if (!validation.valid()) {
             throw new StructuredPlanningSupport.StructuredPlanningException(
                     validation.category(), validation.message());

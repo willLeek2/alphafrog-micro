@@ -123,6 +123,8 @@ final class LangchainWorkflowRouting {
                         .id(item.getId())
                         .sequence(index + 1)
                         .description(item.getDescription())
+                        .expectedTools(item.getExpectedTools() == null
+                                ? List.of() : new ArrayList<>(item.getExpectedTools()))
                         .status(item.getStatus())
                         .resultSummary(item.getResultSummary())
                         .output(item.getOutput())
@@ -139,6 +141,7 @@ final class LangchainWorkflowRouting {
                 .items(linearItems)
                 .extractedEntities(plan.getExtractedEntities() == null
                         ? List.of() : new ArrayList<>(plan.getExtractedEntities()))
+                .dependencyCheck(plan.getDependencyCheck())
                 .executionMode(PlanExecutionMode.LINEAR)
                 .build();
     }
@@ -152,6 +155,7 @@ final class LangchainWorkflowRouting {
                 .items(plan.getItems() == null ? List.of() : new ArrayList<>(plan.getItems()))
                 .extractedEntities(plan.getExtractedEntities() == null
                         ? List.of() : new ArrayList<>(plan.getExtractedEntities()))
+                .dependencyCheck(plan.getDependencyCheck())
                 .executionMode(mode)
                 .build();
     }

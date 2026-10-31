@@ -56,7 +56,7 @@ public final class PlanningPromptPreparation {
             if (dictionary == null || !dictionary.isObject()) throw unreadable("规划结构说明不是JSON对象");
             var keys = new LinkedHashSet<String>();
             dictionary.fieldNames().forEachRemaining(keys::add);
-            if (!keys.equals(StructuredPlanningSupport.planningDescriptionKeys())) {
+            if (!StructuredPlanningSupport.acceptsPlanningDescriptionKeys(keys)) {
                 throw unreadable("规划结构说明缺项或包含未知字段");
             }
             Map<String, String> values = new LinkedHashMap<>();
@@ -155,6 +155,9 @@ public final class PlanningPromptPreparation {
         public SchemaDescriptions {
             values = Map.copyOf(values);
             sources = List.copyOf(sources);
+        }
+        public boolean expectedToolsEnabled() {
+            return values.containsKey(StructuredPlanningSupport.EXPECTED_TOOLS_DESCRIPTION);
         }
         @Override public String toString() { return "SchemaDescriptions[fieldCount=" + values.size() + ", sourceCount=" + sources.size() + "]"; }
     }

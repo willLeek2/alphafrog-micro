@@ -50,6 +50,8 @@ public final class LangchainSubAgentExecutionContext {
         return LangchainWorkflowRequest.builder()
                 .runId(source.getRunId())
                 .userId(source.getUserId())
+                .planGeneration(source.getPlanGeneration())
+                .dependencyCheck(source.getDependencyCheck())
                 .userGoal(source.getUserGoal())
                 .dialogueContext(source.getDialogueContext())
                 .dialogueContextPrompt(source.getDialogueContextPrompt())
