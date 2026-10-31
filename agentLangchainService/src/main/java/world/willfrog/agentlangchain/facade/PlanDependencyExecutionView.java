@@ -87,6 +87,8 @@ final class PlanDependencyExecutionView {
         view.put("frozen_reuse", check != null && Boolean.TRUE.equals(check.payload().get("frozen_reuse")));
         if (check == null) {
             view.put("results", List.of());
+            view.put("call_starts", List.of());
+            view.put("omitted_call_start_count", 0);
             view.put("omitted_count", 0);
             view.put("omitted_todo_ids", List.of());
             return view;
@@ -166,10 +168,36 @@ final class PlanDependencyExecutionView {
         List<Map<String, Object>> all = new ArrayList<>(results.values());
         all.sort(Comparator.comparingInt(PlanDependencyExecutionView::eventSeq).reversed());
         List<Map<String, Object>> selected = new ArrayList<>(all.subList(0, Math.min(MAX_RESULTS, all.size())));
+        List<Map<String, Object>> allStarts = new ArrayList<>();
+        for (Map.Entry<StartKey, Integer> entry : starts.entrySet()) {
+            StartKey identity = entry.getKey();
+            if (results.containsKey(new CallKey(currentGeneration, identity.todo(), identity.tool(), identity.call()))) {
+                continue;
+            }
+            Map<String, Object> start = new LinkedHashMap<>();
+            start.put("event_seq", entry.getValue());
+            start.put("plan_generation", currentGeneration);
+            start.put("todo_id", identity.todo());
+            start.put("tool_name", identity.tool());
+            start.put("tool_call_id", identity.call());
+            allStarts.add(start);
+        }
+        allStarts.sort(Comparator.comparingInt(PlanDependencyExecutionView::eventSeq).reversed());
+        List<Map<String, Object>> selectedStarts = new ArrayList<>(allStarts.subList(0, Math.min(MAX_RESULTS, allStarts.size())));
         fillResults(view, all, selected);
-        while (mapper.writeValueAsString(view).length() > MAX_VIEW_CHARACTERS && !selected.isEmpty()) {
-            selected.remove(selected.size() - 1);
+        fillStarts(view, allStarts, selectedStarts);
+        while (mapper.writeValueAsString(view).length() > MAX_VIEW_CHARACTERS
+                && (!selected.isEmpty() || !selectedStarts.isEmpty())) {
+            // 完成结果和进行中身份共享响应体积预算，优先保留较近的事实。
+            if (!selectedStarts.isEmpty() && (selected.isEmpty()
+                    || eventSeq(selectedStarts.get(selectedStarts.size() - 1))
+                    < eventSeq(selected.get(selected.size() - 1)))) {
+                selectedStarts.remove(selectedStarts.size() - 1);
+            } else {
+                selected.remove(selected.size() - 1);
+            }
             fillResults(view, all, selected);
+            fillStarts(view, allStarts, selectedStarts);
         }
         @SuppressWarnings("unchecked")
         List<String> omittedTodos = (List<String>) view.get("omitted_todo_ids");
@@ -177,6 +205,12 @@ final class PlanDependencyExecutionView {
             omittedTodos.remove(omittedTodos.size() - 1);
         }
         return view;
+    }
+
+    private static void fillStarts(Map<String, Object> view, List<Map<String, Object>> all,
+                                   List<Map<String, Object>> selected) {
+        view.put("call_starts", selected);
+        view.put("omitted_call_start_count", all.size() - selected.size());
     }
 
     private static void fillResults(Map<String, Object> view, List<Map<String, Object>> all,

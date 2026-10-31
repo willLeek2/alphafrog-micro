@@ -71,8 +71,10 @@ public final class AgentExternalObservabilityMapper {
             "plangeneration", "nodeattempt", "segmentsequence", "modelturn", "attempt", "eventseq",
             "contextversion", "runcontrolversion");
     private static final Set<String> DEPENDENCY_RESULT_BOOLEAN_KEYS = Set.of("businesssuccess", "executed");
+    private static final Set<String> DEPENDENCY_START_TEXT_KEYS = Set.of("todoid", "toolname", "toolcallid");
+    private static final Set<String> DEPENDENCY_START_NUMBER_KEYS = Set.of("plangeneration", "eventseq");
     private static final Set<String> DEPENDENCY_VIEW_NUMBER_KEYS = Set.of(
-            "plangeneration", "checkeventseq", "resumeeventseq", "resultafterseq", "omittedcount");
+            "plangeneration", "checkeventseq", "resumeeventseq", "resultafterseq", "omittedcount", "omittedcallstartcount");
     private static final Set<String> DEPENDENCY_VIEW_BOOLEAN_KEYS = Set.of("prepared", "frozenreuse", "requiresstartproof");
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             "authorization", "proxyauthorization", "apikey", "xapikey", "secret", "clientsecret",
@@ -281,6 +283,9 @@ public final class AgentExternalObservabilityMapper {
         if (out != null && value instanceof Map<?, ?> map) {
             copyDependencyField(map, out, "results", item -> sanitizeDisplayObjectList(item,
                     AgentExternalObservabilityMapper::sanitizeDependencyResult));
+            copyDependencyField(map, out, "callstarts", item -> sanitizeDisplayObjectList(item,
+                    start -> sanitizeDisplayScalars(start, DEPENDENCY_START_TEXT_KEYS,
+                            DEPENDENCY_START_NUMBER_KEYS, Set.of())));
             copyDependencyField(map, out, "omittedtodoids", AgentExternalObservabilityMapper::sanitizeDisplayStringList);
         }
         return out;
