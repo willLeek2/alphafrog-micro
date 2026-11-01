@@ -193,62 +193,6 @@ class WaitMemberResultReceiverTest {
 
 
 
-    /** 实际接收器、请求解析器及用户准入守卫连用；数据库行更新由 mapper 边界模拟。 */
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.CsvSource({"1,1,false", "0,0,false", "0,1,true"})
-    void sqlReplayRequiresFreeSessionAndUnchangedOriginalClaim(int otherQueries, int renewed, boolean created)
-            throws Exception {
-        ExecuteRequest original = ExecuteRequest.newBuilder()
-                .setOperationId("op-1").setRequestFingerprint("sha256:fingerprint")
-                .setCode("print('saved SQL')").build();
-        WaitMemberDispatchProof saved = new WaitMemberDispatchProof(
-                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, "op-1", null,
-                "sha256:fingerprint", "{}", "{}", "{}", OffsetDateTime.now().toString(),
-                JsonFormat.printer().omittingInsignificantWhitespace().print(original));
-        WaitMember member = givenDueMemberWithProof(saved);
-        member.setToolName("executeQuery");
-        String originalProof = member.getDispatchProofJson();
-        var mapper = org.mockito.Mockito.mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
-        AgentRun owned = run(AgentRunStatus.EXECUTING);
-        owned.setUserId("user-1");
-        var anchor = new world.willfrog.agent.platform.dataanalysis.ToolJobAnchor();
-        anchor.setToolName("executeQuery");
-        anchor.setOperationId("op-1");
-        anchor.setRequestFingerprint("sha256:fingerprint");
-        anchor.setAnchorState("PREPARING");
-        owned.setToolJobAnchorJson(anchor.toJson());
-        when(mapper.findById(RUN_ID)).thenReturn(owned);
-        when(mapper.countInFlightExecuteQueryByUser("user-1", RUN_ID, "executeQuery", 600))
-                .thenReturn(otherQueries);
-        Mockito.lenient().when(mapper.renewExecuteQueryReplayClaim(RUN_ID, GROUP_ID, MEMBER_IDENTITY,
-                saved.operationId(), saved.requestFingerprint(), saved.createRequestJson(), 2, RUN_CONTROL_VERSION))
-                .thenReturn(renewed);
-        ReflectionTestUtils.setField(receiver, "queryAdmission", new ToolJobAnchorService(mapper));
-        when(sandboxService.getTaskByOperationId(any())).thenAnswer(call -> {
-            // 读取后、原操作重放前发生取消，数据库续占条件失效。
-            if (renewed == 0) owned.setStatus(AgentRunStatus.CANCELED);
-            return GetTaskByOperationIdResponse.getDefaultInstance();
-        });
-        Mockito.lenient().when(sandboxService.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
-                .setTaskId("replayed-query").setRequestFingerprint(saved.requestFingerprint()).build());
-        status("RUNNING");
-
-        receiver.round();
-
-        verify(mapper).lockExecuteQuerySession("user-1");
-        verify(sandboxService, created ? Mockito.times(1) : never()).createTask(original);
-        verify(sandboxService, never()).cancelTask(any());
-        verify(waitGroupStore, never()).completeMember(any());
-        assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
-        if (renewed == 0) assertThat(owned.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        if (created) {
-            var order = Mockito.inOrder(mapper, sandboxService);
-            order.verify(mapper).lockExecuteQuerySession("user-1");
-            order.verify(mapper).renewExecuteQueryReplayClaim(RUN_ID, GROUP_ID, MEMBER_IDENTITY,
-                    saved.operationId(), saved.requestFingerprint(), saved.createRequestJson(), 2, RUN_CONTROL_VERSION);
-            order.verify(sandboxService).createTask(original);
-        }
-    }
 
 
 

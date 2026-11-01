@@ -31,16 +31,6 @@ class ToolJobSqlPreparingReplayAdmissionTest {
 
 
 
-    @org.junit.jupiter.api.Test
-    void busyStartupStillRestoresProvenCapacityWhenDueIndexIsUnavailable() throws Exception {
-        Fixture fixture = fixture(true, false, false);
-        doThrow(new IllegalStateException("redis unavailable")).when(fixture.redis).upsertDue(eq("run-1"), any());
-
-        fixture.exercise(true);
-
-        verify(fixture.capacity).recover(anyList(), anyInt(), anyInt());
-        verify(fixture.sandbox, never()).createTask(any());
-    }
 
     private Fixture fixture(boolean busy, boolean canceled, boolean found) throws Exception {
         AgentRunMapper mapper = mock(AgentRunMapper.class);

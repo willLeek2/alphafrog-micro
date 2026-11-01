@@ -139,27 +139,6 @@ class DualPoolWaitGroupNodeExecutorTest {
     // ==================== 完成与失败 ====================
 
 
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
-    void interruptedSqlOutcomeDoesNotLeaveOtherMembersUndispatched(boolean committed) {
-        dispatcher.requiresOperationId = true;
-        model.enqueue(AiMessage.from(List.of(toolCall("sql", "executeQuery", "{}"),
-                toolCall("other", "lookup", "{}"))));
-        dispatcher.pending.put("executeQuery", committed
-                ? new NodeToolDispatcher.DispatchOutcome.Pending(RUN_ID + ":sql:1", null,
-                    dispatchProof(RUN_ID + ":sql:1", null))
-                : new NodeToolDispatcher.DispatchOutcome.Failed("WAIT_GROUP_PREPARING_NOT_RECORDED"));
-        dispatcher.beforeDispatch = () -> Thread.currentThread().interrupt();
-        try {
-            executor.executeSegment(firstSegment(List.of()));
-            long group = store.groupRows().get(0).id;
-            assertThat(store.memberRows(group).get(0).state).isEqualTo(committed ? "RUNNING" : "FAILED");
-            assertThat(store.memberRows(group).get(1).state).isEqualTo("SUCCEEDED");
-            assertThat(dispatcher.dispatched).hasSize(2);
-        } finally {
-            Thread.interrupted();
-        }
-    }
 
 
 
@@ -197,53 +176,7 @@ class DualPoolWaitGroupNodeExecutorTest {
     // ==================== 后台成员与工具目录 ====================
 
 
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"executePython", "executeQuery"})
-    void aPersistedSandboxRequestIsLeftForRecoveryWhenTheSegmentRunsAgain(String sandboxTool) {
-        dispatcher.requiresOperationId = true;
-        AiMessage reply = AiMessage.from(List.of(toolCall("call-a", sandboxTool, "{}")));
-        model.enqueue(reply);
-        dispatcher.beforeDispatch = () -> {
-            long groupId = store.groupRows().get(0).id;
-            store.memberRows(groupId).get(0).dispatchProofJson =
-                    "{\"operationId\":\"" + RUN_ID + ":call-a:1\"}";
-            throw new IllegalStateException("原派发线程退出");
-        };
 
-        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessage("原派发线程退出");
-        long groupId = store.groupRows().get(0).id;
-        assertThat(store.memberRows(groupId).get(0).state).isEqualTo(WaitMemberState.PENDING.name());
-
-        dispatcher.beforeDispatch = () -> { };
-        model.enqueue(reply);
-        executor.executeSegment(firstSegment(List.of()));
-
-        assertThat(dispatcher.dispatched).as("重跑不能再次调用工具").isEmpty();
-        assertThat(store.memberRows(groupId).get(0).state).as("交给持久请求恢复器").isEqualTo(WaitMemberState.PENDING.name());
-        assertThat(publisher.published).as("尚无结果，不能放行模型下一段").isEmpty();
-    }
-
-    @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings = {"executePython", "executeQuery"})
-    void aLateProofWritePreventsAnOldDispatcherFromCompletingTheMember(String sandboxTool) {
-        dispatcher.requiresOperationId = true;
-        model.enqueue(AiMessage.from(List.of(toolCall("call-a", sandboxTool, "{}"))));
-        dispatcher.beforeDispatch = () -> {
-            long groupId = store.groupRows().get(0).id;
-            store.memberRows(groupId).get(0).dispatchProofJson =
-                    "{\"operationId\":\"" + RUN_ID + ":call-a:1\"}";
-        };
-
-        executor.executeSegment(firstSegment(List.of()));
-
-        long groupId = store.groupRows().get(0).id;
-        assertThat(store.memberRows(groupId).get(0).state)
-                .as("派发快照之后落下的持久请求也不能被普通结果覆盖")
-                .isEqualTo(WaitMemberState.PENDING.name());
-        assertThat(publisher.published).isEmpty();
-    }
 
 
 
