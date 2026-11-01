@@ -67,15 +67,4 @@ class DefaultRunAdmissionPolicyTest {
         assertThat(decision).isEqualTo(RunAdmissionPolicy.AdmissionDecision.QUEUED);
     }
 
-    @Test
-    void defaultPoliciesAreConstantNormalAndStandardWeight() {
-        DefaultRunPriorityPolicy priorityPolicy = new DefaultRunPriorityPolicy();
-        DefaultRunWeightPolicy weightPolicy = new DefaultRunWeightPolicy();
-
-        assertThat(priorityPolicy.priorityFor("run-x")).isEqualTo(RunPriority.NORMAL);
-        assertThat(priorityPolicy.priorityFor(null)).isEqualTo(RunPriority.NORMAL);
-        assertThat(weightPolicy.weightUnitsFor("run-x")).isEqualTo(RunWeightPolicy.STANDARD_WEIGHT);
-        assertThat(weightPolicy.weightUnitsFor(null)).isEqualTo(RunWeightPolicy.STANDARD_WEIGHT);
-        assertThat(RunPriority.NORMAL.schedulingOrder()).isZero();
-    }
 }

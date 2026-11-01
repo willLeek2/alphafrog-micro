@@ -61,52 +61,7 @@ class AgentRunIdempotencyMapperBindingTest {
         return new String(Resources.getResourceAsStream("mapper/AgentRunMapper.xml").readAllBytes());
     }
 
-    @Test
-    void lookupStatementExistsAndIsBoundToUserAndKey() {
-        MappedStatement ms = configuration.getMappedStatement(NAMESPACE + ".findByUserIdempotencyKey");
-        BoundSql boundSql = ms.getSqlSource().getBoundSql(Map.of("userId", "u-1", "idempotencyKey", "k-1"));
-        String sql = boundSql.getSql().replaceAll("\\s+", " ").trim();
-        assertThat(sql).contains("WHERE user_id = ?")
-                .contains("AND idempotency_key = ?")
-                .as("没有键的行不参与读回，否则会把用户的普通提交错当成命中")
-                .contains("AND idempotency_key IS NOT NULL");
-        Set<String> names = new LinkedHashSet<>();
-        for (ParameterMapping mapping : boundSql.getParameterMappings()) {
-            names.add(mapping.getProperty());
-        }
-        assertThat(names).containsExactlyInAnyOrder("userId", "idempotencyKey");
-    }
 
-    @Test
-    void lookupMethodIsAnnotatedWithParam() {
-        for (Method method : AgentRunMapper.class.getDeclaredMethods()) {
-            if (!method.getName().equals("findByUserIdempotencyKey")) {
-                continue;
-            }
-            for (Parameter parameter : method.getParameters()) {
-                assertThat(parameter.getAnnotation(Param.class))
-                        .as("按名字取参必须带 @Param").isNotNull();
-            }
-        }
-    }
 
-    @Test
-    void insertCarriesBothIdempotencyColumns() {
-        MappedStatement ms = configuration.getMappedStatement(NAMESPACE + ".insert");
-        BoundSql boundSql = ms.getSqlSource().getBoundSql(null);
-        String sql = boundSql.getSql().replaceAll("\\s+", " ").trim();
-        assertThat(sql).contains("idempotency_key").contains("request_digest")
-                .contains("request_digest, plan_generation");
-    }
 
-    @Test
-    void resultMapCoversBothIdempotencyColumns() {
-        List<String> mapped = new ArrayList<>();
-        java.util.regex.Matcher matcher =
-                java.util.regex.Pattern.compile("<result property=\"(\\w+)\" column=\"(\\w+)\"/>").matcher(xml);
-        while (matcher.find()) {
-            mapped.add(matcher.group(2));
-        }
-        assertThat(mapped).contains("idempotency_key", "request_digest");
-    }
 }

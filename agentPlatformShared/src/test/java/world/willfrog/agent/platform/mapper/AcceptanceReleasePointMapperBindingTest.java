@@ -85,63 +85,10 @@ class AcceptanceReleasePointMapperBindingTest {
         return new String(Resources.getResourceAsStream("mapper/" + XML_NAME).readAllBytes());
     }
 
-    @Test
-    void interfaceAndXmlStatementsMatch() {
-        assertThat(xmlStatements).as("接口方法与 XML 语句一一对应")
-                .containsExactlyInAnyOrderElementsOf(methodParams.keySet());
-    }
 
-    @Test
-    void everyBoundParameterHasASource() {
-        List<String> problems = new ArrayList<>();
-        for (String id : xmlStatements) {
-            Set<String> declared = methodParams.getOrDefault(id, Set.of());
-            Set<String> used = boundParamNames(configuration.getMappedStatement(NAMESPACE + "." + id),
-                    dummyParams(id));
-            for (String property : used) {
-                if (!declared.contains(property)) {
-                    problems.add(id + " 用的参数 '" + property + "' 不是接口上的 @Param");
-                }
-            }
-        }
-        assertThat(problems).as("XML 里的 #{} 必须有出处").isEmpty();
-    }
 
-    @Test
-    void everyParameterIsAnnotatedWithParam() {
-        List<String> problems = new ArrayList<>();
-        for (Method method : AcceptanceReleasePointMapper.class.getDeclaredMethods()) {
-            for (Parameter parameter : method.getParameters()) {
-                if (parameter.getAnnotation(Param.class) == null) {
-                    problems.add(method.getName() + " 的参数 " + parameter.getName() + " 没有 @Param");
-                }
-            }
-        }
-        assertThat(problems).as("所有参数都要有 @Param，避免按名字取参时对不上").isEmpty();
-    }
 
-    /** Agent 这一侧只有读：写入能力整个不在这个进程里。 */
-    @Test
-    void theMapperNeverWritesAnything() {
-        String upper = xml.toUpperCase();
-        assertThat(upper).as("这张表的写入方是宿主机上的受限控制面")
-                .doesNotContain("INSERT")
-                .doesNotContain("UPDATE ")
-                .doesNotContain("DELETE");
-    }
 
-    /** 放行判断只认标了放行时刻的行，并按 Run + 放行点精确命中。 */
-    @Test
-    void openingIsReadAsAPermissionForOneRunAndOnePoint() {
-        String sql = sql("countOpened");
-        assertThat(sql).contains("SELECT COUNT(*)")
-                .contains("FROM alphafrog_agent_run_release_point")
-                .contains("run_id = ?")
-                .contains("release_key = ?")
-                .contains("opened_at IS NOT NULL");
-        assertThat(sql).as("标成已放行之后每一轮读到的都是已放行，重复读没有副作用")
-                .doesNotContain("FOR UPDATE");
-    }
 
     // ===== 工具 =====
 

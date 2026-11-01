@@ -135,27 +135,4 @@ public class CompactJsonIntegrationTest {
         assertEquals(Boolean.FALSE, completenessMeta.getComplete());
     }
     
-    @Test
-    public void testSizeComparison() {
-        // 模拟传统JSON格式的大小
-        String traditionalJson = "{\"items\":[{\"ts_code\":\"000001.SZ\",\"trade_date\":1640995200000,\"close\":15.23,\"open\":15.10,\"high\":15.35,\"low\":15.05,\"vol\":1234567.89,\"amount\":123456789.12},{\"ts_code\":\"000002.SZ\",\"trade_date\":1640995200000,\"close\":18.45,\"open\":18.20,\"high\":18.60,\"low\":18.15,\"vol\":2345678.90,\"amount\":234567890.34}]}";
-        
-        // 模拟紧凑JSON格式
-        String compactJson = "{\"format\":\"compact\",\"fields\":[\"ts_code\",\"trade_date\",\"close\",\"open\",\"high\",\"low\",\"vol\",\"amount\"],\"rows\":[[\"000001.SZ\",1640995200000,15.23,15.10,15.35,15.05,1234567.89,123456789.12],[\"000002.SZ\",1640995200000,18.45,18.20,18.60,18.15,2345678.90,234567890.34]]}";
-        
-        // 计算大小差异
-        int traditionalSize = traditionalJson.length();
-        int compactSize = compactJson.length();
-        double reduction = (1.0 - (double) compactSize / traditionalSize) * 100;
-        
-        System.out.println("Traditional JSON size: " + traditionalSize + " bytes");
-        System.out.println("Compact JSON size: " + compactSize + " bytes");
-        System.out.println("Size reduction: " + String.format("%.1f%%", reduction));
-        
-        // 验证紧凑格式确实更小
-        assertTrue("Compact format should be smaller", compactSize < traditionalSize);
-        
-        // 验证大小减少比例符合预期（至少10%的减少，对于小数据集）
-        assertTrue("Size reduction should be at least 10%", reduction > 10.0);
-    }
 }

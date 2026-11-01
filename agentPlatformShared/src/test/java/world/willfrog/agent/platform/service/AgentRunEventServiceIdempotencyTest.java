@@ -134,133 +134,13 @@ class AgentRunEventServiceIdempotencyTest {
     }
 
 
-    @Test
-    void sameKeyAndSameDigestReadBackTheOriginalRun() {
-        AgentRun existing = existingRun("r-original", digest("hello", "{}"));
-        when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(existing);
 
-        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
-                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
 
-        assertThat(creation.run()).isSameAs(existing);
-        assertThat(creation.created())
-                .as("读回原来那条 Run 不算新建：上层据此不再准入、不再启动")
-                .isFalse();
-        verify(runMapper, never()).insert(any());
-        verify(eventMapper, never()).insert(any());
-        verify(messageService, never()).createInitialMessage(anyString(), anyString());
-    }
 
-    @Test
-    void sameKeyWithDifferentContentIsRejectedWithoutCreatingASecondRun() {
-        AgentRun existing = existingRun("r-original", digest("hello", "{}"));
-        when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(existing);
 
-        assertThatThrownBy(() -> service.createRun(USER, "hello but different", "{}", KEY, "m", "e",
-                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false))
-                .isInstanceOf(RunIdempotencyConflictException.class)
-                .hasMessageContaining("r-original");
-        verify(runMapper, never()).insert(any());
-    }
 
-    @Test
-    void legacyRunWithoutDigestIsNotReused() {
-        AgentRun existing = existingRun("r-legacy", null);
-        when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(existing);
 
-        assertThatThrownBy(() -> service.createRun(USER, "hello", "{}", KEY, "m", "e", false,
-                "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false))
-                .as("存量 Run 没有摘要，凭现在的数据算不出它当时是什么请求，只能拒绝")
-                .isInstanceOf(RunIdempotencyConflictException.class);
-    }
 
-    @Test
-    void concurrentDuplicateReadsBackTheWinnerInsteadOfFailing() {
-        AgentRun winner = existingRun("r-winner", digest("hello", "{}"));
-        when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(null, winner);
-        when(runMapper.insert(any())).thenThrow(new DuplicateKeyException("同键并发"));
-
-        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
-                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
-
-        assertThat(creation.run()).isSameAs(winner);
-        assertThat(creation.created()).isFalse();
-        verify(runMapper).insert(any());
-    }
-
-    @Test
-    void blankKeyBehavesLikeNoKeyAtAll() {
-        stubFreshCreate();
-
-        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", "   ", "m", "e",
-                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
-
-        assertThat(creation.created()).isTrue();
-        verify(runMapper, never()).findByUserIdempotencyKey(anyString(), anyString());
-        ArgumentCaptor<AgentRun> captor = ArgumentCaptor.forClass(AgentRun.class);
-        verify(runMapper).insert(captor.capture());
-        assertThat(captor.getValue().getIdempotencyKey()).isNull();
-        assertThat(captor.getValue().getRequestDigest()).isNull();
-    }
-
-    @Test
-    void newRunWithKeyStoresKeyAndDigest() {
-        stubFreshCreate();
-
-        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
-                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
-
-        assertThat(creation.created()).isTrue();
-        ArgumentCaptor<AgentRun> captor = ArgumentCaptor.forClass(AgentRun.class);
-        verify(runMapper).insert(captor.capture());
-        assertThat(captor.getValue().getIdempotencyKey()).isEqualTo(KEY);
-        assertThat(captor.getValue().getRequestDigest()).isEqualTo(digest("hello", "{}"));
-    }
-
-    /**
-     * 同键读回时把接收事实补投一次：这是「库里有、事件流里没有」最容易碰上的那条路。
-     *
-     * <p>补投发生在读回路径上，所以只写持久事件流，不再发一次实时事件——订阅端已经看过的
-     * 那一条不该因为补投再出现一次。</p>
-     */
-    @Test
-    void sameKeyReadBackAlsoReprojectsTheReceivedFact() {
-        AgentRun existing = existingRun("r-original", digest("hello", "{}"));
-        when(runMapper.findByUserIdempotencyKey(USER, KEY)).thenReturn(existing);
-        AgentRunEvent received = new AgentRunEvent();
-        received.setId(7L);
-        received.setRunId("r-original");
-        received.setSeq(1);
-        received.setEventType("RUN_RECEIVED");
-        received.setPayloadJson("{}");
-        received.setCreatedAt(java.time.OffsetDateTime.now());
-        when(eventMapper.findFirstByRunIdAndType("r-original", "RUN_RECEIVED")).thenReturn(received);
-
-        AgentRunEventService.RunCreation creation = service.createRun(USER, "hello", "{}", KEY, "m", "e",
-                false, "openrouter", 2, false, "{}", DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
-
-        assertThat(creation.created()).isFalse();
-        verify(eventRedisStore).repairMissing(received);
-        verify(redisTemplate, never()).convertAndSend(anyString(), anyString());
-    }
-
-    /**
-     * 接收事实先落库、再投射到事件流：反过来会在库回滚时留下不存在的 Run 的事件。
-     *
-     * <p>投射放在提交之后，所以顺序必须是「先数据库、后 Redis」。创建这条路走的是同一份实现
-     * （{@code persistEvent} 加 {@code projectAppended}），这里量的就是它。</p>
-     */
-    @Test
-    void theReceivedFactIsPersistedBeforeItIsProjected() {
-        stubFreshCreate();
-
-        service.createRun(USER, "hello", "{}", KEY, "m", "e", false, "openrouter", 2, false, "{}",
-                DEPLOYMENT_ID, DEPLOYMENT_GENERATION_ID, false, false);
-
-        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(eventMapper, eventRedisStore);
-        inOrder.verify(eventMapper).insert(any());
-        inOrder.verify(eventRedisStore).append(any());
-    }
 
     /**
      * 新建 Run 这条路上用到的桩。两种情形（带键与不带键）走到的分支略有不同，

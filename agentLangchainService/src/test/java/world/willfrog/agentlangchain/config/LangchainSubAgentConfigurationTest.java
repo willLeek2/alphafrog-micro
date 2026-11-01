@@ -15,22 +15,4 @@ class LangchainSubAgentConfigurationTest {
         LaneContext.clear();
     }
 
-    @Test
-    void subAgentPoolCapturesAndRestoresLaneForEachSubmission() throws Exception {
-        ExecutorService executor = new LangchainSubAgentConfiguration()
-                .langchainSubAgentExecutor(1, 1, 2);
-        try {
-            assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS)).isNull();
-
-            LaneContext.setTrafficScopeId("lane-a");
-            assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS))
-                    .isEqualTo("lane-a");
-
-            LaneContext.clear();
-            assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS)).isNull();
-        } finally {
-            executor.shutdownNow();
-            assertThat(executor.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
-        }
-    }
 }

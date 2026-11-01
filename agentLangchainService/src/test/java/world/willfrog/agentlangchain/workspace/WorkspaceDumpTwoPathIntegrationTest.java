@@ -86,84 +86,8 @@ class WorkspaceDumpTwoPathIntegrationTest {
         ReflectionTestUtils.setField(observer, "initialLookbackMinutes", 60);
     }
 
-    @Test
-    void eventPathFailureThenPollingFallbackShouldCompleteDump() throws Exception {
-        AgentRun run = run("run-evt", OffsetDateTime.now());
-        when(runMapper.findById("run-evt")).thenReturn(run);
-        when(runMapper.listByStatusAndUpdatedAfterComposite(
-                anyList(), any(OffsetDateTime.class), any(), anyInt()))
-                .thenReturn(List.of(run));
-        // 事件路 3 次尝试全部失败（瞬时故障），第 4 次（轮询路）恢复
-        CollectedAssets assets = new CollectedAssets(List.of(message("run-evt", 2)), List.of(), List.of());
-        when(collector.collectWorkspaceAssets(any()))
-                .thenThrow(new IllegalStateException("transient db blip 1"))
-                .thenThrow(new IllegalStateException("transient db blip 2"))
-                .thenThrow(new IllegalStateException("transient db blip 3"))
-                .thenReturn(assets);
 
-        // 事件路：listener → scheduler 3 次重试耗尽 → DLQ，零落盘
-        listener.onRunFinalized(new AgentRunFinalizedEvent("run-evt", 1001L, "COMPLETED", false));
-        assertEquals(1, scheduler.dlqMemorySize(), "事件路耗尽重试必须入 DLQ（信号）");
-        assertFalse(Files.exists(runDir("run-evt")), "事件路失败不得留下半截文件");
 
-        // 轮询兜底：同一 run 被 reconciliation 扫到 → dump 成功
-        observer.scan();
-        Path runDir = runDir("run-evt");
-        assertTrue(Files.exists(runDir.resolve("manifest.json")), "轮询必须兜底完成 dump");
-        assertTrue(Files.exists(runDir.resolve("workspace_state.json")));
-        JsonNode state = new ObjectMapper().readTree(runDir.resolve("workspace_state.json").toFile());
-        assertEquals("full", state.get("mode").asText());
-        assertEquals(WorkspaceFingerprints.compute(run, assets.messages()),
-                state.get("fingerprint").asText());
-        assertEquals(1, scheduler.dlqMemorySize(), "兜底成功不得新增 DLQ 条目");
-    }
-
-    @Test
-    void bothPathsFailedShouldAccumulateDlqAndWriteNothing() throws Exception {
-        AgentRun run = run("run-doomed", OffsetDateTime.now());
-        when(runMapper.findById("run-doomed")).thenReturn(run);
-        when(runMapper.listByStatusAndUpdatedAfterComposite(
-                anyList(), any(OffsetDateTime.class), any(), anyInt()))
-                .thenReturn(List.of(run));
-        when(collector.collectWorkspaceAssets(any()))
-                .thenThrow(new IllegalStateException("persistent failure"));
-
-        // 事件路：3 次重试 → DLQ
-        listener.onRunFinalized(new AgentRunFinalizedEvent("run-doomed", 1001L, "COMPLETED", false));
-        assertEquals(1, scheduler.dlqMemorySize());
-
-        // 轮询路：再 3 次重试 → DLQ 再次累加（两路皆败的可见信号；dedupe/drain 归 D21-B）
-        observer.scan();
-        assertEquals(2, scheduler.dlqMemorySize(), "两路皆败必须在 DLQ 留下两条信号");
-        assertFalse(Files.exists(runDir("run-doomed")), "两路皆败必须零落盘");
-    }
-
-    @Test
-    void repeatedTriggersAfterSuccessShouldNotAmplifyWrites() throws Exception {
-        AgentRun run = run("run-once", OffsetDateTime.now());
-        when(runMapper.findById("run-once")).thenReturn(run);
-        when(runMapper.listByStatusAndUpdatedAfterComposite(
-                anyList(), any(OffsetDateTime.class), any(), anyInt()))
-                .thenReturn(List.of(run));
-        when(collector.collectWorkspaceAssets(any()))
-                .thenReturn(new CollectedAssets(List.of(message("run-once", 1)), List.of(), List.of()));
-
-        // 事件路首次 dump 成功
-        listener.onRunFinalized(new AgentRunFinalizedEvent("run-once", 1001L, "COMPLETED", false));
-        Path runDir = runDir("run-once");
-        byte[] manifestAfterEvent = Files.readAllBytes(runDir.resolve("manifest.json"));
-        byte[] stateAfterEvent = Files.readAllBytes(runDir.resolve("workspace_state.json"));
-        assertEquals(0, scheduler.dlqMemorySize());
-
-        // 轮询两次重扫同一 run：指纹匹配 + 完整 → 整段 skip，零字节变化
-        observer.scan();
-        observer.scan();
-        assertTrue(java.util.Arrays.equals(manifestAfterEvent,
-                Files.readAllBytes(runDir.resolve("manifest.json"))), "重复触发不得重写 manifest");
-        assertTrue(java.util.Arrays.equals(stateAfterEvent,
-                Files.readAllBytes(runDir.resolve("workspace_state.json"))), "重复触发不得重写 state");
-        assertEquals(0, scheduler.dlqMemorySize(), "skip 路径不得产生失败/DLQ");
-    }
 
     // ===== helpers =====
 

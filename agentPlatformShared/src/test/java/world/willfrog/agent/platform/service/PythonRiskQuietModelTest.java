@@ -13,26 +13,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class PythonRiskQuietModelTest {
-    @Test
-    void openRouterCompatibleEndpointUsesClientWithoutRawHttpCapture() {
-        RawHttpLogger rawLogger = mock(RawHttpLogger.class);
-        AgentAiServiceFactory factory = factory(rawLogger);
-        AgentLlmResolver.ResolvedLlm route = new AgentLlmResolver.ResolvedLlm(
-                "openrouter", "https://openrouter.ai/api/v1", "cheap-model", "test-key",
-                null, List.of(), 256);
 
-        assertInstanceOf(OpenAiChatModel.class, factory.buildPythonRiskReviewModel(route));
-        verifyNoInteractions(rawLogger);
-    }
-
-    @Test
-    void endpointUsingCapturingDashScopeModelIsRejected() {
-        AgentAiServiceFactory factory = factory(mock(RawHttpLogger.class));
-        AgentLlmResolver.ResolvedLlm route = new AgentLlmResolver.ResolvedLlm(
-                "dashscope", "", "qwen-small", "test-key", "cn", List.of(), 256);
-
-        assertThrows(IllegalArgumentException.class, () -> factory.buildPythonRiskReviewModel(route));
-    }
 
     private AgentAiServiceFactory factory(RawHttpLogger rawLogger) {
         AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);

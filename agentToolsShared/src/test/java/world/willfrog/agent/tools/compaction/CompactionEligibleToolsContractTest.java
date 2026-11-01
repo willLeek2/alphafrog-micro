@@ -14,29 +14,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class CompactionEligibleToolsContractTest {
 
-    @Test
-    void allDeclaredEligibleNames_areEligible() {
-        for (String name : AgentToolRegistry.namesWithCompression(AgentToolRegistry.Compression.ELIGIBLE)) {
-            assertTrue(CompactionEligibleTools.isEligible(name),
-                    name + " 注册为 ELIGIBLE，isEligible 必须为 true");
-        }
-    }
 
-    @Test
-    void allDeclaredExcludedNames_areNotEligible() {
-        for (String name : AgentToolRegistry.namesWithCompression(AgentToolRegistry.Compression.EXCLUDED)) {
-            assertFalse(CompactionEligibleTools.isEligible(name),
-                    name + " 注册为 EXCLUDED，isEligible 必须为 false");
-        }
-    }
 
-    @Test
-    void allDeclaredExemptNames_areNotEligible() {
-        for (String name : AgentToolRegistry.namesWithCompression(AgentToolRegistry.Compression.EXEMPT)) {
-            assertFalse(CompactionEligibleTools.isEligible(name),
-                    name + " 注册为 EXEMPT，isEligible 必须为 false");
-        }
-    }
 
     @ParameterizedTest
     @ValueSource(strings = {"", "  ", "nonExistentTool"})

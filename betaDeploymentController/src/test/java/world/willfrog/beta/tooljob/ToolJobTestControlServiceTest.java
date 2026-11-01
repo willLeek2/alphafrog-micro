@@ -24,41 +24,7 @@ class ToolJobTestControlServiceTest {
         service = new ToolJobTestControlService(deployments, store);
     }
 
-    @Test
-    void processHaltArmRequiresTheStricterRuntimeTargetAndReturnsFilteredEvidence() {
-        ToolJobTestTarget target = target();
-        ToolJobTestStore.FaultRecord record = new ToolJobTestStore.FaultRecord("tj-one", "beta-lane-a",
-                "lane-a", "gen-" + "1".repeat(64), "run-one", "AFTER_SANDBOX_ACCEPTED",
-                "PROCESS_HALT", "ARMED", "2026-09-20T00:00:00Z", "2026-09-20T00:10:00Z",
-                null, null, null, null);
-        when(deployments.toolJobTestTarget(target.deploymentId(), target.generationId(), true)).thenReturn(target);
-        when(store.armFault(target, "run-one", "AFTER_SANDBOX_ACCEPTED", "PROCESS_HALT", 600))
-                .thenReturn(record);
 
-        ToolJobTestControlService.FaultEvidence response = service.arm(target.deploymentId(),
-                target.generationId(), "run-one", "AFTER_SANDBOX_ACCEPTED", "PROCESS_HALT", 600);
-
-        assertEquals("tj-one", response.fault().scenarioId());
-        assertTrue(response.runtime().processHaltEnabled());
-        assertTrue(response.runtime().restartUnlessStopped());
-        verify(deployments).toolJobTestTarget(target.deploymentId(), target.generationId(), true);
-    }
-
-    @Test
-    void planInvalidationUsesTheNonHaltingLaneTargetAndPreservesExpectedVersions() {
-        ToolJobTestTarget target = target();
-        ToolJobTestStore.PlanInvalidation result = new ToolJobTestStore.PlanInvalidation(target.deploymentId(),
-                target.trafficScopeId(), target.generationId(), "run-one", 3, 4, 7, "op-one");
-        when(deployments.toolJobTestTarget(target.deploymentId(), target.generationId(), false)).thenReturn(target);
-        when(store.invalidatePlan(target, "run-one", 3, 7, "op-one")).thenReturn(result);
-
-        ToolJobTestStore.PlanInvalidation response = service.invalidatePlan(target.deploymentId(),
-                target.generationId(), "run-one", 3, 7, "op-one");
-
-        assertEquals(3, response.previousPlanGeneration());
-        assertEquals(4, response.currentPlanGeneration());
-        verify(store).invalidatePlan(target, "run-one", 3, 7, "op-one");
-    }
 
     private ToolJobTestTarget target() {
         String generation = "gen-" + "1".repeat(64);

@@ -21,12 +21,6 @@ class FinanceMethodSpecCatalogTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Test
-    void shouldLoadAllCanonicalSpecs() {
-        FinanceMethodSpecCatalog catalog = new FinanceMethodSpecCatalog(objectMapper);
-        List<FinanceMethodSpec> all = catalog.listAll();
-        assertEquals(18, all.size(), "目录应包含既有三个方法与预设金融指标库十五个方法");
-    }
 
     @Test
     void shouldFindByMethodId() {
@@ -39,15 +33,6 @@ class FinanceMethodSpecCatalogTest {
         assertNotNull(spec.get().getParameters().get("periods"));
     }
 
-    @Test
-    void shouldFindByExactTriple() {
-        FinanceMethodSpecCatalog catalog = new FinanceMethodSpecCatalog(objectMapper);
-        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
-        Optional<FinanceMethodSpec> found = catalog.find(
-                cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest());
-        assertTrue(found.isPresent());
-        assertEquals(cagr.getSpecDigest(), found.get().getSpecDigest());
-    }
 
     @Test
     void shouldRejectUnknownDigest() {

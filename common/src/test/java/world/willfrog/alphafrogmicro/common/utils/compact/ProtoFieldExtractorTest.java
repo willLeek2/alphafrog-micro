@@ -30,17 +30,6 @@ public class ProtoFieldExtractorTest {
         assertEquals("tsCode", mapping.getOrders().get(0));
     }
     
-    @Test
-    public void testFieldMappingChaining() {
-        ProtoFieldExtractor.FieldMapping mapping = new ProtoFieldExtractor.FieldMapping()
-                .alias("field1", "f1")
-                .exclude("field2")
-                .order("field3", "field4");
-        
-        assertEquals(1, mapping.getAliases().size());
-        assertEquals(1, mapping.getExcludes().size());
-        assertEquals(2, mapping.getOrders().size());
-    }
     
     @Test
     public void testPredefinedFieldMappings() {

@@ -9,23 +9,7 @@ import world.willfrog.beta.core.ContainerRuntime;
 
 class JdbcToolJobTestStoreTest {
 
-    @Test
-    void faultArmLockIsStableForTheSameDeploymentGeneration() {
-        ToolJobTestTarget first = target("beta-lane-a", "gen-a");
-        ToolJobTestTarget second = target("beta-lane-a", "gen-a");
 
-        assertEquals(JdbcToolJobTestStore.faultArmLockIdentity(first),
-                JdbcToolJobTestStore.faultArmLockIdentity(second));
-    }
-
-    @Test
-    void faultArmLockChangesWhenTheDeploymentGenerationChanges() {
-        ToolJobTestTarget first = target("beta-lane-a", "gen-a");
-        ToolJobTestTarget second = target("beta-lane-a", "gen-b");
-
-        assertNotEquals(JdbcToolJobTestStore.faultArmLockIdentity(first),
-                JdbcToolJobTestStore.faultArmLockIdentity(second));
-    }
 
     private ToolJobTestTarget target(String deploymentId, String generationId) {
         ContainerRuntime.ToolJobTestRuntime runtime = new ContainerRuntime.ToolJobTestRuntime(

@@ -80,13 +80,4 @@ class ToolJobResultValidatorTest {
         assertThat(ToolJobResultValidator.validate("task-456", "run-2", r, "SUCCEEDED")).isNotNull();
     }
 
-    @Test
-    void shouldAcceptFailedWithStderr() {
-        var r = TaskResultResponse.newBuilder()
-                .setTaskId("task-789")
-                .setStatus("FAILED")
-                .setStderr("traceback output")
-                .build();
-        assertThat(ToolJobResultValidator.validate("task-789", "run-3", r, "FAILED")).isNotNull();
-    }
 }

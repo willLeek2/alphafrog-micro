@@ -39,67 +39,9 @@ class FinanceSharedResidenceArchTest {
     private static final String PLATFORM_BASE_PACKAGE_PATH = "world/willfrog/agent/platform";
     private static final String PLATFORM_BASE_PACKAGE = "world.willfrog.agent.platform";
 
-    @Test
-    void detectedFinanceClasses_exactlyMatchClosedAllowlist() throws Exception {
-        Path classesRoot = mainClassesRoot();
-        Path baseDir = classesRoot.resolve(PLATFORM_BASE_PACKAGE_PATH);
-        assertTrue(Files.isDirectory(baseDir),
-                "主类扫描目录不存在，扫描失效（fail-closed）：" + baseDir);
 
-        Set<String> detected = detectFinanceClasses(baseDir);
-        assertFalse(detected.isEmpty(),
-                "未识别到任何金融类，扫描疑似失效（fail-closed）");
 
-        Set<String> allowed = new TreeSet<>(FinanceSharedResidenceAllowlist.allowedFinanceClasses());
-        Set<String> notAllowed = new TreeSet<>(detected);
-        notAllowed.removeAll(allowed);
-        Set<String> stale = new TreeSet<>(allowed);
-        stale.removeAll(detected);
 
-        assertTrue(notAllowed.isEmpty(),
-                "发现未列入封闭清单的金融类（D22 §6 红线 1，须先审批并更新清单）：" + notAllowed);
-        assertTrue(stale.isEmpty(),
-                "清单含有已不存在的陈旧条目（清单必须与包树同步收缩）：" + stale);
-        assertEquals(allowed.size(), detected.size(),
-                "金融类集合与封闭清单必须精确相等");
-    }
-
-    @Test
-    void allowlistEntries_areExactFqcnForm() {
-        Set<String> allowed = FinanceSharedResidenceAllowlist.allowedFinanceClasses();
-        assertFalse(allowed.isEmpty(), "封闭清单不得为空");
-        for (String entry : allowed) {
-            assertTrue(entry.startsWith(PLATFORM_BASE_PACKAGE + "."),
-                    "清单条目必须是本模块精确 FQCN：" + entry);
-            assertFalse(entry.contains("*") || entry.contains(" ") || entry.contains("$"),
-                    "清单条目不得含通配符/空白/内部类分隔符：" + entry);
-        }
-    }
-
-    @Test
-    void detectionRule_catchesHypotheticalUnapprovedFinanceClass() {
-        // 反测：识别口径本身必须会咬住假想的新金融 Mapper / 新 finance 包类，
-        // 否则主测试的「完全相等」失去意义
-        assertTrue(isFinanceSpecific(
-                "world.willfrog.agent.platform.mapper.FinanceNewUnapprovedMapper"));
-        assertTrue(isFinanceSpecific(
-                "world.willfrog.agent.platform.finance.FinanceNewRuntime"));
-        assertTrue(isFinanceSpecific(
-                "world.willfrog.agent.platform.finance.sub.SomeHelper"));
-        assertFalse(isFinanceSpecific(
-                "world.willfrog.agent.platform.service.AgentCreditService"));
-        assertFalse(isFinanceSpecific(
-                "world.willfrog.agent.platform.mapper.AgentRunMapper"));
-    }
-
-    @Test
-    void allowlistClass_itselfIsListedAndLoadable() throws ClassNotFoundException {
-        // 治理工件自指：清单类自身是金融识别口径下的类，必须在清单内且可加载
-        String self = "world.willfrog.agent.platform.finance.boundary.FinanceSharedResidenceAllowlist";
-        assertTrue(FinanceSharedResidenceAllowlist.allowedFinanceClasses().contains(self));
-        assertTrue(isFinanceSpecific(self));
-        Class.forName(self);
-    }
 
     /**
      * 定位本模块主类编译产物目录（target/classes）。

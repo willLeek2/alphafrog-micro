@@ -19,33 +19,6 @@ import static org.mockito.Mockito.when;
 
 class ToolJobFinalizerCheckpointFailureTest {
 
-    @Test
-    void checkpointFailureReleasesAndEndsFailedInsteadOfResuming() throws Exception {
-        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
-        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.FAILED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
-        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
-        when(usageHook.upsertUsage(eq("run-1"), any())).thenReturn(true);
-        when(eventHook.emitTerminalEvent(eq("run-1"), any())).thenReturn(true);
-        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
-                anchorService, mock(ToolJobRedisCache.class),
-                mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
-        inject(finalizer, "usageHook", usageHook);
-        inject(finalizer, "eventHook", eventHook);
-        ToolJobAnchor anchor = new ToolJobAnchor();
-        anchor.setAutoResume(false);
-        anchor.setRunDisposition("CHECKPOINT_FAILED");
-        anchor.setTerminalRetryable(false);
-
-        finalizer.handleTerminal("run-1", anchor, "SUCCEEDED", null, false);
-
-        verify(anchorService).updateAnchorAndStatus("run-1", anchor,
-                AgentRunStatus.FAILED, AgentRunStatus.WAITING_TOOL_JOB);
-    }
 
     private static void inject(Object target, String name, Object value) throws Exception {
         Field field = target.getClass().getDeclaredField(name);

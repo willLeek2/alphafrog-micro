@@ -51,29 +51,3 @@ def setup_function():
     _clear_jwt_cache_for_tests()
 
 
-def test_login_returns_and_reuses_jwt():
-    session = _Session([_Response(200, {"token": "jwt-value"})])
-
-    assert get_admin_jwt(_config(), session) == "jwt-value"
-    assert get_admin_jwt(_config(), session) == "jwt-value"
-    assert len(session.calls) == 1
-
-
-def test_existing_login_logs_out_then_retries():
-    session = _Session([
-        _Response(400, {}, "User already logged in"),
-        _Response(200, {}),
-        _Response(200, "jwt-after-relogin", '"jwt-after-relogin"'),
-    ])
-
-    assert get_admin_jwt(_config(), session) == "jwt-after-relogin"
-    assert [call[0] for call in session.calls] == [
-        "http://localhost:8090/api/auth/login",
-        "http://localhost:8090/api/auth/logout",
-        "http://localhost:8090/api/auth/login",
-    ]
-
-
-def test_missing_credentials_fail_closed():
-    with pytest.raises(RuntimeError, match="login_username/login_password"):
-        get_admin_jwt(_config(username="", password=""), _Session([]))

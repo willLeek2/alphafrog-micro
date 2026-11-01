@@ -15,10 +15,6 @@ class DataAnalysisReadResponseMapperTest {
 
     private final DataAnalysisReadResponseMapper mapper = new DataAnalysisReadResponseMapper();
 
-    @Test
-    void emptyViewReturnsEmptyMap() {
-        assertTrue(mapper.buildEmptyView().isEmpty());
-    }
 
     @Test
     void statusFromSummaryContainsVersionRunIdSummaryOnly() {

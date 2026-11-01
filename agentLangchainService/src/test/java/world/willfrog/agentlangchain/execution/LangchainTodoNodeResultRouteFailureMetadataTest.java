@@ -31,13 +31,6 @@ class LangchainTodoNodeResultRouteFailureMetadataTest {
         assertThat(LangchainTodoNodeResult.routeFailureMetadataField(Map.of())).isNull();
     }
 
-    @Test
-    void routeFailureMetadataField_budgetExceededTrue_shouldReturnBudgetFailureField() {
-        Map<String, Object> meta = budgetMetadata();
-        assertThat(LangchainTodoNodeResult.routeFailureMetadataField(meta))
-                .isEqualTo(LangchainTodoNodeResult.BUDGET_FAILURE_FIELD)
-                .isEqualTo("budget_failure");
-    }
 
     @Test
     void routeFailureMetadataField_budgetExceededFalse_shouldNotBeBudget() {

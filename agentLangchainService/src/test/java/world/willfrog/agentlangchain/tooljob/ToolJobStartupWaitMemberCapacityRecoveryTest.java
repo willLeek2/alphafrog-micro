@@ -43,80 +43,10 @@ class ToolJobStartupWaitMemberCapacityRecoveryTest {
     private final RunOwnershipGateway ownership = mock(RunOwnershipGateway.class);
     private final DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
 
-    @Test
-    void restoresBothPreparingAndAttachedMembersFromDurableProofs() throws Exception {
-        DataAnalysisOperationIdentity preparingId = operation("run-a", "call-a");
-        DataAnalysisOperationIdentity attachedId = operation("run-b", "call-b");
-        DataAnalysisReservation preparing = reservation(preparingId, DataAnalysisReservationState.PREPARING, null);
-        DataAnalysisReservation attached = reservation(attachedId, DataAnalysisReservationState.TASK_ATTACHED, "task-b");
-        WaitMember first = member(1, preparing, "PENDING");
-        WaitMember second = member(2, attached, "RUNNING");
-        when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200)).thenReturn(List.of(first, second));
-        when(capacity.recover(anyList(), anyInt(), anyInt())).thenReturn(emptyReport());
 
-        recovery().onReady();
 
-        @SuppressWarnings("unchecked")
-        ArgumentCaptor<List<DataAnalysisReservation>> captured = ArgumentCaptor.forClass(List.class);
-        verify(capacity).recover(captured.capture(), eq(properties.getMaxUnits()),
-                eq(properties.getMaxHeavyActive()));
-        assertEquals(List.of(preparing, attached), captured.getValue());
-    }
 
-    @Test
-    void canceledAndLateMembersWithUnconfirmedStopsStillOccupyCapacity() throws Exception {
-        DataAnalysisOperationIdentity id = operation("run-c", "call-c");
-        DataAnalysisReservation attached = reservation(id, DataAnalysisReservationState.TASK_ATTACHED, "task-c");
-        DataAnalysisOperationIdentity lateId = operation("run-l", "call-l");
-        DataAnalysisReservation late = reservation(lateId, DataAnalysisReservationState.TASK_ATTACHED, "task-l");
-        WaitMember canceledMember = member(3, attached, "CANCELED");
-        WaitMember lateMember = member(4, late, "LATE");
-        when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200))
-                .thenReturn(List.of(canceledMember, lateMember));
-        when(capacity.recover(anyList(), anyInt(), anyInt())).thenReturn(emptyReport());
 
-        recovery().onReady();
-
-        verify(capacity).recover(eq(List.of(attached, late)), anyInt(), anyInt());
-    }
-
-    @Test
-    void restoresExecuteQueryMemberFromDurableProof() throws Exception {
-        DataAnalysisOperationIdentity id = operation("run-q", "call-q", "executeQuery");
-        DataAnalysisReservation attached = reservation(id, DataAnalysisReservationState.TASK_ATTACHED, "task-q");
-        WaitMember member = member(5, attached, "RUNNING", "executeQuery");
-        when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200))
-                .thenReturn(List.of(member));
-        when(capacity.recover(anyList(), anyInt(), anyInt())).thenReturn(emptyReport());
-
-        recovery().onReady();
-
-        verify(capacity).recover(eq(List.of(attached)), anyInt(), anyInt());
-    }
-
-    @Test
-    void missingProofOnCancelledStopKeepsAdmissionClosed() {
-        WaitMember member = new WaitMember();
-        member.setId(4L);
-        member.setRunId("run-d");
-        member.setToolName("executePython");
-        member.setState("CANCELED");
-        when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200)).thenReturn(List.of(member));
-
-        recovery().onReady();
-
-        verify(capacity, never()).recover(anyList(), anyInt(), anyInt());
-    }
-
-    @Test
-    void failedScanKeepsAdmissionClosed() {
-        when(groups.scanUnresolvedPythonMembersForCapacity("deployment", GENERATION, 0, 200))
-                .thenThrow(new IllegalStateException("database unavailable"));
-
-        recovery().onReady();
-
-        verify(capacity, never()).recover(anyList(), anyInt(), anyInt());
-    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})

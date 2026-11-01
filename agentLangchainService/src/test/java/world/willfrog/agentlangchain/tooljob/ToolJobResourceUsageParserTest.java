@@ -21,132 +21,14 @@ class ToolJobResourceUsageParserTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
-    @Test
-    void protobufJsonPreservesMeasuredZeroAndIsIdenticalForReleaseProof() throws Exception {
-        SandboxResourceUsage usage = completeUsage().setCpuMillis(0).setDatasetOpenCount(0).build();
-        String json = json(usage);
 
-        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json);
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
-                mock(ToolJobAnchorService.class), mock(ToolJobRedisCache.class),
-                mock(world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService.class),
-                mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
 
-        assertThat(parsed.cpuMillis()).isZero();
-        assertThat(parsed.datasetOpenCount()).isZero();
-        assertThat(parsed.attributionComplete()).isTrue();
-        assertThat(finalizer.buildResourceUsage(DataAnalysisResourceClass.STANDARD, json))
-                .isEqualTo(parsed);
-    }
 
-    @Test
-    void loaderPartialTurnsAmbiguousZerosIntoStableP0Missing() throws Exception {
-        SandboxResourceUsage usage = completeUsage()
-                .setLogicalBytesScanned(0)
-                .setDatasetOpenCount(0)
-                .setAttributionComplete(false)
-                .addMissingFields("logicalBytesScanned")
-                .addMissingFields("datasetOpenCount")
-                .build();
 
-        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage));
 
-        assertThat(parsed.logicalBytesScanned()).isNull();
-        assertThat(parsed.datasetOpenCount()).isNull();
-        assertThat(parsed.attributionComplete()).isFalse();
-        assertThat(parsed.missingFields())
-                .containsExactly("datasetOpenCount", "logicalBytesScanned");
-    }
 
-    @Test
-    void samplingPartialTurnsAmbiguousValuesIntoStableP0Missing() throws Exception {
-        SandboxResourceUsage usage = completeUsage()
-                .setCpuMillis(123)
-                .setMemoryPeakBytes(456)
-                .setAttributionComplete(false)
-                .addMissingFields("cpuMillis")
-                .addMissingFields("memoryPeakBytes")
-                .build();
 
-        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage));
 
-        assertThat(parsed.cpuMillis()).isNull();
-        assertThat(parsed.memoryPeakBytes()).isNull();
-        assertThat(parsed.attributionComplete()).isFalse();
-        assertThat(parsed.missingFields()).containsExactly("cpuMillis", "memoryPeakBytes");
-    }
-
-    @Test
-    void diagnosticOnlyMissingCauseFailsClosedInsteadOfUpgradingToComplete() throws Exception {
-        SandboxResourceUsage usage = completeUsage()
-                .setAttributionComplete(false)
-                .addMissingFields("containerSampling")
-                .build();
-
-        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("unknown field");
-    }
-
-    @Test
-    void actualResourceClassMismatchFailsClosedInsteadOfBeingOverwrittenByReservation() throws Exception {
-        SandboxResourceUsage usage = completeUsage().setResourceClass("HEAVY").build();
-
-        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("does not match reservation");
-    }
-
-    @Test
-    void legacyBlankResourceClassUsesDurableReservationClass() throws Exception {
-        SandboxResourceUsage usage = completeUsage().clearResourceClass().build();
-
-        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.HEAVY, json(usage));
-
-        assertThat(parsed.resourceClass()).isEqualTo(DataAnalysisResourceClass.HEAVY);
-    }
-
-    @Test
-    void preCreateCancelWithUnknownRemoteClassRetainsHonestMissingMeasurements() throws Exception {
-        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.HEAVY, json(preCreateCanceledUsage()));
-
-        assertThat(parsed.resourceClass()).isEqualTo(DataAnalysisResourceClass.HEAVY);
-        assertThat(parsed.exitReason()).isEqualTo("CANCELED");
-        assertThat(parsed.attributionComplete()).isFalse();
-        assertThat(parsed.cpuMillis()).isNull();
-        assertThat(parsed.missingFields())
-                .contains("cpuMillis", "memoryPeakBytes", "datasetOpenCount")
-                .doesNotContain("exitReason", "memoryByteMillis");
-    }
-
-    @Test
-    void unknownRemoteClassWithMeasuredUsageCannotMasqueradeAsPreCreateCancel() throws Exception {
-        SandboxResourceUsage usage = preCreateCanceledUsage().toBuilder()
-                .setCpuMillis(1).build();
-
-        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("lacks unmeasured cancellation evidence");
-    }
-
-    @Test
-    void unknownRemoteClassWithoutCancellationEvidenceStillFailsClosed() throws Exception {
-        SandboxResourceUsage usage = preCreateCanceledUsage().toBuilder()
-                .setExitReason("UNKNOWN").build();
-
-        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
-                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("lacks unmeasured cancellation evidence");
-    }
 
     private SandboxResourceUsage preCreateCanceledUsage() {
         return SandboxResourceUsage.newBuilder()

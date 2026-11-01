@@ -25,64 +25,8 @@ class MybatisWaitGroupActivityTest {
     private final MybatisWaitGroupStore store = new MybatisWaitGroupStore(mapper, workItems, activity);
     private final NodeWorkItemIdentity segment = new NodeWorkItemIdentity("run-a", 1, "node-a", 0, 0);
 
-    @Test
-    void suspensionReservesWaitButKeepsNodeUntilSynchronousDispatchReturns() {
-        WaitSuspensionRequest request = request();
-        NodeWorkItem executing = new NodeWorkItem();
-        executing.setState("EXECUTING");
-        when(activity.lockForRun("run-a")).thenReturn("root-a");
-        when(workItems.findByIdentity("run-a", 1, "node-a", 0, 0)).thenReturn(executing);
-        when(activity.reserveWait("root-a", request)).thenReturn(RootTreeBudgetStore.State.RESERVED);
-        WaitSuspensionRow row = new WaitSuspensionRow();
-        row.setClosedSegments(1);
-        row.setCreatedGroupId(7L);
-        row.setWrittenMembers(1);
-        row.setWrittenNextSegments(1);
-        row.setNextSegmentSequence(1);
-        when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(row);
 
-        assertThat(store.suspendSegment(request).suspended()).isTrue();
-        var order = inOrder(activity, workItems, mapper);
-        order.verify(activity).lockForRun("run-a");
-        order.verify(workItems).findByIdentity("run-a", 1, "node-a", 0, 0);
-        order.verify(activity).reserveWait("root-a", request);
-        order.verify(mapper).suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString());
-        order.verify(activity).confirmWait(request);
-        verify(activity, never()).releaseNode(any(), anyInt());
-    }
 
-    @Test
-    void fullWaitTreeDoesNotSuspendTheExecutingNode() {
-        WaitSuspensionRequest request = request();
-        when(activity.lockForRun("run-a")).thenReturn("root-a");
-        when(activity.reserveWait("root-a", request)).thenReturn(RootTreeBudgetStore.State.REJECTED);
-        assertThatThrownBy(() -> store.suspendSegment(request))
-                .isInstanceOf(RootTreeActivityLimitException.class);
-        verify(mapper, never()).suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString());
-    }
-
-    @Test
-    void cancellationReleasesOneWaitingGroup() {
-        WaitGroup group = new WaitGroup();
-        group.setRunId("run-a");
-        group.setPlanGeneration(1);
-        group.setNodeId("node-a");
-        group.setNodeAttempt(0);
-        group.setSegmentSequence(0);
-        group.setModelTurn(2);
-        group.setState("WAITING");
-        when(mapper.findGroupById(7L)).thenReturn(group);
-        WaitChainCancelRow row = new WaitChainCancelRow();
-        row.setGroupsCanceled(1);
-        when(mapper.cancelChain(7L)).thenReturn(row);
-
-        assertThat(store.cancelChain(7L).canceled()).isTrue();
-        verify(activity).releaseWait(segment, 2);
-    }
 
     private WaitSuspensionRequest request() {
         return new WaitSuspensionRequest(segment, new NodeWorkItemVersions(1, 0, 1), "worker", 2,

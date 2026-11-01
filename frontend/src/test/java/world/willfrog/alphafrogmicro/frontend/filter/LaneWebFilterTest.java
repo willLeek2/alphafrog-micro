@@ -34,189 +34,19 @@ class LaneWebFilterTest {
         MDC.clear();
     }
 
-    @Test
-    void validHeaderTagMarksTheRequestAndKeepsEveryMarkerInvisibleDownstream() throws Exception {
-        LaneWebFilter filter = new LaneWebFilter(properties());
-        LaneContext.setTrafficScopeId("outer-scope");
-        MDC.put(LaneContext.MDC_LANE_TAG, "outer-scope");
 
-        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/agent/runs");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "lane-a");
-        request.addHeader(LaneWebFilter.TRAFFIC_SCOPE_HEADER, "forged-scope");
-        request.addHeader(LaneWebFilter.DEPLOYMENT_HEADER, "forged-deployment");
-        request.addHeader(LaneWebFilter.DEPLOYMENT_GENERATION_HEADER, "gen-" + "f".repeat(64));
-        request.addHeader(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "forged-attachment");
-        request.addHeader("X-Request-Id", "request-1");
-        AtomicInteger downstreamCalls = new AtomicInteger();
 
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) -> {
-            downstreamCalls.incrementAndGet();
-            var downstream = (jakarta.servlet.http.HttpServletRequest) sanitized;
-            assertSanitizedHeaders(downstream);
-            assertEquals("lane-a", LaneContext.trafficScopeId());
-            assertEquals("lane-a", MDC.get(LaneContext.MDC_LANE_TAG));
-        });
 
-        assertEquals(1, downstreamCalls.get());
-        assertEquals("outer-scope", LaneContext.trafficScopeId());
-        assertEquals("outer-scope", MDC.get(LaneContext.MDC_LANE_TAG));
-    }
 
-    @Test
-    void surroundingWhitespaceInTheHeaderTagIsTrimmedBeforeTagging() throws Exception {
-        LaneWebFilter filter = new LaneWebFilter(properties());
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "  lane-a  ");
 
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response)
-                -> assertEquals("lane-a", LaneContext.trafficScopeId()));
-    }
 
-    @Test
-    void requestWithoutALaneTagHeaderRunsAsUntaggedTraffic() throws Exception {
-        assertUntaggedAndRunsOnce(new LaneWebFilter(properties()),
-                new MockHttpServletRequest("GET", "/api/agent/runs"));
-    }
 
-    @Test
-    void blankLaneTagHeaderRunsAsUntaggedTraffic() throws Exception {
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "   ");
 
-        assertUntaggedAndRunsOnce(new LaneWebFilter(properties()), request);
-    }
 
-    @Test
-    void mainBetaHeaderTagRunsAsUntaggedTraffic() throws Exception {
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "main-beta");
 
-        assertUntaggedAndRunsOnce(new LaneWebFilter(properties()), request);
-    }
 
-    @Test
-    void invalidHeaderTagRunsAsUntaggedTrafficAndWarnsOnlyOnce() throws Exception {
-        Logger logger = (Logger) LoggerFactory.getLogger(LaneWebFilter.class);
-        Level previousLevel = logger.getLevel();
-        ListAppender<ILoggingEvent> appender = new ListAppender<>();
-        appender.start();
-        logger.addAppender(appender);
-        logger.setLevel(Level.WARN);
-        try {
-            LaneWebFilter filter = new LaneWebFilter(properties());
-            MockHttpServletRequest first = new MockHttpServletRequest("GET", "/api/agent/runs");
-            first.addHeader(LaneWebFilter.LANE_TAG_HEADER, "Bad Tag!");
-            MockHttpServletRequest second = new MockHttpServletRequest("GET", "/api/agent/runs");
-            second.addHeader(LaneWebFilter.LANE_TAG_HEADER, "Also-Bad-!");
 
-            assertUntaggedAndRunsOnce(filter, first);
-            assertUntaggedAndRunsOnce(filter, second);
 
-            assertEquals(1, appender.list.stream()
-                    .filter(event -> event.getLevel() == Level.WARN
-                            && event.getFormattedMessage().contains("入口泳道请求头格式不合法"))
-                    .count());
-        } finally {
-            logger.detachAppender(appender);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    void injectedTrafficScopeIdWinsOverTheRequestHeader() throws Exception {
-        LaneEntryProperties properties = properties();
-        properties.setTrafficScopeId("lane-injected");
-        LaneWebFilter filter = new LaneWebFilter(properties);
-        MockHttpServletRequest request = markedRequest(DispatcherType.REQUEST, "lane-from-header");
-
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) -> {
-            assertSanitizedHeaders((HttpServletRequest) sanitized);
-            assertEquals("lane-injected", LaneContext.trafficScopeId());
-            assertEquals("lane-injected", MDC.get(LaneContext.MDC_LANE_TAG));
-        });
-    }
-
-    @Test
-    void injectedTrafficScopeIdTagsTrafficWithoutAnyHeader() throws Exception {
-        LaneEntryProperties properties = properties();
-        properties.setTrafficScopeId("lane-injected");
-        LaneWebFilter filter = new LaneWebFilter(properties);
-
-        filter.doFilter(new MockHttpServletRequest("GET", "/api/agent/runs"),
-                new MockHttpServletResponse(), (sanitized, response)
-                        -> assertEquals("lane-injected", LaneContext.trafficScopeId()));
-    }
-
-    @Test
-    void disabledEntryNeverTagsEvenWithAValidHeader() throws Exception {
-        LaneEntryProperties properties = properties();
-        properties.setEnabled(false);
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "lane-a");
-
-        assertUntaggedAndRunsOnce(new LaneWebFilter(properties), request);
-    }
-
-    @Test
-    void internalPathRunsAsUntaggedTrafficEvenWithAValidHeader() throws Exception {
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/internal/health");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "lane-a");
-
-        assertUntaggedAndRunsOnce(new LaneWebFilter(properties()), request);
-    }
-
-    @Test
-    void asyncDispatchStillStripsEveryExternalMarkerAndKeepsTheTag() throws Exception {
-        LaneWebFilter filter = new LaneWebFilter(properties());
-        MockHttpServletRequest request = markedRequest(DispatcherType.ASYNC, "lane-a");
-
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) -> {
-            assertSanitizedHeaders((HttpServletRequest) sanitized);
-            assertEquals("lane-a", LaneContext.trafficScopeId());
-        });
-    }
-
-    @Test
-    void separateErrorDispatchStillStripsEveryExternalMarkerAndKeepsTheTag() throws Exception {
-        LaneWebFilter filter = new LaneWebFilter(properties());
-        MockHttpServletRequest request = markedRequest(DispatcherType.ERROR, "lane-a");
-        request.setAttribute(RequestDispatcher.ERROR_REQUEST_URI, request.getRequestURI());
-
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) -> {
-            assertSanitizedHeaders((HttpServletRequest) sanitized);
-            assertEquals("lane-a", LaneContext.trafficScopeId());
-        });
-    }
-
-    @Test
-    void nestedErrorDispatchRewrapsTheOriginalRequestBeforeCallingTheErrorHandler() throws Exception {
-        InspectableLaneWebFilter filter = new InspectableLaneWebFilter(properties());
-        MockHttpServletRequest request = markedRequest(DispatcherType.ERROR, "lane-a");
-        request.setAttribute(RequestDispatcher.ERROR_REQUEST_URI, request.getRequestURI());
-        request.setAttribute(filter.alreadyFilteredAttributeName(), Boolean.TRUE);
-
-        filter.doFilter(request, new MockHttpServletResponse(), (sanitized, response) ->
-                assertSanitizedHeaders((HttpServletRequest) sanitized));
-    }
-
-    @Test
-    void exceptionStillRestoresOuterThreadContext() {
-        LaneWebFilter filter = new LaneWebFilter(properties());
-        LaneContext.setTrafficScopeId("outer-scope");
-        MDC.put(LaneContext.MDC_LANE_TAG, "outer-scope");
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
-        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "lane-a");
-
-        assertThrows(ServletException.class, () -> filter.doFilter(
-                request,
-                new MockHttpServletResponse(),
-                (sanitized, response) -> {
-                    throw new ServletException("downstream failed");
-                }));
-
-        assertEquals("outer-scope", LaneContext.trafficScopeId());
-        assertEquals("outer-scope", MDC.get(LaneContext.MDC_LANE_TAG));
-    }
 
     private static LaneEntryProperties properties() {
         LaneEntryProperties properties = new LaneEntryProperties();

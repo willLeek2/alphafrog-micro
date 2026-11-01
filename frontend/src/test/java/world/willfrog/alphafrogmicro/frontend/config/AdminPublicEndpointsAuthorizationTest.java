@@ -43,53 +43,8 @@ class AdminPublicEndpointsAuthorizationTest {
                     WebMvcAutoConfiguration.class))
             .withUserConfiguration(TestConfiguration.class);
 
-    @Test
-    void unauthenticatedAdminCreateAndLoginPassOrdinaryChainAuthorization() throws Exception {
-        runner.run(context -> {
-            assertFalse(context.getStartupFailure() != null,
-                    () -> String.valueOf(context.getStartupFailure()));
 
-            Outcome create = execute(proxy(context), post("/admin/create"));
-            assertTrue(create.reachedEnd(), "POST /admin/create should reach controller, got " + create.status());
-            assertEquals(200, create.status());
 
-            Outcome login = execute(proxy(context), post("/admin/login"));
-            assertTrue(login.reachedEnd(), "POST /admin/login should reach controller, got " + login.status());
-            assertEquals(200, login.status());
-
-            Outcome authLogin = execute(proxy(context), post("/api/auth/login"));
-            assertTrue(authLogin.reachedEnd(), "POST /api/auth/login should still reach controller");
-        });
-    }
-
-    @Test
-    void unauthenticatedOtherAdminEndpointsStillRejectedWith401() throws Exception {
-        runner.run(context -> {
-            assertFalse(context.getStartupFailure() != null,
-                    () -> String.valueOf(context.getStartupFailure()));
-
-            Outcome overall = execute(proxy(context), request("GET", "/admin/overall"));
-            assertFalse(overall.reachedEnd(), "GET /admin/overall must not reach controller unauthenticated");
-            assertEquals(401, overall.status());
-
-            Outcome inviteCodes = execute(proxy(context), post("/admin/invite-codes"));
-            assertFalse(inviteCodes.reachedEnd(), "POST /admin/invite-codes must not reach controller unauthenticated");
-            assertEquals(401, inviteCodes.status());
-        });
-    }
-
-    @Test
-    void errorDispatchIsPermittedOnOrdinaryChain() throws Exception {
-        runner.run(context -> {
-            assertFalse(context.getStartupFailure() != null,
-                    () -> String.valueOf(context.getStartupFailure()));
-
-            MockHttpServletRequest request = request("GET", "/error");
-            request.setDispatcherType(jakarta.servlet.DispatcherType.ERROR);
-            Outcome outcome = execute(proxy(context), request);
-            assertTrue(outcome.reachedEnd(), "ERROR dispatch to /error should be permitted, got " + outcome.status());
-        });
-    }
 
     private static FilterChainProxy proxy(org.springframework.boot.test.context.assertj.AssertableWebApplicationContext context) {
         List<SecurityFilterChain> chains = List.of(

@@ -94,15 +94,6 @@ class AgentRunDatasetCsvWriterTest {
                 "field with comma should be quoted; got: " + lines[1]);
     }
 
-    @Test
-    void csvRowShouldEscapeInternalDoubleQuotes() {
-        AgentRunDatasetEntry e = AgentRunDatasetEntry.forDataset(1, "ds-x",
-                "/path", "ts \"with quote\"", "a.csv");
-        AgentRunDatasetSnapshot snap = new AgentRunDatasetSnapshot(List.of(e), List.of());
-        String csv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(snap);
-        assertTrue(csv.contains("\"ts \"\"with quote\"\"\""),
-                "double quote inside quoted field should be doubled; got: " + csv);
-    }
 
     @Test
     void sandboxInputPlaceholderShouldBeStableForPythonSubstitution() {

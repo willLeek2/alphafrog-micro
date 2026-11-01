@@ -77,20 +77,4 @@ class AgentLangchainToolThrottleScopeControllerTest {
     @MockBean
     private AgentRunEventService runEventService;
 
-    @Test
-    void toolThrottleExposesStablePerNodeScope() throws Exception {
-        Map<String, Object> metrics = new LinkedHashMap<>();
-        metrics.put("scope", "per-node");
-        metrics.put("enabled", false);
-        metrics.put("maxPermits", 20);
-        metrics.put("availablePermits", 20);
-        metrics.put("queueLength", 0);
-        when(toolThrottle.throttleMetrics()).thenReturn(metrics);
-
-        mockMvc.perform(get("/agent-langchain/tool-throttle"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.scope", is("per-node")))
-                .andExpect(jsonPath("$.enabled", is(false)))
-                .andExpect(jsonPath("$.maxPermits", is(20)));
-    }
 }

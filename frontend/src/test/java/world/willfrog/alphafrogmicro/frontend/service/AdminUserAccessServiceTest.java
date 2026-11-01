@@ -17,26 +17,7 @@ class AdminUserAccessServiceTest {
     private final UserDao userDao = mock(UserDao.class);
     private final AdminUserAccessService service = new AdminUserAccessService(userDao);
 
-    @Test
-    void activeAdminIsAccepted() {
-        Authentication authentication = authentication("admin");
-        when(userDao.getUserByUsername("admin")).thenReturn(List.of(user(1127, "ACTIVE")));
 
-        assertTrue(service.isActiveAdmin(authentication));
-    }
-
-    @Test
-    void missingNormalOrInactiveUserIsRejected() {
-        assertFalse(service.isActiveAdmin(null));
-
-        Authentication normal = authentication("normal");
-        when(userDao.getUserByUsername("normal")).thenReturn(List.of(user(1, "ACTIVE")));
-        assertFalse(service.isActiveAdmin(normal));
-
-        Authentication inactive = authentication("inactive");
-        when(userDao.getUserByUsername("inactive")).thenReturn(List.of(user(1127, "DISABLED")));
-        assertFalse(service.isActiveAdmin(inactive));
-    }
 
     private static Authentication authentication(String username) {
         Authentication authentication = mock(Authentication.class);

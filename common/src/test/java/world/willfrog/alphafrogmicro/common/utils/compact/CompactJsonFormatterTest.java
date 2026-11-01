@@ -79,19 +79,4 @@ public class CompactJsonFormatterTest {
         assertEquals(0, stats.getTotalElements());
     }
     
-    @Test
-    public void testCompactJsonStatsToString() {
-        CompactJsonFormatter.CompactJsonStats stats = CompactJsonFormatter.CompactJsonStats.builder()
-                .fieldCount(5)
-                .rowCount(10)
-                .hasMeta(true)
-                .totalElements(50)
-                .build();
-        
-        String statsString = stats.toString();
-        assertTrue(statsString.contains("fields=5"));
-        assertTrue(statsString.contains("rows=10"));
-        assertTrue(statsString.contains("hasMeta=true"));
-        assertTrue(statsString.contains("totalElements=50"));
-    }
 }

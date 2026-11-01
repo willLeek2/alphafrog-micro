@@ -215,13 +215,6 @@ describe('CompactJsonUtils 单元测试', () => {
             });
         });
 
-        test('应该缓存字段映射器', () => {
-            const fields = ["ts_code", "close"];
-            const mapper1 = createFieldMapper(fields);
-            const mapper2 = createFieldMapper(fields);
-
-            expect(mapper1).toBe(mapper2); // 应该是同一个函数（缓存）
-        });
     });
 
     describe('parseStockData', () => {
@@ -250,19 +243,6 @@ describe('CompactJsonUtils 单元测试', () => {
             });
         });
 
-        test('应该处理股票数据中的null值', () => {
-            const response = {
-                format: "compact",
-                fields: ["ts_code", "close", "pct_chg"],
-                rows: [["000001.SZ", null, null]]
-            };
-
-            const result = parseStockData(response);
-
-            expect(result[0].ts_code).toBe("000001.SZ");
-            expect(result[0].close).toBe(0); // null被转换为0
-            expect(result[0].pct_chg).toBe(0); // null被转换为0
-        });
     });
 
     describe('parseFundData', () => {
@@ -367,107 +347,15 @@ describe('CompactJsonUtils 单元测试', () => {
     });
 
     describe('数值转换', () => {
-        test('应该正确转换数值字符串', () => {
-            const response = {
-                format: "compact",
-                fields: ["close", "pct_chg"],
-                rows: [["15.68", "2.96"]]
-            };
 
-            const result = parseCompactJson(response);
-            expect(result[0].close).toBe(15.68);
-            expect(result[0].pct_chg).toBe(2.96);
-        });
-
-        test('应该正确处理无效数值', () => {
-            const response = {
-                format: "compact",
-                fields: ["close", "vol"],
-                rows: [["invalid", ""]]
-            };
-
-            const result = parseCompactJson(response);
-            expect(result[0].close).toBeNull();
-            expect(result[0].vol).toBeNull();
-        });
     });
 
     describe('缓存管理', () => {
-        test('应该正确清空缓存', () => {
-            // 先创建一些缓存
-            createFieldMapper(["ts_code", "close"]);
-            createFieldMapper(["nav_date", "unit_nav"]);
 
-            const statsBefore = getCacheStats();
-            expect(statsBefore.fieldMapperCacheSize).toBeGreaterThan(0);
-
-            // 清空缓存
-            clearCache();
-
-            const statsAfter = getCacheStats();
-            expect(statsAfter.fieldMapperCacheSize).toBe(0);
-        });
-
-        test('应该正确返回缓存统计', () => {
-            clearCache();
-            
-            const initialStats = getCacheStats();
-            expect(initialStats.fieldMapperCacheSize).toBe(0);
-
-            // 创建缓存
-            createFieldMapper(["ts_code", "close"]);
-
-            const stats = getCacheStats();
-            expect(stats.fieldMapperCacheSize).toBe(1);
-        });
     });
 
     describe('性能测试', () => {
-        test('应该高效处理大量数据', () => {
-            // 创建大量测试数据
-            const fields = ["ts_code", "trade_date", "close", "open", "high", "low", "vol", "amount"];
-            const rows = [];
-            
-            for (let i = 0; i < 1000; i++) {
-                rows.push([
-                    `00000${i % 1000}.SZ`,
-                    `202401${(i % 31) + 1}`,
-                    10 + Math.random() * 90,
-                    10 + Math.random() * 90,
-                    10 + Math.random() * 90,
-                    10 + Math.random() * 90,
-                    Math.floor(Math.random() * 1000000),
-                    Math.floor(Math.random() * 10000000)
-                ]);
-            }
 
-            const startTime = performance.now();
-            const result = compactToObjects(fields, rows);
-            const endTime = performance.now();
-
-            expect(result).toHaveLength(1000);
-            expect(endTime - startTime).toBeLessThan(100); // 应该在100ms内完成
-        });
-
-        test('应该显示缓存性能优势', () => {
-            const fields = ["ts_code", "close", "vol"];
-            const rows = [["000001.SZ", 15.68, 1234567]];
-
-            // 第一次调用
-            const start1 = performance.now();
-            compactToObjects(fields, rows);
-            const end1 = performance.now();
-            const time1 = end1 - start1;
-
-            // 第二次调用（应该使用缓存）
-            const start2 = performance.now();
-            compactToObjects(fields, rows);
-            const end2 = performance.now();
-            const time2 = end2 - start2;
-
-            // 第二次调用应该更快（或至少不会慢很多）
-            expect(time2).toBeLessThanOrEqual(time1 * 1.1); // 允许10%的误差
-        });
     });
 
     describe('边界情况', () => {

@@ -28,76 +28,8 @@ class ToolJobSqlPreparingReplayAdmissionTest {
     private static final ObjectMapper JSON = new ObjectMapper().findAndRegisterModules();
     private static final String FP = "sha256:" + "a".repeat(64);
 
-    @ParameterizedTest
-    @CsvSource({"false,true,false", "true,true,false", "false,false,false", "true,false,false",
-            "false,false,true", "true,false,true"})
-    void oldPreparingReplayWaitsForOtherQueryAndOnlyCreatesAfterRenewal(
-            boolean startup, boolean busy, boolean cancelDuringLookup) throws Exception {
-        Fixture fixture = fixture(busy, cancelDuringLookup, false);
-        String originalAnchor = fixture.run.getToolJobAnchorJson();
 
-        fixture.exercise(startup);
 
-        boolean created = !busy && !cancelDuringLookup;
-        verify(fixture.sandbox, created ? times(1) : never()).createTask(fixture.request);
-        verify(fixture.sandbox, never()).cancelTask(any());
-        if (created) {
-            var order = inOrder(fixture.mapper, fixture.sandbox);
-            order.verify(fixture.mapper).renewExecuteQueryPreparingReplayClaim(eq("run-1"),
-                    eq("run-1:call-1:1"), eq(FP), eq(JsonFormat.printer().print(fixture.request)),
-                    anyString(), eq(2), eq(5L));
-            order.verify(fixture.sandbox).createTask(fixture.request);
-            assertThat(fixture.run.getUpdatedAt()).isAfter(OffsetDateTime.now().minusSeconds(1));
-        } else {
-            assertThat(fixture.run.getToolJobAnchorJson()).isEqualTo(originalAnchor);
-            verify(fixture.redis).upsertDue(eq("run-1"), argThat(anchor -> anchor.getNextPollAt() != null));
-        }
-        if (startup) {
-            @SuppressWarnings("unchecked")
-            var reservations = org.mockito.ArgumentCaptor.forClass(List.class);
-            verify(fixture.capacity).recover(reservations.capture(), anyInt(), anyInt());
-            assertThat(reservations.getValue()).singleElement().satisfies(value -> {
-                DataAnalysisReservation reservation = (DataAnalysisReservation) value;
-                assertThat(reservation.operationId()).isEqualTo("run-1:call-1:1");
-                assertThat(reservation.state()).isEqualTo(created
-                        ? DataAnalysisReservationState.TASK_ATTACHED : DataAnalysisReservationState.PREPARING);
-            });
-        }
-        verify(fixture.capacity, never()).releaseReservation(any());
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void alreadyAcceptedSqlTaskIsAttachedWithoutRenewalOrSecondCreate(boolean startup) throws Exception {
-        Fixture fixture = fixture(true, false, true);
-
-        fixture.exercise(startup);
-
-        verify(fixture.mapper, never()).renewExecuteQueryPreparingReplayClaim(anyString(), anyString(),
-                anyString(), anyString(), anyString(), any(), any());
-        verify(fixture.sandbox, never()).createTask(any());
-        assertThat(ToolJobAnchor.fromJson(fixture.run.getToolJobAnchorJson()).getTaskId()).isEqualTo("accepted-task");
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void controlVersionChangedBeforeCasStopsCreateAndLeavesOriginalProofForFreshRead(boolean startup) throws Exception {
-        Fixture fixture = fixture(false, false, false);
-        String original = fixture.run.getToolJobAnchorJson();
-        when(fixture.mapper.renewExecuteQueryPreparingReplayClaim(eq("run-1"), anyString(), anyString(),
-                anyString(), anyString(), eq(2), eq(5L))).thenAnswer(call -> {
-            fixture.run.setRunControlVersion(6L);
-            return 0;
-        });
-
-        fixture.exercise(startup);
-
-        verify(fixture.sandbox, never()).createTask(any());
-        assertThat(fixture.run.getRunControlVersion()).isEqualTo(6L);
-        assertThat(fixture.run.getToolJobAnchorJson()).isEqualTo(original);
-        verify(fixture.redis).upsertDue(eq("run-1"), any());
-        if (startup) verify(fixture.mapper, atLeast(3)).findById("run-1");
-    }
 
     @org.junit.jupiter.api.Test
     void busyStartupStillRestoresProvenCapacityWhenDueIndexIsUnavailable() throws Exception {

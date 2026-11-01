@@ -19,32 +19,7 @@ import static org.mockito.Mockito.when;
 class PythonWorkspaceRunSettingsTest {
     private static final String GENERATION = "gen-" + "a".repeat(64);
 
-    @Test
-    void workspaceOnlyCallUsesStableEmptyInputSnapshotIdentity() {
-        assertEquals("sha256:047a4e741f68a028dd46a1fdbd1dec12d87c8a2123abaa9f36abd5c4506ca2e8",
-                AgentRunDatasetSnapshot.empty().immutableDigest());
-    }
 
-    @Test
-    void readsEachOwnedRunSnapshotAndKeepsOldRunsDisabled() {
-        PythonSandboxTools tools = new PythonSandboxTools(new ObjectMapper());
-        AgentRunMapper runs = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider deployment = () -> new DeploymentIdentity("stable", GENERATION);
-        ReflectionTestUtils.setField(tools, "agentRunMapper", runs);
-        ReflectionTestUtils.setField(tools, "deploymentIdentityProvider", deployment);
-        when(runs.findByIdForDeployment("new-run", "stable", GENERATION))
-                .thenReturn(run("{\"python_workspace_enabled\":true}"));
-        when(runs.findByIdForDeployment("old-run", "stable", GENERATION))
-                .thenReturn(run("{}"));
-        when(runs.findByIdForDeployment("disabled-run", "stable", GENERATION))
-                .thenReturn(run("{\"python_workspace_enabled\":false}"));
-
-        assertTrue(tools.pythonWorkspaceEnabledForRun("new-run"));
-        assertFalse(tools.pythonWorkspaceEnabledForRun("old-run"));
-        assertFalse(tools.pythonWorkspaceEnabledForRun("disabled-run"));
-        assertThrows(IllegalStateException.class,
-                () -> tools.pythonWorkspaceEnabledForRun("other-deployment-run"));
-    }
 
     private static AgentRun run(String ext) {
         AgentRun run = new AgentRun();

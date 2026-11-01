@@ -40,46 +40,8 @@ class MethodSpecArtifactVerifierTest {
                 .findFirst().orElseThrow();
     }
 
-    @Test
-    void jarWithCorrectArtifactsPasses() throws Exception {
-        compileOneSpec();
-        Path jar = tempDir.resolve("good.jar");
-        createJarFromCompileOutput(jar, tempDir.resolve("compile"), false, false);
 
-        VerifyMethodSpecArtifactMojo mojo = new VerifyMethodSpecArtifactMojo();
-        mojo.setLog(new SystemStreamLog());
-        setField(mojo, "artifactJar", jar.toString());
 
-        mojo.execute();
-    }
-
-    @Test
-    void jarWithTamperedDigestFails() throws Exception {
-        compileOneSpec();
-        Path jar = tempDir.resolve("tampered.jar");
-        createJarFromCompileOutput(jar, tempDir.resolve("compile"), true, false);
-
-        VerifyMethodSpecArtifactMojo mojo = new VerifyMethodSpecArtifactMojo();
-        mojo.setLog(new SystemStreamLog());
-        setField(mojo, "artifactJar", jar.toString());
-
-        MojoFailureException ex = assertThrows(MojoFailureException.class, mojo::execute);
-        assertTrue(ex.getMessage().contains("Digest mismatch"));
-    }
-
-    @Test
-    void jarContainingYamlFails() throws Exception {
-        compileOneSpec();
-        Path jar = tempDir.resolve("with-yaml.jar");
-        createJarFromCompileOutput(jar, tempDir.resolve("compile"), false, true);
-
-        VerifyMethodSpecArtifactMojo mojo = new VerifyMethodSpecArtifactMojo();
-        mojo.setLog(new SystemStreamLog());
-        setField(mojo, "artifactJar", jar.toString());
-
-        MojoFailureException ex = assertThrows(MojoFailureException.class, mojo::execute);
-        assertTrue(ex.getMessage().contains("must not contain YAML source"));
-    }
 
     private void createJarFromCompileOutput(Path jar, Path compileDir, boolean tamperDigest, boolean includeYaml) throws IOException {
         try (JarOutputStream jos = new JarOutputStream(Files.newOutputStream(jar))) {

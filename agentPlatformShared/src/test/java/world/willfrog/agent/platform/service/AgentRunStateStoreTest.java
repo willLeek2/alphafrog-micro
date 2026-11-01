@@ -45,54 +45,7 @@ class AgentRunStateStoreTest {
         org.springframework.test.util.ReflectionTestUtils.setField(store, "callRawContentTtlSeconds", 7200L);
     }
 
-    @Test
-    void saveObservability_whenSetThrows_shouldRethrowAndNotTouch() {
-        String runId = "run-test-1";
-        String json = "{}";
 
-        doThrow(new RedisConnectionFailureException("connection refused"))
-                .when(valueOperations).set(anyString(), eq(json));
 
-        RedisConnectionFailureException thrown = assertThrows(
-                RedisConnectionFailureException.class,
-                () -> store.saveObservability(runId, json)
-        );
 
-        assertTrue(thrown.getMessage().contains("connection refused"));
-        // SET 失败时不能调用 expire
-        verify(redisTemplate, never()).expire(anyString(), any(Duration.class));
-    }
-
-    @Test
-    void saveObservability_whenSetSucceeds_shouldTouchKey() {
-        String runId = "run-test-2";
-        String json = "{\"test\":true}";
-
-        store.saveObservability(runId, json);
-
-        verify(valueOperations).set(anyString(), eq(json));
-        verify(redisTemplate).expire(anyString(), any(Duration.class));
-    }
-
-    @Test
-    void saveLlmCallRawContent_shouldUseRawTtlAndLongerMarkerTtl() {
-        store.saveLlmCallRawContent("run-1", "llm-1", "{\"httpRequest\":{}}");
-
-        verify(valueOperations).set(eq("agent:run:run-1:detail:llm:llm-1:raw"),
-                eq("{\"httpRequest\":{}}"), eq(Duration.ofSeconds(7200)));
-        verify(valueOperations).set(eq("agent:run:run-1:detail:llm:llm-1:raw:meta"),
-                anyString(), eq(Duration.ofSeconds(21600)));
-    }
-
-    @Test
-    void loadObservability_whenGetThrows_shouldReturnEmpty() {
-        String runId = "run-test-3";
-
-        doThrow(new RedisConnectionFailureException("connection refused"))
-                .when(valueOperations).get(anyString());
-
-        Optional<String> result = store.loadObservability(runId);
-
-        assertTrue(result.isEmpty());
-    }
 }

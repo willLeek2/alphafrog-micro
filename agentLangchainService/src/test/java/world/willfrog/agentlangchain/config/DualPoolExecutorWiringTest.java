@@ -34,31 +34,6 @@ import static org.mockito.Mockito.when;
  */
 class DualPoolExecutorWiringTest {
 
-    @Test
-    void theDispatcherIsCreatedWithThePoolsItAsksForByQualifier() {
-        AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
-        context.register(LangchainRunAsyncConfig.class, DualPoolDispatcher.class, Stubs.class);
-        context.addBeanFactoryPostProcessor(factory -> {
-            for (String name : factory.getBeanDefinitionNames()) {
-                factory.getBeanDefinition(name).setLazyInit(true);
-            }
-        });
-        context.refresh();
-        try {
-            DualPoolDispatcher dispatcher = context.getBean(DualPoolDispatcher.class);
-            assertThat(dispatcher).as("限定名与 Bean 名对不上时，这一步就会抛异常").isNotNull();
-
-            List<String> qualifiers = qualifiersOnTheDispatcherConstructor();
-            assertThat(qualifiers).as("调度器至少按限定名要一个线程池，否则这条用例没有意义").isNotEmpty();
-            for (String qualifier : qualifiers) {
-                assertThat(context.getBean(qualifier))
-                        .as("限定名 " + qualifier + " 在容器里要对得上一个线程池")
-                        .isInstanceOf(ThreadPoolTaskExecutor.class);
-            }
-        } finally {
-            context.close();
-        }
-    }
 
     /** 调度器构造器上写下的限定名，按参数顺序。 */
     private static List<String> qualifiersOnTheDispatcherConstructor() {

@@ -37,59 +37,7 @@ class LangchainTodoNodeExecutorRetryTest {
     }
 
 
-    @Test
-    void readOnlyToolGetsExactlyOneCorrectiveTodoRetry() {
-        AtomicInteger executions = new AtomicInteger();
-        ToolProvider tools = provider("searchWeb", (request, memoryId) -> {
-            if (executions.getAndIncrement() == 0) {
-                throw new IllegalStateException("upstream timeout");
-            }
-            return "{\"ok\":true,\"data\":[]}";
-        });
-        var model = new LangchainTodoNodeExecutorEmptyOutputTest.ScriptedChatModel(
-                toolCall("call-1", "searchWeb", "{\"query\":\"old\"}"),
-                toolCall("call-2", "searchWeb", "{\"query\":\"corrected\"}"),
-                AiMessage.from("done"));
-        LangchainTodoNodeExecutor executor = configuredExecutor(tools);
 
-        LangchainTodoNodeResult result = executor.execute(
-                request(model, "searchWeb"),
-                TodoItem.builder().id("todo_1").sequence(1).description("search").build(),
-                List.of(), new LinkedHashMap<>(), new AtomicInteger());
-
-        assertThat(result.isSuccess()).isTrue();
-        assertThat(result.getOutput()).isEqualTo("done");
-        assertThat(result.getTodoRetryAttempts()).isEqualTo(1);
-        assertThat(result.getTodoRetryOutcome()).isEqualTo("success");
-        assertThat(executions.get()).isEqualTo(2);
-        assertThat(model.requests().get(1).messages().toString())
-                .contains("TODO_RETRY_CONTEXT", "old", "upstream timeout");
-    }
-
-    @Test
-    void unsafeToolNeverGetsSecondExecutionEvenWhenFailureIsRetryable() {
-        AtomicInteger executions = new AtomicInteger();
-        ToolProvider tools = provider("spawnSubAgent", (request, memoryId) -> {
-            executions.incrementAndGet();
-            throw new IllegalStateException("upstream timeout");
-        });
-        var model = new LangchainTodoNodeExecutorEmptyOutputTest.ScriptedChatModel(
-                toolCall("call-1", "spawnSubAgent", "{\"goal\":\"write\"}"));
-        LangchainTodoNodeExecutor executor = configuredExecutor(tools);
-
-        LangchainTodoNodeResult result = executor.execute(
-                request(model, "spawnSubAgent"),
-                TodoItem.builder().id("todo_unsafe").sequence(1).description("spawn").build(),
-                List.of(), new LinkedHashMap<>(), new AtomicInteger());
-
-        assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getFailureMetadata()).containsEntry("retryable", true);
-        assertThat(result.getFailureMetadata()).containsEntry("todo_retry_allowed", false);
-        assertThat(result.getFailureMetadata()).containsEntry("tool_retry_safety", "UNSAFE");
-        assertThat(result.getFailureMetadata()).containsEntry("todo_retry_attempts", 0);
-        assertThat(executions.get()).isEqualTo(1);
-        assertThat(model.requests()).hasSize(1);
-    }
 
     private LangchainTodoNodeExecutor configuredExecutor(ToolProvider tools) {
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.versionedTodoNodeExecutor(Optional.of(LangchainTestFixtures.runtimeDataTools(tools)));

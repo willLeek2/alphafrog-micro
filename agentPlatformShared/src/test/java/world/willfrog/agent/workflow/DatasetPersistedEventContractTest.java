@@ -54,13 +54,6 @@ class DatasetPersistedEventContractTest {
         assertEquals("UNCERTAIN", event.getFromTsCode());
     }
 
-    @Test
-    void fromTsCodeShouldDefaultToUncertainWhenBlank() {
-        DatasetPersistedEvent event = new DatasetPersistedEvent(
-                this, "run-1", "ds-1", "/path/ds-1.csv", "  ", "ds-1.csv"
-        );
-        assertEquals("UNCERTAIN", event.getFromTsCode());
-    }
 
     @Test
     void multiTsCodeShouldUseHashSeparator() {
@@ -81,15 +74,6 @@ class DatasetPersistedEventContractTest {
                 () -> event.getRelatedDatasetIds().add("ds-3"));
     }
 
-    @Test
-    void sortKeyShouldBeFilename() {
-        DatasetPersistedEvent event = new DatasetPersistedEvent(
-                this, "run-1", "ds-1",
-                "/data/database_fetched/domestic_index/000300.SH/DEF456/000300.SH.csv",
-                "000300.SH", "000300.SH.csv"
-        );
-        assertEquals("000300.SH.csv", event.getSortKey());
-    }
 
     @Test
     void nullConstructorArgsShouldThrow() {

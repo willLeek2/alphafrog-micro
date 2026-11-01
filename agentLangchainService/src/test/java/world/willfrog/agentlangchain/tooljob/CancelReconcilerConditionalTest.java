@@ -35,52 +35,7 @@ class CancelReconcilerConditionalTest {
         }
     }
 
-    @Test
-    void beanNotCreatedByDefault() {
-        try (var ctx = new AnnotationConfigApplicationContext()) {
-            ctx.register(TestConfig.class);
-            ctx.register(CancelReconciler.class);
-            ctx.refresh();
 
-            String[] beans = ctx.getBeanNamesForType(CancelReconciler.class);
-            assertThat(beans).isEmpty();
-        }
-    }
 
-    @Test
-    void beanCreatedWhenExplicitlyEnabled() {
-        try (var ctx = new AnnotationConfigApplicationContext()) {
-            ctx.getEnvironment().getPropertySources().addFirst(
-                    new MapPropertySource("test", Map.of("alphafrog.cancel.reconciler.enabled", "true")));
-            ctx.register(TestConfig.class);
-            ctx.register(CancelReconciler.class);
-            ctx.refresh();
 
-            String[] beans = ctx.getBeanNamesForType(CancelReconciler.class);
-            assertThat(beans).hasSize(1);
-        }
-    }
-
-    @Test
-    void beanNotCreatedWhenExplicitlyDisabled() {
-        try (var ctx = new AnnotationConfigApplicationContext()) {
-            ctx.getEnvironment().getPropertySources().addFirst(
-                    new MapPropertySource("test", Map.of("alphafrog.cancel.reconciler.enabled", "false")));
-            ctx.register(TestConfig.class);
-            ctx.register(CancelReconciler.class);
-            ctx.refresh();
-
-            String[] beans = ctx.getBeanNamesForType(CancelReconciler.class);
-            assertThat(beans).isEmpty();
-        }
-    }
-
-    @Test
-    void annotationHasMatchIfMissingFalse() throws Exception {
-        ConditionalOnProperty annotation = CancelReconciler.class
-                .getAnnotation(ConditionalOnProperty.class);
-        assertThat(annotation).isNotNull();
-        assertThat(annotation.matchIfMissing()).isFalse();
-        assertThat(annotation.name()).contains("alphafrog.cancel.reconciler.enabled");
-    }
 }

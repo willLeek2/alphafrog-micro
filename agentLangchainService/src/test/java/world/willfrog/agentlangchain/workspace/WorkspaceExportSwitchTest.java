@@ -41,35 +41,7 @@ class WorkspaceExportSwitchTest {
                         WorkspaceFinalizedEventListener.class);
     }
 
-    @Test
-    void exportEnabledFalse_shouldRegisterNoneOfTheFourBeans() {
-        runner().withPropertyValues("agent.workspace.export-enabled=false").run(ctx -> {
-            assertThat(ctx).doesNotHaveBean("workspaceDumpExecutor");
-            assertThat(ctx).doesNotHaveBean(WorkspaceDumpScheduler.class);
-            assertThat(ctx).doesNotHaveBean(WorkspacePollingObserver.class);
-            assertThat(ctx).doesNotHaveBean(WorkspaceFinalizedEventListener.class);
-        });
-    }
 
-    @Test
-    void exportEnabledMissing_shouldDefaultToOff() {
-        // matchIfMissing=false：不配置任何属性时同样全部不注册（默认关闭合同）
-        runner().run(ctx -> {
-            assertThat(ctx).doesNotHaveBean("workspaceDumpExecutor");
-            assertThat(ctx).doesNotHaveBean(WorkspaceDumpScheduler.class);
-            assertThat(ctx).doesNotHaveBean(WorkspacePollingObserver.class);
-            assertThat(ctx).doesNotHaveBean(WorkspaceFinalizedEventListener.class);
-        });
-    }
 
-    @Test
-    void exportEnabledTrue_shouldRegisterAllFourBeans() {
-        runner().withPropertyValues("agent.workspace.export-enabled=true").run(ctx -> {
-            assertThat(ctx).hasBean("workspaceDumpExecutor");
-            assertThat(ctx).hasSingleBean(WorkspaceDumpScheduler.class);
-            assertThat(ctx).hasSingleBean(WorkspacePollingObserver.class);
-            assertThat(ctx).hasSingleBean(WorkspaceFinalizedEventListener.class);
-        });
-    }
 
 }

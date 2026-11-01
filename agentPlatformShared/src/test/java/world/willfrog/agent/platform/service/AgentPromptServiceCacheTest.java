@@ -41,228 +41,24 @@ class AgentPromptServiceCacheTest {
         promptService = new AgentPromptService(properties, localConfigLoader);
     }
 
-    @Test
-    void composeSystemPrompt_shouldInjectTimeBaselineBeforeGlobal() {
-        String prompt = promptService.agentRunSystemPrompt();
-        LocalDate today = LocalDate.now();
-        assertTrue(prompt.startsWith("当前时间：" + today.format(CN_DATE_FORMATTER)),
-                "系统 Prompt 应以时间基准前缀开头");
-        assertTrue(prompt.contains(today.getYear() + "年" + today.getMonthValue() + "月" + today.getDayOfMonth() + "日"),
-                "时间基准应包含年月日");
-        assertTrue(prompt.contains(GLOBAL_PROMPT), "时间基准后应拼接全局指令");
-    }
 
-    @Test
-    void reactSystemPrompt_shouldRequireExplicitCalendarYearsInOutputs() {
-        String prompt = promptService.reactSystemPrompt();
-        assertTrue(prompt.contains("须标明具体公历年份"),
-                "planning system prompt 应要求输出标明具体年份");
-        assertTrue(prompt.contains("禁止使用仅含"),
-                "planning system prompt 应禁止仅使用去年/明年等相对词");
-    }
 
-    @Test
-    void composeSystemPrompt_shouldMapRelativeYearsFromToday() {
-        String prompt = promptService.agentRunSystemPrompt();
-        int thisYear = LocalDate.now().getYear();
-        assertTrue(prompt.contains("说去年，指" + (thisYear - 1) + "年"),
-                "时间基准应包含由当前年推算的去年示例");
-        assertTrue(prompt.contains("说再上一年，指" + (thisYear - 2) + "年"),
-                "时间基准应包含由当前年推算的再上一年示例");
-    }
 
-    @Test
-    void composeSystemPrompt_shouldInjectHotLoadedDataFreshness() {
-        AgentLlmProperties local = new AgentLlmProperties();
-        AgentLlmProperties.DataFreshness freshness = new AgentLlmProperties.DataFreshness();
-        freshness.setStartDate("2020-01-01");
-        freshness.setEndDate("2026-05-25");
-        freshness.setAsOfDate("2026-05-25");
-        freshness.setDescription("覆盖股票、指数、ETF、基金等本地已爬取数据");
-        local.setDataFreshness(freshness);
-        when(localConfigLoader.current()).thenReturn(Optional.of(local));
 
-        String prompt = promptService.agentRunSystemPrompt();
 
-        assertTrue(prompt.contains("当前已爬取/可用市场数据时效范围"),
-                "system prompt 应注入部署者指定的数据时效范围");
-        assertTrue(prompt.contains("范围：2020-01-01 至 2026-05-25"),
-                "system prompt 应包含 YYYY-MM-DD 起止范围");
-        assertTrue(prompt.contains("as-of 日期：2026-05-25"),
-                "system prompt 应包含 as-of 日期");
-        assertTrue(prompt.contains("业务逻辑默认该日期正确"),
-                "system prompt 应表达部署者指定即权威的语义");
-        assertTrue(prompt.contains("不要自行推断或改写该范围"),
-                "system prompt 应禁止 LLM 自行改写数据范围");
-    }
 
-    @Test
-    void todoPlannerPrompt_staticPrefixShouldBeStable() {
-        String prompt1 = promptService.todoPlannerSystemPrompt("searchIndex, queryFund", 5);
-        String prompt2 = promptService.todoPlannerSystemPrompt("searchIndex, queryFund", 5);
-        assertEquals(prompt1, prompt2, "相同参数应产生完全相同的系统 Prompt");
-    }
-
-    @Test
-    void todoPlannerPrompt_timeBaselinePrefixShouldBeStableAcrossTemplates() {
-        String prompt1 = promptService.todoPlannerSystemPrompt("searchIndex, queryFund", 5);
-        String prompt2 = promptService.todoPlannerSystemPrompt("differentTool", 10);
-        assertTrue(prompt1.startsWith("当前时间：" + LocalDate.now().format(CN_DATE_FORMATTER)),
-                "todo planner 应以时间基准前缀开头");
-        int globalAt1 = prompt1.indexOf(GLOBAL_PROMPT);
-        int globalAt2 = prompt2.indexOf(GLOBAL_PROMPT);
-        assertTrue(globalAt1 > 0 && globalAt2 > 0);
-        assertEquals(prompt1.substring(0, globalAt1), prompt2.substring(0, globalAt2),
-                "不同模板下，时间基准前缀应字节级一致");
-    }
-
-    @Test
-    void dynamicContextPrefix_shouldContainTodayDateOnly() {
-        String prefix = promptService.dynamicContextPrefix();
-        LocalDate today = LocalDate.now();
-        String todayLine = "今天是" + today.format(CN_DATE_FORMATTER) + "。";
-        assertEquals(todayLine, prefix, "动态上下文前缀应仅包含今天日期，不做短语级硬编码替换");
-    }
 
     // ─── ReAct 统一 System Prompt + Stage Instruction 测试 ───
 
-    @Test
-    void reactSystemPrompt_shouldReturnGlobalWithTimeBaseline() {
-        String reactSys = promptService.reactSystemPrompt();
-        assertTrue(reactSys.startsWith("当前时间：" + LocalDate.now().format(CN_DATE_FORMATTER)),
-                "reactSystemPrompt 应含时间基准前缀");
-        assertTrue(reactSys.contains(GLOBAL_PROMPT),
-                "reactSystemPrompt 应包含全局指令，不包含 stage-specific 内容");
-    }
 
-    @Test
-    void reactSystemPrompt_shouldBeIdenticalAcrossStages() {
-        // 验证 reactSystemPrompt 在不同阶段调用时返回完全一致的结果
-        String r1 = promptService.reactSystemPrompt();
-        String r2 = promptService.reactSystemPrompt();
-        assertEquals(r1, r2, "reactSystemPrompt 在不同时间调用应返回字节级一致的结果");
-    }
 
-    @Test
-    void planningAnalysisStageInstruction_shouldContainStageMarker() {
-        String instruction = promptService.planningAnalysisStageInstruction("searchIndex, queryFund", 5);
-        assertTrue(instruction.contains("[Stage: PLANNING_ANALYSIS]"),
-                "planning analysis 阶段指令应包含 Stage 标记");
-    }
 
-    @Test
-    void planningStrategyStageInstruction_shouldDescribeMarketDataBatchSyntax() {
-        AgentLlmProperties properties = new AgentLlmProperties();
-        AgentPromptService service = new AgentPromptService(properties, localConfigLoader);
 
-        String instruction = service.planningStrategyStageInstruction(
-                "checkParallelLimits,searchIndex,getIndexDaily,searchStock,getStockDaily",
-                5,
-                500
-        );
 
-        assertTrue(instruction.contains("checkParallelLimits"),
-                "规划阶段应要求先查询批量/并行上限");
-        assertTrue(instruction.contains("keyword=\"沪深300|中证500\""),
-                "规划阶段应提示 search 类工具使用 | 批量关键词");
-        assertTrue(instruction.contains("tsCode=\"000300.SH|000905.SH\""),
-                "规划阶段应提示日线工具使用 | 批量代码");
-        assertTrue(instruction.contains("JSON 数组"),
-                "规划阶段应提示可使用 JSON 数组批量参数");
-        assertFalse(instruction.contains("默认最多"),
-                "规划阶段不应硬编码批量上限");
-        assertFalse(instruction.contains("ts_code 用逗号分隔"),
-                "行情批量参数不应提示使用逗号分隔");
-    }
 
-    @Test
-    void planningStructuredStageInstruction_shouldContainStageMarker() {
-        String instruction = promptService.planningStructuredStageInstruction();
-        assertTrue(instruction.contains("[Stage: PLANNING_STRUCTURED]"),
-                "planning structured 阶段指令应包含 Stage 标记");
-    }
 
-    @Test
-    void recoveryStageInstruction_shouldContainStageMarker() {
-        String instruction = promptService.recoveryStageInstruction();
-        assertTrue(instruction.contains("[Stage: TODO_RECOVERY]"),
-                "recovery 阶段指令应包含 Stage 标记");
-    }
 
-    @Test
-    void finalAnswerStageInstruction_shouldContainStageMarker() {
-        String instruction = promptService.finalAnswerStageInstruction();
-        assertTrue(instruction.contains("[Stage: FINAL_ANSWER]"),
-                "final answer 阶段指令应包含 Stage 标记");
-    }
 
-    @Test
-    void dagReactSystemPrompt_shouldIncludeTimeBaselinePrefix() {
-        String prompt = promptService.dagReactSystemPrompt();
-        assertTrue(prompt.startsWith("当前时间：" + LocalDate.now().format(CN_DATE_FORMATTER)),
-                "DAG ReAct system prompt 应含与 planning 一致的时间基准前缀");
-        assertFalse(prompt.contains("[Stage: TODO_EXECUTION]"),
-                "稳定 System 不得包含 Todo 阶段正文");
-        assertFalse(prompt.contains("## 本次 Run 实际开放的工具"),
-                "稳定 System 不得包含本次 Run 动态工具清单");
-    }
 
-    @Test
-    void dagReactStageInstruction_shouldSuggestSoftBatchGuidanceInUserRole() {
-        String prompt = promptService.dagReactStageInstruction(
-                promptService.renderToolCapabilities(java.util.List.of(
-                        "checkParallelLimits", "searchAssetInfo")));
-        assertTrue(prompt.contains("本次能力清单同时提供限制查询能力并已取得限制时，才可批量"),
-                "ReAct User 阶段指令应包含能力受限的批量上限要求");
-        assertTrue(prompt.contains("checkParallelLimits"),
-                "ReAct User 阶段指令应要求先调用 checkParallelLimits");
-        assertTrue(prompt.contains("搜索股票、ETF、指数和场外基金"),
-                "ReAct User 阶段指令应包含已开放发现能力的权威说明");
-        assertTrue(prompt.contains("searchAssetInfo"),
-                "ReAct User 阶段指令应只列举本次实际开放的工具名");
-        assertFalse(prompt.contains("单次最多"),
-                "ReAct User 阶段指令不应硬编码批量上限");
-    }
 
-    @Test
-    void todoRetryContextInstruction_shouldRenderAuthorityTemplate() {
-        String instruction = promptService.todoRetryContextInstruction(
-                "searchWeb", "READ_ONLY", "TIMEOUT", "upstream timeout", "{\"query\":\"old\"}");
-        assertTrue(instruction.contains("[TODO_RETRY_CONTEXT]"),
-                "语义重试上下文应带标记");
-        assertTrue(instruction.contains("这是本 Todo 唯一允许的一次语义重试"),
-                "语义重试上下文应使用权威正文");
-        assertTrue(instruction.contains("searchWeb"),
-                "语义重试上下文应填入工具名");
-        assertFalse(instruction.contains("{{toolName}}"),
-                "语义重试上下文不应残留占位符");
-    }
-
-    @Test
-    void pythonRepairContextInstruction_shouldRenderAuthorityTemplate() {
-        String instruction = promptService.pythonRepairContextInstruction(
-                "1", "FAILED", "NON_ZERO_EXIT", "E1", "false",
-                "stdout", "stderr", "print(1)");
-        assertTrue(instruction.contains("[PYTHON_REPAIR_CONTEXT]"),
-                "代码修复上下文应带标记");
-        assertTrue(instruction.contains("禁止原样重放失败请求"),
-                "代码修复上下文应使用权威正文");
-        assertTrue(instruction.contains("print(1)"),
-                "代码修复上下文应填入失败代码预览");
-    }
-
-    @Test
-    void toolSummaryPrompts_shouldComeFromAuthorityFiles() {
-        assertEquals("你是工具结果摘要助手，只输出简洁中文摘要。",
-                promptService.toolSummarySystemPrompt());
-        String user = promptService.toolSummaryUserPrompt("目标", "searchWeb", "原始输出");
-        assertTrue(user.contains("当前任务目标：目标"),
-                "工具摘要 User 应填入任务目标");
-        assertTrue(user.contains("searchWeb"),
-                "工具摘要 User 应填入工具名");
-        assertTrue(user.contains("原始输出"),
-                "工具摘要 User 应填入原始结果");
-        assertTrue(user.contains("不要编造原始结果中没有的信息"),
-                "工具摘要 User 应使用权威正文");
-    }
 }

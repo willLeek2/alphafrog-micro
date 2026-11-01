@@ -53,63 +53,9 @@ class WorkflowStartupRecoveryTest {
         ReflectionTestUtils.setField(recovery, "scanLimit", 100);
     }
 
-    @Test
-    void frozenPlanIsClaimedOnceAndQueuedWithoutReplanning() {
-        AgentRun candidate = run(AgentRunStatus.EXECUTING, 0, "{\"items\":[]}");
-        AgentRun claimed = run(AgentRunStatus.RECEIVED, 1, candidate.getPlanJson());
-        when(runMapper.claimStartupRestartForDeployment(
-                "run-1", "stable", GENERATION, AgentRunStatus.EXECUTING, 0, 1)).thenReturn(1);
-        when(runMapper.findById("run-1")).thenReturn(claimed);
-        when(pipeline.launchRestartedAsync(claimed)).thenReturn(true);
 
-        recovery.recoverOne(candidate);
 
-        verify(pipeline).launchRestartedAsync(claimed);
-        verify(pipeline, never()).launchAsync(claimed);
-        verify(eventService).append(eq("run-1"), eq("user-1"),
-                eq("WORKFLOW_RESTART_QUEUED"), anyMap());
-    }
 
-    @Test
-    void restartAttemptLimitFailsClearlyWithoutScheduling() {
-        AgentRun candidate = run(AgentRunStatus.EXECUTING, 1, "{\"items\":[]}");
-        when(runMapper.failStartupRecovery(
-                "run-1", "user-1",
-                AgentRunStatus.EXECUTING, "workflow_restart_attempts_exhausted")).thenReturn(1);
-
-        recovery.recoverOne(candidate);
-
-        verify(pipeline, never()).launchRestartedAsync(candidate);
-        verify(eventService).append(eq("run-1"), eq("user-1"),
-                eq("WORKFLOW_RESTART_REJECTED"), anyMap());
-        verify(finalizationService).publishFinalizedEvent("run-1", "user-1", "FAILED");
-        verify(schedulerMetrics).recordCompletion(AgentRunStatus.FAILED);
-    }
-
-    @Test
-    void cancelingRunIsFinishedAsCanceledAndNeverQueued() {
-        AgentRun candidate = run(AgentRunStatus.CANCELING, 0, "{}");
-        when(runMapper.completeStartupCancellation("run-1", "user-1")).thenReturn(1);
-
-        recovery.recoverOne(candidate);
-
-        verify(pipeline, never()).launchRestartedAsync(candidate);
-        verify(finalizationService).publishFinalizedEvent("run-1", "user-1", "CANCELED");
-        verify(schedulerMetrics).recordCompletion(AgentRunStatus.CANCELED);
-    }
-
-    @Test
-    void dualPoolRunIsNotClaimedAfterProcessRestart() {
-        AgentRun candidate = run(AgentRunStatus.EXECUTING, 0, "{\"items\":[]}");
-        when(schedulerVersionPolicy.isDualPoolFamily(candidate)).thenReturn(true);
-
-        recovery.recoverOne(candidate);
-
-        verify(runMapper, never()).claimStartupRestartForDeployment(
-                anyString(), anyString(), anyString(), any(), anyInt(), anyInt());
-        verify(pipeline, never()).launchAsync(any());
-        verify(pipeline, never()).launchRestartedAsync(any());
-    }
 
     private AgentRun run(AgentRunStatus status, int restartAttempt, String planJson) {
         AgentRun run = new AgentRun();

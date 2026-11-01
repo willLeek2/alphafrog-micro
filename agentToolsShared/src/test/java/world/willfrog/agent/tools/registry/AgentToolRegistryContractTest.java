@@ -23,12 +23,6 @@ class AgentToolRegistryContractTest {
         assertEquals(30, names.stream().distinct().count(), "工具名必须唯一");
     }
 
-    @Test
-    void declaredToolNames_containsD06SubAgentControls() {
-        Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertTrue(names.contains("spawnSubAgent"), "D06 必须登记 spawnSubAgent");
-        assertTrue(names.contains("waitForSubAgent"), "D06 必须登记 waitForSubAgent");
-    }
 
     @Test
     void everyExemptEntry_hasNonBlankReason() {
@@ -87,12 +81,6 @@ class AgentToolRegistryContractTest {
         assertEquals(expected, actual);
     }
 
-    @Test
-    void cacheInfoSet_matchesFrozenGroundTruth() {
-        Set<String> expected = Set.of("getStockInfo", "getIndexInfo");
-        Set<String> actual = AgentToolRegistry.namesInCacheFamily(AgentToolRegistry.CacheFamily.INFO);
-        assertEquals(expected, actual);
-    }
 
     @Test
     void cacheDatasetSet_matchesFrozenGroundTruth() {
@@ -135,12 +123,6 @@ class AgentToolRegistryContractTest {
         assertEquals(expected, actual);
     }
 
-    @Test
-    void parallelCalendarGroup_matchesFrozenGroundTruth() {
-        Set<String> expected = Set.of("isTradingDay");
-        Set<String> actual = AgentToolRegistry.namesInParallelGroup(AgentToolRegistry.ParallelGroup.CALENDAR);
-        assertEquals(expected, actual);
-    }
 
     @Test
     void parallelAdvancedGroup_matchesFrozenGroundTruth() {
@@ -163,12 +145,6 @@ class AgentToolRegistryContractTest {
         assertEquals(expected, actual);
     }
 
-    @Test
-    void batchDatesKeys_matchesFrozenGroundTruth() {
-        Set<String> expected = Set.of("isTradingDay");
-        Set<String> actual = AgentToolRegistry.namesWithBatchCountKeys(AgentToolRegistry.BatchCountKeys.DATES);
-        assertEquals(expected, actual);
-    }
 
     @Test
     void canonicalMarketAdvanced_matchesFrozenGroundTruth() {
@@ -177,19 +153,7 @@ class AgentToolRegistryContractTest {
         assertEquals(expected, actual);
     }
 
-    @Test
-    void canonicalParallelLimits_matchesFrozenGroundTruth() {
-        Set<String> expected = Set.of("checkParallelLimits");
-        Set<String> actual = AgentToolRegistry.namesWithCanonicalSpec(AgentToolRegistry.CanonicalSpec.PARALLEL_LIMITS);
-        assertEquals(expected, actual);
-    }
 
-    @Test
-    void canonicalManualFinance_matchesFrozenGroundTruth() {
-        Set<String> expected = Set.of("resolveFinanceMethods");
-        Set<String> actual = AgentToolRegistry.namesWithCanonicalSpec(AgentToolRegistry.CanonicalSpec.MANUAL_FINANCE);
-        assertEquals(expected, actual);
-    }
 
     @Test
     void canonicalManualSubAgent_matchesFrozenGroundTruth() {

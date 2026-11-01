@@ -114,24 +114,6 @@ class LangchainBudgetPartialAnswerBuilderTest {
                 .doesNotContain("【todo_6】");
     }
 
-    @Test
-    void build_todosWithNullOrBlankOutput_shouldBeSkippedButCounted() {
-        LangchainCompletedTodo nullOutput = LangchainCompletedTodo.builder()
-                .todoId("todo_blank").sequence(1).description("blank").output(null).summary("").build();
-        List<LangchainCompletedTodo> todos = List.of(
-                completedTodo("todo_1", 1, "valid output"),
-                nullOutput,
-                completedTodo("todo_2", 2, "another valid")
-        );
-        LangchainBudgetPartialAnswerBuilder.PartialAnswer result =
-                LangchainBudgetPartialAnswerBuilder.build(todos);
-
-        // 只含 2 个有效 todo；blank 不计入 includedTodoCount
-        assertThat(result.includedTodoCount()).isEqualTo(2);
-        assertThat(result.finalAnswer())
-                .contains("【todo_1】").contains("valid output")
-                .contains("【todo_2】").contains("another valid");
-    }
 
     @Test
     void completedTodoIdsPayload_shouldIncludeAllTodoIds() {

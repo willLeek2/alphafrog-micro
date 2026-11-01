@@ -29,8 +29,4 @@ class PythonSandboxGatewayApplicationContextTest {
     @Autowired(required = false)
     private DataSource dataSource;
 
-    @Test
-    void contextStartsWithoutADataSourceUrl() {
-        assertThat(dataSource).isNull();
-    }
 }

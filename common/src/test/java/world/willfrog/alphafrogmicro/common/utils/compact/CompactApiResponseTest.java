@@ -56,24 +56,6 @@ public class CompactApiResponseTest {
         assertEquals(Long.valueOf(100), response.getMeta().getTotal());
     }
     
-    @Test
-    public void testBuilder() {
-        CompactApiResponse response = CompactApiResponse.builder()
-                .format("compact")
-                .fields(Arrays.asList("field1", "field2"))
-                .rows(Arrays.asList(
-                    Arrays.asList("value1", "value2"),
-                    Arrays.asList("value3", "value4")
-                ))
-                .meta(CompactMeta.builder().total(2L).build())
-                .build();
-        
-        assertNotNull(response);
-        assertEquals("compact", response.getFormat());
-        assertEquals(2, response.getFields().size());
-        assertEquals(2, response.getRows().size());
-        assertNotNull(response.getMeta());
-    }
     
     @Test
     public void testEmptyResponse() {

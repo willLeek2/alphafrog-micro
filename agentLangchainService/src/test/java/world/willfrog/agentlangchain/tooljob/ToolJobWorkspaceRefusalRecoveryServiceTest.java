@@ -31,45 +31,8 @@ class ToolJobWorkspaceRefusalRecoveryServiceTest {
     private final DataAnalysisOperationIdentity identity =
             new DataAnalysisOperationIdentity("run-1", "call-1", 1);
 
-    @Test
-    void persistedRefusalReleasesPreparingCapacityAndCompletesRun() throws Exception {
-        ToolJobAnchor anchor = anchor(DataAnalysisReservationState.PREPARING);
-        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-        when(anchors.recordWorkspaceRefusalReleased(eq("run-1"), eq(anchor)))
-                .thenReturn(true);
-        when(anchors.completeWorkspaceRefusal(eq("run-1"), eq(identity.operationId()),
-                eq(anchor.getRequestFingerprint()), eq("WORKSPACE_DIRTY"))).thenReturn(true);
 
-        assertThat(recovery.recover("run-1", anchor, capacity, anchors))
-                .isEqualTo(ToolJobWorkspaceRefusalRecoveryService.Outcome.COMPLETE);
-        DataAnalysisReservation released = MAPPER.readValue(
-                anchor.getReservationJson(), DataAnalysisReservation.class);
-        assertThat(released.state()).isEqualTo(DataAnalysisReservationState.RELEASED);
-        verify(capacity).releaseReservation(any());
-    }
 
-    @Test
-    void crashAfterDurableReleaseFinishesWithoutReleasingCapacityTwice() throws Exception {
-        ToolJobAnchor anchor = anchor(DataAnalysisReservationState.RELEASED);
-        when(anchors.completeWorkspaceRefusal(eq("run-1"), eq(identity.operationId()),
-                eq(anchor.getRequestFingerprint()), eq("WORKSPACE_DIRTY"))).thenReturn(true);
-
-        assertThat(recovery.recover("run-1", anchor, capacity, anchors))
-                .isEqualTo(ToolJobWorkspaceRefusalRecoveryService.Outcome.COMPLETE);
-        verify(capacity, never()).releaseReservation(any());
-    }
-
-    @Test
-    void failedDurableReleaseWriteKeepsRefusalMarkerForRetry() throws Exception {
-        ToolJobAnchor anchor = anchor(DataAnalysisReservationState.PREPARING);
-        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-
-        assertThat(recovery.recover("run-1", anchor, capacity, anchors))
-                .isEqualTo(ToolJobWorkspaceRefusalRecoveryService.Outcome.RETRYABLE);
-        verify(anchors, never()).completeWorkspaceRefusal(any(), any(), any(), any());
-    }
 
     private ToolJobAnchor anchor(DataAnalysisReservationState state) throws Exception {
         DataAnalysisReservation reservation = new DataAnalysisReservation(

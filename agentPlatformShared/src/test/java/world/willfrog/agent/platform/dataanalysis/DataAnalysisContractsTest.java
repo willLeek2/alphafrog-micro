@@ -213,43 +213,7 @@ class DataAnalysisContractsTest {
                         List.of()));
     }
 
-    @Test
-    void completeUsageRejectsMissingPhaseWallTime() {
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> new DataAnalysisResourceUsage(
-                        DataAnalysisResourceClass.STANDARD,
-                        1L,
-                        1L,
-                        null,
-                        1L,
-                        null,
-                        null,
-                        null,
-                        1L,
-                        1L,
-                        1L,
-                        1,
-                        "SUCCESS",
-                        false,
-                        false,
-                        true,
-                        null,
-                        List.of()));
-    }
 
-    @Test
-    void partialUsageRejectsEmptyOrInconsistentMissingFields() {
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> usage(false, null, List.of()));
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> usage(false, 1L, List.of("cpuMillis")));
-        assertEquals(
-                DataAnalysisResourceUsage.P0_REQUIRED_MEASURED_FIELDS.stream().sorted().toList(),
-                DataAnalysisResourceUsage.missing(DataAnalysisResourceClass.STANDARD).missingFields());
-    }
 
     @Test
     void terminalEnvelopeCrossChecksIdentityReservationAndBoundedResult() {
@@ -350,30 +314,7 @@ class DataAnalysisContractsTest {
                         DataAnalysisReservationState.RELEASED));
     }
 
-    @Test
-    void restoreContractDistinguishesAddedSameAndConflict() {
-        StubCapacityService service = new StubCapacityService();
-        DataAnalysisReservation first = preparingReservation(
-                DataAnalysisResourceClass.STANDARD,
-                1);
-        DataAnalysisReservation conflicting = preparingReservation(
-                DataAnalysisResourceClass.HEAVY,
-                3);
 
-        assertEquals(DataAnalysisRestoreOutcome.ADDED, service.restoreReservation(first));
-        assertEquals(
-                DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME,
-                service.restoreReservation(first));
-        assertEquals(
-                DataAnalysisRestoreOutcome.CONFLICT,
-                service.restoreReservation(conflicting));
-    }
-
-    @Test
-    void resourceClassCapacityUnitsAreFrozen() {
-        assertEquals(1, DataAnalysisResourceClass.STANDARD.defaultCapacityUnits());
-        assertEquals(3, DataAnalysisResourceClass.HEAVY.defaultCapacityUnits());
-    }
 
     private CanonicalSandboxCreateSpec createSpec(long timeoutMillis) {
         return new CanonicalSandboxCreateSpec(

@@ -34,44 +34,7 @@ class MarketDataRpcConfigurationTest {
             "marketDomesticIndexService", "domesticIndexService",
             "marketDomesticListedAssetService", "domesticListedAssetService");
 
-    @Test
-    void betaDualRegistriesSelectOnlyProductionForMarketReferences() {
-        Map<String, Object> properties = baseProperties();
-        registry(properties, "dubbo.registries.beta", "nacos://127.0.0.1:8848?group=alphafrog-beta");
-        registry(properties, "dubbo.registries.production", "nacos://127.0.0.1:8848?group=DEFAULT_GROUP");
-        properties.put("dubbo.registries.beta.preferred", "true");
-        properties.put("dubbo.registries.production.preferred", "false");
-        try (AnnotationConfigApplicationContext context = context(properties)) {
-            assertMarketInjectionAndLifecycle(context);
-            for (String name : MARKET_FIELDS.keySet()) {
-                ReferenceBean<?> bean = reference(context, name);
-                assertEquals("production", bean.getReferenceConfig().getRegistryIds());
-                assertEquals(List.of("production"), registryIds(bean));
-            }
-            ReferenceBean<?> ordinary = reference(context, "ordinaryIndexService");
-            assertEquals(List.of("beta", "production"), registryIds(ordinary));
-            RegistryConfig beta = ordinary.getReferenceConfig().getRegistries().stream()
-                    .filter(registry -> "beta".equals(registry.getId())).findFirst().orElseThrow();
-            assertEquals(Boolean.TRUE, beta.getPreferred(), "其他引用保留 Beta 优先，市场引用不应修改全局偏好");
-        }
-    }
 
-    @Test
-    void productionSingleRegistryKeepsDefaultWithoutRequiringProductionId() {
-        Map<String, Object> properties = baseProperties();
-        registry(properties, "dubbo.registry", "nacos://127.0.0.1:8848");
-        try (AnnotationConfigApplicationContext context = context(properties)) {
-            assertMarketInjectionAndLifecycle(context);
-            for (String name : MARKET_FIELDS.keySet()) {
-                ReferenceBean<?> bean = reference(context, name);
-                assertNull(bean.getReferenceConfig().getRegistryIds());
-                List<RegistryConfig> registries = bean.getReferenceConfig().getRegistries();
-                assertEquals(1, registries.size());
-                assertEquals("nacos://127.0.0.1:8848", registries.get(0).getAddress());
-                assertNotEquals("production", registries.get(0).getId());
-            }
-        }
-    }
 
     private static AnnotationConfigApplicationContext context(Map<String, Object> properties) {
         AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();

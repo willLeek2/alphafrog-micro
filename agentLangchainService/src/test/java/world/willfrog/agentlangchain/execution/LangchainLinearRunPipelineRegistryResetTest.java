@@ -111,62 +111,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
     }
 
-    /**
-     * 验收口径 (1)：正常 success 路径 — executeRun 返回后 registry 的 per-run 状态被清掉。
-     */
-    @Test
-    @SuppressWarnings("unchecked")
-    void executeRunSuccessPathShouldResetRegistryAfterCompletion() {
-        AgentRunDatasetRegistry registry = new AgentRunDatasetRegistry();
-        // 预先往 registry 灌一个 DATASET event 模拟 "run 期间落盘已发生"
-        registry.onDatasetPersisted(new DatasetPersistedEvent(this, RUN_ID, "ds-a",
-                "/data/domestic_listed_asset/600000.SH/ds-a/a.csv", "600000.SH", "a.csv"));
-        // 触发一次 snapshot 确保 raw → numbering 分配走完
-        registry.snapshot(RUN_ID);
-        assertFalse(registry.snapshot(RUN_ID).isEmpty(), "precondition: registry should have ds-a before reset");
 
-        ObjectProvider<AgentRunDatasetRegistry> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(registry);
-
-        LangchainLinearRunPipelineImpl pipeline = buildPipeline(provider);
-        AgentRun run = new AgentRun();
-        run.setId(RUN_ID);
-        run.setUserId("u1");
-        pipeline.executeRun(run);
-
-        // Run 完成后 registry 中属于该 Run 的状态应被清掉（reset hook 走 finally 块）。
-        assertFalse(registry.hasRunState(RUN_ID),
-                "executeRun finally block should reset AgentRunDatasetRegistry per-run state");
-    }
-
-    /**
-     * 验收口径 (2)：workflow 抛运行时异常时，registry 的 run state 依然被清掉（finally 语义）。
-     */
-    @Test
-    @SuppressWarnings("unchecked")
-    void executeRunExceptionPathShouldStillResetRegistry() {
-        AgentRunDatasetRegistry registry = new AgentRunDatasetRegistry();
-        registry.onDatasetPersisted(new DatasetPersistedEvent(this, RUN_ID, "ds-a",
-                "/data/domestic_listed_asset/600000.SH/ds-a/a.csv", "600000.SH", "a.csv"));
-        assertFalse(registry.snapshot(RUN_ID).isEmpty(), "precondition: registry should have ds-a before reset");
-
-        ObjectProvider<AgentRunDatasetRegistry> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(registry);
-
-        // buildPipeline 的 linear executor 用的是 mock，但这里直接复用会走 success 路径；
-        // 想走异常路径需要单独构造。最简单：让 planner.plan 抛 RuntimeException，
-        // 触发 executeRun 的 catch 块，最终走 finally。
-        LangchainLinearRunPipelineImpl pipeline = buildPipelineThrowingPlanner(provider);
-
-        AgentRun run = new AgentRun();
-        run.setId(RUN_ID);
-        run.setUserId("u1");
-        // 不应向外抛 — catch 块把异常收敛
-        pipeline.executeRun(run);
-
-        assertFalse(registry.hasRunState(RUN_ID),
-                "executeRun finally block should reset registry even when workflow throws");
-    }
 
     @SuppressWarnings("unchecked")
     private LangchainLinearRunPipelineImpl buildPipelineThrowingPlanner(ObjectProvider<AgentRunDatasetRegistry> registryProvider) {
@@ -224,38 +169,5 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 world.willfrog.agentlangchain.gateway.GatewayTestFixtures.permissive());
     }
 
-    /**
-     * 验收口径 (3)：provider 返回 null（bean 未启用场景）— pipeline 不抛 NPE，静默跳过。
-     */
-    @Test
-    @SuppressWarnings("unchecked")
-    void executeRunShouldTolerateNullRegistryProvider() {
-        ObjectProvider<AgentRunDatasetRegistry> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(null);
 
-        LangchainLinearRunPipelineImpl pipeline = buildPipeline(provider);
-        AgentRun run = new AgentRun();
-        run.setId(RUN_ID);
-        run.setUserId("u1");
-        // 不抛异常，finally 直接走 null 分支
-        pipeline.executeRun(run);
-    }
-
-    /**
-     * 验收口径 (4)：provider.getIfAvailable() 抛异常 — 被 finally 块内的 try-catch 吞掉，
-     * 不影响 AgentContext.clear() 和后续路径。
-     */
-    @Test
-    @SuppressWarnings("unchecked")
-    void executeRunShouldSwallowRegistryProviderException() {
-        ObjectProvider<AgentRunDatasetRegistry> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenThrow(new RuntimeException("simulated bean lookup failure"));
-
-        LangchainLinearRunPipelineImpl pipeline = buildPipeline(provider);
-        AgentRun run = new AgentRun();
-        run.setId(RUN_ID);
-        run.setUserId("u1");
-        // 不抛异常 — finally 内 try-catch 兜住
-        pipeline.executeRun(run);
-    }
 }

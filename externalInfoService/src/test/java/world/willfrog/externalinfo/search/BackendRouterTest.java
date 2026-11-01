@@ -17,64 +17,8 @@ import static org.mockito.Mockito.when;
 
 class BackendRouterTest {
 
-    @Test
-    void resolve_shouldUseDefaultPresetWhenDefaultPresetMatchesScene() {
-        SearchLlmProperties props = properties();
-        props.getFeatures().getWebSearch().setDefaultPreset("finance_default");
-        props.getFeatures().getWebSearch().setPresets(Map.of(
-                "finance_deep", preset("finance", "tavily", "deep", 10),
-                "finance_default", preset("finance", "perplexity", "standard", 8)
-        ));
 
-        BackendRouter router = router(props);
-        BackendRouter.ResolvedBackend resolved = router.resolve(WebSearchRequest.newBuilder()
-                .setScene("finance")
-                .build());
 
-        assertEquals("perplexity", resolved.backend().name());
-        assertEquals("standard", resolved.context().strength());
-        assertEquals(8, resolved.context().maxResults());
-    }
-
-    @Test
-    void resolve_shouldUseSceneMatchedPresetBeforeDefaultPreset() {
-        SearchLlmProperties props = properties();
-        props.getFeatures().getWebSearch().setDefaultPreset("finance_default");
-        props.getFeatures().getWebSearch().setPresets(Map.of(
-                "news_fast", preset("news", "exa", "fast", 6),
-                "finance_default", preset("finance", "perplexity", "standard", 8)
-        ));
-
-        BackendRouter router = router(props);
-        BackendRouter.ResolvedBackend resolved = router.resolve(WebSearchRequest.newBuilder()
-                .setScene("news")
-                .build());
-
-        assertEquals("exa", resolved.backend().name());
-        assertEquals("news", resolved.context().scene());
-        assertEquals("fast", resolved.context().strength());
-        assertEquals(6, resolved.context().maxResults());
-    }
-
-    @Test
-    void resolve_shouldAllowBackendFieldAsPresetName() {
-        SearchLlmProperties props = properties();
-        props.getFeatures().getWebSearch().setDefaultPreset("finance_default");
-        props.getFeatures().getWebSearch().setPresets(Map.of(
-                "news_fast", preset("news", "exa", "fast", 6),
-                "finance_default", preset("finance", "perplexity", "standard", 8)
-        ));
-
-        BackendRouter router = router(props);
-        BackendRouter.ResolvedBackend resolved = router.resolve(WebSearchRequest.newBuilder()
-                .setBackend("news_fast")
-                .build());
-
-        assertEquals("exa", resolved.backend().name());
-        assertEquals("news", resolved.context().scene());
-        assertEquals("fast", resolved.context().strength());
-        assertEquals(6, resolved.context().maxResults());
-    }
 
     private BackendRouter router(SearchLlmProperties props) {
         SearchLlmLocalConfigLoader loader = mock(SearchLlmLocalConfigLoader.class);

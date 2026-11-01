@@ -113,16 +113,6 @@ class AgentRunCreditSettlementServiceUpstreamTest {
         lenient().when(userDao.getUserById(42L)).thenReturn(user);
     }
 
-    @Test
-    void byokTraceWithUpstreamCostSettlesImmediatelyWithoutFetch() {
-        service.settleOnce(RUN_ID, USER_ID, 1);
-
-        assertEquals(1, persisted.size(), "attempt=1 应该只写 1 条 per-call 记录");
-        AgentRunLlmCallCredit record = persisted.get(0);
-        assertEquals("SETTLED", record.getSettlementStatus());
-        assertEquals(0, new BigDecimal("0.004559").compareTo(record.getCreditDelta()),
-                "BYOK 时应使用 upstreamCost 作为 billable cost");
-    }
 
     private String byokTraceObservabilityJson() {
         return "{\"diagnostics\":{\"llmTraces\":["

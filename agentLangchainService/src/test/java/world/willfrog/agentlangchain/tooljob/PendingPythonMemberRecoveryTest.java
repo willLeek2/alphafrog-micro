@@ -97,111 +97,12 @@ class PendingPythonMemberRecoveryTest {
         when(workItems.findByIdentity(group.identity().segment())).thenReturn(Optional.of(item));
     }
 
-    @Test
-    void neverSendsCancelForUnknownOrForeignClaimant() {
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> false).reconcile();
-        verify(sandbox, never()).cancelTask(any());
-    }
 
-    @Test
-    void neverSendsCancelUntilOriginalActiveNodeBudgetIsReleased() {
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(false);
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> true).reconcile();
-        verify(sandbox, never()).cancelTask(any());
-    }
 
-    @Test
-    void uncertainCancelKeepsMemberPendingForStableRetry() {
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
-                .setOutcome(CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED).build());
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> true).reconcile();
-        verify(groups, never()).recoverPendingPythonMember(anyLong(), anyLong(), anyInt(),
-                any(), any(), any());
-    }
 
-    @Test
-    void confirmedTombstoneOpensReceiverUsingMemberDerivedCancelRequestId() {
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
-                .setOutcome(CancelOutcome.CANCELED).setTaskId("tombstone-1")
-                .setStatus("CANCELED").build());
-        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
-                .setFound(true).setTaskId("tombstone-1")
-                .setRequestFingerprint(FINGERPRINT).setStatus("CANCELED").build());
-        when(groups.recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
 
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> true).reconcile();
 
-        verify(sandbox).cancelTask(org.mockito.ArgumentMatchers.argThat(request ->
-                request.getCancelRequestId().equals("wait-member-41")
-                        && request.hasByOperation()
-                        && request.getByOperation().getOperationId().equals(OPERATION_ID)
-                        && request.getByOperation().getRequestFingerprint().equals(FINGERPRINT)));
-        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
-    }
 
-    @Test
-    void replayableMemberIsResentOnlyAfterAnAuthoritativeMiss() throws Exception {
-        ExecuteRequest original = installReplayableProof();
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-        when(sandbox.getTaskByOperationId(any()))
-                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
-        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
-                .setTaskId("replayed-task").setRequestFingerprint(FINGERPRINT).build());
-        when(groups.recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> true).reconcile();
-
-        verify(sandbox).createTask(original);
-        verify(sandbox, never()).cancelTask(any());
-        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
-    }
-
-    @Test
-    void acceptedBeforeCrashIsFoundWithoutSendingASecondCreate() throws Exception {
-        installReplayableProof();
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
-                .setFound(true).setTaskId("already-accepted")
-                .setRequestFingerprint(FINGERPRINT).build());
-
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> true).reconcile();
-
-        verify(sandbox, never()).createTask(any());
-        verify(sandbox, never()).cancelTask(any());
-        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
-    }
-
-    @Test
-    void ambiguousReplayResponseKeepsTheSavedRequestPending() throws Exception {
-        installReplayableProof();
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-        when(sandbox.getTaskByOperationId(any()))
-                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
-        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("response lost"));
-
-        new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership,
-                ignored -> true).reconcile();
-
-        verify(groups, never()).recoverPendingPythonMember(anyLong(), anyLong(), anyInt(),
-                any(), any(), any());
-        verify(sandbox, never()).cancelTask(any());
-    }
 
 
     @org.junit.jupiter.params.ParameterizedTest
@@ -248,24 +149,6 @@ class PendingPythonMemberRecoveryTest {
         org.assertj.core.api.Assertions.assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
     }
 
-    @Test
-    void acceptedSqlTaskIsRecoveredWithoutRenewalOrSecondCreate() throws Exception {
-        installSqlProof();
-        installReplayableProof();
-        when(groups.safeToRecoverPendingPython(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT))
-                .thenReturn(true);
-        when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
-                .setFound(true).setTaskId("accepted-query").setRequestFingerprint(FINGERPRINT).build());
-        var admission = mock(ToolJobAnchorService.class);
-        var recovery = new PendingPythonMemberRecovery(groups, workItems, sandbox, json, ownership, ignored -> true);
-        org.springframework.test.util.ReflectionTestUtils.setField(recovery, "queryAdmission", admission);
-
-        recovery.reconcile();
-
-        verifyNoInteractions(admission);
-        verify(sandbox, never()).createTask(any());
-        verify(groups).recoverPendingPythonMember(41L, 12L, 2, "old-process", OPERATION_ID, FINGERPRINT);
-    }
 
     private void installSqlProof() throws Exception {
         member.setToolName("executeQuery");

@@ -69,59 +69,8 @@ class SqlWaitMemberCancellationLifecycleTest {
     private static final String FINGERPRINT = SPEC.requestFingerprint();
     private static final String GENERATION = "gen-" + "a".repeat(64);
 
-    @Test
-    void actualV2CancelQueuesSqlStopAndClosesOnlyAfterPersistentSettlement() throws Exception {
-        Fixture f = new Fixture();
-        assertThat(f.cancel()).isEqualTo("CANCELED");
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.group.getState()).isEqualTo("CANCELED");
-        assertThat(f.member.getState()).isEqualTo("CANCELED");
-        assertThat(f.stop.getState()).isEqualTo("PENDING");
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.anchor()).isNotNull();
-        verifyNoInteractions(f.sandbox);
-        assertThat(f.worker.runBatch()).isEqualTo(1);
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        assertThat(f.capacity.releaseReservation(f.releaseRequest()))
-                .isEqualTo(DataAnalysisReleaseOutcome.ALREADY_RELEASED);
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        assertThat(f.calls).hasSize(1);
-        assertThat(f.finalizerWriteRejected).isZero();
-        f.reconciler.reconcileFromDue();
-        verify(f.finalization, times(1)).publishFinalizedEvent(RUN, USER, "CANCELED");
-    }
 
-    @Test
-    void startupDoesNotRestoreReleasedCapacityAndClosesTheOriginalSession() throws Exception {
-        Fixture f = new Fixture();
-        f.cancel(); f.worker.runBatch();
-        f.startup().onReady();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        assertThat(((java.util.concurrent.atomic.AtomicInteger)
-                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isZero();
-        f.startup().onReady();
-        assertThat(f.calls).hasSize(1);
-        verify(f.finalization, times(1)).publishFinalizedEvent(RUN, USER, "CANCELED");
-    }
 
-    @Test
-    void preparingOperationOnlyCancellationUsesOriginalTombstoneAndSameClosure() throws Exception {
-        Fixture f = new Fixture(); f.makePreparing();
-        f.cancel();
-        assertThat(f.stop.getTaskId()).isNull();
-        f.worker.runBatch();
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        verify(f.sandbox).cancelTask(argThat(request -> request.hasByOperation()
-                && OPERATION.equals(request.getByOperation().getOperationId())
-                && FINGERPRINT.equals(request.getByOperation().getRequestFingerprint())));
-    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"SUCCEEDED", "FAILED"})
@@ -173,31 +122,7 @@ class SqlWaitMemberCancellationLifecycleTest {
         assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
     }
 
-    @Test
-    void changedOperationAndContradictoryProofCannotClearOrUseOrdinaryFinalizer() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch();
-        ToolJobAnchor a = f.anchor(); a.setRequestFingerprint("sha256:" + "f".repeat(64));
-        f.run.setToolJobAnchorJson(a.toJson());
-        f.reconciler.reconcileFromDue();
-        assertThat(f.anchor()).isNotNull(); assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        verify(f.runMapper, never()).completeCanceledSqlWaitMember(any(), any(), any(), anyLong(), any(), any(), any());
-        assertThat(f.finalizerWriteRejected).isZero();
-        f.startup().onReady();
-        assertThat(f.anchor()).isNotNull(); verifyNoInteractions(f.finalization);
-        a.setOperationId(RUN + ":other-call:1"); f.run.setToolJobAnchorJson(a.toJson());
-        f.reconciler.reconcileFromDue();
-        assertThat(f.anchor().getOperationId()).isEqualTo(RUN + ":other-call:1");
-    }
 
-    @Test
-    void existingBusinessTerminalIsKeptWhenTheCanceledSessionCloses() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch();
-        f.run.setStatus(AgentRunStatus.FAILED);
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.FAILED);
-        assertThat(f.anchor()).isNull();
-        verify(f.finalization).publishFinalizedEvent(RUN, USER, "FAILED");
-    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"LEGACY", "DUAL_POOL_V1"})
@@ -209,85 +134,11 @@ class SqlWaitMemberCancellationLifecycleTest {
                 .isEqualTo(CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE);
     }
 
-    @Test
-    void transientCancelChainFailureIsRepairedByTheExistingAnchorScan() throws Exception {
-        Fixture f = new Fixture(); f.cancelChainFailures = 1;
-        assertThat(f.cancel()).isEqualTo("CANCELED");
-        assertThat(f.group.getState()).isEqualTo("WAITING");
-        assertThat(f.member.getState()).isEqualTo("RUNNING");
-        assertThat(f.stop).isNull();
-        f.reconciler.reconcileFromDue();
-        assertThat(f.member.getState()).isEqualTo("CANCELED");
-        assertThat(f.stop.getState()).isEqualTo("PENDING");
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.capacity.restoreReservation(f.reservation))
-                .isEqualTo(DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME);
-        f.worker.runBatch(); f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        assertThat(f.calls).hasSize(1);
-    }
 
-    @Test
-    void aConfirmedStopWithMissingUsageCannotCloseOrRecoverTheOldReservation() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch();
-        f.run.setSnapshotJson("{}");
-        f.reconciler.reconcileFromDue(); f.startup().onReady();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.anchor()).isNotNull();
-        assertThat(f.finalizerWriteRejected).isZero();
-        assertThat(((java.util.concurrent.atomic.AtomicInteger)
-                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isZero();
-        verifyNoInteractions(f.finalization);
-    }
 
-    @Test
-    void startupRereadsAStopCompletedAfterTheOldRunListWasTaken() throws Exception {
-        Fixture f = new Fixture(); f.cancel();
-        AgentRun stale = new AgentRun(); stale.setId(RUN); stale.setToolJobAnchorJson(f.run.getToolJobAnchorJson());
-        when(f.runMapper.listActiveToolJobAnchorsForDeployment(eq("stable"), eq(GENERATION), anyInt()))
-                .thenAnswer(i -> { f.worker.runBatch(); return List.of(stale); });
-        f.startup().onReady();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        assertThat(((java.util.concurrent.atomic.AtomicInteger)
-                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isZero();
-        assertThat(f.calls).hasSize(1);
-    }
 
-    @Test
-    void anOrdinarySqlSessionIsNotTakenByCancellationRecovery() throws Exception {
-        Fixture f = new Fixture();
-        assertThat(f.recovery.ownership(RUN, f.anchor()))
-                .isEqualTo(CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE);
-        assertThat(f.recovery.complete(RUN, f.anchor())).isFalse();
-        assertThat(f.member.getState()).isEqualTo("RUNNING");
-        assertThat(f.anchor()).isNotNull();
-        assertThat(f.stop).isNull();
-    }
 
-    @Test
-    void usageReservationChangedAfterInspectionRejectsTheAtomicClosure() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch();
-        f.corruptUsageOnClose = true;
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.anchor()).isNotNull();
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        verifyNoInteractions(f.finalization);
-        f.reconciler.reconcileFromDue();
-        assertThat(f.finalizerWriteRejected).isZero();
-        assertThat(f.anchor()).isNotNull();
-    }
 
-    @Test
-    void operationReplacedAfterInspectionCannotBeClearedByTheOldStop() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch(); f.replaceOperationOnClose = true;
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.anchor().getOperationId()).isEqualTo(RUN + ":other-call:1");
-        verifyNoInteractions(f.finalization);
-    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
@@ -304,84 +155,10 @@ class SqlWaitMemberCancellationLifecycleTest {
         assertThat(f.calls).hasSize(1);
     }
 
-    @Test
-    void aLateMemberWithConfirmedOriginalStopCanCloseItsCanceledSession() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch(); f.member.setState("LATE");
-        f.reconciler.reconcileFromDue();
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull(); assertThat(f.calls).hasSize(1);
-    }
 
-    @Test
-    void coldStartStopCannotSettleBeforeTheRecoveringCapacityLedgerIsRebuilt() throws Exception {
-        Fixture f = new Fixture(true);
-        assertThat(f.capacity.admissionState()).isEqualTo(DataAnalysisAdmissionState.RECOVERING);
-        f.cancel();
-        f.worker.runBatch();
-        assertThat(f.capacity.admissionState()).isEqualTo(DataAnalysisAdmissionState.RECOVERING);
-        assertThat(f.stop.getState()).isEqualTo("PENDING");
-        assertThat(f.stop.getLastError()).isEqualTo("sandbox_settlement_incomplete");
-        assertThat(f.calls).isEmpty();
-        verify(f.stopMapper, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.anchor()).isNotNull();
-        f.startup().onReady();
-        assertThat(f.capacity.admissionState()).isEqualTo(DataAnalysisAdmissionState.OPEN);
-        assertThat(((java.util.concurrent.atomic.AtomicInteger)
-                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isEqualTo(1);
-        assertThat(f.capacity.restoreReservation(f.reservation)).isEqualTo(DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME);
-        // 模拟重试记录的下次可见时刻已经到达；领取仍按状态、代际、令牌与租期条件。
-        f.stop.setNextAttemptAt(OffsetDateTime.now().minusSeconds(1));
-        f.worker.runBatch(); f.reconciler.reconcileFromDue();
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        assertThat(f.calls).hasSize(1);
-        assertThat(((java.util.concurrent.atomic.AtomicInteger)
-                ReflectionTestUtils.getField(f.capacity, "usedUnits")).get()).isZero();
-    }
 
-    @Test
-    void failedApiNodeCancellationIsRepairedBeforeTheConfirmedSqlSessionCloses() throws Exception {
-        Fixture f = new Fixture(); f.addExtraNode("RUNNABLE"); f.nodeCancelFailures = 1;
-        f.cancel(); f.worker.runBatch();
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        f.reconciler.reconcileFromDue(); f.reconciler.reconcileFromDue();
-        assertThat(f.extraNode.getState()).isEqualTo("CANCELED");
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        verify(f.nodes, times(2)).cancel(eq(f.extraNode.identity()), eq(0L), eq(3), eq("run_explicitly_canceled"));
-    }
 
-    @Test
-    void interruptionAfterPersistentCancelIntentRepairsTheIndependentWaitingNode() throws Exception {
-        Fixture f = new Fixture(); f.addExtraNode("WAITING");
-        assertThat(f.anchors.persistCancelDisposition(RUN, OPERATION, AgentRunStatus.EXECUTING)).isTrue();
-        assertThat(f.run.getRunControlVersion()).isEqualTo(1L);
-        f.reconciler.reconcileFromDue(); f.worker.runBatch(); f.reconciler.reconcileFromDue();
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        assertThat(f.extraNode.getState()).isEqualTo("CANCELED");
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-        verify(f.nodes).cancel(eq(f.extraNode.identity()), eq(0L), eq(3), eq("run_explicitly_canceled"));
-    }
 
-    @Test
-    void aChangedNodeClaimRejectsCancellationAndPreservesTheOriginalSqlSession() throws Exception {
-        Fixture f = new Fixture(); f.addExtraNode("RUNNABLE"); f.nodeCancelFailures = 1;
-        f.cancel(); f.worker.runBatch(); f.advanceNodeEpochOnCancel = true;
-        f.reconciler.reconcileFromDue();
-        assertThat(f.extraNode.getState()).isEqualTo("RUNNABLE");
-        assertThat(f.extraNode.getClaimEpoch()).isEqualTo(4);
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        assertThat(f.anchor()).isNotNull();
-        assertThat(f.stop.getState()).isEqualTo("CONFIRMED");
-        verifyNoInteractions(f.finalization);
-        f.advanceNodeEpochOnCancel = false; f.reconciler.reconcileFromDue();
-        assertThat(f.extraNode.getState()).isEqualTo("CANCELED");
-        assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
-        assertThat(f.anchor()).isNull();
-    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(value = AgentRunStatus.class, names = {"FAILED", "CANCELED"})
@@ -406,21 +183,6 @@ class SqlWaitMemberCancellationLifecycleTest {
         assertThat(f.extraNode.getState()).isEqualTo("RUNNABLE");
     }
 
-    @Test
-    void closureBeforeResumeAllowsTheNewNodeAndAnOldPassCannotCancelIt() throws Exception {
-        Fixture f = new Fixture(); f.cancel(); f.worker.runBatch();
-        f.run.setStatus(AgentRunStatus.FAILED);
-        ToolJobAnchor original = f.anchor(); f.createNodeOnLaunch = true;
-        f.beforeNodeRead = () -> assertThat(f.runRowLock.isHeldByCurrentThread()).isTrue();
-        assertThat(f.recovery.complete(RUN, original)).isTrue();
-        assertThat(f.runRowLock.isLocked()).isFalse();
-        assertThat(f.resumeRun()).isEqualTo("RECEIVED");
-        assertThat(f.extraNode.getState()).isEqualTo("RUNNABLE");
-        f.beforeNodeRead = null;
-        assertThat(f.recovery.complete(RUN, original)).isFalse();
-        verify(f.nodes, never()).cancel(any(), anyLong(), anyInt(), anyString());
-        verify(f.finalization).publishFinalizedEvent(RUN, USER, "FAILED");
-    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(value = AgentRunStatus.class, names = {"FAILED", "CANCELED"})

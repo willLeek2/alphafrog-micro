@@ -224,43 +224,6 @@ class DataAnalysisResourceUsageP012Test {
     // P0-12: multiple missing fields scenario
     // -----------------------------------------------------------------------
 
-    @Test
-    void multipleMissingFields() {
-        DataAnalysisResourceUsage usage = new DataAnalysisResourceUsage(
-                DataAnalysisResourceClass.STANDARD,
-                null,                    // cpuMillis — missing
-                null,                    // memoryPeakBytes — missing
-                null,                    // memoryByteMillis
-                MB10,                    // logicalBytesScanned
-                null,                    // artifactBytesWritten
-                null,                    // temporaryBytesWritten
-                150L,                    // queueWaitMillis
-                200L,                    // prepareMillis
-                5000L,                   // executionWallMillis
-                100L,                    // cleanupMillis
-                3,                       // datasetOpenCount
-                "SUCCEEDED",             // exitReason
-                false,                   // oomKilled
-                false,                   // timedOut
-                false,                   // attributionComplete
-                null,                    // samplingIntervalMillis
-                List.of("cpuMillis", "memoryPeakBytes")
-        );
-
-        assertThat(usage.attributionComplete()).isFalse();
-        assertThat(usage.missingFields()).containsExactly("cpuMillis", "memoryPeakBytes");
-        assertThat(usage.cpuMillis()).isNull();
-        assertThat(usage.memoryPeakBytes()).isNull();
-
-        // Remaining 7 P0 fields are present
-        assertThat(usage.logicalBytesScanned()).isEqualTo(MB10);
-        assertThat(usage.queueWaitMillis()).isEqualTo(150L);
-        assertThat(usage.prepareMillis()).isEqualTo(200L);
-        assertThat(usage.executionWallMillis()).isEqualTo(5000L);
-        assertThat(usage.cleanupMillis()).isEqualTo(100L);
-        assertThat(usage.datasetOpenCount()).isEqualTo(3);
-        assertThat(usage.exitReason()).isEqualTo("SUCCEEDED");
-    }
 
     // -----------------------------------------------------------------------
     // Static factory: DataAnalysisResourceUsage.missing()

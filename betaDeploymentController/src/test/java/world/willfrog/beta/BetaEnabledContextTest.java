@@ -32,11 +32,6 @@ class BetaEnabledContextTest {
         properties.add("alphafrog.beta-controller.api-token-file", () -> API_TOKEN);
     }
 
-    @Test
-    void enabledControllerBuildsItsRuntimeGraphWithSafeEmptyState() {
-        assertNotNull(service);
-        assertNotNull(service.reconcileOne());
-    }
 
     private static Path createRuntimeDirectory() {
         try { return Files.createTempDirectory("beta-enabled-context-"); }

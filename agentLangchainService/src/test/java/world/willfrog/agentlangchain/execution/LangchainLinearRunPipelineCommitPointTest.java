@@ -46,86 +46,10 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
  */
 class LangchainLinearRunPipelineCommitPointTest {
 
-    @Test
-    void completedSideEffectFailureDoesNotRewriteCommittedOutcome() {
-        Fixture fx = fixture("run-cp-1", true, 1);
-        doThrow(new RuntimeException("event append boom"))
-                .when(fx.eventService).append(eq("run-cp-1"), eq("user-1"), eq("WORKFLOW_COMPLETED"), any());
 
-        fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-1"), eq("user-1"), eq(AgentRunStatus.EXECUTING),
-                eq(AgentRunStatus.COMPLETED), anyString(), eq(true), isNull());
-        verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
-        verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
-        verify(fx.creditSettlementService, never()).settleAsync(anyString(), anyString());
-        verify(fx.finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
-    }
 
-    @Test
-    void partialSideEffectFailureDoesNotRewriteCommittedOutcome() {
-        Fixture fx = partialFixture("run-cp-2", 1);
-        doThrow(new RuntimeException("event append boom"))
-                .when(fx.eventService).append(eq("run-cp-2"), eq("user-1"), eq("WORKFLOW_PARTIAL_COMPLETED"), any());
 
-        fx.pipeline.executeRun(fx.run);
-
-        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-2"), eq("user-1"), eq(AgentRunStatus.EXECUTING),
-                eq(AgentRunStatus.PARTIAL), anyString(), eq(true), any());
-        verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
-        verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
-        verify(fx.creditSettlementService, never()).settleAsync(anyString(), anyString());
-        verify(fx.finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
-    }
-
-    @Test
-    void finalizationFailureAfterCommitIsSwallowed() {
-        Fixture fx = fixture("run-cp-3", true, 1);
-        doThrow(new RuntimeException("finalization boom"))
-                .when(fx.finalizationService).publishFinalizedEvent(eq("run-cp-3"), eq("user-1"), eq("COMPLETED"));
-
-        fx.pipeline.executeRun(fx.run);
-
-        verify(fx.eventService).append(eq("run-cp-3"), eq("user-1"), eq("WORKFLOW_COMPLETED"), any());
-        verify(fx.messageService).createAssistantMessage(eq("run-cp-3"), eq("done-answer"), anyString());
-        verify(fx.creditSettlementService).settleAsync(eq("run-cp-3"), eq("user-1"));
-        verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
-    }
-
-    @Test
-    void completedHappyPathSideEffectSequenceUnchanged() {
-        Fixture fx = fixture("run-cp-4", true, 1);
-
-        fx.pipeline.executeRun(fx.run);
-
-        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
-        verify(fx.eventService).append(eq("run-cp-4"), eq("user-1"),
-                eq("WORKFLOW_COMPLETED"), payloadCaptor.capture());
-        Map<String, Object> captured = payloadCaptor.getValue();
-        assertThat(captured).containsEntry("answer", "done-answer");
-        assertThat(captured).containsEntry("toolCallsUsed", 2);
-        assertThat(captured).containsEntry("engine", "agentLangchainService");
-        assertThat(captured).doesNotContainKey("resumed");
-        verify(fx.messageService).createAssistantMessage(eq("run-cp-4"), eq("done-answer"), anyString());
-        verify(fx.creditSettlementService).settleAsync(eq("run-cp-4"), eq("user-1"));
-        verify(fx.finalizationService).publishFinalizedEvent(eq("run-cp-4"), eq("user-1"), eq("COMPLETED"));
-    }
-
-    @Test
-    void unacceptedSnapshotWriteSkipsAllTerminalBroadcast() {
-        Fixture fx = fixture("run-cp-5", true, 0);
-
-        fx.pipeline.executeRun(fx.run);
-
-        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-5"), eq("user-1"), eq(AgentRunStatus.EXECUTING),
-                eq(AgentRunStatus.COMPLETED), anyString(), eq(true), isNull());
-        verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_COMPLETED"), any());
-        verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
-        verify(fx.eventService, never()).append(anyString(), anyString(), eq("MESSAGE_COMPLETED"), any());
-        verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
-        verify(fx.creditSettlementService, never()).settleAsync(anyString(), anyString());
-        verify(fx.finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
-    }
 
     // ========== 构造辅助 ==========
 

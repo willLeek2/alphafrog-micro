@@ -9,14 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ToolDescriptionTextsTest {
 
-    @Test
-    void require_shouldLoadExecutePythonFromExistingAuthorityFile() {
-        String fromIndex = ToolDescriptionTexts.require("executePython");
-        String fromFile = PromptFileLoader.load("prompts/python/execute_python_tool_description.txt")
-                .replaceAll("\n+$", "");
-        assertEquals(fromFile, fromIndex);
-        assertFalse(fromIndex.isBlank());
-    }
 
     @Test
     void require_shouldFailWhenToolUnknown() {

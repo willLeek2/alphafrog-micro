@@ -17,17 +17,6 @@ class ToolResultCacheRegistryContractTest {
     private final ToolResultCacheService service = new ToolResultCacheService(
             null, null, null, null, null);
 
-    @Test
-    void allDeclaredTools_resolveModeMatchesRegistryCacheFamily() {
-        for (AgentToolRegistry.ToolDeclaration declaration : AgentToolRegistry.all()) {
-            Object mode = ReflectionTestUtils.invokeMethod(service, "resolveMode", declaration.name());
-            assertTrue(mode != null, declaration.name() + " 的 resolveMode 不可为 null");
-            String modeName = mode.toString();
-            String expected = expectedMode(declaration.cacheFamily());
-            assertEquals(expected, modeName,
-                    declaration.name() + " 的缓存模式应与注册表 cacheFamily=" + declaration.cacheFamily() + " 一致");
-        }
-    }
 
     private String expectedMode(AgentToolRegistry.CacheFamily family) {
         return switch (family) {

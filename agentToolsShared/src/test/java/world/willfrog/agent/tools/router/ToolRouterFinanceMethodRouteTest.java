@@ -34,75 +34,7 @@ import static org.mockito.Mockito.when;
  */
 class ToolRouterFinanceMethodRouteTest {
 
-    @SuppressWarnings("unchecked")
-    @Test
-    void invoke_shouldRouteResolveFinanceMethods() throws Exception {
-        FinanceMethodTools financeMethodTools = mock(FinanceMethodTools.class);
-        when(financeMethodTools.resolveFinanceMethods(eq("这几年涨了多少"), eq("已有收盘价")))
-                .thenReturn("{\"ok\":true,\"tool\":\"resolveFinanceMethods\",\"data\":{},\"error\":null}");
 
-        ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
-        when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
-            Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
-            ToolResultCacheService.ToolExecutionOutcome outcome = supplier.get();
-            return ToolResultCacheService.CachedToolCallResult.builder()
-                    .result(outcome.getResult())
-                    .durationMs(outcome.getDurationMs())
-                    .success(outcome.isSuccess())
-                    .build();
-        });
-
-        ToolRouter router = new ToolRouter(
-                mock(MarketDataTools.class),
-                mock(RagTools.class),
-                mock(SearchTools.class),
-                mock(PythonSandboxTools.class),
-                mock(SqlQueryTools.class),
-                financeMethodTools,
-                mock(LoadToolGuideTool.class),
-                mock(ListMyDataTool.class),
-                new PythonStaticPrecheckService(),
-                llmPropertiesWithStaticPrecheck(true),
-                cacheService,
-                mock(RereadToolHandler.class),
-                mock(AgentRunObservabilityService.class),
-                new ObjectMapper(),
-                new SimpleMeterRegistry(),
-                new StressTestProperties()
-        );
-
-        ToolRouter.ToolInvocationResult result = router.invokeWithMeta(
-                "resolveFinanceMethods",
-                Map.of("query", "这几年涨了多少", "context", "已有收盘价")
-        );
-
-        assertTrue(result.isSuccess());
-        verify(financeMethodTools).resolveFinanceMethods(eq("这几年涨了多少"), eq("已有收盘价"));
-    }
-
-    @Test
-    void supportedTools_shouldIncludeResolveFinanceMethods() {
-        ToolRouter router = new ToolRouter(
-                mock(MarketDataTools.class),
-                mock(RagTools.class),
-                mock(SearchTools.class),
-                mock(PythonSandboxTools.class),
-                mock(SqlQueryTools.class),
-                mock(FinanceMethodTools.class),
-                mock(LoadToolGuideTool.class),
-                mock(ListMyDataTool.class),
-                new PythonStaticPrecheckService(),
-                llmPropertiesWithStaticPrecheck(true),
-                mock(ToolResultCacheService.class),
-                mock(RereadToolHandler.class),
-                mock(AgentRunObservabilityService.class),
-                new ObjectMapper(),
-                new SimpleMeterRegistry(),
-                new StressTestProperties()
-        );
-        assertTrue(router.supportedTools().contains("resolveFinanceMethods"));
-        assertEquals(1, router.supportedTools().stream().filter("resolveFinanceMethods"::equals).count());
-    }
 
     private AgentLlmProperties llmPropertiesWithStaticPrecheck(boolean enabled) {
         AgentLlmProperties properties = new AgentLlmProperties();

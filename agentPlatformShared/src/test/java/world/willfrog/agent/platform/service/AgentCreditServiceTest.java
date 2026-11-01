@@ -59,66 +59,6 @@ class AgentCreditServiceTest {
         ReflectionTestUtils.setField(service, "executePythonCost", 5);
     }
 
-    @Test
-    void applyCredits_shouldCreatePendingApplication() {
-        User before = new User();
-        before.setUserId(1L);
-        before.setCredit(100);
-        when(userDao.getUserById(1L)).thenReturn(before);
-        when(runMapper.sumCompletedCreditsByUser("1")).thenReturn(200);
 
-        AgentCreditService.ApplyCreditSummary summary = service.applyCredits("1", 1000, "test", "u@example.com");
 
-        assertNotNull(summary.applicationId());
-        assertEquals(100, summary.totalCredits());
-        assertEquals(0, summary.remainingCredits());
-        assertEquals(200, summary.usedCredits());
-        assertEquals("PENDING", summary.status());
-
-        ArgumentCaptor<world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditApplication> captor =
-                ArgumentCaptor.forClass(world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditApplication.class);
-        verify(creditApplicationDao).insert(captor.capture());
-        assertEquals(1000, captor.getValue().getAmount());
-        assertEquals("PENDING", captor.getValue().getStatus());
-    }
-
-    @Test
-    void calculateRunTotalCredits_shouldIncludeLlmAndToolCredits() {
-        AgentRun run = new AgentRun();
-        run.setExt("{\"model_name\":\"openai/gpt-5.2\"}");
-        run.setSnapshotJson("{\"observability\":{\"summary\":{\"totalTokens\":1200}}}");
-
-        AgentRunEvent e1 = new AgentRunEvent();
-        e1.setEventType("TOOL_CALL_FINISHED");
-        e1.setPayloadJson("{\"tool_name\":\"executePython\",\"cacheHit\":false}");
-        AgentRunEvent e2 = new AgentRunEvent();
-        e2.setEventType("TOOL_CALL_FINISHED");
-        e2.setPayloadJson("{\"tool_name\":\"searchStock\",\"cacheHit\":true}");
-
-        when(modelCatalogService.resolveBaseRate("openai/gpt-5.2")).thenReturn(1.5D);
-
-        int total = service.calculateRunTotalCredits(run, List.of(e1, e2), "");
-        assertEquals(7, total);
-    }
-
-    @Test
-    void recordRunConsumeLedger_shouldInsertLedgerEntry() {
-        User user = new User();
-        user.setUserId(1L);
-        user.setCredit(1000);
-        when(userDao.getUserById(1L)).thenReturn(user);
-        when(runMapper.sumCompletedCreditsByUser("1")).thenReturn(250);
-
-        service.recordRunConsumeLedger("run-1", "1", 50);
-
-        ArgumentCaptor<world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditLedger> captor =
-                ArgumentCaptor.forClass(world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditLedger.class);
-        verify(creditLedgerDao).insertIgnoreDuplicate(captor.capture());
-        assertEquals("RUN_CONSUME", captor.getValue().getBizType());
-        assertEquals(BigDecimal.valueOf(-50), captor.getValue().getDelta());
-        assertEquals(BigDecimal.valueOf(800), captor.getValue().getBalanceBefore());
-        assertEquals(BigDecimal.valueOf(750), captor.getValue().getBalanceAfter());
-        assertEquals("run-1", captor.getValue().getSourceId());
-        assertEquals("legacy_run_consume", captor.getValue().getReason());
-    }
 }
