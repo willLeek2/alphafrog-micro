@@ -25,12 +25,12 @@ public record PromptText(String text, List<PromptVersionSource> sources) {
         return new PromptText(text, List.of(source));
     }
 
-    /** 用户原话、工具事实与模型输出按数据传递，不为它们编造指令版本。 */
+    /** 用户原话、工具事实和模型输出按运行数据传递。 */
     public static PromptText runtimeData(String text) {
         return new PromptText(text, List.of());
     }
 
-    /** 按传入顺序拼接，不插入或裁剪字符，来源随相应文本保留。 */
+    /** 按传入顺序原样拼接文本，并保留对应来源。 */
     public static PromptText concat(List<PromptText> parts) {
         if (parts == null) {
             throw new ModelSendBlockedException(PROMPT_UNREADABLE, "parts");

@@ -15,12 +15,12 @@ public final class ModelSendBlockedException extends RuntimeException implements
         this(code, reason, RacingFailure.none());
     }
 
-    /** 结构化平台诊断已过滤自由文字，异常仍不附带原始cause。 */
+    /** 结构化诊断只保留已过滤字段，异常原因链留空。 */
     public ModelSendBlockedException(String code, String reason, RacingFailure racingFailure) {
         super(requireCode(code));
         this.code = code;
         String safeReason = reason == null || reason.isBlank() ? "本次模型发送已停止" : reason;
-        // 成员结果保存到 PostgreSQL jsonb；错误说明同样不能携带 NUL。
+        // 成员结果写入PostgreSQL jsonb，错误说明须符合其字符约束。
         this.reason = safeReason.replace("\0", "");
         this.racingFailure = racingFailure == null ? RacingFailure.none() : racingFailure;
     }

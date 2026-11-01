@@ -1361,7 +1361,7 @@ public final class SandboxToolJobLifecycle {
         }
     }
 
-    /** 此处只编码本流程构造的协议、所有权与容量拒绝事实，不接收操作建议正文。 */
+    /** 编码本流程产生的协议、所有权和容量拒绝事实。 */
     private static PromptText factFailure(ObjectMapper mapper, String tool, String code,
                                           String message, Map<String, Object> details) {
         return PromptText.runtimeData(SandboxJobResponses.fail(mapper, tool, code, message, details));

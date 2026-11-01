@@ -32,7 +32,7 @@ import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionBody;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 
-/** 规划专用正文、结构说明和本次输入来源，不读取本地导入材料作为备用。 */
+/** 从所选版本准备规划正文、结构说明与本次输入来源。 */
 @Component
 public final class PlanningPromptPreparation {
     private static final ObjectMapper JSON = new ObjectMapper()
@@ -87,7 +87,7 @@ public final class PlanningPromptPreparation {
         return reader.render(read(fragment), values, Map.of());
     }
 
-    /** 旧裸字符串必须与调用方明确提供的带分类正文相符，不能在此猜测其来源。 */
+    /** 兼容字符串必须与调用方提供的分类正文及来源一致。 */
     public PromptText history(String legacyText, PromptText classified) {
         if (classified == null) {
             if (legacyText != null && !legacyText.isBlank()) {

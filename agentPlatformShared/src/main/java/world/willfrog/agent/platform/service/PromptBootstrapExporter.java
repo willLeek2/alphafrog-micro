@@ -23,14 +23,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** 只读导出Authority登记内容及导入草案，不创建远程版本或切换消费者。 */
+/** 只读导出Authority登记内容和导入草案。 */
 public final class PromptBootstrapExporter {
     private static final String REQUIREMENTS = "prompts/python/python_refine_requirements.txt";
     private static final String DATASET_SPECS = "prompts/python/dataset_field_specs.json";
     private static final String TOOL_INDEX = "prompts/tools/tool_description_index.json";
     private static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
-    /** 这些键来自相应消费方法实际传给render/replace的变量，不从正文猜测。 */
+    /** 变量键取自相应消费方法传入render或replace的参数。 */
     private static final Map<String, Set<String>> RENDER_VARIABLES = Map.ofEntries(
             Map.entry("followUpSummarySystemPrompt", Set.of("maxChars")),
             Map.entry("todoPlannerSystemPromptTemplate", Set.of("toolWhitelist", "maxTodos")),
@@ -48,7 +48,7 @@ public final class PromptBootstrapExporter {
             Map.entry("toolSummaryUserPromptTemplate", Set.of("todoGoal", "toolName", "rawOutput")),
             Map.entry("budgetLastMileStageInstruction", Set.of("dimension", "actual", "limit", "ratioPct")));
 
-    /** 仅表示未登记字段自身的业务render键，不表示下游SDK或嵌入位置不会继续渲染。 */
+    /** 标记当前字段自身使用的渲染键；下游SDK及嵌入位置另有渲染规则。 */
     private static final Set<String> RAW_FIELDS = Set.of(
             "agentRunSystemPrompt", "workflowFinalSystemPrompt", "workflowTodoRecoverySystemPrompt",
             "parallelFinalSystemPrompt", "parallelPatchPlannerSystemPromptTemplate",
@@ -243,7 +243,7 @@ public final class PromptBootstrapExporter {
         }
     }
 
-    /** 与Authority现有指纹使用相同规则，但只使用此次已经捕获的数据。 */
+    /** 按Authority指纹规则计算此次捕获内容的摘要。 */
     private static String authorityDigest(Map<String, String> texts, Map<String, String> tools,
                                            Map<String, String> auxiliary) {
         StringBuilder canonical = new StringBuilder();
@@ -302,7 +302,7 @@ public final class PromptBootstrapExporter {
         public Snapshot { resources = List.copyOf(resources); fragments = List.copyOf(fragments); }
     }
 
-    /** resourcePath是原登记资源定位；进程覆盖的文件路径并未由Authority保存，不在此推断。 */
+    /** resourcePath记录Authority登记的资源位置。 */
     public record ResourceDocument(String authorityField, String resourcePath, SnapshotKind origin,
                                      ResourceKind kind, String rawBody, String utf8Sha256) {
         @Override public String toString() { return "ResourceDocument[resource=" + resourcePath + ", kind=" + kind + "]"; }

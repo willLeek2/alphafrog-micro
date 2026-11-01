@@ -26,7 +26,7 @@ import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSource;
 import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
-/** SDK负责工具循环；每次真正调用模型时才装配消息来源和本线程归档作用域。 */
+/** SDK管理工具循环；每次调用模型时装配消息来源与线程内归档作用域。 */
 final class LangchainTodoPromptModel implements ChatModel {
     private final ChatModel delegate;
     private final PromptText system;
@@ -46,7 +46,7 @@ final class LangchainTodoPromptModel implements ChatModel {
         if (delegate == null || inputs == null || endpoint == null || endpoint.isBlank()) {
             throw missing("节点模型缺少归档模型、端点或输入保存组件");
         }
-        // 两条初始消息由本次调用直接提供，不从SDK消息正文匹配或推断来源。
+        // 本次调用直接提供两条初始消息及其来源。
         PromptMessage.system(system);
         PromptMessage.user(user);
         this.delegate = delegate;

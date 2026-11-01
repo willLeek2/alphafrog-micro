@@ -29,63 +29,14 @@ import java.util.Map;
 import java.util.Locale;
 
 /**
- * Agent 提示词中心 —— 整个 agent 系统所有模型调用的 prompt 都在这里组装。
- * 讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。
+ * 准备各模型阶段的正文、时间基准、工具说明及版本来源。
+ * <p>schema2根运行通过返回PromptText的方法读取持久根集合，同时取得根记录的日期和数据时效。
+ * 兼容字符串入口适用于schema1或非运行调用，按classpath权威正文核对部署投影。</p>
+ * <p>系统消息包含时间基准、数据时效和全局指令；阶段专属指令放在用户消息中，保持系统正文稳定。
+ * 缺少所需正文或选择时，准备过程返回配置错误。</p>
  *
- * <h2>这个类解决什么问题</h2>
- * <p>agent 在不同阶段（planning 规划 / execution 执行 / final answer 最终回答 / recovery 恢复 / judge 判定）
- * 需要给 LLM 发送不同的 system prompt 和 user message。
- * 所有 prompt 的权威加载与投影校验、时间基准注入、阶段指令拼装、工具能力说明生成都集中在这里，避免散落在各处导致不一致。</p>
- *
- * <h2>Prompt 的三层结构</h2>
- * <ol>
- *   <li><b>时间基准前缀</b>（托管正文由 {@link #reactSystemPromptText()} 读取版本并填入日期，
- *       兼容路径由 {@link #composeSystemPrompt(String)} 注入）：
- *       Run 内根据建 Run 时冻结的 reference date 计算当前年月日 + 相对年份映射规则；
- *       非 Run 的轻量调用才使用 {@code LocalDate.now()}。
- *       例如 "当前时间：2026年05月25日（星期一，2026年5月25日）...说去年，指2025年"。
- *       这是防止模型把"去年"推理成错误年份的备用机制。</li>
- *   <li><b>全局 agent 指令</b>（global，来自 {@code agentRunSystemPrompt}）：
- *       所有阶段共享的基础角色定义和约束（如"你是专业金融分析代理"、禁止猜测代码、必须用具体年份等）。
- *       在 System Message 中保持不变，利于 OpenAI 兼容 API 的 KV 前缀缓存（prompt caching）。</li>
- *   <li><b>阶段专属指令</b>（stage-specific，来自各 {@code stageInstruction()} 方法）：
- *       注入到 User Message 而非 System Message，
- *       引导 LLM 在当前阶段完成特定任务（如 strategy 统筹规划、todos 任务拆解、final answer 汇总）。
- *       放在 User Message 的设计意图是保持 System Prompt 稳定以提升缓存命中率。</li>
- * </ol>
- *
- * <h2>正文读取与来源</h2>
- * <p>schema2根运行使用返回PromptText的方法，按持久根集合读取正文、日期和数据时效，
- * 并把实际版本来源交给调用方。旧String出口在schema2或运行选择缺失时停止，避免丢失来源。</p>
- * <p>以下投影规则仅适用于尚未切换的schema1与非Run兼容路径：</p>
- * <ol>
- *   <li><b>唯一权威正文</b>：{@code agentPlatformShared} classpath {@code prompts/}。</li>
- *   <li><b>Nacos / 外置文件</b>：仍可热加载，但只作为权威正文的部署投影；内容不一致时拒绝刷新。</li>
- *   <li><b>application-agent-llm-prompts.yml</b>：不再维护第二份内联正文。</li>
- * </ol>
- * 所有关键正文在追加时间前缀或阶段标记前完成加载和非空校验；缺失时抛出稳定配置异常，
- * 不会用日期前缀把空 Prompt 伪装成可用消息。
- *
- * <h2>与规划（planning）和执行（execution）的协作关系</h2>
- * <ul>
- *   <li>{@link #reactSystemPrompt()} → 用于两阶段 planning 的 System Message，
- *       {@link world.willfrog.agentlangchain.planning.LangchainAiPlanner} 调用。</li>
- *   <li>{@link #dagReactSystemPrompt()} → 用于 DAG 节点执行（单 todo 的 ReAct 循环）的 System Message，
- *       {@code LangchainTodoNodeExecutor} 调用。</li>
- *   <li>{@link #planningStrategyStageInstruction(String, int, int)} → 规划第一阶段（统筹）的 User Message 指令，
- *       含 {@link #renderToolCapabilities(Collection)} 从权威目录渲染的实际工具能力清单。</li>
- *   <li>{@link #planningTodosStageInstruction(String, String, String, int)} → 规划第二阶段（任务拆解）的 User Message 指令。</li>
- *   <li>{@link #composeSystemPrompt(String)} → 所有 System Prompt 的统一入口，注入时间基准 + 全局指令。</li>
- * </ul>
- *
- * <h2>Sub-Agent 模型选择</h2>
- * <p>{@link #selectSubAgentModelName(String, String)} 根据任务目标的文本长度和关键词做启发式复杂度估算
- * （{@link Complexity#LOW}/{@link Complexity#MEDIUM}/{@link Complexity#HIGH}），
- * 然后从配置中选择对应档位的模型名，高复杂度用强模型（如 GPT-5.4），低复杂度用便宜模型（如 Qwen 122B），
- * 兼顾效果和成本。</p>
- *
- * @see AgentLlmLocalConfigLoader 热加载配置加载器
- * @see AgentLlmProperties 配置结构定义
+ * @see AgentLlmLocalConfigLoader
+ * @see AgentLlmProperties
  */
 @Component
 @Slf4j
@@ -149,7 +100,7 @@ public class AgentPromptService {
         this.promptTexts = promptTexts;
     }
 
-    /** 仅为兼容路径生成旧摘要；托管根的真实集合由PromptSelectionCoordinator确认并保存。 */
+    /** 为兼容路径生成摘要；托管根集合由PromptSelectionCoordinator确认并保存。 */
     public PromptRunSelection snapshotPromptSelection(String runId, String userId, String experimentContext) {
         PromptVariantSelector.SelectedVariant selected = promptVariantSelector.select(
                 new PromptSelectionContext(runId, userId, experimentContext));
@@ -169,15 +120,15 @@ public class AgentPromptService {
     }
 
     /**
-     * schema2在此核对选择结构，实际正文仍须由typed入口核对持久根、用途及授权。
-     * schema1兼容路径继续校验当前或近期留存摘要；旧摘要不代表可以还原历史正文。
+     * schema2核对选择结构后，由带来源的正文入口检查持久根、用途与授权。
+     * schema1兼容路径校验当前或近期保留的摘要。
      */
     public void validatePromptSelection(PromptRunSelection selection) {
         if (selection == null) {
             return;
         }
         if (selection.schemaVersion() == PromptRunSelection.RACING_SCHEMA_VERSION) {
-            // 实际正文由typed入口继续核对持久根、用途与当前授权，不查旧Authority摘要。
+            // 带来源的正文入口继续核对持久根、用途和当前授权。
             selection.racingSelection();
             return;
         }
@@ -199,7 +150,7 @@ public class AgentPromptService {
                 "Run 冻结的 Prompt 版本或摘要与当前权威资源不一致");
     }
 
-    /** 原根日期政策、数据时效政策和全局正文；不加入历史specific参数。 */
+    /** 从原根集合准备日期政策、数据时效政策与全局正文。 */
     public PromptText reactSystemPromptText() {
         RootPrompts root = textReader().current();
         String freshness = freshnessClauses(root.freshness());
@@ -295,7 +246,7 @@ public class AgentPromptService {
                         instructions("toolCapabilities", capabilities)));
     }
 
-    // 历史System出口都保持稳定层；阶段专用正文由带来源的阶段接口提供。
+    // 系统正文保持稳定，阶段专属正文通过带来源的阶段接口提供。
     public PromptText agentRunSystemPromptText() { return reactSystemPromptText(); }
     public PromptText todoPlannerSystemPromptText(String toolWhitelist, int maxTodos) { return reactSystemPromptText(); }
     public PromptText workflowFinalSystemPromptText() { return reactSystemPromptText(); }
@@ -334,7 +285,7 @@ public class AgentPromptService {
         return renderText("financeMethodResolverSystemPrompt", data("RESOLVER_CATALOG", resolverCatalog));
     }
 
-    /** 返回真实版本用于模板摘要和单次渲染，未渲染模板不作为已完成的PromptText返回。 */
+    /** 返回实际版本，供模板摘要计算与单次渲染使用。 */
     public PromptVersionBody financeMethodResolverSystemPromptVersion() {
         return readBody(textReader().current(), "financeMethodResolverSystemPrompt");
     }
@@ -1280,34 +1231,13 @@ public class AgentPromptService {
     }
 
     /**
-     * 为未切换的兼容路径组装 System Prompt：<b>时间基准 + 数据时效 + 全局指令</b>。
+     * 为schema1及非运行兼容路径组装系统消息。
+     * <p>时间基准、数据时效与全局指令组成系统正文；阶段指令由调用方放入用户消息。
+     * 日期按运行上下文或当前日期计算，使相对年份随时间更新。</p>
+     * <p>schema2通过reactSystemPromptText读取原根集合。</p>
      *
-     * <p>schema2不能进入此方法；托管系统正文使用reactSystemPromptText读取原根集合。</p>
-     *
-     * <h3>三段式结构</h3>
-     * <ol>
-     *   <li><b>时间基准（动态）</b>：由 {@code LocalDate.now()} 计算，包含
-     *       <ul>
-     *         <li>当前精确时间："2026年05月25日（星期一，2026年5月25日）"</li>
-     *         <li>相对年份映射："用户说2026年，指2026年；说去年，指2025年；说今年，指2026年..."</li>
-     *         <li>输出约束："所有输出内容须标明具体公历年份，禁止使用仅含「去年」「明年」等表述"</li>
-     *       </ul>
-     *       为什么每天动态计算而不是写死：agent 长期运行，去年/今年的含义随时间变化。
-     *       写死会导致跨年后"去年"指代错误。</li>
-     *   <li><b>全局 agent 指令（静态）</b>：来自 {@code agentRunSystemPrompt}
-     *       （通常是 {@code agent_run_system.txt}），包含角色定义、通用约束等。
-     *       这部分内容跨阶段保持不变，利于 OpenAI 兼容 API 的自动 KV 前缀缓存。</li>
-     *   <li><b>阶段专属 prompt</b>：由调用方通过 {@code *StageInstruction()} 注入 User Message；
-     *       兼容参数不再进入 System。</li>
-     * </ol>
-     *
-     * <h3>与 {@link #dynamicContextPrefix()} 的关系</h3>
-     * <p>{@code dynamicContextPrefix()} 返回 "今天是2026年05月25日。" 并注入到 User Message。
-     * 这与本方法在 System Prompt 中注入的时间基准形成<b>双重时间锚点</b>：
-     * System Prompt 一次 + User Message 一次，增强 LLM 的时间感知。</p>
-     *
-     * @param ignoredSpecificPrompt 历史兼容参数；D02 后不再写入 System
-     * @return 稳定时间基准、数据时效与全局指令组成的 System Prompt
+     * @param ignoredSpecificPrompt 兼容参数
+     * @return 时间基准、数据时效与全局指令组成的系统正文
      */
     private String composeSystemPrompt(String ignoredSpecificPrompt) {
         requireLegacyTextPath();

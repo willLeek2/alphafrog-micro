@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-/** 按明确的异常身份识别发送阻止原因，不从普通模型错误的文字推断。 */
+/** 按异常类型识别发送阻止原因。 */
 public final class ModelSendBlocks {
 
     private ModelSendBlocks() {
@@ -59,7 +59,7 @@ public final class ModelSendBlocks {
         return Collections.unmodifiableMap(metadata);
     }
 
-    /** 只恢复显式持久标记；普通错误文字不会升级为控制信号。 */
+    /** 按显式持久标记恢复发送阻止原因。 */
     public static Optional<ModelSendBlockedException> fromFailureMetadata(Map<?, ?> metadata) {
         if (metadata == null || !Boolean.TRUE.equals(metadata.get("model_send_blocked"))) {
             return Optional.empty();
@@ -85,7 +85,7 @@ public final class ModelSendBlocks {
         return value instanceof String text ? text : "";
     }
 
-    /** 持久结果使用同一组稳定码，恢复时不把普通工具错误当成发送阻止。 */
+    /** 持久结果采用统一稳定码，供恢复时识别发送阻止。 */
     public static boolean isBlockedCode(String code) {
         if (code == null) {
             return false;

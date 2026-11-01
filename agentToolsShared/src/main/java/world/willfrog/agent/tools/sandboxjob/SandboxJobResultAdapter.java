@@ -20,7 +20,7 @@ public interface SandboxJobResultAdapter {
         return new ResolvedPromptResult(output, success, success ? null : errorCodeOf(result));
     }
 
-    /** 未迁移的适配器不能把裸结果当作已确认来源。 */
+    /** 兼容适配器的裸结果保持未知来源。 */
     default world.willfrog.alphafrogmicro.common.racing.prompt.PromptText formatTerminalResultText(
             SandboxTerminalResultView result, Object formatContext) {
         throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(

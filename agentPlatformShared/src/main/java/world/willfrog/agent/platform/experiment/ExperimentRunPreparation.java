@@ -25,7 +25,7 @@ public class ExperimentRunPreparation {
         this.prompts = prompts;
     }
 
-    /** 新根使用服务配置确认身份；用户传入的上下文不能覆盖此值。 */
+    /** 新根身份采用服务配置。 */
     public JsonNode freezeContext(String rootRunId) {
         return bindings.toExtValue(contexts.freeze(rootRunId));
     }

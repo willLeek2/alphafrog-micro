@@ -45,8 +45,8 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
         if (anchor == null) {
             throw new IllegalArgumentException("anchor must not be null");
         }
-        // 普通工具失败仍须有明确分类。来源阻止禁止模型续跑，清理记录的 boolean
-        // 在沙箱没有上报分类时只能记 false；anchor 继续保留真实 null，不伪造沙箱字段。
+        // 普通失败也保留明确分类；沙箱未上报分类时，清理记录中的boolean使用false，
+        // 锚点字段保留null。来源阻止会终止后续模型调用。
         if (anchor.getTerminalRetryable() == null
                 && world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.read(anchor) == null) {
             throw new IllegalArgumentException("terminalRetryable must be durably classified");

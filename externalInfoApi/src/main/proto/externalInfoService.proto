@@ -73,7 +73,7 @@ message WebSearchRequest {
   string run_id = 10;                  // agent run ID，用于热点统计去重
   string user_id = 11;                 // 用户 ID，用于热点统计去重
 
-  // 原运行确认的Racing协议消息；不携带服务凭据。
+  // 原运行确认的Racing协议消息。
   bytes runtime_call_context = 12;
   bytes prompt_selection = 13;
 }

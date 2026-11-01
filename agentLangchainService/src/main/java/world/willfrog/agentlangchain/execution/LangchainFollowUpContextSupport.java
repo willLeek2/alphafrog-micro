@@ -30,7 +30,7 @@ public class LangchainFollowUpContextSupport {
         return new ExecutionContext(goal, history.text(), history);
     }
 
-    /** 失败收口只取用户目标，不压缩历史，也不触发模型。 */
+    /** 失败处理仅提取用户目标，直接返回给失败保存流程。 */
     public String userGoal(AgentRun run) {
         String currentGoal = eventService.extractUserGoal(run.getExt());
         AgentRunMessage latestUser = messageService.findLatestUserMessage(run.getId());
@@ -68,7 +68,7 @@ public class LangchainFollowUpContextSupport {
     }
 
     public record ExecutionContext(String userGoal, String dialogueContext, PromptText dialogueContextPrompt) {
-        /** 旧调用只提供文字；后续模型入口不得为非空文字补造来源。 */
+        /** 兼容调用只提供文字，来源保持未知。 */
         public ExecutionContext(String userGoal, String dialogueContext) {
             this(userGoal, dialogueContext, null);
         }

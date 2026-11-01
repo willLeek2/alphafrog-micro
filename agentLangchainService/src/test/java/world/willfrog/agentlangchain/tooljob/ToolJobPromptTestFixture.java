@@ -10,7 +10,7 @@ import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import static org.mockito.Mockito.*;
 
-/** 终态测试在产生结果处绑定实际导入版本，不替旧持久结果推断来源。 */
+/** 测试在结果产生处绑定实际导入的正文版本。 */
 final class ToolJobPromptTestFixture {
     private ToolJobPromptTestFixture() { }
 

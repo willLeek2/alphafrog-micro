@@ -41,8 +41,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.withSettings;
 
 /**
- * 既有业务测试的版本读取、根上下文和输入存储边界替身。
- * 使用真实版本校验、渲染、输入作用域和保存确认；模型边界发送简化消息JSON，未连接Racing、数据库或HTTP。
+ * 为业务测试提供版本读取、根上下文与输入存储替身。
+ * 版本校验、渲染、作用域和保存确认使用实际实现；模型边界发送简化消息JSON。
  */
 final class VersionedModelTestFixture {
     private final Map<String, PromptVersionBody> versions = new LinkedHashMap<>();

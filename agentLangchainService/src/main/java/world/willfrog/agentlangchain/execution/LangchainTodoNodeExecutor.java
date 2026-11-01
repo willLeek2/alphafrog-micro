@@ -285,7 +285,7 @@ public class LangchainTodoNodeExecutor {
             List<LangchainCompletedTodo> completedTodos,
             Map<String, String> datasetRefs,
             String toolResult) {
-        // 旧持久结果只有裸正文，不能据内容猜测其中是否包含应用建议。
+        // 旧持久结果只有正文，来源保持未知。
         return LangchainTodoNodeResult.failure(ModelSendBlocked.PROMPT_SOURCE_MISSING,
                 ModelSendBlocks.failureMetadata(new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
                         "恢复工具结果尚未保存来源，必须使用带来源的恢复入口")));
@@ -914,33 +914,15 @@ public class LangchainTodoNodeExecutor {
     }
 
     /**
-     * 构建用于执行单个 todo 的 LC4j {@link AiServices} 实例。
-     * <p>
-     * 配置要点：
-     * <ul>
-     *   <li><b>chatModel</b>：使用 execution 阶段模型（{@code request.executionModelOrDefault()}），可与 planning/final answer 阶段不同；</li>
-     *   <li><b>systemMessageProvider</b>：每次请求前获取稳定 System（{@link AgentPromptService#reactSystemPrompt()}）；
-     *       Todo 执行阶段正文由 User Message 单独注入；</li>
-     *   <li><b>maxToolCallingRoundTrips</b>：单 todo 内模型↔工具的最大往返轮数，默认 30，受 {@link #resolveMaxToolRoundTrips} 约束；</li>
-     *   <li><b>chatRequestTransformer</b>：每次发 LLM 请求前检查 run 是否被取消/暂停（{@link #ensureRunnable}），
-     *       防止用户已点 cancel 但请求仍发出；同时逐回合注入带来源的工具调用额度现状
-     *       与 90% last-mile 提示；</li>
-     *   <li><b>beforeToolExecution</b>：工具执行前再次检查可运行性，防止在 tool loop 中间被中断后继续执行工具；</li>
-     *   <li><b>toolExecutionErrorHandler</b>：工具执行异常处理器（{@link LangchainTerminalToolErrorHandler#handle}），
-     *       决定某个工具失败时是整个 todo 失败还是继续尝试；</li>
-     *   <li><b>afterToolExecution</b>：工具执行成功后回调，做两件事：
-     *       <ol>
-     *         <li>累加 run 级 {@code toolCalls} 计数器；</li>
-     *         <li>把工具返回的 JSON 结果中的 dataset ref 注册到 {@link DatasetRefRegistry}，供下游 todo 读取。</li>
-     *       </ol>
-     *   </li>
-     *   <li><b>toolProvider</b>：注入可用工具列表；如果当前 run 没有可用工具（如纯分析类 todo），则跳过。</li>
-     * </ul>
+     * 为单个任务节点创建 {@link AiServices} 代理。
+     * <p>使用执行阶段模型和原根系统正文；每轮请求检查运行状态，注入带来源的工具额度与临近耗尽提示。
+     * 工具执行前再次检查运行状态，执行后更新调用次数并登记数据集引用。
+     * 工具异常由 {@link LangchainTerminalToolErrorHandler} 区分可纠正错误与终止信号。</p>
      *
-     * @param request     当前 run 请求上下文
-     * @param toolCalls   run 级工具调用计数器（引用，会被 increment）
-     * @param datasetRefs 跨 todo 数据集引用表
-     * @return 配置完成的 LC4j AiServices 代理实例
+     * @param request 当前运行请求上下文
+     * @param toolCalls 运行级工具调用计数器
+     * @param datasetRefs 跨节点数据集引用表
+     * @return 配置完成的代理实例
      */
     private LangchainTodoExecutionAiService buildTodoAiService(LangchainWorkflowRequest request,
                                                                AtomicInteger toolCalls,

@@ -22,9 +22,9 @@ import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 import world.willfrog.racing.idl.ValueSource;
 import world.willfrog.racing.idl.ValueSourceKind;
 
-/** SDK消息格式保持不变，在同一消息对象内保存明确来源；不序列化任意来源对象。 */
+/** 在SDK消息对象内保存已登记的来源，保留原消息格式。 */
 public final class PromptMessageCodec {
-    /** SDK工具续轮只传这份来源JSON字符串，避免通用Map解码改变版本号的数值类型。 */
+    /** SDK工具续轮通过JSON字符串传递来源，保持版本号数值类型。 */
     public static final String SOURCE_ATTRIBUTE_KEY = "alphafrog.promptSourceJson";
     private static final String SOURCE_FIELD = "promptSource";
     private static final ObjectMapper JSON = new ObjectMapper()
@@ -36,7 +36,7 @@ public final class PromptMessageCodec {
 
     private PromptMessageCodec() { }
 
-    /** 仅编码来源，不把工具结果或其他模型正文复制到attributes。 */
+    /** 将来源编码到attributes。 */
     public static Map<String, Object> sourceAttributes(PromptMessage.Origin origin, List<PromptVersionSource> sources) {
         try {
             ObjectNode attribution = writeAttribution(origin, sources);
@@ -47,7 +47,7 @@ public final class PromptMessageCodec {
         }
     }
 
-    /** 无来源属性的旧消息保持UNKNOWN；存在但损坏的属性不能降级成运行数据。 */
+    /** 旧消息缺少属性时来源保持UNKNOWN；属性存在时必须通过校验。 */
     public static PromptMessage fromSourceAttributes(ChatMessage message, Map<String, Object> attributes) {
         try {
             if (attributes == null || !attributes.containsKey(SOURCE_ATTRIBUTE_KEY)) return PromptMessage.unknown(message);
@@ -67,7 +67,7 @@ public final class PromptMessageCodec {
             for (PromptMessage entry : messages) {
                 ObjectNode message = object(JSON.readTree(ChatMessageSerializer.messageToJson(entry.message())));
                 message.set(SOURCE_FIELD, writeAttribution(entry.origin(), entry.sources()));
-                // 与读取使用同一结构检查，坏字符串不能经JSON转义绕过严格UTF-8校验。
+                // 编码与读取使用相同结构检查，并校验严格UTF-8字符。
                 readMessage(message);
                 result.add(message);
             }

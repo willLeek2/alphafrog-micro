@@ -1188,10 +1188,7 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals(1000, loader.current().orElseThrow().getTools().getResult().getMaxStringLength());
     }
 
-    /**
-     * 真实 loader、resolver、ModelService、版本渲染及输入作用域；版本读取、路由构建、模型响应和输入保存使用边界替身
-     * 的 financeMethodResolver 消费链夹具。
-     */
+    /** 金融方法解析测试使用实际加载器、解析器、模型服务和版本渲染；版本读取、路由、模型响应及输入保存采用替身。 */
     private record RealResolverChain(
             AgentLlmLocalConfigLoader loader,
             FinanceMethodResolverModelResolver modelResolver,

@@ -702,7 +702,7 @@ public class LangchainDagWorkflowExecutor {
             judgeParts.add(promptService.dagRecoveryJudgeStageInstructionText());
             judgeParts.add(PromptText.runtimeData("\n\n" + buildRecoveryJudgeUserMessage(
                     items, graph, results, sharedContext, request)));
-            // 已完成结果的摘要沿用同项来源，恢复出来的旧未知结果不能重新标成运行数据。
+            // 摘要沿用同项结果的来源；恢复出的未知来源保持未知。
             for (LangchainCompletedTodo completed : sharedContext.completedTodosSnapshot()) {
                 judgeParts.add(completed.attributedText(""));
             }

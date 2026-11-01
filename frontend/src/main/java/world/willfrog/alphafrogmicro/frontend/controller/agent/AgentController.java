@@ -683,8 +683,8 @@ public class AgentController {
     }
 
     /**
-     * 按一组根运行编号读取指标。登录在这里解析一次；用户编号为空时返回未登录，不读取运行。
-     * 有效上下文交给批量读取，由它按根运行编号去重。
+     * 解析一次登录上下文，再按根运行编号批量读取指标。
+     * 用户编号为空时返回未登录；有效上下文交由批量读取服务核对和去重。
      */
     @PostMapping("/api/agent/experiment-results/metrics")
     public ResponseWrapper<Map<String, ExperimentResultMetricAssembler.RootRunMetrics>> experimentResultMetrics(

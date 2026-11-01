@@ -21,11 +21,10 @@ fi
 
 echo "[alphafrog] Detected DUBBO_IP: $DUBBO_IP"
 
-# Triple 协议的 TRI_DUBBO_IP_TO_BIND：未设置或空值时使用自动检测的容器 IP；
-# 值为 none 时不向 Java 传入这个绑定覆盖；其他具体地址保持原样。
-# 注册地址若已被外部预设（compose 注入的 DUBBO_IP_TO_REGISTRY，
-# 或外部预设的 TRI_DUBBO_IP_TO_REGISTRY），则不再写容器 IP，
-# 避免带协议前缀的值覆盖宿主机可路由地址。绑定预设不会写入注册地址。
+# TRI_DUBBO_IP_TO_BIND 指定 Triple 绑定地址，缺省或空值时使用自动检测的容器 IP。
+# none 表示取消该绑定覆盖，由 Java 协议配置决定监听地址。
+# 注册地址优先采用 DUBBO_IP_TO_REGISTRY 或 TRI_DUBBO_IP_TO_REGISTRY，
+# 两者均缺失时使用容器 IP；绑定地址与注册地址分别处理。
 case "${TRI_DUBBO_IP_TO_BIND:-}" in
     none)
         unset TRI_DUBBO_IP_TO_BIND

@@ -107,7 +107,7 @@ public class WebSearchOrchestrator {
 
             // 实验请求跳过热点缓存时，同时跳过聚类统计和写入。
             if (!request.getSkipHotCache()) {
-                // 8. 热点缓存写入（P2）
+                // 写入热点缓存。
                 try {
                     hotKeywordCacheService.updateClusterStats(
                             cacheKey, request.getRunId(), request.getUserId());

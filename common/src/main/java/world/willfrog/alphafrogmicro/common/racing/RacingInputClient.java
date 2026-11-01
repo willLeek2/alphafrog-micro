@@ -22,7 +22,7 @@ public final class RacingInputClient {
         this.transport = Objects.requireNonNull(transport);
     }
 
-    /** 绑定公共准备已经确认的根归属与目标；保存过程不重新选择默认正文。 */
+    /** 保存使用公共准备已经确认的根归属、目标和正文选择。 */
     public ModelInputStore boundTo(RuntimeCallContext confirmedContext) {
         if (confirmedContext == null || !confirmedContext.hasRoot() || !confirmedContext.hasTarget()
                 || confirmedContext.getRoot().getRootId().isBlank()
@@ -35,7 +35,7 @@ public final class RacingInputClient {
     private ModelInputStore.Confirmation storeConfirmed(RuntimeCallContext context, ModelInputAttempt attempt) {
         try {
             if (attempt == null) throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);
-            // 不自动重试保存失败；同一不可变输入只发起这一次保存调用。
+            // 对同一不可变输入发起一次保存调用，失败交由调用方处理。
             StoreModelInputReply reply = transport.call(context,
                     (service, currentContext) -> service.storeModelInput(mapper.toRequest(currentContext, attempt)),
                     RacingInputClient::actualTarget);
@@ -57,14 +57,14 @@ public final class RacingInputClient {
             if (failure instanceof RacingCallException racing) {
                 throw blocked(racing.error().getCode(), RacingFailure.from(racing.error()));
             }
-            // 不保留远程消息、HTTP异常或cause，避免正文与变量值进入异常日志。
+            // 仅保留稳定业务错误，保护正文、变量及传输凭据。
             throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);
         }
     }
 
     private static RuntimeIdentity actualTarget(StoreModelInputReply reply) {
         if (reply == null) throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);
-        // 业务阻止原因优先于身份核对，错误回复不伪装成保存成功。
+        // 先处理业务拒绝，再核对成功回执中的身份。
         if (reply.hasError()) throw blocked(reply.getError().getCode(), RacingFailure.from(reply.getError()));
         if (!reply.hasStored() || !reply.hasActualTarget()) {
             throw blocked(ModelSendBlocked.MODEL_INPUT_UNCONFIRMED);

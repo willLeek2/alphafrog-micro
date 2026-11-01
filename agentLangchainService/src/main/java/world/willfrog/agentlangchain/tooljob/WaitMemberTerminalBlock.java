@@ -8,7 +8,7 @@ import world.willfrog.alphafrogmicro.common.racing.error.*;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.agent.platform.wait.WaitMember;
 
-/** 成员的清理凭证仅保存已验证终态事实，绝不复制 stdout 或生成模型正文。 */
+/** 成员清理凭证仅保存已核验的终态事实。 */
 final class WaitMemberTerminalBlock {
     static final String BLOCK = "terminalModelSendBlock";
     static final String CLEANUP = "terminalCleanup";

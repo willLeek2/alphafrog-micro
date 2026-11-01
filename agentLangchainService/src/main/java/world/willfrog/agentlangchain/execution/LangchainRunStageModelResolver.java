@@ -243,7 +243,7 @@ public class LangchainRunStageModelResolver {
             String executionEndpointName,
             String finalAnswerEndpointName) {
 
-        /** 旧构造未提供端点证明；实际归档入口会拒绝缺失的端点。 */
+        /** 兼容构造缺少端点证明，归档入口会拒绝该请求。 */
         public StageModels(ChatModel planningModel, ChatModel executionModel, ChatModel finalAnswerModel,
                            String planningEndpointName, String planningModelName, List<String> planningProviderOrder,
                            AcceptanceReleasePolicy acceptanceReleasePolicy) {

@@ -12,7 +12,7 @@ import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
 
-/** 一次节点分段的完整消息及来源；恢复时两者一起读取，不重新猜测旧消息来源。 */
+/** 节点分段的消息与来源共同保存、共同恢复。 */
 public final class NodeSegmentCheckpoint {
     public static final String FIELD = "nodeLoopCheckpoint";
 
@@ -21,7 +21,7 @@ public final class NodeSegmentCheckpoint {
     private final List<PromptMessage> promptMessages;
     private final int toolCallsUsed;
 
-    /** 兼容旧构造入口，旧消息全部保留UNKNOWN，直至调用方提供真实来源。 */
+    /** 兼容构造将旧消息来源保留为UNKNOWN，等待调用方提供真实来源。 */
     public NodeSegmentCheckpoint(int modelTurn, Integer resumeGroupTurn, List<ChatMessage> messages, int toolCallsUsed) {
         this(modelTurn, resumeGroupTurn, toolCallsUsed, messages == null ? List.of()
                 : messages.stream().map(PromptMessage::unknown).toList());
@@ -59,7 +59,7 @@ public final class NodeSegmentCheckpoint {
         return PromptMessage.toModelInputSources(promptMessages);
     }
 
-    /** 只有完全不存在字段才表示首段；已存在但损坏的检查点必须停止。 */
+    /** 字段缺失表示首段；字段存在时必须通过检查点校验。 */
     public static NodeSegmentCheckpoint read(JsonNode payload) {
         if (payload == null) return null;
         if (!payload.isObject()) throw invalid();
@@ -72,7 +72,7 @@ public final class NodeSegmentCheckpoint {
                 PromptMessageCodec.read(node.get("messages")), count(node.get("toolCallsUsed")));
     }
 
-    /** SDK原消息字段与promptSource在同一数组项中写入，无第二个可变来源列表。 */
+    /** SDK消息与promptSource保存在同一数组项中。 */
     public ObjectNode toJson(ObjectMapper objectMapper) {
         if (objectMapper == null) throw invalid();
         ObjectNode node = objectMapper.createObjectNode();

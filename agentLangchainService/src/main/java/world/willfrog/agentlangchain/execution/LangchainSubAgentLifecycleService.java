@@ -116,7 +116,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
         this.timeoutScheduler = timeoutScheduler;
     }
 
-    /** 这些响应只包含本次执行状态、参数校验事实和子模型输出，没有应用指导正文。 */
+    /** 响应记录本次执行状态、参数校验事实和子模型输出。 */
     @Override
     public PromptText spawnPrompt(Map<String, Object> params) {
         return PromptText.runtimeData(spawn(params));

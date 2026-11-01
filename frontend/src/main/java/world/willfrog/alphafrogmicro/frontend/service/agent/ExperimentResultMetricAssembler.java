@@ -16,9 +16,9 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 
 /**
- * 按根运行读取已有运行接口。每个不同的根运行调用一次。
- * 公开的单根读取自行解析登录。批量读取使用调用方已经解析的登录上下文，自己不再解析。
- * 没有评分字段时分数固定为未评分。缺失的耗时和费用保持空，不填 0。
+ * 通过已有运行接口读取各根运行的指标，每个不同编号调用一次。
+ * 单根入口解析登录，批量入口沿用调用方提供的登录上下文。
+ * 评分缺失时表示未评分，耗时与费用缺失时保持空值。
  */
 @Service
 public class ExperimentResultMetricAssembler {

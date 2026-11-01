@@ -5,7 +5,7 @@ import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.alphafrogmicro.common.racing.error.RacingFailure;
 
-/** 保持最外层不可重试类型，避免SDK沿原HTTP错误重新分类。 */
+/** 最外层异常采用不可重试类型，供SDK判断重试策略。 */
 public final class BlockedModelSendException extends NonRetriableException implements ModelSendBlocked {
     private final String code;
     private final String reason;

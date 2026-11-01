@@ -790,7 +790,7 @@ public class WaitMemberResultReceiver {
             finishBlockedMember(member, run, proof, WaitMemberTerminalBlock.read(objectMapper, member));
             return;
         }
-        // 其他接收线程可能已经保存了来源阻止，不能用旧快照覆盖它。
+        // 保存时保留其他接收线程已经记录的发送阻止原因。
         WaitMember current = waitGroupStore.findMemberByOperation(member.getRunId(), member.getExternalOperationId()).orElse(member);
         var saved = WaitMemberTerminalBlock.read(objectMapper, current);
         if (saved != null) {

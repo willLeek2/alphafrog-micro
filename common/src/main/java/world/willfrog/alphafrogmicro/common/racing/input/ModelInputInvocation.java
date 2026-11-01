@@ -36,7 +36,7 @@ public record ModelInputInvocation(UUID logicalCallId, String endpointName,
             if (original != null) {
                 throw new ModelSendBlockedException(original.code(), original.reason(), original.racingFailure());
             }
-            // 不把远程异常及正文带入模型库的自动重试和异常映射。
+            // 向模型库传递稳定错误，保护远程异常中的正文。
             throw unconfirmed();
         }
         if (saved == null || saved.recordId() == null || saved.recordId().isBlank()

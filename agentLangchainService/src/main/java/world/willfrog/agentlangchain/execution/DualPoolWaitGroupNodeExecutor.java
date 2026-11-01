@@ -238,7 +238,7 @@ public class DualPoolWaitGroupNodeExecutor {
         }
     }
 
-    /** 上层重建历史上下文前先读取已齐备成员的明确阻止，避免失败收口再发模型。 */
+    /** 重建历史上下文前检查成员的持久发送阻止原因，命中后直接结束节点。 */
     public ModelSendBlockedException resumeSendBlock(NodeWorkItemIdentity identity, JsonNode payload) {
         NodeSegmentCheckpoint checkpoint = NodeSegmentCheckpoint.read(payload);
         if (checkpoint == null || checkpoint.resumeGroupTurn() == null) return null;
@@ -464,7 +464,7 @@ public class DualPoolWaitGroupNodeExecutor {
             }
             ModelSendBlockedException blocked = blockedMemberResult(member.getResultRefJson());
             if (blocked != null) {
-                // 仍核对整组已结束；已在执行的其他成员继续遵守原有等待责任。
+                // 整组成员结束后才完成等待；执行中的成员继续由等待组管理。
                 if (sendBlocked == null) {
                     sendBlocked = blocked;
                 }
@@ -475,7 +475,7 @@ public class DualPoolWaitGroupNodeExecutor {
                     WaitMemberResultPayload.errorCode(member.getResultRefJson(), objectMapper));
         }
         if (sendBlocked != null) {
-            // 派发阶段已持久保存这一原因。恢复直接结束节点，不把它交给模型重试。
+            // 恢复时沿用派发阶段保存的阻止原因，直接结束节点。
             throw sendBlocked;
         }
         return riskReplayEvidenceMissing;
@@ -925,7 +925,7 @@ public class DualPoolWaitGroupNodeExecutor {
         } catch (RuntimeException e) {
             ModelSendBlocked blocked = ModelSendBlocks.find(e).orElse(null);
             if (blocked != null) {
-                // 当前分段已挂起，原栈上的异常不能代替持久结果。保留原因供下一分段先于模型识别。
+                // 挂起后以持久结果为准；阻止原因留给下一分段在模型调用前检查。
                 return keepNotification(notificationId,
                         abortRemainingMembers(groupId, input, modelTurn, policy, policyMatches, members,
                                 modelSendBlockPayload(blocked)));
@@ -1111,7 +1111,7 @@ public class DualPoolWaitGroupNodeExecutor {
             log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity(), e);
             ModelSendBlocked blocked = blockedMemberResult(request.resultRefJson());
-            // 短载荷重写也必须保留发送阻止身份，否则写入恢复后会被当成普通工具失败。
+            // 缩短载荷时保留发送阻止标记，供恢复时继续识别。
             String compact = blocked == null
                     ? WaitMemberResultPayload.compactPersistFailurePrompt(
                             objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage(), null)

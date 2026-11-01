@@ -85,7 +85,7 @@ public final class ToolPromptCatalog {
         }
     }
 
-    /** 字典只包含真实说明位置，不允许借说明版本修改协议结构。 */
+    /** 字典维护工具说明的位置；工具协议结构由代码确定。 */
     private static Map<String, String> parseDescriptions(String body) {
         try {
             var node = JSON.readTree(body);
@@ -108,7 +108,7 @@ public final class ToolPromptCatalog {
         }
     }
 
-    /** 供离线导入采集使用；运行时只用位置集合验证，不沿用这些旧正文。 */
+    /** 离线导入使用原始正文，运行时使用位置集合核对说明。 */
     public static Map<String, String> descriptionTexts(Map<String, Object> parameters) {
         Map<String, String> result = new LinkedHashMap<>();
         collectDescriptions(parameters, "", result);

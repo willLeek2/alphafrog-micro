@@ -14,7 +14,7 @@ import world.willfrog.racing.idl.RuntimeCallContext;
 import world.willfrog.racing.idl.RuntimeIdentity;
 import world.willfrog.racing.idl.ValueSource;
 
-/** 通用取值调用只接受确认的值与来源；远程失败不转换成普通默认。 */
+/** 取值调用要求值与来源均通过确认；远程失败直接返回错误。 */
 public final class RacingExperimentClient {
     private static final ObjectMapper JSON = new ObjectMapper()
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);

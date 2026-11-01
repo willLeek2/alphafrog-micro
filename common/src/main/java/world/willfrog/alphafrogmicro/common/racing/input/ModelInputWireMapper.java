@@ -26,7 +26,7 @@ import world.willfrog.racing.idl.StoreModelInputRequest;
 import world.willfrog.racing.idl.ValueSource;
 import world.willfrog.racing.idl.ValueSourceKind;
 
-/** 把最终输入的位置和不可变来源快照转换为平台保存协议，不重新选择正文。 */
+/** 将最终输入位置与来源快照转换为平台保存协议。 */
 public final class ModelInputWireMapper {
     private static final ObjectMapper JSON = new ObjectMapper()
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -56,7 +56,7 @@ public final class ModelInputWireMapper {
         ModelInputSourceBinding.Builder binding = ModelInputSourceBinding.newBuilder();
         String messagePrefix = body.has("messages") ? "/messages/" : "/input/messages/";
         if (pointer.equals("/query")) {
-            // 单查询搜索协议复用消息位置，序号固定为零，原始JSON不增加虚构messages。
+            // 单查询搜索复用消息位置字段，序号为零，正文保持原JSON。
             binding.setMessage(ModelInputMessageLocation.newBuilder().setMessageIndex(0).setFieldPath(pointer));
         } else if (pointer.startsWith(messagePrefix)) {
             int index = arrayIndex(pointer, messagePrefix);
@@ -145,7 +145,7 @@ public final class ModelInputWireMapper {
     }
 
     private static ValueSource valueSource(String json) {
-        // 不忽略未知字段，也不把无法解释的来源降级为空来源。
+        // 来源必须通过完整字段校验，无法解释时返回错误。
         readObject(json);
         ValueSource.Builder source = ValueSource.newBuilder();
         try {

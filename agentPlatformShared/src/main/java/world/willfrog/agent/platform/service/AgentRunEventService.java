@@ -400,7 +400,7 @@ public class AgentRunEventService {
             log.warn("Failed to create initial message for runId={}, but continuing: {}", runId, e.getMessage());
         }
 
-        // 原根先独立提交，平台才能使用真实根身份建立选择；本地选择确认前不返回可启动结果。
+        // 根记录独立提交后，用真实根身份建立并保存选择，再返回可启动结果。
         try {
             prepareExperimentRunContext(runId);
         } catch (RuntimeException failure) {
@@ -642,7 +642,7 @@ public class AgentRunEventService {
         return run;
     }
 
-    /** 根记录必须先提交；后续远端准备和独立保存不能加入尚未提交的创建事务。 */
+    /** 根记录先提交，后续远端准备及选择保存使用独立事务。 */
     private TransactionTemplate rootCreationTransactionTemplate() {
         TransactionTemplate template = transactionTemplate();
         template.setPropagationBehavior(org.springframework.transaction.TransactionDefinition.PROPAGATION_REQUIRES_NEW);

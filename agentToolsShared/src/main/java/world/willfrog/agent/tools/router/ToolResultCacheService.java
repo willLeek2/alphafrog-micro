@@ -239,7 +239,7 @@ public class ToolResultCacheService {
         }
     }
 
-    /** 来源属性只解码版本与分类，不把辅助值或来源元数据写进用户结果JSON。 */
+    /** 来源属性仅解码版本及分类；用户结果JSON保留业务内容。 */
     private PromptMessage decodeSource(String body, String sourceJson) {
         if (sourceJson == null) throw missingSource("缓存缺少结果来源");
         return PromptMessageCodec.fromSourceAttributes(dev.langchain4j.data.message.UserMessage.from(body),

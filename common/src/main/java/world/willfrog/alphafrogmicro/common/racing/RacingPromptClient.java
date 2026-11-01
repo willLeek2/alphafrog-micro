@@ -45,7 +45,7 @@ import java.util.function.Function;
 
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_UNREADABLE;
 
-/** 读取已确认的提示词版本和根选择；任何失败都停止当前发送，不重新选默认。 */
+/** 读取已确认的正文版本和根选择，失败时停止当前发送。 */
 public final class RacingPromptClient {
     private final RacingTransport transport;
 
@@ -107,7 +107,7 @@ public final class RacingPromptClient {
         return version;
     }
 
-    /** 默认定位只是首次选择的输入；已有根记录返回原选择，不与当前默认重新比版。 */
+    /** 默认定位用于首次选择；已有根记录始终返回原选择。 */
     public PromptSelection resolveSelection(ResolvePromptSelectionRequest request) {
         require(request != null && request.hasContext(), "根选择缺少公共上下文");
         requireContext(request.getContext(), true);
@@ -138,7 +138,7 @@ public final class RacingPromptClient {
         return selection;
     }
 
-    /** 查询失败直接停止；缺少定位时不会转为Resolve或读取当前默认。 */
+    /** 按已有定位查询，缺少定位或查询失败时停止发送。 */
     public PromptSelection getSelection(GetPromptSelectionRequest request) {
         require(request != null && request.hasContext(), "根选择查询缺少公共上下文");
         requireContext(request.getContext(), true);
@@ -160,7 +160,7 @@ public final class RacingPromptClient {
         return selection;
     }
 
-    /** 保留原文和实际提供的来源，未参加实验时不编造实验或分配定位。 */
+    /** 保留原文及实际提供的来源，普通默认的实验与分配定位保持缺省。 */
     public static PromptVersionBody toVersionBody(PromptVersion version, PromptInstructionSource source) {
         require(version != null && version.hasReference() && source != null && source.hasVersion(),
                 "提示词正文或来源缺少明确版本");
@@ -231,7 +231,7 @@ public final class RacingPromptClient {
             if (failure instanceof RacingCallException racing) {
                 throw unreadable("平台提示词调用未确认", RacingFailure.from(racing.error()));
             }
-            // 远端错误文字、正文和凭据均不进入发送阻止异常。
+            // 发送阻止异常仅包含稳定错误码与安全定位。
             throw unreadable("平台提示词调用未确认");
         }
     }
@@ -328,7 +328,7 @@ public final class RacingPromptClient {
         TargetIdentity target = context.getTarget();
         requireText(target.getEnvironment(), "逻辑目标缺少环境");
         requireText(target.getTargetScopeInstanceId(), "逻辑目标缺少创建编号");
-        // 主范围可以使用空路由标签；实际范围身份由创建编号而非标签非空判断。
+        // 创建编号确定范围身份，主范围允许空路由标签。
         requireText(target.getTargetDeploymentId(), "逻辑目标缺少部署编号");
         if (requireRoot) {
             require(context.hasRoot(), "根选择缺少根归属");
@@ -383,7 +383,7 @@ public final class RacingPromptClient {
     }
 
     private static boolean sameLogicalTarget(TargetIdentity expected, TargetIdentity actual) {
-        // 构建代际由transport按本次部署配置核对，不把普通发布视为新的逻辑目标。
+        // transport按本次部署配置核对构建代际，逻辑目标身份保持原值。
         return expected.getEnvironment().equals(actual.getEnvironment())
                 && expected.getTargetScopeInstanceId().equals(actual.getTargetScopeInstanceId())
                 && expected.getTargetRouteTag().equals(actual.getTargetRouteTag())

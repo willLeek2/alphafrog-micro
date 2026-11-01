@@ -40,23 +40,11 @@ import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
 /**
- * Lightweight LLM service for the financial MethodSpec resolver; the platform-side
- * implementation of {@link FinanceMethodResolverClient}.
- *
- * <p>Builds a dedicated ChatModel via {@link AgentAiServiceFactory} with
- * {@code phase/stage=finance_method_resolver} and temperature 0, assembles the final
- * system prompt from one saved root-set version plus the caller-supplied compact catalog
- * fragment, and returns the raw
- * model JSON untouched. It performs only fail-closed technical pre-checks (request/response
- * byte bounds, candidate-count bound, strict single-JSON shape) and never silently truncates;
- * per-item semantic validation is the canonical tools-side validator's job.</p>
- *
- * <p>The outer execution context (phase, stage, structuredOutputSpec, reasoningEffort,
- * providerLlmTraceId, llmCallRequestMeta, lastRecordedLlmTraceId) is snapshotted on entry and
- * restored verbatim in {@code finally}; reasoningEffort is additionally cleared explicitly
- * before the resolver call because provider-routed chat models read it directly from
- * AgentContext. No synthetic resolver identity is generated: when the outer toolCallId is
- * absent the tools layer fails with TOOL_CALL_ID_MISSING before this service runs.</p>
+ * 通过专用模型为金融方法目录生成选择结果。
+ * <p>系统正文采用原根集合版本，并加入调用方提供的精简目录。
+ * 请求及响应经过字节数、候选数和单个JSON结构检查；逐项语义校验由工具层完成。</p>
+ * <p>调用前保存阶段、输出结构、推理配置及追踪字段，结束时恢复线程上下文。
+ * 工具层在进入本服务前核对工具调用编号。</p>
  */
 @Service
 @RequiredArgsConstructor
@@ -167,8 +155,8 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                     PromptMessage.runtimeData(new UserMessage(userPayload)));
             List<ChatMessage> messages = messagesWithSources.stream().map(PromptMessage::message).toList();
             List<ModelInputSource> sourceParts = new ArrayList<>(PromptMessage.toModelInputSources(messagesWithSources).parts());
-            // 当前工厂的SDK实现返回OPEN_AI且不读取AgentContext结构；两个自有实现返回OTHER并发送该字段。
-            // 本schema只有协议字段，DashScope实际发送的json_object也属于结构数据。
+            // 为返回OTHER的自有模型登记其实际发送的结构字段。
+            // 此结构仅包含协议字段；DashScope以json_object发送。
             if (selected.model().provider() == ModelProvider.OTHER) {
                 sourceParts.add(new ModelInputSource("/response_format", ModelInputSource.Origin.RUNTIME_DATA, List.of()));
             }

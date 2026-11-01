@@ -5,8 +5,8 @@ import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedExcepti
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_VARIABLE_INVALID;
 
 /**
- * 随正文版本固定的变量规则。可选变量必须声明默认文本；空串规则不拒绝空格或换行。
- * 名称与双花括号中的原文精确匹配，不裁剪名称，不解释表达式或执行循环。
+ * 变量规则随正文版本固定，可选变量声明默认文本。
+ * 名称与双花括号内原文精确匹配；空串规则允许空格和换行，模板仅执行变量替换。
  */
 public record PromptVariableDeclaration(
         String name,

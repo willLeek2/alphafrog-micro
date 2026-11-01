@@ -12,13 +12,13 @@ import java.util.Set;
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_UNREADABLE;
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_VARIABLE_INVALID;
 
-/** 简单的双花括号模板：仅扫描原模板，不解释插入数据中的占位符。 */
+/** 双花括号模板仅扫描原模板，插入值作为数据原样保留。 */
 public final class PromptTemplateRenderer {
 
     private PromptTemplateRenderer() {
     }
 
-    /** 保存版本时校验占位符与声明双向一致，固定正文不解析双花括号。 */
+    /** 保存模板版本时核对占位符与声明；固定正文原样保留。 */
     public static void validate(PromptBodyType type, String body,
                                 List<PromptVariableDeclaration> variables) {
         if (type == null || body == null) {

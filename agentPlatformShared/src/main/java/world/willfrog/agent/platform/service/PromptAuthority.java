@@ -96,7 +96,7 @@ final class PromptAuthority {
         return SHARED;
     }
 
-    /** 一次捕获生效正文；辅助资源原文单列为classpath材料，不改变读取或覆盖状态。 */
+    /** 捕获生效正文及classpath辅助资源，供只读导出使用。 */
     PromptBootstrapExporter.CapturedAuthority captureForExport() {
         AuthoritySnapshot effective = snapshot();
         AuthoritySnapshot baseline = baseSnapshot();
