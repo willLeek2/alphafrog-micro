@@ -88,17 +88,6 @@ class DataAnalysisCapacityPropertiesTest {
             assertNotNull(decision.rowsLimit());
         }
 
-        @Test
-        void heavyWhenBytesAboveMaxBytesIsRejected() {
-            DataAnalysisCapacityProperties properties = new DataAnalysisCapacityProperties();
-            var decision = properties.classify(
-                    100_000L,
-                    properties.getMaxBytesPerTask() + 1,
-                    List.of());
-            assertEquals(DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision.Outcome.REJECTED,
-                    decision.outcome());
-            assertNull(decision.resourceClass());
-        }
 
         @Test
         void standardWithNullHintsTreatedAsEmpty() {

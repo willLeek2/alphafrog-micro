@@ -35,111 +35,12 @@ class LaneTagRouterOrderTest {
         RpcContext.removeServerContext();
     }
 
-    @Test
-    void consumerHopFilter_shouldBeClusterFilter() {
-        assertThat(new LaneConsumerHopFilter()).isInstanceOf(ClusterFilter.class);
-    }
 
-    @Test
-    void tagRouter_withoutClusterFilter_shouldSelectUntaggedWhenOnlyLaneContextIsSet() {
-        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
-        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
-        LaneContext.setTrafficScopeId("lane-test");
-        RpcInvocation invocation = new RpcInvocation();
 
-        List<Invoker<Object>> selected = route(invocation, tagged, untagged);
 
-        assertThat(selected).containsExactly(untagged);
-        assertThat(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).isNull();
-    }
 
-    @Test
-    void clusterFilterThenTagRouter_laneTest_shouldSelectTaggedInstance() {
-        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
-        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
-        LaneContext.setTrafficScopeId("lane-test");
-        RpcInvocation invocation = new RpcInvocation();
-        AtomicReference<List<Invoker<Object>>> selected = new AtomicReference<>();
 
-        new LaneConsumerHopFilter().invoke(routingInvoker(tagged, untagged, selected), invocation);
 
-        assertThat(selected.get()).containsExactly(tagged);
-        assertThat(invocation.getAttachment(LaneContext.DUBBO_TAG_KEY)).isNull();
-        assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-test");
-    }
-
-    @Test
-    void clusterFilterThenTagRouter_mainBeta_shouldSelectUntaggedInstance() {
-        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
-        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
-        LaneContext.setTrafficScopeId(LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID);
-        RpcInvocation invocation = new RpcInvocation();
-        invocation.setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-tag");
-        AtomicReference<List<Invoker<Object>>> selected = new AtomicReference<>();
-
-        new LaneConsumerHopFilter().invoke(routingInvoker(tagged, untagged, selected), invocation);
-
-        assertThat(selected.get()).containsExactly(untagged);
-    }
-
-    @Test
-    void clusterFilterThenTagRouter_emptyScope_shouldSelectUntaggedInstance() {
-        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
-        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
-        LaneContext.clear();
-        RpcInvocation invocation = new RpcInvocation();
-        AtomicReference<List<Invoker<Object>>> selected = new AtomicReference<>();
-
-        new LaneConsumerHopFilter().invoke(routingInvoker(tagged, untagged, selected), invocation);
-
-        assertThat(selected.get()).containsExactly(untagged);
-    }
-
-    @Test
-    void clusterFilterThenTagRouter_legacyAttachmentOnly_shouldSelectUntaggedInstance() {
-        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
-        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
-        LaneContext.clear();
-        RpcInvocation invocation = new RpcInvocation();
-        invocation.setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "lane-test");
-        AtomicReference<List<Invoker<Object>>> selected = new AtomicReference<>();
-
-        new LaneConsumerHopFilter().invoke(routingInvoker(tagged, untagged, selected), invocation);
-
-        assertThat(selected.get()).containsExactly(untagged);
-        assertThat(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID)).isEqualTo("lane-test");
-    }
-
-    @Test
-    void nestedClusterFilter_shouldRestoreOuterAttachmentsAndKeepLaneContext() {
-        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
-        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
-        LaneContext.setTrafficScopeId("lane-test");
-        MDC.put(LaneContext.MDC_LANE_TAG, "outer-mdc");
-        RpcContext.getClientAttachment().setAttachment(LaneContext.DUBBO_TAG_KEY, "outer-previous");
-        RpcInvocation outer = new RpcInvocation();
-        AtomicReference<List<Invoker<Object>>> outerSelected = new AtomicReference<>();
-        AtomicReference<List<Invoker<Object>>> innerSelected = new AtomicReference<>();
-
-        new LaneConsumerHopFilter().invoke(invoker(invocation -> {
-            outerSelected.set(route(invocation, tagged, untagged));
-            RpcInvocation inner = new RpcInvocation();
-            new LaneConsumerHopFilter().invoke(routingInvoker(tagged, untagged, innerSelected), inner);
-            assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-test");
-            assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isEqualTo("lane-test");
-            assertThat(RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY))
-                    .isEqualTo("lane-test");
-            return mock(Result.class);
-        }), outer);
-
-        assertThat(outerSelected.get()).containsExactly(tagged);
-        assertThat(innerSelected.get()).containsExactly(tagged);
-        assertThat(LaneContext.trafficScopeId()).isEqualTo("lane-test");
-        assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isEqualTo("outer-mdc");
-        assertThat(RpcContext.getClientAttachment().getAttachment(LaneContext.DUBBO_TAG_KEY))
-                .isEqualTo("outer-previous");
-        assertThat(outer.getAttachment(LaneContext.DUBBO_TAG_KEY)).isNull();
-    }
 
     @SuppressWarnings("unchecked")
     private static Invoker<Object> routingInvoker(

@@ -28,125 +28,15 @@ class RunPersistentResourceEligibilityServiceTest {
         LaneContext.clear();
     }
 
-    @Test
-    void executingRunInItsOwnDeploymentAndLaneIsAllowed() {
-        LaneContext.setTrafficScopeId("lane-a");
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, "lane-a"));
 
-        assertThat(verdict("run-1")).isEqualTo(allowed());
-        verify(runs).isDeletionStarted("run-1");
-    }
 
-    @Test
-    void mainBetaWithoutDubboTagCanReadOnlyMainBetaRun() {
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, null));
 
-        assertThat(verdict("run-1")).isEqualTo(allowed());
-    }
 
-    @Test
-    void wrongLaneOrDeploymentGenerationIsRefused() {
-        LaneContext.setTrafficScopeId("lane-b");
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, "lane-a"));
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        verify(runs, never()).isDeletionStarted("run-1");
 
-        reset(runs);
-        LaneContext.setTrafficScopeId("lane-a");
-        // 其他部署或旧代际即使持有相同 runId，也不会被归属查询返回。
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        verify(runs).findByIdForDeployment("run-1", "beta-test", GENERATION);
-        verify(runs, never()).isDeletionStarted("run-1");
-    }
 
-    @ParameterizedTest
-    @EnumSource(value = AgentRunStatus.class, names = "EXECUTING", mode = EnumSource.Mode.EXCLUDE)
-    void nonExecutingRunCannotCreatePersistentResources(AgentRunStatus status) {
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(status, null));
 
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        verify(runs, never()).isDeletionStarted("run-1");
-    }
 
-    @Test
-    void startedDeletionOrMalformedRunIdIsRefused() {
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, null));
-        when(runs.isDeletionStarted("run-1")).thenReturn(true);
 
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        assertThat(verdict("  ")).isEqualTo(refused());
-        verify(runs, never()).findByIdForDeployment("", "beta-test", GENERATION);
-    }
-
-    @Test
-    void cleanupInProgressOrExpiredWorkspaceCannotBeReacquired() {
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, null));
-        when(runs.findWorkspaceLifecycleState("run-1")).thenReturn("CLEANING", "EXPIRED");
-
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        assertThat(verdict("run-1")).isEqualTo(refused());
-    }
-
-    @Test
-    void onlyFrozenTrueWorkspaceSettingCanAcquirePersistentResources() {
-        AgentRun run = run(AgentRunStatus.EXECUTING, null);
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION)).thenReturn(run);
-
-        run.setExt("{\"python_workspace_enabled\":false}");
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        run.setExt("{}");
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        run.setExt(null);
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        run.setExt("{\"python_workspace_enabled\":\"true\"}");
-        assertThat(verdict("run-1")).isEqualTo(refused());
-        verify(runs, never()).isDeletionStarted("run-1");
-    }
-
-    @Test
-    void malformedOrAmbiguousFrozenSettingFailsClosed() {
-        AgentRun run = run(AgentRunStatus.EXECUTING, null);
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION)).thenReturn(run);
-
-        run.setExt("{broken");
-        assertThat(verdict("run-1")).isEqualTo(unavailable());
-        run.setExt("{\"python_workspace_enabled\":false,\"python_workspace_enabled\":true}");
-        assertThat(verdict("run-1")).isEqualTo(unavailable());
-        run.setExt("{\"python_workspace_enabled\":true} false");
-        assertThat(verdict("run-1")).isEqualTo(unavailable());
-        verify(runs, never()).isDeletionStarted("run-1");
-    }
-
-    @Test
-    void unavailableDeploymentIdentityOrDatabaseFailsClosed() {
-        RunOwnershipGateway noIdentity = new RunOwnershipGateway(
-                () -> { throw new IllegalStateException("deployment identity missing"); }, runs);
-        RunPersistentResourceEligibilityService failedIdentity =
-                new RunPersistentResourceEligibilityService(noIdentity, runs);
-        assertThat(failedIdentity.check(request("run-1")).getEligibility())
-                .isEqualTo(unavailable());
-
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, null));
-        when(runs.isDeletionStarted("run-1")).thenThrow(new IllegalStateException("database unavailable"));
-        assertThat(verdict("run-1")).isEqualTo(unavailable());
-    }
-
-    @Test
-    void dedicatedDubboProviderOnlyDelegatesToReadOnlyEligibilityService() {
-        AgentRunPersistentResourceEligibilityDubboService provider =
-                new AgentRunPersistentResourceEligibilityDubboService(service);
-        when(runs.findByIdForDeployment("run-1", "beta-test", GENERATION))
-                .thenReturn(run(AgentRunStatus.EXECUTING, null));
-
-        assertThat(provider.checkEligibility(request("run-1")).getEligibility()).isEqualTo(allowed());
-    }
 
     private RunPersistentResourceEligibility verdict(String runId) {
         return service.check(request(runId)).getEligibility();

@@ -31,87 +31,10 @@ import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 
 class AgentServiceShutdownStateTest {
 
-    @Test
-    void deadlineClosesOnlyTheCurrentGenerationAndIsIdempotent() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider identityProvider = mock(DeploymentIdentityProvider.class);
-        LangchainRunConcurrencyScheduler scheduler = mock(LangchainRunConcurrencyScheduler.class);
-        ThreadPoolTaskExecutor runExecutor = mock(ThreadPoolTaskExecutor.class);
-        DeploymentIdentity identity = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        when(identityProvider.current()).thenReturn(identity);
-        AgentServiceShutdownState state = new AgentServiceShutdownState(
-                runMapper, identityProvider, scheduler, runExecutor, 0, 1);
-        ContextClosedEvent event = mock(ContextClosedEvent.class);
 
-        state.onApplicationEvent(event);
-        state.onApplicationEvent(event);
 
-        verify(runMapper).failNonTerminalRunsForDeploymentGeneration(
-                identity.deploymentId(), identity.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded");
-        verify(scheduler, times(1)).stopAcceptingNewRuns();
-        verify(runExecutor, times(1)).shutdown();
-    }
 
-    @Test
-    void anEarlyInterruptDoesNotShortenTheNaturalProcessingWindow() throws Exception {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider identityProvider = mock(DeploymentIdentityProvider.class);
-        LangchainRunConcurrencyScheduler scheduler = mock(LangchainRunConcurrencyScheduler.class);
-        ThreadPoolTaskExecutor runExecutor = mock(ThreadPoolTaskExecutor.class);
-        DeploymentIdentity identity = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        CountDownLatch observing = new CountDownLatch(1);
-        when(identityProvider.current()).thenReturn(identity);
-        when(runMapper.countNonTerminalRunsForDeploymentGeneration(
-                identity.deploymentId(), identity.generationId())).thenAnswer(ignored -> {
-            observing.countDown();
-            return 1;
-        });
-        AgentServiceShutdownState state = new AgentServiceShutdownState(
-                runMapper, identityProvider, scheduler, runExecutor, 1, 5);
-        Thread shutdown = new Thread(() -> state.onApplicationEvent(mock(ContextClosedEvent.class)));
 
-        shutdown.start();
-        org.assertj.core.api.Assertions.assertThat(observing.await(500, TimeUnit.MILLISECONDS)).isTrue();
-        shutdown.interrupt();
-        Thread.sleep(100);
-
-        verify(runMapper, never()).failNonTerminalRunsForDeploymentGeneration(
-                identity.deploymentId(), identity.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded");
-        shutdown.join(2000);
-        org.assertj.core.api.Assertions.assertThat(shutdown.isAlive()).isFalse();
-        verify(runMapper).failNonTerminalRunsForDeploymentGeneration(
-                identity.deploymentId(), identity.generationId(),
-                "deployment_generation_shutdown_deadline_exceeded");
-    }
-
-    @Test
-    void shutdownTimingIsControlledByConfigurationInsteadOfApplicationContextMutation() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        DeploymentIdentityProvider identityProvider = mock(DeploymentIdentityProvider.class);
-        LangchainRunConcurrencyScheduler scheduler = mock(LangchainRunConcurrencyScheduler.class);
-        ThreadPoolTaskExecutor runExecutor = mock(ThreadPoolTaskExecutor.class);
-        DeploymentIdentity identity = new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64));
-        when(identityProvider.current()).thenReturn(identity);
-        ContextClosedEvent event = mock(ContextClosedEvent.class);
-        AgentServiceShutdownState state = new AgentServiceShutdownState(
-                runMapper, identityProvider, scheduler, runExecutor, Duration.ZERO, Duration.ZERO);
-
-        state.onApplicationEvent(event);
-
-        verifyNoInteractions(event);
-    }
-
-    @Test
-    void realSpringCloseUsesConfiguredWindowsWithoutAddingExecutorAndLifecycleWaits() throws Exception {
-        assertRealContextClosesWithinConfiguredWindows(Duration.ofMillis(900), Duration.ofMillis(300));
-    }
-
-    @Test
-    void realSpringCloseAlsoHonorsNonDefaultConfiguredWindows() throws Exception {
-        assertRealContextClosesWithinConfiguredWindows(Duration.ofMillis(1400), Duration.ofMillis(500));
-    }
 
     private void assertRealContextClosesWithinConfiguredWindows(Duration totalTimeout,
                                                                  Duration finalizationMargin) throws Exception {

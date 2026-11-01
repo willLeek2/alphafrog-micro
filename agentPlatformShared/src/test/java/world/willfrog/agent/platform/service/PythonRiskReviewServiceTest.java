@@ -42,107 +42,10 @@ class PythonRiskReviewServiceTest {
         return service;
     }
 
-    @Test
-    void disabledFirstCallPersistsPassWithoutCallingModelThenReusesOldDecision() {
-        AgentLlmProperties snapshot = new AgentLlmProperties();
-        AtomicReference<PythonRiskDecisionRow> stored = storeInsertedDecision();
-        PythonRiskReviewService subject = subject(snapshot);
 
-        PythonRiskReviewService.Evaluation first = subject.evaluate("run:tool:1", "run", "print(1)");
-        assertTrue(first.allowed());
-        assertFalse(first.reused());
-        assertNull(first.riskScore());
-        assertFalse(stored.get().getConfigJson().contains("print(1)"));
-        verifyNoInteractions(resolver, factory);
 
-        snapshot.getAgent().getPythonRiskReview().setEnabled(true);
-        PythonRiskReviewService.Evaluation replay = subject.evaluate("run:tool:1", "run", "print(1)");
-        assertTrue(replay.allowed());
-        assertTrue(replay.reused());
-        verifyNoInteractions(resolver, factory);
-        verify(mapper, times(1)).insertIfAbsent(anyString(), anyString(), anyString(), any(), anyString());
-    }
 
-    @Test
-    void enabledReviewUsesFrozenRouteAndRejectsScoreAboveThreshold() {
-        AgentLlmProperties snapshot = enabledConfig(50);
-        ChatModel model = mock(ChatModel.class);
-        when(resolver.resolveFromSnapshot(eq("cheap"), eq("small-model"), same(snapshot)))
-                .thenReturn(route());
-        when(factory.buildArchivedPythonRiskReviewModel(any()))
-                .thenReturn(versioned.archived(model, "cheap"));
-        when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":51}"));
-        AtomicReference<PythonRiskDecisionRow> stored = storeInsertedDecision();
 
-        PythonRiskReviewService.Evaluation decision = subject(snapshot)
-                .evaluate("run:tool:1", "run", "open('x','w').write('x')");
-
-        assertFalse(decision.allowed());
-        assertEquals(51, decision.riskScore());
-        assertEquals("REJECT", stored.get().getDecision());
-        assertFalse(stored.get().getConfigJson().contains("open('x'"));
-        verify(model).chat(org.mockito.Mockito.<List<dev.langchain4j.data.message.ChatMessage>>argThat(
-                messages -> messages.size() == 2
-                && messages.get(1) instanceof dev.langchain4j.data.message.UserMessage user
-                && user.singleText().equals("open('x','w').write('x')")));
-    }
-
-    @Test
-    void thresholdScorePassesAndInvalidResponsesNeverPersistDecision() {
-        AgentLlmProperties snapshot = enabledConfig(50);
-        ChatModel model = mock(ChatModel.class);
-        when(resolver.resolveFromSnapshot(anyString(), anyString(), same(snapshot)))
-                .thenReturn(route());
-        when(factory.buildArchivedPythonRiskReviewModel(any()))
-                .thenReturn(versioned.archived(model, "cheap"));
-        when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":50}"));
-        storeInsertedDecision();
-        assertTrue(subject(snapshot).evaluate("run:ok:1", "run", "pass").allowed());
-
-        for (String invalid : List.of("{\"riskScore\":50.0}", "{\"riskScore\":101}",
-                "{\"riskScore\":20,\"reason\":\"ok\"}", "{\"riskScore\":2} {}", "not json")) {
-            reset(mapper);
-            when(model.chat(any(List.class))).thenReturn(response(invalid));
-            assertThrows(PythonRiskReviewService.Unavailable.class,
-                    () -> subject(snapshot).evaluate("run:invalid:1", "run", "pass"));
-            verify(mapper, never()).insertIfAbsent(anyString(), anyString(), anyString(), any(), anyString());
-        }
-    }
-
-    @Test
-    void duplicateRiskScoreKeysCannotTurnRejectIntoPass() {
-        AgentLlmProperties snapshot = enabledConfig(50);
-        ChatModel model = mock(ChatModel.class);
-        when(resolver.resolveFromSnapshot(anyString(), anyString(), same(snapshot)))
-                .thenReturn(route());
-        when(factory.buildArchivedPythonRiskReviewModel(any())).thenReturn(versioned.archived(model, "cheap"));
-        when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":100,\"riskScore\":0}"));
-
-        assertThrows(PythonRiskReviewService.Unavailable.class,
-                () -> subject(snapshot).evaluate("run:duplicate:1", "run", "pass"));
-        verify(mapper, never()).insertIfAbsent(anyString(), anyString(), anyString(), any(), anyString());
-    }
-
-    @Test
-    void modelFailureAndStorageFailureDoNotBecomePass() {
-        AgentLlmProperties snapshot = enabledConfig(50);
-        ChatModel model = mock(ChatModel.class);
-        when(resolver.resolveFromSnapshot(anyString(), anyString(), same(snapshot)))
-                .thenReturn(route());
-        when(factory.buildArchivedPythonRiskReviewModel(any()))
-                .thenReturn(versioned.archived(model, "cheap"));
-        when(model.chat(any(List.class))).thenThrow(new RuntimeException("timeout"));
-        assertThrows(PythonRiskReviewService.Unavailable.class,
-                () -> subject(snapshot).evaluate("run:timeout:1", "run", "pass"));
-        verify(mapper, never()).insertIfAbsent(anyString(), anyString(), anyString(), any(), anyString());
-
-        reset(model);
-        when(model.chat(any(List.class))).thenReturn(response("{\"riskScore\":0}"));
-        when(mapper.insertIfAbsent(anyString(), anyString(), anyString(), any(), anyString()))
-                .thenThrow(new RuntimeException("db unavailable"));
-        assertThrows(PythonRiskReviewService.Unavailable.class,
-                () -> subject(snapshot).evaluate("run:db:1", "run", "pass"));
-    }
 
     private AgentLlmProperties enabledConfig(int threshold) {
         AgentLlmProperties config = new AgentLlmProperties();

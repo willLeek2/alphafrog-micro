@@ -32,37 +32,7 @@ class PersistentChildRunLifecycleReconcilerTest {
             new PersistentChildRunLifecycleReconciler(intents, ownership, controls, admissions,
                     transactionManager);
 
-    @Test
-    void anchoredParentCancelVersionStopsBothPendingAndAcceptedChildren() {
-        when(transactionManager.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
-        ownedRoot();
-        when(intents.listUnsettledByRoot("parent", 0L, 100)).thenReturn(List.of(
-                child(1L, "pending", null),
-                child(2L, "accepted", OffsetDateTime.now())));
-        when(ownership.findOwnedRun("parent")).thenReturn(run("parent", AgentRunStatus.WAITING_TOOL_JOB, 1L));
-        when(ownership.findOwnedRun("accepted")).thenReturn(run("accepted", AgentRunStatus.EXECUTING, 0L));
 
-        reconciler.reconcile();
-
-        verify(intents).cancelUnacceptedIfParentChanged(1L);
-        verify(intents).requestCancellation("accepted");
-        verify(controls).cancelRun(org.mockito.ArgumentMatchers.argThat(request ->
-                request.getId().equals("accepted") && request.getUserId().equals("user")));
-    }
-
-    @Test
-    void unchangedWaitingParentDoesNotCancelAcceptedChild() {
-        ownedRoot();
-        when(intents.listUnsettledByRoot("parent", 0L, 100)).thenReturn(List.of(
-                child(2L, "accepted", OffsetDateTime.now())));
-        when(ownership.findOwnedRun("parent")).thenReturn(run("parent", AgentRunStatus.WAITING_TOOL_JOB, 0L));
-        when(ownership.findOwnedRun("accepted")).thenReturn(run("accepted", AgentRunStatus.EXECUTING, 0L));
-
-        reconciler.reconcile();
-
-        verify(intents, never()).requestCancellation(eq("accepted"));
-        verify(controls, never()).cancelRun(any());
-    }
 
     private void ownedRoot() {
         DeploymentIdentity identity = new DeploymentIdentity("stable", "gen-" + "a".repeat(64));

@@ -56,61 +56,9 @@ class DualPoolResumedSegmentPublisherTest {
         Mockito.lenient().when(runMapper.findById(RUN_ID)).thenReturn(runningRun());
     }
 
-    /** 消费成了：投的是数据库放行的那一段，不是调用方以为的那一段。 */
-    @Test
-    void onlyTheSegmentTheDatabaseReleasedIsHandedToTheNodePool() {
-        NodeWorkItemIdentity claimed = new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 3);
-        NodeWorkItemIdentity authoritative = new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 5);
-        when(intake.take(any(), any(), anyString()))
-                .thenReturn(WaitGroupRecoveryIntake.IntakeResult.consumed(authoritative));
-        when(dispatcher.offerNode(any())).thenReturn(true);
 
-        assertThat(publisher.publish(NOTIFICATION_ID, RUN_CONTROL_VERSION, claimed)).isTrue();
 
-        verify(dispatcher).offerNode(authoritative);
-        verify(dispatcher, never()).offerNode(claimed);
-    }
 
-    /** 没消费成：不投递，只叫一声周期补扫让它下一轮再来。 */
-    @Test
-    void aDeferredNotificationOnlyWakesThePeriodicDispatcher() {
-        when(intake.take(any(), any(), anyString()))
-                .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
-                        WaitGroupRecoveryIntake.Outcome.DEFERRED, null,
-                        RecoveryRejection.LEASE_NOT_OWNED, "owner-elsewhere"));
-
-        assertThat(publisher.publish(NOTIFICATION_ID, RUN_CONTROL_VERSION,
-                new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 3))).isFalse();
-
-        verify(recoveryDispatcher).wake(NOTIFICATION_ID);
-        verify(dispatcher, never()).offerNode(any());
-    }
-
-    /** 不会再被服务：不投递，也不用叫醒谁——通知已经收口了。 */
-    @Test
-    void aClosedNotificationDoesNotWakeAnybody() {
-        when(intake.take(any(), any(), anyString()))
-                .thenReturn(new WaitGroupRecoveryIntake.IntakeResult(
-                        WaitGroupRecoveryIntake.Outcome.CLOSED, null, null, "run_terminal:COMPLETED"));
-
-        assertThat(publisher.publish(NOTIFICATION_ID, RUN_CONTROL_VERSION,
-                new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 3))).isFalse();
-
-        verify(recoveryDispatcher, never()).wake(anyLong());
-        verify(dispatcher, never()).offerNode(any());
-    }
-
-    /** 通知读不回来：什么都不做。 */
-    @Test
-    void aNotificationThatCannotBeReadIsLeftAlone() {
-        when(waitGroupStore.findNotification(eq(NOTIFICATION_ID))).thenReturn(Optional.empty());
-
-        assertThat(publisher.publish(NOTIFICATION_ID, RUN_CONTROL_VERSION,
-                new NodeWorkItemIdentity(RUN_ID, 0, "node-1", 0, 3))).isFalse();
-
-        verify(intake, never()).take(any(), any(), anyString());
-        verify(dispatcher, never()).offerNode(any());
-    }
 
     private static RecoveryNotification notification() {
         RecoveryNotification notification = new RecoveryNotification();

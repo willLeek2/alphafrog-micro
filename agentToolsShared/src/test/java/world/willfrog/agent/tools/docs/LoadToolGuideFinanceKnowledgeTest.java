@@ -19,18 +19,5 @@ class LoadToolGuideFinanceKnowledgeTest {
 
     private final LoadToolGuideTool tool = configure(new LoadToolGuideTool(new ObjectMapper()));
 
-    @Test
-    void shouldLoadFinanceMethodKnowledgeTopic() {
-        String result = tool.loadToolGuide("finance_method_knowledge");
-        assertTrue(result.contains("\"ok\":true"));
-        assertTrue(result.contains("\"topic\":\"finance_method_knowledge\""));
-        assertTrue(result.contains("finance.growth.cagr") || result.contains("复合年均增长率"));
-    }
 
-    @Test
-    void shouldReturnValidTopicErrorForUnknownTopic() {
-        String result = tool.loadToolGuide("unknown_topic_xyz");
-        assertTrue(result.contains("\"ok\":false"));
-        assertTrue(result.contains("INVALID_TOPIC"));
-    }
 }

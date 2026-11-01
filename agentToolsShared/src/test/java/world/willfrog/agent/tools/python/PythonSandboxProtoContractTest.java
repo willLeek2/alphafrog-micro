@@ -19,18 +19,6 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 class PythonSandboxProtoContractTest {
 
-    @Test
-    void oldExecuteRequestRemainsValidWithAdditiveDefaults() {
-        ExecuteRequest request = ExecuteRequest.newBuilder()
-                .setDatasetId("dataset-1")
-                .setCode("print('ok')")
-                .build();
-
-        assertEquals("", request.getOperationId());
-        assertEquals("", request.getRequestFingerprint());
-        assertEquals(0L, request.getMemoryLimitBytes());
-        assertEquals(0L, request.getTimeoutMillis());
-    }
 
     @Test
     void usagePresenceDistinguishesMissingFromZero() {

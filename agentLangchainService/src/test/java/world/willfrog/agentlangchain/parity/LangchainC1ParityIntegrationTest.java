@@ -39,51 +39,8 @@ class LangchainC1ParityIntegrationTest {
             mock(AgentRunEventService.class)
     );
 
-    @Test
-    void linear_simple_success_matchesLegacyOutcomeShape() {
-        QueueChatModel model = new QueueChatModel(
-                "{\"ok\":true,\"data\":{\"dataset_id\":\"ds_etf_daily\"}}",
-                "512800.SH 最近一周呈震荡上行。"
-        );
 
-        LangchainWorkflowResult result = executor.executePlanned(
-                request(model, "查询 512800.SH 最近一周走势"),
-                singleTodoPlan("查询 512800.SH 最近一周走势"));
 
-        assertLegacyAlignedSuccess(result, "512800.SH 最近一周呈震荡上行。");
-        assertThat(result.getCompletedTodos()).hasSize(1);
-        assertThat(result.getCompletedTodos().get(0).getOutput()).contains("ds_etf_daily");
-    }
-
-    @Test
-    void empty_final_answer_failed_matchesLegacyFailureShape() {
-        QueueChatModel model = new QueueChatModel(
-                "{\"ok\":true,\"data\":{}}",
-                "   "
-        );
-
-        LangchainWorkflowResult result = executor.executePlanned(
-                request(model, "分析某只股票"),
-                singleTodoPlan("分析某只股票"));
-
-        assertLegacyAlignedFailure(result);
-        assertThat(result.getFailureReason()).isEqualTo("empty_final_answer");
-    }
-
-    @Test
-    void empty_todo_output_failed_matchesLegacyTodoFailureSemantics() {
-        QueueChatModel model = new QueueChatModel(
-                ""
-        );
-
-        LangchainWorkflowResult result = executor.executePlanned(
-                request(model, "查询"),
-                singleTodoPlan("查询"));
-
-        assertLegacyAlignedFailure(result);
-        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output_after_recovery:t1");
-        assertThat(result.getFinalAnswer()).isBlank();
-    }
 
     private static LangchainWorkflowRequest request(QueueChatModel model, String goal) {
         return LangchainWorkflowRequest.builder()

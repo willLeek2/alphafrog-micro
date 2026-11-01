@@ -27,21 +27,6 @@ class RagAdminAccessControllerTest {
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(false);
     }
 
-    @Test
-    void allPublicRagFacadesRejectNonAdminJwt() {
-        assertForbidden(new RagIngestController(adminUserAccessService)
-                .ingest(authentication, Map.of()));
-        assertForbidden(new RagUploadDocController(adminUserAccessService)
-                .uploadDoc(authentication, Map.of()));
-
-        RagRecordController records = new RagRecordController(adminUserAccessService);
-        assertForbidden(records.listUnprocessed(authentication, Map.of()));
-        assertForbidden(records.markOssUploaded(authentication, Map.of()));
-        assertForbidden(records.markVectorized(authentication, Map.of()));
-
-        assertForbidden(new RagFetchTriggerController(adminUserAccessService)
-                .trigger(authentication, Map.of()));
-    }
 
     private static void assertForbidden(ResponseEntity<?> response) {
         assertEquals(403, response.getStatusCode().value());

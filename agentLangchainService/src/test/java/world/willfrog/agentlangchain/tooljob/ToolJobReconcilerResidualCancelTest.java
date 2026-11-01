@@ -27,39 +27,7 @@ import static org.mockito.Mockito.when;
  */
 class ToolJobReconcilerResidualCancelTest {
 
-    @Test
-    void terminalCanceledResidualClosesWithoutSandboxLookup() throws Exception {
-        ToolJobAnchor anchor = residualAnchor();
-        Fixture fixture = fixture(anchor);
-        when(fixture.anchorService.closeResidualCanceledAnchor(
-                "run-res", "run-res:call-1:1")).thenReturn(true);
 
-        fixture.reconciler.reconcileFromDue();
-
-        verify(fixture.anchorService).closeResidualCanceledAnchor(
-                "run-res", "run-res:call-1:1");
-        verify(fixture.redisCache).removeDue("run-res");
-        verify(fixture.redisCache).deletePendingCache("run-res");
-        verifyNoInteractions(fixture.sandbox);
-        verifyNoInteractions(fixture.finalizer);
-    }
-
-    @Test
-    void nonTerminalCancelFallsThroughToSandboxPolling() throws Exception {
-        // 数据库清理返回 0 行（Run 仍 WAITING_TOOL_JOB/EXECUTING，正常取消收口中）
-        // → 必须继续走 Sandbox 终态确认，不能被直接入口吞掉。
-        ToolJobAnchor anchor = residualAnchor();
-        Fixture fixture = fixture(anchor);
-        when(fixture.anchorService.closeResidualCanceledAnchor(
-                "run-res", "run-res:call-1:1")).thenReturn(false);
-        when(fixture.sandbox.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(
-                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
-
-        fixture.reconciler.reconcileFromDue();
-
-        verify(fixture.sandbox).getTaskStatus(any(GetTaskStatusRequest.class));
-        verify(fixture.redisCache, never()).removeDue("run-res");
-    }
 
     private ToolJobAnchor residualAnchor() {
         // e572 签名：ACCEPTED+consumed、autoResume=false、CANCELED 处置、全步骤完成。

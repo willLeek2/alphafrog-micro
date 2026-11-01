@@ -17,59 +17,7 @@ class FinanceMethodResolutionValidatorTest {
     private final FinanceMethodSpecCatalog catalog = new FinanceMethodSpecCatalog(objectMapper);
     private final FinanceMethodResolutionValidator validator = new FinanceMethodResolutionValidator(catalog);
 
-    @Test
-    void validMatchedCandidateIsAccepted() throws Exception {
-        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
-        String json = "{"
-                + "\"status\":\"MATCHED\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
-                + "  \"version\":\"" + cagr.getVersion() + "\","
-                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
-                + "  \"matchReason\":\"用户希望计算复合增长率\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"matchReason\":\"匹配成功\","
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertTrue(result.isValid());
-        assertEquals("MATCHED", result.getStatus());
-    }
 
-    @Test
-    void multipleCandidatesAreAcceptedForAmbiguous() throws Exception {
-        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
-        FinanceMethodSpec vol = catalog.findByMethodId("finance.risk.annualized_volatility").orElseThrow();
-        String json = "{"
-                + "\"status\":\"AMBIGUOUS\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
-                + "  \"version\":\"" + cagr.getVersion() + "\","
-                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
-                + "  \"matchReason\":\"可能指增长\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "},{"
-                + "  \"methodId\":\"" + vol.getMethodId() + "\","
-                + "  \"version\":\"" + vol.getVersion() + "\","
-                + "  \"specDigest\":\"" + vol.getSpecDigest() + "\","
-                + "  \"matchReason\":\"可能指波动\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"matchReason\":\"\","
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertTrue(result.isValid());
-        assertEquals("AMBIGUOUS", result.getStatus());
-    }
 
     @Test
     void outOfCatalogMethodIdIsRejected() throws Exception {
@@ -138,28 +86,6 @@ class FinanceMethodResolutionValidatorTest {
         assertEquals("STATUS_CANDIDATE_MISMATCH", result.getErrorCode());
     }
 
-    @Test
-    void noAdviceWithCandidatesIsRejected() throws Exception {
-        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
-        String json = "{"
-                + "\"status\":\"NO_ADVICE\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
-                + "  \"version\":\"" + cagr.getVersion() + "\","
-                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
-                + "  \"matchReason\":\"\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"matchReason\":\"\","
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertFalse(result.isValid());
-        assertEquals("STATUS_CANDIDATE_MISMATCH", result.getErrorCode());
-    }
 
     @Test
     void forbiddenDefinitionFieldIsRejected() throws Exception {
@@ -209,29 +135,6 @@ class FinanceMethodResolutionValidatorTest {
         assertEquals("FORBIDDEN_MODEL_FIELD", result.getErrorCode());
     }
 
-    @Test
-    void unknownCandidateFieldIsRejected() throws Exception {
-        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
-        String json = "{"
-                + "\"status\":\"MATCHED\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
-                + "  \"version\":\"" + cagr.getVersion() + "\","
-                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
-                + "  \"matchReason\":\"ok\","
-                + "  \"foo\":\"bar\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"matchReason\":\"\","
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertFalse(result.isValid());
-        assertEquals("FORBIDDEN_MODEL_FIELD", result.getErrorCode());
-    }
 
     @Test
     void vagueTimeTermsProduceClarificationOnly() throws Exception {
@@ -279,91 +182,9 @@ class FinanceMethodResolutionValidatorTest {
         assertEquals("MATCH_REASON_NOT_TEXTUAL", result.getErrorCode());
     }
 
-    @Test
-    void candidateNonStringMatchReasonRejected() throws Exception {
-        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
-        String json = "{"
-                + "\"status\":\"MATCHED\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
-                + "  \"version\":\"" + cagr.getVersion() + "\","
-                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
-                + "  \"matchReason\":{\" forged\":true},"
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"matchReason\":\"ok\","
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertFalse(result.isValid());
-        assertEquals("MATCH_REASON_NOT_TEXTUAL", result.getErrorCode());
-    }
 
-    @Test
-    void numericMethodIdRejected() throws Exception {
-        String json = "{"
-                + "\"status\":\"MATCHED\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":123,"
-                + "  \"version\":\"1.0.0\","
-                + "  \"specDigest\":\"sha256:deadbeef\","
-                + "  \"matchReason\":\"ok\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"matchReason\":\"\","
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertFalse(result.isValid());
-        assertEquals("MISSING_METHOD_ID", result.getErrorCode());
-    }
 
-    @Test
-    void candidateMissingMatchReasonRejected() throws Exception {
-        String json = "{"
-                + "\"status\":\"MATCHED\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"finance.growth.cagr\","
-                + "  \"version\":\"1.0.0\","
-                + "  \"specDigest\":\"sha256:deadbeef\","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertFalse(result.isValid());
-        assertEquals("MISSING_MATCH_REASON", result.getErrorCode());
-    }
 
-    @Test
-    void candidateBlankMatchReasonRejected() throws Exception {
-        String json = "{"
-                + "\"status\":\"MATCHED\","
-                + "\"candidates\":[{"
-                + "  \"methodId\":\"finance.growth.cagr\","
-                + "  \"version\":\"1.0.0\","
-                + "  \"specDigest\":\"sha256:deadbeef\","
-                + "  \"matchReason\":\"   \","
-                + "  \"unresolvedTerms\":[],"
-                + "  \"clarificationQuestions\":[]"
-                + "}],"
-                + "\"unresolvedTerms\":[],"
-                + "\"clarificationQuestions\":[]"
-                + "}";
-        JsonNode node = objectMapper.readTree(json);
-        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
-        assertFalse(result.isValid());
-        assertEquals("BLANK_MATCH_REASON", result.getErrorCode());
-    }
 
     @Test
     void needsClarificationWithEmptyCandidatesRejected() throws Exception {

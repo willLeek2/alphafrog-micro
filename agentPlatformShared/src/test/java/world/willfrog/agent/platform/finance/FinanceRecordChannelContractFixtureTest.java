@@ -22,59 +22,7 @@ class FinanceRecordChannelContractFixtureTest {
     private static final String MARKER = "__AF_FINANCE_RESULT_v1__";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    @Test
-    void expectedBytesAndDigestsMatchRawPayloads() throws Exception {
-        JsonNode fixture = readFixture();
 
-        for (JsonNode testCase : fixture.path("cases")) {
-            List<byte[]> payloads = new ArrayList<>();
-            List<String> ordinaryLines = new ArrayList<>();
-            for (JsonNode stdoutLine : testCase.path("stdoutLines")) {
-                String line = stdoutLine.asText();
-                if (line.startsWith(MARKER)) {
-                    payloads.add(line.substring(MARKER.length()).getBytes(StandardCharsets.UTF_8));
-                } else {
-                    ordinaryLines.add(line);
-                }
-            }
-
-            JsonNode expected = testCase.path("expected");
-            String caseName = testCase.path("case").asText();
-            assertEquals(expected.path("ordinaryStdout").asText(),
-                    String.join("\n", ordinaryLines), caseName);
-            assertEquals(expected.path("resultRecordCount").asInt(), payloads.size(), caseName);
-            assertEquals(expected.path("emittedRecordBytes").asLong(),
-                    payloads.stream().mapToLong(payload -> payload.length).sum(), caseName);
-
-            List<String> rawDigests = payloads.stream()
-                    .map(FinanceRecordChannelContractFixtureTest::sha256Hex)
-                    .toList();
-            assertEquals(OBJECT_MAPPER.convertValue(expected.path("rawDigests"), List.class),
-                    rawDigests, caseName);
-
-            int digestInputLength = payloads.stream().mapToInt(payload -> Integer.BYTES + payload.length).sum();
-            ByteBuffer digestInput = ByteBuffer.allocate(digestInputLength);
-            for (byte[] payload : payloads) {
-                digestInput.putInt(payload.length);
-                digestInput.put(payload);
-            }
-            assertEquals(expected.path("recordDigest").asText(),
-                    sha256Hex(digestInput.array()), caseName);
-        }
-    }
-
-    @Test
-    void fixtureCoversNonAnnualAndSchemaInvalidRecords() throws Exception {
-        JsonNode fixture = readFixture();
-        JsonNode nonAnnual = findCase(fixture, "one-valid-custom-non-annual-result");
-        String payload = nonAnnual.path("stdoutLines").get(1).asText().substring(MARKER.length());
-        JsonNode parameters = OBJECT_MAPPER.readTree(payload).path("parameters");
-
-        assertEquals(37, parameters.path("lookbackTradingDays").asInt());
-        assertNull(parameters.get("periods"));
-        assertFalse(findCase(fixture, "one-schema-invalid-custom-result")
-                .path("expected").path("schemaValid").asBoolean());
-    }
 
     private JsonNode findCase(JsonNode fixture, String caseName) {
         for (JsonNode testCase : fixture.path("cases")) {

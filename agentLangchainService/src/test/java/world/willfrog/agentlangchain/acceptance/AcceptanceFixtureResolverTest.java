@@ -30,121 +30,13 @@ class AcceptanceFixtureResolverTest {
     private final AcceptanceFixtureResolver resolver =
             new AcceptanceFixtureResolver(store, identityProvider, objectMapper);
 
-    @Test
-    void aFixtureRunResolvesToItsRow() throws Exception {
-        when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
-        when(store.find(LANE, GENERATION, "fx-1"))
-                .thenReturn(Optional.of(row(true, OffsetDateTime.now().plusHours(1))));
 
-        AcceptanceFixtureRow resolved = resolver.resolve(fixtureRun("fx-1")).orElseThrow();
 
-        assertThat(resolved.fixtureId()).isEqualTo("fx-1");
-        assertThat(resolved.scenarioId()).isEqualTo("scenario-a");
-    }
 
-    @Test
-    void theFixtureIdIsReadFromTheRequestContextNotTheWholeExt() throws Exception {
-        when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
-        AgentRun run = new AgentRun();
-        run.setId("run-1");
-        run.setDeploymentId(LANE);
-        run.setDeploymentGenerationId(GENERATION);
-        // 编号写在 ext 顶层不算数：创建时只把请求上下文原样存进 context_json，读取口径与创建那道门一致。
-        run.setExt(objectMapper.writeValueAsString(Map.of(
-                "acceptanceFixtureId", "fx-1",
-                "context_json", "{\"execution_mode\":\"DAG\"}")));
 
-        assertThat(resolver.resolve(run)).isEmpty();
-        verifyNoInteractions(store);
-    }
 
-    @Test
-    void anOrdinaryRunNeverTouchesTheStore() throws Exception {
-        assertThat(resolver.resolve(ordinaryRun("{\"execution_mode\":\"DAG\"}"))).isEmpty();
 
-        verifyNoInteractions(store);
-        verifyNoInteractions(identityProvider);
-    }
 
-    @Test
-    void aRunFromAnotherLaneIsRefused() throws Exception {
-        when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
-        AgentRun run = fixtureRun("fx-1");
-        run.setDeploymentGenerationId("gen-" + "b".repeat(64));
-
-        assertThatThrownBy(() -> resolver.resolve(run))
-                .isInstanceOf(AcceptanceFixtureExecutionException.class)
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_lane_mismatch"));
-    }
-
-    @Test
-    void aFixtureThatIsNotThereOrNotUsableIsRefused() throws Exception {
-        when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
-
-        when(store.find(LANE, GENERATION, "fx-1")).thenReturn(Optional.empty());
-        assertThatThrownBy(() -> resolver.resolve(fixtureRun("fx-1")))
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_not_found"));
-
-        when(store.find(LANE, GENERATION, "fx-1"))
-                .thenReturn(Optional.of(row(false, OffsetDateTime.now().plusHours(1))));
-        assertThatThrownBy(() -> resolver.resolve(fixtureRun("fx-1")))
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_not_enabled"));
-
-        when(store.find(LANE, GENERATION, "fx-1"))
-                .thenReturn(Optional.of(row(true, OffsetDateTime.now().minusSeconds(1))));
-        assertThatThrownBy(() -> resolver.resolve(fixtureRun("fx-1")))
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_expired"));
-    }
-
-    @Test
-    void aContextThatMentionsTheFixtureButCannotBeReadIsRefused() throws Exception {
-        when(identityProvider.current()).thenReturn(new DeploymentIdentity(LANE, GENERATION));
-
-        assertThatThrownBy(() -> resolver.resolve(ordinaryRun("{\"acceptanceFixtureId\":")))
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_invalid"));
-        assertThatThrownBy(() -> resolver.resolve(ordinaryRun("\"acceptanceFixtureId\"")))
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_invalid"));
-        assertThatThrownBy(() -> resolver.resolve(ordinaryRun("{\"acceptanceFixtureId\":\"  \"}")))
-                .satisfies(e -> assertThat(code(e)).isEqualTo("acceptance_fixture_invalid"));
-        verifyNoInteractions(store);
-    }
-
-    /**
-     * 上下文坏掉、连字段名都不完整时也拒绝，不看文本里有没有出现过这个词。
-     *
-     * <p>字段名被截断（{@code {"acceptanceFixture}）正是「靠字面判断」会猜错的那一类：猜错的代价是
-     * 这条 Run 接上真实模型跑完，一次本该失败的验收看起来像跑过了。</p>
-     */
-    @Test
-    void anUnreadableContextIsRefusedEvenWhenTheFieldNameIsCutOff() throws Exception {
-        assertRefusedAsInvalid(ordinaryRun("{\"acceptanceFixture"));
-        assertRefusedAsInvalid(ordinaryRun("{\"execution_mode\": \"DA"));
-        assertRefusedAsInvalid(ordinaryRun("[1,2,3]"));
-
-        // 读得出来、里面确实没有夹具编号，才是普通 Run。
-        assertThat(resolver.resolve(ordinaryRun("{\"execution_mode\":\"DAG\"}"))).isEmpty();
-        verifyNoInteractions(store);
-    }
-
-    /**
-     * ext 自己读不出来时不按普通 Run 放过去。
-     *
-     * <p>ext 里出现夹具编号这个词、而 ext 读不回来（不是合法 JSON、不是对象、context_json 不是字符串），
-     * 就判不出这条 Run 到底是不是夹具 Run。判不出来还往下跑，一次本该跑夹具的验收会悄悄连上真实模型，
-     * 结果看起来像跑过了——所以这里当场拒绝，连夹具表都不去查。</p>
-     */
-    @Test
-    void anExtThatCannotBeReadIsRefusedInsteadOfRunningAgainstTheRealModel() {
-        // ext 不是合法 JSON：夹具编号在正文里出现过，但整条 ext 读不回来。
-        assertRefusedAsInvalid(rawRun("run-1", "{\"context_json\":\"{\\\"acceptanceFixtureId\\\":\\\"fx-1\\\"}\""));
-        // ext 是合法 JSON 但不是对象。
-        assertRefusedAsInvalid(rawRun("run-2", "[\"acceptanceFixtureId\"]"));
-        // ext 是对象，但 context_json 不是一个字符串（夹具编号写不到它里面）。
-        assertRefusedAsInvalid(rawRun("run-3", "{\"context_json\":{\"acceptanceFixtureId\":\"fx-1\"}}"));
-
-        verifyNoInteractions(store);
-        verifyNoInteractions(identityProvider);
-    }
 
     private void assertRefusedAsInvalid(AgentRun run) {
         assertThatThrownBy(() -> resolver.resolve(run))

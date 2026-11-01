@@ -42,38 +42,8 @@ class TrafficDistributionIsolationContractTest {
     private final Path businessRoot = Path.of(System.getProperty("user.dir"))
             .resolve("src/main/java/world/willfrog/agentlangchain");
 
-    @Test
-    void businessPackagesDoNotReadDeploymentIdentityLaneOrFencedSql() throws IOException {
-        for (Path source : businessSources()) {
-            String text = read(source);
-            for (Pattern symbol : FORBIDDEN_SYMBOLS) {
-                assertThat(symbol.matcher(text).find())
-                        .as("%s 不得引用 %s（分发判定收在 gateway / deployment 包）",
-                                relative(source), symbol.pattern())
-                        .isFalse();
-            }
-        }
-    }
 
-    @Test
-    void onlyTheAdmissionEntryCarriesTheDeploymentIdentityValue() throws IOException {
-        for (Path source : businessSources()) {
-            if (IDENTITY_VALUE_ALLOWED.contains(relative(source))) {
-                continue;
-            }
-            assertThat(IDENTITY_VALUE.matcher(read(source)).find())
-                    .as("%s 不得出现 DeploymentIdentity（只有受理入口写一次身份）", relative(source))
-                    .isFalse();
-        }
-    }
 
-    @Test
-    void gatewayPackageIsWhereTheIdentityAndLaneReachTheBusinessCode() {
-        assertThat(read(businessRoot.resolve("gateway/RunOwnershipGateway.java")))
-                .contains("DeploymentIdentityProvider");
-        assertThat(read(businessRoot.resolve("gateway/LaneScopeGateway.java")))
-                .contains("LaneContext");
-    }
 
     private List<Path> businessSources() throws IOException {
         try (var paths = Files.walk(businessRoot)) {

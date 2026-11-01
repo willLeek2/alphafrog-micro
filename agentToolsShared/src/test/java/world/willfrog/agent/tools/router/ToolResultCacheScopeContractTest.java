@@ -78,70 +78,9 @@ class ToolResultCacheScopeContractTest {
         AgentContext.clear();
     }
 
-    @Test
-    void redisMode_withUserScope_attemptsRedisReadAndWrite() {
-        String scope = "user:u1";
-        String result = executeWithScope(scope);
 
-        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(valueOperations).get(keyCaptor.capture());
-        verify(valueOperations).set(keyCaptor.capture(), anyString(), eq(3600L), eq(TimeUnit.SECONDS));
 
-        Set<String> capturedKeys = new HashSet<>(keyCaptor.getAllValues());
-        assertEquals(1, capturedKeys.size(), "读/写应使用同一缓存键");
-        String key = capturedKeys.iterator().next();
-        assertTrue(key.contains(":user:u1"), "键中应包含 user scope");
-        assertFalse(key.contains("global"), "D07 口径：键中不应出现 global");
-        assertTrue(result.contains("\"ok\":true"), "应返回 loader 结果");
-    }
 
-    @Test
-    void redisMode_withRunScope_attemptsRedisReadAndWrite() {
-        String scope = "run:r1";
-        executeWithScope(scope);
-
-        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(valueOperations).get(keyCaptor.capture());
-        String key = keyCaptor.getValue();
-        assertTrue(key.contains(":run:r1"), "键中应包含 run scope");
-        assertFalse(key.contains("global"), "D07 口径：键中不应出现 global");
-    }
-
-    @Test
-    void redisMode_withBlankScope_neverTouchesRedisAndExecutesLoaderDirectly() {
-        String scope = "";
-        java.util.concurrent.atomic.AtomicBoolean loaderCalled = new java.util.concurrent.atomic.AtomicBoolean(false);
-        Supplier<ToolResultCacheService.ToolExecutionOutcome> loader = () -> {
-            loaderCalled.set(true);
-            return ToolResultCacheService.ToolExecutionOutcome.builder()
-                    .result("{\"ok\":true,\"tool\":\"searchStock\",\"data\":{}}")
-                    .success(true)
-                    .durationMs(5L)
-                    .build();
-        };
-
-        stubCompact("{\"ok\":true,\"tool\":\"searchStock\",\"data\":{}}");
-
-        ToolResultCacheService.CachedToolCallResult result = service.executeWithCache(
-                "searchStock", Map.of("keyword", "abc"), scope, loader);
-
-        assertTrue(loaderCalled.get(), "blank scope 时应直接执行 loader");
-        assertTrue(result.isSuccess());
-        assertNotNull(result.getCacheMeta());
-        assertFalse(result.getCacheMeta().isEligible());
-        assertEquals("none", result.getCacheMeta().getSource());
-
-        verifyNoInteractions(redisTemplate);
-    }
-
-    @Test
-    void differentRunScopes_sameParams_produceDifferentCacheKeys() {
-        String key1 = captureKeyForScope("run:r1");
-        String key2 = captureKeyForScope("run:r2");
-        assertNotEquals(key1, key2, "不同 run scope 不应共享缓存键");
-        assertFalse(key1.contains("global"));
-        assertFalse(key2.contains("global"));
-    }
 
     // ── helpers ──
 

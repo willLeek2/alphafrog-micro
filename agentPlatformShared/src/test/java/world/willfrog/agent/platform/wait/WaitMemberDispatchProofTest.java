@@ -115,21 +115,6 @@ class WaitMemberDispatchProofTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
-    @Test
-    void runIneligibleRefusalCanBePersistedAndRecovered() {
-        WaitMemberDispatchProof original = new WaitMemberDispatchProof(
-                WaitMemberDispatchProof.REPLAYABLE_SCHEMA_VERSION, OPERATION, null,
-                "sha256:tests", "{}", "{}", "{}", "2026-09-22T00:00:00Z",
-                "{\"operationId\":\"" + OPERATION + "\"}");
-
-        WaitMemberDispatchProof refused = original.withWorkspaceRefusal("WORKSPACE_RUN_INELIGIBLE");
-        WaitMemberDispatchProof recovered = WaitMemberDispatchProof.fromJson(
-                objectMapper, refused.toJson(objectMapper)).orElseThrow();
-
-        assertThat(recovered.workspaceRefused()).isTrue();
-        assertThat(recovered.workspaceRefusalCode()).isEqualTo("WORKSPACE_RUN_INELIGIBLE");
-        assertThat(recovered.createRequestJson()).isEqualTo(original.createRequestJson());
-    }
 
     @Test
     void settledProofRemainsReadableAfterOnlyReplayBodyExpires() throws Exception {

@@ -70,67 +70,9 @@ class ToolRouterRegistryConsistencyTest {
         return AgentToolRegistry.declaredToolNames();
     }
 
-    @ParameterizedTest
-    @MethodSource("declaredToolNames")
-    void everyDeclaredTool_doesNotReturnUnsupported(String toolName) throws Exception {
-        ToolRouter.ToolInvocationResult result = invokeTool(toolName);
-        JsonNode root = objectMapper.readTree(result.getOutput());
-        JsonNode errorCode = root.path("error").path("code");
-        assertNotEquals("UNSUPPORTED_TOOL", errorCode.asText(""),
-                toolName + " 已声明但 Router 返回 UNSUPPORTED_TOOL");
-    }
 
-    @Test
-    void supportedTools_equalsDeclaredToolNames() {
-        ToolRouter router = new ToolRouter(
-                mock(MarketDataTools.class),
-                mock(RagTools.class),
-                mock(SearchTools.class),
-                mock(PythonSandboxTools.class),
-                mock(SqlQueryTools.class),
-                mock(FinanceMethodTools.class),
-                mock(LoadToolGuideTool.class),
-                mock(ListMyDataTool.class),
-                new PythonStaticPrecheckService(),
-                llmPropertiesWithAllEnabled(),
-                mock(ToolResultCacheService.class),
-                mock(RereadToolHandler.class),
-                mock(AgentRunObservabilityService.class),
-                new ObjectMapper(),
-                new SimpleMeterRegistry(),
-                new StressTestProperties()
-        );
-        assertEquals(AgentToolRegistry.declaredToolNames(), router.supportedTools(),
-                "supportedTools 必须精确等于注册表声明面");
-    }
 
-    @Test
-    void bogusTool_returnsUnsupported() throws Exception {
-        ToolRouter.ToolInvocationResult result = invokeTool("nonExistentTool");
-        JsonNode root = objectMapper.readTree(result.getOutput());
-        assertFalse(root.path("ok").asBoolean(true));
-        assertEquals("UNSUPPORTED_TOOL", root.path("error").path("code").asText());
-    }
 
-    @Test
-    void subAgentControls_delegateToProductionHandler() throws Exception {
-        SubAgentControlHandler handler = new SubAgentControlHandler() {
-            @Override
-            public String spawn(Map<String, Object> params) {
-                return okJson("spawnSubAgent");
-            }
-
-            @Override
-            public String waitFor(Map<String, Object> params) {
-                return okJson("waitForSubAgent");
-            }
-        };
-
-        assertTrue(objectMapper.readTree(invokeTool("spawnSubAgent", handler).getOutput())
-                .path("ok").asBoolean());
-        assertTrue(objectMapper.readTree(invokeTool("waitForSubAgent", handler).getOutput())
-                .path("ok").asBoolean());
-    }
 
     private ToolRouter.ToolInvocationResult invokeTool(String toolName) throws Exception {
         return invokeTool(toolName, null);

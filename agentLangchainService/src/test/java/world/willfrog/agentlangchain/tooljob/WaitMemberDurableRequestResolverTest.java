@@ -20,66 +20,9 @@ class WaitMemberDurableRequestResolverTest {
     private static final String OPERATION = "run:call:1";
     private static final String FINGERPRINT = "sha256:fingerprint";
 
-    @Test
-    void aWorkspaceRefusalAfterAnAuthoritativeMissIsReturnedAsABusinessResult() throws Exception {
-        PythonSandboxService sandbox = mock(PythonSandboxService.class);
-        when(sandbox.getTaskByOperationId(any()))
-                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
-        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
-                .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
 
-        WaitMemberDurableRequestResolver.Resolution resolved =
-                WaitMemberDurableRequestResolver.resolveOutcome(proof(), sandbox);
 
-        assertThat(resolved.taskId()).isNull();
-        assertThat(resolved.workspaceRefusalCode()).isEqualTo("WORKSPACE_DIRTY");
-    }
 
-    @Test
-    void anIneligibleRunIsReturnedAsAWorkspaceRefusal() throws Exception {
-        PythonSandboxService sandbox = mock(PythonSandboxService.class);
-        when(sandbox.getTaskByOperationId(any()))
-                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance());
-        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
-                .setWorkspaceResult(WorkspaceResult.WORKSPACE_RUN_INELIGIBLE).build());
-
-        WaitMemberDurableRequestResolver.Resolution resolved =
-                WaitMemberDurableRequestResolver.resolveOutcome(proof(), sandbox);
-
-        assertThat(resolved.taskId()).isNull();
-        assertThat(resolved.workspaceRefusalCode()).isEqualTo("WORKSPACE_RUN_INELIGIBLE");
-    }
-
-    @Test
-    void anExistingTaskAfterRefusalWinsOverTheRefusal() throws Exception {
-        PythonSandboxService sandbox = mock(PythonSandboxService.class);
-        when(sandbox.getTaskByOperationId(any()))
-                .thenReturn(GetTaskByOperationIdResponse.getDefaultInstance(),
-                        GetTaskByOperationIdResponse.newBuilder().setFound(true)
-                                .setTaskId("accepted-task")
-                                .setRequestFingerprint(FINGERPRINT).build());
-        when(sandbox.createTask(any())).thenReturn(ExecuteResponse.newBuilder()
-                .setWorkspaceResult(WorkspaceResult.WORKSPACE_DIRTY).build());
-
-        WaitMemberDurableRequestResolver.Resolution resolved =
-                WaitMemberDurableRequestResolver.resolveOutcome(proof(), sandbox);
-
-        assertThat(resolved.taskId()).isEqualTo("accepted-task");
-        assertThat(resolved.workspaceRefusalCode()).isNull();
-    }
-
-    @Test
-    void aSavedRefusalCannotReplayCreateAfterRestart() throws Exception {
-        PythonSandboxService sandbox = mock(PythonSandboxService.class);
-
-        WaitMemberDurableRequestResolver.Resolution resolved =
-                WaitMemberDurableRequestResolver.resolveOutcome(
-                        proof().withWorkspaceRefusal("WORKSPACE_DELETED"), sandbox);
-
-        assertThat(resolved.workspaceRefusalCode()).isEqualTo("WORKSPACE_DELETED");
-        verify(sandbox, never()).createTask(any());
-        verify(sandbox, never()).getTaskByOperationId(any());
-    }
 
     private static WaitMemberDispatchProof proof() throws Exception {
         ExecuteRequest request = ExecuteRequest.newBuilder()

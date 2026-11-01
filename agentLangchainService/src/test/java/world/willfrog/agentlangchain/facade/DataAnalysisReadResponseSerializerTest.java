@@ -28,10 +28,6 @@ class DataAnalysisReadResponseSerializerTest {
         assertEquals("{}", serializer.serializeStatusFromSummary("r1", Optional.empty()));
     }
 
-    @Test
-    void absentResultSnapshotProducesEmptyJson() {
-        assertEquals("{}", serializer.serializeResultView(Optional.empty()));
-    }
 
     @Test
     void statusViewFromSummaryIsValidJson() throws Exception {

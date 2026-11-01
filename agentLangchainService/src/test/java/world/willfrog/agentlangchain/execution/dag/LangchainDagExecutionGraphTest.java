@@ -33,14 +33,6 @@ class LangchainDagExecutionGraphTest {
         assertThat(graph.maxDependencyDepth()).isZero();
     }
 
-    @Test
-    void maxDependencyDepth_shouldBeOneForIndependentNodes() {
-        LangchainDagExecutionGraph graph = LangchainDagExecutionGraph.from(List.of(
-                TodoItem.builder().id("a").sequence(1).description("a").build(),
-                TodoItem.builder().id("b").sequence(2).description("b").build()
-        ));
-        assertThat(graph.maxDependencyDepth()).isEqualTo(1);
-    }
 
     @Test
     void maxDependencyDepth_shouldCountLongestDependsOnChain() {

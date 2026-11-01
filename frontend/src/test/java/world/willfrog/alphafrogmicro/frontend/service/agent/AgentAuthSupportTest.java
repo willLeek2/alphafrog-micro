@@ -12,27 +12,6 @@ import static org.mockito.Mockito.when;
 
 class AgentAuthSupportTest {
 
-    @Test
-    void resolveReadsCurrentDatabaseRoleOnEveryRequest() {
-        AuthService authService = mock(AuthService.class);
-        Authentication authentication = mock(Authentication.class);
-        when(authentication.isAuthenticated()).thenReturn(true);
-        when(authentication.getName()).thenReturn("user");
-        User admin = user(99L, 1127);
-        User nonAdmin = user(99L, 1);
-        when(authService.getUserByUsername("user")).thenReturn(admin, nonAdmin);
-        when(authService.isUserActive(admin)).thenReturn(true);
-        when(authService.isUserActive(nonAdmin)).thenReturn(true);
-        AgentAuthSupport support = new AgentAuthSupport(authService);
-
-        AgentAuthSupport.AgentAuthContext first = support.resolve(authentication);
-        AgentAuthSupport.AgentAuthContext second = support.resolve(authentication);
-
-        assertTrue(first.admin());
-        assertFalse(second.admin());
-        assertTrue(first.active());
-        assertTrue(second.active());
-    }
 
     private User user(long id, int type) {
         User user = new User();

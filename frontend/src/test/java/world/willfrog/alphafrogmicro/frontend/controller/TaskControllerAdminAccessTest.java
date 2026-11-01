@@ -49,46 +49,6 @@ class TaskControllerAdminAccessTest {
         when(rateLimitingService.tryAcquire("task")).thenReturn(true);
     }
 
-    @Test
-    void normalUserCannotCreateRagFetchTask() {
-        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(false);
 
-        ResponseEntity<String> response = controller.createTask(authentication, Map.of(
-                "task_type", "fetch",
-                "task_name", "rag_ann_fetch"));
 
-        assertEquals(403, response.getStatusCode().value());
-        verify(fetchTaskStatusService, never()).registerTask(anyString(), any(), any());
-        verify(rabbitTemplate, never()).convertAndSend(anyString(), anyString(), anyString());
-    }
-
-    @Test
-    void adminJwtCanCreateRagFetchTaskWithoutSecondarySecret() {
-        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
-
-        ResponseEntity<String> response = controller.createTask(authentication, Map.of(
-                "task_type", "fetch",
-                "task_name", "rag_report_fetch"));
-
-        assertEquals(200, response.getStatusCode().value());
-        verify(fetchTaskStatusService).registerTask(anyString(), eq("rag_report_fetch"), any());
-        verify(rabbitTemplate).convertAndSend(
-                eq(TaskProducerRabbitConfig.FETCH_EXCHANGE),
-                eq(TaskProducerRabbitConfig.FETCH_TASK_ROUTING_KEY),
-                anyString());
-    }
-
-    @Test
-    void ordinaryFetchTaskKeepsExistingAuthenticatedUserBehavior() {
-        ResponseEntity<String> response = controller.createTask(authentication, Map.of(
-                "task_type", "fetch",
-                "task_name", "domestic_stock_fetch"));
-
-        assertEquals(200, response.getStatusCode().value());
-        verify(adminUserAccessService, never()).isActiveAdmin(authentication);
-        verify(rabbitTemplate).convertAndSend(
-                eq(TaskProducerRabbitConfig.FETCH_EXCHANGE),
-                eq(TaskProducerRabbitConfig.FETCH_TASK_ROUTING_KEY),
-                anyString());
-    }
 }

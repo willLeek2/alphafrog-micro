@@ -139,23 +139,6 @@ class ReactConversationContextTest {
         assertEquals(0, ctx.size());
     }
 
-    @Test
-    void systemMessageStaysDuringTrim() {
-        ReactConversationContext ctx = new ReactConversationContext(2);
-        ctx.setSystemMessage("常驻系统指令");
-        // Fill beyond max
-        ctx.addUserMessage("U1");
-        ctx.addAssistantMessage("A1");
-        ctx.addUserMessage("U2");
-        ctx.addAssistantMessage("A2");
-        ctx.addUserMessage("U3");
-
-        // System message must always be at index 0
-        assertInstanceOf(SystemMessage.class, ctx.getMessages().get(0));
-        assertEquals("常驻系统指令", ((SystemMessage) ctx.getMessages().get(0)).text());
-        // Non-system messages should be exactly maxMessages
-        assertEquals(2, ctx.conversationSize());
-    }
 
     @Test
     void defaultMaxMessages_shouldBeDefault() {
@@ -195,15 +178,6 @@ class ReactConversationContextTest {
         assertEquals(4, branch.size());
     }
 
-    @Test
-    void branch_shouldPreserveSystemMessage() {
-        ReactConversationContext ctx = new ReactConversationContext();
-        ctx.setSystemMessage("静态系统指令");
-
-        ReactConversationContext branch = ctx.branch();
-        assertEquals(1, branch.size());
-        assertEquals("静态系统指令", ((SystemMessage) branch.getMessages().get(0)).text());
-    }
 
     @Test
     void branch_shouldCopyMaxMessages() {

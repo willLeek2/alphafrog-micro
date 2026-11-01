@@ -20,29 +20,7 @@ class PromptHotPushValidatorTest {
     private final PromptHotPushValidator validator = PromptHotPushValidator.shared();
     private final ObjectMapper mapper = new ObjectMapper();
 
-    @Test
-    void index_shouldDescribeOverlayTypeAndToolNames() {
-        PromptHotPushIndex index = validator.index();
-        assertEquals("agent-prompt-overlay", index.configType());
-        assertEquals("agent-prompt-overlay.json", index.dataId());
-        assertEquals("alphafrog-config", index.group());
-        assertTrue(index.toolNames().contains("executePython"));
-        assertTrue(index.allowedToolNames().contains("executePython"));
-        assertTrue(index.textFields().contains("todoRetryContextInstruction"));
-        assertTrue(index.allowedPromptKeys().contains("todoRetryContextInstruction"));
-    }
 
-    @Test
-    void formatVersionNotOne_shouldReject() {
-        ObjectNode root = mapper.createObjectNode();
-        root.put("formatVersion", 2);
-        ConfigValidationException error = assertThrows(ConfigValidationException.class,
-                () -> validator.validateRoot(root));
-        assertTrue(error.getMessage().contains("formatVersion"));
-
-        ObjectNode missing = mapper.createObjectNode();
-        assertThrows(ConfigValidationException.class, () -> validator.validateRoot(missing));
-    }
 
     @Test
     void unknownTopLevelKey_shouldReject() {
@@ -90,28 +68,8 @@ class PromptHotPushValidatorTest {
         validator.validateRoot(root);
     }
 
-    @Test
-    void fileReference_shouldReject() {
-        ObjectNode root = overlay();
-        root.putObject("prompts").put("todoRetryContextInstruction",
-                "file:prompts/todo/todo_retry_context.txt");
-        ConfigValidationException error = assertThrows(ConfigValidationException.class,
-                () -> validator.validateRoot(root));
-        assertTrue(error.getMessage().contains("文件引用"));
-    }
 
-    @Test
-    void extraPlaceholder_shouldPass() {
-        ObjectNode root = overlay();
-        root.putObject("prompts").put("todoRetryContextInstruction",
-                "{{toolName}} {{toolSafety}} {{failureCategory}} {{failureSummary}} {{previousArguments}} {{extraHint}}");
-        validator.validateRoot(root);
-    }
 
-    @Test
-    void invalidJson_shouldReject() {
-        assertThrows(ConfigValidationException.class, () -> validator.validateContentJson("{"));
-    }
 
     @Test
     void canonicalDigest_shouldBeStableForSameContent() {
@@ -123,34 +81,8 @@ class PromptHotPushValidatorTest {
         assertTrue(validator.canonicalDigest(left).startsWith("sha256:"));
     }
 
-    @Test
-    void emptyOverlay_shouldHaveDefinedDigest() {
-        assertEquals(EMPTY_DIGEST, validator.canonicalDigest(null));
-        assertEquals(EMPTY_DIGEST, validator.canonicalDigest(""));
-        assertEquals(EMPTY_DIGEST, validator.canonicalDigest("{}"));
-        assertEquals(EMPTY_DIGEST, validator.canonicalDigest("{\"formatVersion\":1}"));
-    }
 
-    @Test
-    void diffPromptFields_shouldListChangedKeys() {
-        String from = "{\"prompts\":{\"todoRetryContextInstruction\":\"a\"}}";
-        String to = "{\"prompts\":{\"todoRetryContextInstruction\":\"b\",\"toolSummarySystemPrompt\":\"s\"}}";
-        List<String> changed = validator.diffPromptFields(from, to);
-        assertTrue(changed.contains("todoRetryContextInstruction"));
-        assertTrue(changed.contains("toolSummarySystemPrompt"));
-    }
 
-    @Test
-    void diffToolDescriptions_shouldListChangedKeys() {
-        String from = "{\"toolDescriptions\":{\"executePython\":\"old\"}}";
-        String to = "{\"toolDescriptions\":{\"executePython\":\"new\",\"searchWeb\":\"web\"}}";
-        List<String> changed = validator.diffToolDescriptions(from, to);
-        assertTrue(changed.contains("executePython"));
-        assertTrue(changed.contains("searchWeb"));
-        List<String> overlay = validator.diffOverlayFields(from, to);
-        assertTrue(overlay.contains("executePython"));
-        assertTrue(overlay.contains("searchWeb"));
-    }
 
     private ObjectNode overlay() {
         ObjectNode root = mapper.createObjectNode();

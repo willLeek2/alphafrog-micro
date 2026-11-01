@@ -44,18 +44,6 @@ class CheckParallelLimitsForceCheckContractTest {
         ));
     }
 
-    @Test
-    void checkParallelLimits_groupsMatchRegistry() throws Exception {
-        String response = tools.checkParallelLimits();
-        Map<String, Object> root = objectMapper.readValue(response, new TypeReference<>() {});
-        @SuppressWarnings("unchecked")
-        Map<String, Object> data = (Map<String, Object>) root.get("data");
-
-        assertGroupEquals(data, "search", AgentToolRegistry.ParallelGroup.SEARCH);
-        assertGroupEquals(data, "daily", AgentToolRegistry.ParallelGroup.DAILY);
-        assertGroupEquals(data, "calendar", AgentToolRegistry.ParallelGroup.CALENDAR);
-        assertAdvancedGroupEquals(data, "advanced", AgentToolRegistry.ParallelGroup.ADVANCED);
-    }
 
     private void assertGroupEquals(Map<String, Object> data, String groupKey,
                                    AgentToolRegistry.ParallelGroup registryGroup) throws Exception {

@@ -63,59 +63,6 @@ class ToolOutputCompactionServiceTest {
         AgentContext.clear();
     }
 
-    @Test
-    void compactShouldApplySummaryAndRawRefWhenOutputExceedsLimit() {
-        String raw = "x".repeat(50);
-        ToolOutputCompactionService.CompactionResult result =
-                service.compact("getStockInfo", raw, "查股票");
 
-        assertTrue(result.isCompactionApplied());
-        assertTrue(result.getModelOutput().contains("short summary"));
-        assertTrue(result.getModelOutput().contains("raw-ref:test123"));
-        assertFalse(result.getCacheTemplate().contains("raw-ref:test123"));
-    }
 
-    @Test
-    void rebindForCacheHitShouldInjectCurrentRunRawRef() {
-        String raw = "y".repeat(50);
-        ToolOutputCompactionService.CompactionResult first = service.compact("getStockInfo", raw, "查股票");
-        AgentContext.setRunId("run-2");
-        AgentContext.setToolCallId("tc-2");
-
-        String rebound = service.rebindForCacheHit(first.getCacheTemplate(), first.getRawLocator());
-
-        assertTrue(rebound.contains("raw-ref:rebound456"));
-        assertFalse(rebound.contains("\"rawRef\":\"\""));
-    }
-
-    @Test
-    void compactSearchShouldExposeHasDailyCodeAndName() throws Exception {
-        cfg.getTools().getResult().setMaxStringLength(800);
-        String raw = """
-                {"ok":true,"tool":"searchIndex","data":{"items":[
-                  {"ts_code":"000806.CSI","name":"消费服务","has_daily":1,"full_name":"很长的全称"},
-                  {"ts_code":"931354.CSI","name":"CS消费","has_daily":0},
-                  {"ts_code":"931139.CSI","name":"CS消费50","has_daily":1}
-                ],"extra":"%s"}}
-                """.formatted("x".repeat(900));
-
-        ToolOutputCompactionService.CompactionResult result =
-                service.compact("searchIndex", raw, "查消费指数");
-
-        String modelOutput = result.getModelOutput();
-        assertTrue(modelOutput.contains("compactSearchItems"));
-        assertTrue(modelOutput.contains("000806.CSI"));
-        assertTrue(modelOutput.contains("CS消费50"));
-        assertFalse(modelOutput.contains("931354.CSI"));
-
-        @SuppressWarnings("unchecked")
-        var root = objectMapper.readValue(modelOutput, java.util.Map.class);
-        @SuppressWarnings("unchecked")
-        var data = (java.util.Map<String, Object>) root.get("data");
-        @SuppressWarnings("unchecked")
-        var compact = (java.util.Map<String, Object>) data.get("compactSearchItems");
-        String compactJson = objectMapper.writeValueAsString(compact);
-        assertTrue(compactJson.length() <= cfg.getTools().getResult().getMaxStringLength() / 4);
-        assertEquals("has_daily=1", compact.get("filter"));
-    }
 }

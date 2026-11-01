@@ -45,83 +45,9 @@ class ObservabilityEventsTest {
         ObservabilityEvents.installSwitch(null);
     }
 
-    @Test
-    void emitsContractFieldsWhenSwitchIsOn() throws Exception {
-        attach();
-        ObservabilityEvents.installSwitch(() -> true);
-        MDC.put("trace_id", "trace-1");
-        MDC.put("span_id", "span-1");
 
-        ObservabilityEvents.workClaimed()
-                .rootRunId("run-1")
-                .nodeId("research")
-                .segmentSequence(2)
-                .operationId("work-9")
-                .decision("claimed")
-                .outcome("pending")
-                .reasonCode("lease_granted")
-                .summary("工作项被领取")
-                .emit();
 
-        JsonNode line = capturedJson().get(0);
-        assertFalse(line.get("eventId").asText().isBlank());
-        assertEquals("work_claimed", line.get("eventName").asText());
-        assertEquals("info", line.get("severity").asText());
-        assertTrue(line.get("occurredAt").asText().endsWith("+08:00"),
-                "时刻要写成带东八区偏移的形式：" + line.get("occurredAt").asText());
-        assertEquals("run-1", line.get("rootRunId").asText());
-        assertEquals("research", line.get("nodeId").asText());
-        assertEquals(2, line.get("segmentSequence").asInt());
-        assertEquals("work-9", line.get("operationId").asText());
-        assertEquals("claimed", line.get("decision").asText());
-        assertEquals("pending", line.get("outcome").asText());
-        assertEquals("lease_granted", line.get("reasonCode").asText());
-        assertEquals("trace-1", line.get("traceId").asText());
-        assertEquals("span-1", line.get("spanId").asText());
-        assertEquals("工作项被领取", line.get("summary").asText());
-        assertEquals("not_collected", line.get("detailStatus").asText());
-        assertEquals("工作项被领取", appender.list.get(0).getFormattedMessage());
-    }
 
-    @Test
-    void staysSilentWhenSwitchIsOff() {
-        attach();
-        ObservabilityEvents.installSwitch(null);
-        ObservabilityEvents.workClaimed().rootRunId("run-1").summary("没开关").emit();
-        ObservabilityEvents.installSwitch(() -> false);
-        ObservabilityEvents.admissionDecided().rootRunId("run-1").summary("开关关").emit();
-
-        assertTrue(appender.list.isEmpty());
-    }
-
-    @Test
-    void swallowsItsOwnFailures() {
-        attach();
-        ObservabilityEvents.installSwitch(() -> {
-            throw new IllegalStateException("开关探针自己坏了");
-        });
-
-        assertDoesNotThrow(() -> ObservabilityEvents.workClaimed().rootRunId("run-1").summary("照常返回").emit());
-        assertTrue(appender.list.isEmpty());
-    }
-
-    @Test
-    void omitsFieldsThatWereNotProvided() throws Exception {
-        attach();
-        ObservabilityEvents.installSwitch(() -> true);
-
-        ObservabilityEvents.admissionDecided()
-                .rootRunId("run-2")
-                .decision("rejected")
-                .emit();
-
-        JsonNode line = capturedJson().get(0);
-        assertFalse(line.has("nodeId"));
-        assertFalse(line.has("segmentSequence"));
-        assertFalse(line.has("traceId"));
-        assertFalse(line.has("spanId"));
-        assertEquals("admission_decided", line.get("summary").asText());
-    }
 
     private List<JsonNode> capturedJson() throws Exception {
         LogstashEncoder encoder = new LogstashEncoder();

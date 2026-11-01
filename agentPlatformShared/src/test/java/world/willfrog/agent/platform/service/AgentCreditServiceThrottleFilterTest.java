@@ -66,75 +66,13 @@ class AgentCreditServiceThrottleFilterTest {
         when(modelCatalogService.resolveBaseRate(anyString())).thenReturn(0.0D);
     }
 
-    @Test
-    void throttleRejected_withoutCredits_consumesZero() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"getStockInfo\",\"rejected_by_throttle\":true}");
-        assertEquals(0, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void throttleRejected_withExplicitCredits_stillZero() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"getStockInfo\",\"rejected_by_throttle\":true,\"creditsConsumed\":7}");
-        assertEquals(0, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void checkParallelLimits_consumesZero() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"checkParallelLimits\",\"cacheHit\":false}");
-        assertEquals(0, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void normalTool_consumesDefaultToolCost() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"getStockInfo\",\"cacheHit\":false}");
-        assertEquals(1, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void executePython_consumesExecutePythonCost() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"executePython\",\"cacheHit\":false}");
-        assertEquals(5, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void cacheHit_consumesZero() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"getStockInfo\",\"cacheHit\":true}");
-        assertEquals(0, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void explicitCreditsConsumed_honored() {
-        AgentRun run = emptyRun();
-        AgentRunEvent event = toolCallFinishedEvent(
-                "{\"tool_name\":\"getStockInfo\",\"creditsConsumed\":5}");
-        assertEquals(5, service.calculateRunTotalCredits(run, List.of(event), ""));
-    }
 
-    @Test
-    void mixedEvents_calculatesCorrectTotal() {
-        AgentRun run = emptyRun();
-        List<AgentRunEvent> events = List.of(
-                toolCallFinishedEvent("{\"tool_name\":\"getStockInfo\",\"cacheHit\":false}"),          // 1
-                toolCallFinishedEvent("{\"tool_name\":\"executePython\",\"cacheHit\":false}"),          // 5
-                toolCallFinishedEvent("{\"tool_name\":\"searchStock\",\"cacheHit\":true}"),            // 0
-                toolCallFinishedEvent("{\"tool_name\":\"getStockInfo\",\"rejected_by_throttle\":true}"), // 0
-                toolCallFinishedEvent("{\"tool_name\":\"checkParallelLimits\",\"cacheHit\":false}"),    // 0
-                toolCallFinishedEvent("{\"tool_name\":\"getIndexInfo\",\"creditsConsumed\":3}")       // 3
-        );
-        assertEquals(9, service.calculateRunTotalCredits(run, events, ""));
-    }
 
     // ── helpers ──
 

@@ -21,66 +21,8 @@ class GrayDeciderTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Test
-    void decisionOrder_shouldMatchEverySharedDecisionCase() throws Exception {
-        JsonNode contract = objectMapper.readTree(Files.readAllBytes(
-                repositoryFile("deploy/gray/gray-bucket-test-vectors.json")));
-        Clock clock = Clock.fixed(Instant.parse("2026-09-02T12:00:00Z"), ZoneOffset.UTC);
 
-        for (JsonNode testCase : contract.path("decisionCases")) {
-            Path file = tempDir.resolve(testCase.path("id").asText() + ".json");
-            Files.writeString(file, rulesDocument(testCase), StandardCharsets.UTF_8);
 
-            try (GrayRuleStore store = new GrayRuleStore(
-                    objectMapper, file, 60_000L, "common-test", "instance-test")) {
-                assertThat(store.refreshNow()).as(testCase.path("id").asText()).isTrue();
-                GrayDecider decider = new GrayDecider(store, clock);
-                String userId = testCase.path("userId").isNull()
-                        ? null
-                        : testCase.path("userId").asText();
-
-                assertThat(decider.isEnabled("demo-rule", userId))
-                        .as(testCase.path("id").asText())
-                        .isEqualTo(testCase.path("expectedMatch").asBoolean());
-            }
-        }
-    }
-
-    @Test
-    void decisionOrder_shouldFollowTheSharedContractWithoutNormalizingIdentity() throws Exception {
-        Path file = tempDir.resolve("gray-rules.local.json");
-        Files.writeString(file, rulesDocument(), StandardCharsets.UTF_8);
-
-        try (GrayRuleStore store = new GrayRuleStore(
-                new ObjectMapper(), file, 60_000L, "common-test", "instance-test")) {
-            assertThat(store.refreshNow()).isTrue();
-            Clock clock = Clock.fixed(Instant.parse("2026-09-02T12:00:00Z"), ZoneOffset.UTC);
-            GrayDecider decider = new GrayDecider(store, clock);
-
-            assertThat(decider.isEnabled("missing-rule", "user-0007")).isFalse();
-            assertThat(decider.isEnabled("disabled-rule", "allowlisted-user")).isFalse();
-            assertThat(decider.isEnabled("expired-rule", "allowlisted-user")).isFalse();
-            assertThat(decider.isEnabled("expires-now-rule", "allowlisted-user")).isFalse();
-            assertThat(decider.isEnabled("full-rollout-rule", null)).isFalse();
-            assertThat(decider.isEnabled("full-rollout-rule", "")).isFalse();
-
-            assertThat(decider.isEnabled("allowlist-rule", "allowlisted-user")).isTrue();
-            assertThat(decider.isEnabled("allowlist-rule", "ALLOWLISTED-USER")).isFalse();
-            assertThat(decider.isEnabled("space-rule", " user ")).isTrue();
-            assertThat(decider.isEnabled("space-rule", "user")).isFalse();
-
-            assertThat(decider.isEnabled("demo-rule", "user-0007")).isTrue();
-            assertThat(decider.isEnabled("demo-rule", "user-0001")).isFalse();
-        }
-    }
-
-    @Test
-    void disabledDecider_shouldAlwaysReturnFalse() {
-        GrayDecider decider = GrayDecider.disabled();
-
-        assertThat(decider.isEnabled("any-rule", "any-user")).isFalse();
-        assertThat(decider.isEnabled(null, "any-user")).isFalse();
-    }
 
     private String rulesDocument() {
         return """

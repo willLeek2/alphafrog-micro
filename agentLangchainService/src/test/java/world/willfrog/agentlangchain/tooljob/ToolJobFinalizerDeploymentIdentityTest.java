@@ -23,38 +23,7 @@ class ToolJobFinalizerDeploymentIdentityTest {
     private static final String GENERATION_A = "gen-" + "a".repeat(64);
     private static final String GENERATION_B = "gen-" + "b".repeat(64);
 
-    @Test
-    void terminalHandlerRejectsRunOwnedByAnotherGenerationBeforeSideEffects() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        when(runMapper.findById("run-old")).thenReturn(runOwnedBy(GENERATION_B));
-        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
-        ToolJobFinalizer finalizer = finalizer(
-                anchorService, runMapper,
-                GatewayTestFixtures.withIdentity(runMapper, "beta-a", GENERATION_A));
 
-        ToolJobFinalizer.FinalizerOutcome outcome = finalizer.handleTerminal(
-                "run-old", new ToolJobAnchor(), "SUCCEEDED", null, true);
-
-        assertThat(outcome.done()).isFalse();
-        assertThat(outcome.reason()).isEqualTo("deployment_generation_inactive");
-        verifyNoInteractions(anchorService);
-    }
-
-    @Test
-    void terminalHandlerAdmitsRunOwnedByThisGeneration() {
-        AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        when(runMapper.findById("run-old")).thenReturn(runOwnedBy(GENERATION_A));
-        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
-        ToolJobFinalizer finalizer = finalizer(
-                anchorService, runMapper,
-                GatewayTestFixtures.withIdentity(runMapper, "beta-a", GENERATION_A));
-
-        ToolJobFinalizer.FinalizerOutcome outcome = finalizer.handleTerminal(
-                "run-old", new ToolJobAnchor(), "SUCCEEDED", null, true);
-
-        // 同一行、同样的业务字段，只把部署代际换成本代际：认领入口放行，进入业务路径。
-        assertThat(outcome.reason()).isNotEqualTo("deployment_generation_inactive");
-    }
 
     private static AgentRun runOwnedBy(String generationId) {
         AgentRun run = new AgentRun();

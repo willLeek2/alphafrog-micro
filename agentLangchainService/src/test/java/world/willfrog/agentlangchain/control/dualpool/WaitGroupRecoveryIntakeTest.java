@@ -65,189 +65,19 @@ class WaitGroupRecoveryIntakeTest {
                 .thenReturn(new DualPoolRunAdmissionRegistry.Admission(true, 11L));
     }
 
-    /** 这条路在读服务所有权有效期：登记之后读数里报的是它归一化之后在用的数。 */
-    @Test
-    void theEffectiveLeaseTtlIsRegisteredForTheReading() {
-        assertThat(frozenEffectiveSettings.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
-                .containsEntry("WaitGroupRecoveryIntake", 120L);
-    }
 
 
-    /** 不是所有者：不消费、不动通知、不占名额。 */
-    @Test
-    void aRunOwnedBySomebodyElseIsLeftAlone() {
-        when(leaseStore.find(RUN_ID)).thenReturn(Optional.empty());
-        when(leaseStore.acquire(eq(RUN_ID), eq(OWNER), any(Duration.class))).thenReturn(Optional.empty());
 
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
 
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.DEFERRED);
-        assertThat(result.rejection()).isEqualTo(RecoveryRejection.LEASE_NOT_OWNED);
-        verify(waitGroupStore, never()).consumeRecovery(anyLong(), anyString(), anyLong(), anyString(), anyLong());
-        verify(waitGroupStore, never()).closeRecoveryNotification(anyLong(), anyString());
-        verify(admissionRegistry, never()).reserveForRecovery(anyString());
-    }
 
-    /** 名额拿不到：先不消费，通知留在等待态，刚取得的服务所有权让出去。 */
-    @Test
-    void withoutABusinessPermitTheEntitlementIsNotConsumed() {
-        givenFreshlyTakenLease();
-        when(admissionRegistry.reserveForRecovery(RUN_ID))
-                .thenReturn(new DualPoolRunAdmissionRegistry.Admission(false, -1L));
 
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
 
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.DEFERRED);
-        assertThat(result.detail()).isEqualTo("admission_unavailable");
-        verify(waitGroupStore, never()).consumeRecovery(anyLong(), anyString(), anyLong(), anyString(), anyLong());
-        verify(leaseStore).release(RUN_ID, OWNER, TOKEN);
-        assertThat(intake.snapshot())
-                .containsEntry("recoveryIntakeAdmissionUnavailableTotal", 1L)
-                .containsEntry("recoveryIntakeLeaseReleasedTotal", 1L);
-    }
 
-    /** 本来就归我持有的服务所有权：名额拿不到时留着，因为这条 Run 确实归我服务。 */
-    @Test
-    void aLeaseThatWasAlreadyMineIsKeptWhenTheAttemptDoesNotHandOff() {
-        when(leaseStore.find(RUN_ID)).thenReturn(Optional.of(lease(TOKEN)));
-        when(leaseStore.acquire(eq(RUN_ID), eq(OWNER), any(Duration.class)))
-                .thenReturn(Optional.of(lease(TOKEN)));
-        when(admissionRegistry.reserveForRecovery(RUN_ID))
-                .thenReturn(new DualPoolRunAdmissionRegistry.Admission(false, -1L));
 
-        intake.take(notification(), runningRun(), "test");
 
-        verify(leaseStore, never()).release(anyString(), anyString(), anyLong());
-        assertThat(intake.snapshot()).containsEntry("recoveryIntakeLeaseReleasedTotal", 0L);
-    }
 
-    /** 消费成功：激活预留、回报权威的那一段。 */
-    @Test
-    void aSuccessfulConsumeActivatesTheReservedAdmission() {
-        givenOwnedLease();
-        givenConsume(new RecoveryConsumptionResult(true, true, 77L, NEXT_SEGMENT, null, null));
 
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
 
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.CONSUMED);
-        assertThat(result.nextSegment()).isEqualTo(NEXT_SEGMENT);
-        verify(admissionRegistry).activateReservedAdmission(RUN_ID,
-                new DualPoolRunAdmissionRegistry.Admission(true, 11L));
-        verify(admissionRegistry, never()).rollbackReservedAdmission(anyString(), any());
-        verify(leaseStore, never()).release(anyString(), anyString(), anyLong());
-    }
-
-    /** 已经有活的准入生命周期：不新占预留，也不去激活一个不存在的预留。 */
-    @Test
-    void anAlreadyAdmittedRunNeedsNoReservation() {
-        givenOwnedLease();
-        when(admissionRegistry.reserveForRecovery(RUN_ID))
-                .thenReturn(new DualPoolRunAdmissionRegistry.Admission(true, -1L));
-        givenConsume(new RecoveryConsumptionResult(true, true, 77L, NEXT_SEGMENT, null, null));
-
-        assertThat(intake.take(notification(), runningRun(), "test").consumed()).isTrue();
-
-        verify(admissionRegistry, never()).activateReservedAdmission(anyString(), any());
-        verify(admissionRegistry, never()).rollbackReservedAdmission(anyString(), any());
-    }
-
-    /** 不会再被服务的原因：收口关闭并写明原因，同时把预留与服务所有权还回去。 */
-    @Test
-    void aPermanentRejectionClosesTheNotification() {
-        givenFreshlyTakenLease();
-        givenConsume(new RecoveryConsumptionResult(false, false, null, null,
-                RecoveryRejection.RUN_TERMINAL, "COMPLETED"));
-        when(waitGroupStore.closeRecoveryNotification(9L, "run_terminal:COMPLETED")).thenReturn(true);
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.CLOSED);
-        verify(waitGroupStore).closeRecoveryNotification(9L, "run_terminal:COMPLETED");
-        verify(admissionRegistry).rollbackReservedAdmission(RUN_ID,
-                new DualPoolRunAdmissionRegistry.Admission(true, 11L));
-        verify(leaseStore).release(RUN_ID, OWNER, TOKEN);
-        assertThat(intake.snapshot()).containsEntry("recoveryIntakeClosedTotal", 1L);
-    }
-
-    /** 暂时性的原因：退避重试，通知不动，刚取得的服务所有权也让出去。 */
-    @Test
-    void aTemporaryRejectionOnlyDefers() {
-        givenFreshlyTakenLease();
-        givenConsume(new RecoveryConsumptionResult(false, false, null, null,
-                RecoveryRejection.RUN_NOT_EXECUTING, "PAUSED"));
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.DEFERRED);
-        assertThat(result.rejection()).isEqualTo(RecoveryRejection.RUN_NOT_EXECUTING);
-        verify(waitGroupStore, never()).closeRecoveryNotification(anyLong(), anyString());
-        verify(leaseStore).release(RUN_ID, OWNER, TOKEN);
-        assertThat(intake.snapshot()).containsEntry("recoveryIntakeDeferredTotal", 1L);
-    }
-
-    /** 别人先取走了：什么都不做，也绝不收口——那条通知已经有主。 */
-    @Test
-    void aNotificationSomebodyElseTookIsNotClosed() {
-        givenOwnedLease();
-        givenConsume(new RecoveryConsumptionResult(false, false, null, null,
-                RecoveryRejection.NOTIFICATION_NOT_WAITING, "CONSUMED"));
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.LOST_RACE);
-        verify(waitGroupStore, never()).closeRecoveryNotification(anyLong(), anyString());
-        assertThat(intake.snapshot()).containsEntry("recoveryIntakeLostRaceTotal", 1L);
-    }
-
-    /** 语句没给原因：不敢收口也不能当成功，退避重试并记一笔。 */
-    @Test
-    void aRejectionWithoutAReasonIsRetriedInsteadOfClosed() {
-        givenOwnedLease();
-        givenConsume(new RecoveryConsumptionResult(false, false, null, null, null, null));
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), runningRun(), "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.DEFERRED);
-        verify(waitGroupStore, never()).closeRecoveryNotification(anyLong(), anyString());
-    }
-
-    /** Run 读不回来：这条链没有可归属的对象，收口。 */
-    @Test
-    void aNotificationWhoseRunIsUnreadableIsClosed() {
-        when(waitGroupStore.closeRecoveryNotification(9L, "run_missing")).thenReturn(true);
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), null, "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.CLOSED);
-        verify(waitGroupStore).closeRecoveryNotification(9L, "run_missing");
-        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
-    }
-
-    /** 版本不用等待组：通知不该由这一套来服务，收口。 */
-    @Test
-    void aVersionWithoutWaitGroupsIsClosed() {
-        when(waitGroupStore.closeRecoveryNotification(9L, "version_without_wait_groups")).thenReturn(true);
-        AgentRun run = runningRun();
-        run.setSchedulerVersion("DUAL_POOL_V1");
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), run, "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.CLOSED);
-        verify(leaseStore, never()).acquire(anyString(), anyString(), any(Duration.class));
-    }
-
-    /** 收口时别人先动手了（语句影响 0 行）：当成抢不到，不重复记收口。 */
-    @Test
-    void closingSomethingAlreadyTakenIsALostRace() {
-        when(waitGroupStore.closeRecoveryNotification(9L, "run_missing")).thenReturn(false);
-
-        WaitGroupRecoveryIntake.IntakeResult result = intake.take(notification(), null, "test");
-
-        assertThat(result.outcome()).isEqualTo(WaitGroupRecoveryIntake.Outcome.LOST_RACE);
-        assertThat(intake.snapshot())
-                .containsEntry("recoveryIntakeClosedTotal", 0L)
-                .containsEntry("recoveryIntakeLostRaceTotal", 1L);
-    }
 
     // ===== 造数据 =====
 

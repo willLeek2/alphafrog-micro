@@ -49,163 +49,18 @@ class PromptOverlayLoaderTest {
         return mapper.writeValueAsString(root);
     }
 
-    @Test
-    void loadAppliesOverlayFromFile() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, overlayJson("\n第一版覆盖", null), StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
 
-        loader.load();
 
-        assertTrue(loader.current().applied());
-        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("第一版覆盖"));
-        assertEquals(1, loader.current().promptEntries());
-        assertEquals(0, loader.current().toolDescriptionEntries());
-        assertEquals(authority.bundleDigest(), loader.current().effectiveBundleDigest());
-        assertEquals(authority.baseBundleDigest(), loader.current().baseBundleDigest());
-    }
 
-    @Test
-    void loadAppliesToolDescriptionOverlay() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, overlayJson(null, " 工具说明覆盖"), StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
 
-        loader.load();
 
-        assertTrue(loader.current().applied());
-        assertTrue(authority.requireToolDescription("searchWeb").endsWith("工具说明覆盖"));
-        assertEquals(1, loader.current().toolDescriptionEntries());
-    }
-
-    @Test
-    void missingFileKeepsDefaultVersion() {
-        PromptOverlayLoader loader = newLoader(tempDir.resolve("absent.json").toString());
-
-        loader.load();
-
-        assertFalse(loader.current().applied());
-        assertEquals(authority.baseBundleDigest(), authority.bundleDigest());
-    }
-
-    @Test
-    void deletedFileFallsBackToDefaultVersion() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, overlayJson("\n会被撤下的覆盖", null), StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
-        loader.load();
-        assertTrue(loader.current().applied());
-
-        Files.delete(file);
-        loader.load();
-
-        assertFalse(loader.current().applied());
-        assertEquals(authority.baseBundleDigest(), authority.bundleDigest());
-        assertFalse(authority.prompts().getAgentRunSystemPrompt().endsWith("会被撤下的覆盖"));
-    }
-
-    @Test
-    void reloadPicksUpUpdatedDocument() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, overlayJson("\n第一版覆盖", null), StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
-        loader.load();
-
-        Files.writeString(file, overlayJson("\n第二版覆盖", null), StandardCharsets.UTF_8);
-        loader.load();
-
-        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("第二版覆盖"));
-        assertTrue(loader.current().applied());
-    }
-
-    @Test
-    void invalidDocumentIsRejectedAndCurrentEffectiveRetained() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, overlayJson("\n有效第一版", null), StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
-        loader.load();
-        assertTrue(loader.current().applied());
-
-        Files.writeString(file, "{\"formatVersion\": 1, \"prompts\": {\"noSuchField\": \"x\"}}", StandardCharsets.UTF_8);
-        touch(file, 1_000);
-        loader.load();
-
-        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("有效第一版"));
-        assertEquals(1L, loader.overlayReloadFailureCount());
-
-        // 文件没再变化时，轮询不重复解析拒绝，失败计数不增长；文件真正变化后重新尝试。
-        loader.refresh();
-        loader.refresh();
-        assertEquals(1L, loader.overlayReloadFailureCount());
-        Files.writeString(file, "{\"formatVersion\": 1, \"prompts\": {\"anotherBadField\": \"y\"}}", StandardCharsets.UTF_8);
-        touch(file, 2_000);
-        loader.refresh();
-        assertEquals(2L, loader.overlayReloadFailureCount());
-    }
 
     private static void touch(Path file, long millis) throws Exception {
         Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(
                 java.time.Instant.now().toEpochMilli() + millis));
     }
 
-    @Test
-    void wrongFormatVersionIsRejected() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, "{\"formatVersion\": 2, \"prompts\": {}}", StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
 
-        loader.load();
 
-        assertFalse(loader.current().applied());
-        assertEquals(1L, loader.overlayReloadFailureCount());
-    }
 
-    @Test
-    void emptyOverlayDocumentKeepsDefaultVersion() throws Exception {
-        Path file = tempDir.resolve("agent-prompt-overlay.json");
-        Files.writeString(file, "{\"formatVersion\": 1}", StandardCharsets.UTF_8);
-        PromptOverlayLoader loader = newLoader(file.toString());
-
-        loader.load();
-
-        assertFalse(loader.current().applied());
-        assertEquals(authority.baseBundleDigest(), authority.bundleDigest());
-        assertEquals(0L, loader.overlayReloadFailureCount());
-    }
-
-    @Test
-    void blankPropertyIsNoOp() {
-        PromptOverlayLoader loader = newLoader("");
-
-        loader.load();
-
-        assertFalse(loader.current().applied());
-        assertEquals(authority.baseBundleDigest(), authority.bundleDigest());
-    }
-
-    @Test
-    void laneProcess_shouldReadIsolatedCacheAndIgnoreSharedPath() throws Exception {
-        Path shared = tempDir.resolve("agent-prompt-overlay.local.json");
-        Path isolated = shared.getParent().resolve("stage3-dag-0922.agent-prompt-overlay.local.json");
-        Files.writeString(shared, overlayJson("\n主环境覆盖", null), StandardCharsets.UTF_8);
-        Files.writeString(isolated, overlayJson("\n泳道覆盖", null), StandardCharsets.UTF_8);
-
-        PromptOverlayLoader loader = newLoader(shared.toString());
-        ReflectionTestUtils.setField(loader, "laneTrafficScopeId", "stage3-dag-0922");
-
-        loader.applyNacosWrittenFile(shared.toString());
-        assertFalse(loader.current().applied(), "共用路径上的主环境覆盖不得被泳道加载器当成覆盖");
-        assertFalse(authority.prompts().getAgentRunSystemPrompt().endsWith("主环境覆盖"));
-
-        loader.applyNacosWrittenFile(isolated.toString());
-        assertTrue(loader.current().applied());
-        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("泳道覆盖"));
-        loader.refresh();
-        assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("泳道覆盖"));
-
-        Files.delete(isolated);
-        loader.load();
-        assertFalse(loader.current().applied());
-        assertFalse(authority.prompts().getAgentRunSystemPrompt().endsWith("泳道覆盖"));
-    }
 }

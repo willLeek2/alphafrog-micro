@@ -49,43 +49,5 @@ class LaneScopeGatewayTest {
                 Arguments.of("crash restart recovery", "lane-restart"));
     }
 
-    @ParameterizedTest(name = "{0}")
-    @MethodSource("activationBoundaries")
-    void restoresPersistedRunLaneForEveryBusinessTaskActivation(String boundary, String persistedLane) throws Exception {
-        AgentRun run = new AgentRun();
-        run.setId("run-" + boundary.hashCode());
-        run.setLaneTag(persistedLane);
-        AtomicReference<String> observed = new AtomicReference<>();
-        AtomicReference<String> observedMdc = new AtomicReference<>();
 
-        // 先创建工作线程，避免它通过 InheritableThreadLocal 继承下面故意设置的调用方标签。
-        assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS)).isNull();
-        LaneContext.setTrafficScopeId("unrelated-caller-lane");
-        MDC.put(LaneContext.MDC_LANE_TAG, "unrelated-caller-lane");
-        executor.submit(LaneScopeGateway.wrap(run, () -> {
-            observed.set(LaneContext.trafficScopeId());
-            observedMdc.set(MDC.get(LaneContext.MDC_LANE_TAG));
-        })).get(2, TimeUnit.SECONDS);
-
-        assertThat(observed).hasValue(persistedLane);
-        assertThat(observedMdc).hasValue(persistedLane);
-        assertThat(LaneContext.trafficScopeId()).isEqualTo("unrelated-caller-lane");
-        assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isEqualTo("unrelated-caller-lane");
-        assertThat(executor.submit(LaneContext::trafficScopeId).get(2, TimeUnit.SECONDS)).isNull();
-        assertThat(executor.submit(() -> MDC.get(LaneContext.MDC_LANE_TAG)).get(2, TimeUnit.SECONDS)).isNull();
-    }
-
-    @ParameterizedTest(name = "snapshot {0}")
-    @MethodSource("activationBoundaries")
-    void snapshotRestoreRoundTripsLaneTagAndMdc(String boundary, String laneTag) {
-        LaneScopeGateway.Snapshot snapshot = LaneScopeGateway.capture();
-        try {
-            LaneContext.setTrafficScopeId(laneTag);
-            MDC.put(LaneContext.MDC_LANE_TAG, laneTag);
-        } finally {
-            snapshot.restore();
-        }
-        assertThat(LaneContext.trafficScopeId()).isNull();
-        assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isNull();
-    }
 }

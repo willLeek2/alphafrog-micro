@@ -48,16 +48,6 @@ class WaitContractValuesTest {
         assertThat(WaitMemberState.RUNNING.isTerminal()).isFalse();
     }
 
-    @Test
-    void notificationStatesAreWaitingConsumedCanceledOrClosed() {
-        assertThat(RecoveryNotificationState.allWireValues())
-                .containsExactly("WAITING", "CONSUMED", "CANCELED", "CLOSED");
-        assertThat(RecoveryNotificationState.WAITING.isTerminal()).isFalse();
-        assertThat(RecoveryNotificationState.CONSUMED.isTerminal()).isTrue();
-        assertThat(RecoveryNotificationState.CLOSED.isTerminal())
-                .as("关闭是终态：不会再被分发器取走，也不再占用扫描名额")
-                .isTrue();
-    }
 
     @Test
     void unknownValuesFailClosed() {

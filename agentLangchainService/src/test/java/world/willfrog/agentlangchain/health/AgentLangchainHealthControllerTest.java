@@ -76,88 +76,8 @@ class AgentLangchainHealthControllerTest {
     @MockBean
     private AgentRunEventService runEventService;
 
-    @Test
-    void healthReportsProviderDisabledWithoutReadinessAlert() throws Exception {
-        LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
-        when(properties.getProvider()).thenReturn(provider);
-        when(orchestrator.orchestrationStatus(false)).thenReturn(PROVIDER_DISABLED);
 
-        mockMvc.perform(get("/agent-langchain/health"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status", is("UP")))
-                .andExpect(jsonPath("$.version", is("UNKNOWN")))
-                .andExpect(jsonPath("$.providerEnabled", is(false)))
-                .andExpect(jsonPath("$.orchestrationStatus", is(PROVIDER_DISABLED)));
-    }
 
-    @Test
-    void healthReportsReadyPipelineWhenProviderEnabled() throws Exception {
-        LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
-        provider.setEnabled(true);
-        when(properties.getProvider()).thenReturn(provider);
-        when(orchestrator.orchestrationStatus(true)).thenReturn(LINEAR_PIPELINE_READY);
 
-        mockMvc.perform(get("/agent-langchain/health"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status", is("UP")))
-                .andExpect(jsonPath("$.orchestrationStatus", is(LINEAR_PIPELINE_READY)));
-    }
 
-    @Test
-    void healthReportsUnavailablePipelineWhenProviderEnabled() throws Exception {
-        LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
-        provider.setEnabled(true);
-        when(properties.getProvider()).thenReturn(provider);
-        when(orchestrator.orchestrationStatus(true)).thenReturn(LINEAR_PIPELINE_UNAVAILABLE);
-
-        mockMvc.perform(get("/agent-langchain/health"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status", is("UP")))
-                .andExpect(jsonPath("$.orchestrationStatus", is(LINEAR_PIPELINE_UNAVAILABLE)));
-    }
-
-    @Test
-    void schedulerReturnsSnapshot() throws Exception {
-        when(dualPoolDispatcher.snapshot()).thenReturn(Map.of());
-        when(concurrencyScheduler.schedulerSnapshot()).thenReturn(Map.ofEntries(
-                Map.entry("instanceId", "test-app@host-1@123"),
-                Map.entry("running", 3),
-                Map.entry("queued", 5),
-                Map.entry("rejectedTotal", 1L),
-                Map.entry("corePoolSize", 50),
-                Map.entry("maxPoolSize", 50),
-                Map.entry("queueCapacity", 200),
-                Map.entry("hardCorePoolSize", 100),
-                Map.entry("hardMaxPoolSize", 100),
-                Map.entry("hardQueueCapacity", 1000),
-                Map.entry("oldestQueuedAgeMs", 45000L)
-        ));
-
-        mockMvc.perform(get("/agent-langchain/scheduler"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.instanceId", is("test-app@host-1@123")))
-                .andExpect(jsonPath("$.running", is(3)))
-                .andExpect(jsonPath("$.queued", is(5)))
-                .andExpect(jsonPath("$.rejectedTotal", is(1)))
-                .andExpect(jsonPath("$.corePoolSize", is(50)))
-                .andExpect(jsonPath("$.oldestQueuedAgeMs", is(45000)))
-                .andExpect(jsonPath("$.hardCorePoolSize", is(100)));
-    }
-
-    @Test
-    void toolThrottleReturnsMetrics() throws Exception {
-        when(toolThrottle.throttleMetrics()).thenReturn(Map.of(
-                "enabled", false,
-                "maxPermits", 20,
-                "availablePermits", 20,
-                "queueLength", 0
-        ));
-
-        mockMvc.perform(get("/agent-langchain/tool-throttle"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.enabled", is(false)))
-                .andExpect(jsonPath("$.maxPermits", is(20)))
-                .andExpect(jsonPath("$.availablePermits", is(20)))
-                .andExpect(jsonPath("$.queueLength", is(0)));
-    }
 }

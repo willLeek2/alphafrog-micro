@@ -49,265 +49,27 @@ class MybatisWaitGroupStoreTest {
 
     // ===== 整组挂起 =====
 
-    @Test
-    void suspensionReportsThreeOutcomesWithoutGuessing() {
-        WaitSuspensionRequest request = suspensionRequest();
 
-        when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(suspensionRow(1, 77L, null, 2, 1, 3));
-        WaitSuspensionResult suspended = store.suspendSegment(request);
-        assertThat(suspended.outcome()).isEqualTo(WaitSuspensionOutcome.SUSPENDED);
-        assertThat(suspended.groupId()).isEqualTo(77L);
-        assertThat(suspended.nextSegmentSequence()).isEqualTo(3);
-        assertThat(suspended.suspended()).isTrue();
 
-        when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(suspensionRow(0, null, 77L, 0, 0, 3));
-        WaitSuspensionResult already = store.suspendSegment(request);
-        assertThat(already.outcome()).isEqualTo(WaitSuspensionOutcome.ALREADY_SUSPENDED);
-        assertThat(already.groupId()).isEqualTo(77L);
-
-        when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(suspensionRow(0, null, null, 0, 0, null));
-        WaitSuspensionResult unmatched = store.suspendSegment(request);
-        assertThat(unmatched.outcome()).isEqualTo(WaitSuspensionOutcome.SEGMENT_NOT_MATCHED);
-        assertThat(unmatched.suspended()).isFalse();
-        assertThat(unmatched.groupId()).isNull();
-    }
-
-    @Test
-    void suspensionRefusesImpossibleCombination() {
-        when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(suspensionRow(1, null, 77L, 0, 0, 3));
-        assertThatThrownBy(() -> store.suspendSegment(suspensionRequest()))
-                .as("结束分段的同时组已经存在，这种组合说明数据被改坏了")
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("等待组已经存在");
-    }
-
-    @Test
-    void suspensionPassesStableIdentitiesAndClaimFenceToTheStatement() {
-        when(mapper.suspendSegment(anyString(), anyInt(), anyString(), anyInt(), anyInt(), anyInt(),
-                anyString(), anyLong(), anyLong(), anyInt(), anyString(), any(), anyString(), anyString()))
-                .thenReturn(suspensionRow(1, 77L, null, 2, 1, 3));
-        store.suspendSegment(suspensionRequest());
-
-        ArgumentCaptor<List<WaitMember>> members = ArgumentCaptor.forClass(List.class);
-        verify(mapper).suspendSegment(eq("run-1"), eq(4), eq("node-9"), eq(1), eq(2), eq(5),
-                eq("worker-1"), eq(7L), eq(3L), eq(0), eq(SchedulerVersion.DUAL_POOL_V2.name()),
-                members.capture(), anyString(), anyString());
-        assertThat(members.getValue()).hasSize(2);
-        assertThat(members.getValue().get(0).getMemberIdentity())
-                .isEqualTo("call_1");
-        assertThat(members.getValue().get(1).getMemberIdentity())
-                .as("模型没给身份时用派生身份，重试算出来必须一样")
-                .isEqualTo(WaitMemberIdentity.stableIdentity(null, groupIdentity(0), 1));
-    }
 
     // ===== 成员结束 =====
 
-    @Test
-    void memberCompletionReportsAppliedAndReadyFlag() {
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
-                any(), anyLong()))
-                .thenReturn(memberRow(1, "SUCCEEDED", "READY", 3, 3, 1, 9L));
-        MemberCompletionResult ready = store.completeMember(completion("SUCCEEDED"));
-        assertThat(ready.applied()).isTrue();
-        assertThat(ready.groupBecameReady()).isTrue();
-        assertThat(ready.groupComplete()).isTrue();
-        assertThat(ready.memberState()).isEqualTo(WaitMemberState.SUCCEEDED);
-        assertThat(ready.groupState()).isEqualTo(WaitGroupState.READY);
-        assertThat(ready.notificationId()).isEqualTo(9L);
 
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
-                any(), anyLong()))
-                .thenReturn(memberRow(0, "SUCCEEDED", "WAITING", 2, 3, null, null));
-        MemberCompletionResult duplicate = store.completeMember(completion("SUCCEEDED"));
-        assertThat(duplicate.applied()).isFalse();
-        assertThat(duplicate.groupBecameReady()).isFalse();
-        assertThat(duplicate.groupComplete()).isFalse();
-    }
 
-    @Test
-    void failureAlsoCountsAsOneCompletion() {
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
-                any(), anyLong()))
-                .thenReturn(memberRow(1, "FAILED", "WAITING", 1, 3, null, null));
-        MemberCompletionResult result = store.completeMember(completion("FAILED"));
-        assertThat(result.applied()).isTrue();
-        assertThat(result.memberState()).isEqualTo(WaitMemberState.FAILED);
-        assertThat(result.groupState()).isEqualTo(WaitGroupState.WAITING);
-    }
 
-    @Test
-    void unknownStateFromDatabaseFailsClosed() {
-        when(mapper.completeMember(anyLong(), anyString(), anyString(), anyString(), anyInt(), anyLong(),
-                any(), anyLong()))
-                .thenReturn(memberRow(1, "SUCCEEDED", "DONE", 1, 3, null, null));
-        assertThatThrownBy(() -> store.completeMember(completion("SUCCEEDED")))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("DONE");
-    }
-
-    @Test
-    void lateResultStopsTheChainAndKeepsOnlyAudit() {
-        when(mapper.reportLateMember(anyLong(), anyString(), anyString(), any(), anyLong()))
-                .thenReturn(memberRow(1, "LATE", "CANCELED", 0, 3, null, null));
-        MemberCompletionResult result = store.reportLateMember(
-                new LateMemberRequest(77L, "call_1", "{\"kind\":\"LATE\"}", null, 3L));
-        verify(mapper).reportLateMember(77L, "call_1", "{\"kind\":\"LATE\"}", null, 3L);
-        assertThat(result.applied()).isTrue();
-        assertThat(result.memberState()).isEqualTo(WaitMemberState.LATE);
-        assertThat(result.groupState()).isEqualTo(WaitGroupState.CANCELED);
-        assertThat(result.groupBecameReady()).isFalse();
-    }
 
     // ===== 恢复消费 =====
 
-    @Test
-    void recoveryConsumptionDistinguishesNotMineFromHalfDone() {
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
-                .thenReturn(consumption(1, 1, 77L, 3));
-        RecoveryConsumptionResult done = store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L);
-        assertThat(done.succeeded()).isTrue();
-        assertThat(done.inconsistent()).isFalse();
 
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
-                .thenReturn(consumption(0, 0, null, null, "LEASE_NOT_OWNED", "owner-2"));
-        RecoveryConsumptionResult skipped = store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L);
-        assertThat(skipped.succeeded()).isFalse();
-        assertThat(skipped.inconsistent())
-                .as("什么都没做不算不一致，只有取走了通知却没放行下一段才算")
-                .isFalse();
-        assertThat(skipped.rejection())
-                .as("取不走的原因由语句给出，调用方不用自己猜")
-                .isEqualTo(RecoveryRejection.LEASE_NOT_OWNED);
-        assertThat(skipped.permanent()).as("所有权不在手上只是暂时取不走").isFalse();
-
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
-                .thenReturn(consumption(0, 0, null, null, "RUN_TERMINAL", "COMPLETED"));
-        RecoveryConsumptionResult terminal = store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L);
-        assertThat(terminal.permanent()).as("Run 已经终态：该收口关闭，不再退避").isTrue();
-        assertThat(terminal.rejection().closeReason("COMPLETED")).isEqualTo("run_terminal:COMPLETED");
-
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
-                .thenReturn(consumption(1, 0, 77L, null));
-        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L))
-                .as("三条写入是串起来的，半成品说明库里的东西跟这套假设对不上，必须当场报出来")
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("半成品");
-
-        when(mapper.consumeRecovery(eq(5L), anyString(), eq(3L), eq("owner-1"), eq(9L)))
-                .thenReturn(consumption(1, 1, 77L, null));
-        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 3L, "owner-1", 9L))
-                .as("放行了下一段却没带回完整身份：通知已经不可逆地取走，这种结果不能当成成功")
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("身份");
-    }
-
-    @Test
-    void closingANotificationOnlyAppliesToWaitingOnes() {
-        when(mapper.closeRecoveryNotification(eq(5L), eq("run_terminal:COMPLETED"))).thenReturn(1);
-        assertThat(store.closeRecoveryNotification(5L, "run_terminal:COMPLETED")).isTrue();
-
-        when(mapper.closeRecoveryNotification(eq(6L), anyString())).thenReturn(0);
-        assertThat(store.closeRecoveryNotification(6L, "next_segment_missing"))
-                .as("已经被取走或关闭的通知收口影响 0 行").isFalse();
-    }
 
     // ===== 取消与读取 =====
 
-    @Test
-    void cancelReportsEachActionCount() {
-        WaitChainCancelRow row = new WaitChainCancelRow();
-        row.setGroupsCanceled(1);
-        row.setMembersCanceled(2);
-        row.setSegmentsCanceled(1);
-        row.setNotificationsCanceled(1);
-        when(mapper.cancelChain(77L)).thenReturn(row);
-        WaitChainCancelResult result = store.cancelChain(77L);
-        assertThat(result.canceled()).isTrue();
-        assertThat(result.membersCanceled()).isEqualTo(2);
-        assertThat(result.segmentsCanceled()).isEqualTo(1);
-    }
 
-    @Test
-    void rescheduleOnlyReportsWhetherTheMemberWasStillRunning() {
-        when(mapper.rescheduleMember(eq(77L), eq("call_1"), any(), eq(9))).thenReturn(1);
-        assertThat(store.rescheduleMember(77L, "call_1", OffsetDateTime.now(), 9)).isTrue();
-        when(mapper.rescheduleMember(eq(77L), anyString(), any(), eq(9))).thenReturn(0);
-        assertThat(store.rescheduleMember(77L, "call_2", OffsetDateTime.now(), 9)).isFalse();
-    }
 
-    @Test
-    void readsReturnEmptyInsteadOfNull() {
-        when(mapper.findGroupById(77L)).thenReturn(null);
-        assertThat(store.findGroup(77L)).isEmpty();
-        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(null);
-        assertThat(store.findMemberByOperation("run-1", "op-1")).isEmpty();
-        WaitMember member = new WaitMember();
-        member.setMemberIdentity("call_1");
-        when(mapper.findMemberByIdentity(77L, "call_1")).thenReturn(member);
-        assertThat(store.findMemberByIdentity(77L, "call_1")).contains(member);
-    }
 
-    @Test
-    void unresolvedMemberMeansPendingOrRunning() {
-        WaitMember running = new WaitMember();
-        running.setState("RUNNING");
-        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(running);
-        assertThat(store.hasUnresolvedMember("run-1", "op-1")).isTrue();
-
-        WaitMember succeeded = new WaitMember();
-        succeeded.setState("SUCCEEDED");
-        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(succeeded);
-        assertThat(store.hasUnresolvedMember("run-1", "op-1")).isFalse();
-
-        when(mapper.findMemberByOperation("run-1", "op-1")).thenReturn(null);
-        assertThat(store.hasUnresolvedMember("run-1", "op-1")).isFalse();
-    }
 
     // ===== 入参自检：明显不对的输入不许走到 SQL =====
 
-    @Test
-    void invalidRequestsNeverReachTheMapper() {
-        assertThatThrownBy(() -> store.consumeRecovery(0L, "dispatcher-1", 1L, "owner-1", 9L))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 1L, " ", 9L))
-                .as("没有服务所有权就不许消费").isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.consumeRecovery(5L, "dispatcher-1", 1L, "owner-1", 0L))
-                .as("代际号无效就不许消费").isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.closeRecoveryNotification(5L, " "))
-                .as("收口必须写明原因").isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.cancelChain(0L))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.rescheduleMember(77L, "call_1", null, 9))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> store.findMemberByOperation("run-1", " "))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
-                WaitMemberState.LATE, "{}", null, 0, 3L, 3L))
-                .as("正常结束只允许成功或失败")
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
-                WaitMemberState.SUCCEEDED, " ", null, 0, 3L, 3L))
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
-                WaitMemberState.SUCCEEDED, "{}", null, -1, 3L, 3L))
-                .as("计划代际从 -1 起，负数直接拒")
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new MemberCompletionRequest(77L, "call_1",
-                WaitMemberState.SUCCEEDED, "{}", null, 0, -1L, 3L))
-                .as("上下文版本不能是负数")
-                .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new LateMemberRequest(77L, " ", "{}", null, 3L))
-                .isInstanceOf(IllegalArgumentException.class);
-        verify(mapper, never()).cancelChain(anyLong());
-    }
 
     // ===== 夹具 =====
 

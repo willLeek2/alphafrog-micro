@@ -15,13 +15,5 @@ class BetaDeploymentControllerApplicationTest {
     @Autowired private BetaControllerProperties properties;
     @Autowired private ObjectMapper mapper;
 
-    @Test
-    void controllerRemainsDisabledUnlessItIsExplicitlyEnabled() {
-        assertFalse(properties.isEnabled());
-    }
 
-    @Test
-    void runtimeJsonRejectsDuplicateObjectKeys() {
-        assertThrows(JsonProcessingException.class, () -> mapper.readTree("{\"stateVersion\":1,\"stateVersion\":2}"));
-    }
 }

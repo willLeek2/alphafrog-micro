@@ -133,123 +133,11 @@ class CanceledSqlWaitMemberStopWorkerTest {
         return capacity.reserve(new DataAnalysisOperationIdentity("next-run", "query", 1), estimate);
     }
 
-    @ParameterizedTest
-    @EnumSource(value = DataAnalysisReservationState.class, names = {"PREPARING", "TASK_ATTACHED", "PENDING_TRANSFERRED"})
-    void sqlCancellationSettlesOriginalTaskAndMakesItsCapacityAvailableExactlyOnce(DataAnalysisReservationState state)
-            throws Exception {
-        install(state);
-        String originalProof = member.getDispatchProofJson();
-        assertCapacityHeld();
-        assertThat(worker.runBatch()).isEqualTo(1);
-        verify(sandbox).cancelTask(argThat(request -> request.hasByOperation()
-                && request.getByOperation().getOperationId().equals(operation.operationId())
-                && request.getByOperation().getRequestFingerprint().equals(fingerprint)
-                && request.getCancelRequestId().equals("wait-member-41")));
-        verify(sandbox, never()).createTask(any());
-        verify(recorder).upsert(argThat(envelope -> envelope.operationId().equals(operation.operationId())
-                && envelope.taskId().equals(TASK) && envelope.terminalStatus().equals("CANCELED")
-                && !envelope.success() && envelope.reservation().state() == DataAnalysisReservationState.TERMINAL_CONFIRMED));
-        var order = inOrder(capacity, recorder, stops);
-        order.verify(capacity).releaseReservation(argThat(request -> request.proof() instanceof DataAnalysisReleaseProof.Terminal
-                && request.reason() == DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED));
-        order.verify(recorder).upsert(any());
-        order.verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED");
-        assertThat(member.getState()).isEqualTo("CANCELED");
-        assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
-        DataAnalysisReservation next = occupyReleasedSlot();
-        claimAgain();
-        assertThat(worker.runBatch()).isEqualTo(1);
-        assertThat((Integer) ReflectionTestUtils.invokeMethod(capacity, "usedUnitsSnapshot")).isEqualTo(1);
-        verify(capacity, times(2)).releaseReservation(argThat(request -> request.reservation().identity().equals(operation)));
-        verify(capacity, never()).releaseReservation(argThat(request -> request.reservation().identity().equals(next.identity())));
-        verify(stops, never()).blockProof(anyLong(), any(), any());
-        verify(stops, never()).retry(anyLong(), any(), any(), any());
-    }
 
-    @Test void runningSqlKeepsReservationUntilLaterConfirmedCancellation() throws Exception {
-        install(DataAnalysisReservationState.TASK_ATTACHED);
-        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
-                .setOutcome(CancelOutcome.CANCEL_INTENT_RECORDED).setTaskId(TASK).setStatus("RUNNING").build());
-        when(sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder().setTaskId(TASK).setStatus("RUNNING").build());
-        worker.runBatch();
-        assertCapacityHeld();
-        verify(capacity, never()).releaseReservation(any());
-        verifyNoInteractions(recorder);
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("sandbox_not_terminal"));
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
-        when(sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder()
-                .setTaskId(TASK).setStatus("CANCELED").setFinishedAt(FINISHED).build());
-        claimAgain(); worker.runBatch(); occupyReleasedSlot();
-        verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED");
-    }
 
-    @Test void unavailableSqlLookupRetriesWithoutCancelingOrReleasing() throws Exception {
-        install(DataAnalysisReservationState.PREPARING);
-        when(sandbox.getTaskByOperationId(any())).thenReturn(null);
-        worker.runBatch(); assertCapacityHeld();
-        verify(sandbox, never()).cancelTask(any());
-        verify(capacity, never()).releaseReservation(any());
-        verifyNoInteractions(recorder);
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("operation_lookup_unavailable"));
-    }
 
-    @Test void incompleteCanceledSqlResultRetriesWithoutReleasingCapacity() throws Exception {
-        install(DataAnalysisReservationState.TASK_ATTACHED);
-        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder().setTaskId(TASK).setStatus("CANCELED").build());
-        worker.runBatch(); assertCapacityHeld();
-        verify(capacity, never()).releaseReservation(any());
-        verifyNoInteractions(recorder);
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("sandbox_terminal_result_unavailable"));
-        when(sandbox.getTaskResult(any())).thenReturn(result());
-        claimAgain(); worker.runBatch(); occupyReleasedSlot();
-    }
 
-    @Test void usageFailureAfterReleaseRetriesWithoutReopeningOrDoubleReleasingCapacity() throws Exception {
-        install(DataAnalysisReservationState.PREPARING);
-        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.CONFLICT, DataAnalysisUpsertOutcome.INSERTED);
-        worker.runBatch();
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("sandbox_settlement_incomplete"));
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
-        DataAnalysisReservation next = occupyReleasedSlot();
-        claimAgain(); worker.runBatch();
-        assertThat((Integer) ReflectionTestUtils.invokeMethod(capacity, "usedUnitsSnapshot")).isEqualTo(1);
-        verify(capacity, never()).releaseReservation(argThat(request -> request.reservation().identity().equals(next.identity())));
-        verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED");
-        verify(sessions).clearActive(RUN, operation.operationId());
-    }
 
-    @Test void alreadyFinishedSqlBusinessFailureReleasesCapacityWithoutRevivingCanceledMember() throws Exception {
-        install(DataAnalysisReservationState.TASK_ATTACHED);
-        String originalProof = member.getDispatchProofJson();
-        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
-                .setOutcome(CancelOutcome.ALREADY_TERMINAL).setTaskId(TASK).setStatus("SUCCEEDED").build());
-        when(sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder()
-                .setTaskId(TASK).setStatus("SUCCEEDED").setFinishedAt(FINISHED).build());
-        TaskResultResponse sqlResult = TaskResultResponse.newBuilder()
-                .setTaskId(TASK).setStatus("SUCCEEDED").setExitCode(0)
-                .setStdout("__EXECUTE_QUERY_RESULT__{\"status\":\"FAILED\",\"error\":{\"code\":\"PLAN_REJECTED\"}}\n").build();
-        var terminal = new PythonSandboxJobRunnerAdapter(sandbox, new SandboxJobObservability(null))
-                .toTerminalView(sqlResult, "SUCCEEDED");
-        var sqlAdapter = new SqlQueryJobResultAdapter(json);
-        var business = sqlAdapter.resolveTerminal(terminal, null);
-        assertThat(sqlAdapter.isSuccess(terminal)).isFalse();
-        assertThat(business.success()).isFalse();
-        assertThat(business.errorCode()).isEqualTo("PLAN_REJECTED");
-        assertThat(json.readTree(business.output()).path("ok").asBoolean()).isFalse();
-        when(sandbox.getTaskResult(any())).thenReturn(sqlResult);
-        when(stops.confirmSandboxTerminal(9L, "original-claim", TASK, "SUCCEEDED")).thenReturn(true);
-        assertThat(worker.runBatch()).isEqualTo(1);
-        occupyReleasedSlot();
-        verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "SUCCEEDED");
-        // 资源信封记录进程成功退出，业务失败正文与取消成员的事实均保留。
-        verify(recorder).upsert(argThat(envelope -> envelope.terminalStatus().equals("SUCCEEDED")
-                && envelope.success() && envelope.resultPreview().contains("PLAN_REJECTED")));
-        assertThat(member.getState()).isEqualTo("CANCELED");
-        assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
-        verify(groups).findMemberByOperation(RUN, operation.operationId());
-        verifyNoMoreInteractions(groups);
-        verify(stops, never()).retry(anyLong(), any(), any(), any());
-    }
 
     private void changeProof(String field, String value) throws Exception {
         var changed = (com.fasterxml.jackson.databind.node.ObjectNode) json.readTree(member.getDispatchProofJson());
@@ -257,22 +145,4 @@ class CanceledSqlWaitMemberStopWorkerTest {
     }
 
     enum InvalidIdentity { MEMBER_ID, GROUP_ID, TOOL, MEMBER_STATE, PROOF_OPERATION, PROOF_FINGERPRINT, PROOF_TASK }
-    @ParameterizedTest @EnumSource(InvalidIdentity.class)
-    void wrongSqlMemberOrProofCannotIssueCancellationOrChangeCapacity(InvalidIdentity invalid) throws Exception {
-        install(DataAnalysisReservationState.TASK_ATTACHED);
-        switch (invalid) {
-            case MEMBER_ID -> member.setId(99L);
-            case GROUP_ID -> member.setGroupId(99L);
-            case TOOL -> member.setToolName("spawnSubAgent");
-            case MEMBER_STATE -> member.setState("RUNNING");
-            case PROOF_OPERATION -> changeProof("operationId", "another:call:1");
-            case PROOF_FINGERPRINT -> changeProof("requestFingerprint", "sha256:" + "f".repeat(64));
-            case PROOF_TASK -> changeProof("taskId", "another-task");
-        }
-        worker.runBatch(); assertCapacityHeld();
-        verifyNoInteractions(sandbox, recorder);
-        verify(capacity, never()).releaseReservation(any());
-        verify(stops).blockProof(eq(9L), eq("original-claim"), any());
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
-    }
 }

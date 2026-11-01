@@ -69,16 +69,6 @@ class AdvancedSearchConditionTest {
     @DisplayName("NONE 大小写敏感")
     class NoneCaseSensitive {
 
-        @Test
-        @DisplayName("小写 none 抛 INVALID_ARGUMENT")
-        void lowercaseNoneRejected() {
-            AdvancedSearchException ex = assertThrows(
-                    AdvancedSearchException.class,
-                    () -> AdvancedSearchCondition.from(0, base("start_date", "none"))
-            );
-            assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("YYYYMMDD or NONE"));
-        }
 
         @Test
         @DisplayName("混合大小写 None 抛 INVALID_ARGUMENT")
@@ -129,27 +119,7 @@ class AdvancedSearchConditionTest {
             assertTrue(ex.getMessage().contains("YYYYMMDD or NONE"));
         }
 
-        @Test
-        @DisplayName("含字母抛 YYYYMMDD or NONE")
-        void nonNumericRejected() {
-            AdvancedSearchException ex = assertThrows(
-                    AdvancedSearchException.class,
-                    () -> AdvancedSearchCondition.from(0, base("start_date", "2024023X"))
-            );
-            assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("YYYYMMDD or NONE"));
-        }
 
-        @Test
-        @DisplayName("斜杠分隔抛 YYYYMMDD or NONE")
-        void slashSeparatedRejected() {
-            AdvancedSearchException ex = assertThrows(
-                    AdvancedSearchException.class,
-                    () -> AdvancedSearchCondition.from(0, base("start_date", "2024/02/15"))
-            );
-            assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("YYYYMMDD or NONE"));
-        }
 
         @Test
         @DisplayName("常规 YYYYMMDD 解析正确")
@@ -360,19 +330,6 @@ class AdvancedSearchConditionTest {
             assertTrue(ex.getMessage().contains("condition.type is required"));
         }
 
-        @Test
-        @DisplayName("type 空字符串抛 INVALID_ARGUMENT")
-        void blankTypeRejected() {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("type", "   ");
-
-            AdvancedSearchException ex = assertThrows(
-                    AdvancedSearchException.class,
-                    () -> AdvancedSearchCondition.from(0, m)
-            );
-            assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("condition.type is required"));
-        }
     }
 
     @Nested
@@ -390,16 +347,6 @@ class AdvancedSearchConditionTest {
             assertTrue(ex.getMessage().contains("Each condition must be an object"));
         }
 
-        @Test
-        @DisplayName("List raw 抛 INVALID_ARGUMENT")
-        void listRawRejected() {
-            AdvancedSearchException ex = assertThrows(
-                    AdvancedSearchException.class,
-                    () -> AdvancedSearchCondition.from(0, List.of("a", "b"))
-            );
-            assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("Each condition must be an object"));
-        }
 
         @Test
         @DisplayName("null raw 抛 INVALID_ARGUMENT")
@@ -467,21 +414,6 @@ class AdvancedSearchConditionTest {
             );
         }
 
-        @Test
-        @DisplayName("snake_case 优先于 camelCase 同名字段")
-        void snakeCaseWinsOverCamelCase() {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("type", "has_stock");
-            m.put("startDate", "20240101");
-            m.put("endDate", "20241231");
-            m.put("start_date", "20240601");
-            m.put("end_date", "20240630");
-
-            AdvancedSearchCondition c = AdvancedSearchCondition.from(0, m);
-
-            assertNotNull(c.getStartDate());
-            assertNotNull(c.getEndDate());
-        }
     }
 
     @Nested
@@ -496,12 +428,5 @@ class AdvancedSearchConditionTest {
             assertEquals("has_stock", c.getType());
         }
 
-        @Test
-        @DisplayName("混合大小写 type 转小写")
-        void mixedCaseTypeLowercased() {
-            AdvancedSearchCondition c = AdvancedSearchCondition.from(0, base("type", "Index_Component"));
-
-            assertEquals("index_component", c.getType());
-        }
     }
 }

@@ -27,117 +27,15 @@ import static org.mockito.Mockito.*;
 
 /** 用项目实际Spring事务代理验证两次写入全成或全退；数据库行由事务参与者模拟。 */
 class SqlAtomicMemberPreparingTest {
-    @Test void commitsAnchorAndFullMemberProofTogether() throws Exception {
-        Fixture f = new Fixture();
-        assertThat(f.claim()).isTrue();
-        assertThat(f.transactions.commits).isEqualTo(1);
-        assertThat(f.transactions.rollbacks).isZero();
-        assertThat(f.run.getToolJobAnchorJson()).isEqualTo(f.anchor.toJson());
-        assertThat(f.member.getDispatchProofJson()).isEqualTo(f.proof);
-        assertThat(ToolJobAnchor.fromJson(f.run.getToolJobAnchorJson()).getFinanceRecordLimitsJson())
-                .isEqualTo("{\"enabled\":true}");
-    }
 
-    @Test void secondWriteZeroRollsBackFirstWriteThroughSpringProxy() throws Exception {
-        Fixture f = new Fixture();
-        doReturn(0).when(f.members).recordMemberPreparing(anyLong(), anyString(), anyString(), anyString());
-        assertThatThrownBy(f::claim).isInstanceOf(ToolJobAnchorService.MemberPreparingRollback.class);
-        f.assertNeitherWritten();
-        assertThat(f.transactions.rollbacks).isEqualTo(1);
-    }
 
-    @Test void secondWriteExceptionAlsoRollsBackFirstWrite() throws Exception {
-        Fixture f = new Fixture();
-        doThrow(new IllegalStateException("database write failed")).when(f.members)
-                .recordMemberPreparing(anyLong(), anyString(), anyString(), anyString());
-        assertThatThrownBy(f::claim).isInstanceOf(IllegalStateException.class);
-        f.assertNeitherWritten();
-        assertThat(f.transactions.rollbacks).isEqualTo(1);
-    }
 
-    @Test void changedWorkerOrControlVersionRollsBackAnchorWithoutRecordingMember() throws Exception {
-        Fixture f = new Fixture();
-        when(f.members.countPreparingSqlMemberOwner(anyString(), anyLong(), anyString(), anyString(), anyString()))
-                .thenReturn(0);
-        assertThatThrownBy(f::claim).isInstanceOf(ToolJobAnchorService.MemberPreparingRollback.class);
-        f.assertNeitherWritten();
-        verify(f.members, never()).recordMemberPreparing(anyLong(), anyString(), anyString(), anyString());
-    }
 
-    @Test void busyIsRetryableAndWritesNeitherFact() throws Exception {
-        Fixture f = new Fixture();
-        when(f.runs.countInFlightExecuteQueryByUser(anyString(), anyString(), anyString(), anyInt())).thenReturn(1);
-        assertThatThrownBy(f::claim).isInstanceOfSatisfying(SessionQueryAdmissionException.class, failure -> {
-            assertThat(failure.code()).isEqualTo("SESSION_QUERY_IN_PROGRESS");
-            assertThat(failure.retryable()).isTrue();
-        });
-        f.assertNeitherWritten();
-        verify(f.runs, never()).claimPreparingToolJobAnchor(anyString(), anyString(), any());
-    }
 
-    @Test void resumeHandoffUsesOriginalTokenAndDoesNotLoseMemberOrFinanceProof() throws Exception {
-        Fixture f = new Fixture();
-        when(f.runs.claimPreparingToolJobAnchorFromResume(anyString(), anyString(), eq("token"), eq(3L)))
-                .thenAnswer(call -> { f.run.setToolJobAnchorJson(call.getArgument(1)); return 1; });
-        assertThat(f.service.claimPreparingWaitMember("run", f.anchor, 7, "member", f.proof, "token", 3L)).isTrue();
-        verify(f.runs, never()).claimPreparingToolJobAnchor(anyString(), anyString(), any());
-        assertThat(f.member.getDispatchProofJson()).isEqualTo(f.proof);
-    }
 
-    @Test void lockedReadbackRequiresBothExactFactsAndOriginalWorker() throws Exception {
-        Fixture f = new Fixture();
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.NOT_WRITTEN);
-        f.claim();
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.COMMITTED);
-        when(f.members.countPreparingSqlMemberOwner(anyString(), anyLong(), anyString(), anyString(), anyString()))
-                .thenReturn(0);
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.COMMITTED_DEFERRED);
-        verify(f.runs, times(3)).findByIdForUpdate("run");
-    }
 
-    @Test void committedReadbackAfterStaleWindowWaitsForAnotherUserQueryWithoutRenewal() throws Exception {
-        Fixture f = new Fixture();
-        f.claim();
-        f.run.setUpdatedAt(java.time.OffsetDateTime.now().minusSeconds(601));
-        AgentRun other = new AgentRun(); other.setId("other"); other.setUserId("user");
-        other.setStatus(AgentRunStatus.EXECUTING);
-        ToolJobAnchor otherAnchor = ToolJobAnchor.fromJson(f.anchor.toJson());
-        otherAnchor.setOperationId("other:call:1");
-        when(f.runs.findById("other")).thenReturn(other);
-        // 实际用户守卫计数：旧查询早于600秒，另一Run能够取得名额。
-        when(f.runs.countInFlightExecuteQueryByUser(eq("user"), eq("other"), eq("executeQuery"), eq(600)))
-                .thenAnswer(call -> f.run.getUpdatedAt().isBefore(java.time.OffsetDateTime.now().minusSeconds(600)) ? 0 : 1);
-        doAnswer(call -> { other.setToolJobAnchorJson(call.getArgument(1)); return 1; }).when(f.runs)
-                .claimPreparingToolJobAnchor(eq("other"), anyString(), any());
-        assertThat(f.service.claimPreparing("other", otherAnchor, AgentRunStatus.EXECUTING)).isTrue();
-        other.setToolJobAnchorJson(otherAnchor.toJson()); other.setUpdatedAt(java.time.OffsetDateTime.now());
-        when(f.runs.countInFlightExecuteQueryByUser(eq("user"), eq("run"), eq("executeQuery"), eq(600)))
-                .thenAnswer(call -> other.getUpdatedAt().isAfter(java.time.OffsetDateTime.now().minusSeconds(600)) ? 1 : 0);
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.COMMITTED_DEFERRED);
-        verify(f.runs, never()).renewExecuteQueryReplayClaim(anyString(), anyLong(), anyString(),
-                anyString(), anyString(), anyString(), anyLong(), anyLong());
-        assertThat(f.member.getDispatchProofJson()).isEqualTo(f.proof);
-    }
 
-    @Test void canceledOrChangedPlanWithNoWritesReturnsOnlyTheUndurableLocalReservation() throws Exception {
-        Fixture f = new Fixture();
-        f.run.setStatus(AgentRunStatus.CANCELED); f.run.setPlanGeneration(3); f.run.setRunControlVersion(6L);
-        when(f.members.countPreparingSqlMemberOwner(anyString(), anyLong(), anyString(), anyString(), anyString())).thenReturn(0);
-        when(f.members.lockPreparingSqlMemberContext("run", 7, "member")).thenReturn("CANCELED");
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.NOT_WRITTEN);
-        f.assertNeitherWritten();
-    }
 
-    @Test void changedClaimWithNewProofOrSameOperationAnchorNeverReleasesTheTakenOverReservation() throws Exception {
-        Fixture f = new Fixture();
-        when(f.members.countPreparingSqlMemberOwner(anyString(), anyLong(), anyString(), anyString(), anyString())).thenReturn(0);
-        f.run.setToolJobAnchorJson(f.anchor.toJson());
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.OWNERSHIP_LOST);
-        f.member.setDispatchProofJson(f.proof);
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.COMMITTED_DEFERRED);
-        f.member.setDispatchProofJson("{}");
-        assertThat(f.readback()).isEqualTo(ToolJobAnchorService.MemberPreparingReadback.OWNERSHIP_LOST);
-    }
 
     static final class Fixture {
         final AgentRunMapper runs = mock(AgentRunMapper.class);

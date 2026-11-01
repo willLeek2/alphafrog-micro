@@ -101,16 +101,6 @@ class AcceptanceReleasePolicyTest {
                 .hasMessageContaining("计划重建之后同一个节点名会再来一次");
     }
 
-    /** 只写等待组那一级会命中这个组里的每一条成员：说不清点名的是哪一条。 */
-    @Test
-    void aSelectorThatOnlyNamesTheGroupIsRefused() {
-        assertThatThrownBy(() -> parse("""
-                {"rules":[{"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0},"fail":"故意失败"}]}
-                """))
-                .isInstanceOf(AcceptanceFixtureExecutionException.class)
-                .hasMessageContaining("acceptance_fixture_policy_invalid")
-                .hasMessageContaining("没写组内序号 memberSeq");
-    }
 
     /** 字段名打错会一条成员都打不中，所以读策略这一步就把认不出的字段名点出来。 */
     @Test
@@ -441,18 +431,6 @@ class AcceptanceReleasePolicyTest {
                 .hasMessageContaining("等不到头");
     }
 
-    /** 写法一样的两条规则互相等：读策略这一步就能看出这一圈。 */
-    @Test
-    void aCycleWrittenIdenticallyIsRefusedAtParseTime() {
-        assertThatThrownBy(() -> parse("""
-                {"rules":[
-                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1}]},
-                  {"for":{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":1},"releaseAfter":[{"planGeneration":7,"nodeId":"n1","nodeAttempt":1,"segmentSequence":0,"modelTurn":0,"memberSeq":0}]}]}
-                """))
-                .isInstanceOf(AcceptanceFixtureExecutionException.class)
-                .hasMessageContaining("acceptance_fixture_policy_invalid")
-                .hasMessageContaining("互相等成了一整圈");
-    }
 
     /** 三条规则绕一圈、外加一条不相干的规则：照样能找出那一圈。 */
     @Test

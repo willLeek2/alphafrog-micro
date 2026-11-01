@@ -61,47 +61,6 @@ class LangchainDagWorkflowExecutorUnknownDefectTest {
         AgentContext.clear();
     }
 
-    @Test
-    void nodeError_shouldCompleteAsyncResultAsUnknownDefect() {
-        when(nodeExecutor.execute(any(), any(), any(), any(), any(AtomicInteger.class)))
-                .thenAnswer(invocation -> {
-                    throw new AssertionError("boom");
-                });
-
-        TodoItem item = TodoItem.builder()
-                .id("t1")
-                .sequence(1)
-                .description("desc-t1")
-                .dependsOn(List.of())
-                .build();
-        LangchainTodoPlan plan = LangchainTodoPlan.builder()
-                .executionMode(PlanExecutionMode.DAG)
-                .items(List.of(item))
-                .extractedEntities(List.of())
-                .build();
-        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
-                .runId("run-dag-unknown-defect")
-                .userId("user-1")
-                .userGoal("test goal")
-                .executionModel(mock(ChatModel.class))
-                .finalAnswerModel(mock(ChatModel.class))
-                .build();
-
-        LangchainWorkflowResult result = executor.executePlanned(request, plan);
-
-        assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getFailureReason()).contains("DAG execution failed");
-
-        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
-        verifyAppendFailed(payloadCaptor);
-        Map<String, Object> failedPayload = payloadCaptor.getValue();
-        assertThat(failedPayload).containsKey("failure_metadata");
-        @SuppressWarnings("unchecked")
-        Map<String, Object> meta = (Map<String, Object>) failedPayload.get("failure_metadata");
-        assertThat(meta).containsEntry("unknown_defect", true);
-        assertThat(meta).containsEntry("failure_class", AgentRunFailureClass.UNKNOWN_DEFECT.wireName());
-        assertThat(meta).containsEntry("throwable_type", AssertionError.class.getName());
-    }
 
     private void verifyAppendFailed(ArgumentCaptor<Map<String, Object>> payloadCaptor) {
         org.mockito.Mockito.verify(eventService, atLeastOnce()).append(

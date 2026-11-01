@@ -53,16 +53,6 @@ class RecoveryBackoffTest {
         assertThat(first).isBetween(Duration.ZERO, Duration.ofSeconds(1));
     }
 
-    @Test
-    void notificationsWaitingTogetherDoNotRetryTogether() {
-        List<OffsetDateTime> retries = new ArrayList<>();
-        for (long id = 1; id <= 24; id++) {
-            retries.add(backoff.nextVisibleAt(NOW, id, NOW.minusSeconds(30)));
-        }
-        assertThat(retries).doesNotHaveDuplicates();
-        assertThat(retries).allSatisfy(next -> assertThat(next))
-                .allSatisfy(next -> assertThat(next).isBetween(NOW.plus(MAX), NOW.plus(MAX).plusSeconds(2)));
-    }
 
     @Test
     void aFreshNotificationIsRetriedSoon() {

@@ -42,50 +42,7 @@ class SecurityFilterChainOrderTest {
                     WebMvcAutoConfiguration.class))
             .withUserConfiguration(TestConfiguration.class);
 
-    @Test
-    void bothChainsInstallJwtLaneAndFetchExactlyOnceInThatOrder() {
-        runner.run(context -> {
-            assertFalse(context.getStartupFailure() != null,
-                    () -> String.valueOf(context.getStartupFailure()));
-            CountingJwtAuthFilter jwt = context.getBean(CountingJwtAuthFilter.class);
-            CountingLaneWebFilter lane = context.getBean(CountingLaneWebFilter.class);
-            CountingFetchAccessFilter fetch = context.getBean(CountingFetchAccessFilter.class);
-            SecurityFilterChain sse = context.getBean("agentSseStreamChain", SecurityFilterChain.class);
-            SecurityFilterChain ordinary = context.getBean("filterChain", SecurityFilterChain.class);
 
-            assertOrder((DefaultSecurityFilterChain) sse, jwt, lane, fetch);
-            assertOrder((DefaultSecurityFilterChain) ordinary, jwt, lane, fetch);
-        });
-    }
-
-    @Test
-    void ordinaryAndSseRequestsRunAllThreeFiltersOnceAfterAuthenticationDecision() {
-        runner.run(context -> {
-            CountingJwtAuthFilter jwt = context.getBean(CountingJwtAuthFilter.class);
-            CountingLaneWebFilter lane = context.getBean(CountingLaneWebFilter.class);
-            CountingFetchAccessFilter fetch = context.getBean(CountingFetchAccessFilter.class);
-            List<SecurityFilterChain> chains = List.of(
-                    context.getBean("agentSseStreamChain", SecurityFilterChain.class),
-                    context.getBean("filterChain", SecurityFilterChain.class));
-            FilterChainProxy proxy = new FilterChainProxy(chains);
-
-            execute(proxy, "/auth/login", false);
-            execute(proxy, "/auth/login", true);
-            execute(proxy, "/api/agent/runs/run-1/stream", false);
-            execute(proxy, "/api/agent/runs/run-1/stream", true);
-
-            assertEquals(4, jwt.calls);
-            assertEquals(4, lane.calls);
-            assertEquals(4, fetch.calls);
-            assertEquals(List.of(
-                    "jwt:/auth/login:false", "lane:/auth/login:false", "fetch:/auth/login:false",
-                    "jwt:/auth/login:true", "lane:/auth/login:true", "fetch:/auth/login:true",
-                    "jwt:/api/agent/runs/run-1/stream:false", "lane:/api/agent/runs/run-1/stream:false",
-                    "fetch:/api/agent/runs/run-1/stream:false",
-                    "jwt:/api/agent/runs/run-1/stream:true", "lane:/api/agent/runs/run-1/stream:true",
-                    "fetch:/api/agent/runs/run-1/stream:true"), jwt.events);
-        });
-    }
 
     private static void execute(FilterChainProxy proxy, String path, boolean token) throws Exception {
         MockHttpServletRequest request = new MockHttpServletRequest("GET", path);

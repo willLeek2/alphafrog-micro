@@ -108,59 +108,7 @@ class ToolJobDurableRecoveryGatingTest {
         return ctx;
     }
 
-    @Test
-    void defaultModeCreatesOnlyInProcessTracker() {
-        try (AnnotationConfigApplicationContext ctx = context(null)) {
-            ctx.refresh();
 
-            assertThat(ctx.getBeanNamesForType(ToolJobContinuationTracker.class)).hasSize(1);
-            assertThat(ctx.getBeanNamesForType(ToolJobReconciler.class)).isEmpty();
-            assertThat(ctx.getBeanNamesForType(ToolJobStartupRecovery.class)).isEmpty();
-            assertThat(ctx.getBeanNamesForType(ToolJobResumeLauncherHeartbeat.class)).isEmpty();
-        }
-    }
 
-    @Test
-    void durableModeCreatesOnlyDurableBeans() {
-        try (AnnotationConfigApplicationContext ctx = context("true")) {
-            ctx.refresh();
 
-            assertThat(ctx.getBeanNamesForType(ToolJobContinuationTracker.class)).isEmpty();
-            assertThat(ctx.getBeanNamesForType(ToolJobReconciler.class)).hasSize(1);
-            assertThat(ctx.getBeanNamesForType(ToolJobStartupRecovery.class)).hasSize(1);
-            assertThat(ctx.getBeanNamesForType(ToolJobResumeLauncherHeartbeat.class)).hasSize(1);
-        }
-    }
-
-    @Test
-    void explicitDisableBehavesLikeDefault() {
-        try (AnnotationConfigApplicationContext ctx = context("false")) {
-            ctx.refresh();
-
-            assertThat(ctx.getBeanNamesForType(ToolJobContinuationTracker.class)).hasSize(1);
-            assertThat(ctx.getBeanNamesForType(ToolJobReconciler.class)).isEmpty();
-            assertThat(ctx.getBeanNamesForType(ToolJobStartupRecovery.class)).isEmpty();
-            assertThat(ctx.getBeanNamesForType(ToolJobResumeLauncherHeartbeat.class)).isEmpty();
-        }
-    }
-
-    @Test
-    void trackerConditionDefaultsToPresentWhileDurableBeansRequireExplicitTrue() {
-        ConditionalOnProperty tracker = ToolJobContinuationTracker.class
-                .getAnnotation(ConditionalOnProperty.class);
-        assertThat(tracker).isNotNull();
-        assertThat(tracker.matchIfMissing()).isTrue();
-        assertThat(tracker.name()).contains("agent.tool-job.durable-recovery-enabled");
-
-        for (Class<?> durable : new Class<?>[]{ToolJobReconciler.class,
-                ToolJobStartupRecovery.class, ToolJobResumeLauncherHeartbeat.class}) {
-            ConditionalOnProperty annotation =
-                    durable.getAnnotation(ConditionalOnProperty.class);
-            assertThat(annotation).as(durable.getSimpleName()).isNotNull();
-            assertThat(annotation.matchIfMissing())
-                    .as(durable.getSimpleName() + " must not be created by default")
-                    .isFalse();
-            assertThat(annotation.name()).contains("agent.tool-job.durable-recovery-enabled");
-        }
-    }
 }

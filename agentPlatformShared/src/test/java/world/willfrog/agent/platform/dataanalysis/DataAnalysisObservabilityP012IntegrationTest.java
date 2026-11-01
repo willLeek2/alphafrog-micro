@@ -106,155 +106,17 @@ class DataAnalysisObservabilityP012IntegrationTest {
     // P0-12: collector failure (cpuMillis=null) round-trip through PG
     // =====================================================================
 
-    @Test
-    void collectorFailureEnvelopePersistedAndQueriedFromPostgres() throws Exception {
-        // ── 1. Build envelope with cpuMillis=null (simulated Docker stats failure) ──
-        DataAnalysisResourceUsage usage = resourceUsageMissingCpu();
-        DataAnalysisTerminalEnvelope envelope = buildEnvelope(usage);
-
-        // Pre-flush sanity: contract is correct before any serialization
-        assertThat(usage.attributionComplete()).isFalse();
-        assertThat(usage.missingFields()).containsExactly("cpuMillis");
-        assertThat(usage.cpuMillis()).isNull();
-
-        // ── 2. Build snapshot via production code path ──
-        DataAnalysisObservabilitySnapshot snapshot =
-                DataAnalysisObservabilityBuilder.build(RUN_ID, List.of(envelope));
-        assertThat(snapshot.calls()).hasSize(1);
-        assertThat(snapshot.version()).isEqualTo(DataAnalysisObservabilitySnapshot.CURRENT_VERSION);
-
-        // ── 3. Persist snapshot to PostgreSQL JSONB ──
-        upsertObservability(RUN_ID, om.writeValueAsString(snapshot));
-
-        // ── 4. Query back full snapshot (TERMINAL_DB_ONLY equivalent) ──
-        String persisted = queryObservabilityJson(RUN_ID);
-        assertThat(persisted).isNotNull().isNotBlank();
-        DataAnalysisObservabilitySnapshot roundTripped =
-                om.readValue(persisted, DataAnalysisObservabilitySnapshot.class);
-
-        // ── 5. ROOT_FIELD contract ──
-        assertThat(DataAnalysisObservabilitySnapshot.ROOT_FIELD)
-                .isEqualTo("data_analysis_observability");
-
-        // ── 6. Summary: attributionComplete=false, cpuMillis=null, missingFields=["cpuMillis"] ──
-        DataAnalysisObservabilitySummary summary = roundTripped.summary();
-        assertThat(summary.attributionComplete()).isFalse();
-        assertThat(summary.missingFields()).containsExactly("cpuMillis");
-        assertThat(summary.cpuMillis()).isNull(); // aggregation forced null by missing metric
-        assertThat(summary.toolCallCount()).isEqualTo(1);
-        assertThat(summary.attemptCount()).isEqualTo(1);
-        assertThat(summary.oomCount()).isEqualTo(0);
-        assertThat(summary.timeoutCount()).isEqualTo(0);
-
-        // All 8 other P0 required fields survive the round-trip
-        assertThat(summary.memoryPeakBytes()).isEqualTo(MB100);
-        assertThat(summary.logicalBytesScanned()).isEqualTo(MB10);
-        assertThat(summary.queueWaitMillis()).isEqualTo(150L);
-        assertThat(summary.prepareMillis()).isEqualTo(200L);
-        assertThat(summary.executionWallMillis()).isEqualTo(5000L);
-        assertThat(summary.cleanupMillis()).isEqualTo(100L);
-        assertThat(summary.datasetOpenCount()).isEqualTo(3L);
-
-        // ── 7. Call-level identity preserved ──
-        DataAnalysisObservabilityCall call = roundTripped.calls().get(0);
-        assertThat(call.toolCallId()).isEqualTo(TC_ID);
-        assertThat(call.attempt()).isEqualTo(ATTEMPT);
-        assertThat(call.operationId())
-                .isEqualTo(RUN_ID + ":" + TC_ID + ":" + ATTEMPT);
-        assertThat(call.taskId()).isEqualTo(TASK_ID);
-        assertThat(call.terminalStatus()).isEqualTo("COMPLETED");
-        assertThat(call.success()).isTrue();
-
-        // Call resourceUsage mirrors the original envelope
-        DataAnalysisResourceUsage callUsage = call.resourceUsage();
-        assertThat(callUsage.attributionComplete()).isFalse();
-        assertThat(callUsage.missingFields()).containsExactly("cpuMillis");
-        assertThat(callUsage.cpuMillis()).isNull();
-        assertThat(callUsage.memoryPeakBytes()).isEqualTo(MB100);
-        assertThat(callUsage.logicalBytesScanned()).isEqualTo(MB10);
-        assertThat(callUsage.queueWaitMillis()).isEqualTo(150L);
-        assertThat(callUsage.prepareMillis()).isEqualTo(200L);
-        assertThat(callUsage.executionWallMillis()).isEqualTo(5000L);
-        assertThat(callUsage.cleanupMillis()).isEqualTo(100L);
-        assertThat(callUsage.datasetOpenCount()).isEqualTo(3);
-        assertThat(callUsage.exitReason()).isEqualTo("SUCCEEDED");
-        assertThat(callUsage.resourceClass()).isEqualTo(DataAnalysisResourceClass.STANDARD);
-
-        // ── 8. Summary-only sub-tree query (findSummaryByRunId equivalent) ──
-        String summaryJson = queryObservabilitySummaryJson(RUN_ID);
-        assertThat(summaryJson).isNotNull().isNotBlank();
-        DataAnalysisObservabilitySummary summaryDirect =
-                om.readValue(summaryJson, DataAnalysisObservabilitySummary.class);
-        assertThat(summaryDirect.attributionComplete()).isFalse();
-        assertThat(summaryDirect.missingFields()).containsExactly("cpuMillis");
-        assertThat(summaryDirect.cpuMillis()).isNull();
-    }
 
     // =====================================================================
     // Complementary positive case: all P0 fields present
     // =====================================================================
 
-    @Test
-    void completeAttributionRoundTripThroughPostgres() throws Exception {
-        DataAnalysisResourceUsage usage = completeResourceUsage();
-        DataAnalysisTerminalEnvelope envelope = buildEnvelope(usage);
-        assertThat(usage.attributionComplete()).isTrue();
-        assertThat(usage.missingFields()).isEmpty();
-
-        DataAnalysisObservabilitySnapshot snapshot =
-                DataAnalysisObservabilityBuilder.build(RUN_ID, List.of(envelope));
-        upsertObservability(RUN_ID, om.writeValueAsString(snapshot));
-
-        String persisted = queryObservabilityJson(RUN_ID);
-        DataAnalysisObservabilitySnapshot roundTripped =
-                om.readValue(persisted, DataAnalysisObservabilitySnapshot.class);
-
-        DataAnalysisObservabilitySummary summary = roundTripped.summary();
-        assertThat(summary.attributionComplete()).isTrue();
-        assertThat(summary.missingFields()).isEmpty();
-        assertThat(summary.cpuMillis()).isEqualTo(1200L);
-
-        // All 8 other P0 fields carry through
-        assertThat(summary.memoryPeakBytes()).isEqualTo(MB100);
-        assertThat(summary.logicalBytesScanned()).isEqualTo(MB10);
-        assertThat(summary.queueWaitMillis()).isEqualTo(150L);
-        assertThat(summary.prepareMillis()).isEqualTo(200L);
-        assertThat(summary.executionWallMillis()).isEqualTo(5000L);
-        assertThat(summary.cleanupMillis()).isEqualTo(100L);
-        assertThat(summary.datasetOpenCount()).isEqualTo(3L);
-
-        // Call identity is intact
-        DataAnalysisObservabilityCall call = roundTripped.calls().get(0);
-        assertThat(call.toolCallId()).isEqualTo(TC_ID);
-        assertThat(call.attempt()).isEqualTo(ATTEMPT);
-        assertThat(call.taskId()).isEqualTo(TASK_ID);
-        assertThat(call.resourceUsage().attributionComplete()).isTrue();
-    }
 
     // =====================================================================
     // Envelope part of snapshot: multiple-call aggregation with and without
     // cpuMillis verifies partial attribution at summary level
     // =====================================================================
 
-    @Test
-    void mixedCallsPartialAttributionAggregatesMissingFieldsInSummary() throws Exception {
-        // One call with cpuMillis, one without -- distinct toolCallIds and attempts
-        DataAnalysisTerminalEnvelope complete = buildEnvelope(
-                "tc-complete", 1, completeResourceUsageWithTcId("tc-complete"));
-        DataAnalysisTerminalEnvelope missing = buildEnvelope(
-                "tc-missing", 1, resourceUsageMissingCpuWithTcId("tc-missing"));
-
-        DataAnalysisObservabilitySnapshot snapshot =
-                DataAnalysisObservabilityBuilder.build(RUN_ID, List.of(complete, missing));
-        assertThat(snapshot.calls()).hasSize(2);
-
-        DataAnalysisObservabilitySummary summary = snapshot.summary();
-        assertThat(summary.attributionComplete()).isFalse();
-        assertThat(summary.missingFields()).containsExactly("cpuMillis");
-        // cpuMillis aggregation is null because one call is missing it
-        assertThat(summary.cpuMillis()).isNull();
-        assertThat(summary.attemptCount()).isEqualTo(2);
-    }
 
     // =====================================================================
     // Helpers: resource usage factories

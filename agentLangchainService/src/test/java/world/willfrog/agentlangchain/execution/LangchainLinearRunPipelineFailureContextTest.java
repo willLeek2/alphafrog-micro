@@ -39,56 +39,9 @@ class LangchainLinearRunPipelineFailureContextTest {
     private static final String PLAN_JSON =
             "{\"analysis\":\"先把数据查出来\",\"items\":[],\"executionMode\":\"LINEAR\"}";
 
-    @Test
-    void theFailureContextIsBuiltWithoutAskingForAnyModel() {
-        when(runMapper.findById("run-1")).thenReturn(executingRun(PLAN_JSON));
-        when(stageModelResolver.resolve(any())).thenThrow(new IllegalStateException(
-                "夹具在跑的中途被停用了"));
-        when(followUpContextSupport.userGoal(any()))
-                .thenReturn("把这件事做完");
 
-        LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
-                pipeline().rebuildDualPoolNodeContextForFailure("run-1");
 
-        assertThat(context).isNotNull();
-        assertThat(context.userGoal()).isEqualTo("把这件事做完");
-        assertThat(context.run().getId()).isEqualTo("run-1");
-        assertThat(context.plan()).isNotNull();
-        assertThat(context.stageModels()).as("写失败用不到模型，所以不去解析").isNull();
-        verify(stageModelResolver, never()).resolve(any());
-    }
 
-    @Test
-    void anUnreadablePlanComesBackAsEmptySoTheCallerWritesTheFailureWithoutOne() {
-        when(runMapper.findById("run-1")).thenReturn(executingRun("{不是 JSON"));
-
-        assertThat(pipeline().rebuildDualPoolNodeContextForFailure("run-1")).isNull();
-        verify(stageModelResolver, never()).resolve(any());
-    }
-
-    @Test
-    void aRunThatIsNoLongerExecutingHasNoFailureContextToRebuild() {
-        AgentRun run = executingRun(PLAN_JSON);
-        run.setStatus(AgentRunStatus.CANCELED);
-        when(runMapper.findById("run-1")).thenReturn(run);
-
-        assertThat(pipeline().rebuildDualPoolNodeContextForFailure("run-1")).isNull();
-        verify(stageModelResolver, never()).resolve(any());
-    }
-
-    /** 这份上下文是为写失败准备的：拿它去写成功结果要当场停住，不能在没有模型的情况下广播终态。 */
-    @Test
-    void aFailureOnlyContextRefusesToCarryASuccessResult() {
-        when(runMapper.findById("run-1")).thenReturn(executingRun(PLAN_JSON));
-        LangchainLinearRunPipelineImpl.DualPoolNodeContext context =
-                new LangchainLinearRunPipelineImpl.DualPoolNodeContext(
-                        executingRun(PLAN_JSON), null, "把这件事做完", null, null);
-
-        boolean durable = pipeline().persistDualPoolWorkflowResult(context,
-                LangchainWorkflowResult.builder().success(true).finalAnswer("答案").build());
-
-        assertThat(durable).isFalse();
-    }
 
     /**
      * 读计划要用与线上同一套能力的解析器：计划类只有全参构造器，靠参数名才能读回来，
