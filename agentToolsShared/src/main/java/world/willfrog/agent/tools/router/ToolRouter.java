@@ -186,7 +186,7 @@ public class ToolRouter {
     @Autowired(required = false)
     private SubAgentControlHandler subAgentControlHandler;
     /**
-     * 014-data-04 promoteDatasetToPlatform 工具实现。可选注入（@Autowired(required = false)），
+     * promoteDatasetToPlatform 工具实现。可选注入（@Autowired(required = false)），
      * 与上面几个可选依赖同理：不改构造签名（既有 new ToolRouter 调用点不受影响）；Bean 不在
      * （如纯单元测试上下文）时分发返回结构化 TOOL_UNAVAILABLE，不空指针。
      */

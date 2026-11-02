@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -63,6 +64,19 @@ public class CanceledWaitMemberStopWorker {
     private final long backoffMaxSeconds;
     private final String owner = UUID.randomUUID().toString();
 
+    /** 兼容现有直接构造入口，沿用退避基数并采用默认的有限重试次数。 */
+    public CanceledWaitMemberStopWorker(WaitMemberStopStore stops, WaitGroupStore groups,
+                                        PythonSandboxService sandbox, WaitMemberSettlement settlement,
+                                        ObjectMapper objectMapper, PlatformTransactionManager transactionManager,
+                                        RunOwnershipGateway ownership,
+                                        DualPoolRunAdmissionRegistry admissionRegistry,
+                                        int batchSize, long leaseSeconds, long retrySeconds) {
+        this(stops, groups, sandbox, settlement, objectMapper, transactionManager,
+                ownership, admissionRegistry, batchSize, leaseSeconds, 8,
+                retrySeconds, Math.max(120, retrySeconds));
+    }
+
+    @Autowired
     public CanceledWaitMemberStopWorker(WaitMemberStopStore stops, WaitGroupStore groups,
                                         PythonSandboxService sandbox, WaitMemberSettlement settlement,
                                         ObjectMapper objectMapper, PlatformTransactionManager transactionManager,

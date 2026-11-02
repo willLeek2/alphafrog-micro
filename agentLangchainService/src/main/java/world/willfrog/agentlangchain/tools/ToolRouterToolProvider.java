@@ -126,27 +126,6 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   LangchainToolConcurrencyThrottle toolThrottle,
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore) {
         this(toolRouter, marketDataTools, null, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
-                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper,
-                agentEventService, toolThrottle, pythonSandboxDispatchStore);
-    }
-
-    /** 支持显式提供资产SQL工具，未提供的持久子代理及提示词准备组件保持关闭。 */
-    public ToolRouterToolProvider(ToolRouter toolRouter,
-                                  MarketDataTools marketDataTools,
-                                  AssetSqlTools assetSqlTools,
-                                  RagTools ragTools,
-                                  SearchTools searchTools,
-                                  PythonSandboxTools pythonSandboxTools,
-                                  SqlQueryTools sqlQueryTools,
-                                  ListMyDataTool listMyDataTool,
-                                  PromoteDatasetTool promoteDatasetTool,
-                                  LoadToolGuideTool loadToolGuideTool,
-                                  RereadToolHandler rereadToolHandler,
-                                  ObjectMapper objectMapper,
-                                  AgentRunEventService agentEventService,
-                                  LangchainToolConcurrencyThrottle toolThrottle,
-                                  PythonSandboxDispatchStore pythonSandboxDispatchStore) {
-        this(toolRouter, marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
                 listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
                 toolThrottle, pythonSandboxDispatchStore, null, null, null);
     }

@@ -14,6 +14,7 @@ import dev.langchain4j.model.chat.request.json.JsonSchemaElement;
 import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -33,7 +34,7 @@ import java.util.List;
 import java.util.Map;
 
 @Service
-@RequiredArgsConstructor
+@RequiredArgsConstructor(onConstructor_ = @Autowired)
 @Slf4j
 public class LangchainToolCatalogService {
 
@@ -48,6 +49,21 @@ public class LangchainToolCatalogService {
     private final LoadToolGuideTool loadToolGuideTool;
     private final RereadToolHandler rereadToolHandler;
     private final ObjectMapper objectMapper;
+
+    /** 保留未提供资产SQL工具的直接构造入口，生产装配使用完整构造器。 */
+    public LangchainToolCatalogService(MarketDataTools marketDataTools,
+                                      RagTools ragTools,
+                                      SearchTools searchTools,
+                                      PythonSandboxTools pythonSandboxTools,
+                                      SqlQueryTools sqlQueryTools,
+                                      ListMyDataTool listMyDataTool,
+                                      PromoteDatasetTool promoteDatasetTool,
+                                      LoadToolGuideTool loadToolGuideTool,
+                                      RereadToolHandler rereadToolHandler,
+                                      ObjectMapper objectMapper) {
+        this(marketDataTools, null, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper);
+    }
 
     /**
      * 返回对外 API 可见的工具目录。
