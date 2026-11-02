@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.facade;
 
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 
 final class AgentLangchainRunMessageMapper {
@@ -9,10 +10,11 @@ final class AgentLangchainRunMessageMapper {
     }
 
     static AgentRunMessage toRunMessage(AgentRun run) {
+        AgentRunStatus visibleStatus = AgentRunVisibleStatus.resolve(run, run.getStatus());
         return AgentRunMessage.newBuilder()
                 .setId(nvl(run.getId()))
                 .setUserId(nvl(run.getUserId()))
-                .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
+                .setStatus(visibleStatus == null ? "" : visibleStatus.name())
                 .setCurrentStep(run.getCurrentStep() == null ? 0 : run.getCurrentStep())
                 .setMaxSteps(run.getMaxSteps() == null ? 0 : run.getMaxSteps())
                 .setPlanJson(nvl(run.getPlanJson()))

@@ -217,7 +217,8 @@ public class LangchainRunReadService {
                 .setHasMore(offset + runs.size() < total);
         for (AgentRun run : runs) {
             AgentRunStatus effectiveStatus = agentEventService.shouldMarkExpired(run)
-                    ? AgentRunStatus.EXPIRED : run.getStatus();
+                    ? AgentRunStatus.EXPIRED
+                    : AgentRunVisibleStatus.resolve(run, run.getStatus());
             builder.addItems(AgentRunListItemMessage.newBuilder()
                     .setId(nvl(run.getId()))
                     .setMessage(nvl(agentEventService.extractRunDisplayTitle(run.getExt())))
@@ -289,9 +290,10 @@ public class LangchainRunReadService {
                 ? agentEventService.listByRunIdFromDatabase(run.getId())
                 : agentEventService.listByRunId(run.getId());
         int totalCredits = creditService.calculateRunTotalCredits(run, events, observabilityJson);
+        AgentRunStatus visibleStatus = AgentRunVisibleStatus.resolve(run, run.getStatus());
         return AgentRunResultMessage.newBuilder()
                 .setId(nvl(run.getId()))
-                .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
+                .setStatus(visibleStatus == null ? "" : visibleStatus.name())
                 .setAnswer(nvl(answerMarkdown))
                 .setPayloadJson(snapshotJson)
                 .setObservabilityJson(observabilityJson)

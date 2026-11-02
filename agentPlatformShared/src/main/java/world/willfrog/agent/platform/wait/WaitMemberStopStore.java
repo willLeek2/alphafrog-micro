@@ -14,8 +14,8 @@ public interface WaitMemberStopStore {
     /** 外调失败或任务尚未终态时，按同一固定取消身份稍后再试。 */
     boolean retry(long stopId, String claimToken, OffsetDateTime nextAttemptAt, String reason);
 
-    /** 身份或派发证明确定冲突时停止自动发送，保留任务供人工核查。 */
-    boolean blockProof(long stopId, String claimToken, String reason);
+    /** 确定无法确认外部作业停止时结束自动尝试（未确认），保留任务供人工核查。 */
+    boolean unconfirm(long stopId, String claimToken, String reason);
 
     /** 仅在 PostgreSQL 已有匹配的 Sandbox 终态凭证时确认停机。 */
     boolean confirmSandboxTerminal(long stopId, String claimToken,

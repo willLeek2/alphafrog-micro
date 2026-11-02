@@ -73,10 +73,11 @@ final class LangchainRunStatusReadModel {
                                             int totalCreditsConsumed,
                                             int eventCount) {
         String lastEventType = lastEvent == null ? "" : nvl(lastEvent.getEventType());
+        AgentRunStatus visibleStatus = AgentRunVisibleStatus.resolve(run, run.getStatus());
         return AgentRunStatusMessage.newBuilder()
                 .setId(nvl(run.getId()))
-                .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
-                .setPhase(resolvePhase(run.getStatus(), lastEventType))
+                .setStatus(visibleStatus == null ? "" : visibleStatus.name())
+                .setPhase(resolvePhase(visibleStatus, lastEventType))
                 .setCurrentTool(resolveCurrentTool(lastEventType,
                         lastEvent == null ? null : lastEvent.getPayloadJson()))
                 .setLastEventType(lastEventType)

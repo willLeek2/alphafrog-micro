@@ -141,8 +141,9 @@ public class ToolJobStartupRecovery {
                         quarantinedRuns.add(run.getId());
                         continue;
                     }
-                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.MEMBER_OWNED) {
-                        // 未确认成员由下方成员扫描重建；已确认停止的旧Run预约不再占容量。
+                    if (ownership == CanceledSqlWaitMemberRecovery.Ownership.MEMBER_OWNED
+                            || ownership == CanceledSqlWaitMemberRecovery.Ownership.UNCONFIRMED) {
+                        // 成员尚未确认停止时由下方成员扫描重建预约，容量占用保留。
                         continue;
                     }
                 }
@@ -543,17 +544,22 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
-                if (canceledSqlWaitMemberRecovery != null
-                        && canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor)
-                        != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
-                    if (canceledSqlWaitMemberRecovery.complete(run.getId(), anchor)) {
-                        redisCache.removeDue(run.getId());
-                        redisCache.deletePendingCache(run.getId());
-                    } else {
-                        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-                        redisCache.upsertDue(run.getId(), anchor);
+                if (canceledSqlWaitMemberRecovery != null) {
+                    var ownership = canceledSqlWaitMemberRecovery.ownership(run.getId(), anchor);
+                    if (ownership != CanceledSqlWaitMemberRecovery.Ownership.NOT_APPLICABLE) {
+                        if (ownership == CanceledSqlWaitMemberRecovery.Ownership.UNCONFIRMED) {
+                            // 外部作业未确认：不再重建到期项，保留会话锁与容量。
+                            redisCache.removeDue(run.getId());
+                            redisCache.deletePendingCache(run.getId());
+                        } else if (canceledSqlWaitMemberRecovery.complete(run.getId(), anchor)) {
+                            redisCache.removeDue(run.getId());
+                            redisCache.deletePendingCache(run.getId());
+                        } else {
+                            anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                            redisCache.upsertDue(run.getId(), anchor);
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 if ("WORKSPACE_REFUSED".equals(anchor.getAnchorState())) {
                     anchor.setNextPollAt(Instant.now());

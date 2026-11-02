@@ -465,12 +465,19 @@
                                THEN (snapshot_json #>> '{observability,summary,tool_calls}')::int
                            END,
                        0
-               ) AS tool_calls
+               ) AS tool_calls,
+               tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run run_row
         WHERE user_id = #{userId}
           AND COALESCE(run_row.ext -&gt;&gt; 'child_run', 'false') &lt;&gt; 'true'
         <if test="status != null">
-            AND status = #{status}
+            AND CASE
+                    WHEN status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+                         AND status &lt;&gt; 'RECEIVED'
+                         AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                        THEN 'CANCELED'
+                    ELSE status
+                END = #{status}
         </if>
         <if test="fromTime != null">
             AND started_at &gt;= #{fromTime}
@@ -486,7 +493,13 @@
         WHERE user_id = #{userId}
           AND COALESCE(run_row.ext -&gt;&gt; 'child_run', 'false') &lt;&gt; 'true'
         <if test="status != null">
-            AND status = #{status}
+            AND CASE
+                    WHEN status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+                         AND status &lt;&gt; 'RECEIVED'
+                         AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                        THEN 'CANCELED'
+                    ELSE status
+                END = #{status}
         </if>
         <if test="fromTime != null">
             AND started_at &gt;= #{fromTime}
@@ -1893,6 +1906,11 @@
           AND deployment_id = #{deploymentId}
           AND deployment_generation_id = #{deploymentGenerationId}
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND NOT EXISTS (
+                SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                 WHERE s.run_id = alphafrog_agent_run.id
+                   AND s.state = 'UNCONFIRMED'
+              )
           AND NOT (
                 status = 'EXECUTING'
                 AND (
