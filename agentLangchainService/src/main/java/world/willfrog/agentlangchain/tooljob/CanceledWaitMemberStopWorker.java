@@ -177,7 +177,7 @@ public class CanceledWaitMemberStopWorker {
             var settledBlock = settlement.settleBlocked(member, proof, persistedBlock.status(),
                     persistedBlock.result(), persistedBlock.finishedAt(), persistedBlock.blocked());
             if (!settledBlock.ok()) {
-                retry(stop, "sandbox_settlement_incomplete");
+                retryOrUnconfirm(stop, "sandbox_settlement_incomplete");
                 return;
             }
             confirmSettlement(stop, persistedBlock.result().getTaskId(), persistedBlock.status());
