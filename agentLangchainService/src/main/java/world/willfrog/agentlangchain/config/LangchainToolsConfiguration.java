@@ -12,6 +12,7 @@ import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -27,7 +28,7 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
  * 把基于 {@link ToolRouter} 的 {@link ToolProvider} 注册给 AiServices 使用。
  */
 @Configuration
-@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class,
+@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, AssetSqlTools.class, RagTools.class, SearchTools.class,
         PythonSandboxTools.class, ListMyDataTool.class, PromoteDatasetTool.class, LoadToolGuideTool.class,
         RereadToolHandler.class, AgentRunEventService.class, PythonSandboxDispatchStore.class})
 public class LangchainToolsConfiguration {
@@ -35,6 +36,7 @@ public class LangchainToolsConfiguration {
     @Bean
     ToolProvider langchainToolProvider(ToolRouter toolRouter,
                                        MarketDataTools marketDataTools,
+                                       AssetSqlTools assetSqlTools,
                                        RagTools ragTools,
                                        SearchTools searchTools,
                                        PythonSandboxTools pythonSandboxTools,
@@ -53,6 +55,7 @@ public class LangchainToolsConfiguration {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
+                assetSqlTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,

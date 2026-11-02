@@ -25,7 +25,10 @@ public class ToolRetrySafetyCatalog {
                 "getTradingDaysSummary", "isTradingDay", "getExchangeAssetDaily", "getOffExchangeAssetDaily",
                 "getEtfAdj", "getListedAssetShareSize", "getFinancialReport", "ragSearch", "loadDocument",
                 "searchWeb", "resolveFinanceMethods", "loadToolGuide", "rereadToolResult", "listMyData",
-                "waitForSubAgent"
+                "waitForSubAgent",
+                // 014 资产 SQL 工具：listAssetTables 纯目录渲染；queryAssetData 服务端只读执行，
+                // 大结果落数据集与 getStockDaily 同类（复用键命中不重复写），均无外部写入。
+                "queryAssetData", "listAssetTables"
         }) {
             safety.put(name, ToolRetrySafety.READ_ONLY);
         }

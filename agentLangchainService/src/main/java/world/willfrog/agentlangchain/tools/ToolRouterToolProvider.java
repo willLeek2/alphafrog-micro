@@ -17,6 +17,7 @@ import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -73,6 +74,7 @@ public class ToolRouterToolProvider implements ToolProvider {
 
     private final ToolRouter toolRouter;
     private final MarketDataTools marketDataTools;
+    private final AssetSqlTools assetSqlTools;
     private final RagTools ragTools;
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
@@ -103,7 +105,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore,
                                   ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
                                   AgentPromptService promptService) {
-        this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+        this(toolRouter, marketDataTools, null, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
                 listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper,
                 agentEventService, toolThrottle, pythonSandboxDispatchStore, subAgentBridge, promptService, null);
     }
@@ -123,9 +125,30 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   AgentRunEventService agentEventService,
                                   LangchainToolConcurrencyThrottle toolThrottle,
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore) {
-        this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+        this(toolRouter, marketDataTools, null, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper,
+                agentEventService, toolThrottle, pythonSandboxDispatchStore);
+    }
+
+    /** 支持显式提供资产SQL工具，未提供的持久子代理及提示词准备组件保持关闭。 */
+    public ToolRouterToolProvider(ToolRouter toolRouter,
+                                  MarketDataTools marketDataTools,
+                                  AssetSqlTools assetSqlTools,
+                                  RagTools ragTools,
+                                  SearchTools searchTools,
+                                  PythonSandboxTools pythonSandboxTools,
+                                  SqlQueryTools sqlQueryTools,
+                                  ListMyDataTool listMyDataTool,
+                                  PromoteDatasetTool promoteDatasetTool,
+                                  LoadToolGuideTool loadToolGuideTool,
+                                  RereadToolHandler rereadToolHandler,
+                                  ObjectMapper objectMapper,
+                                  AgentRunEventService agentEventService,
+                                  LangchainToolConcurrencyThrottle toolThrottle,
+                                  PythonSandboxDispatchStore pythonSandboxDispatchStore) {
+        this(toolRouter, marketDataTools, assetSqlTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
                 listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
-                toolThrottle, pythonSandboxDispatchStore, null, null);
+                toolThrottle, pythonSandboxDispatchStore, null, null, null);
     }
 
     /**
@@ -154,6 +177,7 @@ public class ToolRouterToolProvider implements ToolProvider {
 
         List<ToolSpecification> specifications = ToolCatalogBuilder.buildSpecifications(
                 marketDataTools,
+                assetSqlTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,

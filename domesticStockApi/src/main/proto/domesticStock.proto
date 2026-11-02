@@ -554,6 +554,35 @@ message DomesticStockReportRcQueryResponse {
   repeated StockReportRcItem items = 1;
 }
 
+// ==================== 统一 SQL 资产取数工具新增：服务端只读 SQL 执行 ====================
+// 模型提交只读 SELECT/WITH 查询，服务端守卫（单语句 / 表白名单 / 函数族 / LIMIT 强制）后执行；
+// 行传输＝每行一个 JSON 数组字符串（与既有 repeated string 行传输风格一致）；
+// 拒绝一律经响应级 error 结构返回（跨 RPC 可机读），不靠异常传递。
+
+message ExecuteAssetSqlRequest {
+  string sql = 1;  // 只读查询文本；日期条件用 af_date('YYYY-MM-DD') 写法，由服务端替换为上海零点毫秒时间戳
+}
+
+// 结构化拒绝/执行错误（稳定错误码）：
+// 守卫类：MISSING_LIMIT / NOT_SELECT / FORBIDDEN_KEYWORD / TABLE_NOT_ALLOWED /
+//         FORBIDDEN_FUNCTION / MULTI_STATEMENT / INVALID_DATE_LITERAL
+// 执行类：SERVER_BUSY / STATEMENT_TIMEOUT / QUERY_FAILED
+message ExecuteAssetSqlError {
+  string code = 1;
+  string message = 2;       // 给人/模型看的中文说明
+  string details_json = 3;  // 机读补充（JSON 文本，如被拒关系名/函数名/关键字）
+}
+
+message ExecuteAssetSqlResponse {
+  repeated string columns = 1;  // 列名（按结果集元数据顺序）
+  repeated string rows = 2;     // 每行一个 JSON 数组字符串，元素与 columns 一一对应
+  int64 row_count = 3;          // 实际返回行数
+  bool truncated = 4;           // 结果被截断：外层 LIMIT 超硬上限被改写，或行/字节硬上限触顶
+  int64 enforced_limit = 5;     // 守卫强制后的外层 LIMIT 值（改写后的生效值）
+  int64 elapsed_ms = 6;         // 服务端处理耗时（毫秒）
+  optional ExecuteAssetSqlError error = 7;  // 拒绝/执行错误；成功执行时为空
+}
+
 service DomesticStockService {
   rpc getStockInfoByTsCode(DomesticStockInfoByTsCodeRequest) returns (DomesticStockInfoByTsCodeResponse);
   rpc searchStock(DomesticStockSearchRequest) returns (DomesticStockSearchResponse);
@@ -574,6 +603,9 @@ service DomesticStockService {
   // 指标库扩充新增：财务指标 / 券商盈利预测查询
   rpc queryStockFinaIndicator(DomesticStockFinancialQueryRequest) returns (DomesticStockFinaIndicatorQueryResponse);
   rpc queryStockReportRc(DomesticStockFinancialQueryRequest) returns (DomesticStockReportRcQueryResponse);
+
+  // 统一 SQL 资产取数工具新增：只读 SQL 资产查询（守卫八步在服务端 AssetSqlGuard 实现）
+  rpc executeAssetSql(ExecuteAssetSqlRequest) returns (ExecuteAssetSqlResponse);
 }
 
 

@@ -19,8 +19,8 @@ class AgentToolRegistryContractTest {
     @Test
     void declaredToolNames_hasExactly30UniqueNames() {
         Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertEquals(30, names.size(), "生产声明面应保持 30 个工具名");
-        assertEquals(30, names.stream().distinct().count(), "工具名必须唯一");
+        assertEquals(32, names.size(), "生产声明应包含 32 个工具名");
+        assertEquals(32, names.stream().distinct().count(), "工具名必须唯一");
     }
 
 
@@ -54,6 +54,8 @@ class AgentToolRegistryContractTest {
                 "getListedAssetShareSize",
                 "getFinancialReport",
                 "getSpecialAssetDaily",
+                "queryAssetData",
+                "listAssetTables",
                 "ragSearch",
                 "loadDocument"
         );
@@ -91,7 +93,8 @@ class AgentToolRegistryContractTest {
                 "getOffExchangeAssetDaily",
                 "getListedAssetShareSize",
                 "getEtfAdj",
-                "getSpecialAssetDaily"
+                "getSpecialAssetDaily",
+                "queryAssetData"
         );
         Set<String> actual = AgentToolRegistry.namesInCacheFamily(AgentToolRegistry.CacheFamily.DATASET);
         assertEquals(expected, actual);

@@ -19,6 +19,7 @@ import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.market.AssetSqlTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -37,6 +38,7 @@ import java.util.Map;
 public class LangchainToolCatalogService {
 
     private final MarketDataTools marketDataTools;
+    private final AssetSqlTools assetSqlTools;
     private final RagTools ragTools;
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
@@ -61,6 +63,7 @@ public class LangchainToolCatalogService {
     public List<AgentToolMessage> listToolMessages() {
         List<ToolSpecification> specifications = ToolCatalogBuilder.buildSpecifications(
                 marketDataTools,
+                assetSqlTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
