@@ -305,6 +305,33 @@ class RereadToolHandlerTest {
                 () -> handler.reread("raw_ref_001", "现金流", 0, 80));
     }
 
+    @Test
+    void rereadKeywordWithNullServiceHitCountShouldOmitHitCountKey() throws Exception {
+        // 014-opt-10：hitCount 键只在服务层真的给出命中数时输出——
+        // StubRunRawRefStore 的 keyword 模式读取不设置 hitCount（null），
+        // data 回显 keyword 但不落 hitCount 键
+        AgentContext.setRunId("run-1");
+        AgentContext.setUserId("user-1");
+        RereadToolHandler handler = configure(new RereadToolHandler(
+                new StubToolOutputRefService(),
+                objectMapper,
+                Optional.empty(),
+                Optional.of(new StubRunRawRefStore())
+        ));
+
+        Map<String, Object> response = objectMapper.readValue(
+                handler.reread("raw_ref_001", "现金流", 0, 80),
+                new TypeReference<>() {}
+        );
+
+        assertEquals(Boolean.TRUE, response.get("ok"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) response.get("data");
+        assertEquals("short-content", data.get("content"));
+        assertEquals("现金流", data.get("keyword"));
+        assertFalse(data.containsKey("hitCount"), "服务层 hitCount=null 时 data 不应输出 hitCount 键");
+    }
+
     private static class StubToolOutputRefService implements ToolOutputRefService {
         @Override
         public world.willfrog.agent.platform.artifact.PersistentArtifactRegistration registerRawOutput(

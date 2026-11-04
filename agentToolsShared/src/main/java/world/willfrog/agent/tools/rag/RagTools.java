@@ -257,10 +257,12 @@ public class RagTools {
         keyword.put("tool", "rereadToolResult");
         keyword.put("rawRef", rawRef);
         keyword.put("required_args", List.of("keyword"));
-        keyword.put("optional_args", List.of("limit"));
+        keyword.put("optional_args", List.of("offset", "limit"));
         keyword.put("constraints", Map.of(
                 "keyword_required", true,
-                "max_limit", keywordMax
+                "max_limit", keywordMax,
+                "offset_semantics", "search start index in original content; pass nextOffset from previous call to continue",
+                "returns", "hit windows with @offset headers; use offsets for keyword-less range reads"
         ));
 
         Map<String, Object> range = new LinkedHashMap<>();

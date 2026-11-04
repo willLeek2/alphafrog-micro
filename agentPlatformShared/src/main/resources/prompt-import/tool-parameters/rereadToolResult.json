@@ -2,9 +2,9 @@
   "fragment" : "tool.parameters.rereadToolResult",
   "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
   "bodyType" : "FIXED",
-  "body" : "{\"/properties/keyword/description\":\"可选关键词；非空时只返回匹配片段\",\"/properties/limit/description\":\"可选读取长度，0 表示使用服务默认\",\"/properties/offset/description\":\"可选读取偏移，默认 0\",\"/properties/rawRef/description\":\"工具结果 data.rawRef 字段，形如 raw_ref_001 或 raw-ref:...\"}",
+  "body" : "{\"/properties/keyword/description\":\"可选关键词；非空时返回命中窗口——每个命中位置前后各约 200 字符、段头标注命中在全文中的偏移（如 @48210），最多 20 个命中；hasMore=true 时把 nextOffset 传入下一次调用的 offset 续读；段头偏移可用于去掉 keyword 的分段精读\",\"/properties/limit/description\":\"可选读取长度，0 表示使用服务默认；带 keyword 时是本次返回文本的字符上限，容纳不下的命中窗口由下一次调用返回\",\"/properties/offset/description\":\"可选偏移，默认 0；带 keyword 时表示从全文该字符下标起向后查找命中（续查传上次返回的 nextOffset），不带 keyword 时表示读取起始字符下标\",\"/properties/rawRef/description\":\"工具结果 data.rawRef 字段，形如 raw_ref_001 或 raw-ref:...\"}",
   "variables" : [ ],
-  "utf8Sha256" : "f75b3c584894e5726695e989275de05385954e6e882749a4ea80ea6287b61d5f",
+  "utf8Sha256" : "8b599627fb19bb3f8f497248a3c1ee3303b5e2fd45a2d1e4c62fd5eeddf4aa4a",
   "source" : {
     "toolName" : "rereadToolResult",
     "repository" : "alphafrog-micro",

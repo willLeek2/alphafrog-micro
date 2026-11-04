@@ -845,7 +845,9 @@ class AgentLlmLocalConfigLoaderTest {
                     "reread": {
                       "keyword-char-limit": 3000,
                       "range-max-limit": 6000,
-                      "range-min-limit-without-keyword": 3000
+                      "range-min-limit-without-keyword": 3000,
+                      "keyword-window-radius": 150,
+                      "keyword-window-max-hits": 15
                     },
                     "rag": {
                       "visible-chars": 3000,
@@ -866,6 +868,9 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals(3000, tools.getReread().getKeywordCharLimit());
         assertEquals(6000, tools.getReread().getRangeMaxLimit());
         assertEquals(3000, tools.getReread().getRangeMinLimitWithoutKeyword());
+        // 014-opt-10：keyword 命中窗口两个热配置字段的解析
+        assertEquals(150, tools.getReread().getKeywordWindowRadius());
+        assertEquals(15, tools.getReread().getKeywordWindowMaxHits());
         assertEquals(3000, tools.getRag().getVisibleChars());
         assertEquals(500, tools.getRag().getPreviewChars());
         assertEquals(3, tools.getRag().getSnippetCapPerDoc());
