@@ -2249,10 +2249,8 @@ public class MarketDataTools {
     }
 
     /**
-     * 构造成功响应的 JSON 正文，并保留其中实际政策的版本来源。
-     *
-     * <p>统一响应格式：{@code {ok: true, tool, data, error: null}}。
-     * 所有工具方法无论成功或失败都返回同一结构，便于 LangchainTodoNodeExecutor 统一解析。</p>
+     * 构造统一响应JSON，并保留实际政策的版本来源。
+     * <p>响应包含ok、tool、data和error字段，供节点执行器统一解析。</p>
      */
     PromptText okPrompt(String tool, Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();

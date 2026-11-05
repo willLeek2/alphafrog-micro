@@ -142,11 +142,7 @@ public class ReactConversationContext {
         }
     }
 
-    /**
-     * 获取当前完整的消息快照；兼容旧消费者，但不丢弃内部来源。
-     *
-     * @return 不可变的消息列表
-     */
+    /** 返回不可变消息快照，内部继续保留每条消息的来源。 */
     public List<ChatMessage> getMessages() {
         return messages.stream().map(PromptMessage::message).toList();
     }
@@ -155,7 +151,7 @@ public class ReactConversationContext {
         return List.copyOf(messages);
     }
 
-    /** 旧入口留下UNKNOWN时停止，调用方不能把旧消息直接标记为运行数据。 */
+    /** 发送前要求消息来源明确；UNKNOWN来源会停止发送。 */
     public ModelInputSources modelInputSources() {
         return PromptMessage.toModelInputSources(snapshot());
     }

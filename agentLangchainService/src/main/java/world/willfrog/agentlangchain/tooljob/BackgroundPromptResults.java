@@ -8,7 +8,7 @@ import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
-/** 正文和来源来自同一份持久记录；旧记录没有来源时保持未知并停止。 */
+/** 从同一持久记录读取正文与来源；缺少来源时停止发送。 */
 public final class BackgroundPromptResults {
     private BackgroundPromptResults() { }
     public static String encode(PromptText text) {

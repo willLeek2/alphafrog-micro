@@ -87,7 +87,7 @@ public class SearchTools {
                 skipRagPrefetch, timeRangeStart, timeRangeEnd, maxResults));
     }
 
-    /** 缓存读取之前固定实际参数，后续执行不再读取运行配置或重新取值。 */
+    /** 缓存读取前固定实际参数，后续执行沿用该快照。 */
     public PreparedSearchArguments prepareArguments(String query, String scene, String backend, String strength,
             boolean skipHotCache, boolean skipRagPrefetch, String timeRangeStart, String timeRangeEnd, int maxResults) {
         AgentContext.WebSearchConfig runConfig = AgentContext.getWebSearchConfig();
@@ -308,7 +308,7 @@ public class SearchTools {
                 usageStatus = reportUsage(usage, usageResult(e));
             }
             ModelSendBlocks.rethrowIfBlocked(e);
-            // 本地异常包装行：RPC/序列化一类的上游或系统故障。搜索已经发起时保留原失败，不再次搜索。
+            // RPC或序列化异常保留原失败；已发起的搜索按该结果返回。
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("ok", false);
             payload.put("tool", "searchWeb");
@@ -394,7 +394,7 @@ public class SearchTools {
         }
     }
 
-    /** 调用外部搜索之前固定的一次上报。重传只重复这个对象，不重新搜索。 */
+    /** 搜索前固定上报对象，重传时复用同一对象。 */
     private record ExperimentUsageReport(String attemptId, String experimentId, String assignmentId,
             String adoptedValueJson, String toolCallId, String occurredAt) {
     }

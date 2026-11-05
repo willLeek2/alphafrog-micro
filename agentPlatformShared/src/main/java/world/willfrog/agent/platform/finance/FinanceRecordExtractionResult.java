@@ -22,7 +22,7 @@ public record FinanceRecordExtractionResult(
 
     public record ModelNotice(String code, String message, String action,
                               PromptText messagePrompt, PromptText actionPrompt) {
-        /** 旧构造只提供文字，不能证明这些说明和建议的来源。 */
+        /** 兼容构造只提供文字，来源保持未知。 */
         public ModelNotice(String code, String message, String action) {
             this(code, message, action, null, null);
         }

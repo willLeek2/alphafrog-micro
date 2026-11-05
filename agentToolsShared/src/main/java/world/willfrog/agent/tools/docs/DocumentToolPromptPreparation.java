@@ -38,7 +38,7 @@ public final class DocumentToolPromptPreparation {
         return reader.render(body, data, Map.of());
     }
 
-    /** 只为实际进入响应的应用文字附带来源，不从JSON正文猜测来源。 */
+    /** 为实际进入响应的应用文字附带来源。 */
     public static PromptText envelope(ObjectMapper json, Object payload, List<PromptVersionSource> sources) {
         try {
             return new PromptText(json.writeValueAsString(payload), sources);

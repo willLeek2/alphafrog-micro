@@ -57,7 +57,7 @@ public final class SqlQueryJobResultAdapter implements SandboxJobResultAdapter {
         return resolveTerminal(result, formatContext).output();
     }
 
-    /** 运行器给出的数据和错误事实不带指令版本；处理建议在实际分支重新读取版本。 */
+    /** 运行器提供数据与错误事实，实际分支从原根版本读取处理建议。 */
     @Override
     public PromptText formatTerminalResultText(SandboxTerminalResultView result, Object formatContext) {
         return resolveTerminalText(result, formatContext).output();

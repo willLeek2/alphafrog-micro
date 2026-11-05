@@ -339,7 +339,7 @@ public class FinanceToolResultFormatter {
             String action,
             PromptText messagePrompt,
             PromptText actionPrompt) {
-        /** 旧构造不补造说明与操作建议的来源。 */
+        /** 兼容构造中的说明与操作建议保留未知来源。 */
         public FailureDetail(String code, String message, boolean retryable, String action) {
             this(code, message, retryable, action, null, null);
         }

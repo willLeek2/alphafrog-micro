@@ -102,7 +102,7 @@ public record ModelInputSources(List<ModelInputSource> parts) {
     private static void validateStructure(Map<String, ModelInputSource> locations, Set<String> allowed,
                                           String position, JsonNode structure) {
         allowed.add(position);
-        // 整体来源随结构保留；只有协议字段的结构允许标记为数据，不编造正文版本。
+        // 来源随结构保留；仅含协议字段的结构标记为数据。
         require(locations, position, false);
         Set<String> descriptions = new LinkedHashSet<>();
         descriptionLocations(structure, position, descriptions);

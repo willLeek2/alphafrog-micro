@@ -12,7 +12,7 @@ import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedExcepti
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
-/** 工具执行器自己的纠正建议按实际分支读取版本，不替原工具正文猜测来源。 */
+/** 执行器按实际分支读取纠正建议的版本；工具正文沿用原来源。 */
 @Component
 public final class ToolExecutorPromptPreparation {
     private final AgentPromptTextReader reader;

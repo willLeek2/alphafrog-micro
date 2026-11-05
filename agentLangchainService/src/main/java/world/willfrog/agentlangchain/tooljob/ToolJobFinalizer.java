@@ -190,7 +190,7 @@ public class ToolJobFinalizer {
         } catch (RuntimeException failure) {
             var blocked = ModelSendBlocks.find(failure).orElse(null);
             if (blocked == null) throw failure;
-            // 模型正文不可交付，但已核验的沙箱终态仍须先落库再释放容量。
+            // 先保存已核验的沙箱终态，再释放容量；模型正文继续受发送检查约束。
             anchor.setAnchorState("TERMINAL");
             anchor.setTerminalStatus(terminalStatus);
             anchor.setSandboxTerminalStatus(terminalStatus);

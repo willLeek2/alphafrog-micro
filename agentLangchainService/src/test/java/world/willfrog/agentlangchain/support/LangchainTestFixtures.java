@@ -226,7 +226,7 @@ public final class LangchainTestFixtures {
         return planner;
     }
 
-    /** 调用方仅用于本测试自行产生的工具事实；历史结果、真实工具和指令正文不能用此替身补来源。 */
+    /** 为本测试产生的工具事实提供来源替身。 */
     public static ToolProvider runtimeDataTools(ToolProvider scriptedFacts) {
         return request -> {
             var provided = scriptedFacts.provideTools(request);
@@ -248,7 +248,7 @@ public final class LangchainTestFixtures {
         };
     }
 
-    /** 注入测试自己声明的固定预算提示版本，保留既有逐字节断言。 */
+    /** 注入固定预算提示版本，供正文逐字节断言使用。 */
     public static world.willfrog.alphafrogmicro.common.racing.prompt.PromptText versionedTestHint(String text) {
         return world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.instruction(text,
                 VersionedNodeInputs.source("fixtureLastMileHint", "BUDGET_HINT"));
@@ -256,7 +256,7 @@ public final class LangchainTestFixtures {
 
     public static final String NODE_ENDPOINT = "fixture-node-endpoint";
 
-    /** 使用简化文本消息JSON执行真实保存确认，再调用原有队列模型；不访问HTTP。 */
+    /** 使用简化消息JSON确认保存顺序，再调用队列模型替身。 */
     public static ChatModel archivedNodeModel(ChatModel delegate) {
         ChatModel boundary = new ChatModel() {
             @Override public ModelProvider provider() {
@@ -378,7 +378,7 @@ public final class LangchainTestFixtures {
                             body.path("body").asText(), variables));
                 } catch (java.io.IOException failure) { throw new AssertionError(failure); }
             }
-            // 附加政策及工具参数也按实际导入文件建立本次固定版本，不从旧消息猜测来源。
+            // 附加政策和工具参数采用实际导入文件中的固定版本。
             for (String group : java.util.List.of("execution", "tool-parameters", "tool-executor", "sandbox-producers", "terminal-results", "router-results", "planning", "background-results")) {
                 try {
                     var resolver = new org.springframework.core.io.support.PathMatchingResourcePatternResolver();

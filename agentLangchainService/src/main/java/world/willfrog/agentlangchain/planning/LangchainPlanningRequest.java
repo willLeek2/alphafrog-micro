@@ -24,7 +24,7 @@ public class LangchainPlanningRequest {
     private Integer planGeneration;
     private String userGoal;
     private String dialogueContext;
-    /** 历史正文及其中的应用指令版本；旧裸字符串不提供来源证明。 */
+    /** 历史正文及其指令版本；兼容字符串入口的来源保持未知。 */
     private PromptText dialogueContextPrompt;
     private ChatModel model;
     private List<ToolSpecification> toolSpecifications;

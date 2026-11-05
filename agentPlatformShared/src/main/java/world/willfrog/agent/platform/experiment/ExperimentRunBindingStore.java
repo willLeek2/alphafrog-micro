@@ -16,11 +16,11 @@ import world.willfrog.alphafrogmicro.common.racing.RacingCallException;
 import world.willfrog.racing.idl.RuntimeCallContext;
 import world.willfrog.racing.idl.TargetIdentity;
 
-/** 根绑定只从持久记录读取；提示词准备使用专属字段更新，不能整体替换运行上下文。 */
+/** 从持久记录读取根绑定，通过专属字段更新提示词选择并保留其余运行上下文。 */
 @Component
 public final class ExperimentRunBindingStore {
     public static final String CONTEXT_FIELD = "experiment_context";
-    // JSON数值按含义比较；Java整数宽度及小数表示不改变已保存的选择。
+    // 按JSON数值含义比较选择，兼容Java整数宽度与小数表示差异。
     private static final Comparator<JsonNode> JSON_VALUES = (left, right) -> {
         if (left.isNumber() && right.isNumber()) return left.decimalValue().compareTo(right.decimalValue());
         return left.equals(right) ? 0 : 1;
@@ -44,7 +44,7 @@ public final class ExperimentRunBindingStore {
         return read(runId).context();
     }
 
-    /** 创建根记录时仅保存服务生成的值，不从用户 context_json 中提升身份。 */
+    /** 根记录的身份字段由服务生成。 */
     public JsonNode toExtValue(RuntimeCallContext context) {
         try {
             return json.readTree(JsonFormat.printer().preservingProtoFieldNames()
@@ -54,7 +54,7 @@ public final class ExperimentRunBindingStore {
         }
     }
 
-    /** 成功返回前提交专属更新并重读；未知写入结果只确认原结果，不重新选择。 */
+    /** 提交专属更新并独立重读后返回；写入结果未知时读回原结果。 */
     public void confirmPromptSelection(RuntimeCallContext confirmedContext, Map<String, Object> selectionMap) {
         if (confirmedContext == null || !confirmedContext.hasRoot()
                 || selectionMap == null || selectionMap.isEmpty()) {
@@ -72,7 +72,7 @@ public final class ExperimentRunBindingStore {
         } catch (RuntimeException ex) {
             writeFailure = ex;
         }
-        // 独立事务在此之前已经退出，即使写入事务失败，新查询也不会沿用失败事务。
+        // 写入事务已结束，使用独立事务查询其提交结果。
         try {
             Binding actual = transaction.execute(status -> read(confirmedContext.getRoot().getRootId()));
             if (actual == null) throw failure("PERSISTENCE_UNCONFIRMED", "根记录重读结果为空");

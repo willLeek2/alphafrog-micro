@@ -67,7 +67,7 @@ class RawRefRereadCompositeChainTest {
         rawRefRoot = tempDir.resolve("raw-ref");
         localStore = new RunRawRefLocalStore(rawRefRoot.toString(),
                 8_388_608L, 512, 536_870_912L);
-        store = new RunRawRefStoreImpl(localStore);
+        store = new RunRawRefStoreImpl(localStore, java.util.Optional.empty());
         handler = configure(new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper,
                 Optional.empty(), Optional.of(store)));
         AgentContext.clear();
@@ -140,7 +140,8 @@ class RawRefRereadCompositeChainTest {
         assertEquals(Boolean.FALSE, secondData.get("hasMore"));
         assertEquals(3000, secondData.get("nextOffset"));
 
-        // keyword 模式：只回匹配行（经短 ID→内容→逐行过滤全链）
+        // keyword 模式（014-opt-10 起为命中窗口）：经短 ID→内容→窗口提取全链，
+        // 两处命中（下标 6 与 22）在半径内合并成一段，段头标注每个命中的原文偏移
         AgentContext.setRunId("run-kw");
         store.registerPrompt("run-kw", "user-slice", "kw",
                 world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData("alpha\nneedle-one\nbeta\nneedle-two\n"), 7200);
@@ -149,8 +150,79 @@ class RawRefRereadCompositeChainTest {
         assertEquals(Boolean.TRUE, kw.get("ok"));
         @SuppressWarnings("unchecked")
         Map<String, Object> kwData = (Map<String, Object>) kw.get("data");
-        assertEquals("needle-one\nneedle-two", kwData.get("content"));
+        assertEquals("@6 @22\nalpha\nneedle-one\nbeta\nneedle-two\n", kwData.get("content"));
         assertEquals("needle", kwData.get("keyword"));
+        assertEquals(2, kwData.get("hitCount"));
+        assertEquals(Boolean.FALSE, kwData.get("hasMore"));
+        assertEquals(33, kwData.get("totalLength"));
+        assertEquals(33, kwData.get("nextOffset"));
+    }
+
+    // ===== ② b 014-opt-10 命中窗口：超过默认 maxHits 的续查环 / keyword 空白不带 hitCount =====
+
+    @Test
+    void keywordWindowsOverDefaultMaxHitsShouldResumeUntilAllHitsReturned() throws Exception {
+        // 014-opt-10 ②⑦：25 个命中、间距 56 字符，loader 缺省 → 默认
+        // keywordWindowMaxHits=20：首次只回 20 个（hitCount 仍报检索范围总数 25），
+        // 把 nextOffset 传入下一次调用的 offset 续查；第二次检索范围内只剩 5 个
+        // （hitCount=5，offset 起只有范围命中），hasMore=false、nextOffset=全文长度。
+        AgentContext.setRunId("run-resume");
+        AgentContext.setUserId("user-resume");
+        String content = ("NEEDLE" + "f".repeat(50)).repeat(24) + "NEEDLE"; // 1350 字符，命中 0/56/.../1344
+        store.registerPrompt("run-resume", "user-resume", "密集命中",
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(content), 7200);
+
+        Map<String, Object> first = objectMapper.readValue(
+                handler.reread("raw_ref_001", "NEEDLE", null, null), new TypeReference<>() {});
+        assertEquals(Boolean.TRUE, first.get("ok"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> firstData = (Map<String, Object>) first.get("data");
+        assertEquals(25, firstData.get("hitCount"), "hitCount 不受 maxHits 截断，仍报检索范围总数");
+        assertEquals(Boolean.TRUE, firstData.get("hasMore"));
+        assertEquals(1120, firstData.get("nextOffset"), "第 21 个命中（下标 1120）是下一处未返回命中");
+        assertEquals(1350, firstData.get("totalLength"), "totalLength 恒为全文长度");
+        String firstContent = (String) firstData.get("content");
+        assertTrue(firstContent.startsWith("@0 @56 "), "段头应从首个命中偏移开始: " + firstContent.substring(0, 20));
+        assertTrue(firstContent.contains("@1064"), "第 20 个命中（下标 1064）应在本批返回");
+        assertFalse(firstContent.contains("@1120"), "第 21 个命中（下标 1120，即 nextOffset）不应在本批返回");
+        assertFalse(firstContent.contains("\n\n"), "56 字符间距在默认半径 200 内，20 个命中应合并成一段");
+
+        Map<String, Object> second = objectMapper.readValue(
+                handler.reread("raw_ref_001", "NEEDLE", 1120, null), new TypeReference<>() {});
+        assertEquals(Boolean.TRUE, second.get("ok"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> secondData = (Map<String, Object>) second.get("data");
+        assertEquals(5, secondData.get("hitCount"), "续查的检索范围（1120 起）只有 5 个命中");
+        assertEquals(Boolean.FALSE, secondData.get("hasMore"));
+        assertEquals(1350, secondData.get("nextOffset"), "全部返回后 nextOffset=全文长度");
+        assertEquals(1350, secondData.get("totalLength"));
+        assertTrue(((String) secondData.get("content")).startsWith("@1120 @1176 "),
+                "续查段头应从下一处命中偏移开始");
+    }
+
+    @Test
+    void blankKeywordShouldPageWithoutHitCountKey() throws Exception {
+        // 014-opt-10 ⑥：keyword 为空白串（"" 或 "   "）时走非关键词分页分支——
+        // data 不输出 keyword / hitCount 键，content 是整段 offset/limit 切片
+        AgentContext.setRunId("run-blankkw");
+        AgentContext.setUserId("user-blankkw");
+        String content = "alpha\nneedle-one\nbeta\nneedle-two\n"; // 33 字符
+        store.registerPrompt("run-blankkw", "user-blankkw", "混合",
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText.runtimeData(content), 7200);
+
+        for (String blank : new String[] {"", "   "}) {
+            Map<String, Object> response = objectMapper.readValue(
+                    handler.reread("raw_ref_001", blank, 0, 1500), new TypeReference<>() {});
+            assertEquals(Boolean.TRUE, response.get("ok"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = (Map<String, Object>) response.get("data");
+            assertEquals(content, data.get("content"), "空白 keyword 必须按分页整段读回，不进入命中窗口");
+            assertEquals(Boolean.FALSE, data.get("hasMore"));
+            assertEquals(33, data.get("nextOffset"));
+            assertEquals(33, data.get("totalLength"));
+            assertFalse(data.containsKey("hitCount"), "非关键词分页不应输出 hitCount 键");
+            assertFalse(data.containsKey("keyword"), "空白 keyword 不应回显 keyword 键");
+        }
     }
 
     // ===== ③ 内容层严格归属（短 ID 属于该 run 也不放行） =====

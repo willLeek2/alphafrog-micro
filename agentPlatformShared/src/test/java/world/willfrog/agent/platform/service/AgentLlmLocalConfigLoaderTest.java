@@ -845,7 +845,9 @@ class AgentLlmLocalConfigLoaderTest {
                     "reread": {
                       "keyword-char-limit": 3000,
                       "range-max-limit": 6000,
-                      "range-min-limit-without-keyword": 3000
+                      "range-min-limit-without-keyword": 3000,
+                      "keyword-window-radius": 150,
+                      "keyword-window-max-hits": 15
                     },
                     "rag": {
                       "visible-chars": 3000,
@@ -866,6 +868,9 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals(3000, tools.getReread().getKeywordCharLimit());
         assertEquals(6000, tools.getReread().getRangeMaxLimit());
         assertEquals(3000, tools.getReread().getRangeMinLimitWithoutKeyword());
+        // 014-opt-10：keyword 命中窗口两个热配置字段的解析
+        assertEquals(150, tools.getReread().getKeywordWindowRadius());
+        assertEquals(15, tools.getReread().getKeywordWindowMaxHits());
         assertEquals(3000, tools.getRag().getVisibleChars());
         assertEquals(500, tools.getRag().getPreviewChars());
         assertEquals(3, tools.getRag().getSnippetCapPerDoc());
@@ -1188,10 +1193,7 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals(1000, loader.current().orElseThrow().getTools().getResult().getMaxStringLength());
     }
 
-    /**
-     * 真实 loader、resolver、ModelService、版本渲染及输入作用域；版本读取、路由构建、模型响应和输入保存使用边界替身
-     * 的 financeMethodResolver 消费链夹具。
-     */
+    /** 金融方法解析测试使用实际加载器、解析器、模型服务和版本渲染；版本读取、路由、模型响应及输入保存采用替身。 */
     private record RealResolverChain(
             AgentLlmLocalConfigLoader loader,
             FinanceMethodResolverModelResolver modelResolver,

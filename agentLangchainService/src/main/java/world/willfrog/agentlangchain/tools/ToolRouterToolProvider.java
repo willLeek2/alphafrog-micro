@@ -93,7 +93,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final AgentPromptService promptService;
     private final ToolExecutorPromptPreparation promptPreparation;
 
-    /** 旧装配未提供正文准备组件，新托管执行入口会明确停止。 */
+    /** 兼容装配缺少正文准备组件，托管执行入口会停止发送。 */
     public ToolRouterToolProvider(ToolRouter toolRouter, MarketDataTools marketDataTools, RagTools ragTools,
                                   SearchTools searchTools, PythonSandboxTools pythonSandboxTools, SqlQueryTools sqlQueryTools,
                                   ListMyDataTool listMyDataTool, PromoteDatasetTool promoteDatasetTool,

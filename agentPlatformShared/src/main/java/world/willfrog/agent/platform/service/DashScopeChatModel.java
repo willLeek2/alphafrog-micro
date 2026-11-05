@@ -559,7 +559,7 @@ public class DashScopeChatModel implements ChatModel {
         );
     }
 
-    /** json_object没有发送schema说明，只登记实际存在的协议字段。 */
+    /** json_object仅登记实际发送的协议字段。 */
     private ModelInputInvocation inputForActualFormat(String requestJson) {
         ModelInputInvocation input = ModelInputScope.currentRequired();
         try {

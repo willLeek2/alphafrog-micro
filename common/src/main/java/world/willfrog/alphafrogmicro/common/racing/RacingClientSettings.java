@@ -5,7 +5,7 @@ import java.util.function.Function;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.racing.idl.TargetIdentity;
 
-/** 在调用时读取受限配置；配置缺失不会被解释成主范围或本地范围。 */
+/** 调用时读取配置，缺少配置时返回错误。 */
 public final class RacingClientSettings {
     private final Function<String, String> properties;
 

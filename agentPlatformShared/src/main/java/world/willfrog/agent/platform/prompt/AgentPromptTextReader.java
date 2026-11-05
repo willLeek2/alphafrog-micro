@@ -90,7 +90,7 @@ public final class AgentPromptTextReader {
         }
     }
 
-    /** 按已选集合的结构化成员名枚举要求，序号可以有空缺，不依赖本地资源条数。 */
+    /** 按所选集合的成员名枚举结构要求，允许序号空缺。 */
     public List<PromptVersionBody> requirements(RootPrompts root) {
         try {
             require(root != null, "要求读取缺少原根上下文");

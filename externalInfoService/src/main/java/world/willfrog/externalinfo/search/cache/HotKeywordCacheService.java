@@ -132,7 +132,7 @@ public class HotKeywordCacheService {
                     : objectMapper.readValue(payload, ClusterData.class);
             if (cluster == null || cluster.getResponse() == null
                     || cluster.getResponse().getResultOrigin() != WebSearchResultOrigin.WEB_SEARCH_RESULT_RUNTIME_DATA_VALUE) {
-                // 旧缓存的答案没有同项来源，不能在加入新答案后补成已知数据。
+                // 旧缓存答案缺少同项来源时保持未知来源。
                 cluster = new ClusterData();
             }
             if (cluster.getCreatedAt() == null) {

@@ -34,39 +34,14 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /**
- * Agent 规划阶段（planning）的主要实现类。
- *
- * <h2>在 agent run 生命周期中的位置</h2>
- * 每个 agent run 的第一步都是规划（planning）——把用户输入的自然语言目标拆分为可执行的
- * Todo 列表。本类负责 agentLangchainService 中这个规划步骤的实现。
- *
- * <h2>两套规划路径</h2>
- * 实际存在两套规划实现，通过 Nacos 配置项
- * {@code runtime.planning.structuredOutput.strategyStageEnabled} 切换：
- * <ol>
- *   <li><b>两阶段结构化规划（strategy → todos）</b>：先让 LLM 输出一个整体策略
- *       （分析用户意图、判断 LINEAR/DAG 模式），再基于该策略生成具体的 Todo 列表。
- *       每一步都通过 OpenRouter 的 structured output（json_schema）约束输出格式。</li>
- *   <li><b>单阶段 LangChain4j（LC4j）AI Service 规划</b>：通过 LC4j 的
- *       {@code @AiService} 接口代理，直接调用 LLM 生成 Todo 列表。
- *       保留为两阶段规划的 legacy-compatible（兼容旧版）fallback（降级）路径。</li>
- * </ol>
- *
- * <h2>Structured Output 的 ThreadLocal 机制</h2>
- * 自有模型从 {@link AgentContext} 的线程上下文读取结构要求，SDK模型通过
- * 本次请求的参数接收同一份结构。每次调用同时登记实际消息和结构说明的来源，
- * 发送器确认保存最终请求后才发送。调用结束后恢复原有结构、阶段和输入作用域。
- *
- * <h2>与共享规划组件的关系</h2>
- * 本类的两阶段路径直接复用了 {@link StructuredPlanningSupport} 做 schema
- * 生成和 JSON 校验；provider 参数策略由 {@link LangchainPlanningStructuredOutputSettings}
- * 控制——其中 OpenRouter 的 {@code require_parameters} 默认设为 false，
- * 避免因 {@code stream_options} 等扩展字段导致 provider 路由错误。
+ * 将用户目标转换为可执行任务列表。
+ * <p>两阶段路径先生成策略，再生成任务列表；兼容路径通过LangChain4j代理直接生成任务列表。
+ * 两条路径共享JSON解析、结构校验及重试配置。</p>
+ * <p>自有模型从 {@link AgentContext} 读取输出结构，SDK模型通过请求参数接收同一结构。
+ * 每次调用登记消息与结构说明的来源，保存最终输入后发送，结束时恢复原线程上下文。</p>
  *
  * @see LangchainPlanningStructuredOutputSettings
- * @see LangchainPlannerAiService 单阶段路径使用的 LC4j AI Service 接口
- * @see StructuredPlanningSupport 两阶段路径复用的 schema 与校验工具
- * @see AgentContext ThreadLocal 上下文管理
+ * @see StructuredPlanningSupport
  */
 @Service
 @RequiredArgsConstructor
@@ -298,26 +273,10 @@ public class LangchainAiPlanner {
     }
 
     /**
-     * 单阶段规划：通过 LangChain4j 的 {@code @AiService} 接口代理直接生成 Todo 列表。
-     *
-     * <h3>与两阶段路径的主要差异</h3>
-     * <ol>
-     *   <li>不先问 strategy，直接把动态前缀 + Todo 阶段指令 + 用户目标拼成一条消息发给 LLM</li>
-     *   <li>使用 LC4j 的 {@code AiServices.builder()} 创建代理并取得原始 JSON</li>
-     *   <li>与两阶段 Todo 阶段复用同一套 JSON 解析、结构校验和重试配置</li>
-     * </ol>
-     *
-     * <h3>为什么原始字符串返回仍需要 ThreadLocal</h3>
-     * {@code OpenRouterProviderRoutedChatModel} 只从 ThreadLocal 读取
-     * {@link AgentContext.StructuredOutputSpec}。因此单阶段即使返回原始 JSON，
-     * 也必须显式设置与两阶段 Todo 相同的 schema。
-     *
-     * <h3>系统正文装配</h3>
-     * 系统正文已经按原根冻结的版本和日期渲染，装配辅助类跳过SDK的再次模板解析。
-     * 工具能力摘要放在本次用户消息中；规划阶段不会发送可执行工具定义。
-     *
-     * @see LangchainPlannerAiService 规划专用的 LC4j AI Service 接口
-     * @see StructuredPlanningSupport 共享 JSON 解析与结构校验
+     * 通过LangChain4j代理直接生成任务列表。
+     * <p>动态前缀、任务指令与用户目标组成用户消息，输出复用两阶段规划的JSON结构及校验规则。
+     * 系统正文采用原根冻结的版本和日期，装配后跳过SDK模板解析；工具能力摘要随用户消息传入。</p>
+     * <p>自有模型从线程上下文读取输出结构，因此本路径也需要设置任务列表的结构要求。</p>
      */
     private LangchainTodoPlan planSingleStageLegacyTemplate(LangchainPlanningRequest request,
                                                             PlanExecutionMode mode,

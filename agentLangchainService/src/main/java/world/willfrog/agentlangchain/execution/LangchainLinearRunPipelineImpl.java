@@ -845,7 +845,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 已持久的发送阻止先于原根读取、历史压缩和模型构建，走原失败保存出口。
             ModelSendBlocks.fromFailureMetadata(resumeContext.getTerminalModelSendBlock())
                     .ifPresent(blocked -> { throw blocked; });
-            // 恢复也重新确认原根范围及选择，不使用子运行扩展字段中的摘要代替。
+            // 恢复时重新核对持久根记录的范围和选择。
             AgentContext.setPromptRunSelection(eventService.prepareExperimentRunContext(runId));
             // 恢复排队期间若用户已暂停/取消，不能继续执行原 Todo。
             if (!eventService.isRunnable(runId, userId)) {

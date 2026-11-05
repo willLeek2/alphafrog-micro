@@ -31,7 +31,7 @@ public interface ToolRepairHandler {
     /** 拼进当前待办 user message 的修复指令（含阶段说明与诊断上下文）。 */
     String buildRepairInstruction(ToolJobResumeContext context);
 
-    /** 新模型路径必须携带真实指令来源；旧handler不能自动降级成运行数据。 */
+    /** 模型修复入口要求结果携带真实指令来源；兼容处理器的来源保持未知。 */
     default PromptText buildRepairInstructionText(ToolJobResumeContext context) {
         throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
                 "工具修复处理器尚未提供带来源指令：" + toolName());

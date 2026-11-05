@@ -22,7 +22,7 @@ import world.willfrog.racing.idl.ReadPromptSetVersionRequest;
 import world.willfrog.racing.idl.ReadPromptVersionsRequest;
 import world.willfrog.racing.idl.RuntimeCallContext;
 
-/** 按根运行已经确认的集合读取所需片段，不随当前默认切换，也不扩大实际来源清单。 */
+/** 按已确认的根集合读取所需片段及其来源。 */
 public final class RacingPromptSetReader {
     private final RacingPromptClient client;
 
@@ -30,7 +30,7 @@ public final class RacingPromptSetReader {
         this.client = Objects.requireNonNull(client, "client");
     }
 
-    /** 业务明确提供片段及预期用途，不能以集合自身的用途声明代替业务核对。 */
+    /** 业务提供片段名称和预期用途，用于核对集合成员。 */
     public Map<String, PromptVersionBody> readFragments(RuntimeCallContext context, PromptSelection binding,
                                                        Map<String, String> expectedPurposes) {
         require(context != null && binding != null && !binding.getSelectionId().isBlank(),
@@ -40,7 +40,7 @@ public final class RacingPromptSetReader {
         expected.forEach((fragment, purpose) -> require(fragment != null && !fragment.isBlank()
                 && purpose != null && !purpose.isBlank(), "业务片段名称及预期用途不能为空"));
 
-        // 跨服务传入的绑定先与平台持久记录核对，不能只信任请求自报的集合版本。
+        // 跨服务绑定先与平台持久记录核对。
         PromptSelection saved = client.getSelection(GetPromptSelectionRequest.newBuilder()
                 .setContext(context).setSelectionId(binding.getSelectionId()).build());
         require(stableSelection(saved).equals(stableSelection(binding)),
@@ -76,7 +76,7 @@ public final class RacingPromptSetReader {
         return Collections.unmodifiableMap(result);
     }
 
-    /** 返回的来源只覆盖所请求片段；渲染失败不改读其他片段或当前默认。 */
+    /** 仅返回所请求片段的来源；渲染失败时停止读取。 */
     public Map<String, PromptText> renderFragments(RuntimeCallContext context, PromptSelection binding,
                                                   Map<String, String> expectedPurposes,
                                                   Map<String, Map<String, String>> values) {

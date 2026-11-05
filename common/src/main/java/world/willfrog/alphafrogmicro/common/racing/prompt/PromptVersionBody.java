@@ -11,7 +11,7 @@ import java.util.List;
 
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_UNREADABLE;
 
-/** 一个不可变正文版本；正文、变量声明与用途一起读取，不读取可移动的默认指针。 */
+/** 按明确版本共同读取正文、变量声明与用途。 */
 public record PromptVersionBody(
         PromptVersionSource source,
         PromptBodyType type,
@@ -34,7 +34,7 @@ public record PromptVersionBody(
         }
     }
 
-    /** 严格读取UTF-8；不替换坏字节，不裁剪空白，也不去除正文中的BOM。 */
+    /** 严格校验UTF-8字节，保留原空白和BOM。 */
     public static PromptVersionBody fromUtf8(PromptVersionSource source, PromptBodyType type,
                                               byte[] body, List<PromptVariableDeclaration> variables) {
         if (body == null) {

@@ -94,7 +94,7 @@ public final class WaitMemberResultPayload {
         }
     }
 
-    /** 来源随已分类正文一起保存；旧encode入口不会为裸字符串补造来源。 */
+    /** 来源随分类后的正文保存；兼容编码入口的来源保持未知。 */
     public static String encodePrompt(ObjectMapper objectMapper, String toolName, String toolCallId,
                                       boolean success, PromptText output, Map<String, Object> extra, int maxChars) {
         Map<String, Object> attributes = new LinkedHashMap<>(extra == null ? Map.of() : extra);
@@ -134,7 +134,7 @@ public final class WaitMemberResultPayload {
         return encode(objectMapper, toolName, toolCallId, false, "", extra, Integer.MAX_VALUE);
     }
 
-    /** 新产生的持久化失败是框架事实；旧 compact 入口继续不推断来源。 */
+    /** 本次持久化失败记为框架事实；兼容压缩入口沿用原来源。 */
     public static String compactPersistFailurePrompt(ObjectMapper objectMapper, String toolName,
                                                      String toolCallId, String errorDetail, String taskId) {
         String detail = errorDetail == null || errorDetail.isBlank() ? "成员结果无法写入等待组" : errorDetail;

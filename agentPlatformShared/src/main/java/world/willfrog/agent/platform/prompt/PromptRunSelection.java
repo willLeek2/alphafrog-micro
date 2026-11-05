@@ -16,9 +16,7 @@ import world.willfrog.racing.idl.ValueSourceKind;
 
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_UNREADABLE;
 
-/**
- * 根运行的提示词定位。旧摘要仅供历史解析，真实集合选择保存完整平台定位而不保存正文。
- */
+/** 根运行保存完整的集合定位；兼容摘要仅用于解析历史记录。 */
 public record PromptRunSelection(
         int schemaVersion,
         String bundleVersion,
@@ -33,7 +31,7 @@ public record PromptRunSelection(
     private static final ObjectMapper JSON = new ObjectMapper()
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
-    /** 保留旧摘要结构的构造入口，不将摘要转换成正文版本。 */
+    /** 兼容摘要结构的构造入口。 */
     public PromptRunSelection(int schemaVersion, String bundleVersion, String variant, String bundleDigest,
                               String capabilityCatalogDigest, LocalDate referenceDate) {
         this(schemaVersion, bundleVersion, variant, bundleDigest, capabilityCatalogDigest, referenceDate, null);
@@ -94,7 +92,7 @@ public record PromptRunSelection(
                 "prompt_reference_date", referenceDate.toString());
     }
 
-    /** 参数是ext中的prompt_selection对象；未知结构不读取当前默认作为替代。 */
+    /** 解析ext中的prompt_selection对象；结构未知时停止读取。 */
     public static PromptRunSelection fromExt(JsonNode node) {
         try {
             if (node == null || !node.isObject() || !node.path("schema_version").isIntegralNumber()
@@ -187,7 +185,7 @@ public record PromptRunSelection(
         checkText(selection.getTarget().getEnvironment());
         checkText(selection.getTarget().getTargetScopeInstanceId());
         checkText(selection.getTarget().getTargetDeploymentId());
-        // 主范围路由可为空；构建代际不参与逻辑目标的唯一身份。
+        // 逻辑目标由创建身份确定，主范围允许空路由标签。
         checkText(selection.getTarget().getExpectedTargetGenerationId());
         checkText(selection.getSelectionId());
         checkText(selection.getSelectionKey());

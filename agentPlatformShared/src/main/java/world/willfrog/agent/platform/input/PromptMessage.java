@@ -13,7 +13,7 @@ import world.willfrog.alphafrogmicro.common.racing.input.ModelInputSources;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 
-/** 消息与实际指令来源一起移动；未迁移的消息显式保持未知，不根据正文猜测。 */
+/** 消息与指令来源共同移动；缺少来源的消息保持未知。 */
 public record PromptMessage(ChatMessage message, Origin origin, List<PromptVersionSource> sources) {
     public enum Origin { APPLICATION_INSTRUCTION, RUNTIME_DATA, UNKNOWN }
 
@@ -54,7 +54,7 @@ public record PromptMessage(ChatMessage message, Origin origin, List<PromptVersi
         return new PromptMessage(message, Origin.UNKNOWN, List.of());
     }
 
-    /** 在最后一次消息增删之后计算位置，避免沿用插入预算消息之前的序号。 */
+    /** 消息增删完成后计算最终位置。 */
     public static ModelInputSources toModelInputSources(List<PromptMessage> messages) {
         return toModelInputSources(messages, "/messages");
     }

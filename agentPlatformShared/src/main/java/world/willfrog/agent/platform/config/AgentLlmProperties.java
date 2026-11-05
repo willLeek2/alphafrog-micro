@@ -442,6 +442,12 @@ public class AgentLlmProperties {
         private Integer rangeMaxLimit;
         @JsonAlias({"range-min-limit-without-keyword", "range_min_limit_without_keyword"})
         private Integer rangeMinLimitWithoutKeyword;
+        /** 014-opt-10：keyword 命中窗口半径（每个命中位置前后各取的字符数），缺省 200。 */
+        @JsonAlias({"keyword-window-radius", "keyword_window_radius"})
+        private Integer keywordWindowRadius;
+        /** 014-opt-10：keyword 模式单次返回的命中数上限，缺省 20。 */
+        @JsonAlias({"keyword-window-max-hits", "keyword_window_max_hits"})
+        private Integer keywordWindowMaxHits;
 
         public Integer getMaxLimit() { return maxLimit; }
         public void setMaxLimit(Integer maxLimit) { this.maxLimit = maxLimit; }
@@ -451,6 +457,10 @@ public class AgentLlmProperties {
         public void setRangeMaxLimit(Integer rangeMaxLimit) { this.rangeMaxLimit = rangeMaxLimit; }
         public Integer getRangeMinLimitWithoutKeyword() { return rangeMinLimitWithoutKeyword; }
         public void setRangeMinLimitWithoutKeyword(Integer rangeMinLimitWithoutKeyword) { this.rangeMinLimitWithoutKeyword = rangeMinLimitWithoutKeyword; }
+        public Integer getKeywordWindowRadius() { return keywordWindowRadius; }
+        public void setKeywordWindowRadius(Integer keywordWindowRadius) { this.keywordWindowRadius = keywordWindowRadius; }
+        public Integer getKeywordWindowMaxHits() { return keywordWindowMaxHits; }
+        public void setKeywordWindowMaxHits(Integer keywordWindowMaxHits) { this.keywordWindowMaxHits = keywordWindowMaxHits; }
     }
 
     public static class ToolRawRef {

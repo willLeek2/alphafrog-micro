@@ -225,7 +225,7 @@ public class AgentAiServiceFactory {
         return buildArchivedChatModelWithProviderOrder(resolved, providerOrder, null);
     }
 
-    /** 每次发送必须先保存完整输入，构建时不读取当前线程的输入作用域。 */
+    /** 输入作用域在实际发送时读取，保存完整输入后才发送。 */
     public ChatModel buildArchivedChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
                                                              List<String> providerOrder,
                                                              Integer maxTokensOverride) {

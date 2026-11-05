@@ -62,9 +62,9 @@ public class RereadToolHandler {
     @Tool
     public String rereadToolResult(
             @P(value = "工具结果 data.rawRef 字段，形如 raw_ref_001 或 raw-ref:...", required = true) String rawRef,
-            @P(value = "可选关键词；非空时只返回匹配片段", required = false) String keyword,
-            @P(value = "可选读取偏移，默认 0", required = false) Integer offset,
-            @P(value = "可选读取长度，0 表示使用服务默认", required = false) Integer limit
+            @P(value = "可选关键词；非空时返回命中窗口——每个命中位置前后各约 200 字符、段头标注命中在全文中的偏移（如 @48210），最多 20 个命中；hasMore=true 时把 nextOffset 传入下一次调用的 offset 续读；段头偏移可用于去掉 keyword 的分段精读", required = false) String keyword,
+            @P(value = "可选偏移，默认 0；带 keyword 时表示从全文该字符下标起向后查找命中（续查传上次返回的 nextOffset），不带 keyword 时表示读取起始字符下标", required = false) Integer offset,
+            @P(value = "可选读取长度，0 表示使用服务默认；带 keyword 时是本次返回文本的字符上限，容纳不下的命中窗口由下一次调用返回", required = false) Integer limit
     ) {
         return rereadToolResultPrompt(rawRef, keyword, offset, limit).text();
     }
@@ -119,6 +119,10 @@ public class RereadToolHandler {
         data.put("totalLength", read.getTotalLength());
         if (keyword != null && !keyword.isBlank()) {
             data.put("keyword", keyword);
+            // 014-opt-10：本次检索范围内（offset 起向后）的命中总数，配合 hasMore/nextOffset 判断续查。
+            if (read.getHitCount() != null) {
+                data.put("hitCount", read.getHitCount());
+            }
         }
         return ok(data, read.getContentPrompt().sources());
     }

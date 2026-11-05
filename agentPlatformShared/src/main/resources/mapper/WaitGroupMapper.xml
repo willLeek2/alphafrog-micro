@@ -1364,7 +1364,7 @@
       成员还在执行中时推后它的下次查询时间并累加轮询次数。已经落终态的成员不会被改，
       所以「某个操作被查了第几次」永远只增一次。
     -->
-    <!-- 仅保存原成员已确认的终态事实；暂停后的控制版本变化不阻止清理，取消先完成则返回0。 -->
+    <!-- 保存原成员已确认的终态事实；暂停后仍允许清理，取消先完成时返回0。 -->
     <update id="recordMemberTerminalBlock">
         UPDATE alphafrog_agent_run_wait_member m SET
             dispatch_proof_json = CAST(#{blockedProofJson} AS jsonb),

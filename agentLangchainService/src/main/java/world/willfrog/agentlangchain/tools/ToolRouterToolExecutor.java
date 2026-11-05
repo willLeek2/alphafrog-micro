@@ -40,37 +40,10 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * LC4j {@link ToolExecutor}：模型在 tool loop 里发起一次 tool call 后，由此类把请求转给
- * legacy {@link ToolRouter}，并处理 langchain 路径特有的防护与提示。
- *
- * <p>与 {@link ToolRouterToolProvider} 的配合：Provider 负责「有哪些工具」；本类负责
- * 「选中某个工具后怎么跑」。托管入口使用带正文来源的路由，旧String入口保留原路由，
- * 因此预算检查、observability trace、结果缓存、统一 JSON 响应格式都由 ToolRouter
- * 统一完成。</p>
- *
- * <p>工具路由的讲解要点已迁出，见
- * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
- *
- * <p>单次调用的处理顺序（{@link #execute}）：</p>
- * <ol>
- *   <li>解析或生成 {@code tool_call_id}：优先复用 LC4j 请求中的 ID，若无则 fallback 到 UUID，
- *       确保 SSE 事件和 observability trace 的 tool call 归属一致；</li>
- *   <li>把 LC4j 传来的 arguments JSON 解析为 {@code Map<String, Object>}；</li>
- *   <li>{@link LangchainRepeatedToolCallGuard}：同一 run 内相同工具+相同参数重复超过阈值则直接返回错误文本
- *       （此路径跳过 STARTED 直接 emit FINISHED，避免前端 UI card 永远转圈）；</li>
- *   <li>emit <b>TOOL_CALL_STARTED</b> 事件（经 SSE + Redis），携带 tool_call_id、tool_name、arguments、phase；</li>
- *   <li>{@link ToolRouter#invokeWithMeta} 执行并取 output 字符串；</li>
- *   <li>emit <b>TOOL_CALL_FINISHED</b> 事件（经 SSE + Redis），携带结果、duration_ms、success；</li>
- *   <li>从 output 解析 {@code dataset_id}，写入 {@link DatasetRefRegistry} 与
- *       {@link LangchainDatasetRefContext}，供 DAG 下游 todo 或 executePython 引用；</li>
- *   <li>若 output 暗示 dataset 缺失/无效，或发生重复调用，在结果末尾追加 {@code _retry_hint_}
- *       引导模型改参（不抛异常，让模型在下一轮 tool loop 自行纠正）。</li>
- * </ol>
- *
- * @see ToolRouterToolProvider 工具目录入口
- * @see world.willfrog.agent.tools.router.ToolRouter 统一执行与观测
- * @see LangchainRepeatedToolCallGuard 重复调用防护
- * @see world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor tool loop 宿主
+ * 将LangChain4j工具调用转给 {@link ToolRouter}。
+ * <p>工具目录由 {@link ToolRouterToolProvider} 提供，执行时补齐调用编号、解析参数并检查重复调用。
+ * 路由器统一处理预算、缓存和结果格式；本类发送开始与结束事件，并登记返回的数据集引用。</p>
+ * <p>托管模型使用带正文来源的执行入口，兼容字符串入口沿用原路由。</p>
  */
 @RequiredArgsConstructor
 @Slf4j
@@ -89,7 +62,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
     private final ToolExecutorPromptPreparation promptPreparation;
 
-    /** 旧构造只支持未登记来源的String业务入口。 */
+    /** 兼容构造仅支持来源未登记的字符串入口。 */
     public ToolRouterToolExecutor(ToolRouter toolRouter, ObjectMapper objectMapper,
                                   AgentRunEventService agentEventService,
                                   LangchainToolConcurrencyThrottle toolThrottle,
@@ -134,7 +107,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
         return executeResult(request, memoryId, false);
     }
 
-    /** 托管模型使用明确来源的结果；旧裸字符串入口不在此补造来源。 */
+    /** 托管模型读取带明确来源的结果；兼容字符串入口沿用原来源。 */
     public InvocationResult executeWithPromptResult(ToolExecutionRequest request, Object memoryId) {
         if (promptPreparation == null) {
             throw ToolExecutorPromptPreparation.missing("工具执行器未配置正文来源准备组件");
@@ -287,10 +260,7 @@ public final class ToolRouterToolExecutor implements ToolExecutor {
         }
     }
 
-    /**
-     * LC4j 带上下文执行：先把 {@link InvocationContext#invocationParameters()} 灌进
-     * {@link world.willfrog.agent.platform.context.AgentContext}（经 {@link LangchainRunContextBridge}），再调用带正文来源的 {@link #executeWithPromptResult}。
-     */
+    /** 先通过 {@link LangchainRunContextBridge} 将调用参数放入线程上下文，再调用 {@link #executeWithPromptResult}。 */
     @Override
     public ToolExecutionResult executeWithContext(ToolExecutionRequest request, InvocationContext context) {
         if (context != null) {

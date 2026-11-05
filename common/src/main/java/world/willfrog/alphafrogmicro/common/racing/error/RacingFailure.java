@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.Set;
 import world.willfrog.racing.idl.RacingError;
 
-/** 保留平台拒绝的稳定原因与对象编号，不携带远端自由文字、正文、凭据或异常。 */
+/** 平台拒绝仅保留稳定原因码与对象编号。 */
 public record RacingFailure(String code, String reasonCode, Map<String, String> objectLocator) {
     private static final Set<String> LOCATOR_KEYS = Set.of(
             "environment", "scope", "scopeid", "scopeinstanceid", "targetscopeinstanceid",

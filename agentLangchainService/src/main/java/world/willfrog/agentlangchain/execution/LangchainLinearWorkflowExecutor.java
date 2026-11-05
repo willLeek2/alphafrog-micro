@@ -301,7 +301,7 @@ public class LangchainLinearWorkflowExecutor {
                     repairExecutionContext = resumeContext;
                 }
                 if (resumeContext.isTerminalSuccess()) {
-                    // 沿用原有成功恢复语义：直接完成节点，不增加一次模型调用。
+                    // 成功恢复后直接完成节点。
                     DatasetRefRegistry.registerFromJson(injectedOutput, datasetRefs);
                     // 把挂起 Todo 追加为已完成，但不增加 toolCalls：那次调用在挂起前已经计数。
                     completedTodos.add(LangchainCompletedTodo.builder()

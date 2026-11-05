@@ -26,7 +26,7 @@ import world.willfrog.racing.idl.TargetIdentity;
 
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_UNREADABLE;
 
-/** 确认远端根选择后保存本地专属字段；旧摘要需要补录，不能重新选默认代替。 */
+/** 确认远端根选择后保存本地专属字段；兼容摘要需要补录完整定位。 */
 @Component
 @Import(RacingPromptClientConfiguration.class)
 public final class PromptSelectionCoordinator {
@@ -87,7 +87,7 @@ public final class PromptSelectionCoordinator {
                 requireSelection(actual, confirmedContext, settings.experimentId());
                 result = PromptRunSelection.fromRacing(actual, referenceDate);
             }
-            // 公共存储提交并重读后才成功返回，外层公共准备不再重复写相同字段。
+            // 公共存储提交并独立重读后返回选择。
             bindings.confirmPromptSelection(confirmedContext, result.toExtMap());
             return result;
         } catch (RuntimeException failure) {

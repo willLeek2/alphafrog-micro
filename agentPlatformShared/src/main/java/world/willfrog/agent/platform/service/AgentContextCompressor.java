@@ -95,7 +95,7 @@ public class AgentContextCompressor {
             CompressionResult compression,
             PromptText dialogueContextPrompt
     ) {
-        /** 旧构造未提供来源，不能由非空String推断为运行事实。 */
+        /** 兼容构造缺少来源，文字保持未知来源。 */
         public ContextBuildResult(String text, CompressionResult compression) {
             this(text, compression, null);
         }

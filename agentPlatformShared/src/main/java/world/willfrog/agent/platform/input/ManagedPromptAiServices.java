@@ -9,8 +9,8 @@ import java.util.Objects;
 import static world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING;
 
 /**
- * 将已渲染正文装配到未声明SystemMessage注解的托管接口，跳过SDK的再次模板解析。
- * 调用方另外登记同一份正文的输入来源并执行发送前保存，本类只负责系统消息装配。
+ * 为托管接口装配已渲染的系统正文，跳过SDK模板解析。
+ * 调用方负责登记正文来源并在发送前确认输入保存。
  */
 public final class ManagedPromptAiServices {
     private ManagedPromptAiServices() {

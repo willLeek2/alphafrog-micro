@@ -21,7 +21,7 @@ public class LangchainCompletedTodo {
     /** Legacy/raw output kept for observability and backward compatibility. */
     private String output;
     private String summary;
-    /** 输出及其摘要的规范来源；旧快照缺失时不能推断为模型输出。 */
+    /** 输出与摘要共用的来源；旧快照缺少来源时保持未知。 */
     private String outputSourceJson;
 
     public static String sourceJson(PromptText output) {
@@ -35,7 +35,7 @@ public class LangchainCompletedTodo {
         return sourceJson(PromptText.runtimeData(""));
     }
 
-    /** 摘要可能是输出的截取，沿用同项来源而不凭字面内容重新归类。 */
+    /** 摘要截取自同项输出，沿用该输出的来源。 */
     public PromptText attributedText(String text) {
         if (outputSourceJson == null || outputSourceJson.isBlank()) throw missingSource();
         PromptMessage message = PromptMessageCodec.fromSourceAttributes(UserMessage.from("completed-todo"),

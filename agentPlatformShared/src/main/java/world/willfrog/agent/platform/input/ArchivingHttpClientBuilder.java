@@ -61,7 +61,7 @@ public final class ArchivingHttpClientBuilder implements HttpClientBuilder {
 
     private static void beforeSend(HttpRequest request) {
         try {
-            // 请求头及端点凭据不进入输入记录。委托方继续发送同一request对象。
+            // 输入记录仅保存正文；委托方发送同一request对象。
             ModelInputScope.currentRequired().beforeSend(request.body());
         } catch (RuntimeException failure) {
             throw BlockedModelSendException.from(failure);

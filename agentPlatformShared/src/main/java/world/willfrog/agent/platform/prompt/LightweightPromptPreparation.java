@@ -92,8 +92,8 @@ public final class LightweightPromptPreparation {
             if (decoded.origin() == PromptMessage.Origin.UNKNOWN) throw missing("历史消息仍为未知来源");
             return new PromptText(content, decoded.sources());
         }
-        // 既有保存入口：EventService原始问题、FollowUpService原始追问、Pipeline最终回答。
-        // 身份和消息类型共同核对；未知system或其他拼装历史不能凭角色标为事实。
+        // 历史来源按保存入口核对：原始问题、原始追问及最终回答。
+        // 消息身份与类型必须同时匹配；未知来源保持未知。
         boolean persisted = message.getId() != null && message.getId() > 0 && message.getSeq() != null
                 && message.getSeq() > 0 && message.getRunId() != null && !message.getRunId().isBlank();
         boolean userInput = AgentRunMessage.ROLE_USER.equals(message.getRole())

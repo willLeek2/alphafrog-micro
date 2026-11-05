@@ -142,7 +142,7 @@ public class LangchainNodeToolDispatcher implements NodeToolDispatcher {
         }
     }
 
-    /** 在实际拒绝与异常捕获处生成的状态事实，不包含应用指令。 */
+    /** 记录本次拒绝或异常的状态事实。 */
     private static DispatchOutcome.Failed failureData(String reason) {
         return new DispatchOutcome.Failed(reason, PromptText.runtimeData(reason));
     }

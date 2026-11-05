@@ -315,7 +315,7 @@ public class ToolRouter {
         long preparationDurationMs = 0;
         ToolResultCacheService.CachedToolCallResult cached;
         if ("searchWeb".equals(toolName)) {
-            // 能力检查先于实验取值和缓存读取，关闭能力时不取得旧缓存结果。
+            // 能力检查通过后再取实验参数及缓存结果。
             if (!AgentContext.isWebSearchEnabled()) {
                 cached = withoutCache(executeDirect(toolName, params, classified));
             } else {
@@ -357,7 +357,7 @@ public class ToolRouter {
         if (!"checkParallelLimits".equals(toolName)) {
             Map<String, Object> observed = actualParams;
             if ("searchWeb".equals(toolName)) {
-                // 观测对象由服务端组装，不进入缓存参数或远端搜索请求。
+                // 服务端单独组装观测对象，缓存及搜索请求使用各自参数。
                 observed = new LinkedHashMap<>(originalParams);
                 observed.put("requested_parameters", originalParams);
                 observed.put("actual_parameters", preparedSearch == null ? Map.of() : preparedSearch.parameters());

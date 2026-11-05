@@ -22,7 +22,7 @@ public final class ArchivingChatModel implements ChatModel {
         this(delegate, null);
     }
 
-    /** 实际模型持有解析后的端点，预录调用转真实模型时不沿用预录标记。 */
+    /** 真实模型使用已解析的端点标记，替换预录调用标记。 */
     public ArchivingChatModel(ChatModel delegate, String endpointName) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.endpointName = endpointName;
