@@ -6,7 +6,8 @@ import com.alibaba.ttl.TransmittableThreadLocal;
  * 当前请求所属的隔离流量范围。
  *
  * <p>入口过滤器写入范围标识；服务间调用在提供方入站时从官方 {@code dubbo.tag} 恢复，
- * 在消费方出站时继续写入同一附件。线程复用前必须恢复旧值。主 Beta 范围不对应官方标签。
+ * 在消费方出站时继续写入同一附件。线程复用前必须恢复旧值。部署的主范围不对应官方标签：
+ * Beta 主范围是 main-beta，生产主范围是 stable。
  * 存储使用可传递线程本地（TransmittableThreadLocal），线程池任务提交时捕获、执行时重放。
  * 本对象不保存实例地址，也不读取控制器状态文件；Dubbo 根据当前标签和注册中心事实选择提供者。</p>
  */
@@ -15,6 +16,8 @@ public final class LaneContext {
     public static final String ATTACHMENT_TRAFFIC_SCOPE_ID = "alphafrog.traffic-scope-id";
     public static final String DUBBO_TAG_KEY = "dubbo.tag";
     public static final String MAIN_BETA_TRAFFIC_SCOPE_ID = "main-beta";
+    /** 生产部署的主范围名称。它不是泳道名，注册信息里不写 Dubbo 标签。 */
+    public static final String PRODUCTION_MAIN_TRAFFIC_SCOPE_ID = "stable";
     public static final String MDC_LANE_TAG = "lane_tag";
 
     private static final TransmittableThreadLocal<String> TRAFFIC_SCOPE_ID =
@@ -28,17 +31,22 @@ public final class LaneContext {
     }
 
     /**
-     * 当前范围对应的官方 Dubbo 标签；主 Beta 或空范围返回 {@code null}。
+     * 当前范围对应的官方 Dubbo 标签。空范围和部署主范围返回 {@code null}，调用方不附带标签。
      */
     public static String officialDubboTag() {
         return toOfficialDubboTag(trafficScopeId());
     }
 
+    /**
+     * 这个名称是部署的主范围，而不是泳道。Beta 与生产各有一个主范围名称。
+     */
+    public static boolean isDeploymentMainScope(String trafficScopeId) {
+        return MAIN_BETA_TRAFFIC_SCOPE_ID.equals(trafficScopeId)
+                || PRODUCTION_MAIN_TRAFFIC_SCOPE_ID.equals(trafficScopeId);
+    }
+
     public static String toOfficialDubboTag(String trafficScopeId) {
-        if (trafficScopeId == null || trafficScopeId.isBlank()) {
-            return null;
-        }
-        if (MAIN_BETA_TRAFFIC_SCOPE_ID.equals(trafficScopeId)) {
+        if (trafficScopeId == null || trafficScopeId.isBlank() || isDeploymentMainScope(trafficScopeId)) {
             return null;
         }
         return trafficScopeId;

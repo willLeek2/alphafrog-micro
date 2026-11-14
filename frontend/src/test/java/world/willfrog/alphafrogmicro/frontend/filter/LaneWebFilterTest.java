@@ -95,6 +95,14 @@ class LaneWebFilterTest {
     }
 
     @Test
+    void productionMainHeaderTagRunsAsUntaggedTraffic() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/agent/runs");
+        request.addHeader(LaneWebFilter.LANE_TAG_HEADER, "stable");
+
+        assertUntaggedAndRunsOnce(new LaneWebFilter(properties()), request);
+    }
+
+    @Test
     void invalidHeaderTagRunsAsUntaggedTrafficAndWarnsOnlyOnce() throws Exception {
         Logger logger = (Logger) LoggerFactory.getLogger(LaneWebFilter.class);
         Level previousLevel = logger.getLevel();
