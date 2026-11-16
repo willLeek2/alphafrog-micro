@@ -3,9 +3,9 @@ package world.willfrog.agent.tools.search;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
-import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -48,7 +48,8 @@ import java.util.UUID;
 @Component
 public class SearchTools {
 
-    @DubboReference(timeout = 60000, retries = 0)
+    @Autowired
+    @Qualifier("externalInfoDubboService")
     private ExternalInfoDubboService externalInfoDubboService;
 
     @Autowired(required = false)
