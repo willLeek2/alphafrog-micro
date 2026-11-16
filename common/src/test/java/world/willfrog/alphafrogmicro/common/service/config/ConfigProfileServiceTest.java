@@ -13,6 +13,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import world.willfrog.alphafrogmicro.common.config.ConfigJsonCanonicalizer;
+import world.willfrog.alphafrogmicro.common.config.PromptDisplayNameDefaults;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigActiveDao;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigAuditLogDao;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigSnapshotDao;
@@ -159,6 +160,49 @@ class ConfigProfileServiceTest {
         assertEquals(replicaMd5, result.get("activeContentMd5"));
         assertEquals(replicaMd5, ((ConfigSnapshot) result.get("activeSnapshot")).getContentMd5());
         assertEquals("legacy-md5", snapshot.getContentMd5());
+    }
+
+    @Test
+    void getActiveWithReplicasShouldAttachPromptDisplayNameDefaultsForAgentLlm() {
+        // agent-llm 类型：响应应附带 promptDisplayNameDefaults，且值就是 common 里的默认表原对象
+        ConfigType type = buildAgentLlmType();
+        ConfigSnapshot snapshot = buildSnapshot();
+        snapshot.setTypeId(type.getId());
+        ConfigActive active = new ConfigActive();
+        active.setTypeId(type.getId());
+        active.setSnapshotId(snapshot.getId());
+
+        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+        when(configActiveDao.getByType(type.getId())).thenReturn(active);
+        when(configSnapshotDao.getById(snapshot.getId())).thenReturn(snapshot);
+        when(redisTemplate.keys("config:state:*:*:agent-llm.json")).thenReturn(Collections.emptySet());
+
+        Map<String, Object> result = configProfileService.getActiveWithReplicas("agent-llm");
+
+        assertEquals(PromptDisplayNameDefaults.DEFAULTS, result.get("promptDisplayNameDefaults"));
+    }
+
+    @Test
+    void getActiveWithReplicasShouldNotAttachPromptDisplayNameDefaultsForOtherTypes() {
+        // 非 agent-llm 类型（这里用 agent-prompt-overlay）：响应不应带 promptDisplayNameDefaults 键
+        ConfigType type = buildOverlayType();
+        ConfigSnapshot snapshot = new ConfigSnapshot();
+        snapshot.setId(5);
+        snapshot.setTypeId(type.getId());
+        snapshot.setVersion("v5");
+        snapshot.setContentJson("{\"formatVersion\":1,\"prompts\":{}}");
+        ConfigActive active = new ConfigActive();
+        active.setTypeId(type.getId());
+        active.setSnapshotId(snapshot.getId());
+
+        when(configTypeDao.getByName("agent-prompt-overlay")).thenReturn(type);
+        when(configActiveDao.getByType(type.getId())).thenReturn(active);
+        when(configSnapshotDao.getById(snapshot.getId())).thenReturn(snapshot);
+        when(redisTemplate.keys("config:state:*:*:agent-prompt-overlay.json")).thenReturn(Collections.emptySet());
+
+        Map<String, Object> result = configProfileService.getActiveWithReplicas("agent-prompt-overlay");
+
+        assertFalse(result.containsKey("promptDisplayNameDefaults"));
     }
 
     @Test
@@ -512,6 +556,15 @@ class ConfigProfileServiceTest {
         type.setDataId("agent-prompt-overlay.json");
         type.setConfigGroup("alphafrog-config");
         type.setSchemaJson("");
+        return type;
+    }
+
+    private ConfigType buildAgentLlmType() {
+        ConfigType type = new ConfigType();
+        type.setId(21);
+        type.setName("agent-llm");
+        type.setDataId("agent-llm.json");
+        type.setConfigGroup("alphafrog-config");
         return type;
     }
 

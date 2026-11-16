@@ -19,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import world.willfrog.alphafrogmicro.common.config.ConfigJsonCanonicalizer;
+import world.willfrog.alphafrogmicro.common.config.PromptDisplayNameDefaults;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigAuditLogDao;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigActiveDao;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigSnapshotDao;
@@ -50,6 +51,9 @@ public class ConfigProfileService {
     private final ConfigService nacosConfigService;
     private final StringRedisTemplate redisTemplate;
     private final PromptHotPushValidator promptHotPushValidator = PromptHotPushValidator.shared();
+
+    /** agent-llm 基配置的类型名；激活查询响应对这一类型附加提示词默认中文名表。 */
+    private static final String CONFIG_TYPE_AGENT_LLM = "agent-llm";
 
     @Autowired
     public ConfigProfileService(ConfigTypeDao configTypeDao,
@@ -362,6 +366,10 @@ public class ConfigProfileService {
         result.put("replicaCount", replicas.size());
         result.put("synced", synced);
         result.put("syncStatus", syncStatus);
+        if (CONFIG_TYPE_AGENT_LLM.equals(type.getName())) {
+            // 提示词默认中文名只随响应附带，不写入快照正文，也不参与内容摘要，副本不因它重新加载。
+            result.put("promptDisplayNameDefaults", PromptDisplayNameDefaults.DEFAULTS);
+        }
         return result;
     }
 

@@ -5,6 +5,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -2334,6 +2335,8 @@ public class AgentLlmProperties {
         private String dagRecoveryJudgeSystemPromptFile;
         /** DAG recovery judge prompt 内容（只能是 classpath 权威正文或其逐字一致投影）。 */
         private String dagRecoveryJudgeSystemPromptTemplate;
+        /** 提示词字段名到给人看的中文名的映射，仅供管理后台展示，运行时不读取；快照没写或没写全时按 common 模块的 PromptDisplayNameDefaults.DEFAULTS 兜底。 */
+        private Map<String, String> displayNames = new LinkedHashMap<>();
 
         public String getAgentRunSystemPrompt() {
             return agentRunSystemPrompt;
@@ -2701,6 +2704,14 @@ public class AgentLlmProperties {
 
         public void setDagRecoveryJudgeSystemPromptTemplate(String dagRecoveryJudgeSystemPromptTemplate) {
             this.dagRecoveryJudgeSystemPromptTemplate = dagRecoveryJudgeSystemPromptTemplate;
+        }
+
+        public Map<String, String> getDisplayNames() {
+            return displayNames;
+        }
+
+        public void setDisplayNames(Map<String, String> displayNames) {
+            this.displayNames = displayNames;
         }
     }
 
