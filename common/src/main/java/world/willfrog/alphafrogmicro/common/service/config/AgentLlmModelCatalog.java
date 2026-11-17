@@ -29,7 +29,7 @@ public final class AgentLlmModelCatalog {
                             String displayName,
                             Double baseRate,
                             List<String> validProviders,
-                            JsonNode features,
+                            List<String> features,
                             Integer maxTokens) {
     }
 
@@ -101,7 +101,7 @@ public final class AgentLlmModelCatalog {
             String displayName = requiredText(item, "displayName");
             Double baseRate = requiredBaseRate(item.get("baseRate"));
             List<String> providers = readProviders(item.get("validProviders"));
-            JsonNode features = readFeatures(item.get("features"));
+            List<String> features = readFeatures(item.get("features"));
             Integer maxTokens = readMaxTokens(item.get("maxTokens"));
             placements.add(new Placement(endpoint, displayName, baseRate, providers, features, maxTokens));
         }
@@ -222,7 +222,7 @@ public final class AgentLlmModelCatalog {
         String displayName = meta.path("displayName").isTextual() ? meta.get("displayName").asText() : null;
         Double baseRate = meta.path("baseRate").isNumber() ? meta.get("baseRate").doubleValue() : null;
         List<String> providers = readStoredProviders(meta.get("validProviders"));
-        JsonNode features = meta.path("features").isObject() ? meta.get("features") : null;
+        List<String> features = readStoredProviders(meta.get("features"));
         Integer maxTokens = meta.path("maxTokens").isIntegralNumber() ? meta.get("maxTokens").intValue() : null;
         return new Placement(endpoint, displayName, baseRate, providers, features, maxTokens);
     }
@@ -250,7 +250,8 @@ public final class AgentLlmModelCatalog {
             placement.validProviders().forEach(providers::add);
         }
         if (placement.features() != null) {
-            meta.set("features", placement.features().deepCopy());
+            ArrayNode features = meta.putArray("features");
+            placement.features().forEach(features::add);
         }
         if (placement.maxTokens() != null) {
             meta.put("maxTokens", placement.maxTokens());
@@ -434,14 +435,21 @@ public final class AgentLlmModelCatalog {
         return providers;
     }
 
-    private static JsonNode readFeatures(JsonNode node) {
+    private static List<String> readFeatures(JsonNode node) {
         if (node == null || node.isNull()) {
             return null;
         }
-        if (!node.isObject()) {
-            throw new IllegalArgumentException("features 必须是对象");
+        if (!node.isArray()) {
+            throw new IllegalArgumentException("features 必须是字符串数组");
         }
-        return node;
+        List<String> features = new ArrayList<>();
+        for (JsonNode item : node) {
+            if (item == null || !item.isTextual() || item.asText().isBlank()) {
+                throw new IllegalArgumentException("features 里的每一项都必须是非空字符串");
+            }
+            features.add(item.asText());
+        }
+        return features;
     }
 
     private static Integer readMaxTokens(JsonNode node) {

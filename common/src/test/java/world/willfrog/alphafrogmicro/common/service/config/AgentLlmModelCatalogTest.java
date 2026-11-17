@@ -110,6 +110,35 @@ class AgentLlmModelCatalogTest {
     }
 
     @Test
+    void featuresStayStringArrayThroughListAndUpdate() throws Exception {
+        ObjectNode created = AgentLlmModelCatalog.create(document(), "qwen3.7-max",
+                AgentLlmModelCatalog.readPlacements(objectMapper.readTree("""
+                        [{"endpoint":"dashscope-cn","displayName":"Qwen3.7-Max","baseRate":0.6,
+                          "features":["thinking"]}]
+                        """)));
+        assertEquals(List.of("thinking"), objectMapper.convertValue(
+                created.at("/endpoints/dashscope-cn/models/qwen3.7-max/features"), List.class));
+
+        AgentLlmModelCatalog.ModelRecord listed = AgentLlmModelCatalog.list(created).stream()
+                .filter(record -> "qwen3.7-max".equals(record.modelId()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(List.of("thinking"), listed.placements().get(0).features());
+
+        ObjectNode updated = AgentLlmModelCatalog.update(created, "qwen3.7-max",
+                AgentLlmModelCatalog.readPlacements(objectMapper.readTree("""
+                        [{"endpoint":"dashscope-cn","displayName":"Qwen3.7-Max","baseRate":0.6,
+                          "features":["thinking"]}]
+                        """)));
+        assertEquals(List.of("thinking"), objectMapper.convertValue(
+                updated.at("/endpoints/dashscope-cn/models/qwen3.7-max/features"), List.class));
+        assertThrows(IllegalArgumentException.class,
+                () -> AgentLlmModelCatalog.readPlacements(objectMapper.readTree("""
+                        [{"endpoint":"dashscope-cn","displayName":"X","baseRate":0.1,"features":{"thinking":true}}]
+                        """)));
+    }
+
+    @Test
     void listMarksEndpointOnlyModelsAsNotStartable() throws Exception {
         List<AgentLlmModelCatalog.ModelRecord> records = AgentLlmModelCatalog.list(document());
         AgentLlmModelCatalog.ModelRecord flash = records.stream()
