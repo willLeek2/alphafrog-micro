@@ -14,6 +14,7 @@ import world.willfrog.alphafrogmicro.common.exception.config.ConfigPublishExcept
 import world.willfrog.alphafrogmicro.common.pojo.config.ConfigAuditLog;
 import world.willfrog.alphafrogmicro.common.pojo.config.ConfigSnapshot;
 import world.willfrog.alphafrogmicro.common.pojo.config.ConfigType;
+import world.willfrog.alphafrogmicro.common.service.config.AgentLlmModelCatalog;
 import world.willfrog.alphafrogmicro.common.service.config.ConfigProfileService;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 
@@ -298,6 +299,74 @@ public class AdminConfigController {
         }
     }
 
+    @GetMapping("/{type}/models")
+    public ResponseEntity<?> listModels(@PathVariable String type,
+                                        @RequestParam(required = false) String modelId,
+                                        Authentication authentication) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        try {
+            if (modelId == null || modelId.isBlank()) {
+                List<Map<String, Object>> models = configProfileService.listAgentModels(type).stream()
+                        .map(AgentLlmModelCatalog.ModelRecord::toMap)
+                        .toList();
+                return ResponseEntity.ok(Map.of("models", models));
+            }
+            return ResponseEntity.ok(configProfileService.findAgentModel(type, modelId).toMap());
+        } catch (ConfigNotFoundException e) {
+            return ResponseEntity.status(404).body(Map.of("error", e.getMessage()));
+        } catch (ConfigPublishException e) {
+            return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("查询模型失败 type={}", type, e);
+            if (e instanceof IllegalArgumentException) {
+                return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+            }
+            return ResponseEntity.status(500).body(Map.of("error", "Internal Server Error"));
+        }
+    }
+
+    @PostMapping("/{type}/models")
+    public ResponseEntity<?> createModel(@PathVariable String type,
+                                         @RequestBody Map<String, Object> request,
+                                         Authentication authentication) {
+        return changeModel(type, AgentLlmModelCatalog.Change.CREATE, request, authentication);
+    }
+
+    @PutMapping("/{type}/models")
+    public ResponseEntity<?> updateModel(@PathVariable String type,
+                                         @RequestBody Map<String, Object> request,
+                                         Authentication authentication) {
+        return changeModel(type, AgentLlmModelCatalog.Change.UPDATE, request, authentication);
+    }
+
+    @DeleteMapping("/{type}/models")
+    public ResponseEntity<?> deleteModel(@PathVariable String type,
+                                         @RequestParam String modelId,
+                                         Authentication authentication) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        try {
+            Map<String, Object> result = configProfileService.changeAgentModel(
+                    type, AgentLlmModelCatalog.Change.DELETE, modelId, null, getOperatorId(authentication));
+            return ResponseEntity.ok(result);
+        } catch (ConfigNotFoundException e) {
+            return ResponseEntity.status(404).body(Map.of("error", e.getMessage()));
+        } catch (ConfigConflictException e) {
+            return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
+        } catch (ConfigPublishException e) {
+            return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("删除模型失败 type={} modelId={}", type, modelId, e);
+            if (e instanceof IllegalArgumentException) {
+                return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+            }
+            return ResponseEntity.status(500).body(Map.of("error", "Internal Server Error"));
+        }
+    }
+
     @DeleteMapping("/{type}/snapshots/{version}")
     public ResponseEntity<?> deleteSnapshot(@PathVariable String type,
                                             @PathVariable String version,
@@ -315,6 +384,34 @@ public class AdminConfigController {
             return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
         } catch (Exception e) {
             log.error("删除配置快照失败 type={} version={}", type, version, e);
+            return ResponseEntity.status(500).body(Map.of("error", "Internal Server Error"));
+        }
+    }
+
+    private ResponseEntity<?> changeModel(String type,
+                                          AgentLlmModelCatalog.Change change,
+                                          Map<String, Object> request,
+                                          Authentication authentication) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        try {
+            String modelId = request.get("modelId") == null ? "" : String.valueOf(request.get("modelId"));
+            JsonNode placements = objectMapper.valueToTree(request.get("placements"));
+            Map<String, Object> result = configProfileService.changeAgentModel(
+                    type, change, modelId, placements, getOperatorId(authentication));
+            return ResponseEntity.ok(result);
+        } catch (ConfigNotFoundException e) {
+            return ResponseEntity.status(404).body(Map.of("error", e.getMessage()));
+        } catch (ConfigConflictException e) {
+            return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
+        } catch (ConfigPublishException e) {
+            return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("修改模型失败 type={} change={}", type, change, e);
+            if (e instanceof IllegalArgumentException) {
+                return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+            }
             return ResponseEntity.status(500).body(Map.of("error", "Internal Server Error"));
         }
     }

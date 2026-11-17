@@ -227,6 +227,88 @@ public class ConfigProfileService {
     }
 
     /**
+     * 按模型编号读取正在生效的 agent-llm。底稿是 Nacos 当前文档。
+     * 读不到当前文档时失败，不用数据库里可能落后的快照顶上。
+     */
+    public List<AgentLlmModelCatalog.ModelRecord> listAgentModels(String typeName) throws Exception {
+        return AgentLlmModelCatalog.list(readRunningAgentLlm(typeName));
+    }
+
+    public AgentLlmModelCatalog.ModelRecord findAgentModel(String typeName, String modelId) throws Exception {
+        AgentLlmModelCatalog.ModelRecord record = AgentLlmModelCatalog.find(readRunningAgentLlm(typeName), modelId);
+        if (record == null) {
+            throw new ConfigNotFoundException("模型不存在: " + modelId);
+        }
+        return record;
+    }
+
+    /**
+     * 按模型编号增加、修改或删除，并把改完的整份文档写成新快照后激活。
+     * 激活沿用原有发布：事务提交后把整份 agent-llm.json 发回 Nacos。
+     */
+    @Transactional
+    public Map<String, Object> changeAgentModel(String typeName,
+                                                 AgentLlmModelCatalog.Change change,
+                                                 String modelId,
+                                                 JsonNode placements,
+                                                 String operatorId) throws Exception {
+        ObjectNode current = readRunningAgentLlm(typeName);
+        ObjectNode updated = switch (change) {
+            case CREATE -> AgentLlmModelCatalog.create(
+                    current, modelId, AgentLlmModelCatalog.readPlacements(placements));
+            case UPDATE -> AgentLlmModelCatalog.update(
+                    current, modelId, AgentLlmModelCatalog.readPlacements(placements));
+            case DELETE -> AgentLlmModelCatalog.delete(current, modelId);
+        };
+        ConfigType type = getTypeOrThrow(typeName);
+        validateSchema(type, updated);
+        String comment = switch (change) {
+            case CREATE -> "按模型编号增加 " + modelId;
+            case UPDATE -> "按模型编号修改 " + modelId;
+            case DELETE -> "按模型编号删除 " + modelId;
+        };
+        ConfigActive active = configActiveDao.getByType(type.getId());
+        Integer expectedSnapshotId = active == null ? null : active.getSnapshotId();
+        ConfigSnapshot saved = createFromScratch(typeName, updated, comment, operatorId);
+        activate(typeName, saved.getVersion(), expectedSnapshotId, operatorId);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("version", saved.getVersion());
+        result.put("snapshotId", saved.getId());
+        if (change == AgentLlmModelCatalog.Change.DELETE) {
+            result.put("modelId", modelId);
+            result.put("deleted", true);
+        } else {
+            result.put("model", AgentLlmModelCatalog.find(updated, modelId).toMap());
+        }
+        return result;
+    }
+
+    private ObjectNode readRunningAgentLlm(String typeName) throws Exception {
+        if (!CONFIG_TYPE_AGENT_LLM.equals(typeName)) {
+            throw new IllegalArgumentException("只有 agent-llm 可以按模型编号管理");
+        }
+        ConfigType type = getTypeOrThrow(typeName);
+        if (nacosConfigService == null) {
+            throw new ConfigPublishException("Nacos Config 未启用，不能按模型编号管理");
+        }
+        String current;
+        try {
+            current = nacosConfigService.getConfig(type.getDataId(), type.getConfigGroup(), 3000);
+        } catch (NacosException e) {
+            throw new ConfigPublishException("读取 Nacos 上的 agent-llm 失败", e);
+        }
+        if (current == null || current.isBlank()) {
+            throw new ConfigPublishException("Nacos 上没有当前 agent-llm 配置，已停止，避免用数据库里的旧快照覆盖线上");
+        }
+        JsonNode parsed = objectMapper.readTree(current);
+        if (!parsed.isObject()) {
+            throw new IllegalArgumentException("agent-llm 配置必须是 JSON 对象");
+        }
+        return (ObjectNode) parsed;
+    }
+
+    /**
      * 应用侧确认：各副本是否已加载当前激活版本。
      * 回滚接口把这份状态一并返回；未同步时不要把这次回滚当成应用侧已生效。
      */
