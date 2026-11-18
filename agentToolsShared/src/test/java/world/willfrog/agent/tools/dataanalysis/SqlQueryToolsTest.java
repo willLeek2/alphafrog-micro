@@ -26,6 +26,8 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -403,6 +405,29 @@ class SqlQueryToolsTest {
         assertEquals("QUERY_SANDBOX_FAILED", failed.path("error").path("code").asText());
         // 等待组成员失败映射的兜底码：非取消一律 QUERY_EXECUTION_FAILED
         assertEquals("QUERY_SANDBOX_FAILED", resultAdapter.errorCodeOf(view("FAILED", 1, "", "engine died")));
+    }
+
+    @Test
+    void marketTargetRejectsNonAdminBeforeOpeningConnection() throws Exception {
+        javax.sql.DataSource dataSource = mock(javax.sql.DataSource.class);
+        world.willfrog.agent.platform.mapper.AgentRunMapper mapper =
+                mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
+        world.willfrog.agent.platform.entity.AgentRun run =
+                new world.willfrog.agent.platform.entity.AgentRun();
+        run.setExt("{\"is_admin\":false}");
+        when(mapper.findById("run-admin")).thenReturn(run);
+        ReflectionTestUtils.setField(tools, "dataSource", dataSource);
+        ReflectionTestUtils.setField(tools, "agentRunMapper", mapper);
+        AgentContext.setRunId("run-admin");
+        try {
+            JsonNode out = objectMapper.readTree(tools.executeQuery(
+                    "SELECT ts_code FROM alphafrog_index_info", null, "INTERACTIVE", "market_db"));
+            assertFalse(out.path("ok").asBoolean());
+            assertEquals("NOT_ADMIN", out.path("error").path("code").asText());
+        } finally {
+            AgentContext.clear();
+        }
+        verify(dataSource, never()).getConnection();
     }
 
     private JsonNode decodeSpec(String rendered) throws Exception {

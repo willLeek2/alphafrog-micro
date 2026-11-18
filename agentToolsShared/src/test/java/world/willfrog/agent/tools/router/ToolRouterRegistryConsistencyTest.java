@@ -171,7 +171,7 @@ class ToolRouterRegistryConsistencyTest {
         PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
         when(pythonSandboxTools.executePython(anyString(), anyString(), anyString(), anyString(), any())).thenReturn(okJson("executePython"));
         SqlQueryTools sqlQueryTools = mock(SqlQueryTools.class);
-        when(sqlQueryTools.executeQuery(any(), any(), any())).thenReturn(okJson("executeQuery"));
+        when(sqlQueryTools.executeQuery(any(), any(), any(), any())).thenReturn(okJson("executeQuery"));
 
         FinanceMethodTools financeMethodTools = mock(FinanceMethodTools.class);
         when(financeMethodTools.resolveFinanceMethods(anyString(), anyString())).thenReturn(okJson("resolveFinanceMethods"));

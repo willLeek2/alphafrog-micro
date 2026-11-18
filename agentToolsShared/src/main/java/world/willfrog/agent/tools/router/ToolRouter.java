@@ -577,12 +577,14 @@ public class ToolRouter {
         return selectOutput(classified, () -> sqlQueryTools.executeQuery(
                 str(params.get("sql"), params.get("arg0")),
                 str(params.get("dataset_ids"), params.get("datasetIds"), params.get("arg1")),
-                str(params.get("product_tier"), params.get("productTier"), params.get("arg2"))
+                str(params.get("product_tier"), params.get("productTier"), params.get("arg2")),
+                str(params.get("query_target"), params.get("queryTarget"), params.get("arg3"))
         ),
                 () -> sqlQueryTools.executeQueryPrompt(
                 str(params.get("sql"), params.get("arg0")),
                 str(params.get("dataset_ids"), params.get("datasetIds"), params.get("arg1")),
-                str(params.get("product_tier"), params.get("productTier"), params.get("arg2"))
+                str(params.get("product_tier"), params.get("productTier"), params.get("arg2")),
+                str(params.get("query_target"), params.get("queryTarget"), params.get("arg3"))
         ));
     }
 
