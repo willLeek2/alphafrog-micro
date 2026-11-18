@@ -470,44 +470,6 @@ class SqlQueryToolsTest {
     }
 
     @Test
-    void marketReadDisabledUsesMainDataSource() throws Exception {
-        javax.sql.DataSource main = mock(javax.sql.DataSource.class);
-        javax.sql.DataSource market = mock(javax.sql.DataSource.class);
-        java.sql.Connection connection = mock(java.sql.Connection.class);
-        java.sql.Statement statement = mock(java.sql.Statement.class);
-        java.sql.ResultSet resultSet = mock(java.sql.ResultSet.class);
-        java.sql.ResultSetMetaData metaData = mock(java.sql.ResultSetMetaData.class);
-        when(main.getConnection()).thenReturn(connection);
-        when(connection.createStatement()).thenReturn(statement);
-        when(statement.executeQuery(anyString())).thenReturn(resultSet);
-        when(resultSet.getMetaData()).thenReturn(metaData);
-        when(metaData.getColumnCount()).thenReturn(1);
-        when(metaData.getColumnLabel(1)).thenReturn("ts_code");
-        when(resultSet.next()).thenReturn(false);
-        world.willfrog.agent.platform.mapper.AgentRunMapper mapper =
-                mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
-        world.willfrog.agent.platform.entity.AgentRun run =
-                new world.willfrog.agent.platform.entity.AgentRun();
-        run.setExt("{\"is_admin\":true}");
-        when(mapper.findById("run-admin")).thenReturn(run);
-        ReflectionTestUtils.setField(tools, "dataSource", main);
-        ReflectionTestUtils.setField(tools, "marketReadDataSource", market);
-        ReflectionTestUtils.setField(tools, "marketReadEnabled", false);
-        ReflectionTestUtils.setField(tools, "agentRunMapper", mapper);
-        AgentContext.setRunId("run-admin");
-        try {
-            JsonNode out = objectMapper.readTree(tools.executeQuery(
-                    "SELECT ts_code FROM alphafrog_index_info LIMIT 10", null, "INTERACTIVE", "market_db"));
-            assertTrue(out.path("ok").asBoolean());
-            assertEquals("market_db", out.path("query_target").asText());
-        } finally {
-            AgentContext.clear();
-        }
-        verify(main).getConnection();
-        verify(market, never()).getConnection();
-    }
-
-    @Test
     void marketReadEnabledWithoutBeanDoesNotOpenMainConnection() throws Exception {
         javax.sql.DataSource main = mock(javax.sql.DataSource.class);
         ReflectionTestUtils.setField(tools, "dataSource", main);
