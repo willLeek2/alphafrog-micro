@@ -10,6 +10,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -40,6 +41,7 @@ import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.alphafrogmicro.common.datasource.MarketReadAutoConfiguration;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import com.google.protobuf.util.JsonFormat;
@@ -164,9 +166,17 @@ public class SqlQueryTools {
     @Autowired(required = false)
     private FinanceRecordChannelConfigLoader financeRecordChannelConfigLoader;
 
-    /** 主库连接。行情库查询复用它，不把地址或密码交给沙箱。 */
+    /** 主库连接。行情只读开关关闭时，行情 SQL 使用它。 */
     @Autowired(required = false)
     private DataSource dataSource;
+
+    /** 开关打开时的独立只读连接。开关关闭时这个 Bean 不存在。 */
+    @Autowired(required = false)
+    @Qualifier(MarketReadAutoConfiguration.DATA_SOURCE_BEAN_NAME)
+    private DataSource marketReadDataSource;
+
+    @Value("${alphafrog.market-read.enabled:false}")
+    private boolean marketReadEnabled;
 
     @Autowired(required = false)
     private AgentRunMapper agentRunMapper;
@@ -936,12 +946,19 @@ public class SqlQueryTools {
     }
 
     /**
-     * 管理员运行直接在主库上执行一条已检查过的 SELECT。
+     * 管理员运行执行一条已检查过的 SELECT。
+     * 行情只读开关打开时使用独立只读连接；关闭时使用 agent 主库。
      * 非管理员在这里被拒绝，SQL 不会打开连接。
      */
     private PromptText executeMarketDb(String sql, String tier, ProductTier tierLimits) {
         String runId = AgentContext.getRunId();
-        if (runId == null || runId.isBlank() || agentRunMapper == null || dataSource == null) {
+        if (marketReadEnabled && marketReadDataSource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情只读连接没有装配",
+                    Map.of("retryable", false));
+        }
+        DataSource querySource = marketReadEnabled ? marketReadDataSource : dataSource;
+        if (runId == null || runId.isBlank() || agentRunMapper == null || querySource == null) {
             return fail("MARKET_DB_UNAVAILABLE",
                     "行情库查询需要当前运行和主库连接",
                     Map.of("retryable", false));
@@ -963,7 +980,7 @@ public class SqlQueryTools {
         }
         try {
             MarketDbQueryExecutor.Rows result = marketDbQueryExecutor.execute(
-                    dataSource, prepared.sql(), tierLimits.statementTimeoutSeconds(), prepared.appliedLimit());
+                    querySource, prepared.sql(), tierLimits.statementTimeoutSeconds(), prepared.appliedLimit());
             boolean truncated = prepared.capped() && result.rows().size() >= prepared.appliedLimit();
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("query_target", "market_db");

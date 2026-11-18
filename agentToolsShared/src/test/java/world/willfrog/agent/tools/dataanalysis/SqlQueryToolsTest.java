@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -428,6 +429,60 @@ class SqlQueryToolsTest {
             AgentContext.clear();
         }
         verify(dataSource, never()).getConnection();
+    }
+
+    @Test
+    void marketReadEnabledUsesDedicatedDataSource() throws Exception {
+        javax.sql.DataSource main = mock(javax.sql.DataSource.class);
+        javax.sql.DataSource market = mock(javax.sql.DataSource.class);
+        java.sql.Connection connection = mock(java.sql.Connection.class);
+        java.sql.Statement statement = mock(java.sql.Statement.class);
+        java.sql.ResultSet resultSet = mock(java.sql.ResultSet.class);
+        java.sql.ResultSetMetaData metaData = mock(java.sql.ResultSetMetaData.class);
+        when(market.getConnection()).thenReturn(connection);
+        when(connection.createStatement()).thenReturn(statement);
+        when(statement.executeQuery(anyString())).thenReturn(resultSet);
+        when(resultSet.getMetaData()).thenReturn(metaData);
+        when(metaData.getColumnCount()).thenReturn(1);
+        when(metaData.getColumnLabel(1)).thenReturn("ts_code");
+        when(resultSet.next()).thenReturn(false);
+        world.willfrog.agent.platform.mapper.AgentRunMapper mapper =
+                mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class);
+        world.willfrog.agent.platform.entity.AgentRun run =
+                new world.willfrog.agent.platform.entity.AgentRun();
+        run.setExt("{\"is_admin\":true}");
+        when(mapper.findById("run-admin")).thenReturn(run);
+        ReflectionTestUtils.setField(tools, "dataSource", main);
+        ReflectionTestUtils.setField(tools, "marketReadDataSource", market);
+        ReflectionTestUtils.setField(tools, "marketReadEnabled", true);
+        ReflectionTestUtils.setField(tools, "agentRunMapper", mapper);
+        AgentContext.setRunId("run-admin");
+        try {
+            JsonNode out = objectMapper.readTree(tools.executeQuery(
+                    "SELECT ts_code FROM alphafrog_index_info LIMIT 10", null, "INTERACTIVE", "market_db"));
+            assertEquals("market_db", out.path("query_target").asText());
+        } finally {
+            AgentContext.clear();
+        }
+        verify(market).getConnection();
+        verify(main, never()).getConnection();
+    }
+
+    @Test
+    void marketReadEnabledWithoutBeanDoesNotOpenMainConnection() throws Exception {
+        javax.sql.DataSource main = mock(javax.sql.DataSource.class);
+        ReflectionTestUtils.setField(tools, "dataSource", main);
+        ReflectionTestUtils.setField(tools, "marketReadDataSource", null);
+        ReflectionTestUtils.setField(tools, "marketReadEnabled", true);
+        AgentContext.setRunId("run-admin");
+        try {
+            JsonNode out = objectMapper.readTree(tools.executeQuery(
+                    "SELECT ts_code FROM alphafrog_index_info", null, "INTERACTIVE", "market_db"));
+            assertEquals("MARKET_DB_UNAVAILABLE", out.path("error").path("code").asText());
+        } finally {
+            AgentContext.clear();
+        }
+        verify(main, never()).getConnection();
     }
 
     private JsonNode decodeSpec(String rendered) throws Exception {
