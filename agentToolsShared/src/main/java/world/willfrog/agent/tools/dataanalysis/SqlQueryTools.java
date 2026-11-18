@@ -983,6 +983,7 @@ public class SqlQueryTools {
                     querySource, prepared.sql(), tierLimits.statementTimeoutSeconds(), prepared.appliedLimit());
             boolean truncated = prepared.capped() && result.rows().size() >= prepared.appliedLimit();
             Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
             body.put("query_target", "market_db");
             body.put("product_tier", tier);
             body.put("columns", result.columns());

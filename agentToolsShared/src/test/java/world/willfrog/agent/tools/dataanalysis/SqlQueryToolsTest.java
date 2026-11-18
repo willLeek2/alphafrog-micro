@@ -460,6 +460,7 @@ class SqlQueryToolsTest {
         try {
             JsonNode out = objectMapper.readTree(tools.executeQuery(
                     "SELECT ts_code FROM alphafrog_index_info LIMIT 10", null, "INTERACTIVE", "market_db"));
+            assertTrue(out.path("ok").asBoolean());
             assertEquals("market_db", out.path("query_target").asText());
         } finally {
             AgentContext.clear();
