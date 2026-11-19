@@ -10,9 +10,12 @@ import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
@@ -38,12 +41,14 @@ import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.alphafrogmicro.common.datasource.MarketReadAutoConfiguration;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import com.google.protobuf.util.JsonFormat;
 
 import java.io.IOException;
 import java.io.InputStream;
+import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -161,6 +166,23 @@ public class SqlQueryTools {
     @Autowired(required = false)
     private FinanceRecordChannelConfigLoader financeRecordChannelConfigLoader;
 
+    /** 主库连接。行情只读开关关闭时，行情 SQL 使用它。 */
+    @Autowired(required = false)
+    private DataSource dataSource;
+
+    /** 开关打开时的独立只读连接。开关关闭时这个 Bean 不存在。 */
+    @Autowired(required = false)
+    @Qualifier(MarketReadAutoConfiguration.DATA_SOURCE_BEAN_NAME)
+    private DataSource marketReadDataSource;
+
+    @Value("${alphafrog.market-read.enabled:false}")
+    private boolean marketReadEnabled;
+
+    @Autowired(required = false)
+    private AgentRunMapper agentRunMapper;
+
+    private final MarketDbQueryExecutor marketDbQueryExecutor = new MarketDbQueryExecutor();
+
     @Value("${agent.tool-job.fast-path-ms:1500}")
     private long fastPathMs = 1500L;
 
@@ -179,19 +201,28 @@ public class SqlQueryTools {
     }
 
     /**
-     * LangChain4j 暴露给模型的入口：SQL 文本、run 级数据集编号、产品档位。
+     * LangChain4j 暴露给模型的入口：SQL 文本、run 级数据集编号、产品档位、查询目标。
      * 方法名即工具名；说明正文在目录构建时覆盖成权威文件。
+     * query_target 省略时走原来的数据集路径。
      */
     @Tool
+    public String executeQuery(String sql, String dataset_ids, String product_tier, String query_target) {
+        return executeQueryPrompt(sql, dataset_ids, product_tier, query_target).text();
+    }
+
     public String executeQuery(String sql, String dataset_ids, String product_tier) {
-        return executeQueryPrompt(sql, dataset_ids, product_tier).text();
+        return executeQuery(sql, dataset_ids, product_tier, null);
+    }
+
+    public PromptText executeQueryPrompt(String sql, String dataset_ids, String product_tier, String query_target) {
+        return executeQueryInternal(sql, dataset_ids, product_tier, query_target);
     }
 
     public PromptText executeQueryPrompt(String sql, String dataset_ids, String product_tier) {
-        return executeQueryInternal(sql, dataset_ids, product_tier);
+        return executeQueryPrompt(sql, dataset_ids, product_tier, null);
     }
 
-    private PromptText executeQueryInternal(String sql, String datasetIds, String productTier) {
+    private PromptText executeQueryInternal(String sql, String datasetIds, String productTier, String queryTarget) {
         long toolStartMs = System.currentTimeMillis();
         try {
             // --- 档位解析： blank 默认 INTERACTIVE；未知档位直接拒，带上合法名单。 ---
@@ -205,6 +236,17 @@ public class SqlQueryTools {
             }
             if (sql == null || sql.isBlank()) {
                 return fail("MISSING_SQL", "sql is required", Map.of("retryable", true));
+            }
+            String target = queryTarget == null || queryTarget.isBlank()
+                    ? "run_dataset"
+                    : queryTarget.trim().toLowerCase(Locale.ROOT);
+            if ("market_db".equals(target)) {
+                return executeMarketDb(sql, tier, tierLimits);
+            }
+            if (!"run_dataset".equals(target)) {
+                return fail("UNKNOWN_QUERY_TARGET",
+                        "query_target 只接受 run_dataset 或 market_db",
+                        Map.of("legal_targets", List.of("run_dataset", "market_db"), "retryable", true));
             }
 
             // --- 入参编号解析：dataset_ids 是当前 Run 内的局部整数编号。 ---
@@ -900,6 +942,66 @@ public class SqlQueryTools {
     private void hitFaultPoint(String runId, String checkpoint) {
         if (toolJobFaultInjector != null) {
             toolJobFaultInjector.hit(runId, checkpoint);
+        }
+    }
+
+    /**
+     * 管理员运行执行一条已检查过的 SELECT。
+     * 行情只读开关打开时使用独立只读连接；关闭时使用 agent 主库。
+     * 非管理员在这里被拒绝，SQL 不会打开连接。
+     */
+    private PromptText executeMarketDb(String sql, String tier, ProductTier tierLimits) {
+        String runId = AgentContext.getRunId();
+        if (marketReadEnabled && marketReadDataSource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情只读连接没有装配",
+                    Map.of("retryable", false));
+        }
+        DataSource querySource = marketReadEnabled ? marketReadDataSource : dataSource;
+        if (runId == null || runId.isBlank() || agentRunMapper == null || querySource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情库查询需要当前运行和主库连接",
+                    Map.of("retryable", false));
+        }
+        AgentRun run = agentRunMapper.findById(runId);
+        if (run == null || !MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper)) {
+            return fail("NOT_ADMIN",
+                    "这次运行创建时没有管理员标记，不能查询行情库",
+                    Map.of("retryable", false));
+        }
+        MarketDbSqlGuard.Prepared prepared;
+        try {
+            prepared = MarketDbSqlGuard.prepare(sql, tierLimits.rowCap());
+        } catch (MarketSqlRejected rejected) {
+            return fail("SQL_REJECTED", rejected.getMessage(), Map.of(
+                    "retryable", true,
+                    "allowed_tables", List.copyOf(MarketDbSqlGuard.ALLOWED_TABLES),
+                    "allowed_columns", List.copyOf(MarketDbSqlGuard.ALLOWED_COLUMNS)));
+        }
+        try {
+            MarketDbQueryExecutor.Rows result = marketDbQueryExecutor.execute(
+                    querySource, prepared.sql(), tierLimits.statementTimeoutSeconds(), prepared.appliedLimit());
+            boolean truncated = prepared.capped() && result.rows().size() >= prepared.appliedLimit();
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
+            body.put("query_target", "market_db");
+            body.put("product_tier", tier);
+            body.put("columns", result.columns());
+            body.put("rows", result.rows());
+            body.put("row_count", result.rows().size());
+            body.put("row_cap", tierLimits.rowCap());
+            body.put("truncated", truncated);
+            return PromptText.runtimeData(objectMapper.writeValueAsString(body));
+        } catch (MarketDbQueryExecutor.MarketDbTimeoutException timeout) {
+            return fail("STATEMENT_TIMEOUT",
+                    "语句超过本档位时限，没有返回部分结果",
+                    Map.of("retryable", true,
+                            "statement_timeout_seconds", tierLimits.statementTimeoutSeconds()));
+        } catch (RuntimeException failure) {
+            String message = failure.getMessage() == null ? "行情库查询失败" : failure.getMessage();
+            return fail("SQL_FAILED", message, Map.of("retryable", true));
+        } catch (Exception failure) {
+            return fail("SQL_FAILED", "行情库查询失败", Map.of("retryable", true));
         }
     }
 

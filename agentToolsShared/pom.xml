@@ -84,6 +84,12 @@
             <artifactId>duckdb_jdbc</artifactId>
             <version>1.3.1.0</version>
         </dependency>
+        <!-- 管理员行情库 SQL：在执行前用语法树拒绝多语句、核对表和列，并改写 LIMIT。 -->
+        <dependency>
+            <groupId>com.github.jsqlparser</groupId>
+            <artifactId>jsqlparser</artifactId>
+            <version>4.9</version>
+        </dependency>
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
