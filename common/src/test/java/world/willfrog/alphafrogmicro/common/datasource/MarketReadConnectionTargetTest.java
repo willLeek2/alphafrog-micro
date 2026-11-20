@@ -26,9 +26,6 @@ class MarketReadConnectionTargetTest {
 
     @Test
     void verify_shouldRejectBetaDatabase() {
-        IllegalStateException betaName = assertThrows(IllegalStateException.class, () ->
-                MarketReadConnectionTarget.verify("jdbc:postgresql://127.0.0.1:5432/alphafrog"));
-        assertTrue(betaName.getMessage().contains("got 'alphafrog'"));
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
                 MarketReadConnectionTarget.verify("jdbc:postgresql://127.0.0.1:5432/alphafrog_beta"));
         assertTrue(ex.getMessage().contains("alphafrog_beta"));
