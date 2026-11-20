@@ -3,8 +3,8 @@ package world.willfrog.agent.tools.rag;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 import world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService;
 import world.willfrog.alphafrogmicro.externalinfo.idl.RagSearchRequest;
@@ -38,7 +38,8 @@ public class RagTools {
     private static final int LOAD_DOCUMENT_PREVIEW_CHARS = 1600;
     private static final int LOAD_DOCUMENT_FULL_CONTENT_MAX_CHARS = 6000;
 
-    @DubboReference(timeout = 60000, retries = 0)
+    @Autowired
+    @Qualifier("externalInfoDubboService")
     private ExternalInfoDubboService externalInfoDubboService;
 
     private final ObjectMapper objectMapper;

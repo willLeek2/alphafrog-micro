@@ -2,7 +2,8 @@ package world.willfrog.alphafrogmicro.frontend.controller.domestic;
 
 import com.google.protobuf.util.JsonFormat;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.config.annotation.DubboReference;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
@@ -22,10 +23,12 @@ import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetSearchRequest;
 @Slf4j
 public class DomesticListedAssetController {
 
-    @DubboReference(timeout = 35000)
+    @Autowired
+    @Qualifier("listedAssetService")
     private DomesticListedAssetService domesticListedAssetService;
 
-    @DubboReference(timeout = 35000)
+    @Autowired
+    @Qualifier("listedAssetFundService")
     private DomesticFundService domesticFundService;
 
     @GetMapping("/info/ts_code")
