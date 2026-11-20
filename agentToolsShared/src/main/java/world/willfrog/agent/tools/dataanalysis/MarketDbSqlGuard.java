@@ -9,6 +9,7 @@ import net.sf.jsqlparser.expression.LongValue;
 import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.Statements;
 import net.sf.jsqlparser.statement.select.AllColumns;
@@ -29,25 +30,29 @@ import net.sf.jsqlparser.util.TablesNamesFinder;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
 /**
- * 在 SQL 送到主库之前检查语句：只留一条 SELECT，表和列必须落在允许清单里，
- * 并把最外层 LIMIT 改成不超过当前档位的行数。
+ * 在 SQL 送到主库之前检查语句：只留一条 SELECT，表必须在四个资产类别的名单里，
+ * 列必须属于语句里的那张表，并把最外层 LIMIT 改成不超过当前档位的行数。
  */
 public final class MarketDbSqlGuard {
 
-    public static final Set<String> ALLOWED_TABLES = Set.of(
-            "alphafrog_index_daily",
-            "alphafrog_index_info");
+    public static final Set<String> ALLOWED_TABLES = allowedTables();
 
-    /** 两张表允许列的并集。工具说明里的列清单与这里是同一份范围。 */
-    public static final Set<String> ALLOWED_COLUMNS = Set.of(
-            "ts_code", "trade_date", "amount", "name");
+    private static Set<String> allowedTables() {
+        Set<String> names = new LinkedHashSet<>();
+        for (String category : MarketDbCatalog.CATEGORIES) {
+            names.addAll(MarketDbCatalog.tables(category));
+        }
+        return Set.copyOf(names);
+    }
 
     private static final Set<String> FORBIDDEN_FUNCTIONS = Set.of(
             "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file",
@@ -96,14 +101,13 @@ public final class MarketDbSqlGuard {
                 continue;
             }
             if (!ALLOWED_TABLES.contains(normalized)) {
-                throw new MarketSqlRejected("表 " + rawName + " 不在允许范围内。当前允许的表："
-                        + String.join("、", ALLOWED_TABLES));
+                throw new MarketSqlRejected("表 " + rawName
+                        + " 不在允许范围内。请先按 ETF、股票、指数、基金查看表名");
             }
             referenced.add(normalized);
         }
         if (referenced.isEmpty()) {
-            throw new MarketSqlRejected("语句没有引用允许的行情表。当前允许的表："
-                    + String.join("、", ALLOWED_TABLES));
+            throw new MarketSqlRejected("语句没有引用允许的行情表。请先按 ETF、股票、指数、基金查看表名");
         }
         ColumnCheck check = new ColumnCheck();
         walk(select, check);
@@ -182,13 +186,13 @@ public final class MarketDbSqlGuard {
             throw new MarketSqlRejected("不接受 SELECT INTO");
         }
         check.pushAliasScope();
+        check.pushTableScope(tableScope(plain));
         try {
         if (plain.getSelectItems() != null) {
             for (SelectItem<?> item : plain.getSelectItems()) {
                 Expression expression = item.getExpression();
                 if (expression instanceof AllColumns || expression instanceof AllTableColumns) {
-                    throw new MarketSqlRejected("SELECT * 不在允许范围内。当前允许的列："
-                            + String.join("、", ALLOWED_COLUMNS));
+                    throw new MarketSqlRejected("不接受 SELECT *。请写出列名，列必须属于语句里的那张表");
                 }
                 if (item.getAlias() != null && item.getAlias().getName() != null) {
                     check.addAlias(item.getAlias().getName().replace("\"", "").toLowerCase(Locale.ROOT));
@@ -223,7 +227,34 @@ public final class MarketDbSqlGuard {
             }
         }
         } finally {
+            check.popTableScope();
             check.popAliasScope();
+        }
+    }
+
+    private static Map<String, String> tableScope(PlainSelect plain) {
+        Map<String, String> scope = new LinkedHashMap<>();
+        addTable(plain.getFromItem(), scope);
+        if (plain.getJoins() != null) {
+            for (Join join : plain.getJoins()) {
+                addTable(join.getRightItem(), scope);
+            }
+        }
+        return scope;
+    }
+
+    private static void addTable(FromItem item, Map<String, String> scope) {
+        if (!(item instanceof Table table)) {
+            return;
+        }
+        String raw = table.getSchemaName() == null || table.getSchemaName().isBlank()
+                ? table.getName()
+                : table.getSchemaName() + "." + table.getName();
+        String canonical = normalizeTable(raw);
+        scope.put(canonical, canonical);
+        if (table.getAlias() != null && table.getAlias().getName() != null) {
+            String alias = table.getAlias().getName().replace("\"", "").toLowerCase(Locale.ROOT);
+            scope.put(alias, canonical);
         }
     }
 
@@ -275,6 +306,7 @@ public final class MarketDbSqlGuard {
 
         private boolean capped;
         private final Deque<Set<String>> aliasScopes = new ArrayDeque<>();
+        private final Deque<Map<String, String>> tableScopes = new ArrayDeque<>();
 
         private void pushAliasScope() {
             aliasScopes.push(new LinkedHashSet<>());
@@ -282,6 +314,14 @@ public final class MarketDbSqlGuard {
 
         private void popAliasScope() {
             aliasScopes.pop();
+        }
+
+        private void pushTableScope(Map<String, String> scope) {
+            tableScopes.push(scope);
+        }
+
+        private void popTableScope() {
+            tableScopes.pop();
         }
 
         private void addAlias(String name) {
@@ -303,9 +343,28 @@ public final class MarketDbSqlGuard {
             if (!qualified && !aliasScopes.isEmpty() && aliasScopes.peek().contains(name)) {
                 return;
             }
-            if (!ALLOWED_COLUMNS.contains(name)) {
-                throw new MarketSqlRejected("列 " + column.getColumnName()
-                        + " 不在允许范围内。当前允许的列：" + String.join("、", ALLOWED_COLUMNS));
+            Map<String, String> scope = tableScopes.isEmpty() ? Map.of() : tableScopes.peek();
+            if (!qualified) {
+                boolean found = false;
+                for (String tableName : new LinkedHashSet<>(scope.values())) {
+                    if (MarketDbCatalog.columns(tableName).contains(name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    throw new MarketSqlRejected("列 " + column.getColumnName() + " 不属于本次查询里的表");
+                }
+                return;
+            }
+            String qualifier = column.getTable().getName().replace("\"", "").toLowerCase(Locale.ROOT);
+            String tableName = scope.get(qualifier);
+            if (tableName == null) {
+                throw new MarketSqlRejected("列前缀 " + qualifier + " 对不上本次查询里的表");
+            }
+            if (!MarketDbCatalog.columns(tableName).contains(name)) {
+                throw new MarketSqlRejected("列 " + name + " 不属于表 " + tableName
+                        + "。该表的列：" + String.join("、", MarketDbCatalog.columns(tableName)));
             }
         }
 

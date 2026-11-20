@@ -1,4 +1,4 @@
-用 SQL 查询。query_target 省略或为 run_dataset 时，查询当前 Run 已授权的数据集，SQL 在隔离沙箱里由平台固定的 DuckDB 引擎执行，你只提供 SQL 文本，不提供执行代码。query_target 为 market_db 时，直接查询主库行情表，规则见文末「行情库查询」。
+用 SQL 查询。query_target 省略或为 run_dataset 时，查询当前 Run 已授权的数据集，SQL 在隔离沙箱里由平台固定的 DuckDB 引擎执行，你只提供 SQL 文本，不提供执行代码。行情库查询先取类别和表名，再取一个类别的列，然后写 SELECT。规则见文末「行情库查询」。
 
 适用场景：
   - 跨多个数据集做条件筛选、连接、分组聚合等固定参数工具做不到的查询
@@ -14,9 +14,9 @@
 
 参数说明：
   sql           - 一条查询语句，必填。只接受单条语句；多语句以及 ATTACH/COPY/INSTALL/LOAD 语句在准入阶段直接拒绝
-  dataset_ids   - query_target 为 run_dataset 时必填：要挂载的数据集编号，逗号分隔（如 "1,2"）或 JSON 数组（如 "[1,2]"）。query_target 为 market_db 时不需要
+  dataset_ids   - query_target 为 run_dataset 时必填：要挂载的数据集编号，逗号分隔（如 "1,2"）或 JSON 数组（如 "[1,2]"）。行情库的三次调用不需要
   product_tier  - 产品档位："INTERACTIVE"（默认，语句上限 30 秒，最多返回 100 行）| "BACKGROUND"（语句上限 120 秒，最多返回 1000 行，占用更多容量）
-  query_target  - "run_dataset"（默认）| "market_db"
+  query_target  - "run_dataset"（默认）| "market_tables" | "market_schema" | "market_db"
 
 返回结果：
   - 成功：columns（列名）、rows（数据行）、row_count、truncated（是否因行数上限被截断）
@@ -30,16 +30,13 @@
   - 结果集有单次返回体积上限（约 900 KiB）：超限返回 QUERY_RESULT_TOO_LARGE，收窄查询后重试。宽表（列多或文本列长）即使行数在档位上限内也可能超体积上限，这时要减少列或缩短文本列，只减行数不一定够
   - executeQuery 支持 DUAL_POOL_V2 的等待组成员调用，但同一用户同一时刻只允许一条查询执行（包括同一 Run 的多项查询）。如返回可重试的 SESSION_QUERY_IN_PROGRESS，等待当前查询完成后再发起该项查询；批量查询请逐项执行，不能假定同一批 SQL 会全部同时启动
 
-行情库查询（query_target=market_db）：
-  - 只有创建这次运行时带有管理员标记的运行可以走这条路径。没有该标记时，调用在执行前被拒绝，SQL 不会送到数据库。普通用户看到的是同一份说明
-  - 数据库是 PostgreSQL。请直接写 PostgreSQL，不要写 DuckDB 方言，也不要写 t1、t2 这类数据集视图名
-  - 允许查询的表只有下面两张。表名带 schema 时只接受 public。名单以外的表会被拒绝，并带回当前允许的表名
-  - 下面列出的列就是这两张表允许使用的全部列。不要猜测名单以外的列名，也不要写 SELECT *
-      alphafrog_index_daily：ts_code、trade_date、amount
-      alphafrog_index_info：ts_code、name
+行情库查询：
+  - 只有创建这次运行时带有管理员标记的运行可以走下面三次调用。没有该标记时，调用在执行前被拒绝，SQL 不会送到数据库。普通用户看到的是同一份说明
+  - 第一次调用 query_target=market_tables。sql 留空。返回四个类别和各类表名：ETF、股票、指数、基金。这次不返回列
+  - 选定一个类别后，第二次调用 query_target=market_schema。sql 只填写类别名，只能是 ETF、股票、指数、基金 其中之一。返回这个类别下面每张表的表名和列名。不要一次索取四个类别
+  - 第三次调用 query_target=market_db。sql 是一条 PostgreSQL SELECT。不要写 DuckDB 方言，也不要写 t1、t2 这类数据集视图名。表名带 schema 时只接受 public。列必须属于语句里的那张表，不能把另一张表的列写过来。不要写 SELECT *
   - trade_date 是从 1970-01-01 起算的毫秒整数。把日期写成毫秒可以用 extract(epoch from date '2025-10-01') * 1000
-  - amount 是成交额
-  - 只接受一条 SELECT。多条语句、写入语句、SELECT * 都会在执行前被拒绝
-  - 返回行数不超过当前档位上限（INTERACTIVE 100 行，BACKGROUND 1000 行）。你写的 LIMIT 若更大，服务会改成该上限；结果被这个上限截断时，返回里带 truncated=true，并写明实际行数和档位上限
-  - 语句超时与数据集查询相同：INTERACTIVE 30 秒，BACKGROUND 120 秒。超时返回 STATEMENT_TIMEOUT，不返回部分行
-  - 这条路径不使用 dataset_ids，也不要先调用 listMyData 去找这两张表
+  - 日线表上的 amount 是成交额
+  - 只接受一条 SELECT。多条语句和写入语句都会在送到数据库之前被拒绝
+  - 返回行数不超过当前档位上限（INTERACTIVE 100 行、30 秒，BACKGROUND 1000 行、120 秒）。你写的 LIMIT 若更大，服务会改成该上限；结果被这个上限截断时，返回里带 truncated=true，并写明实际行数和档位上限。超时返回 STATEMENT_TIMEOUT，不返回部分行
+  - 这三次调用都不使用 dataset_ids，也不要先调用 listMyData 去找行情表
