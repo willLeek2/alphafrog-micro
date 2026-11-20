@@ -8,6 +8,7 @@ import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -707,6 +708,41 @@ class DualPoolWaitGroupNodeExecutorTest {
         assertThat(messages.subList(5, 8)).extracting(message ->
                         ((ToolExecutionResultMessage) message).text())
                 .containsExactly("第一个结果", "第二个结果", "第三个结果");
+    }
+
+    @Test
+    void changingToolBudgetFollowsStackedToolResults() {
+        RootTreeCallBudget budget = mock(RootTreeCallBudget.class);
+        ReflectionTestUtils.setField(executor, "rootTreeCallBudget", budget);
+        int[] used = {2};
+        when(budget.toolCallBudgetStatus(RUN_ID)).thenAnswer(invocation ->
+                new RootTreeCallBudget.ToolCallBudgetStatus(
+                        "tool_calls", false, used[0], 10, 10L - used[0], "本运行"));
+        model.enqueue(AiMessage.from(List.of(toolCall("call-a", "getStockDaily", "{}"))));
+        dispatcher.pending.put("getStockDaily", new NodeToolDispatcher.DispatchOutcome.Pending(
+                RUN_ID + ":call-a:1", "task-a",
+                dispatchProof(RUN_ID + ":call-a:1", "task-a")));
+
+        DualPoolWaitGroupNodeExecutor.Outcome first = executor.executeSegment(firstSegment(List.of()));
+        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) first).groupId();
+        List<ChatMessage> firstRequest = List.copyOf(model.lastRequest());
+        assertThat(firstRequest).hasSize(5);
+        assertThat(((SystemMessage) firstRequest.get(1)).text()).doesNotContain("剩余");
+        assertThat(((UserMessage) firstRequest.get(4)).singleText()).contains("已用2次", "剩余8次");
+
+        Long notificationId = completeMember(groupId, "call-a", "行情结果");
+        store.consumeRecovery(notificationId, "test-dispatcher", 0L, "test-owner", 1L);
+        used[0] = 3;
+        model.enqueue(AiMessage.from("汇总完成"));
+        executor.executeSegment(segment(segmentIdentity(1), nextPayload(0, 0)));
+        List<ChatMessage> secondRequest = model.lastRequest();
+
+        assertThat(secondRequest.subList(0, firstRequest.size())).containsExactlyElementsOf(firstRequest);
+        assertThat(secondRequest.get(6)).isInstanceOf(ToolExecutionResultMessage.class);
+        assertThat(((ToolExecutionResultMessage) secondRequest.get(6)).text()).isEqualTo("行情结果");
+        assertThat(((UserMessage) secondRequest.get(7)).singleText()).contains("已用3次", "剩余7次");
+        assertThat(((SystemMessage) secondRequest.get(1)).text())
+                .isEqualTo(((SystemMessage) firstRequest.get(1)).text());
     }
 
     @Test
