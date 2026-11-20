@@ -915,7 +915,6 @@ services:
       NACOS_ADDRESS: nacos
       # 可选：覆盖 JWT 密钥（默认值在 frontend 的 application.yml 里）
       # AF_JWT_SECRET: ${AF_JWT_SECRET}
-      AF_DOMESTIC_FETCH_DEBUG_BASE_URL: http://domestic-fetch-service:18082
       AF_CONFIG_NACOS_ENABLED: "true"
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
       AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP: ${AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP:-langchain}

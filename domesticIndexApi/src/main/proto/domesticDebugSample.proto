@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+
+package world.willfrog.alphafrogmicro.domestic.idl;
+
+// 管理员抽样。frontend 通过注册中心调用，不再访问固定 HTTP 地址。
+
+message DebugAssetName {
+  string ts_code = 1;
+  string name = 2;
+  string full_name = 3;
+  bool has_full_name = 4;
+  int64 daily_count = 5;
+  bool has_daily_count = 6;
+  double average_amount = 7;
+  bool has_average_amount = 8;
+}
+
+message DebugAssetSample {
+  string status = 1;
+  int32 requested_count = 2;
+  int32 returned_count = 3;
+  int32 candidate_count = 4;
+  int32 attempts = 5;
+  int32 max_attempts = 6;
+  string start_date = 7;
+  string end_date = 8;
+  int32 ideal_daily_count = 9;
+  int32 required_daily_count = 10;
+  repeated DebugAssetName items = 11;
+}
+
+message DebugSampleStatus {
+  int32 http_status = 1;
+  string message = 2;
+}
+
+message RandomIndexConstituentsRequest {
+  string ts_code = 1;
+  int32 year = 2;
+  int32 count = 3;
+}
+
+message RandomIndexConstituentsResponse {
+  DebugSampleStatus status = 1;
+  repeated DebugAssetName items = 2;
+}
+
+message RandomSwL3IndustriesRequest {
+  int32 count = 1;
+}
+
+message RandomSwL3IndustriesResponse {
+  DebugSampleStatus status = 1;
+  repeated string names = 2;
+}
+
+message RandomIndexNamesByAmountRequest {
+  int32 start_year = 1;
+  int32 end_year = 2;
+  optional double min_avg_amount = 3;
+  bool cny_only = 4;
+  int32 candidate_count = 5;
+  int32 max_attempts = 6;
+  int32 count = 7;
+}
+
+message RandomIndexNamesByAmountResponse {
+  DebugSampleStatus status = 1;
+  DebugAssetSample sample = 2;
+}
+
+message RandomListedStocksRequest {
+  int32 start_year = 1;
+  int32 end_year = 2;
+  optional double min_avg_amount = 3;
+  int32 candidate_count = 4;
+  int32 max_attempts = 5;
+  int32 count = 6;
+}
+
+message RandomListedStocksResponse {
+  DebugSampleStatus status = 1;
+  DebugAssetSample sample = 2;
+}
+
+message RandomListedEtfsRequest {
+  int32 start_year = 1;
+  int32 end_year = 2;
+  optional double min_avg_amount = 3;
+  int32 candidate_count = 4;
+  int32 max_attempts = 5;
+  int32 count = 6;
+}
+
+message RandomListedEtfsResponse {
+  DebugSampleStatus status = 1;
+  DebugAssetSample sample = 2;
+}
+
+service DomesticDebugSampleService {
+  rpc randomIndexConstituents(RandomIndexConstituentsRequest) returns (RandomIndexConstituentsResponse);
+  rpc randomSwL3Industries(RandomSwL3IndustriesRequest) returns (RandomSwL3IndustriesResponse);
+  rpc randomIndexNamesByAmount(RandomIndexNamesByAmountRequest) returns (RandomIndexNamesByAmountResponse);
+  rpc randomListedStocks(RandomListedStocksRequest) returns (RandomListedStocksResponse);
+  rpc randomListedEtfs(RandomListedEtfsRequest) returns (RandomListedEtfsResponse);
+}

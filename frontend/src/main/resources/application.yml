@@ -47,8 +47,6 @@ alphafrog:
     entry:
       enabled: ${AF_LANE_ENTRY_ENABLED:false}
       traffic-scope-id: ${AF_LANE_TRAFFIC_SCOPE_ID:}
-  domestic-fetch:
-    debug-base-url: ${AF_DOMESTIC_FETCH_DEBUG_BASE_URL:http://domestic-fetch-service:18082}
   debug:
     observability:
       output-root: ${AF_DEBUG_OBSERVABILITY_OUTPUT_ROOT:/app/logs/agent-debug-observability}

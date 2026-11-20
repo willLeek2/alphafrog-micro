@@ -21,7 +21,7 @@ import java.util.function.Supplier;
  * 管理员随机抽样 facade。
  *
  * <p>{@code /admin/**} 先由 JWT 过滤器认证，本控制器再校验账户类型与状态，
- * 然后通过仅在容器网络开放的 HTTP 接口访问 domestic-fetch。</p>
+ * 然后通过注册中心里的 Dubbo 服务访问 domestic-fetch。</p>
  */
 @RestController
 @RequestMapping("/admin/debug/market-samples")
