@@ -70,7 +70,8 @@ final class LangchainTodoPromptModel implements ChatModel {
             var status = budget.toolCallBudgetStatus(runId);
             if (status != null) {
                 if (reader == null) throw missing("工具预算说明缺少正文读取组件");
-                messages.add(1, PromptMessage.system(ToolBudgetPromptRenderer.render(reader, status)));
+                // 额度数字每次都会变。放在本次请求末尾，前面的工具结果才能在下一次请求里继续作为前缀。
+                messages.add(PromptMessage.user(ToolBudgetPromptRenderer.render(reader, status)));
             }
         }
         PromptText hint = AgentContext.getLastMileHintPrompt();

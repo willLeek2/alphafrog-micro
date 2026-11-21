@@ -341,11 +341,11 @@ public class DualPoolWaitGroupNodeExecutor {
         if (modelInputs == null || promptTexts == null || toolPrompts == null) {
             throw sourceMissing("节点输入保存和正文准备组件未配置");
         }
+        // 已用和剩余每次都会变。附在已经堆叠的正文末尾并留下，下一次请求才能沿用前面的工具结果。
+        appendCurrentToolBudget(messages, input.identity().runId());
         List<PromptMessage> actualMessages = new ArrayList<>(messages);
         PromptText admission = renderPolicy("nodeToolAdmissionInstruction", Map.of("maxMembers", String.valueOf(maxMembers)));
-        PromptText budget = toolCallBudgetNote(input.identity().runId());
-        PromptText policies = PromptText.concat(admission, budget);
-        actualMessages.add(Math.min(1, actualMessages.size()), PromptMessage.system(policies));
+        actualMessages.add(Math.min(1, actualMessages.size()), PromptMessage.system(admission));
         PromptText dependencyFacts = LangchainTodoUserMessageBuilder.dependencyCheckFacts(
                 input.request().getDependencyCheck(), input.request().getPlanGeneration(), input.todo().getId());
         actualMessages.add(Math.min(2, actualMessages.size()),
@@ -400,11 +400,19 @@ public class DualPoolWaitGroupNodeExecutor {
      * <p>只调统一状态方法 {@link RootTreeCallBudget#toolCallBudgetStatus(String)} 传当前运行编号，
      * 计数源（V2 根树共享 / V1 本运行观测统计）由该方法按运行冻结的调度版本自选，本注入点不自选。
      * 额度快照仅用于模型可见性，能否派发仍由既有准入决定。读不到额度（无预算组件或快照为空，
-     * 如旧测试桩）时返回空串，不附加任何额度文字。</p>
+     * 如旧测试桩）时返回空串，调用方不写额度消息。有文字时由 {@link #appendCurrentToolBudget}
+     * 接到本回合已堆叠正文的末尾。</p>
      */
     private PromptText toolCallBudgetNote(String runId) {
         return rootTreeCallBudget == null ? PromptText.runtimeData("")
                 : ToolBudgetPromptRenderer.render(promptTexts, rootTreeCallBudget.toolCallBudgetStatus(runId));
+    }
+
+    /** 把当前剩余额度写成一条用户消息，留在这次请求和之后的上下文末尾。空额度不写。 */
+    private void appendCurrentToolBudget(List<PromptMessage> messages, String runId) {
+        PromptText budget = toolCallBudgetNote(runId);
+        if (budget == null || budget.text() == null || budget.text().isBlank()) return;
+        messages.add(PromptMessage.user(budget));
     }
 
     /** 给每个被拒绝的原调用配一个结果，保留完整对话配对关系，不派发任何工具。 */
