@@ -234,19 +234,24 @@ public class SqlQueryTools {
                 return fail("UNKNOWN_TIER", policy("sqlUnknownTierAdvice"),
                         Map.of("legal_tiers", List.of("INTERACTIVE", "BACKGROUND"), "retryable", true));
             }
-            if (sql == null || sql.isBlank()) {
-                return fail("MISSING_SQL", "sql is required", Map.of("retryable", true));
-            }
             String target = queryTarget == null || queryTarget.isBlank()
                     ? "run_dataset"
                     : queryTarget.trim().toLowerCase(Locale.ROOT);
+            if ("market_tables".equals(target) || "market_schema".equals(target)) {
+                return marketDiscovery(target, sql);
+            }
+            if (sql == null || sql.isBlank()) {
+                return fail("MISSING_SQL", "sql is required", Map.of("retryable", true));
+            }
             if ("market_db".equals(target)) {
                 return executeMarketDb(sql, tier, tierLimits);
             }
             if (!"run_dataset".equals(target)) {
                 return fail("UNKNOWN_QUERY_TARGET",
-                        "query_target 只接受 run_dataset 或 market_db",
-                        Map.of("legal_targets", List.of("run_dataset", "market_db"), "retryable", true));
+                        "query_target 只接受 run_dataset、market_tables、market_schema 或 market_db",
+                        Map.of("legal_targets", List.of(
+                                "run_dataset", "market_tables", "market_schema", "market_db"),
+                                "retryable", true));
             }
 
             // --- 入参编号解析：dataset_ids 是当前 Run 内的局部整数编号。 ---
@@ -946,27 +951,104 @@ public class SqlQueryTools {
     }
 
     /**
-     * 管理员运行执行一条已检查过的 SELECT。
-     * 行情只读开关打开时使用独立只读连接；关闭时使用 agent 主库。
-     * 非管理员在这里被拒绝，SQL 不会打开连接。
+     * 管理员先看四个资产类别的表名，再看其中一个类别的列。
+     * 这两次调用不打开数据库连接。非管理员在返回名单之前被拒绝。
      */
-    private PromptText executeMarketDb(String sql, String tier, ProductTier tierLimits) {
-        String runId = AgentContext.getRunId();
-        if (marketReadEnabled && marketReadDataSource == null) {
-            return fail("MARKET_DB_UNAVAILABLE",
-                    "行情只读连接没有装配",
-                    Map.of("retryable", false));
+    private PromptText marketDiscovery(String target, String sql) {
+        PromptText denied = rejectUnlessAdmin();
+        if (denied != null) {
+            return denied;
         }
-        DataSource querySource = marketReadEnabled ? marketReadDataSource : dataSource;
-        if (runId == null || runId.isBlank() || agentRunMapper == null || querySource == null) {
+        try {
+            if ("market_tables".equals(target)) {
+                List<Map<String, Object>> categories = new ArrayList<>();
+                for (String category : MarketDbCatalog.CATEGORIES) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("category", category);
+                    item.put("tables", MarketDbCatalog.tables(category));
+                    categories.add(item);
+                }
+                Map<String, Object> body = new LinkedHashMap<>();
+                body.put("ok", true);
+                body.put("query_target", "market_tables");
+                body.put("categories", categories);
+                return PromptText.runtimeData(objectMapper.writeValueAsString(body));
+            }
+            String category = sql == null ? "" : sql.trim();
+            if (!MarketDbCatalog.CATEGORIES.contains(category)) {
+                return fail("UNKNOWN_MARKET_CATEGORY",
+                        "market_schema 的 sql 参数只接受一个类别名",
+                        Map.of("legal_categories", MarketDbCatalog.CATEGORIES, "retryable", true));
+            }
+            List<Map<String, Object>> tables = new ArrayList<>();
+            for (String table : MarketDbCatalog.tables(category)) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("table", table);
+                item.put("columns", columnNotes(table));
+                tables.add(item);
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
+            body.put("query_target", "market_schema");
+            body.put("category", category);
+            body.put("tables", tables);
+            return PromptText.runtimeData(objectMapper.writeValueAsString(body));
+        } catch (Exception failure) {
+            return fail("MARKET_DB_UNAVAILABLE", "行情表名单暂时不能返回", Map.of("retryable", true));
+        }
+    }
+
+    /** 列名保持名单顺序。有仓库注释或列注释的列带上 explanation。 */
+    private static List<Map<String, Object>> columnNotes(String table) {
+        List<Map<String, Object>> columns = new ArrayList<>();
+        for (String name : MarketDbCatalog.columns(table)) {
+            Map<String, Object> column = new LinkedHashMap<>();
+            column.put("name", name);
+            String explanation = MarketDbColumnNotes.explanation(table, name);
+            if (explanation != null && !explanation.isBlank()) {
+                column.put("explanation", explanation);
+            }
+            columns.add(column);
+        }
+        return columns;
+    }
+
+    /** 没有管理员标记时返回拒绝；可以继续时返回 null。这里不打开行情库连接。 */
+    private PromptText rejectUnlessAdmin() {
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank() || agentRunMapper == null) {
             return fail("MARKET_DB_UNAVAILABLE",
-                    "行情库查询需要当前运行和主库连接",
+                    "行情库查询需要当前运行",
                     Map.of("retryable", false));
         }
         AgentRun run = agentRunMapper.findById(runId);
         if (run == null || !MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper)) {
             return fail("NOT_ADMIN",
                     "这次运行创建时没有管理员标记，不能查询行情库",
+                    Map.of("retryable", false));
+        }
+        return null;
+    }
+
+    /**
+     * 管理员运行执行一条已检查过的 SELECT。
+     * 行情只读开关打开时使用独立只读连接；关闭时使用 agent 主库。
+     * 非管理员在这里被拒绝，SQL 不会打开连接。
+     */
+    private PromptText executeMarketDb(String sql, String tier, ProductTier tierLimits) {
+        if (marketReadEnabled && marketReadDataSource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情只读连接没有装配",
+                    Map.of("retryable", false));
+        }
+        DataSource querySource = marketReadEnabled ? marketReadDataSource : dataSource;
+        PromptText denied = rejectUnlessAdmin();
+        if (denied != null) {
+            return denied;
+        }
+        if (querySource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情库查询需要当前运行和主库连接",
                     Map.of("retryable", false));
         }
         MarketDbSqlGuard.Prepared prepared;
@@ -976,7 +1058,7 @@ public class SqlQueryTools {
             return fail("SQL_REJECTED", rejected.getMessage(), Map.of(
                     "retryable", true,
                     "allowed_tables", List.copyOf(MarketDbSqlGuard.ALLOWED_TABLES),
-                    "allowed_columns", List.copyOf(MarketDbSqlGuard.ALLOWED_COLUMNS)));
+                    "categories", MarketDbCatalog.CATEGORIES));
         }
         try {
             MarketDbQueryExecutor.Rows result = marketDbQueryExecutor.execute(
