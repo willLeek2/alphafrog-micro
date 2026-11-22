@@ -984,7 +984,7 @@ public class SqlQueryTools {
             for (String table : MarketDbCatalog.tables(category)) {
                 Map<String, Object> item = new LinkedHashMap<>();
                 item.put("table", table);
-                item.put("columns", MarketDbCatalog.columns(table));
+                item.put("columns", columnNotes(table));
                 tables.add(item);
             }
             Map<String, Object> body = new LinkedHashMap<>();
@@ -996,6 +996,21 @@ public class SqlQueryTools {
         } catch (Exception failure) {
             return fail("MARKET_DB_UNAVAILABLE", "行情表名单暂时不能返回", Map.of("retryable", true));
         }
+    }
+
+    /** 列名保持名单顺序。有仓库注释或列注释的列带上 explanation。 */
+    private static List<Map<String, Object>> columnNotes(String table) {
+        List<Map<String, Object>> columns = new ArrayList<>();
+        for (String name : MarketDbCatalog.columns(table)) {
+            Map<String, Object> column = new LinkedHashMap<>();
+            column.put("name", name);
+            String explanation = MarketDbColumnNotes.explanation(table, name);
+            if (explanation != null && !explanation.isBlank()) {
+                column.put("explanation", explanation);
+            }
+            columns.add(column);
+        }
+        return columns;
     }
 
     /** 没有管理员标记时返回拒绝；可以继续时返回 null。这里不打开行情库连接。 */
