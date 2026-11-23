@@ -178,6 +178,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                             && !"waitForSubAgent".equals(spec.name()))
                     .collect(Collectors.toCollection(java.util.ArrayList::new));
         }
+        specifications = new java.util.ArrayList<>(MarketQueryVisibility.apply(specifications));
 
         ToolExecutor executor = new ToolRouterToolExecutor(
                 toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore, promptPreparation);

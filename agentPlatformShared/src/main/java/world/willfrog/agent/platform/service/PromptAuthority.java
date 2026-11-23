@@ -466,6 +466,10 @@ final class PromptAuthority {
         return found;
     }
 
+    String readAuthorityText(String resource) {
+        return stripTrailingNewlines(requireResource(resource));
+    }
+
     String requireToolDescription(String toolName) {
         if (toolName == null || toolName.isBlank()) {
             throw new PromptConfigurationException("tool_description_missing", "工具名为空，无法读取权威说明");

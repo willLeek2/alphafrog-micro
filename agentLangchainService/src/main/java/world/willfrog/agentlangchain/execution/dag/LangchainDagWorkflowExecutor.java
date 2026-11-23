@@ -1230,6 +1230,9 @@ public class LangchainDagWorkflowExecutor {
             AgentContext.setUserId(request.getUserId());
         }
         AgentContext.setWebSearchEnabled(Boolean.TRUE.equals(request.getWebSearchEnabled()));
+        if (request.getMarketQueryVisible() != null) {
+            AgentContext.setMarketQueryVisible(request.getMarketQueryVisible());
+        }
     }
 
     /**

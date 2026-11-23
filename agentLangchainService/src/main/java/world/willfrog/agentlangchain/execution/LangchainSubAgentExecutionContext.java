@@ -63,6 +63,7 @@ public final class LangchainSubAgentExecutionContext {
                 .maxTodos(source.getMaxTodos())
                 .maxToolRoundTrips(source.getMaxToolRoundTrips())
                 .webSearchEnabled(source.getWebSearchEnabled())
+                .marketQueryVisible(source.getMarketQueryVisible())
                 .codeInterpreterEnabled(source.getCodeInterpreterEnabled())
                 .planningEndpointName(source.getPlanningEndpointName())
                 .executionEndpointName(source.getExecutionEndpointName())

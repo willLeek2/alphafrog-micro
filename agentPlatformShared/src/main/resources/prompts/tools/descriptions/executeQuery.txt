@@ -32,7 +32,6 @@
 
 行情库查询：
   - 用户要股票、ETF、指数或基金的代码和名称，但没有给出要匹配的名称、代码或拼音时，用下面三步从对应类别的表里 SELECT 代码列和名称列。不要改用 searchStock、searchIndex、searchFund 或 searchAssetInfo
-  - 只有创建这次运行时带有管理员标记的运行可以走下面三次调用。没有该标记时，调用在执行前被拒绝，SQL 不会送到数据库。普通用户看到的是同一份说明
   - 第一次调用 query_target=market_tables。sql 留空。返回四个类别和各类表名：ETF、股票、指数、基金。这次不返回列
   - 选定一个类别后，第二次调用 query_target=market_schema。sql 只填写类别名，只能是 ETF、股票、指数、基金 其中之一。返回这个类别下面每张表的表名和列。每一列有 name。仓库里已经写过解释的列同时带 explanation。没有解释的列不带这个字段。不要一次索取四个类别
   - 第三次调用 query_target=market_db。sql 是一条 PostgreSQL SELECT。不要写 DuckDB 方言，也不要写 t1、t2 这类数据集视图名。表名带 schema 时只接受 public。列必须属于语句里的那张表，不能把另一张表的列写过来。不要写 SELECT *

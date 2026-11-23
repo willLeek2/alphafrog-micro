@@ -30,6 +30,7 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
+import world.willfrog.agent.tools.dataanalysis.MarketDbRunAccess;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.PlanDependencyCheckReport;
@@ -686,6 +687,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
         AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
         AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+        AgentContext.setMarketQueryVisible(MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper));
         // 从 ext 反序列化 run 启动时冻结的 dataFreshness 快照
         setDataFreshnessFromExt(run.getExt());
         // 这里先解析”当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
@@ -872,6 +874,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
             AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
             AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+            AgentContext.setMarketQueryVisible(MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper));
             setDataFreshnessFromExt(run.getExt());
             // 用相同运行配置重建工具目录，但不会再次调用 planner。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
@@ -1021,6 +1024,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .toolSpecifications(toolSpecifications)
                 .webSearchEnabled(runConfig.webSearchEnabled())
                 .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
+                .marketQueryVisible(AgentContext.getMarketQueryVisible())
                 .build();
     }
 
