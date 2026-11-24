@@ -27,7 +27,7 @@ class ToolPromptCatalogVisibilityTest {
         assertFalse(actual.text().contains("executeQuery"));
         assertFalse(actual.text().contains("行情库"));
         assertTrue(actual.text().contains("关键词"));
-        assertTrue(actual.sources().isEmpty());
+        assertEquals(authoritativeText().sources(), actual.sources());
     }
 
     @Test

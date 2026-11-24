@@ -90,15 +90,16 @@ public final class ToolPromptCatalog {
     }
 
     /**
-     * 非管理员运行不把权威说明里指向 executeQuery 的句子发给模型。
-     * 隐藏正文来自运行时资源，不再登记成实验平台里那条权威说明的版本。
+     * 非管理员运行发给模型的是隐藏说明。
+     * 工具这一格仍保留原来的版本来源。来源列表空了，执行请求会在发出前被拒绝。
+     * 模型读到的正文是隐藏说明。
      */
     static PromptText modelDescription(PromptText authoritative, String toolName) {
         if (authoritative == null) {
             throw blocked();
         }
         if (AgentContext.isMarketQueryHidden() && MarketQueryTexts.rewrites(toolName)) {
-            return PromptText.runtimeData(MarketQueryTexts.hiddenDescription(toolName));
+            return new PromptText(MarketQueryTexts.hiddenDescription(toolName), authoritative.sources());
         }
         return authoritative;
     }
