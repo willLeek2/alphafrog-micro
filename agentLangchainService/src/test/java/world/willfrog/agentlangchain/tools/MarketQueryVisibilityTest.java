@@ -47,12 +47,17 @@ class MarketQueryVisibilityTest {
     }
 
     @Test
-    void unsetOrAdminRunKeepsOriginalDescriptions() {
+    void unsetRunHidesExecuteQueryAndAdminRunKeepsIt() {
         List<ToolSpecification> original = List.of(
                 ToolSpecification.builder().name("executeQuery").description("原说明").build());
-        assertTrue(MarketQueryVisibility.apply(original).get(0).description().equals("原说明"));
+        assertFalse(AgentContext.getMarketQueryVisible());
+        assertTrue(AgentContext.isMarketQueryHidden());
+        assertTrue(MarketQueryVisibility.apply(original).stream()
+                .noneMatch(spec -> "executeQuery".equals(spec.name())));
         AgentContext.setMarketQueryVisible(true);
         assertTrue(MarketQueryVisibility.apply(original).get(0).description().equals("原说明"));
+        AgentContext.clear();
+        assertFalse(AgentContext.getMarketQueryVisible());
     }
 
     private static boolean containsMarketWords(String text) {

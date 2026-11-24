@@ -1165,9 +1165,8 @@ public class DatabaseDualPoolWorkHandler implements DualPoolWorkHandler, Termina
         // 所以这里要把规划阶段写进请求的开关落到上下文，否则派发时算出来的目录会比模型看到的那份少。
         AgentContext.setWebSearchEnabled(
                 Boolean.TRUE.equals(context.workflowRequest().getWebSearchEnabled()));
-        if (context.workflowRequest().getMarketQueryVisible() != null) {
-            AgentContext.setMarketQueryVisible(context.workflowRequest().getMarketQueryVisible());
-        }
+        AgentContext.setMarketQueryVisible(
+                Boolean.TRUE.equals(context.workflowRequest().getMarketQueryVisible()));
         long startedAt = System.currentTimeMillis();
         freshRunPipeline.emitDualPoolTodoNodeEvent(
                 identity.runId(), context.run().getUserId(), "TODO_NODE_STARTED", todo,
