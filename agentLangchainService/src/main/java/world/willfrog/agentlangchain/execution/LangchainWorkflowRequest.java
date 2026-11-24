@@ -44,6 +44,8 @@ public class LangchainWorkflowRequest {
     private Integer maxToolRoundTrips;
     private Boolean webSearchEnabled;
     private Boolean codeInterpreterEnabled;
+    /** 创建运行时的管理员标记。false 时模型说明不包含行情库查询。 */
+    private Boolean marketQueryVisible;
     private String planningEndpointName;
     private String executionEndpointName;
     private String finalAnswerEndpointName;

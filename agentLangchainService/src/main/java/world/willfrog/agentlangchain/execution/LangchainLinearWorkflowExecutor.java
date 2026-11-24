@@ -679,6 +679,7 @@ public class LangchainLinearWorkflowExecutor {
             AgentContext.setUserId(request.getUserId());
         }
         AgentContext.setWebSearchEnabled(Boolean.TRUE.equals(request.getWebSearchEnabled()));
+        AgentContext.setMarketQueryVisible(Boolean.TRUE.equals(request.getMarketQueryVisible()));
     }
 
     private void validate(LangchainWorkflowRequest request) {

@@ -15,7 +15,9 @@ import java.nio.CharBuffer;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.prompt.AgentPromptTextReader;
+import world.willfrog.agent.platform.service.MarketQueryTexts;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
 import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
@@ -58,7 +60,9 @@ public final class ToolPromptCatalog {
                 String parameterFragment = "tool.parameters." + specification.name();
                 if (!originalDescriptions.isEmpty()) expected.put(parameterFragment, "TOOL_PARAMETER_DESCRIPTIONS");
                 var bodies = reader.read(root, expected);
-                PromptText description = reader.render(bodies.get(descriptionFragment), Map.of(), Map.of());
+                PromptText description = modelDescription(
+                        reader.render(bodies.get(descriptionFragment), Map.of(), Map.of()),
+                        specification.name());
                 List<PromptVersionSource> toolSources = new ArrayList<>(description.sources());
                 JsonObjectSchema schema = specification.parameters();
                 if (!originalDescriptions.isEmpty()) {
@@ -83,6 +87,21 @@ public final class ToolPromptCatalog {
             ModelSendBlocks.rethrowIfBlocked(failure);
             throw blocked();
         }
+    }
+
+    /**
+     * 非管理员运行发给模型的是隐藏说明。
+     * 工具这一格仍保留原来的版本来源。来源列表空了，执行请求会在发出前被拒绝。
+     * 模型读到的正文是隐藏说明。
+     */
+    static PromptText modelDescription(PromptText authoritative, String toolName) {
+        if (authoritative == null) {
+            throw blocked();
+        }
+        if (AgentContext.isMarketQueryHidden() && MarketQueryTexts.rewrites(toolName)) {
+            return new PromptText(MarketQueryTexts.hiddenDescription(toolName), authoritative.sources());
+        }
+        return authoritative;
     }
 
     /** 字典维护工具说明的位置；工具协议结构由代码确定。 */

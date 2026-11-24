@@ -209,10 +209,15 @@ public class AgentPromptService {
         return renderToolCapabilities(textReader().current(), toolNames);
     }
 
+    private static boolean visibleCapability(String name) {
+        return name != null && !name.isBlank()
+                && !(AgentContext.isMarketQueryHidden() && MarketQueryTexts.omitted(name));
+    }
+
     private PromptText renderToolCapabilities(RootPrompts root, Collection<String> toolNames) {
         List<String> ordered = new ArrayList<>();
         if (toolNames.contains("checkParallelLimits")) ordered.add("checkParallelLimits");
-        toolNames.stream().filter(name -> name != null && !name.isBlank() && !"checkParallelLimits".equals(name))
+        toolNames.stream().filter(name -> visibleCapability(name) && !"checkParallelLimits".equals(name))
                 .distinct().sorted().forEach(ordered::add);
         if (ordered.isEmpty()) return PromptText.runtimeData("");
         Map<String, String> expected = new LinkedHashMap<>();
@@ -220,8 +225,11 @@ public class AgentPromptService {
         Map<String, PromptVersionBody> bodies = textReader().read(root, expected);
         List<PromptText> lines = new ArrayList<>();
         for (String name : ordered) {
-            lines.add(PromptText.concat(PromptText.runtimeData("- " + name + ": "),
-                    textReader().render(bodies.get("tool.capability." + name), Map.of(), Map.of())));
+            PromptText capability = textReader().render(bodies.get("tool.capability." + name), Map.of(), Map.of());
+            if (AgentContext.isMarketQueryHidden() && MarketQueryTexts.rewrites(name)) {
+                capability = PromptText.runtimeData(MarketQueryTexts.hiddenCapability(name));
+            }
+            lines.add(PromptText.concat(PromptText.runtimeData("- " + name + ": "), capability));
         }
         return joinTexts(lines, "\n");
     }
@@ -1015,13 +1023,16 @@ public class AgentPromptService {
             ordered.add("checkParallelLimits");
         }
         toolNames.stream()
-                .filter(name -> name != null && !name.isBlank() && !"checkParallelLimits".equals(name))
+                .filter(name -> visibleCapability(name) && !"checkParallelLimits".equals(name))
                 .distinct()
                 .sorted()
                 .forEach(ordered::add);
         List<String> capabilities = new ArrayList<>();
         for (String name : ordered) {
             String description = catalog.get(name);
+            if (AgentContext.isMarketQueryHidden() && MarketQueryTexts.rewrites(name)) {
+                description = MarketQueryTexts.hiddenCapability(name);
+            }
             if (description == null || description.isBlank()) {
                 throw new PromptConfigurationException(
                         "tool_capability_missing", "工具 " + name + " 缺少权威能力说明");

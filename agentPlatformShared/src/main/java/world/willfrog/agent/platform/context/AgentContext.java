@@ -114,6 +114,13 @@ public class AgentContext {
      */
     private static final ThreadLocal<Boolean> WEB_SEARCH_ENABLED_HOLDER = new ThreadLocal<>();
     /**
+     * 当前运行是否把行情库查询写进模型可见的工具说明。
+     * 这个变量一直有值，默认 false，模型看不到 executeQuery。
+     * 管理员运行在渲染工具之前写成 true。
+     */
+    private static final ThreadLocal<Boolean> MARKET_QUERY_VISIBLE_HOLDER =
+            ThreadLocal.withInitial(() -> Boolean.FALSE);
+    /**
      * 网页搜索的详细配置(后端、强度、是否跳过缓存等)。
      * 与 webSearchEnabled 配合使用,搜索工具据此选择具体后端和参数。
      */
@@ -402,6 +409,26 @@ public class AgentContext {
     /** 清理网页搜索开关。 */
     public static void clearWebSearchEnabled() {
         WEB_SEARCH_ENABLED_HOLDER.remove();
+    }
+
+    /** 按创建运行时的管理员标记决定模型能否看见行情库查询。 */
+    public static void setMarketQueryVisible(boolean visible) {
+        MARKET_QUERY_VISIBLE_HOLDER.set(visible);
+    }
+
+    /** 一直返回 true 或 false。缺省是 false，模型看不到 executeQuery。 */
+    public static Boolean getMarketQueryVisible() {
+        return Boolean.TRUE.equals(MARKET_QUERY_VISIBLE_HOLDER.get());
+    }
+
+    /** 默认隐藏。只有明确写成 true 时，模型工具清单才保留 executeQuery。 */
+    public static boolean isMarketQueryHidden() {
+        return !Boolean.TRUE.equals(getMarketQueryVisible());
+    }
+
+    /** 恢复默认值 false，不把变量从线程上拿掉。 */
+    public static void clearMarketQueryVisible() {
+        MARKET_QUERY_VISIBLE_HOLDER.set(Boolean.FALSE);
     }
 
     /**
@@ -804,7 +831,8 @@ public class AgentContext {
                 getDebugObservabilitySessionId(),
                 getToolJobResumeToken(),
                 getToolJobResumeLeaseVersion(),
-                getLastMileHintPrompt()
+                getLastMileHintPrompt(),
+                getMarketQueryVisible()
         );
     }
 
@@ -911,6 +939,11 @@ public class AgentContext {
             setToolJobResumeHandoff(
                     snapshot.toolJobResumeToken(), snapshot.toolJobResumeLeaseVersion());
         }
+        if (snapshot.marketQueryVisible() == null) {
+            clearMarketQueryVisible();
+        } else {
+            setMarketQueryVisible(snapshot.marketQueryVisible());
+        }
     }
 
     /**
@@ -939,6 +972,7 @@ public class AgentContext {
         clearStructuredOutputSpec();
         clearDebugMode();
         clearWebSearchEnabled();
+        clearMarketQueryVisible();
         clearWebSearchConfig();
         clearExtractedEntities();
         clearReasoningEffort();
@@ -1010,7 +1044,8 @@ public class AgentContext {
             String debugObservabilitySessionId,
             String toolJobResumeToken,
             Long toolJobResumeLeaseVersion,
-            PromptText lastMileHintPrompt
+            PromptText lastMileHintPrompt,
+            Boolean marketQueryVisible
     ) {
         public ContextSnapshot(String runId, String userId, Boolean debugMode, Boolean webSearchEnabled,
                                WebSearchConfig webSearchConfig, List<String> extractedEntities,
@@ -1021,7 +1056,7 @@ public class AgentContext {
                                String toolJobResumeToken, Long toolJobResumeLeaseVersion) {
             this(runId, userId, debugMode, webSearchEnabled, webSearchConfig, extractedEntities, reasoningEffort,
                     stageConfig, effectiveExecutionStageConfig, workflow, dataFreshness, promptRunSelection,
-                    lastMileHint, debugObservabilitySessionId, toolJobResumeToken, toolJobResumeLeaseVersion, null);
+                    lastMileHint, debugObservabilitySessionId, toolJobResumeToken, toolJobResumeLeaseVersion, null, null);
         }
     }
 
