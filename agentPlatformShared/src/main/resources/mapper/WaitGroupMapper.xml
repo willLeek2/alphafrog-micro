@@ -1200,7 +1200,7 @@
           AND m.member_identity = #{memberIdentity} AND m.state = 'PENDING'
           AND m.tool_name = 'executeQuery'
           AND m.external_operation_id = CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'operationId'
-          AND (m.dispatch_proof_json IS NULL OR m.dispatch_proof_json = CAST(#{proofJson} AS jsonb))
+          AND (m.request_json = '{}'::jsonb OR m.request_json = CAST(#{proofJson} AS jsonb))
           AND g.plan_generation = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemPlanGeneration')::int
           AND g.node_id = CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemNodeId'
           AND g.node_attempt = (CAST(#{anchorJson} AS jsonb) -&gt;&gt; 'workItemNodeAttempt')::int
