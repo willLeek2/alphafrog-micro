@@ -6,7 +6,11 @@ import java.time.OffsetDateTime;
  * 编排调度存储包里的取消入口。
  *
  * <p>一笔 PostgreSQL 事务里改运行主记录、等待组、节点工作项、未完结异步任务与停机意图，
- * 并写取消事件；方法返回即已提交。历史锚点的等待态过渡判断封在实现内部。</p>
+ * 方法返回即已提交；取消事件由控制层在返回后追加，不走这里。历史锚点的等待态过渡判断
+ * 封在实现内部。</p>
+ *
+ * <p>部署标识与部署代际仍由控制层先经 RunOwnershipGateway 校验；本方法只校验用户归属。
+ * 运行已终态时返回 NOT_APPLIED，控制层读到终态后直接返回当前运行，不重试。</p>
  */
 public interface RunCancellationStore {
 

@@ -31,13 +31,12 @@ public interface RunCancellationMapper {
                                    @Param("snapshotJson") String snapshotJson,
                                    @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
+    /** 有旧锚点时写取消处置：关闭自动恢复并记账取消，第二版调度同时递增控制版本。 */
+    int persistCancelDisposition(@Param("runId") String runId,
+                                 @Param("expectedStatus") String expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId);
+
     int cancelWaitGroups(@Param("runId") String runId);
 
     int cancelRecoveryNotifications(@Param("runId") String runId);
-
-    int cancelWorkItems(@Param("runId") String runId);
-
-    /** 写一条 CANCELED 事件，序号取当前最大值加一。 */
-    int appendCanceledEvent(@Param("runId") String runId,
-                            @Param("payloadJson") String payloadJson);
 }

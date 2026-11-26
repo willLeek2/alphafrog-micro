@@ -1,36 +1,38 @@
 package world.willfrog.agent.platform.orchestration;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import world.willfrog.agent.platform.mapper.AsyncToolTaskMapper;
 import world.willfrog.agent.platform.mapper.RunCancellationMapper;
 import world.willfrog.agent.platform.wait.WaitGroup;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItem;
+import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 
 import java.time.OffsetDateTime;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 /**
  * 取消一笔运行的默认事务实现。
  *
- * <p>整笔 PostgreSQL 事务里改运行主记录、等待组、节点工作项、未完结异步任务与停机意图，
- * 并写取消事件；方法返回即已提交。控制层拿到结果后再做提交后动作。</p>
+ * <p>整笔 PostgreSQL 事务里改运行主记录、等待组、节点工作项、未完结异步任务与停机意图；
+ * 取消事件仍由控制层在方法返回后追加，不走这里，避免绕过事件的 Redis 序号。</p>
  */
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class MybatisRunCancellationStore implements RunCancellationStore {
 
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final Set<String> TERMINAL_STATUSES =
             Set.of("COMPLETED", "PARTIAL", "FAILED", "CANCELED", "EXPIRED");
 
     private final RunCancellationMapper mapper;
     private final AsyncToolTaskMapper asyncToolTaskMapper;
     private final WaitGroupStore waitGroupStore;
+    private final NodeWorkItemStore nodeWorkItemStore;
 
     @Override
     @Transactional
@@ -42,19 +44,28 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
         CancelableRun run = mapper.lockRunForUser(runId, userId);
         if (run == null) {
             // 与现码 RunOwnershipGateway.requireOwnedRunForUser 的归属失败保持同一异常与文案。
+            // 部署标识与代际仍由控制层先经 gateway 校验，本方法只校验用户归属。
             throw new IllegalStateException("原测试部署已停用");
         }
         if (run.getStatus() == null || TERMINAL_STATUSES.contains(run.getStatus())) {
+            // 已终态不重试；控制层读到终态后直接返回当前运行。
             return CancelRunOutcome.NOT_APPLIED;
         }
         boolean hasUnfinishedTask = mapper.hasUnfinishedTask(runId);
-        boolean activeAnchor = Boolean.TRUE.equals(run.getActiveAnchor());
-        if (activeAnchor || hasUnfinishedTask) {
+        String anchorOperationId = run.getAnchorOperationId();
+        boolean hasActiveAnchor = anchorOperationId != null && !anchorOperationId.isBlank();
+        if (hasActiveAnchor || hasUnfinishedTask) {
+            if (hasActiveAnchor) {
+                // 与现码相同：先做窄合并写，关闭自动恢复并记账取消；V2 同一语句递增控制版本。
+                if (mapper.persistCancelDisposition(runId, run.getStatus(), anchorOperationId) != 1) {
+                    throw new IllegalStateException(
+                            "cancel_anchor_cas_failed: unable to persist cancel disposition");
+                }
+            }
             if (mapper.snapshotIfStatus(runId, userId, run.getStatus(), snapshotJson) != 1) {
                 return CancelRunOutcome.STATE_CHANGED;
             }
             cancelChildren(runId);
-            appendCanceledEvent(runId);
             return CancelRunOutcome.CANCEL_INTENT_RECORDED;
         }
         if (mapper.cancelTerminalNoActiveTask(runId, userId, snapshotJson,
@@ -62,7 +73,6 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
             return CancelRunOutcome.NOT_APPLIED;
         }
         cancelChildren(runId);
-        appendCanceledEvent(runId);
         return CancelRunOutcome.TERMINAL_WRITTEN;
     }
 
@@ -83,17 +93,24 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
         asyncToolTaskMapper.requestStopByRun(runId, OffsetDateTime.now());
         mapper.cancelWaitGroups(runId);
         mapper.cancelRecoveryNotifications(runId);
-        mapper.cancelWorkItems(runId);
+        cancelWorkItems(runId);
     }
 
-    private void appendCanceledEvent(String runId) {
+    /** 与现码相同：逐条带运行控制版本与领取轮次做条件取消，不覆盖仍在执行的领取者。 */
+    private void cancelWorkItems(String runId) {
         try {
-            String payload = OBJECT_MAPPER.writeValueAsString(Map.of(
-                    "run_id", runId,
-                    "engine", "agentLangchainService"));
-            mapper.appendCanceledEvent(runId, payload);
-        } catch (Exception e) {
-            throw new IllegalStateException("取消事件序列化失败：run=" + runId, e);
+            for (NodeWorkItem item : nodeWorkItemStore.listUnfinishedByRun(runId)) {
+                long runControlVersion = item.getRunControlVersion() == null ? 0L : item.getRunControlVersion();
+                int claimEpoch = item.getClaimEpoch() == null ? 0 : item.getClaimEpoch();
+                if (!nodeWorkItemStore.cancel(item.identity(), runControlVersion, claimEpoch,
+                        "run_explicitly_canceled").applied()) {
+                    log.warn("取消运行时工作项条件更新未命中：runId={} identity={}",
+                            runId, item.identity().describe());
+                }
+            }
+        } catch (RuntimeException e) {
+            // 取消意图已经生效，工作项收口失败不回滚整笔取消；遗留行留给运行期收口。
+            log.error("取消运行时工作项收口失败：runId={}", runId, e);
         }
     }
 

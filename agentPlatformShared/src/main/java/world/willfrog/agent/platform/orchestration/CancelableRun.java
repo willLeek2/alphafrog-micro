@@ -10,6 +10,6 @@ public class CancelableRun {
     private String status;
     private String schedulerVersion;
     private Long runControlVersion;
-    /** 旧锚点列是否还有内容；迁移期用来兼容上一版仍在等待长工具的运行。 */
-    private Boolean activeAnchor;
+    /** 旧锚点上的操作标识；非空才说明有活跃长工具，迁移期用来兼容上一版等待。 */
+    private String anchorOperationId;
 }

@@ -9,7 +9,7 @@
         <result property="status" column="status"/>
         <result property="schedulerVersion" column="scheduler_version"/>
         <result property="runControlVersion" column="run_control_version"/>
-        <result property="activeAnchor" column="active_anchor"/>
+        <result property="anchorOperationId" column="anchor_operation_id"/>
     </resultMap>
 
     <select id="lockRunForUser" resultMap="CancelableRunMap">
@@ -18,8 +18,8 @@
                r.status,
                r.scheduler_version,
                r.run_control_version,
-               (r.tool_job_anchor_json IS NOT NULL
-                AND r.tool_job_anchor_json &lt;&gt; '{}'::jsonb) AS active_anchor
+               NULLIF(btrim(COALESCE(r.tool_job_anchor_json ->> 'operationId', '')), '')
+                   AS anchor_operation_id
         FROM alphafrog_agent_run r
         WHERE r.id = #{runId}
           AND r.user_id = #{userId}
@@ -78,6 +78,24 @@
           )
     </update>
 
+    <update id="persistCancelDisposition">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'autoResume', false,
+                'runDisposition', 'CANCELED'
+            ),
+            run_control_version = CASE
+                WHEN scheduler_version = 'DUAL_POOL_V2'
+                     AND tool_job_anchor_json ->> 'runDisposition' IS DISTINCT FROM 'CANCELED'
+                THEN run_control_version + 1
+                ELSE run_control_version
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json ->> 'operationId' = #{expectedOperationId}
+    </update>
+
     <update id="cancelWaitGroups">
         UPDATE alphafrog_agent_run_wait_group
         SET state = 'CANCELED',
@@ -96,23 +114,6 @@
           AND n.state = 'WAITING'
     </update>
 
-    <update id="cancelWorkItems">
-        UPDATE alphafrog_agent_run_work_item
-        SET state = 'CANCELED',
-            lease_expires_at = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE run_id = #{runId}
-          AND state NOT IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE')
-    </update>
 
-    <insert id="appendCanceledEvent">
-        INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, payload_json)
-        SELECT #{runId},
-               COALESCE(MAX(seq), 0) + 1,
-               'CANCELED',
-               CAST(#{payloadJson} AS jsonb)
-        FROM alphafrog_agent_run_event
-        WHERE run_id = #{runId}
-    </insert>
 
 </mapper>
