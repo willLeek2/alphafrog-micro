@@ -220,73 +220,61 @@
          ORDER BY g.id LIMIT #{limit}
     </select>
 
-    <select id="listMembers" resultMap="WaitMemberResultMap">
-        SELECT id,
-               group_id,
-               run_id,
-               member_seq,
-               member_identity,
-               tool_call_id,
-               tool_name,
-               external_operation_id,
-               state,
-               result_ref_json::text AS result_ref_json,
-               dispatch_proof_json::text AS dispatch_proof_json,
-               next_poll_at,
-               poll_count,
-               backoff_step,
-               finished_at,
-               created_at,
-               updated_at
-        FROM alphafrog_agent_run_wait_member
-        WHERE group_id = #{groupId}
-        ORDER BY member_seq
+    <!--
+      迁移期读取适配：新表一行就是旧模型里的一个等待成员。派发证明不按旧列保存，
+      由请求快照、任务编号与名额凭证现拼成旧形状，调用方不用同时改两套模型。
+    -->
+    <sql id="TaskAsWaitMemberColumns">
+        t.job_id AS id,
+        t.group_id,
+        t.run_id,
+        t.member_seq,
+        t.member_identity,
+        t.tool_call_id,
+        t.tool_name,
+        t.external_operation_id,
+        t.state,
+        t.result_ref_json::text AS result_ref_json,
+        CASE WHEN t.request_json &lt;&gt; '{}'::jsonb
+                  OR t.task_id IS NOT NULL
+                  OR t.reservation_json IS NOT NULL
+             THEN jsonb_strip_nulls(jsonb_build_object(
+                 'schemaVersion', t.schema_version,
+                 'operationId', t.request_json ->> 'operationId',
+                 'requestFingerprint', t.request_json ->> 'requestFingerprint',
+                 'canonicalCreateSpecJson', t.request_json ->> 'canonicalCreateSpecJson',
+                 'createRequestJson', t.request_json ->> 'createRequestJson',
+                 'submittedAt', t.request_json ->> 'submittedAt',
+                 'taskId', t.task_id,
+                 'reservationJson', t.reservation_json::text))::text
+        END AS dispatch_proof_json,
+        t.next_poll_at,
+        t.poll_count,
+        t.backoff_step,
+        t.finished_at,
+        t.created_at,
+        t.updated_at
+    </sql>
+
+        <select id="listMembers" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        WHERE t.group_id = #{groupId}
+        ORDER BY t.member_seq
     </select>
 
-    <select id="findMemberByOperation" resultMap="WaitMemberResultMap">
-        SELECT id,
-               group_id,
-               run_id,
-               member_seq,
-               member_identity,
-               tool_call_id,
-               tool_name,
-               external_operation_id,
-               state,
-               result_ref_json::text AS result_ref_json,
-               dispatch_proof_json::text AS dispatch_proof_json,
-               next_poll_at,
-               poll_count,
-               backoff_step,
-               finished_at,
-               created_at,
-               updated_at
-        FROM alphafrog_agent_run_wait_member
-        WHERE run_id = #{runId}
-          AND external_operation_id = #{externalOperationId}
+        <select id="findMemberByOperation" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        WHERE t.run_id = #{runId}
+          AND t.external_operation_id = #{externalOperationId}
     </select>
 
-    <select id="findMemberByIdentity" resultMap="WaitMemberResultMap">
-        SELECT id,
-               group_id,
-               run_id,
-               member_seq,
-               member_identity,
-               tool_call_id,
-               tool_name,
-               external_operation_id,
-               state,
-               result_ref_json::text AS result_ref_json,
-               dispatch_proof_json::text AS dispatch_proof_json,
-               next_poll_at,
-               poll_count,
-               backoff_step,
-               finished_at,
-               created_at,
-               updated_at
-        FROM alphafrog_agent_run_wait_member
-        WHERE group_id = #{groupId}
-          AND member_identity = #{memberIdentity}
+        <select id="findMemberByIdentity" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        WHERE t.group_id = #{groupId}
+          AND t.member_identity = #{memberIdentity}
     </select>
 
     <!--
@@ -295,105 +283,74 @@
       一轮只取一批候选：每个成员要打一次外部查询，一轮能查多少由调用方给的上限说了算。
       按 next_poll_at 的偏索引取（那张索引只收执行中的成员），不扫整张成员表。
     -->
-    <select id="scanDueMembers" resultMap="WaitMemberResultMap">
-        SELECT id,
-               group_id,
-               run_id,
-               member_seq,
-               member_identity,
-               tool_call_id,
-               tool_name,
-               external_operation_id,
-               state,
-               result_ref_json::text AS result_ref_json,
-               dispatch_proof_json::text AS dispatch_proof_json,
-               next_poll_at,
-               poll_count,
-               backoff_step,
-               finished_at,
-               created_at,
-               updated_at
-        FROM alphafrog_agent_run_wait_member
-        WHERE state = 'RUNNING'
-          AND tool_name IN ('executePython', 'executeQuery')
-          AND next_poll_at IS NOT NULL
-          AND next_poll_at &lt;= #{now}
-        ORDER BY next_poll_at, id
+        <select id="scanDueMembers" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        WHERE t.job_kind = 'SANDBOX_TOOL'
+          AND t.state = 'RUNNING'
+          AND t.next_poll_at IS NOT NULL
+          AND t.next_poll_at &lt;= #{now}
+        ORDER BY t.next_poll_at, t.job_id
         LIMIT #{limit}
     </select>
 
-    <select id="scanDueMembersForDeployment" resultMap="WaitMemberResultMap">
-        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity,
-               m.tool_call_id, m.tool_name, m.external_operation_id, m.state,
-               m.result_ref_json::text AS result_ref_json,
-               m.dispatch_proof_json::text AS dispatch_proof_json,
-               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at,
-               m.created_at, m.updated_at
-          FROM alphafrog_agent_run_wait_member m
-          JOIN alphafrog_agent_run r ON r.id = m.run_id
-         WHERE r.deployment_id = #{deploymentId}
-           AND r.deployment_generation_id = #{deploymentGenerationId}
-           AND m.state = 'RUNNING'
-           AND m.tool_name IN ('executePython', 'executeQuery')
-           AND m.next_poll_at IS NOT NULL
-           AND m.next_poll_at &lt;= #{now}
-         ORDER BY m.next_poll_at, m.id
-         LIMIT #{limit}
+        <select id="scanDueMembersForDeployment" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        JOIN alphafrog_agent_run r ON r.id = t.run_id
+        WHERE r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+          AND t.job_kind = 'SANDBOX_TOOL'
+          AND t.state = 'RUNNING'
+          AND t.next_poll_at IS NOT NULL
+          AND t.next_poll_at &lt;= #{now}
+        ORDER BY t.next_poll_at, t.job_id
+        LIMIT #{limit}
     </select>
 
     <!-- 启动时恢复容量账本：未决成员，以及已取消/迟到但停机尚未确认的 Python 成员。 -->
-    <select id="scanUnresolvedPythonMembersForCapacity" resultMap="WaitMemberResultMap">
-        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity, m.tool_call_id,
-               m.tool_name, m.external_operation_id, m.state,
-               m.result_ref_json::text AS result_ref_json,
-               m.dispatch_proof_json::text AS dispatch_proof_json,
-               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at, m.created_at, m.updated_at
-          FROM alphafrog_agent_run_wait_member m
-          JOIN alphafrog_agent_run r ON r.id = m.run_id
-         WHERE m.id &gt; #{afterMemberId}
-           AND r.deployment_id = #{deploymentId}
-           AND r.deployment_generation_id = #{deploymentGenerationId}
-           AND m.tool_name IN ('executePython', 'executeQuery')
-           AND (m.state IN ('PENDING', 'RUNNING')
-                OR (m.state IN ('CANCELED', 'LATE') AND (
-                    m.dispatch_proof_json IS NOT NULL
-                    OR EXISTS (
-                        SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
-                         WHERE s.wait_member_id = m.id AND s.state &lt;&gt; 'CONFIRMED'))
-                    AND NOT EXISTS (
-                        SELECT 1 FROM alphafrog_agent_run_wait_member_stop confirmed
-                         WHERE confirmed.wait_member_id = m.id AND confirmed.state = 'CONFIRMED')))
-         ORDER BY m.id LIMIT #{limit}
+        <select id="scanUnresolvedPythonMembersForCapacity" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        JOIN alphafrog_agent_run r ON r.id = t.run_id
+        WHERE t.job_id &gt; #{afterMemberId}
+          AND r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+          AND t.job_kind = 'SANDBOX_TOOL'
+          AND (t.state IN ('PENDING', 'RUNNING')
+               OR (t.state = 'CANCELED'
+                   AND (t.request_json &lt;&gt; '{}'::jsonb OR t.task_id IS NOT NULL)
+                   AND (t.stop_state IS NULL OR t.stop_state &lt;&gt; 'CONFIRMED')))
+        ORDER BY t.job_id
+        LIMIT #{limit}
     </select>
 
     <!-- 创建前请求身份已落库、但旧派发线程退出前未记录 createTask 结论的成员。 -->
-    <select id="scanPendingPythonMembersWithProof" resultMap="WaitMemberResultMap">
-        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity, m.tool_call_id,
-               m.tool_name, m.external_operation_id, m.state,
-               m.result_ref_json::text AS result_ref_json,
-               m.dispatch_proof_json::text AS dispatch_proof_json,
-               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at, m.created_at, m.updated_at
-          FROM alphafrog_agent_run_wait_member m
-          JOIN alphafrog_agent_run_wait_group g ON g.id = m.group_id AND g.state = 'WAITING'
-          JOIN alphafrog_agent_run r ON r.id = g.run_id AND r.status = 'EXECUTING'
-         WHERE m.id &gt; #{afterMemberId}
-           AND r.deployment_id = #{deploymentId}
-           AND r.deployment_generation_id = #{deploymentGenerationId}
-           AND m.tool_name IN ('executePython', 'executeQuery') AND m.state = 'PENDING'
-           AND m.external_operation_id IS NOT NULL
-           AND m.dispatch_proof_json IS NOT NULL
-           AND m.dispatch_proof_json -&gt;&gt; 'taskId' IS NULL
-         ORDER BY m.id LIMIT #{limit}
+        <select id="scanPendingPythonMembersWithProof" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        JOIN alphafrog_agent_run_wait_group g ON g.id = t.group_id AND g.state = 'WAITING'
+        JOIN alphafrog_agent_run r ON r.id = g.run_id AND r.status = 'EXECUTING'
+        WHERE t.job_id &gt; #{afterMemberId}
+          AND r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+          AND t.job_kind = 'SANDBOX_TOOL'
+          AND t.state = 'PENDING'
+          AND t.external_operation_id IS NOT NULL
+          AND t.request_json &lt;&gt; '{}'::jsonb
+          AND t.task_id IS NULL
+        ORDER BY t.job_id
+        LIMIT #{limit}
     </select>
 
     <sql id="safePendingPythonRecovery">
-        m.id = #{memberId}
-           AND m.tool_name IN ('executePython', 'executeQuery') AND m.state = 'PENDING'
-        AND m.external_operation_id = #{operationId}
-        AND m.dispatch_proof_json -&gt;&gt; 'operationId' = #{operationId}
-        AND m.dispatch_proof_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
-        AND m.dispatch_proof_json -&gt;&gt; 'taskId' IS NULL
-        AND g.id = m.group_id AND g.state = 'WAITING'
+        t.job_id = #{memberId}
+           AND t.job_kind = 'SANDBOX_TOOL' AND t.state = 'PENDING'
+        AND t.external_operation_id = #{operationId}
+        AND t.request_json -&gt;&gt; 'operationId' = #{operationId}
+        AND t.request_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
+        AND t.task_id IS NULL
+        AND g.id = t.group_id AND g.state = 'WAITING'
         AND r.id = g.run_id AND r.status = 'EXECUTING'
         AND wi.id = #{workItemId}
         AND wi.run_id = g.run_id AND wi.plan_generation = g.plan_generation
@@ -407,7 +364,7 @@
 
     <select id="countSafePendingPythonRecovery" resultType="int">
         SELECT count(*)
-          FROM alphafrog_agent_run_wait_member m,
+          FROM alphafrog_agent_async_tool_task t,
                alphafrog_agent_run_wait_group g,
                alphafrog_agent_run r,
                alphafrog_agent_run_work_item wi,
@@ -417,7 +374,7 @@
 
     <!-- 旧证明已确认取消墓碑，或新版证明已按原操作号接回任务，才开放轮询；再次核对原 worker 的额度已归还。 -->
     <update id="recoverPendingPythonMember">
-        UPDATE alphafrog_agent_run_wait_member m
+        UPDATE alphafrog_agent_async_tool_task t
            SET state = 'RUNNING', next_poll_at = CURRENT_TIMESTAMP,
                updated_at = CURRENT_TIMESTAMP
           FROM alphafrog_agent_run_wait_group g,
@@ -427,38 +384,29 @@
          WHERE <include refid="safePendingPythonRecovery"/>
     </update>
 
-    <select id="scanDueSubAgentMembers" resultMap="WaitMemberResultMap">
-        SELECT id, group_id, run_id, member_seq, member_identity, tool_call_id,
-               tool_name, external_operation_id, state,
-               result_ref_json::text AS result_ref_json,
-               dispatch_proof_json::text AS dispatch_proof_json,
-               next_poll_at, poll_count, backoff_step, finished_at, created_at, updated_at
-        FROM alphafrog_agent_run_wait_member
-        WHERE state = 'RUNNING'
-          AND tool_name IN ('spawnSubAgent', 'waitForSubAgent')
-          AND next_poll_at IS NOT NULL
-          AND next_poll_at &lt;= #{now}
-        ORDER BY next_poll_at, id
+        <select id="scanDueSubAgentMembers" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        WHERE t.job_kind = 'CHILD_RUN_WAIT'
+          AND t.state = 'RUNNING'
+          AND t.next_poll_at IS NOT NULL
+          AND t.next_poll_at &lt;= #{now}
+        ORDER BY t.next_poll_at, t.job_id
         LIMIT #{limit}
     </select>
 
-    <select id="scanDueSubAgentMembersForDeployment" resultMap="WaitMemberResultMap">
-        SELECT m.id, m.group_id, m.run_id, m.member_seq, m.member_identity,
-               m.tool_call_id, m.tool_name, m.external_operation_id, m.state,
-               m.result_ref_json::text AS result_ref_json,
-               m.dispatch_proof_json::text AS dispatch_proof_json,
-               m.next_poll_at, m.poll_count, m.backoff_step, m.finished_at,
-               m.created_at, m.updated_at
-          FROM alphafrog_agent_run_wait_member m
-          JOIN alphafrog_agent_run r ON r.id = m.run_id
-         WHERE r.deployment_id = #{deploymentId}
-           AND r.deployment_generation_id = #{deploymentGenerationId}
-           AND m.state = 'RUNNING'
-           AND m.tool_name IN ('spawnSubAgent', 'waitForSubAgent')
-           AND m.next_poll_at IS NOT NULL
-           AND m.next_poll_at &lt;= #{now}
-         ORDER BY m.next_poll_at, m.id
-         LIMIT #{limit}
+        <select id="scanDueSubAgentMembersForDeployment" resultMap="WaitMemberResultMap">
+        SELECT <include refid="TaskAsWaitMemberColumns"/>
+        FROM alphafrog_agent_async_tool_task t
+        JOIN alphafrog_agent_run r ON r.id = t.run_id
+        WHERE r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+          AND t.job_kind = 'CHILD_RUN_WAIT'
+          AND t.state = 'RUNNING'
+          AND t.next_poll_at IS NOT NULL
+          AND t.next_poll_at &lt;= #{now}
+        ORDER BY t.next_poll_at, t.job_id
+        LIMIT #{limit}
     </select>
 
     <select id="listNotifications" resultMap="RecoveryNotificationResultMap">

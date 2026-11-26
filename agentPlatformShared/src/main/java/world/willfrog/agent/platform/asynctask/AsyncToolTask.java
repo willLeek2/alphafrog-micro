@@ -43,6 +43,8 @@ public class AsyncToolTask {
     private Long claimEpoch;
     private OffsetDateTime nextPollAt;
     private Integer pollCount;
+    /** 退避步数：每次推后查询加一，用于计算下次查询间隔。 */
+    private Integer backoffStep;
     /** 停机状态：null 表示未请求，PENDING 待停止，CLAIMED 进行中，CONFIRMED 已确认。 */
     private String stopState;
     private Integer stopAttemptCount;

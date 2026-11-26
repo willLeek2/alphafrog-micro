@@ -25,6 +25,7 @@
         <result property="claimEpoch" column="claim_epoch"/>
         <result property="nextPollAt" column="next_poll_at"/>
         <result property="pollCount" column="poll_count"/>
+        <result property="backoffStep" column="backoff_step"/>
         <result property="stopState" column="stop_state"/>
         <result property="stopAttemptCount" column="stop_attempt_count"/>
         <result property="stopLastError" column="stop_last_error"/>
@@ -56,6 +57,7 @@
         claim_epoch,
         next_poll_at,
         poll_count,
+        backoff_step,
         stop_state,
         stop_attempt_count,
         stop_last_error,
@@ -72,13 +74,13 @@
             tool_call_id, tool_name, external_operation_id, state, request_json,
             task_id, reservation_json, result_ref_json, schema_version,
             owner_instance_id, lease_expires_at, claim_epoch, next_poll_at, poll_count,
-            stop_state, stop_attempt_count, stop_last_error, timeout_at, finished_at
+            backoff_step, stop_state, stop_attempt_count, stop_last_error, timeout_at, finished_at
         ) VALUES (
             #{jobKind}, #{runId}, #{workItemId}, #{groupId}, #{memberSeq}, #{memberIdentity},
             #{toolCallId}, #{toolName}, #{externalOperationId}, #{state}, #{requestJson}::jsonb,
             #{taskId}, #{reservationJson}::jsonb, #{resultRefJson}::jsonb, #{schemaVersion},
             #{ownerInstanceId}, #{leaseExpiresAt}, #{claimEpoch}, #{nextPollAt}, #{pollCount},
-            #{stopState}, #{stopAttemptCount}, #{stopLastError}, #{timeoutAt}, #{finishedAt}
+            #{backoffStep}, #{stopState}, #{stopAttemptCount}, #{stopLastError}, #{timeoutAt}, #{finishedAt}
         )
     </insert>
 

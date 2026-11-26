@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_async_tool_task (
     claim_epoch BIGINT NOT NULL DEFAULT 0,
     next_poll_at TIMESTAMPTZ,
     poll_count INT NOT NULL DEFAULT 0,
+    backoff_step INT NOT NULL DEFAULT 0,
     stop_state VARCHAR(32),
     stop_attempt_count INT NOT NULL DEFAULT 0,
     stop_last_error VARCHAR(512),
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_async_tool_task (
     CONSTRAINT agent_async_tool_task_state_check
         CHECK (state IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED')),
     CONSTRAINT agent_async_tool_task_counter_check
-        CHECK (poll_count >= 0 AND claim_epoch >= 0 AND stop_attempt_count >= 0),
+        CHECK (poll_count >= 0 AND backoff_step >= 0 AND claim_epoch >= 0
+               AND stop_attempt_count >= 0),
     CONSTRAINT agent_async_tool_task_stop_state_check
         CHECK (stop_state IS NULL OR stop_state IN ('PENDING', 'CLAIMED', 'CONFIRMED')),
     -- 终态与结束时刻一一对应：终态必须有结束时刻，非终态必须没有。
@@ -82,7 +84,7 @@ INSERT INTO alphafrog_agent_async_tool_task (
     tool_call_id, tool_name, external_operation_id, state, request_json,
     task_id, reservation_json, result_ref_json, schema_version,
     owner_instance_id, lease_expires_at, claim_epoch, next_poll_at, poll_count,
-    timeout_at, finished_at, created_at, updated_at
+    backoff_step, timeout_at, finished_at, created_at, updated_at
 )
 SELECT
     CASE WHEN m.tool_name IN ('executePython', 'executeQuery')
@@ -95,7 +97,7 @@ SELECT
     m.tool_call_id,
     m.tool_name,
     m.external_operation_id,
-    m.state,
+    CASE WHEN m.state = 'LATE' THEN 'CANCELED' ELSE m.state END,
     jsonb_strip_nulls(jsonb_build_object(
         'schemaVersion', (m.dispatch_proof_json ->> 'schemaVersion')::int,
         'operationId', m.dispatch_proof_json ->> 'operationId',
@@ -112,6 +114,7 @@ SELECT
     0,
     m.next_poll_at,
     m.poll_count,
+    m.backoff_step,
     NULL,
     m.finished_at,
     m.created_at,
