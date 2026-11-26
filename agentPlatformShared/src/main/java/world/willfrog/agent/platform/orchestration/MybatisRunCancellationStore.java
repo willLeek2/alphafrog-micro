@@ -96,22 +96,25 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
         cancelWorkItems(runId);
     }
 
-    /** 与现码相同：逐条带运行控制版本与领取轮次做条件取消，不覆盖仍在执行的领取者。 */
+    /**
+     * 逐条带运行控制版本与领取轮次做条件取消，不覆盖仍在执行的领取者；随后按状态收口。
+     *
+     * <p>任何一条语句失败都向外抛出，让整笔事务回滚：同一事务里语句失败后事务已中止，
+     * 吞掉异常再提交等于让服务端回滚，却把「已提交」的结果交给控制层。</p>
+     */
     private void cancelWorkItems(String runId) {
-        try {
-            for (NodeWorkItem item : nodeWorkItemStore.listUnfinishedByRun(runId)) {
-                long runControlVersion = item.getRunControlVersion() == null ? 0L : item.getRunControlVersion();
-                int claimEpoch = item.getClaimEpoch() == null ? 0 : item.getClaimEpoch();
-                if (!nodeWorkItemStore.cancel(item.identity(), runControlVersion, claimEpoch,
-                        "run_explicitly_canceled").applied()) {
-                    log.warn("取消运行时工作项条件更新未命中：runId={} identity={}",
-                            runId, item.identity().describe());
-                }
+        final String reason = "run_explicitly_canceled";
+        for (NodeWorkItem item : nodeWorkItemStore.listUnfinishedByRun(runId)) {
+            long runControlVersion = item.getRunControlVersion() == null ? 0L : item.getRunControlVersion();
+            int claimEpoch = item.getClaimEpoch() == null ? 0 : item.getClaimEpoch();
+            if (!nodeWorkItemStore.cancel(item.identity(), runControlVersion, claimEpoch,
+                    reason).applied()) {
+                log.warn("取消运行时工作项条件更新未命中，交由同事务收口：runId={} identity={}",
+                        runId, item.identity().describe());
             }
-        } catch (RuntimeException e) {
-            // 取消意图已经生效，工作项收口失败不回滚整笔取消；遗留行留给运行期收口。
-            log.error("取消运行时工作项收口失败：runId={}", runId, e);
         }
+        // 列候选之后才被领取的工作项会未命中上一条；运行行锁在本事务手上，按状态一次收口。
+        mapper.cancelAllUnfinishedWorkItems(runId, reason);
     }
 
     private static void required(String value, String name) {
