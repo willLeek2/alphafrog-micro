@@ -17,7 +17,7 @@ public interface RunCancellationStore {
      * @param userId                 调用者；与运行归属不匹配时不写任何东西
      * @param snapshotJson           取消时的可观测快照；没有可传空
      * @param interruptedExpiresAt   中断运行的过期时刻；没有可传空
-     * @return 三种结果之一，见 {@link CancelRunOutcome}
+     * @return 四种结果之一，见 {@link CancelRunOutcome}
      */
     CancelRunOutcome cancelRunInTransaction(String runId, String userId,
                                             String snapshotJson,
