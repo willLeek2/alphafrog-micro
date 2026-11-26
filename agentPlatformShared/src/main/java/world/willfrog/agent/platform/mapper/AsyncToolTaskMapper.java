@@ -76,9 +76,8 @@ public interface AsyncToolTaskMapper {
                      @Param("resultRefJson") String resultRefJson,
                      @Param("finishedAt") OffsetDateTime finishedAt);
 
-    /** 取消一笔运行时，把该运行所有未完结任务标成待停止；同一事务内调用。 */
-    int requestStopByRun(@Param("runId") String runId,
-                         @Param("now") OffsetDateTime now);
+    /** 取消一笔运行时，把该运行所有未完结任务标成待停止；同一事务内调用。时间取数据库时钟。 */
+    int requestStopByRun(@Param("runId") String runId);
 
     /** 扫描待停止或停机重试到期的任务。 */
     List<AsyncToolTask> scanStopDue(@Param("now") OffsetDateTime now,

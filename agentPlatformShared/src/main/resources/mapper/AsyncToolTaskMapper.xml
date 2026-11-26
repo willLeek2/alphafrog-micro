@@ -194,9 +194,9 @@
     <update id="requestStopByRun">
         UPDATE alphafrog_agent_async_tool_task
         SET state = 'CANCELED',
-            finished_at = #{now},
+            finished_at = CURRENT_TIMESTAMP,
             stop_state = 'PENDING',
-            next_poll_at = #{now},
+            next_poll_at = CURRENT_TIMESTAMP,
             updated_at = CURRENT_TIMESTAMP
         WHERE run_id = #{runId}
           AND state IN ('PENDING', 'RUNNING')

@@ -42,8 +42,8 @@ public interface AsyncToolTaskStore {
     boolean markTerminal(long jobId, String owner, long claimEpoch, AsyncToolTaskState state,
                          String resultRefJson, OffsetDateTime finishedAt);
 
-    /** 取消一笔运行：把该运行所有未完结任务标成已取消并留下待停止意图。 */
-    int requestStopByRun(String runId, OffsetDateTime now);
+    /** 取消一笔运行：把该运行所有未完结任务标成已取消并留下待停止意图；时间取数据库时钟。 */
+    int requestStopByRun(String runId);
 
     /** 扫描待停止或停机重试到期的任务。 */
     List<AsyncToolTask> scanStopDue(OffsetDateTime now, long afterJobId, int limit);

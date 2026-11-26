@@ -90,7 +90,7 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
                 afterGroupId = group.getId();
             }
         }
-        asyncToolTaskMapper.requestStopByRun(runId, OffsetDateTime.now());
+        asyncToolTaskMapper.requestStopByRun(runId);
         mapper.cancelWaitGroups(runId);
         mapper.cancelRecoveryNotifications(runId);
         cancelWorkItems(runId);

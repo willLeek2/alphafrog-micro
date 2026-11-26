@@ -116,4 +116,15 @@
 
 
 
+    <!-- 取消收口：按状态清掉逐条条件取消没有命中的非终态工作项。 -->
+    <update id="cancelAllUnfinishedWorkItems">
+        UPDATE alphafrog_agent_run_work_item SET
+            state = 'CANCELED',
+            lease_expires_at = NULL,
+            payload_json = payload_json || jsonb_build_object('cancelReason', COALESCE(#{reason}, '')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId}
+          AND state NOT IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE')
+    </update>
+
 </mapper>

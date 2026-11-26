@@ -143,12 +143,9 @@ public class MybatisAsyncToolTaskStore implements AsyncToolTaskStore {
     }
 
     @Override
-    public int requestStopByRun(String runId, OffsetDateTime now) {
+    public int requestStopByRun(String runId) {
         required(runId, "运行编号");
-        if (now == null) {
-            throw new IllegalArgumentException("取消时刻不能为空");
-        }
-        return mapper.requestStopByRun(runId, now);
+        return mapper.requestStopByRun(runId);
     }
 
     @Override
