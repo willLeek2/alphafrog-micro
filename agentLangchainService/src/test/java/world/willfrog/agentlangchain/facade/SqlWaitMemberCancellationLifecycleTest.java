@@ -324,7 +324,7 @@ class SqlWaitMemberCancellationLifecycleTest {
         assertThat(f.stop.getState()).isEqualTo("PENDING");
         assertThat(f.stop.getLastError()).isEqualTo("sandbox_settlement_incomplete");
         assertThat(f.calls).isEmpty();
-        verify(f.tasks, never()).finishStop(anyLong(), any(), anyLong());
+        verify(f.tasks, never()).finishStop(anyLong(), any(), anyLong(), any());
         assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
         assertThat(f.anchor()).isNotNull();
         f.startup().onReady();
@@ -614,7 +614,8 @@ class SqlWaitMemberCancellationLifecycleTest {
             settlement.setDispatchStore(new PythonSandboxDispatchStoreImpl(anchors, cache, config,
                     mock(ObjectProvider.class), mock(LangchainSchedulerMetrics.class)));
             worker = new CanceledWaitMemberStopWorker(tasks, groups,
-                    sandbox, settlement, json, ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+                    sandbox, settlement, json, ownership,
+                    mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5, 30);
             ToolJobFinalizer finalizer = new ToolJobFinalizer(anchors, cache, capacity,
                     resume, config, mock(FinanceRecordChannelProcessor.class),
                     mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
@@ -874,6 +875,8 @@ class SqlWaitMemberCancellationLifecycleTest {
             task.setTaskId(stop.getTaskId());
             task.setState("RUNNING");
             task.setStopState(stop.getState());
+            task.setStopAttemptCount(stop.getAttemptCount());
+            task.setStopLastError(stop.getLastError());
             task.setClaimEpoch(taskClaimEpoch);
             // 工人只区分「请求快照为空／非空」；非空代表创建请求可能已经发出。
             task.setRequestJson("{\"create_request\":\"persisted\"}");
@@ -907,9 +910,12 @@ class SqlWaitMemberCancellationLifecycleTest {
                 taskClaimEpoch++;
                 return Optional.of(asyncStopTask());
             });
-            when(tasks.finishStop(anyLong(), anyString(), anyLong())).thenAnswer(i -> {
+            when(tasks.finishStop(anyLong(), anyString(), anyLong(), any())).thenAnswer(i -> {
                 if (stop == null || !"CLAIMED".equals(stop.getState())
                         || taskClaimEpoch != (long) i.getArgument(2)) return false;
+                // 停机确认把回查到的任务编号写回任务行（真实语句 task_id = COALESCE(NULLIF(...), task_id)）。
+                String confirmedTaskId = i.getArgument(3);
+                if (confirmedTaskId != null && !confirmedTaskId.isBlank()) stop.setTaskId(confirmedTaskId);
                 // 停机确认不携带终态；终态事实来自刚写入的用量信封，和旧语句从快照核对等价。
                 String terminalTaskId = recordedEnvelope == null ? stop.getTaskId() : recordedEnvelope.taskId();
                 String terminalStatus = recordedEnvelope == null ? "CANCELED" : recordedEnvelope.terminalStatus();

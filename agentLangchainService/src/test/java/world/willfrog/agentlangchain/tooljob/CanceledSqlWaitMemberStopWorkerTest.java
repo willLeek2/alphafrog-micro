@@ -71,7 +71,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         AgentRun run = new AgentRun(); run.setId(RUN); run.setStatus(AgentRunStatus.CANCELED); run.setLaneTag("sql-stop-lane");
         when(ownership.findOwnedRun(RUN)).thenReturn(run);
         worker = new CanceledWaitMemberStopWorker(tasks, groups, sandbox, settlement, json,
-                ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+                ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5, 30);
         member = new WaitMember(); member.setId(JOB_ID); member.setGroupId(7L); member.setRunId(RUN);
         member.setMemberIdentity("query-member"); member.setToolCallId("raw-model-call");
         member.setToolName("executeQuery"); member.setExternalOperationId(operation.operationId()); member.setState("CANCELED");
@@ -81,7 +81,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         // 请求快照非空表示创建请求可能已经发出；具体内容工人不解析，只用来区分「还没落库」。
         task.setRequestJson("{\"create_request\":\"pending\"}");
         when(groups.findMemberByOperation(RUN, operation.operationId())).thenReturn(Optional.of(member));
-        when(tasks.finishStop(anyLong(), anyString(), anyLong())).thenReturn(true);
+        when(tasks.finishStop(anyLong(), anyString(), anyLong(), any())).thenReturn(true);
         when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED, DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME);
         claimAgain();
     }
@@ -157,7 +157,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         order.verify(capacity).releaseReservation(argThat(request -> request.proof() instanceof DataAnalysisReleaseProof.Terminal
                 && request.reason() == DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED));
         order.verify(recorder).upsert(any());
-        order.verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
+        order.verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L), any());
         assertThat(member.getState()).isEqualTo("CANCELED");
         assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
         DataAnalysisReservation next = occupyReleasedSlot();
@@ -180,11 +180,11 @@ class CanceledSqlWaitMemberStopWorkerTest {
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
         verify(tasks).retryStop(eq(JOB_ID), anyString(), eq(1L), any(), eq("sandbox_not_terminal"));
-        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong(), any());
         when(sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder()
                 .setTaskId(TASK).setStatus("CANCELED").setFinishedAt(FINISHED).build());
         claimAgain(); worker.runBatch(); occupyReleasedSlot();
-        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
+        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L), any());
     }
 
     @Test void unavailableSqlLookupRetriesWithoutCancelingOrReleasing() throws Exception {
@@ -213,12 +213,12 @@ class CanceledSqlWaitMemberStopWorkerTest {
         when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.CONFLICT, DataAnalysisUpsertOutcome.INSERTED);
         worker.runBatch();
         verify(tasks).retryStop(eq(JOB_ID), anyString(), eq(1L), any(), eq("sandbox_settlement_incomplete"));
-        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong(), any());
         DataAnalysisReservation next = occupyReleasedSlot();
         claimAgain(); worker.runBatch();
         assertThat((Integer) ReflectionTestUtils.invokeMethod(capacity, "usedUnitsSnapshot")).isEqualTo(1);
         verify(capacity, never()).releaseReservation(argThat(request -> request.reservation().identity().equals(next.identity())));
-        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
+        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L), any());
         verify(sessions).clearActive(RUN, operation.operationId());
     }
 
@@ -241,10 +241,10 @@ class CanceledSqlWaitMemberStopWorkerTest {
         assertThat(business.errorCode()).isEqualTo("PLAN_REJECTED");
         assertThat(json.readTree(business.output()).path("ok").asBoolean()).isFalse();
         when(sandbox.getTaskResult(any())).thenReturn(sqlResult);
-        when(tasks.finishStop(eq(JOB_ID), anyString(), eq(1L))).thenReturn(true);
+        when(tasks.finishStop(eq(JOB_ID), anyString(), eq(1L), any())).thenReturn(true);
         assertThat(worker.runBatch()).isEqualTo(1);
         occupyReleasedSlot();
-        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
+        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L), any());
         // 资源信封记录进程成功退出，业务失败正文与取消成员的事实均保留。
         verify(recorder).upsert(argThat(envelope -> envelope.terminalStatus().equals("SUCCEEDED")
                 && envelope.success() && envelope.resultPreview().contains("PLAN_REJECTED")));
@@ -280,6 +280,6 @@ class CanceledSqlWaitMemberStopWorkerTest {
         verify(recorder, never()).upsert(any());
         verify(capacity, never()).releaseReservation(any());
         verify(tasks).abandonStop(eq(JOB_ID), anyString(), eq(1L), any());
-        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong(), any());
     }
 }

@@ -37,6 +37,19 @@ class AsyncToolTaskMigrationSqlTest {
     }
 
     @Test
+    void upgradeChecksItsOwnResultAndCarriesTheStopTail() {
+        assertThat(UPGRADE).as("迁移要自己对账并在不一致时中止整份脚本")
+                .contains("DO $migration_check$")
+                .contains("RAISE EXCEPTION")
+                .contains("migrated <> expected");
+        assertThat(UPGRADE).as("停机尾巴要带上下一次尝试时刻与领取信息")
+                .contains("next_poll_at = COALESCE(t.next_poll_at, s.next_attempt_at)")
+                .contains("CASE WHEN s.state = 'CLAIMED' THEN s.claimed_by END");
+        assertThat(UPGRADE).as("停机扫描要有自己的部分索引，取消后的行不在到期索引覆盖范围内")
+                .contains("idx_agent_async_tool_task_stop_due");
+    }
+
+    @Test
     void rollbackRewritesUnfinishedTasksForBothExistingAndNewRows() {
         assertThat(DOWNGRADE).as("升级后新产生的任务没有旧行，必须允许新建")
                 .contains("INSERT INTO alphafrog_agent_run_wait_member");
@@ -44,5 +57,17 @@ class AsyncToolTaskMigrationSqlTest {
                 .contains("ON CONFLICT (group_id, member_identity) DO UPDATE");
         assertThat(DOWNGRADE).as("快照里已有字符串结构版本时不能再拼一个数字版本")
                 .contains("CASE WHEN t.request_json ->> 'schemaVersion' IS NULL");
+    }
+
+    @Test
+    void rollbackIsAtomicAndMarksWhatItCannotWriteBack() {
+        assertThat(DOWNGRADE).as("手工执行的脚本也要整份一个事务")
+                .contains("BEGIN;")
+                .contains("COMMIT;");
+        assertThat(DOWNGRADE).as("回写不进去的任务要留原因码，不能静默丢")
+                .contains("ROLLBACK_INCOMPLETE")
+                .contains("missing_member_identity");
+        assertThat(DOWNGRADE).as("核对查询要能直接执行，覆盖被丢弃的停机尾巴")
+                .contains("SELECT t.job_id, t.run_id, t.tool_name, t.external_operation_id, t.stop_state");
     }
 }

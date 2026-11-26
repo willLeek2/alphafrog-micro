@@ -415,6 +415,38 @@ class WaitMemberSettlementTest {
         return new DataAnalysisOperationIdentity(RUN_ID, TOOL_CALL_ID, ATTEMPT).operationId();
     }
 
+    /** 沙箱权威查无作业：按派发前中止归还名额，不写用量。 */
+    @Test
+    void preDispatchAbortReleasesThePreparingReservationWithoutUsage() {
+        DataAnalysisReservation preparing = new DataAnalysisReservation(operationId(),
+                new DataAnalysisOperationIdentity(RUN_ID, TOOL_CALL_ID, ATTEMPT),
+                DataAnalysisResourceClass.STANDARD, 2,
+                DataAnalysisReservationState.PREPARING, null, Instant.now());
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+
+        WaitMemberSettlement.Outcome outcome = settlement.settleNotStarted(member, proof(preparing));
+
+        assertThat(outcome.ok()).isTrue();
+        ArgumentCaptor<DataAnalysisReleaseRequest> release =
+                ArgumentCaptor.forClass(DataAnalysisReleaseRequest.class);
+        verify(capacityService).releaseReservation(release.capture());
+        assertThat(release.getValue().reason()).isEqualTo(DataAnalysisReleaseReason.CREATE_NOT_STARTED);
+        assertThat(release.getValue().proof())
+                .isInstanceOf(DataAnalysisReleaseProof.PreDispatchAbort.class);
+        verify(terminalRecorder, never()).upsert(any());
+    }
+
+    /** 已经绑定任务的凭证不能按派发前中止释放，否则会把真实作业的账赖掉。 */
+    @Test
+    void preDispatchAbortRefusesAnAttachedReservation() {
+        WaitMemberSettlement.Outcome outcome = settlement.settleNotStarted(member, proof(reservation));
+
+        assertThat(outcome.ok()).isFalse();
+        assertThat(outcome.reason()).isEqualTo("predispatch_abort_identity_mismatch");
+        verify(capacityService, never()).releaseReservation(any());
+    }
+
     private WaitMemberDispatchProof proof(DataAnalysisReservation stored) {
         return new WaitMemberDispatchProof(WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
                 stored.operationId(), stored.taskId(), "sha256:fingerprint",

@@ -29,6 +29,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -68,7 +69,7 @@ class CanceledWaitMemberStopWorkerTest {
         when(ownership.findOwnedRun("run-1")).thenReturn(run);
         worker = new CanceledWaitMemberStopWorker(tasks, groups, sandbox,
                 settlement, objectMapper, ownership,
-                mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+                mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5, 30);
         task = new AsyncToolTask();
         task.setJobId(41L);
         task.setRunId("run-1");
@@ -154,12 +155,12 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("CANCELED").setError("canceled").build());
         when(settlement.settle(any(), any(), eq("CANCELED"), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
-        when(tasks.finishStop(eq(41L), any(), eq(1L))).thenReturn(true);
+        when(tasks.finishStop(eq(41L), any(), eq(1L), any())).thenReturn(true);
 
         assertThat(worker.runBatch()).isEqualTo(1);
         var order = org.mockito.Mockito.inOrder(settlement, tasks);
         order.verify(settlement).settle(any(), any(), eq("CANCELED"), any(), any(), any());
-        order.verify(tasks).finishStop(eq(41L), any(), eq(1L));
+        order.verify(tasks).finishStop(eq(41L), any(), eq(1L), any());
         verify(sandbox).cancelTask(org.mockito.ArgumentMatchers.argThat(request ->
                 request.getCancelRequestId().equals("async-task-41")
                         && request.hasByOperation()
@@ -180,10 +181,10 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("CANCELED").setError("canceled").build());
         when(settlement.settle(any(), any(), eq("CANCELED"), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
-        when(tasks.finishStop(eq(41L), any(), eq(1L))).thenReturn(true);
+        when(tasks.finishStop(eq(41L), any(), eq(1L), any())).thenReturn(true);
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(tasks).finishStop(eq(41L), any(), eq(1L));
+        verify(tasks).finishStop(eq(41L), any(), eq(1L), any());
         verify(tasks, never()).abandonStop(anyLong(), any(), anyLong(), any());
     }
 
@@ -202,7 +203,7 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("CANCELED").setError("canceled before create").build());
         when(settlement.settle(any(), any(), eq("CANCELED"), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
-        when(tasks.finishStop(eq(41L), any(), eq(1L))).thenReturn(true);
+        when(tasks.finishStop(eq(41L), any(), eq(1L), any())).thenReturn(true);
 
         assertThat(worker.runBatch()).isEqualTo(1);
         verify(sandbox).cancelTask(any());
@@ -229,7 +230,7 @@ class CanceledWaitMemberStopWorkerTest {
         assertThat(worker.runBatch()).isEqualTo(1);
         verify(tasks).retryStop(eq(41L), any(), eq(1L), any(), eq("sandbox_not_terminal"));
         verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
-        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong(), any());
     }
 
     @Test
@@ -271,5 +272,71 @@ class CanceledWaitMemberStopWorkerTest {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    /** 沙箱权威查无此作业：按派发前中止归还名额，任务行不带任务编号收尾。 */
+    @Test
+    void authoritativeAbsenceReleasesPreDispatchReservationWithoutTaskId() {
+        task.setTaskId(null);
+        member.setDispatchProofJson(proofJson(null));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.NOT_FOUND).build());
+        when(settlement.settleNotStarted(any(), any()))
+                .thenReturn(new WaitMemberSettlement.Outcome(true, null));
+        when(tasks.finishStop(eq(41L), any(), eq(1L), isNull())).thenReturn(true);
+
+        assertThat(worker.runBatch()).isEqualTo(1);
+        verify(settlement).settleNotStarted(any(), any());
+        verify(tasks).finishStop(eq(41L), any(), eq(1L), isNull());
+        verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
+        verify(tasks, never()).retryStop(anyLong(), any(), anyLong(), any(), any());
+        verify(tasks, never()).abandonStop(anyLong(), any(), anyLong(), any());
+    }
+
+    /** 取消返回查无作业，但重查发现作业已经出现：交给下一轮按正常停机处理。 */
+    @Test
+    void operationAppearingDuringStopIsLeftToNextRound() {
+        when(sandbox.getTaskByOperationId(any()))
+                .thenReturn(GetTaskByOperationIdResponse.newBuilder().setFound(false).build())
+                .thenReturn(lookup("task-1", FINGERPRINT));
+        when(sandbox.cancelTask(any())).thenReturn(CancelTaskResponse.newBuilder()
+                .setOutcome(CancelOutcome.NOT_FOUND).build());
+
+        assertThat(worker.runBatch()).isEqualTo(1);
+        verify(tasks).retryStop(eq(41L), any(), eq(1L), any(), eq("operation_appeared_during_stop"));
+        verify(settlement, never()).settleNotStarted(any(), any());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong(), any());
+    }
+
+    /** 停机重试次数用尽：停止自动重试并留下原因，不再每 5 秒空转。 */
+    @Test
+    void exhaustedStopAttemptsAbandonWithoutFurtherRetry() {
+        task.setStopAttemptCount(29);
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setError("sandbox timeout").build());
+
+        assertThat(worker.runBatch()).isEqualTo(1);
+        verify(tasks).abandonStop(eq(41L), any(), eq(1L),
+                eq("stop_attempts_exhausted:operation_lookup_unavailable"));
+        verify(tasks, never()).retryStop(anyLong(), any(), anyLong(), any(), any());
+    }
+
+    /** 终态清理凭证解析不了是永久失败：收尾并留下原因，不能无限重试。 */
+    @Test
+    void unreadableTerminalBlockStopsRetrying() {
+        task.setTaskId(null);
+        member.setDispatchProofJson("{\"schemaVersion\":1,"
+                + "\"operationId\":\"run-1:call-1:1\","
+                + "\"requestFingerprint\":\"" + FINGERPRINT + "\","
+                + "\"canonicalCreateSpecJson\":\"{}\",\"estimateJson\":\"{}\","
+                + "\"reservationJson\":\"{}\",\"submittedAt\":\"2026-01-01T00:00:00Z\","
+                + "\"terminalModelSendBlock\":\"unexpected\"}");
+        when(sandbox.getTaskByOperationId(any())).thenReturn(lookup("task-1", FINGERPRINT));
+
+        assertThat(worker.runBatch()).isEqualTo(1);
+        verify(tasks).abandonStop(eq(41L), any(), eq(1L), eq("terminal_block_unreadable"));
+        verify(tasks, never()).retryStop(anyLong(), any(), anyLong(), any(), any());
     }
 }

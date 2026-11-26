@@ -9,6 +9,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.test.util.ReflectionTestUtils;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.slf4j.LoggerFactory;
 import world.willfrog.agent.tools.sandboxjob.*;
 import world.willfrog.agent.tools.python.PythonSandboxJobRequestAdapter;
 import world.willfrog.agent.tools.python.PythonSandboxJobResultAdapter;
@@ -61,6 +66,7 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -1440,5 +1446,37 @@ class WaitMemberResultReceiverTest {
         run.setPlanGeneration(2);
         run.setRunControlVersion(RUN_CONTROL_VERSION);
         return run;
+    }
+
+    /** 连续写库失败达到上限时报警一次，计数不再无限涨，成员状态不动。 */
+    @Test
+    void consecutiveWriteFailuresAlertOnceAtTheThreshold() {
+        WaitMember member = new WaitMember();
+        member.setId(41L);
+        member.setGroupId(GROUP_ID);
+        member.setRunId(RUN_ID);
+        member.setMemberIdentity(MEMBER_IDENTITY);
+        Logger logger = (Logger) LoggerFactory.getLogger(WaitMemberResultReceiver.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            for (int i = 1; i <= 25; i++) {
+                ReflectionTestUtils.invokeMethod(receiver, "recordWriteFailure", member,
+                        new IllegalStateException("PostgreSQL 拒收工具输出里的空字符"));
+            }
+            long alerts = appender.list.stream()
+                    .filter(event -> event.getLevel() == Level.ERROR)
+                    .filter(event -> event.getFormattedMessage().contains("连续"))
+                    .count();
+            assertThat(alerts).as("达到上限只报警一次，之后按最大退避重试但不再刷屏").isEqualTo(1);
+            @SuppressWarnings("unchecked")
+            Map<String, Integer> counts = (Map<String, Integer>)
+                    ReflectionTestUtils.getField(receiver, "consecutiveWriteFailures");
+            assertThat(counts).hasSize(1);
+            assertThat(counts.values()).containsExactly(25);
+        } finally {
+            logger.detachAppender(appender);
+        }
     }
 }
