@@ -77,6 +77,11 @@ CREATE INDEX IF NOT EXISTS idx_agent_async_tool_task_run_state
 CREATE INDEX IF NOT EXISTS idx_agent_async_tool_task_work_item
     ON alphafrog_agent_async_tool_task(run_id, work_item_id, state);
 
+-- 停机扫描只取待停止与已领取的行；取消后的行是 CANCELED，到期索引覆盖不到，单独建一条。
+CREATE INDEX IF NOT EXISTS idx_agent_async_tool_task_stop_due
+    ON alphafrog_agent_async_tool_task(next_poll_at, job_id)
+    WHERE stop_state IN ('PENDING', 'CLAIMED');
+
 -- 一次性迁移：只迁未完结的异步任务，以及仍有未确认停机的已取消任务。
 -- 已终态且没有停机尾巴的行留在旧表，随第七步删表一起清理。
 --
@@ -129,7 +134,9 @@ WHERE m.state IN ('PENDING', 'RUNNING')
    );
 
 -- 停机尾巴按成员行挂到新任务行上。BLOCKED_PROOF 并入待停止，
--- 停机的领取复用任务租约，重试次数与最后错误原样带过来。
+-- 停机的领取复用任务租约：重试时刻取旧停机记录的下一次尝试时刻，已领取的行连持有实例与租约一起带过来
+-- （旧实例已停服，租约到期前新实例不会接手，等它过期或旧实例退出后自然接手）。
+-- 旧的 claim_token 是随机串，与新的领取轮次不是一套东西，不搬；轮次从 0 开始重新计数。
 UPDATE alphafrog_agent_async_tool_task t
 SET stop_state = CASE s.state
                      WHEN 'CONFIRMED' THEN 'CONFIRMED'
@@ -138,12 +145,52 @@ SET stop_state = CASE s.state
                  END,
     stop_attempt_count = s.attempt_count,
     stop_last_error = s.last_error,
+    next_poll_at = COALESCE(t.next_poll_at, s.next_attempt_at),
+    owner_instance_id = CASE WHEN s.state = 'CLAIMED' THEN s.claimed_by END,
+    lease_expires_at = CASE WHEN s.state = 'CLAIMED' THEN s.lease_until END,
     updated_at = GREATEST(t.updated_at, s.updated_at)
 FROM alphafrog_agent_run_wait_member_stop s
 JOIN alphafrog_agent_run_wait_member m ON m.id = s.wait_member_id
 WHERE m.run_id = t.run_id
   AND m.group_id = t.group_id
   AND m.member_seq = t.member_seq;
+
+UPDATE alphafrog_agent_async_tool_task
+SET timeout_at = CAST(r.tool_job_anchor_json ->> 'timeoutAt' AS timestamptz),
+    updated_at = GREATEST(updated_at, CURRENT_TIMESTAMP)
+FROM alphafrog_agent_run r
+WHERE r.id = run_id
+  AND external_operation_id = r.tool_job_anchor_json ->> 'operationId'
+  AND (r.tool_job_anchor_json ->> 'timeoutAt') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+  AND timeout_at IS NULL;
+
+-- 迁移校验：与源表未完结行数对账、检查关键列，不通过就抛异常，整份脚本随事务回滚。
+DO $migration_check$
+DECLARE
+    expected BIGINT;
+    migrated BIGINT;
+BEGIN
+    SELECT count(*) INTO expected
+      FROM alphafrog_agent_run_wait_member m
+     WHERE m.state IN ('PENDING', 'RUNNING')
+        OR EXISTS (
+            SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+             WHERE s.wait_member_id = m.id AND s.state <> 'CONFIRMED');
+    SELECT count(*) INTO migrated
+      FROM alphafrog_agent_async_tool_task
+     WHERE member_identity IS NOT NULL AND work_item_id IS NULL;
+    IF migrated <> expected THEN
+        RAISE EXCEPTION '异步工具任务迁移行数不一致：源表未完结 % 行，新表迁入 % 行', expected, migrated;
+    END IF;
+    IF EXISTS (
+            SELECT 1 FROM alphafrog_agent_async_tool_task
+             WHERE member_identity IS NOT NULL AND work_item_id IS NULL
+               AND (run_id IS NULL OR tool_name IS NULL OR state IS NULL
+                    OR request_json IS NULL OR finished_at IS NOT NULL AND state IN ('PENDING', 'RUNNING'))) THEN
+        RAISE EXCEPTION '异步工具任务迁移后存在关键列为空或状态与结束时刻不一致的行';
+    END IF;
+END
+$migration_check$;
 
 COMMENT ON TABLE alphafrog_agent_async_tool_task IS
     '异步工具任务：一次异步工具调用一行，合并等待成员、停机记录与运行锚点里的任务状态。';
