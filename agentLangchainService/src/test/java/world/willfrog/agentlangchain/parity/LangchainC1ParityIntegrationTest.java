@@ -34,7 +34,7 @@ import static org.mockito.Mockito.when;
 class LangchainC1ParityIntegrationTest {
 
     private final LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-            LangchainTestFixtures.todoNodeExecutor(),
+            LangchainTestFixtures.versionedTodoNodeExecutor(),
             noopExecutionGuard(),
             mock(AgentRunEventService.class)
     );
@@ -90,7 +90,9 @@ class LangchainC1ParityIntegrationTest {
                 .runId("run-parity-1")
                 .userId("u1")
                 .userGoal(goal)
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                        .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                        .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build();
     }
 

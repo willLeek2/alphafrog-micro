@@ -1,14 +1,14 @@
 package world.willfrog.alphafrogmicro.common.datasource;
 
 /**
- * 核对行情只读连接指向生产库 {@code alphafrog}，拒绝指到 beta 库或非 PostgreSQL URL。
+ * 核对行情只读连接指向生产库 {@code alphafrog-v3}，拒绝指到 Beta 库 {@code alphafrog} 或非 PostgreSQL URL。
  *
- * <p>beta 实例跨机读 101 生产库时，host 由 {@code AF_DB_MARKET_HOST} 注入；本类不写死 IP，
+ * <p>Beta 实例跨机读生产库时，host 由 {@code AF_DB_MARKET_HOST} 注入；本类不写死 IP，
  * 只锁定协议、库名与 host 非空。</p>
  */
 public final class MarketReadConnectionTarget {
 
-    public static final String REQUIRED_DATABASE = "alphafrog";
+    public static final String REQUIRED_DATABASE = "alphafrog-v3";
     public static final String JDBC_PREFIX = "jdbc:postgresql://";
 
     private MarketReadConnectionTarget() {

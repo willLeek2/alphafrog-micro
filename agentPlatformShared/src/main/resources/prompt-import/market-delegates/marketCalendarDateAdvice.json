@@ -1,0 +1,14 @@
+{
+  "fragment": "marketCalendarDateAdvice",
+  "purpose": "marketCalendarDateAdvice",
+  "bodyType": "FIXED",
+  "body": "Invalid date, please use YYYYMMDD.",
+  "variables": [],
+  "utf8Sha256": "6331070655b1b652f698370fa22d1cf803d242d7052bfe9eed2da32955ec7351",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataCalendarTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

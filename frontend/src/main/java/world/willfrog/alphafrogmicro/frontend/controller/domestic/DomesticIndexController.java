@@ -2,7 +2,8 @@ package world.willfrog.alphafrogmicro.frontend.controller.domestic;
 
 import com.google.protobuf.util.JsonFormat;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.config.annotation.DubboReference;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
@@ -21,7 +22,8 @@ import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
 @RequestMapping("/domestic/index")
 public class DomesticIndexController {
 
-    @DubboReference
+    @Autowired
+    @Qualifier("domesticPageIndexService")
     private DomesticIndexService domesticIndexService;
 
     @GetMapping("/info/ts_code")

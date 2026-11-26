@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
+import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
@@ -20,6 +21,7 @@ import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
+import world.willfrog.agentlangchain.control.dualpool.TerminalResidueCloser;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityContractFixtures;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
@@ -209,6 +211,7 @@ class LangchainRunReadServiceTest {
         order.verify(stateStore).markRunStatus("r1", "EXPIRED");
         order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
     }
+
 
     @Test
     void getRunPublisherFailureDoesNotRollbackPersistedExpiredState() {
@@ -620,6 +623,7 @@ class LangchainRunReadServiceTest {
         // 开关开启时：空产物 → false；非空产物 → true。
         AgentRun empty = run("{\"generate_artifacts\": true}");
         AgentRun withArtifact = run("{\"generate_artifacts\": true}");
+        withArtifact.setId("r2");
         when(runMapper.listByUser(any(), any(), any(), anyInt(), anyInt()))
                 .thenReturn(List.of(empty, withArtifact));
         when(runMapper.countByUser(any(), any(), any())).thenReturn(2);

@@ -8,6 +8,9 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -40,6 +43,8 @@ public class RunServiceLeaseKeeper {
     private final RunServiceLeaseStore leaseStore;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
     private final ProcessInstanceIdentity instanceIdentity;
+    private final RunOwnershipGateway ownership;
+    private final DualPoolSchedulerSettings settings;
     private final Duration serviceTtl;
     private final int ownedLimit;
     private final long renewIntervalMs;
@@ -62,6 +67,8 @@ public class RunServiceLeaseKeeper {
             RunServiceLeaseStore leaseStore,
             DualPoolRunAdmissionRegistry admissionRegistry,
             ProcessInstanceIdentity instanceIdentity,
+            RunOwnershipGateway ownership,
+            DualPoolSchedulerSettings settings,
             @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long serviceTtlSeconds,
             @Value("${agent.langchain.dual-pool.service-lease-owned-limit:512}") int ownedLimit,
             @Value("${agent.langchain.dual-pool.service-lease-renew-interval-ms:40000}") long renewIntervalMs,
@@ -69,6 +76,8 @@ public class RunServiceLeaseKeeper {
         this.leaseStore = leaseStore;
         this.admissionRegistry = admissionRegistry;
         this.instanceIdentity = instanceIdentity;
+        this.ownership = ownership;
+        this.settings = settings;
         this.serviceTtl = Duration.ofSeconds(Math.max(1L, serviceTtlSeconds));
         this.ownedLimit = Math.max(1, ownedLimit);
         this.renewIntervalMs = Math.max(1L, renewIntervalMs);
@@ -145,13 +154,15 @@ public class RunServiceLeaseKeeper {
             return 0;
         }
 
-        // 这一页之外的租约靠整批续期活着：清点是有界的，本进程手上可能还有更多条。
-        leaseStore.renewOwned(owner, serviceTtl);
+        ServiceOwnershipScope scope = currentScope();
+        // 这一页之外的服务所有权靠整批续期活着：清点是有界的，本进程手上可能还有更多条。
+        // 部署、代际、泳道对不上的不会被续上。
+        leaseStore.renewOwned(owner, serviceTtl, scope);
 
         List<RunServiceLease> lost = new ArrayList<>();
         int renewed = 0;
         for (RunServiceLease lease : owned) {
-            if (leaseStore.renew(lease.runId(), owner, lease.fencingToken(), serviceTtl)) {
+            if (leaseStore.renew(lease.runId(), owner, lease.fencingToken(), serviceTtl, scope)) {
                 renewed++;
                 continue;
             }
@@ -177,6 +188,13 @@ public class RunServiceLeaseKeeper {
                     lost.size(), lost.stream().map(RunServiceLease::runId).toList());
         }
         return renewed;
+    }
+
+    /** 本进程的部署、代际、泳道。续期语句用这份去核对运行主表。 */
+    private ServiceOwnershipScope currentScope() {
+        DeploymentIdentity identity = ownership.requireIdentity();
+        return new ServiceOwnershipScope(
+                identity.deploymentId(), identity.generationId(), settings.processLaneTag());
     }
 
     /** 续期的读数：续了多少轮、手上该有多少条、续上多少条、丢了多少条。 */

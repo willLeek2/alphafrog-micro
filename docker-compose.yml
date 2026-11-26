@@ -16,6 +16,8 @@ x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_ENDPOINT: ${AF_OTEL_TRACES_ENDPOINT:-http://jaeger:4318}
   OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
   OTEL_TRACES_EXPORTER: otlp
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
   OTEL_METRICS_EXPORTER: none
   OTEL_LOGS_EXPORTER: none
   AF_DEPLOYMENT_ID: ${AF_DEPLOYMENT_ID:-stable}
@@ -764,6 +766,10 @@ services:
       AF_SANDBOX_POOL_ACQUIRE_TIMEOUT: ${AF_SANDBOX_POOL_ACQUIRE_TIMEOUT:-30}
       AF_SANDBOX_POOL_IDLE_TIMEOUT: ${AF_SANDBOX_POOL_IDLE_TIMEOUT:-300}
       AF_SANDBOX_POOL_MAX_CONTAINER_USES: ${AF_SANDBOX_POOL_MAX_CONTAINER_USES:-}
+      # 014-opt-04 排队期限：任务入队后等待调度的超时上限（秒），超时走 200-data
+      # 终态。启动时经 load_config 读一次固化（改后需重启，无热更新）；生效值与
+      # 来源从 python-sandbox /health 回读（queue_wait_timeout_seconds/_source）。
+      AF_SANDBOX_QUEUE_WAIT_TIMEOUT: ${AF_SANDBOX_QUEUE_WAIT_TIMEOUT:-30}
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
       AF_SANDBOX_TASK_STORE_PATH: /data/sandbox_tasks/state.json
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
@@ -911,7 +917,6 @@ services:
       NACOS_ADDRESS: nacos
       # 可选：覆盖 JWT 密钥（默认值在 frontend 的 application.yml 里）
       # AF_JWT_SECRET: ${AF_JWT_SECRET}
-      AF_DOMESTIC_FETCH_DEBUG_BASE_URL: http://domestic-fetch-service:18082
       AF_CONFIG_NACOS_ENABLED: "true"
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
       AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP: ${AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP:-langchain}
@@ -943,8 +948,9 @@ services:
       AF_OTEL_FILE_STORAGE_DIRECTORY: /var/lib/otelcol
     volumes:
       - ./deploy/otel/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
-      - ./data/logs:/var/log/apps:ro
-      - alphafrog_otelcoldata:/var/lib/otelcol
+      # 本机 .env 把这两个目录指到数据盘 /data/log-collection。未设置时仍用仓库内日志目录和命名卷。
+      - ${AF_OTEL_APP_LOG_DIR:-./data/logs}:/var/log/apps:ro
+      - ${AF_OTEL_COLLECTOR_STATE:-alphafrog_otelcoldata}:/var/lib/otelcol
     restart: unless-stopped
     deploy:
       resources:

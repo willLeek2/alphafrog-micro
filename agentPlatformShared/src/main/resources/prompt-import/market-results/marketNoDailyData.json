@@ -1,0 +1,14 @@
+{
+  "fragment": "marketNoDailyData",
+  "purpose": "marketNoDailyData",
+  "bodyType": "FIXED",
+  "body": "该资产在指定日期范围内无日线记录，请考虑调整起止日期或更换资产。",
+  "variables": [],
+  "utf8Sha256": "7c79fd1ee5a6620e7f33d9f595fbf7c0457d51001eed167918268ca33eb17f36",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -1,0 +1,21 @@
+{
+  "fragment": "toolDatasetObservedIdsAdvice",
+  "purpose": "toolDatasetObservedIdsAdvice",
+  "bodyType": "TEMPLATE",
+  "body": "Observed raw ids available for lookup: {{rawIds}}. Resolve them through listMyData instead of passing them directly.",
+  "variables": [
+    {
+      "name": "rawIds",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "db03db28234d8353f3c425bb87515787fd6ec5c215782cc46e65837c24cbb70c",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tools/ToolRouterToolExecutor.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -9,6 +9,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -24,22 +25,30 @@ import world.willfrog.agent.platform.idempotency.RunIdempotencyConflictException
 import world.willfrog.agent.platform.idempotency.RunRequestDigest;
 import world.willfrog.agent.platform.idempotency.RunRequestFingerprint;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.agent.platform.prompt.PromptSelectionCoordinator;
+import world.willfrog.agent.platform.experiment.ExperimentRunPreparation;
+import world.willfrog.agent.platform.experiment.ExperimentRunBindingStore;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
+import java.time.LocalDate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 @Service
@@ -102,6 +111,10 @@ public class AgentRunEventService {
     private final AgentMessageService messageService;
     /** 提示词服务：用于在 run 创建时快照当前 dataFreshness */
     private final AgentPromptService agentPromptService;
+    /** 创建、执行和恢复共同使用原根的实验绑定与真实提示词选择。 */
+    @Autowired
+    private ExperimentRunPreparation experimentRunPreparation;
+
     /** 事务管理器：Run 主记录与它的事件必须在同一条事务里落库 */
     private final PlatformTransactionManager transactionManager;
     /**
@@ -111,6 +124,10 @@ public class AgentRunEventService {
      * Run 主记录只有这一处插入点。</p>
      */
     private final RunCoordinationStore coordinationStore;
+    /** 新建 Run 时领取与让出服务所有权。 */
+    private final RunServiceLeaseStore leaseStore;
+    /** 本进程的持有者标识：领取与让出服务所有权都用它认人。 */
+    private final ProcessInstanceIdentity instanceIdentity;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -127,6 +144,14 @@ public class AgentRunEventService {
     /** 热配置缺省时的 Python 持久工作区开关；新 Run 创建时读取当下生效值。 */
     @Value("${agent.python-workspace.enabled:false}")
     private boolean pythonWorkspaceEnabled;
+
+    /** 新根运行采用的整组提示词实验，创建时冻结到根记录。 */
+    @Value("${agent.llm.prompt-set-experiment-id:}")
+    private String promptSetExperimentId;
+
+    /** 新建 Run 领取服务所有权时的有效期（秒），使用时最短按 1 秒收成 Duration。 */
+    @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}")
+    private long serviceLeaseTtlSeconds;
 
     @PostConstruct
     void logPythonWorkspaceSetting() {
@@ -255,9 +280,9 @@ public class AgentRunEventService {
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
         ext.put("python_workspace_enabled", resolvePythonWorkspaceEnabled());
-        PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
-                runId, userId, contextJson);
-        ext.put("prompt_selection", promptSelection.toExtMap());
+        ext.put(PromptSelectionCoordinator.REFERENCE_DATE_FIELD, LocalDate.now().toString());
+        ext.put(PromptSelectionCoordinator.EXPERIMENT_ID_FIELD, resolvePromptSetExperimentId());
+        ext.put(ExperimentRunBindingStore.CONTEXT_FIELD, experimentRunPreparation.freezeContext(runId));
         // 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
         ext.put("generate_artifacts", generateArtifacts);
@@ -330,13 +355,18 @@ public class AgentRunEventService {
         // 「有 Run、没有接收事实」的半成品——那种记录会被幂等重试直接读回，缺失的事实再也没人补。
         AgentRunEvent received;
         try {
-            received = transactionTemplate().execute(status -> {
+            received = rootCreationTransactionTemplate().execute(status -> {
                 runMapper.insert(run);
                 // 排进共享候选与创建同一条事务：资格行缺了，这条 Run 在候选里就没有位置，
                 // 而候选是三个版本共用的唯一入口——旧版本的 Run 也没有第二条路会来补它。
                 // 与版本无关：记的是这条 Run 自己冻结的版本，新建的每一条都在候选里。
                 if (!coordinationStore.ensure(runId)) {
                     log.warn("这条 Run 建出来却没有排进共享候选，需要人看一眼: runId={}", runId);
+                }
+                // 领取服务所有权与创建同一条事务：拿不到就整次回滚，库里不留下无人认领的 Run。
+                if (leaseStore.acquire(runId, instanceIdentity.value(), serviceLeaseTtl()).isEmpty()) {
+                    throw new IllegalStateException(
+                            "创建 Run 时没有拿到服务所有权，整次创建回滚：runId=" + runId);
                 }
                 // 接收事实与 Run 主记录同一条事务：只落库，投射留到提交之后。
                 return persistEvent(runId, "RUN_RECEIVED", ext);
@@ -370,6 +400,24 @@ public class AgentRunEventService {
             log.warn("Failed to create initial message for runId={}, but continuing: {}", runId, e.getMessage());
         }
 
+        // 根记录独立提交后，用真实根身份建立并保存选择，再返回可启动结果。
+        try {
+            prepareExperimentRunContext(runId);
+        } catch (RuntimeException failure) {
+            var blocked = ModelSendBlocks.find(failure);
+            String reason = blocked.map(value -> value.code()).orElse("PROMPT_UNREADABLE");
+            try {
+                closeUnacceptedCreate(runId, userId, reason);
+                if (blocked.isPresent()) {
+                    append(runId, userId, "EXPERIMENT_PREPARATION_FAILED",
+                            ModelSendBlocks.failureMetadata(blocked.get()));
+                }
+            } catch (RuntimeException persistenceFailure) {
+                log.error("新根提示词准备失败后未能确认关闭运行: runId={}", runId);
+            }
+            throw failure;
+        }
+
         // 重新查询返回,保证字段(自增 id、created_at 等)是 DB 最终视图
         AgentRun persisted = runMapper.findByIdAndUserForDeployment(
                 runId, userId, run.getDeploymentId(), run.getDeploymentGenerationId());
@@ -379,6 +427,11 @@ public class AgentRunEventService {
         return new RunCreation(persisted, true);
     }
 
+    /** 执行和恢复在任何模型调用之前读取原根已提交的真实选择。 */
+    public PromptRunSelection prepareExperimentRunContext(String runId) {
+        return experimentRunPreparation.ensurePrepared(runId);
+    }
+
     /**
      * 一次创建请求的结果。
      *
@@ -386,6 +439,34 @@ public class AgentRunEventService {
      * 新建的那条才允许准入与启动：读回的 Run 已经在别处跑着，再启动一次会让同一次请求执行两遍。</p>
      */
     public record RunCreation(AgentRun run, boolean created) {
+    }
+
+    /**
+     * 把还没被受理的新建 Run 关掉：状态从 RECEIVED 改成 FAILED，并让出本进程持有的服务所有权。
+     *
+     * <p>已经不是 RECEIVED 的，这一步改不动，返回 false。这是幂等关闭：第二次进来不会再写事件、
+     * 也不会再让出一次所有权。</p>
+     *
+     * @return 这次把状态从 RECEIVED 改成了 FAILED 时为 true；本来就已经关掉则为 false
+     */
+    public boolean closeUnacceptedCreate(String runId, String userId, String reason) {
+        Objects.requireNonNull(runId, "runId");
+        Objects.requireNonNull(userId, "userId");
+        Objects.requireNonNull(reason, "reason");
+        int updated = runMapper.updateStatus(
+                runId, userId, AgentRunStatus.RECEIVED, AgentRunStatus.FAILED);
+        if (updated == 0) {
+            return false;
+        }
+        append(runId, userId, "RUN_ENQUEUE_FAILED", Map.of(
+                "engine", "agentLangchainService",
+                "reason", reason));
+        leaseStore.find(runId)
+                .filter(lease -> instanceIdentity.value().equals(lease.ownerInstanceId())
+                        && lease.fencingToken() > 0)
+                .ifPresent(lease -> leaseStore.release(
+                        runId, lease.ownerInstanceId(), lease.fencingToken()));
+        return true;
     }
 
     /**
@@ -476,6 +557,10 @@ public class AgentRunEventService {
         if (!coordinationStore.ensure(childRunId)) {
             throw new IllegalStateException("Child Run did not receive a coordination row: " + childRunId);
         }
+        if (leaseStore.acquire(childRunId, instanceIdentity.value(), serviceLeaseTtl()).isEmpty()) {
+            throw new IllegalStateException(
+                    "创建子 Run 时没有拿到服务所有权，整次创建回滚：runId=" + childRunId);
+        }
         AgentRunEvent received = persistEvent(childRunId, "RUN_RECEIVED", ext);
         messageService.createInitialMessage(childRunId, childGoal);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -557,9 +642,22 @@ public class AgentRunEventService {
         return run;
     }
 
+    /** 根记录先提交，后续远端准备及选择保存使用独立事务。 */
+    private TransactionTemplate rootCreationTransactionTemplate() {
+        TransactionTemplate template = transactionTemplate();
+        template.setPropagationBehavior(org.springframework.transaction.TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        template.setIsolationLevel(org.springframework.transaction.TransactionDefinition.ISOLATION_READ_COMMITTED);
+        return template;
+    }
+
     /** 事务模板按需构造：它只是配置的载体，每次调用新建一个比放进字段更省心。 */
     private TransactionTemplate transactionTemplate() {
         return new TransactionTemplate(transactionManager);
+    }
+
+    /** 领取服务所有权时的有效期：配置小于 1 秒时按 1 秒用。 */
+    private Duration serviceLeaseTtl() {
+        return Duration.ofSeconds(Math.max(1L, serviceLeaseTtlSeconds));
     }
 
     /** 空串与纯空白都按「没有带幂等键」处理：历史客户端会把空串传进来。 */
@@ -680,27 +778,39 @@ public class AgentRunEventService {
      * 一个号，不会在读者那边留下孤儿事件。</p>
      */
     private AgentRunEvent persistEvent(String runId, String eventType, Object payload) {
-        // 事件序号采用 Redis 原子递增，避免并发落库时 seq 冲突。
+        return persistEvent(runId, eventType, payload, true);
+    }
+
+    /**
+     * 事件序号用 Redis 原子递增。序号键过期后，自增会从 1 重新开始，和库里已有序号撞车。
+     * 键刚好被建成 1 时，若库里已经有事件，改按库里的最大序号续上再自增。
+     * 插入仍然撞上 (run_id, seq) 时，在创建事务外面按库里的最大序号重铺一次并再写一行。
+     * 创建事务里插入失败会把整段事务作废，那里不重试。
+     */
+    private AgentRunEvent persistEvent(String runId, String eventType, Object payload, boolean allowSeqRetry) {
         int nextSeq = nextSeq(runId);
         AgentRunEvent event = new AgentRunEvent();
         event.setRunId(runId);
         event.setSeq(nextSeq);
         event.setEventType(eventType);
-        // payload 已经是字符串则直接使用,否则序列化为 JSON
         String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
         event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
         event.setCreatedAt(OffsetDateTime.now());
-        // TRANSITIONAL: dual-write to PostgreSQL until all readers are Redis-only.
-        // This database insert will be removed in a near-term release.
         try {
             eventMapper.insert(event);
-        } catch (Exception e) {
+        } catch (RuntimeException failure) {
+            if (allowSeqRetry
+                    && isRunSeqConflict(failure)
+                    && !TransactionSynchronizationManager.isActualTransactionActive()) {
+                reseedEventSeqFromDatabase(runId);
+                return persistEvent(runId, eventType, payload, false);
+            }
             String msg = String.format(
                     "Append event failed (fail-fast): runId=%s, eventType=%s, seq=%d",
                     runId, eventType, nextSeq
             );
-            log.error(msg, e);
-            throw new IllegalStateException(msg, e);
+            log.error(msg, failure);
+            throw new IllegalStateException(msg, failure);
         }
         return canonicalEvent(runId, nextSeq, eventType);
     }
@@ -1467,22 +1577,24 @@ public class AgentRunEventService {
     }
 
     /**
-     * 判断中断状态 run 是否到了应该被清理为 EXPIRED 的时刻。
+     * 判断这条运行是否到了该收成过期的时刻。
      *
-     * <p>仅 WAITING/FAILED/CANCELED 三种状态走 interrupted TTL 检查,
-     * 其他状态由其他流程管理生命周期。</p>
+     * <p>等待中、失败、已取消用的是进入这些状态时延长过的到期时间。已接收、规划中、执行中、
+     * 总结中用的是创建时写下的到期时间：到点还没结束，就停掉。等待外部工具作业不按这个时间停，
+     * 工具自己的完成或失败再决定运行怎么走。正在取消的运行留给取消收尾。</p>
      */
     public boolean shouldMarkExpired(AgentRun run) {
-        if (run == null) {
+        if (run == null || run.getTtlExpiresAt() == null) {
             return false;
         }
         AgentRunStatus status = run.getStatus();
         if (status != AgentRunStatus.WAITING
                 && status != AgentRunStatus.FAILED
-                && status != AgentRunStatus.CANCELED) {
-            return false;
-        }
-        if (run.getTtlExpiresAt() == null) {
+                && status != AgentRunStatus.CANCELED
+                && status != AgentRunStatus.RECEIVED
+                && status != AgentRunStatus.PLANNING
+                && status != AgentRunStatus.EXECUTING
+                && status != AgentRunStatus.SUMMARIZING) {
             return false;
         }
         return OffsetDateTime.now().isAfter(run.getTtlExpiresAt());
@@ -1517,24 +1629,58 @@ public class AgentRunEventService {
     private int nextSeq(String runId) {
         String key = eventSeqKey(runId);
         try {
-            // 第一次写入时初始化为 0,INCR 后即为 1
-            redisTemplate.opsForValue().setIfAbsent(key, "0", Duration.ofMinutes(ttlMinutes));
             Long next = redisTemplate.opsForValue().increment(key);
             if (next == null) {
                 throw new IllegalStateException("Redis INCR returned null");
             }
-            // 每次刷新 TTL,防止长 run 中途 key 过期
             redisTemplate.expire(key, Duration.ofMinutes(ttlMinutes));
-            // seq 是 INT 类型,溢出时抛错,理论上不该发生
+            if (next == 1L) {
+                int dbMax = databaseMaxSeq(runId);
+                if (dbMax >= 1) {
+                    redisTemplate.opsForValue().set(
+                            key, Integer.toString(dbMax), Duration.ofMinutes(ttlMinutes));
+                    next = redisTemplate.opsForValue().increment(key);
+                    if (next == null) {
+                        throw new IllegalStateException("Redis INCR returned null");
+                    }
+                    redisTemplate.expire(key, Duration.ofMinutes(ttlMinutes));
+                }
+            }
             if (next > Integer.MAX_VALUE) {
                 throw new IllegalStateException("Event seq overflow: " + next);
             }
             return next.intValue();
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             String msg = String.format("Next seq generation failed (Redis only): runId=%s", runId);
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
         }
+    }
+
+    private void reseedEventSeqFromDatabase(String runId) {
+        String key = eventSeqKey(runId);
+        redisTemplate.opsForValue().set(
+                key, Integer.toString(databaseMaxSeq(runId)), Duration.ofMinutes(ttlMinutes));
+    }
+
+    private int databaseMaxSeq(String runId) {
+        Integer max = eventMapper.findMaxSeq(runId);
+        return max == null ? 0 : max;
+    }
+
+    private static boolean isRunSeqConflict(RuntimeException failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof DuplicateKeyException) {
+                return true;
+            }
+            String message = current.getMessage();
+            if (message != null && message.contains("(run_id, seq)")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     /**
@@ -1645,6 +1791,14 @@ public class AgentRunEventService {
                 .orElse(pythonWorkspaceEnabled);
     }
 
+    private String resolvePromptSetExperimentId() {
+        String configured = Optional.ofNullable(llmLocalConfigLoader.current())
+                .flatMap(value -> value)
+                .map(AgentLlmProperties::getPromptSetExperimentId)
+                .orElse(promptSetExperimentId);
+        return configured == null ? "" : configured.trim();
+    }
+
     /**
      * 解析中断状态 run 的 TTL 天数。
      *
@@ -1656,15 +1810,33 @@ public class AgentRunEventService {
      * </ol>
      */
     private int resolveInterruptedTtlDays() {
+        return interruptedTtlDaysWithSource().value();
+    }
+
+    /** 中断 Run 存活期读数：生效值与来源层级（hot_config|property|default）。 */
+    public record InterruptedTtlDaysWithSource(int value, String source) { }
+
+    /**
+     * 中断 Run 存活期的生效值与来源，供回读端点展示；{@link #resolveInterruptedTtlDays()} 委托到这里，
+     * 解析路径只有一份。
+     *
+     * <p>来源层级与 {@link #resolveInterruptedTtlDays()} 的三级优先级一致：热配置 →
+     * {@code agent.run.interrupted-ttl-days} 属性 → 代码默认。上层给了不合法的值（≤0）时按既有
+     * 行为落到下一层，读数里报的就是实际生效的那一层。</p>
+     */
+    public InterruptedTtlDaysWithSource interruptedTtlDaysWithSource() {
         int local = llmLocalConfigLoader.current()
                 .map(AgentLlmProperties::getRuntime)
                 .map(AgentLlmProperties.Runtime::getResume)
                 .map(AgentLlmProperties.Resume::getInterruptedTtlDays)
                 .orElse(0);
         if (local > 0) {
-            return local;
+            return new InterruptedTtlDaysWithSource(local, "hot_config");
         }
-        return interruptedTtlDays > 0 ? interruptedTtlDays : 7;
+        if (interruptedTtlDays > 0) {
+            return new InterruptedTtlDaysWithSource(interruptedTtlDays, "property");
+        }
+        return new InterruptedTtlDaysWithSource(7, "default");
     }
 
     /**

@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
@@ -39,6 +40,8 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.when;
 
 /**
@@ -162,8 +165,8 @@ class ToolRouterRegistryConsistencyTest {
         when(ragTools.ragSearch(anyString(), anyString(), anyString(), anyString(), anyInt())).thenReturn(okJson("ragSearch"));
         when(ragTools.loadDocument(anyString())).thenReturn(okJson("loadDocument"));
 
-        SearchTools searchTools = mock(SearchTools.class);
-        when(searchTools.searchWeb(anyString(), anyString(), anyString(), anyString(), anyBoolean(), anyBoolean(), anyString(), anyString(), anyInt())).thenReturn(okJson("searchWeb"));
+        SearchTools searchTools = spy(new SearchTools(new ObjectMapper(), null));
+        doReturn(okJson("searchWeb")).when(searchTools).searchWebPrepared(any());
 
         PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
         when(pythonSandboxTools.executePython(anyString(), anyString(), anyString(), anyString(), any())).thenReturn(okJson("executePython"));
@@ -213,6 +216,7 @@ class ToolRouterRegistryConsistencyTest {
                 new StressTestProperties()
         );
         ReflectionTestUtils.setField(router, "subAgentControlHandler", subAgentControlHandler);
+        ReflectionTestUtils.setField(router, "promoteDatasetTool", new PromoteDatasetTool(new ObjectMapper()));
 
         Map<String, Object> params = toolSpecificParams(toolName);
         return router.invokeWithMeta(toolName, params);
@@ -238,6 +242,15 @@ class ToolRouterRegistryConsistencyTest {
             case "loadToolGuide" -> Map.of("topic", "t");
             case "rereadToolResult" -> Map.of("rawRef", "ref");
             case "listMyData" -> Map.of("query_type", "dataset");
+            case "promoteDatasetToPlatform" -> Map.of(
+                    "dataset_number", 1,
+                    "name", "promote_demo",
+                    "description", "demo dataset promoted from run",
+                    "semantic_refs", "price_daily@1",
+                    "primary_key", "trade_date",
+                    "coverage_scope", "A股股票日线演示",
+                    "coverage_start", "2024-01-01",
+                    "coverage_end", "2024-01-31");
             case "spawnSubAgent" -> Map.of("goal", "check one bounded fact");
             case "waitForSubAgent" -> Map.of("subAgentIds", java.util.List.of("sa_1"));
             default -> Map.of();

@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.promoteDatasetToPlatform",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/coverage_end/description\":\"必填，数据覆盖结束日期，格式 YYYY-MM-DD\",\"/properties/coverage_scope/description\":\"必填，覆盖范围说明，如 \\\"A股股票日线\\\"\",\"/properties/coverage_start/description\":\"必填，数据覆盖起始日期，格式 YYYY-MM-DD\",\"/properties/dataset_number/description\":\"listMyData 返回的 run 级 dataset 编号\",\"/properties/description/description\":\"平台对象描述（必填，非空）\",\"/properties/frequency/description\":\"必填，更新频率：daily（每日更新）或 single_period（一次性单期）\",\"/properties/name/description\":\"平台对象名称\",\"/properties/primary_key/description\":\"必填，逗号分隔的主键列名列表，如 \\\"trade_date,ts_code\\\"\",\"/properties/semantic_refs/description\":\"必填，逗号分隔的语义定义引用列表，每项 name@version，如 \\\"price_daily@1,adj_factor@2\\\"；语义定义必须已在平台登记，否则登记失败\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "5eb1065b5ad0e35db6e8b1cfe426e81aca4028708d98f87fd8a10b48c9269ea4",
+  "source" : {
+    "toolName" : "promoteDatasetToPlatform",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

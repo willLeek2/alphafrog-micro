@@ -6,6 +6,9 @@ import org.mockito.Mockito;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.config.ScheduledTaskRegistrar;
@@ -38,10 +41,16 @@ import static org.mockito.Mockito.when;
 class RunServiceLeaseKeeperTest {
 
     private static final String OWNER = "instance-under-test";
+    private static final String DEPLOYMENT_ID = "beta-test";
+    private static final String GENERATION = "gen-" + "a".repeat(64);
+    private static final ServiceOwnershipScope SCOPE =
+            new ServiceOwnershipScope(DEPLOYMENT_ID, GENERATION, null);
 
     private RunServiceLeaseStore leaseStore;
     private DualPoolRunAdmissionRegistry admissionRegistry;
     private ProcessInstanceIdentity identity;
+    private RunOwnershipGateway ownership;
+    private DualPoolSchedulerSettings settings;
     private RunServiceLeaseKeeper keeper;
     private FrozenEffectiveSettings frozenEffectiveSettings;
 
@@ -51,9 +60,13 @@ class RunServiceLeaseKeeperTest {
         admissionRegistry = Mockito.mock(DualPoolRunAdmissionRegistry.class);
         identity = Mockito.mock(ProcessInstanceIdentity.class);
         Mockito.lenient().when(identity.value()).thenReturn(OWNER);
+        ownership = Mockito.mock(RunOwnershipGateway.class);
+        Mockito.lenient().when(ownership.requireIdentity())
+                .thenReturn(new DeploymentIdentity(DEPLOYMENT_ID, GENERATION));
+        settings = TestSchedulerSettings.propertyOnly();
         frozenEffectiveSettings = new FrozenEffectiveSettings();
-        keeper = new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, 120L, 512, 40_000L,
-                frozenEffectiveSettings);
+        keeper = new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, ownership, settings,
+                120L, 512, 40_000L, frozenEffectiveSettings);
     }
 
     /**
@@ -65,15 +78,15 @@ class RunServiceLeaseKeeperTest {
     void aNormalRoundRenewsEachOwnedLeaseByItsToken() {
         when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
                 .thenReturn(List.of(lease("run-a", 1L), lease("run-b", 2L)));
-        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(2);
-        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
-        when(leaseStore.renew(eq("run-b"), eq(OWNER), eq(2L), any(Duration.class))).thenReturn(true);
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class), eq(SCOPE))).thenReturn(2);
+        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class), eq(SCOPE))).thenReturn(true);
+        when(leaseStore.renew(eq("run-b"), eq(OWNER), eq(2L), any(Duration.class), eq(SCOPE))).thenReturn(true);
 
         assertThat(keeper.renewOwnedOnce()).isEqualTo(2);
 
-        verify(leaseStore).renewOwned(eq(OWNER), any(Duration.class));
-        verify(leaseStore).renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class));
-        verify(leaseStore).renew(eq("run-b"), eq(OWNER), eq(2L), any(Duration.class));
+        verify(leaseStore).renewOwned(eq(OWNER), any(Duration.class), eq(SCOPE));
+        verify(leaseStore).renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class), eq(SCOPE));
+        verify(leaseStore).renew(eq("run-b"), eq(OWNER), eq(2L), any(Duration.class), eq(SCOPE));
         verify(admissionRegistry, never()).revokeOwnership(anyString(), anyLong());
         assertThat(keeper.snapshot())
                 .containsEntry("serviceLeaseOwnedLastRound", 2)
@@ -94,9 +107,9 @@ class RunServiceLeaseKeeperTest {
     void aLeaseThatDoesNotRenewByItsTokenWasTakenOver() {
         when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
                 .thenReturn(List.of(lease("run-mine", 1L), lease("run-taken", 3L)));
-        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(2);
-        when(leaseStore.renew(eq("run-mine"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
-        when(leaseStore.renew(eq("run-taken"), eq(OWNER), eq(3L), any(Duration.class))).thenReturn(false);
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class), eq(SCOPE))).thenReturn(2);
+        when(leaseStore.renew(eq("run-mine"), eq(OWNER), eq(1L), any(Duration.class), eq(SCOPE))).thenReturn(true);
+        when(leaseStore.renew(eq("run-taken"), eq(OWNER), eq(3L), any(Duration.class), eq(SCOPE))).thenReturn(false);
         when(admissionRegistry.revokeOwnership("run-taken", 3L)).thenReturn(true);
 
         assertThat(keeper.renewOwnedOnce()).isEqualTo(1);
@@ -119,8 +132,8 @@ class RunServiceLeaseKeeperTest {
     void aRevocationThatDoesNotMatchTheCurrentTokenLeavesTheNewerLifecycleAlone() {
         when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
                 .thenReturn(List.of(lease("run-back", 9L)));
-        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(0);
-        when(leaseStore.renew(eq("run-back"), eq(OWNER), eq(9L), any(Duration.class))).thenReturn(false);
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class), eq(SCOPE))).thenReturn(0);
+        when(leaseStore.renew(eq("run-back"), eq(OWNER), eq(9L), any(Duration.class), eq(SCOPE))).thenReturn(false);
         when(admissionRegistry.revokeOwnership("run-back", 9L)).thenReturn(false);
 
         keeper.renewOwnedOnce();
@@ -138,7 +151,7 @@ class RunServiceLeaseKeeperTest {
 
         assertThat(keeper.renewOwnedOnce()).isZero();
 
-        verify(leaseStore, never()).renewOwned(anyString(), any(Duration.class));
+        verify(leaseStore, never()).renewOwned(anyString(), any(Duration.class), eq(SCOPE));
         assertThat(keeper.snapshot())
                 .containsEntry("serviceLeaseOwnedLastRound", 0)
                 .containsEntry("serviceLeaseRenewRounds", 1L);
@@ -150,8 +163,8 @@ class RunServiceLeaseKeeperTest {
         when(leaseStore.listOwnedWithLiveRun(OWNER, 512))
                 .thenThrow(new IllegalStateException("库读不了"))
                 .thenReturn(List.of(lease("run-a", 1L)));
-        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(1);
-        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class), eq(SCOPE))).thenReturn(1);
+        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class), eq(SCOPE))).thenReturn(true);
 
         assertThat(keeper.safeRenew()).as("读库就失败了：这一轮没有续上任何一条").isZero();
         assertThat(keeper.snapshot())
@@ -174,8 +187,8 @@ class RunServiceLeaseKeeperTest {
             release.await(5, TimeUnit.SECONDS);
             return List.of(lease("run-a", 1L));
         });
-        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class))).thenReturn(1);
-        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class))).thenReturn(true);
+        when(leaseStore.renewOwned(eq(OWNER), any(Duration.class), eq(SCOPE))).thenReturn(1);
+        when(leaseStore.renew(eq("run-a"), eq(OWNER), eq(1L), any(Duration.class), eq(SCOPE))).thenReturn(true);
 
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
@@ -196,7 +209,8 @@ class RunServiceLeaseKeeperTest {
     @Test
     void theOwnedListingIsBounded() {
         RunServiceLeaseKeeper bounded = new RunServiceLeaseKeeper(
-                leaseStore, admissionRegistry, identity, 60L, 7, 20_000L, frozenEffectiveSettings);
+                leaseStore, admissionRegistry, identity, ownership, settings, 60L, 7, 20_000L,
+                frozenEffectiveSettings);
         when(leaseStore.listOwnedWithLiveRun(OWNER, 7)).thenReturn(List.of());
         bounded.renewOwnedOnce();
         verify(leaseStore).listOwnedWithLiveRun(OWNER, 7);
@@ -217,7 +231,7 @@ class RunServiceLeaseKeeperTest {
 
         // 属性值不合法时按 1 处理：登记的也是归一化之后的 1，读数才不会报一个这里根本没采用的数。
         FrozenEffectiveSettings illegal = new FrozenEffectiveSettings();
-        new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, 0L, 0, 0L, illegal);
+        new RunServiceLeaseKeeper(leaseStore, admissionRegistry, identity, ownership, settings, 0L, 0, 0L, illegal);
         assertThat(illegal.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS))
                 .containsEntry("RunServiceLeaseKeeper", 1L);
         assertThat(illegal.inUseBy(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_OWNED_LIMIT))
@@ -236,7 +250,7 @@ class RunServiceLeaseKeeperTest {
     void theScheduledRenewalUsesTheRegisteredInterval() {
         FrozenEffectiveSettings illegal = new FrozenEffectiveSettings();
         RunServiceLeaseKeeper clamped = new RunServiceLeaseKeeper(
-                leaseStore, admissionRegistry, identity, 0L, 0, 0L, illegal);
+                leaseStore, admissionRegistry, identity, ownership, settings, 0L, 0, 0L, illegal);
         ScheduledTaskRegistrar registrar = new ScheduledTaskRegistrar();
         new RunServiceLeaseRenewSchedule(clamped).configureTasks(registrar);
 
@@ -255,6 +269,8 @@ class RunServiceLeaseKeeperTest {
             context.registerBean(RunServiceLeaseStore.class, () -> leaseStore);
             context.registerBean(DualPoolRunAdmissionRegistry.class, () -> admissionRegistry);
             context.registerBean(ProcessInstanceIdentity.class, () -> identity);
+            context.registerBean(RunOwnershipGateway.class, () -> ownership);
+            context.registerBean(DualPoolSchedulerSettings.class, () -> settings);
             context.registerBean(FrozenEffectiveSettings.class, FrozenEffectiveSettings::new);
             context.register(RunServiceLeaseKeeper.class, RunServiceLeaseRenewSchedule.class, SchedulingEnabler.class);
             context.refresh();

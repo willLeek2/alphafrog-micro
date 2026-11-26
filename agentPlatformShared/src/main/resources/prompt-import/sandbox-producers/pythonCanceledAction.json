@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonCanceledAction",
+  "purpose": "pythonCanceledAction",
+  "bodyType": "FIXED",
+  "body": "确认仍需计算后重新提交任务",
+  "variables": [],
+  "utf8Sha256": "da0cec0714e56b5a6f7de14bb15595bde8e182f10dde3bac993258d93b5d4f3a",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

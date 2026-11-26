@@ -14,6 +14,19 @@ public interface ToolOutputRefService {
     PersistentArtifactRegistration registerRawOutput(String runId, String userId, String logicalId,
                                                      String displayName, String content);
 
+    default PersistentArtifactRegistration registerRawPrompt(String logicalId, String displayName,
+            world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content) {
+        return registerRawPrompt(world.willfrog.agent.platform.context.AgentContext.getRunId(),
+                world.willfrog.agent.platform.context.AgentContext.getUserId(), logicalId, displayName, content);
+    }
+
+    default PersistentArtifactRegistration registerRawPrompt(String runId, String userId, String logicalId,
+            String displayName, world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content) {
+        throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "原始工具产物尚未提供正文来源保存");
+    }
+
     PersistentArtifactRegistration rebindFromLocator(String logicalId, String displayName, RawPayloadLocator locator);
 
     RawPayloadLocator locatorFor(String rawRef);

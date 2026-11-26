@@ -1,0 +1,21 @@
+{
+  "fragment": "webSearchProfileLanguage",
+  "purpose": "webSearchProfileLanguage",
+  "bodyType": "TEMPLATE",
+  "body": "使用{{value}}回答",
+  "variables": [
+    {
+      "name": "value",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "aea286379e440351b8c1510dce92c83476aad5fd6889d4a48b29103984cd2269",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "externalInfoService/src/main/java/world/willfrog/externalinfo/search/profile/GlobalUserProfileInjector.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

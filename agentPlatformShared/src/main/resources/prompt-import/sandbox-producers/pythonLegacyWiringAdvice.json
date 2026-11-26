@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonLegacyWiringAdvice",
+  "purpose": "pythonLegacyWiringAdvice",
+  "bodyType": "FIXED",
+  "body": "Python sandbox production wiring incomplete; refuses Legacy create without capacity reservation and operationId. Non-production fixtures must enable the documented Legacy compatibility switches as a group (no global capacity admission / no idempotent recovery).",
+  "variables": [],
+  "utf8Sha256": "f3e769a62880e4d97163b55812d59054f7c21f306dec8519ede9a20089e99297",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

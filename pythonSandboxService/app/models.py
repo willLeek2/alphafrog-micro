@@ -110,6 +110,19 @@ class ExecuteRequest(BaseModel):
     workspace_generation: Optional[str] = Field(
         default=None, description="Workspace generation at acquisition time"
     )
+    # 014-new-03 产物收割请求开关。false/缺省 = 完全不收割（runner 不读
+    # 产物目录、不产生回传字段，行为与今天一致，零开销）；true 时 runner
+    # 在清理 task_workspace 前收割 AF_TASK_ARTIFACT_DIR 顶层常规文件，
+    # gzip+base64 后随结果响应回传（collected_artifacts/skipped_artifacts）。
+    collect_artifacts: bool = Field(
+        default=False,
+        description="Harvest AF_TASK_ARTIFACT_DIR top-level files into the task result",
+    )
+    collect_artifact_max_bytes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Per-file raw byte cap for harvested artifacts (required when collect_artifacts is true)",
+    )
 
     @model_validator(mode="after")
     def validate_idempotency_identity(self) -> "ExecuteRequest":
@@ -189,6 +202,14 @@ class ExecuteRequest(BaseModel):
                 value = getattr(self, csv_field)
                 if value is not None and "\n" not in value.strip():
                     setattr(self, csv_field, None)
+        # 014-new-03: 开启收割时必须显式携带单文件字节上限。fail-closed
+        # （出问题就拒绝继续）：无上限收割可能把超大文件塞进结果响应，
+        # 撑爆 HTTP 响应体和网关→Java 的 Dubbo 报文，宁可在创建入口报
+        # 参数错误也不让运行期爆。
+        if self.collect_artifacts and self.collect_artifact_max_bytes is None:
+            raise ValueError(
+                "collect_artifact_max_bytes is required when collect_artifacts is true"
+            )
         return self
 
 
@@ -274,6 +295,38 @@ class ExecutionEnvironment(BaseModel):
     )
 
 
+class CollectedArtifact(BaseModel):
+    """014-new-03: 收割成功的单个产物文件（容器内 AF_TASK_ARTIFACT_DIR 顶层常规文件）。"""
+
+    filename: str = Field(
+        ..., description="Top-level file name under AF_TASK_ARTIFACT_DIR"
+    )
+    sha256: str = Field(
+        ..., description="SHA-256 hex digest of the RAW file bytes (pre-gzip)"
+    )
+    size_bytes: int = Field(
+        ..., description="Raw file size in bytes (pre-gzip)"
+    )
+    gzip_data: str = Field(
+        ...,
+        description="gzip-compressed raw file bytes, then base64-encoded",
+    )
+
+
+class SkippedArtifact(BaseModel):
+    """014-new-03: 未收割的产物目录顶层条目及稳定原因。"""
+
+    filename: str = Field(
+        ..., description="Top-level entry name under AF_TASK_ARTIFACT_DIR"
+    )
+    reason: str = Field(
+        ...,
+        description=(
+            "subdirectory_ignored / not_regular_file / exceeds_max_bytes / read_failed"
+        ),
+    )
+
+
 class ExecuteResult(BaseModel):
     exit_code: int
     stdout: str
@@ -287,6 +340,12 @@ class ExecuteResult(BaseModel):
     # but complete batch). Same convention applies to execution_environment.
     finance_record_channel: Optional[FinanceRecordChannel] = None
     execution_environment: Optional[ExecutionEnvironment] = None
+    # 014-new-03 产物收割回传。Presence-aware（同上）：None = 本次任务没有
+    # 运行收割（请求未开启 / 任务失败、取消或超时 / 收割整体异常）；
+    # 非 None（包括空列表）= 收割已运行。runner 侧只在收割实际发生时
+    # 填充，缺省请求零开销。
+    collected_artifacts: Optional[List[CollectedArtifact]] = None
+    skipped_artifacts: Optional[List[SkippedArtifact]] = None
 
 
 # === work-package-C (ccqwen) ===

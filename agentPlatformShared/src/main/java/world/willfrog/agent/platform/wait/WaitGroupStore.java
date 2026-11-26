@@ -164,6 +164,12 @@ public interface WaitGroupStore {
     }
 
     /** 成员还在执行中时推后它的下次查询时间并累加轮询次数；已经落终态的成员不会被改。 */
+    /** 保存同一外部终态已确认的发送阻止与清理事实，保留成员当前状态。 */
+    default boolean recordMemberTerminalBlock(long groupId, String memberIdentity, String operationId,
+                                              String expectedProofJson, String blockedProofJson) {
+        throw new UnsupportedOperationException("member terminal block persistence is not implemented");
+    }
+
     boolean rescheduleMember(long groupId, String memberIdentity, OffsetDateTime nextPollAt, int maxBackoffStep);
 
     /**

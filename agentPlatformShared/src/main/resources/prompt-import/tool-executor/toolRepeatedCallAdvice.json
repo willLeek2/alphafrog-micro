@@ -1,0 +1,27 @@
+{
+  "fragment": "toolRepeatedCallAdvice",
+  "purpose": "toolRepeatedCallAdvice",
+  "bodyType": "TEMPLATE",
+  "body": "Do not call {{toolName}} again with identical arguments. Use the previous tool result, change arguments, or summarize/fail. repeat_count={{count}}",
+  "variables": [
+    {
+      "name": "toolName",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "count",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "600c30af2e42707b00160f322e2f39b02bc010bb417798bf612935ccb5c30cfe",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tools/LangchainRepeatedToolCallGuard.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

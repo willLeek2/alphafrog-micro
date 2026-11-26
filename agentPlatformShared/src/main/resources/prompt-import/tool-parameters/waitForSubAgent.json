@@ -1,0 +1,14 @@
+{
+  "fragment" : "tool.parameters.waitForSubAgent",
+  "purpose" : "TOOL_PARAMETER_DESCRIPTIONS",
+  "bodyType" : "FIXED",
+  "body" : "{\"/properties/subAgentIds/description\":\"One or more ids returned by spawnSubAgent.\",\"/properties/timeoutMillis/description\":\"Optional wait duration in milliseconds; the server applies a bounded maximum.\"}",
+  "variables" : [ ],
+  "utf8Sha256" : "3913269d1c971d86b6877a46178b968983c25762a88e78822ee21191ba7086e2",
+  "source" : {
+    "toolName" : "waitForSubAgent",
+    "repository" : "alphafrog-micro",
+    "kind" : "JAVA_SCHEMA_DESCRIPTIONS"
+  },
+  "importOnly" : true
+}

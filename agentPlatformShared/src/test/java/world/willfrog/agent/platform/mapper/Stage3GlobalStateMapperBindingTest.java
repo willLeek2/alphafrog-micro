@@ -249,6 +249,7 @@ class Stage3GlobalStateMapperBindingTest {
                 .contains("ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id");
     }
 
+
     @Test
     void deferReasonLiteralsExistInTheJavaEnum() {
         String sql = sql("RunCoordinationMapper", "deferFor");
@@ -303,9 +304,13 @@ class Stage3GlobalStateMapperBindingTest {
     // ===== 工具 =====
 
     private String sql(String mapperName, String id) {
+        return sql(mapperName, id, dummyParams(id, paramsByMapper.get(mapperName)));
+    }
+
+    private String sql(String mapperName, String id, Map<String, Object> params) {
         MappedStatement ms = configurations.get(mapperName)
                 .getMappedStatement("world.willfrog.agent.platform.mapper." + mapperName + "." + id);
-        return ms.getSqlSource().getBoundSql(dummyParams(id, paramsByMapper.get(mapperName)))
+        return ms.getSqlSource().getBoundSql(params)
                 .getSql().replaceAll("\\s+", " ").trim();
     }
 
@@ -330,6 +335,9 @@ class Stage3GlobalStateMapperBindingTest {
         return switch (name) {
             case "runId" -> "run-1";
             case "schedulerVersion" -> "DUAL_POOL_V2";
+            case "deploymentId" -> "stable";
+            case "deploymentGenerationId" -> "gen-1";
+            case "laneTag" -> null;
             case "scopeKey" -> "GLOBAL";
             case "deferReason" -> RunCoordinationDeferReason.PER_ROUND_NEW_NODE_LIMIT.name();
             case "nextVisibleAt" -> java.time.OffsetDateTime.now();

@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import world.willfrog.agent.platform.PlatformModuleMarker;
 import world.willfrog.agent.platform.capacity.SchedulerBackpressureProbe;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
@@ -17,6 +18,7 @@ import world.willfrog.agentlangchain.control.dualpool.DualPoolRecoveryDispatcher
 import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.FrozenEffectiveSettings;
 import world.willfrog.agentlangchain.tooljob.WaitMemberResultReceiver;
+import world.willfrog.agentlangchain.workspace.PythonWorkspaceRetentionCoordinator;
 
 import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
@@ -37,6 +39,8 @@ public class AgentLangchainHealthController {
     private final DualPoolSchedulerSettings schedulerSettings;
     private final FrozenEffectiveSettings frozenEffectiveSettings;
     private final WaitMemberResultReceiver waitMemberResultReceiver;
+    private final PythonWorkspaceRetentionCoordinator retentionCoordinator;
+    private final AgentRunEventService runEventService;
 
     @Value("${agent.langchain.service.version:UNKNOWN}")
     private String serviceVersion;
@@ -75,6 +79,38 @@ public class AgentLangchainHealthController {
         dualPool.put("settingsSampledAt", OffsetDateTime.now().toString());
         snapshot.put("dualPool", dualPool);
         return snapshot;
+    }
+
+    /**
+     * 沙箱治理参数的生效值读数：工作区保留时长、中断 Run 存活期、清理扫描周期，以及清理扫描
+     * 实际在跑的两个生效条件。对齐 {@link #scheduler()} 的「值 + 来源 + 改了要不要重启」读法，
+     * 但各值从各自的持有方现算，不复用双池的 {@link DualPoolSchedulerSettings}（那一份绑死双池键名）。
+     */
+    @GetMapping("/sandbox-governance")
+    public Map<String, Object> sandboxGovernance() {
+        Map<String, Object> body = new LinkedHashMap<>();
+        // ②工作区保留时长：协调器删盘判定前每轮重读热配置，这份读数就是下一轮判定会用的值；
+        // 被下限钳过时原始配置值一并带出。
+        body.put("retentionHours", retentionCoordinator.retentionHoursWithSource());
+        // ③中断 Run 存活期：热配置 → 环境属性 → 代码默认三层解析，与各 TTL 写入点同一口径。
+        body.put("interruptedTtlDays", runEventService.interruptedTtlDaysWithSource());
+        // ④清理扫描周期：@Scheduled 启动时读一次定死，改后需重启，读数报的是启动时定下的值。
+        Map<String, Object> cleanupScanMs = new LinkedHashMap<>();
+        cleanupScanMs.put("value", retentionCoordinator.cleanupScanMs());
+        cleanupScanMs.put("restartRequired", true);
+        cleanupScanMs.put("source", "property");
+        body.put("cleanupScanMs", cleanupScanMs);
+        // 清理扫描实际在跑的两个生效条件，与协调器 scan() 开头的判断同一处：清理端口组件在位
+        // （网关接口未升级时为空）+ 热配置已同步权威。两者合取才是扫描实际在跑。
+        body.put("retentionPortPresent", retentionCoordinator.retentionPortPresent());
+        body.put("hotConfigIsAuthoritative", retentionCoordinator.hotConfigIsAuthoritative());
+        // ①排队期限固化在 pythonSandbox 进程内（启动时读一次环境变量），本端点不跨服务聚合；
+        // 生效值从 pythonSandbox 的 /health 读。
+        Map<String, Object> queueWaitTimeoutSeconds = new LinkedHashMap<>();
+        queueWaitTimeoutSeconds.put("readFrom", "pythonSandbox /health");
+        body.put("queueWaitTimeoutSeconds", queueWaitTimeoutSeconds);
+        body.put("sampledAt", OffsetDateTime.now().toString());
+        return body;
     }
 
     @GetMapping("/tool-throttle")

@@ -236,6 +236,31 @@
     </select>
 
     <!--
+      这一轮可以被协调的 Run，限定在本进程所属的部署身份与泳道。
+      到期条件、存活状态与排序与 scanDue 相同；泳道标记为空时只取主表上 lane_tag 为空的行。
+    -->
+    <select id="scanDueForDeployment" resultMap="RunCoordinationResultMap">
+        SELECT <include refid="coordinationColumns"/>
+        FROM alphafrog_agent_run_coordination c
+        JOIN alphafrog_agent_run r ON r.id = c.run_id
+        WHERE c.next_visible_at &lt;= CURRENT_TIMESTAMP
+          AND r.status IN (<include refid="liveRunStatuses"/>)
+          AND r.deployment_id = #{deploymentId}
+          AND r.deployment_generation_id = #{deploymentGenerationId}
+          AND
+          <choose>
+            <when test="laneTag == null">
+              r.lane_tag IS NULL
+            </when>
+            <otherwise>
+              r.lane_tag = #{laneTag}
+            </otherwise>
+          </choose>
+        ORDER BY c.coordination_served_round, c.next_visible_at, c.run_id
+        LIMIT #{limit}
+    </select>
+
+    <!--
       一轮结束时，给「这一轮确实站着排队却没轮到」的记录各加一轮。
 
       口径是每轮加一，不按全局轮次差补算。差值法会把「没在竞争的那段时间」也算成没被服务：

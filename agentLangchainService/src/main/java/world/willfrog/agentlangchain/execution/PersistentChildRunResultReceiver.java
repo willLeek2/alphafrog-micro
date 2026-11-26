@@ -1,9 +1,13 @@
 package world.willfrog.agentlangchain.execution;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
@@ -18,6 +22,7 @@ import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.agentlangchain.tooljob.ToolResultRecordedEventPublisher;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.OffsetDateTime;
@@ -38,22 +43,32 @@ public class PersistentChildRunResultReceiver {
     private final AgentRunMapper runs;
     private final RunOwnershipGateway ownership;
     private final ObjectMapper json;
+    private final ToolResultRecordedEventPublisher resultEventPublisher;
     private final int batchSize;
     private final int maxResultChars;
     private long spawnScanCursor;
 
+    public PersistentChildRunResultReceiver(WaitGroupStore waitGroups, ChildRunIntentStore intents,
+                                            AgentRunMapper runs, RunOwnershipGateway ownership,
+                                            ObjectMapper json, int batchSize, int maxResultChars) {
+        this(waitGroups, intents, runs, ownership, json, batchSize, maxResultChars, null);
+    }
+
+    @Autowired
     public PersistentChildRunResultReceiver(WaitGroupStore waitGroups,
                                             ChildRunIntentStore intents,
                                             AgentRunMapper runs,
                                             RunOwnershipGateway ownership,
                                             ObjectMapper json,
                                             @Value("${agent.langchain.child-run.result-batch-size:64}") int batchSize,
-                                            @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}") int maxResultChars) {
+                                            @Value("${agent.langchain.dual-pool.wait-group.max-member-result-chars:1048576}") int maxResultChars,
+                                            ToolResultRecordedEventPublisher resultEventPublisher) {
         this.waitGroups = waitGroups;
         this.intents = intents;
         this.runs = runs;
         this.ownership = ownership;
         this.json = json;
+        this.resultEventPublisher = resultEventPublisher;
         this.batchSize = Math.max(1, Math.min(batchSize, 256));
         this.maxResultChars = Math.max(1024, maxResultChars);
     }
@@ -201,6 +216,15 @@ public class PersistentChildRunResultReceiver {
                 results.add(Map.of("subAgentId", childId,
                         "status", expired ? "WAIT_TIMEOUT" : "ACCEPTED"));
             } else if (terminal(child.getStatus())) {
+                Map<?, ?> metadata = childFailureMetadata(child);
+                var blocked = ModelSendBlocks.fromFailureMetadata(metadata);
+                if (blocked.isPresent()) {
+                    Map<String, Object> extra = new LinkedHashMap<>(ModelSendBlocks.failureMetadata(blocked.get()));
+                    extra.put("errorCode", blocked.get().code());
+                    extra.put("errorDetail", blocked.get().reason());
+                    finishWithMetadata(member, proof, false, "", extra);
+                    return;
+                }
                 Map<String, Object> state = new LinkedHashMap<>();
                 state.put("subAgentId", childId);
                 state.put("status", childStatus(child.getStatus()));
@@ -223,21 +247,46 @@ public class PersistentChildRunResultReceiver {
 
     private void finish(WaitMember member, JsonNode proof, boolean success,
                         String output, String errorCode) {
-        String payload = WaitMemberResultPayload.encode(json, member.getToolName(), member.getToolCallId(),
-                success, output, errorCode == null ? Map.of() : Map.of("errorCode", errorCode), maxResultChars);
+        finishWithMetadata(member, proof, success, output, errorCode == null ? Map.of() : Map.of("errorCode", errorCode));
+    }
+
+    private void finishWithMetadata(WaitMember member, JsonNode proof, boolean success,
+                        String output, Map<String, Object> extra) {
+        // 此处只组合持久子运行的状态、模型回答和诊断事实。
+        String payload = WaitMemberResultPayload.encodePrompt(json, member.getToolName(), member.getToolCallId(),
+                success, PromptText.runtimeData(output), extra, maxResultChars);
         MemberCompletionResult completed = waitGroups.completeMember(new MemberCompletionRequest(
                 member.getGroupId(), member.getMemberIdentity(),
-                success ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
+                WaitMemberResultPayload.succeeded(payload, json) ? WaitMemberState.SUCCEEDED : WaitMemberState.FAILED,
                 payload, member.getExternalOperationId(),
                 proof.path("planGeneration").asInt(-1),
                 proof.path("contextVersion").asLong(-1L),
                 proof.path("runControlVersion").asLong(-1L)));
+        if (completed.applied()) {
+            publishRecordedResult(member);
+        }
         if (!completed.applied() && !member.terminal()) {
             waitGroups.reportLateMember(new LateMemberRequest(member.getGroupId(),
                     member.getMemberIdentity(), payload, member.getExternalOperationId(),
                     proof.path("runControlVersion").asLong(-1L)));
         }
         // The durable recovery notification is picked up by DualPoolRecoveryDispatcher.
+    }
+
+    private void publishRecordedResult(WaitMember member) {
+        if (resultEventPublisher == null) {
+            return;
+        }
+        try {
+            AgentRun parent = runs.findById(member.getRunId());
+            if (parent != null) {
+                resultEventPublisher.publishMemberAfterCommit(parent.getId(), parent.getUserId(),
+                        member.getGroupId(), member.getMemberIdentity());
+            }
+        } catch (Exception failure) {
+            log.warn("子工具成员结果已保存但展示通知未保存: runId={} memberId={} exception={}",
+                    member.getRunId(), member.getId(), failure.getClass().getSimpleName());
+        }
     }
 
     private void later(WaitMember member) {
@@ -272,6 +321,17 @@ public class PersistentChildRunResultReceiver {
         } catch (Exception failure) {
             throw new IllegalStateException("child tool response could not be serialized", failure);
         }
+    }
+
+    private Map<?, ?> childFailureMetadata(AgentRun child) {
+        JsonNode snapshot;
+        try {
+            snapshot = json.readTree(child.getSnapshotJson());
+        } catch (Exception malformed) {
+            return Map.of();
+        }
+        JsonNode metadata = snapshot == null ? null : snapshot.get("failure_metadata");
+        return metadata != null && metadata.isObject() ? json.convertValue(metadata, Map.class) : Map.of();
     }
 
     private String answer(AgentRun child) {

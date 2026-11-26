@@ -130,6 +130,9 @@ class MarketDataRpcConfigurationTest {
     @Configuration(proxyBeanMethods = false)
     @EnableDubbo
     static class TestConfiguration {
+        @Bean MarketDataPromptPolicy promptPolicy() {
+            return new MarketDataPromptPolicy(world.willfrog.agent.tools.support.ToolPromptTestFixture.reader());
+        }
         @Bean
         ReferenceBean<DomesticIndexService> ordinaryIndexService() {
             return new ReferenceBeanBuilder().setInterface(DomesticIndexService.class).build();

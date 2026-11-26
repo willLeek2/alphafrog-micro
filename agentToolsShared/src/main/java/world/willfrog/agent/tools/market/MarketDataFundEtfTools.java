@@ -1,5 +1,8 @@
 package world.willfrog.agent.tools.market;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -49,14 +52,18 @@ final class MarketDataFundEtfTools {
     }
 
     String getOffExchangeAssetDaily(String tsCode, String startDate, String endDate, String includeDataset) {
+        return getOffExchangeAssetDailyPrompt(tsCode, startDate, endDate, includeDataset).text();
+    }
+
+    PromptText getOffExchangeAssetDailyPrompt(String tsCode, String startDate, String endDate, String includeDataset) {
         String normalizedTsCode = support.nvl(tsCode).trim();
         String normalizedStart = support.compactDate(startDate);
         String normalizedEnd = support.compactDate(endDate);
         long startMs = support.convertToMsTimestamp(normalizedStart);
         long endMs = support.convertToMsTimestamp(normalizedEnd);
         if (normalizedTsCode.isBlank() || startMs <= 0 || endMs <= 0) {
-            return support.fail("getOffExchangeAssetDaily", "INVALID_ARGUMENT",
-                    "Invalid tsCode or date range, use YYYYMMDD",
+            return support.failPrompt("getOffExchangeAssetDaily", "INVALID_ARGUMENT",
+                    support.policy("marketAssetDateFormatAdvice"),
                     Map.of("ts_code", normalizedTsCode, "start_date", normalizedStart, "end_date", normalizedEnd));
         }
         // 指标库扩充：整段净值序列数据集做成传参才走——不传/false 保持 20 行轻量预览（与现状一致）
@@ -67,8 +74,8 @@ final class MarketDataFundEtfTools {
         } else if ("true".equals(flag)) {
             datasetMode = true;
         } else {
-            return support.fail("getOffExchangeAssetDaily", "INVALID_ARGUMENT",
-                    "includeDataset 只接受 true/false：true 时把整段净值序列写入数据集并返回 dataset_id；不传或 false 保持 20 行预览。",
+            return support.failPrompt("getOffExchangeAssetDaily", "INVALID_ARGUMENT",
+                    support.policy("marketOffExchangeDatasetAdvice"),
                     Map.of("includeDataset", support.nvl(includeDataset)));
         }
         try {
@@ -80,7 +87,7 @@ final class MarketDataFundEtfTools {
                                     .setEndDateTimestamp(endMs)
                                     .build());
             if (response.getItemsCount() <= 0) {
-                return support.fail("getOffExchangeAssetDaily", "NO_DATA", "No fund nav data found", Map.of(
+                return support.failPrompt("getOffExchangeAssetDaily", "NO_DATA", "No fund nav data found", Map.of(
                         "ts_code", normalizedTsCode, "start_date", normalizedStart, "end_date", normalizedEnd));
             }
             if (datasetMode && datasetWriter.isEnabled()) {
@@ -106,9 +113,10 @@ final class MarketDataFundEtfTools {
             if (datasetMode) {
                 data.put("dataset_note", "includeDataset=true 但数据集写入未启用，返回轻量预览");
             }
-            return support.ok("getOffExchangeAssetDaily", data);
+            return support.okPrompt("getOffExchangeAssetDaily", data);
         } catch (Exception e) {
-            return support.fail("getOffExchangeAssetDaily", "TOOL_ERROR", "Error fetching fund nav data",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return support.failPrompt("getOffExchangeAssetDaily", "TOOL_ERROR", "Error fetching fund nav data",
                     Map.of("message", support.nvl(e.getMessage())));
         }
     }
@@ -119,7 +127,7 @@ final class MarketDataFundEtfTools {
      * <p>累计净值区间收益类方法需要整段序列，20 行预览不够；此路径仅在
      * includeDataset=true 且数据集启用时进入，默认查询路径不受影响。</p>
      */
-    private String offExchangeNavDatasetResponse(DomesticFundNavsByTsCodeAndDateRangeResponse response,
+    private PromptText offExchangeNavDatasetResponse(DomesticFundNavsByTsCodeAndDateRangeResponse response,
                                                  String tsCode,
                                                  String start,
                                                  String end) {
@@ -131,7 +139,7 @@ final class MarketDataFundEtfTools {
                 // 否则下游按「首行到末行」算区间收益会把长窗口当成请求窗口。
                 String metaStart = reused.get().getStartDate();
                 String metaEnd = reused.get().getEndDate();
-                return support.ok("getOffExchangeAssetDaily", fundNavDatasetData(
+                return support.okPrompt("getOffExchangeAssetDaily", fundNavDatasetData(
                         tsCode,
                         metaStart == null || metaStart.isBlank() ? start : metaStart,
                         metaEnd == null || metaEnd.isBlank() ? end : metaEnd,
@@ -151,7 +159,7 @@ final class MarketDataFundEtfTools {
             datasetRegistry.registerDataset("fund_nav", tsCode, start, end,
                     FUND_NAV_DATASET_HEADERS, datasetId, response.getItemsCount());
         }
-        return support.ok("getOffExchangeAssetDaily", fundNavDatasetData(
+        return support.okPrompt("getOffExchangeAssetDaily", fundNavDatasetData(
                 tsCode, start, end, datasetId, response.getItemsCount(), "created", false));
     }
 
@@ -177,8 +185,12 @@ final class MarketDataFundEtfTools {
     }
 
     String getEtfAdj(String tsCode, String startDate, String endDate) {
+        return getEtfAdjPrompt(tsCode, startDate, endDate).text();
+    }
+
+    PromptText getEtfAdjPrompt(String tsCode, String startDate, String endDate) {
         if (!support.isAdjFactorEnabled()) {
-            return support.fail("getEtfAdj", "CAPABILITY_DISABLED",
+            return support.failPrompt("getEtfAdj", "CAPABILITY_DISABLED",
                     "ETF adj factor is disabled (adjFactorEnabled=false)", Map.of("adjFactorEnabled", false));
         }
         String normalizedTsCode = support.nvl(tsCode).trim();
@@ -187,7 +199,7 @@ final class MarketDataFundEtfTools {
         long startMs = support.convertToMsTimestamp(normalizedStart);
         long endMs = support.convertToMsTimestamp(normalizedEnd);
         if (normalizedTsCode.isBlank() || startMs <= 0 || endMs <= 0) {
-            return support.fail("getEtfAdj", "INVALID_ARGUMENT", "Invalid tsCode or date range, use YYYYMMDD",
+            return support.failPrompt("getEtfAdj", "INVALID_ARGUMENT", support.policy("marketAssetDateFormatAdvice"),
                     Map.of("ts_code", normalizedTsCode, "start_date", normalizedStart, "end_date", normalizedEnd));
         }
         try {
@@ -198,7 +210,7 @@ final class MarketDataFundEtfTools {
                             .setEndDate(endMs)
                             .build());
             if (response.getItemsCount() <= 0) {
-                return support.fail("getEtfAdj", "NO_DATA", "No ETF adj factor data found", Map.of(
+                return support.failPrompt("getEtfAdj", "NO_DATA", "No ETF adj factor data found", Map.of(
                         "ts_code", normalizedTsCode, "start_date", normalizedStart, "end_date", normalizedEnd));
             }
             List<Map<String, Object>> previewRows = new ArrayList<>();
@@ -215,14 +227,19 @@ final class MarketDataFundEtfTools {
             data.put("asset_type", "etf");
             data.put("rows", response.getItemsCount());
             data.put("preview_rows", previewRows);
-            return support.ok("getEtfAdj", data);
+            return support.okPrompt("getEtfAdj", data);
         } catch (Exception e) {
-            return support.fail("getEtfAdj", "TOOL_ERROR", "Error fetching ETF adj factors",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return support.failPrompt("getEtfAdj", "TOOL_ERROR", "Error fetching ETF adj factors",
                     Map.of("message", support.nvl(e.getMessage())));
         }
     }
 
     String getListedAssetShareSize(String tsCode, String startDate, String endDate, String exchange) {
+        return getListedAssetShareSizePrompt(tsCode, startDate, endDate, exchange).text();
+    }
+
+    PromptText getListedAssetShareSizePrompt(String tsCode, String startDate, String endDate, String exchange) {
         String normalizedTsCode = support.nvl(tsCode).trim();
         String normalizedStart = support.compactDate(startDate);
         String normalizedEnd = support.compactDate(endDate);
@@ -230,13 +247,13 @@ final class MarketDataFundEtfTools {
         long startMs = support.convertToMsTimestamp(normalizedStart);
         long endMs = support.convertToMsTimestamp(normalizedEnd);
         if (normalizedTsCode.isBlank() || startMs <= 0 || endMs <= 0) {
-            return support.fail("getListedAssetShareSize", "INVALID_ARGUMENT",
-                    "Invalid tsCode or date range, use YYYYMMDD",
+            return support.failPrompt("getListedAssetShareSize", "INVALID_ARGUMENT",
+                    support.policy("marketAssetDateFormatAdvice"),
                     Map.of("ts_code", normalizedTsCode, "start_date", normalizedStart, "end_date", normalizedEnd));
         }
         if (!normalizedExchange.isBlank() && !Set.of("SSE", "SZSE", "BSE").contains(normalizedExchange)) {
-            return support.fail("getListedAssetShareSize", "INVALID_ARGUMENT",
-                    "exchange must be SSE, SZSE, or BSE", Map.of("exchange", support.nvl(exchange)));
+            return support.failPrompt("getListedAssetShareSize", "INVALID_ARGUMENT",
+                    support.policy("marketExchangeAdvice"), Map.of("exchange", support.nvl(exchange)));
         }
         try {
             DomesticEtfShareSizesByTsCodeAndDateRangeResponse response =
@@ -253,7 +270,7 @@ final class MarketDataFundEtfTools {
                         .toList();
             }
             if (items.isEmpty()) {
-                return support.fail("getListedAssetShareSize", "NO_DATA", "No ETF share size data found", Map.of(
+                return support.failPrompt("getListedAssetShareSize", "NO_DATA", "No ETF share size data found", Map.of(
                         "ts_code", normalizedTsCode, "start_date", normalizedStart,
                         "end_date", normalizedEnd, "exchange", normalizedExchange));
             }
@@ -276,9 +293,10 @@ final class MarketDataFundEtfTools {
             }
             data.put("rows", items.size());
             data.put("preview_rows", previewRows);
-            return support.ok("getListedAssetShareSize", data);
+            return support.okPrompt("getListedAssetShareSize", data);
         } catch (Exception e) {
-            return support.fail("getListedAssetShareSize", "TOOL_ERROR", "Error fetching ETF share size",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return support.failPrompt("getListedAssetShareSize", "TOOL_ERROR", "Error fetching ETF share size",
                     Map.of("message", support.nvl(e.getMessage())));
         }
     }

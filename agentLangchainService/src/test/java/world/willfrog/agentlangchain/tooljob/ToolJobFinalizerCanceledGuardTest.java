@@ -57,11 +57,11 @@ class ToolJobFinalizerCanceledGuardTest {
         canceledRun.setStatus(AgentRunStatus.CANCELED);
         when(runMapper.findById("run-1")).thenReturn(canceledRun);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class),
-                runMapper, finalizationService, null);
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class),
+                runMapper, finalizationService, null));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -95,12 +95,12 @@ class ToolJobFinalizerCanceledGuardTest {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
 
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-2:call-1:1");
@@ -145,12 +145,12 @@ class ToolJobFinalizerCanceledGuardTest {
         doThrow(new RuntimeException("listener unavailable"))
                 .when(finalizationService).publishFinalizedEvent("run-3", "7", "CANCELED");
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();
@@ -180,14 +180,15 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
         when(eventHook.emitTerminalEvent(eq("run-4"), any())).thenReturn(true);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        when(runMapper.findById("run-4")).thenReturn(ToolJobPromptTestFixture.run("run-4"));
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();
@@ -198,7 +199,9 @@ class ToolJobFinalizerCanceledGuardTest {
 
         finalizer.handleTerminal("run-4", anchor, "SUCCEEDED", null, false);
 
-        verifyNoInteractions(runMapper, finalizationService);
+        verify(runMapper).findById("run-4");
+        verifyNoMoreInteractions(runMapper);
+        verifyNoInteractions(finalizationService);
         // 260819：残留清理 CAS 未胜出（mock 默认 false，SQL 栅栏拒绝）时维持既有重试语义，
         // 不清 Redis——唯一重试入口（due）保留。
         verify(anchorService).closeResidualCanceledAnchor("run-4", "run-4:call-1:1");
@@ -220,12 +223,12 @@ class ToolJobFinalizerCanceledGuardTest {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-5:call-1:1");
         anchor.setAutoResume(false);
@@ -254,12 +257,12 @@ class ToolJobFinalizerCanceledGuardTest {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-6:call-1:1");
         anchor.setAutoResume(false);
@@ -293,12 +296,12 @@ class ToolJobFinalizerCanceledGuardTest {
         when(runMapper.findById("run-7")).thenReturn(canceledRun);
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-7:call-1:1");
         anchor.setAutoResume(false);
@@ -324,12 +327,12 @@ class ToolJobFinalizerCanceledGuardTest {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
-                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
-                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null);
+                mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService, null));
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-8:call-1:1");
         anchor.setAutoResume(false);

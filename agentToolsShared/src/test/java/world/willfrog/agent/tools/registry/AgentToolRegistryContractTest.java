@@ -17,10 +17,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AgentToolRegistryContractTest {
 
     @Test
-    void declaredToolNames_hasExactly29UniqueNames() {
+    void declaredToolNames_hasExactly30UniqueNames() {
         Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertEquals(29, names.size(), "生产声明面应保持 29 个工具名");
-        assertEquals(29, names.stream().distinct().count(), "工具名必须唯一");
+        assertEquals(30, names.size(), "生产声明面应保持 30 个工具名");
+        assertEquals(30, names.stream().distinct().count(), "工具名必须唯一");
     }
 
     @Test

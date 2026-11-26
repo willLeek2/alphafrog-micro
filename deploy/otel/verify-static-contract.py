@@ -78,8 +78,8 @@ def verify_compose() -> int:
     require("image: otel/opentelemetry-collector-contrib:0.159.0" in collector, "采集器镜像未固定版本")
     require("${AF_OTEL_VICTORIALOGS_ENDPOINT:-http://victorialogs:9428/insert/opentelemetry}" in collector, "VictoriaLogs 地址不可移植")
     require("AF_OTEL_FILE_STORAGE_DIRECTORY: /var/lib/otelcol" in collector, "采集器持久存储目录没有固定到挂载点")
-    require("./data/logs:/var/log/apps:ro" in collector, "采集器未只读挂载所有应用日志")
-    require("alphafrog_otelcoldata:/var/lib/otelcol" in collector, "采集器读取位置和发送队列没有持久卷")
+    require("${AF_OTEL_APP_LOG_DIR:-./data/logs}:/var/log/apps:ro" in collector, "采集器未只读挂载所有应用日志")
+    require("${AF_OTEL_COLLECTOR_STATE:-alphafrog_otelcoldata}:/var/lib/otelcol" in collector, "采集器读取位置和发送队列没有持久卷")
     require('user: "0:0"' in collector, "采集器没有以容器 root 读取 0700 日志目录")
     checks += 6
 

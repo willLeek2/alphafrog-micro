@@ -26,6 +26,9 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
 class LangchainLinearWorkflowExecutorTest {
 
+    @org.junit.jupiter.api.AfterEach
+    void clearContext() { AgentContext.clear(); }
+
     @Test
     void executePlanned_shouldRunPlanTodosAndFinalAnswerInOrder() {
         QueueChatModel model = new QueueChatModel(
@@ -34,7 +37,7 @@ class LangchainLinearWorkflowExecutorTest {
                 "final answer"
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.todoNodeExecutor(),
+                LangchainTestFixtures.versionedTodoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentRunEventService.class)
         );
@@ -50,7 +53,9 @@ class LangchainLinearWorkflowExecutorTest {
                         .runId("run-linear-1")
                         .userId("user-1")
                         .userGoal("分析沪深300")
-                        .model(model)
+                        .model(LangchainTestFixtures.archivedNodeModel(model))
+                        .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                        .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                         .maxTodos(5)
                         .build(),
                 plan);
@@ -75,7 +80,7 @@ class LangchainLinearWorkflowExecutorTest {
                 "   "   // 第二次：recovery 也返回空 → empty_todo_output_after_recovery
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.todoNodeExecutor(),
+                LangchainTestFixtures.versionedTodoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentRunEventService.class)
         );
@@ -86,8 +91,11 @@ class LangchainLinearWorkflowExecutorTest {
 
         LangchainWorkflowResult result = executor.executePlanned(
                 LangchainWorkflowRequest.builder()
+                        .runId("run-empty")
                         .userGoal("分析")
-                        .model(model)
+                        .model(LangchainTestFixtures.archivedNodeModel(model))
+                        .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                        .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                         .build(),
                 plan);
 
@@ -104,7 +112,7 @@ class LangchainLinearWorkflowExecutorTest {
                 "final answer"
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.todoNodeExecutor(),
+                LangchainTestFixtures.versionedTodoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentRunEventService.class)
         );
@@ -120,7 +128,9 @@ class LangchainLinearWorkflowExecutorTest {
                         .runId("run-dataset-1")
                         .userId("user-1")
                         .userGoal("计算收益")
-                        .model(model)
+                        .model(LangchainTestFixtures.archivedNodeModel(model))
+                        .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                        .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                         .maxTodos(5)
                         .build(),
                 plan);
@@ -176,12 +186,14 @@ class LangchainLinearWorkflowExecutorTest {
             }
         };
 
-        LangchainTodoNodeResult result = LangchainTestFixtures.todoNodeExecutor().execute(
+        AgentContext.setRunId("run-pending");
+        LangchainTodoNodeResult result = LangchainTestFixtures.versionedTodoNodeExecutor().execute(
                 LangchainWorkflowRequest.builder()
                         .runId("run-pending")
                         .userId("user-1")
                         .userGoal("analyze")
-                        .model(pendingModel)
+                        .model(LangchainTestFixtures.archivedNodeModel(pendingModel))
+                        .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                         .build(),
                 TodoItem.builder().id("todo_2").sequence(2).description("long python").build(),
                 List.of(),

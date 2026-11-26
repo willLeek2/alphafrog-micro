@@ -1,0 +1,14 @@
+{
+  "fragment": "financeSummaryTruncatedAction",
+  "purpose": "financeSummaryTruncatedAction",
+  "bodyType": "FIXED",
+  "body": "缩小计算范围或分批执行后重试",
+  "variables": [],
+  "utf8Sha256": "38362e51f256eb79869b8497e0a6ca13532afdd80d5eecaac1125f1e230f620e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/finance/FinanceToolResultFormatter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

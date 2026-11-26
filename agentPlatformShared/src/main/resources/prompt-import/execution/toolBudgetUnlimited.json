@@ -1,0 +1,21 @@
+{
+  "fragment": "toolBudgetUnlimited",
+  "purpose": "toolBudgetUnlimited",
+  "bodyType": "TEMPLATE",
+  "body": "工具调用预算现状：{{scopeNote}}不设工具调用次数上限。",
+  "variables": [
+    {
+      "name": "scopeNote",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "68d75c50a3638cd017eacb62aa8c58e28be2800115c3c9faad4cff2fa3c64422",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/execution/DualPoolWaitGroupNodeExecutor.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

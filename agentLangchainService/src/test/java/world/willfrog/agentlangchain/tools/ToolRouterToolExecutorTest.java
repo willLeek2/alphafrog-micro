@@ -189,7 +189,11 @@ class ToolRouterToolExecutorTest {
         String output = executor.execute(request, null);
 
         // Then
-        assertEquals("API timeout", output);
+        // 普通异常按结构化失败信封返回：码 TOOL_INVOCATION_ERROR、类别上游或系统故障，
+        // 原始异常消息保留在 message（原裸文本预期随信封化按需求变更）。
+        assertTrue(output.contains("\"code\":\"TOOL_INVOCATION_ERROR\""));
+        assertTrue(output.contains("\"category\":\"UPSTREAM_OR_SYSTEM\""));
+        assertTrue(output.contains("API timeout"));
 
         // Verify TOOL_CALL_STARTED still emitted
         verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), any());
@@ -200,7 +204,10 @@ class ToolRouterToolExecutorTest {
         Map<String, Object> finishedPayload = finishedPayloadCaptor.getValue();
         assertEquals("getStockInfo", finishedPayload.get("tool_name"));
         assertEquals(false, finishedPayload.get("success"));
-        assertEquals("API timeout", finishedPayload.get("result_preview"));
+        // result_preview 现在是结构化失败信封（码/类别/原始消息），不再是裸文本。
+        String preview = String.valueOf(finishedPayload.get("result_preview"));
+        assertTrue(preview.contains("TOOL_INVOCATION_ERROR"));
+        assertTrue(preview.contains("API timeout"));
     }
 
     @Test

@@ -11,6 +11,7 @@ import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
@@ -40,6 +41,7 @@ final class ToolCatalogBuilder {
                                                        PythonSandboxTools pythonSandboxTools,
                                                        SqlQueryTools sqlQueryTools,
                                                        ListMyDataTool listMyDataTool,
+                                                       PromoteDatasetTool promoteDatasetTool,
                                                        LoadToolGuideTool loadToolGuideTool,
                                                        RereadToolHandler rereadToolHandler,
                                                        boolean webSearchEnabled,
@@ -51,6 +53,7 @@ final class ToolCatalogBuilder {
         addSpecsIfPresent(specifications, pythonSandboxTools);
         addSpecsIfPresent(specifications, sqlQueryTools);
         addSpecsIfPresent(specifications, listMyDataTool);
+        addSpecsIfPresent(specifications, promoteDatasetTool);
         addSpecsIfPresent(specifications, loadToolGuideTool);
         addSpecsIfPresent(specifications, rereadToolHandler);
 

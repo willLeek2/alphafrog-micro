@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.dataanalysis;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -35,7 +36,7 @@ import static org.mockito.Mockito.when;
 class SqlQueryToolsTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final SqlQueryTools tools = new SqlQueryTools(objectMapper);
+    private final SqlQueryTools tools = configure(new SqlQueryTools(objectMapper));
     private final SqlQueryJobResultAdapter resultAdapter = new SqlQueryJobResultAdapter(objectMapper);
 
     // ---------- 入口参数校验（先于任何上下文访问，纯构造即可测） ----------

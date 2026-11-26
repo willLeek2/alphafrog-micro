@@ -52,12 +52,15 @@ def fail(stage, code, message, **extra):
     sys.exit(0)  # 运行器正常退出；失败语义全在信封里，退出码留给真正的运行器崩溃。
 
 
-def plan_reject(reason_code, message, gate_report):
-    emit({
+def plan_reject(reason_code, message, gate_report, error_facts=None):
+    envelope = {
         "status": "PLAN_REJECTED",
         "error": {"code": reason_code, "message": message},
         "gate": gate_report,
-    })
+    }
+    if error_facts is not None:
+        envelope["error"]["facts"] = error_facts
+    emit(envelope)
     sys.exit(0)
 
 
@@ -289,7 +292,7 @@ def gate(con, sql, tier, spec):
             plan_reject("PLAN_FULL_SCAN",
                         f"查询顶层输出估计 {estimated if estimated is not None else '未知'} 行，"
                         f"超过返回行数上限 {row_cap}，准入拒绝；请加 LIMIT、加过滤条件或改用聚合",
-                        report)
+                        report, error_facts={"estimatedRows": estimated, "rowCap": row_cap})
 
     # 规模规则二：各算子估计行数对照档位上限。估计行数上限与返回行数上限是两个
     # 不同口径：这里管估计处理规模。新渲染的规格永远带 estimated_row_cap（值由

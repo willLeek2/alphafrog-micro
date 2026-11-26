@@ -41,12 +41,12 @@ class ToolJobFinalizerDagCleanupTest {
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
         when(usageHook.upsertUsage(eq("run-dag"), any())).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-dag"), any())).thenReturn(true);
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService,
                 redisCache,
                 mock(DataAnalysisCapacityService.class),
                 resumeService,
-                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = cleanupAnchor();
@@ -81,12 +81,12 @@ class ToolJobFinalizerDagCleanupTest {
         when(anchorService.completeDagCleanupAndClear(
                 "run-dag", "run-dag:call-1:1", "owner-old",
                 ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST)).thenReturn(true);
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService,
                 redisCache,
                 mock(DataAnalysisCapacityService.class),
                 resumeService,
-                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         ToolJobAnchor anchor = cleanupAnchor();
         anchor.setAnchorState("ATTACHED");
         anchor.setTerminalStatus("FAILED");
@@ -120,12 +120,12 @@ class ToolJobFinalizerDagCleanupTest {
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
         when(usageHook.upsertUsage(eq("run-dag"), any())).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-dag"), any())).thenReturn(true);
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService,
                 redisCache,
                 mock(DataAnalysisCapacityService.class),
                 resumeService,
-                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -156,12 +156,12 @@ class ToolJobFinalizerDagCleanupTest {
         when(eventHook.emitTerminalEvent(eq("run-dag"), any())).thenReturn(true);
         ToolJobConfig config = new ToolJobConfig();
         config.setResultFetchMaxAttempts(1);
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService,
                 redisCache,
                 mock(DataAnalysisCapacityService.class),
                 resumeService,
-                config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = cleanupAnchor();

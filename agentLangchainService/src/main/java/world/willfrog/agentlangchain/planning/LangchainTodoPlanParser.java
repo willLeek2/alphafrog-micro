@@ -36,6 +36,13 @@ final class LangchainTodoPlanParser {
                         dependsOn.add(depNode.asText());
                     }
                 }
+                List<String> expectedTools = new ArrayList<>();
+                JsonNode expectedToolsNode = node.path("expectedTools");
+                if (expectedToolsNode.isArray()) {
+                    for (JsonNode toolName : expectedToolsNode) {
+                        expectedTools.add(toolName.asText().trim());
+                    }
+                }
                 String description = nvl(node.path("description").asText(""));
                 if (description.isBlank()) {
                     continue;
@@ -50,6 +57,7 @@ final class LangchainTodoPlanParser {
                         .sequence(sequence)
                         .description(description)
                         .dependsOn(dependsOn)
+                        .expectedTools(expectedTools)
                         .groupKey(nvl(node.path("groupKey").asText("")))
                         .parallelizable(node.path("parallelizable").asBoolean(false))
                         .status(TodoStatus.PENDING)

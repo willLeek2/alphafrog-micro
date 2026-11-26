@@ -1,0 +1,14 @@
+{
+  "fragment": "sqlUnknownTierAdvice",
+  "purpose": "sqlUnknownTierAdvice",
+  "bodyType": "FIXED",
+  "body": "Unknown product_tier; use INTERACTIVE or BACKGROUND",
+  "variables": [],
+  "utf8Sha256": "99973a039d7ff45c747bc06a29e73d23c5b8ea694f0f35e2977f7600e1e0573d",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataanalysis/SqlQueryTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

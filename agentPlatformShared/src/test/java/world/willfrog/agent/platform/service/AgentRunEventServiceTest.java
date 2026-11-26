@@ -8,6 +8,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -17,12 +18,18 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.childrun.ChildRunAcceptanceControls;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
+import world.willfrog.agent.platform.lease.RunServiceLease;
+import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 
+import java.time.Duration;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -38,6 +45,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -46,6 +54,7 @@ class AgentRunEventServiceTest {
 
     private static final String DEPLOYMENT_ID = "stable";
     private static final String DEPLOYMENT_GENERATION_ID = "gen-" + "a".repeat(64);
+    private static final String INSTANCE_OWNER = "test-instance";
 
     @Mock
     private AgentRunMapper runMapper;
@@ -65,6 +74,10 @@ class AgentRunEventServiceTest {
     private AgentPromptService mockPromptService;
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
+    @Mock
+    private RunServiceLeaseStore leaseStore;
+    @Mock
+    private ProcessInstanceIdentity instanceIdentity;
 
     private world.willfrog.agent.platform.coordination.RunCoordinationStore coordinationStore;
     private AgentRunEventService service;
@@ -77,6 +90,10 @@ class AgentRunEventServiceTest {
         org.mockito.Mockito.lenient().when(llmLocalConfigLoader.current()).thenReturn(Optional.empty());
         coordinationStore = org.mockito.Mockito.mock(world.willfrog.agent.platform.coordination.RunCoordinationStore.class);
         org.mockito.Mockito.lenient().when(coordinationStore.ensure(anyString())).thenReturn(true);
+        org.mockito.Mockito.lenient().when(instanceIdentity.value()).thenReturn(INSTANCE_OWNER);
+        org.mockito.Mockito.lenient().when(leaseStore.acquire(anyString(), anyString(), any(Duration.class)))
+                .thenAnswer(invocation -> Optional.of(ownedLease(
+                        invocation.getArgument(0), invocation.getArgument(1))));
         service = new AgentRunEventService(
                 runMapper,
                 eventMapper,
@@ -87,14 +104,19 @@ class AgentRunEventServiceTest {
                 messageService,
                 mockPromptService,
                 transactionManager,
-                coordinationStore
+                coordinationStore,
+                leaseStore,
+                instanceIdentity
         );
-        org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
-                        anyString(), anyString(), any()))
-                .thenReturn(new PromptRunSelection(
-                        PromptRunSelection.SCHEMA_VERSION,
-                        "default-v1", "control", "bundle-digest", "capability-digest",
-                        LocalDate.of(2025, 2, 3)));
+        ReflectionTestUtils.setField(service, "serviceLeaseTtlSeconds", 120L);
+        var experimentPreparation = org.mockito.Mockito.mock(
+                world.willfrog.agent.platform.experiment.ExperimentRunPreparation.class);
+        org.springframework.test.util.ReflectionTestUtils.setField(service,
+                "experimentRunPreparation", experimentPreparation);
+        org.mockito.Mockito.lenient().when(experimentPreparation.freezeContext(anyString()))
+                .thenAnswer(invocation -> objectMapper.valueToTree(java.util.Map.of(
+                        "root", java.util.Map.of("root_id", invocation.getArgument(0)),
+                        "target", java.util.Map.of("target_scope_instance_id", "racing-main"))));
         stubCanonicalEventReadBack(eventMapper);
     }
 
@@ -216,7 +238,9 @@ class AgentRunEventServiceTest {
                 messageService,
                 mockPromptService,
                 transactionManager,
-                coordinationStore
+                coordinationStore,
+                leaseStore,
+                instanceIdentity
         );
         AgentRunEvent pending = new AgentRunEvent();
         pending.setRunId("r1");
@@ -267,6 +291,7 @@ class AgentRunEventServiceTest {
         assertTrue(String.valueOf(envelope.get("payloadJson")).contains("\"ok\":true"));
         assertTrue(String.valueOf(envelope.get("createdAt")).contains("T"));
     }
+
 
     @Test
     void append_shouldNotFailWhenLivePublishFails() {
@@ -460,12 +485,10 @@ class AgentRunEventServiceTest {
         Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
         assertEquals("DAG", ext.get("execution_mode"));
         assertEquals(false, ext.get("generate_artifacts"));
-        Map<?, ?> promptSelection = (Map<?, ?>) ext.get("prompt_selection");
-        assertEquals("default-v1", promptSelection.get("bundle_version"));
-        assertEquals("control", promptSelection.get("variant"));
-        assertEquals("bundle-digest", promptSelection.get("bundle_digest"));
-        assertEquals("capability-digest", promptSelection.get("capability_catalog_digest"));
-        assertEquals("2025-02-03", promptSelection.get("reference_date"));
+        assertFalse(ext.containsKey("prompt_selection"));
+        assertEquals(LocalDate.now().toString(), ext.get("prompt_reference_date"));
+        Map<?, ?> binding = (Map<?, ?>) ext.get("experiment_context");
+        assertEquals(captured.getId(), ((Map<?, ?>) binding.get("root")).get("root_id"));
         Map<?, ?> df = (Map<?, ?>) ext.get("data_freshness");
         assertEquals("2020-01-01", df.get("start_date"));
         assertEquals("2026-06-24", df.get("end_date"));
@@ -600,10 +623,16 @@ class AgentRunEventServiceTest {
         assertEquals(true, ext.get("generate_artifacts"));
     }
 
+
     private AgentRun run(String runId, String userId) {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId(userId);
         return run;
+    }
+
+    private static RunServiceLease ownedLease(String runId, String owner) {
+        OffsetDateTime now = OffsetDateTime.now();
+        return new RunServiceLease(runId, owner, 1L, now, now, now.plusMinutes(2));
     }
 }

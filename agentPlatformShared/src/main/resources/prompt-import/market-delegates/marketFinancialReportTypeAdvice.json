@@ -1,0 +1,21 @@
+{
+  "fragment": "marketFinancialReportTypeAdvice",
+  "purpose": "marketFinancialReportTypeAdvice",
+  "bodyType": "TEMPLATE",
+  "body": "Unknown reportType: {{reportType}}. Must be one of: income, balancesheet, cashflow, express, fina_indicator, report_rc",
+  "variables": [
+    {
+      "name": "reportType",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "caa21f10f0bd8b61626a039408b79db60e027220ba9dad6e9c98d55e154e8de1",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataFinancialTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

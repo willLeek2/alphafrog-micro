@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonStatusFailureAction",
+  "purpose": "pythonStatusFailureAction",
+  "bodyType": "FIXED",
+  "body": "根据错误信息修正代码或输入后重试",
+  "variables": [],
+  "utf8Sha256": "18d1c794d4bea691025a0ede1e9911b8f8ffadcbcd09f496399f192a5c22820e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -1,0 +1,45 @@
+{
+  "fragment": "planningTodosStage",
+  "purpose": "planningTodosStage",
+  "bodyType": "TEMPLATE",
+  "body": "[Stage: PLANNING_TODOS]\n\n统筹规划（来自第一阶段）：\nMode: {{mode}}\nDetail: {{detail}}\n\n{{modeGuidance}}\n\n请将上述统筹规划转化为具体的 Todo List JSON。\n注意：analysis 字段直接复用上面的 Detail 内容。\n\n## 输出格式\n{\"analysis\":\"复用第一阶段的detail\",\"items\":[{\"id\":\"todo_1\",\"sequence\":1,\"description\":\"...\",\"dependsOn\":[],\"expectedTools\":[]}]}\n\n## 字段说明\n- analysis: 直接复制上面的 Detail 内容\n- items: Todo 列表\n  - id: 唯一标识，如 todo_1, todo_2\n  - sequence: 执行顺序\n  - description: 1-3句话描述任务意图，不包含具体工具参数\n  - expectedTools: 可选数组，从本次工具清单填写预计可能使用的工具名；无法确定时为空，不填写工具参数\n  - dependsOn: 依赖的 todoId 列表（DAG模式下可选）\n  - groupKey: 可选，并行分组键\n  - parallelizable: 可选，是否可并行化\n\n## 规则\n1) 只能使用工具: {{toolWhitelist}}\n2) 步骤数尽可能少，上限 {{maxTodos}}，目标是远少于上限\n3) DAG 模式下用 dependsOn 表达依赖关系（而非仅靠 sequence）\n4) expectedTools 只用于分析前检查已知依赖，不指定实际调用顺序，不限制执行模型随后按上下文选择工具\n",
+  "variables": [
+    {
+      "name": "mode",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "detail",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    },
+    {
+      "name": "modeGuidance",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    },
+    {
+      "name": "toolWhitelist",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "maxTodos",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "3e97af4f3bf8d7bda350f4e5c85df4d3d4df1024a39decdf323bcf85e93897f7",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/resources/prompts/todo/planning_todos_stage.txt",
+    "kind": "RESOURCE_INSTRUCTION"
+  },
+  "importOnly": true
+}

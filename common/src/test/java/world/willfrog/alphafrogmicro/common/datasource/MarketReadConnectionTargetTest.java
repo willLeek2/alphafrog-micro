@@ -10,16 +10,16 @@ class MarketReadConnectionTargetTest {
 
     @Test
     void verify_shouldAcceptProductionDatabaseOnRemoteHost() {
-        String url = "jdbc:postgresql://10.0.0.101:5432/alphafrog";
+        String url = "jdbc:postgresql://10.0.0.101:5432/alphafrog-v3";
         MarketReadConnectionTarget.verify(url);
         MarketReadConnectionTarget.Parsed parsed = MarketReadConnectionTarget.parse(url);
         assertEquals("10.0.0.101", parsed.host());
-        assertEquals("alphafrog", parsed.database());
+        assertEquals("alphafrog-v3", parsed.database());
     }
 
     @Test
     void verify_shouldAcceptQueryString() {
-        String url = "jdbc:postgresql://prod-db:5432/alphafrog?sslmode=require";
+        String url = "jdbc:postgresql://prod-db:5432/alphafrog-v3?sslmode=require";
         MarketReadConnectionTarget.verify(url);
         assertEquals("prod-db", MarketReadConnectionTarget.parse(url).host());
     }

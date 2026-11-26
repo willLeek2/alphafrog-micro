@@ -1,0 +1,14 @@
+{
+  "fragment": "promotePrimaryKeyAdvice",
+  "purpose": "promotePrimaryKeyAdvice",
+  "bodyType": "FIXED",
+  "body": "primary_key must be a non-empty comma-separated column name list, e.g. trade_date,ts_code",
+  "variables": [],
+  "utf8Sha256": "bdd6a865d7d6b62bb8f083bdc7875d92beb283ed9ab6db0383a75cd562c69e10",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataset/PromoteDatasetTool.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

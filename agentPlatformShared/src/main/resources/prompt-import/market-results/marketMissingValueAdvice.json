@@ -1,0 +1,14 @@
+{
+  "fragment": "marketMissingValueAdvice",
+  "purpose": "marketMissingValueAdvice",
+  "bodyType": "FIXED",
+  "body": "本次工具调用落盘的数据存在部分字段缺失；Python 分析时请按缺失值处理，不要把空值当成 0。",
+  "variables": [],
+  "utf8Sha256": "2d1379d3e4d8da47e865e732ba79b49e26d4c6cdc967d3af7f24c860738a499b",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

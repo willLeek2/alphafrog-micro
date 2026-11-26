@@ -14,6 +14,15 @@ spring:
   autoconfigure:
     exclude: []
 
+alphafrog:
+  market-read:
+    enabled: ${AF_MARKET_READ_ENABLED:false}
+  datasource:
+    market-read:
+      url: jdbc:postgresql://${AF_DB_MARKET_HOST:}:${AF_DB_MARKET_PORT:5432}/${AF_DB_MARKET_DATABASE:alphafrog-v3}
+      username: ${AF_DB_MARKET_USER:}
+      password: ${AF_DB_MARKET_PASSWORD:}
+
 mybatis:
   mapper-locations: classpath*:mapper/*.xml
   configuration:

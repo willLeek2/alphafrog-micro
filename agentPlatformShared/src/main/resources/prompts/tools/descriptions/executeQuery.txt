@@ -1,4 +1,4 @@
-用 SQL 查询当前 Run 已授权的数据集。SQL 在隔离沙箱里由平台固定的 DuckDB 引擎执行，你只提供 SQL 文本，不提供执行代码。
+用 SQL 查询。query_target 省略或为 run_dataset 时，查询当前 Run 已授权的数据集，SQL 在隔离沙箱里由平台固定的 DuckDB 引擎执行，你只提供 SQL 文本，不提供执行代码。行情库查询先取类别和表名，再取一个类别的列，然后写 SELECT。规则见文末「行情库查询」。
 
 适用场景：
   - 跨多个数据集做条件筛选、连接、分组聚合等固定参数工具做不到的查询
@@ -13,9 +13,10 @@
   - CSV、Parquet和登记的表格JSON均按实际格式挂载。JSON声明recordsPath时读取该顶层对象数组；未声明时，根对象是一行、对象数组是多行。嵌套列表和字典保留为DuckDB列表与结构列，不自动展开；空数组保留元数据列。
 
 参数说明：
-  sql           - 一条 DuckDB SQL 查询语句，必填。只接受单条语句；多语句以及 ATTACH/COPY/INSTALL/LOAD 语句在准入阶段直接拒绝
-  dataset_ids   - 要挂载的数据集编号，逗号分隔（如 "1,2"）或 JSON 数组（如 "[1,2]"），必填
+  sql           - 一条查询语句，必填。只接受单条语句；多语句以及 ATTACH/COPY/INSTALL/LOAD 语句在准入阶段直接拒绝
+  dataset_ids   - query_target 为 run_dataset 时必填：要挂载的数据集编号，逗号分隔（如 "1,2"）或 JSON 数组（如 "[1,2]"）。行情库的三次调用不需要
   product_tier  - 产品档位："INTERACTIVE"（默认，语句上限 30 秒，最多返回 100 行）| "BACKGROUND"（语句上限 120 秒，最多返回 1000 行，占用更多容量）
+  query_target  - "run_dataset"（默认）| "market_tables" | "market_schema" | "market_db"
 
 返回结果：
   - 成功：columns（列名）、rows（数据行）、row_count、truncated（是否因行数上限被截断）
@@ -28,3 +29,14 @@
   - 结果行数超过档位上限会被截断并标记 truncated=true；需要更多行时换 BACKGROUND 档或收窄查询
   - 结果集有单次返回体积上限（约 900 KiB）：超限返回 QUERY_RESULT_TOO_LARGE，收窄查询后重试。宽表（列多或文本列长）即使行数在档位上限内也可能超体积上限，这时要减少列或缩短文本列，只减行数不一定够
   - executeQuery 支持 DUAL_POOL_V2 的等待组成员调用，但同一用户同一时刻只允许一条查询执行（包括同一 Run 的多项查询）。如返回可重试的 SESSION_QUERY_IN_PROGRESS，等待当前查询完成后再发起该项查询；批量查询请逐项执行，不能假定同一批 SQL 会全部同时启动
+
+行情库查询：
+  - 用户要股票、ETF、指数或基金的代码和名称，但没有给出要匹配的名称、代码或拼音时，用下面三步从对应类别的表里 SELECT 代码列和名称列。不要改用 searchStock、searchIndex、searchFund 或 searchAssetInfo
+  - 第一次调用 query_target=market_tables。sql 留空。返回四个类别和各类表名：ETF、股票、指数、基金。这次不返回列
+  - 选定一个类别后，第二次调用 query_target=market_schema。sql 只填写类别名，只能是 ETF、股票、指数、基金 其中之一。返回这个类别下面每张表的表名和列。每一列有 name。仓库里已经写过解释的列同时带 explanation。没有解释的列不带这个字段。不要一次索取四个类别
+  - 第三次调用 query_target=market_db。sql 是一条 PostgreSQL SELECT。不要写 DuckDB 方言，也不要写 t1、t2 这类数据集视图名。表名带 schema 时只接受 public。列必须属于语句里的那张表，不能把另一张表的列写过来。不要写 SELECT *
+  - trade_date 是从 1970-01-01 起算的毫秒整数。把日期写成毫秒可以用 extract(epoch from date '2025-10-01') * 1000
+  - 日线表上的 amount 是成交额
+  - 只接受一条 SELECT。多条语句和写入语句都会在送到数据库之前被拒绝
+  - 返回行数不超过当前档位上限（INTERACTIVE 100 行、30 秒，BACKGROUND 1000 行、120 秒）。你写的 LIMIT 若更大，服务会改成该上限；结果被这个上限截断时，返回里带 truncated=true，并写明实际行数和档位上限。超时返回 STATEMENT_TIMEOUT，不返回部分行
+  - 这三次调用都不使用 dataset_ids，也不要先调用 listMyData 去找行情表

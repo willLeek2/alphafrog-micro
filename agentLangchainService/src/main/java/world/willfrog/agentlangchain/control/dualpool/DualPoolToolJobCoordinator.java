@@ -301,6 +301,11 @@ public class DualPoolToolJobCoordinator {
         if (!resume.isObject()) {
             throw new IllegalArgumentException("dual_pool_tool_job_resume_payload_missing");
         }
+        var terminalBlock = terminalBlock(resume);
+        if (terminalBlock != null) {
+            return LangchainTodoNodeResult.failure(terminalBlock.code(),
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.failureMetadata(terminalBlock));
+        }
         String terminalStatus = resume.path("terminalStatus").asText("");
         if (!resume.has("toolCallsUsed") || !resume.path("toolCallsUsed").canConvertToInt()) {
             log.warn("长工具恢复载荷缺少有效的工具调用总数，按 0 处理: operationId={}",
@@ -309,7 +314,7 @@ public class DualPoolToolJobCoordinator {
         int totalToolCalls = Math.max(0, resume.path("toolCallsUsed").asInt(0));
         int completedToolCalls = Math.max(0, payload.path("toolCallsUsed").asInt(0));
         int nodeToolCalls = Math.max(0, totalToolCalls - completedToolCalls);
-        if ("SUCCEEDED".equals(terminalStatus)) {
+        if (resumeTerminalSuccess(payload)) {
             String output = resume.path("terminalResultPreview").asText("");
             if (output.isBlank()) {
                 output = "external tool completed";
@@ -341,9 +346,35 @@ public class DualPoolToolJobCoordinator {
         return output.isBlank() ? "external tool completed" : output;
     }
 
+    public world.willfrog.alphafrogmicro.common.racing.prompt.PromptText resumeToolOutputPrompt(JsonNode payload) {
+        JsonNode resume = payload == null ? null : payload.path("toolJobResume");
+        if (resume == null || !resume.isObject()) {
+            throw new IllegalArgumentException("dual_pool_tool_job_resume_payload_missing");
+        }
+        var blocked = terminalBlock(resume);
+        if (blocked != null) throw blocked;
+        return world.willfrog.agentlangchain.tooljob.BackgroundPromptResults.decode(
+                resume.path("terminalResultPreview").asText(null),
+                resume.path("terminalPromptSourcesJson").asText(null));
+    }
+
+    private world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException terminalBlock(JsonNode resume) {
+        JsonNode metadata = resume.get("terminalModelSendBlock");
+        return metadata == null || metadata.isNull() ? null
+                : world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.fromFailureMetadata(
+                        objectMapper.convertValue(metadata, java.util.Map.class)).orElse(null);
+    }
+
     public boolean resumeTerminalSuccess(JsonNode payload) {
-        return payload != null
-                && "SUCCEEDED".equals(payload.path("toolJobResume").path("terminalStatus").asText(""));
+        if (payload == null) return false;
+        JsonNode resume = payload.path("toolJobResume");
+        if (terminalBlock(resume) != null) return false;
+        JsonNode businessSuccess = resume.get("terminalBusinessSuccess");
+        // 与普通恢复入口一致：新锚点采用适配器业务结论，旧缺失字段沿用沙箱终态判据。
+        if (businessSuccess != null && !businessSuccess.isNull()) {
+            return businessSuccess.isBoolean() && businessSuccess.asBoolean();
+        }
+        return "SUCCEEDED".equals(resume.path("terminalStatus").asText(""));
     }
 
     public String resumeOperationId(JsonNode payload) {
@@ -375,6 +406,7 @@ public class DualPoolToolJobCoordinator {
                 record.setModelOutput(todo.getModelOutput());
                 record.setOutput(todo.getOutput());
                 record.setSummary(todo.getSummary());
+                record.setOutputSourceJson(todo.getOutputSourceJson());
                 completed.add(record);
             }
         }
@@ -406,7 +438,10 @@ public class DualPoolToolJobCoordinator {
         payload.put("attempt", anchor.getAttempt());
         payload.put("taskId", anchor.getTaskId());
         payload.put("terminalStatus", anchor.getTerminalStatus());
+        payload.put("terminalBusinessSuccess", anchor.getTerminalBusinessSuccess());
         payload.put("terminalResultPreview", anchor.getTerminalResultPreview());
+        payload.put("terminalPromptSourcesJson", anchor.getTerminalPromptSourcesJson());
+        payload.put("terminalModelSendBlock", anchor.getTerminalModelSendBlock());
         payload.put("terminalRawRef", anchor.getTerminalRawRef());
         payload.put("terminalErrorCode", anchor.getTerminalErrorCode());
         payload.put("terminalExitReason", anchor.getTerminalExitReason());

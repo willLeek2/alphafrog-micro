@@ -122,10 +122,15 @@ public class PersistentChildRunCoordinator {
             log.warn("子 Run 不属于当前部署代际，停止投递: runId={}", child.getId());
             return;
         }
-        if (!admissionRegistry.isAdmitted(child.getId())
-                && !admissionRegistry.admitNewRun(child.getId(), SchedulerVersion.DUAL_POOL_V2.name())) {
-            log.warn("子 Run 已持久受理，当前进程尚未取得执行资格，等待扫描补投: runId={}", child.getId());
-            return;
+        if (!admissionRegistry.isAdmitted(child.getId())) {
+            if (!admissionRegistry.acquireAcceptedChildOwnership(child.getId())) {
+                log.warn("子 Run 已持久受理，当前进程尚未取得服务所有权，等待扫描补投: runId={}", child.getId());
+                return;
+            }
+            if (!admissionRegistry.admitNewRun(child.getId(), SchedulerVersion.DUAL_POOL_V2.name())) {
+                log.warn("子 Run 已持久受理，当前进程尚未取得执行资格，等待扫描补投: runId={}", child.getId());
+                return;
+            }
         }
         try {
             runPipeline.enqueue(child, RunCoordinationHint.Reason.NEW_RUN);

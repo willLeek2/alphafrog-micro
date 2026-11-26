@@ -5,6 +5,8 @@ import dev.langchain4j.model.chat.ChatModel;
 import lombok.Builder;
 import lombok.Data;
 import world.willfrog.agentlangchain.acceptance.AcceptanceReleasePolicy;
+import world.willfrog.agent.workflow.PlanDependencyCheckReport;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -26,8 +28,12 @@ public class LangchainWorkflowRequest {
      * <p>不认识这个值的调用点可以不写，读的一方按 0 处理（{@link #planGenerationOrDefault()}）。</p>
      */
     private Integer planGeneration;
+    /** 数据库计划中的原检查报告，检查代次和当前执行代次分别保留。 */
+    private PlanDependencyCheckReport dependencyCheck;
     private String userGoal;
     private String dialogueContext;
+    /** 历史正文及其中的应用指令版本，随工作流和子线程请求一起传递。 */
+    private PromptText dialogueContextPrompt;
     private ChatModel model;
     private ChatModel planningModel;
     private ChatModel executionModel;
@@ -38,7 +44,11 @@ public class LangchainWorkflowRequest {
     private Integer maxToolRoundTrips;
     private Boolean webSearchEnabled;
     private Boolean codeInterpreterEnabled;
+    /** 创建运行时的管理员标记。false 时模型说明不包含行情库查询。 */
+    private Boolean marketQueryVisible;
     private String planningEndpointName;
+    private String executionEndpointName;
+    private String finalAnswerEndpointName;
     private String planningModelName;
     private List<String> planningProviderOrder;
     /**

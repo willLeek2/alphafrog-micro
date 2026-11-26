@@ -1,0 +1,14 @@
+{
+  "fragment": "marketSpecialAssetTypeAdvice",
+  "purpose": "marketSpecialAssetTypeAdvice",
+  "bodyType": "FIXED",
+  "body": "assetType 必须是 cb（可转债）或 ah（AH 比价），当前值不被识别。",
+  "variables": [],
+  "utf8Sha256": "22a695129fb6d4a275ec10985e3800f53db7e7fe5a25d3907684f8b88e0f018c",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataSpecialAssetTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

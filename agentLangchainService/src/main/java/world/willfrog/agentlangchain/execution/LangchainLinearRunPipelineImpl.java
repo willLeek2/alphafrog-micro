@@ -1,6 +1,8 @@
 package world.willfrog.agentlangchain.execution;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.invocation.InvocationContext;
@@ -10,6 +12,7 @@ import dev.langchain4j.service.tool.ToolProviderRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -19,7 +22,6 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
@@ -28,8 +30,10 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
+import world.willfrog.agent.tools.dataanalysis.MarketDbRunAccess;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
+import world.willfrog.agent.workflow.PlanDependencyCheckReport;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.execution.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
@@ -39,19 +43,24 @@ import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.agentlangchain.planning.PlanDependencyCheckService;
 import world.willfrog.agentlangchain.failure.LangchainFailureDecision;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.BooleanSupplier;
-import java.time.LocalDate;
 import java.time.OffsetDateTime;
 
 /**
@@ -118,6 +127,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
+
+    @Autowired(required = false)
+    private PlanDependencyCheckService planDependencyCheckService;
+
+    @Value("${agent.event.payload.max-chars:10000}")
+    private int dependencyEventMaxChars = 10000;
 
     private final RunOwnershipGateway ownershipGateway;
 
@@ -264,6 +279,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             stage = "resolve_plan";
             PlanResolution resolution = resolvePlan(run, inputs);
 
+            if (resolution == null) {
+                return;
+            }
+
             stage = "execute_workflow";
             LangchainWorkflowResult result = executeWorkflow(inputs, resolution);
             if (result == null) {
@@ -360,6 +379,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             userGoal = inputs.userGoal();
             stage = "resolve_plan";
             PlanResolution resolution = resolvePlan(run, inputs);
+            if (resolution == null) {
+                return null;
+            }
             return new DualPoolPlanPreparation(
                     run,
                     resolution.plan(),
@@ -398,6 +420,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         StageInputs inputs = resolveStageInputs(run);
         LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+        inputs.workflowRequest().setDependencyCheck(plan.getDependencyCheck());
         return new DualPoolNodeContext(
                 run,
                 plan,
@@ -435,7 +458,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         String userGoal = "";
         try {
-            userGoal = followUpContextSupport.resolve(run).userGoal();
+            userGoal = followUpContextSupport.userGoal(run);
         } catch (Exception e) {
             log.warn("写终态失败时用户目标读不回来，按空目标写: runId={} reason={}", runId, e.getMessage());
         }
@@ -571,9 +594,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 后续 OpenRouterProviderRoutedChatModel、ToolRouterToolProvider、可观测服务都会从这里取 runId/userId/phase。
         AgentContext.setRunId(runId);
         AgentContext.setUserId(userId);
-        // 先恢复并校验 run 级 Prompt 身份，再允许任何模型解析、观测初始化或
-        // follow-up 摘要调用。坏摘要必须在第一次 LLM 副作用之前失败即关闭。
-        setPromptSelectionFromExt(run.getExt());
+        // 原根选择先确认保存与重读，随后才允许模型、摘要和观测初始化。
+        AgentContext.setPromptRunSelection(eventService.prepareExperimentRunContext(runId));
         DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
         if (debugObservabilityService != null) {
             DebugObservabilityRequest debugRequest = debugObservabilityService.parseFromExt(run.getExt());
@@ -665,6 +687,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
         AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
         AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+        AgentContext.setMarketQueryVisible(MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper));
         // 从 ext 反序列化 run 启动时冻结的 dataFreshness 快照
         setDataFreshnessFromExt(run.getExt());
         // 这里先解析”当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
@@ -672,7 +695,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
         List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
         LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
-                runId, userId, run.getPlanGeneration(), userGoal, dialogueContext, stageModels,
+                runId, userId, run.getPlanGeneration(), userGoal, dialogueContext,
+                executionContext.dialogueContextPrompt(), stageModels,
                 toolSpecifications, runConfig);
         /*
          * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
@@ -681,7 +705,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
          */
         PlanExecutionMode requestedExecutionMode = AgentRunEventService.parseExecutionMode(
                 eventService.extractExecutionMode(run.getExt()));
-        return new StageInputs(runId, userId, userGoal, dialogueContext, stageModels,
+        return new StageInputs(runId, userId, userGoal, dialogueContext,
+                executionContext.dialogueContextPrompt(), stageModels,
                 toolSpecifications, workflowRequest, requestedExecutionMode);
     }
 
@@ -699,6 +724,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .planGeneration(run.getPlanGeneration())
                 .userGoal(inputs.userGoal())
                 .dialogueContext(inputs.dialogueContext())
+                .dialogueContextPrompt(inputs.dialogueContextPrompt())
                 .model(inputs.stageModels().planningModel())
                 .planningEndpointName(inputs.stageModels().planningEndpointName())
                 .planningModelName(inputs.stageModels().planningModelName())
@@ -716,8 +742,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
                     inputs.runId(), inputs.requestedExecutionMode(), planned.getExecutionMode(), effectiveExecutionMode);
         }
-        // PLAN_READY 前先把冻结 Plan 和 LINEAR 初始 checkpoint 写稳。
-        persistPlan(inputs.runId(), inputs.userId(), plan);
+        PlanDependencyCheckService checker = planDependencyCheckService == null
+                ? new PlanDependencyCheckService(null, objectMapper) : planDependencyCheckService;
+        plan.setDependencyCheck(checker.check(plan, inputs.workflowRequest()));
+        inputs.workflowRequest().setDependencyCheck(plan.getDependencyCheck());
+        // 计划保存成功后再建立检查点和发送事件，状态已变化时停止准备。
+        if (!persistPlan(inputs.runId(), inputs.userId(), plan)) {
+            return null;
+        }
         if (workflowCheckpointService != null) {
             if (useDag) {
                 workflowCheckpointService.initializeDag(inputs.runId(), inputs.userId());
@@ -734,9 +766,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 "effective_execution_mode", effectiveExecutionMode.name(),
                 "workflow", useDag ? "dag" : "linear",
                 "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
-                "plan", plan,
+                "plan", planReadyEventPlan(plan),
                 "reason", modeDecision.reason()
         ));
+        appendDependencyCheckEvent(inputs.runId(), inputs.userId(), run.getPlanGeneration(), plan, false, null);
         return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
     }
 
@@ -765,6 +798,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                  String userId,
                                  String userGoal,
                                  String dialogueContext,
+                                 PromptText dialogueContextPrompt,
                                  LangchainRunStageModelResolver.StageModels stageModels,
                                  List<ToolSpecification> toolSpecifications,
                                  LangchainWorkflowRequest workflowRequest,
@@ -810,8 +844,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 新线程不会继承旧 worker 的 ThreadLocal，必须从持久化身份重新建立。
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
-            // durable resume 使用同一前置门；不能让 follow-up 摘要先于 digest 校验调用模型。
-            setPromptSelectionFromExt(run.getExt());
+            // 已持久的发送阻止先于原根读取、历史压缩和模型构建，走原失败保存出口。
+            ModelSendBlocks.fromFailureMetadata(resumeContext.getTerminalModelSendBlock())
+                    .ifPresent(blocked -> { throw blocked; });
+            // 恢复时重新核对持久根记录的范围和选择。
+            AgentContext.setPromptRunSelection(eventService.prepareExperimentRunContext(runId));
             // 恢复排队期间若用户已暂停/取消，不能继续执行原 Todo。
             if (!eventService.isRunnable(runId, userId)) {
                 // 只有停止状态已经持久化，才算这次 launcher 可以安全完成交接。
@@ -837,13 +874,16 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
             AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
             AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+            AgentContext.setMarketQueryVisible(MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper));
             setDataFreshnessFromExt(run.getExt());
             // 用相同运行配置重建工具目录，但不会再次调用 planner。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
             // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
             LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
                     runId, userId, run.getPlanGeneration(), userGoal, executionContext.dialogueContext(),
+                    executionContext.dialogueContextPrompt(),
                     stageModels, toolSpecifications, runConfig);
+            workflowRequest.setDependencyCheck(plan.getDependencyCheck());
 
             // token + leaseVersion 使重复 launcher 只能写出一条 WORKFLOW_RESUMED 事件。
             String resumedDedupeKey = runId + ":" + resumeContext.getResumeToken()
@@ -855,6 +895,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     "resume_lease_version", resumeContext.getResumeLeaseVersion(),
                     "planner_skipped", true
             ));
+            appendDependencyCheckEvent(runId, userId, run.getPlanGeneration(), plan, true,
+                    resumedDedupeKey + ":dependency_check");
 
             // executor 按 checkpoint 跳过已完成 Todo，并把终态结果注入原挂起节点。
             LangchainWorkflowResult result = linearWorkflowExecutor.resumePlanned(
@@ -869,6 +911,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                         LangchainWorkflowResult.builder()
                                 .success(false)
                                 .failureReason(e.getMessage())
+                                .failureMetadata(ModelSendBlocks.find(e).map(ModelSendBlocks::failureMetadata).orElse(null))
                                 .toolCallsUsed(resumeContext.getToolCallsUsed())
                                 .build(), e, resumeContext, "resume_execute");
             } catch (Exception persistEx) {
@@ -957,6 +1000,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                                                  Integer planGeneration,
                                                                  String userGoal,
                                                                  String dialogueContext,
+                                                                 PromptText dialogueContextPrompt,
                                                                  LangchainRunStageModelResolver.StageModels stageModels,
                                                                  List<ToolSpecification> toolSpecifications,
                                                                  AgentRunEventService.RunConfig runConfig) {
@@ -966,17 +1010,21 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .planGeneration(planGeneration)
                 .userGoal(userGoal)
                 .dialogueContext(dialogueContext)
+                .dialogueContextPrompt(dialogueContextPrompt)
                 .model(stageModels.executionModel())
                 .planningModel(stageModels.planningModel())
                 .executionModel(stageModels.executionModel())
                 .finalAnswerModel(stageModels.finalAnswerModel())
                 .planningEndpointName(stageModels.planningEndpointName())
+                .executionEndpointName(stageModels.executionEndpointName())
+                .finalAnswerEndpointName(stageModels.finalAnswerEndpointName())
                 .planningModelName(stageModels.planningModelName())
                 .planningProviderOrder(stageModels.planningProviderOrder())
                 .acceptanceReleasePolicy(stageModels.acceptanceReleasePolicy())
                 .toolSpecifications(toolSpecifications)
                 .webSearchEnabled(runConfig.webSearchEnabled())
                 .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
+                .marketQueryVisible(AgentContext.getMarketQueryVisible())
                 .build();
     }
 
@@ -1246,15 +1294,62 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 checkpointCoordinator());
     }
 
-    private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
+    private boolean persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
-        updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, planJson);
+        if (updatePlanForLocal(runId, userId, AgentRunStatus.EXECUTING, planJson) <= 0) {
+            return false;
+        }
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
             // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史的权威副本。
             // valid=true 说明这是 planner 生成并被 pipeline 接受的计划，不是 HITL 修改中的临时草稿。
             stateStore.recordPlan(runId, planJson, true);
         }
+        return true;
+    }
+
+    /** 普通计划事件维持原字段，检查报告通过独立事件和计划快照读取。 */
+    private ObjectNode planReadyEventPlan(LangchainTodoPlan plan) {
+        ObjectNode copy = objectMapper.valueToTree(plan);
+        copy.remove("dependencyCheck");
+        for (JsonNode item : copy.path("items")) {
+            if (item instanceof ObjectNode object) object.remove("expectedTools");
+        }
+        return copy;
+    }
+
+    /** 恢复只公布原报告的复用事实，不重新检查或改写原检查时间。 */
+    protected void appendDependencyCheckEvent(String runId, String userId, Integer generation,
+                                             LangchainTodoPlan plan, boolean frozenReuse, String dedupeKey) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        PlanDependencyCheckReport report = plan.getDependencyCheck();
+        payload.put("report", report);
+        payload.put("plan_generation", generation);
+        payload.put("frozen_reuse", frozenReuse);
+        if (report == null) payload.put("report_missing", true);
+        int limit = dependencyEventMaxChars <= 0 ? PlanDependencyCheckReport.MAX_REPORT_CHARACTERS
+                : Math.min(dependencyEventMaxChars, PlanDependencyCheckReport.MAX_REPORT_CHARACTERS);
+        if (writeJson(payload).length() > limit && report != null) {
+            Set<String> affected = new LinkedHashSet<>();
+            if (plan.getItems() != null) {
+                for (TodoItem item : plan.getItems()) {
+                    if (item != null && item.getId() != null && !item.getId().isBlank()) affected.add(item.getId());
+                }
+            }
+            List<String> visibleIds = new ArrayList<>(affected.stream()
+                    .map(PlanDependencyCheckService::safeIdentifier).filter(id -> !id.isBlank())
+                    .limit(PlanDependencyCheckReport.MAX_HINTS).toList());
+            PlanDependencyCheckReport summary = report.toBuilder()
+                    .hints(List.of(new PlanDependencyCheckReport.Hint("", "", "report.omitted", "未覆盖部分",
+                            PlanDependencyCheckReport.Status.UNCHECKED, PlanDependencyCheckReport.Basis.NONE,
+                            "事件报告已缩减；业务调用和数据覆盖未检查，完整事实保存在计划快照中。")))
+                    .omittedCount(report.getOmittedCount() + (report.getHints() == null ? 0 : report.getHints().size()))
+                    .omittedTodoIds(visibleIds).omittedTodoCount(affected.size()).truncated(true).build();
+            payload.put("report", summary);
+            while (!visibleIds.isEmpty() && writeJson(payload).length() > limit) visibleIds.remove(visibleIds.size() - 1);
+        }
+        if (dedupeKey == null) eventService.append(runId, userId, "DEPENDENCIES_CHECKED", payload);
+        else eventService.appendOnce(runId, userId, "DEPENDENCIES_CHECKED", dedupeKey, payload);
     }
 
     protected void validateFrozenPlan(LangchainTodoPlan plan) {
@@ -1301,6 +1396,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         snapshot.put("answer_markdown", nvl(result.getFinalAnswer()));
         snapshot.put("status", status.name());
         snapshot.put("failure_reason", nvl(result.getFailureReason()));
+        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks
+                .fromFailureMetadata(result.getFailureMetadata())
+                .ifPresent(blocked -> snapshot.put("failure_metadata",
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.failureMetadata(blocked)));
         snapshot.put("tool_calls_used", result.getToolCallsUsed());
         snapshot.put("engine", "agentLangchainService");
         return writeJson(snapshot);
@@ -1316,6 +1415,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         snapshot.put("answer_markdown", nvl(result.getFinalAnswer()));
         snapshot.put("status", AgentRunStatus.PARTIAL.name());
         snapshot.put("failure_reason", nvl(result.getFailureReason()));
+        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks
+                .fromFailureMetadata(result.getFailureMetadata())
+                .ifPresent(blocked -> snapshot.put("failure_metadata",
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks.failureMetadata(blocked)));
         snapshot.put("tool_calls_used", result.getToolCallsUsed());
         snapshot.put("engine", "agentLangchainService");
         snapshot.put("partial", true);
@@ -1397,31 +1500,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.setDataFreshness(freshness);
         } catch (Exception e) {
             log.warn("Failed to parse data_freshness from ext for agent run, falling back to live config", e);
-        }
-    }
-
-    /** 从 run.ext 恢复冻结的 Prompt 选择；旧 Run 没有该字段时保持兼容的当前默认。 */
-    private void setPromptSelectionFromExt(String extJson) {
-        if (extJson == null || extJson.isBlank()) {
-            return;
-        }
-        try {
-            var extNode = objectMapper.readTree(extJson);
-            var node = extNode.get("prompt_selection");
-            if (node == null || node.isNull()) {
-                return;
-            }
-            PromptRunSelection selection = new PromptRunSelection(
-                    node.path("schema_version").asInt(-1),
-                    textOrNull(node, "bundle_version"),
-                    textOrNull(node, "variant"),
-                    textOrNull(node, "bundle_digest"),
-                    textOrNull(node, "capability_catalog_digest"),
-                    LocalDate.parse(textOrNull(node, "reference_date")));
-            AgentContext.setPromptRunSelection(selection);
-            promptService.validatePromptSelection(selection);
-        } catch (Exception e) {
-            throw new IllegalStateException("PROMPT_SELECTION_INVALID", e);
         }
     }
 

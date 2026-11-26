@@ -2,8 +2,11 @@ package world.willfrog.agent.workflow;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -20,8 +23,17 @@ public final class StructuredPlanningSupport {
 
     public static final String CATEGORY_JSON_PARSE_ERROR = "JSON_PARSE_ERROR";
     public static final String CATEGORY_SCHEMA_VALIDATION_ERROR = "SCHEMA_VALIDATION_ERROR";
+    public static final String EXPECTED_TOOLS_DESCRIPTION = "todos.expectedTools";
 
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([A-Za-z0-9_-]+)\\.output(?:\\.([A-Za-z0-9_.-]+))?}");
+    private static final Map<String, String> LEGACY_DESCRIPTIONS = Map.of(
+            "todos.extractedEntities", "用户明确提到的金融实体、指数、基金或股票名称。",
+            "todos.description", "1-3句话描述该Todo要完成的任务",
+            "todos.dependsOn", "依赖的todoId列表（DAG模式下可选）",
+            "todos.groupKey", "可选：并行分组键",
+            "todos.parallelizable", "可选：该节点是否可并行",
+            "strategy.mode", "执行模式：LINEAR串行(1段描述)或DAG并行(2-3段描述)",
+            "strategy.detail", "LINEAR模式用1个完整自然段，DAG模式用2-3个完整自然段，描述整体思路。严禁展开具体工作内容、代码、参数。");
 
     private StructuredPlanningSupport() {
     }
@@ -39,6 +51,11 @@ public final class StructuredPlanningSupport {
     }
 
     public static ValidationResult validateTodoPlan(JsonNode root, int maxTodos) {
+        return validateTodoPlan(root, maxTodos, false);
+    }
+
+    /** 返回校验采用本次所选说明字典支持的字段，不借用另一版本的约定。 */
+    public static ValidationResult validateTodoPlan(JsonNode root, int maxTodos, boolean expectedToolsEnabled) {
         if (root == null || !root.isObject()) {
             return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_plan_not_object");
         }
@@ -76,6 +93,20 @@ public final class StructuredPlanningSupport {
             JsonNode dependsOnNode = itemNode.get("dependsOn");
             if (dependsOnNode != null && !dependsOnNode.isArray()) {
                 return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_depends_on@" + index);
+            }
+            JsonNode expectedToolsNode = itemNode.get("expectedTools");
+            if (expectedToolsNode != null) {
+                if (!expectedToolsEnabled) {
+                    return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_unexpected_expected_tools@" + index);
+                }
+                if (!expectedToolsNode.isArray()) {
+                    return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_expected_tools@" + index);
+                }
+                for (JsonNode toolName : expectedToolsNode) {
+                    if (!toolName.isTextual()) {
+                        return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_item_invalid_expected_tool@" + index);
+                    }
+                }
             }
             JsonNode groupKeyNode = itemNode.get("groupKey");
             if (groupKeyNode != null && !groupKeyNode.isTextual()) {
@@ -186,6 +217,23 @@ public final class StructuredPlanningSupport {
      * 具体工具调用由执行阶段的 LLM 自主决策。</p>
      */
     public static Map<String, Object> todoPlanningJsonSchema() {
+        return todoPlanningJsonSchema(LEGACY_DESCRIPTIONS);
+    }
+
+    /** 协议结构继续由Java生成，说明只从业务已经核对的版本字典取值。 */
+    public static Map<String, Object> todoPlanningJsonSchema(Map<String, String> descriptions) {
+        Map<String, Object> itemProperties = new LinkedHashMap<>();
+        itemProperties.put("id", Map.of("type", "string"));
+        itemProperties.put("sequence", Map.of("type", "integer"));
+        itemProperties.put("description", Map.of("type", "string", "description", description(descriptions, "todos.description")));
+        itemProperties.put("dependsOn", Map.of("type", "array", "description", description(descriptions, "todos.dependsOn"),
+                "items", Map.of("type", "string")));
+        itemProperties.put("groupKey", Map.of("type", "string", "description", description(descriptions, "todos.groupKey")));
+        itemProperties.put("parallelizable", Map.of("type", "boolean", "description", description(descriptions, "todos.parallelizable")));
+        if (descriptions != null && descriptions.containsKey(EXPECTED_TOOLS_DESCRIPTION)) {
+            itemProperties.put("expectedTools", Map.of("type", "array", "description", description(descriptions, EXPECTED_TOOLS_DESCRIPTION),
+                    "items", Map.of("type", "string")));
+        }
         return Map.of(
                 "type", "object",
                 "additionalProperties", false,
@@ -194,7 +242,7 @@ public final class StructuredPlanningSupport {
                         "analysis", Map.of("type", "string"),
                         "extractedEntities", Map.of(
                                 "type", "array",
-                                "description", "用户明确提到的金融实体、指数、基金或股票名称。",
+                                "description", description(descriptions, "todos.extractedEntities"),
                                 "items", Map.of("type", "string")
                         ),
                         "items", Map.of(
@@ -204,27 +252,7 @@ public final class StructuredPlanningSupport {
                                         "type", "object",
                                         "additionalProperties", false,
                                         "required", List.of("id", "sequence", "description"),
-                                        "properties", Map.of(
-                                                "id", Map.of("type", "string"),
-                                                "sequence", Map.of("type", "integer"),
-                                                "description", Map.of(
-                                                        "type", "string",
-                                                        "description", "1-3句话描述该Todo要完成的任务"
-                                                ),
-                                                "dependsOn", Map.of(
-                                                        "type", "array",
-                                                        "description", "依赖的todoId列表（DAG模式下可选）",
-                                                        "items", Map.of("type", "string")
-                                                ),
-                                                "groupKey", Map.of(
-                                                        "type", "string",
-                                                        "description", "可选：并行分组键"
-                                                ),
-                                                "parallelizable", Map.of(
-                                                        "type", "boolean",
-                                                        "description", "可选：该节点是否可并行"
-                                                )
-                                        )
+                                        "properties", itemProperties
                                 )
                         )
                 )
@@ -319,6 +347,29 @@ public final class StructuredPlanningSupport {
      * @param maxDetailLength detail 字段最大长度限制
      */
     public static Map<String, Object> strategyStageJsonSchema(int maxDetailLength) {
+        return strategyStageJsonSchema(maxDetailLength, LEGACY_DESCRIPTIONS);
+    }
+
+    public static Set<String> planningDescriptionKeys() {
+        return LEGACY_DESCRIPTIONS.keySet();
+    }
+
+    /** 已发布七键字典及增加预计工具说明的八键字典是两种明确的协议。 */
+    public static boolean acceptsPlanningDescriptionKeys(Set<String> keys) {
+        Set<String> legacy = planningDescriptionKeys();
+        return legacy.equals(keys) || keys != null && keys.size() == legacy.size() + 1
+                && keys.containsAll(legacy) && keys.contains(EXPECTED_TOOLS_DESCRIPTION);
+    }
+
+    private static String description(Map<String, String> descriptions, String key) {
+        String value = descriptions == null ? null : descriptions.get(key);
+        if (value == null || value.isBlank()) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_UNREADABLE, "规划输出说明缺少已知字段：" + key);
+        }
+        return value;
+    }
+
+    public static Map<String, Object> strategyStageJsonSchema(int maxDetailLength, Map<String, String> descriptions) {
         return Map.of(
                 "type", "object",
                 "additionalProperties", false,
@@ -332,12 +383,12 @@ public final class StructuredPlanningSupport {
                                         "mode", Map.of(
                                                 "type", "string",
                                                 "enum", List.of("LINEAR", "DAG"),
-                                                "description", "执行模式：LINEAR串行(1段描述)或DAG并行(2-3段描述)"
+                                                "description", description(descriptions, "strategy.mode")
                                         ),
                                         "detail", Map.of(
                                                 "type", "string",
                                                 "maxLength", maxDetailLength,
-                                                "description", "LINEAR模式用1个完整自然段，DAG模式用2-3个完整自然段，描述整体思路。严禁展开具体工作内容、代码、参数。"
+                                                "description", description(descriptions, "strategy.detail")
                                         )
                                 )
                         )

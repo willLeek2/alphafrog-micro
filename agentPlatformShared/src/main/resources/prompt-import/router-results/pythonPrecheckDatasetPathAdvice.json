@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonPrecheckDatasetPathAdvice",
+  "purpose": "pythonPrecheckDatasetPathAdvice",
+  "bodyType": "FIXED",
+  "body": "禁止在代码中使用 /datasets 路径，请改用 /sandbox/input/<dataset_id>/... 或 /tmp 输出",
+  "variables": [],
+  "utf8Sha256": "0875a30c97ba30da8e4543594bb2862613bbdcfda08736c3ef577503001986c8",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/router/PythonStaticPrecheckService.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

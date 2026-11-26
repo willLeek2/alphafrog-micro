@@ -6,7 +6,7 @@
 
 ## 启用前配置
 
-控制器默认关闭，只有 `AF_BETA_CONTROLLER_ENABLED=true` 时才装配运行组件。HTTP 默认只监听 `127.0.0.1:19090`。所有 `/internal/beta/` 接口都要求 Bearer 凭证；凭证从 `AF_BETA_CONTROLLER_API_TOKEN_FILE` 指向的普通文件读取，文件不能是符号链接，内容至少 32 个字符且权限不得宽于 `0600`。
+控制器默认关闭，只有 `AF_BETA_CONTROLLER_ENABLED=true` 时才装配运行组件。HTTP 默认只监听 `127.0.0.1:19090`。所有 `/internal/beta/` 接口都要求 Bearer 凭证；凭证从 `AF_BETA_CONTROLLER_API_TOKEN_FILE` 指向的普通文件读取，文件不能是符号链接，内容至少 32 个字符，权限可以是 `0600` 或 `0640`，组可写、其他人可读都不接受。
 
 控制器本身不作为 Dubbo 服务注册到 Nacos，也不开启 Dubbo 服务监听。它不会调用 Agent 退役接口，也不持有 Agent 退役凭证。Agent 在自然处理窗口内完成已经受理的工作，并在窗口结束后为本代剩余 Run 写入明确失败。若这次收尾没有成功，`DeploymentGenerationReaper`（代际清扫器）只有在 Nacos 连续一个确认期限都找不到目标代际，并在写数据库前再次确认仍无注册后，才按每轮固定数量上限分批补写失败；这项补漏不以是否发生过容器强停为前提，也不承诺在固定时间内清完。
 

@@ -1,8 +1,11 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -115,6 +118,7 @@ public class WaitMemberResultReceiver {
     private final WaitMemberSettlement settlement;
     private final DualPoolRecoveryDispatcher recoveryDispatcher;
     private final ObjectMapper objectMapper;
+    private final ToolResultRecordedEventPublisher resultEventPublisher;
     /** 每轮读一次的参数：批次、退避与最多翻几步都允许在运行期改，改完下一轮生效。 */
     private final DualPoolSchedulerSettings settings;
     /** 最近一次构造退避用的初值与上限；配置变了就按新值重建，不用重启。 */
@@ -155,6 +159,19 @@ public class WaitMemberResultReceiver {
     private final AtomicLong failures = new AtomicLong();
 
     public WaitMemberResultReceiver(
+            WaitGroupStore waitGroupStore, RunOwnershipGateway ownership, NodeWorkItemStore nodeWorkItemStore,
+            PythonSandboxService sandboxService, PythonSandboxTools pythonSandboxTools,
+            WaitMemberSettlement settlement, DualPoolRecoveryDispatcher recoveryDispatcher, ObjectMapper objectMapper,
+            DualPoolSchedulerSettings settings, int maxMemberResultChars, long pollIntervalMs,
+            FrozenEffectiveSettings frozenEffectiveSettings, AcceptanceRunPolicyRegistry acceptancePolicies,
+            AcceptanceReleasePointStore releasePoints, FixtureRuleHitStore ruleHitStore) {
+        this(waitGroupStore, ownership, nodeWorkItemStore, sandboxService, pythonSandboxTools, settlement,
+                recoveryDispatcher, objectMapper, settings, maxMemberResultChars, pollIntervalMs,
+                frozenEffectiveSettings, acceptancePolicies, releasePoints, ruleHitStore, null);
+    }
+
+    @Autowired
+    public WaitMemberResultReceiver(
             WaitGroupStore waitGroupStore,
             RunOwnershipGateway ownership,
             NodeWorkItemStore nodeWorkItemStore,
@@ -170,7 +187,8 @@ public class WaitMemberResultReceiver {
             FrozenEffectiveSettings frozenEffectiveSettings,
             AcceptanceRunPolicyRegistry acceptancePolicies,
             AcceptanceReleasePointStore releasePoints,
-            FixtureRuleHitStore ruleHitStore) {
+            FixtureRuleHitStore ruleHitStore,
+            ToolResultRecordedEventPublisher resultEventPublisher) {
         this.waitGroupStore = waitGroupStore;
         this.ownership = ownership;
         this.nodeWorkItemStore = nodeWorkItemStore;
@@ -179,6 +197,7 @@ public class WaitMemberResultReceiver {
         this.settlement = settlement;
         this.recoveryDispatcher = recoveryDispatcher;
         this.objectMapper = objectMapper;
+        this.resultEventPublisher = resultEventPublisher;
         this.settings = settings;
         this.acceptancePolicies = acceptancePolicies;
         this.releasePoints = releasePoints;
@@ -272,6 +291,11 @@ public class WaitMemberResultReceiver {
             return;
         }
         WaitMemberDispatchProof proof = proofOpt.get();
+        var savedBlock = WaitMemberTerminalBlock.read(objectMapper, member);
+        if (savedBlock != null) {
+            finishBlockedMember(member, run, proof, savedBlock);
+            return;
+        }
 
         if (run.getStatus() != AgentRunStatus.EXECUTING) {
             // Run 不在执行中：取消、暂停、终态都由它们自己的路径收尾，这里不动它。
@@ -471,8 +495,8 @@ public class WaitMemberResultReceiver {
             return;
         }
         String code = proof.workspaceRefusalCode();
-        String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
-                member.getToolCallId(), false, "Python workspace rejected the task: " + code,
+        String resultJson = WaitMemberResultPayload.encodePrompt(objectMapper, member.getToolName(),
+                member.getToolCallId(), false, PromptText.runtimeData("Python workspace rejected the task: " + code),
                 Map.of("errorCode", code, "errorDetail", "Python workspace rejected the task: " + code,
                         "retryable", false), maxMemberResultChars);
         MemberCompletionResult result = persistMemberCompletion(new MemberCompletionRequest(
@@ -483,6 +507,7 @@ public class WaitMemberResultReceiver {
             duplicates.incrementAndGet();
             return;
         }
+        publishRecordedResult(member, run);
         completed.incrementAndGet();
         if (result.groupBecameReady()) {
             recoveryDispatcher.wake(result.notificationId());
@@ -764,10 +789,33 @@ public class WaitMemberResultReceiver {
         // 两种工具共用已核验的 Python 沙箱协议；业务解释由成员工具自己的适配器负责。
         var terminalView = new PythonSandboxJobRunnerAdapter(sandboxService, null)
                 .toTerminalView(terminal.result(), terminal.statusName());
-        SandboxJobResultAdapter.ResolvedResult resolved = adapters.resolveTerminal(
-                new SandboxJobAdapters.TerminalContext(member.getRunId(), run.getUserId(),
-                        group.getNodeId(), member.getToolCallId()), terminalView);
-        String output = resolved.output();
+        SandboxJobResultAdapter.ResolvedPromptResult resolved;
+        try (var context = BackgroundPromptContext.open(run, group.getNodeId(), null, member.getToolCallId())) {
+            resolved = adapters.resolveTerminalText(
+                    new SandboxJobAdapters.TerminalContext(member.getRunId(), run.getUserId(),
+                            group.getNodeId(), member.getToolCallId()), terminalView);
+        } catch (RuntimeException failure) {
+            var blocked = ModelSendBlocks.find(failure).orElse(null);
+            if (blocked == null) throw failure;
+            String captured = WaitMemberTerminalBlock.capture(objectMapper, member.getDispatchProofJson(), blocked,
+                    member.getRunId(), terminal.statusName(), terminal.result(), terminal.finishedAt());
+            if (!waitGroupStore.recordMemberTerminalBlock(member.getGroupId(), member.getMemberIdentity(),
+                    member.getExternalOperationId(), member.getDispatchProofJson(), captured)) {
+                defer(member, OffsetDateTime.now(), "terminal_block_cas_changed");
+                return;
+            }
+            member.setDispatchProofJson(captured);
+            finishBlockedMember(member, run, proof, WaitMemberTerminalBlock.read(objectMapper, member));
+            return;
+        }
+        // 保存时保留其他接收线程已经记录的发送阻止原因。
+        WaitMember current = waitGroupStore.findMemberByOperation(member.getRunId(), member.getExternalOperationId()).orElse(member);
+        var saved = WaitMemberTerminalBlock.read(objectMapper, current);
+        if (saved != null) {
+            finishBlockedMember(current, run, proof, saved);
+            return;
+        }
+        String output = resolved.output().text();
         // 结果太大时载荷会把它改写成失败：成员行也跟着落失败，两处结论必须一致。
         boolean oversized = WaitMemberResultPayload.tooLarge(output, maxMemberResultChars);
         boolean success = resolved.success() && !oversized;
@@ -801,15 +849,14 @@ public class WaitMemberResultReceiver {
         } else if (failedAlready) {
             extra.put("errorCode", failureCode);
         }
-        String resultJson = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
-                member.getToolCallId(), success, output, extra, maxMemberResultChars);
+        String resultJson = WaitMemberResultPayload.encodePrompt(objectMapper, member.getToolName(),
+                member.getToolCallId(), success, resolved.output(), extra, maxMemberResultChars);
 
         // 先把这次后台作业的账收干净再写成员终态：名额还回去、用量记下来。收尾没成时这条成员
         // 保持执行中，下一轮拿同一份证明重来（两步都是幂等的），绝不出现「成员已经落终态、
         // 名额还挂在账上」这种没人会再回来处理的状态。
-        WaitMemberSettlement.Outcome settled = settlement.settle(member, proof,
-                terminal.statusName(), terminal.result(),
-                output, terminal.finishedAt());
+        WaitMemberSettlement.Outcome settled = settlement.settlePrompt(member, proof,
+                terminal.statusName(), terminal.result(), resolved, terminal.finishedAt());
         if (!settled.ok()) {
             settlementFailures.incrementAndGet();
             log.warn("成员的结果已经拿到，但名额与用量还没收干净，先把这条成员推后：member={} reason={}",
@@ -837,6 +884,7 @@ public class WaitMemberResultReceiver {
                     member.getGroupId(), member.getMemberIdentity());
             return;
         }
+        publishRecordedResult(member, run);
         completed.incrementAndGet();
         // 策略定下的事到这里才真的发生过一次：决策处计数会把收尾失败后的重试也记成新的一次。
         if (refusal != null) {
@@ -862,6 +910,20 @@ public class WaitMemberResultReceiver {
         }
     }
 
+    private void publishRecordedResult(WaitMember member, AgentRun run) {
+        if (resultEventPublisher == null) {
+            return;
+        }
+        try {
+            resultEventPublisher.publishMemberAfterCommit(run.getId(), run.getUserId(),
+                    member.getGroupId(), member.getMemberIdentity());
+        } catch (Exception failure) {
+            // 展示通知不改变已保存的结果，也不影响原有组齐备唤醒。
+            log.warn("成员展示通知未保存: runId={} memberId={} exception={}",
+                    run.getId(), member.getId(), failure.getClass().getSimpleName());
+        }
+    }
+
     /**
      * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
      */
@@ -870,9 +932,10 @@ public class WaitMemberResultReceiver {
         try {
             return waitGroupStore.completeMember(request);
         } catch (RuntimeException e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
                     member.getGroupId(), member.getMemberIdentity(), e);
-            String compact = WaitMemberResultPayload.compactPersistFailure(
+            String compact = WaitMemberResultPayload.compactPersistFailurePrompt(
                     objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage(), taskId);
             MemberCompletionRequest fallback = new MemberCompletionRequest(
                     request.groupId(),
@@ -893,6 +956,42 @@ public class WaitMemberResultReceiver {
     }
 
     /** 到点的成员还没结论：按退避推后下次查询时间。 */
+    private void finishBlockedMember(WaitMember member, AgentRun run, WaitMemberDispatchProof proof,
+                                     WaitMemberTerminalBlock.Saved saved) {
+        WaitMemberSettlement.Outcome settled = settlement.settleBlocked(member, proof, saved.status(),
+                saved.result(), saved.finishedAt(), saved.blocked());
+        if (!settled.ok()) {
+            defer(member, OffsetDateTime.now(), "blocked_terminal_settlement:" + settled.reason());
+            return;
+        }
+        // 暂停只允许清理，恢复工作仍受原有运行状态与版本守卫控制。
+        if (run.getStatus() != AgentRunStatus.EXECUTING) {
+            defer(member, OffsetDateTime.now(), "blocked_terminal_cleanup_done");
+            return;
+        }
+        WaitGroup group = waitGroupStore.findGroup(member.getGroupId()).orElse(null);
+        if (group == null) return;
+        NodeWorkItem segment = nodeWorkItemStore.findByIdentity(new NodeWorkItemIdentity(
+                group.getRunId(), group.getPlanGeneration(), group.getNodeId(),
+                group.getNodeAttempt(), group.getSegmentSequence())).orElse(null);
+        if (segment == null || segment.getContextVersion() == null) return;
+        Map<String, Object> metadata = new LinkedHashMap<>(ModelSendBlocks.failureMetadata(saved.blocked()));
+        metadata.put("errorCode", saved.blocked().code());
+        metadata.put("errorDetail", saved.blocked().reason());
+        String payload = WaitMemberResultPayload.encode(objectMapper, member.getToolName(),
+                member.getToolCallId(), false, "", metadata, maxMemberResultChars);
+        MemberCompletionResult completed = persistMemberCompletion(new MemberCompletionRequest(
+                member.getGroupId(), member.getMemberIdentity(), WaitMemberState.FAILED, payload,
+                member.getExternalOperationId(), group.getPlanGeneration(), segment.getContextVersion(),
+                run.getRunControlVersion()), member, saved.result().getTaskId());
+        if (completed.applied()) {
+            publishRecordedResult(member, run);
+            if (completed.notificationId() != null) {
+                recoveryDispatcher.wake(completed.notificationId());
+            }
+        }
+    }
+
     private void defer(WaitMember member, OffsetDateTime now, String reason) {
         long memberId = member.getId() == null ? 0L : member.getId();
         OffsetDateTime nextVisibleAt = backoff().nextVisibleAt(now, memberId, member.getCreatedAt());

@@ -1,0 +1,14 @@
+{
+  "fragment": "marketParallelFallbackRule",
+  "purpose": "marketParallelFallbackRule",
+  "bodyType": "FIXED",
+  "body": "If checkParallelLimits is unavailable, assume batch/parallel querying is disabled and call tools with one item at a time.",
+  "variables": [],
+  "utf8Sha256": "8aa1e4711d3d8174977fef9b68f337de7d9c22ba9022047fd5a5832a657e3f37",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

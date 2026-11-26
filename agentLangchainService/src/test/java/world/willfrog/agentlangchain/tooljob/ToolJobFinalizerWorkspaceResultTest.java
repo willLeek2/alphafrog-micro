@@ -40,11 +40,11 @@ class ToolJobFinalizerWorkspaceResultTest {
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
         when(usageHook.upsertUsage(eq("run-a"), any())).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-a"), any())).thenReturn(true);
-        finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+        finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class),
-                new FinanceToolResultFormatter(objectMapper), mock(FinanceResultModelAdapter.class));
+                ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         ReflectionTestUtils.setField(finalizer, "usageHook", usageHook);
         ReflectionTestUtils.setField(finalizer, "eventHook", eventHook);
     }
@@ -56,7 +56,7 @@ class ToolJobFinalizerWorkspaceResultTest {
 
     @Test
     void sqlBusinessFailureKeepsSqlEnvelopeAcrossFinalizerRetry() throws Exception {
-        SqlQueryTools query = new SqlQueryTools(objectMapper);
+        SqlQueryTools query = ToolJobPromptTestFixture.configureTool(new SqlQueryTools(objectMapper));
         ReflectionTestUtils.invokeMethod(query, "registerSandboxJobAdapters");
         ToolJobAnchor anchor = anchor();
         anchor.setToolName(ToolJobAnchor.EXECUTE_QUERY_TOOL);

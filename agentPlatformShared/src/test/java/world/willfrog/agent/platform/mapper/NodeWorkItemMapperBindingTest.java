@@ -421,7 +421,10 @@ class NodeWorkItemMapperBindingTest {
         String terminal = String.join(", ",
                 NodeWorkItemState.terminalWireValues().stream().map(v -> "'" + v + "'").toList());
         for (String id : List.of("listUnfinishedByRun", "listUnfinishedBySchedulerVersion",
-                "countUnfinished", "countUnfinishedByRun", "countUnfinishedBySchedulerVersion")) {
+                "countUnfinished", "countUnfinishedByRun", "countUnfinishedBySchedulerVersion",
+                "listUnfinishedByRunSchedulerVersion", "countUnfinishedByRunSchedulerVersion",
+                "listUnfinishedByRunSchedulerVersionForDeployment",
+                "countUnfinishedByRunSchedulerVersionForDeployment")) {
             String sql = normalized(configuration.getMappedStatement(NAMESPACE + "." + id)
                     .getSqlSource().getBoundSql(dummyParams(id)).getSql());
             assertThat(sql).as(id + " 未完成的范围就是「不在终态里」")
@@ -439,17 +442,20 @@ class NodeWorkItemMapperBindingTest {
      */
     @Test
     void columnsAreAliasedWhenTheQueryJoinsTheRunTable() {
-        String sql = normalized(configuration.getMappedStatement(
-                        NAMESPACE + ".listUnfinishedByRunSchedulerVersion")
-                .getSqlSource().getBoundSql(dummyParams("listUnfinishedByRunSchedulerVersion")).getSql());
-        assertThat(sql).as("这条语句连了 Run 主表，才需要这条保护").contains("JOIN alphafrog_agent_run");
-        for (String column : List.of("id", "run_id", "plan_generation", "node_id", "node_attempt",
-                "segment_sequence", "state", "context_version", "run_control_version", "claim_epoch",
-                "scheduler_version", "claimed_by", "lease_expires_at", "next_visible_at",
-                "runnable_since", "dispatch_defer_reason", "payload_json", "created_at", "updated_at")) {
-            assertThat(sql).as("列 " + column + " 要带本表别名 wi.").contains("wi." + column);
+        for (String id : List.of("listUnfinishedByRunSchedulerVersion",
+                "listUnfinishedByRunSchedulerVersionForDeployment")) {
+            String sql = normalized(configuration.getMappedStatement(NAMESPACE + "." + id)
+                    .getSqlSource().getBoundSql(dummyParams(id)).getSql());
+            assertThat(sql).as(id + " 连了 Run 主表，才需要这条保护").contains("JOIN alphafrog_agent_run");
+            for (String column : List.of("id", "run_id", "plan_generation", "node_id", "node_attempt",
+                    "segment_sequence", "state", "context_version", "run_control_version", "claim_epoch",
+                    "scheduler_version", "claimed_by", "lease_expires_at", "next_visible_at",
+                    "runnable_since", "dispatch_defer_reason", "payload_json", "created_at", "updated_at")) {
+                assertThat(sql).as(id + " 列 " + column + " 要带本表别名 wi.").contains("wi." + column);
+            }
         }
     }
+
 
     /**
      * 创建工作项这一条是 Run 级写入：两层条件都要在同一句里核。
@@ -571,6 +577,9 @@ class NodeWorkItemMapperBindingTest {
             case "nodeId" -> "node-1";
             case "claimedBy", "newOwner" -> "worker-1";
             case "schedulerVersion" -> SchedulerVersion.DUAL_POOL_V1.name();
+            case "deploymentId" -> "stable";
+            case "deploymentGenerationId" -> "gen-1";
+            case "laneTag" -> null;
             case "payloadPatchJson", "payloadJson" -> "{}";
             case "reason" -> "test";
             case "limit" -> 10;

@@ -83,6 +83,20 @@ class LaneTagRouterOrderTest {
     }
 
     @Test
+    void clusterFilterThenTagRouter_productionMain_shouldSelectUntaggedInstance() {
+        Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
+        Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);
+        LaneContext.setTrafficScopeId(LaneContext.PRODUCTION_MAIN_TRAFFIC_SCOPE_ID);
+        RpcInvocation invocation = new RpcInvocation();
+        invocation.setAttachment(LaneContext.DUBBO_TAG_KEY, "stale-tag");
+        AtomicReference<List<Invoker<Object>>> selected = new AtomicReference<>();
+
+        new LaneConsumerHopFilter().invoke(routingInvoker(tagged, untagged, selected), invocation);
+
+        assertThat(selected.get()).containsExactly(untagged);
+    }
+
+    @Test
     void clusterFilterThenTagRouter_emptyScope_shouldSelectUntaggedInstance() {
         Invoker<Object> tagged = invoker(TAGGED_PROVIDER);
         Invoker<Object> untagged = invoker(UNTAGGED_PROVIDER);

@@ -141,6 +141,18 @@ public class CanceledWaitMemberStopWorker {
             return;
         }
 
+        var persistedBlock = WaitMemberTerminalBlock.read(objectMapper, member);
+        if (persistedBlock != null) {
+            var settledBlock = settlement.settleBlocked(member, proof, persistedBlock.status(),
+                    persistedBlock.result(), persistedBlock.finishedAt(), persistedBlock.blocked());
+            if (!settledBlock.ok()) {
+                retry(stop, "sandbox_settlement_incomplete");
+                return;
+            }
+            confirmSettlement(stop, persistedBlock.result().getTaskId(), persistedBlock.status());
+            return;
+        }
+
         GetTaskByOperationIdResponse lookup = sandbox.getTaskByOperationId(
                 GetTaskByOperationIdRequest.newBuilder().setOperationId(stop.getOperationId()).build());
         if (lookup == null || lookup.hasErrorDetail() || !lookup.getError().isBlank()) {
@@ -223,16 +235,21 @@ public class CanceledWaitMemberStopWorker {
         }
         String preview = !result.getStdout().isBlank() ? result.getStdout()
                 : !result.getStderr().isBlank() ? result.getStderr() : result.getError();
-        WaitMemberSettlement.Outcome settled = settlement.settle(member, proof,
-                terminalStatus, result, preview, status.getFinishedAt());
+        var savedBlock = WaitMemberTerminalBlock.read(objectMapper, member);
+        WaitMemberSettlement.Outcome settled = savedBlock == null
+                ? settlement.settle(member, proof, terminalStatus, result, preview, status.getFinishedAt())
+                : settlement.settleBlocked(member, proof, savedBlock.status(), savedBlock.result(),
+                        savedBlock.finishedAt(), savedBlock.blocked());
         if (!settled.ok()) {
             retry(stop, "sandbox_settlement_incomplete");
             return;
         }
-        String confirmedTaskId = taskId;
-        String confirmedStatus = terminalStatus;
+        confirmSettlement(stop, taskId, terminalStatus);
+    }
+
+    private void confirmSettlement(WaitMemberStopTask stop, String taskId, String terminalStatus) {
         Boolean confirmed = transaction.execute(ignored -> stops.confirmSandboxTerminal(
-                stop.getId(), stop.getClaimToken(), confirmedTaskId, confirmedStatus));
+                stop.getId(), stop.getClaimToken(), taskId, terminalStatus));
         if (!Boolean.TRUE.equals(confirmed)) {
             retry(stop, "terminal_evidence_not_committed");
             return;

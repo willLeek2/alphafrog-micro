@@ -1,0 +1,14 @@
+{
+  "fragment": "sqlQueryOutputCapacityMessage",
+  "purpose": "sqlQueryOutputCapacityMessage",
+  "bodyType": "FIXED",
+  "body": "Query result exceeded the output size limit; narrow the query and retry",
+  "variables": [],
+  "utf8Sha256": "b5af22bd3c8a5d776b568faa847c82cfdebc788fe55ad3465cbd50f8ca6e11cc",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataanalysis/SqlQueryJobResultAdapter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

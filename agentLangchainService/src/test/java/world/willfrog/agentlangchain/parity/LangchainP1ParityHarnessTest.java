@@ -18,8 +18,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * 生产默认两阶段规划的最小契约回归。
  */
 class LangchainP1ParityHarnessTest {
+    @org.junit.jupiter.api.AfterEach
+    void clearVersionedRunContext() { world.willfrog.agent.platform.context.AgentContext.clear(); }
 
-    private final LangchainAiPlanner planner = LangchainTestFixtures.planner();
+    @org.junit.jupiter.api.BeforeEach
+    void prepareVersionedRunContext() {
+        world.willfrog.agent.platform.context.AgentContext.setRunId("fixture-current-run");
+    }
+
+
+    private final LangchainAiPlanner planner = LangchainTestFixtures.versionedPlanner();
 
     @Test
     void linear_simple_success_plan() {
@@ -38,7 +46,8 @@ class LangchainP1ParityHarnessTest {
 
         LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                 .userGoal("analyze one stock")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .executionMode(PlanExecutionMode.LINEAR)
                 .build());
 
@@ -57,7 +66,8 @@ class LangchainP1ParityHarnessTest {
 
         assertThatThrownBy(() -> planner.plan(LangchainPlanningRequest.builder()
                 .userGoal("do nothing")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .planningEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("planning_retry_exhausted")

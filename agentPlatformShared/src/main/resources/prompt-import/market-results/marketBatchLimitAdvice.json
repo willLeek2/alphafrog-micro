@@ -1,0 +1,14 @@
+{
+  "fragment": "marketBatchLimitAdvice",
+  "purpose": "marketBatchLimitAdvice",
+  "bodyType": "FIXED",
+  "body": "Call checkParallelLimits before batching, then split the request into batches no larger than max_items.",
+  "variables": [],
+  "utf8Sha256": "15c1bc309e212ddb5eb70fc0a96e982a48884351bd5ae8133aa350b20b197bb4",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

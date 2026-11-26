@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.market;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -39,8 +40,8 @@ class MarketDataToolsCheckParallelLimitsTest {
         when(datasetWriter.isEnabled()).thenReturn(false);
         when(datasetRegistry.isEnabled()).thenReturn(false);
         llmProperties = new AgentLlmProperties();
-        tools = new MarketDataTools(datasetWriter, datasetRegistry, null, localConfigLoader,
-                llmProperties, objectMapper);
+        tools = configure(new MarketDataTools(datasetWriter, datasetRegistry, null, localConfigLoader,
+                llmProperties, objectMapper));
     }
 
     private Map<String, Object> invoke() throws Exception {

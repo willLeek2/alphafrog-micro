@@ -44,8 +44,10 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.mapper.ChildRunIntentMapper;
 import world.willfrog.agent.platform.coordination.MybatisRunCoordinationStore;
 import world.willfrog.agent.platform.lease.MybatisRunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
 import world.willfrog.agent.platform.mapper.RunServiceLeaseMapper;
 import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
@@ -2123,13 +2125,13 @@ class Stage3WaitContractPostgresTest {
                 .isEqualTo(1L);
         assertThat(store.acquire("run-lease", "owner-b", ttl))
                 .as("别人正活着持有：领不到，也不该领到").isEmpty();
-        assertThat(store.renew("run-lease", "owner-b", 1L, ttl))
+        assertThat(store.renew("run-lease", "owner-b", 1L, ttl, testScope()))
                 .as("续期要核对主人").isFalse();
-        assertThat(store.renew("run-lease", "owner-a", 1L, ttl)).isTrue();
-        assertThat(store.renew("run-lease", "owner-a", 2L, ttl))
+        assertThat(store.renew("run-lease", "owner-a", 1L, ttl, testScope())).isTrue();
+        assertThat(store.renew("run-lease", "owner-a", 2L, ttl, testScope()))
                 .as("续期要核对代际：号对不上说明这条已经换了主人").isFalse();
-        assertThat(store.renewOwned("owner-a", ttl)).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
-        assertThat(store.renewOwned("owner-b", ttl)).as("别人的租约一条都不动").isZero();
+        assertThat(store.renewOwned("owner-a", ttl, testScope())).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
+        assertThat(store.renewOwned("owner-b", ttl, testScope())).as("别人的租约一条都不动").isZero();
 
         // 到期之后可以被接手：代际加一，旧主人手里那个号立刻写不动。
         execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP, "
@@ -2137,7 +2139,7 @@ class Stage3WaitContractPostgresTest {
         RunServiceLease takenOver = store.acquire("run-lease", "owner-b", ttl).orElseThrow();
         assertThat(takenOver.ownerInstanceId()).isEqualTo("owner-b");
         assertThat(takenOver.fencingToken()).as("接手要换代，旧主人的号从此作废").isEqualTo(2L);
-        assertThat(store.renew("run-lease", "owner-a", 1L, ttl))
+        assertThat(store.renew("run-lease", "owner-a", 1L, ttl, testScope()))
                 .as("旧主人迟到的续期写不动").isFalse();
         assertThat(store.release("run-lease", "owner-a", 1L))
                 .as("旧主人迟到的让出也写不动").isFalse();
@@ -2212,7 +2214,7 @@ class Stage3WaitContractPostgresTest {
                 .as("清点只看还在跑的：自己的两条里有一条已经结束了")
                 .extracting(RunServiceLease::runId)
                 .containsExactly("run-renew-mine");
-        assertThat(store.renewOwned("owner-renew", ttl))
+        assertThat(store.renewOwned("owner-renew", ttl, testScope()))
                 .as("续上的条数与清点的一致，才不会每轮报假的「被接手」")
                 .isEqualTo(1);
 
@@ -2220,7 +2222,7 @@ class Stage3WaitContractPostgresTest {
         assertThat(store.find("run-renew-peer").orElseThrow().expiresAt())
                 .as("别人持有的那条一点都不动")
                 .isEqualTo(before);
-        assertThat(store.renewOwned("owner-other", ttl)).as("别人续自己的那条照常").isEqualTo(1);
+        assertThat(store.renewOwned("owner-other", ttl, testScope())).as("别人续自己的那条照常").isEqualTo(1);
     }
 
     /**
@@ -2239,16 +2241,21 @@ class Stage3WaitContractPostgresTest {
         RunServiceLease taken = store.acquire("run-renew-taken", "owner-second", ttl).orElseThrow();
         assertThat(taken.fencingToken()).isEqualTo(mine.fencingToken() + 1);
 
-        assertThat(store.renew("run-renew-taken", "owner-first", mine.fencingToken(), ttl))
+        assertThat(store.renew("run-renew-taken", "owner-first", mine.fencingToken(), ttl, testScope()))
                 .as("旧主人手里那个代际号续不动了")
                 .isFalse();
-        assertThat(store.renewOwned("owner-first", ttl))
+        assertThat(store.renewOwned("owner-first", ttl, testScope()))
                 .as("批量续期也一样：这条已经不归它")
                 .isZero();
         assertThat(store.listOwnedWithLiveRun("owner-first", 50))
                 .as("清点里也不再出现：旧主人这轮的「该续几条」自然对得上")
                 .isEmpty();
-        assertThat(store.renewOwned("owner-second", ttl)).isEqualTo(1);
+        assertThat(store.renewOwned("owner-second", ttl, testScope())).isEqualTo(1);
+    }
+
+
+    private static ServiceOwnershipScope testScope() {
+        return new ServiceOwnershipScope("stable", "gen-" + "a".repeat(64), null);
     }
 
     /**
@@ -2301,6 +2308,17 @@ class Stage3WaitContractPostgresTest {
                         java.time.LocalDate.of(2025, 2, 3)));
         Mockito.lenient().when(promptService.snapshotDataFreshness()).thenReturn(null);
 
+        RunServiceLeaseStore leaseStore = Mockito.mock(RunServiceLeaseStore.class);
+        ProcessInstanceIdentity instanceIdentity = Mockito.mock(ProcessInstanceIdentity.class);
+        Mockito.lenient().when(instanceIdentity.value()).thenReturn("test-instance");
+        Mockito.lenient().when(leaseStore.acquire(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenAnswer(invocation -> Optional.of(new RunServiceLease(
+                        invocation.getArgument(0, String.class),
+                        invocation.getArgument(1, String.class),
+                        1L,
+                        OffsetDateTime.now(),
+                        OffsetDateTime.now(),
+                        OffsetDateTime.now().plusMinutes(2))));
         AgentRunEventService service = new AgentRunEventService(
                 template.getMapper(AgentRunMapper.class),
                 template.getMapper(AgentRunEventMapper.class),
@@ -2312,12 +2330,15 @@ class Stage3WaitContractPostgresTest {
                 promptService,
                 new DataSourceTransactionManager(dataSource),
                 // 创建那条事务里会往共享候选里排队：用真的资格表，量的才是「Run 一出生就在候选里」。
-                coordinationStore());
+                coordinationStore(),
+                leaseStore,
+                instanceIdentity);
         // 这些值平时由配置注入，直接 new 出来是 0/空；显式给上，免得量的是个退化配置。
         ReflectionTestUtils.setField(service, "ttlMinutes", 60);
         ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
         ReflectionTestUtils.setField(service, "payloadMaxChars", 10000);
         ReflectionTestUtils.setField(service, "payloadPreviewChars", 4096);
+        ReflectionTestUtils.setField(service, "serviceLeaseTtlSeconds", 120L);
         return service;
     }
 

@@ -62,6 +62,7 @@
     "listMyData",
     "loadDocument",
     "loadToolGuide",
+    "promoteDatasetToPlatform",
     "ragSearch",
     "rereadToolResult",
     "resolveFinanceMethods",

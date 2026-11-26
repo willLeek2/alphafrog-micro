@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonRepeatedFailureAdvice",
+  "purpose": "pythonRepeatedFailureAdvice",
+  "bodyType": "FIXED",
+  "body": "The same Python code and effective parameters already failed in this Todo; change the code or meaningful parameters before retrying",
+  "variables": [],
+  "utf8Sha256": "4db3bd01bef9691767d14b568d226e6501908b96ed0d6893342f8115b81a2663",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

@@ -62,6 +62,10 @@ class SandboxJob:
     # None = legacy non-wrapper path.
     effective_output_limits: dict | None = None
     # === end work-package-C ===
+    # 014-new-03: 产物收割请求开关，从 ExecuteRequest 原样带到 runner
+    # （false/缺省 = 不收割，零开销）。
+    collect_artifacts: bool = False
+    collect_artifact_max_bytes: int | None = None
 
 
 class ContainerWorker:
@@ -272,6 +276,8 @@ class ContainerWorker:
             usage_sampling_interval_millis=self.config.usage_sampling_interval_millis,
             effective_output_limits=job.effective_output_limits,
             execution_environment=self.execution_environment,
+            collect_artifacts=job.collect_artifacts,
+            collect_artifact_max_bytes=job.collect_artifact_max_bytes,
         )
 
     def _on_job_done(self, job: SandboxJob, future: Future) -> None:
@@ -362,6 +368,8 @@ class ContainerPoolScheduler:
         path_manifest_csv: str | None = None,
         resource_class: str = "STANDARD",
         effective_output_limits: dict | None = None,
+        collect_artifacts: bool = False,
+        collect_artifact_max_bytes: int | None = None,
     ) -> dict:
         if self._closing:
             raise RuntimeError("sandbox pool is closing")
@@ -392,6 +400,8 @@ class ContainerPoolScheduler:
                 path_manifest_csv=path_manifest_csv,
                 resource_class=resource_class,
                 effective_output_limits=effective_output_limits,
+                collect_artifacts=collect_artifacts,
+                collect_artifact_max_bytes=collect_artifact_max_bytes,
             )
         )
         self._maybe_scale_up()

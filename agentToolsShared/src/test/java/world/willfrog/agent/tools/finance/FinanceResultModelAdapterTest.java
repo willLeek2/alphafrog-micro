@@ -84,6 +84,7 @@ class FinanceResultModelAdapterTest {
                                 record("0.1", "{\"periods\":4}", true),
                                 record("0.2", "{\"periods\":5}", true)),
                         "rows=2",
+                        "",
                         List.of(),
                         true));
 
@@ -161,7 +162,7 @@ class FinanceResultModelAdapterTest {
             FinanceMetricRecord record,
             List<FinanceRecordExtractionResult.ModelNotice> notices) {
         return new FinanceRecordExtractionResult(
-                null, List.of(record), "rows=5", notices, true);
+                null, List.of(record), "rows=5", "", notices, true);
     }
 
     private FinanceMetricRecord record(

@@ -1,17 +1,25 @@
 package world.willfrog.agent.tools.dataanalysis;
 
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import dev.langchain4j.agent.tool.Tool;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.exception.RunStartedAtMissingException;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.service.ToolDescriptionTexts;
@@ -33,12 +41,14 @@ import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.alphafrogmicro.common.datasource.MarketReadAutoConfiguration;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 import com.google.protobuf.util.JsonFormat;
 
 import java.io.IOException;
 import java.io.InputStream;
+import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -117,6 +127,12 @@ public class SqlQueryTools {
     private PythonSandboxService pythonSandboxService;
 
     private final ObjectMapper objectMapper;
+
+    @Autowired
+    private ProducerPromptTexts promptTexts;
+
+    @Autowired
+    private TerminalResultPromptTexts terminalPromptTexts;
     private final DatasetEntryMetadataReader metadataReader;
 
     /** 订阅数据集持久化事件，并在单次 agent 运行内维护「局部编号 → 条目」映射。 */
@@ -150,6 +166,23 @@ public class SqlQueryTools {
     @Autowired(required = false)
     private FinanceRecordChannelConfigLoader financeRecordChannelConfigLoader;
 
+    /** 主库连接。行情只读开关关闭时，行情 SQL 使用它。 */
+    @Autowired(required = false)
+    private DataSource dataSource;
+
+    /** 开关打开时的独立只读连接。开关关闭时这个 Bean 不存在。 */
+    @Autowired(required = false)
+    @Qualifier(MarketReadAutoConfiguration.DATA_SOURCE_BEAN_NAME)
+    private DataSource marketReadDataSource;
+
+    @Value("${alphafrog.market-read.enabled:false}")
+    private boolean marketReadEnabled;
+
+    @Autowired(required = false)
+    private AgentRunMapper agentRunMapper;
+
+    private final MarketDbQueryExecutor marketDbQueryExecutor = new MarketDbQueryExecutor();
+
     @Value("${agent.tool-job.fast-path-ms:1500}")
     private long fastPathMs = 1500L;
 
@@ -168,15 +201,28 @@ public class SqlQueryTools {
     }
 
     /**
-     * LangChain4j 暴露给模型的入口：SQL 文本、run 级数据集编号、产品档位。
+     * LangChain4j 暴露给模型的入口：SQL 文本、run 级数据集编号、产品档位、查询目标。
      * 方法名即工具名；说明正文在目录构建时覆盖成权威文件。
+     * query_target 省略时走原来的数据集路径。
      */
     @Tool
-    public String executeQuery(String sql, String dataset_ids, String product_tier) {
-        return executeQueryInternal(sql, dataset_ids, product_tier);
+    public String executeQuery(String sql, String dataset_ids, String product_tier, String query_target) {
+        return executeQueryPrompt(sql, dataset_ids, product_tier, query_target).text();
     }
 
-    private String executeQueryInternal(String sql, String datasetIds, String productTier) {
+    public String executeQuery(String sql, String dataset_ids, String product_tier) {
+        return executeQuery(sql, dataset_ids, product_tier, null);
+    }
+
+    public PromptText executeQueryPrompt(String sql, String dataset_ids, String product_tier, String query_target) {
+        return executeQueryInternal(sql, dataset_ids, product_tier, query_target);
+    }
+
+    public PromptText executeQueryPrompt(String sql, String dataset_ids, String product_tier) {
+        return executeQueryPrompt(sql, dataset_ids, product_tier, null);
+    }
+
+    private PromptText executeQueryInternal(String sql, String datasetIds, String productTier, String queryTarget) {
         long toolStartMs = System.currentTimeMillis();
         try {
             // --- 档位解析： blank 默认 INTERACTIVE；未知档位直接拒，带上合法名单。 ---
@@ -185,11 +231,27 @@ public class SqlQueryTools {
                     : productTier.trim().toUpperCase(Locale.ROOT);
             ProductTier tierLimits = PRODUCT_TIERS.get(tier);
             if (tierLimits == null) {
-                return fail("UNKNOWN_TIER", "Unknown product_tier; use INTERACTIVE or BACKGROUND",
+                return fail("UNKNOWN_TIER", policy("sqlUnknownTierAdvice"),
                         Map.of("legal_tiers", List.of("INTERACTIVE", "BACKGROUND"), "retryable", true));
+            }
+            String target = queryTarget == null || queryTarget.isBlank()
+                    ? "run_dataset"
+                    : queryTarget.trim().toLowerCase(Locale.ROOT);
+            if ("market_tables".equals(target) || "market_schema".equals(target)) {
+                return marketDiscovery(target, sql);
             }
             if (sql == null || sql.isBlank()) {
                 return fail("MISSING_SQL", "sql is required", Map.of("retryable", true));
+            }
+            if ("market_db".equals(target)) {
+                return executeMarketDb(sql, tier, tierLimits);
+            }
+            if (!"run_dataset".equals(target)) {
+                return fail("UNKNOWN_QUERY_TARGET",
+                        "query_target 只接受 run_dataset、market_tables、market_schema 或 market_db",
+                        Map.of("legal_targets", List.of(
+                                "run_dataset", "market_tables", "market_schema", "market_db"),
+                                "retryable", true));
             }
 
             // --- 入参编号解析：dataset_ids 是当前 Run 内的局部整数编号。 ---
@@ -215,7 +277,7 @@ public class SqlQueryTools {
                 details.put("legal_dataset_numbers", registry.listDatasetNumbers(runId));
                 details.put("retryable", true);
                 return fail("ILLEGAL_RUN_LEVEL_IDS",
-                        "Some dataset_ids are not valid run-level numbers; pass values from the legal list below",
+                        policy("sqlIllegalRunIdsAdvice"),
                         details);
             }
 
@@ -322,8 +384,15 @@ public class SqlQueryTools {
                 String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                         ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                         : "DATA_ANALYSIS_SERVER_BUSY";
+                // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因（恢复中、预留身份冲突、
+                // 非法恢复）不猜类别，走码默认兜底，原码与具体原因文案保留。
+                ToolFailureCategory capacityCategory =
+                        admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                                || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                                ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                                : null;
                 return fail(code, admission.getMessage(), Map.of("retryable",
-                        admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                        admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE), capacityCategory);
             }
 
             ExecuteRequest baseRequest = buildBaseRequest(
@@ -387,7 +456,9 @@ public class SqlQueryTools {
                                 reservation, estimate, anchor,
                                 waitPolicy.durableSuspend(), toolStartMs));
                 if (attachOutcome instanceof SandboxToolJobLifecycle.AttachOutcome.FailureText failureText) {
-                    return failureText.text();
+                    if (failureText.prompt() == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "sandbox-attach");
+                return failureText.prompt();
                 }
                 SandboxToolJobLifecycle.AttachOutcome.Attached attached =
                         (SandboxToolJobLifecycle.AttachOutcome.Attached) attachOutcome;
@@ -395,15 +466,16 @@ public class SqlQueryTools {
                 reservation = attached.reservation();
 
                 // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
-                return SandboxToolJobLifecycle.pollFastPath(
+                return SandboxToolJobLifecycle.pollFastPathText(
                         deps,
                         new SandboxToolJobLifecycle.PollRequest(
                                 runId, identity, estimate, reservation, anchor, taskId,
                                 waitPolicy.durableSuspend(), toolStartMs,
                                 runnerAdapter(), resultAdapter(), meteringAdapter(), null));
             } catch (Exception lifecycleFailure) {
+                ModelSendBlocks.rethrowIfBlocked(lifecycleFailure);
                 if (!waitPolicy.durableSuspend()) {
-                    return SandboxToolJobLifecycle.promoteDagBlockingFailure(
+                    return SandboxToolJobLifecycle.promoteDagBlockingFailureText(
                             deps,
                             runId,
                             anchor,
@@ -427,6 +499,7 @@ public class SqlQueryTools {
             // 挂起信号：后台任务、名额与 Run 状态均已落库，原样上抛由上层释放线程。
             throw pending;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Execute query tool error", e);
             observability().emitToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("TOOL_ERROR", "Query sandbox invocation error",
@@ -442,7 +515,7 @@ public class SqlQueryTools {
      * 先占 PREPARING 名额，完整请求组装后在原用户锁事务中一起写Run会话锚点和成员证明，
      * 两项全部提交才创建沙箱任务。成员路径不读 DAG 阻塞轮询。</p>
      */
-    private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
+    private PromptText submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       String sql,
                                       String tier,
                                       ProductTier tierLimits,
@@ -526,14 +599,21 @@ public class SqlQueryTools {
             String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                     ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                     : "DATA_ANALYSIS_SERVER_BUSY";
+            // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因（恢复中、预留身份冲突、
+            // 非法恢复）不猜类别，走码默认兜底，原码与具体原因文案保留。
+            ToolFailureCategory capacityCategory =
+                    admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                            || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                            ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                            : null;
             return fail(code, admission.getMessage(), Map.of("retryable",
-                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE), capacityCategory);
         }
         java.util.concurrent.atomic.AtomicReference<PreparedSqlMember> session =
                 new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.atomic.AtomicBoolean preparingInvoked = new java.util.concurrent.atomic.AtomicBoolean();
         try {
-            String dispatched = SandboxToolJobLifecycle.dispatchWaitGroupMember(
+            PromptText dispatched = SandboxToolJobLifecycle.dispatchWaitGroupMemberText(
                     deps,
                     new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                             member, identity, spec, plan.estimate(), baseRequest,
@@ -577,6 +657,7 @@ public class SqlQueryTools {
         } catch (ToolJobInjectedInterruption interruption) {
             throw interruption;
         } catch (RuntimeException dispatchFailure) {
+            ModelSendBlocks.rethrowIfBlocked(dispatchFailure);
             if (!preparingInvoked.get()) {
                 SandboxToolJobLifecycle.releasePreDispatch(deps, reservation);
             }
@@ -769,6 +850,7 @@ public class SqlQueryTools {
         try {
             specJson = objectMapper.writeValueAsString(spec);
         } catch (Exception serializeFailure) {
+            ModelSendBlocks.rethrowIfBlocked(serializeFailure);
             throw new IllegalStateException("query runner spec could not be serialized");
         }
         String encoded = Base64.getEncoder().encodeToString(specJson.getBytes(StandardCharsets.UTF_8));
@@ -824,7 +906,7 @@ public class SqlQueryTools {
                     local = new SandboxJobAdapters(
                             new SqlQueryJobRequestAdapter(),
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
-                            new SqlQueryJobResultAdapter(objectMapper),
+                            new SqlQueryJobResultAdapter(objectMapper, terminalPromptTexts),
                             new PythonSandboxJobMeteringAdapter(objectMapper));
                     sandboxJobAdapters = local;
                 }
@@ -868,8 +950,151 @@ public class SqlQueryTools {
         }
     }
 
-    private String fail(String code, String message, Map<String, Object> details) {
-        return SandboxJobResponses.fail(objectMapper, "executeQuery", code, message, details);
+    /**
+     * 管理员先看四个资产类别的表名，再看其中一个类别的列。
+     * 这两次调用不打开数据库连接。非管理员在返回名单之前被拒绝。
+     */
+    private PromptText marketDiscovery(String target, String sql) {
+        PromptText denied = rejectUnlessAdmin();
+        if (denied != null) {
+            return denied;
+        }
+        try {
+            if ("market_tables".equals(target)) {
+                List<Map<String, Object>> categories = new ArrayList<>();
+                for (String category : MarketDbCatalog.CATEGORIES) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("category", category);
+                    item.put("tables", MarketDbCatalog.tables(category));
+                    categories.add(item);
+                }
+                Map<String, Object> body = new LinkedHashMap<>();
+                body.put("ok", true);
+                body.put("query_target", "market_tables");
+                body.put("categories", categories);
+                return PromptText.runtimeData(objectMapper.writeValueAsString(body));
+            }
+            String category = sql == null ? "" : sql.trim();
+            if (!MarketDbCatalog.CATEGORIES.contains(category)) {
+                return fail("UNKNOWN_MARKET_CATEGORY",
+                        "market_schema 的 sql 参数只接受一个类别名",
+                        Map.of("legal_categories", MarketDbCatalog.CATEGORIES, "retryable", true));
+            }
+            List<Map<String, Object>> tables = new ArrayList<>();
+            for (String table : MarketDbCatalog.tables(category)) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("table", table);
+                item.put("columns", columnNotes(table));
+                tables.add(item);
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
+            body.put("query_target", "market_schema");
+            body.put("category", category);
+            body.put("tables", tables);
+            return PromptText.runtimeData(objectMapper.writeValueAsString(body));
+        } catch (Exception failure) {
+            return fail("MARKET_DB_UNAVAILABLE", "行情表名单暂时不能返回", Map.of("retryable", true));
+        }
+    }
+
+    /** 列名保持名单顺序。有仓库注释或列注释的列带上 explanation。 */
+    private static List<Map<String, Object>> columnNotes(String table) {
+        List<Map<String, Object>> columns = new ArrayList<>();
+        for (String name : MarketDbCatalog.columns(table)) {
+            Map<String, Object> column = new LinkedHashMap<>();
+            column.put("name", name);
+            String explanation = MarketDbColumnNotes.explanation(table, name);
+            if (explanation != null && !explanation.isBlank()) {
+                column.put("explanation", explanation);
+            }
+            columns.add(column);
+        }
+        return columns;
+    }
+
+    /** 没有管理员标记时返回拒绝；可以继续时返回 null。这里不打开行情库连接。 */
+    private PromptText rejectUnlessAdmin() {
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank() || agentRunMapper == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情库查询需要当前运行",
+                    Map.of("retryable", false));
+        }
+        AgentRun run = agentRunMapper.findById(runId);
+        if (run == null || !MarketDbRunAccess.isAdminSnapshot(run.getExt(), objectMapper)) {
+            return fail("NOT_ADMIN",
+                    "这次运行创建时没有管理员标记，不能查询行情库",
+                    Map.of("retryable", false));
+        }
+        return null;
+    }
+
+    /**
+     * 管理员运行执行一条已检查过的 SELECT。
+     * 行情只读开关打开时使用独立只读连接；关闭时使用 agent 主库。
+     * 非管理员在这里被拒绝，SQL 不会打开连接。
+     */
+    private PromptText executeMarketDb(String sql, String tier, ProductTier tierLimits) {
+        if (marketReadEnabled && marketReadDataSource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情只读连接没有装配",
+                    Map.of("retryable", false));
+        }
+        DataSource querySource = marketReadEnabled ? marketReadDataSource : dataSource;
+        PromptText denied = rejectUnlessAdmin();
+        if (denied != null) {
+            return denied;
+        }
+        if (querySource == null) {
+            return fail("MARKET_DB_UNAVAILABLE",
+                    "行情库查询需要当前运行和主库连接",
+                    Map.of("retryable", false));
+        }
+        MarketDbSqlGuard.Prepared prepared;
+        try {
+            prepared = MarketDbSqlGuard.prepare(sql, tierLimits.rowCap());
+        } catch (MarketSqlRejected rejected) {
+            return fail("SQL_REJECTED", rejected.getMessage(), Map.of(
+                    "retryable", true,
+                    "allowed_tables", List.copyOf(MarketDbSqlGuard.ALLOWED_TABLES),
+                    "categories", MarketDbCatalog.CATEGORIES));
+        }
+        try {
+            MarketDbQueryExecutor.Rows result = marketDbQueryExecutor.execute(
+                    querySource, prepared.sql(), tierLimits.statementTimeoutSeconds(), prepared.appliedLimit());
+            boolean truncated = prepared.capped() && result.rows().size() >= prepared.appliedLimit();
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("ok", true);
+            body.put("query_target", "market_db");
+            body.put("product_tier", tier);
+            body.put("columns", result.columns());
+            body.put("rows", result.rows());
+            body.put("row_count", result.rows().size());
+            body.put("row_cap", tierLimits.rowCap());
+            body.put("truncated", truncated);
+            return PromptText.runtimeData(objectMapper.writeValueAsString(body));
+        } catch (MarketDbQueryExecutor.MarketDbTimeoutException timeout) {
+            return fail("STATEMENT_TIMEOUT",
+                    "语句超过本档位时限，没有返回部分结果",
+                    Map.of("retryable", true,
+                            "statement_timeout_seconds", tierLimits.statementTimeoutSeconds()));
+        } catch (RuntimeException failure) {
+            String message = failure.getMessage() == null ? "行情库查询失败" : failure.getMessage();
+            return fail("SQL_FAILED", message, Map.of("retryable", true));
+        } catch (Exception failure) {
+            return fail("SQL_FAILED", "行情库查询失败", Map.of("retryable", true));
+        }
+    }
+
+    private PromptText fail(String code, Object message, Map<String, Object> details) {
+        return ProducerPromptTexts.failure(objectMapper, "executeQuery", code, message, details, Map.of(), null);
+    }
+
+    /** 带失败类别的重载：构造点掌握具体原因（如容量准入的具体拒绝原因）时显式覆盖兜底映射。 */
+    private PromptText fail(String code, Object message, Map<String, Object> details,
+                        ToolFailureCategory category) {
+        return ProducerPromptTexts.failure(objectMapper, "executeQuery", code, message, details, Map.of(), category);
     }
 
     /** 从 classpath 读入运行器脚本原文；资源缺失属打包错误，直接让类初始化失败。 */
@@ -895,7 +1120,14 @@ public class SqlQueryTools {
             }
             return hex.toString();
         } catch (Exception digestFailure) {
+            ModelSendBlocks.rethrowIfBlocked(digestFailure);
             throw new IllegalStateException("SHA-256 unavailable", digestFailure);
         }
     }
+    private PromptText policy(String fragment) {
+        if (promptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "producer-policy");
+        return promptTexts.policy(fragment);
+    }
+
 }

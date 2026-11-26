@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.market;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -61,14 +62,14 @@ class MarketDataToolsSearchIndexTest {
                                 .build())
                         .build());
 
-        MarketDataTools tools = new MarketDataTools(
+        MarketDataTools tools = configure(new MarketDataTools(
                 null,
                 null,
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
 
         Map<String, Object> response = objectMapper.readValue(
@@ -97,14 +98,14 @@ class MarketDataToolsSearchIndexTest {
                                 .build())
                         .build());
 
-        MarketDataTools tools = new MarketDataTools(
+        MarketDataTools tools = configure(new MarketDataTools(
                 null,
                 null,
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
 
         Map<String, Object> response = objectMapper.readValue(
@@ -137,14 +138,14 @@ class MarketDataToolsSearchIndexTest {
                                 .build())
                         .build());
 
-        MarketDataTools tools = new MarketDataTools(
+        MarketDataTools tools = configure(new MarketDataTools(
                 null,
                 null,
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
         ReflectionTestUtils.setField(tools, "domesticStockService", stockService);
 
         Map<String, Object> response = objectMapper.readValue(
@@ -185,14 +186,14 @@ class MarketDataToolsSearchIndexTest {
 
         DatasetWriter datasetWriter = mock(DatasetWriter.class);
         when(datasetWriter.isEnabled()).thenReturn(false);
-        MarketDataTools tools = new MarketDataTools(
+        MarketDataTools tools = configure(new MarketDataTools(
                 datasetWriter,
                 null,
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
 
         Map<String, Object> response = objectMapper.readValue(
@@ -223,14 +224,14 @@ class MarketDataToolsSearchIndexTest {
                 .columns(headers)
                 .rowCount(20)
                 .build();
-        MarketDataTools tools = new MarketDataTools(
+        MarketDataTools tools = configure(new MarketDataTools(
                 null,
                 null,
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
 
         Map<String, Object> data = ReflectionTestUtils.invokeMethod(
                 tools, "datasetDataFromMeta", "000001.SZ", "20240110", "20240120", headers, meta);
@@ -291,14 +292,14 @@ class MarketDataToolsSearchIndexTest {
         when(listedAssetService.getListedAssetAdjFactors(any()))
                 .thenReturn(ListedAssetAdjFactorResponse.getDefaultInstance());
 
-        MarketDataTools tools = new MarketDataTools(
+        MarketDataTools tools = configure(new MarketDataTools(
                 datasetWriter,
                 datasetRegistry,
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
         ReflectionTestUtils.setField(tools, "domesticListedAssetService", listedAssetService);
 
         AgentContext.setRunId("run-batch-etf");

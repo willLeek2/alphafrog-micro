@@ -1,0 +1,14 @@
+{
+  "fragment": "marketIndexOptionalColumnsAdvice",
+  "purpose": "marketIndexOptionalColumnsAdvice",
+  "bodyType": "FIXED",
+  "body": "includeColumns 只接受 pe_ttm / pb，多个用逗号分隔；留空则只返回基础行情列。",
+  "variables": [],
+  "utf8Sha256": "38909ba70d8c3c75257dd01bd55038d08654b1c0078e9a3fc38834b67e3a9c77",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

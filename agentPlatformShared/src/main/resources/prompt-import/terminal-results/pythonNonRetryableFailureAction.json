@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonNonRetryableFailureAction",
+  "purpose": "pythonNonRetryableFailureAction",
+  "bodyType": "FIXED",
+  "body": "检查输入和资源限制；如问题持续，请联系管理员",
+  "variables": [],
+  "utf8Sha256": "83a3a50d7d50c3cf83573aef518eed9f50003ec7d4824dab17483d64509cd52e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxJobResultAdapter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

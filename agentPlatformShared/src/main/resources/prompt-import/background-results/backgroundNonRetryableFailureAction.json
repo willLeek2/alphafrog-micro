@@ -1,0 +1,14 @@
+{
+  "fragment": "backgroundNonRetryableFailureAction",
+  "purpose": "backgroundNonRetryableFailureAction",
+  "bodyType": "FIXED",
+  "body": "检查代码或联系管理员",
+  "variables": [],
+  "utf8Sha256": "633e0910241756c2a92e37c3b6be43155f07f26c43c8abcebeb4bfadaef4d09d",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tooljob/ToolJobFinalizer.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

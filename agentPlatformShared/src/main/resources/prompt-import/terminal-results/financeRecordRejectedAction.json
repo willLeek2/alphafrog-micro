@@ -1,0 +1,14 @@
+{
+  "fragment": "financeRecordRejectedAction",
+  "purpose": "financeRecordRejectedAction",
+  "bodyType": "FIXED",
+  "body": "检查 report_custom() 必填字段或减少单批记录数量后重试",
+  "variables": [],
+  "utf8Sha256": "5e03066ac29a258e84d39b870158d88e70f0a999156cdf2cb0f6afb328e98720",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/finance/FinanceRecordChannelProcessor.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

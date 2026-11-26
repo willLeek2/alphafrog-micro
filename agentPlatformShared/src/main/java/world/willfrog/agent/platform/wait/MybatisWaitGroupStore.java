@@ -472,6 +472,16 @@ public class MybatisWaitGroupStore implements WaitGroupStore {
     }
 
     @Override
+    public boolean recordMemberTerminalBlock(long groupId, String memberIdentity, String operationId,
+                                             String expectedProofJson, String blockedProofJson) {
+        if (groupId <= 0 || memberIdentity == null || memberIdentity.isBlank()
+                || operationId == null || operationId.isBlank() || expectedProofJson == null
+                || blockedProofJson == null) throw new IllegalArgumentException("terminal block identity missing");
+        return mapper.recordMemberTerminalBlock(groupId, memberIdentity, operationId,
+                expectedProofJson, blockedProofJson) == 1;
+    }
+
+    @Override
     public boolean rescheduleMember(long groupId,
                                     String memberIdentity,
                                     OffsetDateTime nextPollAt,

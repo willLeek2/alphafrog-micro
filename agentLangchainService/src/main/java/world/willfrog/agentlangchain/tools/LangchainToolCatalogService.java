@@ -17,6 +17,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
@@ -41,6 +42,7 @@ public class LangchainToolCatalogService {
     private final PythonSandboxTools pythonSandboxTools;
     private final SqlQueryTools sqlQueryTools;
     private final ListMyDataTool listMyDataTool;
+    private final PromoteDatasetTool promoteDatasetTool;
     private final LoadToolGuideTool loadToolGuideTool;
     private final RereadToolHandler rereadToolHandler;
     private final ObjectMapper objectMapper;
@@ -64,6 +66,7 @@ public class LangchainToolCatalogService {
                 pythonSandboxTools,
                 sqlQueryTools,
                 listMyDataTool,
+                promoteDatasetTool,
                 loadToolGuideTool,
                 rereadToolHandler,
                 true,

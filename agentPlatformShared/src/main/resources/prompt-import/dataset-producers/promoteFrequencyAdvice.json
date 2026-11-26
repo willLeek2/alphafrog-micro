@@ -1,0 +1,14 @@
+{
+  "fragment": "promoteFrequencyAdvice",
+  "purpose": "promoteFrequencyAdvice",
+  "bodyType": "FIXED",
+  "body": "frequency must be daily or single_period",
+  "variables": [],
+  "utf8Sha256": "de4aa35638267c94a6aaef699fa8bc0b488b9c4b32014028d524dec815bcf37f",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataset/PromoteDatasetTool.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

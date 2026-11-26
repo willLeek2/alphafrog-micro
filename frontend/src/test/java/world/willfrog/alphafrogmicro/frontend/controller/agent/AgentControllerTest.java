@@ -40,6 +40,7 @@ import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobR
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
+import world.willfrog.alphafrogmicro.frontend.service.agent.ExperimentResultMetricAssembler;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCreditGateway;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentTracePartsService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentTimelineMergeService;
@@ -89,7 +90,7 @@ class AgentControllerTest {
         ObjectMapper objectMapper = new ObjectMapper();
         controller = new AgentController(new AgentAuthSupport(authService), creditGateway,
                 objectMapper, runResultCacheService, callDetailBlobReader, new AgentTracePartsService(),
-                new AgentTimelineMergeService(objectMapper));
+                new AgentTimelineMergeService(objectMapper), mock(ExperimentResultMetricAssembler.class));
         ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
 
         authentication = mock(Authentication.class);

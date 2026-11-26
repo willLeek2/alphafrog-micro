@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.python;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -53,7 +54,7 @@ class PythonSandboxToolsTest {
 
     @BeforeEach
     void setUp() {
-        tools = new PythonSandboxTools(mapper);
+        tools = configure(new PythonSandboxTools(mapper));
         world.willfrog.agent.platform.service.PythonRiskReviewService review =
                 mock(world.willfrog.agent.platform.service.PythonRiskReviewService.class);
         org.springframework.test.util.ReflectionTestUtils.setField(tools, "pythonRiskReviewService", review);

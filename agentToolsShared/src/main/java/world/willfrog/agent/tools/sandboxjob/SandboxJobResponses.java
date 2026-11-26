@@ -1,6 +1,7 @@
 package world.willfrog.agent.tools.sandboxjob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -8,9 +9,10 @@ import java.util.Map;
 /**
  * 沙箱长工具统一响应文本构造（工具中立）。
  *
- * <p>{@code {"ok":...,"tool":<工具名>,"data":...,"error":{code,message,details}}} 的形状
+ * <p>{@code {"ok":...,"tool":<工具名>,"data":...,"error":{code,message,details[,category]}}} 的形状
  * 是三条路径（同步返回、后台注入、恢复注入）共用的用户可见协议，字段顺序与序列化
- * 回退文本从 executePython 的既有实现原样搬入，逐字节保持一致。</p>
+ * 回退文本从 executePython 的既有实现原样搬入，逐字节保持一致；{@code category} 是失败类别的
+ * 可选附加字段（四类通用失败类别，非故障结果族不写）。</p>
  */
 public final class SandboxJobResponses {
 
@@ -38,6 +40,25 @@ public final class SandboxJobResponses {
      */
     public static String fail(ObjectMapper objectMapper, String tool, String code, String message,
                               Map<String, Object> details, Map<String, Object> data) {
+        return fail(objectMapper, tool, code, message, details, data, null);
+    }
+
+    /** 带 {@code category} 的失败响应（无部分 {@code data}）；类别规则见全参重载的说明。 */
+    public static String fail(ObjectMapper objectMapper, String tool, String code, String message,
+                              Map<String, Object> details, ToolFailureCategory category) {
+        return fail(objectMapper, tool, code, message, details, Map.of(), category);
+    }
+
+    /**
+     * 构造 {@code ok=false} 的 JSON 工具响应（全参版本）。
+     *
+     * <p>失败类别：{@code category} 传 null 时按 {@link ToolFailureCategory#of(String)} 兜底映射，
+     * 构造点已知更细事实（HTTP 状态、失败分支）时传显式类别覆盖；非故障结果族解析为 null 时
+     * error 里不写 {@code category} 字段。code/ok 语义与既有信封一致。</p>
+     */
+    public static String fail(ObjectMapper objectMapper, String tool, String code, String message,
+                              Map<String, Object> details, Map<String, Object> data,
+                              ToolFailureCategory category) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", tool);
@@ -46,6 +67,7 @@ public final class SandboxJobResponses {
         err.put("code", nvl(code));
         err.put("message", nvl(message));
         err.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(err, code, category);
         payload.put("error", err);
         return writeJson(objectMapper, tool, payload);
     }

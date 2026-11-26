@@ -42,7 +42,7 @@ class MarketReadAutoConfigurationTest {
     void enabledTrue_shouldWireReadOnlyPoolToProductionDatabase() {
         runner().withPropertyValues(
                 "alphafrog.market-read.enabled=true",
-                "alphafrog.datasource.market-read.url=jdbc:postgresql://10.0.0.101:5432/alphafrog",
+                "alphafrog.datasource.market-read.url=jdbc:postgresql://10.0.0.101:5432/alphafrog-v3",
                 "alphafrog.datasource.market-read.username=alphafrog_market_reader",
                 "alphafrog.datasource.market-read.password=secret",
                 "alphafrog.datasource.market-read.hikari.initialization-fail-timeout=-1"
@@ -52,7 +52,7 @@ class MarketReadAutoConfigurationTest {
             assertThat(ctx).hasSingleBean(MarketReadResultGuard.class);
             HikariDataSource dataSource = ctx.getBean(
                     MarketReadAutoConfiguration.DATA_SOURCE_BEAN_NAME, HikariDataSource.class);
-            assertThat(dataSource.getJdbcUrl()).isEqualTo("jdbc:postgresql://10.0.0.101:5432/alphafrog");
+            assertThat(dataSource.getJdbcUrl()).isEqualTo("jdbc:postgresql://10.0.0.101:5432/alphafrog-v3");
             assertThat(dataSource.getUsername()).isEqualTo("alphafrog_market_reader");
             assertThat(dataSource.getMaximumPoolSize()).isEqualTo(5);
             assertThat(dataSource.getConnectionTimeout()).isEqualTo(3000L);
@@ -60,7 +60,7 @@ class MarketReadAutoConfigurationTest {
             assertThat(dataSource.getPoolName()).isEqualTo(MarketReadDataSourceFactory.POOL_NAME);
             MarketReadConnectionTarget.Parsed parsed = MarketReadConnectionTarget.parse(dataSource.getJdbcUrl());
             assertThat(parsed.host()).isEqualTo("10.0.0.101");
-            assertThat(parsed.database()).isEqualTo("alphafrog");
+            assertThat(parsed.database()).isEqualTo("alphafrog-v3");
         });
     }
 
@@ -79,7 +79,7 @@ class MarketReadAutoConfigurationTest {
     void enabledTrue_shouldRejectBlankPassword() {
         runner().withPropertyValues(
                 "alphafrog.market-read.enabled=true",
-                "alphafrog.datasource.market-read.url=jdbc:postgresql://10.0.0.101:5432/alphafrog",
+                "alphafrog.datasource.market-read.url=jdbc:postgresql://10.0.0.101:5432/alphafrog-v3",
                 "alphafrog.datasource.market-read.username=alphafrog_market_reader",
                 "alphafrog.datasource.market-read.password=",
                 "alphafrog.datasource.market-read.hikari.initialization-fail-timeout=-1"

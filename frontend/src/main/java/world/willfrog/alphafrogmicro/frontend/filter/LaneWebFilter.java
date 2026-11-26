@@ -23,7 +23,7 @@ import world.willfrog.alphafrogmicro.frontend.lane.LaneEntryProperties;
  * <p>泳道名有两个来源：部署注入的 {@code alphafrog.lane.entry.traffic-scope-id}（只有泳道自己的
  * frontend 实例会被注入，优先采用，此时不看请求头），以及共用入口的请求头
  * {@code X-AlphaFrog-Lane-Tag}（主 Beta frontend 上没有注入时的兜底）。两者按同一套规则解析：
- * 空白或 {@code main-beta} 不打标；格式不合法只告警一次并按普通流量处理。所有可伪造的入口
+ * 空白、{@code main-beta} 或生产主范围 {@code stable} 不打标；格式不合法只告警一次并按普通流量处理。所有可伪造的入口
  * 标记头都会在进入业务代码前剥除，业务代码只认线程上下文里的泳道名。</p>
  */
 public class LaneWebFilter extends OncePerRequestFilter {
@@ -125,7 +125,7 @@ public class LaneWebFilter extends OncePerRequestFilter {
             return null;
         }
         String normalized = candidate.trim();
-        if (LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID.equals(normalized)) {
+        if (LaneContext.isDeploymentMainScope(normalized)) {
             return null;
         }
         if (!normalized.matches(LANE_TAG_PATTERN)) {

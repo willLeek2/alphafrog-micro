@@ -32,19 +32,36 @@ public class MybatisRunServiceLeaseStore implements RunServiceLeaseStore {
     }
 
     @Override
-    public boolean renew(String runId, String ownerInstanceId, long fencingToken, Duration ttl) {
+    public Optional<RunServiceLease> acquirePastDeadline(String runId, String ownerInstanceId, Duration ttl,
+                                                         ServiceOwnershipScope scope, String expectedOwner) {
         requireRunId(runId);
         requireOwner(ownerInstanceId);
-        if (fencingToken <= 0) {
-            throw new IllegalArgumentException("租约代际必须为正数：" + fencingToken);
+        requireOwner(expectedOwner);
+        requireScope(scope);
+        if (ownerInstanceId.equals(expectedOwner)) {
+            throw new IllegalArgumentException("强制接手时期望的旧持有人不能是自己");
         }
-        return mapper.renew(runId, ownerInstanceId, fencingToken, requireTtl(ttl)) > 0;
+        return Optional.ofNullable(mapper.acquirePastDeadline(
+                runId, ownerInstanceId, requireTtl(ttl), scope, expectedOwner));
     }
 
     @Override
-    public int renewOwned(String ownerInstanceId, Duration ttl) {
+    public boolean renew(String runId, String ownerInstanceId, long fencingToken, Duration ttl,
+                         ServiceOwnershipScope scope) {
+        requireRunId(runId);
         requireOwner(ownerInstanceId);
-        return mapper.renewOwned(ownerInstanceId, requireTtl(ttl));
+        requireScope(scope);
+        if (fencingToken <= 0) {
+            throw new IllegalArgumentException("服务所有权代际必须为正数：" + fencingToken);
+        }
+        return mapper.renew(runId, ownerInstanceId, fencingToken, requireTtl(ttl), scope) > 0;
+    }
+
+    @Override
+    public int renewOwned(String ownerInstanceId, Duration ttl, ServiceOwnershipScope scope) {
+        requireOwner(ownerInstanceId);
+        requireScope(scope);
+        return mapper.renewOwned(ownerInstanceId, requireTtl(ttl), scope);
     }
 
     @Override
@@ -92,6 +109,14 @@ public class MybatisRunServiceLeaseStore implements RunServiceLeaseStore {
     private static void requireOwner(String ownerInstanceId) {
         if (ownerInstanceId == null || ownerInstanceId.isBlank()) {
             throw new IllegalArgumentException("租约必须留下持有者标识");
+        }
+    }
+
+    private static void requireScope(ServiceOwnershipScope scope) {
+        if (scope == null
+                || scope.deploymentId() == null || scope.deploymentId().isBlank()
+                || scope.deploymentGenerationId() == null || scope.deploymentGenerationId().isBlank()) {
+            throw new IllegalArgumentException("续期和强制接手必须带上部署和代际");
         }
     }
 

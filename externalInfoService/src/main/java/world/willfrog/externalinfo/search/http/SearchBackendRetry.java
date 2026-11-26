@@ -1,6 +1,9 @@
 package world.willfrog.externalinfo.search.http;
 
 import lombok.extern.slf4j.Slf4j;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputInvocation;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.externalinfo.search.SearchPromptPreparation;
 import org.springframework.stereotype.Component;
 import world.willfrog.externalinfo.config.SearchLlmProperties;
 
@@ -60,6 +63,12 @@ public class SearchBackendRetry {
     public RetryResult sendWithRetry(HttpClient client,
                                      HttpRequest request,
                                      String backendName) {
+        throw SearchPromptPreparation.missing("网页搜索发送缺少实际输入及保存上下文");
+    }
+
+    public RetryResult sendWithRetry(HttpClient client, HttpRequest request, String backendName,
+                                     String finalJson, ModelInputInvocation invocation) {
+        if (invocation == null || finalJson == null) throw SearchPromptPreparation.missing("网页搜索发送缺少完整输入");
         long startMs = System.currentTimeMillis();
         int maxAttempts = Math.max(1, config.maxAttempts());
         long delayMs = Math.max(0, config.delayMs());
@@ -68,6 +77,7 @@ public class SearchBackendRetry {
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
+                invocation.beforeSend(finalJson);
                 HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
                 lastResponse = response;
                 lastError = null;
@@ -93,6 +103,7 @@ public class SearchBackendRetry {
                 Thread.currentThread().interrupt();
                 return RetryResult.exception(attempt, System.currentTimeMillis() - startMs, e);
             } catch (RuntimeException e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 // HttpClient wraps connect / timeout in HttpConnectTimeoutException
                 // (subclass of IOException) — any other RuntimeException is a bug
                 // in our caller code, not the upstream; do not retry it.

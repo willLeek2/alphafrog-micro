@@ -5,6 +5,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -13,6 +14,8 @@ public class AgentLlmProperties {
 
     private String defaultEndpoint;
     private String defaultModel;
+    @JsonAlias({"prompt-set-experiment-id", "prompt_set_experiment_id"})
+    private String promptSetExperimentId;
     private Map<String, Endpoint> endpoints = new HashMap<>();
     private List<String> models = new ArrayList<>();
     private Runtime runtime = new Runtime();
@@ -41,6 +44,15 @@ public class AgentLlmProperties {
 
     public void setDefaultModel(String defaultModel) {
         this.defaultModel = defaultModel;
+    }
+
+    /** 新根运行使用的整组提示词实验；运行创建后使用根记录冻结的编号。 */
+    public String getPromptSetExperimentId() {
+        return promptSetExperimentId;
+    }
+
+    public void setPromptSetExperimentId(String promptSetExperimentId) {
+        this.promptSetExperimentId = promptSetExperimentId;
     }
 
     public Map<String, Endpoint> getEndpoints() {
@@ -431,6 +443,12 @@ public class AgentLlmProperties {
         private Integer rangeMaxLimit;
         @JsonAlias({"range-min-limit-without-keyword", "range_min_limit_without_keyword"})
         private Integer rangeMinLimitWithoutKeyword;
+        /** 014-opt-10：keyword 命中窗口半径（每个命中位置前后各取的字符数），缺省 200。 */
+        @JsonAlias({"keyword-window-radius", "keyword_window_radius"})
+        private Integer keywordWindowRadius;
+        /** 014-opt-10：keyword 模式单次返回的命中数上限，缺省 20。 */
+        @JsonAlias({"keyword-window-max-hits", "keyword_window_max_hits"})
+        private Integer keywordWindowMaxHits;
 
         public Integer getMaxLimit() { return maxLimit; }
         public void setMaxLimit(Integer maxLimit) { this.maxLimit = maxLimit; }
@@ -440,6 +458,10 @@ public class AgentLlmProperties {
         public void setRangeMaxLimit(Integer rangeMaxLimit) { this.rangeMaxLimit = rangeMaxLimit; }
         public Integer getRangeMinLimitWithoutKeyword() { return rangeMinLimitWithoutKeyword; }
         public void setRangeMinLimitWithoutKeyword(Integer rangeMinLimitWithoutKeyword) { this.rangeMinLimitWithoutKeyword = rangeMinLimitWithoutKeyword; }
+        public Integer getKeywordWindowRadius() { return keywordWindowRadius; }
+        public void setKeywordWindowRadius(Integer keywordWindowRadius) { this.keywordWindowRadius = keywordWindowRadius; }
+        public Integer getKeywordWindowMaxHits() { return keywordWindowMaxHits; }
+        public void setKeywordWindowMaxHits(Integer keywordWindowMaxHits) { this.keywordWindowMaxHits = keywordWindowMaxHits; }
     }
 
     public static class ToolRawRef {
@@ -2313,6 +2335,8 @@ public class AgentLlmProperties {
         private String dagRecoveryJudgeSystemPromptFile;
         /** DAG recovery judge prompt 内容（只能是 classpath 权威正文或其逐字一致投影）。 */
         private String dagRecoveryJudgeSystemPromptTemplate;
+        /** 提示词字段名到给人看的中文名的映射，仅供管理后台展示，运行时不读取；快照没写或没写全时按 common 模块的 PromptDisplayNameDefaults.DEFAULTS 兜底。 */
+        private Map<String, String> displayNames = new LinkedHashMap<>();
 
         public String getAgentRunSystemPrompt() {
             return agentRunSystemPrompt;
@@ -2680,6 +2704,14 @@ public class AgentLlmProperties {
 
         public void setDagRecoveryJudgeSystemPromptTemplate(String dagRecoveryJudgeSystemPromptTemplate) {
             this.dagRecoveryJudgeSystemPromptTemplate = dagRecoveryJudgeSystemPromptTemplate;
+        }
+
+        public Map<String, String> getDisplayNames() {
+            return displayNames;
+        }
+
+        public void setDisplayNames(Map<String, String> displayNames) {
+            this.displayNames = displayNames;
         }
     }
 

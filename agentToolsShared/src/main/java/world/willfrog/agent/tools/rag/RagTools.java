@@ -3,8 +3,8 @@ package world.willfrog.agent.tools.rag;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 import world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService;
 import world.willfrog.alphafrogmicro.externalinfo.idl.RagSearchRequest;
@@ -13,7 +13,12 @@ import world.willfrog.alphafrogmicro.externalinfo.idl.RagSearchResultItem;
 import world.willfrog.agent.platform.artifact.RunRawRefStore;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.tools.sandboxjob.SandboxJobResponses;
+import world.willfrog.agent.tools.docs.DocumentToolPromptPreparation;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -33,12 +38,15 @@ public class RagTools {
     private static final int LOAD_DOCUMENT_PREVIEW_CHARS = 1600;
     private static final int LOAD_DOCUMENT_FULL_CONTENT_MAX_CHARS = 6000;
 
-    @DubboReference(timeout = 60000, retries = 0)
+    @Autowired
+    @Qualifier("externalInfoDubboService")
     private ExternalInfoDubboService externalInfoDubboService;
 
     private final ObjectMapper objectMapper;
     private final Optional<RunRawRefStore> runRawRefStore;
     private final Optional<AgentLlmLocalConfigLoader> localConfigLoader;
+    @Autowired
+    private DocumentToolPromptPreparation promptPreparation;
 
     public RagTools(ObjectMapper objectMapper) {
         this(objectMapper, Optional.empty(), Optional.empty());
@@ -55,6 +63,10 @@ public class RagTools {
 
     @Tool
     public String ragSearch(String queryText, String docType, String tsCode, String indName, int topK) {
+        return ragSearchPrompt(queryText, docType, tsCode, indName, topK).text();
+    }
+
+    public PromptText ragSearchPrompt(String queryText, String docType, String tsCode, String indName, int topK) {
         try {
             int k = (topK <= 0 || topK > MAX_TOP_K) ? 5 : topK;
             RagSearchRequest req = RagSearchRequest.newBuilder()
@@ -128,21 +140,32 @@ public class RagTools {
             payload.put("ok", true);
             payload.put("tool", "ragSearch");
             payload.put("data", data);
-            return objectMapper.writeValueAsString(payload);
+            return DocumentToolPromptPreparation.envelope(objectMapper, payload, List.of());
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"ragSearch\",\"error\":{\"code\":\"TOOL_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "ragSearch", "TOOL_ERROR",
+                    nvl(e.getMessage()), Map.of()));
         }
     }
 
     @Tool
     public String loadDocument(String ossUrl) {
+        return loadDocumentPrompt(ossUrl).text();
+    }
+
+    public PromptText loadDocumentPrompt(String ossUrl) {
         try {
             if (ossUrl == null || ossUrl.isBlank()) {
-                return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"INVALID_ARGUMENT\",\"message\":\"ossUrl is empty\"}}";
+                return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "loadDocument", "INVALID_ARGUMENT",
+                        "ossUrl is empty", Map.of()));
             }
             if (ossUrl.startsWith("raw_ref_") || ossUrl.startsWith("raw-ref:")) {
-                return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"INVALID_ARGUMENT\",\"message\":\"rawRef must be passed to rereadToolResult, not loadDocument\"}}";
+                if (promptPreparation == null) {
+                    throw DocumentToolPromptPreparation.missing("文档重定向建议缺少原根正文读取组件");
+                }
+                PromptText message = promptPreparation.policy("ragRawRefRedirectInstruction", Map.of());
+                return DocumentToolPromptPreparation.failure(objectMapper, "loadDocument", "INVALID_ARGUMENT",
+                        message, Map.of());
             }
             var httpClient = java.net.http.HttpClient.newHttpClient();
             var request = java.net.http.HttpRequest.newBuilder()
@@ -153,8 +176,13 @@ public class RagTools {
             var response = httpClient.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() != 200) {
-                return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"HTTP_ERROR\",\"message\":\"Status "
-                        + response.statusCode() + "\"}}";
+                // 同一码按状态码区分事实：429 系是上游限流，其余非 200（5xx 等）按上游或系统故障；
+                // 原 code 仍写 HTTP_ERROR，message 说明状态。
+                return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "loadDocument", "HTTP_ERROR",
+                        "Status " + response.statusCode(), Map.of(),
+                        response.statusCode() == 429
+                                ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                                : ToolFailureCategory.UPSTREAM_OR_SYSTEM));
             }
             Map<String, Object> data = new LinkedHashMap<>();
             String body = response.body();
@@ -177,10 +205,12 @@ public class RagTools {
             result.put("ok", true);
             result.put("tool", "loadDocument");
             result.put("data", data);
-            return objectMapper.writeValueAsString(result);
+            return DocumentToolPromptPreparation.envelope(objectMapper, result, List.of());
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"loadDocument\",\"error\":{\"code\":\"TOOL_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            ModelSendBlocks.rethrowIfBlocked(e);
+            // 文档读取走网络取回正文，异常基本都是网络/IO 一类的上游或系统故障，显式归类。
+            return PromptText.runtimeData(SandboxJobResponses.fail(objectMapper, "loadDocument", "TOOL_ERROR",
+                    nvl(e.getMessage()), Map.of(), ToolFailureCategory.UPSTREAM_OR_SYSTEM));
         }
     }
 
@@ -203,13 +233,15 @@ public class RagTools {
         }
         try {
             String rawContent = objectMapper.writeValueAsString(data);
-            String rawRef = runRawRefStore.get().register(runId, nvl(userId), displayName, rawContent, rawRefTtlSeconds());
+            String rawRef = runRawRefStore.get().registerPrompt(runId, nvl(userId), displayName,
+                    PromptText.runtimeData(rawContent), rawRefTtlSeconds());
             data.remove("needs_raw_ref");
             data.remove("raw_refs");
             data.remove("content");
             data.put("rawRef", rawRef);
             data.put("read_hints", readHints(rawRef));
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.warn("Failed to register rawRef for {}", displayName, e);
             data.put("rawRef_error", "RAW_REF_REGISTER_FAILED");
         }
@@ -226,10 +258,12 @@ public class RagTools {
         keyword.put("tool", "rereadToolResult");
         keyword.put("rawRef", rawRef);
         keyword.put("required_args", List.of("keyword"));
-        keyword.put("optional_args", List.of("limit"));
+        keyword.put("optional_args", List.of("offset", "limit"));
         keyword.put("constraints", Map.of(
                 "keyword_required", true,
-                "max_limit", keywordMax
+                "max_limit", keywordMax,
+                "offset_semantics", "search start index in original content; pass nextOffset from previous call to continue",
+                "returns", "hit windows with @offset headers; use offsets for keyword-less range reads"
         ));
 
         Map<String, Object> range = new LinkedHashMap<>();
@@ -380,13 +414,5 @@ public class RagTools {
     private int rereadRangeMinLimitWithoutKeyword() {
         Integer value = toolsConfig().getReread().getRangeMinLimitWithoutKeyword();
         return value != null && value > 0 ? value : 3000;
-    }
-
-    private String escapeJson(String text) {
-        return nvl(text)
-                .replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r");
     }
 }

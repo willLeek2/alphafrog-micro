@@ -24,6 +24,7 @@ class LaneContextTest {
         assertThat(LaneContext.toOfficialDubboTag("")).isNull();
         assertThat(LaneContext.toOfficialDubboTag("   ")).isNull();
         assertThat(LaneContext.toOfficialDubboTag(LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID)).isNull();
+        assertThat(LaneContext.toOfficialDubboTag(LaneContext.PRODUCTION_MAIN_TRAFFIC_SCOPE_ID)).isNull();
         assertThat(LaneContext.toOfficialDubboTag("lane-test")).isEqualTo("lane-test");
     }
 
@@ -32,6 +33,8 @@ class LaneContextTest {
         LaneContext.setTrafficScopeId("lane-a");
         assertThat(LaneContext.officialDubboTag()).isEqualTo("lane-a");
         LaneContext.setTrafficScopeId(LaneContext.MAIN_BETA_TRAFFIC_SCOPE_ID);
+        assertThat(LaneContext.officialDubboTag()).isNull();
+        LaneContext.setTrafficScopeId(LaneContext.PRODUCTION_MAIN_TRAFFIC_SCOPE_ID);
         assertThat(LaneContext.officialDubboTag()).isNull();
         LaneContext.clear();
         assertThat(LaneContext.officialDubboTag()).isNull();

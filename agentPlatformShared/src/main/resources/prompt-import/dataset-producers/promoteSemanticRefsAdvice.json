@@ -1,0 +1,14 @@
+{
+  "fragment": "promoteSemanticRefsAdvice",
+  "purpose": "promoteSemanticRefsAdvice",
+  "bodyType": "FIXED",
+  "body": "semantic_refs must be comma-separated name@version entries, e.g. price_daily@1,adj_factor@2",
+  "variables": [],
+  "utf8Sha256": "f6a1d28a842e383ee0da0110026efa03a569f16d8acb93272e9878d7f82e908a",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataset/PromoteDatasetTool.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

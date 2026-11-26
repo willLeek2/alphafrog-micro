@@ -1,0 +1,14 @@
+{
+  "fragment": "promoteDatasetLookupAdvice",
+  "purpose": "promoteDatasetLookupAdvice",
+  "bodyType": "FIXED",
+  "body": "dataset_number is not a valid run-level dataset number; use listMyData first",
+  "variables": [],
+  "utf8Sha256": "870391293b155c26225674dbc897cda0e39774a915beb947230c559084ffa97b",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/dataset/PromoteDatasetTool.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

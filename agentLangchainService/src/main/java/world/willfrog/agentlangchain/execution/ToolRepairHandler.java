@@ -1,6 +1,9 @@
 package world.willfrog.agentlangchain.execution;
 
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.util.Map;
 
@@ -27,6 +30,12 @@ public interface ToolRepairHandler {
 
     /** 拼进当前待办 user message 的修复指令（含阶段说明与诊断上下文）。 */
     String buildRepairInstruction(ToolJobResumeContext context);
+
+    /** 模型修复入口要求结果携带真实指令来源；兼容处理器的来源保持未知。 */
+    default PromptText buildRepairInstructionText(ToolJobResumeContext context) {
+        throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "工具修复处理器尚未提供带来源指令：" + toolName());
+    }
 
     /** 本工具允许的修复轮次上限（含首次执行）。 */
     int maxAttempts();

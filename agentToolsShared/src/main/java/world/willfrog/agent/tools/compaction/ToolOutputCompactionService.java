@@ -13,6 +13,10 @@ import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -36,33 +40,59 @@ public class ToolOutputCompactionService {
     private final ObjectMapper objectMapper;
 
     public CompactionResult compact(String toolName, String rawOutput, String todoGoal) {
+        return compact(toolName, rawOutput, null, todoGoal);
+    }
+
+    public CompactionResult compactPrompt(String toolName, PromptText rawPrompt, String todoGoal) {
+        if (rawPrompt == null) throw missingSource();
+        return compact(toolName, rawPrompt.text(), rawPrompt, todoGoal);
+    }
+
+    private CompactionResult compact(String toolName, String rawOutput, PromptText rawPrompt, String todoGoal) {
         if (!CompactionEligibleTools.isEligible(toolName) || blank(rawOutput)) {
-            return passThrough(rawOutput);
+            return passThrough(rawOutput, rawPrompt);
         }
         if (rawOutput.length() <= effectiveMaxLength()) {
-            return passThrough(rawOutput);
+            return passThrough(rawOutput, rawPrompt);
         }
         String logicalId = firstNonBlank(AgentContext.getToolCallId(), toolName, "tool-output");
         String displayName = nvl(toolName);
-        PersistentArtifactRegistration registration =
-                toolOutputRefService.registerRawOutput(logicalId, displayName, rawOutput);
+        PersistentArtifactRegistration registration = rawPrompt == null
+                ? toolOutputRefService.registerRawOutput(logicalId, displayName, rawOutput)
+                : toolOutputRefService.registerRawPrompt(logicalId, displayName, rawPrompt);
         String rawRef = registration.getArtifactId();
         RawPayloadLocator locator = registration.getLocator();
-        String summary = toolSummaryService.summarize(toolName, rawOutput, todoGoal);
+        PromptText summaryPrompt = rawPrompt == null ? null
+                : toolSummaryService.summarizePrompt(toolName, rawPrompt, todoGoal);
+        if (rawPrompt != null && summaryPrompt == null) throw missingSource();
+        String summary = rawPrompt == null ? toolSummaryService.summarize(toolName, rawOutput, todoGoal)
+                : summaryPrompt.text();
         boolean truncated = summary.isBlank();
         if (truncated) {
             summary = "[summary 生成失败，以下为截断内容] " + truncate(rawOutput, FALLBACK_TRUNCATE_CHARS);
         }
         Map<String, Object> compactSearchItems = buildCompactSearchItems(toolName, rawOutput, effectiveMaxLength());
-        String modelOutput = buildModelOutput(toolName, summary, rawRef, truncated, compactSearchItems);
-        String cacheTemplate = buildModelOutput(toolName, summary, "", truncated, compactSearchItems);
+        SerializedOutput modelOutput = buildModelOutput(toolName, summary, rawRef, truncated, compactSearchItems);
+        SerializedOutput cacheTemplate = buildModelOutput(toolName, summary, "", truncated, compactSearchItems);
+        List<PromptVersionSource> actualSources = rawPrompt == null ? List.of()
+                : truncated ? rawPrompt.sources() : summaryPrompt.sources();
         return CompactionResult.builder()
-                .modelOutput(modelOutput)
-                .cacheTemplate(cacheTemplate)
+                .modelOutput(modelOutput.text())
+                .modelPrompt(rawPrompt == null ? null : new PromptText(modelOutput.text(),
+                        modelOutput.includesPayload() ? actualSources : List.of()))
+                .cacheTemplate(cacheTemplate.text())
+                .cacheTemplatePrompt(rawPrompt == null ? null : new PromptText(cacheTemplate.text(),
+                        cacheTemplate.includesPayload() ? actualSources : List.of()))
                 .rawLocator(locator)
                 .compactionApplied(true)
                 .observabilityOutput(rawOutput)
+                .observabilityPrompt(rawPrompt)
                 .build();
+    }
+
+    public PromptText rebindPromptForCacheHit(PromptText cacheTemplate, RawPayloadLocator locator) {
+        if (cacheTemplate == null) throw missingSource();
+        return new PromptText(rebindForCacheHit(cacheTemplate.text(), locator), cacheTemplate.sources());
     }
 
     public String rebindForCacheHit(String cacheTemplate, RawPayloadLocator locator) {
@@ -96,17 +126,20 @@ public class ToolOutputCompactionService {
         }
     }
 
-    private CompactionResult passThrough(String rawOutput) {
+    private CompactionResult passThrough(String rawOutput, PromptText rawPrompt) {
         return CompactionResult.builder()
                 .modelOutput(rawOutput)
+                .modelPrompt(rawPrompt)
                 .cacheTemplate(rawOutput)
+                .cacheTemplatePrompt(rawPrompt)
                 .rawLocator(null)
                 .compactionApplied(false)
                 .observabilityOutput(rawOutput)
+                .observabilityPrompt(rawPrompt)
                 .build();
     }
 
-    private String buildModelOutput(String toolName, String summary, String rawRef, boolean truncated,
+    private SerializedOutput buildModelOutput(String toolName, String summary, String rawRef, boolean truncated,
                                     Map<String, Object> compactSearchItems) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("format", truncated ? "tool_result truncated" : "tool_result summary");
@@ -125,9 +158,9 @@ public class ToolOutputCompactionService {
         payload.put("tool", nvl(toolName));
         payload.put("data", data);
         try {
-            return objectMapper.writeValueAsString(payload);
+            return new SerializedOutput(objectMapper.writeValueAsString(payload), true);
         } catch (Exception e) {
-            return rawRef;
+            return new SerializedOutput(rawRef, false);
         }
     }
 
@@ -273,13 +306,26 @@ public class ToolOutputCompactionService {
         return text == null ? "" : text;
     }
 
+    private static ModelSendBlockedException missingSource() {
+        return new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                "工具结果压缩缺少已分类的正文来源");
+    }
+
+    private record SerializedOutput(String text, boolean includesPayload) { }
+
     @Data
     @Builder
     public static class CompactionResult {
         private String modelOutput;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText modelPrompt;
         private String cacheTemplate;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText cacheTemplatePrompt;
         private RawPayloadLocator rawLocator;
         private boolean compactionApplied;
         private String observabilityOutput;
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        private PromptText observabilityPrompt;
     }
 }

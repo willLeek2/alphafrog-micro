@@ -1,5 +1,8 @@
 package world.willfrog.agent.tools.market;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -41,6 +44,10 @@ final class MarketDataFinancialTools {
     }
 
     String getFinancialReport(String tsCode, String reportType, String startPeriod, String endPeriod) {
+        return getFinancialReportPrompt(tsCode, reportType, startPeriod, endPeriod).text();
+    }
+
+    PromptText getFinancialReportPrompt(String tsCode, String reportType, String startPeriod, String endPeriod) {
         try {
             String tool = "getFinancialReport";
             String type = support.nvl(reportType).trim().toLowerCase();
@@ -52,11 +59,12 @@ final class MarketDataFinancialTools {
 
             List<Map<String, Object>> items = fetchItems(type, request);
             if (items == null) {
-                return support.fail(tool, "INVALID_ARGUMENT", "Unknown reportType: " + type
-                        + ". Must be one of: income, balancesheet, cashflow, express, fina_indicator, report_rc", Map.of("reportType", type));
+                return support.failPrompt(tool, "INVALID_ARGUMENT",
+                        support.policy("marketFinancialReportTypeAdvice", Map.of("reportType", type)),
+                        Map.of("reportType", type));
             }
             if (items.isEmpty()) {
-                return support.fail(tool, "NO_DATA", "No financial data found", Map.of(
+                return support.failPrompt(tool, "NO_DATA", "No financial data found", Map.of(
                         "ts_code", support.nvl(tsCode),
                         "report_type", type,
                         "start_period", support.compactDate(startPeriod),
@@ -75,9 +83,10 @@ final class MarketDataFinancialTools {
                 data.put("dataset_id", datasetId);
                 data.put("dataset_ids", List.of(datasetId));
             }
-            return support.ok(tool, data);
+            return support.okPrompt(tool, data);
         } catch (Exception e) {
-            return support.fail("getFinancialReport", "TOOL_ERROR", "Error fetching financial report",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return support.failPrompt("getFinancialReport", "TOOL_ERROR", "Error fetching financial report",
                     Map.of("message", support.nvl(e.getMessage())));
         }
     }

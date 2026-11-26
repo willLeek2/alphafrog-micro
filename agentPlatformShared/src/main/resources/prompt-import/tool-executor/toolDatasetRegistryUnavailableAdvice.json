@@ -1,0 +1,14 @@
+{
+  "fragment": "toolDatasetRegistryUnavailableAdvice",
+  "purpose": "toolDatasetRegistryUnavailableAdvice",
+  "bodyType": "FIXED",
+  "body": "RUN_LEVEL_IDS_UNAVAILABLE means the active run registry is not available; do not keep retrying the same raw ids. ",
+  "variables": [],
+  "utf8Sha256": "438d1955e11a0688a4ab426b4c83039b41fb8868bf69b3f10ae11e429b744473",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tools/ToolRouterToolExecutor.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

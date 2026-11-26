@@ -41,6 +41,8 @@ public class ToolJobResumeContext {
     private boolean terminalSuccess;
     // preview 是可直接注入后续模型上下文的有界结果摘要。
     private String terminalResultPreview;
+    private String terminalPromptSourcesJson;
+    private java.util.Map<String, Object> terminalModelSendBlock;
     // rawRef 指向完整结果，避免把大结果塞回 Run 上下文。
     private String terminalRawRef;
     // stderr/error/exitReason/retryable 用来仅对用户代码失败开启有界修复。
@@ -96,6 +98,11 @@ public class ToolJobResumeContext {
 
     public String getTerminalResultPreview() { return terminalResultPreview; }
     public void setTerminalResultPreview(String terminalResultPreview) { this.terminalResultPreview = terminalResultPreview; }
+
+    public java.util.Map<String, Object> getTerminalModelSendBlock() { return terminalModelSendBlock; }
+    public void setTerminalModelSendBlock(java.util.Map<String, Object> value) { terminalModelSendBlock = value; }
+    public String getTerminalPromptSourcesJson() { return terminalPromptSourcesJson; }
+    public void setTerminalPromptSourcesJson(String value) { terminalPromptSourcesJson = value; }
 
     public String getTerminalRawRef() { return terminalRawRef; }
     public void setTerminalRawRef(String terminalRawRef) { this.terminalRawRef = terminalRawRef; }

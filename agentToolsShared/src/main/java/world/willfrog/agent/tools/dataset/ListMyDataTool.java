@@ -1,15 +1,21 @@
 package world.willfrog.agent.tools.dataset;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
+import world.willfrog.agent.tools.datafrog.DataFrogObjectClient;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.datafrog.idl.DataObjectCard;
 
 import java.io.IOException;
 import java.nio.charset.CharacterCodingException;
@@ -87,6 +93,13 @@ public class ListMyDataTool {
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
 
+    /**
+     * 014-data-04: DataFrog 平台数据对象消费端（可选注入）。dataset 模式时附带「平台数据对象」
+     * 区（当前登录用户自己的对象，owner 固定取 AgentContext 当前用户，不接受工具参数传入 owner）。
+     */
+    @Autowired(required = false)
+    private DataFrogObjectClient dataFrogObjectClient;
+
     @Autowired
     public ListMyDataTool(ObjectMapper objectMapper) {
         this(objectMapper, new DatasetEntryMetadataReader(objectMapper));
@@ -102,6 +115,11 @@ public class ListMyDataTool {
      */
     void setAgentRunDatasetRegistry(AgentRunDatasetRegistry registry) {
         this.agentRunDatasetRegistry = registry;
+    }
+
+    /** 同包注入平台对象消费端（单测 / 014-data-04 平台条目区）。 */
+    void setDataFrogObjectClient(DataFrogObjectClient client) {
+        this.dataFrogObjectClient = client;
     }
 
     /**
@@ -120,6 +138,10 @@ public class ListMyDataTool {
             @P(value = "可选，单页返回上限（默认 50，上限 200）", required = false) Integer limit,
             @P(value = "可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest", required = false) String related_dataset_ids
     ) {
+        return listMyDataPrompt(query_type, from_ts_code, grep, file_offset, file_limit, offset, limit, related_dataset_ids).text();
+    }
+
+    public PromptText listMyDataPrompt(String query_type, String from_ts_code, String grep, Integer file_offset, Integer file_limit, Integer offset, Integer limit, String related_dataset_ids) {
         return executeCore(query_type, from_ts_code, grep, file_offset, file_limit,
                 offset, limit, related_dataset_ids);
     }
@@ -146,14 +168,14 @@ public class ListMyDataTool {
             Integer limit,
             String related_dataset_ids
     ) {
-        return executeLegacy6Core(query_type, from_ts_code, grep, offset, limit, related_dataset_ids);
+        return executeLegacy6Core(query_type, from_ts_code, grep, offset, limit, related_dataset_ids).text();
     }
 
     /**
      * 8 形参版的核心实现：合并「非 grep 列表」和「grep raw file content」两种语义。
      * 同时被 {@code @Tool} 公开方法和 ToolRouter 路由调用，确保两种入口行为一致。
      */
-    private String executeCore(String queryType,
+    private PromptText executeCore(String queryType,
                                String fromTsCode,
                                String grep,
                                Integer fileOffset,
@@ -184,9 +206,7 @@ public class ListMyDataTool {
             List<String> relatedFilter = splitHash(relatedDatasetIds);
 
             AgentRunDatasetSnapshot snapshot = registry.snapshot(runId);
-            List<AgentRunDatasetEntry> candidates = "dataset".equals(qType)
-                    ? snapshot.datasets()
-                    : snapshot.manifests();
+            List<AgentRunDatasetEntry> candidates = datasetCandidatesWithoutPlatformObjects(qType, snapshot);
 
             // grep 模式：仅 dataset 模式 + grep 非空；走 raw file content 全文搜索。
             if ("dataset".equals(qType) && !grepQuery.isEmpty()) {
@@ -228,8 +248,13 @@ public class ListMyDataTool {
             data.put("offset", off);
             data.put("limit", lim);
             data.put("entries", entries);
+            // 014-data-04：dataset 模式附带平台数据对象区（当前用户自己的对象，只以 ds_ 标识展示）。
+            if ("dataset".equals(qType)) {
+                attachPlatformObjects(data);
+            }
             return ok(data);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("listMyData failed", e);
             return fail("TOOL_ERROR", "listMyData invocation error",
                     Map.of("message", nvl(e.getMessage())));
@@ -240,7 +265,7 @@ public class ListMyDataTool {
      * 6 形参版的核心实现：保留旧 ToolRouter 入口的 originalId grep 语义，避免破坏既有 routing 逻辑。
      * 行为与原始 commit ec2b31e 完全一致：grep 对 originalId 做大小写不敏感子串匹配。
      */
-    private String executeLegacy6Core(String queryType,
+    private PromptText executeLegacy6Core(String queryType,
                                       String fromTsCode,
                                       String grep,
                                       Integer offset,
@@ -269,9 +294,7 @@ public class ListMyDataTool {
             List<String> relatedFilter = splitHash(relatedDatasetIds);
 
             AgentRunDatasetSnapshot snapshot = registry.snapshot(runId);
-            List<AgentRunDatasetEntry> candidates = "dataset".equals(qType)
-                    ? snapshot.datasets()
-                    : snapshot.manifests();
+            List<AgentRunDatasetEntry> candidates = datasetCandidatesWithoutPlatformObjects(qType, snapshot);
 
             List<AgentRunDatasetEntry> filtered = new ArrayList<>();
             for (AgentRunDatasetEntry entry : candidates) {
@@ -297,12 +320,103 @@ public class ListMyDataTool {
             data.put("offset", off);
             data.put("limit", lim);
             data.put("entries", entries);
+            // 014-data-04：dataset 模式附带平台数据对象区（当前用户自己的对象，只以 ds_ 标识展示）。
+            if ("dataset".equals(qType)) {
+                attachPlatformObjects(data);
+            }
             return ok(data);
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("listMyData failed", e);
             return fail("TOOL_ERROR", "listMyData invocation error",
                     Map.of("message", nvl(e.getMessage())));
         }
+    }
+
+    /**
+     * 014-data-04：dataset 模式的候选集剔除 platform_object 来源的登记条目——平台对象挂载副本
+     * 只在平台条目区以 ds_ 标识展示，run 数据集区不重复列出（manifest 模式不含平台对象，原样返回）。
+     */
+    private static List<AgentRunDatasetEntry> datasetCandidatesWithoutPlatformObjects(
+            String qType, AgentRunDatasetSnapshot snapshot) {
+        List<AgentRunDatasetEntry> candidates = "dataset".equals(qType)
+                ? snapshot.datasets()
+                : snapshot.manifests();
+        if (!"dataset".equals(qType)) {
+            return candidates;
+        }
+        List<AgentRunDatasetEntry> filtered = new ArrayList<>(candidates.size());
+        for (AgentRunDatasetEntry entry : candidates) {
+            if (!entry.isPlatformObject()) {
+                filtered.add(entry);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * 014-data-04：组装「平台数据对象」区。数据源是 DataFrogObjectClient.listMyDataObjects
+     * （014-data-04 起 ListDataObjects 带服务端 filter_owner 等值过滤，owner 固定取当前登录
+     * 用户，不接受工具参数传入；bob 节点 c 裁定 d61398da）。平台侧不可用时列表主流程不失败：
+     * run 级条目仍完整返回，且「空平台区 + 不可用说明」必须写进返回给模型的结果文本
+     * （platform_objects_note），不能只打日志。
+     */
+    private void attachPlatformObjects(Map<String, Object> data) {
+        if (dataFrogObjectClient == null) {
+            data.put("platform_objects", List.of());
+            data.put("platform_object_count", 0);
+            data.put("platform_objects_note",
+                    "platform objects unavailable: DataFrog channel is not wired in this deployment");
+            return;
+        }
+        String userId = AgentContext.getUserId();
+        if (userId == null || userId.isBlank()) {
+            data.put("platform_objects", List.of());
+            data.put("platform_object_count", 0);
+            data.put("platform_objects_note",
+                    "platform objects unavailable: no current user context in this run");
+            return;
+        }
+        try {
+            List<Map<String, Object>> platformObjects = new ArrayList<>();
+            for (DataObjectCard card : dataFrogObjectClient.listMyDataObjects(userId)) {
+                platformObjects.add(platformObjectView(card));
+            }
+            data.put("platform_objects", platformObjects);
+            data.put("platform_object_count", platformObjects.size());
+        } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
+            log.warn("listMyData 平台对象区查询失败: {}", e.getMessage());
+            data.put("platform_objects", List.of());
+            data.put("platform_object_count", 0);
+            data.put("platform_objects_note",
+                    "platform objects temporarily unavailable: " + nvl(e.getMessage()));
+        }
+    }
+
+    /** 平台对象条目视图：ds_ id、名称、描述、覆盖终点、断言汇总文案（014-data-04）。 */
+    private static Map<String, Object> platformObjectView(DataObjectCard card) {
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("id", card.getId());
+        view.put("name", card.getName());
+        view.put("description", card.getDescription());
+        view.put("coverageEnd", card.getCoverageEnd());
+        view.put("assertionStatus", assertionStatusText(card.getAssertionStatus()));
+        return view;
+    }
+
+    /** 断言汇总枚举的中文文案；认不出的值按「断言状态未知」呈现。 */
+    private static String assertionStatusText(world.willfrog.datafrog.idl.AssertionStatus status) {
+        if (status == null) {
+            return "断言状态未知";
+        }
+        return switch (status) {
+            case NO_ASSERTIONS -> "未登记断言";
+            case PASS -> "断言全部通过";
+            case PARTIAL -> "断言部分通过";
+            case FAIL -> "断言未通过";
+            default -> "断言状态未知";
+        };
     }
 
     private Map<String, Object> buildGrepResult(String runId,
@@ -490,7 +604,7 @@ public class ListMyDataTool {
         return out;
     }
 
-    private String ok(Map<String, Object> data) {
+    private PromptText ok(Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
         payload.put("tool", "listMyData");
@@ -499,25 +613,27 @@ public class ListMyDataTool {
         return writeJson(payload);
     }
 
-    private String fail(String code, String message, Map<String, Object> details) {
+    private PromptText fail(String code, Object message, Map<String, Object> details) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", false);
         payload.put("tool", "listMyData");
         payload.put("data", Map.of());
         Map<String, Object> err = new LinkedHashMap<>();
         err.put("code", nvl(code));
-        err.put("message", nvl(message));
+        err.put("message", message == null ? "" : message);
         err.put("details", details == null ? Map.of() : details);
+        ToolFailureCategory.putCategoryIfResolved(err, code, null);
         payload.put("error", err);
         return writeJson(payload);
     }
 
-    private String writeJson(Object payload) {
+    private PromptText writeJson(Object payload) {
         try {
-            return objectMapper.writeValueAsString(payload);
+            return ProducerPromptTexts.json(objectMapper, payload);
         } catch (Exception e) {
-            return "{\"ok\":false,\"tool\":\"listMyData\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
-                    + escapeJson(nvl(e.getMessage())) + "\"}}";
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return PromptText.runtimeData("{\"ok\":false,\"tool\":\"listMyData\",\"error\":{\"code\":\"JSON_SERIALIZE_ERROR\",\"message\":\""
+                    + escapeJson(nvl(e.getMessage())) + "\"}}");
         }
     }
 

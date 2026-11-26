@@ -1,5 +1,8 @@
 package world.willfrog.agent.tools.market;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -56,6 +59,10 @@ final class MarketDataSpecialAssetTools {
     }
 
     String getSpecialAssetDaily(String tsCode, String assetType, String startDate, String endDate) {
+        return getSpecialAssetDailyPrompt(tsCode, assetType, startDate, endDate).text();
+    }
+
+    PromptText getSpecialAssetDailyPrompt(String tsCode, String assetType, String startDate, String endDate) {
         String tool = "getSpecialAssetDaily";
         String normalizedTsCode = support.nvl(tsCode).trim();
         String normalizedStart = support.compactDate(startDate);
@@ -64,13 +71,13 @@ final class MarketDataSpecialAssetTools {
         long endMs = support.convertToMsTimestamp(normalizedEnd);
         String type = normalizeAssetType(assetType);
         if (type == null) {
-            return support.fail(tool, "INVALID_ARGUMENT",
-                    "assetType 必须是 cb（可转债）或 ah（AH 比价），当前值不被识别。",
+            return support.failPrompt(tool, "INVALID_ARGUMENT",
+                    support.policy("marketSpecialAssetTypeAdvice"),
                     Map.of("assetType", support.nvl(assetType), "allowed", List.of("cb", "ah")));
         }
         if (normalizedTsCode.isBlank() || startMs <= 0 || endMs <= 0) {
-            return support.fail(tool, "INVALID_ARGUMENT",
-                    "Invalid tsCode or date range, use YYYYMMDD",
+            return support.failPrompt(tool, "INVALID_ARGUMENT",
+                    support.policy("marketAssetDateFormatAdvice"),
                     Map.of("ts_code", normalizedTsCode, "start_date", normalizedStart, "end_date", normalizedEnd));
         }
         try {
@@ -78,7 +85,8 @@ final class MarketDataSpecialAssetTools {
                     ? fetchCbDaily(normalizedTsCode, normalizedStart, normalizedEnd)
                     : fetchStkAh(normalizedTsCode, normalizedStart, normalizedEnd);
         } catch (Exception e) {
-            return support.fail(tool, "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+            ModelSendBlocks.rethrowIfBlocked(e);
+            return support.failPrompt(tool, "TOOL_ERROR", support.policy("marketQueryFailure"),
                     Map.of("message", support.nvl(e.getMessage())));
         }
     }
@@ -98,14 +106,14 @@ final class MarketDataSpecialAssetTools {
         return metaDate == null || metaDate.isBlank() ? requestDate : metaDate;
     }
 
-    private String fetchCbDaily(String tsCode, String startDate, String endDate) {
+    private PromptText fetchCbDaily(String tsCode, String startDate, String endDate) {
         String tool = "getSpecialAssetDaily";
         if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
             var reused = datasetRegistry.findReusable("cb_daily", tsCode, startDate, endDate, CB_DAILY_HEADERS);
             if (reused.isPresent()) {
                 // 复用命中报数据集实际覆盖区间（超集复用时与请求窗口不同），语义对齐
                 // getStockDaily 复用分支：rows 是数据集实际行数，区间必须配套。
-                return support.ok(tool, specialAssetData(
+                return support.okPrompt(tool, specialAssetData(
                         tsCode,
                         reusedMetaDate(reused.get().getStartDate(), startDate),
                         reusedMetaDate(reused.get().getEndDate(), endDate),
@@ -120,8 +128,8 @@ final class MarketDataSpecialAssetTools {
                         .setEndDate(support.convertToMsTimestamp(endDate))
                         .build());
         if (response.getItemsCount() <= 0) {
-            return support.fail(tool, "NO_DATA",
-                    "该可转债在指定日期范围内无日线记录，请检查代码或调整起止日期。",
+            return support.failPrompt(tool, "NO_DATA",
+                    support.policy("marketCbNoDailyDataAdvice"),
                     Map.of("ts_code", tsCode, "asset_type", "cb",
                             "start_date", startDate, "end_date", endDate));
         }
@@ -146,7 +154,7 @@ final class MarketDataSpecialAssetTools {
                 datasetRegistry.registerDataset("cb_daily", tsCode, startDate, endDate,
                         CB_DAILY_HEADERS, datasetId, items.size());
             }
-            return support.ok(tool, specialAssetData(tsCode, startDate, endDate, "cb",
+            return support.okPrompt(tool, specialAssetData(tsCode, startDate, endDate, "cb",
                     CB_DAILY_HEADERS, datasetId, items.size(), "created", false, List.of()));
         }
         List<Map<String, Object>> previewRows = new ArrayList<>();
@@ -157,16 +165,16 @@ final class MarketDataSpecialAssetTools {
             row.put("premium", item.getPremium().isEmpty() ? null : item.getPremium());
             previewRows.add(row);
         });
-        return support.ok(tool, specialAssetData(tsCode, startDate, endDate, "cb",
+        return support.okPrompt(tool, specialAssetData(tsCode, startDate, endDate, "cb",
                 CB_DAILY_HEADERS, "", items.size(), "inline", false, previewRows));
     }
 
-    private String fetchStkAh(String tsCode, String startDate, String endDate) {
+    private PromptText fetchStkAh(String tsCode, String startDate, String endDate) {
         String tool = "getSpecialAssetDaily";
         if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
             var reused = datasetRegistry.findReusable("stk_ah", tsCode, startDate, endDate, STK_AH_HEADERS);
             if (reused.isPresent()) {
-                return support.ok(tool, specialAssetData(
+                return support.okPrompt(tool, specialAssetData(
                         tsCode,
                         reusedMetaDate(reused.get().getStartDate(), startDate),
                         reusedMetaDate(reused.get().getEndDate(), endDate),
@@ -181,8 +189,8 @@ final class MarketDataSpecialAssetTools {
                         .setEndDate(support.convertToMsTimestamp(endDate))
                         .build());
         if (response.getItemsCount() <= 0) {
-            return support.fail(tool, "NO_DATA",
-                    "该股票在指定日期范围内无 AH 比价记录（仅同时登录 A/H 两地的股票有此数据），请检查代码或调整起止日期。",
+            return support.failPrompt(tool, "NO_DATA",
+                    support.policy("marketAhNoDailyDataAdvice"),
                     Map.of("ts_code", tsCode, "asset_type", "ah",
                             "start_date", startDate, "end_date", endDate));
         }
@@ -203,7 +211,7 @@ final class MarketDataSpecialAssetTools {
                 datasetRegistry.registerDataset("stk_ah", tsCode, startDate, endDate,
                         STK_AH_HEADERS, datasetId, items.size());
             }
-            return support.ok(tool, specialAssetData(tsCode, startDate, endDate, "ah",
+            return support.okPrompt(tool, specialAssetData(tsCode, startDate, endDate, "ah",
                     STK_AH_HEADERS, datasetId, items.size(), "created", false, List.of()));
         }
         List<Map<String, Object>> previewRows = new ArrayList<>();
@@ -215,7 +223,7 @@ final class MarketDataSpecialAssetTools {
             row.put("ah_premium", item.hasAhPremium() ? item.getAhPremium() : null);
             previewRows.add(row);
         });
-        return support.ok(tool, specialAssetData(tsCode, startDate, endDate, "ah",
+        return support.okPrompt(tool, specialAssetData(tsCode, startDate, endDate, "ah",
                 STK_AH_HEADERS, "", items.size(), "inline", false, previewRows));
     }
 

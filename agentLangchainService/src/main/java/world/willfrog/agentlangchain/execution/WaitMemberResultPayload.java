@@ -3,6 +3,9 @@ package world.willfrog.agentlangchain.execution;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.input.PromptMessageCodec;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -91,6 +94,18 @@ public final class WaitMemberResultPayload {
         }
     }
 
+    /** 来源随分类后的正文保存；兼容编码入口的来源保持未知。 */
+    public static String encodePrompt(ObjectMapper objectMapper, String toolName, String toolCallId,
+                                      boolean success, PromptText output, Map<String, Object> extra, int maxChars) {
+        Map<String, Object> attributes = new LinkedHashMap<>(extra == null ? Map.of() : extra);
+        boolean removed = tooLarge(stripJsonbUnsafe(output.text()), maxChars);
+        var sources = removed ? java.util.List.<world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource>of()
+                : output.sources();
+        attributes.putAll(PromptMessageCodec.sourceAttributes(sources.isEmpty()
+                ? PromptMessage.Origin.RUNTIME_DATA : PromptMessage.Origin.APPLICATION_INSTRUCTION, sources));
+        return encode(objectMapper, toolName, toolCallId, success, output.text(), attributes, maxChars);
+    }
+
     /**
      * 第一次写入失败后改用的短失败载荷：不含工具原文，避免同一条非法字符或超大 JSON 再次把语句打爆。
      */
@@ -117,6 +132,18 @@ public final class WaitMemberResultPayload {
         extra.put("errorDetail", detail);
         if (taskId != null && !taskId.isBlank()) extra.put("taskId", taskId);
         return encode(objectMapper, toolName, toolCallId, false, "", extra, Integer.MAX_VALUE);
+    }
+
+    /** 本次持久化失败记为框架事实；兼容压缩入口沿用原来源。 */
+    public static String compactPersistFailurePrompt(ObjectMapper objectMapper, String toolName,
+                                                     String toolCallId, String errorDetail, String taskId) {
+        String detail = errorDetail == null || errorDetail.isBlank() ? "成员结果无法写入等待组" : errorDetail;
+        if (detail.length() > 240) detail = detail.substring(0, 240);
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("errorCode", PERSIST_FAILED); extra.put("errorDetail", detail);
+        if (taskId != null && !taskId.isBlank()) extra.put("taskId", taskId);
+        return encodePrompt(objectMapper, toolName, toolCallId, false, PromptText.runtimeData(""),
+                extra, Integer.MAX_VALUE);
     }
 
     /**
@@ -152,6 +179,10 @@ public final class WaitMemberResultPayload {
      *
      * <p>失败的成员要把失败文本一并交回，模型才有机会换参数重试或改用别的做法；结果过大被改写成
      * 失败的成员同样如此，它看到的是一句明确的说明，不是半截数据。</p>
+     *
+     * <p>例外是携带结构化预算字段（dimension/used/limit）的预算拒绝成员：这类成员的工具根本没执行，
+     * 恢复时输出 {@link #budgetRejectionText} 的结构化信封，不再伪装成「工具调用失败」；没有结构化
+     * 字段的旧载荷（如子代理预占路径写入的）继续走原模板，旧数据也能读出可理解的文本。</p>
      */
     public static String modelText(String resultRefJson, ObjectMapper objectMapper) {
         JsonNode node = parse(resultRefJson, objectMapper);
@@ -167,8 +198,73 @@ public final class WaitMemberResultPayload {
         if (!output.isBlank()) {
             return output;
         }
+        if ("run_budget_exceeded".equals(errorCode) && node.has("dimension")) {
+            return budgetRejectionText(node.path("dimension").asText(""),
+                    node.path("used").asLong(-1L), node.path("limit").asLong(-1L), objectMapper);
+        }
         String reason = !errorCode.isBlank() ? errorCode : "tool_failed";
         return detail.isBlank() ? "工具调用失败：" + reason : "工具调用失败：" + reason + "（" + detail + "）";
+    }
+
+    /**
+     * 预算拒绝的结构化信封（模型可见文本）。
+     *
+     * <p>预算拒绝不是工具故障：工具根本没执行（rejected_before_dispatch=true），也不该按工具报错
+     * 重试（retryable=false，建议基于已有结果作答），与「单次回复条数超限、减少条数即可」的语义分开。
+     * dimension/used/limit 是捕获处透传的真实数字，往后每跳只透传不重算；message 按维度生成。
+     * V2 成员渲染与 V1 工具执行器共用这一份定义。预算拒绝不属四类工具故障，信封不带 category，
+     * 拒绝语义由 rejected_before_dispatch + dimension 表达。</p>
+     */
+    public static String budgetRejectionText(String dimension, long used, long limit,
+                                             ObjectMapper objectMapper) {
+        return budgetRejectionText(dimension, used, limit, budgetRejectionMessage(dimension), objectMapper, false);
+    }
+
+    public static PromptText budgetRejectionPrompt(String dimension, long used, long limit,
+                                                   PromptText message, ObjectMapper objectMapper) {
+        if (message == null || message.sources().isEmpty()) {
+            throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                    world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "预算拒绝建议缺少真实指令版本");
+        }
+        return new PromptText(budgetRejectionText(dimension, used, limit, message.text(), objectMapper, true), message.sources());
+    }
+
+    private static String budgetRejectionText(String dimension, long used, long limit, String message,
+                                              ObjectMapper objectMapper, boolean requireInstruction) {
+        Map<String, Object> error = new LinkedHashMap<>();
+        error.put("code", "RUN_BUDGET_EXCEEDED");
+        error.put("dimension", dimension == null ? "" : dimension);
+        error.put("used", used);
+        error.put("limit", limit);
+        error.put("retryable", false);
+        error.put("rejected_before_dispatch", true);
+        error.put("message", message);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", false);
+        payload.put("error", error);
+        try {
+            return objectMapper.writeValueAsString(payload);
+        } catch (Exception e) {
+            if (requireInstruction) {
+                throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "预算拒绝的指令正文无法编码");
+            }
+            // 序列化兜底：退回与 RunBudgetException 异常消息同款的可识别文本。
+            return "RUN_BUDGET_EXCEEDED:" + (dimension == null ? "" : dimension) + ":" + used + "/" + limit;
+        }
+    }
+
+    /** 预算拒绝 message 按维度生成；表外维度用通用句，并附上基于已有结果作答的建议。 */
+    private static String budgetRejectionMessage(String dimension) {
+        String byDimension = switch (dimension == null ? "" : dimension) {
+            case "tool_calls" -> "工具调用次数预算已用尽";
+            case "wall_clock_ms" -> "运行时间预算已用尽";
+            case "tokens" -> "令牌预算已用尽";
+            default -> "运行预算已用尽";
+        };
+        return byDimension + "。请根据已有结果回答；信息不足时说明无法完成。";
     }
 
     private static JsonNode parse(String resultRefJson, ObjectMapper objectMapper) {

@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.control.dualpool;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -14,10 +15,13 @@ import world.willfrog.agent.platform.wait.RecoveryRejection;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -27,19 +31,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>三条入口（提交后马上唤醒、周期补扫、启动扫描）都必须从这里过，因为顺序不能各写各的：</p>
  *
  * <ol>
- *   <li><b>服务所有权</b>：先按租约表取得或确认这条 Run 的服务所有权，再进消费语句；消费语句在同一次
- *   条件更新里核对持有者与代际，并且把租约行与 Run 行一起锁住。非所有者、旧代际、核对与写入之间被
+ *   <li><b>服务所有权</b>：先按服务所有权记录取得或确认这条 Run 的服务所有权，再进消费语句；消费语句在同一次
+ *   条件更新里核对持有者与代际，并且把服务所有权行与 Run 行一起锁住。非所有者、旧代际、核对与写入之间被
  *   接手都改不动任何一行。</li>
  *   <li><b>业务名额预留</b>：消费是一锤子买卖——通知只有一条，取走了就不会再来。所以名额必须在这之前
  *   拿到手，而且要是可以回滚的那种：拿不到名额就不消费，通知留在等待态按退避推后，下一轮再来。
  *   反过来的顺序（先消费再要名额）在名额满时会把 Run 永久停在「下一段已放行、通知已取走、没人受理」。</li>
  *   <li><b>消费与收尾</b>：消费成功就把预留激活；消费没成按语句给的原因分两种：不会再被服务的
  *   （Run 终态、计划或控制版本作废、下一段已不在等待态）落成关闭态并写明原因，暂时性的推后重试。
- *   两种都要把刚占的预留回滚掉，把刚取得、还没接手的租约按持有者与代际让出。</li>
+ *   两种都要把刚占的预留回滚掉，把刚取得、还没接手的服务所有权按持有者与代际让出。</li>
  * </ol>
  *
- * <p>让出那一步是有讲究的：本进程刚取得租约却没接手时如果一直握着，续期循环会把它当成「我在服务」
- * 一直续下去，别人永远接不了手。只有本来就是我持有的租约才留着——那说明这条 Run 确实归我。</p>
+ * <p>让出那一步是有讲究的：本进程刚取得服务所有权却没接手时如果一直握着，续期循环会把它当成「我在服务」
+ * 一直续下去，别人永远接不了手。只有本来就是我持有的服务所有权才留着——那说明这条 Run 确实归我。</p>
  */
 @Service
 @Slf4j
@@ -76,6 +80,8 @@ public class WaitGroupRecoveryIntake {
     private final RunServiceLeaseStore leaseStore;
     private final ProcessInstanceIdentity instanceIdentity;
     private final DualPoolRunAdmissionRegistry admissionRegistry;
+    private final DualPoolSchedulerSettings settings;
+    private final RunOwnershipGateway ownership;
     private final Duration leaseTtl;
 
     private final AtomicLong consumed = new AtomicLong();
@@ -86,20 +92,38 @@ public class WaitGroupRecoveryIntake {
     private final AtomicLong leaseReleased = new AtomicLong();
     private final AtomicLong admissionUnavailable = new AtomicLong();
 
+    @Autowired
     public WaitGroupRecoveryIntake(
             WaitGroupStore waitGroupStore,
             RunServiceLeaseStore leaseStore,
             ProcessInstanceIdentity instanceIdentity,
             DualPoolRunAdmissionRegistry admissionRegistry,
+            DualPoolSchedulerSettings settings,
+            RunOwnershipGateway ownership,
             @Value("${agent.langchain.dual-pool.service-lease-ttl-seconds:120}") long leaseTtlSeconds,
             FrozenEffectiveSettings frozenEffectiveSettings) {
         this.waitGroupStore = waitGroupStore;
         this.leaseStore = leaseStore;
         this.instanceIdentity = instanceIdentity;
         this.admissionRegistry = admissionRegistry;
-        this.leaseTtl = Duration.ofSeconds(Math.max(1L, leaseTtlSeconds));
+        this.settings = settings;
+        this.ownership = ownership;
+        this.leaseTtl = Duration.ofSeconds(
+                DualPoolSchedulerSettings.normalizeServiceLeaseTtlSeconds(leaseTtlSeconds));
         frozenEffectiveSettings.register(DualPoolSchedulerSettings.KEY_SERVICE_LEASE_TTL_SECONDS,
                 "WaitGroupRecoveryIntake", this.leaseTtl.toSeconds());
+    }
+
+    /** 窄测试入口：不注入部署归属时，领取前不做部署或泳道核对。 */
+    WaitGroupRecoveryIntake(
+            WaitGroupStore waitGroupStore,
+            RunServiceLeaseStore leaseStore,
+            ProcessInstanceIdentity instanceIdentity,
+            DualPoolRunAdmissionRegistry admissionRegistry,
+            long leaseTtlSeconds,
+            FrozenEffectiveSettings frozenEffectiveSettings) {
+        this(waitGroupStore, leaseStore, instanceIdentity, admissionRegistry, null, null,
+                leaseTtlSeconds, frozenEffectiveSettings);
     }
 
     /**
@@ -246,6 +270,11 @@ public class WaitGroupRecoveryIntake {
      * <p>拿不到就说明别人正活着持有它——这条 Run 现在不归我们动，也不能拿别人的所有权去消费。</p>
      */
     private LeaseStep takeLease(AgentRun run, String caller) {
+        if (ownership != null && settings != null && !matchesThisProcess(run)) {
+            log.debug("这条 Run 不属于本进程的部署或泳道，先不动它：runId={} caller={}",
+                    run.getId(), caller);
+            return new LeaseStep(false, null, false);
+        }
         String runId = run.getId();
         boolean alreadyMine = leaseStore.find(runId)
                 .map(existing -> instanceIdentity.value().equals(existing.ownerInstanceId()))
@@ -261,7 +290,7 @@ public class WaitGroupRecoveryIntake {
         return new LeaseStep(true, acquired.get(), alreadyMine);
     }
 
-    /** 刚取得、还没接手的租约要让出去：握着不服务的租约会被续期循环一直续住，别人接不了手。 */
+    /** 刚取得、还没接手的服务所有权要让出去：握着不服务的服务所有权会被续期循环一直续住，别人接不了手。 */
     private void releaseIfFreshlyTaken(LeaseStep lease, String caller) {
         if (!lease.acquired() || lease.alreadyMine() || lease.lease() == null) {
             return;
@@ -281,6 +310,24 @@ public class WaitGroupRecoveryIntake {
         }
     }
 
+    /**
+     * 这条 Run 是不是本进程该服务的部署代际与泳道。
+     *
+     * <p>部署归属还没注入时（窄测试构造器）不做过滤。两边泳道都是空表示主 Beta，算匹配。</p>
+     */
+    private boolean matchesThisProcess(AgentRun run) {
+        if (run == null) {
+            return false;
+        }
+        if (ownership == null || settings == null) {
+            return true;
+        }
+        DeploymentIdentity identity = ownership.requireIdentity();
+        return Objects.equals(identity.deploymentId(), run.getDeploymentId())
+                && Objects.equals(identity.generationId(), run.getDeploymentGenerationId())
+                && Objects.equals(settings.processLaneTag(), run.getLaneTag());
+    }
+
     private static long value(Long value) {
         return value == null ? 0L : value;
     }
@@ -289,7 +336,7 @@ public class WaitGroupRecoveryIntake {
     private record LeaseStep(boolean acquired, RunServiceLease lease, boolean alreadyMine) {
     }
 
-    /** 受理这一层的读数：成、退避、关闭、抢不到与名额拿不到各多少，以及租约的取得与让出。 */
+    /** 受理这一层的读数：成、退避、关闭、抢不到与名额拿不到各多少，以及服务所有权的取得与让出。 */
     public Map<String, Object> snapshot() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("recoveryIntakeConsumedTotal", consumed.get());

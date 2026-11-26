@@ -1,0 +1,14 @@
+{
+  "fragment": "planningStructuredStage",
+  "purpose": "planningStructuredStage",
+  "bodyType": "FIXED",
+  "body": "[Stage: PLANNING_STRUCTURED]\n请将上述分析转化为简化的 Todo List JSON，只输出 JSON，不要包含其他文字。\n\n格式示例：\n{\"analysis\":\"分析摘要\",\"items\":[{\"id\":\"todo_1\",\"sequence\":1,\"description\":\"查询目标资产代码\",\"dependsOn\":[],\"expectedTools\":[]},{\"id\":\"todo_2\",\"sequence\":2,\"description\":\"获取所需数据\",\"dependsOn\":[\"todo_1\"]},{\"id\":\"todo_3\",\"sequence\":3,\"description\":\"分析数据并回答用户问题\",\"dependsOn\":[\"todo_2\"]}]}\n\n每个 Todo 需要一至三句话的 description；可以用 expectedTools 数组填写本次工具清单中预计可能使用的工具名，无法确定时省略或填空数组。expectedTools 只用于检查已知依赖，不指定调用顺序，也不限制执行模型随后选择工具。不要预先填写 toolName 或 params。DAG 模式可以用 dependsOn 表达依赖，LINEAR 模式按 sequence 顺序执行。\n",
+  "variables": [],
+  "utf8Sha256": "c51b55f55ba5e527c02ab480dfc9449b31cbdae87d3b2bd05eec9ef43e150a16",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/resources/prompts/todo/planning_structured_stage.txt",
+    "kind": "RESOURCE_INSTRUCTION"
+  },
+  "importOnly": true
+}

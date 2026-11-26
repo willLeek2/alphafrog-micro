@@ -1,6 +1,9 @@
 package world.willfrog.agent.tools.python;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.agent.tools.prompt.ProducerPromptTexts;
+import world.willfrog.agent.platform.prompt.TerminalResultPromptTexts;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 import com.fasterxml.jackson.databind.JsonNode;
 import dev.langchain4j.agent.tool.Tool;
 import jakarta.annotation.PostConstruct;
@@ -8,8 +11,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.failure.ToolFailureCategory;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapterRegistry;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobAdapters;
 import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
@@ -39,14 +45,21 @@ import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.agent.workflow.DatasetPersistedEvent;
+import world.willfrog.agent.tools.datafrog.DataFrogObjectClient;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
 import world.willfrog.agent.tools.dataset.RunLevelIdResolver;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
 
 import com.google.protobuf.util.JsonFormat;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -84,6 +97,16 @@ public class PythonSandboxTools {
     private static final int DATA_ANALYSIS_ATTEMPT = 1;
 
     /**
+     * 平台数据对象标识前缀（014-data-04）：dataset_ids 里 ds_ 前缀 token 走平台对象分支，
+     * 纯数字 token 走原 run 级编号路径；两套标识互不混用。
+     */
+    private static final String PLATFORM_OBJECT_ID_PREFIX = "ds_";
+    /** 平台对象 CSV 副本的持久化登记 TTL（小时）：与 DatasetRegistry 既有口径一致，12h。 */
+    private static final long PLATFORM_OBJECT_ARTIFACT_TTL_HOURS = 12L;
+    /** 平台对象名做文件名的长度上限（防超长名打爆文件系统）。 */
+    private static final int PLATFORM_OBJECT_NAME_MAX_CHARS = 64;
+
+    /**
      * 写给模型的完整说明只维护在 classpath 权威文件里。
      * {@code @Tool} 不再放正文：LangChain4j 反射只要方法签名，目录构建时再覆盖成权威正文。
      * 文件缺失或为空时加载直接失败，不再在 Java 里放第二份说明。
@@ -97,12 +120,49 @@ public class PythonSandboxTools {
 
     private final ObjectMapper objectMapper;
 
+    @Autowired
+    private ProducerPromptTexts promptTexts;
+
+    @Autowired
+    private TerminalResultPromptTexts terminalPromptTexts;
+
     /**
      * 订阅数据集持久化事件，并在单次 agent 运行内维护「局部编号 → 条目」映射。
      * 标记为可选注入（{@code required=false}），便于单元测试在不启动完整 Spring 上下文时运行。
      */
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
+
+    /**
+     * 014-data-04：DataFrog 平台数据对象消费端（可选注入，纯单元测试不接 DataFrog 时为 null；
+     * dataset_ids 里出现 ds_ token 且本依赖缺失时按结构化错误失败，不创建沙箱任务）。
+     */
+    @Autowired(required = false)
+    private DataFrogObjectClient dataFrogObjectClient;
+
+    /** 014-data-04：平台对象 CSV 经 DatasetPersistedEvent 登记进当前 run（与取数工具同一入口）。 */
+    @Autowired(required = false)
+    private ApplicationEventPublisher eventPublisher;
+
+    /** 014-data-04：平台对象 CSV 目录的持久化登记（TTL 与 Run 删除清理），可选注入。 */
+    @Autowired(required = false)
+    private PersistentArtifactRegistry persistentArtifactRegistry;
+
+    /**
+     * 014-new-03：收割产物落盘与幂等登记的公共实现。三个终态出口共用：
+     * 本类的 terminalSideEffect 回调、TerminalFormatContextFactory、
+     * ToolJobFinalizer 挂起恢复路径；可选注入，纯单元测试未接 Spring 时为 null。
+     */
+    @Autowired(required = false)
+    private RunOutputArtifactHarvester runOutputArtifactHarvester;
+
+    /**
+     * 014-data-04：平台对象 CSV 落盘根。与取数工具 dataset 共用同一存储根
+     * （agent.tools.market-data.dataset.database-fetched-path），沙箱 runner 能直接按
+     * source_path cp，沙箱服务与 Dubbo 契约零改动。
+     */
+    @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
+    private String platformObjectStorageRoot;
 
     @Autowired
     private AgentRunMapper agentRunMapper;
@@ -160,12 +220,33 @@ public class PythonSandboxTools {
     @Value("${sandbox.create.allow-legacy-without-capacity:false}")
     private boolean allowLegacyWithoutCapacity = false;
 
+    /**
+     * 014-new-03：收割开关开启时的单文件收割上限（字节）。与下载侧上限同一配置键、
+     * 同一默认 10MB（AgentArtifactService.downloadMaxBytes 同源），保证「收割进来的
+     * 文件必然下载得动」。字段初始化值对齐 @Value 默认，纯单元测试不接 Spring 时行为一致。
+     */
+    @Value("${agent.artifact.download.max-bytes:10485760}")
+    private long collectArtifactMaxBytes = 10485760L;
+
+    /** 014-new-03 CR B2：max-bytes ≤0 时的「warn 一次」开关，避免每次调用刷日志。 */
+    private final java.util.concurrent.atomic.AtomicBoolean collectMaxBytesZeroWarned =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private final DatasetEntryMetadataReader metadataReader;
 
     public PythonSandboxTools(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
         this.metadataReader = new DatasetEntryMetadataReader(objectMapper);
         this.financeToolResultFormatter = new FinanceToolResultFormatter(objectMapper);
+    }
+
+    @Autowired
+    public PythonSandboxTools(ObjectMapper objectMapper, FinanceToolResultFormatter formatter,
+                              TerminalResultPromptTexts terminalPromptTexts) {
+        this.objectMapper = objectMapper;
+        this.metadataReader = new DatasetEntryMetadataReader(objectMapper);
+        this.financeToolResultFormatter = formatter;
+        this.terminalPromptTexts = terminalPromptTexts;
     }
 
     // ==================== 适配器装配（生命周期框架的四个出口） ====================
@@ -193,11 +274,20 @@ public class PythonSandboxTools {
                     current = new SandboxJobAdapters(
                             new PythonSandboxJobRequestAdapter(),
                             new PythonSandboxJobRunnerAdapter(pythonSandboxService, observability()),
-                            new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter),
+                            new PythonSandboxJobResultAdapter(financeToolResultFormatter, financeResultModelAdapter, terminalPromptTexts),
                             new PythonSandboxJobMeteringAdapter(objectMapper),
-                            (context, terminal) -> extractFinanceIfPresent(
-                                    context.runId(), context.userId(), context.todoId(), context.toolCallId(),
-                                    terminal.statusName(), (TaskResultResponse) terminal.nativePayload()));
+                            (context, terminal) -> {
+                                // 014-new-03：等待组成员接回路径（WaitMemberResultReceiver 拉到
+                                // 终态结果之后）在这里收割产物；成员身份由持久上下文显式传入。
+                                // 收割先于 finance：finance 失败会抛出阻断格式化，产物落袋不受它影响。
+                                if (runOutputArtifactHarvester != null) {
+                                    runOutputArtifactHarvester.harvest(context.runId(), context.userId(),
+                                            (TaskResultResponse) terminal.nativePayload());
+                                }
+                                return extractFinanceIfPresent(
+                                        context.runId(), context.userId(), context.todoId(), context.toolCallId(),
+                                        terminal.statusName(), (TaskResultResponse) terminal.nativePayload());
+                            });
                     sandboxJobAdapters = current;
                 }
             }
@@ -235,10 +325,21 @@ public class PythonSandboxTools {
                 POLL_INTERVAL_MS, DAG_LEASE_RENEW_AHEAD_MILLIS, fastPathMs);
     }
 
-    /** finance 记录通道是 executePython 的自有终态副作用；框架在结果格式化前回调这里。 */
+    /**
+     * finance 记录通道是 executePython 的自有终态副作用；框架在结果格式化前回调这里。
+     * 014-new-03：同一回调里先做收割产物落袋（生产同步/DAG 阻塞路径的收割挂钩点），
+     * 再处理 finance——收割失败只记 warn 不抛出，finance 的失败语义保持原样；
+     * 反过来把收割放 finance 之后，会让 finance 异常连带丢掉本可落袋的产物。
+     */
     private SandboxToolJobLifecycle.TerminalSideEffect terminalSideEffect() {
-        return (runId, identity, anchor, view) -> processFinanceResult(
-                runId, identity, anchor, view.statusName(), (TaskResultResponse) view.nativePayload());
+        return (runId, identity, anchor, view) -> {
+            if (runOutputArtifactHarvester != null) {
+                runOutputArtifactHarvester.harvest(runId, AgentContext.getUserId(),
+                        (TaskResultResponse) view.nativePayload());
+            }
+            return processFinanceResult(
+                    runId, identity, anchor, view.statusName(), (TaskResultResponse) view.nativePayload());
+        };
     }
 
     /** 每次工具调用都按当前 Run 的持久快照读取，避免热配置改变旧 Run 的磁盘语义。 */
@@ -278,12 +379,43 @@ public class PythonSandboxTools {
     }
 
     /**
+     * 014-new-03：读取 Run 创建时冻结进 ext JSON 的 generate_artifacts 开关，决定本次
+     * 沙箱任务是否请求收割任务产物。语义对齐查询侧判定（LangchainArtifactFacadeService.
+     * generateArtifactsRequested）：缺失 / 非 JSON / 解析失败一律按 false——开关缺失只是
+     * 「用户没要产物」，不值得像工作区开关那样 fail-closed 拒绝执行；该 helper 是
+     * agentLangchainService 包内方法，工具层用不了，只能自读。
+     */
+    boolean generateArtifactsEnabledForRun(String runId) {
+        // 直接构造本工具的旧单元测试没有 Spring 接线，按关闭路径运行。
+        if (runId == null || runId.isBlank() || agentRunMapper == null || deploymentIdentityProvider == null) {
+            return false;
+        }
+        try {
+            DeploymentIdentity identity = deploymentIdentityProvider.current();
+            AgentRun run = agentRunMapper.findByIdForDeployment(
+                    runId, identity.deploymentId(), identity.generationId());
+            if (run == null || run.getExt() == null || run.getExt().isBlank()) {
+                return false;
+            }
+            JsonNode ext = objectMapper.readTree(run.getExt());
+            if (ext == null || !ext.isObject()) {
+                return false;
+            }
+            return ext.path("generate_artifacts").asBoolean(false);
+        } catch (Exception readFailure) {
+            ModelSendBlocks.rethrowIfBlocked(readFailure);
+            log.warn("读取 Run 的产物开关失败，按未开启处理: runId={} err={}", runId, readFailure.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * LangChain4j 暴露给 LLM 的五参数入口；参数名与权威说明中的字段一一对应。
      * 方法上的 {@code @Tool} 不再带正文，目录构建时会覆盖成权威文件。
      */
     @Tool
     public String executePython(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
-        return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
+        return executePythonPrompt(code, dataset_ids, manifest_ids, libraries, timeout_seconds).text();
     }
 
     /**
@@ -292,7 +424,7 @@ public class PythonSandboxTools {
      * 分别在各自编号空间中解析，不会再按旧逻辑串行混查。
      */
     public String executePython(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
-        return executePythonInternal(code, dataset_ids, null, libraries, timeout_seconds);
+        return executePythonPrompt(code, dataset_ids, null, libraries, timeout_seconds).text();
     }
 
     /**
@@ -308,7 +440,15 @@ public class PythonSandboxTools {
      * 返回值始终是 JSON 字符串：{@code ok=true} 时 {@code data} 含 stdout/stderr 等字段；
      * {@code ok=false} 时 {@code error.code} 标识失败类型，{@code error.details} 附带结构化上下文。
      */
-    private String executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
+    public PromptText executePythonPrompt(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
+        return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
+    }
+
+    public PromptText executePythonPrompt(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
+        return executePythonPrompt(code, dataset_ids, null, libraries, timeout_seconds);
+    }
+
+    private PromptText executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
         long toolStartMs = System.currentTimeMillis();
         try {
             long prepareStartMs = System.currentTimeMillis();
@@ -317,6 +457,22 @@ public class PythonSandboxTools {
             // LLM 可能传入逗号分隔数字，也可能传入 JSON 数组形态（如 "[1, 3]"），统一经 parseDatasetIds 规范化。
             String[] parsedDatasetNumbers = parseDatasetIds(dataset_ids);
             String[] parsedManifestNumbers = parseDatasetIds(manifest_ids);
+            // 014-data-04 两套标识分流：ds_ 前缀 token 是 DataFrog 平台数据对象，走平台对象分支；
+            // 其余 token 维持原 run 级编号语义不动。混传（数字 + ds_）支持，任一 ds_ 解析/校验
+            // 失败则整个调用结构化失败，不创建沙箱任务。
+            String[] runLevelDatasetTokens = new String[parsedDatasetNumbers.length];
+            int runLevelTokenCount = 0;
+            List<String> platformObjectIds = new ArrayList<>();
+            for (String token : parsedDatasetNumbers) {
+                if (token != null && token.startsWith(PLATFORM_OBJECT_ID_PREFIX)) {
+                    if (!platformObjectIds.contains(token)) {
+                        platformObjectIds.add(token);
+                    }
+                } else {
+                    runLevelDatasetTokens[runLevelTokenCount++] = token;
+                }
+            }
+            String[] numericDatasetTokens = java.util.Arrays.copyOf(runLevelDatasetTokens, runLevelTokenCount);
 
             // --- 第二阶段：读取当前 agent 运行的 registry 快照 ---
             // dataset_ids 与 manifest_ids 均为当前 agent 运行内的局部编号（由 listMyData 分配），
@@ -367,7 +523,7 @@ public class PythonSandboxTools {
             List<Map<String, Object>> illegalDatasetRefs = new ArrayList<>();
             List<Map<String, Object>> illegalManifestRefs = new ArrayList<>();
 
-            resolveRunLevelNumbers(parsedDatasetNumbers, registry, runId, "dataset",
+            resolveRunLevelNumbers(numericDatasetTokens, registry, runId, "dataset",
                     resolvedDatasets, illegalDatasetRefs, false);
             resolveRunLevelNumbers(parsedManifestNumbers, registry, runId, "manifest",
                     resolvedManifests, illegalManifestRefs, true);
@@ -379,8 +535,24 @@ public class PythonSandboxTools {
                 details.put("legal_dataset_numbers", legalDatasetNumbers);
                 details.put("legal_manifest_numbers", legalManifestNumbers);
                 return fail("executePython", "ILLEGAL_RUN_LEVEL_IDS",
-                        "Some dataset_ids / manifest_ids are not valid run-level numbers; pass values from the legal lists below",
+                        policy("pythonIllegalRunIdsAdvice"),
                         details);
+            }
+
+            // --- 第二阶段附加：ds_ 平台数据对象解析（014-data-04）---
+            // 拉全量 part 过 content_checksum 校验（fail-closed）→ parquet 转 CSV（对象名.csv）→
+            // 经 DatasetPersistedEvent 登记为本 run 条目（来源 platform_object）。此后与 run 级
+            // 数据集同链路：originalId 汇总进 originalIdsToMount、路径映射 CSV 加一行
+            // （沙箱内文件名 = 对象名.csv）。挂载顺序：数字 token 条目在前，ds_ 条目按入参顺序随后。
+            if (!platformObjectIds.isEmpty()) {
+                List<AgentRunDatasetEntry> platformDatasets;
+                try {
+                    platformDatasets = resolvePlatformObjects(runId, platformObjectIds);
+                } catch (PlatformObjectResolutionException resolutionFailure) {
+                    return fail("executePython", resolutionFailure.code(),
+                            resolutionFailure.getMessage(), resolutionFailure.details());
+                }
+                resolvedDatasets.addAll(platformDatasets);
             }
 
             // --- 第三阶段：根据 manifest 补全成员 dataset ---
@@ -486,7 +658,7 @@ public class PythonSandboxTools {
                     primaryOriginalId, originalIdsToMount.size(), resolvedDatasets.size(), resolvedManifests.size(), relatedDatasets.size());
 
             // 持久操作号先于工作区取得确定；拒绝的脚本不能创建工作区或沙箱任务。
-            String riskRefusal = reviewPythonBeforeWorkspace(runId, code);
+            PromptText riskRefusal = reviewPythonBeforeWorkspace(runId, code);
             if (riskRefusal != null) {
                 return riskRefusal;
             }
@@ -502,6 +674,7 @@ public class PythonSandboxTools {
                     acquired = pythonSandboxService.acquireWorkspace(
                             AcquireWorkspaceRequest.newBuilder().setRunId(runId).build());
                 } catch (Exception acquireFailure) {
+                    ModelSendBlocks.rethrowIfBlocked(acquireFailure);
                     log.warn("当前 Run 暂不能取得 Python 工作区: run={}", runId, acquireFailure);
                     return fail("executePython", "WORKSPACE_ACQUIRE_UNAVAILABLE",
                             "Python workspace acquisition is temporarily unavailable", Map.of());
@@ -543,6 +716,21 @@ public class PythonSandboxTools {
                 requestBuilder.setRunId(runId)
                         .setWorkspaceId(workspace.getWorkspaceId())
                         .setWorkspaceGeneration(workspace.getWorkspaceGeneration());
+            }
+
+            // 014-new-03：Run 冻结的 generate_artifacts 开关为 true 时，向沙箱请求收割
+            // 任务产物目录的顶层文件；单文件上限与下载侧同一配置（收割进来的必然下载得动）。
+            // 上限必须大于 0 才开启收割：Python 契约校验 collect=true 必须携带上限，
+            // 而下载侧把 max-bytes 配成 0 表达「不限量」——不设此条件会把开关打开的
+            // run 里每个请求都变成契约拒绝（工具完全不可用），故降级为不收割并 warn 一次。
+            if (generateArtifactsEnabledForRun(runId)) {
+                if (collectArtifactMaxBytes > 0) {
+                    requestBuilder.setCollectArtifacts(true)
+                            .setCollectArtifactMaxBytes(collectArtifactMaxBytes);
+                } else if (collectMaxBytesZeroWarned.compareAndSet(false, true)) {
+                    log.warn("agent.artifact.download.max-bytes 配置为 {}（≤0），收割不开启、交付文件不回传；"
+                            + "如需收割请把该配置设为正数", collectArtifactMaxBytes);
+                }
             }
 
             for (String oid : originalIdsToMount) {
@@ -591,11 +779,7 @@ public class PythonSandboxTools {
                 return fail(
                         "executePython",
                         "SANDBOX_CAPACITY_WIRING_INCOMPLETE",
-                        "Python sandbox production wiring incomplete; "
-                                + "refuses Legacy create without capacity reservation "
-                                + "and operationId. Non-production fixtures must enable "
-                                + "the documented Legacy compatibility switches as a group "
-                                + "(no global capacity admission / no idempotent recovery).",
+                        policy("pythonLegacyWiringAdvice"),
                         Map.of());
             }
             log.warn("sandbox.create.legacyWithoutCapacity: allow-legacy-without-capacity=true "
@@ -647,7 +831,7 @@ public class PythonSandboxTools {
                 lastRemoteStatus = remoteStatus;
                 pollIndex++;
                 // terminalOutput 对终态返回 JSON 字符串，对 RUNNING 等中间态返回 null，继续轮询。
-                String terminal = terminalOutput(taskId, statusResp);
+                PromptText terminal = terminalOutput(taskId, statusResp);
                 if (terminal != null) {
                     emitSandboxToolTotal(toolStartMs, "OK", "");
                     return terminal;
@@ -675,13 +859,14 @@ public class PythonSandboxTools {
         } catch (PythonRiskReplayEvidenceMissingException missing) {
             throw missing;
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             log.error("Execute python tool error", e);
             emitSandboxToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));
         }
     }
 
-    private String reviewPythonBeforeWorkspace(String runId, String code) {
+    private PromptText reviewPythonBeforeWorkspace(String runId, String code) {
         if (pythonRiskReviewService == null) {
             return fail("executePython", "PYTHON_RISK_REVIEW_UNAVAILABLE",
                     "Python review service is unavailable", Map.of());
@@ -763,6 +948,7 @@ public class PythonSandboxTools {
             JsonFormat.parser().merge(requestJson, original);
             return operationId.equals(original.getOperationId()) && code.equals(original.getCode());
         } catch (Exception malformed) {
+            ModelSendBlocks.rethrowIfBlocked(malformed);
             log.warn("原 Python 完整请求无法确认：run={} operation={}", runId, operationId, malformed);
             return false;
         }
@@ -799,10 +985,12 @@ public class PythonSandboxTools {
     private static final class DataIntenseRefusal extends RuntimeException {
 
         private final String code;
+        private final Object promptMessage;
         private final Map<String, Object> details;
 
-        DataIntenseRefusal(String code, String message, Map<String, Object> details) {
-            super(message);
+        DataIntenseRefusal(String code, Object message, Map<String, Object> details) {
+            super(message instanceof PromptText text ? text.text() : String.valueOf(message));
+            this.promptMessage = message;
             this.code = code;
             this.details = details == null ? Map.of() : details;
         }
@@ -895,8 +1083,7 @@ public class PythonSandboxTools {
         PythonRepairContext repairContext = AgentContext.getPythonRepairContext();
         if (repairContext != null && repairContext.hasFailed(pythonRequestFingerprint)) {
             throw new DataIntenseRefusal("REPEATED_FAILED_PYTHON_ATTEMPT",
-                    "The same Python code and effective parameters already failed in this Todo; "
-                            + "change the code or meaningful parameters before retrying",
+                    policy("pythonRepeatedFailureAdvice"),
                     Map.of("python_repair_attempt", repairContext.repairAttempt(),
                             "request_fingerprint", pythonRequestFingerprint));
         }
@@ -912,7 +1099,7 @@ public class PythonSandboxTools {
      * {@link SandboxToolJobLifecycle#dispatchWaitGroupMember}；这里只保留工具自有的
      * 接线检查、成员身份比对与容量事实冻结（planCapacity）。</p>
      */
-    private String submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
+    private PromptText submitForWaitGroup(WaitGroupMemberExecutionContext.Snapshot member,
                                       AgentRunDatasetSnapshot datasetSnapshot,
                                       List<AgentRunDatasetEntry> datasets,
                                       List<AgentRunDatasetEntry> manifests,
@@ -945,9 +1132,9 @@ public class PythonSandboxTools {
             plan = planCapacity(identity.operationId(), datasetSnapshot, datasets, manifests,
                     baseRequest, timeoutSeconds);
         } catch (DataIntenseRefusal refusal) {
-            return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
+            return fail("executePython", refusal.code(), refusal.promptMessage, refusal.details());
         }
-        return SandboxToolJobLifecycle.dispatchWaitGroupMember(
+        return SandboxToolJobLifecycle.dispatchWaitGroupMemberText(
                 lifecycleDeps(),
                 new SandboxToolJobLifecycle.WaitGroupDispatchRequest<>(
                         member, identity, plan.spec(), plan.estimate(), baseRequest,
@@ -955,7 +1142,7 @@ public class PythonSandboxTools {
                         ToolJobAnchor.EXECUTE_PYTHON_TOOL, toolStartMs, null));
     }
 
-    private String executeDataIntense(
+    private PromptText executeDataIntense(
             String runId,
             AgentRunDatasetSnapshot datasetSnapshot,
             List<AgentRunDatasetEntry> datasets,
@@ -990,7 +1177,7 @@ public class PythonSandboxTools {
             plan = planCapacity(identity.operationId(), datasetSnapshot, datasets, manifests,
                     baseRequest, timeoutSeconds);
         } catch (DataIntenseRefusal refusal) {
-            return fail("executePython", refusal.code(), refusal.getMessage(), refusal.details());
+            return fail("executePython", refusal.code(), refusal.promptMessage, refusal.details());
         }
         DataAnalysisEstimate estimate = plan.estimate();
         CanonicalSandboxCreateSpec spec = plan.spec();
@@ -1006,8 +1193,15 @@ public class PythonSandboxTools {
             String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
                     ? "DATA_ANALYSIS_TASK_TOO_LARGE"
                     : "DATA_ANALYSIS_SERVER_BUSY";
+            // 名额不足与请求规模超限是明确的容量约束语义；其余 BUSY 原因不猜类别，
+            // 走码默认兜底，原码与具体原因文案保留。
+            ToolFailureCategory capacityCategory =
+                    admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                            || admission.reason() == CapacityAdmissionException.Reason.SERVER_BUSY
+                            ? ToolFailureCategory.RATE_LIMITED_OR_CAPACITY
+                            : null;
             return fail("executePython", code, admission.getMessage(), Map.of("retryable",
-                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE), capacityCategory);
         }
 
         // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
@@ -1086,7 +1280,9 @@ public class PythonSandboxTools {
                             reservation, estimate, anchor,
                             waitPolicy.durableSuspend(), toolStartMs));
             if (attachOutcome instanceof SandboxToolJobLifecycle.AttachOutcome.FailureText failureText) {
-                return failureText.text();
+                if (failureText.prompt() == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                        world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "sandbox-attach");
+                return failureText.prompt();
             }
             SandboxToolJobLifecycle.AttachOutcome.Attached attached =
                     (SandboxToolJobLifecycle.AttachOutcome.Attached) attachOutcome;
@@ -1094,15 +1290,16 @@ public class PythonSandboxTools {
             reservation = attached.reservation();
 
             // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
-            return SandboxToolJobLifecycle.pollFastPath(
+            return SandboxToolJobLifecycle.pollFastPathText(
                     deps,
                     new SandboxToolJobLifecycle.PollRequest(
                             runId, identity, estimate, reservation, anchor, taskId,
                             waitPolicy.durableSuspend(), toolStartMs,
                             runnerAdapter(), resultAdapter(), meteringAdapter(), terminalSideEffect()));
         } catch (Exception lifecycleFailure) {
+            ModelSendBlocks.rethrowIfBlocked(lifecycleFailure);
             if (!waitPolicy.durableSuspend()) {
-                return SandboxToolJobLifecycle.promoteDagBlockingFailure(
+                return SandboxToolJobLifecycle.promoteDagBlockingFailureText(
                         deps,
                         runId,
                         anchor,
@@ -1129,6 +1326,7 @@ public class PythonSandboxTools {
                     .digest((value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
             return "sha256:" + java.util.HexFormat.of().formatHex(digest);
         } catch (Exception impossible) {
+            ModelSendBlocks.rethrowIfBlocked(impossible);
             throw new IllegalStateException("SHA-256 unavailable", impossible);
         }
     }
@@ -1172,6 +1370,166 @@ public class PythonSandboxTools {
         RunLevelIdResolver.resolveRunLevelNumbers(tokens, registry, runId, kind, resolved, illegal, allowEmptyTokens);
     }
 
+    /**
+     * 「这次 ds_ 平台对象解析被拒绝」的内部异常（014-data-04）。
+     *
+     * <p>携带结构化失败的 code 与 details，由 executePythonInternal 转成 fail 响应；
+     * 任一 ds_ 对象解析/校验失败，整个调用失败，不创建沙箱任务。</p>
+     */
+    private static final class PlatformObjectResolutionException extends RuntimeException {
+        private final String code;
+        private final Map<String, Object> details;
+
+        PlatformObjectResolutionException(String code, String message, Map<String, Object> details) {
+            super(message);
+            this.code = code;
+            this.details = details == null ? Map.of() : details;
+        }
+
+        String code() {
+            return code;
+        }
+
+        Map<String, Object> details() {
+            return details;
+        }
+    }
+
+    /**
+     * 解析 dataset_ids 里的全部 ds_ 平台数据对象（014-data-04）。
+     *
+     * <p>每个对象：GetDataObject 拿卡（version 固定取当前 ACTIVE）→ readAllObjectData 拉全量
+     * part 并对拼接字节算 sha256 与版本行 content_checksum 比对（不一致即 fail-closed 拒绝，
+     * 宁可报错不挂错文件）→ 校验通过后 parquetToCsv 转成 CSV（文件名 = 对象名.csv，校验和只对
+     * parquet part 字节算、不算 CSV）→ 写 rowCount 伴随元数据（容量预估的行数来源）→ 经
+     * DatasetPersistedEvent 登记为本 run 条目（来源 platform_object，originalId 即 ds_ 对象 id，
+     * sortKey 即对象名.csv，沙箱内文件名由此而来）。part 临时文件转换后即删。</p>
+     *
+     * @return 每个对象对应的 run 级 dataset 条目（registry 已分配编号）
+     */
+    private List<AgentRunDatasetEntry> resolvePlatformObjects(String runId, List<String> platformObjectIds) {
+        if (dataFrogObjectClient == null || eventPublisher == null) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CHANNEL_UNAVAILABLE",
+                    "Platform object channel is not wired; ds_ ids cannot be mounted in this deployment",
+                    Map.of("platform_object_ids", platformObjectIds));
+        }
+        List<AgentRunDatasetEntry> resolved = new ArrayList<>(platformObjectIds.size());
+        for (String objectId : platformObjectIds) {
+            resolved.add(mountPlatformObject(runId, objectId));
+        }
+        return resolved;
+    }
+
+    /** 单个平台对象的「拉取 → 校验 → 转 CSV → 登记」全流程；任一步失败抛 PlatformObjectResolutionException。 */
+    private AgentRunDatasetEntry mountPlatformObject(String runId, String objectId) {
+        // part 临时目录按调用唯一：不同 run / 不同版本并发挂同一对象时互不踩踏。
+        Path partsDir = Paths.get(platformObjectStorageRoot, "platform_objects", objectId,
+                "parts-" + java.util.UUID.randomUUID());
+        DataFrogObjectClient.ObjectContent content;
+        try {
+            content = dataFrogObjectClient.readAllObjectData(objectId, 0, partsDir);
+        } catch (DataFrogObjectClient.ChecksumMismatchException mismatch) {
+            // fail-closed：拼接字节与登记卡 content_checksum 不一致，宁可报错不挂错文件。
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CHECKSUM_MISMATCH",
+                    "Platform object content checksum mismatch; refuse to mount corrupted data",
+                    Map.of("object_id", objectId,
+                            "expected_checksum", mismatch.expected(),
+                            "actual_checksum", mismatch.actual()));
+        } catch (RuntimeException readFailure) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_UNAVAILABLE",
+                    "Platform object is unavailable: " + readFailure.getMessage(),
+                    Map.of("object_id", objectId));
+        }
+
+        String csvBaseName = platformObjectFileName(content.card().getName(), objectId);
+        Path objectDir = Paths.get(platformObjectStorageRoot, "platform_objects", objectId,
+                "v" + content.version());
+        Path csvPath = objectDir.resolve(csvBaseName + ".csv");
+        try {
+            dataFrogObjectClient.parquetToCsv(content.partFiles(), csvPath);
+        } catch (RuntimeException convertFailure) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CONVERT_FAILED",
+                    "Failed to convert platform object parquet to CSV: " + convertFailure.getMessage(),
+                    Map.of("object_id", objectId));
+        } finally {
+            // part 临时文件转换完即删（尽力清理，失败不阻断主流程）。
+            for (Path partFile : content.partFiles()) {
+                try {
+                    Files.deleteIfExists(partFile);
+                } catch (IOException cleanupFailure) {
+                    log.warn("平台对象 part 临时文件清理失败: {}", partFile, cleanupFailure);
+                }
+            }
+            try {
+                Files.deleteIfExists(partsDir);
+            } catch (IOException dirCleanupFailure) {
+                log.warn("平台对象 part 临时目录清理失败: {}", partsDir, dirCleanupFailure);
+            }
+        }
+
+        // rowCount 伴随元数据：容量准入的行数来源（DatasetEntryMetadataReader 侧读 <stem>.meta.json）。
+        try {
+            Files.createDirectories(objectDir);
+            Path metaPath = objectDir.resolve(csvBaseName + ".meta.json");
+            Files.writeString(metaPath, "{\"rowCount\":" + content.card().getRowCount()
+                    + ",\"format\":\"csv\"}", StandardCharsets.UTF_8);
+        } catch (IOException metaFailure) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_CONVERT_FAILED",
+                    "Failed to write platform object CSV metadata: " + metaFailure.getMessage(),
+                    Map.of("object_id", objectId));
+        }
+
+        // 与取数工具产出 dataset 同一登记入口：发布 DatasetPersistedEvent，registry 分配 run 级编号。
+        // 来源标记 platform_object：listMyData 的 run 数据集区跳过这类条目（平台条目区只以 ds_ 标识展示）。
+        String sortKey = csvBaseName + ".csv";
+        eventPublisher.publishEvent(new DatasetPersistedEvent(
+                this, runId, objectId, csvPath.toString(), null, sortKey,
+                DatasetPersistedEvent.SOURCE_PLATFORM_OBJECT));
+        registerPlatformObjectArtifact(objectId, objectDir);
+
+        AgentRunDatasetEntry entry = agentRunDatasetRegistry.snapshot(runId).datasets().stream()
+                .filter(e -> objectId.equals(e.originalId()))
+                .findFirst()
+                .orElse(null);
+        if (entry == null) {
+            throw new PlatformObjectResolutionException("PLATFORM_OBJECT_REGISTER_FAILED",
+                    "Platform object CSV was not registered into the run registry",
+                    Map.of("object_id", objectId));
+        }
+        log.info("平台对象已登记为本 run 数据集: runId={} objectId={} number={} csv={}",
+                runId, objectId, entry.number(), csvPath);
+        return entry;
+    }
+
+    /** 平台对象 CSV 目录的持久化登记（TTL 与 Run 删除清理）；失败只 warn，不影响挂载。 */
+    private void registerPlatformObjectArtifact(String objectId, Path objectDir) {
+        if (persistentArtifactRegistry == null) {
+            return;
+        }
+        try {
+            persistentArtifactRegistry.registerExternal("dataset", objectId, "platform_object",
+                    objectDir.toAbsolutePath().normalize(), PLATFORM_OBJECT_ARTIFACT_TTL_HOURS, false);
+        } catch (Exception registrationFailure) {
+            ModelSendBlocks.rethrowIfBlocked(registrationFailure);
+            log.warn("平台对象 CSV 目录持久化登记失败（不影响本次挂载）: objectId={} err={}",
+                    objectId, registrationFailure.getMessage());
+        }
+    }
+
+    /** 对象名做安全文件名：去路径分隔与非法字符、限长；空白名回退为对象 id。 */
+    private static String platformObjectFileName(String objectName, String objectId) {
+        String raw = objectName == null ? "" : objectName.trim();
+        if (raw.isEmpty()) {
+            raw = objectId;
+        }
+        String cleaned = raw.replaceAll("[/\\\\:*?\"<>|\\s]+", "_");
+        if (cleaned.length() > PLATFORM_OBJECT_NAME_MAX_CHARS) {
+            cleaned = cleaned.substring(0, PLATFORM_OBJECT_NAME_MAX_CHARS);
+        }
+        return cleaned;
+    }
+
+
     /** 查询沙箱任务当前状态；每次 Dubbo 调用前都会尝试安装调试 attachment。 */
     private TaskStatusResponse getTaskStatus(String taskId) {
         installDebugRpcAttachments();
@@ -1188,52 +1546,42 @@ public class PythonSandboxTools {
      *   <li>其余状态（如 RUNNING）：返回 {@code null}，由轮询循环继续等待</li>
      * </ul>
      */
-    private String terminalOutput(String taskId, TaskStatusResponse statusResp) {
+    private PromptText terminalOutput(String taskId, TaskStatusResponse statusResp) {
         String status = statusResp.getStatus();
         if ("SUCCEEDED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
             if (result == null) {
                 return resultLostFailure();
             }
-            if (result.hasFinanceRecordChannel()
-                    || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+            // 共用的金融载荷判断：检测到载荷说明金融接线未就位，拒绝把带标记的输出交给模型。
+            if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                 return unavailableFinanceWiringFailure();
             }
-            return formatResult(status, result, null);
+            return formatResultText(status, result, null);
         }
         if ("FAILED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
             if (result != null) {
-                if (result.hasFinanceRecordChannel()
-                        || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                     return unavailableFinanceWiringFailure();
                 }
-                return formatResult(status, result, null);
+                return formatResultText(status, result, null);
             }
-            return formatter().formatFailure(
+            return formatter().formatFailureText(
                     "", nvl(statusResp.getError()),
-                    new FinanceToolResultFormatter.FailureDetail(
-                            "PYTHON_EXECUTION_FAILED",
-                            "Python 执行失败",
-                            true,
-                            "根据错误信息修正代码或输入后重试"));
+                    FinanceToolResultFormatter.FailureDetail.withPrompts("PYTHON_EXECUTION_FAILED", PromptText.runtimeData("Python 执行失败"), true, terminalPolicies().instruction("pythonStatusFailureAction")));
         }
         if ("CANCELED".equals(status)) {
             TaskResultResponse result = fetchTerminalResult(taskId);
             if (result != null) {
-                if (result.hasFinanceRecordChannel()
-                        || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                if (FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
                     return unavailableFinanceWiringFailure();
                 }
-                return formatResult(status, result, null);
+                return formatResultText(status, result, null);
             }
-            return formatter().formatFailure(
+            return formatter().formatFailureText(
                     "", "",
-                    new FinanceToolResultFormatter.FailureDetail(
-                            "PYTHON_EXECUTION_CANCELED",
-                            "Python 执行已取消",
-                            false,
-                            "确认仍需计算后重新提交任务"));
+                    FinanceToolResultFormatter.FailureDetail.withPrompts("PYTHON_EXECUTION_CANCELED", PromptText.runtimeData("Python 执行已取消"), false, terminalPolicies().instruction("pythonCanceledAction")));
         }
         if ("NOT_FOUND".equals(status)) {
             return resultLostFailure();
@@ -1262,6 +1610,7 @@ public class PythonSandboxTools {
             }
             return result;
         } catch (Exception exception) {
+            ModelSendBlocks.rethrowIfBlocked(exception);
             fetchStatus = "ERROR";
             log.warn("Unable to fetch terminal sandbox result: taskId={}, error={}",
                     taskId, exception.getMessage());
@@ -1278,24 +1627,12 @@ public class PythonSandboxTools {
         }
     }
 
-    private String unavailableFinanceWiringFailure() {
-        return formatter().formatFailure(
-                "", "",
-                new FinanceToolResultFormatter.FailureDetail(
-                        "FINANCE_RECORD_DURABLE_WIRING_UNAVAILABLE",
-                        "结构化金融结果暂时无法安全保存",
-                        false,
-                        "稍后重试，或改为普通文本输出"));
+    private PromptText unavailableFinanceWiringFailure() {
+        return formatter().formatFailureText("", "", FinanceToolResultFormatter.FailureDetail.withPrompts("FINANCE_RECORD_DURABLE_WIRING_UNAVAILABLE", PromptText.runtimeData("结构化金融结果暂时无法安全保存"), false, terminalPolicies().instruction("pythonFinanceWiringAction")));
     }
 
-    private String resultLostFailure() {
-        return formatter().formatFailure(
-                "", "",
-                new FinanceToolResultFormatter.FailureDetail(
-                        "PYTHON_RESULT_LOST",
-                        "Python 执行结果已丢失",
-                        false,
-                        "重新提交计算任务"));
+    private PromptText resultLostFailure() {
+        return formatter().formatFailureText("", "", FinanceToolResultFormatter.FailureDetail.withPrompts("PYTHON_RESULT_LOST", PromptText.runtimeData("Python 执行结果已丢失"), false, terminalPolicies().instruction("pythonResultLostAction")));
     }
 
     /**
@@ -1344,13 +1681,25 @@ public class PythonSandboxTools {
                 runnerAdapter().toTerminalView(result, status), financeResult);
     }
 
+    public PromptText formatTerminalResultText(String status, TaskResultResponse result,
+                                               String runId, String userId, String todoId, String toolCallId) {
+        FinanceRecordExtractionResult finance = extractFinanceIfPresent(runId, userId, todoId, toolCallId, status, result);
+        return formatResultText(status, result, finance);
+    }
+
+    private PromptText formatResultText(String status, TaskResultResponse result,
+                                       FinanceRecordExtractionResult financeResult) {
+        return resultAdapter().resolveTerminalText(runnerAdapter().toTerminalView(result, status), financeResult).output();
+    }
+
     private FinanceRecordExtractionResult processFinanceResult(
             String runId,
             DataAnalysisOperationIdentity identity,
             ToolJobAnchor anchor,
             String status,
             TaskResultResponse result) {
-        if (!hasFinancePayload(result)) {
+        if (result == null
+                || !FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
             return null;
         }
         if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
@@ -1387,7 +1736,8 @@ public class PythonSandboxTools {
             String toolCallId,
             String status,
             TaskResultResponse result) {
-        if (!hasFinancePayload(result)) {
+        if (result == null
+                || !FinanceRecordDecoder.hasFinancePayload(result.getStdout(), result.hasFinanceRecordChannel())) {
             return null;
         }
         if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
@@ -1443,15 +1793,6 @@ public class PythonSandboxTools {
                 frozen.limits()));
     }
 
-    private static boolean hasFinancePayload(TaskResultResponse result) {
-        if (result == null) {
-            return false;
-        }
-        String stdout = result.getStdout();
-        return result.hasFinanceRecordChannel()
-                || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY));
-    }
-
     private static String firstNonBlank(String preferred, String fallback) {
         if (preferred != null && !preferred.isBlank()) {
             return preferred;
@@ -1469,20 +1810,26 @@ public class PythonSandboxTools {
     }
 
     /** 构造 {@code ok=false} 的标准 JSON 工具响应；{@code details} 供 LLM 或上层做结构化重试。 */
-    private String fail(String tool, String code, String message, Map<String, Object> details) {
-        return SandboxJobResponses.fail(objectMapper, tool, code, message, details);
+    private PromptText fail(String tool, String code, Object message, Map<String, Object> details) {
+        return ProducerPromptTexts.failure(objectMapper, tool, code, message, details, Map.of(), null);
+    }
+
+    /** 带失败类别的重载：构造点掌握具体原因（如容量准入的具体拒绝原因）时显式覆盖兜底映射。 */
+    private PromptText fail(String tool, String code, Object message, Map<String, Object> details,
+                        ToolFailureCategory category) {
+        return ProducerPromptTexts.failure(objectMapper, tool, code, message, details, Map.of(), category);
     }
 
     /**
      * 构造 {@code ok=false} 的 JSON 工具响应，可在失败时仍附带部分 {@code data}
      *（例如 exit code 非零但 stdout 有内容的场景）。
      */
-    private String fail(String tool,
+    private PromptText fail(String tool,
                         String code,
-                        String message,
+                        Object message,
                         Map<String, Object> details,
                         Map<String, Object> data) {
-        return SandboxJobResponses.fail(objectMapper, tool, code, message, details, data);
+        return ProducerPromptTexts.failure(objectMapper, tool, code, message, details, data, null);
     }
 
     private String nvl(String text) {
@@ -1495,4 +1842,16 @@ public class PythonSandboxTools {
     void setAgentRunDatasetRegistry(AgentRunDatasetRegistry registry) {
         this.agentRunDatasetRegistry = registry;
     }
+    private TerminalResultPromptTexts terminalPolicies() {
+        if (terminalPromptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "python-terminal-policy");
+        return terminalPromptTexts;
+    }
+
+    private PromptText policy(String fragment) {
+        if (promptTexts == null) throw new world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException(
+                world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked.PROMPT_SOURCE_MISSING, "producer-policy");
+        return promptTexts.policy(fragment);
+    }
+
 }

@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonResultLostAction",
+  "purpose": "pythonResultLostAction",
+  "bodyType": "FIXED",
+  "body": "重新提交计算任务",
+  "variables": [],
+  "utf8Sha256": "40951910b5351a502ed0672514f53c31e147a146ccf15407aa7848facc008fe7",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxJobResultAdapter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

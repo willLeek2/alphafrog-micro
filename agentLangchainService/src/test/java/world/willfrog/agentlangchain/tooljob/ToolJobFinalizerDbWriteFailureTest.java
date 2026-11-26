@@ -69,9 +69,9 @@ class ToolJobFinalizerDbWriteFailureTest {
         when(usageHook.upsertUsage(eq("run-1"), any(ToolJobAnchor.class))).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-1"), any(ToolJobAnchor.class))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -137,9 +137,9 @@ class ToolJobFinalizerDbWriteFailureTest {
         when(usageHook.upsertUsage(eq("run-2"), any(ToolJobAnchor.class))).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-2"), any(ToolJobAnchor.class))).thenReturn(true);
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -203,9 +203,9 @@ class ToolJobFinalizerDbWriteFailureTest {
         DurableUsageFake usageFake = new DurableUsageFake();
         DedupedEventFake eventFake = new DedupedEventFake();
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache, capacityService, resumeService,
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer, "eventHook", (ToolJobEventHook) eventFake);
 
@@ -264,9 +264,9 @@ class ToolJobFinalizerDbWriteFailureTest {
         DurableUsageFake usageFake = new DurableUsageFake();
         DedupedEventFake eventFake = new DedupedEventFake();
 
-        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+        ToolJobFinalizer finalizer = ToolJobPromptTestFixture.configure(new ToolJobFinalizer(
                 anchorService, redisCache, capacityService, resumeService,
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), ToolJobPromptTestFixture.formatter(), mock(FinanceResultModelAdapter.class)));
         inject(finalizer, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer, "eventHook", (ToolJobEventHook) eventFake);
 

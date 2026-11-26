@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.rag;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -55,7 +56,7 @@ class RagToolsTest {
                 .build());
 
         StubRunRawRefStore rawRefStore = new StubRunRawRefStore();
-        RagTools tools = new RagTools(objectMapper, Optional.of(rawRefStore), Optional.empty());
+        RagTools tools = configure(new RagTools(objectMapper, Optional.of(rawRefStore), Optional.empty()));
         injectService(tools, service);
         AgentContext.setRunId("run-1");
         AgentContext.setUserId("user-1");
@@ -105,7 +106,7 @@ class RagToolsTest {
         server.start();
         try {
             StubRunRawRefStore rawRefStore = new StubRunRawRefStore();
-            RagTools tools = new RagTools(objectMapper, Optional.of(rawRefStore), Optional.empty());
+            RagTools tools = configure(new RagTools(objectMapper, Optional.of(rawRefStore), Optional.empty()));
             AgentContext.setRunId("run-doc");
             AgentContext.setUserId("user-doc");
 
@@ -129,7 +130,7 @@ class RagToolsTest {
 
     @Test
     void loadDocumentShouldRejectRawRefArgument() throws Exception {
-        RagTools tools = new RagTools(objectMapper, Optional.empty(), Optional.empty());
+        RagTools tools = configure(new RagTools(objectMapper, Optional.empty(), Optional.empty()));
 
         Map<String, Object> response = objectMapper.readValue(
                 tools.loadDocument("raw_ref_001"),
@@ -150,6 +151,12 @@ class RagToolsTest {
 
     private static class StubRunRawRefStore implements RunRawRefStore {
         private String registeredContent;
+
+        @Override
+        public String registerPrompt(String runId, String userId, String displayName,
+                world.willfrog.alphafrogmicro.common.racing.prompt.PromptText content, long ttlSeconds) {
+            return register(runId, userId, displayName, content.text(), ttlSeconds);
+        }
 
         @Override
         public String register(String runId, String userId, String displayName, String content, long ttlSeconds) {

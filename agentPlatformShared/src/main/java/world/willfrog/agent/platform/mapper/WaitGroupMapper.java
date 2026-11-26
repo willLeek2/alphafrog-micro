@@ -244,6 +244,12 @@ public interface WaitGroupMapper {
                                                           @Param("limit") int limit);
 
     /** 成员还在执行中时推后下次查询时间；已经落终态的成员不会被改。 */
+    int recordMemberTerminalBlock(@Param("groupId") long groupId,
+                                  @Param("memberIdentity") String memberIdentity,
+                                  @Param("operationId") String operationId,
+                                  @Param("expectedProofJson") String expectedProofJson,
+                                  @Param("blockedProofJson") String blockedProofJson);
+
     int rescheduleMember(@Param("groupId") long groupId,
                          @Param("memberIdentity") String memberIdentity,
                          @Param("nextPollAt") OffsetDateTime nextPollAt,

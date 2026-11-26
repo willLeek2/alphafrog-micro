@@ -1,5 +1,7 @@
 package world.willfrog.agentlangchain.execution;
 
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -174,18 +176,18 @@ public class DatabasePersistentSubAgentToolBridge implements PersistentSubAgentT
     public NodeToolDispatcher.DispatchOutcome dispatch(NodeToolDispatcher.DispatchRequest request) {
         if (request == null || !availableForRun(request.runId())
                 || (!SPAWN.equals(request.toolName()) && !WAIT.equals(request.toolName()))) {
-            return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_tool_not_available");
+            return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_tool_not_available", PromptText.runtimeData("sub_agent_tool_not_available"));
         }
         WaitMember member = waitGroupStore.findMemberByIdentity(request.groupId(), request.memberIdentity())
                 .orElse(null);
         if (member == null || member.stateEnum() != WaitMemberState.RUNNING
                 || !request.runId().equals(member.getRunId())) {
-            return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_wait_member_missing");
+            return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_wait_member_missing", PromptText.runtimeData("sub_agent_wait_member_missing"));
         }
         JsonNode proof = parseProof(member.getDispatchProofJson());
         if (!sameProofIdentity(proof, member.getExternalOperationId(), request.runId(),
                 request.groupId(), request.memberIdentity(), request.toolName())) {
-            return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_dispatch_proof_mismatch");
+            return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_dispatch_proof_mismatch", PromptText.runtimeData("sub_agent_dispatch_proof_mismatch"));
         }
         if (SPAWN.equals(request.toolName())) {
             String childRunId = proof.path("childRunId").asText("");
@@ -193,13 +195,13 @@ public class DatabasePersistentSubAgentToolBridge implements PersistentSubAgentT
             if (view.isEmpty() || !request.runId().equals(view.get().parentRunId())
                     || view.get().parentWaitGroupId() != request.groupId()
                     || !request.memberIdentity().equals(view.get().parentMemberIdentity())) {
-                return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_creation_intent_missing");
+                return new NodeToolDispatcher.DispatchOutcome.Failed("sub_agent_creation_intent_missing", PromptText.runtimeData("sub_agent_creation_intent_missing"));
             }
             if ("ACCEPTED".equals(view.get().intentState()) && view.get().childRunStatus() != null) {
                 String output = json(Map.of("ok", true, "tool", SPAWN,
                         "data", Map.of("subAgentId", childRunId, "runId", request.runId(),
                                 "status", "ACCEPTED"), "error", Map.of()));
-                return new NodeToolDispatcher.DispatchOutcome.Completed(output);
+                return new NodeToolDispatcher.DispatchOutcome.Completed(output, PromptText.runtimeData(output));
             }
             return new NodeToolDispatcher.DispatchOutcome.Pending(member.getExternalOperationId(),
                     childRunId, member.getDispatchProofJson());

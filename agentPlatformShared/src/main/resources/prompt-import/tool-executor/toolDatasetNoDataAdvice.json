@@ -1,0 +1,14 @@
+{
+  "fragment": "toolDatasetNoDataAdvice",
+  "purpose": "toolDatasetNoDataAdvice",
+  "bodyType": "FIXED",
+  "body": "If listMyData has no data, call a market data tool first, then listMyData, and do not use placeholders such as placeholder/data/test or hand-code market data.",
+  "variables": [],
+  "utf8Sha256": "f7a97b00877815d0a031ab6a50a1a8a54cabeed7a5dbbc1e9e54dca32acdef91",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/tools/ToolRouterToolExecutor.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

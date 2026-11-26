@@ -1,0 +1,14 @@
+{
+  "fragment": "marketQueryFailure",
+  "purpose": "marketQueryFailure",
+  "bodyType": "FIXED",
+  "body": "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+  "variables": [],
+  "utf8Sha256": "1045891118a443923cd4e318f92c738915c653d9ff22d429d7d71dc9dc02d22e",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/market/MarketDataTools.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

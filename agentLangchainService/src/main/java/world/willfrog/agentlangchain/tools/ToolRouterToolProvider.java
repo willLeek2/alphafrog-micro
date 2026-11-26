@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.PromoteDatasetTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.dataanalysis.SqlQueryTools;
@@ -77,6 +78,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final PythonSandboxTools pythonSandboxTools;
     private final SqlQueryTools sqlQueryTools;
     private final ListMyDataTool listMyDataTool;
+    private final PromoteDatasetTool promoteDatasetTool;
     private final LoadToolGuideTool loadToolGuideTool;
     private final RereadToolHandler rereadToolHandler;
     private final ObjectMapper objectMapper;
@@ -89,6 +91,22 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
     private final ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge;
     private final AgentPromptService promptService;
+    private final ToolExecutorPromptPreparation promptPreparation;
+
+    /** 兼容装配缺少正文准备组件，托管执行入口会停止发送。 */
+    public ToolRouterToolProvider(ToolRouter toolRouter, MarketDataTools marketDataTools, RagTools ragTools,
+                                  SearchTools searchTools, PythonSandboxTools pythonSandboxTools, SqlQueryTools sqlQueryTools,
+                                  ListMyDataTool listMyDataTool, PromoteDatasetTool promoteDatasetTool,
+                                  LoadToolGuideTool loadToolGuideTool, RereadToolHandler rereadToolHandler,
+                                  ObjectMapper objectMapper, AgentRunEventService agentEventService,
+                                  LangchainToolConcurrencyThrottle toolThrottle,
+                                  PythonSandboxDispatchStore pythonSandboxDispatchStore,
+                                  ObjectProvider<PersistentSubAgentToolBridge> subAgentBridge,
+                                  AgentPromptService promptService) {
+        this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
+                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper,
+                agentEventService, toolThrottle, pythonSandboxDispatchStore, subAgentBridge, promptService, null);
+    }
 
     /** 保留旧调度器现有的独立构造调用点；生产构造由配置类传入持久子代理桥接。 */
     public ToolRouterToolProvider(ToolRouter toolRouter,
@@ -98,6 +116,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   PythonSandboxTools pythonSandboxTools,
                                   SqlQueryTools sqlQueryTools,
                                   ListMyDataTool listMyDataTool,
+                                  PromoteDatasetTool promoteDatasetTool,
                                   LoadToolGuideTool loadToolGuideTool,
                                   RereadToolHandler rereadToolHandler,
                                   ObjectMapper objectMapper,
@@ -105,7 +124,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                                   LangchainToolConcurrencyThrottle toolThrottle,
                                   PythonSandboxDispatchStore pythonSandboxDispatchStore) {
         this(toolRouter, marketDataTools, ragTools, searchTools, pythonSandboxTools, sqlQueryTools,
-                listMyDataTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
+                listMyDataTool, promoteDatasetTool, loadToolGuideTool, rereadToolHandler, objectMapper, agentEventService,
                 toolThrottle, pythonSandboxDispatchStore, null, null);
     }
 
@@ -140,6 +159,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 pythonSandboxTools,
                 sqlQueryTools,
                 listMyDataTool,
+                promoteDatasetTool,
                 loadToolGuideTool,
                 rereadToolHandler,
                 webSearchEnabled,
@@ -158,9 +178,10 @@ public class ToolRouterToolProvider implements ToolProvider {
                             && !"waitForSubAgent".equals(spec.name()))
                     .collect(Collectors.toCollection(java.util.ArrayList::new));
         }
+        specifications = new java.util.ArrayList<>(MarketQueryVisibility.apply(specifications));
 
         ToolExecutor executor = new ToolRouterToolExecutor(
-                toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore);
+                toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore, promptPreparation);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);

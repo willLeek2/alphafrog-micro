@@ -31,6 +31,11 @@ import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
  * 并把 composer 的返回值作为最终答案字符串返回。</p>
  */
 class LangchainTodoNodeExecutorFinalAnswerComposerTest {
+    @org.junit.jupiter.api.BeforeEach
+    void prepareVersionedRunContext() {
+        world.willfrog.agent.platform.context.AgentContext.setRunId("fixture-current-run");
+    }
+
 
     @AfterEach
     void cleanup() {
@@ -48,7 +53,9 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
                 .runId("run-x")
                 .userId("user-y")
                 .userGoal("分析指数")
-                .model(new FixedChatModel("模型最终答案"))
+                .model(LangchainTestFixtures.archivedNodeModel(new FixedChatModel("模型最终答案")))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build();
 
         String result = executor.writeFinalAnswer(request, List.of());
@@ -68,7 +75,9 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
                 .runId("run-no-records")
                 .userId("user-z")
                 .userGoal("分析指数")
-                .model(new FixedChatModel("纯文本答案"))
+                .model(LangchainTestFixtures.archivedNodeModel(new FixedChatModel("纯文本答案")))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build();
 
         String result = executor.writeFinalAnswer(request, List.of());
@@ -91,7 +100,9 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
                 .runId("run-prompt")
                 .userId("user-p")
                 .userGoal("分析指数")
-                .model(model)
+                .model(LangchainTestFixtures.archivedNodeModel(model))
+                .executionEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
+                .finalAnswerEndpointName(LangchainTestFixtures.NODE_ENDPOINT)
                 .build();
 
         executor.writeFinalAnswer(request, List.of());
@@ -133,8 +144,8 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         AgentRunBudgetService budget = LangchainTestFixtures.noopBudgetService();
         AgentRunStateStore stateStore = LangchainTestFixtures.noopStateStore();
-        return new LangchainTodoNodeExecutor(
-                LangchainTestFixtures.promptService(), provider, guard, budget, stateStore, composer);
+        return LangchainTestFixtures.versionedNode(new LangchainTodoNodeExecutor(
+                LangchainTestFixtures.promptService(), provider, guard, budget, stateStore, composer));
     }
 
     /** 固定文本 ChatModel：无论请求内容都返回同一最终答案；记录全部请求供 prompt 断言。 */

@@ -1,0 +1,14 @@
+{
+  "fragment": "rereadRangeTooSmallMessage",
+  "purpose": "rereadRangeTooSmallMessage",
+  "bodyType": "FIXED",
+  "body": "rereadToolResult without keyword must use configured minimum range limit, or provide keyword for filtered reread",
+  "variables": [],
+  "utf8Sha256": "1994233062a243436ed0a3239ee0ae4c79e8beea400b1135f54d276632afe1e5",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/compaction/RereadToolHandler.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

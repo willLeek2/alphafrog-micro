@@ -2,8 +2,9 @@ package world.willfrog.alphafrogmicro.frontend.controller.market;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -32,7 +33,8 @@ public class MarketNewsController {
 
     private static final int MAX_LIMIT = 50;
 
-    @DubboReference
+    @Autowired
+    @Qualifier("marketNewsExternalInfoService")
     private ExternalInfoDubboService externalInfoDubboService;
 
     private final AuthService authService;

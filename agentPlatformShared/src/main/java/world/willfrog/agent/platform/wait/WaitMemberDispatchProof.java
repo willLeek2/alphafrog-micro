@@ -25,6 +25,7 @@ import java.util.Optional;
  * @param createRequestJson       发往沙箱的完整请求；版本 2 起在调用前持久保存，供崩溃后原样重放
  * @param createRequestExpired    已结清成员所属工作区删盘后才写入；表明完整请求按保留期清除
  */
+@com.fasterxml.jackson.annotation.JsonIgnoreProperties({"terminalModelSendBlock", "terminalCleanup"})
 public record WaitMemberDispatchProof(int schemaVersion,
                                       String operationId,
                                       String taskId,

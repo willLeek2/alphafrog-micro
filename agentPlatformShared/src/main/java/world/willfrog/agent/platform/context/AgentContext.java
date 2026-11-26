@@ -3,12 +3,17 @@ package world.willfrog.agent.platform.context;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptVersionSource;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
 
 /**
  * Agent 运行时上下文中枢 —— 跨组件共享的 {@link ThreadLocal} 容器。
@@ -109,6 +114,13 @@ public class AgentContext {
      */
     private static final ThreadLocal<Boolean> WEB_SEARCH_ENABLED_HOLDER = new ThreadLocal<>();
     /**
+     * 当前运行是否把行情库查询写进模型可见的工具说明。
+     * 这个变量一直有值，默认 false，模型看不到 executeQuery。
+     * 管理员运行在渲染工具之前写成 true。
+     */
+    private static final ThreadLocal<Boolean> MARKET_QUERY_VISIBLE_HOLDER =
+            ThreadLocal.withInitial(() -> Boolean.FALSE);
+    /**
      * 网页搜索的详细配置(后端、强度、是否跳过缓存等)。
      * 与 webSearchEnabled 配合使用,搜索工具据此选择具体后端和参数。
      */
@@ -163,7 +175,8 @@ public class AgentContext {
      * <p>字符串内容由 budget service 拼装（含维度名 / 实际值 / 上限 / 建议话术），
      * transformer 只负责"读到就注入、读不到就透传"。</p>
      */
-    private static final ThreadLocal<String> LAST_MILE_HINT_HOLDER = new ThreadLocal<>();
+    private record LastMileHint(String text, PromptText prompt) { }
+    private static final ThreadLocal<LastMileHint> LAST_MILE_HINT_HOLDER = new ThreadLocal<>();
 
     /** 设置当前线程的 Run ID。 */
     public static void setRunId(String runId) {
@@ -398,6 +411,26 @@ public class AgentContext {
         WEB_SEARCH_ENABLED_HOLDER.remove();
     }
 
+    /** 按创建运行时的管理员标记决定模型能否看见行情库查询。 */
+    public static void setMarketQueryVisible(boolean visible) {
+        MARKET_QUERY_VISIBLE_HOLDER.set(visible);
+    }
+
+    /** 一直返回 true 或 false。缺省是 false，模型看不到 executeQuery。 */
+    public static Boolean getMarketQueryVisible() {
+        return Boolean.TRUE.equals(MARKET_QUERY_VISIBLE_HOLDER.get());
+    }
+
+    /** 默认隐藏。只有明确写成 true 时，模型工具清单才保留 executeQuery。 */
+    public static boolean isMarketQueryHidden() {
+        return !Boolean.TRUE.equals(getMarketQueryVisible());
+    }
+
+    /** 恢复默认值 false，不把变量从线程上拿掉。 */
+    public static void clearMarketQueryVisible() {
+        MARKET_QUERY_VISIBLE_HOLDER.set(Boolean.FALSE);
+    }
+
     /**
      * 设置网页搜索详细配置。
      * 传入 null 等价于清理,避免误覆盖。
@@ -609,7 +642,25 @@ public class AgentContext {
             LAST_MILE_HINT_HOLDER.remove();
             return;
         }
-        LAST_MILE_HINT_HOLDER.set(hint);
+        LAST_MILE_HINT_HOLDER.set(new LastMileHint(hint, null));
+    }
+
+    /** 正文与真实指令来源同项保存，异步快照继续保留这份来源。 */
+    public static void setLastMileHintPrompt(PromptText hint) {
+        if (hint == null || hint.text().isBlank()) {
+            clearLastMileHint();
+            return;
+        }
+        if (hint.sources().isEmpty()) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                    "预算建议缺少真实指令版本");
+        }
+        LAST_MILE_HINT_HOLDER.set(new LastMileHint(hint.text(), hint));
+    }
+
+    public static PromptText getLastMileHintPrompt() {
+        LastMileHint hint = LAST_MILE_HINT_HOLDER.get();
+        return hint == null ? null : hint.prompt();
     }
 
     /**
@@ -618,7 +669,8 @@ public class AgentContext {
      * 读到非空字符串时追加为 UserMessage，促使 LLM 尽快给出最终结论且不改写稳定 System。
      */
     public static String getLastMileHint() {
-        return LAST_MILE_HINT_HOLDER.get();
+        LastMileHint hint = LAST_MILE_HINT_HOLDER.get();
+        return hint == null ? null : hint.text();
     }
 
     /** 清理 last-mile hint(在 chatRequestTransformer 注入完成后立即清,避免下次 LLM 调用误注入)。 */
@@ -778,7 +830,9 @@ public class AgentContext {
                 getLastMileHint(),
                 getDebugObservabilitySessionId(),
                 getToolJobResumeToken(),
-                getToolJobResumeLeaseVersion()
+                getToolJobResumeLeaseVersion(),
+                getLastMileHintPrompt(),
+                getMarketQueryVisible()
         );
     }
 
@@ -863,7 +917,13 @@ public class AgentContext {
             setPromptRunSelection(snapshot.promptRunSelection());
         }
         // last-mile hint:子线程的 LLM 调用也需要继承,否则在并行 DAG 子节点里 hint 看不到
-        if (snapshot.lastMileHint() == null) {
+        if (snapshot.lastMileHintPrompt() != null) {
+            if (!Objects.equals(snapshot.lastMileHint(), snapshot.lastMileHintPrompt().text())) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "预算建议与快照来源不一致");
+            }
+            setLastMileHintPrompt(snapshot.lastMileHintPrompt());
+        } else if (snapshot.lastMileHint() == null) {
             clearLastMileHint();
         } else {
             setLastMileHint(snapshot.lastMileHint());
@@ -878,6 +938,11 @@ public class AgentContext {
         } else {
             setToolJobResumeHandoff(
                     snapshot.toolJobResumeToken(), snapshot.toolJobResumeLeaseVersion());
+        }
+        if (snapshot.marketQueryVisible() == null) {
+            clearMarketQueryVisible();
+        } else {
+            setMarketQueryVisible(snapshot.marketQueryVisible());
         }
     }
 
@@ -907,6 +972,7 @@ public class AgentContext {
         clearStructuredOutputSpec();
         clearDebugMode();
         clearWebSearchEnabled();
+        clearMarketQueryVisible();
         clearWebSearchConfig();
         clearExtractedEntities();
         clearReasoningEffort();
@@ -977,8 +1043,21 @@ public class AgentContext {
             String lastMileHint,
             String debugObservabilitySessionId,
             String toolJobResumeToken,
-            Long toolJobResumeLeaseVersion
+            Long toolJobResumeLeaseVersion,
+            PromptText lastMileHintPrompt,
+            Boolean marketQueryVisible
     ) {
+        public ContextSnapshot(String runId, String userId, Boolean debugMode, Boolean webSearchEnabled,
+                               WebSearchConfig webSearchConfig, List<String> extractedEntities,
+                               String reasoningEffort, RunStageConfig stageConfig,
+                               StageLlmConfig effectiveExecutionStageConfig, String workflow,
+                               AgentLlmProperties.DataFreshness dataFreshness, PromptRunSelection promptRunSelection,
+                               String lastMileHint, String debugObservabilitySessionId,
+                               String toolJobResumeToken, Long toolJobResumeLeaseVersion) {
+            this(runId, userId, debugMode, webSearchEnabled, webSearchConfig, extractedEntities, reasoningEffort,
+                    stageConfig, effectiveExecutionStageConfig, workflow, dataFreshness, promptRunSelection,
+                    lastMileHint, debugObservabilitySessionId, toolJobResumeToken, toolJobResumeLeaseVersion, null, null);
+        }
     }
 
     /**
@@ -1006,6 +1085,7 @@ public class AgentContext {
         private final Map<String, Object> schema;
         private final boolean requireProviderParameters;
         private final boolean allowProviderFallbacks;
+        private final List<PromptVersionSource> instructionSources;
 
         /**
          * 构造结构化输出 spec。对入参做空安全保护:
@@ -1017,11 +1097,26 @@ public class AgentContext {
                                     Map<String, Object> schema,
                                     boolean requireProviderParameters,
                                     boolean allowProviderFallbacks) {
+            this(schemaName, strict, schema, requireProviderParameters, allowProviderFallbacks, List.of());
+        }
+
+        /** 结构字段仍由业务生成，说明文字使用的明确正文版本随本次输出要求保存。 */
+        public StructuredOutputSpec(String schemaName,
+                                    boolean strict,
+                                    Map<String, Object> schema,
+                                    boolean requireProviderParameters,
+                                    boolean allowProviderFallbacks,
+                                    List<PromptVersionSource> instructionSources) {
             this.schemaName = schemaName == null ? "" : schemaName;
             this.strict = strict;
             this.schema = schema == null ? Map.of() : Map.copyOf(schema);
             this.requireProviderParameters = requireProviderParameters;
             this.allowProviderFallbacks = allowProviderFallbacks;
+            if (instructionSources == null || instructionSources.stream().anyMatch(Objects::isNull)) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                        "输出结构说明的版本来源不完整");
+            }
+            this.instructionSources = List.copyOf(instructionSources);
         }
 
         public String schemaName() {
@@ -1042,6 +1137,10 @@ public class AgentContext {
 
         public boolean allowProviderFallbacks() {
             return allowProviderFallbacks;
+        }
+
+        public List<PromptVersionSource> instructionSources() {
+            return instructionSources;
         }
 
         /**

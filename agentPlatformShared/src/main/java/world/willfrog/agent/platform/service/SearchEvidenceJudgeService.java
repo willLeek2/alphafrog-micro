@@ -3,16 +3,23 @@ package world.willfrog.agent.platform.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.output.TokenUsage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.input.AgentModelInputs;
+import world.willfrog.agent.platform.input.PromptMessage;
+import world.willfrog.agent.platform.prompt.LightweightPromptPreparation;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -36,6 +43,10 @@ public class SearchEvidenceJudgeService {
     private final SearchEvidenceJudgeModelResolver judgeModelResolver;
     private final JudgeModelSelectorService judgeModelSelectorService;
     private final AgentRunObservabilityService observabilityService;
+    @Autowired
+    private LightweightPromptPreparation promptPreparation;
+    @Autowired
+    private AgentModelInputs modelInputs;
 
     public JudgeResult judge(String query,
                              List<String> requestedEntities,
@@ -54,14 +65,23 @@ public class SearchEvidenceJudgeService {
 
         String previousPhase = AgentContext.getPhase();
         String previousStage = AgentContext.getStage();
+        AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         long startedAtMillis = System.currentTimeMillis();
         try {
+            AgentContext.clearStructuredOutputSpec();
             AgentContext.clearLastRecordedLlmTraceId();
             AgentContext.setLlmCallRequestMeta(buildJudgeRequestMeta(
                     selected, safeHits.size(), safeCitations.size()));
             AgentContext.setPhase(AgentRunObservabilityService.PHASE_SUMMARIZING);
             AgentContext.setStage(STAGE);
-            ChatResponse response = selected.model().chat(buildMessages(query, requestedEntities, safeHits, safeCitations));
+            List<PromptMessage> prepared = buildMessages(query, requestedEntities, safeHits, safeCitations);
+            if (modelInputs == null) {
+                throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "搜索证据判定缺少输入保存组件");
+            }
+            ChatResponse response;
+            try (ModelInputScope ignored = modelInputs.open(selected.archiveEndpointName(), PromptMessage.toModelInputSources(prepared))) {
+                response = selected.model().chat(prepared.stream().map(PromptMessage::message).toList());
+            }
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             String text = response.aiMessage() == null ? "" : nvl(response.aiMessage().text());
             JsonNode root = parseJson(text);
@@ -81,6 +101,7 @@ public class SearchEvidenceJudgeService {
                     parseItems(root.path("citations"), safeCitations.size(), "")
             );
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             log.warn("Search evidence judge failed: {}", e.getMessage());
             recordJudgeObservability(selected, durationMs, startedAtMillis, safeHits.size(), safeCitations.size(),
@@ -88,6 +109,8 @@ public class SearchEvidenceJudgeService {
             return failOpen("JUDGE_CALL_FAILED: " + nvl(e.getMessage()), safeHits.size(), safeCitations.size());
         } finally {
             restorePhaseAndStage(previousPhase, previousStage);
+            if (previousSpec == null) AgentContext.clearStructuredOutputSpec();
+            else AgentContext.setStructuredOutputSpec(previousSpec);
         }
     }
 
@@ -99,14 +122,15 @@ public class SearchEvidenceJudgeService {
                 AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
                         cfg.getEndpointName(), cfg.getModelName());
                 List<String> providerOrder = cfg.getProviderOrder() == null ? List.of() : cfg.getProviderOrder();
-                ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+                ChatModel model = aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                         resolved, providerOrder, 0.0D, JUDGE_MAX_TOKENS);
                 return new SelectionAndModel(
                         cfg.getEndpointName(),
                         cfg.getModelName(),
                         resolvedStage.get().source(),
-                        model);
+                        model, resolved.endpointName());
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 log.warn("Init search evidence judge from stage config failed: endpoint={}, model={}, err={}",
                         cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
             }
@@ -120,14 +144,15 @@ public class SearchEvidenceJudgeService {
             try {
                 AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
                         candidate.getEndpointName(), candidate.getModelName());
-                ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+                ChatModel model = aiServiceFactory.buildArchivedChatModelWithProviderOrderAndTemperature(
                         resolved, List.of(), 0.0D, JUDGE_MAX_TOKENS);
                 return new SelectionAndModel(
                         candidate.getEndpointName(),
                         candidate.getModelName(),
                         SearchEvidenceJudgeModelResolver.ModelSource.ROUTE_FALLBACK,
-                        model);
+                        model, resolved.endpointName());
             } catch (Exception e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 log.warn("Init search evidence judge model failed: endpoint={}, model={}, err={}",
                         candidate.getEndpointName(), candidate.getModelName(), e.getMessage());
             }
@@ -188,7 +213,7 @@ public class SearchEvidenceJudgeService {
         return meta;
     }
 
-    private List<ChatMessage> buildMessages(String query,
+    private List<PromptMessage> buildMessages(String query,
                                             List<String> requestedEntities,
                                             List<Map<String, Object>> hits,
                                             List<Map<String, Object>> citations) {
@@ -197,19 +222,11 @@ public class SearchEvidenceJudgeService {
         payload.put("requested_entities", requestedEntities == null ? List.of() : requestedEntities);
         payload.put("hits", compactItems(hits, true));
         payload.put("citations", compactItems(citations, false));
-        return List.of(
-                new SystemMessage("""
-                        你是搜索证据相关性 judge。只判断每条搜索结果是否围绕用户明确问题和明确实体。
-                        不要回答用户问题，不要改写搜索结果，不要删除结果。
-                        只输出 JSON，格式为:
-                        {"hits":[{"position":0,"entityMatch":true,"matchedEntities":[],"outOfScopeEntities":[],"relevanceWarning":""}],"citations":[{"position":0,"entityMatch":true,"matchedEntities":[],"outOfScopeEntities":[],"relevanceWarning":""}]}
-                        position 必须从 0 开始，并与输入数组一一对应。
-                        entityMatch 表示结果是否命中用户明确实体或用户未给出明确实体时是否围绕查询主题。
-                        outOfScopeEntities 只列出明显偏离用户明确实体范围的实体。
-                        relevanceWarning 为空字符串表示无警告；存在偏题、实体错配或证据不足时用简短中文说明。
-                        """),
-                new UserMessage(writeJson(payload))
-        );
+        if (promptPreparation == null) {
+            throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING, "搜索证据判定缺少原根政策读取组件");
+        }
+        return List.of(PromptMessage.system(promptPreparation.policy("searchEvidenceJudgeSystemPrompt")),
+                PromptMessage.runtimeData(new UserMessage(writeJson(payload))));
     }
 
     private List<Map<String, Object>> compactItems(List<Map<String, Object>> items, boolean includeSnippet) {
@@ -390,7 +407,8 @@ public class SearchEvidenceJudgeService {
             String endpointName,
             String modelName,
             SearchEvidenceJudgeModelResolver.ModelSource source,
-            ChatModel model) {
+            ChatModel model,
+            String archiveEndpointName) {
     }
 
     private record Validation(boolean valid, String error) {

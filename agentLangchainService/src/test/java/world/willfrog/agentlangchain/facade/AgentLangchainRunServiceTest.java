@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.facade;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.ObjectProvider;
@@ -24,8 +24,6 @@ import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
-
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -290,11 +288,10 @@ class AgentLangchainRunServiceTest {
                         .setMessage("v2")
                         .build()));
 
-        @SuppressWarnings("unchecked")
-        ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
-        verify(eventService).append(eq("run-v2"), eq("u1"), eq("RUN_ENQUEUE_FAILED"), captor.capture());
-        assertTrue(String.valueOf(captor.getValue().get("reason")).contains("argument type mismatch"));
+        InOrder order = inOrder(dualPoolRunAdmissionRegistry, eventService);
+        order.verify(dualPoolRunAdmissionRegistry).forgetFailedAdmission("run-v2");
+        order.verify(eventService).closeUnacceptedCreate(eq("run-v2"), eq("u1"), argThat(reason ->
+                String.valueOf(reason).contains("argument type mismatch")));
         verify(pipeline, never()).launchAsync(any(), any());
-        verify(dualPoolRunAdmissionRegistry).forgetFailedAdmission("run-v2");
     }
 }

@@ -1,0 +1,14 @@
+{
+  "fragment": "pythonWorkspaceDirtyAction",
+  "purpose": "pythonWorkspaceDirtyAction",
+  "bodyType": "FIXED",
+  "body": "检查前一个任务的失败原因后，使用新的 Run 重新执行",
+  "variables": [],
+  "utf8Sha256": "c667da21834c4c29b7bb5f321769dfad3fff77f52d3f96a077b5fd4ba29da18f",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/python/PythonSandboxJobResultAdapter.java",
+    "kind": "APPLICATION_ADVICE"
+  },
+  "importOnly": true
+}

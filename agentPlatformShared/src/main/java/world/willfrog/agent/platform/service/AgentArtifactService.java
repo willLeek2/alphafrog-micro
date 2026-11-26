@@ -78,6 +78,13 @@ public class AgentArtifactService {
     private static final String TYPE_PYTHON_SCRIPT = "python_script";
 
     /**
+     * 014-new-03：沙箱任务收割产物的类型串（executePython 工具层注册）。
+     * 注意：绝不加入 {@link #EVENT_DERIVED_TYPES}——收割产物由登记表自管生命周期，
+     * 走事件重放分支反而会让它不可见、不可下载。
+     */
+    private static final String TYPE_RUN_OUTPUT = "run_output";
+
+    /**
      * 事件派生制品类型：list 的 scope/retention 过滤与 load 的可见性判定都依赖事件重放，
      * 非事件派生制品（rawRef / tool-output / DatasetRegistry 注册项等）由 registry 自管生命周期。
      */
@@ -283,7 +290,7 @@ public class AgentArtifactService {
             }
             byte[] bytes = readRegistryArtifact(meta, enforceDownloadMaxBytes, diagnosticNoTouch);
             return new ArtifactContent(meta.getArtifactId(), filename,
-                    contentTypeFor(meta.getArtifactType()), bytes);
+                    contentTypeFor(meta.getArtifactType(), filename), bytes);
         }
 
         // Registry miss：仅历史 Base64 type|runId|ref ID 允许只读回退（不写文件、不注册）。
@@ -533,7 +540,8 @@ public class AgentArtifactService {
                 ? legacyScriptPath(runId, ref.ref())
                 : legacyDatasetPath(runId, ref.type(), ref.ref());
         byte[] bytes = readLegacyFile(file, enforceDownloadMaxBytes);
-        return new ArtifactContent(artifactId, file.getFileName().toString(), contentTypeFor(type), bytes);
+        return new ArtifactContent(artifactId, file.getFileName().toString(),
+                contentTypeFor(type, file.getFileName().toString()), bytes);
     }
 
     /** 旧脚本快照位置（只读）：{artifactRoot}/{runId}/scripts/{sanitizedRef}.py。 */
@@ -606,7 +614,9 @@ public class AgentArtifactService {
                 .setArtifactId(artifactId)
                 .setType(type)
                 .setName(name)
-                .setContentType(contentTypeFor(type))
+                // 014-new-03：run_output 按文件名后缀推断 contentType，name 即登记条目的
+                // 展示名（收割注册时固定填原文件名），其余类型忽略文件名。
+                .setContentType(contentTypeFor(type, name))
                 .setUrl("/api/agent/runs/" + runId + "/artifacts/" + artifactId + "/download")
                 .setMetaJson(metaJson)
                 .setCreatedAt(formatTime(toOffsetDateTime(createdAtMillis)))
@@ -615,7 +625,19 @@ public class AgentArtifactService {
     }
 
     private static String contentTypeFor(String artifactType) {
+        return contentTypeFor(artifactType, null);
+    }
+
+    /**
+     * 014-new-03：contentType 推断带文件名重载。只有 run_output 依赖文件名——
+     * 登记表 meta 没有 contentType 字段，收割产物是任意文件（csv/json/xlsx/…），
+     * 同一类型串下只能按文件名后缀区分；其余类型不依赖文件名，保持既有 type 单参口径。
+     */
+    private static String contentTypeFor(String artifactType, String fileName) {
         String type = artifactType == null ? "" : artifactType;
+        if (TYPE_RUN_OUTPUT.equals(type)) {
+            return runOutputContentType(fileName);
+        }
         switch (type) {
             case TYPE_PYTHON_SCRIPT:
                 return "text/x-python";
@@ -627,6 +649,21 @@ public class AgentArtifactService {
             default:
                 return "application/octet-stream";
         }
+    }
+
+    /** run_output 的文件名后缀 → contentType；未知后缀按通用二进制流兜底。 */
+    private static String runOutputContentType(String fileName) {
+        String name = fileName == null ? "" : fileName.toLowerCase(java.util.Locale.ROOT);
+        if (name.endsWith(".csv")) {
+            return "text/csv";
+        }
+        if (name.endsWith(".json")) {
+            return "application/json";
+        }
+        if (name.endsWith(".xlsx")) {
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        }
+        return "application/octet-stream";
     }
 
     private static String displayNameOf(PersistentArtifactMeta meta) {

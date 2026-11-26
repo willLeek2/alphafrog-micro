@@ -22,6 +22,9 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.ProviderChatException;
 import world.willfrog.agent.platform.exception.ProviderFailureCategory;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.input.ArchivingChatModel;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocks;
+import world.willfrog.alphafrogmicro.common.racing.input.ModelInputScope;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -111,6 +114,14 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
     @Setter
     private AgentRunBudgetService budgetService;
+
+    private volatile boolean inputArchivingEnabled;
+
+    /** 构建完成、交给调用方之前启用归档，HTTP重试复用本次逻辑调用编号。 */
+    public ChatModel withInputArchiving() {
+        inputArchivingEnabled = true;
+        return new ArchivingChatModel(this, endpointName);
+    }
 
     @Override
     public ChatResponse doChat(ChatRequest chatRequest) {
@@ -429,6 +440,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             throw new IllegalStateException(detail, e);
             
         } catch (Exception e) {
+            ModelSendBlocks.rethrowIfBlocked(e);
             // SSE live event: LLM call finished (error)
             long durationMs = System.currentTimeMillis() - requestStartedAt;
             String errorType = e.getClass().getSimpleName();
@@ -641,8 +653,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             try {
                 HttpRequest.Builder httpRequestBuilder = buildHttpRequest(
                         requestUrl, apiKey, customHeaders, currentRequestJson, requestTimeout);
+                HttpRequest httpRequest = httpRequestBuilder.build();
+                if (inputArchivingEnabled) {
+                    ModelInputScope.currentRequired().beforeSend(currentRequestJson);
+                }
                 HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
-                        httpRequestBuilder.build(),
+                        httpRequest,
                         HttpResponse.BodyHandlers.ofInputStream()
                 );
                 int status = httpResponse.statusCode();
@@ -677,6 +693,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                         return new AttemptResult(httpResponse, null, status, null, attempts,
                                 aggregateResult, progressSnapshot, null);
                     } catch (RuntimeException e) {
+                        ModelSendBlocks.rethrowIfBlocked(e);
                         long streamDuration = System.currentTimeMillis() - attemptStarted;
                         lastException = e;
                         lastStatusCode = status;
@@ -715,6 +732,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                     }
                 }
             } catch (IOException e) {
+                ModelSendBlocks.rethrowIfBlocked(e);
                 long attemptDuration = System.currentTimeMillis() - attemptStarted;
                 lastException = e;
                 Map<String, Object> attemptMeta = new LinkedHashMap<>();

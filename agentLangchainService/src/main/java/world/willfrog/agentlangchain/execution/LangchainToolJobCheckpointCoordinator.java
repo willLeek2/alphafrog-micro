@@ -78,6 +78,7 @@ final class LangchainToolJobCheckpointCoordinator {
                     record.setModelOutput(todo.getModelOutput());
                     record.setOutput(todo.getOutput());
                     record.setSummary(todo.getSummary());
+                    record.setOutputSourceJson(todo.getOutputSourceJson());
                     completed.add(record);
                 }
             }

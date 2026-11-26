@@ -243,6 +243,20 @@ public class AgentRunBudgetService {
     }
 
     /**
+     * 只读读取当前 run 观测统计里的累计工具调用次数。
+     *
+     * <p>数据源与 {@code check(String)} 的 tool_calls 拒绝检查完全相同（observability
+     * summary.toolCalls），供展示类消费方取数，保证展示数字与拒绝判定不出现两套口径。
+     * 只读：不触发检查、不递增计数、不写事件。</p>
+     */
+    public long observedToolCalls(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return 0L;
+        }
+        return toLong(loadSummary(runId).get("toolCalls"));
+    }
+
+    /**
      * 构造预算超限异常，同时向事件总线写入 RUN_BUDGET_EXCEEDED 事件。
      * <p>异常消息格式：{@code RUN_BUDGET_EXCEEDED:<维度>:<实际值>/<上限>}，
      * 例如 {@code RUN_BUDGET_EXCEEDED:tool_calls:30/30}。</p>
@@ -345,7 +359,8 @@ public class AgentRunBudgetService {
             return;
         }
         long ratioPct = (long) Math.floor(ratio * 100);
-        AgentContext.setLastMileHint(buildLastMileHint(dimension, actual, limit, ratioPct));
+        AgentContext.setLastMileHintPrompt(promptService.budgetLastMileStageInstructionText(
+                dimension, actual, limit, ratioPct));
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("dimension", dimension);
         payload.put("actual", actual);
@@ -353,16 +368,6 @@ public class AgentRunBudgetService {
         payload.put("ratio", ratio);
         payload.put("ratioPct", ratioPct);
         eventService.append(runId, userId, "BUDGET_LAST_MILE", payload);
-    }
-
-    /**
-     * 拼装 90% last-mile hint 中文文本。
-     * 模板：{@code [last_mile_hint] 本 run 已使用 <pct>% <dim> 预算（<act>/<limit>），<advice>}
-     * advice 按维度区分：tokens 提示精简输出；tool_calls 提示精简工具调用；llm_calls 提示本轮直接给结论；wall_clock_ms 提示尽快完成。
-     */
-    private String buildLastMileHint(String dimension, long actual, long limit, long ratioPct) {
-        return promptService.budgetLastMileStageInstruction(
-                dimension, actual, limit, ratioPct);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */

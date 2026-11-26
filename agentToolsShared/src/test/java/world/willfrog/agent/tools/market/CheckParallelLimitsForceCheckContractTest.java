@@ -1,5 +1,6 @@
 package world.willfrog.agent.tools.market;
 
+import static world.willfrog.agent.tools.support.ToolPromptTestFixture.configure;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -33,14 +34,14 @@ class CheckParallelLimitsForceCheckContractTest {
     void setUp() {
         DatasetWriter datasetWriter = mock(DatasetWriter.class);
         when(datasetWriter.isEnabled()).thenReturn(false);
-        tools = new MarketDataTools(
+        tools = configure(new MarketDataTools(
                 datasetWriter,
                 mock(DatasetRegistry.class),
                 null,
                 null,
                 new AgentLlmProperties(),
                 objectMapper
-        );
+        ));
     }
 
     @Test

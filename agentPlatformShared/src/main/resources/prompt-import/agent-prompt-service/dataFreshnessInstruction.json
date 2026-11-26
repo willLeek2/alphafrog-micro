@@ -1,0 +1,22 @@
+{
+  "fragment": "dataFreshnessInstruction",
+  "purpose": "dataFreshnessInstruction",
+  "bodyType": "TEMPLATE",
+  "body": "当前已爬取/可用市场数据时效范围（部署者在 agent-llm 配置中指定，业务逻辑默认该日期正确）：{{clauses}}。涉及行情、基金、指数、ETF 等本地数据查询时，应将该范围视为当前数据覆盖边界，不要自行推断或改写该范围。",
+  "variables": [
+    {
+      "name": "clauses",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "2b6c42b945f947312c19673b35e912ea88b1ac490f2d592fe244eee703f4b440",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentPlatformShared/src/main/java/world/willfrog/agent/platform/service/AgentPromptService.java",
+    "method": "dataFreshnessPrompt",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

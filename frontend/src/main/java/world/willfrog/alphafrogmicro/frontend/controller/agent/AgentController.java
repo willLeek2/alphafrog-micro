@@ -57,6 +57,7 @@ import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
+import world.willfrog.alphafrogmicro.frontend.model.agent.ExperimentResultMetricsRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactPartsMetaResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentExportRequest;
@@ -84,6 +85,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceSpanItem;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
+import world.willfrog.alphafrogmicro.frontend.service.agent.ExperimentResultMetricAssembler;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentEventEnvelopeMapper;
@@ -129,6 +131,7 @@ public class AgentController {
     private final AgentCallDetailBlobReader callDetailBlobReader;
     private final AgentTracePartsService tracePartsService;
     private final AgentTimelineMergeService timelineMergeService;
+    private final ExperimentResultMetricAssembler experimentResultMetricAssembler;
 
     private AgentDubboService resolveService() {
         return agentDubboServiceLangchain;
@@ -526,7 +529,8 @@ public class AgentController {
             String minEventTime = null;
             String maxEventTime = null;
             for (var e : resp.getItemsList()) {
-                Object payload = parseOutboundJson(e.getPayloadJson(), AgentExternalObservabilityMapper.View.EVENT);
+                Object payload = AgentExternalObservabilityMapper.parseEvent(
+                        objectMapper, e.getPayloadJson(), e.getEventType());
                 String eventTime = safeTimelineString(e.getCreatedAt(), 128);
                 String eventType = safeTimelineString(e.getEventType(), 200);
                 if (minEventTime == null || eventTime.compareTo(minEventTime) < 0) {
@@ -679,6 +683,22 @@ public class AgentController {
         }
     }
 
+    /**
+     * 解析一次登录上下文，再按根运行编号批量读取指标。
+     * 用户编号为空时返回未登录；有效上下文交由批量读取服务核对和去重。
+     */
+    @PostMapping("/api/agent/experiment-results/metrics")
+    public ResponseWrapper<Map<String, ExperimentResultMetricAssembler.RootRunMetrics>> experimentResultMetrics(
+            Authentication authentication,
+            @RequestBody ExperimentResultMetricsRequest request) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (caller.userId() == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        List<String> rootRunIds = request == null ? null : request.rootRunIds();
+        return ResponseWrapper.success(experimentResultMetricAssembler.loadByRoots(caller, rootRunIds));
+    }
+
     @GetMapping(AGENT_RUNS + "/{runId}/credits")
     public ResponseWrapper<AgentRunCreditsResponse> runCredits(Authentication authentication,
                                                                @PathVariable("runId") String runId) {
@@ -752,7 +772,8 @@ public class AgentController {
                     emptyToNull(status.getCurrentTool()),
                     emptyToNull(status.getLastEventType()),
                     emptyToNull(status.getLastEventAt()),
-                    parseOutboundJson(status.getLastEventPayloadJson(), AgentExternalObservabilityMapper.View.EVENT),
+                    AgentExternalObservabilityMapper.parseEvent(
+                            objectMapper, status.getLastEventPayloadJson(), status.getLastEventType()),
                     parseOutboundJson(status.getPlanJson(), admin
                             ? AgentExternalObservabilityMapper.View.ADMIN
                             : AgentExternalObservabilityMapper.View.PLAN),

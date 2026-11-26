@@ -1,0 +1,39 @@
+{
+  "fragment": "toolBudgetLimited",
+  "purpose": "toolBudgetLimited",
+  "bodyType": "TEMPLATE",
+  "body": "工具调用预算现状：{{scopeNote}}累计工具调用已用{{used}}次、上限{{limit}}次、剩余{{remaining}}次；预算耗尽时新调用会在派发前被拒绝，请据此安排调用。",
+  "variables": [
+    {
+      "name": "scopeNote",
+      "required": true,
+      "allowEmpty": true,
+      "defaultValue": null
+    },
+    {
+      "name": "used",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "limit",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    },
+    {
+      "name": "remaining",
+      "required": true,
+      "allowEmpty": false,
+      "defaultValue": null
+    }
+  ],
+  "utf8Sha256": "30942121bb28ef5242fc09795ae14babb76c5084b05191f6c9010eaa4057c30b",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentLangchainService/src/main/java/world/willfrog/agentlangchain/execution/DualPoolWaitGroupNodeExecutor.java",
+    "kind": "JAVA_INSTRUCTION"
+  },
+  "importOnly": true
+}

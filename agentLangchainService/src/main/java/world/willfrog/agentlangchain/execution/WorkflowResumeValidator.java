@@ -201,6 +201,7 @@ public class WorkflowResumeValidator {
                         .sequence(record.getSequence())
                         .description(record.getDescription())
                         .modelOutput(record.getModelOutput())
+                        .outputSourceJson(record.getOutputSourceJson())
                         .output(record.getOutput())
                         .summary(record.getSummary())
                         .build())

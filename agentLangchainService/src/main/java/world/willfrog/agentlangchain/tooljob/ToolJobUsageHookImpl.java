@@ -45,8 +45,10 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
         if (anchor == null) {
             throw new IllegalArgumentException("anchor must not be null");
         }
-        // retryable 必须显式分类；null 不能默认为 false。
-        if (anchor.getTerminalRetryable() == null) {
+        // 普通失败也保留明确分类；沙箱未上报分类时，清理记录中的boolean使用false，
+        // 锚点字段保留null。来源阻止会终止后续模型调用。
+        if (anchor.getTerminalRetryable() == null
+                && world.willfrog.agent.platform.dataanalysis.TerminalModelSendBlock.read(anchor) == null) {
             throw new IllegalArgumentException("terminalRetryable must be durably classified");
         }
         // 从 anchor 恢复原 reservation，再规范成终态确认状态用于 recorder 契约。
@@ -62,7 +64,8 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
                 objectMapper, confirmed.resourceClass(), anchor.getTerminalUsageJson());
         String terminalStatus = anchor.getTerminalStatus();
         // 只有明确 SUCCEEDED 才是成功，其余终态均带 errorCode。
-        boolean success = "SUCCEEDED".equals(terminalStatus);
+        boolean success = anchor.getTerminalBusinessSuccess() != null
+                ? anchor.getTerminalBusinessSuccess() : "SUCCEEDED".equals(terminalStatus);
         String preview = trim(anchor.getTerminalResultPreview());
         String rawRef = trim(anchor.getTerminalRawRef());
         if (success && preview == null && rawRef == null) {
@@ -83,13 +86,13 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
                 preview,
                 rawRef,
                 errorCode,
-                success ? null : "sandbox " + terminalStatus,
+                success ? null : "SUCCEEDED".equals(terminalStatus) ? "business failure: " + errorCode : "sandbox " + terminalStatus,
                 Boolean.TRUE.equals(anchor.getTerminalRetryable()),
                 estimate,
                 confirmed,
                 usage,
                 anchor.getTerminalAt(),
-                true);
+                true, anchor.getTerminalPromptSourcesJson());
     }
 
     private static String trim(String value) {

@@ -1,0 +1,14 @@
+{
+  "fragment": "toolWeightLimitAdvice",
+  "purpose": "toolWeightLimitAdvice",
+  "bodyType": "FIXED",
+  "body": "Tool weighted concurrency limit exceeded, retry later",
+  "variables": [],
+  "utf8Sha256": "9277dcda0d93c7ca5ac7d90bbe6a6b95c031788137483c4a0b0f029e8b3eedae",
+  "source": {
+    "repository": "alphafrog-micro",
+    "file": "agentToolsShared/src/main/java/world/willfrog/agent/tools/router/ToolRouter.java",
+    "kind": "JAVA_TOOL_RESULT_INSTRUCTION"
+  },
+  "importOnly": true
+}

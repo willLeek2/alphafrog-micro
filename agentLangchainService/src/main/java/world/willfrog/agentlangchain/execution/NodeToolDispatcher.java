@@ -1,6 +1,9 @@
 package world.willfrog.agentlangchain.execution;
 
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
+import world.willfrog.alphafrogmicro.common.racing.prompt.PromptText;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlocked;
+import world.willfrog.alphafrogmicro.common.racing.error.ModelSendBlockedException;
 
 import java.util.Optional;
 
@@ -63,7 +66,14 @@ public interface NodeToolDispatcher {
     sealed interface DispatchOutcome {
 
         /** 当场拿到结果：结果正文原样交给调用方写进成员行。 */
-        record Completed(String output) implements DispatchOutcome {
+        record Completed(String output, PromptText outputPrompt) implements DispatchOutcome {
+            public Completed(String output) { this(output, null); }
+            public Completed {
+                if (outputPrompt != null && !outputPrompt.text().equals(output)) {
+                    throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                            "工具结果正文与来源载体不一致");
+                }
+            }
         }
 
         /**
@@ -87,7 +97,14 @@ public interface NodeToolDispatcher {
         }
 
         /** 工具自己报了失败：失败文本交给调用方写进成员行，恢复后由模型决定下一步。 */
-        record Failed(String reason) implements DispatchOutcome {
+        record Failed(String reason, PromptText reasonPrompt) implements DispatchOutcome {
+            public Failed(String reason) { this(reason, null); }
+            public Failed {
+                if (reasonPrompt != null && !reasonPrompt.text().equals(reason)) {
+                    throw new ModelSendBlockedException(ModelSendBlocked.PROMPT_SOURCE_MISSING,
+                            "工具失败正文与来源载体不一致");
+                }
+            }
         }
     }
 }

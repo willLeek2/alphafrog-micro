@@ -5,6 +5,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.ObjectProvider;
+import world.willfrog.agent.platform.childrun.ChildRunIntentStore;
+import world.willfrog.agent.platform.childrun.ChildRunIntentView;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
@@ -13,9 +15,13 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.lease.ProcessInstanceIdentity;
 import world.willfrog.agent.platform.lease.RunServiceLease;
 import world.willfrog.agent.platform.lease.RunServiceLeaseStore;
+import world.willfrog.agent.platform.lease.ServiceOwnershipScope;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.platform.workitem.NodeWorkItemMutationResult;
 import world.willfrog.agent.platform.workitem.NodeWorkItem;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import world.willfrog.agent.platform.workitem.NodeWorkItemState;
@@ -26,6 +32,8 @@ import world.willfrog.agentlangchain.execution.DualPoolWaitGroupNodeExecutor;
 import world.willfrog.agentlangchain.execution.FreshRunPipeline;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
+import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -40,6 +48,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -56,6 +65,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
 
     private static final String TEST_INSTANCE = "agent@localhost@"
             + ProcessHandle.current().pid() + "@test-instance";
+    private static final String DEPLOYMENT_ID = "beta-test";
+    private static final String GENERATION = "gen-" + "a".repeat(64);
 
     private RunCoordinationStore coordinationStore;
     private SchedulerStateStore stateStore;
@@ -65,7 +76,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
     private SchedulerVersionPolicy versionPolicy;
     private RunServiceLeaseStore leaseStore;
     private LegacyRunHandoff legacyHandoff;
-    /** 读数用的登记表：这一份用例顺带量「领取租约、两次重试与服务租约时长」有没有登记在用的值。 */
+    /** 读数用的登记表：这一份用例顺带量「节点领取有效期、两次重试与服务所有权有效期」有没有登记在用的值。 */
     private final FrozenEffectiveSettings frozenEffectiveSettings = new FrozenEffectiveSettings();
 
     private DatabaseDualPoolWorkHandler handler;
@@ -111,14 +122,14 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 handoffProvider,
                 // 上限与水位按默认值；这一份用例量的是路由，不是参数解析。
                 TestSchedulerSettings.propertyOnly(),
+                null,
                 300, 1000, 5000, 120, frozenEffectiveSettings);
     }
 
     /**
      * 四个启动冻结的值各自登记归一化之后真正在用的数。
      *
-     * <p>读数里这几项报的是这里登记的数，不是属性请求值；服务租约时长这一项要求至少 5 秒，所以请求
-     * 1 秒时登记的是 5 秒——报出 1 秒会让验收与排查以为真的只保 1 秒。</p>
+     * <p>读数里这几项报的是这里登记的数，不是属性请求值；服务所有权有效期至少 1 秒。</p>
      */
     @Test
     void preparingInterruptedExitRetriesOriginalClaimEpochAndRestoresInterrupt() {
@@ -207,7 +218,8 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 .containsEntry("DatabaseDualPoolWorkHandler", 120L);
     }
 
-    /** 本进程已经握着这条 Run 的租约：读一次就够，不必再写一遍。 */
+
+    /** 本进程已经握着这条 Run 的服务所有权：读一次就够，不必再写一遍。 */
     private void ownedByThisProcess(String runId) {
         RunServiceLease lease = new RunServiceLease(runId, TEST_INSTANCE, 1L,
                 OffsetDateTime.now().minusMinutes(1), OffsetDateTime.now(),
@@ -428,12 +440,7 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
                 .containsExactly("run-dead-peer");
     }
 
-    /**
-     * 本进程受理过、但主表上已经不是双池家族的 Run：交还名额，不发提示。
-     *
-     * <p>候选行那一路按主表版本分流，旧版本走旧入口；这条走的是本进程受理集合那一路：
-     * 受理在前、版本后来不是双池了，就不该继续当双池的活来推。</p>
-     */
+
     @Test
     void aLocallyAdmittedRunWhoseFamilyChangedIsReleasedInsteadOfHinted() {
         when(coordinationStore.scanDue(10)).thenReturn(List.of());
@@ -445,6 +452,46 @@ class DatabaseDualPoolWorkHandlerRoutingTest {
         assertThat(handler.scanRunnableRuns(10)).isEmpty();
         verify(admissionRegistry).releaseBusinessPermitIfCurrent(
                 Mockito.eq("run-replaced"), Mockito.anyLong(), Mockito.any());
+    }
+
+    private ChildRunIntentStore childRunIntents;
+    private AgentRunStateStore runStateStore;
+    private AgentRunFinalizationService finalizationService;
+
+    @SuppressWarnings("unchecked")
+    private DatabaseDualPoolWorkHandler handlerWith(RunOwnershipGateway ownership,
+                                                    AgentRunEventService events,
+                                                    DualPoolSchedulerSettings settings) {
+        ProcessInstanceIdentity identity = Mockito.mock(ProcessInstanceIdentity.class);
+        ObjectProvider<LegacyRunHandoff> handoffProvider = Mockito.mock(ObjectProvider.class);
+        Mockito.lenient().when(identity.value()).thenReturn(TEST_INSTANCE);
+        Mockito.lenient().when(handoffProvider.getIfAvailable()).thenReturn(legacyHandoff);
+        runStateStore = Mockito.mock(AgentRunStateStore.class);
+        finalizationService = Mockito.mock(AgentRunFinalizationService.class);
+        return new DatabaseDualPoolWorkHandler(
+                runMapper,
+                freshRunPipeline,
+                workItemStore,
+                Mockito.mock(NodeWorkPlanAdapter.class),
+                Mockito.mock(LangchainTodoNodeExecutor.class),
+                events,
+                new ObjectMapper(),
+                Mockito.mock(DualPoolDispatcher.class),
+                admissionRegistry,
+                versionPolicy,
+                Mockito.mock(DualPoolToolJobCoordinator.class),
+                Mockito.mock(DualPoolWaitGroupNodeExecutor.class),
+                coordinationStore,
+                stateStore,
+                leaseStore,
+                identity,
+                handoffProvider,
+                settings,
+                ownership,
+                childRunIntents = Mockito.mock(ChildRunIntentStore.class),
+                runStateStore,
+                finalizationService,
+                300, 1000, 5000, 120, new FrozenEffectiveSettings());
     }
 
     private static RunCoordination candidate(String runId, String version) {
