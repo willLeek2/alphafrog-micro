@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_async_tool_task (
     CONSTRAINT agent_async_tool_task_member_identity_not_blank_check
         CHECK (member_identity IS NULL OR length(btrim(member_identity)) > 0),
     CONSTRAINT agent_async_tool_task_tool_name_not_blank_check
-        CHECK (length(btrim(tool_name)) > 0)
+        CHECK (length(btrim(tool_name)) > 0),
+    -- 任务行只能挂在本组的 Run 上：组在 A 运行、成员行却写 B 运行，结果接收方与停机扫描
+    -- 就会在两个 Run 之间各找一半。组编号为空的行不受这条约束（复合外键按 MATCH SIMPLE 判定）。
+    CONSTRAINT agent_async_tool_task_group_fk
+        FOREIGN KEY (group_id, run_id) REFERENCES alphafrog_agent_run_wait_group(id, run_id)
 );
 
 -- 一个外部作业只能挂到一行；跨运行也一样。唯一约束只防两行抢同一作业，
@@ -145,7 +149,8 @@ SET stop_state = CASE s.state
                  END,
     stop_attempt_count = s.attempt_count,
     stop_last_error = s.last_error,
-    next_poll_at = COALESCE(t.next_poll_at, s.next_attempt_at),
+    -- 停机记录的时刻优先：带停机尾巴的行要尽快被停机扫描取走，成员行的轮询退避可能还在未来。
+    next_poll_at = COALESCE(s.next_attempt_at, t.next_poll_at),
     owner_instance_id = CASE WHEN s.state = 'CLAIMED' THEN s.claimed_by END,
     lease_expires_at = CASE WHEN s.state = 'CLAIMED' THEN s.lease_until END,
     updated_at = GREATEST(t.updated_at, s.updated_at)

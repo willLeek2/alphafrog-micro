@@ -42,11 +42,14 @@ class AsyncToolTaskMigrationSqlTest {
                 .contains("DO $migration_check$")
                 .contains("RAISE EXCEPTION")
                 .contains("migrated <> expected");
-        assertThat(UPGRADE).as("停机尾巴要带上下一次尝试时刻与领取信息")
-                .contains("next_poll_at = COALESCE(t.next_poll_at, s.next_attempt_at)")
+        assertThat(UPGRADE).as("停机尾巴要带上下一次尝试时刻与领取信息，且停机记录的时刻优先")
+                .contains("next_poll_at = COALESCE(s.next_attempt_at, t.next_poll_at)")
                 .contains("CASE WHEN s.state = 'CLAIMED' THEN s.claimed_by END");
         assertThat(UPGRADE).as("停机扫描要有自己的部分索引，取消后的行不在到期索引覆盖范围内")
                 .contains("idx_agent_async_tool_task_stop_due");
+        assertThat(UPGRADE).as("任务行与所属组必须同 Run，旧等待成员表的这条外键要原样保留")
+                .contains("CONSTRAINT agent_async_tool_task_group_fk")
+                .contains("FOREIGN KEY (group_id, run_id) REFERENCES alphafrog_agent_run_wait_group(id, run_id)");
     }
 
     @Test

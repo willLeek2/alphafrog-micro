@@ -53,12 +53,15 @@ import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.mapper.MigrationStatements;
+import world.willfrog.agent.platform.asynctask.AsyncToolTask;
+import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
+import world.willfrog.agent.platform.asynctask.MybatisAsyncToolTaskStore;
 import world.willfrog.agent.platform.mapper.NodeWorkItemMapper;
 import world.willfrog.agent.platform.mapper.RunCoordinationMapper;
 import world.willfrog.agent.platform.mapper.RootTreeBudgetMapper;
 import world.willfrog.agent.platform.mapper.SchedulerStateMapper;
 import world.willfrog.agent.platform.mapper.WaitGroupMapper;
-import world.willfrog.agent.platform.mapper.WaitMemberStopMapper;
+import world.willfrog.agent.platform.mapper.AsyncToolTaskMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.treebudget.MybatisRootTreeBudgetStore;
 import world.willfrog.agent.platform.treebudget.RootTreeActivityBudget;
@@ -111,7 +114,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>做法：建一个临时 schema，用数据源自己的 schema 属性指到它（建表之前先读回
  * {@code current_schema()} 确认写入落在这里）→ 走真实升级链（init 建表脚本加各版本升级脚本，一路升到
  * 006）→ 把这一阶段的各份脚本按顺序整份执行两遍（第二遍要一样通过，证明脚本可重复执行）
- * → 逐条插反例确认被约束拒绝 → 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次
+ * → 逐条插反例确认被约束拒绝 → 第一步的 026 异步任务表迁移再整份执行一次（它带一次性搬运行与
+ * 自校验块，不参与上面的两遍重跑）→ 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次
  * 恢复资格、组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
  *
  * <p>正式出证据时要同时置上 {@code AF_STAGE3_PG_DSN} 与 {@code AF_STAGE3_PG_REQUIRED}：后者让缺连接串
@@ -142,6 +146,8 @@ class Stage3WaitContractPostgresTest {
     private static final String TREE_BUDGET_SCRIPT = "019_agent_run_tree_budget.sql";
     private static final String WAIT_MEMBER_STOP_SCRIPT = "020_agent_run_wait_member_stop.sql";
     private static final String TREE_ACTIVITY_SCRIPT = "021_agent_run_tree_activity_gate.sql";
+    /** 第一步的异步任务表迁移：一次性脚本，整份执行一次，不参与上面的两遍重跑。 */
+    private static final String ASYNC_TASK_SCRIPT = "026_agent_async_tool_task.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -179,6 +185,7 @@ class Stage3WaitContractPostgresTest {
         assertThat(currentSchema()).as("所有连接都必须落在本次随机临时 schema 里").isEqualTo(SCHEMA);
         applyUpgradeChain();
         applyStage3ScriptsTwice();
+        applyAsyncTaskScriptOnce();
         // 空表与列形状的检查放在这里：这些用例共用同一个 schema，JUnit 又不保证方法顺序，
         // 放到某一条用例里断言「表还是空的」会变成顺序依赖。
         assertFreshlyMigratedSchema();
@@ -421,69 +428,79 @@ class Stage3WaitContractPostgresTest {
         long groupId = suspendExternalGroup(runId);
         assertThat(groups.listOpenGroupsByRun(runId, 0, 10))
                 .extracting(WaitGroup::getId).contains(groupId);
+        String fingerprint = "sha256:" + "a".repeat(64);
         String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
-                + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
+                + "\"requestFingerprint\":\"" + fingerprint + "\"}";
         assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
                 OffsetDateTime.now(), 0L)).isTrue();
         long memberId = groups.listMembers(groupId).get(0).getId();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
-            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            AsyncToolTaskStore tasks = context.getBean(AsyncToolTaskStore.class);
             TransactionTemplate transaction = new TransactionTemplate(
                     context.getBean(PlatformTransactionManager.class));
+            // 取消与停机意图写在同一个事务里：回滚时两者都不留。
             assertThatThrownBy(() -> transaction.executeWithoutResult(ignored -> {
                 assertThat(groups.cancelChain(groupId).canceled()).isTrue();
-                assertThat(stops.findByWaitMemberId(memberId)).isPresent();
+                assertThat(tasks.findByJobId(memberId)).isPresent();
                 throw new IllegalStateException("roll back cancellation");
             })).isInstanceOf(IllegalStateException.class);
             assertThat(groups.listOpenGroupsByRun(runId, 0, 10))
                     .extracting(WaitGroup::getId).contains(groupId);
-            assertThat(stops.findByWaitMemberId(memberId)).isEmpty();
+            assertThat(tasks.findByJobId(memberId).orElseThrow().getStopState()).isNull();
             transaction.executeWithoutResult(ignored -> {
                 assertThat(groups.cancelChain(groupId).canceled()).isTrue();
-                assertThat(stops.findByWaitMemberId(memberId)).isPresent();
+                assertThat(tasks.findByJobId(memberId)).isPresent();
             });
-            WaitMemberStopTask first = stops.findByWaitMemberId(memberId).orElseThrow();
-            assertThat(first.getState()).isEqualTo("PENDING");
-            assertThat(first.getCancelRequestId()).isEqualTo("wait-member-" + memberId);
-            assertThat(first.getRequestFingerprint()).isEqualTo("sha256:" + "a".repeat(64));
+            AsyncToolTask first = tasks.findByJobId(memberId).orElseThrow();
+            assertThat(first.getState()).isEqualTo("CANCELED");
+            assertThat(first.getStopState()).isEqualTo("PENDING");
+            assertThat(first.getTaskId()).isEqualTo("task-1");
+            assertThat(first.getExternalOperationId()).isEqualTo("run:call:1");
+            assertThat(readJsonText(first.getRequestJson(), "requestFingerprint")).isEqualTo(fingerprint);
             assertThat(groups.cancelChain(groupId).canceled()).isFalse();
-            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).hasSize(1);
-            assertThat(stops.hasUnconfirmedByRootRunId(runId)).isTrue();
+            assertThat(unconfirmedStopCount(runId)).isEqualTo(1);
             assertThat(groups.listOpenGroupsByRun(runId, 0, 10)).isEmpty();
 
-            WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
-                    "stable", "gen-" + "a".repeat(64), "worker-a", "token-a", OffsetDateTime.now(),
+            // 入队时就到期：停机扫描必须立刻看得见它，不能等任务行原来的轮询退避。
+            assertThat(tasks.scanStopDue(OffsetDateTime.now(), 0, 1000))
+                    .extracting(AsyncToolTask::getJobId).contains(memberId);
+
+            AsyncToolTask claimed = transaction.execute(ignored -> tasks.claimStop(
+                    memberId, "worker-a", OffsetDateTime.now(),
                     OffsetDateTime.now().plusMinutes(1)).orElseThrow());
-            assertThat(claimed.getId()).isEqualTo(first.getId());
+            long claimedEpoch = claimed.getClaimEpoch();
             transaction.executeWithoutResult(ignored -> {
-                assertThat(stops.confirmSandboxTerminal(first.getId(), "token-a", "task-1", "CANCELED"))
-                        .isFalse();
-                assertThat(stops.retry(first.getId(), "wrong-token", OffsetDateTime.now().plusMinutes(2),
-                        "terminal unavailable")).isFalse();
-                assertThat(stops.retry(first.getId(), "token-a", OffsetDateTime.now().plusMinutes(2),
-                        "terminal unavailable")).isTrue();
+                // 持有实例与领取轮次都要对上：别的实例或旧轮次写不进停机结果。
+                assertThat(tasks.finishStop(memberId, "worker-b", claimedEpoch, "task-1")).isFalse();
+                assertThat(tasks.finishStop(memberId, "worker-a", claimedEpoch - 1, "task-1")).isFalse();
+                assertThat(tasks.retryStop(memberId, "worker-b", claimedEpoch,
+                        OffsetDateTime.now().plusMinutes(2), "terminal unavailable")).isFalse();
+                assertThat(tasks.retryStop(memberId, "worker-a", claimedEpoch,
+                        OffsetDateTime.now().plusMinutes(2), "terminal unavailable")).isTrue();
             });
-            assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getState()).isEqualTo("PENDING");
-            WaitMemberStopTask reclaimed = transaction.execute(ignored -> stops.claimDue(
-                    "stable", "gen-" + "a".repeat(64), "worker-b", "token-b", OffsetDateTime.now().plusMinutes(3),
-                    OffsetDateTime.now().plusMinutes(4)).orElseThrow());
-            assertThat(reclaimed.getCancelRequestId()).isEqualTo(first.getCancelRequestId());
-            execute("UPDATE alphafrog_agent_run SET snapshot_json = "
-                    + "'{\"data_analysis_observability\":{\"calls\":[{\"operationId\":\"run:call:1\","
-                    + "\"taskId\":\"task-1\",\"terminalStatus\":\"CANCELED\","
-                    + "\"terminalAt\":\"2026-01-01T00:00:00Z\","
-                    + "\"reservation\":{\"state\":\"TERMINAL_CONFIRMED\"}}]}}'::jsonb "
-                    + "WHERE id = '" + runId + "'");
-            transaction.executeWithoutResult(ignored -> {
-                assertThat(stops.confirmSandboxTerminal(first.getId(), "token-b", "other-task", "CANCELED"))
-                        .isFalse();
-                assertThat(stops.confirmSandboxTerminal(first.getId(), "token-b", "task-1", "CANCELED"))
-                        .isTrue();
-            });
-            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).isEmpty();
-            assertThat(stops.hasUnconfirmedByRootRunId(runId)).isFalse();
-            assertThat(stops.findByWaitMemberId(memberId).orElseThrow().getTerminalStatus())
-                    .isEqualTo("CANCELED");
+            AsyncToolTask retried = tasks.findByJobId(memberId).orElseThrow();
+            assertThat(retried.getStopState()).isEqualTo("PENDING");
+            assertThat(retried.getStopAttemptCount()).isEqualTo(1);
+            assertThat(retried.getStopLastError()).isEqualTo("terminal unavailable");
+            // 重试把租约还回去，但在下一次尝试时刻之前不会被停机扫描取走。
+            OffsetDateTime retryAt = OffsetDateTime.now().plusMinutes(3);
+            assertThat(tasks.scanStopDue(OffsetDateTime.now(), 0, 1000))
+                    .extracting(AsyncToolTask::getJobId).doesNotContain(memberId);
+            assertThat(tasks.scanStopDue(retryAt, 0, 1000))
+                    .extracting(AsyncToolTask::getJobId).contains(memberId);
+            // 到了重试时刻，别的实例可以接手，领取轮次随之前进一格。
+            AsyncToolTask reclaimed = transaction.execute(ignored -> tasks.claimStop(
+                    memberId, "worker-b", retryAt, retryAt.plusMinutes(1)).orElseThrow());
+            assertThat(reclaimed.getClaimEpoch()).isEqualTo(claimedEpoch + 1);
+            assertThat(tasks.finishStop(memberId, "worker-a", claimedEpoch, "task-1")).isFalse();
+            transaction.executeWithoutResult(ignored ->
+                    assertThat(tasks.finishStop(memberId, "worker-b",
+                            reclaimed.getClaimEpoch(), "task-1")).isTrue());
+            assertThat(unconfirmedStopCount(runId)).isZero();
+            AsyncToolTask confirmed = tasks.findByJobId(memberId).orElseThrow();
+            assertThat(confirmed.getStopState()).isEqualTo("CONFIRMED");
+            assertThat(confirmed.getStopLastError()).isNull();
+            assertThat(confirmed.getTaskId()).isEqualTo("task-1");
         }
     }
 
@@ -495,14 +512,17 @@ class Stage3WaitContractPostgresTest {
         WaitGroupStore groups = new MybatisWaitGroupStore(
                 new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
         long groupId = suspendExternalGroup(runId);
-        execute("UPDATE alphafrog_agent_run_wait_member SET external_operation_id = 'run:call:2' "
+        // 外部作业身份已经落下，但请求快照是空的：这个作业从来没有被创建过，没有可停的对象。
+        execute("UPDATE alphafrog_agent_async_tool_task SET external_operation_id = 'run:call:2' "
                 + "WHERE group_id = " + groupId);
         long memberId = groups.listMembers(groupId).get(0).getId();
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
-            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
-            assertThat(stops.findByWaitMemberId(memberId)).isEmpty();
-            assertThat(stops.listUnconfirmedByRun(runId, 0, 10)).isEmpty();
+            AsyncToolTaskStore tasks = context.getBean(AsyncToolTaskStore.class);
+            AsyncToolTask task = tasks.findByJobId(memberId).orElseThrow();
+            assertThat(task.getState()).isEqualTo("CANCELED");
+            assertThat(task.getStopState()).isNull();
+            assertThat(unconfirmedStopCount(runId)).isZero();
             assertThat(groups.scanCanceledGroupsMissingStopTasks(0, 100))
                     .extracting(WaitGroup::getId).doesNotContain(groupId);
         }
@@ -525,22 +545,23 @@ class Stage3WaitContractPostgresTest {
         assertThat(late.memberState()).isEqualTo(WaitMemberState.LATE);
         assertThat(memberByIdentity(fixture.groupId(), "call-b").getState()).isEqualTo("CANCELED");
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
-            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
-            assertThat(stops.findByWaitMemberId(siblingId).orElseThrow().getState()).isEqualTo("PENDING");
-            // 模拟旧进程在组已取消后未留下停机任务：补扫仍能从成员派发证明找回责任。
-            execute("DELETE FROM alphafrog_agent_run_wait_member_stop WHERE wait_member_id = " + siblingId);
+            AsyncToolTaskStore tasks = context.getBean(AsyncToolTaskStore.class);
+            assertThat(tasks.findByJobId(siblingId).orElseThrow().getStopState()).isEqualTo("PENDING");
+            // 模拟旧进程在组已取消后没留下停机意图：补扫仍能从任务行找回责任，再补一次也只有一个。
+            execute("UPDATE alphafrog_agent_async_tool_task SET stop_state = NULL, next_poll_at = NULL "
+                    + "WHERE job_id = " + siblingId);
             assertThat(groups.scanCanceledGroupsMissingStopTasks(0, 100))
                     .extracting(WaitGroup::getId).contains(fixture.groupId());
             assertThat(groups.ensureCanceledMemberStopTasks(fixture.groupId())).isEqualTo(1);
             assertThat(groups.ensureCanceledMemberStopTasks(fixture.groupId())).isZero();
-            assertThat(stops.findByWaitMemberId(siblingId).orElseThrow().getState()).isEqualTo("PENDING");
+            assertThat(tasks.findByJobId(siblingId).orElseThrow().getStopState()).isEqualTo("PENDING");
             assertThat(groups.scanCanceledGroupsMissingStopTasks(0, 100))
                     .extracting(WaitGroup::getId).doesNotContain(fixture.groupId());
         }
     }
 
     @Test
-    void stopWorkerCanBlockAnIdentityMismatchWithoutReclaimingTheTask() throws Exception {
+    void stopWorkerCanAbandonAnIdentityMismatchWithoutReclaimingTheTask() throws Exception {
         String runId = "run-external-stop-mismatch";
         createRun(runId, 0, 0L);
         createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
@@ -551,25 +572,28 @@ class Stage3WaitContractPostgresTest {
                 + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
         assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
                 OffsetDateTime.now(), 0L)).isTrue();
+        long memberId = groups.listMembers(groupId).get(0).getId();
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
-            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
+            AsyncToolTaskStore tasks = context.getBean(AsyncToolTaskStore.class);
             TransactionTemplate transaction = new TransactionTemplate(
                     context.getBean(PlatformTransactionManager.class));
-            WaitMemberStopTask claimed = transaction.execute(ignored -> stops.claimDue(
-                    "stable", "gen-" + "a".repeat(64), "worker-a", "token-a", OffsetDateTime.now(),
+            AsyncToolTask claimed = transaction.execute(ignored -> tasks.claimStop(
+                    memberId, "worker-a", OffsetDateTime.now(),
                     OffsetDateTime.now().plusMinutes(1)).orElseThrow());
             transaction.executeWithoutResult(ignored -> {
-                assertThat(stops.blockProof(claimed.getId(), "wrong-token", "identity_mismatch"))
-                        .isFalse();
-                assertThat(stops.blockProof(claimed.getId(), "token-a", "identity_mismatch"))
-                        .isTrue();
+                assertThat(tasks.abandonStop(memberId, "worker-b", claimed.getClaimEpoch(),
+                        "identity_mismatch")).isFalse();
+                assertThat(tasks.abandonStop(memberId, "worker-a", claimed.getClaimEpoch(),
+                        "identity_mismatch")).isTrue();
             });
-            assertThat(stops.findByWaitMemberId(claimed.getWaitMemberId()).orElseThrow().getState())
-                    .isEqualTo("BLOCKED_PROOF");
-            Optional<WaitMemberStopTask> reclaimed = transaction.execute(ignored -> stops.claimDue(
-                    "stable", "gen-" + "a".repeat(64), "worker-b", "token-b", OffsetDateTime.now().plusMinutes(2),
-                    OffsetDateTime.now().plusMinutes(3)));
+            AsyncToolTask abandoned = tasks.findByJobId(memberId).orElseThrow();
+            assertThat(abandoned.getStopState()).isEqualTo("CONFIRMED");
+            assertThat(abandoned.getStopLastError()).isEqualTo("identity_mismatch");
+            // 收过尾的行不再回到停机队列，别的实例也不会重复领取。
+            Optional<AsyncToolTask> reclaimed = transaction.execute(ignored -> tasks.claimStop(
+                    memberId, "worker-b", OffsetDateTime.now(),
+                    OffsetDateTime.now().plusMinutes(1)));
             assertThat(reclaimed).isEmpty();
         }
     }
@@ -604,11 +628,19 @@ class Stage3WaitContractPostgresTest {
         assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
                 OffsetDateTime.now(), 0L)).isTrue();
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
-        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
-            WaitMemberStopStore stops = context.getBean(WaitMemberStopStore.class);
-            assertThat(stops.hasUnconfirmedByRootRunId(rootRunId)).isTrue();
-            assertThat(stops.hasUnconfirmedByRootRunId("unrelated-root")).isFalse();
-        }
+        assertThat(unconfirmedStopCount(childRunId)).isEqualTo(1);
+        // 与 hasUnsettledDescendants 和 listReservedRootRunIds 里的条件同一口径：
+        // 子运行名下还有未确认的停机任务时，根 Run 的树保留不能被放开。
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task t "
+                + "LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = t.run_id "
+                + "WHERE t.stop_state IS NOT NULL AND t.stop_state <> 'CONFIRMED' "
+                + "AND (t.run_id = '" + rootRunId + "' OR i.root_run_id = '" + rootRunId + "')"))
+                .as("根 Run 名下还有子运行的停机尾巴").isEqualTo(1);
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task t "
+                + "LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = t.run_id "
+                + "WHERE t.stop_state IS NOT NULL AND t.stop_state <> 'CONFIRMED' "
+                + "AND (t.run_id = 'unrelated-root' OR i.root_run_id = 'unrelated-root')"))
+                .as("不相干的根 Run 不受影响").isZero();
     }
 
     @Test
@@ -1129,20 +1161,21 @@ class Stage3WaitContractPostgresTest {
         String otherRun = "run-other";
         createRun(otherRun, 0, 0L);
 
-        String memberInsert = "INSERT INTO alphafrog_agent_run_wait_member "
-                + "(group_id, run_id, member_seq, member_identity, tool_name, state) VALUES ";
-        expectRejected(memberInsert + "(" + groupId + ", '" + otherRun + "', 99, "
+        String taskInsert = "INSERT INTO alphafrog_agent_async_tool_task "
+                + "(job_kind, group_id, run_id, member_seq, member_identity, tool_name, state) VALUES ";
+        // 任务行只能挂在组的同一个 Run 上：组在 A 运行、成员却写在 B 运行，会让结果接收方找不到主人。
+        expectRejected(taskInsert + "('SANDBOX_TOOL', " + groupId + ", '" + otherRun + "', 99, "
                 + "'foreign-member', 'tool', 'PENDING')",
-                "alphafrog_agent_run_wait_member_group_fk");
+                "agent_async_tool_task_group_fk");
         // 终态与结束时间要一一对应，两个方向都要管住。
-        expectRejected(memberInsert + "(" + groupId + ", '" + fixture.runId() + "', 99, "
+        expectRejected(taskInsert + "('SANDBOX_TOOL', " + groupId + ", '" + fixture.runId() + "', 99, "
                 + "'done-no-time', 'tool', 'SUCCEEDED')",
-                "alphafrog_agent_run_wait_member_finished_check");
-        expectRejected("INSERT INTO alphafrog_agent_run_wait_member "
-                + "(group_id, run_id, member_seq, member_identity, tool_name, state, finished_at) "
-                + "VALUES (" + groupId + ", '" + fixture.runId() + "', 99, 'time-no-done', 'tool', "
-                + "'RUNNING', CURRENT_TIMESTAMP)",
-                "alphafrog_agent_run_wait_member_finished_check");
+                "agent_async_tool_task_finished_check");
+        expectRejected("INSERT INTO alphafrog_agent_async_tool_task "
+                + "(job_kind, group_id, run_id, member_seq, member_identity, tool_name, state, finished_at) "
+                + "VALUES ('SANDBOX_TOOL', " + groupId + ", '" + fixture.runId() + "', 99, "
+                + "'time-no-done', 'tool', 'RUNNING', CURRENT_TIMESTAMP)",
+                "agent_async_tool_task_finished_check");
         // 通知的 run_id 也要等于组的 run_id。
         expectRejected("INSERT INTO alphafrog_agent_run_recovery_notification "
                 + "(group_id, run_id, recovery_generation) VALUES (" + groupId + ", '" + otherRun + "', 9)",
@@ -1161,14 +1194,14 @@ class Stage3WaitContractPostgresTest {
     void externalOperationIdentityIsUniqueAcrossRuns() throws Exception {
         GroupFixture first = suspendSimpleGroup("run-op-a", 2, 0L);
         GroupFixture second = suspendSimpleGroup("run-op-b", 2, 0L);
-        execute("UPDATE alphafrog_agent_run_wait_member SET external_operation_id = 'op-shared' "
+        execute("UPDATE alphafrog_agent_async_tool_task SET external_operation_id = 'op-shared' "
                 + "WHERE group_id = " + first.groupId() + " AND member_seq = 0");
         // 另一个 Run 的成员用同一个外部作业身份必须被拒：范围是全局，不是 Run 内。
-        expectRejected("INSERT INTO alphafrog_agent_run_wait_member "
-                + "(group_id, run_id, member_seq, member_identity, tool_name, external_operation_id, state) "
-                + "VALUES (" + second.groupId() + ", '" + second.runId() + "', 99, 'op-member', 'tool', "
-                + "'op-shared', 'PENDING')",
-                "uq_agent_run_wait_member_operation");
+        expectRejected("INSERT INTO alphafrog_agent_async_tool_task "
+                + "(job_kind, group_id, run_id, member_seq, member_identity, tool_name, "
+                + "external_operation_id, state) VALUES ('SANDBOX_TOOL', " + second.groupId() + ", '"
+                + second.runId() + "', 99, 'op-member', 'tool', 'op-shared', 'PENDING')",
+                "uq_agent_async_tool_task_operation");
     }
 
     @Test
@@ -1766,9 +1799,9 @@ class Stage3WaitContractPostgresTest {
     void afterCancelALateResultOnlyLeavesAudit() throws Exception {
         GroupFixture fixture = suspendSimpleGroup("run-cancel", 2, 0L);
         // 一个成员看起来已经在外面跑：结果到达时它是要留审计的那一个。
-        execute("UPDATE alphafrog_agent_run_wait_member SET state = 'RUNNING', "
-                + "external_operation_id = 'op-late' WHERE group_id = " + fixture.groupId()
-                + " AND member_seq = 0");
+        execute("UPDATE alphafrog_agent_async_tool_task SET state = 'RUNNING', "
+                + "external_operation_id = 'op-late', next_poll_at = NULL WHERE group_id = "
+                + fixture.groupId() + " AND member_seq = 0");
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
             WaitChainCancelResult canceled = store.cancelChain(fixture.groupId());
@@ -1787,13 +1820,13 @@ class Stage3WaitContractPostgresTest {
             // 再报一次：审计字段只写一次，后到的不能覆盖先到的。
             store.reportLateMember(new LateMemberRequest(fixture.groupId(), "call-a",
                     "{\"note\":\"late-2\"}", "op-late", fixture.runControlVersion()));
-            assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_member WHERE group_id = "
+            assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task WHERE group_id = "
                     + fixture.groupId() + " AND member_identity = 'call-a' "
                     + "AND result_ref_json->>'note' = 'late-1'"))
                     .as("第一次留下的引子不许被后来的上报覆盖")
                     .isEqualTo(1);
         }
-        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_member WHERE group_id = "
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task WHERE group_id = "
                 + fixture.groupId() + " AND state IN ('PENDING', 'RUNNING')"))
                 .as("取消之后没有成员还留在待派发或执行中的状态，不会有下一次派发")
                 .isZero();
@@ -2704,6 +2737,22 @@ class Stage3WaitContractPostgresTest {
         }
     }
 
+    /**
+     * 异步任务表迁移整份执行一次。
+     *
+     * <p>不参与两遍重跑：它带一段一次性的行数校验块，第二遍会重复插入并撞唯一约束；
+     * 脚本里的 {@code DO $tag$ ... $tag$} 也不能交给按分号切句的工具。</p>
+     */
+    private static void applyAsyncTaskScriptOnce() throws Exception {
+        String script = MigrationStatements.read(ASYNC_TASK_SCRIPT);
+        try (Connection connection = dataSource.getConnection();
+             Statement statement = connection.createStatement()) {
+            statement.execute(script);
+        } catch (SQLException e) {
+            throw new IllegalStateException("异步任务表迁移执行失败：" + ASYNC_TASK_SCRIPT, e);
+        }
+    }
+
     private static SqlSessionFactory buildSessionFactory(DataSource source) throws Exception {
         // 事务工厂用 Spring 那一套：容量并发用例走 SqlSessionTemplate + DataSourceTransactionManager，
         // 会话要能挂进当前事务。直接用 JdbcTransactionFactory 建出来的工厂接不上 Spring 的事务，
@@ -2716,7 +2765,7 @@ class Stage3WaitContractPostgresTest {
                 "mapper/RunServiceLeaseMapper.xml",
                 "mapper/SchedulerStateMapper.xml",
                 "mapper/AcceptanceReleasePointMapper.xml",
-                "mapper/ChildRunIntentMapper.xml", "mapper/WaitMemberStopMapper.xml",
+                "mapper/ChildRunIntentMapper.xml", "mapper/AsyncToolTaskMapper.xml",
                 "mapper/RootTreeBudgetMapper.xml")) {
             try (InputStream xml = Resources.getResourceAsStream(resource)) {
                 new XMLMapperBuilder(xml, configuration, resource, configuration.getSqlFragments()).parse();
@@ -2976,8 +3025,20 @@ class Stage3WaitContractPostgresTest {
     }
 
     private static long memberCount(long groupId, String memberIdentity, String state) throws Exception {
-        return countRows("SELECT count(*) FROM alphafrog_agent_run_wait_member WHERE group_id = "
+        return countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task WHERE group_id = "
                 + groupId + " AND member_identity = '" + memberIdentity + "' AND state = '" + state + "'");
+    }
+
+    /** 这个 Run 名下还没确认停机的任务行数：与树保留判定用的是同一个条件。 */
+    private static long unconfirmedStopCount(String runId) throws Exception {
+        return countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task "
+                + "WHERE run_id = '" + runId + "' AND stop_state IS NOT NULL "
+                + "AND stop_state <> 'CONFIRMED'");
+    }
+
+    /** 从库里的 JSONB 文本取一个字段；直接用字符串包含判断会被键顺序和空白干扰。 */
+    private static String readJsonText(String json, String field) throws Exception {
+        return new ObjectMapper().readTree(json).path(field).asText();
     }
 
     /** 多线程同时做同一件事；每次调用各自开一个连接，和线上并发走的是同一条路。 */
@@ -3056,6 +3117,26 @@ class Stage3WaitContractPostgresTest {
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_group")).isZero();
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_scheduler_round")).isEqualTo(2);
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_scheduler_capacity_state")).isEqualTo(1);
+        // 026 建的第一批异步任务表：只加结构与索引，不写业务数据（源表为空，搬运行也是零行）。
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task")).isZero();
+        assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                + "WHERE table_schema = current_schema() "
+                + "AND table_name = 'alphafrog_agent_async_tool_task' "
+                + "AND column_name IN ('request_json', 'reservation_json', 'result_ref_json') "
+                + "AND data_type = 'jsonb'"))
+                .as("任务表的三份内容列都应当是 JSONB").isEqualTo(3);
+        assertThat(countRows("SELECT count(*) FROM pg_constraint WHERE connamespace = "
+                + "current_schema()::regnamespace AND conname IN ("
+                + "'agent_async_tool_task_kind_check', "
+                + "'agent_async_tool_task_state_check', "
+                + "'agent_async_tool_task_stop_state_check', "
+                + "'agent_async_tool_task_finished_check', "
+                + "'agent_async_tool_task_group_fk')"))
+                .as("任务表的种类、状态、停机、终态与组归属五条约束都要在").isEqualTo(5);
+        assertThat(countRows("SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                + "AND indexname IN ('uq_agent_async_tool_task_operation', "
+                + "'idx_agent_async_tool_task_stop_due')"))
+                .as("外部作业唯一索引与停机到期索引都要在").isEqualTo(2);
         // 008 加的那一列：重复执行两遍之后仍然只有一列，且类型就是 JSONB。
         assertThat(countRows("SELECT count(*) FROM information_schema.columns "
                 + "WHERE table_schema = current_schema() "
@@ -3183,9 +3264,9 @@ class Stage3WaitContractPostgresTest {
         AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
         context.registerBean("probeDataSource", DataSource.class, () -> dataSource);
         context.registerBean(PlatformTransactionManager.class, () -> new DataSourceTransactionManager(dataSource));
-        context.registerBean(WaitMemberStopMapper.class,
-                () -> new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitMemberStopMapper.class));
-        context.registerBean(MybatisWaitMemberStopStore.class);
+        context.registerBean(AsyncToolTaskMapper.class,
+                () -> new SqlSessionTemplate(sqlSessionFactory).getMapper(AsyncToolTaskMapper.class));
+        context.registerBean(MybatisAsyncToolTaskStore.class);
         context.register(TransactionManagementEnablement.class);
         context.refresh();
         return context;
