@@ -39,12 +39,6 @@ public interface AsyncToolTaskMapper {
                  @Param("leaseUntil") OffsetDateTime leaseUntil,
                  @Param("now") OffsetDateTime now);
 
-    /** 派发证明已写入时同步保存请求快照；按组与成员身份定位任务行。 */
-    int updatePreparingByMember(@Param("groupId") long groupId,
-                                @Param("memberIdentity") String memberIdentity,
-                                @Param("requestJson") String requestJson,
-                                @Param("schemaVersion") int schemaVersion);
-
     /** 沙箱任务编号已证实，按外部作业身份把任务推进到执行中。 */
     int updateAttachedByOperation(@Param("operationId") String operationId,
                                   @Param("taskId") String taskId,

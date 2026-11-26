@@ -34,8 +34,8 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     private final LangchainSchedulerMetrics metrics;
 
     /**
-     * 第一步迁移期的双写目标；测试里没有这个依赖时跳过，旧路径不受影响。
-     * 第四步完成后这里是唯一写入目标，不再允许为空。
+     * 沙箱任务编号与轮询时刻写进异步工具任务表。测试里没有这个依赖时跳过；
+     * 第四步轮询迁到新表后这是唯一写入目标，不再允许为空。
      */
     @Autowired(required = false)
     private AsyncToolTaskMapper asyncToolTaskMapper;
@@ -109,12 +109,9 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                                                String resumeToken, Long resumeVersion) {
         if (!applyDualPoolIdentity(runId, anchor)) return false;
         try {
-            boolean claimed = anchorService.claimPreparingWaitMember(runId, anchor, groupId, memberIdentity,
+            // 完整请求由 claimPreparingWaitMember 直接写进任务行的请求快照，这里不再补写第二次。
+            return anchorService.claimPreparingWaitMember(runId, anchor, groupId, memberIdentity,
                     proofJson, resumeToken, resumeVersion);
-            if (claimed) {
-                recordPreparingTask(groupId, memberIdentity, proofJson, anchor.getSchemaVersion());
-            }
-            return claimed;
         } catch (world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException admission) {
             throw admission;
         } catch (RuntimeException uncertainCommit) {
@@ -222,24 +219,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
         return updated;
     }
 
-    /** 迁移期双写：旧路径成功后再同步新表；新表写失败只记日志，不反向影响旧路径。 */
-    private void recordPreparingTask(long groupId, String memberIdentity, String proofJson,
-                                     int schemaVersion) {
-        if (asyncToolTaskMapper == null) {
-            return;
-        }
-        try {
-            int rows = asyncToolTaskMapper.updatePreparingByMember(
-                    groupId, memberIdentity, proofJson, schemaVersion);
-            if (rows != 1) {
-                log.warn("新任务表未命中准备行: group={} member={} rows={}", groupId, memberIdentity, rows);
-            }
-        } catch (RuntimeException e) {
-            log.error("新任务表准备行写入失败: group={} member={}", groupId, memberIdentity, e);
-        }
-    }
-
-    /** 迁移期双写：沙箱任务编号证实后同步新表。 */
+    /** 沙箱任务编号证实后写任务行：编号、执行中状态、下次查询与超时时刻。 */
     private void recordAttachedTask(ToolJobAnchor anchor) {
         if (asyncToolTaskMapper == null || anchor.getOperationId() == null
                 || anchor.getTaskId() == null || anchor.getNextPollAt() == null) {

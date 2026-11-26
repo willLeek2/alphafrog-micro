@@ -130,17 +130,6 @@
           AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
     </update>
 
-    <update id="updatePreparingByMember">
-        UPDATE alphafrog_agent_async_tool_task
-        SET request_json = #{requestJson}::jsonb,
-            schema_version = #{schemaVersion},
-            next_poll_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE group_id = #{groupId}
-          AND member_identity = #{memberIdentity}
-          AND state IN ('PENDING', 'RUNNING')
-    </update>
-
     <update id="updateAttachedByOperation">
         UPDATE alphafrog_agent_async_tool_task
         SET task_id = #{taskId},
