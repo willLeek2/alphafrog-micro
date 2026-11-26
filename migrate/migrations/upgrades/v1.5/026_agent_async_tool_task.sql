@@ -164,14 +164,17 @@ WHERE m.run_id = t.run_id
   AND m.group_id = t.group_id
   AND m.member_seq = t.member_seq;
 
-UPDATE alphafrog_agent_async_tool_task
+-- 目标表必须带别名、列都写全名：带 FROM 的 UPDATE 里，没写表名的列会在目标表与 FROM 表
+-- 之间一起寻找，运行表也有 updated_at，写成 GREATEST(updated_at, ...) 会报列引用歧义，
+-- 整份脚本随事务回滚。
+UPDATE alphafrog_agent_async_tool_task t
 SET timeout_at = CAST(r.tool_job_anchor_json ->> 'timeoutAt' AS timestamptz),
-    updated_at = GREATEST(updated_at, CURRENT_TIMESTAMP)
+    updated_at = GREATEST(t.updated_at, CURRENT_TIMESTAMP)
 FROM alphafrog_agent_run r
-WHERE r.id = run_id
-  AND external_operation_id = r.tool_job_anchor_json ->> 'operationId'
+WHERE r.id = t.run_id
+  AND t.external_operation_id = r.tool_job_anchor_json ->> 'operationId'
   AND (r.tool_job_anchor_json ->> 'timeoutAt') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
-  AND timeout_at IS NULL;
+  AND t.timeout_at IS NULL;
 
 -- 迁移校验：与源表未完结行数对账、检查关键列，不通过就抛异常，整份脚本随事务回滚。
 DO $migration_check$

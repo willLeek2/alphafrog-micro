@@ -1,7 +1,11 @@
 -- 异步工具任务表的一次性回退脚本。
 --
--- 使用方式：停服务，执行本脚本（整份在一个事务里），确认末尾三条核对查询都是空结果，
--- 再部署上一个版本。本脚本不在 migrate.py 的自动迁移序列里，必须由操作者显式执行；
+-- 使用方式：停服务，用 psql 执行本脚本（整份在一个事务里）：
+--     psql -v ON_ERROR_STOP=1 -f 026_agent_async_tool_task_down.sql
+-- 必须带 ON_ERROR_STOP=1：不带它时，某条语句出错后 psql 不会停下来，退出码仍然是 0；
+-- 而事务里出过错以后 COMMIT 会被当成回滚执行，不看输出会误以为回写成功。
+-- 执行完确认前三条核对查询都是空结果、第四条信息查询没有需要人工处理的行，再部署上一个版本。
+-- 本脚本不在 migrate.py 的自动迁移序列里，必须由操作者显式执行；
 -- 执行前先确认新表之外没有别的写入方。
 --
 -- 回写范围是还没走完的异步任务：待执行、执行中，以及取消后停机未确认的任务。
@@ -135,7 +139,8 @@ COMMIT;
 
 -- 4. 回退后核对：前三查询必须返回 0 行，有结果时不要部署上一版本；
 --    第四条是信息查询，正常情况下会有 0 行，出现行时按凭证人工核对，不属于「必须为空」。
---    第一条：新表里还有未完结任务没写回旧表（正常应为 0，除第 2 步标记为失败的之外）。
+--    第一条：新表里还有待执行或执行中的任务没写回旧表（正常应为 0；第 2 步已经把
+--    写不回的未完结行改成失败，它们不会出现在这里）。
 SELECT t.job_id, t.run_id, t.state, t.tool_name, t.reservation_json
   FROM alphafrog_agent_async_tool_task t
  WHERE t.state IN ('PENDING', 'RUNNING')
@@ -149,14 +154,23 @@ SELECT m.id, m.group_id, m.member_identity, m.tool_name
  WHERE m.state IN ('PENDING', 'RUNNING')
    AND (m.member_identity IS NULL OR m.tool_name IS NULL OR m.group_id IS NULL);
 
---    第三条：还没确认的停机行（正常应为 0；有结果说明这些沙箱作业要在旧版本上继续停，
---    或由人工确认后按任务行的名额凭证核对容量）。
+--    第三条：取消后停机未确认、而且旧停机表里也没有对应记录的行（正常应为 0）。
+--    第 3 步已经把能写回旧表的停机行写回去了，旧版本会继续执行停止；这里只列第 3 步
+--    跳过的行——缺外部作业号或缺请求快照，回退后没有人会去停它们，需要人工确认。
+--    按组与成员身份能在旧停机表找到记录的行属于正常回写，不出现在这里，否则正常回退
+--    永远等不到空结果。
 SELECT t.job_id, t.run_id, t.tool_name, t.external_operation_id, t.stop_state,
        t.stop_last_error, t.reservation_json
   FROM alphafrog_agent_async_tool_task t
  WHERE t.state = 'CANCELED'
    AND t.stop_state IS NOT NULL
-   AND t.stop_state <> 'CONFIRMED';
+   AND t.stop_state <> 'CONFIRMED'
+   AND NOT EXISTS (
+       SELECT 1
+         FROM alphafrog_agent_run_wait_member m
+         JOIN alphafrog_agent_run_wait_member_stop s ON s.wait_member_id = m.id
+        WHERE m.group_id = t.group_id
+          AND m.member_identity = t.member_identity);
 
 --    第四条（信息查询，不属于「必须为空」）：第 2 步标成 ROLLBACK_INCOMPLETE 的行。
 --    它们没有能写回旧表的身份，随旧表删除也无法被上一版本推进；请按名额凭证与容量账本

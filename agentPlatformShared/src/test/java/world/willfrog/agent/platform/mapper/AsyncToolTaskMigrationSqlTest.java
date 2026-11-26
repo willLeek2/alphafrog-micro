@@ -76,5 +76,12 @@ class AsyncToolTaskMigrationSqlTest {
                 .contains("result_ref_json ->> 'exit_reason' = 'ROLLBACK_INCOMPLETE'")
                 .contains("第四条（信息查询，不属于「必须为空」）")
                 .contains("前三查询必须返回 0 行");
+        assertThat(DOWNGRADE).as("第三条只列旧停机表里也没有记录的行，正常回退才能等到空结果")
+                .contains("AND NOT EXISTS (")
+                .contains("JOIN alphafrog_agent_run_wait_member_stop s ON s.wait_member_id = m.id");
+        assertThat(DOWNGRADE).as("执行方式要写明 ON_ERROR_STOP，否则出错后退出码仍是 0")
+                .contains("ON_ERROR_STOP=1")
+                .contains("psql -v ON_ERROR_STOP=1 -f 026_agent_async_tool_task_down.sql")
+                .contains("前三条核对查询都是空结果");
     }
 }
