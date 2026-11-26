@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.AsyncToolTaskMapper">
+
+    <resultMap id="AsyncToolTaskMap" type="world.willfrog.agent.platform.asynctask.AsyncToolTask">
+        <id property="jobId" column="job_id"/>
+        <result property="jobKind" column="job_kind"/>
+        <result property="runId" column="run_id"/>
+        <result property="workItemId" column="work_item_id"/>
+        <result property="groupId" column="group_id"/>
+        <result property="memberSeq" column="member_seq"/>
+        <result property="memberIdentity" column="member_identity"/>
+        <result property="toolCallId" column="tool_call_id"/>
+        <result property="toolName" column="tool_name"/>
+        <result property="externalOperationId" column="external_operation_id"/>
+        <result property="state" column="state"/>
+        <result property="requestJson" column="request_json"/>
+        <result property="taskId" column="task_id"/>
+        <result property="reservationJson" column="reservation_json"/>
+        <result property="resultRefJson" column="result_ref_json"/>
+        <result property="schemaVersion" column="schema_version"/>
+        <result property="ownerInstanceId" column="owner_instance_id"/>
+        <result property="leaseExpiresAt" column="lease_expires_at"/>
+        <result property="claimEpoch" column="claim_epoch"/>
+        <result property="nextPollAt" column="next_poll_at"/>
+        <result property="pollCount" column="poll_count"/>
+        <result property="stopState" column="stop_state"/>
+        <result property="stopAttemptCount" column="stop_attempt_count"/>
+        <result property="stopLastError" column="stop_last_error"/>
+        <result property="timeoutAt" column="timeout_at"/>
+        <result property="finishedAt" column="finished_at"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="Columns">
+        job_id,
+        job_kind,
+        run_id,
+        work_item_id,
+        group_id,
+        member_seq,
+        member_identity,
+        tool_call_id,
+        tool_name,
+        external_operation_id,
+        state,
+        request_json::text AS request_json,
+        task_id,
+        reservation_json::text AS reservation_json,
+        result_ref_json::text AS result_ref_json,
+        schema_version,
+        owner_instance_id,
+        lease_expires_at,
+        claim_epoch,
+        next_poll_at,
+        poll_count,
+        stop_state,
+        stop_attempt_count,
+        stop_last_error,
+        timeout_at,
+        finished_at,
+        created_at,
+        updated_at
+    </sql>
+
+    <insert id="insert" parameterType="world.willfrog.agent.platform.asynctask.AsyncToolTask"
+            useGeneratedKeys="true" keyProperty="jobId" keyColumn="job_id">
+        INSERT INTO alphafrog_agent_async_tool_task (
+            job_kind, run_id, work_item_id, group_id, member_seq, member_identity,
+            tool_call_id, tool_name, external_operation_id, state, request_json,
+            task_id, reservation_json, result_ref_json, schema_version,
+            owner_instance_id, lease_expires_at, claim_epoch, next_poll_at, poll_count,
+            stop_state, stop_attempt_count, stop_last_error, timeout_at, finished_at
+        ) VALUES (
+            #{jobKind}, #{runId}, #{workItemId}, #{groupId}, #{memberSeq}, #{memberIdentity},
+            #{toolCallId}, #{toolName}, #{externalOperationId}, #{state}, #{requestJson}::jsonb,
+            #{taskId}, #{reservationJson}::jsonb, #{resultRefJson}::jsonb, #{schemaVersion},
+            #{ownerInstanceId}, #{leaseExpiresAt}, #{claimEpoch}, #{nextPollAt}, #{pollCount},
+            #{stopState}, #{stopAttemptCount}, #{stopLastError}, #{timeoutAt}, #{finishedAt}
+        )
+    </insert>
+
+    <select id="findByJobId" resultMap="AsyncToolTaskMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_async_tool_task
+        WHERE job_id = #{jobId}
+    </select>
+
+    <select id="findByOperationId" resultMap="AsyncToolTaskMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_async_tool_task
+        WHERE external_operation_id = #{operationId}
+    </select>
+
+    <select id="listFailedByWorkItem" resultMap="AsyncToolTaskMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_async_tool_task
+        WHERE run_id = #{runId}
+          AND work_item_id IS NOT DISTINCT FROM #{workItemId}
+          AND tool_name = #{toolName}
+          AND state = 'FAILED'
+        ORDER BY job_id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="scanDue" resultMap="AsyncToolTaskMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_async_tool_task
+        WHERE state IN ('PENDING', 'RUNNING')
+          AND next_poll_at IS NOT NULL
+          AND next_poll_at &lt;= #{now}
+          AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
+          AND job_id &gt; #{afterJobId}
+        ORDER BY job_id
+        LIMIT #{limit}
+    </select>
+
+    <update id="claimDue">
+        UPDATE alphafrog_agent_async_tool_task
+        SET owner_instance_id = #{owner},
+            lease_expires_at = #{leaseUntil},
+            claim_epoch = claim_epoch + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND state IN ('PENDING', 'RUNNING')
+          AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
+    </update>
+
+    <update id="attachTask">
+        UPDATE alphafrog_agent_async_tool_task
+        SET task_id = #{taskId},
+            state = 'RUNNING',
+            next_poll_at = #{nextPollAt},
+            timeout_at = #{timeoutAt},
+            lease_expires_at = #{leaseUntil},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND owner_instance_id = #{owner}
+          AND claim_epoch = #{claimEpoch}
+          AND state IN ('PENDING', 'RUNNING')
+    </update>
+
+    <update id="updateProgress">
+        UPDATE alphafrog_agent_async_tool_task
+        SET next_poll_at = #{nextPollAt},
+            poll_count = #{pollCount},
+            lease_expires_at = #{leaseUntil},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND owner_instance_id = #{owner}
+          AND claim_epoch = #{claimEpoch}
+          AND state = 'RUNNING'
+    </update>
+
+    <update id="markTerminal">
+        UPDATE alphafrog_agent_async_tool_task
+        SET state = #{state},
+            result_ref_json = #{resultRefJson}::jsonb,
+            finished_at = #{finishedAt},
+            next_poll_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND owner_instance_id = #{owner}
+          AND claim_epoch = #{claimEpoch}
+          AND state IN ('PENDING', 'RUNNING')
+    </update>
+
+    <update id="requestStopByRun">
+        UPDATE alphafrog_agent_async_tool_task
+        SET state = 'CANCELED',
+            finished_at = #{now},
+            stop_state = 'PENDING',
+            next_poll_at = #{now},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId}
+          AND state IN ('PENDING', 'RUNNING')
+          AND stop_state IS NULL
+    </update>
+
+    <select id="scanStopDue" resultMap="AsyncToolTaskMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_async_tool_task
+        WHERE stop_state IN ('PENDING', 'CLAIMED')
+          AND next_poll_at IS NOT NULL
+          AND next_poll_at &lt;= #{now}
+          AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
+          AND job_id &gt; #{afterJobId}
+        ORDER BY job_id
+        LIMIT #{limit}
+    </select>
+
+    <update id="claimStop">
+        UPDATE alphafrog_agent_async_tool_task
+        SET stop_state = 'CLAIMED',
+            owner_instance_id = #{owner},
+            lease_expires_at = #{leaseUntil},
+            claim_epoch = claim_epoch + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND stop_state IN ('PENDING', 'CLAIMED')
+          AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
+    </update>
+
+    <update id="finishStop">
+        UPDATE alphafrog_agent_async_tool_task
+        SET stop_state = 'CONFIRMED',
+            stop_last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND owner_instance_id = #{owner}
+          AND claim_epoch = #{claimEpoch}
+          AND stop_state = 'CLAIMED'
+    </update>
+
+    <update id="retryStop">
+        UPDATE alphafrog_agent_async_tool_task
+        SET stop_state = 'PENDING',
+            stop_attempt_count = stop_attempt_count + 1,
+            stop_last_error = #{lastError},
+            next_poll_at = #{nextPollAt},
+            owner_instance_id = NULL,
+            lease_expires_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND owner_instance_id = #{owner}
+          AND claim_epoch = #{claimEpoch}
+          AND stop_state = 'CLAIMED'
+    </update>
+
+</mapper>
