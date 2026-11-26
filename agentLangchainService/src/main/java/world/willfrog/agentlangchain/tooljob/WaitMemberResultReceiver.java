@@ -109,6 +109,8 @@ public class WaitMemberResultReceiver {
      * 的代价是放行之后最多等这么久才被接回来，验收看得见、几秒钟的延迟可以接受。</p>
      */
     private static final long HOLD_POLL_DELAY_MS = 5000L;
+    /** 同一成员连续写库失败多少次后报警一次；超过后仍按最大退避重试，但不再重复报警。 */
+    private static final int MAX_CONSECUTIVE_WRITE_FAILURES = 20;
 
     private final WaitGroupStore waitGroupStore;
     private final RunOwnershipGateway ownership;
@@ -147,6 +149,11 @@ public class WaitMemberResultReceiver {
     private final AtomicLong policyRefusals = new AtomicLong();
     /** 被压住的成员从哪一刻起被压：兜底放行按这个时刻算；不再被压、成员落终态、Run 进终态时清掉。 */
     private final Map<String, HeldSince> heldSinceByMember = new ConcurrentHashMap<>();
+    /**
+     * 连续写库失败的成员与次数。写不进数据库的失败（例如工具输出含 PostgreSQL 拒收的字符）
+     * 不会自己变好；连续失败达到上限时保持成员原状态并报警，让人看见，而不是每轮安静重试。
+     */
+    private final Map<String, Integer> consecutiveWriteFailures = new ConcurrentHashMap<>();
 
     private final AtomicLong rounds = new AtomicLong();
     private final AtomicLong scanned = new AtomicLong();
@@ -267,11 +274,13 @@ public class WaitMemberResultReceiver {
                 }
                 LaneScopeGateway.wrap(run, () -> collect(member, now, run)).run();
                 handled++;
+                consecutiveWriteFailures.remove(memberKey(member));
             } catch (RuntimeException e) {
                 // 一个成员上的意外不带走这一批：推后它、记一笔，别的成员照旧。
                 failures.incrementAndGet();
                 log.error("接这个成员的结果时出错，推后下一轮再问: group={} member={} reason={}",
                         member.getGroupId(), member.getMemberIdentity(), e.getMessage(), e);
+                recordWriteFailure(member, e);
                 defer(member, now, "unexpected_error");
             }
         }
@@ -974,6 +983,25 @@ public class WaitMemberResultReceiver {
             if (completed.notificationId() != null) {
                 recoveryDispatcher.wake(completed.notificationId());
             }
+        }
+    }
+
+    /**
+     * 记一次连续写库失败；达到上限时报警一次。
+     *
+     * <p>只报警、不改成员状态：结果写不进去时最安全的做法是保持原状态等修复后重试，
+     * 报警让人知道这条成员一直没落库。成员恢复或离开扫描后计数会清掉。</p>
+     */
+    private void recordWriteFailure(WaitMember member, RuntimeException failure) {
+        if (consecutiveWriteFailures.size() > 4096) {
+            // 安全阀：异常情况下不清会一直涨；清空只会让报警晚一点出现，不影响数据。
+            consecutiveWriteFailures.clear();
+        }
+        String key = memberKey(member);
+        int count = consecutiveWriteFailures.merge(key, 1, Integer::sum);
+        if (count == MAX_CONSECUTIVE_WRITE_FAILURES) {
+            log.error("成员结果连续 {} 次写库失败，保持原状态并报警: group={} member={} reason={}",
+                    count, member.getGroupId(), member.getMemberIdentity(), failure.getMessage(), failure);
         }
     }
 
