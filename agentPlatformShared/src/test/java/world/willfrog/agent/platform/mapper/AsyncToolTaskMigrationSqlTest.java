@@ -72,5 +72,9 @@ class AsyncToolTaskMigrationSqlTest {
                 .contains("missing_member_identity");
         assertThat(DOWNGRADE).as("核对查询要能直接执行，覆盖被丢弃的停机尾巴")
                 .contains("SELECT t.job_id, t.run_id, t.tool_name, t.external_operation_id, t.stop_state");
+        assertThat(DOWNGRADE).as("凑不齐回写键、被标为失败的行要有专门的信息查询，并写明它不属于必须为空")
+                .contains("result_ref_json ->> 'exit_reason' = 'ROLLBACK_INCOMPLETE'")
+                .contains("第四条（信息查询，不属于「必须为空」）")
+                .contains("前三查询必须返回 0 行");
     }
 }

@@ -17,7 +17,7 @@
 -- 旧版本不再按迟到分支处理它。
 --
 -- 凑不齐回写键（组、成员序号、成员身份）的未完结任务写不进旧表：把它的原因码与名额凭证记录
--- 留在新表里（ROLLBACK_INCOMPLETE），末尾核对查询会把它们列出来，由操作者按凭证核对容量账本，
+-- 留在新表里（ROLLBACK_INCOMPLETE），末尾第四条查询会把它们列出来，由操作者按凭证核对容量账本，
 -- 不静默丢任务。第一步的所有任务都来自等待成员，本来就不该出现这种行；出现了说明新表里混入了
 -- 别的写入方，回退前应先查清。
 
@@ -133,7 +133,8 @@ ON CONFLICT DO NOTHING;
 
 COMMIT;
 
--- 4. 回退后核对：三条查询都必须返回 0 行；有结果时不要部署上一版本。
+-- 4. 回退后核对：前三查询必须返回 0 行，有结果时不要部署上一版本；
+--    第四条是信息查询，正常情况下会有 0 行，出现行时按凭证人工核对，不属于「必须为空」。
 --    第一条：新表里还有未完结任务没写回旧表（正常应为 0，除第 2 步标记为失败的之外）。
 SELECT t.job_id, t.run_id, t.state, t.tool_name, t.reservation_json
   FROM alphafrog_agent_async_tool_task t
@@ -156,3 +157,12 @@ SELECT t.job_id, t.run_id, t.tool_name, t.external_operation_id, t.stop_state,
  WHERE t.state = 'CANCELED'
    AND t.stop_state IS NOT NULL
    AND t.stop_state <> 'CONFIRMED';
+
+--    第四条（信息查询，不属于「必须为空」）：第 2 步标成 ROLLBACK_INCOMPLETE 的行。
+--    它们没有能写回旧表的身份，随旧表删除也无法被上一版本推进；请按名额凭证与容量账本
+--    核对后人工归还容量，并把处理结果记进发布记录。
+SELECT t.job_id, t.run_id, t.tool_name, t.stop_state,
+       t.result_ref_json ->> 'rollback_reason' AS rollback_reason,
+       t.reservation_json
+  FROM alphafrog_agent_async_tool_task t
+ WHERE t.result_ref_json ->> 'exit_reason' = 'ROLLBACK_INCOMPLETE';
