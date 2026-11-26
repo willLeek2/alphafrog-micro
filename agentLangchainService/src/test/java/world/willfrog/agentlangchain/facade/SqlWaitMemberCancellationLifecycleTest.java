@@ -182,7 +182,7 @@ class SqlWaitMemberCancellationLifecycleTest {
         f.run.setToolJobAnchorJson(a.toJson());
         f.reconciler.reconcileFromDue();
         assertThat(f.anchor()).isNotNull(); assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-        verify(f.runMapper, never()).completeCanceledSqlWaitMember(any(), any(), any(), anyLong(), any(), any(), any());
+        verify(f.runMapper, never()).completeCanceledSqlWaitMember(any(), any(), any(), anyLong(), any(), any());
         assertThat(f.finalizerWriteRejected).isZero();
         f.startup().onReady();
         assertThat(f.anchor()).isNotNull(); verifyNoInteractions(f.finalization);
@@ -756,7 +756,7 @@ class SqlWaitMemberCancellationLifecycleTest {
                         || "CANCELED".equals(a.getRunDisposition())) { clearRejected++; return 0; }
                 run.setToolJobAnchorJson("{}"); return 1;
             });
-            when(runMapper.completeCanceledSqlWaitMember(eq(RUN), any(), any(), anyLong(), any(), any(), any()))
+            when(runMapper.completeCanceledSqlWaitMember(eq(RUN), any(), any(), anyLong(), any(), any()))
                     .thenAnswer(i -> {
                         if (corruptUsageOnClose) {
                             var root = json.readTree(run.getSnapshotJson());
@@ -777,12 +777,11 @@ class SqlWaitMemberCancellationLifecycleTest {
                                 || !"executeQuery".equals(a.getToolName()) || !"CANCELED".equals(a.getRunDisposition())
                                 || a.isAutoResume() || !a.getOperationId().equals(i.getArgument(1))
                                 || !a.getRequestFingerprint().equals(i.getArgument(2))
-                                || !a.getReservationJson().equals(i.getArgument(5))
+                                || !a.getReservationJson().equals(i.getArgument(4))
                                 || member.getId() != (long) i.getArgument(3)
                                 || !"executeQuery".equals(member.getToolName())
                                 || !Set.of("CANCELED", "LATE").contains(member.getState())
                                 || !member.getExternalOperationId().equals(i.getArgument(1))
-                                || !json.readTree(member.getDispatchProofJson()).equals(json.readTree((String) i.getArgument(4)))
                                 || stop == null || !"CONFIRMED".equals(stop.getState())
                                 || !stop.getOperationId().equals(i.getArgument(1))
                                 || !stop.getRequestFingerprint().equals(i.getArgument(2))
@@ -803,7 +802,7 @@ class SqlWaitMemberCancellationLifecycleTest {
                                     && stop.getTerminalStatus().equals(call.path("terminalStatus").asText())
                                     && call.path("reservation").path("state").asText().equals("TERMINAL_CONFIRMED")
                                     && !call.path("terminalAt").asText().isBlank()
-                                    && call.path("reservation").equals(json.readTree((String) i.getArgument(6)))) terminalPresent = true;
+                                    && call.path("reservation").equals(json.readTree((String) i.getArgument(5)))) terminalPresent = true;
                         }
                         if (!terminalPresent) return 0;
                         if (!Set.of(AgentRunStatus.FAILED, AgentRunStatus.CANCELED, AgentRunStatus.COMPLETED,
