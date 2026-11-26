@@ -169,10 +169,10 @@ public class MybatisAsyncToolTaskStore implements AsyncToolTaskStore {
     }
 
     @Override
-    public boolean finishStop(long jobId, String owner, long claimEpoch) {
+    public boolean finishStop(long jobId, String owner, long claimEpoch, String taskId) {
         positive(jobId);
         required(owner, "持有实例");
-        return mapper.finishStop(jobId, owner, claimEpoch) == 1;
+        return mapper.finishStop(jobId, owner, claimEpoch, taskId) == 1;
     }
 
     @Override

@@ -198,9 +198,18 @@ public class CanceledSqlWaitMemberRecovery {
             String terminalReservationJson = null;
             if (alreadyClosed && (task == null || !"CONFIRMED".equals(task.getStopState()))) return Inspection.invalid();
             if (task != null && "CONFIRMED".equals(task.getStopState())) {
+                if (task.getTaskId() == null || task.getTaskId().isBlank()) {
+                    // 沙箱权威查无此作业的分支：创建请求从未生效，没有任务编号也没有终态用量。
+                    // 只有干净收尾（最后错误为空、各处的任务编号都为空）才算数；
+                    // 容量已按派发前中止归还，这里不再提供终态用量凭证。
+                    if (task.getStopLastError() != null
+                            || proof.taskId() != null || anchor.getTaskId() != null) {
+                        return Inspection.invalid();
+                    }
+                    return new Inspection(Ownership.MEMBER_OWNED, member, task, null);
+                }
                 // 终态证据在任务行上：任务编号是沙箱作业身份，终态名与用量看观测快照里的那次调用。
-                if (task.getTaskId() == null || task.getTaskId().isBlank()
-                        || disagrees(proof.taskId(), task.getTaskId())
+                if (disagrees(proof.taskId(), task.getTaskId())
                         || disagrees(anchor.getTaskId(), task.getTaskId())) return Inspection.invalid();
                 boolean matchingUsage = false;
                 for (var item : json.readTree(run.getSnapshotJson())

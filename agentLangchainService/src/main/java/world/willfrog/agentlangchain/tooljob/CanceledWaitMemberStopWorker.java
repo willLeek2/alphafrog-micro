@@ -56,6 +56,8 @@ public class CanceledWaitMemberStopWorker {
     private final int batchSize;
     private final long leaseSeconds;
     private final long retrySeconds;
+    /** 同一任务最多重试几次停机；用尽后停止自动重试并报警，不再每 5 秒空转。 */
+    private final int maxAttempts;
     private final String owner = UUID.randomUUID().toString();
 
     public CanceledWaitMemberStopWorker(AsyncToolTaskStore tasks, WaitGroupStore groups,
@@ -65,8 +67,10 @@ public class CanceledWaitMemberStopWorker {
                                         DualPoolRunAdmissionRegistry admissionRegistry,
                                         @Value("${agent.langchain.wait-member.stop.batch-size:16}") int batchSize,
                                         @Value("${agent.langchain.wait-member.stop.lease-seconds:120}") long leaseSeconds,
-                                        @Value("${agent.langchain.wait-member.stop.retry-seconds:5}") long retrySeconds) {
-        if (batchSize < 1 || batchSize > 1000 || leaseSeconds < 1 || retrySeconds < 1) {
+                                        @Value("${agent.langchain.wait-member.stop.retry-seconds:5}") long retrySeconds,
+                                        @Value("${agent.langchain.wait-member.stop.max-attempts:30}") int maxAttempts) {
+        if (batchSize < 1 || batchSize > 1000 || leaseSeconds < 1 || retrySeconds < 1
+                || maxAttempts < 1) {
             throw new IllegalArgumentException("停机 worker 参数无效");
         }
         this.tasks = tasks;
@@ -79,6 +83,7 @@ public class CanceledWaitMemberStopWorker {
         this.batchSize = batchSize;
         this.leaseSeconds = leaseSeconds;
         this.retrySeconds = retrySeconds;
+        this.maxAttempts = maxAttempts;
     }
 
     @Scheduled(fixedDelayString = "${agent.langchain.wait-member.stop.interval-ms:1000}")
@@ -94,9 +99,9 @@ public class CanceledWaitMemberStopWorker {
         ownership.requireIdentity();
         int processed = 0;
         long afterJobId = 0;
-        OffsetDateTime now = OffsetDateTime.now();
         while (processed < batchSize) {
-            List<AsyncToolTask> due = tasks.scanStopDue(now, afterJobId, batchSize);
+            // 每轮扫描用自己的时刻：批内处理可能耗时，不能拿批开始时的时刻判断「到期」。
+            List<AsyncToolTask> due = tasks.scanStopDue(OffsetDateTime.now(), afterJobId, batchSize);
             if (due.isEmpty()) {
                 break;
             }
@@ -106,8 +111,10 @@ public class CanceledWaitMemberStopWorker {
                 if (processed >= batchSize) {
                     break;
                 }
+                // 每行按领取时刻算租约；否则批内越靠后的行有效租约越短，别的实例可以提前接手。
+                OffsetDateTime claimedAt = OffsetDateTime.now();
                 Optional<AsyncToolTask> claimed = tasks.claimStop(
-                        candidate.getJobId(), owner, now, now.plusSeconds(leaseSeconds));
+                        candidate.getJobId(), owner, claimedAt, claimedAt.plusSeconds(leaseSeconds));
                 if (claimed.isEmpty()) {
                     continue;
                 }
@@ -167,7 +174,14 @@ public class CanceledWaitMemberStopWorker {
             return;
         }
 
-        var persistedBlock = WaitMemberTerminalBlock.read(objectMapper, member);
+        WaitMemberTerminalBlock.Saved persistedBlock;
+        try {
+            persistedBlock = WaitMemberTerminalBlock.read(objectMapper, member);
+        } catch (RuntimeException unreadable) {
+            // 终态阻塞原文解析不了是永久失败：重试不会变好，收尾并留下原因。
+            abandon(task, "terminal_block_unreadable");
+            return;
+        }
         if (persistedBlock != null) {
             var settledBlock = settlement.settleBlocked(member, proof, persistedBlock.status(),
                     persistedBlock.result(), persistedBlock.finishedAt(), persistedBlock.blocked());
@@ -218,10 +232,38 @@ public class CanceledWaitMemberStopWorker {
             }
             return;
         }
-        if (cancel.getOutcome() == CancelOutcome.NOT_FOUND
-                || cancel.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED
-                || cancel.getTaskId().isBlank()
-                || knownTaskId != null && !knownTaskId.equals(cancel.getTaskId())) {
+        if (cancel.getOutcome() == CancelOutcome.NOT_FOUND) {
+            // 取消返回「查无此作业」后再查一次：防止并发重放恰好在这个窗口把创建请求送进沙箱。
+            GetTaskByOperationIdResponse recheck = sandbox.getTaskByOperationId(
+                    GetTaskByOperationIdRequest.newBuilder().setOperationId(operationId).build());
+            if (recheck == null || recheck.hasErrorDetail() || !recheck.getError().isBlank()) {
+                retry(task, "operation_recheck_unavailable");
+                return;
+            }
+            if (recheck.getFound() || !recheck.getTaskId().isBlank()) {
+                retry(task, "operation_appeared_during_stop");
+                return;
+            }
+            // 沙箱权威无此作业：创建请求从未生效，没有任务可停、也没有终态可结算。
+            // 名额按「派发前中止」归还，任务行在归还成功后收尾。
+            WaitMemberSettlement.Outcome released = settlement.settleNotStarted(member, proof);
+            if (!released.ok()) {
+                retry(task, "predispatch_release:" + released.reason());
+                return;
+            }
+            confirmSettlement(task, null, "NOT_STARTED");
+            return;
+        }
+        if (cancel.getOutcome() == CancelOutcome.CANCEL_OUTCOME_UNSPECIFIED) {
+            retry(task, "sandbox_cancel_unspecified");
+            return;
+        }
+        if (cancel.getTaskId().isBlank()) {
+            // 取消已生效但这次响应没带任务编号：下一轮按操作号回查就能拿到，不能当身份冲突。
+            retry(task, "sandbox_cancel_task_id_missing");
+            return;
+        }
+        if (knownTaskId != null && !knownTaskId.equals(cancel.getTaskId())) {
             abandon(task, "sandbox_cancel_identity_mismatch");
             return;
         }
@@ -274,7 +316,7 @@ public class CanceledWaitMemberStopWorker {
     }
 
     private void confirmSettlement(AsyncToolTask task, String taskId, String terminalStatus) {
-        if (!tasks.finishStop(task.getJobId(), owner, task.getClaimEpoch())) {
+        if (!tasks.finishStop(task.getJobId(), owner, task.getClaimEpoch(), taskId)) {
             log.warn("停机收尾未命中，本轮放弃：job={} taskId={} status={}",
                     task.getJobId(), taskId, terminalStatus);
             return;
@@ -292,6 +334,13 @@ public class CanceledWaitMemberStopWorker {
     }
 
     private void retry(AsyncToolTask task, String reason) {
+        int attempts = task.getStopAttemptCount() == null ? 0 : task.getStopAttemptCount();
+        if (attempts + 1 >= maxAttempts) {
+            log.error("外部等待成员停机重试次数用尽，停止自动重试：job={} attempts={} reason={}",
+                    task.getJobId(), attempts, reason);
+            abandon(task, "stop_attempts_exhausted:" + reason);
+            return;
+        }
         tasks.retryStop(task.getJobId(), owner, task.getClaimEpoch(),
                 OffsetDateTime.now().plusSeconds(retrySeconds), reason);
     }

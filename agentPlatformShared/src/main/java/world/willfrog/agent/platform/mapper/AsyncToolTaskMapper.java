@@ -84,10 +84,11 @@ public interface AsyncToolTaskMapper {
                   @Param("leaseUntil") OffsetDateTime leaseUntil,
                   @Param("now") OffsetDateTime now);
 
-    /** 沙箱已确认停机，停止状态收尾。 */
+    /** 沙箱已确认停机，停止状态收尾；回查到的任务编号随收尾写回任务行。 */
     int finishStop(@Param("jobId") long jobId,
                    @Param("owner") String owner,
-                   @Param("claimEpoch") long claimEpoch);
+                   @Param("claimEpoch") long claimEpoch,
+                   @Param("taskId") String taskId);
 
     /**
      * 停机无需继续：没有外部作业、或身份对不上不再重试。停机收尾并把原因留在最后错误里。

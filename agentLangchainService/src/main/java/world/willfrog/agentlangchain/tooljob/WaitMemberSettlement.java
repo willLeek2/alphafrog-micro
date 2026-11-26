@@ -187,6 +187,51 @@ public class WaitMemberSettlement {
         }
     }
 
+    /**
+     * 沙箱权威查无此作业时归还名额：创建请求从未生效，没有任务终态与资源用量可记录。
+     *
+     * <p>这是取消停机路径里「请求快照已落库、沙箱任务编号还没证实」那个分支的收尾：
+     * 先按派发前中止把名额还回去，停机工人再把任务行的停止状态收成已确认。</p>
+     */
+    public Outcome settleNotStarted(WaitMember member, WaitMemberDispatchProof proof) {
+        if (member == null || proof == null || !proof.operationId().equals(member.getExternalOperationId())) {
+            return Outcome.blocked("predispatch_abort_identity_mismatch");
+        }
+        DataAnalysisReservation preparing;
+        try {
+            preparing = objectMapper.readValue(proof.reservationJson(), DataAnalysisReservation.class);
+        } catch (Exception unreadable) {
+            return Outcome.blocked("reservation_unreadable");
+        }
+        // 只有「还没绑定任务」的凭证能按派发前中止释放；已经绑定任务的凭证必须走终态结算。
+        if (preparing.state() != DataAnalysisReservationState.PREPARING
+                || preparing.taskId() != null
+                || proof.taskId() != null
+                || !preparing.operationId().equals(proof.operationId())
+                || !preparing.identity().runId().equals(member.getRunId())) {
+            return Outcome.blocked("predispatch_abort_identity_mismatch");
+        }
+        DataAnalysisReleaseRequest request = new DataAnalysisReleaseRequest(preparing,
+                new DataAnalysisReleaseProof.PreDispatchAbort(preparing.identity()),
+                DataAnalysisReleaseReason.CREATE_NOT_STARTED);
+        try {
+            DataAnalysisRestoreOutcome restored = capacityService.restoreReservation(preparing);
+            if (restored == DataAnalysisRestoreOutcome.CONFLICT) {
+                DataAnalysisReleaseOutcome prior = capacityService.releaseReservation(request);
+                return prior == DataAnalysisReleaseOutcome.ALREADY_RELEASED
+                        ? Outcome.success() : Outcome.blocked("capacity_reservation_conflict");
+            }
+            DataAnalysisReleaseOutcome released = capacityService.releaseReservation(request);
+            return released == DataAnalysisReleaseOutcome.RELEASED
+                    || released == DataAnalysisReleaseOutcome.ALREADY_RELEASED
+                    ? Outcome.success() : Outcome.blocked("release:" + released);
+        } catch (RuntimeException e) {
+            log.warn("沙箱查无作业后容量归还暂不可用：member={} operation={}",
+                    member.getMemberIdentity(), proof.operationId(), e);
+            return Outcome.blocked("predispatch_release_error");
+        }
+    }
+
     /** 有结论的作业：名额还回去、用量记下来。两步都幂等。 */
     private Outcome releaseWithUsage(WaitMember member,
                                      DataAnalysisReservation stored,

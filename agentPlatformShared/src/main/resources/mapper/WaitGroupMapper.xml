@@ -237,7 +237,7 @@
         CASE WHEN t.request_json &lt;&gt; '{}'::jsonb
                   OR t.task_id IS NOT NULL
                   OR t.reservation_json IS NOT NULL
-             THEN jsonb_strip_nulls(
+             THEN (
                       t.request_json
                       -- 子智能体证明里的 schemaVersion 是字符串（sub_agent_wait_v1），
                       -- 已有就原样保留；只有沙箱证明被拆成独立列之后才需要拼回来。
@@ -591,8 +591,14 @@
                 (job_kind, run_id, work_item_id, group_id, member_seq, member_identity,
                  tool_call_id, tool_name, external_operation_id, state, request_json,
                  schema_version, claim_epoch, next_poll_at, poll_count, stop_attempt_count)
+            -- 只登记已知的两类异步工具：以后新增异步工具却忘了登记时，把工具名本身写进种类列，
+            -- 会撞上任务表的种类检查约束让这一段落库直接失败（错误里带工具名），
+            -- 而不是被当成子智能体等待混进扫描。
             SELECT CASE WHEN m.tool_name IN ('executePython', 'executeQuery')
-                        THEN 'SANDBOX_TOOL' ELSE 'CHILD_RUN_WAIT' END,
+                        THEN 'SANDBOX_TOOL'
+                        WHEN m.tool_name IN ('spawnSubAgent', 'waitForSubAgent')
+                        THEN 'CHILD_RUN_WAIT'
+                        ELSE m.tool_name END,
                    g.run_id, s.work_item_id, g.id, m.member_seq, m.member_identity,
                    m.tool_call_id, m.tool_name, m.external_operation_id, 'PENDING',
                    '{}'::jsonb, 1, 0, CURRENT_TIMESTAMP, 0, 0
@@ -780,11 +786,13 @@
     <!--
       迟到结果留档。
 
+      新表没有迟到状态：结果晚于取消到达时，任务留在取消终态，结果引用就是审计事实。
+
       三种情况一次说清：
 
-      1. 成员还在等（待派发/执行中）：改成迟到，并停掉这条链。链停不下来时兄弟成员会一直等在
+      1. 成员还在等（待派发/执行中）：改成取消并停掉这条链。链停不下来时兄弟成员会一直等在
          等待态，最后谁也不推进。
-      2. 成员已经被取消（取消先落地、结果随后才回来）：只补审计字段，状态迁到迟到。
+      2. 成员已经被取消（取消先落地、结果随后才回来）：只补审计字段，状态保持取消。
          `result_ref_json`、外部作业身份、结束时间都只在还是空的时候写一次——
          重复上报不能把第一次留下的审计结果覆盖掉。
       3. 报上来的身份与这一行对不上（组号或成员身份传错）：什么都不做。错的身份不该有权停掉
@@ -848,7 +856,10 @@
             UPDATE alphafrog_agent_async_tool_task t SET
                 state = 'CANCELED',
                 finished_at = COALESCE(t.finished_at, CURRENT_TIMESTAMP),
-                next_poll_at = NULL,
+                next_poll_at = CASE WHEN t.job_kind = 'SANDBOX_TOOL'
+                                         AND t.external_operation_id IS NOT NULL
+                                         AND t.request_json &lt;&gt; '{}'::jsonb
+                                    THEN CURRENT_TIMESTAMP END,
                 stop_state = CASE WHEN t.job_kind = 'SANDBOX_TOOL'
                                        AND t.external_operation_id IS NOT NULL
                                        AND t.request_json &lt;&gt; '{}'::jsonb
@@ -1097,7 +1108,11 @@
             UPDATE alphafrog_agent_async_tool_task t SET
                 state = 'CANCELED',
                 finished_at = CURRENT_TIMESTAMP,
-                next_poll_at = NULL,
+                -- 停机扫描按 next_poll_at 到期取行：入队时立刻到期，没进停机队列的行不再被扫描。
+                next_poll_at = CASE WHEN t.job_kind = 'SANDBOX_TOOL'
+                                         AND t.external_operation_id IS NOT NULL
+                                         AND t.request_json &lt;&gt; '{}'::jsonb
+                                    THEN CURRENT_TIMESTAMP END,
                 stop_state = CASE WHEN t.job_kind = 'SANDBOX_TOOL'
                                        AND t.external_operation_id IS NOT NULL
                                        AND t.request_json &lt;&gt; '{}'::jsonb
@@ -1154,6 +1169,7 @@
         stop_queued AS (
             UPDATE alphafrog_agent_async_tool_task t SET
                 stop_state = 'PENDING',
+                next_poll_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
               FROM run_fence f
              WHERE t.group_id = f.group_id

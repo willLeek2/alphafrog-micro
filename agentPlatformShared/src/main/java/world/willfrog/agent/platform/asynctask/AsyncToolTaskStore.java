@@ -53,7 +53,7 @@ public interface AsyncToolTaskStore {
                                       OffsetDateTime leaseUntil);
 
     /** 沙箱已确认停机。 */
-    boolean finishStop(long jobId, String owner, long claimEpoch);
+    boolean finishStop(long jobId, String owner, long claimEpoch, String taskId);
 
     /** 停机无需继续：没有外部作业、或身份对不上不再重试；原因留在最后错误里。 */
     boolean abandonStop(long jobId, String owner, long claimEpoch, String reason);

@@ -196,8 +196,8 @@
         SELECT <include refid="Columns"/>
         FROM alphafrog_agent_async_tool_task
         WHERE stop_state IN ('PENDING', 'CLAIMED')
-          AND next_poll_at IS NOT NULL
-          AND next_poll_at &lt;= #{now}
+          -- 到期时刻为空视为立刻到期：停机意图不允许因为少写一个时刻而永远扫不到。
+          AND (next_poll_at IS NULL OR next_poll_at &lt;= #{now})
           AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
           AND job_id &gt; #{afterJobId}
         ORDER BY job_id
@@ -219,6 +219,9 @@
     <update id="finishStop">
         UPDATE alphafrog_agent_async_tool_task
         SET stop_state = 'CONFIRMED',
+            -- 停机确认时把沙箱任务编号写回任务行：取消之后 attach 语句不再命中（它只认待执行/执行中），
+            -- 不在这里写，收口侧永远看不到「这次停的是哪个作业」。查无作业时保持原值（空）。
+            task_id = COALESCE(NULLIF(#{taskId}::varchar, ''), task_id),
             stop_last_error = NULL,
             updated_at = CURRENT_TIMESTAMP
         WHERE job_id = #{jobId}

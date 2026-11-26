@@ -1579,18 +1579,25 @@
                   AND t.request_json -&gt;&gt; 'operationId' = #{operationId}
                   AND t.request_json -&gt;&gt; 'requestFingerprint' = #{requestFingerprint}
                   AND t.stop_state = 'CONFIRMED'
-                  AND t.task_id IS NOT NULL
                   AND (NULLIF(r.tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
                        OR r.tool_job_anchor_json -&gt;&gt; 'taskId' = t.task_id)
-                  AND EXISTS (
-                      SELECT 1 FROM jsonb_array_elements(COALESCE(
-                          r.snapshot_json #&gt; '{data_analysis_observability,calls}', '[]'::jsonb)) AS terminal(call)
-                       WHERE terminal.call -&gt;&gt; 'operationId' = t.external_operation_id
-                         AND terminal.call -&gt;&gt; 'taskId' = t.task_id
-                         AND terminal.call -&gt;&gt; 'terminalStatus' IN ('SUCCEEDED', 'FAILED', 'CANCELED')
-                         AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
-                         AND terminal.call -&gt; 'reservation' = CAST(#{terminalReservationJson} AS jsonb)
-                         AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL))
+                  -- 两条收口路径：有任务编号时按观测快照里的终态用量核对；
+                  -- 沙箱权威查无此作业时没有任务编号，只认干净收尾且不带终态凭证（容量已按派发前中止归还）。
+                  AND (
+                      (t.task_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM jsonb_array_elements(COALESCE(
+                               r.snapshot_json #&gt; '{data_analysis_observability,calls}', '[]'::jsonb)) AS terminal(call)
+                            WHERE terminal.call -&gt;&gt; 'operationId' = t.external_operation_id
+                              AND terminal.call -&gt;&gt; 'taskId' = t.task_id
+                              AND terminal.call -&gt;&gt; 'terminalStatus' IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+                              AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                              AND terminal.call -&gt; 'reservation' = CAST(#{terminalReservationJson} AS jsonb)
+                              AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL))
+                      OR
+                      (t.task_id IS NULL
+                       AND t.stop_last_error IS NULL
+                       AND CAST(#{terminalReservationJson} AS jsonb) IS NULL))
            AND NOT EXISTS (SELECT 1 FROM alphafrog_agent_async_tool_task other
                             WHERE other.run_id = r.id AND other.stop_state IS NOT NULL
                               AND other.stop_state &lt;&gt; 'CONFIRMED')
