@@ -239,7 +239,11 @@
                   OR t.reservation_json IS NOT NULL
              THEN jsonb_strip_nulls(
                       t.request_json
-                      || jsonb_build_object('schemaVersion', t.schema_version)
+                      -- 子智能体证明里的 schemaVersion 是字符串（sub_agent_wait_v1），
+                      -- 已有就原样保留；只有沙箱证明被拆成独立列之后才需要拼回来。
+                      || CASE WHEN t.request_json ->> 'schemaVersion' IS NOT NULL
+                              THEN '{}'::jsonb
+                              ELSE jsonb_build_object('schemaVersion', t.schema_version) END
                       || CASE WHEN t.task_id IS NOT NULL
                               THEN jsonb_build_object('taskId', t.task_id)
                               ELSE '{}'::jsonb END
@@ -1217,7 +1221,8 @@
         UPDATE alphafrog_agent_async_tool_task t SET
             request_json = CAST(#{dispatchProofJson} AS jsonb),
             schema_version = COALESCE(
-                (CAST(#{dispatchProofJson} AS jsonb) ->> 'schemaVersion')::int,
+                CASE WHEN jsonb_typeof(CAST(#{dispatchProofJson} AS jsonb) -> 'schemaVersion') = 'number'
+                     THEN (CAST(#{dispatchProofJson} AS jsonb) ->> 'schemaVersion')::int END,
                 t.schema_version),
             updated_at = CURRENT_TIMESTAMP
         WHERE t.group_id = #{groupId}
@@ -1268,7 +1273,8 @@
             external_operation_id = COALESCE(#{externalOperationId}::varchar, t.external_operation_id),
             request_json = COALESCE(CAST(#{dispatchProofJson} AS jsonb), t.request_json),
             schema_version = COALESCE(
-                (CAST(#{dispatchProofJson} AS jsonb) ->> 'schemaVersion')::int,
+                CASE WHEN jsonb_typeof(CAST(#{dispatchProofJson} AS jsonb) -> 'schemaVersion') = 'number'
+                     THEN (CAST(#{dispatchProofJson} AS jsonb) ->> 'schemaVersion')::int END,
                 t.schema_version),
             -- 任务编号与名额凭证从派发证明里拆到独立列，扫描与停机都按列判断。
             task_id = COALESCE(

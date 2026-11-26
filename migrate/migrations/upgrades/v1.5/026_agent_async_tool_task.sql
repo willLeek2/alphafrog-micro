@@ -79,6 +79,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_async_tool_task_work_item
 
 -- 一次性迁移：只迁未完结的异步任务，以及仍有未确认停机的已取消任务。
 -- 已终态且没有停机尾巴的行留在旧表，随第七步删表一起清理。
+--
+-- 派发证明原样搬进请求快照列：沙箱证明与子智能体证明（spawnSubAgent、waitForSubAgent）
+-- 的字段形状不同，后者的结构版本是字符串 sub_agent_wait_v1，不做逐字段拆分，
+-- 由读适配把它拼回旧形状，避免两类证明互相覆盖。
 INSERT INTO alphafrog_agent_async_tool_task (
     job_kind, run_id, work_item_id, group_id, member_seq, member_identity,
     tool_call_id, tool_name, external_operation_id, state, request_json,
@@ -98,17 +102,13 @@ SELECT
     m.tool_name,
     m.external_operation_id,
     CASE WHEN m.state = 'LATE' THEN 'CANCELED' ELSE m.state END,
-    jsonb_strip_nulls(jsonb_build_object(
-        'schemaVersion', (m.dispatch_proof_json ->> 'schemaVersion')::int,
-        'operationId', m.dispatch_proof_json ->> 'operationId',
-        'requestFingerprint', m.dispatch_proof_json ->> 'requestFingerprint',
-        'canonicalCreateSpecJson', m.dispatch_proof_json ->> 'canonicalCreateSpecJson',
-        'createRequestJson', m.dispatch_proof_json ->> 'createRequestJson',
-        'submittedAt', m.dispatch_proof_json ->> 'submittedAt')),
+    COALESCE(m.dispatch_proof_json, '{}'::jsonb),
     NULLIF(m.dispatch_proof_json ->> 'taskId', ''),
     NULLIF(m.dispatch_proof_json ->> 'reservationJson', '')::jsonb,
     m.result_ref_json,
-    COALESCE((m.dispatch_proof_json ->> 'schemaVersion')::int, 1),
+    CASE WHEN jsonb_typeof(m.dispatch_proof_json -> 'schemaVersion') = 'number'
+         THEN (m.dispatch_proof_json ->> 'schemaVersion')::int
+         ELSE 1 END,
     NULL,
     NULL,
     0,
@@ -120,16 +120,13 @@ SELECT
     m.created_at,
     m.updated_at
 FROM alphafrog_agent_run_wait_member m
-WHERE m.tool_name <> 'spawnSubAgent'
-  AND (
-      m.state IN ('PENDING', 'RUNNING')
-      OR EXISTS (
-          SELECT 1
-          FROM alphafrog_agent_run_wait_member_stop s
-          WHERE s.wait_member_id = m.id
-            AND s.state <> 'CONFIRMED'
-      )
-  );
+WHERE m.state IN ('PENDING', 'RUNNING')
+   OR EXISTS (
+       SELECT 1
+       FROM alphafrog_agent_run_wait_member_stop s
+       WHERE s.wait_member_id = m.id
+         AND s.state <> 'CONFIRMED'
+   );
 
 -- 停机尾巴按成员行挂到新任务行上。BLOCKED_PROOF 并入待停止，
 -- 停机的领取复用任务租约，重试次数与最后错误原样带过来。
