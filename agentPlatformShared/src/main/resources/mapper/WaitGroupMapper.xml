@@ -621,7 +621,8 @@
               AND wi.context_version = #{contextVersion}
               AND wi.run_control_version = #{runControlVersion}
               AND EXISTS (SELECT 1 FROM run_fence)
-            RETURNING wi.run_id, wi.plan_generation, wi.node_id, wi.node_attempt, wi.segment_sequence
+            RETURNING wi.id AS work_item_id, wi.run_id, wi.plan_generation, wi.node_id,
+                      wi.node_attempt, wi.segment_sequence
         ),
         group_created AS (
             INSERT INTO alphafrog_agent_run_wait_group
@@ -642,6 +643,27 @@
                    m.external_operation_id, 'PENDING'
             FROM group_created g
             CROSS JOIN member_input m
+            RETURNING 1
+        ),
+        tasks_written AS (
+            -- 第一步迁移期：新表与旧成员表在同一语句里各写一份，开发完成后旧写入删除。
+            INSERT INTO alphafrog_agent_async_tool_task
+                (job_kind, run_id, work_item_id, group_id, member_seq, member_identity,
+                 tool_call_id, tool_name, external_operation_id, state, request_json,
+                 schema_version, claim_epoch, next_poll_at, poll_count, stop_attempt_count)
+            SELECT CASE WHEN m.tool_name IN ('executePython', 'executeQuery')
+                        THEN 'SANDBOX_TOOL' ELSE 'CHILD_RUN_WAIT' END,
+                   g.run_id, s.work_item_id, g.id, m.member_seq, m.member_identity,
+                   m.tool_call_id, m.tool_name, m.external_operation_id, 'PENDING',
+                   '{}'::jsonb, 1, 0, CURRENT_TIMESTAMP, 0, 0
+            FROM group_created g
+            CROSS JOIN member_input m
+            JOIN segment_closed s
+              ON s.run_id = g.run_id
+             AND s.plan_generation = g.plan_generation
+             AND s.node_id = g.node_id
+             AND s.node_attempt = g.node_attempt
+             AND s.segment_sequence = g.segment_sequence
             RETURNING 1
         ),
         next_segment_created AS (

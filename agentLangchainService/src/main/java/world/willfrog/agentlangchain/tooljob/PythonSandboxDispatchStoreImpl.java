@@ -2,11 +2,13 @@ package world.willfrog.agentlangchain.tooljob;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
+import world.willfrog.agent.platform.mapper.AsyncToolTaskMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.workitem.SchedulerVersion;
 import world.willfrog.agent.platform.workitem.UnknownSchedulerVersionException;
@@ -14,6 +16,7 @@ import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics
 import world.willfrog.agentlangchain.control.dualpool.DualPoolToolJobExecutionContext;
 
 import java.time.Instant;
+import java.time.ZoneOffset;
 
 /**
  * executePython 分发阶段的 PostgreSQL 真相源实现。
@@ -29,6 +32,13 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     private final ToolJobConfig config;
     private final ObjectProvider<ToolJobContinuationTracker> trackerProvider;
     private final LangchainSchedulerMetrics metrics;
+
+    /**
+     * 第一步迁移期的双写目标；测试里没有这个依赖时跳过，旧路径不受影响。
+     * 第四步完成后这里是唯一写入目标，不再允许为空。
+     */
+    @Autowired(required = false)
+    private AsyncToolTaskMapper asyncToolTaskMapper;
 
     public PythonSandboxDispatchStoreImpl(ToolJobAnchorService anchorService,
                                           ToolJobRedisCache redisCache,
@@ -99,8 +109,12 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                                                String resumeToken, Long resumeVersion) {
         if (!applyDualPoolIdentity(runId, anchor)) return false;
         try {
-            return anchorService.claimPreparingWaitMember(runId, anchor, groupId, memberIdentity,
+            boolean claimed = anchorService.claimPreparingWaitMember(runId, anchor, groupId, memberIdentity,
                     proofJson, resumeToken, resumeVersion);
+            if (claimed) {
+                recordPreparingTask(groupId, memberIdentity, proofJson, anchor.getSchemaVersion());
+            }
+            return claimed;
         } catch (world.willfrog.agent.platform.dataanalysis.SessionQueryAdmissionException admission) {
             throw admission;
         } catch (RuntimeException uncertainCommit) {
@@ -189,17 +203,61 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                 && !"TERMINAL".equals(anchor.getAnchorState())) {
             return false;
         }
+        boolean updated;
         if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
-            return anchorService.updateLiveDagBlocking(
+            updated = anchorService.updateLiveDagBlocking(
                     runId,
                     anchor,
                     AgentRunStatus.EXECUTING,
                     anchor.getOperationId(),
                     anchor.getBlockingOwnerId(),
                     anchor.getBlockingLeaseUntil());
+        } else {
+            updated = anchorService.updateActive(
+                    runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
         }
-        return anchorService.updateActive(
-                runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+        if (updated) {
+            recordAttachedTask(anchor);
+        }
+        return updated;
+    }
+
+    /** 迁移期双写：旧路径成功后再同步新表；新表写失败只记日志，不反向影响旧路径。 */
+    private void recordPreparingTask(long groupId, String memberIdentity, String proofJson,
+                                     int schemaVersion) {
+        if (asyncToolTaskMapper == null) {
+            return;
+        }
+        try {
+            int rows = asyncToolTaskMapper.updatePreparingByMember(
+                    groupId, memberIdentity, proofJson, schemaVersion);
+            if (rows != 1) {
+                log.warn("新任务表未命中准备行: group={} member={} rows={}", groupId, memberIdentity, rows);
+            }
+        } catch (RuntimeException e) {
+            log.error("新任务表准备行写入失败: group={} member={}", groupId, memberIdentity, e);
+        }
+    }
+
+    /** 迁移期双写：沙箱任务编号证实后同步新表。 */
+    private void recordAttachedTask(ToolJobAnchor anchor) {
+        if (asyncToolTaskMapper == null || anchor.getOperationId() == null
+                || anchor.getTaskId() == null || anchor.getNextPollAt() == null) {
+            return;
+        }
+        try {
+            int rows = asyncToolTaskMapper.updateAttachedByOperation(
+                    anchor.getOperationId(), anchor.getTaskId(),
+                    anchor.getNextPollAt().atOffset(ZoneOffset.UTC),
+                    anchor.getTimeoutAt() == null ? null
+                            : anchor.getTimeoutAt().atOffset(ZoneOffset.UTC));
+            if (rows != 1) {
+                log.warn("新任务表未命中 attach 行: operation={} rows={}",
+                        anchor.getOperationId(), rows);
+            }
+        } catch (RuntimeException e) {
+            log.error("新任务表 attach 行写入失败: operation={}", anchor.getOperationId(), e);
+        }
     }
 
     @Override
