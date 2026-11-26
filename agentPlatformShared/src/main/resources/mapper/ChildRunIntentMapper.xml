@@ -113,7 +113,7 @@
 
     <select id="matchesParentWaitMember" resultType="java.lang.Integer">
         SELECT count(*) FROM alphafrog_agent_run_wait_group g
-        JOIN alphafrog_agent_run_wait_member m ON m.group_id = g.id AND m.run_id = g.run_id
+        JOIN alphafrog_agent_async_tool_task m ON m.group_id = g.id AND m.run_id = g.run_id
         WHERE g.id = #{request.parentWaitGroupId}
           AND g.run_id = #{request.parentRunId}
           AND g.plan_generation = #{request.planGeneration}
@@ -129,7 +129,7 @@
         SELECT count(*) FROM alphafrog_agent_run_child_intent i
         JOIN alphafrog_agent_run_wait_group g
           ON g.id = i.parent_wait_group_id AND g.run_id = i.parent_run_id
-        JOIN alphafrog_agent_run_wait_member m
+        JOIN alphafrog_agent_async_tool_task m
           ON m.group_id = g.id AND m.member_identity = i.parent_member_identity
         WHERE i.id = #{intentId} AND g.state = 'WAITING'
           AND m.state IN ('PENDING', 'RUNNING')
@@ -271,59 +271,52 @@
            AND i.physical_stopped_at IS NULL
            AND child.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
            AND COALESCE(child.tool_job_anchor_json, '{}'::jsonb) = '{}'::jsonb
-           AND NOT EXISTS (
-               SELECT 1 FROM alphafrog_agent_run_wait_member m
-                WHERE m.run_id = child.id
-                  AND NOT (
-                    (m.state IN ('SUCCEEDED', 'FAILED')
-                     AND (m.tool_name &lt;&gt; 'executePython'
-                          OR (m.external_operation_id IS NULL AND m.dispatch_proof_json IS NULL)
-                          OR EXISTS (
-                        SELECT 1
-                          FROM jsonb_array_elements(COALESCE(
-                               child.snapshot_json #&gt; '{data_analysis_observability,calls}',
-                               '[]'::jsonb)) AS terminal(call)
-                         WHERE m.dispatch_proof_json -&gt;&gt; 'operationId' = m.external_operation_id
-                           AND NULLIF(m.dispatch_proof_json -&gt;&gt; 'requestFingerprint', '') IS NOT NULL
-                           AND NULLIF(m.result_ref_json -&gt;&gt; 'taskId', '') IS NOT NULL
-                           AND (NULLIF(m.dispatch_proof_json -&gt;&gt; 'taskId', '') IS NULL
-                                OR m.result_ref_json -&gt;&gt; 'taskId'
-                                   = m.dispatch_proof_json -&gt;&gt; 'taskId')
-                           AND terminal.call -&gt;&gt; 'operationId' = m.external_operation_id
-                           AND terminal.call -&gt;&gt; 'taskId' = m.result_ref_json -&gt;&gt; 'taskId'
-                           AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
-                           AND NULLIF(terminal.call -&gt;&gt; 'terminalStatus', '') IS NOT NULL
-                           AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL)))
-                    OR (m.state = 'FAILED' AND m.tool_name = 'executePython'
-                        AND m.dispatch_proof_json IS NULL)
-                    OR (m.state IN ('CANCELED', 'LATE') AND m.tool_name &lt;&gt; 'executePython')
-                    OR (m.state IN ('CANCELED', 'LATE') AND m.tool_name = 'executePython'
-                        AND m.dispatch_proof_json IS NULL)
-                    OR (m.state IN ('CANCELED', 'LATE') AND m.tool_name = 'executePython'
-                        AND m.external_operation_id IS NOT NULL
-                        AND EXISTS (
-                            SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
-                             WHERE s.wait_member_id = m.id AND s.run_id = child.id
-                               AND s.group_id = m.group_id
-                               AND s.operation_id = m.external_operation_id
-                               AND s.request_fingerprint = m.dispatch_proof_json -&gt;&gt; 'requestFingerprint'
-                               AND s.state = 'CONFIRMED'
-                               AND s.task_id = s.terminal_task_id
-                               AND s.terminal_confirmed_at IS NOT NULL
-                               AND EXISTS (
-                                   SELECT 1 FROM jsonb_array_elements(COALESCE(
-                                        child.snapshot_json #&gt; '{data_analysis_observability,calls}',
-                                        '[]'::jsonb)) AS terminal(call)
-                                    WHERE terminal.call -&gt;&gt; 'operationId' = s.operation_id
-                                      AND terminal.call -&gt;&gt; 'taskId' = s.terminal_task_id
-                                      AND terminal.call -&gt;&gt; 'terminalStatus' = s.terminal_status
-                                      AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
-                                      AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL)))
-                  )
-               )
-           AND NOT EXISTS (
-               SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
-                WHERE s.run_id = child.id AND s.state &lt;&gt; 'CONFIRMED')
+            AND NOT EXISTS (
+                SELECT 1 FROM alphafrog_agent_async_tool_task t
+                 WHERE t.run_id = child.id
+                   AND NOT (
+                     (t.state IN ('SUCCEEDED', 'FAILED')
+                      AND (t.tool_name &lt;&gt; 'executePython'
+                           OR (t.external_operation_id IS NULL AND t.request_json = '{}'::jsonb)
+                           OR EXISTS (
+                         SELECT 1
+                           FROM jsonb_array_elements(COALESCE(
+                                child.snapshot_json #&gt; '{data_analysis_observability,calls}',
+                                '[]'::jsonb)) AS terminal(call)
+                          WHERE t.request_json -&gt;&gt; 'operationId' = t.external_operation_id
+                            AND NULLIF(t.request_json -&gt;&gt; 'requestFingerprint', '') IS NOT NULL
+                            AND t.task_id IS NOT NULL
+                            AND terminal.call -&gt;&gt; 'operationId' = t.external_operation_id
+                            AND terminal.call -&gt;&gt; 'taskId' = t.task_id
+                            AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                            AND NULLIF(terminal.call -&gt;&gt; 'terminalStatus', '') IS NOT NULL
+                            AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL)))
+                     OR (t.state = 'FAILED' AND t.tool_name = 'executePython'
+                         AND t.request_json = '{}'::jsonb)
+                     OR (t.state = 'CANCELED' AND t.tool_name &lt;&gt; 'executePython')
+                     OR (t.state = 'CANCELED' AND t.tool_name = 'executePython'
+                         AND t.request_json = '{}'::jsonb)
+                     OR (t.state = 'CANCELED' AND t.tool_name = 'executePython'
+                         AND t.external_operation_id IS NOT NULL
+                         AND t.stop_state = 'CONFIRMED'
+                         AND t.task_id IS NOT NULL
+                         AND EXISTS (
+                             SELECT 1 FROM jsonb_array_elements(COALESCE(
+                                  child.snapshot_json #&gt; '{data_analysis_observability,calls}',
+                                  '[]'::jsonb)) AS terminal(call)
+                              WHERE terminal.call -&gt;&gt; 'operationId' = t.external_operation_id
+                                AND terminal.call -&gt;&gt; 'taskId' = t.task_id
+                                AND terminal.call -&gt;&gt; 'terminalStatus'
+                                    IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+                                AND terminal.call #&gt;&gt; '{reservation,state}' = 'TERMINAL_CONFIRMED'
+                                AND NULLIF(terminal.call -&gt;&gt; 'terminalAt', '') IS NOT NULL))
+                   )
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM alphafrog_agent_async_tool_task other
+                 WHERE other.run_id = child.id
+                   AND other.stop_state IS NOT NULL
+                   AND other.stop_state &lt;&gt; 'CONFIRMED')
            AND NOT EXISTS (
                SELECT 1 FROM alphafrog_agent_run_tree_budget_operation o
                JOIN alphafrog_agent_run_work_item active_item
@@ -367,11 +360,11 @@
                       OR EXISTS (SELECT 1 FROM alphafrog_agent_run_tree_budget b
                                   WHERE b.root_run_id = #{rootRunId}
                                     AND (b.active_nodes &gt; 0 OR b.external_waits &gt; 0))
-                      OR EXISTS (SELECT 1 FROM alphafrog_agent_run_wait_member_stop s
+                      OR EXISTS (SELECT 1 FROM alphafrog_agent_async_tool_task t
                                   LEFT JOIN alphafrog_agent_run_child_intent i
-                                    ON i.child_run_id = s.run_id
-                                 WHERE s.state &lt;&gt; 'CONFIRMED'
-                                   AND (s.run_id = #{rootRunId}
+                                    ON i.child_run_id = t.run_id
+                                 WHERE t.stop_state IS NOT NULL AND t.stop_state &lt;&gt; 'CONFIRMED'
+                                   AND (t.run_id = #{rootRunId}
                                         OR i.root_run_id = #{rootRunId}))
                     ELSE NULL END
     </select>
@@ -384,10 +377,10 @@
             SELECT root_run_id FROM alphafrog_agent_run_tree_budget
              WHERE active_nodes &gt; 0 OR external_waits &gt; 0
             UNION
-            SELECT COALESCE(i.root_run_id, s.run_id) AS root_run_id
-              FROM alphafrog_agent_run_wait_member_stop s
-              LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = s.run_id
-             WHERE s.state &lt;&gt; 'CONFIRMED'
+            SELECT COALESCE(i.root_run_id, t.run_id) AS root_run_id
+              FROM alphafrog_agent_async_tool_task t
+              LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = t.run_id
+             WHERE t.stop_state IS NOT NULL AND t.stop_state &lt;&gt; 'CONFIRMED'
         ) active
         WHERE 1 = 1
         <if test="afterRootRunId != null and afterRootRunId != ''">
@@ -404,10 +397,10 @@
             SELECT root_run_id FROM alphafrog_agent_run_tree_budget
              WHERE active_nodes &gt; 0 OR external_waits &gt; 0
             UNION
-            SELECT COALESCE(i.root_run_id, s.run_id) AS root_run_id
-              FROM alphafrog_agent_run_wait_member_stop s
-              LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = s.run_id
-             WHERE s.state &lt;&gt; 'CONFIRMED'
+            SELECT COALESCE(i.root_run_id, t.run_id) AS root_run_id
+              FROM alphafrog_agent_async_tool_task t
+              LEFT JOIN alphafrog_agent_run_child_intent i ON i.child_run_id = t.run_id
+             WHERE t.stop_state IS NOT NULL AND t.stop_state &lt;&gt; 'CONFIRMED'
         ) active
         JOIN alphafrog_agent_run root ON root.id = active.root_run_id
         WHERE root.deployment_id = #{deploymentId}
@@ -475,7 +468,7 @@
                member.state AS parent_member_state
           FROM alphafrog_agent_run_child_intent i
           JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
-          JOIN alphafrog_agent_run_wait_member member
+          JOIN alphafrog_agent_async_tool_task member
             ON member.group_id = i.parent_wait_group_id
            AND member.member_identity = i.parent_member_identity
           LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
@@ -491,7 +484,7 @@
           FROM alphafrog_agent_run_child_intent i
           JOIN alphafrog_agent_run_child_outbox o ON o.intent_id = i.id
           JOIN alphafrog_agent_run parent ON parent.id = i.parent_run_id
-          JOIN alphafrog_agent_run_wait_member member
+          JOIN alphafrog_agent_async_tool_task member
             ON member.group_id = i.parent_wait_group_id
            AND member.member_identity = i.parent_member_identity
           LEFT JOIN alphafrog_agent_run child ON child.id = i.child_run_id
