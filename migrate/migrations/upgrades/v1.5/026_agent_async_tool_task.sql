@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_async_tool_task (
         CHECK (length(btrim(tool_name)) > 0),
     -- 任务行只能挂在本组的 Run 上：组在 A 运行、成员行却写 B 运行，结果接收方与停机扫描
     -- 就会在两个 Run 之间各找一半。组编号为空的行不受这条约束（复合外键按 MATCH SIMPLE 判定）。
+    --
+    -- 旧等待成员表的同一条外键带 ON DELETE CASCADE，这里刻意不带：删运行时等待组与任务行
+    -- 各自按运行编号级联删除，检查在语句末尾进行，两边都已经不在，不会互相挡住；
+    -- 而有人想直接删一个还挂着任务的等待组时，这里会拒绝，任务行不会被静默删掉。
     CONSTRAINT agent_async_tool_task_group_fk
         FOREIGN KEY (group_id, run_id) REFERENCES alphafrog_agent_run_wait_group(id, run_id)
 );

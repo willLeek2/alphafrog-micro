@@ -643,6 +643,25 @@ class Stage3WaitContractPostgresTest {
                 .as("不相干的根 Run 不受影响").isZero();
     }
 
+    /**
+     * 删运行要一次走完：等待组与任务行各自按运行编号级联删除，两者之间的复合外键
+     * 在语句末尾检查时两边都已经不在，不会互相挡住，也不会留下没有组或没有运行的任务行。
+     */
+    @Test
+    void deletingARunRemovesItsWaitGroupAndTaskRowsTogether() throws Exception {
+        GroupFixture fixture = suspendSimpleGroup("run-cascade-delete", 2, 0L);
+        execute("UPDATE alphafrog_agent_async_tool_task SET state = 'RUNNING', "
+                + "external_operation_id = 'op-cascade', next_poll_at = NULL WHERE group_id = "
+                + fixture.groupId() + " AND member_seq = 0");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task WHERE group_id = "
+                + fixture.groupId())).isEqualTo(2);
+        execute("DELETE FROM alphafrog_agent_run WHERE id = '" + fixture.runId() + "'");
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_wait_group WHERE id = "
+                + fixture.groupId())).as("等待组随运行一起走").isZero();
+        assertThat(countRows("SELECT count(*) FROM alphafrog_agent_async_tool_task WHERE group_id = "
+                + fixture.groupId())).as("任务行随运行一起走").isZero();
+    }
+
     @Test
     void runIdempotencyColumnsArePairedAndUniquePerUser() throws Exception {
         createRunFor("run-idem-1", "user-idem", 0, 0L);
