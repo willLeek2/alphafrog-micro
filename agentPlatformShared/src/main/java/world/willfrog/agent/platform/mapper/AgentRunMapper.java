@@ -549,7 +549,6 @@ public interface AgentRunMapper {
                                      @Param("operationId") String operationId,
                                      @Param("requestFingerprint") String requestFingerprint,
                                      @Param("waitMemberId") long waitMemberId,
-                                     @Param("dispatchProofJson") String dispatchProofJson,
                                      @Param("reservationJson") String reservationJson,
                                      @Param("terminalReservationJson") String terminalReservationJson);
 

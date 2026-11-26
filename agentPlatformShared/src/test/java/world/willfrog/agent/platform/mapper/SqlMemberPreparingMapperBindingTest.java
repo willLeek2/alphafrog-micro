@@ -28,7 +28,7 @@ class SqlMemberPreparingMapperBindingTest {
         String firstWrite = config.getMappedStatement(WaitGroupMapper.class.getName() + ".recordMemberPreparing")
                 .getBoundSql(Map.of("groupId", 7, "memberIdentity", "member", "externalOperationId", "op", "dispatchProofJson", "{}"))
                 .getSql();
-        assertThat(firstWrite).contains("AND m.dispatch_proof_json IS NULL").doesNotContain("OR m.dispatch_proof_json");
+        assertThat(firstWrite).contains("AND t.request_json = '{}'::jsonb").doesNotContain("OR t.request_json");
     }
 
     @Test void lockedReadWaitsOnRunAndNormalCompletionCannotOverwriteSqlPreparingProof() throws Exception {
@@ -38,7 +38,7 @@ class SqlMemberPreparingMapperBindingTest {
         Configuration members = mapper(WaitGroupMapper.class, "mapper/WaitGroupMapper.xml");
         var sql = members.getMappedStatement(WaitGroupMapper.class.getName() + ".completeMember")
                 .getBoundSql(Map.of()).getSql().replaceAll("\\s+", " ");
-        assertThat(sql).contains("m.state = 'PENDING' AND m.tool_name IN ('executePython', 'executeQuery')");
+        assertThat(sql).contains("t.state = 'PENDING' AND t.tool_name IN ('executePython', 'executeQuery')");
     }
 
     private Configuration mapper(Class<?> type, String path) throws Exception {

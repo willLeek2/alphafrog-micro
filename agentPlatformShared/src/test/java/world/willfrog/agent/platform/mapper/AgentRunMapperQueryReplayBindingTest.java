@@ -37,7 +37,7 @@ class AgentRunMapperQueryReplayBindingTest {
                 .contains("r.status = 'EXECUTING'", "'anchorState' = 'PREPARING'", "'taskId'", "'autoResume'", "'runDisposition'",
                         "'operationId' = ?", "'requestFingerprint' = ?", "'createRequestJson' = ?", "'reservationJson' = ?",
                         "r.plan_generation IS NOT DISTINCT FROM ?", "r.run_control_version IS NOT DISTINCT FROM ?",
-                        "NOT EXISTS", "m.external_operation_id = ?")
+                        "NOT EXISTS", "t.external_operation_id = ?")
                 .doesNotContain("m.state", "SET tool_job_anchor_json", "SET dispatch_proof_json");
     }
 
@@ -65,8 +65,8 @@ class AgentRunMapperQueryReplayBindingTest {
         assertThat(sql).startsWith("UPDATE alphafrog_agent_run r SET updated_at = clock_timestamp() WHERE")
                 .contains("r.status = 'EXECUTING'", "r.run_control_version = ?", "r.plan_generation = ?",
                         "'operationId' = ?", "'requestFingerprint' = ?", "'createRequestJson' = ?",
-                        "g.state = 'WAITING'", "m.state IN ('PENDING', 'RUNNING')", "m.run_id = r.id",
-                        "'taskId' IS NULL", "'workspaceRefusalCode' IS NULL", "'createRequestExpired'")
+                        "g.state = 'WAITING'", "t.state IN ('PENDING', 'RUNNING')", "t.run_id = r.id",
+                        "t.task_id IS NULL", "'workspaceRefusalCode' IS NULL", "'createRequestExpired'")
                 .doesNotContain("SET tool_job_anchor_json", "SET dispatch_proof_json");
         var count = configuration.getMappedStatement(AgentRunMapper.class.getName() + ".countInFlightExecuteQueryByUser")
                 .getBoundSql(Map.of("userId", "user", "excludeRunId", "run", "toolName", "executeQuery", "staleSeconds", 600));

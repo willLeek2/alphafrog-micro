@@ -24,7 +24,7 @@ class CanceledSqlWaitMemberMapperBindingTest {
         var statement = configuration.getMappedStatement(AgentRunMapper.class.getName()
                 + ".completeCanceledSqlWaitMember");
         var sql = statement.getBoundSql(Map.of("runId", "run", "operationId", "op", "requestFingerprint", "fp",
-                "waitMemberId", 41L, "dispatchProofJson", "{}", "reservationJson", "{}", "terminalReservationJson", "{}"));
+                "waitMemberId", 41L, "reservationJson", "{}", "terminalReservationJson", "{}"));
         var method = Arrays.stream(AgentRunMapper.class.getMethods())
                 .filter(candidate -> candidate.getName().equals("completeCanceledSqlWaitMember")).findFirst().orElseThrow();
         var parameters = Arrays.stream(method.getParameters()).map(parameter ->
@@ -36,11 +36,11 @@ class CanceledSqlWaitMemberMapperBindingTest {
                 "THEN r.status ELSE 'CANCELED' END", "r.scheduler_version = 'DUAL_POOL_V2'",
                 "'toolName' = 'executeQuery'", "'operationId' = ?", "'requestFingerprint' = ?",
                 "'reservationJson' = ?", "'runDisposition' = 'CANCELED'", "'autoResume'",
-                "m.state IN ('CANCELED', 'LATE')", "m.dispatch_proof_json = CAST(? AS jsonb)",
-                "'schemaVersion' = '2'", "'createRequestJson'", "'createRequestExpired'",
-                "s.state = 'CONFIRMED'", "s.task_id = s.terminal_task_id", "s.terminal_status",
+                "t.state = 'CANCELED'", "t.schema_version = 2",
+                "'createRequestJson'", "'createRequestExpired'",
+                "t.stop_state = 'CONFIRMED'", "t.task_id IS NOT NULL", "'terminalStatus' IN",
                 "'{data_analysis_observability,calls}'", "'{reservation,state}' = 'TERMINAL_CONFIRMED'",
-                "'terminalAt'", "terminal.call -> 'reservation' = CAST(? AS jsonb)", "other.state != 'CONFIRMED'", "g.state IN ('WAITING', 'READY')",
+                "'terminalAt'", "terminal.call -> 'reservation' = CAST(? AS jsonb)", "other.stop_state <> 'CONFIRMED'", "g.state IN ('WAITING', 'READY')",
                 "other.state IN ('PENDING', 'RUNNING')", "wi.state NOT IN ('RESULT_COMMITTED', 'EXECUTION_FAILED', 'CANCELED', 'STALE')");
         assertThat(text).doesNotContain("SET snapshot_json", "SET dispatch_proof_json");
         var scan = configuration.getMappedStatement(AgentRunMapper.class.getName()

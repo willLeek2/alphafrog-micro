@@ -116,8 +116,7 @@ public class CanceledSqlWaitMemberRecovery {
         if (!"CONFIRMED".equals(inspected.task().getStopState())) return null;
         int rows = runs.completeCanceledSqlWaitMember(runId, anchor.getOperationId(),
                 anchor.getRequestFingerprint(), inspected.member().getId(),
-                inspected.member().getDispatchProofJson(), anchor.getReservationJson(),
-                inspected.terminalReservationJson());
+                anchor.getReservationJson(), inspected.terminalReservationJson());
         if (rows != 1) return null;
         AgentRun closed = runs.findById(runId);
         return closed == null || closed.getStatus() == null ? null

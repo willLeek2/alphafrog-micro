@@ -27,13 +27,11 @@ class PythonWorkspaceRetentionSqlTest {
             String sql = bound(configuration, AgentRunMapper.class, statement);
             assertThat(sql).contains("r.status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')")
                     .contains("g.state IN ('WAITING', 'READY')")
-                    .contains("m.tool_name = 'executePython'")
-                    .contains("m.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELED', 'LATE')")
-                    .contains("m.state = 'CANCELED' AND m.dispatch_proof_json IS NOT NULL")
-                    .contains("confirmed.state = 'CONFIRMED'")
-                    .contains("m.state = 'LATE' AND EXISTS")
-                    .contains("pending_stop.state <> 'CONFIRMED'")
-                    .contains("s.state <> 'CONFIRMED'")
+                    .contains("t.job_kind = 'SANDBOX_TOOL'")
+                    .contains("t.state IN ('PENDING', 'RUNNING')")
+                    .contains("t.state = 'CANCELED'")
+                    .contains("t.request_json <> '{}'::jsonb")
+                    .contains("t.stop_state IS NULL OR t.stop_state <> 'CONFIRMED'")
                     .contains("i.capacity_released_at IS NULL")
                     .contains("c.active_child_count > 0")
                     .contains("b.active_nodes > 0 OR b.external_waits > 0")
@@ -90,13 +88,11 @@ class PythonWorkspaceRetentionSqlTest {
         Configuration configuration = mapper(WaitGroupMapper.class, "mapper/WaitGroupMapper.xml");
         String sql = bound(configuration, WaitGroupMapper.class, "compactExpiredWaitMemberProofs");
         assertThat(sql).contains("r.workspace_expired_at IS NOT NULL")
-                .contains("m.state IN ('SUCCEEDED', 'FAILED', 'LATE')")
-                .contains("m.state = 'CANCELED' AND EXISTS")
-                .contains("confirmed.state = 'CONFIRMED'")
-                .contains("s.state <> 'CONFIRMED'")
-                .contains("m.dispatch_proof_json - 'createRequestJson'")
+                .contains("t.state IN ('SUCCEEDED', 'FAILED', 'CANCELED')")
+                .contains("t.stop_state IS NULL OR t.stop_state = 'CONFIRMED'")
+                .contains("t.tool_name = 'executePython'")
+                .contains("t.request_json - 'createRequestJson'")
                 .contains("jsonb_build_object('createRequestExpired', true)");
-        assertThat(sql).doesNotContain("dispatch_proof_json = '{}'::jsonb");
     }
 
     @Test
@@ -106,17 +102,12 @@ class PythonWorkspaceRetentionSqlTest {
         String compacting = bound(mapper(WaitGroupMapper.class, "mapper/WaitGroupMapper.xml"),
                 WaitGroupMapper.class, "compactExpiredWaitMemberProofs");
 
-        assertThat(marking).contains("m.state = 'LATE' AND EXISTS (")
-                .contains("pending_stop.wait_member_id = m.id")
-                .contains("pending_stop.state <> 'CONFIRMED'")
-                .contains("m.state = 'CANCELED' AND m.dispatch_proof_json IS NOT NULL")
-                .contains("NOT EXISTS (")
-                .contains("confirmed.state = 'CONFIRMED'");
-        assertThat(compacting).contains("m.state IN ('SUCCEEDED', 'FAILED', 'LATE')")
-                .contains("NOT EXISTS (")
-                .contains("s.wait_member_id = m.id AND s.state <> 'CONFIRMED'")
-                .contains("m.state = 'CANCELED' AND EXISTS (")
-                .contains("confirmed.state = 'CONFIRMED'");
+        assertThat(marking).contains("t.state = 'CANCELED'")
+                .contains("t.request_json <> '{}'::jsonb")
+                .contains("t.stop_state IS NULL OR t.stop_state <> 'CONFIRMED'")
+                .contains("NOT EXISTS (");
+        assertThat(compacting).contains("t.state IN ('SUCCEEDED', 'FAILED', 'CANCELED')")
+                .contains("t.stop_state IS NULL OR t.stop_state = 'CONFIRMED'");
     }
 
     private static Configuration mapper(Class<?> type, String path) throws Exception {

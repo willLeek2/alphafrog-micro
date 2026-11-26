@@ -13,7 +13,6 @@ import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -32,26 +31,26 @@ class MapperStatementCoverageTest {
 
     @Test
     void everyMapperMethodHasStatement() throws Exception {
-        Set<String> statementIds = statementIds();
         for (Class<?> mapper : MAPPERS) {
+            // 只核对该接口自己的映射文件：别的文件里出现同名语句不能算实现。
+            Set<String> statementIds = statementIds(mapper);
             for (Method method : mapper.getDeclaredMethods()) {
                 assertTrue(statementIds.contains(method.getName()),
                         () -> mapper.getSimpleName() + "." + method.getName()
-                                + " 在映射文件里没有同名语句");
+                                + " 在 " + mapper.getSimpleName() + ".xml 里没有同名语句");
             }
         }
     }
 
-    private Set<String> statementIds() throws Exception {
+    private Set<String> statementIds(Class<?> mapper) throws Exception {
+        Path file = mapperDirectory().resolve(mapper.getSimpleName() + ".xml");
+        assertTrue(Files.exists(file), () -> "找不到映射文件：" + file.getFileName());
+        Document document = DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder().parse(file.toFile());
+        assertTrue(mapper.getName().equals(document.getDocumentElement().getAttribute("namespace")),
+                () -> file.getFileName() + " 的命名空间与接口不一致");
         Set<String> ids = new HashSet<>();
-        Path mapperDir = mapperDirectory();
-        try (Stream<Path> files = Files.list(mapperDir)) {
-            for (Path file : files.filter(p -> p.toString().endsWith(".xml")).toList()) {
-                Document document = DocumentBuilderFactory.newInstance()
-                        .newDocumentBuilder().parse(file.toFile());
-                collect(document, ids);
-            }
-        }
+        collect(document, ids);
         return ids;
     }
 

@@ -215,7 +215,7 @@ class WaitGroupMapperBindingTest {
     @Test
     void completionOnlyWritesStillOpenMembersAndCountsOnce() {
         String sql = sql("completeMember");
-        assertThat(sql).contains("m.state IN ('PENDING', 'RUNNING')")
+        assertThat(sql).contains("t.state IN ('PENDING', 'RUNNING')")
                 .contains("AND g.state = 'WAITING'");
         assertThat(sql.split("UPDATE alphafrog_agent_run_wait_group", -1).length - 1)
                 .as("完成数和齐备状态必须同一次写入，不能对这一行再 UPDATE 一次")
@@ -234,8 +234,8 @@ class WaitGroupMapperBindingTest {
         assertThat(sql).as("通知只写一条靠唯一约束兜底")
                 .contains("ON CONFLICT (group_id, recovery_generation) DO NOTHING");
         assertThat(sql).as("外部作业身份给了就必须对上，两边都是空也只算同一成员")
-                .contains("m.external_operation_id = ?::varchar")
-                .contains("m.external_operation_id IS NULL AND ?::varchar IS NULL");
+                .contains("t.external_operation_id = ?::varchar")
+                .contains("t.external_operation_id IS NULL AND ?::varchar IS NULL");
         assertThat(sql).as("Run 的当前计划代际与这一段的上下文版本都要在同一写入里核对")
                 .contains("r.plan_generation = ?")
                 .contains("wi.context_version = ?")
@@ -245,23 +245,23 @@ class WaitGroupMapperBindingTest {
     @Test
     void lateResultStopsTheWholeChain() {
         String sql = sql("reportLateMember");
-        assertThat(sql).contains("state = 'LATE'")
+        assertThat(sql).contains("state = 'CANCELED'")
                 .contains("g.state IN ('WAITING', 'READY')")
                 .contains("state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')")
                 .doesNotContain("INSERT INTO alphafrog_agent_run_recovery_notification")
                 .doesNotContain("completed_members = completed_members + 1");
         assertThat(sql).as("被停链的 Python 兄弟成员必须在同一事务留下停机责任")
-                .contains("INSERT INTO alphafrog_agent_run_wait_member_stop")
-                .contains("FROM siblings_canceled m")
-                .contains("m.dispatch_proof_json IS NOT NULL")
-                .contains("m.id <> (SELECT id FROM member_late)");
+                .contains("stop_state = CASE WHEN t.job_kind = 'SANDBOX_TOOL'")
+                .contains("FROM group_stopped s")
+                .contains("t.request_json <> '{}'::jsonb")
+                .contains("t.job_id <> (SELECT id FROM member_late)");
         // 已经被取消的成员也要能补审计：否则取消之后真到的结果连引用都留不下来。
         assertThat(sql).as("迟到结果允许从「已取消」补一次审计")
-                .contains("m.state IN ('PENDING', 'RUNNING', 'CANCELED')");
+                .contains("t.state IN ('PENDING', 'RUNNING', 'CANCELED')");
         // 审计只写一次：结果引用与外部作业身份都只在还是空的时候写。
         assertThat(sql).as("重复上报不许覆盖先到的审计")
-                .contains("result_ref_json = COALESCE(m.result_ref_json,")
-                .contains("finished_at = COALESCE(m.finished_at,");
+                .contains("result_ref_json = CASE WHEN t.result_ref_json = '{}'::jsonb")
+                .contains("finished_at = COALESCE(t.finished_at,");
         assertThat(sql).as("停链要 Run 还在这一代执行，版本对不上只留审计")
                 .contains("f.status = 'EXECUTING'")
                 .contains("f.run_plan_generation = g.plan_generation")
@@ -297,11 +297,11 @@ class WaitGroupMapperBindingTest {
     void cancellationStopsGroupMembersSegmentAndNotification() {
         String sql = sql("cancelChain");
         assertThat(sql).contains("g.state IN ('WAITING', 'READY')")
-                .contains("m.state IN ('PENDING', 'RUNNING')")
+                .contains("t.state IN ('PENDING', 'RUNNING')")
                 .contains("wi.state IN ('WAITING', 'RESUMABLE', 'RUNNABLE')")
                 .contains("n.state = 'WAITING'")
                 .contains("state = 'CANCELED'")
-                .contains("m.tool_name IN ('executePython', 'executeQuery')");
+                .contains("stop_state = CASE WHEN t.job_kind = 'SANDBOX_TOOL'");
     }
 
     // ===== 字面量与 Java 取值一致 =====
@@ -321,8 +321,12 @@ class WaitGroupMapperBindingTest {
         for (var state : world.willfrog.agent.platform.treebudget.RootTreeBudgetStore.State.values()) {
             known.add(state.name());
         }
-        // cancelChain 同时插入外部停机任务；它的缺证明状态属于停机记录，不属于等待成员。
-        known.add("BLOCKED_PROOF");
+        // 新任务表的种类与停机状态来自任务表自己的取值，不属于等待成员状态。
+        for (var kind : world.willfrog.agent.platform.asynctask.AsyncToolTaskKind.values()) {
+            known.add(kind.name());
+        }
+        known.add("CLAIMED");
+        known.add("CONFIRMED");
         for (AgentRunStatus status : AgentRunStatus.values()) {
             known.add(status.name());
         }
