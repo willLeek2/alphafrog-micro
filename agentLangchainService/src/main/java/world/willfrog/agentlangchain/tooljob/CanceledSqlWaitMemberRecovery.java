@@ -16,8 +16,8 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
-import world.willfrog.agent.platform.wait.WaitMemberStopStore;
-import world.willfrog.agent.platform.wait.WaitMemberStopTask;
+import world.willfrog.agent.platform.asynctask.AsyncToolTask;
+import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemStore;
 import world.willfrog.agentlangchain.tools.DurableToolCallIds;
 
@@ -35,19 +35,19 @@ public class CanceledSqlWaitMemberRecovery {
 
     private final AgentRunMapper runs;
     private final WaitGroupStore groups;
-    private final WaitMemberStopStore stops;
+    private final AsyncToolTaskStore tasks;
     private final AgentRunFinalizationService finalization;
     private final NodeWorkItemStore workItems;
     private final ObjectMapper json;
     private final TransactionTemplate transaction;
 
     public CanceledSqlWaitMemberRecovery(AgentRunMapper runs, WaitGroupStore groups,
-                                        WaitMemberStopStore stops, NodeWorkItemStore workItems,
+                                        AsyncToolTaskStore tasks, NodeWorkItemStore workItems,
                                         AgentRunFinalizationService finalization, ObjectMapper json,
                                         PlatformTransactionManager transactionManager) {
         this.runs = runs;
         this.groups = groups;
-        this.stops = stops;
+        this.tasks = tasks;
         this.workItems = workItems;
         this.finalization = finalization;
         this.json = json;
@@ -109,11 +109,11 @@ public class CanceledSqlWaitMemberRecovery {
             groups.cancelChain(inspected.member().getGroupId());
             return null;
         }
-        if (inspected.stop() == null) {
+        if (inspected.task() == null) {
             groups.ensureCanceledMemberStopTasks(inspected.member().getGroupId());
             return null;
         }
-        if (!"CONFIRMED".equals(inspected.stop().getState())) return null;
+        if (!"CONFIRMED".equals(inspected.task().getStopState())) return null;
         int rows = runs.completeCanceledSqlWaitMember(runId, anchor.getOperationId(),
                 anchor.getRequestFingerprint(), inspected.member().getId(),
                 inspected.member().getDispatchProofJson(), anchor.getReservationJson(),
@@ -190,28 +190,26 @@ public class CanceledSqlWaitMemberRecovery {
                     || disagrees(proof.taskId(), anchor.getTaskId())
                     || disagrees(original.taskId(), anchor.getTaskId())
                     || disagrees(session.taskId(), anchor.getTaskId())) return Inspection.invalid();
-            WaitMemberStopTask stop = stops.findByWaitMemberId(member.getId()).orElse(null);
-            if (stop != null && (!Objects.equals(stop.getWaitMemberId(), member.getId())
-                    || !Objects.equals(stop.getGroupId(), member.getGroupId())
-                    || !runId.equals(stop.getRunId()) || !proof.operationId().equals(stop.getOperationId())
-                    || !proof.requestFingerprint().equals(stop.getRequestFingerprint())
-                    || disagrees(proof.taskId(), stop.getTaskId())
-                    || disagrees(anchor.getTaskId(), stop.getTaskId()))) return Inspection.invalid();
+            AsyncToolTask task = tasks.findByJobId(member.getId()).orElse(null);
+            if (task != null && (!Objects.equals(task.getGroupId(), member.getGroupId())
+                    || !runId.equals(task.getRunId())
+                    || !proof.operationId().equals(task.getExternalOperationId())
+                    || disagrees(proof.taskId(), task.getTaskId())
+                    || disagrees(anchor.getTaskId(), task.getTaskId()))) return Inspection.invalid();
             String terminalReservationJson = null;
-            if (alreadyClosed && (stop == null || !"CONFIRMED".equals(stop.getState()))) return Inspection.invalid();
-            if (stop != null && "CONFIRMED".equals(stop.getState())) {
-                if (stop.getTerminalTaskId() == null || stop.getTerminalTaskId().isBlank()
-                        || !Objects.equals(stop.getTaskId(), stop.getTerminalTaskId())
-                        || !Set.of("SUCCEEDED", "FAILED", "CANCELED").contains(stop.getTerminalStatus())
-                        || disagrees(proof.taskId(), stop.getTerminalTaskId())
-                        || disagrees(anchor.getTaskId(), stop.getTerminalTaskId())) return Inspection.invalid();
+            if (alreadyClosed && (task == null || !"CONFIRMED".equals(task.getStopState()))) return Inspection.invalid();
+            if (task != null && "CONFIRMED".equals(task.getStopState())) {
+                // 终态证据在任务行上：任务编号是沙箱作业身份，终态名与用量看观测快照里的那次调用。
+                if (task.getTaskId() == null || task.getTaskId().isBlank()
+                        || disagrees(proof.taskId(), task.getTaskId())
+                        || disagrees(anchor.getTaskId(), task.getTaskId())) return Inspection.invalid();
                 boolean matchingUsage = false;
                 for (var item : json.readTree(run.getSnapshotJson())
                         .path("data_analysis_observability").path("calls")) {
                     DataAnalysisObservabilityCall call = json.treeToValue(item, DataAnalysisObservabilityCall.class);
                     if (proof.operationId().equals(call.operationId())
-                            && stop.getTerminalTaskId().equals(call.taskId())
-                            && stop.getTerminalStatus().equals(call.terminalStatus())
+                            && task.getTaskId().equals(call.taskId())
+                            && Set.of("SUCCEEDED", "FAILED", "CANCELED").contains(call.terminalStatus())
                             && call.terminalAt() != null
                             && call.reservation().state() == DataAnalysisReservationState.TERMINAL_CONFIRMED
                             && call.reservation().identity().equals(original.identity())
@@ -225,7 +223,7 @@ public class CanceledSqlWaitMemberRecovery {
                 }
                 if (!matchingUsage) return Inspection.invalid();
             }
-            return new Inspection(Ownership.MEMBER_OWNED, member, stop, terminalReservationJson);
+            return new Inspection(Ownership.MEMBER_OWNED, member, task, terminalReservationJson);
         } catch (Exception invalid) {
             log.warn("取消SQL会话的成员证明不完整，保留原资源责任：run={}", runId);
             return Inspection.invalid();
@@ -237,7 +235,7 @@ public class CanceledSqlWaitMemberRecovery {
                 && !first.equals(second);
     }
 
-    private record Inspection(Ownership ownership, WaitMember member, WaitMemberStopTask stop,
+    private record Inspection(Ownership ownership, WaitMember member, AsyncToolTask task,
                               String terminalReservationJson) {
         static Inspection notApplicable() { return new Inspection(Ownership.NOT_APPLICABLE, null, null, null); }
         static Inspection invalid() { return new Inspection(Ownership.INVALID_PROOF, null, null, null); }

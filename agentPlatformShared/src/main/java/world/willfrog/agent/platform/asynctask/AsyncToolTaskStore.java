@@ -55,6 +55,9 @@ public interface AsyncToolTaskStore {
     /** 沙箱已确认停机。 */
     boolean finishStop(long jobId, String owner, long claimEpoch);
 
+    /** 停机无需继续：没有外部作业、或身份对不上不再重试；原因留在最后错误里。 */
+    boolean abandonStop(long jobId, String owner, long claimEpoch, String reason);
+
     /** 停机失败，记录次数与最后错误，等待下一次重试。 */
     boolean retryStop(long jobId, String owner, long claimEpoch, OffsetDateTime nextPollAt,
                       String lastError);

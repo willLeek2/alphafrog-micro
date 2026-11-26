@@ -238,6 +238,17 @@
           AND stop_state = 'CLAIMED'
     </update>
 
+    <update id="abandonStop">
+        UPDATE alphafrog_agent_async_tool_task
+        SET stop_state = 'CONFIRMED',
+            stop_last_error = #{reason},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = #{jobId}
+          AND owner_instance_id = #{owner}
+          AND claim_epoch = #{claimEpoch}
+          AND stop_state = 'CLAIMED'
+    </update>
+
     <update id="retryStop">
         UPDATE alphafrog_agent_async_tool_task
         SET stop_state = 'PENDING',

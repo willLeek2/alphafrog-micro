@@ -95,6 +95,14 @@ public interface AsyncToolTaskMapper {
                    @Param("owner") String owner,
                    @Param("claimEpoch") long claimEpoch);
 
+    /**
+     * 停机无需继续：没有外部作业、或身份对不上不再重试。停机收尾并把原因留在最后错误里。
+     */
+    int abandonStop(@Param("jobId") long jobId,
+                    @Param("owner") String owner,
+                    @Param("claimEpoch") long claimEpoch,
+                    @Param("reason") String reason);
+
     /** 停机失败，记录次数与最后错误，等待下一次重试。 */
     int retryStop(@Param("jobId") long jobId,
                   @Param("owner") String owner,

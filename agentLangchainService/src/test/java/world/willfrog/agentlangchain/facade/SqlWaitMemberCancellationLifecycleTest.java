@@ -5,6 +5,8 @@ import world.willfrog.agentlangchain.tooljob.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
 import world.willfrog.agentlangchain.tools.DurableToolCallIds;
+import world.willfrog.agent.platform.asynctask.AsyncToolTask;
+import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
@@ -322,7 +324,7 @@ class SqlWaitMemberCancellationLifecycleTest {
         assertThat(f.stop.getState()).isEqualTo("PENDING");
         assertThat(f.stop.getLastError()).isEqualTo("sandbox_settlement_incomplete");
         assertThat(f.calls).isEmpty();
-        verify(f.stopMapper, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
+        verify(f.tasks, never()).finishStop(anyLong(), any(), anyLong());
         assertThat(f.run.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
         assertThat(f.anchor()).isNotNull();
         f.startup().onReady();
@@ -476,9 +478,14 @@ class SqlWaitMemberCancellationLifecycleTest {
         final WaitGroup group = new WaitGroup();
         final WaitMember member = new WaitMember();
         WaitMemberStopTask stop;
+        /**
+         * 停机意图的持久替身：旧停机记录承载测试里直接断言的字段，
+         * 这个存储把同一份事实映射成工人与 CanceledSqlWaitMemberRecovery 读取的异步任务行。
+         */
+        final AsyncToolTaskStore tasks = mock(AsyncToolTaskStore.class);
+        long taskClaimEpoch;
         final AgentRunMapper runMapper = mock(AgentRunMapper.class);
         final WaitGroupMapper groupMapper = mock(WaitGroupMapper.class);
-        final WaitMemberStopMapper stopMapper = mock(WaitMemberStopMapper.class);
         final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
         final NodeWorkItemStore nodes = mock(NodeWorkItemStore.class);
         NodeWorkItem extraNode;
@@ -547,7 +554,8 @@ class SqlWaitMemberCancellationLifecycleTest {
                     JsonFormat.printer().print(ExecuteRequest.newBuilder().setOperationId(OPERATION)
                             .setRequestFingerprint(FINGERPRINT).setCode("print('query')").build()))));
             if (!coldStart) capacity.recover(List.of(reservation), capacityConfig.getMaxUnits(), capacityConfig.getMaxHeavyActive());
-            installRunMapperConditions(); installWaitMapperConditions(); installStopMapperConditions();
+            installRunMapperConditions(); installWaitMapperConditions();
+            installAsyncTaskStoreConditions();
             anchors = new ToolJobAnchorService(runMapper);
             var ownership = GatewayTestFixtures.withIdentity(runMapper, "stable", GENERATION);
             var groups = new MybatisWaitGroupStore(groupMapper);
@@ -605,10 +613,8 @@ class SqlWaitMemberCancellationLifecycleTest {
             ToolJobConfig config = new ToolJobConfig();
             settlement.setDispatchStore(new PythonSandboxDispatchStoreImpl(anchors, cache, config,
                     mock(ObjectProvider.class), mock(LangchainSchedulerMetrics.class)));
-            PlatformTransactionManager tx = mock(PlatformTransactionManager.class);
-            when(tx.getTransaction(any())).thenAnswer(i -> new SimpleTransactionStatus());
-            worker = new CanceledWaitMemberStopWorker(new MybatisWaitMemberStopStore(stopMapper), groups,
-                    sandbox, settlement, json, tx, ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
+            worker = new CanceledWaitMemberStopWorker(tasks, groups,
+                    sandbox, settlement, json, ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
             ToolJobFinalizer finalizer = new ToolJobFinalizer(anchors, cache, capacity,
                     resume, config, mock(FinanceRecordChannelProcessor.class),
                     mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
@@ -624,7 +630,7 @@ class SqlWaitMemberCancellationLifecycleTest {
             doAnswer(i -> { finishRecoveryTransaction(); return null; }).when(recoveryTx).commit(any());
             doAnswer(i -> { finishRecoveryTransaction(); return null; }).when(recoveryTx).rollback(any());
             recovery = new CanceledSqlWaitMemberRecovery(runMapper, groups,
-                    new MybatisWaitMemberStopStore(stopMapper), nodes, finalization, json, recoveryTx);
+                    tasks, nodes, finalization, json, recoveryTx);
             ReflectionTestUtils.setField(reconciler, "canceledSqlWaitMemberRecovery", recovery);
             when(cache.fetchDue(20)).thenReturn(Set.of(RUN));
             when(sandbox.getTaskByOperationId(any())).thenReturn(GetTaskByOperationIdResponse.newBuilder()
@@ -853,38 +859,85 @@ class SqlWaitMemberCancellationLifecycleTest {
             });
         }
 
-        void installStopMapperConditions() {
-            when(stopMapper.claimDue(any(), any(), any(), any(), any(), any())).thenAnswer(i -> {
-                OffsetDateTime now = i.getArgument(4);
-                if (stop == null || !run.getDeploymentId().equals(i.getArgument(0))
-                        || !run.getDeploymentGenerationId().equals(i.getArgument(1))
-                        || !("PENDING".equals(stop.getState()) && !stop.getNextAttemptAt().isAfter(now)
-                        || "CLAIMED".equals(stop.getState()) && !stop.getLeaseUntil().isAfter(now))) return null;
-                stop.setState("CLAIMED"); stop.setClaimedBy(i.getArgument(2)); stop.setClaimToken(i.getArgument(3));
-                stop.setLeaseUntil(i.getArgument(5)); stop.setAttemptCount(stop.getAttemptCount() + 1); return stop.getId();
+        /**
+         * 把停机意图映射成异步任务行：任务行编号就是原等待成员编号（41），
+         * 外部操作号、分组、沙箱任务号和停机状态取同一份事实。工人负责推进停机状态，
+         * 收口组件据此判断能否关闭取消会话。
+         */
+        AsyncToolTask asyncStopTask() {
+            if (stop == null) return null;
+            AsyncToolTask task = new AsyncToolTask();
+            task.setJobId(stop.getWaitMemberId());
+            task.setRunId(stop.getRunId());
+            task.setGroupId(stop.getGroupId());
+            task.setMemberIdentity(member.getMemberIdentity());
+            task.setExternalOperationId(stop.getOperationId());
+            task.setTaskId(stop.getTaskId());
+            task.setState("RUNNING");
+            task.setStopState(stop.getState());
+            task.setClaimEpoch(taskClaimEpoch);
+            // 工人只区分「请求快照为空／非空」；非空代表创建请求可能已经发出。
+            task.setRequestJson("{\"create_request\":\"persisted\"}");
+            return task;
+        }
+
+        /** 新表扫描口径：待停止或已领取且下次处理时刻已到、租约已过期。 */
+        boolean stopDue(OffsetDateTime now) {
+            return stop != null && Set.of("PENDING", "CLAIMED").contains(stop.getState())
+                    && stop.getNextAttemptAt() != null && !stop.getNextAttemptAt().isAfter(now)
+                    && (stop.getLeaseUntil() == null || !stop.getLeaseUntil().isAfter(now));
+        }
+
+        void installAsyncTaskStoreConditions() {
+            when(tasks.findByJobId(anyLong())).thenAnswer(i ->
+                    stop != null && stop.getWaitMemberId() == (long) i.getArgument(0)
+                            ? Optional.of(asyncStopTask()) : Optional.empty());
+            when(tasks.scanStopDue(any(), anyLong(), anyInt())).thenAnswer(i -> {
+                OffsetDateTime now = i.getArgument(0);
+                long afterJobId = i.getArgument(1);
+                return stopDue(now) && stop.getWaitMemberId() > afterJobId
+                        ? List.of(asyncStopTask()) : List.of();
             });
-            when(stopMapper.findById(9L)).thenAnswer(i -> stop);
-            when(stopMapper.findByWaitMemberId(41L)).thenAnswer(i -> stop);
-            when(stopMapper.retry(eq(9L), any(), any(), any())).thenAnswer(i -> {
-                if (stop == null || !"CLAIMED".equals(stop.getState())
-                        || !stop.getClaimToken().equals(i.getArgument(1))
-                        || !stop.getLeaseUntil().isAfter(OffsetDateTime.now())) return 0;
-                stop.setState("PENDING"); stop.setClaimToken(null); stop.setLeaseUntil(null);
-                stop.setNextAttemptAt(i.getArgument(2)); stop.setLastError(i.getArgument(3)); return 1;
+            when(tasks.claimStop(anyLong(), anyString(), any(), any())).thenAnswer(i -> {
+                if (stop == null || stop.getWaitMemberId() != (long) i.getArgument(0)
+                        || !stopDue(i.getArgument(2))) return Optional.empty();
+                stop.setState("CLAIMED");
+                stop.setClaimedBy(i.getArgument(1));
+                stop.setLeaseUntil(i.getArgument(3));
+                stop.setAttemptCount(stop.getAttemptCount() == null ? 1 : stop.getAttemptCount() + 1);
+                taskClaimEpoch++;
+                return Optional.of(asyncStopTask());
             });
-            when(stopMapper.confirmSandboxTerminal(eq(9L), any(), any(), any())).thenAnswer(i -> {
-                DataAnalysisObservabilityCall call = null;
-                var persisted = json.readTree(run.getSnapshotJson()).path("data_analysis_observability").path("calls");
-                for (var item : persisted) if (OPERATION.equals(item.path("operationId").asText())) {
-                    call = json.treeToValue(item, DataAnalysisObservabilityCall.class);
-                }
+            when(tasks.finishStop(anyLong(), anyString(), anyLong())).thenAnswer(i -> {
                 if (stop == null || !"CLAIMED".equals(stop.getState())
-                        || !stop.getClaimToken().equals(i.getArgument(1)) || !stop.getLeaseUntil().isAfter(OffsetDateTime.now())
-                        || stop.getTaskId() != null && !stop.getTaskId().equals(i.getArgument(2)) || call == null || !TASK.equals(call.taskId())
-                        || !call.terminalStatus().equals(i.getArgument(3)) || call.terminalAt() == null
-                        || call.reservation().state() != DataAnalysisReservationState.TERMINAL_CONFIRMED) return 0;
-                stop.setState("CONFIRMED"); stop.setTaskId(TASK); stop.setTerminalTaskId(TASK); stop.setTerminalStatus(i.getArgument(3));
-                stop.setClaimToken(null); stop.setLeaseUntil(null); return 1;
+                        || taskClaimEpoch != (long) i.getArgument(2)) return false;
+                // 停机确认不携带终态；终态事实来自刚写入的用量信封，和旧语句从快照核对等价。
+                String terminalTaskId = recordedEnvelope == null ? stop.getTaskId() : recordedEnvelope.taskId();
+                String terminalStatus = recordedEnvelope == null ? "CANCELED" : recordedEnvelope.terminalStatus();
+                stop.setState("CONFIRMED");
+                stop.setTaskId(stop.getTaskId() == null ? terminalTaskId : stop.getTaskId());
+                stop.setTerminalTaskId(terminalTaskId);
+                stop.setTerminalStatus(terminalStatus);
+                stop.setTerminalConfirmedAt(OffsetDateTime.now());
+                stop.setClaimedBy(null); stop.setClaimToken(null); stop.setLeaseUntil(null);
+                stop.setLastError(null);
+                return true;
+            });
+            when(tasks.retryStop(anyLong(), anyString(), anyLong(), any(), anyString())).thenAnswer(i -> {
+                if (stop == null || !"CLAIMED".equals(stop.getState())
+                        || taskClaimEpoch != (long) i.getArgument(2)) return false;
+                stop.setState("PENDING");
+                stop.setNextAttemptAt(i.getArgument(3));
+                stop.setLastError(i.getArgument(4));
+                stop.setClaimedBy(null); stop.setClaimToken(null); stop.setLeaseUntil(null);
+                return true;
+            });
+            when(tasks.abandonStop(anyLong(), anyString(), anyLong(), anyString())).thenAnswer(i -> {
+                if (stop == null || !"CLAIMED".equals(stop.getState())) return false;
+                stop.setState("CONFIRMED");
+                stop.setLastError(i.getArgument(3));
+                stop.setClaimedBy(null); stop.setClaimToken(null); stop.setLeaseUntil(null);
+                return true;
             });
         }
     }

@@ -4,13 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.SimpleTransactionStatus;
+import world.willfrog.agent.platform.asynctask.AsyncToolTask;
+import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
 import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
-import world.willfrog.agent.platform.wait.WaitMemberStopStore;
-import world.willfrog.agent.platform.wait.WaitMemberStopTask;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
@@ -23,12 +21,15 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -38,13 +39,13 @@ class CanceledWaitMemberStopWorkerTest {
     private static final String FINGERPRINT = "sha256:" + "a".repeat(64);
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private WaitMemberStopStore stops;
+    private AsyncToolTaskStore tasks;
     private WaitGroupStore groups;
     private PythonSandboxService sandbox;
     private WaitMemberSettlement settlement;
     private RunOwnershipGateway ownership;
     private CanceledWaitMemberStopWorker worker;
-    private WaitMemberStopTask stop;
+    private AsyncToolTask task;
     private WaitMember member;
 
     @AfterEach
@@ -54,7 +55,7 @@ class CanceledWaitMemberStopWorkerTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        stops = mock(WaitMemberStopStore.class);
+        tasks = mock(AsyncToolTaskStore.class);
         groups = mock(WaitGroupStore.class);
         sandbox = mock(PythonSandboxService.class);
         settlement = mock(WaitMemberSettlement.class);
@@ -65,23 +66,22 @@ class CanceledWaitMemberStopWorkerTest {
         run.setId("run-1");
         run.setLaneTag("lane-test");
         when(ownership.findOwnedRun("run-1")).thenReturn(run);
-        PlatformTransactionManager transaction = mock(PlatformTransactionManager.class);
-        when(transaction.getTransaction(any())).thenAnswer(ignored -> new SimpleTransactionStatus());
-        worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox,
-                settlement, objectMapper, transaction, ownership,
+        worker = new CanceledWaitMemberStopWorker(tasks, groups, sandbox,
+                settlement, objectMapper, ownership,
                 mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
-        stop = new WaitMemberStopTask();
-        stop.setId(9L);
-        stop.setWaitMemberId(41L);
-        stop.setRunId("run-1");
-        stop.setGroupId(7L);
-        stop.setOperationId("run-1:call-1:1");
-        stop.setTaskId("task-1");
-        stop.setRequestFingerprint(FINGERPRINT);
-        stop.setCancelRequestId("wait-member-41");
-        stop.setClaimToken("claim-1");
-        when(stops.claimDue(any(), any(), any(), any(), any(), any()))
-                .thenReturn(Optional.of(stop), Optional.empty());
+        task = new AsyncToolTask();
+        task.setJobId(41L);
+        task.setRunId("run-1");
+        task.setGroupId(7L);
+        task.setMemberIdentity("call-1");
+        task.setExternalOperationId("run-1:call-1:1");
+        task.setTaskId("task-1");
+        task.setState("CANCELED");
+        task.setClaimEpoch(1L);
+        task.setRequestJson(proofJson("task-1"));
+        when(tasks.scanStopDue(any(), anyLong(), anyInt())).thenReturn(List.of(task));
+        when(tasks.claimStop(eq(41L), any(), any(), any()))
+                .thenReturn(Optional.of(task), Optional.empty());
 
         member = new WaitMember();
         member.setId(41L);
@@ -112,8 +112,7 @@ class CanceledWaitMemberStopWorkerTest {
         worker.runBatch();
 
         assertThat(LaneContext.trafficScopeId()).isEqualTo("previous-thread-lane");
-        verify(stops, org.mockito.Mockito.times(2)).claimDue(
-                eq("stable"), eq("gen-" + "a".repeat(64)), any(), any(), any(), any());
+        verify(tasks, atLeastOnce()).claimStop(eq(41L), any(), any(), any());
     }
 
     @Test
@@ -141,7 +140,7 @@ class CanceledWaitMemberStopWorkerTest {
         worker.runBatch();
 
         org.mockito.Mockito.verifyNoInteractions(sandbox);
-        verify(stops).retry(eq(9L), eq("claim-1"), any(), eq("run_ownership_unavailable"));
+        verify(tasks).retryStop(eq(41L), any(), eq(1L), any(), eq("run_ownership_unavailable"));
     }
 
     @Test
@@ -155,19 +154,18 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("CANCELED").setError("canceled").build());
         when(settlement.settle(any(), any(), eq("CANCELED"), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
-        when(stops.confirmSandboxTerminal(9L, "claim-1", "task-1", "CANCELED"))
-                .thenReturn(true);
+        when(tasks.finishStop(eq(41L), any(), eq(1L))).thenReturn(true);
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        var order = org.mockito.Mockito.inOrder(settlement, stops);
+        var order = org.mockito.Mockito.inOrder(settlement, tasks);
         order.verify(settlement).settle(any(), any(), eq("CANCELED"), any(), any(), any());
-        order.verify(stops).confirmSandboxTerminal(9L, "claim-1", "task-1", "CANCELED");
+        order.verify(tasks).finishStop(eq(41L), any(), eq(1L));
         verify(sandbox).cancelTask(org.mockito.ArgumentMatchers.argThat(request ->
-                request.getCancelRequestId().equals("wait-member-41")
+                request.getCancelRequestId().equals("async-task-41")
                         && request.hasByOperation()
                         && request.getByOperation().getOperationId().equals("run-1:call-1:1")
                         && request.getByOperation().getRequestFingerprint().equals(FINGERPRINT)));
-        verify(stops, never()).retry(anyLong(), any(), any(), any());
+        verify(tasks, never()).retryStop(anyLong(), any(), anyLong(), any(), any());
     }
 
     @Test
@@ -182,17 +180,16 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("CANCELED").setError("canceled").build());
         when(settlement.settle(any(), any(), eq("CANCELED"), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
-        when(stops.confirmSandboxTerminal(9L, "claim-1", "task-1", "CANCELED"))
-                .thenReturn(true);
+        when(tasks.finishStop(eq(41L), any(), eq(1L))).thenReturn(true);
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).confirmSandboxTerminal(9L, "claim-1", "task-1", "CANCELED");
-        verify(stops, never()).blockProof(anyLong(), any(), any());
+        verify(tasks).finishStop(eq(41L), any(), eq(1L));
+        verify(tasks, never()).abandonStop(anyLong(), any(), anyLong(), any());
     }
 
     @Test
     void authoritativeLookupAbsenceStillSendsOperationCancellationTombstone() {
-        stop.setTaskId(null);
+        task.setTaskId(null);
         member.setDispatchProofJson(proofJson(null));
         when(sandbox.getTaskByOperationId(any())).thenReturn(
                 GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
@@ -205,8 +202,7 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("CANCELED").setError("canceled before create").build());
         when(settlement.settle(any(), any(), eq("CANCELED"), any(), any(), any()))
                 .thenReturn(new WaitMemberSettlement.Outcome(true, null));
-        when(stops.confirmSandboxTerminal(9L, "claim-1", "task-1", "CANCELED"))
-                .thenReturn(true);
+        when(tasks.finishStop(eq(41L), any(), eq(1L))).thenReturn(true);
 
         assertThat(worker.runBatch()).isEqualTo(1);
         verify(sandbox).cancelTask(any());
@@ -218,7 +214,7 @@ class CanceledWaitMemberStopWorkerTest {
         when(sandbox.getTaskByOperationId(any())).thenReturn(lookup("task-1", "sha256:" + "b".repeat(64)));
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).blockProof(9L, "claim-1", "sandbox_operation_identity_mismatch");
+        verify(tasks).abandonStop(eq(41L), any(), eq(1L), eq("sandbox_operation_identity_mismatch"));
         verify(sandbox, never()).cancelTask(any());
         verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
     }
@@ -231,9 +227,9 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("task-1").setStatus("RUNNING").build());
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).retry(eq(9L), eq("claim-1"), any(), eq("sandbox_not_terminal"));
+        verify(tasks).retryStop(eq(41L), any(), eq(1L), any(), eq("sandbox_not_terminal"));
         verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
     }
 
     @Test
@@ -244,7 +240,7 @@ class CanceledWaitMemberStopWorkerTest {
                 .setTaskId("other-task").setStatus("CANCELED").build());
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).blockProof(9L, "claim-1", "sandbox_status_identity_mismatch");
+        verify(tasks).abandonStop(eq(41L), any(), eq(1L), eq("sandbox_status_identity_mismatch"));
         verify(settlement, never()).settle(any(), any(), any(), any(), any(), any());
     }
 
@@ -253,7 +249,7 @@ class CanceledWaitMemberStopWorkerTest {
         member.setToolName("spawnSubAgent");
 
         assertThat(worker.runBatch()).isEqualTo(1);
-        verify(stops).blockProof(9L, "claim-1", "wait_member_identity_mismatch");
+        verify(tasks).abandonStop(eq(41L), any(), eq(1L), eq("wait_member_identity_mismatch"));
         verify(sandbox, never()).cancelTask(any());
     }
 

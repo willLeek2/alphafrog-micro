@@ -8,8 +8,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.SimpleTransactionStatus;
+import world.willfrog.agent.platform.asynctask.AsyncToolTask;
+import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -38,23 +38,25 @@ class CanceledSqlWaitMemberStopWorkerTest {
     private static final String RUN = "run-sql-stop";
     private static final String TASK = "sql-task";
     private static final String FINISHED = "2026-10-09T10:00:00Z";
+    /** 新任务表主键替代旧等待成员身份：工人要求任务行编号与成员编号一致（41）。 */
+    private static final long JOB_ID = 41L;
     private final ObjectMapper json = new ObjectMapper().findAndRegisterModules();
     private final DataAnalysisOperationIdentity operation = new DataAnalysisOperationIdentity(RUN, "query-node-s1", 1);
     private final DataAnalysisEstimate estimate = new DataAnalysisEstimate(1, 1024, 1, 1.0, 0,
             List.of(), DataAnalysisResourceClass.STANDARD, 1);
-    private WaitMemberStopStore stops;
+    private AsyncToolTaskStore tasks;
     private WaitGroupStore groups;
     private PythonSandboxService sandbox;
     private DataAnalysisCapacityServiceImpl capacity;
     private DataAnalysisTerminalRecorder recorder;
     private PythonSandboxDispatchStore sessions;
     private CanceledWaitMemberStopWorker worker;
-    private WaitMemberStopTask stop;
+    private AsyncToolTask task;
     private WaitMember member;
     private String fingerprint;
 
     @BeforeEach void setUp() {
-        stops = mock(WaitMemberStopStore.class);
+        tasks = mock(AsyncToolTaskStore.class);
         sandbox = mock(PythonSandboxService.class);
         recorder = mock(DataAnalysisTerminalRecorder.class);
         sessions = mock(PythonSandboxDispatchStore.class);
@@ -68,18 +70,18 @@ class CanceledSqlWaitMemberStopWorkerTest {
         when(ownership.requireIdentity()).thenReturn(new DeploymentIdentity("beta", "gen-" + "a".repeat(64)));
         AgentRun run = new AgentRun(); run.setId(RUN); run.setStatus(AgentRunStatus.CANCELED); run.setLaneTag("sql-stop-lane");
         when(ownership.findOwnedRun(RUN)).thenReturn(run);
-        PlatformTransactionManager transactions = mock(PlatformTransactionManager.class);
-        when(transactions.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
-        worker = new CanceledWaitMemberStopWorker(stops, groups, sandbox, settlement, json, transactions,
+        worker = new CanceledWaitMemberStopWorker(tasks, groups, sandbox, settlement, json,
                 ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5);
-        member = new WaitMember(); member.setId(41L); member.setGroupId(7L); member.setRunId(RUN);
+        member = new WaitMember(); member.setId(JOB_ID); member.setGroupId(7L); member.setRunId(RUN);
         member.setMemberIdentity("query-member"); member.setToolCallId("raw-model-call");
         member.setToolName("executeQuery"); member.setExternalOperationId(operation.operationId()); member.setState("CANCELED");
-        stop = new WaitMemberStopTask(); stop.setId(9L); stop.setWaitMemberId(41L); stop.setGroupId(7L);
-        stop.setRunId(RUN); stop.setOperationId(operation.operationId()); stop.setCancelRequestId("wait-member-41");
-        stop.setClaimToken("original-claim");
+        task = new AsyncToolTask(); task.setJobId(JOB_ID); task.setGroupId(7L);
+        task.setRunId(RUN); task.setMemberIdentity("query-member");
+        task.setExternalOperationId(operation.operationId()); task.setClaimEpoch(1L);
+        // 请求快照非空表示创建请求可能已经发出；具体内容工人不解析，只用来区分「还没落库」。
+        task.setRequestJson("{\"create_request\":\"pending\"}");
         when(groups.findMemberByOperation(RUN, operation.operationId())).thenReturn(Optional.of(member));
-        when(stops.confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED")).thenReturn(true);
+        when(tasks.finishStop(anyLong(), anyString(), anyLong())).thenReturn(true);
         when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED, DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME);
         claimAgain();
     }
@@ -100,7 +102,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         member.setDispatchProofJson(new WaitMemberDispatchProof(WaitMemberDispatchProof.CURRENT_SCHEMA_VERSION,
                 operation.operationId(), taskId, fingerprint, json.writeValueAsString(spec), json.writeValueAsString(estimate),
                 json.writeValueAsString(reservation), "2026-10-09T09:00:00Z", JsonFormat.printer().print(request)).toJson(json));
-        stop.setTaskId(taskId); stop.setRequestFingerprint(fingerprint);
+        task.setTaskId(taskId); task.setRequestJson(JsonFormat.printer().print(request));
         when(sandbox.getTaskByOperationId(any())).thenReturn(taskId == null
                 ? GetTaskByOperationIdResponse.getDefaultInstance()
                 : GetTaskByOperationIdResponse.newBuilder().setFound(true).setTaskId(TASK)
@@ -119,7 +121,9 @@ class CanceledSqlWaitMemberStopWorkerTest {
     }
 
     private void claimAgain() {
-        when(stops.claimDue(any(), any(), any(), any(), any(), any())).thenReturn(Optional.of(stop), Optional.empty());
+        when(tasks.scanStopDue(any(), anyLong(), anyInt())).thenReturn(List.of(task), List.of());
+        when(tasks.claimStop(anyLong(), anyString(), any(), any()))
+                .thenReturn(Optional.of(task), Optional.empty());
     }
 
     private void assertCapacityHeld() {
@@ -144,16 +148,16 @@ class CanceledSqlWaitMemberStopWorkerTest {
         verify(sandbox).cancelTask(argThat(request -> request.hasByOperation()
                 && request.getByOperation().getOperationId().equals(operation.operationId())
                 && request.getByOperation().getRequestFingerprint().equals(fingerprint)
-                && request.getCancelRequestId().equals("wait-member-41")));
+                && request.getCancelRequestId().equals("async-task-" + JOB_ID)));
         verify(sandbox, never()).createTask(any());
         verify(recorder).upsert(argThat(envelope -> envelope.operationId().equals(operation.operationId())
                 && envelope.taskId().equals(TASK) && envelope.terminalStatus().equals("CANCELED")
                 && !envelope.success() && envelope.reservation().state() == DataAnalysisReservationState.TERMINAL_CONFIRMED));
-        var order = inOrder(capacity, recorder, stops);
+        var order = inOrder(capacity, recorder, tasks);
         order.verify(capacity).releaseReservation(argThat(request -> request.proof() instanceof DataAnalysisReleaseProof.Terminal
                 && request.reason() == DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED));
         order.verify(recorder).upsert(any());
-        order.verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED");
+        order.verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
         assertThat(member.getState()).isEqualTo("CANCELED");
         assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
         DataAnalysisReservation next = occupyReleasedSlot();
@@ -162,8 +166,8 @@ class CanceledSqlWaitMemberStopWorkerTest {
         assertThat((Integer) ReflectionTestUtils.invokeMethod(capacity, "usedUnitsSnapshot")).isEqualTo(1);
         verify(capacity, times(2)).releaseReservation(argThat(request -> request.reservation().identity().equals(operation)));
         verify(capacity, never()).releaseReservation(argThat(request -> request.reservation().identity().equals(next.identity())));
-        verify(stops, never()).blockProof(anyLong(), any(), any());
-        verify(stops, never()).retry(anyLong(), any(), any(), any());
+        verify(tasks, never()).abandonStop(anyLong(), any(), anyLong(), any());
+        verify(tasks, never()).retryStop(anyLong(), any(), anyLong(), any(), any());
     }
 
     @Test void runningSqlKeepsReservationUntilLaterConfirmedCancellation() throws Exception {
@@ -175,12 +179,12 @@ class CanceledSqlWaitMemberStopWorkerTest {
         assertCapacityHeld();
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("sandbox_not_terminal"));
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
+        verify(tasks).retryStop(eq(JOB_ID), anyString(), eq(1L), any(), eq("sandbox_not_terminal"));
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
         when(sandbox.getTaskStatus(any())).thenReturn(TaskStatusResponse.newBuilder()
                 .setTaskId(TASK).setStatus("CANCELED").setFinishedAt(FINISHED).build());
         claimAgain(); worker.runBatch(); occupyReleasedSlot();
-        verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED");
+        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
     }
 
     @Test void unavailableSqlLookupRetriesWithoutCancelingOrReleasing() throws Exception {
@@ -190,7 +194,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         verify(sandbox, never()).cancelTask(any());
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("operation_lookup_unavailable"));
+        verify(tasks).retryStop(eq(JOB_ID), anyString(), eq(1L), any(), eq("operation_lookup_unavailable"));
     }
 
     @Test void incompleteCanceledSqlResultRetriesWithoutReleasingCapacity() throws Exception {
@@ -199,7 +203,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         worker.runBatch(); assertCapacityHeld();
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("sandbox_terminal_result_unavailable"));
+        verify(tasks).retryStop(eq(JOB_ID), anyString(), eq(1L), any(), eq("sandbox_terminal_result_unavailable"));
         when(sandbox.getTaskResult(any())).thenReturn(result());
         claimAgain(); worker.runBatch(); occupyReleasedSlot();
     }
@@ -208,13 +212,13 @@ class CanceledSqlWaitMemberStopWorkerTest {
         install(DataAnalysisReservationState.PREPARING);
         when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.CONFLICT, DataAnalysisUpsertOutcome.INSERTED);
         worker.runBatch();
-        verify(stops).retry(eq(9L), eq("original-claim"), any(), eq("sandbox_settlement_incomplete"));
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
+        verify(tasks).retryStop(eq(JOB_ID), anyString(), eq(1L), any(), eq("sandbox_settlement_incomplete"));
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
         DataAnalysisReservation next = occupyReleasedSlot();
         claimAgain(); worker.runBatch();
         assertThat((Integer) ReflectionTestUtils.invokeMethod(capacity, "usedUnitsSnapshot")).isEqualTo(1);
         verify(capacity, never()).releaseReservation(argThat(request -> request.reservation().identity().equals(next.identity())));
-        verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "CANCELED");
+        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
         verify(sessions).clearActive(RUN, operation.operationId());
     }
 
@@ -237,10 +241,10 @@ class CanceledSqlWaitMemberStopWorkerTest {
         assertThat(business.errorCode()).isEqualTo("PLAN_REJECTED");
         assertThat(json.readTree(business.output()).path("ok").asBoolean()).isFalse();
         when(sandbox.getTaskResult(any())).thenReturn(sqlResult);
-        when(stops.confirmSandboxTerminal(9L, "original-claim", TASK, "SUCCEEDED")).thenReturn(true);
+        when(tasks.finishStop(eq(JOB_ID), anyString(), eq(1L))).thenReturn(true);
         assertThat(worker.runBatch()).isEqualTo(1);
         occupyReleasedSlot();
-        verify(stops).confirmSandboxTerminal(9L, "original-claim", TASK, "SUCCEEDED");
+        verify(tasks).finishStop(eq(JOB_ID), anyString(), eq(1L));
         // 资源信封记录进程成功退出，业务失败正文与取消成员的事实均保留。
         verify(recorder).upsert(argThat(envelope -> envelope.terminalStatus().equals("SUCCEEDED")
                 && envelope.success() && envelope.resultPreview().contains("PLAN_REJECTED")));
@@ -248,7 +252,7 @@ class CanceledSqlWaitMemberStopWorkerTest {
         assertThat(member.getDispatchProofJson()).isEqualTo(originalProof);
         verify(groups).findMemberByOperation(RUN, operation.operationId());
         verifyNoMoreInteractions(groups);
-        verify(stops, never()).retry(anyLong(), any(), any(), any());
+        verify(tasks, never()).retryStop(anyLong(), any(), anyLong(), any(), any());
     }
 
     private void changeProof(String field, String value) throws Exception {
@@ -270,9 +274,12 @@ class CanceledSqlWaitMemberStopWorkerTest {
             case PROOF_TASK -> changeProof("taskId", "another-task");
         }
         worker.runBatch(); assertCapacityHeld();
-        verifyNoInteractions(sandbox, recorder);
+        // 指纹矛盾现在没有本地停机记录可比，要靠一次沙箱只读查询发现；无论哪种身份矛盾，
+        // 都不许发取消、不许落用量、不许动容量。
+        verify(sandbox, never()).cancelTask(any());
+        verify(recorder, never()).upsert(any());
         verify(capacity, never()).releaseReservation(any());
-        verify(stops).blockProof(eq(9L), eq("original-claim"), any());
-        verify(stops, never()).confirmSandboxTerminal(anyLong(), any(), any(), any());
+        verify(tasks).abandonStop(eq(JOB_ID), anyString(), eq(1L), any());
+        verify(tasks, never()).finishStop(anyLong(), any(), anyLong());
     }
 }

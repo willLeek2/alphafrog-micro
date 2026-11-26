@@ -176,6 +176,15 @@ public class MybatisAsyncToolTaskStore implements AsyncToolTaskStore {
     }
 
     @Override
+    public boolean abandonStop(long jobId, String owner, long claimEpoch, String reason) {
+        positive(jobId);
+        required(owner, "持有实例");
+        required(reason, "停机收尾原因");
+        String bounded = reason.length() > 512 ? reason.substring(0, 512) : reason;
+        return mapper.abandonStop(jobId, owner, claimEpoch, bounded) == 1;
+    }
+
+    @Override
     public boolean retryStop(long jobId, String owner, long claimEpoch,
                              OffsetDateTime nextPollAt, String lastError) {
         positive(jobId);
