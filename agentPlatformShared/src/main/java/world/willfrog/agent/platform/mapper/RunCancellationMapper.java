@@ -22,9 +22,6 @@ public interface RunCancellationMapper {
                          @Param("expectedStatus") String expectedStatus,
                          @Param("snapshotJson") String snapshotJson);
 
-    /** 新表里是否还有未完结的异步任务。 */
-    boolean hasUnfinishedTask(@Param("runId") String runId);
-
     /** 无活跃异步任务时把运行写成取消终态，并保持旧锚点为空。 */
     int cancelTerminalNoActiveTask(@Param("runId") String runId,
                                    @Param("userId") String userId,

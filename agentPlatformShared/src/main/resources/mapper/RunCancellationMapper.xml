@@ -41,14 +41,6 @@
           AND status = #{expectedStatus}
     </update>
 
-    <select id="hasUnfinishedTask" resultType="boolean">
-        SELECT EXISTS (
-            SELECT 1
-            FROM alphafrog_agent_async_tool_task t
-            WHERE t.run_id = #{runId}
-              AND t.state IN ('PENDING', 'RUNNING')
-        )
-    </select>
 
     <update id="cancelTerminalNoActiveTask">
         UPDATE alphafrog_agent_run
@@ -64,18 +56,12 @@
                 WHEN scheduler_version IN ('DUAL_POOL_V1', 'DUAL_POOL_V2') THEN run_control_version + 1
                 ELSE run_control_version
             END,
-            ttl_expires_at = #{ttlExpiresAt},
+            ttl_expires_at = COALESCE(#{ttlExpiresAt}, ttl_expires_at),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{runId}
           AND user_id = #{userId}
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
           AND (tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb)
-          AND NOT EXISTS (
-              SELECT 1
-              FROM alphafrog_agent_async_tool_task t
-              WHERE t.run_id = #{runId}
-                AND t.state IN ('PENDING', 'RUNNING')
-          )
     </update>
 
     <update id="persistCancelDisposition">

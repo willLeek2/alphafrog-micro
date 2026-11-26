@@ -51,16 +51,13 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
             // 已终态不重试；控制层读到终态后直接返回当前运行。
             return CancelRunOutcome.NOT_APPLIED;
         }
-        boolean hasUnfinishedTask = mapper.hasUnfinishedTask(runId);
         String anchorOperationId = run.getAnchorOperationId();
         boolean hasActiveAnchor = anchorOperationId != null && !anchorOperationId.isBlank();
-        if (hasActiveAnchor || hasUnfinishedTask) {
-            if (hasActiveAnchor) {
-                // 与现码相同：先做窄合并写，关闭自动恢复并记账取消；V2 同一语句递增控制版本。
-                if (mapper.persistCancelDisposition(runId, run.getStatus(), anchorOperationId) != 1) {
-                    throw new IllegalStateException(
-                            "cancel_anchor_cas_failed: unable to persist cancel disposition");
-                }
+        if (hasActiveAnchor) {
+            // 与现码相同：先做窄合并写，关闭自动恢复并记账取消；V2 同一语句递增控制版本。
+            if (mapper.persistCancelDisposition(runId, run.getStatus(), anchorOperationId) != 1) {
+                throw new IllegalStateException(
+                        "cancel_anchor_cas_failed: unable to persist cancel disposition");
             }
             if (mapper.snapshotIfStatus(runId, userId, run.getStatus(), snapshotJson) != 1) {
                 return CancelRunOutcome.STATE_CHANGED;
@@ -68,6 +65,8 @@ public class MybatisRunCancellationStore implements RunCancellationStore {
             cancelChildren(runId);
             return CancelRunOutcome.CANCEL_INTENT_RECORDED;
         }
+        // 无旧锚点：本事务自己写运行终态。新表的未完结任务在同一事务里已改成取消，
+        // 沙箱容器由控制层提交后唤醒停机工人停止，不需要把运行留在非终态。
         if (mapper.cancelTerminalNoActiveTask(runId, userId, snapshotJson,
                 interruptedExpiresAt) != 1) {
             return CancelRunOutcome.NOT_APPLIED;
