@@ -765,6 +765,31 @@
               AND EXISTS (SELECT 1 FROM run_fence)
             RETURNING m.id, m.group_id, m.member_seq, m.state
         ),
+        task_done AS (
+            -- 第一步迁移期：旧成员行写终态时，新表同一语句同步写一份。
+            UPDATE alphafrog_agent_async_tool_task t SET
+                state = #{memberState}::varchar,
+                result_ref_json = CAST(#{resultRefJson} AS jsonb),
+                external_operation_id = COALESCE(t.external_operation_id,
+                                                 #{externalOperationId}::varchar),
+                finished_at = CURRENT_TIMESTAMP,
+                next_poll_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE t.group_id = #{groupId}
+              AND t.member_identity = #{memberIdentity}
+              AND ((t.external_operation_id IS NULL AND #{externalOperationId}::varchar IS NULL)
+                   OR t.external_operation_id = #{externalOperationId}::varchar)
+              AND t.state IN ('PENDING', 'RUNNING')
+              AND (NOT (jsonb_exists(COALESCE(t.request_json, '{}'::jsonb),
+                                     'terminalModelSendBlock'))
+                   OR (#{memberState}::varchar = 'FAILED'
+                       AND CAST(#{resultRefJson} AS jsonb)
+                           @&gt; (t.request_json -&gt; 'terminalModelSendBlock')))
+              AND NOT (t.state = 'PENDING' AND t.tool_name IN ('executePython', 'executeQuery')
+                       AND t.request_json &lt;&gt; '{}'::jsonb)
+              AND EXISTS (SELECT 1 FROM run_fence)
+            RETURNING 1
+        ),
         -- 完成数和齐备状态必须在同一次 UPDATE 里写完。同一语句里对这一行再 UPDATE
         -- 一次时，后一次按原行快照写 READY，完成数仍是 0，齐备约束会拒收整句，成员也回滚。
         group_bumped AS (
