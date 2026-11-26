@@ -1135,37 +1135,13 @@ public class DualPoolWaitGroupNodeExecutor {
     }
 
     /**
-     * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
+     * 按工具原文写入成员终态。
+     *
+     * <p>写不进去就向外抛出，由工作项的租约与领取轮次决定下一次重试；不再用短失败载荷
+     * 改写一次已经成功的结果，避免把成功改写成失败。</p>
      */
     private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member) {
-        try {
-            return waitGroupStore.completeMember(request);
-        } catch (RuntimeException e) {
-            log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
-                    member.getGroupId(), member.getMemberIdentity(), e);
-            ModelSendBlocked blocked = blockedMemberResult(request.resultRefJson());
-            // 缩短载荷时保留发送阻止标记，供恢复时继续识别。
-            String compact = blocked == null
-                    ? WaitMemberResultPayload.compactPersistFailurePrompt(
-                            objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage(), null)
-                    : WaitMemberResultPayload.encode(objectMapper, member.getToolName(), member.getToolCallId(),
-                            false, "", modelSendBlockPayload(blocked), Integer.MAX_VALUE);
-            MemberCompletionRequest fallback = new MemberCompletionRequest(
-                    request.groupId(),
-                    request.memberIdentity(),
-                    WaitMemberState.FAILED,
-                    compact,
-                    request.externalOperationId(),
-                    request.planGeneration(),
-                    request.contextVersion(),
-                    request.runControlVersion());
-            try {
-                return waitGroupStore.completeMember(fallback);
-            } catch (RuntimeException retry) {
-                e.addSuppressed(retry);
-                throw e;
-            }
-        }
+        return waitGroupStore.completeMember(request);
     }
 
     /**

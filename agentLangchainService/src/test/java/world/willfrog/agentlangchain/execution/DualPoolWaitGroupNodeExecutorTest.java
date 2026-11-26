@@ -344,23 +344,22 @@ class DualPoolWaitGroupNodeExecutorTest {
     }
 
     @Test
-    void aJsonbRejectOnTheFirstWriteStillFinishesTheMemberWithACompactFailure() {
+    void aJsonbRejectOnTheFirstWritePropagatesInsteadOfRewritingTheResult() {
         dispatcher.outputs.put("searchIndex", "CANNOT_STORE_THIS_OUTPUT");
         store.rejectCompleteMemberJsonContaining = "CANNOT_STORE_THIS_OUTPUT";
         model.enqueue(AiMessage.from(List.of(toolCall("call-a", "searchIndex", "{\"keyword\":\"沪深300\"}"))));
 
-        DualPoolWaitGroupNodeExecutor.Outcome outcome = executor.executeSegment(firstSegment(List.of()));
+        assertThatThrownBy(() -> executor.executeSegment(firstSegment(List.of())))
+                .hasMessageContaining("simulated jsonb reject");
 
-        long groupId = ((DualPoolWaitGroupNodeExecutor.Outcome.Suspended) outcome).groupId();
-        assertThat(store.memberRows(groupId)).as("第一次写入失败后仍落了终态")
-                .extracting(row -> row.state)
-                .containsExactly(WaitMemberState.FAILED.name());
-        assertThat(store.memberRows(groupId).get(0).resultRefJson)
-                .contains(WaitMemberResultPayload.PERSIST_FAILED)
-                .doesNotContain("CANNOT_STORE_THIS_OUTPUT");
-        assertThat(store.events()).as("短失败载荷写进去之后组照样齐备")
-                .anyMatch(event -> event.startsWith("group_ready:"));
-        assertThat(publisher.published).as("组齐备之后立刻放行下一段").hasSize(1);
+        // 写不进去就整笔抛回，由工作项的租约与领取轮次决定重试；不再用短失败载荷
+        // 把一条成功的结果改写成失败，也不会把组推成齐备。
+        assertThat(store.events()).noneMatch(event -> event.startsWith("group_ready:"));
+        assertThat(store.groupRows()).flatExtracting(group -> store.memberRows(group.id))
+                .noneMatch(row -> WaitMemberState.FAILED.name().equals(row.state)
+                        && row.resultRefJson != null
+                        && row.resultRefJson.contains(WaitMemberResultPayload.PERSIST_FAILED));
+        assertThat(publisher.published).isEmpty();
     }
 
     @Test

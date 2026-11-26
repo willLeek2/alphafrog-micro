@@ -925,7 +925,10 @@ public class WaitMemberResultReceiver {
     }
 
     /**
-     * 先按工具原文写入；写成 jsonb 失败时改用短失败载荷再写一次，让等待组仍能齐备。
+     * 按工具原文写入成员终态。
+     *
+     * <p>写不进去就向外抛出，由工作项的租约与领取轮次决定下一次重试；不再用短失败载荷改写
+     * 一次已经成功的结果——那会把成功改写成失败，是这一步要消除的旧兜底。</p>
      */
     private MemberCompletionResult persistMemberCompletion(MemberCompletionRequest request, WaitMember member,
                                                            String taskId) {
@@ -933,25 +936,7 @@ public class WaitMemberResultReceiver {
             return waitGroupStore.completeMember(request);
         } catch (RuntimeException e) {
             ModelSendBlocks.rethrowIfBlocked(e);
-            log.error("成员结果没能写入等待组，改用短失败载荷再写一次：group={} member={}",
-                    member.getGroupId(), member.getMemberIdentity(), e);
-            String compact = WaitMemberResultPayload.compactPersistFailurePrompt(
-                    objectMapper, member.getToolName(), member.getToolCallId(), e.getMessage(), taskId);
-            MemberCompletionRequest fallback = new MemberCompletionRequest(
-                    request.groupId(),
-                    request.memberIdentity(),
-                    WaitMemberState.FAILED,
-                    compact,
-                    request.externalOperationId(),
-                    request.planGeneration(),
-                    request.contextVersion(),
-                    request.runControlVersion());
-            try {
-                return waitGroupStore.completeMember(fallback);
-            } catch (RuntimeException retry) {
-                e.addSuppressed(retry);
-                throw e;
-            }
+            throw e;
         }
     }
 

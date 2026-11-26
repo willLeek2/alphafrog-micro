@@ -794,25 +794,19 @@ class WaitMemberResultReceiverTest {
         verify(waitGroupStore, never()).completeMember(any());
     }
 
-    /** 结果正文无法保存时，短失败载荷仍须留下已结算的 Sandbox 任务号。 */
+    /** 结果正文写不进去时只记一次失败并推后下轮，不再用短失败载荷把成功改写成失败。 */
     @Test
-    void compactPersistenceFallbackKeepsSandboxTaskIdentity() {
+    void persistenceFailureIsDeferredInsteadOfRewritten() {
         givenDueMember();
         status("SUCCEEDED");
         result("SUCCEEDED", 0, "done");
         when(waitGroupStore.completeMember(any()))
-                .thenThrow(new IllegalStateException("unserializable result"))
-                .thenReturn(new MemberCompletionResult(true, WaitMemberState.FAILED,
-                        WaitGroupState.READY, 1, 1, null));
+                .thenThrow(new IllegalStateException("unserializable result"));
 
         receiver.round();
 
-        ArgumentCaptor<MemberCompletionRequest> requests =
-                ArgumentCaptor.forClass(MemberCompletionRequest.class);
-        verify(waitGroupStore, times(2)).completeMember(requests.capture());
-        assertThat(requests.getAllValues().get(1).resultRefJson())
-                .contains("\"taskId\":\"task-1\"")
-                .contains(WaitMemberResultPayload.PERSIST_FAILED);
+        verify(waitGroupStore, times(1)).completeMember(any());
+        assertThat(receiver.snapshot()).containsEntry("waitMemberReceiverFailuresTotal", 1L);
     }
 
     /** 远端失败不能被空任务号伪装成“权威未创建”，否则会提前归还容量。 */
