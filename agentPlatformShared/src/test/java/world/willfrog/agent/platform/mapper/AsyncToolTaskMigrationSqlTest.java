@@ -47,6 +47,12 @@ class AsyncToolTaskMigrationSqlTest {
                 .contains("CASE WHEN s.state = 'CLAIMED' THEN s.claimed_by END");
         assertThat(UPGRADE).as("停机扫描要有自己的部分索引，取消后的行不在到期索引覆盖范围内")
                 .contains("idx_agent_async_tool_task_stop_due");
+        // 带 FROM 的 UPDATE 里，没写表名的列会在目标表与运行表之间一起寻找：
+        // 两张表都有 updated_at，不写别名会报列引用歧义，整份脚本回滚。
+        assertThat(UPGRADE).as("补充超时时刻的 UPDATE 要给目标表起别名并写全列名")
+                .contains("UPDATE alphafrog_agent_async_tool_task t")
+                .contains("GREATEST(t.updated_at, CURRENT_TIMESTAMP)")
+                .doesNotContain("GREATEST(updated_at, CURRENT_TIMESTAMP)");
         assertThat(UPGRADE).as("任务行与所属组必须同 Run，旧等待成员表的这条外键要原样保留")
                 .contains("CONSTRAINT agent_async_tool_task_group_fk")
                 .contains("FOREIGN KEY (group_id, run_id) REFERENCES alphafrog_agent_run_wait_group(id, run_id)");
