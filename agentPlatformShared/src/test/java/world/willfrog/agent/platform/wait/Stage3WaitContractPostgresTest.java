@@ -389,14 +389,17 @@ class Stage3WaitContractPostgresTest {
                     .extracting("childRunId").contains(delivery.childRunId());
             assertThat(store.listAcceptedSpawnMembersPending(0, 1000))
                     .extracting("childRunId").contains(delivery.childRunId());
+            // 子运行还没到终态时，物理停机不能记账：产品只在子运行终态后才允许写这个事实。
+            transaction.executeWithoutResult(ignored ->
+                    assertThat(store.markPhysicalStopped(delivery.childRunId())).isFalse());
+            // 产品由子运行生命周期巡检先把子运行写成终态，再记账子运行终态与物理停机；
+            // 夹具按同一顺序走，两个事实都记录之后才归还容量。
+            execute("UPDATE alphafrog_agent_run SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP "
+                    + "WHERE id = '" + delivery.childRunId() + "'");
             transaction.executeWithoutResult(ignored ->
                     assertThat(store.markChildTerminal(delivery.childRunId())).isTrue());
             assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
                     + "WHERE root_run_id = '" + runId + "'")).isEqualTo(1);
-            transaction.executeWithoutResult(ignored ->
-                    assertThat(store.markPhysicalStopped(delivery.childRunId())).isFalse());
-            execute("UPDATE alphafrog_agent_run SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP "
-                    + "WHERE id = '" + delivery.childRunId() + "'");
             transaction.executeWithoutResult(ignored ->
                     assertThat(store.markPhysicalStopped(delivery.childRunId())).isTrue());
             assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
@@ -822,9 +825,10 @@ class Stage3WaitContractPostgresTest {
                 .as("没被点名的成员下次查询时间不变")
                 .isEqualTo(siblingPollBefore);
 
-        // 已经落终态的成员压不住：这时它已经在别人手里收尾了。
+        // 已经落终态的成员压不住：这时它已经在别人手里收尾了。成员派发时写下的外部作业身份
+        // 是「op-call-a」，完成上报要带上同一个值，产品的完成语句按它逐字核对。
         assertThat(completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
-                fixture.runControlVersion()).applied()).isTrue();
+                fixture.runControlVersion(), "op-call-a").applied()).isTrue();
         assertThat(holdMember(fixture.groupId(), "call-a", heldUntil.plusSeconds(60)))
                 .as("落终态之后压住写不进去").isFalse();
         assertThat(memberByIdentity(fixture.groupId(), "call-a").getNextPollAt()
@@ -3064,10 +3068,20 @@ class Stage3WaitContractPostgresTest {
 
     private static MemberCompletionResult completeMember(long groupId, String memberIdentity,
                                                          WaitMemberState state, long runControlVersion) {
+        return completeMember(groupId, memberIdentity, state, runControlVersion, null);
+    }
+
+    /**
+     * 完成上报要带上成员派发时写下的外部作业身份：产品语句要求两边的值逐字一致，
+     * 派发过的成员传 null 会匹配不到任何行。
+     */
+    private static MemberCompletionResult completeMember(long groupId, String memberIdentity,
+                                                         WaitMemberState state, long runControlVersion,
+                                                         String externalOperationId) {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             WaitGroupStore store = new MybatisWaitGroupStore(session.getMapper(WaitGroupMapper.class));
             return store.completeMember(new MemberCompletionRequest(groupId, memberIdentity, state,
-                    "{\"result\":\"ok\"}", null, 0, 2L, runControlVersion));
+                    "{\"result\":\"ok\"}", externalOperationId, 0, 2L, runControlVersion));
         }
     }
 
