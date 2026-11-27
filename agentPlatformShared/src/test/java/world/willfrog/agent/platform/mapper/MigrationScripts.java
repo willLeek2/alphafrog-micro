@@ -17,6 +17,11 @@ import java.util.stream.Stream;
  * <em>最后一份</em>定义它的脚本，否则宽化之后旧断言还在比对老取值。这里把「按版本与文件名排序取全部脚本」
  * 和「取某条约束的取值」两件事集中一份，避免每个测试各写一遍排序规则。</p>
  *
+ * <p>排序规则与 {@code migrate/migrate.py} 的 {@code plan_current} 保持一致：版本目录
+ * 按目录名字典序（那边是 {@code sorted(..., key=lambda d: d.name)}），目录内文件按文件名排序。
+ * 不用「按数字段比较」：像 {@code v1.10} 这样的目录名，migrate.py 会按字典序排在 {@code v1.5}
+ * 前面，测试侧必须跟部署路径一致。{@code .py} 配置检查脚本不在这里排序：本测试只执行 SQL。</p>
+ *
  * <p>找不到就报错，不跳过：脚本不在仓库里本身就说明合同漂了。</p>
  */
 final class MigrationScripts {
@@ -31,9 +36,8 @@ final class MigrationScripts {
             return stream.filter(Files::isRegularFile)
                     .filter(path -> path.getFileName().toString().endsWith(".sql"))
                     .sorted((left, right) -> {
-                        int byVersion = compareVersionDir(
-                                left.getParent().getFileName().toString(),
-                                right.getParent().getFileName().toString());
+                        int byVersion = left.getParent().getFileName().toString()
+                                .compareTo(right.getParent().getFileName().toString());
                         return byVersion != 0 ? byVersion
                                 : left.getFileName().toString().compareTo(right.getFileName().toString());
                     })
@@ -150,30 +154,4 @@ final class MigrationScripts {
         throw new IllegalStateException("在 " + userDir + " 的各级父目录下都没有 migrate/migrations/upgrades");
     }
 
-    /** 版本目录名比较：按数字段逐段比，避免 v1.10 排到 v1.5 前面。 */
-    private static int compareVersionDir(String left, String right) {
-        int[] leftParts = versionNumbers(left);
-        int[] rightParts = versionNumbers(right);
-        for (int index = 0; index < Math.max(leftParts.length, rightParts.length); index++) {
-            int leftValue = index < leftParts.length ? leftParts[index] : 0;
-            int rightValue = index < rightParts.length ? rightParts[index] : 0;
-            if (leftValue != rightValue) {
-                return Integer.compare(leftValue, rightValue);
-            }
-        }
-        return left.compareTo(right);
-    }
-
-    private static int[] versionNumbers(String versionDir) {
-        Matcher matcher = Pattern.compile("(\\d+)").matcher(versionDir);
-        List<Integer> numbers = new ArrayList<>();
-        while (matcher.find()) {
-            numbers.add(Integer.parseInt(matcher.group(1)));
-        }
-        int[] result = new int[numbers.size()];
-        for (int index = 0; index < numbers.size(); index++) {
-            result[index] = numbers.get(index);
-        }
-        return result;
-    }
 }

@@ -35,6 +35,7 @@ import world.willfrog.agent.platform.capacity.SchedulerPauseDecision;
 import world.willfrog.agent.platform.capacity.SchedulerStateStore;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.experiment.ExperimentRunPreparation;
 import world.willfrog.agent.platform.mapper.AcceptanceReleasePointMapper;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.service.AgentRunEventProjectionRepair;
@@ -53,6 +54,7 @@ import world.willfrog.agent.platform.coordination.RunCoordination;
 import world.willfrog.agent.platform.coordination.RunCoordinationDeferReason;
 import world.willfrog.agent.platform.coordination.RunCoordinationStore;
 import world.willfrog.agent.platform.mapper.MigrationStatements;
+import world.willfrog.agent.platform.mapper.Stage3MigrationPlan;
 import world.willfrog.agent.platform.asynctask.AsyncToolTask;
 import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.asynctask.MybatisAsyncToolTaskStore;
@@ -92,6 +94,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.time.OffsetDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -112,11 +116,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * 证据要在负责人授权的外部 PostgreSQL 上跑出来。</p>
  *
  * <p>做法：建一个临时 schema，用数据源自己的 schema 属性指到它（建表之前先读回
- * {@code current_schema()} 确认写入落在这里）→ 走真实升级链（init 建表脚本加各版本升级脚本，一路升到
- * 006）→ 把这一阶段的各份脚本按顺序整份执行两遍（第二遍要一样通过，证明脚本可重复执行）
- * → 逐条插反例确认被约束拒绝 → 第一步的 026 异步任务表迁移再整份执行一次（它带一次性搬运行与
- * 自校验块，不参与上面的两遍重跑）→ 再用真的 MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次
- * 恢复资格、组只齐备一次、旧领取提交为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
+ * {@code current_schema()} 确认写入落在这里）→ 走真实升级链（init 建表脚本加各版本升级脚本，按
+ * migrate.py 的排序一路升到 025，见 {@link Stage3MigrationPlan}）→ 把这一阶段的各份脚本按顺序
+ * 整份执行两遍（第二遍要一样通过，证明脚本可重复执行）→ 逐条插反例确认被约束拒绝 → 第一步的
+ * 026 异步任务表迁移再整份执行一次（它带一次性搬运行与自校验块，不参与上面的两遍重跑）→ 再用真的
+ * MyBatis 语句跑并发用例（成员只结束一次、最后成员只产生一次恢复资格、组只齐备一次、旧领取提交
+ * 为零、同一条恢复资格只被消费一次）→ 收尾删掉整个 schema。</p>
  *
  * <p>正式出证据时要同时置上 {@code AF_STAGE3_PG_DSN} 与 {@code AF_STAGE3_PG_REQUIRED}：后者让缺连接串
  * 变成一条失败用例，而不是一次「跳过」——跳过的报告照样能让 Maven 以 0 退出，光看退出码会把没跑当跑过。</p>
@@ -129,25 +134,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class Stage3WaitContractPostgresTest {
 
-    private static final String STAGE3_SCRIPT = "007_agent_run_dag_wait_group.sql";
-    private static final String DISPATCH_PROOF_SCRIPT = "008_agent_run_wait_member_dispatch_proof.sql";
-    private static final String CONSUMED_BY_SCRIPT = "009_agent_run_recovery_consumed_by_check.sql";
-    private static final String REPAIR_INDEX_SCRIPT = "010_agent_run_event_received_repair_index.sql";
-    private static final String SERVICE_LEASE_SCRIPT = "011_agent_run_service_lease.sql";
-    private static final String SHARED_CANDIDATE_SCRIPT = "012_agent_run_coordination_shared_candidate.sql";
-    private static final String RECOVERY_CLOSE_SCRIPT =
-            "013_agent_run_recovery_notification_close.sql";
-    private static final String ACCEPTANCE_FIXTURE_SCRIPT =
-            "014_agent_run_acceptance_fixture.sql";
-    private static final String RELEASE_POINT_SCRIPT = "015_agent_run_release_point.sql";
-    private static final String FIXTURE_CALL_SCRIPT = "016_agent_run_acceptance_fixture_call.sql";
-    private static final String FIXTURE_POLICY_SCRIPT = "017_agent_run_acceptance_fixture_policy.sql";
-    private static final String CHILD_INTENT_SCRIPT = "018_agent_run_child_intent.sql";
-    private static final String TREE_BUDGET_SCRIPT = "019_agent_run_tree_budget.sql";
-    private static final String WAIT_MEMBER_STOP_SCRIPT = "020_agent_run_wait_member_stop.sql";
-    private static final String TREE_ACTIVITY_SCRIPT = "021_agent_run_tree_activity_gate.sql";
-    /** 第一步的异步任务表迁移：一次性脚本，整份执行一次，不参与上面的两遍重跑。 */
-    private static final String ASYNC_TASK_SCRIPT = "026_agent_async_tool_task.sql";
     /** 轮转用例自己造的四条 Run：断言只看这几条，别的用例留下的行不参与。 */
     private static final List<String> ROTATION_RUNS =
             List.of("run-cold", "run-warm", "run-hot", "run-legacy");
@@ -429,9 +415,11 @@ class Stage3WaitContractPostgresTest {
         assertThat(groups.listOpenGroupsByRun(runId, 0, 10))
                 .extracting(WaitGroup::getId).contains(groupId);
         String fingerprint = "sha256:" + "a".repeat(64);
-        String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
+        // 外部作业身份在整张任务表上全局唯一，用例之间共用同一个 schema：每条用例用自己的编号，
+        // 否则前一条留下的行会让这一条撞 uq_agent_async_tool_task_operation。
+        String proof = "{\"operationId\":\"run-extstop:call:1\",\"taskId\":\"task-1\","
                 + "\"requestFingerprint\":\"" + fingerprint + "\"}";
-        assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
+        assertThat(groups.markMemberDispatched(groupId, "call-a", "run-extstop:call:1", proof,
                 OffsetDateTime.now(), 0L)).isTrue();
         long memberId = groups.listMembers(groupId).get(0).getId();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
@@ -455,7 +443,7 @@ class Stage3WaitContractPostgresTest {
             assertThat(first.getState()).isEqualTo("CANCELED");
             assertThat(first.getStopState()).isEqualTo("PENDING");
             assertThat(first.getTaskId()).isEqualTo("task-1");
-            assertThat(first.getExternalOperationId()).isEqualTo("run:call:1");
+            assertThat(first.getExternalOperationId()).isEqualTo("run-extstop:call:1");
             assertThat(readJsonText(first.getRequestJson(), "requestFingerprint")).isEqualTo(fingerprint);
             assertThat(groups.cancelChain(groupId).canceled()).isFalse();
             assertThat(unconfirmedStopCount(runId)).isEqualTo(1);
@@ -513,8 +501,8 @@ class Stage3WaitContractPostgresTest {
                 new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
         long groupId = suspendExternalGroup(runId);
         // 外部作业身份已经落下，但请求快照是空的：这个作业从来没有被创建过，没有可停的对象。
-        execute("UPDATE alphafrog_agent_async_tool_task SET external_operation_id = 'run:call:2' "
-                + "WHERE group_id = " + groupId);
+        execute("UPDATE alphafrog_agent_async_tool_task SET external_operation_id = "
+                + "'run-proof-missing:call:2' WHERE group_id = " + groupId);
         long memberId = groups.listMembers(groupId).get(0).getId();
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
@@ -542,7 +530,9 @@ class Stage3WaitContractPostgresTest {
         MemberCompletionResult late = groups.reportLateMember(new LateMemberRequest(
                 fixture.groupId(), "call-a", "{\"note\":\"late\"}", null,
                 fixture.runControlVersion()));
-        assertThat(late.memberState()).isEqualTo(WaitMemberState.LATE);
+        // 026 之后异步任务表没有「迟到」这个状态：结果晚于取消到达时，任务留在取消终态，
+        // 结果引用就是审计事实。所以这里读回来的成员状态是 CANCELED，不是 LATE。
+        assertThat(late.memberState()).isEqualTo(WaitMemberState.CANCELED);
         assertThat(memberByIdentity(fixture.groupId(), "call-b").getState()).isEqualTo("CANCELED");
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
             AsyncToolTaskStore tasks = context.getBean(AsyncToolTaskStore.class);
@@ -568,10 +558,10 @@ class Stage3WaitContractPostgresTest {
         WaitGroupStore groups = new MybatisWaitGroupStore(
                 new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
         long groupId = suspendExternalGroup(runId);
-        String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
+        String proof = "{\"operationId\":\"run-extstop-mismatch:call:1\",\"taskId\":\"task-1\","
                 + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
-        assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
-                OffsetDateTime.now(), 0L)).isTrue();
+        assertThat(groups.markMemberDispatched(groupId, "call-a", "run-extstop-mismatch:call:1",
+                proof, OffsetDateTime.now(), 0L)).isTrue();
         long memberId = groups.listMembers(groupId).get(0).getId();
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
         try (AnnotationConfigApplicationContext context = stopStoreContext()) {
@@ -623,9 +613,9 @@ class Stage3WaitContractPostgresTest {
         WaitGroupStore groups = new MybatisWaitGroupStore(
                 new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
         long groupId = suspendExternalGroup(childRunId);
-        String proof = "{\"operationId\":\"run:call:1\",\"taskId\":\"task-1\","
+        String proof = "{\"operationId\":\"run-childstop:call:1\",\"taskId\":\"task-1\","
                 + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
-        assertThat(groups.markMemberDispatched(groupId, "call-a", "run:call:1", proof,
+        assertThat(groups.markMemberDispatched(groupId, "call-a", "run-childstop:call:1", proof,
                 OffsetDateTime.now(), 0L)).isTrue();
         assertThat(groups.cancelChain(groupId).canceled()).isTrue();
         assertThat(unconfirmedStopCount(childRunId)).isEqualTo(1);
@@ -807,8 +797,11 @@ class Stage3WaitContractPostgresTest {
         assertThat(holdMember(fixture.groupId(), "call-a", heldUntil)).as("压住要写进去").isTrue();
 
         WaitMember after = memberByIdentity(fixture.groupId(), "call-a");
-        assertThat(after.getNextPollAt().toInstant()).as("下次查询时间按压住给的那一刻走")
-                .isEqualTo(heldUntil.toInstant());
+        // PostgreSQL 的 timestamptz 只存到微秒，Java 传进去的纳秒会被驱动截掉；
+        // 两边都截到微秒再比，断言的仍是「按压住给的那一刻走」，不是碰巧的纳秒尾巴。
+        assertThat(after.getNextPollAt().truncatedTo(ChronoUnit.MICROS).toInstant())
+                .as("下次查询时间按压住给的那一刻走")
+                .isEqualTo(heldUntil.truncatedTo(ChronoUnit.MICROS).toInstant());
         assertThat(after.getPollCount()).as("被压住不算「问过一轮」")
                 .isEqualTo(before.getPollCount());
         assertThat(after.getBackoffStep()).as("被压住与「问不到结论」是两回事，退避步数不涨")
@@ -824,8 +817,10 @@ class Stage3WaitContractPostgresTest {
                 fixture.runControlVersion()).applied()).isTrue();
         assertThat(holdMember(fixture.groupId(), "call-a", heldUntil.plusSeconds(60)))
                 .as("落终态之后压住写不进去").isFalse();
-        assertThat(memberByIdentity(fixture.groupId(), "call-a").getNextPollAt().toInstant())
-                .as("没写进去就不能改已经落定的那一行").isEqualTo(heldUntil.toInstant());
+        assertThat(memberByIdentity(fixture.groupId(), "call-a").getNextPollAt()
+                .truncatedTo(ChronoUnit.MICROS).toInstant())
+                .as("没写进去就不能改已经落定的那一行")
+                .isEqualTo(heldUntil.truncatedTo(ChronoUnit.MICROS).toInstant());
     }
 
     @Test
@@ -841,8 +836,12 @@ class Stage3WaitContractPostgresTest {
         // 同一个逻辑节点被重做过一次：最新尝试里的最新分段才算数。
         createSegment(runId, 2, "node-1", 1, 0, 0, null, 3L, 0L, "RUNNABLE");
         createSegment(runId, 2, "node-2", 0, 0, 0, null, 3L, 0L, "RUNNABLE");
-        // 另一个计划代际的行不属于这一次读取。
+        // 另一个计划代际的行不属于这一次读取。产品插入语句只让写 Run 当前计划代际的行，
+        // 要造「上一代留下的行」，先把父 Run 抬到第 3 代插进去，再降回第 2 代：
+        // 读取按第 2 代过滤，这一行就不该出现。
+        execute("UPDATE alphafrog_agent_run SET plan_generation = 3 WHERE id = '" + runId + "'");
         createSegment(runId, 3, "node-1", 0, 0, 0, null, 3L, 0L, "RUNNABLE");
+        execute("UPDATE alphafrog_agent_run SET plan_generation = 2 WHERE id = '" + runId + "'");
 
         List<NodeWorkItem> latest = latestSegments(runId, 2);
         assertThat(latest).extracting(NodeWorkItem::getNodeId)
@@ -1146,10 +1145,12 @@ class Stage3WaitContractPostgresTest {
         expectRejected(String.format(insert, "DUAL_POOL_V2", 2, "WAITING", 0, "NULL"),
                 "alphafrog_agent_run_wait_group_counter_check");
         // 下一段必须是一行真实工作项：给它一个没有对应行的分段序号（0+1 存在，所以换一个身份不存在的前置段）。
+        // 这两行只当外键目标用，造在可领取态：EXECUTING 按 004 的 owner_check 必须带领取者，
+        // 这里不需要那个事实，写一个空领取者的执行中行只会被约束挡住。
         execute("INSERT INTO alphafrog_agent_run_work_item "
                 + "(run_id, plan_generation, node_id, node_attempt, segment_sequence, state, "
                 + "context_version, run_control_version, scheduler_version) "
-                + "VALUES ('" + runId + "', 4, 'node-2', 0, 0, 'EXECUTING', 3, 0, 'DUAL_POOL_V2')");
+                + "VALUES ('" + runId + "', 4, 'node-2', 0, 0, 'RUNNABLE', 3, 0, 'DUAL_POOL_V2')");
         execute("INSERT INTO alphafrog_agent_run_work_item "
                 + "(run_id, plan_generation, node_id, node_attempt, segment_sequence, state, "
                 + "context_version, run_control_version, scheduler_version) "
@@ -1199,10 +1200,12 @@ class Stage3WaitContractPostgresTest {
         expectRejected("INSERT INTO alphafrog_agent_run_recovery_notification "
                 + "(group_id, run_id, recovery_generation) VALUES (" + groupId + ", '" + otherRun + "', 9)",
                 "alphafrog_agent_run_recovery_notification_group_fk");
+        // 状态写着已消费却没写消费方：009 的 consumed_by_check 先把它挡住（007 的 consumed_check
+        // 管的是「状态与消费时刻成对」，这里消费时刻为空，两条都看不过去时按约束的触发顺序报名字）。
         expectRejected("INSERT INTO alphafrog_agent_run_recovery_notification "
                 + "(group_id, run_id, recovery_generation, state) "
                 + "VALUES (" + groupId + ", '" + fixture.runId() + "', 9, 'CONSUMED')",
-                "alphafrog_agent_run_recovery_notification_consumed_check");
+                "alphafrog_agent_run_recovery_notification_consumed_by_check");
         expectRejected("INSERT INTO alphafrog_agent_run_recovery_notification "
                 + "(group_id, run_id, recovery_generation, state, consumed_at) "
                 + "VALUES (" + groupId + ", '" + fixture.runId() + "', 9, 'WAITING', CURRENT_TIMESTAMP)",
@@ -1502,6 +1505,10 @@ class Stage3WaitContractPostgresTest {
             assertThat(mapper.handOverClaim(runId, 0, "node-1", 0, 0, 1, "worker-2",
                     java.time.OffsetDateTime.now().plusMinutes(1)))
                     .as("显式转交把代际推到 2").isEqualTo(2);
+            // 转交只把行放回「已领取」；要测「新代际能不能提交」，新领取者得先走到执行中，
+            // 否则 commitSegmentResult 的 state = 'EXECUTING' 条件会先把它挡住，量到的就不是代际。
+            assertThat(mapper.startExecution(runId, 0, "node-1", 0, 0, 2, "worker-2"))
+                    .as("新领取者开始执行").isEqualTo(1);
             assertThat(mapper.commitSegmentResult(runId, 0, "node-1", 0, 0, 1L, 0L, 1, "{}"))
                     .as("旧领取者拿着旧代际提交，一行都写不进去").isZero();
             assertThat(mapper.commitSegmentResult(runId, 0, "node-1", 0, 0, 1L, 0L, 2, "{\"ok\":1}"))
@@ -1831,7 +1838,9 @@ class Stage3WaitContractPostgresTest {
 
             MemberCompletionResult late = store.reportLateMember(new LateMemberRequest(fixture.groupId(),
                     "call-a", "{\"note\":\"late-1\"}", "op-late", fixture.runControlVersion()));
-            assertThat(late.memberState()).isEqualTo(WaitMemberState.LATE);
+            // 026 把等待成员并进异步任务表之后没有 LATE 状态：迟到结果只补审计，
+            // 任务保持在取消终态，所以这里读回的是 CANCELED。
+            assertThat(late.memberState()).isEqualTo(WaitMemberState.CANCELED);
             assertThat(groupById(fixture.groupId()).getState())
                     .as("迟到结果不重新激活组")
                     .isEqualTo(WaitGroupState.CANCELED.name());
@@ -1869,22 +1878,25 @@ class Stage3WaitContractPostgresTest {
         Long notificationId = completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
                 fixture.runControlVersion()).notificationId();
         assertThat(notificationId).isNotNull();
-        String notification = "alphafrog_agent_run_recovery_notification WHERE id = " + notificationId;
+        String table = "alphafrog_agent_run_recovery_notification";
+        // UPDATE 的 SET 必须写在 WHERE 前面；把「表名 + 条件」拼成一整段交给 UPDATE 会直接语法错，
+        // 那样测到的不是约束，而是 SQL 拼写。SELECT 与 UPDATE 各自拼各自的条件。
+        String whereId = " WHERE id = " + notificationId;
 
-        expectRejected("UPDATE " + notification + " SET consumed_by = '   '",
+        expectRejected("UPDATE " + table + " SET consumed_by = '   '" + whereId,
                 "alphafrog_agent_run_recovery_notification_consumed_by_check");
-        expectRejected("UPDATE " + notification + " SET consumed_by = ''",
+        expectRejected("UPDATE " + table + " SET consumed_by = ''" + whereId,
                 "alphafrog_agent_run_recovery_notification_consumed_by_check");
-        expectRejected("UPDATE " + notification + " SET state = 'CONSUMED', "
-                        + "consumed_at = CURRENT_TIMESTAMP",
+        expectRejected("UPDATE " + table + " SET state = 'CONSUMED', "
+                        + "consumed_at = CURRENT_TIMESTAMP" + whereId,
                 "alphafrog_agent_run_recovery_notification_consumed_by_check");
 
         // 还没被取走时留空是常态，约束不许把它当成错的。
-        execute("UPDATE " + notification + " SET consumed_by = NULL");
+        execute("UPDATE " + table + " SET consumed_by = NULL" + whereId);
         // 正常取走：状态、时刻、消费方三样齐全，写进去。
-        execute("UPDATE " + notification + " SET state = 'CONSUMED', "
-                + "consumed_at = CURRENT_TIMESTAMP, consumed_by = 'dispatcher-1'");
-        assertThat(countRows("SELECT count(*) FROM " + notification
+        execute("UPDATE " + table + " SET state = 'CONSUMED', "
+                + "consumed_at = CURRENT_TIMESTAMP, consumed_by = 'dispatcher-1'" + whereId);
+        assertThat(countRows("SELECT count(*) FROM " + table + whereId
                 + " AND state = 'CONSUMED' AND consumed_by = 'dispatcher-1'"))
                 .isEqualTo(1);
     }
@@ -2347,6 +2359,7 @@ class Stage3WaitContractPostgresTest {
      */
     private static AgentRunEventService admissionService(AgentRunEventRedisStore eventRedisStore) {
         SqlSessionTemplate template = new SqlSessionTemplate(sqlSessionFactory);
+        ObjectMapper objectMapper = new ObjectMapper();
         StringRedisTemplate redisTemplate = Mockito.mock(StringRedisTemplate.class);
         @SuppressWarnings("unchecked")
         ValueOperations<String, String> valueOperations = Mockito.mock(ValueOperations.class);
@@ -2371,20 +2384,31 @@ class Stage3WaitContractPostgresTest {
                         OffsetDateTime.now(),
                         OffsetDateTime.now(),
                         OffsetDateTime.now().plusMinutes(2))));
+        // 创建路径会把这个结果原样写进 ext；本用例量的是事务、唯一约束与候选资格，不看它的内容，
+        // 所以这里用替身，只要求它不为空——产品后来加的这个依赖曾经让创建在真库上直接空指针。
+        ExperimentRunPreparation experimentRunPreparation =
+                Mockito.mock(ExperimentRunPreparation.class);
+        Mockito.lenient().when(experimentRunPreparation.freezeContext(Mockito.anyString()))
+                .thenAnswer(invocation -> objectMapper.createObjectNode());
+
         AgentRunEventService service = new AgentRunEventService(
-                template.getMapper(AgentRunMapper.class),
-                template.getMapper(AgentRunEventMapper.class),
-                eventRedisStore,
-                new ObjectMapper(),
-                redisTemplate,
-                Mockito.mock(AgentLlmLocalConfigLoader.class),
-                Mockito.mock(AgentMessageService.class),
-                promptService,
-                new DataSourceTransactionManager(dataSource),
+                required(template.getMapper(AgentRunMapper.class), "Run 主表映射"),
+                required(template.getMapper(AgentRunEventMapper.class), "Run 事件表映射"),
+                required(eventRedisStore, "事件流投射端"),
+                required(objectMapper, "JSON 序列化工具"),
+                required(redisTemplate, "Redis 客户端"),
+                required(Mockito.mock(AgentLlmLocalConfigLoader.class), "本地模型配置加载器"),
+                required(Mockito.mock(AgentMessageService.class), "消息服务"),
+                required(promptService, "提示词服务"),
+                required(new DataSourceTransactionManager(dataSource), "事务管理器"),
                 // 创建那条事务里会往共享候选里排队：用真的资格表，量的才是「Run 一出生就在候选里」。
-                coordinationStore(),
-                leaseStore,
-                instanceIdentity);
+                required(coordinationStore(), "共享候选资格存储"),
+                required(leaseStore, "服务所有权租约存储"),
+                required(instanceIdentity, "本进程身份"));
+        // 这个依赖是字段注入、不在构造器参数里，漏了只会在真库上表现成空指针；装配点直接断言它，
+        // 缺依赖时本机就报出缺的是哪一个。
+        ReflectionTestUtils.setField(service, "experimentRunPreparation",
+                required(experimentRunPreparation, "实验运行准备"));
         // 这些值平时由配置注入，直接 new 出来是 0/空；显式给上，免得量的是个退化配置。
         ReflectionTestUtils.setField(service, "ttlMinutes", 60);
         ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
@@ -2392,6 +2416,16 @@ class Stage3WaitContractPostgresTest {
         ReflectionTestUtils.setField(service, "payloadPreviewChars", 4096);
         ReflectionTestUtils.setField(service, "serviceLeaseTtlSeconds", 120L);
         return service;
+    }
+
+    /**
+     * 手工装配产品服务时的必需依赖：缺一个就在装配点报错，并说清缺的是哪一个。
+     *
+     * <p>不这样做的话，漏掉的依赖只有在真库上跑到某条分支时才会变成空指针，失败信息里只有
+     * 字段名，很难看出是测试装配漏了还是产品真的没注入。</p>
+     */
+    private static <T> T required(T dependency, String name) {
+        return Objects.requireNonNull(dependency, () -> "AgentRunEventService 装配缺少必需依赖：" + name);
     }
 
     /** 一次正常的创建请求：内容固定，便于同键请求算出同一份请求摘要。 */
@@ -2518,7 +2552,9 @@ class Stage3WaitContractPostgresTest {
                 + "WHERE run_id = '" + runId + "' AND node_id = 'node-v1'");
 
         NodeWorkItemStore store = workItemStore();
-        assertThat(store.listUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2, 10))
+        // 整个用例类共用一个 schema，前面用例留下的未完成分段会把小页占满：这里取足够大的一页，
+        // 再按本 Run 过滤；断言的是「这条 Run 的两行都在结果里」，不是别处有多少行。
+        assertThat(store.listUnfinishedByRunSchedulerVersion(SchedulerVersion.DUAL_POOL_V2, 1000))
                 .filteredOn(item -> runId.equals(item.getRunId()))
                 .as("按 Run 的调度器版本取行时，行自己的版本不参与筛选：混在里面的 V1 行也看得见")
                 .extracting(NodeWorkItem::getNodeId)
@@ -2548,7 +2584,9 @@ class Stage3WaitContractPostgresTest {
         createRun(runId, 0, 0L);
         RunCoordinationStore store = coordinationStore();
         assertThat(store.ensure(runId)).as("第一条资格记录建出来").isTrue();
-        assertThat(store.ensure(runId)).as("再调一次不重复建行").isTrue();
+        // ensure 是 INSERT ... ON CONFLICT DO NOTHING：行已经在时影响 0 行，返回 false。
+        // 不重复建行看的是下面的行数，不是这次调用的返回值。
+        assertThat(store.ensure(runId)).as("再调一次不重复建行：影响 0 行").isFalse();
         assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_coordination WHERE run_id = '"
                 + runId + "'")).as("一个 Run 一条资格记录").isEqualTo(1);
 
@@ -2718,10 +2756,14 @@ class Stage3WaitContractPostgresTest {
 
     // ==================== 语句与工具 ====================
 
-    /** 真实升级链：先建表脚本，再按版本顺序升到 006；这样验证的是部署时真正会走的路径。 */
+    /**
+     * 真实升级链：init 建表脚本加 upgrades 里排序到 025 的全部脚本，验证的是部署时真正会走的路径。
+     *
+     * <p>链不再手工停在 006 再补几份：022–025 这些后续脚本一旦漏掉，产品映射语句会在真库上报
+     * 「列不存在」。同样的缺口由 {@code MigrationStatementsTest} 在无数据库时先拦住。</p>
+     */
     private static void applyUpgradeChain() throws Exception {
-        List<java.nio.file.Path> chain = MigrationStatements.upgradeChainUpTo(
-                "006_agent_tool_job_test_control.sql");
+        List<java.nio.file.Path> chain = Stage3MigrationPlan.upgradeChain();
         assertThat(chain).as("升级链不能是手工摆的简化前置表").hasSizeGreaterThan(30);
         for (java.nio.file.Path path : chain) {
             for (String statement : MigrationStatements.split(MigrationStatements.read(path))) {
@@ -2737,11 +2779,7 @@ class Stage3WaitContractPostgresTest {
     /** 每份脚本整份执行两遍：第二遍必须一样通过，证明脚本可以重复执行。 */
     private static void applyStage3ScriptsTwice() throws Exception {
         for (int round = 1; round <= 2; round++) {
-            for (String script : List.of(STAGE3_SCRIPT, DISPATCH_PROOF_SCRIPT, CONSUMED_BY_SCRIPT,
-                    REPAIR_INDEX_SCRIPT, SERVICE_LEASE_SCRIPT, SHARED_CANDIDATE_SCRIPT,
-                    RECOVERY_CLOSE_SCRIPT, ACCEPTANCE_FIXTURE_SCRIPT, RELEASE_POINT_SCRIPT,
-                    FIXTURE_CALL_SCRIPT, FIXTURE_POLICY_SCRIPT, CHILD_INTENT_SCRIPT,
-                    TREE_BUDGET_SCRIPT, WAIT_MEMBER_STOP_SCRIPT, TREE_ACTIVITY_SCRIPT)) {
+            for (String script : Stage3MigrationPlan.rerunTwiceScripts()) {
                 List<String> statements = MigrationStatements.split(MigrationStatements.read(script));
                 assertThat(statements).as("脚本要能被切成可执行语句：" + script).isNotEmpty();
                 for (String statement : statements) {
@@ -2763,12 +2801,13 @@ class Stage3WaitContractPostgresTest {
      * 脚本里的 {@code DO $tag$ ... $tag$} 也不能交给按分号切句的工具。</p>
      */
     private static void applyAsyncTaskScriptOnce() throws Exception {
-        String script = MigrationStatements.read(ASYNC_TASK_SCRIPT);
+        String script = MigrationStatements.read(Stage3MigrationPlan.ASYNC_TASK_SCRIPT);
         try (Connection connection = dataSource.getConnection();
              Statement statement = connection.createStatement()) {
             statement.execute(script);
         } catch (SQLException e) {
-            throw new IllegalStateException("异步任务表迁移执行失败：" + ASYNC_TASK_SCRIPT, e);
+            throw new IllegalStateException(
+                    "异步任务表迁移执行失败：" + Stage3MigrationPlan.ASYNC_TASK_SCRIPT, e);
         }
     }
 
@@ -2917,11 +2956,24 @@ class Stage3WaitContractPostgresTest {
         }
     }
 
-    /** 让这条 Run 的服务所有权归某个持有者，返回代际号；恢复消费必须先有这条事实。 */
+    /**
+     * 让这条 Run 的服务所有权归某个持有者，返回代际号；恢复消费必须先有这条事实。
+     *
+     * <p>夹具在前面造分段时，为了让插入语句的所有权条件成立，已经用固定身份
+     * {@code stage3-fence-owner} 领过一次租约。用例接下来要换成另一个身份持有时，先把这条
+     * 仍然活着的旧租约让出（等价于它到期），否则「别人正活着持有」会挡住领取，夹具自己先失败。
+     * 让出之后再领取会按产品语义换代，旧代际照样立刻作废。</p>
+     */
     private static long ownRun(String runId, String owner) {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
-            return new MybatisRunServiceLeaseStore(session.getMapper(RunServiceLeaseMapper.class))
-                    .acquire(runId, owner, java.time.Duration.ofMinutes(2))
+            RunServiceLeaseMapper mapper = session.getMapper(RunServiceLeaseMapper.class);
+            MybatisRunServiceLeaseStore store = new MybatisRunServiceLeaseStore(mapper);
+            RunServiceLease existing = mapper.find(runId);
+            if (existing != null && !existing.expiredAt(OffsetDateTime.now())
+                    && !owner.equals(existing.ownerInstanceId())) {
+                store.release(runId, existing.ownerInstanceId(), existing.fencingToken());
+            }
+            return store.acquire(runId, owner, java.time.Duration.ofMinutes(2))
                     .orElseThrow(() -> new IllegalStateException("没能取得服务所有权：" + runId))
                     .fencingToken();
         }
@@ -3156,6 +3208,13 @@ class Stage3WaitContractPostgresTest {
                 + "AND indexname IN ('uq_agent_async_tool_task_operation', "
                 + "'idx_agent_async_tool_task_stop_due')"))
                 .as("外部作业唯一索引与停机到期索引都要在").isEqualTo(2);
+        // 024/025 给 Run 补的三列：产品映射语句按它们判断「这条运行还能不能再建子运行、
+        // 工作区是不是正在清理或已过期」。升级链漏掉这两份脚本时，这里先失败。
+        assertThat(countRows("SELECT count(*) FROM information_schema.columns "
+                + "WHERE table_schema = current_schema() AND table_name = 'alphafrog_agent_run' "
+                + "AND column_name IN ('deletion_started_at', 'workspace_cleanup_started_at', "
+                + "'workspace_expired_at')"))
+                .as("删除意图与工作区保留三列都要在").isEqualTo(3);
         // 008 加的那一列：重复执行两遍之后仍然只有一列，且类型就是 JSONB。
         assertThat(countRows("SELECT count(*) FROM information_schema.columns "
                 + "WHERE table_schema = current_schema() "

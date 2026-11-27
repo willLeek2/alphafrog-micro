@@ -2,13 +2,16 @@ package world.willfrog.agent.platform.mapper;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * 迁移脚本切句工具的自检：真库用例靠它把 007 逐条执行，切错了会在真库上表现出很难查的失败。
+ * 迁移脚本切句工具的自检：真库用例靠它把升级链与阶段脚本逐条执行，切错了会在真库上表现出
+ * 很难查的失败。
  *
  * <p>这里能覆盖的是切句规则本身；「这些语句在真库上能不能执行」由 {@code Stage3WaitContractPostgresTest}
  * 在给了外部连接串的环境里回答。</p>
@@ -56,6 +59,60 @@ class MigrationStatementsTest {
         assertThat(names).endsWith("006_agent_tool_job_test_control.sql");
         assertThat(names).as("阶段三脚本要单独应用，不混在升级链里").doesNotContain(SCRIPT);
         assertThat(names).contains("004_agent_run_work_item.sql");
+    }
+
+    /**
+     * 真库用例的升级链必须一路走到工作区保留那一份，不能停在 006 之后手写补几份。
+     *
+     * <p>缺 022–025 时，产品映射语句会在真库上报「列不存在」；这类缺口在单测里就该红，
+     * 不该等到有数据库的环境才暴露。断言的是顺序与端点：022、023、024、025 按顺序出现，
+     * 且 026 仍由用例单独执行、不在链里。</p>
+     */
+    @Test
+    void stage3UpgradeChainRunsThroughWorkspaceRetentionAndStopsBeforeAsyncTask() {
+        List<String> chain = Stage3MigrationPlan.upgradeChainScriptNames();
+        assertThat(chain).containsSubsequence(
+                "022_finance_indicators.sql",
+                "023_agent_python_risk_decision.sql",
+                "024_agent_run_deletion_intent.sql",
+                "025_agent_run_workspace_retention.sql");
+        assertThat(chain).endsWith(Stage3MigrationPlan.CHAIN_LAST_SCRIPT);
+        assertThat(chain).as("026 带一次性搬运行，必须由用例单独整份执行一次")
+                .doesNotContain(Stage3MigrationPlan.ASYNC_TASK_SCRIPT);
+    }
+
+    /**
+     * 把「真库用例到底应用了哪些脚本」摊开核对：升级链（到 025）∪ 两遍重跑的 007…021 ∪ 026，
+     * 必须覆盖 upgrades 目录里排序不超过 026 的全部 SQL，且清单里每个名字都真实存在。
+     *
+     * <p>不写成「等于目录里的全部文件」：以后新增 027 时，本用例还没有应用它，不该误报；
+     * 要管的是「已应用范围内不能有缺口」。</p>
+     */
+    @Test
+    void stage3PlanCoversEverySqlUpgradeThroughAsyncTaskWithoutGaps() {
+        List<String> ordered = MigrationScripts.pathsInOrder().stream()
+                .map(path -> path.getFileName().toString())
+                .toList();
+        int lastAppliedIndex = ordered.indexOf(Stage3MigrationPlan.ASYNC_TASK_SCRIPT);
+        assertThat(lastAppliedIndex).as("026 必须在 upgrades 目录里").isNotNegative();
+        List<String> mustApply = ordered.subList(0, lastAppliedIndex + 1);
+
+        assertThat(mustApply)
+                .as("计划里点名的脚本都要真实存在于 upgrades 目录")
+                .containsAll(Stage3MigrationPlan.rerunTwiceScripts())
+                .contains(Stage3MigrationPlan.CHAIN_LAST_SCRIPT,
+                        Stage3MigrationPlan.ASYNC_TASK_SCRIPT);
+        assertThat(Stage3MigrationPlan.rerunTwiceScripts())
+                .as("两遍重跑的都是链里已经跑过、并且排在 025 之前的脚本")
+                .allSatisfy(name -> assertThat(mustApply.indexOf(name))
+                        .isLessThan(mustApply.indexOf(Stage3MigrationPlan.CHAIN_LAST_SCRIPT)));
+
+        Set<String> applied = new LinkedHashSet<>(Stage3MigrationPlan.upgradeChainScriptNames());
+        applied.addAll(Stage3MigrationPlan.rerunTwiceScripts());
+        applied.add(Stage3MigrationPlan.ASYNC_TASK_SCRIPT);
+        assertThat(applied)
+                .as("已应用范围内不能有缺口：漏掉的脚本就是真库上「表/列不存在」的来源")
+                .containsAll(mustApply);
     }
 
     @Test
