@@ -792,6 +792,9 @@ class Stage3WaitContractPostgresTest {
                 .as("成员先要真的转成执行中").isTrue();
         WaitMember before = memberByIdentity(fixture.groupId(), "call-a");
         assertThat(before.getState()).isEqualTo(WaitMemberState.RUNNING.name());
+        // 建组时新表会给所有成员写入初始查询时间；「没被点名」的意思是压住前后这一行不变，
+        // 不是「这一列一定是空」——先记下基线，再比压住后的值。
+        OffsetDateTime siblingPollBefore = memberByIdentity(fixture.groupId(), "call-b").getNextPollAt();
 
         OffsetDateTime heldUntil = OffsetDateTime.now().plusSeconds(5);
         assertThat(holdMember(fixture.groupId(), "call-a", heldUntil)).as("压住要写进去").isTrue();
@@ -810,7 +813,8 @@ class Stage3WaitContractPostgresTest {
 
         // 另外一个成员一点都不受影响：压住的写法只落在被点名的那一行。
         assertThat(memberByIdentity(fixture.groupId(), "call-b").getNextPollAt())
-                .as("没被点名的成员下次查询时间不变").isNull();
+                .as("没被点名的成员下次查询时间不变")
+                .isEqualTo(siblingPollBefore);
 
         // 已经落终态的成员压不住：这时它已经在别人手里收尾了。
         assertThat(completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
@@ -2179,38 +2183,42 @@ class Stage3WaitContractPostgresTest {
         createRun("run-lease", 0, 0L);
         RunServiceLeaseStore store = leaseStore();
         java.time.Duration ttl = java.time.Duration.ofMinutes(2);
+        // 整个用例类共用一个 schema，持有者名字必须独占：别的用例也用 owner-a/owner-b 持过租约，
+        // renewOwned 按名字扫全表，会把别人还活着的行一起续上。
+        String ownerA = "lease-case-owner-a";
+        String ownerB = "lease-case-owner-b";
 
-        RunServiceLease first = store.acquire("run-lease", "owner-a", ttl).orElseThrow();
+        RunServiceLease first = store.acquire("run-lease", ownerA, ttl).orElseThrow();
         assertThat(first.fencingToken()).as("第一次领取代际从 1 开始").isEqualTo(1L);
-        assertThat(first.ownerInstanceId()).isEqualTo("owner-a");
+        assertThat(first.ownerInstanceId()).isEqualTo(ownerA);
 
-        assertThat(store.acquire("run-lease", "owner-a", ttl).orElseThrow().fencingToken())
+        assertThat(store.acquire("run-lease", ownerA, ttl).orElseThrow().fencingToken())
                 .as("同一位主人重复领取是续上，不是换代：换号会把自己在飞的操作一起作废")
                 .isEqualTo(1L);
-        assertThat(store.acquire("run-lease", "owner-b", ttl))
+        assertThat(store.acquire("run-lease", ownerB, ttl))
                 .as("别人正活着持有：领不到，也不该领到").isEmpty();
-        assertThat(store.renew("run-lease", "owner-b", 1L, ttl, testScope()))
+        assertThat(store.renew("run-lease", ownerB, 1L, ttl, testScope()))
                 .as("续期要核对主人").isFalse();
-        assertThat(store.renew("run-lease", "owner-a", 1L, ttl, testScope())).isTrue();
-        assertThat(store.renew("run-lease", "owner-a", 2L, ttl, testScope()))
+        assertThat(store.renew("run-lease", ownerA, 1L, ttl, testScope())).isTrue();
+        assertThat(store.renew("run-lease", ownerA, 2L, ttl, testScope()))
                 .as("续期要核对代际：号对不上说明这条已经换了主人").isFalse();
-        assertThat(store.renewOwned("owner-a", ttl, testScope())).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
-        assertThat(store.renewOwned("owner-b", ttl, testScope())).as("别人的租约一条都不动").isZero();
+        assertThat(store.renewOwned(ownerA, ttl, testScope())).as("这位主人名下的租约都在续").isGreaterThanOrEqualTo(1);
+        assertThat(store.renewOwned(ownerB, ttl, testScope())).as("别人的租约一条都不动").isZero();
 
         // 到期之后可以被接手：代际加一，旧主人手里那个号立刻写不动。
         execute("UPDATE alphafrog_agent_run_service_lease SET expires_at = CURRENT_TIMESTAMP, "
                 + "renewed_at = CURRENT_TIMESTAMP - INTERVAL '1 minute' WHERE run_id = 'run-lease'");
-        RunServiceLease takenOver = store.acquire("run-lease", "owner-b", ttl).orElseThrow();
-        assertThat(takenOver.ownerInstanceId()).isEqualTo("owner-b");
+        RunServiceLease takenOver = store.acquire("run-lease", ownerB, ttl).orElseThrow();
+        assertThat(takenOver.ownerInstanceId()).isEqualTo(ownerB);
         assertThat(takenOver.fencingToken()).as("接手要换代，旧主人的号从此作废").isEqualTo(2L);
-        assertThat(store.renew("run-lease", "owner-a", 1L, ttl, testScope()))
+        assertThat(store.renew("run-lease", ownerA, 1L, ttl, testScope()))
                 .as("旧主人迟到的续期写不动").isFalse();
-        assertThat(store.release("run-lease", "owner-a", 1L))
+        assertThat(store.release("run-lease", ownerA, 1L))
                 .as("旧主人迟到的让出也写不动").isFalse();
 
         // 让出：立刻变成可以接手，但代际号留着继续往上涨，不会回到 1。
-        assertThat(store.release("run-lease", "owner-b", 2L)).isTrue();
-        RunServiceLease reacquired = store.acquire("run-lease", "owner-a", ttl).orElseThrow();
+        assertThat(store.release("run-lease", ownerB, 2L)).isTrue();
+        RunServiceLease reacquired = store.acquire("run-lease", ownerA, ttl).orElseThrow();
         assertThat(reacquired.fencingToken())
                 .as("让出不删行：号要是回到 1，旧主人手里那个号有可能正好对上")
                 .isEqualTo(3L);
@@ -2980,13 +2988,17 @@ class Stage3WaitContractPostgresTest {
     }
 
     private static RunServiceLeaseStore leaseStore() {
-        SqlSession session = sqlSessionFactory.openSession(true);
-        return new MybatisRunServiceLeaseStore(session.getMapper(RunServiceLeaseMapper.class));
+        // 与 coordinationStore 同理：会话按调用取，避免事务回滚关闭连接后缓存到已关闭的连接。
+        return new MybatisRunServiceLeaseStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(RunServiceLeaseMapper.class));
     }
 
     private static RunCoordinationStore coordinationStore() {
-        SqlSession session = sqlSessionFactory.openSession(true);
-        return new MybatisRunCoordinationStore(session.getMapper(RunCoordinationMapper.class));
+        // 用 SqlSessionTemplate 而不是长期持有的 openSession：事务回滚时事务管理器会关闭连接，
+        // 长期持有的会话会把那条已关闭的连接缓存下来，下一次调用就报 “This connection has been closed”。
+        // 生产里这个存储拿的也是 SqlSessionTemplate 的 mapper，会话按调用取、随事务走。
+        return new MybatisRunCoordinationStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(RunCoordinationMapper.class));
     }
 
     private static NodeWorkItemStore workItemStore() {
@@ -3215,6 +3227,12 @@ class Stage3WaitContractPostgresTest {
                 + "AND column_name IN ('deletion_started_at', 'workspace_cleanup_started_at', "
                 + "'workspace_expired_at')"))
                 .as("删除意图与工作区保留三列都要在").isEqualTo(3);
+        // 子运行意图原来有一条外键指向旧等待成员表；026 之后新成员只写新表，这条外键必须已经删除，
+        // 否则每一条新建的子运行意图都会在事务提交时被拒。应用层的 matchesParentWaitMember 改查新表。
+        assertThat(countRows("SELECT count(*) FROM information_schema.table_constraints "
+                + "WHERE table_schema = current_schema() "
+                + "AND constraint_name = 'agent_run_child_intent_member_fk'"))
+                .as("指向旧等待成员表的外键要随 026 删除").isZero();
         // 008 加的那一列：重复执行两遍之后仍然只有一列，且类型就是 JSONB。
         assertThat(countRows("SELECT count(*) FROM information_schema.columns "
                 + "WHERE table_schema = current_schema() "
